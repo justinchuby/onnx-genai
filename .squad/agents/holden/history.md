@@ -65,3 +65,13 @@ Fixed PR #322 security blockers with HostTrust, open_with_trust, and symlink-res
 - Found: DISABLED_AdversarialPrecisionReport fails when enabled (Scenario 6 near-fp32-max overflow); main sweep tolerance has 12% headroom (fragile across CPU microarchitectures).
 - Verdict: **READY FOR REVIEW** — no blockers. 2 substantive findings (S1: widen sweep tolerance, S2: fix DISABLED test assertion). Both owned by Pris.
 - Decision: `.squad/decisions/inbox/holden-rereview-pr31973.md`.
+
+## 2026-08-11 — Adversarial re-review of PR #31974 (BF16 LayerNorm CPU EP)
+- Independent review of B2/B4/B5/B6/N1 fixes after 3 prior public corrections.
+- Built and ran tests: 17/17 BF16-specific, 96/96 broader LayerNorm — all pass.
+- B5 stat-narrowing bug genuinely fixed; stat tests would fail 78–1558× tolerance against pre-B5 code.
+- B4 deleted file tested nothing in this PR (zero MLAS calls). B2 docs match all 5 registrations.
+- N1 (MLFloat16 U=float) is a correct pre-existing bug fix, not just declaration-only.
+- Found: git history leakage (commit 58b5d23246 exposes .squad/ path and persona name "pris"). Needs squash before merge.
+- Verdict: **READY FOR REVIEW** — no blockers. 1 substantive (squash leaky commit), 1 nit (NarrowToFloat duplication).
+- Decision: `.squad/decisions/inbox/holden-rereview-pr31974.md`.

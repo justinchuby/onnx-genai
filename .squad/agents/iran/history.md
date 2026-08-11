@@ -56,3 +56,27 @@
 - **CreateEpFactories drift check:** Signature matches `CreateEpApiFactoriesFn` at header line 2654 — no drift.
 - **Fail-closed unchanged:** Both configs still return 0 factories + error status.
 - **Validation:** `cargo check --workspace` ✓, `cargo check -p onnx-runtime-ep-cuda-plugin --features cuda` ✓, ep-plugin 9 tests ✓, clippy clean ✓, fmt clean ✓.
+
+## 2026-08-11 — B5: Fix stats round-trip through BFloat16 (PR #31974)
+
+**Task:** Reviewer rejection B5 — Mean/InvStdDev outputs were narrowed through BFloat16/MLFloat16 instead of being written as float, losing ~0.4% precision.
+
+**Changes:**
+- `layer_norm_impl.cc`: BFloat16 and MLFloat16 `ComputeJob` overloads now use `WriteStat<U>()` (U=float) instead of `BFloat16(mean)` / `MLFloat16(mean)`.
+- `layer_norm_impl.h`: `SrcDispatcher` changed from runtime `if` to `if constexpr` to avoid instantiating `ComputeImpl<NarrowType, NarrowType>`, eliminating dead template paths.
+- `WriteStat`: Removed dead `MLFloat16`/`BFloat16` branches now that they can never be instantiated.
+- `layer_norm_impl.cc`, `skip_layer_norm.cc`: Updated `NarrowToFloat`/`FloatToNarrow` comments to honestly describe scalar BF16 conversions (no hardware bf16 instructions on AVX2).
+
+**N1 decision:** Keep MLFloat16 `U=float` registration (matches schema, matches CUDA, declaration-only change, adjacent to BFloat16 registration).
+
+**Deduplication:** Not done — `NarrowToFloat`/`FloatToNarrow` duplication between files requires a shared header, which is scope creep. Follow-up.
+
+**Validation:** Build clean with `-Werror`. 17/17 BFloat16 tests ✓, 96/96 full LayerNorm suite ✓.
+
+## 2026-08-11 — Deduplicate NarrowToFloat/FloatToNarrow (PR #31974)
+
+Reviewer flagged duplicated conversion helpers. Confirmed `ConvertMLFloat16ToFloatIfNeeded` was pre-existing (left alone). `NarrowToFloat<T>` / `FloatToNarrow<T>` were ours — identical copies in `layer_norm_impl.cc` and `skip_layer_norm.cc`.
+
+No upstream template helper for dispatching across both narrow types existed. Created `onnxruntime/core/util/narrow_float_utils.h` in `namespace onnxruntime`, included from both sites, removed local defs.
+
+Build clean, 17/17 BFloat16 LayerNorm tests pass, 96/96 `*LayerNorm*` pass, clang-format clean. Pushed as `6dd19a6f56`.

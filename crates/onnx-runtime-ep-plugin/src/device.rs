@@ -22,7 +22,9 @@
 //!   ownership of the returned `OrtEpDevice` array entries.
 //!   (header line ~1225–1241)
 
+use std::collections::HashMap;
 use std::ptr;
+use std::sync::Mutex;
 
 use onnx_genai_ort_sys as ort;
 use onnx_runtime_ep_api::provider::ExecutionProvider;
@@ -87,6 +89,14 @@ pub struct DeviceAllocator {
     /// ORT owns the lifetime and releases it when `ReleaseEpDevice` is called.
     /// Must not be passed to `EpDevice_AddAllocatorInfo` (that's separate).
     pub memory_info: *const ort::OrtMemoryInfo,
+    /// Tracks allocation sizes so `Free` can pass the true size to the EP's
+    /// `deallocate`. Keyed by pointer address. (Fixes defect #4: Free was
+    /// passing size=0, violating the allocator contract.)
+    pub alloc_sizes: Mutex<HashMap<usize, usize>>,
+    /// Whether this allocator owns the EP (and should drop it on release).
+    /// When the EP is shared across components, it is owned by the factory,
+    /// not by the allocator.
+    pub owns_ep: bool,
 }
 
 // SAFETY: The EP behind the raw pointer is Send+Sync per ExecutionProvider trait bound.
@@ -107,6 +117,7 @@ impl DeviceAllocator {
     pub unsafe fn new(
         ep: *const dyn ExecutionProvider,
         memory_info: *const ort::OrtMemoryInfo,
+        owns_ep: bool,
     ) -> Box<Self> {
         Box::new(Self {
             vtable: ort::OrtAllocator {
@@ -121,6 +132,8 @@ impl DeviceAllocator {
             },
             ep,
             memory_info,
+            alloc_sizes: Mutex::new(HashMap::new()),
+            owns_ep,
         })
     }
 }
@@ -139,6 +152,10 @@ unsafe extern "C" fn device_alloc(
         match ep.allocate(size, 16) {
             Ok(buf) => {
                 let ptr = buf.as_ptr() as *mut std::os::raw::c_void;
+                // Track the allocation size so device_free can pass it back.
+                if let Ok(mut sizes) = alloc.alloc_sizes.lock() {
+                    sizes.insert(ptr as usize, size);
+                }
                 // DeviceBuffer has no Drop impl — when `buf` goes out of scope,
                 // only the handle metadata is discarded; the underlying
                 // allocation stays alive until `device_free` reconstructs a
@@ -158,21 +175,19 @@ unsafe extern "C" fn device_free(this: *mut ort::OrtAllocator, p: *mut std::os::
         }
         let alloc = unsafe { &*(this.cast::<DeviceAllocator>()) };
         let ep = unsafe { &*alloc.ep };
-        // BUG (defect #4): size is unknown at free time. We pass size=0 which
-        // violates the allocator contract — the EP's `deallocate` may need the
-        // real size for arena management, cudaFree bookkeeping, or leak detection.
-        //
-        // FIX REQUIRED: Track allocation sizes in a side table (e.g.
-        // HashMap<*mut c_void, usize> behind a Mutex) populated by device_alloc
-        // and looked up here. Alternatively, the EP could support free-by-pointer
-        // (ignoring size), but that must be an explicit contract, not an accident.
-        //
-        // Alignment is also hardcoded to 16 — must match what device_alloc used.
+        // Look up the true allocation size from our tracking table.
+        let size = alloc
+            .alloc_sizes
+            .lock()
+            .ok()
+            .and_then(|mut sizes| sizes.remove(&(p as usize)))
+            .unwrap_or(0);
+        // Alignment must match what device_alloc used.
         let buf = unsafe {
             onnx_runtime_ep_api::provider::DeviceBuffer::from_raw_parts(
                 p,
                 ep.device_id(),
-                0, // BUG: size unknown — see defect #4 above
+                size,
                 16,
             )
         };
@@ -205,6 +220,11 @@ pub struct DeviceSyncStream {
     pub vtable: ort::OrtSyncStreamImpl,
     /// EP reference for sync/flush operations.
     pub ep: *const dyn ExecutionProvider,
+    /// Native stream handle (e.g. `cudaStream_t` for CUDA). Returned from
+    /// `GetHandle`. Null for non-stream-aware EPs (CPU).
+    pub stream_handle: *mut std::os::raw::c_void,
+    /// Whether this stream owns the EP (and should drop it on release).
+    pub owns_ep: bool,
 }
 
 // SAFETY: EP is Send+Sync.
@@ -214,11 +234,18 @@ unsafe impl Sync for DeviceSyncStream {}
 impl DeviceSyncStream {
     /// Create a new sync stream wrapping the given EP.
     ///
+    /// `stream_handle` is the native stream handle (e.g. `cudaStream_t`). Pass
+    /// `null_mut()` for non-stream-aware EPs.
+    ///
     /// # Safety
     ///
     /// `ep` must remain valid for the lifetime of this stream. ORT calls
     /// `Release` on the vtable when it's done.
-    pub unsafe fn new(ep: *const dyn ExecutionProvider) -> Box<Self> {
+    pub unsafe fn new(
+        ep: *const dyn ExecutionProvider,
+        stream_handle: *mut std::os::raw::c_void,
+        owns_ep: bool,
+    ) -> Box<Self> {
         Box::new(Self {
             vtable: ort::OrtSyncStreamImpl {
                 ort_version_supported: ort::ORT_API_VERSION,
@@ -229,6 +256,8 @@ impl DeviceSyncStream {
                 OnSessionRunEnd: Some(stream_on_session_run_end),
             },
             ep,
+            stream_handle,
+            owns_ep,
         })
     }
 }
@@ -238,13 +267,11 @@ unsafe extern "C" fn stream_release(this: *mut ort::OrtSyncStreamImpl) {
         if this.is_null() {
             return;
         }
-        // Reconstruct and drop the Box, then reclaim the owned EP.
-        // The EP was created via `Box::into_raw` in `factory_create_sync_stream`
-        // and must be reclaimed here — ORT calls `Release` exactly once per
-        // created stream (header line ~207–216).
         unsafe {
             let stream = Box::from_raw(this.cast::<DeviceSyncStream>());
-            if !stream.ep.is_null() {
+            // Only drop the EP if we own it. When the EP is shared (owned by
+            // the factory), the factory handles cleanup.
+            if stream.owns_ep && !stream.ep.is_null() {
                 drop(Box::from_raw(stream.ep as *mut dyn ExecutionProvider));
             }
         }
@@ -252,10 +279,13 @@ unsafe extern "C" fn stream_release(this: *mut ort::OrtSyncStreamImpl) {
 }
 
 unsafe extern "C" fn stream_get_handle(
-    _this: *mut ort::OrtSyncStreamImpl,
+    this: *mut ort::OrtSyncStreamImpl,
 ) -> *mut std::os::raw::c_void {
-    // For mock/CPU: no native stream handle. Real CUDA EP would return cudaStream_t.
-    ptr::null_mut()
+    if this.is_null() {
+        return ptr::null_mut();
+    }
+    let stream = unsafe { &*(this.cast::<DeviceSyncStream>()) };
+    stream.stream_handle
 }
 
 unsafe extern "C" fn stream_flush(this: *mut ort::OrtSyncStreamImpl) -> ort::OrtStatusPtr {
@@ -777,7 +807,7 @@ mod tests {
     fn device_allocator_alloc_and_free_roundtrip() {
         let ep = MockGpuEp;
         let alloc =
-            unsafe { DeviceAllocator::new(&ep as *const dyn ExecutionProvider, ptr::null()) };
+            unsafe { DeviceAllocator::new(&ep as *const dyn ExecutionProvider, ptr::null(), true) };
         let alloc_ptr = Box::into_raw(alloc);
 
         // Allocate
@@ -797,7 +827,7 @@ mod tests {
         let sentinel: u8 = 42;
         let fake_mem_info = &sentinel as *const u8 as *const ort::OrtMemoryInfo;
         let alloc =
-            unsafe { DeviceAllocator::new(&ep as *const dyn ExecutionProvider, fake_mem_info) };
+            unsafe { DeviceAllocator::new(&ep as *const dyn ExecutionProvider, fake_mem_info, true) };
         let alloc_ptr = Box::into_raw(alloc);
 
         let info = unsafe { device_info(alloc_ptr.cast()) };
@@ -818,7 +848,7 @@ mod tests {
     fn device_sync_stream_flush_succeeds() {
         let ep: Box<dyn ExecutionProvider> = Box::new(MockGpuEp);
         let ep_ptr: *const dyn ExecutionProvider = Box::into_raw(ep);
-        let stream = unsafe { DeviceSyncStream::new(ep_ptr) };
+        let stream = unsafe { DeviceSyncStream::new(ep_ptr, ptr::null_mut(), true) };
         let stream_ptr = Box::into_raw(stream);
 
         let status = unsafe { stream_flush(stream_ptr.cast()) };
@@ -840,7 +870,7 @@ mod tests {
     fn device_sync_stream_get_handle_returns_null_for_mock() {
         let ep: Box<dyn ExecutionProvider> = Box::new(MockGpuEp);
         let ep_ptr: *const dyn ExecutionProvider = Box::into_raw(ep);
-        let stream = unsafe { DeviceSyncStream::new(ep_ptr) };
+        let stream = unsafe { DeviceSyncStream::new(ep_ptr, ptr::null_mut(), true) };
         let stream_ptr = Box::into_raw(stream);
 
         let handle = unsafe { stream_get_handle(stream_ptr.cast()) };
@@ -853,7 +883,7 @@ mod tests {
     fn device_sync_stream_release_does_not_panic() {
         let ep: Box<dyn ExecutionProvider> = Box::new(MockGpuEp);
         let ep_ptr: *const dyn ExecutionProvider = Box::into_raw(ep);
-        let stream = unsafe { DeviceSyncStream::new(ep_ptr) };
+        let stream = unsafe { DeviceSyncStream::new(ep_ptr, ptr::null_mut(), true) };
         let stream_ptr = Box::into_raw(stream);
         // Should not panic or leak.
         unsafe { stream_release(stream_ptr.cast()) };
@@ -962,7 +992,7 @@ mod tests {
         let ep: Box<dyn ExecutionProvider> = Box::new(CountingEp);
         let ep_ptr: *const dyn ExecutionProvider = Box::into_raw(ep);
 
-        let stream = unsafe { DeviceSyncStream::new(ep_ptr) };
+        let stream = unsafe { DeviceSyncStream::new(ep_ptr, ptr::null_mut(), true) };
         let stream_ptr = Box::into_raw(stream);
 
         assert_eq!(

@@ -103,3 +103,16 @@ Exactly as expected: bf16 has 8 mantissa bits vs fp16's 11 bits, so 2^3 = 8× co
 **ACCEPT** — the widen→f32-accumulate→narrow approach is sound for bf16 LayerNorm/RMSNorm. The f32 arithmetic provides more than enough precision; the bottleneck is entirely the bf16 I/O quantization (≤0.5 ULP floor), with kernel accumulation adding at most 1 ULP even at N=65536. The rounding rule is correct (RNE) and consistent across ORT.
 
 **Pending:** Resch's actual kernel landing — at that point, the oracle tests will activate kernel-vs-oracle comparison. The test file is structured to add `MlasLayerNormBF16()` calls when the API exists.
+
+## 8. CI Fix — Dead Functions Removed (2026-08-11)
+
+**Root cause of 46 CI failures:** Two unused static functions in `test_layernorm_bf16.cpp` triggered `-Werror=unused-function`:
+
+1. **`BF16Ulp` (was line 78)** — computed the float-valued ULP magnitude of a bf16 value. All test tolerances use integer ULP distance via `BF16UlpDistance` instead. Genuinely leftover scaffolding; removed.
+2. **`ReportErrors` (was line 445)** — private static method on `BF16LayerNormPrecisionTest` that formatted error decomposition. Was intended for kernel-vs-oracle comparison when Resch's kernel lands, but no test method calls it yet. Removed now; will be re-added when the kernel hook activates.
+
+**Sweep of all PR-touched files:** No other `-Werror` issues found. Implementation files (`layer_norm_impl.cc`, `layer_norm.cc`, `skip_layer_norm.cc`, `cpu_contrib_kernels.cc`, `cpu_execution_provider.cc`) properly use `ORT_UNUSED_PARAMETER` for conditionally-unused parameters. No sign-compare, shadowing, or unused-variable warnings.
+
+**Minimal-build consideration:** The test file has no conditional compilation (`#ifdef`), so no code becomes dead under minimal build flags (exceptions disabled, reduced types). The implementation files gate unused parameters with `ORT_UNUSED_PARAMETER`.
+
+**Validation:** Built without `--compile_no_warning_as_error` — clean. All 45 MLAS bf16 tests pass.

@@ -6,6 +6,7 @@
 use std::ffi::{CString, c_char};
 use std::panic::AssertUnwindSafe;
 use std::ptr;
+use std::sync::{Arc, Mutex};
 
 use onnx_genai_ort_sys as ort;
 use onnx_runtime_ep_api::provider::ExecutionProvider;
@@ -37,7 +38,24 @@ pub struct ExportedFactory {
     pub kernel_registry_entries: Vec<crate::ep::KernelRegistryEntry>,
     /// Device support configuration for generalized enumeration.
     pub device_support: DeviceSupport,
+    /// Optional shared EP instance for device EPs that require a single
+    /// runtime/context shared across allocator, stream, and data transfer.
+    /// When set, factory callbacks use this instead of calling `constructor`
+    /// for each component. (Fixes defect #1: separate CUDA runtime/context.)
+    ///
+    /// The EP is wrapped in `Arc<Mutex<..>>` so multiple ORT callbacks can
+    /// borrow it safely. The `Mutex` is only held briefly during each callback.
+    pub shared_ep: Option<Arc<Mutex<Box<dyn ExecutionProvider + Send>>>>,
+    /// Optional native stream handle for device EPs. Returned from
+    /// `DeviceSyncStream::GetHandle`. For CUDA, this would be `cudaStream_t`.
+    pub stream_handle: *mut std::os::raw::c_void,
 }
+
+// SAFETY: The raw stream_handle pointer is only accessed from ORT callbacks
+// which are single-threaded per factory. The Arc<Mutex<..>> for shared_ep is
+// inherently Send+Sync. All other fields are Send+Sync by construction.
+unsafe impl Send for ExportedFactory {}
+unsafe impl Sync for ExportedFactory {}
 
 /// Implementation of `CreateEpFactories` — called by the macro-generated export.
 ///
@@ -152,6 +170,8 @@ where
         constructor: Box::new(move || constructor()),
         kernel_registry_entries: Vec::new(),
         device_support: DeviceSupport::cpu_only(),
+        shared_ep: None,
+        stream_handle: ptr::null_mut(),
     });
 
     let factory_ptr = Box::into_raw(factory);
@@ -560,18 +580,24 @@ unsafe extern "C" fn factory_create_allocator(
             }
         }
 
-        // Device path: create a DeviceAllocator backed by a fresh EP instance.
-        // The EP instance must outlive the allocator. We Box-leak it; ORT calls
-        // ReleaseAllocator which drops the DeviceAllocator (but not the EP —
-        // that lives as a raw pointer). The factory's constructor produces a
-        // fresh EP for the allocator to use.
-        let mut ep = (exported.constructor)();
-        let config = onnx_runtime_ep_api::provider::EpConfig::default();
-        if let Err(e) = ep.initialize(&config) {
-            return fail_status(&format!("CreateAllocator: EP init failed: {e}"));
-        }
-        let ep_ptr: *const dyn ExecutionProvider = Box::into_raw(ep);
-        let dev_alloc = unsafe { DeviceAllocator::new(ep_ptr, memory_info) };
+        // Device path: create a DeviceAllocator. If a shared EP is available
+        // (device EPs that need a single CUDA context), use it. Otherwise
+        // construct a fresh EP for this allocator.
+        let (ep_ptr, owns_ep): (*const dyn ExecutionProvider, bool) =
+            if let Some(ref shared) = exported.shared_ep {
+                // Shared EP: borrow the pointer. Factory owns the EP.
+                let guard = shared.lock().unwrap();
+                let ep_ref: &dyn ExecutionProvider = &**guard;
+                (ep_ref as *const dyn ExecutionProvider, false)
+            } else {
+                let mut ep = (exported.constructor)();
+                let config = onnx_runtime_ep_api::provider::EpConfig::default();
+                if let Err(e) = ep.initialize(&config) {
+                    return fail_status(&format!("CreateAllocator: EP init failed: {e}"));
+                }
+                (Box::into_raw(ep) as *const dyn ExecutionProvider, true)
+            };
+        let dev_alloc = unsafe { DeviceAllocator::new(ep_ptr, memory_info, owns_ep) };
         let alloc_ptr = Box::into_raw(dev_alloc);
         unsafe { *allocator = alloc_ptr.cast::<ort::OrtAllocator>() };
         ok_status()
@@ -591,10 +617,10 @@ unsafe extern "C" fn factory_release_allocator(
         }
         let exported = unsafe { &*(factory.cast::<ExportedFactory>()) };
         if !exported.device_support.host_accessible {
-            // This is a DeviceAllocator we created — drop it and the EP.
+            // This is a DeviceAllocator we created — drop it.
             let dev_alloc = unsafe { Box::from_raw(allocator.cast::<DeviceAllocator>()) };
-            // Drop the leaked EP behind the allocator.
-            if !dev_alloc.ep.is_null() {
+            // Only drop the EP if the allocator owns it (not shared).
+            if dev_alloc.owns_ep && !dev_alloc.ep.is_null() {
                 unsafe {
                     drop(Box::from_raw(dev_alloc.ep as *mut dyn ExecutionProvider));
                 }
@@ -616,15 +642,75 @@ unsafe extern "C" fn factory_is_stream_aware(factory: *const ort::OrtEpFactory) 
     result.unwrap_or(false)
 }
 
-/// No data transfer needed for CPU EP — set output to null.
+/// Creates data transfer for device EPs. CPU EPs don't need data transfer.
 unsafe extern "C" fn factory_create_data_transfer(
-    _factory: *mut ort::OrtEpFactory,
+    factory: *mut ort::OrtEpFactory,
     data_transfer: *mut *mut ort::OrtDataTransferImpl,
 ) -> *mut ort::OrtStatus {
-    if !data_transfer.is_null() {
-        unsafe { *data_transfer = ptr::null_mut() };
-    }
-    ok_status()
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        if data_transfer.is_null() {
+            return ok_status();
+        }
+        if factory.is_null() {
+            unsafe { *data_transfer = ptr::null_mut() };
+            return fail_status("CreateDataTransfer: factory is null");
+        }
+
+        let exported = unsafe { &*(factory.cast::<ExportedFactory>()) };
+        let support = &exported.device_support;
+
+        if support.host_accessible {
+            // CPU path: no data transfer needed.
+            unsafe { *data_transfer = ptr::null_mut() };
+            return ok_status();
+        }
+
+        // Device path: create a DeviceDataTransferFull with ORT API access.
+        let api = host_api();
+        if api.is_null() {
+            unsafe { *data_transfer = ptr::null_mut() };
+            return fail_status(
+                "CreateDataTransfer: host ORT API not available (cannot extract tensor data)",
+            );
+        }
+
+        // Resolve OrtEpApi for MemoryDevice_GetDeviceType (used by CanCopy).
+        let ep_api: *const ort::OrtEpApi = unsafe {
+            match (*api).GetEpApi {
+                Some(get_ep_api) => get_ep_api(),
+                None => ptr::null(),
+            }
+        };
+
+        // Device path: use shared EP if available, otherwise construct fresh.
+        let (ep_ptr, owns_ep): (*const dyn ExecutionProvider, bool) =
+            if let Some(ref shared) = exported.shared_ep {
+                let guard = shared.lock().unwrap();
+                let ep_ref: &dyn ExecutionProvider = &**guard;
+                (ep_ref as *const dyn ExecutionProvider, false)
+            } else {
+                let mut ep = (exported.constructor)();
+                let config = onnx_runtime_ep_api::provider::EpConfig::default();
+                if let Err(e) = ep.initialize(&config) {
+                    unsafe { *data_transfer = ptr::null_mut() };
+                    return fail_status(&format!("CreateDataTransfer: EP init failed: {e}"));
+                }
+                (Box::into_raw(ep) as *const dyn ExecutionProvider, true)
+            };
+        let transfer = unsafe {
+            crate::transfer::DeviceDataTransferFull::new(
+                ep_ptr,
+                support.clone(),
+                api,
+                ep_api,
+                owns_ep,
+            )
+        };
+        let raw = Box::into_raw(transfer);
+        unsafe { *data_transfer = raw.cast::<ort::OrtDataTransferImpl>() };
+        ok_status()
+    }));
+    result.unwrap_or_else(|_| fail_status("CreateDataTransfer: internal panic"))
 }
 
 /// Creates a sync stream. For non-stream-aware EPs (CPU), returns null (no-op).
@@ -656,15 +742,24 @@ unsafe extern "C" fn factory_create_sync_stream(
             );
         }
 
-        // Stream-aware path: create a DeviceSyncStream backed by a fresh EP.
-        let mut ep = (exported.constructor)();
-        let config = onnx_runtime_ep_api::provider::EpConfig::default();
-        if let Err(e) = ep.initialize(&config) {
-            unsafe { *stream = ptr::null_mut() };
-            return fail_status(&format!("CreateSyncStream: EP init failed: {e}"));
-        }
-        let ep_ptr: *const dyn ExecutionProvider = Box::into_raw(ep);
-        let sync_stream = unsafe { DeviceSyncStream::new(ep_ptr) };
+        // Stream-aware path: create a DeviceSyncStream. Use shared EP if
+        // available, otherwise construct a fresh one.
+        let (ep_ptr, owns_ep): (*const dyn ExecutionProvider, bool) =
+            if let Some(ref shared) = exported.shared_ep {
+                let guard = shared.lock().unwrap();
+                let ep_ref: &dyn ExecutionProvider = &**guard;
+                (ep_ref as *const dyn ExecutionProvider, false)
+            } else {
+                let mut ep = (exported.constructor)();
+                let config = onnx_runtime_ep_api::provider::EpConfig::default();
+                if let Err(e) = ep.initialize(&config) {
+                    unsafe { *stream = ptr::null_mut() };
+                    return fail_status(&format!("CreateSyncStream: EP init failed: {e}"));
+                }
+                (Box::into_raw(ep) as *const dyn ExecutionProvider, true)
+            };
+        let stream_handle = exported.stream_handle;
+        let sync_stream = unsafe { DeviceSyncStream::new(ep_ptr, stream_handle, owns_ep) };
         let stream_ptr = Box::into_raw(sync_stream);
         unsafe { *stream = stream_ptr.cast::<ort::OrtSyncStreamImpl>() };
         ok_status()

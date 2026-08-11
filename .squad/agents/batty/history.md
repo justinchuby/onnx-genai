@@ -113,3 +113,15 @@ Test results:
 
 Durable lesson: Multi-output ops must not assume all outputs share input[0]'s shape.
 Reduction outputs (Mean, InvStdDev) follow keepdims semantics over the normalised axes.
+
+## 2026-08-11 — ARM64 Debug CI failure on onnxruntime PR #31973
+
+**Task:** Root-cause the single failing CI job `Build Linux arm64 Debug / build_test_pipeline`.
+
+**Finding:** Build reached [1452/1458] with zero compiler errors, then silently died during the final 6 link steps (onnxruntime_test_all, onnxruntime_provider_test, etc.). No error message, no exit code, no "ninja: build stopped" — classic OOM-kill signature. VM is Standard_D8pds_v5 (32 GB RAM). CCache missed, so all targets compiled fresh. Docker container killed mid-link.
+
+**Code review:** All x86/ARM64 guards verified correct — `MlasLayerNormKernelAvx2` properly guarded by `MLAS_TARGET_AMD64` in both mlasi.h and platform.cpp. CMake entries properly in x86_64-only sections. No code bug found.
+
+**Verdict:** STILL UNKNOWN — strong OOM circumstantial evidence but cannot conclusively prove without dmesg/kernel logs. No code fix applied. Recommended re-trigger to test flakiness.
+
+**Decision doc:** `.squad/decisions/inbox/batty-arm64-31973.md`

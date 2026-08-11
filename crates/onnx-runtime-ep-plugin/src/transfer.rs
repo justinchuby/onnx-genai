@@ -354,6 +354,10 @@ pub struct DeviceDataTransferFull {
     support: DeviceSupport,
     /// ORT API pointer for tensor data access.
     api: *const ort::OrtApi,
+    /// ORT EP API pointer for `MemoryDevice_GetDeviceType`.
+    ep_api: *const ort::OrtEpApi,
+    /// Whether this transfer owns the EP (and should drop it on release).
+    owns_ep: bool,
 }
 
 unsafe impl Send for DeviceDataTransferFull {}
@@ -365,18 +369,22 @@ impl DeviceDataTransferFull {
     /// # Constructor signature for `factory.rs`
     ///
     /// ```ignore
-    /// let transfer = DeviceDataTransferFull::new(ep_ptr, support.clone(), api);
+    /// let transfer = DeviceDataTransferFull::new(ep_ptr, support.clone(), api, ep_api, false);
     /// let raw = Box::into_raw(transfer) as *mut OrtDataTransferImpl;
     /// *out_data_transfer = raw;
     /// ```
     ///
     /// # Safety
     ///
-    /// `ep` and `api` must remain valid until ORT calls `Release`.
+    /// `ep`, `api`, and `ep_api` must remain valid until ORT calls `Release`.
+    /// `ep_api` may be null if `OrtApi::GetEpApi` is unavailable; `CanCopy`
+    /// will fall back to fail-closed.
     pub unsafe fn new(
         ep: *const dyn ExecutionProvider,
         support: DeviceSupport,
         api: *const ort::OrtApi,
+        ep_api: *const ort::OrtEpApi,
+        owns_ep: bool,
     ) -> Box<Self> {
         Box::new(Self {
             vtable: ort::OrtDataTransferImpl {
@@ -388,6 +396,8 @@ impl DeviceDataTransferFull {
             ep,
             support,
             api,
+            ep_api,
+            owns_ep,
         })
     }
 }
@@ -398,7 +408,10 @@ unsafe extern "C" fn transfer_full_release(this: *mut ort::OrtDataTransferImpl) 
             return;
         }
         unsafe {
-            drop(Box::from_raw(this.cast::<DeviceDataTransferFull>()));
+            let transfer = Box::from_raw(this.cast::<DeviceDataTransferFull>());
+            if transfer.owns_ep && !transfer.ep.is_null() {
+                drop(Box::from_raw(transfer.ep as *mut dyn ExecutionProvider));
+            }
         }
     }));
 }
@@ -416,12 +429,28 @@ unsafe extern "C" fn transfer_full_can_copy(
         if transfer.support.host_accessible {
             return false;
         }
-        // With OrtEpApi we could call MemoryDevice_GetDeviceType, but the
-        // EpApi pointer isn't stored here (it's separate from OrtApi).
-        // The underlying CopyTensors implementation is non-functional for
-        // device EPs without a shared CUDA context and stream. Returning
-        // true here is fail-open. Fail closed until the transfer is wired.
-        false
+
+        // Use OrtEpApi::MemoryDevice_GetDeviceType to classify copy direction.
+        if transfer.ep_api.is_null() {
+            // No EpApi available — fail closed.
+            return false;
+        }
+        let ep_api = unsafe { &*transfer.ep_api };
+        let get_dev_type = match ep_api.MemoryDevice_GetDeviceType {
+            Some(f) => f,
+            None => return false, // fail closed
+        };
+
+        let src_type = unsafe { get_dev_type(src_memory_device) };
+        let dst_type = unsafe { get_dev_type(dst_memory_device) };
+
+        let src_is_cpu = src_type == ort::OrtMemoryInfoDeviceType_CPU;
+        let dst_is_cpu = dst_type == ort::OrtMemoryInfoDeviceType_CPU;
+        // Same-device: both non-CPU and pointer equality (conservative).
+        let same_device = src_memory_device == dst_memory_device;
+
+        let direction = CopyDirection::classify(src_is_cpu, dst_is_cpu, same_device);
+        direction.is_supported()
     }));
     result.unwrap_or(false)
 }
@@ -1185,7 +1214,8 @@ mod tests {
         let api = ort::OrtApi::default();
         let api_ptr: *const ort::OrtApi = &api;
 
-        let transfer = unsafe { DeviceDataTransferFull::new(ep_ptr, support, api_ptr) };
+        let transfer =
+            unsafe { DeviceDataTransferFull::new(ep_ptr, support, api_ptr, std::ptr::null(), false) };
         let raw = Box::into_raw(transfer) as *mut ort::OrtDataTransferImpl;
 
         // Release.

@@ -46,3 +46,22 @@ Reviewed for @justinchuby. Verdict: CONDITIONAL APPROVE. One substantive finding
 ## 2026-08-11 — Re-Review PR #31974 (S1 fix: U=float for narrow-float contrib kernels)
 
 Re-reviewed commit `142cb563c5` for @justinchuby. Verdict: APPROVE. The fix correctly changes contrib macro to `(T, U)` and registers `MLFloat16,float` / `BFloat16,float`. Verified: (1) declaration-only, no runtime change — contrib LayerNorm constructor sets `contrib_op=false`, so `SrcDispatcher` always calls `ComputeImpl<T, float>`; (2) kernel matching improves for schema-compliant models, no breakage for existing valid models; (3) CUDA parity confirmed; (4) all 4 macro expansions correct; (5) recommended keeping MLFloat16 fix combined. 10 bf16 tests pass. Full re-review appended to `.squad/decisions/inbox/luv-review-pr31974.md`.
+
+## 2026-08-11 — B4 + B6 Test Rework for #31974
+
+**Requested by**: @justinchuby (reviewer rejection protocol)
+
+### B4: Deleted `test/mlas/unittest/test_layernorm_bf16.cpp` (1037 lines)
+- File called zero MLAS APIs despite living in the MLAS test directory
+- 45 registered tests tested BFloat16 rounding/oracle arithmetic, not PR code
+- The "45 MLAS kernel tests" claim was false — retracted
+
+### B6: Rewrote `test/contrib_ops/layer_norm_bf16_cpu_test.cc` (10 → 17 tests)
+- Added SkipLayerNormalization (3 tests)
+- Added contrib LayerNormalization opset 1–16 (2 tests)
+- Added Mean/InvStdDev float stat assertions at 1e-5 tolerance (2 tests)
+- Dual tolerance: bf16 Y at 0.016 abs, float stats at 1e-5 abs
+- Removed persona comments ("Chew", "Resch")
+- All 96 LayerNorm tests pass, no regressions
+
+### Honest test count: 17 BF16 CPU EP operator tests

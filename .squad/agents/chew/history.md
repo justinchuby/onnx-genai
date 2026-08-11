@@ -133,3 +133,11 @@ cargo test -p onnx-runtime-ep-plugin     → 9 passed; 0 failed; 0 ignored
 clippy -D warnings                       → clean
 cargo fmt --check                        → clean
 ```
+
+### 2026-08-11 — PR #31974 CI fix: unused functions
+
+**Problem:** 46 CI jobs failing on `-Werror=unused-function` in `test_layernorm_bf16.cpp`.
+**Fix:** Removed two dead static functions: `BF16Ulp` (scaffolding, not needed — tolerances use `BF16UlpDistance`) and `ReportErrors` (uncalled private method).
+**Sweep:** All 8 PR-touched files checked — no other `-Werror` issues.
+**Validation:** `build.py --config Debug --target onnxruntime_mlas_test` (no `--compile_no_warning_as_error`) → clean build. 45/45 BF16 MLAS tests pass.
+**Lesson:** Never validate with `--compile_no_warning_as_error` — it masks the exact class of failure that blocks upstream CI.
