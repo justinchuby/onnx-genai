@@ -30,6 +30,7 @@ const LINEAR_BF16_ENTRY: &str = "qmoe_linear_bf16";
 const COMBINE_F32_ENTRY: &str = "qmoe_combine_f32";
 const COMBINE_F16_ENTRY: &str = "qmoe_combine_f16";
 const COMBINE_BF16_ENTRY: &str = "qmoe_combine_bf16";
+const LINEAR_ONE_TASK_PER_BLOCK_MAX_ROUTES: usize = 16;
 
 const CUDA_SRC: &str = r#"
 #ifndef QMOE_BITS
@@ -363,7 +364,9 @@ __device__ void qmoe_linear_impl(
                 (unsigned long long)expert * out_features + output_feature;
             output[task] = value + (bias ? bias[bias_index] : 0.0f);
         }
-        __syncthreads();
+        if (task + gridDim.x < tasks) {
+            __syncthreads();
+        }
     }
 }
 
@@ -1709,7 +1712,7 @@ impl QMoEKernel {
         let zero_points = weights.zero_points.map(tensor_ptr).unwrap_or(0);
         let bias = weights.bias.map(tensor_ptr).unwrap_or(0);
         let tasks = checked_product(&[routes, weights.out_features], "linear output task count")?;
-        let grid_x = self.reduction_grid(tasks)?;
+        let grid_x = self.linear_reduction_grid(tasks, routes)?;
         let config = self.runtime.reduction_launch_config(
             &function,
             grid_x,
@@ -1848,6 +1851,16 @@ impl QMoEKernel {
             .min(saturation.max(1))
             .min(u64::from(u32::MAX));
         u32::try_from(grid).map_err(|_| error("reduction grid exceeds CUDA limits"))
+    }
+
+    fn linear_reduction_grid(&self, tasks: usize, routes: usize) -> Result<u32> {
+        if tasks == 0 {
+            return Ok(1);
+        }
+        if routes <= LINEAR_ONE_TASK_PER_BLOCK_MAX_ROUTES {
+            return u32::try_from(tasks).map_err(|_| error("linear task count exceeds CUDA grid"));
+        }
+        self.reduction_grid(tasks)
     }
 
     /// Launch geometry for `qmoe_route`: one block per row (grid-strided),
