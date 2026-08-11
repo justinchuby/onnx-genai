@@ -3,7 +3,10 @@
 #
 # Run this on a host with an NVIDIA GPU to validate the CUDA execution provider.
 # It detects preconditions and runs the full validation chain:
-#   device enumeration → allocator → stream → data transfer → capability → compile → execute
+#   CreateEpFactories → GetSupportedDevices → CreateEp → device_type() == Cuda
+#   allocator alloc/free round-trip → sync-stream creation → full session Run
+#   on a MatMul model with numeric assertions → weight offload with
+#   ONNX_GENAI_WEIGHT_OFFLOAD=1
 #
 # Exit codes:
 #   0 = VALIDATED (all tests pass on real GPU hardware)
@@ -50,7 +53,25 @@ if [ -z "$SKIP_REASON" ]; then
     fi
 fi
 
-# Check 3: Rust toolchain can build with cuda feature
+# Check 3: cuBLAS LT (required for MatMul kernels)
+if [ -z "$SKIP_REASON" ]; then
+    if ! ldconfig -p 2>/dev/null | grep -q "libcublasLt.so.1[23]"; then
+        if [ ! -f /usr/lib/x86_64-linux-gnu/libcublasLt.so.13 ] && \
+           [ ! -f /usr/local/cuda/lib64/libcublasLt.so.13 ]; then
+            SKIP_REASON="libcublasLt.so.13 not found — cuBLAS LT required for MatMul kernels"
+        fi
+    fi
+fi
+
+# Check 4: At least 1 CUDA GPU
+if [ -z "$SKIP_REASON" ]; then
+    GPU_COUNT=$(nvidia-smi --query-gpu=count --format=csv,noheader 2>/dev/null | head -1 || echo "0")
+    if [ "$GPU_COUNT" -lt 1 ] 2>/dev/null; then
+        SKIP_REASON="nvidia-smi reports 0 CUDA GPUs"
+    fi
+fi
+
+# Check 5: Rust toolchain can build with cuda feature
 if [ -z "$SKIP_REASON" ]; then
     if ! cargo check -p onnx-runtime-ep-cuda --features cuda --message-format=short 2>/dev/null; then
         SKIP_REASON="cargo check -p onnx-runtime-ep-cuda --features cuda failed — cuda feature not buildable on this host"
@@ -72,7 +93,8 @@ if [ -n "$SKIP_REASON" ]; then
     echo "  this script on a host with:"
     echo "    - NVIDIA GPU with compute capability ≥ 7.0"
     echo "    - NVIDIA driver ≥ 535.x"
-    echo "    - libcuda.so / libcublas.so loadable"
+    echo "    - libcuda.so / libcublasLt.so.13 loadable"
+    echo "    - ≥ 1 CUDA GPU visible"
     echo "    - Rust workspace building with 'cuda' feature"
     echo ""
     exit 2
@@ -88,7 +110,10 @@ echo "Running CUDA EP conformance suite..."
 echo ""
 
 # Phase 1: Device/allocator/transfer tests
-echo "── Phase 1: Device allocator + data transfer ──"
+echo "── Phase 1: CreateEpFactories → factory count ≥ 1 ──"
+echo "── Phase 1b: GetSupportedDevices → GPU type ──"
+echo "── Phase 1c: CreateEp → device_type() == Cuda ──"
+echo "── Phase 1d: Allocator alloc/free round-trip ──"
 if ! cargo test -p onnx-runtime-ep-cuda --features cuda \
     --test device_allocator_gpu -- --nocapture 2>&1; then
     echo -e "${RED}FAILED: Device allocator tests${NC}"
@@ -96,8 +121,8 @@ if ! cargo test -p onnx-runtime-ep-cuda --features cuda \
 fi
 echo ""
 
-# Phase 2: Construction/movement (exercises stream + H2D/D2H/D2D)
-echo "── Phase 2: Construction + movement (stream + copies) ──"
+# Phase 2: Sync-stream creation + H2D/D2H/D2D
+echo "── Phase 2: Sync-stream creation + copies ──"
 if ! cargo test -p onnx-runtime-ep-cuda --features cuda \
     --test construction_gpu -- --nocapture 2>&1; then
     echo -e "${RED}FAILED: Construction/movement tests${NC}"
@@ -105,8 +130,8 @@ if ! cargo test -p onnx-runtime-ep-cuda --features cuda \
 fi
 echo ""
 
-# Phase 3: Capability + compile + execute (matmul as canonical op)
-echo "── Phase 3: MatMul capability → compile → execute ──"
+# Phase 3: Full session Run on MatMul with numeric assertions
+echo "── Phase 3: MatMul session Run with numeric assertions ──"
 if ! cargo test -p onnx-runtime-ep-cuda --features cuda \
     --test matmul_gpu -- --nocapture 2>&1; then
     echo -e "${RED}FAILED: MatMul parity tests${NC}"
@@ -128,6 +153,15 @@ echo "── Phase 5: Attention kernels ──"
 if ! cargo test -p onnx-runtime-ep-cuda --features cuda \
     --test attention_gpu -- --nocapture 2>&1; then
     echo -e "${RED}FAILED: Attention tests${NC}"
+    exit 1
+fi
+echo ""
+
+# Phase 6: Weight offload
+echo "── Phase 6: Weight offload (ONNX_GENAI_WEIGHT_OFFLOAD=1) ──"
+if ! ONNX_GENAI_WEIGHT_OFFLOAD=1 cargo test -p onnx-runtime-ep-cuda --features cuda \
+    --test weight_offload_gpu -- --nocapture 2>&1; then
+    echo -e "${RED}FAILED: Weight offload tests${NC}"
     exit 1
 fi
 echo ""

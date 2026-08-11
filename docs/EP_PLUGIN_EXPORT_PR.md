@@ -1,9 +1,13 @@
 # PR: ORT Plugin EP Export — Rust CPU EP via upstream ORT 1.27.0 (Milestone 1) + Parity, f16/bf16, Device Surfaces & CUDA Prep (Milestone 2)
 
-> **Status as of 2026-08-11, HEAD `4212e090e`:** M1 and M2 are complete. The
-> EP-compatibility milestone (native nxrt dynamic ABI) was opened but its new
-> crates (`onnx-runtime-ep-nxrt-abi`, `onnx-runtime-ep-nxrt-host`) have NOT
-> landed. §524 is still partially incomplete. See §524 table below.
+> **Status as of 2026-08-11, HEAD `99560c876`:** M1 and M2 are complete. The
+> EP-compatibility milestone (native nxrt dynamic ABI) has now LANDED at
+> `99560c876` — `onnx-runtime-ep-nxrt-abi`, `onnx-runtime-ep-nxrt-host`, and
+> `onnx-runtime-ep-nxrt-testplugin` are committed workspace members. §524 C ABI,
+> Rust trait, and fail-closed requirements are met. The native nxrt dynamic ABI is
+> committed and ABI-unit-tests pass (30/30). However, **one round-trip test is
+> still red** (`full_lifecycle_negotiate_create_release` — env-var race, see
+> `docs/NXRT_ABI.md` §6.10). PR stays draft until that test is green.
 >
 > **This PR stays draft** until the milestone is complete. Justin's direction:
 > single draft PR, not two stacked PRs (supersedes the stacked-PR recommendation
@@ -14,7 +18,7 @@
 | Branch | Milestone | Status |
 |---|---|---|
 | `squad/ep-plugin-export` | M1 — CPU EP fully exported as ORT plugin | ✅ Complete — superseded by M2 branch |
-| `squad/ep-plugin-parity-cuda` | M2 — trait↔C-ABI parity proven, f16/bf16 end-to-end, device/allocator/stream surfaces, CUDA shim | 🟡 YELLOW — M2 work complete; EP-compatibility milestone not yet landed |
+| `squad/ep-plugin-parity-cuda` | M2 — trait↔C-ABI parity proven, f16/bf16 end-to-end, device/allocator/stream surfaces, CUDA shim; EP-compat milestone (native nxrt dynamic ABI) | 🟡 YELLOW — nxrt ABI committed at `99560c876`; 1 round-trip test failing (env-var race); Pris fixture-isolation fix pending |
 
 **Earlier recommendation (superseded):** Two stacked PRs, not one.
 M1 (`squad/ep-plugin-export`) is independently correct and mergeable; merging it
@@ -393,13 +397,13 @@ sync; the ORT ABI evolves toward nxrt; fail closed on unsupported capabilities.
 | Trait↔C-ABI parity rule | — | ✅ `C_ABI_claims = trait_claims ∩ { for_node != Declined }`. Pinned and tested. Declined set is smaller than originally assumed — Squeeze/ReduceMean/Conv resolve; confirmed Declined: NonZero, opset-13 data-dependent Unsqueeze. | ✅ Unchanged |
 | Fail closed on unsupported capabilities | ✅ `Declined` path; shape-inference rules | ✅ Strengthened — `node_passes_dtype_filter()` adds dtype-level fail-closed gating | ✅ Unchanged |
 | ORT ABI evolves toward nxrt | ✅ Plugin adapter is a thin shim | ✅ Unchanged | ✅ Unchanged |
-| **Native nxrt dynamic ABI** | 🔴 Not implemented | 🔴 **Not implemented.** No `extern "C"` nxrt-native ABI has been designed or implemented in either milestone. | ⚠️ **In working tree, not committed.** `crates/onnx-runtime-ep-nxrt-abi/` (Nabil) and `crates/onnx-runtime-ep-nxrt-host/` (Isidore) exist as untracked files at HEAD `4212e090e`. **Integration gap:** Nabil exports `NxrtNegotiate`/`NxrtCreateEpFactories` (vtable model); Isidore's loader expects `nxrt_abi_version`/`nxrt_create_ep`/… (opaque-handle model). Protocols are incompatible. Reconciliation required before commit. |
+| **Native nxrt dynamic ABI** | 🔴 Not implemented | 🔴 **Not implemented.** No `extern "C"` nxrt-native ABI has been designed or implemented in either milestone. | 🟡 **Committed at `99560c876`, 1 test failing.** `onnx-runtime-ep-nxrt-abi`, `onnx-runtime-ep-nxrt-host`, and `onnx-runtime-ep-nxrt-testplugin` are genuine workspace members. Exports `NxrtNegotiate`/`NxrtCreateEpFactories`; vtable-based ownership; `struct_size` forward compat; major/minor negotiation; fail-closed on unknown capability bits; panic containment; `export_nxrt_ep_factories!` macro; `Arc<Library>` lifetime guarantee in host loader. ABI unit tests: 30/30 passing. Host roundtrip: 9/10 passing — `full_lifecycle_negotiate_create_release` fails due to env-var race with parallel negative tests (Pris's fixture isolation fix not yet landed). See `docs/NXRT_ABI.md` §6.10. |
 
-**Honest §524 status as of HEAD `4212e090e`:**
+**Honest §524 status as of HEAD `99560c876`:**
 - C ABI: ✅ Complete and proven by 23 ORT conformance tests.
 - Rust trait: ✅ **Proven** — 9 parity tests confirm agreement.
-- Fail-closed: ✅ Complete — shape-inference Declined path + dtype filter.
-- **Native nxrt dynamic ABI: ⚠️ In working tree, not committed. Has a symbol-protocol integration gap between the plugin-side ABI crate (Nabil) and the host loader (Isidore). Reconciliation required; PR stays draft.**
+- Fail-closed: ✅ Complete — shape-inference Declined path + dtype filter + nxrt `NXRT_CAP_KNOWN_MASK` reject.
+- **Native nxrt dynamic ABI: 🟡 Committed. ABI unit tests 30/30 green. One round-trip test failing (env-var race — Pris's fixture isolation fix needed). PR stays draft.**
 
 ---
 
@@ -413,5 +417,5 @@ sync; the ORT ABI evolves toward nxrt; fail closed on unsupported capabilities.
 6. ~~**Leon (pre-M2-merge):** Fix M2-2 misleading doc on `DeviceAllocator::memory_info:86`~~ — **DONE** (`3ab0ded68`).
 7. ~~**Any M2 committer (pre-M2-merge):** Fix clippy regression in `ep.rs:1041,1047`~~ — **DONE** by Deckard (`3ab0ded68`).
 8. **CUDA EP work (post-both-PRs):** `onnx-runtime-ep-cuda-plugin` shim + real device-pointer/stream/allocator integration — hardware-gated AND design-gated; requires CUDA toolkit, GPU, and resolution of context/stream sharing design. See `docs/CUDA_EP_STATUS.md` for full blocker list.
-9. **Native nxrt dynamic ABI — reconciliation needed:** `crates/onnx-runtime-ep-nxrt-abi/` (Nabil) and `crates/onnx-runtime-ep-nxrt-host/` (Isidore) exist in working tree but have incompatible symbol protocols. Nabil exports `NxrtNegotiate`/`NxrtCreateEpFactories` (vtable model); Isidore's loader expects `nxrt_abi_version`/`nxrt_create_ep`/… (opaque-handle model). Nabil and Isidore must reconcile, then commit, to complete §524.
+9. **Native nxrt dynamic ABI — fixture isolation fix needed (Pris):** `onnx-runtime-ep-nxrt-abi`, `onnx-runtime-ep-nxrt-host`, and `onnx-runtime-ep-nxrt-testplugin` are committed at `99560c876`. ABI negotiation, ownership, panic containment, and `export_nxrt_ep_factories!` macro all work. One round-trip test (`full_lifecycle_negotiate_create_release`) fails due to an env-var race: `factory_panic_is_contained` sets `NXRT_TEST_PANIC` without serializing against the lifecycle test in a parallel run. Pris must fix the fixture isolation; then the full round-trip suite will be green.
 10. **CUDA hardware conformance runner (Pris):** Not yet committed. Required before any hardware-validated claim can be made. See `docs/CUDA_EP_STATUS.md`.

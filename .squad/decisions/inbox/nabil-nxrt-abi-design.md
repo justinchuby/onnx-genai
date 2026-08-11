@@ -121,3 +121,81 @@ export_nxrt_ep_factories!(|| MyExecutionProvider::new());
 ## Error Model
 
 `NxrtStatus` is a `#[repr(C)]` struct: `{ code: NxrtStatusCode, _reserved: u32, message: *mut c_char }`. Codes are stable `#[repr(u32)]` enum values 0-7. Unknown codes must be treated as fatal (fail closed). Messages are heap-allocated CStrings owned by the receiver.
+
+## Export Macros (shipped 2026-08-11)
+
+### `export_nxrt_ep_factories!` — standard plugin authoring
+
+```rust
+use onnx_runtime_ep_nxrt_abi::export_nxrt_ep_factories;
+
+export_nxrt_ep_factories!(|| {
+    Box::new(MyEp::new()) as Box<dyn ExecutionProvider>
+});
+```
+
+Emits `NxrtNegotiate` and `NxrtCreateEpFactories` with full panic containment. Fully-qualified paths (`::std::panic::catch_unwind`, `$crate::...`). No reliance on caller-scope names.
+
+### `export_nxrt_ep_negotiate_custom!` — negative-test negotiate override
+
+```rust
+use onnx_runtime_ep_nxrt_abi::export_nxrt_ep_negotiate_custom;
+use onnx_runtime_ep_nxrt_abi::testing::NxrtNegotiateOverride;
+
+// Wrong major:
+export_nxrt_ep_negotiate_custom!(NxrtNegotiateOverride::wrong_major(99));
+// Unknown caps:
+export_nxrt_ep_negotiate_custom!(NxrtNegotiateOverride::unknown_caps(1 << 63));
+// Panicking:
+export_nxrt_ep_negotiate_custom!(NxrtNegotiateOverride::panicking());
+```
+
+### `export_nxrt_ep_create_custom!` — negative-test factory override
+
+```rust
+use onnx_runtime_ep_nxrt_abi::export_nxrt_ep_create_custom;
+use onnx_runtime_ep_nxrt_abi::testing::NxrtCreateFactoriesOverride;
+
+// Error:
+export_nxrt_ep_create_custom!(NxrtCreateFactoriesOverride::error(NxrtStatusCode::DeviceError));
+// Zero factories:
+export_nxrt_ep_create_custom!(NxrtCreateFactoriesOverride::zero());
+// Panic:
+export_nxrt_ep_create_custom!(NxrtCreateFactoriesOverride::panicking());
+```
+
+### Testing module public surface (`onnx_runtime_ep_nxrt_abi::testing`)
+
+- `NxrtNegotiateOverride` — `normal()`, `wrong_major(u32)`, `unknown_caps(u64)`, `panicking()`
+- `NxrtCreateFactoriesOverride` — `error(NxrtStatusCode)`, `zero()`, `panicking()`
+
+Both have an `unsafe fn execute(...)` method that Pris can call from her fixture plugins or directly in tests. The macros wrap these with panic containment automatically.
+
+### Complete re-exported public surface
+
+```rust
+// Top-level re-exports (lib.rs)
+pub use status::{NxrtStatus, NxrtStatusCode};
+pub use testing::{NxrtCreateFactoriesOverride, NxrtNegotiateOverride};
+pub use version::{
+    NXRT_ABI_VERSION_MAJOR, NXRT_ABI_VERSION_MINOR,
+    NXRT_CAP_ALLOCATOR, NXRT_CAP_DEVICE_ENUMERATION,
+    NXRT_CAP_EP_CONTEXT, NXRT_CAP_KNOWN_MASK, NXRT_CAP_STREAM_SYNC,
+    NxrtNegotiateRequest, NxrtNegotiateResponse, NxrtVersionRange,
+    validate_negotiation,
+};
+pub use vtable::{
+    NxrtAllocatorVtable, NxrtEpFactoryVtable, NxrtEpVtable,
+    NxrtKernelVtable, NxrtNodeCapability, NxrtTensorDesc,
+};
+// Constants
+pub const NXRT_SYMBOL_NEGOTIATE: &[u8];
+pub const NXRT_SYMBOL_CREATE_EP_FACTORIES: &[u8];
+// Function pointer types
+pub type NxrtNegotiateFn;
+pub type NxrtCreateEpFactoriesFn;
+// Macros
+export_nxrt_ep_factories!
+export_nxrt_ep_negotiate_custom!
+export_nxrt_ep_create_custom!
+```

@@ -98,7 +98,8 @@ impl NxrtStatus {
 
     /// Create a status from a code and a message string.
     pub fn from_code_with_message(code: NxrtStatusCode, msg: &str) -> Self {
-        let c_msg = CString::new(msg).unwrap_or_else(|_| CString::new("(invalid message)").unwrap());
+        let c_msg =
+            CString::new(msg).unwrap_or_else(|_| CString::new("(invalid message)").unwrap());
         Self {
             code,
             _reserved: 0,

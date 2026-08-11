@@ -147,10 +147,7 @@ impl DeviceDataTransfer {
     ///
     /// `ep` must remain valid for the lifetime of this data transfer (until ORT
     /// calls `Release`).
-    pub unsafe fn new(
-        ep: *const dyn ExecutionProvider,
-        support: DeviceSupport,
-    ) -> Box<Self> {
+    pub unsafe fn new(ep: *const dyn ExecutionProvider, support: DeviceSupport) -> Box<Self> {
         Box::new(Self {
             vtable: ort::OrtDataTransferImpl {
                 ort_version_supported: ort::ORT_API_VERSION,
@@ -497,9 +494,7 @@ unsafe extern "C" fn transfer_full_copy_tensors(
         };
         let release_type_shape = match api.ReleaseTensorTypeAndShapeInfo {
             Some(f) => f,
-            None => {
-                return fail_status("CopyTensors: ReleaseTensorTypeAndShapeInfo not available")
-            }
+            None => return fail_status("CopyTensors: ReleaseTensorTypeAndShapeInfo not available"),
         };
 
         for i in 0..num_tensors {
@@ -561,9 +556,7 @@ unsafe extern "C" fn transfer_full_copy_tensors(
             let status = unsafe { get_dims(type_shape, dims.as_mut_ptr(), ndim) };
             if !status.is_null() {
                 unsafe { release_type_shape(type_shape) };
-                return fail_status(&format!(
-                    "CopyTensors: GetDimensions failed at index {i}"
-                ));
+                return fail_status(&format!("CopyTensors: GetDimensions failed at index {i}"));
             }
             unsafe { release_type_shape(type_shape) };
 
@@ -577,7 +570,11 @@ unsafe extern "C" fn transfer_full_copy_tensors(
                 }
             };
 
-            let (_, _, byte_len) = match crate::kernel_ctx::validate_dims(&dims, dtype, &format!("CopyTensors[{i}]")) {
+            let (_, _, byte_len) = match crate::kernel_ctx::validate_dims(
+                &dims,
+                dtype,
+                &format!("CopyTensors[{i}]"),
+            ) {
                 Ok(v) => v,
                 Err(e) => return fail_status(&e),
             };
@@ -609,17 +606,12 @@ unsafe extern "C" fn transfer_full_copy_tensors(
             };
             let mut dst_buf = match unsafe {
                 onnx_runtime_ep_api::provider::DeviceBuffer::from_borrowed_mut_parts(
-                    dst_data,
-                    src_device,
-                    byte_len,
-                    1,
+                    dst_data, src_device, byte_len, 1,
                 )
             } {
                 Some(buf) => buf,
                 None => {
-                    return fail_status(&format!(
-                        "CopyTensors: null dst buffer at index {i}"
-                    ));
+                    return fail_status(&format!("CopyTensors: null dst buffer at index {i}"));
                 }
             };
 
@@ -666,8 +658,8 @@ mod tests {
     use onnx_runtime_ep_api::provider::{DeviceBuffer, EpConfig, Fence};
     use onnx_runtime_ep_api::{EpError, Kernel, KernelMatch, Result as EpResult};
     use onnx_runtime_ir::{DataType, DeviceId, DeviceType, Node, Shape, TensorLayout};
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     // ─── Mock device EP with non-host-dereferenceable memory ─────────────────
 
@@ -886,7 +878,10 @@ mod tests {
     fn copy_direction_classify_device_to_different_device() {
         let dir = CopyDirection::classify(false, false, false);
         assert_eq!(dir, CopyDirection::DeviceToDifferentDevice);
-        assert!(!dir.is_supported(), "cross-device must be unsupported (fail closed)");
+        assert!(
+            !dir.is_supported(),
+            "cross-device must be unsupported (fail closed)"
+        );
     }
 
     #[test]
@@ -936,9 +931,7 @@ mod tests {
         let dummy_device = 0u8;
         let dev_ptr = &dummy_device as *const u8 as *const ort::OrtMemoryDevice;
 
-        let result = unsafe {
-            transfer_can_copy(raw as *const _, dev_ptr, dev_ptr)
-        };
+        let result = unsafe { transfer_can_copy(raw as *const _, dev_ptr, dev_ptr) };
         assert!(!result, "host-accessible EP should not claim CanCopy");
 
         unsafe { transfer_release(raw) };
@@ -957,10 +950,11 @@ mod tests {
         let dummy_device = 0u8;
         let dev_ptr = &dummy_device as *const u8 as *const ort::OrtMemoryDevice;
 
-        let result = unsafe {
-            transfer_can_copy(raw as *const _, dev_ptr, dev_ptr)
-        };
-        assert!(result, "device EP should claim CanCopy for device transfers");
+        let result = unsafe { transfer_can_copy(raw as *const _, dev_ptr, dev_ptr) };
+        assert!(
+            result,
+            "device EP should claim CanCopy for device transfers"
+        );
 
         unsafe { transfer_release(raw) };
     }
@@ -978,15 +972,11 @@ mod tests {
         // Null src_memory_device → false (fail closed).
         let dummy_device = 0u8;
         let dev_ptr = &dummy_device as *const u8 as *const ort::OrtMemoryDevice;
-        let result = unsafe {
-            transfer_can_copy(raw as *const _, std::ptr::null(), dev_ptr)
-        };
+        let result = unsafe { transfer_can_copy(raw as *const _, std::ptr::null(), dev_ptr) };
         assert!(!result);
 
         // Null this_ptr → false.
-        let result = unsafe {
-            transfer_can_copy(std::ptr::null(), dev_ptr, dev_ptr)
-        };
+        let result = unsafe { transfer_can_copy(std::ptr::null(), dev_ptr, dev_ptr) };
         assert!(!result);
 
         unsafe { transfer_release(raw) };

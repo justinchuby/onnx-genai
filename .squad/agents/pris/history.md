@@ -360,3 +360,123 @@ New ignored tests:
 **Test counts:** ep-plugin 154+9, nxrt-abi 19+10 = 192 pass, 0 fail. CUDA UNVALIDATED (no GPU).
 
 **Decision:** `.squad/decisions/inbox/pris-nxrt-and-cuda-runner.md`
+
+---
+
+## 2026-08-11T00:40:00Z — nxrt ABI testplugin rebuilt on real shipped ABI
+
+**Commit:** 99560c876  
+**Branch:** `squad/ep-plugin-parity-cuda` (PR #762)
+
+### What changed
+- **Rebuilt testplugin on Nabil's real ABI:** `crates/onnx-runtime-ep-nxrt-testplugin` now
+  depends on `onnx-runtime-ep-nxrt-abi` and uses the `export_nxrt_ep_factories!` macro.
+  Old private duplicate symbols (`nxrt_abi_version`, `nxrt_create_ep`, etc.) removed.
+- **Added to workspace:** removed crate-local `[workspace]` table, registered as member
+  (not default-member) in root `Cargo.toml`. `cargo check --workspace` now builds it.
+- **10 integration tests** in `crates/onnx-runtime-ep-nxrt-host/tests/nxrt_abi_roundtrip.rs`
+  exercise the real cdylib via `libloading`:
+  - Full lifecycle (negotiate → create factories → create EP → query → release)
+  - Ownership: drop counter returns to zero
+  - Negative: incompatible major, minor > host, unknown cap bits, missing lib,
+    missing symbol, panic containment, factory error
+- **CUDA runner updated** with libcublasLt.so.13 precondition check, GPU count check,
+  and weight-offload phase. Exits 2 (UNVALIDATED) on this GPU-less host.
+
+### Bug found
+- `crates/onnx-runtime-ep-nxrt-host/src/abi_contract.rs` is a stale private duplicate
+  of the ABI — the host loader still expects the old symbols. **Owner: Isidore.**
+
+### Validation
+- `cargo check --workspace`: PASS (includes testplugin)
+- `cargo test -p onnx-runtime-ep-nxrt-host`: 4 lib + 10 integration = 14 passed
+- `cargo test -p onnx-runtime-ep-plugin`: 154 lib + 9 parity = 163 passed
+- `cargo test -p onnx-runtime-ep-cpu-plugin`: 6 + 17 = 23 passed
+- CUDA: UNVALIDATED (exit 2)
+
+## 2026-08-11 — nxrt fixture resolution fix & suite de-duplication
+
+- Fixed `testplugin_path()` to resolve workspace-level `target/` with CARGO_TARGET_DIR and PROFILE support
+- Added auto-build fallback so tests self-heal when cdylib is missing
+- Deleted duplicate `crates/onnx-runtime-ep-nxrt-abi/tests/nxrt_roundtrip.rs` — authoritative suite is in host crate
+- Added ENV_MUTEX to serialize env-var-dependent tests (fixed parallel flakiness)
+- Added `onnx-runtime-ep-nxrt-testplugin` as dev-dep of host (ensures rlib is built)
+- All suites green: ABI 30, host 14, plugin 163, cpu-plugin 23
+- Clean-state verified: auto-build triggers correctly
+- CUDA remains UNVALIDATED (no GPU)
+
+## 2026-08-11 — Clippy fix + doc-test `no_run` analysis
+
+### Task 1 — Clippy error in testplugin
+Added `Default` impl for `TestNxrtEp` (delegates to `::new()`).
+`cargo clippy -p onnx-runtime-ep-nxrt-host --all-targets -- -D warnings` → clean.
+
+### Task 2 — `ignore`d doc-tests in onnx-runtime-ep-nxrt-abi
+**Verdict: keep `ignore` for all four; `no_run` is not viable.** Rationale:
+
+1. `export_nxrt_ep_factories!` (lib.rs ~103): example calls `MyExecutionProvider::new()`
+   which is undefined — fails to compile regardless of `ignore`/`no_run`.
+
+2. All three macro examples (`export_nxrt_ep_factories`, `export_nxrt_ep_negotiate_custom`,
+   `export_nxrt_ep_create_custom`) and the `testing.rs` module example invoke macros that
+   emit `#[unsafe(no_mangle)] pub unsafe extern "C" fn ...` items. Without an explicit
+   `fn main()`, cargo wraps the doc-test body in `fn main() {}`. `pub` on an inner function
+   generates a dead_code/unreachable-pub lint that fails under `-D warnings`, and
+   `#[unsafe(no_mangle)]` on a nested fn is semantically meaningless. Both issues prevent
+   `no_run` from working cleanly. The `#[no_mangle]` symbol-clash concern that may have
+   originally motivated `ignore` is *not* the real blocker (each doc-test is its own binary);
+   the item-inside-main-function issue is.
+
+**Recommendation to Nabil:** Keep `ignore` on all four. Add a brief comment above each
+doc-test block explaining why, e.g.:
+  ```
+  // `ignore` rather than `no_run`: macro emits `#[unsafe(no_mangle)] pub extern "C"` items
+  // which are invalid inside the `fn main()` wrapper cargo generates for doc-tests.
+  ```
+
+**Macro coverage adequacy:** Sufficient. Nabil's `lib.rs` tests cover:
+- `export_macro_negotiate_produces_correct_response` — symbol fires, returns correct ABI version
+- `export_macro_create_factories_succeeds` — factory vtable allocated, released cleanly
+- `export_macro_panic_in_constructor_contained` — panic → InternalError status (via catch_status_panic)
+- `custom_negotiate_override_through_validate` — NxrtNegotiateOverride wrong_major path
+- `custom_create_override_zero_factories` — NxrtCreateFactoriesOverride::zero path
+All five pass. The doc-tests are purely illustrative usage examples, not the test surface.
+
+### Validation (final)
+- `cargo clippy -p onnx-runtime-ep-nxrt-host --all-targets -- -D warnings`: clean
+- `cargo test -p onnx-runtime-ep-nxrt-abi`: 30 passed, 4 ignored (expected)
+- `cargo test -p onnx-runtime-ep-nxrt-host`: 4 unit + 10 round-trip = 14 passed
+- `cargo test -p onnx-runtime-ep-plugin`: 154 lib + 9 parity = 163 passed
+- `cargo test -p onnx-runtime-ep-cpu-plugin`: 6 + 17 = 23 passed
+
+---
+
+## 2026-08-11T01:03:00Z — Last lint gate: NULL_API + collapsible-if (PR #762)
+
+**Branch:** `squad/ep-plugin-parity-cuda`
+
+### NULL_API verdict: genuinely redundant
+
+`static NULL_API: OnceLock<ort::OrtApi>` in `tests/plugin_export_abi.rs:631` was scaffolding that was never wired up. The `l2_fail_closed_unsupported_api_version` test correctly uses a raw function pointer (`returns_null_api`) returned via `NULL_API_BASE.GetApi`, not a stored `OrtApi` instance. The fail-closed null-API behavior is fully covered by that test — `NULL_API` was an unused placeholder. **Removed** the dead static.
+
+### Collapsed-if fix
+
+`tests/plugin_ort_e2e.rs:66-67` — two nested `if` blocks collapsed to `if build_dir.exists() && let Ok(entries) = std::fs::read_dir(&build_dir)` as clippy suggested. The surrounding logic is a real directory scan returning `Some(lib_dir)` — no silent skip, just a None return if the dir doesn't exist or can't be read (correct behavior for a build-artifact finder).
+
+### Validation
+
+```
+cargo clippy -p onnx-runtime-ep-cpu-plugin --all-targets -- -D warnings
+→ Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.38s  (clean)
+
+cargo test -p onnx-runtime-ep-cpu-plugin --test plugin_export_abi
+→ test result: ok. 6 passed; 0 failed
+
+cargo test -p onnx-runtime-ep-cpu-plugin
+→ test result: ok. 17 passed; 0 failed (integration suite)
+
+cargo test -p onnx-runtime-ep-plugin -p onnx-runtime-ep-nxrt-abi -p onnx-runtime-ep-nxrt-host
+→ 30 passed (abi) · 4+10 passed (host) · 154+9 passed (plugin)
+
+cargo fmt --all -- --check → EXIT:0
+```

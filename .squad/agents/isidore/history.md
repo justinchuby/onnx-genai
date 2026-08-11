@@ -99,3 +99,25 @@ Implemented `crates/onnx-runtime-ep-nxrt-host/` — the inbound dynamic-loading 
 - Existing tests unaffected (`onnx-runtime-ep-plugin`, `onnx-runtime-ep-cpu-plugin`)
 
 **Needs from Nabil:** ABI type exports in `onnx-runtime-ep-nxrt-abi`; once landed, replace local `abi_contract` module.
+
+## 2026-08-11 — nxrt Host Loader ABI Reconciliation (§524 critical path)
+
+**Problem:** The host loader carried a duplicate ABI in `src/abi_contract.rs` (opaque-handle model: `nxrt_abi_version`/`nxrt_create_ep`) that was incompatible with Nabil's shipped ABI (vtable model: `NxrtNegotiate`/`NxrtCreateEpFactories`). The two halves compiled independently but never linked — green build, nothing connected.
+
+**Fix:**
+1. Deleted `src/abi_contract.rs` entirely.
+2. Added `onnx-runtime-ep-nxrt-abi = { workspace = true }` dependency.
+3. Rewrote `loader.rs` to the real protocol: `NxrtNegotiate` → `validate_negotiation()` → `NxrtCreateEpFactories`.
+4. Rewrote `provider_adapter.rs` to hold `*mut NxrtEpVtable` (owned, released on Drop) instead of opaque handle.
+5. Factory vtables owned by `FactorySet` (in `Arc`), released on Drop with panic containment.
+6. Borrowed-pointer rules honored: EP `name` pointer copied to owned `String` at creation time.
+
+**Validation:**
+```
+cargo clippy -p onnx-runtime-ep-nxrt-host --all-targets -- -D warnings → clean
+cargo test -p onnx-runtime-ep-nxrt-host → 14 passed (4 unit + 10 integration)
+cargo check --workspace → ok
+grep for duplicate ABI symbols → none found
+```
+
+**Nothing missing from Nabil's ABI.** All types and functions the host needs are exported.

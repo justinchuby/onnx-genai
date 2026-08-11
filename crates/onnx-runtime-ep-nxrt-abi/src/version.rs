@@ -191,8 +191,7 @@ pub fn validate_negotiation(
     host_range: &NxrtVersionRange,
     response: &NxrtNegotiateResponse,
 ) -> Result<(), String> {
-    if response.agreed_major < host_range.major_min
-        || response.agreed_major > host_range.major_max
+    if response.agreed_major < host_range.major_min || response.agreed_major > host_range.major_max
     {
         return Err(format!(
             "agreed major {} outside host range [{}, {}]",
@@ -307,4 +306,3 @@ mod tests {
         assert_eq!(r.minor_max, NXRT_ABI_VERSION_MINOR);
     }
 }
-

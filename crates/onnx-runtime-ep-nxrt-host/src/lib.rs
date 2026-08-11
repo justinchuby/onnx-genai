@@ -12,11 +12,10 @@
 //! the library is not unloaded while any live EP instance or kernel references
 //! symbols inside it.
 
-pub mod abi_contract;
 mod error;
 mod loader;
 mod provider_adapter;
 
 pub use error::NxrtHostError;
-pub use loader::{NxrtPlugin, load_nxrt_plugin};
+pub use loader::{load_nxrt_plugin, NxrtPlugin};
 pub use provider_adapter::NxrtExecutionProvider;

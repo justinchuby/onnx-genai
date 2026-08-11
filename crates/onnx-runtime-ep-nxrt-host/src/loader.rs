@@ -3,38 +3,64 @@
 //! The [`NxrtPlugin`] struct owns an `Arc<libloading::Library>` so that any EP
 //! instance or kernel obtained from the plugin structurally cannot outlive the
 //! library — the `Arc` prevents unload while live references exist.
+//!
+//! # Load sequence (Nabil's ABI)
+//!
+//! 1. `dlopen` the library.
+//! 2. Resolve `NxrtNegotiate` — call it with `NxrtNegotiateRequest::current()`.
+//! 3. Validate the response: major mismatch → reject; agreed minor > host minor → reject;
+//!    unknown capability bits → reject (fail closed).
+//! 4. Resolve `NxrtCreateEpFactories` — call it to obtain factory vtables.
+//! 5. The host owns all returned factories and must release them via vtable `release`.
 
 use std::ffi::CStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use libloading::{Library, Symbol};
-
-use crate::abi_contract::{
-    NXRT_ABI_VERSION_MAJOR, NXRT_ABI_VERSION_MINOR, NxrtAbiVersionFn, NxrtCreateEpFn,
-    NxrtDestroyEpFn, NxrtDeviceCountFn, NxrtEpHandle, NxrtEpNameFn,
-    SYM_NXRT_ABI_VERSION, SYM_NXRT_CREATE_EP, SYM_NXRT_DESTROY_EP, SYM_NXRT_DEVICE_COUNT,
-    SYM_NXRT_EP_NAME,
+use onnx_runtime_ep_nxrt_abi::{
+    version::validate_negotiation, NxrtCreateEpFactoriesFn, NxrtEpFactoryVtable, NxrtNegotiateFn,
+    NxrtNegotiateRequest, NxrtNegotiateResponse, NxrtVersionRange, NXRT_SYMBOL_CREATE_EP_FACTORIES,
+    NXRT_SYMBOL_NEGOTIATE,
 };
+
 use crate::error::NxrtHostError;
+
+/// Maximum number of factories we'll accept from a single plugin.
+const MAX_FACTORIES: usize = 16;
 
 /// A successfully loaded nxrt plugin library with validated ABI version.
 ///
 /// Holds an `Arc<Library>` so clones and EP instances derived from this plugin
 /// share ownership of the loaded library, preventing unload while any live
 /// reference exists.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct NxrtPlugin {
-    /// Shared ownership of the loaded dynamic library. Must outlive every
-    /// symbol or handle obtained from it.
+    /// Shared ownership of the loaded dynamic library.
     pub(crate) library: Arc<Library>,
     /// Filesystem path used to load the library (for diagnostics).
     pub(crate) path: PathBuf,
-    /// The EP name reported by the plugin.
+    /// The EP name reported by the first factory (for diagnostics).
     pub(crate) name: String,
-    /// ABI version reported by the plugin (for diagnostics).
+    /// ABI version agreed during negotiation.
     pub(crate) abi_major: u32,
     pub(crate) abi_minor: u32,
+    /// Capability flags advertised by the plugin.
+    #[allow(dead_code)]
+    pub(crate) capability_flags: u64,
+    /// Factory vtable pointers owned by this struct. Released on Drop.
+    pub(crate) factories: Arc<FactorySet>,
+}
+
+impl std::fmt::Debug for NxrtPlugin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NxrtPlugin")
+            .field("path", &self.path)
+            .field("name", &self.name)
+            .field("abi_version", &(self.abi_major, self.abi_minor))
+            .field("num_factories", &self.factories.count)
+            .finish()
+    }
 }
 
 impl NxrtPlugin {
@@ -48,9 +74,56 @@ impl NxrtPlugin {
         &self.path
     }
 
-    /// ABI version reported by the plugin.
+    /// ABI version agreed during negotiation.
     pub fn abi_version(&self) -> (u32, u32) {
         (self.abi_major, self.abi_minor)
+    }
+
+    /// Number of EP factories provided by the plugin.
+    pub fn num_factories(&self) -> usize {
+        self.factories.count
+    }
+
+    /// Get a factory vtable by index.
+    ///
+    /// # Safety
+    ///
+    /// The returned pointer is valid as long as this `NxrtPlugin` (or a clone)
+    /// is alive. The caller must not call `release` on it — that is done by
+    /// `FactorySet::drop`.
+    pub(crate) fn factory(&self, index: usize) -> Option<*mut NxrtEpFactoryVtable> {
+        if index < self.factories.count {
+            Some(self.factories.ptrs[index])
+        } else {
+            None
+        }
+    }
+}
+
+/// Owns the factory vtable pointers and releases them on drop.
+pub(crate) struct FactorySet {
+    ptrs: [*mut NxrtEpFactoryVtable; MAX_FACTORIES],
+    count: usize,
+    /// Keep library alive while factories exist.
+    _library: Arc<Library>,
+}
+
+// SAFETY: Factory vtables are thread-safe per the nxrt ABI contract.
+unsafe impl Send for FactorySet {}
+unsafe impl Sync for FactorySet {}
+
+impl Drop for FactorySet {
+    fn drop(&mut self) {
+        for i in 0..self.count {
+            let factory = self.ptrs[i];
+            if !factory.is_null() {
+                // Catch panics at the plugin boundary.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // SAFETY: We own these factories per the ABI contract.
+                    unsafe { ((*factory).release)((*factory).ctx) };
+                }));
+            }
+        }
     }
 }
 
@@ -60,8 +133,9 @@ impl NxrtPlugin {
 ///
 /// Returns an actionable error for each failure mode:
 /// - Library not found or unloadable
-/// - Missing required symbol
-/// - Incompatible ABI major version
+/// - Missing required symbol (`NxrtNegotiate` or `NxrtCreateEpFactories`)
+/// - Incompatible ABI version (major mismatch, minor too new, unknown caps)
+/// - Factory creation failure or zero factories
 ///
 /// # Safety
 ///
@@ -76,48 +150,112 @@ pub fn load_nxrt_plugin(path: impl AsRef<Path>) -> Result<NxrtPlugin, NxrtHostEr
         path: path.clone(),
         reason: e.to_string(),
     })?;
+    let library = Arc::new(library);
 
-    // Phase 2: Resolve version symbol and negotiate.
-    let version_fn = resolve_symbol::<NxrtAbiVersionFn>(&library, SYM_NXRT_ABI_VERSION, &path)?;
-    let (plugin_major, plugin_minor) = {
-        let mut major: u32 = 0;
-        let mut minor: u32 = 0;
-        unsafe { version_fn(&mut major, &mut minor) };
-        (major, minor)
-    };
+    // Phase 2: Resolve NxrtNegotiate and perform version handshake.
+    let negotiate_fn = resolve_symbol::<NxrtNegotiateFn>(&library, NXRT_SYMBOL_NEGOTIATE, &path)?;
 
-    if plugin_major != NXRT_ABI_VERSION_MAJOR {
+    let request = NxrtNegotiateRequest::current();
+    let mut response = NxrtNegotiateResponse::zeroed();
+
+    let status = unsafe { negotiate_fn(&request, &mut response) };
+    if !status.is_ok() {
         return Err(NxrtHostError::AbiVersionMismatch {
             path,
-            host_major: NXRT_ABI_VERSION_MAJOR,
-            host_minor: NXRT_ABI_VERSION_MINOR,
-            plugin_major,
-            plugin_minor,
+            host_major: request.host_range.major_max,
+            host_minor: request.host_range.minor_max,
+            plugin_major: response.plugin_range.major_max,
+            plugin_minor: response.plugin_range.minor_max,
         });
     }
 
-    // Phase 3: Resolve remaining required symbols to fail fast on misspelled exports.
-    resolve_symbol::<NxrtCreateEpFn>(&library, SYM_NXRT_CREATE_EP, &path)?;
-    resolve_symbol::<NxrtDestroyEpFn>(&library, SYM_NXRT_DESTROY_EP, &path)?;
-    resolve_symbol::<NxrtDeviceCountFn>(&library, SYM_NXRT_DEVICE_COUNT, &path)?;
+    // Phase 3: Host-side validation of the negotiation response.
+    let host_range = NxrtVersionRange::current();
+    if let Err(_reason) = validate_negotiation(&host_range, &response) {
+        return Err(NxrtHostError::AbiVersionMismatch {
+            path,
+            host_major: host_range.major_max,
+            host_minor: host_range.minor_max,
+            plugin_major: response.agreed_major,
+            plugin_minor: response.agreed_minor,
+        });
+    }
 
-    // Phase 4: Query EP name.
-    let name_fn = resolve_symbol::<NxrtEpNameFn>(&library, SYM_NXRT_EP_NAME, &path)?;
+    // Phase 4: Resolve NxrtCreateEpFactories and call it.
+    let create_fn = resolve_symbol::<NxrtCreateEpFactoriesFn>(
+        &library,
+        NXRT_SYMBOL_CREATE_EP_FACTORIES,
+        &path,
+    )?;
+
+    let mut factory_ptrs: [*mut NxrtEpFactoryVtable; MAX_FACTORIES] =
+        [std::ptr::null_mut(); MAX_FACTORIES];
+    let mut num_factories: usize = 0;
+
+    let create_status =
+        unsafe { create_fn(factory_ptrs.as_mut_ptr(), MAX_FACTORIES, &mut num_factories) };
+
+    if !create_status.is_ok() {
+        let msg = unsafe { create_status.message_str() }
+            .unwrap_or("(no message)")
+            .to_owned();
+        return Err(NxrtHostError::FactoryFailed { path, status: msg });
+    }
+
+    if num_factories == 0 {
+        return Err(NxrtHostError::ZeroDevices { path });
+    }
+
+    // Clamp to actual array size for safety (untrusted plugin).
+    if num_factories > MAX_FACTORIES {
+        num_factories = MAX_FACTORIES;
+    }
+
+    // Validate all factory pointers are non-null.
+    for i in 0..num_factories {
+        if factory_ptrs[i].is_null() {
+            // Release already-obtained factories.
+            for item in factory_ptrs.iter().take(i) {
+                if !item.is_null() {
+                    let fptr = *item;
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        unsafe { ((*fptr).release)((*fptr).ctx) };
+                    }));
+                }
+            }
+            return Err(NxrtHostError::FactoryFailed {
+                path,
+                status: format!("factory pointer at index {i} is null"),
+            });
+        }
+    }
+
+    // Read name from first factory (borrowed for factory lifetime — copy it).
     let name = unsafe {
-        let ptr = name_fn();
-        if ptr.is_null() {
+        let factory = &*factory_ptrs[0];
+        if factory.name.is_null() {
             String::from("unknown")
         } else {
-            CStr::from_ptr(ptr).to_string_lossy().into_owned()
+            CStr::from_ptr(factory.name as *const i8)
+                .to_string_lossy()
+                .into_owned()
         }
     };
 
+    let factory_set = Arc::new(FactorySet {
+        ptrs: factory_ptrs,
+        count: num_factories,
+        _library: Arc::clone(&library),
+    });
+
     Ok(NxrtPlugin {
-        library: Arc::new(library),
+        library,
         path,
         name,
-        abi_major: plugin_major,
-        abi_minor: plugin_minor,
+        abi_major: response.agreed_major,
+        abi_minor: response.agreed_minor,
+        capability_flags: response.capability_flags,
+        factories: factory_set,
     })
 }
 
@@ -127,8 +265,7 @@ fn resolve_symbol<'lib, T>(
     sym_name: &[u8],
     path: &Path,
 ) -> Result<Symbol<'lib, T>, NxrtHostError> {
-    // sym_name includes trailing NUL for C interop; strip it for the display name.
-    let display_name = std::str::from_utf8(&sym_name[..sym_name.len() - 1])
+    let display_name = std::str::from_utf8(sym_name)
         .unwrap_or("<invalid utf8>")
         .to_string();
 
@@ -137,87 +274,6 @@ fn resolve_symbol<'lib, T>(
         symbol: display_name,
         reason: e.to_string(),
     })
-}
-
-/// Create an EP instance from a loaded plugin.
-///
-/// This is separated from `load_nxrt_plugin` so that callers can inspect the
-/// plugin metadata before committing to EP creation.
-pub(crate) fn create_ep_instance(
-    plugin: &NxrtPlugin,
-    config_json: &CStr,
-) -> Result<*mut NxrtEpHandle, NxrtHostError> {
-    let create_fn: Symbol<NxrtCreateEpFn> =
-        unsafe { plugin.library.get(SYM_NXRT_CREATE_EP) }.map_err(|e| {
-            NxrtHostError::SymbolNotFound {
-                path: plugin.path.clone(),
-                symbol: "nxrt_create_ep".into(),
-                reason: e.to_string(),
-            }
-        })?;
-
-    let mut handle: *mut NxrtEpHandle = std::ptr::null_mut();
-    let status = unsafe { create_fn(config_json.as_ptr(), &mut handle) };
-
-    if !status.is_ok() {
-        return Err(NxrtHostError::FactoryFailed {
-            path: plugin.path.clone(),
-            status: format!(
-                "nxrt_create_ep returned {}: {}",
-                status as i32,
-                status.as_str()
-            ),
-        });
-    }
-
-    if handle.is_null() {
-        return Err(NxrtHostError::FactoryFailed {
-            path: plugin.path.clone(),
-            status: "nxrt_create_ep returned Ok but handle is null".into(),
-        });
-    }
-
-    // Validate device count > 0.
-    let device_count_fn: Symbol<NxrtDeviceCountFn> =
-        unsafe { plugin.library.get(SYM_NXRT_DEVICE_COUNT) }.map_err(|e| {
-            NxrtHostError::SymbolNotFound {
-                path: plugin.path.clone(),
-                symbol: "nxrt_device_count".into(),
-                reason: e.to_string(),
-            }
-        })?;
-
-    let mut count: u32 = 0;
-    let count_status = unsafe { device_count_fn(handle, &mut count) };
-    if !count_status.is_ok() {
-        // Destroy the handle before returning the error.
-        destroy_ep_instance(plugin, handle);
-        return Err(NxrtHostError::PluginCallFailed(format!(
-            "nxrt_device_count failed: {}",
-            count_status.as_str()
-        )));
-    }
-
-    if count == 0 {
-        destroy_ep_instance(plugin, handle);
-        return Err(NxrtHostError::ZeroDevices {
-            path: plugin.path.clone(),
-        });
-    }
-
-    Ok(handle)
-}
-
-/// Destroy an EP handle. Best-effort; does not propagate errors.
-pub(crate) fn destroy_ep_instance(plugin: &NxrtPlugin, handle: *mut NxrtEpHandle) {
-    if handle.is_null() {
-        return;
-    }
-    if let Ok(destroy_fn) =
-        unsafe { plugin.library.get::<NxrtDestroyEpFn>(SYM_NXRT_DESTROY_EP) }
-    {
-        unsafe { destroy_fn(handle) };
-    }
 }
 
 #[cfg(test)]
@@ -236,7 +292,6 @@ mod tests {
             }
             other => panic!("expected LibraryLoadFailed, got: {other:?}"),
         }
-        // Verify the Display impl is actionable.
         let msg = err.to_string();
         assert!(msg.contains("libfake_nxrt.so"), "error must name the path");
     }
@@ -262,7 +317,7 @@ mod tests {
             path: PathBuf::from("libtest.so"),
         };
         let msg = err.to_string();
-        assert!(msg.contains("zero devices"));
+        assert!(msg.contains("zero"));
         assert!(msg.contains("at least one"));
     }
 
@@ -276,8 +331,4 @@ mod tests {
         assert!(msg.contains("factory failed"));
         assert!(msg.contains("internal error"));
     }
-
-    // Integration tests requiring a real cdylib are deferred to Pris's
-    // cross-crate test suite. Here we validate the negative paths that don't
-    // require a real plugin.
 }

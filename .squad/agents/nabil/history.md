@@ -51,3 +51,7 @@ Clippy `--all-targets` flagged two more `forget_non_drop` errors (device.rs:465 
 ## 2026-08-11 — Implemented native nxrt dynamic EP ABI (§524)
 
 Designed and implemented `crates/onnx-runtime-ep-nxrt-abi/` — the native half of the §524 extension contract. Full ABI surface: version negotiation (`NxrtNegotiate`), factory creation (`NxrtCreateEpFactories`), vtable-based lifecycle for factory/EP/kernel/allocator, explicit ownership rules, panic containment via `catch_status_panic`/`catch_void_panic`, and the `export_nxrt_ep_factories!` macro. All 19 unit tests pass. Clippy clean. Workspace check green. Added both `-nxrt-abi` and `-nxrt-host` to workspace members for Isidore's concurrent work.
+
+## 2026-08-11 — Export macros + testing module for negative fixtures
+
+Shipped three macros closing the "duplicate ABI" hole: `export_nxrt_ep_factories!` (standard plugins), `export_nxrt_ep_negotiate_custom!` (negative-test negotiate overrides), `export_nxrt_ep_create_custom!` (negative-test factory overrides). Added `testing` module exposing `NxrtNegotiateOverride` and `NxrtCreateFactoriesOverride` with `wrong_major`, `unknown_caps`, `panicking`, `zero`, `error` variants. Re-exported all capability constants and `validate_negotiation` at crate root. Macro hygiene: fully-qualified `::std::`/`$crate::` paths, `$constructor` evaluated outside unsafe block (clippy::macro_metavars_in_unsafe clean). Tests: **30 unit tests pass** (up from 19). `cargo check --workspace` green. Decision note updated.

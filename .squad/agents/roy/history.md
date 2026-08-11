@@ -279,3 +279,27 @@ it lands." A reconciliation pass is the immediate blocker before either crate is
 
 Docs updated accordingly (NXRT_ABI.md §6.3, EP_PLUGIN_EXPORT_PR.md §524 table and
 Follow-Ups item 9, decisions inbox).
+
+---
+
+## 2026-08-11 — nxrt ABI Landing Documentation Pass (HEAD 99560c876)
+
+**Task:** Update `docs/NXRT_ABI.md`, `docs/CUDA_EP_STATUS.md`, `docs/EP_PLUGIN_EXPORT_PR.md` to reflect the nxrt dynamic ABI landing at commit `99560c876`.
+
+**What I verified by reading code and running tests:**
+- `onnx-runtime-ep-nxrt-host/Cargo.toml` depends on `onnx-runtime-ep-nxrt-abi` (no duplicate `abi_contract.rs`).
+- Testplugin is a genuine workspace member (`[workspace]` removed; `version.workspace = true`).
+- ABI: `NxrtNegotiate` + `NxrtCreateEpFactories`; major=1, minor=0; `export_nxrt_ep_factories!` macro; vtable ownership; `struct_size` forward compat; `NXRT_CAP_KNOWN_MASK` fail-closed.
+- Host loader: `Arc<Library>` lifetime guarantee; `validate_negotiation` rejects major mismatch / plugin minor newer / unknown caps.
+- `cargo test -p onnx-runtime-ep-nxrt-abi`: **30/30 passing**.
+- `cargo test -p onnx-runtime-ep-nxrt-host`: **9/10 passing, 1 FAILING** (`full_lifecycle_negotiate_create_release` — env-var race with `NXRT_TEST_PANIC` from parallel `factory_panic_is_contained` test).
+- `scripts/cuda_conformance_runner.sh` IS committed. Not run (no GPU on this host).
+
+**What I updated:**
+- `docs/NXRT_ABI.md`: Complete rewrite. Added §0 single-source-of-truth lesson. Updated preamble table to show committed status. Replaced stale §6 (working tree / integration gap) with accurate §6 describing the landed nxrt dynamic ABI (symbols, negotiation rules, struct_size forward compat, ownership contract, panic containment, authoring path, host loading path, and honest test results with failure callout).
+- `docs/CUDA_EP_STATUS.md`: Updated HEAD ref. Replaced "not yet committed" conformance runner note with accurate section describing the committed runner, its preconditions, exit-code contract, and invocation.
+- `docs/EP_PLUGIN_EXPORT_PR.md`: Updated header note, branch table, §524 nxrt row, honest §524 status bullet, and follow-up item 9.
+
+**Still incomplete:**
+- Pris's fixture isolation fix for `full_lifecycle_negotiate_create_release`.
+- Hardware GPU validation (no GPU on this host; conformance runner exits 2 = UNVALIDATED).

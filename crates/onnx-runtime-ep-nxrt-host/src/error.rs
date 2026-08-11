@@ -52,10 +52,12 @@ impl NxrtHostError {
     /// Convert to the EP-API error type for trait compatibility.
     pub fn into_ep_error(self) -> onnx_runtime_ep_api::EpError {
         match &self {
-            Self::LibraryLoadFailed { path, reason } => onnx_runtime_ep_api::EpError::EpLoadFailed {
-                path: path.clone(),
-                reason: reason.clone(),
-            },
+            Self::LibraryLoadFailed { path, reason } => {
+                onnx_runtime_ep_api::EpError::EpLoadFailed {
+                    path: path.clone(),
+                    reason: reason.clone(),
+                }
+            }
             _ => onnx_runtime_ep_api::EpError::EpLoadFailed {
                 path: PathBuf::new(),
                 reason: self.to_string(),

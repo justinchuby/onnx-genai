@@ -1,17 +1,17 @@
 [package]
 name = "onnx-runtime-ep-nxrt-testplugin"
 description = "Test-fixture nxrt plugin cdylib for integration testing (Pris owns)"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 publish = false
-
-[workspace]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-onnx-runtime-ep-api = { path = "../onnx-runtime-ep-api" }
+onnx-runtime-ep-api = { workspace = true }
+onnx-runtime-ep-nxrt-abi = { workspace = true }
+onnx-runtime-ir = { workspace = true }
 
-[lints.clippy]
-all = "warn"
+[lints]
+workspace = true

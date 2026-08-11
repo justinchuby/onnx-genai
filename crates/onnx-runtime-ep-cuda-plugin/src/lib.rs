@@ -59,8 +59,7 @@ mod cuda_impl {
     /// Returns an error if no CUDA GPU is available or the driver cannot be
     /// loaded. The plugin exports zero factories in that case (fail-closed).
     pub(crate) fn construct_ep()
-        -> Result<Box<dyn onnx_runtime_ep_api::provider::ExecutionProvider>, String>
-    {
+    -> Result<Box<dyn onnx_runtime_ep_api::provider::ExecutionProvider>, String> {
         CudaExecutionProvider::new_default()
             .map(|ep| Box::new(ep) as Box<dyn onnx_runtime_ep_api::provider::ExecutionProvider>)
             .map_err(|e| format!("CUDA EP construction failed (no GPU or driver unavailable): {e}"))

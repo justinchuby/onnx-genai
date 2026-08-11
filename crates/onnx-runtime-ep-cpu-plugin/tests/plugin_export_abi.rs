@@ -628,7 +628,6 @@ fn l2_fail_closed_unsupported_api_version() {
 
     // An OrtApiBase whose GetApi always returns null — simulating an older ORT
     // host that does not support ORT_API_VERSION = 27.
-    static NULL_API: OnceLock<ort::OrtApi> = OnceLock::new();
     static NULL_API_BASE: OnceLock<ort::OrtApiBase> = OnceLock::new();
 
     unsafe extern "C" fn returns_null_api(_version: u32) -> *const ort::OrtApi {

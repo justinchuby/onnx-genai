@@ -3,7 +3,7 @@
 **Author:** Roy (Lead)
 **Date:** 2026-08-11
 **Branch:** `squad/ep-plugin-parity-cuda` (draft PR #762)
-**HEAD at time of writing:** `4212e090e`
+**HEAD at time of writing:** `99560c876`
 
 ---
 
@@ -86,33 +86,56 @@ scope.
 
 ---
 
-## Running Pris's Hardware Conformance Runner
+## Running the Hardware Conformance Runner
 
-> **Note:** The hardware conformance runner described below is the INTENDED
-> validation harness. As of HEAD `4212e090e`, it has not been committed to this
-> branch. When it lands, update this section.
+**`scripts/cuda_conformance_runner.sh` is committed at HEAD `99560c876`.**
 
-When the runner is available, a real GPU host requires:
+### Preconditions (runner validates these before testing)
 
-1. **Hardware:** NVIDIA GPU with compute capability ≥ 7.0 (Volta or later).
-   VRAM ≥ 8 GB for the standard test matrix.
-2. **Software:** CUDA toolkit ≥ 12.6, cuBLAS, cuDNN, Rust stable toolchain.
-3. **Build:**
-   ```bash
-   cargo build --features cuda -p onnx-runtime-ep-cuda
-   cargo test --features cuda -p onnx-runtime-ep-cuda
-   ```
-4. **The runner** (when committed) is expected to exercise:
-   - `CudaExecutionProvider::initialize` → device bind → success
-   - `allocate` / `copy_from_host` / `copy_to_host` → bit-exact roundtrip
-   - At least one `MatMul` kernel invocation with a reference output comparison
-   - `sync` / `wait_fence` ordering — confirms no race under concurrent dispatch
-   - `device_argmax` on a known vector
-5. **Report format** (expected): per-test PASS/FAIL, CUDA device name, toolkit
-   version, driver version, commit SHA, and a "validated" timestamp.
+1. `nvidia-smi` reachable and a GPU detected.
+2. `libcuda.so` loadable (via `ldconfig -p` or standard CUDA paths).
+3. `libcublasLt.so.13` loadable.
+4. At least one CUDA GPU present.
+5. CUDA toolkit ≥ 12.6, cuBLAS, cuDNN, Rust stable.
 
-Until the runner is committed and run on hardware, the VALIDATED-ON-HARDWARE column
-above remains entirely empty.
+If any precondition fails, the runner exits with **code 2 (UNVALIDATED)** — not a
+test failure, just "can't run here."
+
+### Exit code contract
+
+| Code | Meaning |
+|---|---|
+| **0** | VALIDATED — all tests passed on real GPU hardware |
+| **1** | FAILED — test failures on GPU hardware (real bugs) |
+| **2** | UNVALIDATED — preconditions not met (no GPU, no driver, `cuda` feature not enabled) |
+
+### Build and invoke
+
+```bash
+# Build with CUDA feature first (requires CUDA toolkit ≥ 12.6):
+cargo build --features cuda -p onnx-runtime-ep-cuda
+
+# Run the conformance suite:
+./scripts/cuda_conformance_runner.sh
+
+# Target a specific GPU:
+CUDA_VISIBLE_DEVICES=0 ./scripts/cuda_conformance_runner.sh
+```
+
+### What the runner exercises
+
+- `CudaExecutionProvider::initialize` → device bind → success
+- `allocate` / `copy_from_host` / `copy_to_host` → bit-exact roundtrip
+- At least one `MatMul` kernel invocation with reference output comparison
+- `sync` / `wait_fence` ordering under concurrent dispatch
+- `device_argmax` on a known vector
+- Weight offload with `ONNX_GENAI_WEIGHT_OFFLOAD=1`
+
+The runner outputs per-test PASS/FAIL, CUDA device name, toolkit version, driver
+version, commit SHA, and a validated timestamp.
+
+**This host has no CUDA GPU.** The conformance runner was not run here. Every row
+in the VALIDATED-ON-HARDWARE column above remains empty.
 
 ---
 

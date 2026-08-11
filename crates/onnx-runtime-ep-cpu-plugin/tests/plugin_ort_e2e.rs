@@ -63,15 +63,15 @@ fn find_ort_lib_dir() -> Option<PathBuf> {
         .parent()
         .unwrap();
     let build_dir = workspace_root.join("target/debug/build");
-    if build_dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(&build_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                if name.to_string_lossy().starts_with("onnx-genai-ort-sys-") {
-                    let lib_dir = entry.path().join("out/ort-prebuilt/lib");
-                    if lib_dir.join("libonnxruntime.so").exists() {
-                        return Some(lib_dir);
-                    }
+    if build_dir.exists()
+        && let Ok(entries) = std::fs::read_dir(&build_dir)
+    {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with("onnx-genai-ort-sys-") {
+                let lib_dir = entry.path().join("out/ort-prebuilt/lib");
+                if lib_dir.join("libonnxruntime.so").exists() {
+                    return Some(lib_dir);
                 }
             }
         }
