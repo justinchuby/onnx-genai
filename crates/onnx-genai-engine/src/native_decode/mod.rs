@@ -76,6 +76,15 @@ pub struct NativeDecodeCudaOptions {
     pub metadata_max_len: Option<usize>,
     pub graph_capture: Option<bool>,
     pub weight_offload_enabled: Option<bool>,
+    /// Whether live weight offload runs on the **stable virtual address** VMM
+    /// paging path (issue #716). When `Some(true)`, every retained weight is
+    /// served from a reserved-once device VA whose physical granules are
+    /// mapped/unmapped underneath, so a captured CUDA graph that baked a weight
+    /// pointer stays valid across evict→repage — which is what lets whole-step
+    /// graph capture stay ON while offload is active. `Some(false)`/`None` means
+    /// the pointer-unstable `alloc_raw`/`free_raw` path, so offload keeps forcing
+    /// capture OFF as before.
+    pub weight_offload_stable_va: Option<bool>,
 }
 
 /// Stateful decoder-with-past adapter over the pure-Rust native runtime.

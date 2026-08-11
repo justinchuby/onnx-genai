@@ -453,17 +453,38 @@ capability negotiation are tracked in #783. The fixed-stride/dummy-tail work in
 #759 remains complementary fault-safety machinery; it cannot repair residency
 that a layout has already scattered.
 
-**Weight offload and CUDA graph capture are mutually exclusive today.** The
-pager's alloc/copy/free operations are capture-illegal, so enabling offload
-disables capture (see the module docs in
-`crates/onnx-genai-engine/src/native_decode/cuda.rs`). Large models that need
-offload therefore get **none** of the capture-fragmentation wins that #708 and
-#728 landed — those took 35B-A3B decode from **154 to 34** graph segments. The
-fix is **#716**: page weights under a stable virtual address so page-in remaps
-physical granules at the same VA (proven survivable, #727 — see the status
-table) instead of returning a new pointer that would invalidate the capture.
-Until #716 lands, offload-on implies capture-off, and that is a large part of why
-managed offload trails WDDM demand paging on a model that does not fit.
+**Weight offload and CUDA graph capture no longer force each other off on the
+managed no-spill path (#716).** The legacy pager's alloc/copy/free operations are
+capture-illegal because each page-in returns a different device pointer and a
+captured graph bakes pointers into its recorded nodes, so on that path enabling
+offload still disables capture (see the module docs in
+`crates/onnx-genai-engine/src/native_decode/cuda.rs`). **#716** removes the
+mutual exclusion for the managed no-spill authority path: each retained weight
+`key` is served from a **reserved-once device virtual address** whose physical
+granules are committed on page-in and decommitted on eviction under the same VA
+(mechanism proven survivable by #727; isolated end-to-end for a captured read
+that tracks repaged granules in
+`crates/onnx-runtime-cuda-memory/tests/vmm_stable_va_weight_slot_gpu.rs`, and at
+the residency level in `weight_paging.rs`'s
+`vmm_retained_weight_key_keeps_a_stable_virtual_address_across_repage`). Physical
+granules still come from the #740 authority-scoped pool through `carve()`
+suballocation and are charged once on the global `0→1 / 1→0` granule-ref
+attribution — no second allocator, no per-weight reservation (the mistake that
+made #733 net-negative). The addressing change is strictly underneath #723's
+`StableResident` policy, which is unchanged. Gating: capture is kept ON under
+offload only when `weight_offload_enabled && managed_no_spill` (the explicit
+byte `--vram-limit` authority that installs the VMM arena + physical pool); the
+pointer-unstable `alloc_raw`/`free_raw` compatibility path keeps the old
+capture-off exclusion. This unblocks the capture-fragmentation wins that #708 and
+#728 landed — those took 35B-A3B decode from **154 to 34** graph segments — for
+large models that need offload, and is a hard prerequisite for #755 (managed
+no-spill VMM as the default with automatic weight streaming). Ordering rule the
+safety relies on, enforced in code rather than by comment: page-ins (and thus the
+eviction-driven `decommit` of any stable slot) run entirely under the residency
+mutex, whole-step capture is capture-once/replay-many with no page-ins during
+replay, and the engine additionally declines capture when a step reports a
+bypass/eviction — so no `decommit` of a baked VA can occur while a replay is in
+flight (the case #727 explicitly did not prove safe).
 
 **Sequential weight prefetch does not work and was deleted (#715, #718).** It was
 implemented, measured to produce no usable compute/transfer overlap on the dev

@@ -31,11 +31,22 @@ use onnx_runtime_memory_governor::{DeviceAllocator, Tier};
 
 use crate::runtime::{CudaRuntime, PinnedStaging, raw_ptr};
 
+/// Alignment for stable-VA weight slots (issue #716). The VMM arena rounds
+/// commits to the 2 MiB device granule (#776) regardless, so this only governs
+/// the reserved VA start; 256 B matches the value used for the pre-#716
+/// throwaway carves so slot addresses stay comparably aligned.
+const WEIGHT_SLOT_ALIGN: usize = 256;
+
 /// Process-global weight-offload activity counters. These may be reset between
 /// benchmark measurement windows while caches remain alive.
 static GLOBAL_PAGE_INS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_HITS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+// Page-ins under scan-resistant admission that could not be admitted to the
+// resident set and were handed back to the caller transiently (issue #716:
+// a non-zero value since capture arm means the resident set is NOT stable, so
+// whole-step CUDA graph capture must stay declined for correctness).
+static GLOBAL_BYPASSED_PAGE_INS: AtomicU64 = AtomicU64::new(0);
 // Time spent filling the host staging buffer from mmap regions. This is a
 // host-blocking CPU memcpy span and contains no CUDA synchronization.
 static GLOBAL_MATERIALIZE_NS: AtomicU64 = AtomicU64::new(0);
@@ -107,6 +118,7 @@ pub struct GlobalOffloadStats {
     pub page_ins: u64,
     pub hits: u64,
     pub evictions: u64,
+    pub bypassed_page_ins: u64,
     pub materialize_ns: u64,
     pub htod_ns: u64,
     pub admit_sync_ns: u64,
@@ -130,6 +142,7 @@ pub fn global_offload_stats() -> GlobalOffloadStats {
         page_ins: GLOBAL_PAGE_INS.load(Ordering::Relaxed),
         hits: GLOBAL_HITS.load(Ordering::Relaxed),
         evictions: GLOBAL_EVICTIONS.load(Ordering::Relaxed),
+        bypassed_page_ins: GLOBAL_BYPASSED_PAGE_INS.load(Ordering::Relaxed),
         materialize_ns: GLOBAL_MATERIALIZE_NS.load(Ordering::Relaxed),
         htod_ns: GLOBAL_HTOD_NS.load(Ordering::Relaxed),
         admit_sync_ns: GLOBAL_ADMIT_SYNC_NS.load(Ordering::Relaxed),
@@ -159,6 +172,7 @@ pub fn reset_global_offload_stats() {
     GLOBAL_PAGE_INS.store(0, Ordering::Relaxed);
     GLOBAL_HITS.store(0, Ordering::Relaxed);
     GLOBAL_EVICTIONS.store(0, Ordering::Relaxed);
+    GLOBAL_BYPASSED_PAGE_INS.store(0, Ordering::Relaxed);
     GLOBAL_MATERIALIZE_NS.store(0, Ordering::Relaxed);
     GLOBAL_HTOD_NS.store(0, Ordering::Relaxed);
     GLOBAL_ADMIT_SYNC_NS.store(0, Ordering::Relaxed);
@@ -356,7 +370,27 @@ enum WeightAllocation {
     Vmm {
         allocator: Arc<crate::vmm_allocator::CudaVmmAllocator>,
         allowance: onnx_runtime_memory_governor::MappedAllowance,
+        /// When `true`, this page occupies a per-key **stable virtual address
+        /// slot** (issue #716). Its Drop unmaps the physical granules but KEEPS
+        /// the reserved VA live so the next page-in of the same key reuses the
+        /// identical device pointer a captured CUDA graph baked into its nodes.
+        /// The VA itself is reclaimed by the arena reservation's Drop at model
+        /// unload. When `false`, this is a transient (bypassed) page on its own
+        /// throwaway VA, freed outright on Drop — it is never baked into a
+        /// captured graph, so no stable address is required.
+        stable_slot: bool,
     },
+}
+
+/// A reserved-once virtual address slot backing a paged weight `key` (issue
+/// #716). The physical granules under `va` are mapped on page-in and unmapped
+/// on eviction, but the `va` itself persists for the residency's lifetime so a
+/// captured graph that baked this pointer keeps reading the current physical
+/// mapping across repeated page-ins.
+#[derive(Clone, Copy, Debug)]
+struct StableWeightSlot {
+    va: CUdeviceptr,
+    len: usize,
 }
 
 impl CudaWeightPage {
@@ -583,6 +617,7 @@ impl Drop for CudaWeightPage {
             WeightAllocation::Vmm {
                 allocator,
                 allowance,
+                stable_slot,
             } => {
                 // Unlike cuMemFree, unmapping a VMM span does not implicitly
                 // wait for kernels that still reference its virtual address.
@@ -594,7 +629,25 @@ impl Drop for CudaWeightPage {
                     return;
                 }
                 if let Some(ptr) = NonNull::new(self.ptr as *mut u8) {
-                    let unmapped = allocator.deallocate_span(ptr);
+                    // A stable slot (issue #716) unmaps only the physical
+                    // granules and KEEPS the reserved VA so the next page-in of
+                    // this key reuses the identical device pointer a captured
+                    // graph baked. A transient bypass page frees its throwaway
+                    // VA outright. Never assert in Drop (STATUS_STACK_BUFFER_-
+                    // OVERRUN on Windows): decommit failures fall back to zero.
+                    let unmapped = if *stable_slot {
+                        allocator
+                            .decommit_allocation_range(
+                                ptr,
+                                self.len,
+                                WEIGHT_SLOT_ALIGN,
+                                0,
+                                self.len,
+                            )
+                            .unwrap_or(0)
+                    } else {
+                        allocator.deallocate_span(ptr)
+                    };
                     allowance.unmap(unmapped);
                     let _ = GLOBAL_WEIGHT_MAPPED_BYTES.fetch_update(
                         Ordering::Relaxed,
@@ -737,6 +790,13 @@ struct ResidencyInner {
     /// See `residency_holds_its_lease_until_its_pages_are_gone`.
     lease: Option<onnx_runtime_memory_governor::MemoryLease>,
     admission_no_progress: u64,
+    /// Per-key **stable virtual address slots** (issue #716). A key's slot is
+    /// reserved once (VA only, no physical bytes) on its first retained page-in
+    /// and reused for every subsequent page-in of that key, so the device
+    /// pointer a captured CUDA graph baked stays valid across evict→repage
+    /// cycles. Only retained (resident-set) keys get a slot; transient bypass
+    /// page-ins keep their own throwaway VA and never appear here.
+    slots: HashMap<u64, StableWeightSlot>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -932,6 +992,7 @@ impl CudaWeightResidency {
                 pages: HashMap::new(),
                 mapped_allowance: None,
                 admission_no_progress: 0,
+                slots: HashMap::new(),
             }),
         }
     }
@@ -980,6 +1041,7 @@ impl CudaWeightResidency {
                 pages: HashMap::new(),
                 mapped_allowance: None,
                 admission_no_progress: 0,
+                slots: HashMap::new(),
             }),
         })
     }
@@ -1297,35 +1359,127 @@ impl CudaWeightResidency {
             .physical
             .get()
             .expect("VMM residency helper requires physical admission");
-        let ptr = physical
-            .allocator
-            .allocate_committed(len, 256, &[])
-            .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))?;
-        let allowance = self.lock().mapped_allowance.clone().ok_or_else(|| {
+        let mut inner = self.lock();
+        if let Some(existing) = inner.pages.get(&key).cloned() {
+            inner.record_hit(key);
+            return Ok(existing);
+        }
+        let allowance = inner.mapped_allowance.clone().ok_or_else(|| {
             WeightHandleError::DeviceBinding(
                 "VMM weight residency has no authority-scoped mapped-byte allowance; \
                      adopt the memory governor before page-in"
                     .into(),
             )
         })?;
+
+        // Issue #716: reserve a per-key **stable virtual address** once and
+        // reuse it for every page-in of this key. A captured CUDA graph bakes
+        // the device pointer of each weight it reads; reusing the identical VA
+        // — with physical granules mapped underneath on page-in and unmapped on
+        // eviction — is what lets a captured graph replay correctly after the
+        // weight is evicted and paged back in (proven in
+        // `vmm_stable_va_weight_slot_gpu`). A first-seen key gets a fresh
+        // throwaway reservation; whether that becomes a persistent slot is
+        // decided once admission classifies the page as retained vs bypassed.
+        let reused_slot = inner.slots.get(&key).copied();
+        let ptr = match reused_slot {
+            Some(slot) => {
+                // A key's byte size is fixed by the weight it names; a differing
+                // length means two weights collided on one key, which would
+                // corrupt the baked-pointer contract. Refuse rather than remap.
+                if slot.len != len {
+                    return Err(WeightHandleError::DeviceBinding(format!(
+                        "stable weight slot for key {key} was reserved for {} bytes but a \
+                         {len}-byte page-in requested it",
+                        slot.len
+                    )));
+                }
+                NonNull::new(slot.va as *mut u8).ok_or_else(|| {
+                    WeightHandleError::DeviceBinding("stable weight slot has a null VA".into())
+                })?
+            }
+            None => physical
+                .allocator
+                .allocate_committed(len, WEIGHT_SLOT_ALIGN, &[])
+                .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))?,
+        };
+
+        let bypass = match self
+            .admit_committed_span(&mut inner, physical, &allowance, ptr, len, eviction, fill)
+        {
+            Ok(bypass) => bypass,
+            Err(error) => {
+                // A reused slot's VA is persistent (its physical is already
+                // decommitted); a fresh throwaway reservation must be released
+                // so a failed page-in never leaks address space.
+                if reused_slot.is_none() {
+                    let _ = physical.allocator.deallocate_span(ptr);
+                }
+                return Err(error);
+            }
+        };
+
+        // A reused slot is always persistent. A fresh page that admission
+        // retained (not bypassed) becomes a persistent slot; a fresh bypassed
+        // page keeps its throwaway VA and is freed outright on Drop, so two
+        // concurrent bypass page-ins can never alias one physical granule.
+        let stable_slot = reused_slot.is_some() || !bypass;
+        if stable_slot && reused_slot.is_none() {
+            inner.slots.insert(
+                key,
+                StableWeightSlot {
+                    va: ptr.as_ptr() as CUdeviceptr,
+                    len,
+                },
+            );
+        }
         let page = Arc::new(CudaWeightPage {
             runtime: Arc::clone(&self.runtime),
             allocation: WeightAllocation::Vmm {
                 allocator: Arc::clone(&physical.allocator),
                 allowance: allowance.clone(),
+                stable_slot,
             },
             ptr: ptr.as_ptr() as CUdeviceptr,
             len,
             dtype,
             shape,
         });
-
-        let mut inner = self.lock();
-        if let Some(existing) = inner.pages.get(&key).cloned() {
-            inner.record_hit(key);
-            return Ok(existing);
+        if bypass {
+            inner.record_bypassed_page_in();
+        } else {
+            inner.insert_page(key, Arc::clone(&page), len as u64);
         }
+        Ok(page)
+    }
 
+    /// Commit `len` physical bytes under the reserved VA `ptr`, evicting other
+    /// resident pages as `eviction` permits, then run `fill` to copy the weight
+    /// bytes into the freshly mapped granules. Returns `true` when the page
+    /// could not be admitted to the resident set and is handed back transiently
+    /// (a "bypass" under scan-resistant admission), `false` when it is retained.
+    ///
+    /// This runs entirely under the residency lock (`inner`), so page-ins —
+    /// and therefore the eviction-driven `decommit` of any stable slot — are
+    /// fully serialized. Whole-step CUDA graph capture is capture-once /
+    /// replay-many and performs no page-ins during replay, so no `decommit` of
+    /// a baked VA can occur while a replay is in flight; the engine additionally
+    /// declines capture whenever a step reports a bypass or eviction (issue
+    /// #716), keeping the invariant enforceable rather than advisory.
+    #[allow(clippy::too_many_arguments)]
+    fn admit_committed_span<F>(
+        &self,
+        inner: &mut ResidencyInner,
+        physical: &PhysicalAdmission,
+        allowance: &onnx_runtime_memory_governor::MappedAllowance,
+        ptr: NonNull<u8>,
+        len: usize,
+        eviction: WeightEvictionPolicy,
+        fill: F,
+    ) -> Result<bool, WeightHandleError>
+    where
+        F: FnOnce(&CudaRuntime, CUdeviceptr) -> Result<(), WeightHandleError>,
+    {
         let mut fill = Some(fill);
         let max_evictions = inner.pages.len();
         let mut evictions = 0usize;
@@ -1369,13 +1523,11 @@ impl CudaWeightResidency {
                                 |current| Some(current.saturating_sub(excess)),
                             );
                         }
-                        fill.take().expect("VMM page fill runs once")(&self.runtime, page.ptr)?;
-                        if bypass {
-                            inner.record_bypassed_page_in();
-                        } else {
-                            inner.insert_page(key, Arc::clone(&page), len as u64);
-                        }
-                        return Ok(page);
+                        fill.take().expect("VMM page fill runs once")(
+                            &self.runtime,
+                            ptr.as_ptr() as CUdeviceptr,
+                        )?;
+                        return Ok(bypass);
                     }
                     Err(error) => {
                         allowance.unmap(required_mapped);
@@ -1601,6 +1753,18 @@ impl CudaWeightResidency {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+
+    /// Whether page-ins go through the stable-virtual-address VMM path (issue
+    /// #716). When `true`, every retained weight `key` is served from a
+    /// reserved-once device VA whose physical granules are mapped/unmapped
+    /// underneath, so a captured CUDA graph that baked a weight pointer stays
+    /// valid across evict→repage. This is the gate the decode session uses to
+    /// decide that weight offload no longer forces whole-step graph capture
+    /// OFF. `false` means the non-VMM `alloc_raw`/`free_raw` path is in use,
+    /// which hands out a different pointer per page-in and is capture-illegal.
+    pub fn stable_va_paging_active(&self) -> bool {
+        self.physical.get().is_some()
+    }
 }
 
 impl std::fmt::Debug for CudaWeightResidency {
@@ -1708,6 +1872,7 @@ impl ResidencyInner {
     fn record_bypassed_page_in(&mut self) {
         self.policy.record_page_in();
         GLOBAL_PAGE_INS.fetch_add(1, Ordering::Relaxed);
+        GLOBAL_BYPASSED_PAGE_INS.fetch_add(1, Ordering::Relaxed);
     }
 
     fn next_evictable_key(&self, eviction: WeightEvictionPolicy) -> Option<u64> {
@@ -2037,6 +2202,132 @@ mod tests {
         assert_eq!(retained.mapped_bytes, 0);
         assert_eq!(retained.pooled_unmapped_bytes, granule as u64);
         assert_eq!(retained.total_owned_bytes, granule as u64);
+    }
+
+    /// Issue #716: a retained weight `key` keeps a **stable device virtual
+    /// address** across an evict→repage cycle. The first page-in reserves the
+    /// key's VA slot; evicting it (paging another key under a one-page budget)
+    /// unmaps only the physical granule and keeps the VA; paging the key back in
+    /// reuses that identical VA. This is the residency-level guarantee that lets
+    /// a captured CUDA graph — which baked the weight's device pointer — replay
+    /// correctly after the weight was evicted and paged back in.
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn vmm_retained_weight_key_keeps_a_stable_virtual_address_across_repage() {
+        use onnx_runtime_memory_governor::{
+            DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryRole,
+        };
+
+        unsafe {
+            std::env::set_var(
+                crate::vmm_allocator::CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV,
+                (64usize << 20).to_string(),
+            );
+        }
+        let Ok(runtime) = CudaRuntime::new(0).map(Arc::new) else {
+            eprintln!("SKIPPED (CUDA runtime dependencies unavailable): stable-VA repage GPU test");
+            return;
+        };
+        let granule = 2usize << 20;
+        // Two granules of global headroom, but a one-granule weight budget: the
+        // second key must evict the first, exercising the evict→repage path.
+        let governor = Arc::new(LedgerGovernor::new(LeaseLedger::new(
+            (granule * 2) as u64,
+            0,
+            0,
+        )));
+        let allocator = Arc::new(
+            crate::vmm_allocator::CudaVmmAllocator::new(
+                runtime.cuda_context(),
+                DeviceKey::device(0),
+                0,
+                64 << 20,
+                governor.as_ref(),
+                HolderId::new(716),
+                MemoryRole::Weights,
+            )
+            .expect("VMM allocator"),
+        );
+        let authority: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync> =
+            governor.clone();
+        let residency = CudaWeightResidency::new(Arc::clone(&runtime), granule as u64)
+            .with_vmm_admission(Arc::clone(&allocator), authority)
+            .expect("install VMM admission");
+        residency
+            .adopt_governed_budget(governor.as_ref(), Tier::Device, HolderId::new(716))
+            .expect("reserve mapped weight allowance");
+
+        assert!(
+            residency.stable_va_paging_active(),
+            "installing VMM admission must activate the stable-VA paging path"
+        );
+
+        let page_key_1 = |fill_byte: u8| {
+            let bytes = vec![fill_byte; granule];
+            residency
+                .resident_vmm_with(
+                    1,
+                    DataType::Uint8,
+                    vec![granule],
+                    granule,
+                    WeightEvictionPolicy::Lru,
+                    move |runtime, ptr| {
+                        unsafe { runtime.htod(&bytes, ptr) }
+                            .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))
+                    },
+                )
+                .expect("page key 1")
+        };
+
+        // First page-in of key 1 reserves its stable slot and records its VA.
+        let first = page_key_1(0x11);
+        let stable_va = first.device_ptr();
+        drop(first);
+
+        // Page key 2 under the one-page budget: key 1 is evicted, which unmaps
+        // its physical granule but keeps its VA slot reserved.
+        let second_bytes = vec![0x22u8; granule];
+        let second = residency
+            .resident_vmm_with(
+                2,
+                DataType::Uint8,
+                vec![granule],
+                granule,
+                WeightEvictionPolicy::Lru,
+                move |runtime, ptr| {
+                    unsafe { runtime.htod(&second_bytes, ptr) }
+                        .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))
+                },
+            )
+            .expect("page key 2 evicts key 1");
+        assert_ne!(
+            second.device_ptr(),
+            stable_va,
+            "a different key must get a different VA slot"
+        );
+        drop(second);
+
+        // Page key 1 back in: it must reuse the identical device VA it had
+        // before, even though the physical granule underneath was returned to
+        // the pool and re-mapped.
+        let repaged = page_key_1(0x33);
+        assert_eq!(
+            repaged.device_ptr(),
+            stable_va,
+            "issue #716: a retained key must keep its stable VA across evict→repage"
+        );
+
+        let stats = residency.stats();
+        assert_eq!(stats.page_ins, 3);
+        // key 2 evicted key 1; re-paging key 1 evicted key 2 — two evictions.
+        assert_eq!(stats.evictions, 2);
+        // No churn allocator: physical ownership stayed at one reused granule.
+        assert_eq!(stats.physical_owned_bytes, granule as u64);
+        drop(repaged);
+        drop(residency);
     }
 
     /// A locally chosen budget becomes a claim the rest of the system can see.
