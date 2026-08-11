@@ -31,3 +31,13 @@ Fresh adversarial pass after rebase onto upstream/main. All 6 original blockers 
 ## 2026-08-11 (upstream CI correction wave) — Lessons enforced
 
 Persona name leaks found only after two prior diff sweeps. Rule confirmed: grep the actual source content in the diff, not just `.squad/` paths. Two PRs converted back to draft — "infra flake" reasoning does not justify marking ready while CI is red.
+
+---
+
+## 2026-08-11 — Review of onnxruntime PR #31993 (MLAS Apple f16 cast)
+
+**Task:** Adversarial review of `nxrt/mlas-apple-f16-cast` @ `df162d9`. Verified ARM64-only gating across preprocessor, CMake, and universal2 paths. Confirmed kernel is wired up (not dead code). Found two substantive issues: (S1) dispatch reachability test is a no-op — cannot distinguish scalar from vectorised path; (S2) missing sNaN test cases. No blocking issues. No performance claims, no persona leaks. Recommended: push to CI as draft, fix S1/S2 before marking ready.
+
+**Lockout:** Holden barred from revision after authoring the review; Freysa revised.
+
+**Output:** `.squad/decisions/inbox/holden-review-31993.md` (now merged)

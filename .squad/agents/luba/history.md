@@ -1,50 +1,22 @@
 # Luba — History
 
-## Project Context (joined day)
-- **Project:** onnx-genai — Rust inference runtime for generative AI on ONNX Runtime.
-- **State when joined:** Native CUDA EP beats/parity ORT on several Foundry models; correctness suite green (int8/block32 f64-adjudicated in #190). Team reorganized into pods; CPU & Edge pod formed to broaden hardware coverage beyond CUDA/Metal.
-- **Role:** ARM CPU / QNN EP Engineer — ARM64 CPU (NEON/SVE) perf + Qualcomm QNN NPU execution provider, edge/Windows-on-ARM.
-- **Requested by:** Justin Chu
-- **Joined:** 2026-07-26
+## Role
+ARM CPU / QNN EP Engineer — ARM64 CPU (NEON/SVE) perf + Qualcomm QNN NPU execution provider, edge/Windows-on-ARM. CPU & Edge pod. Joined 2026-07-26.
 
-## 2026-07-26 — Joined the team
-Cast into the CPU & Edge pod. Standing directive: optimizations must be portable (consumer/edge hardware, not just H200); every perf claim backed by a benchmark; SIMD/NPU paths must match the scalar/f64 reference within a justified tolerance and be locked with regression tests.
-## 2026-07-27T04:35:00-07:00 — Scribe update: Mac CPU EP PR #227
+## Historical context
 
-- Native Mac CPU EP now has Apple-Silicon-general NEON paths for multi-thread GEMV, SDPA, SiLU, and direct-from-mmap FP16 GEMV; runtime feature detection/dispatch is expected for SIMD paths instead of machine-specific tuning.
-- FP16 works because Apple Silicon NEON can widen f16 loads directly while ORT CPU widens before GEMM; keep this architectural distinction in mind for CPU EP work on other platforms.
-- The campaign learned that untested SIMD paths are as risky as placeholders; new AVX/NEON/SVE/QNN paths need guard-break tests and paired scalar/reference checks.
+Joined during CUDA parity wave. Fixed PR #294 aarch64 build by cfg-gating the x86-only perf probe. Worked through the Mac CPU EP PR #227 wave (Apple-Silicon-general NEON paths). Triage: ARM/Apple CI failures for upstream PRs #31973 and #31974 were all confirmed infra flakes (CDN timeouts, job timeouts) — no code bugs. Helped fix B3 NxrtStatus inline buffer for PR #762.
 
-## 2026-07-27T19:35:00Z — Roadmap wave update
-- Fixed PR #294 aarch64 build by cfg-gating the x86-only perf probe after Drake lockout.
+Pre-2026-08-11 entries archived in `history-archive.md`.
 
-## 2026-08-11 — B3: NxrtStatus cross-module allocator fix (PR #762 rejection)
+## 2026-08-11 — Apple MLAS FP16 cast kernel audit and implementation (PR #31993)
 
-**Problem:** `NxrtStatus.message` was heap-allocated in the plugin (`CString::into_raw`) and freed in the host (`CString::from_raw`/`Drop`). Across a `cdylib` boundary with different CRTs this is UB (Windows heap corruption).
+Audited: Apple ARM64 genuinely excluded from NEON f16↔f32 cast kernel. Gap is real; "baseline instructions" claim was wrong (vcvt_f32_f16 needs `-march=armv8.2-a+fp16`). All Apple Silicon has FEAT_FP16, so this is a build-system issue, not hardware. Introduced `MLAS_CAST_F16_NEON_SUPPORTED`, gated on `__APPLE__ && MLAS_TARGET_ARM64`. Draft PR #31993 opened. No performance claims.
 
-**Fix:** Replaced `*mut c_char` with inline `[u8; 256]` buffer + `message_len: u32`. `NxrtStatus` is now a pure value type — no heap, no pointers, no `Drop`, no cross-module free. `message_str()` is no longer `unsafe`.
+## 2026-08-11 — PR #31993 Holden review and Freysa revision
 
-**Also fixed:** Two `as *const i8` casts in `loader.rs` and `provider_adapter.rs` that fail on aarch64 (where `c_char = u8`). Changed to `as *const c_char`.
+Holden reviewed `nxrt/mlas-apple-f16-cast` @ `df162d9`. All gating confirmed correct. Two substantive findings: S1 (vacuous dispatch test — 1.0 converts identically on scalar path), S2 (missing sNaN/denormal coverage). Freysa revised under lockout (Luba barred). Both issues fixed. Head: `54f2fc8`. PR remains draft pending Apple CI.
 
-**Tests:** 32 nxrt-abi unit tests pass, 4 nxrt-host unit + 10 roundtrip tests pass. Clippy + fmt clean.
+## Archive pointer
 
-**Note for Chew:** Two `as *const i8` casts remain in `tests/nxrt_abi_roundtrip.rs:173,187` — need the same `c_char` fix.
-
----
-
-## 2026-08-11 — Apple/ARM CI failure triage for #31973 and #31974
-
-**Task:** Investigate three CI failures on upstream PRs to determine if caused by our code.
-
-**Findings:** All three failures are **infra flakes**, not caused by our code:
-1. PR #31973 `coreml / build-and-test` — FetchContent download of cpuinfo.zip failed (CDN timeout)
-2. PR #31974 `iphone_simulator (arm64)` — FetchContent download of XNNPACK.zip failed
-3. PR #31974 `Build Linux arm64 Debug` — Job timeout at link step 1453/1459, no compile error
-
-**Control:** PR #31985 (docs-only, same main) passed all these jobs at the same time, confirming transient infra issues.
-
-**Action:** No code changes. Recommend re-running failed jobs.
-
-## 2026-08-11 (upstream CI correction wave) — Apple/arm64 CI triage
-
-Pulled real logs for all Apple/arm64 failures on #31973 and #31974. All three failures occur before compilation: (1) cpuinfo archive download failure (#31973 coreml), (2) XNNPACK archive download failure (#31974 iphone_simulator), (3) job timeout at step 1453/1459 during `onnxruntime_mlas_test` link (#31974 arm64 Debug). All confirmed infra flakes via control PR #31985. `gh run rerun` refuses fork-PR jobs; only retrigger is a push.
+Older entries in `history-archive.md`.

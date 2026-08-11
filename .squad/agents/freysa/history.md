@@ -1,46 +1,26 @@
 # Freysa — History
 
-## 2026-07-12: Joined
-Hired as MPS Perf & Testing engineer for the new Apple Metal EP for ONNX Runtime (`../onnxruntime-mps`). Owns per-kernel correctness (vs ORT CPU reference), benchmarking, Metal profiling, and E2E testing through the onnx-genai runtime (`ONNX_GENAI_EP=metal`). Targets: beat llama.cpp Metal / LM Studio / Foundry Local on Apple Silicon. Reuses the onnx-genai benchmark harness (`scripts/compare_runtimes.sh`, `compare.rs`). Pairs with Sebastian. Correctness (coherent output) gates every perf claim.
+## Role
+MPS Perf & Testing engineer. Owns Apple Metal EP correctness (vs ORT CPU reference), benchmarking, Metal profiling, and E2E testing through onnx-genai. Pairs with Sebastian. Joined 2026-07-12.
 
-- 2026-07-14T19:05:00Z — Pipeline API seams (`ChatTemplate::builtin_default`, `Engine::tokenize`, `embed_text*`) recorded in decisions; Holden review GREEN for commit `ecba2c1`.
+## Historical context
 
-## 2026-07-15T00:00:00Z — Cross-agent session update
+Joined during Apple Metal EP bringup. Rejected Batty's onnx-rs binding for lossy paths; cleared Deckard's revision. Handled WP-B raw-protobuf admission rejection. July–August: `disable_cpu_ep_fallback=1` added to conformance setup for PR #762 to prove EP assignment non-vacuously. Corrected false deferral on `Session_GetEpGraphAssignmentInfo` (present since ORT 1.24).
 
-- Added missing C1 shape handlers and initial DLPack import support; both were consolidated in the July 15 coverage/interoperability work.
+Pre-2026-08-11 entries archived in `history-archive.md`.
 
-### 2026-07-16T00:00:00Z — Performance-and-design wave
-Reviewed the unified string-serde surface as approve-with-notes.
+## 2026-08-11 — PR #31993 test revision (f16 cast dispatch, lockout)
 
-### 2026-07-16T00:00:00Z — onnx-rs Python binding review cycle
-Rejected Batty's initial `onnx_rs` binding for lossy paths, an `exists()` preflight, and swallowed `__fspath__` exceptions. Cleared Deckard's `5b348b5` revision after targeted Rust tests and six Python regressions verified lossless paths and native filesystem errors.
+**Task:** Fix S1 and S2 flagged by Holden's review of MLAS Apple f16 cast PR. Luba (author) and Holden (reviewer) both barred under lockout.
 
-- 2026-07-21: Scribe reconciled the perf campaign inbox; key decisions are now consolidated in `.squad/decisions.md` under the 2026-07-21 perf campaign section.
+**S1:** Replaced `Convert(1.0) == 1.0f` assertion (passes on scalar fallback too) with direct pointer checks: `GetMlasPlatform().CastF16ToF32Kernel != nullptr` and `CastF32ToF16Kernel != nullptr`. Only honest assertion — NEON and scalar paths are bit-exact by design.
 
-### 2026-07-22T14:59:36+0000 — WP-B landed
-WP-B landed: Freysa's raw-protobuf admission rejection was resolved in the final WP-B3 path.
+**S2:** Added signalling NaN (`0x7C01`), mid-range denormal (`0x0200`), negative denormal (`0x8001`) to f16→f32. Added `signaling_NaN()` to f32→f16.
 
-## 2026-07-28T09-10-28+00-00 — PR #338 review
-- Approved Luv's #67 CUDA `Pad`/`Range` batch after H200 GPU 2 passed 174/174 parity cases, the coverage gate passed, a content-corrupting mutation probe failed as expected, and default-target warnings-denied Clippy was clean. PR #338 merged as `c59383db`.
+**Head:** `54f2fc8`. Tests not run (Linux host); Apple CI will validate.
 
-## 2026-08-11 — EP assignment proof (PR #762)
+**Lesson:** A dispatch test that uses values producible by both paths is vacuous. Test the dispatch mechanism itself (pointer, flag) rather than a value that happens to be correct.
 
-- Added `session.disable_cpu_ep_fallback=1` to `conformance_setup()` in `plugin_ort_e2e.rs`
-- All 22 conformance tests (plus stress test) now prove our EP actually claimed nodes
-- `conformance_mixed_partition` exempted (intentionally tests partition with fallback)
-- Proved non-vacuity: with flag applied universally, mixed_partition correctly fails with ORT's "fallback disabled" error
-- Profiling assertion not practical: ORT 1.27 plugin-EP API has no post-session per-node provider query
-- 23 tests pass, 0 fail. No test count decrease.
+## Archive pointer
 
-## 2026-08-11 — PR #762 third corrective wave: disable_cpu_ep_fallback
-
-**Task:** Set `session.disable_cpu_ep_fallback=1` in `conformance_setup()` to prove our EP executes nodes.
-
-**Commit:** `034876d30`
-
-- Applied to all 21 conformance tests. `conformance_mixed_partition` exempted (`disable_fallback: false`) — intentionally tests unsupported ops.
-- Non-vacuity proved: before exemption, `mixed_partition` failed with ORT error about nodes assigned to default CPU EP with fallback explicitly disabled.
-
-**Outcome:** Correct. Later in the wave, Fact Checker found `Session_GetEpGraphAssignmentInfo` existed since ORT 1.24 — the profiling assertion deferral was incorrect. Resch wired the direct API.
-
-**Lesson:** Verify an API's absence before deferring on it. Check the generated bindings.
+Older entries in `history-archive.md`.

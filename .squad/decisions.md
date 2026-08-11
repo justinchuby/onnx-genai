@@ -285,6 +285,34 @@ Full narrative in `.squad/decisions-archive/2026-08.md` (DROP sections: copilot-
 - **Apple/arm64 fork-PR jobs fail frequently at dependency download** (cpuinfo, XNNPACK, eigen3, protoc), always before compilation. `gh run rerun` refuses fork-PR jobs; only retrigger available is a push.
 - **Reviewer lockout held:** Iran and Pris were barred from fixing the persona-name comments they authored; Chew did it.
 
+## Current active wave — 2026-08-11 (Apple MLAS f16 cast — upstream PR #31993)
+
+### Upstream ORT PR #31993 — MLAS f16↔f32 cast kernel on Apple ARM64
+
+**By:** Luba (audit + implementation), Holden (review), Freysa (lockout revision — S1/S2)
+
+**PR:** microsoft/onnxruntime#31993 — open as **draft**. Head: `54f2fc8`.
+
+**What was done:**
+- Confirmed Apple ARM64 excluded from cast kernel by `!defined(__APPLE__)` (mlas.h:100) and `if (NOT APPLE)` (cmake:608). All f16↔f32 conversion used scalar loop.
+- Introduced `MLAS_CAST_F16_NEON_SUPPORTED`, gated on `__APPLE__ && MLAS_TARGET_ARM64`. ARM64-only gating verified across preprocessor, CMake (nested inside `if(ARM64 AND MLAS_SOURCE_IS_NOT_SET)`), universal2/MULTI_ARCH checkpoint, `mlasi.h:1400` declaration, and `platform.cpp:810` dispatch.
+- `-march=armv8.2-a+fp16` scoped to `cast_kernel_neon.cpp` via `set_source_files_properties`; matches existing pattern (`gelu_neon_fp16.cpp`, `activate_fp16.cpp`).
+- Holden review: 0 blocking. Two substantive — S1 (vacuous dispatch test), S2 (missing sNaN). Freysa revised under lockout (Luba and Holden both barred).
+- S1 fixed: `TestKernelIsDispatched` now asserts `CastF16ToF32Kernel`/`CastF32ToF16Kernel` pointers non-null (under macro) / null (without). S2 fixed: added `0x7C01` (sNaN), `0x0200` (mid-range denormal), `0x8001` (negative denormal).
+- **No performance claims.** Validation depends on Apple CI legs (Linux x86_64 host cannot run it).
+
+**Scope NOT started:** Full fp16 arithmetic family (compiler-flag probe needed); ARM64 LayerNormF32 (separate PR); TransB M=1 SGEMV and P-core macOS thread count (benchmark-gated, no Apple hardware).
+
+**Accelerate/BNNS/vDSP confirmed non-candidates for upstream MLAS.**
+
+### Durable lessons from Apple MLAS f16 cast wave
+
+- **A reachability test that passes on both the fast and fallback path proves nothing.** `TestKernelIsDispatched` asserted `Convert(1.0) == 1.0f`, true on the scalar fallback too. Assert on the dispatch pointer itself. Same failure class as the CUDA optional-slot fix that was dead code while its tests stayed green.
+- **"Apple" is not "ARM64".** Intel Macs and the x86_64 iPhone simulator are Apple targets without FEAT_FP16; universal2 compiles per-arch then lipos. Platform gating must be `APPLE AND ARM64` in both CMake and preprocessor.
+- **Verify the premise, not just the conclusion.** The brief said the cast kernel uses baseline ARM64 instructions; it actually needs `-march=armv8.2-a+fp16`. The gap was still real, but the fix shape differed.
+- **Upstream has no ARM64 LayerNormF32 kernel** (only RISC-V) — a confirmed separate opportunity, sibling to the AVX2 LayerNorm work in #31973.
+- **Reviewer lockout held:** Luba (author) and Holden (reviewer) were both barred from the revision; Freysa did it.
+
 ## Current active wave — 2026-08-12 (CUDA MatMulNBits upstream workstream)
 
 ### Upstream ORT PR #31988 — SM-count-adaptive columns-per-CTA for M=1 MatMulNBits
