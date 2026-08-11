@@ -551,6 +551,8 @@ fn l1_no_symbol_leakage() {
         .filter(|name| {
             *name != "CreateEpFactories"
                 && *name != "ReleaseEpFactory"
+                && *name != "nxrt_ep_compiled_node_count"
+                && *name != "nxrt_ep_reset_compiled_node_count"
                 && !name.starts_with("_Z")
                 && !name.starts_with("__rust")
                 && !name.starts_with("__rdl_")

@@ -245,11 +245,13 @@ impl ShapeInference {
         }
     }
 
-    /// Full shape inference from a compiled IR `Node` plus the static shapes
+    /// Full shape inference from a compiled IR `Node` plus the shapes
     /// of its inputs (may be empty slices for absent optional inputs).
+    /// Each dimension is `Some(n)` for a statically known extent or `None`
+    /// for a symbolic/dynamic dimension — preserving rank.
     ///
     /// `num_outputs` is how many output slots the node has in the graph.
-    pub fn for_node(node: &Node, input_shapes: &[Vec<usize>], num_outputs: usize) -> Self {
+    pub fn for_node(node: &Node, input_shapes: &[Vec<Option<usize>>], num_outputs: usize) -> Self {
         let op = node.op_type.as_str();
         let domain = node.domain.as_str();
         let opset = node.version.unwrap_or(0);
@@ -480,7 +482,7 @@ fn is_reduction(op: &str) -> bool {
     )
 }
 
-fn build_conv(node: &Node, input_shapes: &[Vec<usize>]) -> Option<ShapeInference> {
+fn build_conv(node: &Node, input_shapes: &[Vec<Option<usize>>]) -> Option<ShapeInference> {
     let auto_pad = node
         .attr("auto_pad")
         .and_then(|a| a.as_str())
@@ -496,8 +498,11 @@ fn build_conv(node: &Node, input_shapes: &[Vec<usize>]) -> Option<ShapeInference
     }
     let spatial_dims = in_shape.len() - 2;
 
-    // weight[0] first dim is out_channels.
-    let out_channels = input_shapes.get(1).and_then(|w| w.first()).copied()?;
+    // weight[0] first dim is out_channels — fail closed if dynamic.
+    let out_channels = input_shapes
+        .get(1)
+        .and_then(|w| w.first().copied())
+        .flatten()?;
 
     let kernel_shape: Vec<usize> = node
         .attr("kernel_shape")
@@ -507,7 +512,8 @@ fn build_conv(node: &Node, input_shapes: &[Vec<usize>]) -> Option<ShapeInference
             // derive from weight shape: weight=[out_ch, in_ch/group, k0, k1, ...]
             let w = input_shapes.get(1)?;
             if w.len() == 2 + spatial_dims {
-                Some(w[2..].to_vec())
+                // Fail closed: all kernel dims must be static.
+                w[2..].iter().copied().collect::<Option<Vec<usize>>>()
             } else {
                 None
             }

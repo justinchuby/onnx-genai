@@ -4,7 +4,7 @@
 //! `OrtGraph*`. Here we read a REAL `OrtGraph*` from upstream ORT and build
 //! a nxrt `Graph` for capability discovery.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::ptr;
 
@@ -22,6 +22,11 @@ pub struct OutboundGraphReader {
     /// Owned copies of small int64 initializer tensors, keyed by value name.
     /// Used to resolve opset-13 Unsqueeze/Squeeze axes from constant inputs.
     initializer_int64: HashMap<String, Vec<i64>>,
+    /// Out-of-band set of ValueIds that represent absent optional output slots.
+    /// This replaces the previous in-band string sentinel (`__absent_output_*`)
+    /// which was forgeable from model content. ValueIds are graph-internal
+    /// identifiers not derivable from untrusted model data.
+    absent_outputs: HashSet<ValueId>,
 }
 
 // OutboundGraphReader intentionally does NOT implement Send or Sync.
@@ -150,6 +155,8 @@ impl OutboundGraphReader {
         let initializer_int64 =
             unsafe { Self::read_initializers_int64(api, graph_ptr).unwrap_or_default() };
 
+        let mut absent_outputs: HashSet<ValueId> = HashSet::new();
+
         // Second pass: create nodes with proper edges and attributes.
         for (i, ort_node) in ort_nodes.iter().enumerate() {
             if ort_node.is_null() {
@@ -181,13 +188,17 @@ impl OutboundGraphReader {
                 .enumerate()
                 .map(|(slot, n)| {
                     if n.is_empty() {
-                        // Absent output slot — create a sentinel value so the
-                        // position is preserved in the IR node's output list.
-                        ir_graph.create_named_value(
-                            format!("__absent_output_{i}_{slot}"),
+                        // Absent output slot — create a placeholder value so the
+                        // position is preserved. The ValueId is recorded in
+                        // `absent_outputs` (out-of-band) rather than using a
+                        // magic name prefix that could be forged from model content.
+                        let vid = ir_graph.create_named_value(
+                            format!("_absent_{i}_{slot}"),
                             DataType::Undefined,
                             vec![],
-                        )
+                        );
+                        absent_outputs.insert(vid);
+                        vid
                     } else {
                         *value_map.get(n).unwrap_or_else(|| {
                             panic!("BUG: output name {n:?} not found in value_map")
@@ -246,12 +257,20 @@ impl OutboundGraphReader {
             ort_index_to_node_id,
             ort_node_ptrs: ort_nodes,
             initializer_int64,
+            absent_outputs,
         })
     }
 
     /// Get the IR graph for capability discovery.
     pub fn to_ir_graph(&self) -> &Graph {
         &self.graph
+    }
+
+    /// Out-of-band set of ValueIds representing absent optional output slots.
+    /// These are not derivable from model content — they are assigned by the
+    /// reader at graph construction time.
+    pub fn absent_outputs(&self) -> &HashSet<ValueId> {
+        &self.absent_outputs
     }
 
     /// Access the owned int64 initializer data (copied from ORT during construction).

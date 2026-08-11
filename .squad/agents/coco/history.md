@@ -19,3 +19,10 @@ WP-B landed: Coco's initial WP-B3 admission work was superseded by raw-protobuf 
 
 ## 2026-07-28T09-10-28+00-00 — Shape-inference catalog batch 2 merged
 - PR #339 (`b1f9d3bb`) added Det, LpPool, GlobalLpPool, MaxUnpool, Col2Im, and CenterCropPad; registry 181→187 operators and 219→226 versioned entries. Chew approved after specification review and mutation probing. #75 remains open; signal/loss operators and SSA container types are deferred.
+
+## 2026-08-11 — B1/B2 blocker fixes (PR #762)
+
+- **B1:** Replaced in-band `__absent_output_*` string sentinel with `HashSet<ValueId>` on `OutboundGraphReader`. Unforgeable: ValueIds are arena indices not derivable from model content.
+- **B2:** Replaced `filter_map(|d| d.as_static())` with `map(|d| d.as_static())` at both call sites (ep.rs:238, ep.rs:493). `ShapeInference::for_node` now takes `&[Vec<Option<usize>>]`. `build_conv` fails closed on unknown dims.
+- **mixed_partition:** Added compiled-node counter + C symbol. Soft diagnostic (ORT 1.27 lacks per-node provider attribution API).
+- Tests: 269 passed (+3 new: `forgeable_name_not_treated_as_absent`, `symbolic_dims_preserve_rank`, `conv_declines_with_symbolic_spatial_dims`), 0 failed.

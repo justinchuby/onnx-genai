@@ -109,7 +109,10 @@ fn capability_parity_supported_ops_with_known_shapes() {
 
         // Shape inference must NOT decline
         let node = view.node(node_idx);
-        let shapes_vec: Vec<Vec<usize>> = input_shapes.iter().map(|s| s.to_vec()).collect();
+        let shapes_vec: Vec<Vec<Option<usize>>> = input_shapes
+            .iter()
+            .map(|s| s.iter().copied().map(Some).collect())
+            .collect();
         let si = ShapeInference::for_node(node, &shapes_vec, 1);
         assert!(
             !matches!(si, ShapeInference::Declined { .. }),
@@ -153,9 +156,9 @@ fn capability_parity_supported_but_shape_declined() {
     let node_idx = view.nodes().next().unwrap();
     let node = view.node(node_idx);
 
-    let shapes_vec: Vec<Vec<usize>> = [&[3usize, 4][..], &[1usize][..]]
+    let shapes_vec: Vec<Vec<Option<usize>>> = [&[3usize, 4][..], &[1usize][..]]
         .iter()
-        .map(|s| s.to_vec())
+        .map(|s| s.iter().copied().map(Some).collect())
         .collect();
     let si = ShapeInference::for_node(node, &shapes_vec, 1);
 
@@ -317,7 +320,7 @@ fn error_parity_declined_shape_inference_is_cabi_only() {
     );
 
     // Step 2 — Shape inference is Declined for this node (axes are data-dependent).
-    let input_shapes = vec![vec![3usize, 4], vec![1usize]];
+    let input_shapes: Vec<Vec<Option<usize>>> = vec![vec![Some(3), Some(4)], vec![Some(1)]];
     let si = ShapeInference::for_node(node, &input_shapes, 1);
     assert!(
         matches!(si, ShapeInference::Declined { .. }),

@@ -142,3 +142,19 @@ pub unsafe extern "C" fn ReleaseEpFactory(
         ),
     }
 }
+
+// ─── Test observability: compiled-node counter ───────────────────────────────
+
+/// Returns the number of nodes compiled by our EP since last reset.
+/// Exported as a C symbol so integration tests (which load us via dlopen)
+/// can assert that our EP actually claimed and compiled nodes.
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_compiled_node_count() -> usize {
+    onnx_runtime_ep_plugin::ep::compiled_node_count()
+}
+
+/// Resets the compiled-node counter to zero.
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_reset_compiled_node_count() {
+    onnx_runtime_ep_plugin::ep::reset_compiled_node_count()
+}

@@ -3,12 +3,31 @@
 //! Implements `GetCapability`, `Compile`, `ReleaseNodeComputeInfos`, and
 //! `GetKernelRegistry` by delegating to the Rust `ExecutionProvider` trait.
 
+use std::collections::HashSet;
 use std::panic::AssertUnwindSafe;
 use std::ptr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use onnx_genai_ort_sys as ort;
 use onnx_runtime_ep_api::provider::ExecutionProvider;
-use onnx_runtime_ir::DataType;
+use onnx_runtime_ir::{DataType, ValueId};
+
+/// Global counter of nodes compiled by this EP (across all subgraphs).
+/// Incremented in `ep_compile` for each kernel entry. Used for test
+/// observability: confirms our EP actually compiled nodes (not just that
+/// ORT's built-in fallback produced correct output).
+static COMPILED_NODE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Returns the total number of nodes compiled by our EP since process start.
+/// Reset with [`reset_compiled_node_count`] before a test session.
+pub fn compiled_node_count() -> usize {
+    COMPILED_NODE_COUNT.load(Ordering::Relaxed)
+}
+
+/// Resets the compiled-node counter to zero.
+pub fn reset_compiled_node_count() {
+    COMPILED_NODE_COUNT.store(0, Ordering::Relaxed);
+}
 
 use crate::compute::ExportedComputeInfo;
 use crate::graph_reader::OutboundGraphReader;
@@ -229,13 +248,13 @@ fn ep_get_capability_inner(
                     return false;
                 }
                 let node = node.unwrap();
-                let input_shapes: Vec<Vec<usize>> = node
+                let input_shapes: Vec<Vec<Option<usize>>> = node
                     .inputs
                     .iter()
                     .map(|input| {
                         input
                             .and_then(|vid| ir_graph.values.get(vid))
-                            .map(|v| v.shape.iter().filter_map(|d| d.as_static()).collect())
+                            .map(|v| v.shape.iter().map(|d| d.as_static()).collect())
                             .unwrap_or_default()
                     })
                     .collect();
@@ -260,6 +279,9 @@ fn ep_get_capability_inner(
     // cannot produce a tensor if we don't know its element type. This is
     // independent of the registry filter: even when no registry entries
     // exist, we refuse to claim nodes whose output types are unknown.
+    // Absent optional outputs (tracked out-of-band via the reader's
+    // `absent_outputs` set) are exempt — they represent known absence.
+    let absent = reader.absent_outputs();
     let claims: Vec<_> = claims
         .into_iter()
         .filter(|claim| {
@@ -268,8 +290,7 @@ fn ep_get_capability_inner(
                     return false;
                 };
                 // Fail-closed: every output must have a resolved, producible dtype
-                // UNLESS it is an intentionally absent optional output slot
-                // (sentinel created by graph_reader with name `__absent_output_*`).
+                // UNLESS it is an intentionally absent optional output slot.
                 for &vid in &node.outputs {
                     let Some(value) = ir_graph.values.get(vid) else {
                         return false;
@@ -277,16 +298,12 @@ fn ep_get_capability_inner(
                     if value.dtype == DataType::Undefined {
                         // Absent optional outputs are a known absence, not an
                         // unresolved dtype — do not decline the node for these.
-                        let is_absent_slot = value
-                            .name
-                            .as_ref()
-                            .is_some_and(|n| n.starts_with("__absent_output_"));
-                        if !is_absent_slot {
+                        if !absent.contains(&vid) {
                             return false;
                         }
                     }
                 }
-                node_passes_dtype_filter(node, ir_graph, &exported.registry_entries)
+                node_passes_dtype_filter(node, ir_graph, &exported.registry_entries, absent)
             })
         })
         .collect();
@@ -362,6 +379,7 @@ pub(crate) fn node_passes_dtype_filter(
     node: &onnx_runtime_ir::Node,
     ir_graph: &onnx_runtime_ir::Graph,
     entries: &[KernelRegistryEntry],
+    absent_outputs: &HashSet<ValueId>,
 ) -> bool {
     if entries.is_empty() {
         return true;
@@ -394,12 +412,8 @@ pub(crate) fn node_passes_dtype_filter(
             continue;
         };
         if value.dtype == DataType::Undefined {
-            // Absent optional output — known absence, not unknown dtype.
-            let is_absent = value
-                .name
-                .as_ref()
-                .is_some_and(|n| n.starts_with("__absent_output_"));
-            if is_absent {
+            // Absent optional output — known absence tracked out-of-band.
+            if absent_outputs.contains(&vid) {
                 continue;
             }
             return false;
@@ -481,20 +495,26 @@ fn ep_compile_inner(
         let mut entries: Vec<crate::compute::CompiledKernelEntry> = Vec::new();
         for node_idx in view.nodes() {
             let node = view.node(node_idx);
-            let shapes: Vec<Vec<usize>> = view
+            // Preserve rank: map each dim to Option<usize> so symbolic dims
+            // become None rather than being dropped (which would destroy rank).
+            let shapes_opt: Vec<Vec<Option<usize>>> = view
                 .node_inputs(node_idx)
                 .iter()
                 .map(|input| {
                     input
-                        .map(|v| {
-                            view.value(v)
-                                .shape
-                                .iter()
-                                .filter_map(|d| d.as_static())
-                                .collect()
-                        })
+                        .map(|v| view.value(v).shape.iter().map(|d| d.as_static()).collect())
                         .unwrap_or_default()
                 })
+                .collect();
+
+            // For the get_kernel trait (which takes &[Vec<usize>]):
+            // substitute 0 for unknown dims. This preserves rank while
+            // signalling "dynamic" — valid static dims are always ≥1 for
+            // non-empty tensors, and the kernel receives actual shapes from
+            // OrtKernelContext at runtime.
+            let shapes: Vec<Vec<usize>> = shapes_opt
+                .iter()
+                .map(|s| s.iter().map(|d| d.unwrap_or(0)).collect())
                 .collect();
 
             let opset = ir_graph.effective_opset(node).unwrap_or(0);
@@ -516,7 +536,7 @@ fn ep_compile_inner(
                     // Determine shape inference strategy using full node
                     // attributes (wired to Deckard's 22 rules).
                     let shape_inference =
-                        crate::compute::ShapeInference::for_node(node, &shapes, num_outputs);
+                        crate::compute::ShapeInference::for_node(node, &shapes_opt, num_outputs);
 
                     // Build input_slots: maps node input position → ORT index
                     // (sequential for present inputs, None for absent).
@@ -543,6 +563,7 @@ fn ep_compile_inner(
                         shape_inference,
                         input_slots,
                     });
+                    COMPILED_NODE_COUNT.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(e) => {
                     cleanup_partial_infos(out_infos, i);
@@ -1144,7 +1165,7 @@ mod tests {
     fn shape_inference_declines_nonzero() {
         use onnx_runtime_ir::{Node, NodeId};
         let node = Node::new(NodeId(0), "NonZero", vec![None], vec![]);
-        let si = crate::compute::ShapeInference::for_node(&node, &[vec![2, 3]], 1);
+        let si = crate::compute::ShapeInference::for_node(&node, &[vec![Some(2), Some(3)]], 1);
         assert!(
             matches!(si, crate::compute::ShapeInference::Declined { .. }),
             "NonZero must be Declined; got {si:?}"
@@ -1157,7 +1178,11 @@ mod tests {
     fn shape_inference_accepts_add() {
         use onnx_runtime_ir::{Node, NodeId};
         let node = Node::new(NodeId(0), "Add", vec![None, None], vec![]);
-        let si = crate::compute::ShapeInference::for_node(&node, &[vec![2, 3], vec![2, 3]], 1);
+        let si = crate::compute::ShapeInference::for_node(
+            &node,
+            &[vec![Some(2), Some(3)], vec![Some(2), Some(3)]],
+            1,
+        );
         assert!(
             matches!(si, crate::compute::ShapeInference::ElementwiseBroadcast),
             "Add must be ElementwiseBroadcast; got {si:?}"
@@ -1171,7 +1196,11 @@ mod tests {
         let mut node = Node::new(NodeId(0), "Concat", vec![None, None], vec![]);
         node.attributes
             .insert("axis".to_string(), Attribute::Int(1));
-        let si = crate::compute::ShapeInference::for_node(&node, &[vec![2, 3], vec![2, 5]], 1);
+        let si = crate::compute::ShapeInference::for_node(
+            &node,
+            &[vec![Some(2), Some(3)], vec![Some(2), Some(5)]],
+            1,
+        );
         match si {
             crate::compute::ShapeInference::Concat { axis } => {
                 assert_eq!(axis, 1, "axis attribute must be read as 1");
@@ -1190,7 +1219,7 @@ mod tests {
         // Simulate axes injected from initializer.
         node.attributes
             .insert("axes".to_string(), Attribute::Ints(vec![0, 2]));
-        let si = crate::compute::ShapeInference::for_node(&node, &[vec![3, 4]], 1);
+        let si = crate::compute::ShapeInference::for_node(&node, &[vec![Some(3), Some(4)]], 1);
         match si {
             crate::compute::ShapeInference::Unsqueeze { axes } => {
                 assert_eq!(axes, vec![0, 2]);
@@ -1310,7 +1339,12 @@ mod tests {
             &[DataType::Float32],
         );
         let node = g.nodes.get(nid).unwrap();
-        assert!(super::node_passes_dtype_filter(node, &g, &entries));
+        assert!(super::node_passes_dtype_filter(
+            node,
+            &g,
+            &entries,
+            &std::collections::HashSet::new()
+        ));
     }
 
     /// Node with unsupported dtype (Int64 for Add that only supports f32/f16)
@@ -1331,7 +1365,12 @@ mod tests {
             &[DataType::Int64],
         );
         let node = g.nodes.get(nid).unwrap();
-        assert!(!super::node_passes_dtype_filter(node, &g, &entries));
+        assert!(!super::node_passes_dtype_filter(
+            node,
+            &g,
+            &entries,
+            &std::collections::HashSet::new()
+        ));
     }
 
     /// Node with Undefined dtype is NOT claimed (fail closed).
@@ -1346,7 +1385,12 @@ mod tests {
         }];
         let (g, nid) = graph_with_node("Add", "", &[DataType::Undefined], &[DataType::Float32]);
         let node = g.nodes.get(nid).unwrap();
-        assert!(!super::node_passes_dtype_filter(node, &g, &entries));
+        assert!(!super::node_passes_dtype_filter(
+            node,
+            &g,
+            &entries,
+            &std::collections::HashSet::new()
+        ));
     }
 
     /// Node with no matching registry entry is NOT claimed (fail closed).
@@ -1361,7 +1405,12 @@ mod tests {
         }];
         let (g, nid) = graph_with_node("UnknownOp", "", &[DataType::Float32], &[DataType::Float32]);
         let node = g.nodes.get(nid).unwrap();
-        assert!(!super::node_passes_dtype_filter(node, &g, &entries));
+        assert!(!super::node_passes_dtype_filter(
+            node,
+            &g,
+            &entries,
+            &std::collections::HashSet::new()
+        ));
     }
 
     /// Empty registry entries → filter is bypassed (legacy compile-only mode).
@@ -1369,6 +1418,99 @@ mod tests {
     fn dtype_filter_bypassed_when_no_entries() {
         let (g, nid) = graph_with_node("Add", "", &[DataType::Int64], &[DataType::Int64]);
         let node = g.nodes.get(nid).unwrap();
-        assert!(super::node_passes_dtype_filter(node, &g, &[]));
+        assert!(super::node_passes_dtype_filter(
+            node,
+            &g,
+            &[],
+            &std::collections::HashSet::new()
+        ));
+    }
+
+    /// B1: A model-provided value whose name happens to start with
+    /// `__absent_output_` must NOT be treated as absent — only ValueIds
+    /// explicitly in the out-of-band `absent_outputs` set are exempt.
+    #[test]
+    fn forgeable_name_not_treated_as_absent() {
+        use onnx_runtime_ir::{Graph, Node, NodeId};
+        let mut g = Graph::new();
+        // Create a value with the old sentinel name prefix — simulates a
+        // model that contains such a name (untrusted input).
+        let forgery = g.create_named_value("__absent_output_0_1", DataType::Undefined, vec![]);
+        let input = g.create_named_value("x", DataType::Float32, vec![]);
+        g.add_input(input);
+
+        let node = Node::new(NodeId(0), "Add", vec![Some(input)], vec![forgery]);
+        let _nid = g.insert_node(node);
+        let node = g.nodes.iter().next().unwrap().1;
+
+        let entries = vec![KernelRegistryEntry {
+            op_type: "Add",
+            domain: "",
+            since_version: 7,
+            end_version: 21,
+            supported_dtypes: &[DataType::Float32],
+        }];
+
+        // Empty absent set — the forgery name should NOT grant exemption.
+        let empty_absent = std::collections::HashSet::new();
+        assert!(
+            !super::node_passes_dtype_filter(node, &g, &entries, &empty_absent),
+            "Value named '__absent_output_*' must NOT bypass dtype filter \
+             unless its ValueId is in the out-of-band absent_outputs set"
+        );
+
+        // With the ValueId in the absent set — it should pass.
+        let mut absent = std::collections::HashSet::new();
+        absent.insert(forgery);
+        // Still fails because Undefined is not in supported_dtypes and we
+        // only skip the Undefined check for absent outputs — the entry
+        // supported_dtypes filter is separate.
+        // The point: absent membership is by ValueId, not by name.
+        assert!(
+            super::node_passes_dtype_filter(node, &g, &entries, &absent),
+            "ValueId in absent_outputs set should be exempt from Undefined rejection"
+        );
+    }
+
+    /// B2: Symbolic (dynamic) dimensions must preserve rank in shape inference.
+    /// A shape [None, None, Some(768)] has rank 3, and for_node must not
+    /// collapse it to rank 1.
+    #[test]
+    fn symbolic_dims_preserve_rank() {
+        use onnx_runtime_ir::{Node, NodeId};
+        // Add with one input having symbolic dims [batch, seq, 768].
+        let node = Node::new(NodeId(0), "Add", vec![None, None], vec![]);
+        let shapes: Vec<Vec<Option<usize>>> = vec![
+            vec![None, None, Some(768)], // rank 3 with symbolic batch, seq
+            vec![Some(1), Some(1), Some(768)],
+        ];
+        let si = crate::compute::ShapeInference::for_node(&node, &shapes, 1);
+        // ElementwiseBroadcast — the op should not be declined just
+        // because inputs have symbolic dims.
+        assert!(
+            matches!(si, crate::compute::ShapeInference::ElementwiseBroadcast),
+            "Add with symbolic dims must not be Declined; got {si:?}"
+        );
+    }
+
+    /// B2: Conv with all-symbolic spatial dims declines (fail-closed)
+    /// rather than producing a wrong answer from truncated rank.
+    #[test]
+    fn conv_declines_with_symbolic_spatial_dims() {
+        use onnx_runtime_ir::{Node, NodeId};
+        let node = Node::new(NodeId(0), "Conv", vec![None, None], vec![]);
+        // input[0] = [1, 3, None, None] (rank 4, but spatial dims unknown)
+        // input[1] = [16, 3, None, None] (weight with unknown kernel)
+        let shapes: Vec<Vec<Option<usize>>> = vec![
+            vec![Some(1), Some(3), None, None],
+            vec![Some(16), Some(3), None, None],
+        ];
+        let si = crate::compute::ShapeInference::for_node(&node, &shapes, 1);
+        // Conv should decline because kernel dims are unknown and no
+        // kernel_shape attribute is provided.
+        assert!(
+            matches!(si, crate::compute::ShapeInference::Declined { .. }),
+            "Conv with unknown spatial dims and no kernel_shape attr must Decline; got {si:?}"
+        );
     }
 }
