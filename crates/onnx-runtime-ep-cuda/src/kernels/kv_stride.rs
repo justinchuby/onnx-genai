@@ -1,5 +1,4 @@
-//! Descriptor-driven KV-cache stride indexing for the converted GQA decode
-//! path.
+//! Descriptor-driven KV-cache stride indexing for converted GQA paths.
 //!
 //! The CUDA EP used to select the KV cache physical layout with a two-valued
 //! `kv_layout` integer (`0` = head-major BNSH, `1` = seq-major BSNH) that every
@@ -28,6 +27,41 @@ pub(crate) enum KvDim {
     /// Per-token head width.
     HeadDim,
 }
+
+/// A GQA path that may touch the physical KV-cache layout.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum KvCachePath {
+    FusedDecodePrep,
+    FlashPrefillPrep,
+    FlashPrefillRead,
+    Fp16DecodeRead,
+    UnfusedDecodePrep,
+    F32DecodeRead,
+    ReferenceRead,
+    Phase2aRead,
+}
+
+impl KvCachePath {
+    fn name(self) -> &'static str {
+        match self {
+            Self::FusedDecodePrep => "fused fp16 decode prep",
+            Self::FlashPrefillPrep => "flash prefill prep",
+            Self::FlashPrefillRead => "flash prefill read",
+            Self::Fp16DecodeRead => "fp16 split-K decode read",
+            Self::UnfusedDecodePrep => "unfused decode prep",
+            Self::F32DecodeRead => "f32 split-K decode read",
+            Self::ReferenceRead => "reference attention read",
+            Self::Phase2aRead => "phase2a attention read",
+        }
+    }
+}
+
+const CONVERTED_PATHS: &[KvCachePath] = &[
+    KvCachePath::FusedDecodePrep,
+    KvCachePath::FlashPrefillPrep,
+    KvCachePath::FlashPrefillRead,
+    KvCachePath::Fp16DecodeRead,
+];
 
 /// Symbolic per-axis strides of a KV-cache binding, general over layout.
 ///
@@ -98,18 +132,15 @@ impl KvCacheStrides {
     }
 
     /// Whether this is the head-major default layout that every reader and
-    /// writer honors. Non-default layouts are gated to the one converted path.
+    /// writer honors. Non-default layouts are gated to converted paths.
     pub(crate) fn is_head_major(&self) -> bool {
         self.named == "bnsh"
     }
 
-    /// Reject any descriptor the converted single-token decode path cannot
-    /// honor, rather than mis-indexing it. The path requires a contiguous
-    /// (unit-stride) `head_dim` innermost axis — the fp16 read vectorizes it as
-    /// `half2` and the fused write addresses it as `dst + d` — and it addresses
-    /// a whole-buffer binding, so a non-zero reservation offset or a
-    /// reservation-spanning seq extent (a token-major view) is not honored yet.
-    pub(crate) fn require_converted_path_support(&self) -> Result<()> {
+    /// Reject a descriptor/path pair that is not converted, rather than
+    /// silently mis-indexing it. Converted paths require a contiguous
+    /// (unit-stride) `head_dim` innermost axis and whole-buffer bindings.
+    pub(crate) fn require_converted_path_support(&self, path: KvCachePath) -> Result<()> {
         if !self.head_dim.is_empty() {
             return Err(EpError::KernelFailed(
                 "cuda_ep GroupQueryAttention: KV descriptor has a non-unit head_dim stride; the \
@@ -132,6 +163,14 @@ impl KvCacheStrides {
                     .into(),
             ));
         }
+        if !self.is_head_major() && !CONVERTED_PATHS.contains(&path) {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep GroupQueryAttention: seq-major (BSNH) KV cannot use the {} path; \
+                 converted paths are fused fp16 decode prep, flash prefill prep/read, and fp16 \
+                 split-K decode read",
+                path.name()
+            )));
+        }
         Ok(())
     }
 
@@ -144,13 +183,34 @@ impl KvCacheStrides {
         }
     }
 
-    /// The `'static` module-cache key for a non-default (seq-major) fp16/bf16
-    /// prep module. Head-major reuses the shared prep module const (with its
-    /// `#ifndef` default write formula), so only the specialized layout needs a
-    /// distinct key here.
+    /// The `'static` module-cache key for a non-default f32 prep module.
+    pub(crate) fn prep_f32_module_key(&self) -> Result<&'static str> {
+        match self.named {
+            "bsnh" => Ok("group_query_attention_prep_v4_bsnh"),
+            _ => Err(self.no_cached_module_err()),
+        }
+    }
+
+    /// The `'static` module-cache key for a non-default fp16/bf16 prep module.
     pub(crate) fn prep_half_module_key(&self) -> Result<&'static str> {
         match self.named {
-            "bsnh" => Ok("group_query_attention_prep_half_v3_bsnh"),
+            "bsnh" => Ok("group_query_attention_prep_half_v4_bsnh"),
+            _ => Err(self.no_cached_module_err()),
+        }
+    }
+
+    pub(crate) fn flash_f32_module_key(&self) -> Result<&'static str> {
+        match self.named {
+            "bnsh" => Ok("flash_attention_f32_v2_bnsh"),
+            "bsnh" => Ok("flash_attention_f32_v2_bsnh"),
+            _ => Err(self.no_cached_module_err()),
+        }
+    }
+
+    pub(crate) fn flash_half_module_key(&self) -> Result<&'static str> {
+        match self.named {
+            "bnsh" => Ok("flash_attention_half_v3_bnsh"),
+            "bsnh" => Ok("flash_attention_half_v3_bsnh"),
             _ => Err(self.no_cached_module_err()),
         }
     }
@@ -177,18 +237,30 @@ impl KvCacheStrides {
         )
     }
 
-    /// The CUDA `#define` prelude that specializes the fused decode-prep write
-    /// kernel's destination-index arithmetic for this descriptor. The macro
-    /// references the kernel's in-scope `kv_heads`, `present_capacity`, and
-    /// `dim` variables. Prepended only for a non-default layout; head-major uses
-    /// the `#ifndef` default baked into the prep source.
-    pub(crate) fn prep_prelude(&self) -> String {
-        let batch = product_expr(&self.batch, "kv_heads", "present_capacity", "dim");
-        let head = product_expr(&self.head, "kv_heads", "present_capacity", "dim");
-        let seq = product_expr(&self.seq, "kv_heads", "present_capacity", "dim");
+    /// The CUDA `#define` prelude that specializes flash/prefill KV reads.
+    pub(crate) fn flash_prelude(&self) -> String {
+        let batch = product_expr(&self.batch, "kv_heads", "kv_capacity", "dim");
+        let head = product_expr(&self.head, "kv_heads", "kv_capacity", "dim");
+        let seq = product_expr(&self.seq, "kv_heads", "kv_capacity", "dim");
         format!(
-            "#define GQA_KV_DST(b, h, slot) ( (long)(b) * {batch} \
-             + (long)(h) * {head} + (long)(slot) * {seq} )\n"
+            "#define FLASH_KV_BASE(b, h) ( (long)(b) * {batch} + (long)(h) * {head} )\n\
+             #define FLASH_KV_STRIDE ( {seq} )\n"
+        )
+    }
+
+    /// The CUDA prelude that specializes prep cache reads/writes. The generic
+    /// index macro accepts the runtime head count, capacity, and head dimension
+    /// so the build path can address past and present buffers with different
+    /// capacities.
+    pub(crate) fn prep_prelude(&self) -> String {
+        let batch = product_expr(&self.batch, "heads", "capacity", "dim");
+        let head = product_expr(&self.head, "heads", "capacity", "dim");
+        let seq = product_expr(&self.seq, "heads", "capacity", "dim");
+        format!(
+            "#define GQA_KV_INDEX(b, h, slot, heads, capacity, dim) ( (long)(b) * {batch} \
+             + (long)(h) * {head} + (long)(slot) * {seq} )\n\
+             #define GQA_KV_DST(b, h, slot) \
+             GQA_KV_INDEX(b, h, slot, kv_heads, present_capacity, dim)\n"
         )
     }
 }
@@ -225,13 +297,18 @@ mod tests {
     fn named_layouts_are_honored() {
         assert!(
             KvCacheStrides::head_major_bnsh()
-                .require_converted_path_support()
+                .require_converted_path_support(KvCachePath::ReferenceRead)
                 .is_ok()
         );
         assert!(
             KvCacheStrides::seq_major_bsnh()
-                .require_converted_path_support()
+                .require_converted_path_support(KvCachePath::FlashPrefillRead)
                 .is_ok()
+        );
+        assert!(
+            KvCacheStrides::seq_major_bsnh()
+                .require_converted_path_support(KvCachePath::ReferenceRead)
+                .is_err()
         );
     }
 
@@ -242,7 +319,9 @@ mod tests {
         let mut view = KvCacheStrides::seq_major_bsnh();
         view.offset_elements = 4096;
         view.reservation_override = true;
-        let error = view.require_converted_path_support().unwrap_err();
+        let error = view
+            .require_converted_path_support(KvCachePath::Fp16DecodeRead)
+            .unwrap_err();
         assert!(matches!(error, EpError::KernelFailed(_)));
         assert!(view.decode_module_key().is_ok());
     }
@@ -251,7 +330,10 @@ mod tests {
     fn non_unit_head_dim_is_rejected() {
         let mut bad = KvCacheStrides::head_major_bnsh();
         bad.head_dim = vec![KvDim::KvHeads];
-        assert!(bad.require_converted_path_support().is_err());
+        assert!(
+            bad.require_converted_path_support(KvCachePath::Fp16DecodeRead)
+                .is_err()
+        );
     }
 
     // The generated arithmetic must reproduce the two hand-written layouts.
@@ -276,6 +358,14 @@ mod tests {
         // distributed sum b*(N*cap*dim) + h*(cap*dim) + slot*dim.
         assert!(bnsh.contains("(long)(slot) * ((long)dim)"));
         let bsnh = KvCacheStrides::seq_major_bsnh().prep_prelude();
-        assert!(bsnh.contains("(long)(slot) * ((long)kv_heads * (long)dim)"));
+        assert!(bsnh.contains("(long)(slot) * ((long)heads * (long)dim)"));
+    }
+
+    #[test]
+    fn flash_prelude_matches_layout_formulae() {
+        let bnsh = KvCacheStrides::head_major_bnsh().flash_prelude();
+        assert!(bnsh.contains("#define FLASH_KV_STRIDE ( ((long)dim) )"));
+        let bsnh = KvCacheStrides::seq_major_bsnh().flash_prelude();
+        assert!(bsnh.contains("#define FLASH_KV_STRIDE ( ((long)kv_heads * (long)dim) )"));
     }
 }
