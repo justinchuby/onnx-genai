@@ -153,3 +153,13 @@ These are engineering gaps, not merely hardware-absent gaps:
 
 These are in addition to the hardware requirement. A host with a GPU still cannot
 produce a working CUDA ORT plugin without first resolving the design blockers above.
+
+## GPU validation tracking
+
+Hardware validation is tracked in [#768](https://github.com/justinchuby/onnx-genai/issues/768).
+This repository has **zero self-hosted runners** (`GET /repos/justinchuby/onnx-genai/actions/runners` -> `total_count: 0`)
+and the owner is a User account, so there is no org-level GPU pool. Hosted runners have no NVIDIA GPU,
+so CUDA cannot be validated by CI as configured; it requires a human-operated CUDA host.
+
+Run `scripts/cuda_conformance_runner.sh`; exit 0 = VALIDATED, 1 = FAILED, 2 = UNVALIDATED.
+See #768 for prerequisites and the acceptance evidence required.

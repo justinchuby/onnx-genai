@@ -30,3 +30,15 @@ Created `dispatch_manifest.toml` plus `scripts/check_dispatch_manifest.py`: decl
 Backfilled PR #324 claims (MaxPool→BNNS, Add→vDSP, MatMul f16 colmaj→NEON GEMV), added dilated MaxPool and BatchNorm fusion exclusions, and implemented inverse checking so any optimization counter without a manifest row fails CI. Fixed the AtomicU64 blind spot in both reachability and manifest lints. BatchNorm was documented as graph-level fusion elimination, not a dispatch-tier claim. Guard-breaks failed as intended; 973 CPU EP tests, 4 lints, and fmt were green.
 
 Full pre-compaction history in `history-archive.md`.
+
+### 2026-08-11T03:27:00+00:00 — Upstream CPU pilot: AVX2 LayerNorm kernel
+
+**Phase 1:** Traced x86 fp16 MatMul path end-to-end. On x86, `MlasFp16AccelerationSupported()=false`, `MlasHalfGemmNativePackBSize()=0`, so MatMul<MLFloat16> falls to Eigen fp32-accumulate GEMM (math_cpu.cc:220-226). Since AVX2 has only F16C conversion (no fp16 arithmetic), an AVX2 "half GEMM" would replicate Eigen's path — **not viable**.
+
+**Correction:** GatherBlockQuantized CPU kernel exists at `contrib_ops/cpu/quantization/gather_block_quantized.cc`. Prior gap analysis missed `contrib_ops/cpu/`. Candidate #2 from ranked plan is dead.
+
+**Phase 2:** Chose AVX2 LayerNorm/RMSNorm as alternative. `MlasLayerNormF32` dispatch existed (layernorm.cpp) with only a RVV kernel — no x86. Float LayerNorm fell back to scalar Welford; MLFloat16 path is element-by-element scalar.
+
+**Phase 3:** Implemented `layernorm_kernel_avx2.cpp` — two-pass vectorized kernel (8-wide reduce + normalize) with FMA3 fused multiply-add for bias case. Wired dispatch in `platform.cpp` AVX2 block, declared in `mlasi.h`, added to both Windows and Linux CMake lists. 5 files changed.
+
+**Phase 4:** Full `onnxruntime_mlas` library compiled successfully (zero warnings). No runtime benchmark — stated honestly. Entry points documented for Pris.

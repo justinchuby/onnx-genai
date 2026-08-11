@@ -592,3 +592,39 @@ on arm64 it was non-null (fail).
 clippy clean, fmt clean.
 **CI must confirm:** macOS arm64, Windows, Windows ARM64 — these could not be
 tested locally.
+
+---
+
+## 2026-08-11 — Upstream ORT test harness for x86 fp16 GEMM (PR #763)
+
+**Task:** Learn upstream MLAS test conventions, build test harness for CPU contribution.
+
+**What I did:**
+- Read upstream MLAS test files: `test_halfgemm.{h,cpp}`, `test_fgemm.cpp`, `test_fp16.h`, `test_util.h`, `test_main.cpp`, `test_fgemm_fixture.h`
+- Documented conventions: `AddTestRegister()` pattern, short/long execute tiers, ISA gating via `GTEST_SKIP`, tolerance policies, `MatrixGuardBuffer` with tail canaries
+- Built harness: `test_x86_halfgemm.{h,cpp}` in `/workspace/upstream/ort-fork/onnxruntime/test/mlas/unittest/`
+- Harness covers: reachability (fails on silent fallback), numeric parity (fp64 reference), edge cases (K=0, non-tile-aligned, GEMV), benchmark scaffolding (p50/p95/stdev)
+- **Host ISA:** AMD EPYC 9V74 — AVX2+F16C only, **no AVX-512**. All tests GTEST_SKIP. Honest: baseline unmeasurable here.
+- **Key finding:** `MlasFp16AccelerationSupported()` is ARM64-only on x86. No x86 fp16 GEMM dispatch exists upstream. The contribution must add both the kernel AND the dispatch entry.
+- Decision doc: `.squad/decisions/inbox/pris-upstream-test-harness.md`
+
+## 2026-08-11 — AVX2 LayerNorm test harness (replaces fp16 GEMM harness)
+
+**Context:** fp16 GEMM candidate refuted; actual contribution is AVX2 LayerNorm kernel.
+
+**Actions:**
+1. Deleted `test_x86_halfgemm.{h,cpp}` — dead code for abandoned candidate
+2. Rewrote `test_layernorm.cpp`: fp64 reference, reachability assertion, 8 NormSizes, both Simplified modes, bias variants, edge cases (zero-variance, denormals, large magnitudes, NaN/Inf), in-process benchmark
+3. Built `onnxruntime_mlas_test` (cmake + ninja, Release) — SUCCESS
+4. Ran tests — **ALL 36 PASS**
+5. Ran benchmark — 2.9×–5.1× speedup measured (AVX2 kernel vs scalar, AMD EPYC 9V74)
+
+**Key findings:**
+- Reachability works: `MlasLayerNormF32()` returns `true` on AVX2 host, test FAILS on fallback
+- FMA contraction causes up to 0.02% relative divergence from fp64 reference (worst at NormSize=1)
+- Zero-variance edge case: kernel produces ~1.3e-4 residual due to FMA in `(x-mean)*inv_denom` — within tolerance but worth noting
+- This is the first time this session that kernel code was actually built AND executed with real test output
+
+**Tolerance:** rel 0.5% + abs 1e-4 floor (matching upstream CloseEnough). Zero-variance: abs 2e-4 floor.
+
+**Benchmark note:** Scalar baseline is fp64 C++ reference, not the exact upstream scalar path. Speedup is honest but reflects both vectorization and fp32-vs-fp64.

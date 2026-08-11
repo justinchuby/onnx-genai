@@ -19,4 +19,6 @@
 - 2026-07-28: Pointwise Conv microbench diagnosis was useful, but the initial 5.7–9.8× BNNS headline overstated real impact.
 - 2026-07-28T17:40:00+0000: PR #362 merged (`5a079029`): If/Loop/Scan inference landed; #355 container typing remains deferred.
 
+- 2026-08-11T03:47:00+0000: AVX2 LayerNorm/RMSNorm benchmark — measured against true scalar fp32 baseline (Welford's fallback from `layer_norm_impl.cc`). Found Pris's original fp64-reference numbers were conservative, not inflated. True speedup: LayerNorm 15–22× (algorithmic + SIMD), RMSNorm 3–4× (pure SIMD). Updated benchmark in `test_layernorm.cpp` to use correct baseline. Report: `.squad/decisions/inbox/sebastian-layernorm-benchmark.md`. Upstream PR #31973.
+
 Full pre-compaction history in `history-archive.md`.
