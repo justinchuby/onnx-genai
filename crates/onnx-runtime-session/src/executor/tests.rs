@@ -2364,7 +2364,24 @@ impl ExecutionProvider for WeightDeliveryEp {
     ) -> onnx_runtime_ep_api::Result<Option<onnx_runtime_memory_governor::MemoryLease>> {
         assert_eq!(role, MemoryRole::Workspace { step_scoped: false });
         self.deliveries.lock().unwrap().push("reserve_workspace");
-        assert_eq!(bytes, self.workspace_bytes);
+        // Static-bytes fixtures reserve exactly `workspace_bytes`. The per-row
+        // fixture (`workspace_bytes_per_row != 0`, e.g.
+        // `inference_session_fallback_workspace_grows_retries_and_reuses`)
+        // reserves `rows * per_row`, so the governed reservation legitimately
+        // scales with the input row count — 2048 for 2 rows, 4096 for 4. This
+        // method has no row count to recompute the exact figure, so it asserts
+        // the non-vacuous invariant that the reservation is a positive multiple
+        // of the per-row size (the exact bytes are separately pinned at each
+        // call site). A zero or mis-sized reservation still fails here.
+        if self.workspace_bytes_per_row == 0 {
+            assert_eq!(bytes, self.workspace_bytes);
+        } else {
+            assert!(
+                bytes != 0 && bytes.is_multiple_of(self.workspace_bytes_per_row),
+                "per-row workspace reservation {bytes} must be a positive multiple of {}",
+                self.workspace_bytes_per_row
+            );
+        }
         Ok(None)
     }
 }

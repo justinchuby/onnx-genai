@@ -577,6 +577,7 @@ fn index_share_workspace_layout(
     dims: Dims,
     dtype: DataType,
     has_bias: bool,
+    want_present: bool,
 ) -> Result<WorkspaceLayout> {
     let element_size = dtype.storage_bytes(1);
     let present_elements = dims
@@ -599,10 +600,17 @@ fn index_share_workspace_layout(
     let scores_bytes = scores_elements
         .checked_mul(std::mem::size_of::<f32>())
         .ok_or_else(|| error("IndexShare score workspace byte count overflow"))?;
-    // The prepare-only contract has input metadata but not output arity/shapes,
-    // so the layout is intentionally conservative: present K/V staging is always
-    // reserved even when execution writes present outputs directly, and the tiny
-    // frontier segment is reserved whenever the optional bias is present.
+    // The 3-output (`want_present`) path writes present K/V straight into the
+    // caller's output slots (`index_share.rs` execute: `want_present =
+    // outputs.len() == 3`), so their workspace staging is dead capacity on that
+    // path and is NOT reserved here — sizing the governed reservation to what
+    // execution actually touches. The 1-output path has no present outputs, so
+    // it stages present K/V in the workspace and the segments are reserved. Node
+    // output arity is static and the executor never trims output slots, so
+    // planning (`workspace_requirement`, which threads the kernel's captured
+    // arity) and execution (which recomputes `want_present` from the same arity)
+    // agree by construction and cannot drift. The tiny frontier segment is
+    // reserved whenever the optional bias is present.
     let frontier_bytes = if has_bias {
         2usize
             .checked_mul(dims.batch)
@@ -613,8 +621,13 @@ fn index_share_workspace_layout(
     };
 
     let mut offset = 0usize;
-    let present_key_offset = append_workspace_segment(&mut offset, present_bytes)?;
-    let present_value_offset = append_workspace_segment(&mut offset, present_bytes)?;
+    let (present_key_offset, present_value_offset) = if want_present {
+        (0, 0)
+    } else {
+        let present_key_offset = append_workspace_segment(&mut offset, present_bytes)?;
+        let present_value_offset = append_workspace_segment(&mut offset, present_bytes)?;
+        (present_key_offset, present_value_offset)
+    };
     let scores_offset = append_workspace_segment(&mut offset, scores_bytes)?;
     let frontier_offset = if frontier_bytes == 0 {
         0
@@ -660,6 +673,7 @@ impl KernelFactory for IndexShareFactory {
             num_heads,
             kv_num_heads,
             scale,
+            present_outputs: node.outputs.len() == 3,
             warmed: AtomicBool::new(false),
         }))
     }
@@ -671,6 +685,12 @@ pub struct IndexShareKernel {
     num_heads: usize,
     kv_num_heads: usize,
     scale: Option<f32>,
+    /// Whether this graph node declares the 3-output form (Y + present K/V).
+    /// Captured from the static node arity at construction so workspace planning
+    /// and execution size the present staging identically: on the 3-output path
+    /// present K/V are written to the caller's output slots, so no workspace
+    /// staging is reserved for them.
+    present_outputs: bool,
     /// Set after a successful eager execution has compiled every NVRTC kernel
     /// and sized the persistent workspace, which is the precondition for capturing this
     /// kernel into a CUDA graph.
@@ -692,7 +712,7 @@ impl Kernel for IndexShareKernel {
             .map(|input| input.dtype)
             .ok_or_else(|| error("IndexShare requires input metadata"))?;
         let has_bias = inputs.get(6).is_some_and(|input| input.present);
-        let layout = index_share_workspace_layout(dims, dtype, has_bias)?;
+        let layout = index_share_workspace_layout(dims, dtype, has_bias, self.present_outputs)?;
         Ok(WorkspaceRequirement {
             bytes: u64::try_from(layout.bytes)
                 .map_err(|_| error("IndexShare workspace does not fit u64"))?,
@@ -845,6 +865,14 @@ impl Kernel for IndexShareKernel {
         // when requested (outputs 1 and 2); otherwise present K/V land in scratch
         // that only feeds the attention kernel.
         let want_present = outputs.len() == 3;
+        // Node output arity is static and the executor never trims output slots,
+        // so the runtime arity must match the arity captured at construction.
+        // Both feed `index_share_workspace_layout`, so planning and execution
+        // size the present staging identically.
+        debug_assert_eq!(
+            want_present, self.present_outputs,
+            "IndexShare runtime output arity disagrees with the arity captured at construction"
+        );
         let (output_head, output_tail) = outputs.split_at_mut(1);
         let y_ptr = cuptr(output_head[0].data_ptr_mut::<u8>() as *const c_void);
         let (present_key_out, present_value_out) = if want_present {
@@ -855,8 +883,12 @@ impl Kernel for IndexShareKernel {
         } else {
             (0, 0)
         };
-        let layout =
-            index_share_workspace_layout(dims, dtype, optional_input(inputs, 6).is_some())?;
+        let layout = index_share_workspace_layout(
+            dims,
+            dtype,
+            optional_input(inputs, 6).is_some(),
+            want_present,
+        )?;
         if workspace.bytes() < layout.bytes {
             return Err(error(format!(
                 "IndexShare workspace invariant mismatch: execute requires {} bytes, prepared {} bytes",
