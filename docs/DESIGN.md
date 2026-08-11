@@ -8002,16 +8002,33 @@ Both are standard ONNX ops. No custom ops needed. The "paging" is expressed pure
 > where this is cheap. ONNX exposes one `past_key`/`past_value` per layer, so a
 > range is reserved per tensor and layers cannot share one:
 >
-> | mapping | granularity | tokens per granule, 8B GQA (2048 B/token) |
-> |---|---|---|
-> | CUDA VMM (min and recommended) | 2 MiB | 1024 |
-> | Windows host | 64 KiB | 32 |
+> | mapping | granularity |
+> |---|---|
+> | CUDA VMM (min **and** recommended — no finer granule on this device, PR #776) | 2 MiB |
+> | Windows host | 64 KiB |
 >
-> On the host, granularity is as fine as paging, so virtual contiguity is
-> strictly better than both copying and a paged kernel. On CUDA the 2 MiB granule
-> floors a sequence at `num_layers × 2 × 2 MiB` regardless of its length, which
-> only matters with many concurrent short sequences — a workload this project has
-> decided not to target.
+> **Correction (PR #776).** An earlier version of this table added a "tokens per
+> granule" column (e.g. "2 MiB / 2048 B ≈ 1024 tokens") and claimed the CUDA
+> floor was `num_layers × 2 × 2 MiB` regardless of length. That framing was
+> measured wrong and was publicly corrected. KV is **per-binding / head-major**,
+> so a fixed full-context stride does not pack tokens into a granule — it commits
+> `objects × granule`, where `objects` is the number of head-stripe bindings.
+> Measured: qwen2.5-0.5b commits **96 head-stripes × 2 MiB = 192 MiB to hold
+> ~12 KiB of live content**. The relevant question is therefore not "how many
+> tokens fit in a granule" but "at what context length does a stable full-context
+> VA commit *less* than bucket-growth reservation".
+>
+> **The crossover is `granule / (head_dim × sizeof(dtype))`** under head-major,
+> and it is **model-size independent** — `layers` and `kv_heads` cancel. On this
+> device (2 MiB granule): ~**8,192 tokens** at head_dim 128 / fp16, ~**16,384
+> tokens** at head_dim 64 / fp16. Verified on hardware across a 480× model-size
+> range (PR #776). Quantized KV makes it **worse**: fp8/int8 halves bytes per
+> element and so **doubles** the crossover in tokens. Below the crossover, a
+> stable full-context VA over-commits (this is the mechanism behind the #721
+> stage-4 regression — a full-context VA committed 1.5 GB where bucket growth
+> commits 48 MB); above it, virtual contiguity wins. See
+> [`MEMORY_ARCHITECTURE.md`](./MEMORY_ARCHITECTURE.md) for the full KV-geometry
+> analysis and the read-bounded-commit result (PR #772).
 >
 > **Phase 3 is dropped.** ORT's `PagedAttention`
 > (`contrib_ops/cuda/bert/paged_attention.*`) exists, but it is CUDA-only — zero

@@ -265,6 +265,7 @@ impl NativeDecodeSession {
         path: impl AsRef<Path>,
         device: NativeDecodeDevice,
         io: Option<&ModelIoSpec>,
+        offload_policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy,
         governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
     ) -> anyhow::Result<Self> {
         Self::load_with_cuda_options_and_io(
@@ -273,7 +274,7 @@ impl NativeDecodeSession {
             NativeDecodeCudaOptions::default(),
             io,
             Some(governor),
-            None,
+            Some(offload_policy),
         )
     }
 
@@ -421,6 +422,7 @@ impl NativeDecodeSession {
         Some(ModelIoSpec {
             sequence_source: None,
             kv_ownership: None,
+            kv_layout: None,
             token_input: present_input("input_ids"),
             inputs_embeds_input: None,
             attention_mask_input: present_input("attention_mask"),

@@ -947,8 +947,9 @@ Approve the five-milestone plan with these initial choices:
   launch requirement;
 - hard-fail all-CUDA decode placement;
 - 4K default KV capacity for the first Qwen benchmark, configurable upward;
-- current cudarc pin retained for M1; M4 must use a non-default stream and choose
-  a serialized graph-ownership model;
+- current default cudarc selector (`cuda-13000`) retained for M1 while allowing
+  users to choose one alternate `cuda-*` selector; M4 must use a non-default
+  stream and choose a serialized graph-ownership model;
 - packed-QKV GQA, standard-domain `SimplifiedLayerNormalization`, and fused CUDA
   SiLU treated as M2 prerequisites;
 - true packed-int4 decode kernel treated as the primary M5 performance item.

@@ -1028,6 +1028,55 @@ pub(crate) fn past_kv_from_payloads(
 /// int8) is skipped so a dtype mismatch can never corrupt injected output. The
 /// check uses the model's actual past-input dtype (not the coarser
 /// [`KvDType`], which folds fp16 into `F32`).
+/// Whether the ORT decoder `session` declares loop-carried recurrent state
+/// (hybrid conv/recurrent `fixed_state` alongside attention KV).
+///
+/// This mirrors the native [`has_recurrent_state`] gate (#700) onto the ORT
+/// paged-KV reuse path (#701). Paged / materialized-past reuse
+/// ([`load_materialized_past`]) restores only attention KV, so a hybrid
+/// recurrent model reused this way would run a fresh-zero recurrent/conv state
+/// against a reused attention prefix and silently emit wrong continuation
+/// logits (the #695 failure #700 fixed for the native backend). When this
+/// returns `true` the reuse decision must decline paged reuse and force a full
+/// recompute — correct, if slower — until per-prefix recurrent-state restore
+/// lands.
+///
+/// The signal is purely structural (RULES.md §2), never a model-name gate: a
+/// state counts as recurrent only when the model's I/O spec declares it as a
+/// loop-carried `state_pair` input AND that input's shape carries a static
+/// penultimate (feature) axis, exactly as the native path classifies declared
+/// state inputs. Attention KV past inputs carry a symbolic `past_sequence`
+/// length on that axis and are never declared as state pairs, so this is a
+/// guaranteed no-op for every attention-only model loadable today.
+///
+/// [`has_recurrent_state`]: crate::native_decode
+pub(crate) fn ort_session_has_recurrent_state(
+    session: &Session,
+    io: Option<&onnx_genai_metadata::ModelIoSpec>,
+) -> bool {
+    let Some(state_pairs) = io.and_then(|io| io.state_pairs.as_ref()) else {
+        return false;
+    };
+    let declared = state_pairs
+        .iter()
+        .map(|pair| pair.input.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    session
+        .inputs()
+        .iter()
+        .filter(|info| declared.contains(info.name.as_str()))
+        .any(|info| is_recurrent_state_input_shape(&info.shape))
+}
+
+/// Structural test matching `native_decode::is_recurrent_state_shape` for the
+/// ORT session's concrete `i64` shapes: a declared loop-carried state input is
+/// a fixed-size recurrent state (replaced wholesale each step) rather than a
+/// growable KV cache when its sequence axis — the penultimate axis — is
+/// statically sized (`>= 0`) rather than symbolic (`< 0`).
+fn is_recurrent_state_input_shape(shape: &[i64]) -> bool {
+    shape.len() >= 2 && shape[shape.len() - 2] >= 0
+}
+
 pub(crate) fn kv_model_past_is_f32(session: &Session, kv_model: &KvModelInfo) -> bool {
     let Some(layer) = kv_model.layers.first() else {
         return false;
@@ -1096,6 +1145,60 @@ mod tests {
             page_size: 2,
             dtype: KvDType::F32,
         }
+    }
+
+    fn load_named_session(dir: &str, model_file: &str) -> anyhow::Result<(Environment, Session)> {
+        let environment = Environment::new("kv-bridge-tests")?;
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures")
+            .join(dir)
+            .join(model_file);
+        let session = Session::new(
+            &environment,
+            &path,
+            SessionOptions::default().with_intra_op_threads(1),
+        )?;
+        Ok((environment, session))
+    }
+
+    #[test]
+    fn ort_recurrent_state_guard_is_noop_for_attention_only_model() -> anyhow::Result<()> {
+        let _guard = model_test_lock();
+        // An attention-only KV model declares no loop-carried `state_pairs`, so
+        // the #701 ORT paged-reuse guard must not trip: reuse stays enabled.
+        let (_environment, session) = load_session("tiny-llm")?;
+        let io = fixture_io("tiny-llm")?;
+        assert!(
+            !ort_session_has_recurrent_state(&session, Some(&io)),
+            "attention-only model must not be treated as recurrent (guard must be a no-op)"
+        );
+        // Absent I/O metadata is also treated as non-recurrent.
+        assert!(!ort_session_has_recurrent_state(&session, None));
+        Ok(())
+    }
+
+    #[test]
+    fn ort_recurrent_state_guard_trips_for_hybrid_recurrent_model() -> anyhow::Result<()> {
+        let _guard = model_test_lock();
+        // A hybrid decoder declares loop-carried `state_a.in` / `state_b.in`
+        // recurrent states (static penultimate axis) alongside its attention KV
+        // past inputs. The guard must trip so paged/materialized-past reuse is
+        // declined and a full recompute is forced (#701), mirroring the native
+        // `has_recurrent_state` gate (#700).
+        let (_environment, session) =
+            load_named_session("tiny-multiaxis-state-decoder", "decoder.onnx.textproto")?;
+        let io: onnx_genai_metadata::ModelIoSpec = serde_json::from_value(serde_json::json!({
+            "kv_inputs": ["past.3.key", "past.3.value", "past.11.key", "past.11.value"],
+            "state_pairs": [
+                {"input": "state_a.in", "output": "state_a.out"},
+                {"input": "state_b.in", "output": "state_b.out"},
+            ],
+        }))?;
+        assert!(
+            ort_session_has_recurrent_state(&session, Some(&io)),
+            "hybrid recurrent model must be gated out of ORT paged-KV reuse"
+        );
+        Ok(())
     }
 
     fn append_token(cache: &mut PagedKvCache, seq: SessionId, base: f32) {

@@ -10,3 +10,8 @@
 - Fixed the #676 oracle test in merged PR #692 by using a fresh engine for teacher-forced logits after autoregressive decode.
 - Root cause: reused-engine teacher forcing restored attention KV but not Mamba conv/recurrent state, causing wrong argmax 279; fresh-engine teacher forcing correctly returns oracle token 33803.
 - Flagged the underlying hybrid-Mamba prefix-cache-reuse engine bug, now filed as issue #695.
+
+## 2026-08-11T03:25:00Z — Megakernel Phase 0 dispatched
+
+- Dispatched for persistent single-op QMoE decode kernel work: counter-synchronized FC1→FC2 pipeline, remove four scratch DRAM round-trips, preserve fp32 accumulation order.
+- Current status is running; continuation gates are oracle margin 0.09375 and >=3% wall-clock improvement.

@@ -360,6 +360,9 @@ impl ActivationKernel {
         // SAFETY: every entry in SRC has the same (x, y, n, p0, p1) signature;
         // x/y cover n contiguous f32 elements, validated above.
         unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e))?;
+        if self.runtime.is_capturing()? {
+            return Ok(());
+        }
         self.runtime.synchronize()
     }
 }
