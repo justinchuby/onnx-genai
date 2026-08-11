@@ -1,0 +1,19 @@
+[package]
+name = "bench-tokenmajor"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "tokenmajor_bench"
+path = "src/main.rs"
+
+[dependencies]
+half = "2"
+
+[dependencies.cudarc]
+version = "0.19"
+default-features = false
+features = ["std", "driver", "nvrtc", "f16", "dynamic-loading", "cuda-13000"]
+
+[workspace]

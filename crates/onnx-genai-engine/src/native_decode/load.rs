@@ -265,6 +265,7 @@ impl NativeDecodeSession {
         path: impl AsRef<Path>,
         device: NativeDecodeDevice,
         io: Option<&ModelIoSpec>,
+        offload_policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy,
         governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
     ) -> anyhow::Result<Self> {
         Self::load_with_cuda_options_and_io(
@@ -273,7 +274,7 @@ impl NativeDecodeSession {
             NativeDecodeCudaOptions::default(),
             io,
             Some(governor),
-            None,
+            Some(offload_policy),
         )
     }
 
@@ -390,54 +391,7 @@ impl NativeDecodeSession {
             inputs: session.inputs().iter().map(to_graph_tensor).collect(),
             outputs: session.outputs().iter().map(to_graph_tensor).collect(),
         };
-        let derived = onnx_genai_genai_config::GenAiConfig::derive_decoder_io_from_graph(&graph)?;
-        // Safety gate: only the recurrent-hybrid case the shape-inference path
-        // cannot handle. Pure-dense decoders (no state pairs) keep `io = None`.
-        if derived.state_pairs.is_empty() {
-            return None;
-        }
-        let input_names: HashSet<&str> = session
-            .inputs()
-            .iter()
-            .map(|meta| meta.name.as_str())
-            .collect();
-        let output_names: HashSet<&str> = session
-            .outputs()
-            .iter()
-            .map(|meta| meta.name.as_str())
-            .collect();
-        let present_input = |name: &str| input_names.contains(name).then(|| name.to_owned());
-        let present_output = |name: &str| output_names.contains(name).then(|| name.to_owned());
-        let state_pairs = derived
-            .state_pairs
-            .into_iter()
-            .map(|pair| LoopStatePair {
-                input: pair.input,
-                output: pair.output,
-                init: Some("zeros".to_owned()),
-                update: Some("replace".to_owned()),
-            })
-            .collect::<Vec<_>>();
-        Some(ModelIoSpec {
-            sequence_source: None,
-            kv_ownership: None,
-            token_input: present_input("input_ids"),
-            inputs_embeds_input: None,
-            attention_mask_input: present_input("attention_mask"),
-            position_ids_input: present_input("position_ids"),
-            logits_output: present_output("logits"),
-            hidden_output: None,
-            kv_inputs: (!derived.kv_inputs.is_empty()).then_some(derived.kv_inputs),
-            kv_outputs: (!derived.kv_outputs.is_empty()).then_some(derived.kv_outputs),
-            encoder_hidden_states_input: None,
-            audio_features_input: None,
-            cross_kv_inputs: None,
-            cross_kv_outputs: None,
-            kv_update: None,
-            state_pairs: Some(state_pairs),
-            optional_inputs: BTreeMap::new(),
-            static_cache: None,
-        })
+        onnx_genai_genai_config::GenAiConfig::derive_model_io_spec_from_graph(&graph)
     }
 
     fn from_session_with_cuda_options_and_io(

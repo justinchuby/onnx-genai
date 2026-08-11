@@ -375,30 +375,10 @@ pub(super) fn build_lazy_weight_handles(
     }
 
     let mut handles = HashMap::new();
-    for (&value, weight) in &graph.initializers {
-        let graph_value = graph.value(value);
-        let consumers = graph.consumers(value);
-        // A weight is offload-eligible only if it feeds exclusively into offload
-        // boundary ops (BlockQuantizedMoE, QMoE, or MatMulNBits) and nothing
-        // else. Capture the boundary from the first consumer so the lazy handle
-        // carries the right binding site.
-        let mut boundary = None;
-        let lazy_only = graph_value.producer.is_none()
-            && !graph.outputs.contains(&value)
-            && !consumers.is_empty()
-            && consumers.into_iter().all(|consumer| {
-                let node = graph.node(consumer);
-                match LazyWeightBoundary::for_op(&node.domain, &node.op_type) {
-                    Some(found) => {
-                        boundary.get_or_insert(found);
-                        true
-                    }
-                    None => false,
-                }
-            });
-        let Some(boundary) = boundary.filter(|_| lazy_only) else {
-            continue;
-        };
+    for candidate in lazy_weight_candidates(graph) {
+        let value = candidate.value;
+        let boundary = candidate.boundary;
+        let weight = &graph.initializers[&value];
         let Some((mapping_id, offset, len)) = weights.external_mmap_provenance(weight) else {
             continue;
         };

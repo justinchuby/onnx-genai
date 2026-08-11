@@ -425,6 +425,10 @@ impl Engine {
         }
     }
 
+    pub fn memory_strategy_plan(&self) -> &MemoryStrategyPlan {
+        &self.memory_strategy_plan
+    }
+
     /// Change the live VRAM ceiling when runtime overrides are enabled.
     pub fn set_vram_limit(
         &self,
@@ -1493,6 +1497,7 @@ impl Engine {
             && state.decode_state.use_kv
             && self.kv_model.is_some()
             && self.kv_cache.page_table.tensor_config.is_some()
+            && !self.ort_session_has_recurrent_state()
         {
             let matched = self
                 .prefix_cache
@@ -1785,6 +1790,23 @@ impl Engine {
         self.session
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))
+    }
+
+    /// Whether the loaded ORT decoder declares loop-carried recurrent state, in
+    /// which case paged / materialized-past prefix reuse must be declined and a
+    /// full recompute forced (#701), mirroring the native `has_recurrent_state`
+    /// gate (#700). Returns `false` when no ORT session is loaded — the paged
+    /// reuse path requires one, so the guard cannot suppress a legitimate reuse.
+    fn ort_session_has_recurrent_state(&self) -> bool {
+        let Some(session) = self.session.as_deref() else {
+            return false;
+        };
+        let io = self
+            .metadata
+            .model
+            .as_ref()
+            .and_then(|model| model.io.as_ref());
+        ort_session_has_recurrent_state(session, io)
     }
 
     fn ensure_session_kv_current(
@@ -2369,6 +2391,7 @@ mod tests {
             session: None,
             native_session: None,
             weight_placement: None,
+            memory_strategy_plan: MemoryStrategyPlan::unknown(0, None, "test engine fixture"),
             native_sessions: HashMap::new(),
             native_active_session: None,
             native_session_counter: 0,
@@ -2409,6 +2432,87 @@ mod tests {
             "native backend was touched before scheduler admission rejected: {error}"
         );
         assert!(!admitted, "refused requests must not signal admission");
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_backend_batching_capability_reports_single_sequence() -> anyhow::Result<()> {
+        let tokenizer_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm/tokenizer.json")
+            .canonicalize()?;
+        let tokenizer = Tokenizer::from_file(&tokenizer_path)
+            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
+        let governor = EngineResourceGovernor::new(
+            ResourceLimits::default(),
+            false,
+            ModelKvConfig::known(10, 1),
+            0,
+        )?;
+        // A native engine reports batch=1 even when the model's KV I/O shape
+        // (here StaticCache, which batches under ORT) would otherwise support
+        // batching: the cap is a property of the native decode path, not the
+        // model. This is the honesty guarantee -- capability is not read off the
+        // decode_path alone.
+        let engine = Engine {
+            decode_backend: EngineDecodeBackend::Native,
+            metadata: InferenceMetadata::default(),
+            metadata_hints: MetadataHints::default(),
+            kv_cache: PagedKvCache::new(1, 1),
+            prefix_cache: PrefixCache::new(),
+            token_prefix_cache: Vec::new(),
+            kv_model: None,
+            decode_path: ModelDecodePath::StaticCache { max_len: 16 },
+            scheduler: Scheduler::with_byte_budget(
+                onnx_genai_scheduler::SchedulerConfig::default(),
+                onnx_genai_scheduler::ByteBudget::new(10),
+            ),
+            governor,
+            sessions: HashMap::new(),
+            session: None,
+            native_session: None,
+            weight_placement: None,
+            native_sessions: HashMap::new(),
+            native_active_session: None,
+            native_session_counter: 0,
+            native_access_counter: 0,
+            native_default_session: None,
+            native_max_sessions: 8,
+            native_shared_kv_proposer: None,
+            native_recurrent_prefix_stats: RecurrentPrefixCacheStats::default(),
+            draft: None,
+            mtp: None,
+            eagle3: None,
+            shared_kv_proposer: None,
+            tokenizer,
+            fim_config: None,
+            num_speculative_tokens: 1,
+            speculative_mode: SpeculativeMode::None,
+            last_speculative_stats: SpeculativeStats::default(),
+            connector: ConnectorBridge::null(),
+            _environment: None,
+        };
+
+        let capability = engine.batching_capability();
+        assert_eq!(
+            capability.max_concurrent_sequences(),
+            Some(1),
+            "native decode path pins batch to 1"
+        );
+        assert!(!capability.supports_batching());
+        assert!(!capability.allows(2));
+        assert_eq!(capability.effective_max_batch(4), 1);
+        assert!(
+            capability.reason().contains("native"),
+            "reason must name the backend: {}",
+            capability.reason()
+        );
+        // Tie the reported capability to reality: the native engine cannot
+        // actually build a batched manager for more than one sequence.
+        assert!(
+            engine.continuous_batch_manager(2).is_err(),
+            "native backend must not build a >1 continuous batch manager"
+        );
         Ok(())
     }
 }

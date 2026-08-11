@@ -1223,6 +1223,21 @@
       },
       "type": "object"
     },
+    "KvLayout": {
+      "description": "Physical memory layout of a backend's KV cache tensors.\n\nThis is a **per-backend capability**, not a cross-backend constant: the two\nbackends own their KV buffers independently and never read each other's KV\nbytes, so they may store the cache differently. The ONNX Runtime backend\nrequires head-major BNSH (`[batch, kv_heads, seq, head_dim]`) because ORT's\nGroupQueryAttention past/present is BNSH on every dispatch path (Flash,\ncuDNN SDPA, memory-efficient, XQA). The native backend additionally supports\nseq-major BSNH (`[batch, seq, kv_heads, head_dim]`), which makes each token's\nlive prefix contiguous across heads — shrinking the VMM granule floor by the\n`kv_heads` factor, removing growth-triggered graph re-capture (the append\nstride is sequence-length independent), and making page-level prefix sharing\n(#777) practical. Absent preserves the historical head-major behavior.\n\nOn-device, the native backend selects the layout by stamping the `kv_layout`\nattribute (`0` = BNSH, `1` = BSNH) on its GroupQueryAttention nodes; the\nCUDA EP honors it on the fused fp16 single-token decode pair. Seq-major is\nonly enabled end-to-end once the prefill (flash) read is also converted, so\nthe two never disagree about how a shared cache is physically laid out.",
+      "oneOf": [
+        {
+          "const": "head_major_bnsh",
+          "description": "Head-major BNSH `[batch, kv_heads, seq, head_dim]`. ORT-compatible; the\ndefault for both backends.",
+          "type": "string"
+        },
+        {
+          "const": "seq_major_bsnh",
+          "description": "Seq-major BSNH `[batch, seq, kv_heads, head_dim]`. Native backend only.",
+          "type": "string"
+        }
+      ]
+    },
     "KvOwnership": {
       "description": "Ownership model for a graph's KV cache inputs.",
       "oneOf": [
@@ -1732,6 +1747,17 @@
             "array",
             "null"
           ]
+        },
+        "kv_layout": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/KvLayout"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Physical layout of this backend's KV cache tensors (`head_major_bnsh` or\n`seq_major_bsnh`). This is a per-backend capability — each backend owns\nits KV buffers and never reads the other's KV bytes — so the ORT backend\nstays head-major while the native backend may declare seq-major. Absent\npreserves the historical head-major (BNSH) behavior. See [`KvLayout`]."
         },
         "kv_outputs": {
           "description": "Present-KV cache outputs, paired positionally with `kv_inputs`.",

@@ -172,6 +172,14 @@ pub(crate) struct DebugKvResponse {
     available_admission_slots: usize,
     rejected_requests: u64,
     engine_kv_introspection: &'static str,
+    /// Whether the decode path can advance more than one sequence per step.
+    /// `active_batch_size` counts admitted generations, so it can be > 1 even
+    /// when `batch_supported` is false and nothing is actually co-decoded — this
+    /// pair is what makes the difference observable (issue #750).
+    batch_supported: bool,
+    /// The batch width that actually takes effect after clamping the requested
+    /// `--max-batch` to what the decode path can honor.
+    effective_max_batch: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -182,6 +190,26 @@ pub(crate) struct ResourcesResponse {
     vram: ResourceTier,
     host_ram: ResourceTier,
     disk_spill: Option<ResourceTier>,
+    /// Honest, decode-path-sourced batching capability for this model. Lets an
+    /// operator read `supported=false` / `effective_max_batch=1` directly rather
+    /// than inferring it from a debug-level log line (issue #750). `None` only
+    /// when the response is built without a resolved engine handle.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    batching: Option<BatchingInfo>,
+}
+
+/// Operator-facing batching capability report for `/v1/resources`.
+#[derive(Debug, Serialize)]
+pub(crate) struct BatchingInfo {
+    /// Whether the decode path can advance more than one sequence per step.
+    pub(crate) supported: bool,
+    /// The `--max-batch` width the operator requested (or the server default).
+    pub(crate) requested_max_batch: u64,
+    /// The width that actually takes effect after clamping to the decode path's
+    /// structural limit.
+    pub(crate) effective_max_batch: u64,
+    /// Human-readable explanation naming the backend / decode path.
+    pub(crate) reason: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -236,6 +264,7 @@ pub(crate) struct DebugProfileResponse {
     collecting: bool,
     note: &'static str,
     stages: Vec<ProfileStage>,
+    memory_strategy_plans: Vec<ModelMemoryStrategyPlan>,
 }
 
 #[derive(Debug, Serialize)]
@@ -244,6 +273,12 @@ pub(crate) struct ProfileStage {
     total_ms: f64,
     calls: u64,
     us_per_call: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ModelMemoryStrategyPlan {
+    model_id: String,
+    plan: onnx_genai_engine::MemoryStrategyPlan,
 }
 
 /// Discovery payload describing the downloadable Perfetto trace export.

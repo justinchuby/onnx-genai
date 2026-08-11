@@ -749,6 +749,7 @@ fn target_io(sequence_source: SequenceInputKind) -> ModelIoSpec {
     ModelIoSpec {
         sequence_source: Some(sequence_source),
         kv_ownership: Some(KvOwnership::Owned),
+        kv_layout: None,
         token_input: (sequence_source == SequenceInputKind::TokenIds).then(|| "input_ids".into()),
         inputs_embeds_input: (sequence_source == SequenceInputKind::InputsEmbeds)
             .then(|| "embedded_sequence".into()),
@@ -773,6 +774,7 @@ fn tiny_decoder_io() -> ModelIoSpec {
     ModelIoSpec {
         sequence_source: Some(SequenceInputKind::TokenIds),
         kv_ownership: Some(KvOwnership::Owned),
+        kv_layout: None,
         token_input: Some("input_ids".into()),
         inputs_embeds_input: None,
         attention_mask_input: Some("attention_mask".into()),
@@ -918,6 +920,7 @@ fn proposer_io(sequence_source: SequenceInputKind, kv_ownership: KvOwnership) ->
     ModelIoSpec {
         sequence_source: Some(sequence_source),
         kv_ownership: Some(kv_ownership),
+        kv_layout: None,
         token_input: (sequence_source == SequenceInputKind::TokenIds).then(|| "input_ids".into()),
         inputs_embeds_input: (sequence_source == SequenceInputKind::InputsEmbeds)
             .then(|| "embeddings".into()),
