@@ -1875,6 +1875,10 @@ backend, is actively maintained, and covers **CUDA 11.4 → 13.3** (feature-flag
   entry point isn't yet wrapped.
 - **Dynamic linking by default** (no build-time CUDA toolkit required to `cargo build` the crate
   metadata); static linking supported.
+- **Selectable CUDA binding version:** enable exactly one of `cuda-12060`, `cuda-12080`,
+  `cuda-12090`, or `cuda-13000`. Workspace defaults select `cuda-13000`; consumers targeting
+  CUDA 12.x should build with `--no-default-features --features "cuda cuda-12080"` (or the
+  desired 12.x selector) so only one `cudarc` binding set is active.
 
 This replaces any bespoke driver FFI: the EP does **not** hand-roll `cuMemAlloc`/`cuLaunchKernel`
 bindings — it consumes `cudarc` and reserves hand-written FFI strictly for our own `extern "C"`
@@ -2013,7 +2017,7 @@ fused elementwise variants still go to a `.cu`/CuTe kernel.
 ```
 onnx-runtime-ep-cuda/
 ├── build.rs                  # nvcc: native-eps/cuda/*.cu → libcuda_kernels.a
-├── Cargo.toml                # cudarc = { features = ["cuda-12090","cublas","cublaslt","cudnn","nccl"] }
+├── Cargo.toml                # cudarc non-version features + one cuda-* selector (default cuda-13000)
 └── src/
     ├── provider.rs           # CudaExecutionProvider (cudarc::driver device/context)
     ├── allocator.rs          # device allocator (cudarc)
@@ -3524,10 +3528,25 @@ Priority heuristic (customizable via `execution_hints.json` or `onnx_runtime.mem
 
 For long-sequence prefill where activations exceed GPU memory:
 
+> **Measured correction (2026-08, PR #715, issue #718).** The
+> "prefetch next layer's weights so the transfer hides behind compute" idea
+> sketched below was *implemented and then deleted*: sequential weight prefetch
+> was measured ineffective on the RTX 4060 Laptop dev box and removed in
+> PR #715. AirLLM's own analysis (issue #718) reaches the same conclusion — the
+> bottleneck is disk/transfer bandwidth, not a lack of compute/transfer overlap,
+> and they rate prefetch at ~10% by their own account. On a model that does not
+> fit, the transfer cannot be hidden because there is not enough independent
+> compute to hide it behind. Treat the code below as **falsified design intent**,
+> retained to show what was tried. See
+> [`MEMORY_ARCHITECTURE.md`](./MEMORY_ARCHITECTURE.md) for the measurement
+> narrative.
+
 ```rust
 fn execute_with_activation_spill(&mut self, layers: &[Layer]) -> Result<()> {
     for (i, layer) in layers.iter().enumerate() {
-        // Async prefetch next layer's weights (overlaps with current compute)
+        // NOTE: prefetch/compute overlap was measured ineffective and removed
+        // (PR #715, corroborated by AirLLM in #718). Kept only to illustrate the
+        // discarded design; it is not the plan and is not implemented.
         if i + 1 < layers.len() {
             self.prefetch_weights_async(i + 1);
         }
@@ -3573,17 +3592,29 @@ impl PagedKvCache {
 
 ### 30.5 Overlap: Hiding Transfer Latency
 
-Offloading doesn't mean stalling — **prefetch overlaps with compute:**
+> **Superseded by measurement (PR #715, issue #718).** This section asserted that
+> prefetch overlaps with compute and that offloading therefore need not stall.
+> That was measured false on the dev box: sequential weight prefetch produced no
+> usable overlap and was removed in PR #715; issue #718 (AirLLM) independently
+> attributes the cost to disk/transfer bandwidth, not to missing overlap. When a
+> model does not fit, per-layer compute is far smaller than the per-layer
+> transfer, so there is nothing to hide the transfer behind — "zero visible
+> overhead" does not occur. Re-measured with CUDA events, host-to-device transfer
+> is **18.8%** of decode step time (not the withdrawn 1.7% `h2d_enqueue_copy_ms`
+> figure; see [`MEMORY_ARCHITECTURE.md`](./MEMORY_ARCHITECTURE.md)). The timeline
+> below is retained only as a record of the discarded design.
 
 ```
-Timeline (layer-pipeline offloading):
+Timeline (layer-pipeline offloading) — DISCARDED DESIGN, prefetch did not overlap:
 
 GPU compute:  [== Layer N ==]  [== Layer N+1 ==]  [== Layer N+2 ==]
 H2D stream:        [-- prefetch N+1 weights --]  [-- prefetch N+2 --]
 D2H stream:   [-- spill N-1 activation --]
 
-If compute time > transfer time: zero visible overhead.
-If not: partially hidden, still better than blocking.
+Intended claim (falsified): if compute time > transfer time, zero visible
+overhead. In practice on a model that does not fit, transfer time dominates
+compute time and the prefetch stream cannot be hidden — this is why PR #715
+deleted it.
 ```
 
 Implementation: separate CUDA streams for compute vs transfer, fence synchronization:
@@ -3617,10 +3648,18 @@ impl OverlappedExecutor {
 
 ### 30.6 Performance Expectation
 
+> **Caveat (PR #715, #718).** The "prefetch mostly hidden by compute" column
+> below was written before measurement and is not what the hardware showed —
+> prefetch was measured ineffective and removed (PR #715). Read these as an
+> original optimistic estimate, not a measured result. On the dev box, managed
+> weight offload was **~27x slower than doing nothing** (WDDM demand paging) on a
+> model that does not fit; see the status table in
+> [`MEMORY_ARCHITECTURE.md`](./MEMORY_ARCHITECTURE.md).
+
 | Scenario | Relative Speed | What's happening |
 |----------|---------------|------------------|
 | 100% GPU-resident | 1.0× | Ideal |
-| 30% weights on CPU | ~0.7× | Prefetch mostly hidden by compute |
+| 30% weights on CPU | ~0.7× (estimate; prefetch overlap unproven) | Transfer, not overlap, dominates |
 | 70% weights on CPU | ~0.3-0.4× | Transfer becomes bottleneck |
 | Activation spill | ~0.5× | Extra D2H + H2D per layer |
 | KV pages on CPU | ~0.7-0.9× | Only evicted pages need fetch |
@@ -3644,7 +3683,7 @@ Namespaced options for fine control:
 session = nxrt.load("model.onnx", options={
     "memory.gpu_budget_mb": "12000",       # 12GB GPU budget
     "memory.offload_strategy": "layerwise", # vs "tensorwise"
-    "memory.prefetch_layers": "2",          # prefetch 2 layers ahead
+    "memory.prefetch_layers": "2",          # prefetch 2 layers ahead (NOT active: sequential prefetch removed in PR #715 as ineffective)
     "memory.kv_gpu_pages": "1024",          # max KV pages on GPU
     "memory.activation_spill": "auto",      # auto/always/never
 })
@@ -3658,7 +3697,7 @@ session = nxrt.load("model.onnx", options={
 | Weight placement at load time | **Yes (static)** | Avoids runtime jitter. Re-plan only on explicit resize. |
 | Activation spill | **Dynamic** | Can't predict at load time (depends on input shapes). |
 | KV cache eviction | **LRU per-page** | Matches paged attention. Old context evicted first. |
-| Overlap compute + transfer | **Always** | Separate streams, fence sync. Zero overhead when compute-bound. |
+| Overlap compute + transfer | **Removed (PR #715)** | Sequential prefetch was measured ineffective and deleted; #718 corroborates the bottleneck is transfer bandwidth, not overlap. Not "always", and not currently a lever. |
 | Disk tier (mmap) | **Tier 2 fallback** | For 405B on 32GB RAM laptops. Not primary path. |
 | Offload granularity | **Per-layer (weights), per-page (KV), per-tensor (activation)** | Each has different lifecycle. |
 

@@ -639,6 +639,158 @@ pub struct WeightPlacementReport {
     pub explanation: String,
 }
 
+/// Load-time memory strategy selected from graph/model evidence and overrides.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct MemoryStrategyPlan {
+    /// Effective strategy selected for the current runtime. Policy construction
+    /// must consume this value rather than resolving the same inputs again.
+    pub strategy: MemoryStrategy,
+    /// Unconditionally inferred strategy before the current activation gate or
+    /// an explicit override is applied.
+    pub inferred_strategy: MemoryStrategy,
+    pub weight_access_pattern: WeightAccessPattern,
+    pub total_weight_bytes: u64,
+    pub kv_bytes_per_token: Option<u64>,
+    pub per_layer_weight_bytes: Vec<LayerWeightBytes>,
+    pub resolved_device_budget_bytes: Option<u64>,
+    pub fits_resolved_device_budget: Option<bool>,
+    pub application: MemoryPolicyApplication,
+    /// True when the backend can report the plan but cannot safely enforce
+    /// weight residency with its current provider lifecycle.
+    pub advisory_only: bool,
+    pub decisions: Vec<MemoryStrategyDecision>,
+}
+
+impl MemoryStrategyPlan {
+    pub fn unknown(
+        total_weight_bytes: u64,
+        kv_bytes_per_token: Option<u64>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            strategy: MemoryStrategy::Unknown,
+            inferred_strategy: MemoryStrategy::Unknown,
+            weight_access_pattern: WeightAccessPattern::Unknown,
+            total_weight_bytes,
+            kv_bytes_per_token,
+            per_layer_weight_bytes: Vec::new(),
+            resolved_device_budget_bytes: None,
+            fits_resolved_device_budget: None,
+            application: MemoryPolicyApplication::default(),
+            advisory_only: true,
+            decisions: vec![MemoryStrategyDecision::new(
+                "strategy",
+                "Unknown",
+                DecisionSource::Unknown,
+                reason,
+                format!(
+                    "total_weight_bytes={total_weight_bytes} kv_bytes_per_token={kv_bytes_per_token:?}"
+                ),
+            )],
+        }
+    }
+
+    /// Concrete policy the runtime applies for this plan.
+    ///
+    /// The effective strategy remains authoritative: changing it changes
+    /// whether paging is active instead of leaving behavior hidden in a
+    /// separately resolved boolean.
+    pub fn runtime_application(&self) -> MemoryPolicyApplication {
+        let mut application = self.application.clone();
+        application.weight_offload_enabled = match self.strategy {
+            MemoryStrategy::FullResident => false,
+            MemoryStrategy::DynamicWeightResidency | MemoryStrategy::MoeRoutingAware => true,
+            MemoryStrategy::Compatibility | MemoryStrategy::Unknown => {
+                self.application.weight_offload_enabled
+            }
+        };
+        application
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum MemoryStrategy {
+    Compatibility,
+    FullResident,
+    DynamicWeightResidency,
+    MoeRoutingAware,
+    Unknown,
+}
+
+/// Concrete policy fields derived from [`MemoryStrategyPlan::strategy`].
+///
+/// Native CUDA provider construction consumes this object directly. Keeping it
+/// in the serialized plan makes the applied behavior and its evidence the same
+/// source of truth.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct MemoryPolicyApplication {
+    pub weight_offload_enabled: bool,
+    pub device_budget_bytes: Option<u64>,
+    pub scan_resistant_dense: bool,
+    pub managed_no_spill: bool,
+    pub managed_limit_bytes: Option<u64>,
+    pub device_budget_is_override: bool,
+    pub auto_enabled_from_vram_limit: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum WeightAccessPattern {
+    SequentialDense,
+    MoeRouted,
+    Iterative,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct LayerWeightBytes {
+    pub layer_index: usize,
+    pub bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct MemoryStrategyDecision {
+    pub field: &'static str,
+    pub value: String,
+    pub source: DecisionSource,
+    /// Inferred value retained when an override or compatibility gate changes
+    /// the effective value.
+    pub inferred_value: Option<String>,
+    pub reason: String,
+    pub evidence: String,
+}
+
+impl MemoryStrategyDecision {
+    pub fn new(
+        field: &'static str,
+        value: impl Into<String>,
+        source: DecisionSource,
+        reason: impl Into<String>,
+        evidence: impl Into<String>,
+    ) -> Self {
+        Self {
+            field,
+            value: value.into(),
+            source,
+            inferred_value: None,
+            reason: reason.into(),
+            evidence: evidence.into(),
+        }
+    }
+
+    pub fn with_inferred_value(mut self, inferred_value: impl Into<String>) -> Self {
+        self.inferred_value = Some(inferred_value.into());
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum DecisionSource {
+    Inference,
+    ExplicitOverride,
+    CompatibilityDefault,
+    Unknown,
+}
+
 /// Engine configuration.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {

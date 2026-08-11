@@ -593,7 +593,11 @@ pub(super) fn run(
         ))
     })?;
     if grid_x == 0 || sk == 0 {
-        return runtime.synchronize();
+        return if runtime.is_capturing()? {
+            Ok(())
+        } else {
+            runtime.synchronize()
+        };
     }
 
     let function = runtime.nvrtc_function(module, source, entry)?;
@@ -629,6 +633,9 @@ pub(super) fn run(
         })
     }
     .map_err(|error| driver_err(&format!("launch {entry}"), error))?;
+    if runtime.is_capturing()? {
+        return Ok(());
+    }
     runtime.synchronize()
 }
 

@@ -328,7 +328,6 @@ impl Kernel for ArgKernel {
 pub struct TopKKernel {
     axis: i64,
     largest: bool,
-    sorted: bool,
 }
 
 /// ONNX `NonMaxSuppression` for the standard `[batch, boxes, 4]` /
@@ -550,7 +549,9 @@ impl KernelFactory for TopKFactory {
         Ok(Box::new(TopKKernel {
             axis: node.attr("axis").and_then(|a| a.as_int()).unwrap_or(-1),
             largest: node.attr("largest").and_then(|a| a.as_int()).unwrap_or(1) != 0,
-            sorted: node.attr("sorted").and_then(|a| a.as_int()).unwrap_or(1) != 0,
+            // `sorted` is intentionally not stored: this kernel always emits the
+            // k winners in sorted order, which satisfies both `sorted=1` (must be
+            // sorted) and `sorted=0` (order unspecified).
         }))
     }
 }
@@ -584,12 +585,29 @@ impl Kernel for TopKKernel {
             ));
         }
         let inner = numel(&inputs[0].shape[axis + 1..]);
-        let mut values = Vec::with_capacity(numel(outputs[0].shape));
-        let mut indices = Vec::with_capacity(numel(outputs[1].shape));
+        // TopK output shares the input shape with `shape[axis] = k`, so the
+        // reduced axis stays in place: the rank-`r` winner for a given
+        // (outer, inner) slot lands at `(outer * k + r) * inner + i`, NOT at the
+        // sequential push position. These differ whenever `inner > 1` (a
+        // non-final axis), so writing to the strided destination is required to
+        // match the ONNX (and CUDA-EP) k-major layout `[outer][k][inner]`.
+        let out_len = numel(outputs[0].shape);
+        let mut values = vec![0f32; out_len];
+        let mut indices = vec![0i64; out_len];
         for outer in 0..numel(&inputs[0].shape[..axis]) {
             for i in 0..inner {
+                if k == 0 {
+                    continue;
+                }
                 let mut candidates: Vec<usize> = (0..width).collect();
-                candidates.sort_by(|&a, &b| {
+                // `topk_order` is a total order (ties broken by index), so we do
+                // not need to fully sort the whole axis. Partition once to move
+                // the k winners to the front in O(width) average (introselect,
+                // the same `select_nth_unstable_by` technique the sampler's
+                // `top_k_threshold` uses), then sort only those k in O(k log k).
+                // For k << width (e.g. k=40 over a 152k-wide vocab axis) this is
+                // an order-of-magnitude fewer comparisons than a full sort.
+                let cmp = |&a: &usize, &b: &usize| {
                     topk_order(
                         x[(outer * width + a) * inner + i],
                         x[(outer * width + b) * inner + i],
@@ -597,13 +615,16 @@ impl Kernel for TopKKernel {
                         b,
                         self.largest,
                     )
-                });
-                if !self.sorted {
+                };
+                if k < width {
+                    candidates.select_nth_unstable_by(k - 1, &cmp);
                     candidates.truncate(k);
                 }
-                for d in candidates.into_iter().take(k) {
-                    values.push(x[(outer * width + d) * inner + i]);
-                    indices.push(d as i64);
+                candidates.sort_by(&cmp);
+                for (rank, d) in candidates.into_iter().enumerate() {
+                    let dst = (outer * k + rank) * inner + i;
+                    values[dst] = x[(outer * width + d) * inner + i];
+                    indices[dst] = d as i64;
                 }
             }
         }
@@ -932,7 +953,6 @@ mod tests {
         TopKKernel {
             axis: -1,
             largest: true,
-            sorted: true,
         }
         .execute(
             &[input.view(), count.view()],
@@ -976,7 +996,6 @@ mod tests {
         TopKKernel {
             axis: -1,
             largest: true,
-            sorted: true,
         }
         .execute(&[x.view(), k.view()], &mut [v.view_mut(), i.view_mut()])
         .unwrap();
@@ -988,6 +1007,91 @@ mod tests {
             .execute(&[z.view()], &mut [o.view_mut()])
             .unwrap();
         assert_eq!(o.to_i64(), vec![0, 1, 1, 0]);
+    }
+
+    #[test]
+    fn topk_non_final_axis_uses_k_major_layout() {
+        // Shape [2,3,2], axis=1 (width=3, inner=2), k=2. This is the case the
+        // old push-order layout got wrong: with inner>1 and k>1 the winners must
+        // land in k-major `[outer=2][k=2][inner=2]` order, not `[outer][inner][k]`.
+        // Column i=0 down axis 1: [1,5,3] -> top2 values [5,3] idx [1,2].
+        // Column i=1 down axis 1: [2,0,4] -> top2 values [4,2] idx [2,0].
+        // outer=1 mirrors with +10 so the two outers are distinguishable.
+        let x = Owned::f32(
+            &[2, 3, 2],
+            &[
+                1., 2., 5., 0., 3., 4., // outer 0: rows (1,2),(5,0),(3,4)
+                11., 12., 15., 10., 13., 14., // outer 1
+            ],
+        );
+        let k = Owned::i64(&[], &[2]);
+        let mut v = Owned::zeros_f32(&[2, 2, 2]);
+        let mut i = Owned::zeros(DataType::Int64, &[2, 2, 2]);
+        TopKKernel {
+            axis: 1,
+            largest: true,
+        }
+        .execute(&[x.view(), k.view()], &mut [v.view_mut(), i.view_mut()])
+        .unwrap();
+        // k-major: [ [rank0_i0, rank0_i1], [rank1_i0, rank1_i1] ] per outer.
+        assert_eq!(v.to_f32(), vec![5., 4., 3., 2., 15., 14., 13., 12.]);
+        assert_eq!(i.to_i64(), vec![1, 2, 2, 0, 1, 2, 2, 0]);
+    }
+
+    #[test]
+    fn topk_first_axis_is_k_major() {
+        // Shape [3,2], axis=0 (width=3, inner=2), k=2.
+        // Column 0: [2,4,1] -> top2 [4,2] idx [1,0]. Column 1: [5,0,3] -> [5,3] idx [0,2].
+        let x = Owned::f32(&[3, 2], &[2., 5., 4., 0., 1., 3.]);
+        let k = Owned::i64(&[], &[2]);
+        let mut v = Owned::zeros_f32(&[2, 2]);
+        let mut i = Owned::zeros(DataType::Int64, &[2, 2]);
+        TopKKernel {
+            axis: 0,
+            largest: true,
+        }
+        .execute(&[x.view(), k.view()], &mut [v.view_mut(), i.view_mut()])
+        .unwrap();
+        assert_eq!(v.to_f32(), vec![4., 5., 2., 3.]);
+        assert_eq!(i.to_i64(), vec![1, 0, 0, 2]);
+    }
+
+    #[test]
+    fn topk_partial_select_breaks_ties_by_index() {
+        // k < width with duplicate values forces the introselect partition to
+        // resolve ties: ONNX requires the lower index to win. Shape [1,6], k=3.
+        // Values [5,5,5,5,1,2] -> top3 must be indices [0,1,2] (the three
+        // lowest indices among the tied 5.0s), NOT any partition-dependent set.
+        let x = Owned::f32(&[1, 6], &[5., 5., 5., 5., 1., 2.]);
+        let k = Owned::i64(&[], &[3]);
+        let mut v = Owned::zeros_f32(&[1, 3]);
+        let mut i = Owned::zeros(DataType::Int64, &[1, 3]);
+        TopKKernel {
+            axis: 1,
+            largest: true,
+        }
+        .execute(&[x.view(), k.view()], &mut [v.view_mut(), i.view_mut()])
+        .unwrap();
+        assert_eq!(v.to_f32(), vec![5., 5., 5.]);
+        assert_eq!(i.to_i64(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn topk_smallest_partial_select() {
+        // largest=false with k < width, exercising the ascending partition.
+        // [7,3,9,1,5] -> smallest 2 are [1,3] at indices [3,1].
+        let x = Owned::f32(&[1, 5], &[7., 3., 9., 1., 5.]);
+        let k = Owned::i64(&[], &[2]);
+        let mut v = Owned::zeros_f32(&[1, 2]);
+        let mut i = Owned::zeros(DataType::Int64, &[1, 2]);
+        TopKKernel {
+            axis: 1,
+            largest: false,
+        }
+        .execute(&[x.view(), k.view()], &mut [v.view_mut(), i.view_mut()])
+        .unwrap();
+        assert_eq!(v.to_f32(), vec![1., 3.]);
+        assert_eq!(i.to_i64(), vec![3, 1]);
     }
 
     #[test]

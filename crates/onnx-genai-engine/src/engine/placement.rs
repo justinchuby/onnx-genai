@@ -182,9 +182,7 @@ fn required_initializer<'a>(
         .get(input_index)
         .and_then(|slot| *slot)
         .with_context(|| format!("QMoE input {input_index} is absent"))?;
-    graph
-        .initializers
-        .get(&value)
+    initializer_or_initializer_cast(graph, value)
         .with_context(|| format!("QMoE input {input_index} is not a graph initializer"))
 }
 
@@ -196,9 +194,27 @@ fn optional_initializer<'a>(
     let Some(value) = node.inputs.get(input_index).and_then(|slot| *slot) else {
         return Ok(None);
     };
-    Ok(Some(graph.initializers.get(&value).with_context(|| {
-        format!("QMoE input {input_index} is present but is not a graph initializer")
-    })?))
+    Ok(Some(
+        initializer_or_initializer_cast(graph, value).with_context(|| {
+            format!("QMoE input {input_index} is present but is not a graph initializer")
+        })?,
+    ))
+}
+
+fn initializer_or_initializer_cast(
+    graph: &Graph,
+    value: onnx_runtime_ir::ValueId,
+) -> Option<&WeightRef> {
+    if let Some(weight) = graph.initializers.get(&value) {
+        return Some(weight);
+    }
+    let producer = graph.values.get(value)?.producer?;
+    let node = graph.nodes.get(producer)?;
+    if node.domain.is_empty() && node.op_type == "Cast" {
+        let source = node.inputs.first().and_then(|slot| *slot)?;
+        return graph.initializers.get(&source);
+    }
+    None
 }
 
 fn qmoe_dims(weight: &WeightRef, input_index: usize) -> anyhow::Result<&[usize]> {
@@ -216,5 +232,88 @@ fn int_attr(node: &Node, name: &'static str, default: i64) -> anyhow::Result<i64
             .as_int()
             .with_context(|| format!("QMoE attribute {name} must be an integer")),
         None => Ok(default),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use onnx_runtime_ir::{Attribute, DataType, NodeId, TensorData, static_shape};
+
+    #[test]
+    fn qmoe_static_placement_accepts_cast_backed_scale_initializers() {
+        let mut graph = Graph::new();
+        let activation = graph.create_value(DataType::Float32, static_shape([1, 4]));
+        graph.add_input(activation);
+
+        let fc1_packed = initializer(&mut graph, DataType::Int4, vec![2, 3, 2]);
+        let fc1_scales = cast_initializer(
+            &mut graph,
+            DataType::Float16,
+            DataType::Float32,
+            vec![2, 3, 1],
+        );
+        let fc2_packed = initializer(&mut graph, DataType::Int4, vec![2, 4, 2]);
+        let fc2_scales = cast_initializer(
+            &mut graph,
+            DataType::Float16,
+            DataType::Float32,
+            vec![2, 4, 1],
+        );
+        let output = graph.create_value(DataType::Float32, static_shape([1, 4]));
+
+        let mut node = Node::new(
+            NodeId(0),
+            "QMoE",
+            vec![
+                Some(activation),
+                None,
+                Some(fc1_packed),
+                Some(fc1_scales),
+                None,
+                Some(fc2_packed),
+                Some(fc2_scales),
+            ],
+            vec![output],
+        );
+        node.domain = "com.microsoft".to_owned();
+        node.attributes
+            .insert("block_size".to_owned(), Attribute::Int(32));
+        graph.insert_node(node);
+
+        let layers = qmoe_layers(&graph).expect("QMoE placement should accept Cast(initializer)");
+
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].regions.len(), 4);
+    }
+
+    fn initializer(
+        graph: &mut Graph,
+        dtype: DataType,
+        dims: Vec<usize>,
+    ) -> onnx_runtime_ir::ValueId {
+        let value = graph.create_value(dtype, static_shape(dims.iter().copied()));
+        graph.set_initializer(
+            value,
+            WeightRef::Inline(TensorData::from_raw(dtype, dims, Vec::new())),
+        );
+        value
+    }
+
+    fn cast_initializer(
+        graph: &mut Graph,
+        source_dtype: DataType,
+        cast_dtype: DataType,
+        dims: Vec<usize>,
+    ) -> onnx_runtime_ir::ValueId {
+        let source = initializer(graph, source_dtype, dims.clone());
+        let cast_output = graph.create_value(cast_dtype, static_shape(dims.iter().copied()));
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Cast",
+            vec![Some(source)],
+            vec![cast_output],
+        ));
+        cast_output
     }
 }

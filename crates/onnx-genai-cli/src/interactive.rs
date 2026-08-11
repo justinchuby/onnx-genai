@@ -721,6 +721,7 @@ impl Backend {
                         }
                     }),
                     weight_placement,
+                    memory_strategy_plan: Some(engine.memory_strategy_plan().clone()),
                     vmm_arena: engine.vmm_arena_stats().map(|stats| profile::VmmArena {
                         commits: stats.commits,
                         releases: stats.releases,
@@ -734,7 +735,10 @@ impl Backend {
                     }),
                 })
             }
-            Self::Pipeline(_) => None,
+            Self::Pipeline(pipeline) => Some(profile::MemoryUsage {
+                memory_strategy_plan: Some(pipeline.engine.memory_strategy_plan().clone()),
+                ..profile::MemoryUsage::default()
+            }),
         }
     }
 

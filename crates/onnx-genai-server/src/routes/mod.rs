@@ -236,6 +236,7 @@ pub(crate) struct DebugProfileResponse {
     collecting: bool,
     note: &'static str,
     stages: Vec<ProfileStage>,
+    memory_strategy_plans: Vec<ModelMemoryStrategyPlan>,
 }
 
 #[derive(Debug, Serialize)]
@@ -244,6 +245,12 @@ pub(crate) struct ProfileStage {
     total_ms: f64,
     calls: u64,
     us_per_call: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ModelMemoryStrategyPlan {
+    model_id: String,
+    plan: onnx_genai_engine::MemoryStrategyPlan,
 }
 
 /// Discovery payload describing the downloadable Perfetto trace export.
