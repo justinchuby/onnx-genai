@@ -1092,6 +1092,7 @@ fn device_weight_package_bytes(model_path: &std::path::Path) -> u64 {
     onnx_genai_ort::model_weight_bytes(model_path)
 }
 
+#[cfg(feature = "native-backend")]
 fn native_kv_reservation_max_context(
     native_capacity: Option<(usize, String)>,
     metadata_max_len: Option<usize>,
@@ -2115,6 +2116,7 @@ mod pool_sizing_tests {
         );
     }
 
+    #[cfg(feature = "native-backend")]
     #[test]
     fn native_kv_reservation_uses_runtime_capacity_before_metadata() {
         let (max_len, source) = native_kv_reservation_max_context(
@@ -2127,6 +2129,7 @@ mod pool_sizing_tests {
         assert_eq!(source, "ONNX_GENAI_CUDA_KV_MAX_LEN");
     }
 
+    #[cfg(feature = "native-backend")]
     #[test]
     fn native_kv_reservation_falls_back_to_metadata() {
         let (max_len, source) = native_kv_reservation_max_context(None, Some(131_072))
@@ -2136,6 +2139,7 @@ mod pool_sizing_tests {
         assert_eq!(source, "model.max_sequence_length");
     }
 
+    #[cfg(feature = "native-backend")]
     #[test]
     fn native_kv_reservation_ignores_unbounded_runtime_capacity_without_metadata() {
         assert_eq!(
@@ -2144,6 +2148,7 @@ mod pool_sizing_tests {
         );
     }
 
+    #[cfg(feature = "native-backend")]
     #[test]
     fn native_kv_reservation_uses_metadata_after_unbounded_runtime_capacity() {
         let (max_len, source) = native_kv_reservation_max_context(
