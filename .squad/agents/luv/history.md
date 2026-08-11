@@ -38,3 +38,7 @@ Durable rules recorded:
 Full review detail in `.squad/decisions.md` ("Luv round-3 review" section, 2026-07-29). Inbox drops `luv-round3-verdict.md` and `luv-round3-delta-verdict.md` survived (written to both TEAM ROOT and worktree) and merged into decisions.
 
 Full pre-compaction history in `history-archive.md`.
+
+## 2026-08-11 — Review PR #31974 (BFloat16 LayerNorm/RMSNorm CPU EP)
+
+Reviewed for @justinchuby. Verdict: CONDITIONAL APPROVE. One substantive finding (contrib U=BFloat16 schema mismatch — pre-existing pattern from MLFloat16). No blockers. 10 tests, clean anti-fallback design, correct rounding (RNE via BFloat16 constructor). Noted code duplication (NarrowToFloat/FloatToNarrow in two files, BFloat16 ComputeJob/BFloat16Math are near-clones of MLFloat16 versions). Full review at `.squad/decisions/inbox/luv-review-pr31974.md`.

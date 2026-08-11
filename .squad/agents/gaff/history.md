@@ -42,3 +42,13 @@ to `ENV_PATTERN` so documentation cross-references are not mistaken for
 environment variables. Updated the module docstring to explain the exclusion.
 Re-proved the gate still catches genuinely undocumented variables (`NXRT_FAKE_KNOB`
 experiment passed).
+
+## 2026-08-11 — PR #31973 Review: AVX2 LayerNorm/RMSNorm kernel
+
+Reviewed microsoft/onnxruntime PR #31973 (branch `nxrt/mlas-avx2-layernorm`).
+Independently verified: 40/40 tests pass, AVX2+FMA dispatch guard correct,
+Welford pairwise merge formula matches textbook, no alignment/UB issues,
+precision claims confirmed (AVX2 Welford genuinely more accurate than scalar).
+No blocking findings. Two substantive items: (S1) unnecessary sum accumulation
+in RMSNorm path when MeanOut is null, (S2) test reference variance formula
+comment clarity. Decision written to `decisions/inbox/gaff-review-pr31973.md`.
