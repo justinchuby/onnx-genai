@@ -339,6 +339,17 @@ impl ModelRegistry {
         Ok(self.read()?.models.values().next().cloned())
     }
 
+    pub(crate) fn memory_strategy_plans(
+        &self,
+    ) -> Result<Vec<(String, Arc<onnx_genai_engine::MemoryStrategyPlan>)>, RegistryError> {
+        Ok(self
+            .read()?
+            .models
+            .iter()
+            .map(|(id, handle)| (id.clone(), handle.engine.memory_strategy_plan()))
+            .collect())
+    }
+
     /// Build a registry from a list of specs, loading the eager ones immediately.
     ///
     /// All specs (eager or not) are recorded in `available`.  Eager specs are also
@@ -782,6 +793,11 @@ mod tests {
                 // decode path, and "pending" is the only claim that holds.
                 kv_telemetry: Default::default(),
                 resource_snapshot: Default::default(),
+                memory_strategy_plan: Arc::new(onnx_genai_engine::MemoryStrategyPlan::unknown(
+                    0,
+                    None,
+                    "registry test stub",
+                )),
                 device_authority: None,
             },
             tokenizer,

@@ -43,16 +43,17 @@ pub use batched::{
 pub use connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 pub use embedding::{EmbeddingOptions, EmbeddingPooling};
 pub use engine::{
-    DevicePolicy, DevicePolicyParseError, DryConfig, Eagle3Config, Engine, EngineConfig,
-    EngineConfigError, EngineDecodeBackend, EngineGovernorError, EngineResourceGovernor,
-    FinishReason, GenerateConstraint, GenerateOptions, GeneratePrompt, GenerateRequest,
-    GenerateResult, GenerateToken, GenerateTokenCallback, GenerationBudgetCap, KvConnectorBackend,
-    KvConnectorConfig, LimitParseError, MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig,
-    MtpHiddenLayout, MtpWeightSource, PrioritizedGenerateRequest, PrioritizedGenerateResult,
-    RewindTokenCount, SamplingOverrides, ScheduledGenerateArrival, SessionCheckpoint,
-    SessionForkCapability, SessionId, SessionPosition, SharedKvBinding, SharedKvProposerConfig,
-    SpeculativeMode, TokenLogprob, WeightPlacementReport, XtcConfig, parse_device_policy,
-    parse_resource_limit,
+    DecisionSource, DevicePolicy, DevicePolicyParseError, DryConfig, Eagle3Config, Engine,
+    EngineConfig, EngineConfigError, EngineDecodeBackend, EngineGovernorError,
+    EngineResourceGovernor, FinishReason, GenerateConstraint, GenerateOptions, GeneratePrompt,
+    GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback, GenerationBudgetCap,
+    KvConnectorBackend, KvConnectorConfig, LayerWeightBytes, LimitParseError,
+    MemoryPolicyApplication, MemoryStrategy, MemoryStrategyDecision, MemoryStrategyPlan,
+    MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource,
+    PrioritizedGenerateRequest, PrioritizedGenerateResult, RewindTokenCount, SamplingOverrides,
+    ScheduledGenerateArrival, SessionCheckpoint, SessionForkCapability, SessionId, SessionPosition,
+    SharedKvBinding, SharedKvProposerConfig, SpeculativeMode, TokenLogprob, WeightAccessPattern,
+    WeightPlacementReport, XtcConfig, parse_device_policy, parse_resource_limit,
 };
 pub use fim::{FimConfig, FimFormat};
 pub use logits::{

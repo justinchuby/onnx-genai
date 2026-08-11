@@ -117,9 +117,54 @@ impl Engine {
             &domain,
             config.limits.vram_limit,
         )?;
+        let metadata = load_inference_metadata(&model_directory)?;
+        let model_io = metadata.model.as_ref().and_then(|model| model.io.as_ref());
+        let kv_inputs = model_io
+            .and_then(|io| io.kv_inputs.clone())
+            .unwrap_or_default();
+        let kv_outputs = model_io
+            .and_then(|io| io.kv_outputs.clone())
+            .unwrap_or_default();
+        let graph_io = onnx_genai_ort::graph_io_from_model_path_for_kv_pairs(
+            &model_directory.model_path,
+            &kv_inputs,
+            &kv_outputs,
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to read decoder graph I/O for KV geometry: {e}"))?;
+        let kv_model =
+            infer_kv_model_info(&graph_io, model_io, config.page_size, config.kv_cache_dtype)?;
+        let plan_kv_config = match kv_model.as_ref() {
+            Some(kv_model) => governor_kv_config(Some(kv_model), &config)?,
+            None if model_io_declares_only_fixed_state(model_io) => {
+                governor_no_paged_kv_config(&config)?
+            }
+            None => governor_kv_config(None, &config)?,
+        };
+        let model_weight_bytes = device_weight_package_bytes(&model_directory.model_path);
+        let resolved_vram_bytes = resolve_vram_limit_bytes(&config.limits)?;
+        let graph_memory = analyze_model_memory(&model_directory.model_path);
+        let minimum_useful_weight_budget_bytes = graph_memory
+            .per_layer_weight_bytes
+            .iter()
+            .map(|layer| layer.bytes)
+            .max()
+            .unwrap_or(0);
+        let memory_strategy_plan = build_memory_strategy_plan(MemoryStrategyPlanInput {
+            config: &config,
+            resolved_vram_bytes,
+            model_weight_bytes,
+            kv_config: plan_kv_config,
+            graph: graph_memory,
+            required_device_non_weight_bytes: 0,
+            minimum_useful_weight_budget_bytes,
+            default_dynamic_device_budget_bytes: None,
+            inferred_policy_enabled: matches!(config.limits.vram_limit, ResourceLimit::Bytes(_)),
+            overrides: MemoryStrategyOverrides::default(),
+            advisory_only: true,
+        });
+        log_memory_strategy_plan(&memory_strategy_plan, "single_model_ort");
         fail_explicit_vram_limit_without_offload(
-            &config,
-            device_weight_package_bytes(&model_directory.model_path),
+            &memory_strategy_plan,
             session_options
                 .execution_providers
                 .iter()
@@ -154,7 +199,7 @@ impl Engine {
             metadata,
             metadata_max_context,
             decode_path,
-        } = resolve_metadata_and_decode_path(&model_directory, &session)?;
+        } = resolve_metadata_and_decode_path(&session, metadata)?;
 
         let tokenizer = {
             let _span = onnx_genai_ort::prof_span!("engine.tokenizer_load");
@@ -162,16 +207,6 @@ impl Engine {
                 .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?
         };
         let fim_config = load_fim_config_from_model_dir(&model_directory.root)?;
-        let kv_model = {
-            let _span = onnx_genai_ort::prof_span!("engine.kv_model_info");
-            infer_kv_model_info(
-                &session,
-                metadata.model.as_ref().and_then(|model| model.io.as_ref()),
-                config.page_size,
-                config.kv_cache_dtype,
-            )?
-        };
-
         // Stage: resource governor and batch scheduler.
         let (governor, scheduler) = build_governor_and_scheduler(
             &config,
@@ -181,7 +216,6 @@ impl Engine {
             authority_provider.as_ref(),
             &domain,
         )?;
-
         // Stage: draft-model loading. Kept before KV-cache allocation to preserve
         // the original constructor's fallible-step ordering.
         let draft = load_draft_model(
@@ -238,6 +272,7 @@ impl Engine {
             native_session: None,
             #[cfg(feature = "native-backend")]
             weight_placement: None,
+            memory_strategy_plan,
             #[cfg(feature = "native-backend")]
             native_sessions: HashMap::new(),
             #[cfg(feature = "native-backend")]
@@ -354,9 +389,73 @@ impl Engine {
             None => governor_kv_config(None, &config)?,
         };
         let model_weight_bytes = device_weight_package_bytes(&model_directory.model_path);
+        let graph_memory = analyze_model_memory(&model_directory.model_path);
+        let minimum_useful_weight_budget_bytes = graph_memory
+            .per_layer_weight_bytes
+            .iter()
+            .map(|layer| layer.bytes)
+            .max()
+            .unwrap_or(0);
+        let resolved_vram_bytes = resolve_vram_limit_bytes(&config.limits)?;
+        #[cfg(feature = "cuda")]
+        let required_device_non_weight_bytes = if matches!(
+            native_device,
+            crate::native_decode::NativeDecodeDevice::Cuda { .. }
+        ) {
+            let metadata_max_len = metadata
+                .model
+                .as_ref()
+                .and_then(|model| model.max_sequence_length);
+            let max_context = crate::native_decode::configured_cuda_kv_max_len()?
+                .map(|limit| metadata_max_len.map_or(limit, |metadata| limit.min(metadata)))
+                .or(metadata_max_len);
+            let kv_bytes = governor_kv_config
+                .bytes_per_token()
+                .zip(max_context)
+                .map_or(0, |(bytes, max_context)| {
+                    bytes.saturating_mul(max_context as u64)
+                });
+            let graph = onnx_runtime_loader::load_model(&model_directory.model_path)
+                .context("loading native graph for recurrent-state memory planning")?;
+            let recurrent_bytes =
+                crate::native_decode::recurrent_state_bytes_from_graph(&graph, model_io)?;
+            kv_bytes.saturating_add(recurrent_bytes)
+        } else {
+            0
+        };
+        #[cfg(not(feature = "cuda"))]
+        let required_device_non_weight_bytes = 0;
+        #[cfg(feature = "cuda")]
+        let cuda_env_policy = onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env();
+        #[cfg(feature = "cuda")]
+        let memory_strategy_overrides = memory_strategy_overrides_from_cuda_env(cuda_env_policy);
+        #[cfg(not(feature = "cuda"))]
+        let memory_strategy_overrides = MemoryStrategyOverrides::default();
+        let memory_strategy_plan = build_memory_strategy_plan(MemoryStrategyPlanInput {
+            config: &config,
+            resolved_vram_bytes,
+            model_weight_bytes,
+            kv_config: governor_kv_config,
+            graph: graph_memory,
+            required_device_non_weight_bytes,
+            minimum_useful_weight_budget_bytes,
+            #[cfg(feature = "cuda")]
+            default_dynamic_device_budget_bytes: Some(
+                onnx_runtime_ep_cuda::DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES,
+            ),
+            #[cfg(not(feature = "cuda"))]
+            default_dynamic_device_budget_bytes: None,
+            inferred_policy_enabled: matches!(config.limits.vram_limit, ResourceLimit::Bytes(_)),
+            overrides: memory_strategy_overrides,
+            advisory_only: !matches!(
+                native_device,
+                crate::native_decode::NativeDecodeDevice::Cuda { .. }
+            ),
+        });
+        log_memory_strategy_plan(&memory_strategy_plan, "single_model_native");
         #[cfg(feature = "cuda")]
         let cuda_offload_resolution =
-            resolve_cuda_offload_policy(&native_device, &config.limits, model_weight_bytes);
+            cuda_offload_resolution_from_plan(&native_device, &memory_strategy_plan);
         #[cfg(feature = "cuda")]
         let cuda_offload_policy = cuda_offload_resolution.map(|resolution| resolution.policy);
         #[cfg(feature = "cuda")]
@@ -685,6 +784,7 @@ impl Engine {
             session: None,
             native_session: Some(native_session),
             weight_placement,
+            memory_strategy_plan,
             native_sessions: HashMap::new(),
             native_active_session: None,
             native_session_counter: 0,
@@ -784,6 +884,7 @@ fn maybe_fill_hybrid_io_from_graph(metadata: &mut InferenceMetadata, model_path:
     let io = ModelIoSpec {
         sequence_source: None,
         kv_ownership: None,
+        kv_layout: None,
         token_input: present_input("input_ids"),
         inputs_embeds_input: None,
         attention_mask_input: present_input("attention_mask"),
@@ -835,34 +936,29 @@ struct MetadataResolution {
     decode_path: ModelDecodePath,
 }
 
-fn resolve_metadata_and_decode_path(
-    model_directory: &ModelDirectory,
-    session: &Session,
-) -> anyhow::Result<MetadataResolution> {
-    // Resolve inference metadata. Our own `inference_metadata.yaml` is the
-    // canonical source of truth. When a model ships without it (e.g. the
-    // onnxruntime-genai / Foundry Local models, which carry only a
-    // `genai_config.json`), fall back to converting that config into native
-    // metadata so share-buffer-capable GQA models still get the O(1)/token
-    // decode path instead of the growing rebind path.
-    let metadata = {
-        let _span = onnx_genai_ort::prof_span!("engine.metadata_load");
-        if let Some(metadata_path) = &model_directory.metadata_path {
-            onnx_genai_metadata::load_metadata(metadata_path)
-                .map_err(|e| anyhow::anyhow!("Failed to load metadata: {e}"))?
-        } else if let Some(compat) =
-            genai_config_compat_metadata(model_directory.genai_config_path.as_deref(), session)?
-        {
-            tracing::info!(
-                "No inference_metadata.yaml found; derived inference metadata from genai_config.json (onnxruntime-genai compatibility)"
-            );
-            compat
-        } else {
-            tracing::warn!("No inference metadata found, using defaults");
-            default_inference_metadata()
-        }
-    };
+fn load_inference_metadata(model_directory: &ModelDirectory) -> anyhow::Result<InferenceMetadata> {
+    let _span = onnx_genai_ort::prof_span!("engine.metadata_load");
+    if let Some(metadata_path) = &model_directory.metadata_path {
+        return onnx_genai_metadata::load_metadata(metadata_path)
+            .map_err(|e| anyhow::anyhow!("Failed to load metadata: {e}"));
+    }
+    if let Some(compat) = genai_config_compat_metadata_from_model_path(
+        model_directory.genai_config_path.as_deref(),
+        &model_directory.model_path,
+    )? {
+        tracing::info!(
+            "No inference_metadata.yaml found; derived inference metadata from genai_config.json (onnxruntime-genai compatibility)"
+        );
+        return Ok(compat);
+    }
+    tracing::warn!("No inference metadata found, using defaults");
+    Ok(default_inference_metadata())
+}
 
+fn resolve_metadata_and_decode_path(
+    session: &Session,
+    metadata: InferenceMetadata,
+) -> anyhow::Result<MetadataResolution> {
     // Validate capabilities
     let runtime_caps = onnx_genai_metadata::RuntimeCapabilities::default();
     if let Err(unsupported) = onnx_genai_metadata::validate(&metadata, &runtime_caps) {
@@ -1286,25 +1382,9 @@ fn cuda_weight_startup_reservation(
 }
 
 #[cfg(all(feature = "cuda", feature = "native-backend"))]
-fn resolve_cuda_offload_policy(
+fn cuda_offload_resolution_from_plan(
     native_device: &crate::native_decode::NativeDecodeDevice,
-    limits: &ResourceLimits,
-    package_bytes: u64,
-) -> Option<CudaOffloadResolution> {
-    resolve_cuda_offload_policy_from_env_policy(
-        native_device,
-        limits,
-        package_bytes,
-        onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env(),
-    )
-}
-
-#[cfg(all(feature = "cuda", feature = "native-backend"))]
-fn resolve_cuda_offload_policy_from_env_policy(
-    native_device: &crate::native_decode::NativeDecodeDevice,
-    limits: &ResourceLimits,
-    package_bytes: u64,
-    env_policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy,
+    plan: &MemoryStrategyPlan,
 ) -> Option<CudaOffloadResolution> {
     if !matches!(
         native_device,
@@ -1312,51 +1392,17 @@ fn resolve_cuda_offload_policy_from_env_policy(
     ) {
         return None;
     }
-
-    let explicit_byte_limit = matches!(limits.vram_limit, ResourceLimit::Bytes(_));
-    if env_policy.enabled {
-        let mut policy = env_policy;
-        policy.managed_no_spill = explicit_byte_limit;
-        policy.managed_limit_bytes = explicit_byte_limit.then_some(match limits.vram_limit {
-            ResourceLimit::Bytes(bytes) => bytes,
-            _ => unreachable!("explicit_byte_limit checked above"),
-        });
-        return Some(CudaOffloadResolution {
-            policy,
-            device_budget_is_override: env_policy.device_budget_bytes.is_some(),
-            auto_enabled_from_vram_limit: false,
-        });
-    }
-
-    let ResourceLimit::Bytes(resolved_vram_bytes) = limits.vram_limit else {
+    let application = plan.runtime_application();
+    if !application.weight_offload_enabled
+        && !application.managed_no_spill
+        && application.device_budget_bytes.is_none()
+    {
         return None;
-    };
-    if package_bytes <= resolved_vram_bytes {
-        return Some(CudaOffloadResolution {
-            policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy {
-                managed_no_spill: true,
-                managed_limit_bytes: Some(resolved_vram_bytes),
-                ..env_policy
-            },
-            device_budget_is_override: false,
-            auto_enabled_from_vram_limit: false,
-        });
     }
-
-    let offload_device_budget_bytes = env_policy
-        .device_budget_bytes
-        .unwrap_or(resolved_vram_bytes);
     Some(CudaOffloadResolution {
-        policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy {
-            enabled: true,
-            managed_no_spill: true,
-            managed_limit_bytes: Some(resolved_vram_bytes),
-            device_budget_bytes: Some(offload_device_budget_bytes),
-            async_pagein: env_policy.async_pagein,
-            scan_resistant_dense: env_policy.scan_resistant_dense,
-        },
-        device_budget_is_override: env_policy.device_budget_bytes.is_some(),
-        auto_enabled_from_vram_limit: true,
+        policy: cuda_policy_from_memory_strategy_plan(plan),
+        device_budget_is_override: application.device_budget_is_override,
+        auto_enabled_from_vram_limit: application.auto_enabled_from_vram_limit,
     })
 }
 
@@ -1450,19 +1496,17 @@ fn reconcile_cuda_offload_budget_after_native_load(
 }
 
 fn fail_explicit_vram_limit_without_offload(
-    config: &EngineConfig,
-    package_bytes: u64,
+    plan: &MemoryStrategyPlan,
     device_weights_are_selected: bool,
 ) -> anyhow::Result<()> {
     if !device_weights_are_selected {
         return Ok(());
     }
-    let ResourceLimit::Bytes(resolved_vram_bytes) = config.limits.vram_limit else {
-        return Ok(());
-    };
-    if package_bytes <= resolved_vram_bytes {
+    if !plan.runtime_application().weight_offload_enabled {
         return Ok(());
     }
+    let resolved_vram_bytes = plan.resolved_device_budget_bytes.unwrap_or(0);
+    let package_bytes = plan.total_weight_bytes;
     anyhow::bail!(
         "model weights require {package_bytes} bytes of device memory, but --vram-limit / \
          serving.memory.limits.vram_limit allows {resolved_vram_bytes} bytes and this backend \
@@ -1880,6 +1924,23 @@ fn load_shared_kv_proposer(
 mod pool_sizing_tests {
     use super::*;
 
+    #[cfg(feature = "cuda")]
+    fn cuda_plan(
+        strategy: MemoryStrategy,
+        total_weight_bytes: u64,
+        resolved_device_budget_bytes: u64,
+        application: MemoryPolicyApplication,
+    ) -> MemoryStrategyPlan {
+        let mut plan =
+            MemoryStrategyPlan::unknown(total_weight_bytes, None, "CUDA policy test plan");
+        plan.strategy = strategy;
+        plan.inferred_strategy = strategy;
+        plan.resolved_device_budget_bytes = Some(resolved_device_budget_bytes);
+        plan.fits_resolved_device_budget = Some(total_weight_bytes <= resolved_device_budget_bytes);
+        plan.application = application;
+        plan
+    }
+
     fn geometry(layers: usize) -> Vec<onnx_genai_kv::LayerTensorConfig> {
         (0..layers)
             .map(|_| onnx_genai_kv::LayerTensorConfig {
@@ -2264,19 +2325,12 @@ mod pool_sizing_tests {
 
     #[test]
     fn explicit_vram_limit_fails_without_an_offload_capable_backend() {
-        let error = fail_explicit_vram_limit_without_offload(
-            &EngineConfig {
-                limits: ResourceLimits {
-                    vram_limit: ResourceLimit::Bytes(6_000),
-                    ..ResourceLimits::default()
-                },
-                ..EngineConfig::default()
-            },
-            10_000,
-            true,
-        )
-        .unwrap_err()
-        .to_string();
+        let mut plan = MemoryStrategyPlan::unknown(10_000, None, "test plan");
+        plan.strategy = MemoryStrategy::DynamicWeightResidency;
+        plan.resolved_device_budget_bytes = Some(6_000);
+        let error = fail_explicit_vram_limit_without_offload(&plan, true)
+            .unwrap_err()
+            .to_string();
 
         assert!(error.contains("require 10000 bytes"), "{error}");
         assert!(error.contains("allows 6000 bytes"), "{error}");
@@ -2285,38 +2339,33 @@ mod pool_sizing_tests {
 
     #[test]
     fn explicit_vram_limit_does_not_reject_host_only_execution() {
-        fail_explicit_vram_limit_without_offload(
-            &EngineConfig {
-                limits: ResourceLimits {
-                    vram_limit: ResourceLimit::Bytes(6_000),
-                    ..ResourceLimits::default()
-                },
-                ..EngineConfig::default()
-            },
-            10_000,
-            false,
-        )
-        .expect("a VRAM limit should not reject a host-only execution provider");
+        let mut plan = MemoryStrategyPlan::unknown(10_000, None, "test plan");
+        plan.strategy = MemoryStrategy::DynamicWeightResidency;
+        plan.resolved_device_budget_bytes = Some(6_000);
+        fail_explicit_vram_limit_without_offload(&plan, false)
+            .expect("a VRAM limit should not reject a host-only execution provider");
     }
 
     #[cfg(feature = "cuda")]
     #[test]
     fn explicit_vram_limit_auto_enables_cuda_weight_offload() {
-        let policy = resolve_cuda_offload_policy_from_env_policy(
-            &crate::native_decode::NativeDecodeDevice::Cuda { index: Some(0) },
-            &ResourceLimits {
-                vram_limit: ResourceLimit::Bytes(6_000),
-                ..ResourceLimits::default()
-            },
+        let plan = cuda_plan(
+            MemoryStrategy::DynamicWeightResidency,
             10_000,
-            onnx_runtime_ep_cuda::DeviceOffloadPolicy {
-                enabled: false,
-                managed_no_spill: false,
-                managed_limit_bytes: None,
-                device_budget_bytes: None,
-                async_pagein: true,
+            6_000,
+            MemoryPolicyApplication {
+                weight_offload_enabled: true,
+                device_budget_bytes: Some(6_000),
                 scan_resistant_dense: true,
+                managed_no_spill: true,
+                managed_limit_bytes: Some(6_000),
+                device_budget_is_override: false,
+                auto_enabled_from_vram_limit: true,
             },
+        );
+        let policy = cuda_offload_resolution_from_plan(
+            &crate::native_decode::NativeDecodeDevice::Cuda { index: Some(0) },
+            &plan,
         )
         .expect("weights above an explicit CUDA VRAM limit should enable offload");
 
@@ -2324,7 +2373,7 @@ mod pool_sizing_tests {
         assert!(policy.policy.managed_no_spill);
         assert_eq!(policy.policy.managed_limit_bytes, Some(6_000));
         assert_eq!(policy.policy.device_budget_bytes, Some(6_000));
-        assert!(policy.policy.async_pagein);
+        assert!(!policy.policy.async_pagein, "prefetch remains disabled");
         assert!(policy.auto_enabled_from_vram_limit);
         assert!(uses_governed_physical_pool(Some(policy), true, false));
         assert_eq!(
@@ -2345,21 +2394,23 @@ mod pool_sizing_tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn explicit_weight_offload_device_bytes_overrides_vram_limit_derivation() {
-        let policy = resolve_cuda_offload_policy_from_env_policy(
-            &crate::native_decode::NativeDecodeDevice::Cuda { index: Some(0) },
-            &ResourceLimits {
-                vram_limit: ResourceLimit::Bytes(6_000),
-                ..ResourceLimits::default()
-            },
+        let plan = cuda_plan(
+            MemoryStrategy::DynamicWeightResidency,
             10_000,
-            onnx_runtime_ep_cuda::DeviceOffloadPolicy {
-                enabled: false,
-                managed_no_spill: false,
-                managed_limit_bytes: None,
+            6_000,
+            MemoryPolicyApplication {
+                weight_offload_enabled: true,
                 device_budget_bytes: Some(4_000),
-                async_pagein: false,
                 scan_resistant_dense: true,
+                managed_no_spill: true,
+                managed_limit_bytes: Some(6_000),
+                device_budget_is_override: true,
+                auto_enabled_from_vram_limit: false,
             },
+        );
+        let policy = cuda_offload_resolution_from_plan(
+            &crate::native_decode::NativeDecodeDevice::Cuda { index: Some(0) },
+            &plan,
         )
         .expect("the explicit limit still triggers offload");
 
@@ -2371,14 +2422,23 @@ mod pool_sizing_tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn explicit_vram_limit_selects_managed_mode_even_when_weights_fit() {
-        let policy = resolve_cuda_offload_policy_from_env_policy(
-            &crate::native_decode::NativeDecodeDevice::Cuda { index: Some(0) },
-            &ResourceLimits {
-                vram_limit: ResourceLimit::Bytes(12_000),
-                ..ResourceLimits::default()
-            },
+        let plan = cuda_plan(
+            MemoryStrategy::FullResident,
             10_000,
-            onnx_runtime_ep_cuda::DeviceOffloadPolicy::default(),
+            12_000,
+            MemoryPolicyApplication {
+                weight_offload_enabled: false,
+                device_budget_bytes: None,
+                scan_resistant_dense: true,
+                managed_no_spill: true,
+                managed_limit_bytes: Some(12_000),
+                device_budget_is_override: false,
+                auto_enabled_from_vram_limit: false,
+            },
+        );
+        let policy = cuda_offload_resolution_from_plan(
+            &crate::native_decode::NativeDecodeDevice::Cuda { index: Some(0) },
+            &plan,
         )
         .expect("explicit byte limit selects managed allocation");
         assert!(!policy.policy.enabled);

@@ -45,15 +45,17 @@ pub(crate) use std::path::Path;
 pub(crate) use std::sync::Arc;
 
 pub use crate::config::{
-    DevicePolicy, DevicePolicyParseError, DryConfig, Eagle3Config, EngineConfig, EngineConfigError,
-    EngineDecodeBackend, FinishReason, GenerateConstraint, GenerateOptions, GeneratePrompt,
-    GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback, GenerationBudgetCap,
-    KvConnectorBackend, KvConnectorConfig, LimitParseError, MirostatConfig, MirostatVersion,
-    MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource, PrioritizedGenerateRequest,
-    PrioritizedGenerateResult, RecurrentPrefixCacheStats, RewindTokenCount, SamplingOverrides,
-    ScheduledGenerateArrival, SessionCheckpoint, SessionForkCapability, SessionId, SessionPosition,
-    SharedKvBinding, SharedKvProposerConfig, SpeculativeMode, TokenLogprob, WeightPlacementReport,
-    XtcConfig, parse_device_policy, parse_resource_limit,
+    DecisionSource, DevicePolicy, DevicePolicyParseError, DryConfig, Eagle3Config, EngineConfig,
+    EngineConfigError, EngineDecodeBackend, FinishReason, GenerateConstraint, GenerateOptions,
+    GeneratePrompt, GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback,
+    GenerationBudgetCap, KvConnectorBackend, KvConnectorConfig, LayerWeightBytes, LimitParseError,
+    MemoryPolicyApplication, MemoryStrategy, MemoryStrategyDecision, MemoryStrategyPlan,
+    MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource,
+    PrioritizedGenerateRequest, PrioritizedGenerateResult, RecurrentPrefixCacheStats,
+    RewindTokenCount, SamplingOverrides, ScheduledGenerateArrival, SessionCheckpoint,
+    SessionForkCapability, SessionId, SessionPosition, SharedKvBinding, SharedKvProposerConfig,
+    SpeculativeMode, TokenLogprob, WeightAccessPattern, WeightPlacementReport, XtcConfig,
+    parse_device_policy, parse_resource_limit,
 };
 pub use crate::connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 pub(crate) use crate::speculative::{
@@ -65,6 +67,7 @@ mod decode_backend;
 mod governor;
 mod load;
 pub(crate) mod memory_plan;
+mod memory_strategy;
 mod metadata;
 mod model;
 #[cfg(feature = "native-backend")]
@@ -80,6 +83,7 @@ pub(crate) use load::{
 };
 #[cfg(feature = "native-backend")]
 pub(crate) use memory_plan::Holder;
+pub(crate) use memory_strategy::*;
 pub(crate) use metadata::*;
 pub use model::Engine;
 pub(crate) use model::*;
@@ -213,6 +217,7 @@ mod tests {
             native_session: None,
             #[cfg(feature = "native-backend")]
             weight_placement: None,
+            memory_strategy_plan: MemoryStrategyPlan::unknown(0, None, "test engine fixture"),
             #[cfg(feature = "native-backend")]
             native_sessions: HashMap::new(),
             #[cfg(feature = "native-backend")]
