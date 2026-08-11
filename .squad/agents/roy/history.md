@@ -184,3 +184,39 @@ Full pre-compaction history in `history-archive.md`.
 - `docs/EP_PLUGIN_EXPORT_INVENTORY.md` — summary table and Roy verification note updated for M2 CUDA scaffold state.
 - `.squad/decisions/inbox/roy-milestone2-status.md` — final status of both milestones.
 - `.squad/agents/roy/history.md` (this entry).
+
+---
+
+## 2026-08-11T00:00Z — Final doc correction pass (commit `3ab0ded68`)
+
+**Branch:** `squad/ep-plugin-parity-cuda` — HEAD confirmed at `3ab0ded68`.
+
+**Task:** Third and final correctness pass on `docs/EP_PLUGIN_EXPORT_PR.md` after Leon's M2-1/M2-2 fixes and Deckard's clippy fix landed post `5a5b40877`.
+
+**Validation observed (Roy, personal, `3ab0ded68`):**
+
+| Command | Result |
+|---------|--------|
+| `cargo clippy -p onnx-runtime-ep-plugin --all-targets -- -D warnings` | **CLEAN** — 0 errors, 0 warnings (Finished in 3.56s) |
+| `cargo test -p onnx-runtime-ep-plugin` | **142 pass** (133 lib + 9 parity), 0 fail (lib +1 from Leon's `stream_release_reclaims_owned_ep_no_leak` regression test) |
+| `cargo test -p onnx-runtime-ep-cpu-plugin` | **23 pass** (6 lib + 17 integration), 0 fail, 0 ignored |
+| `cargo check --workspace` | **CLEAN** — Finished in 0.25s |
+
+**Stale claims removed from `docs/EP_PLUGIN_EXPORT_PR.md`:**
+
+1. M2 status row: removed "one MEDIUM resource-leak and one LOW doc advisory open; clippy regression must be fixed" — replaced with "all findings resolved; Holden's re-verification was not separately run."
+2. Pre-merge blocker paragraph: removed the clippy blocker warning; replaced with "Both M1 and M2 are now green and mergeable."
+3. Validation section: removed stale `5a5b40877` clippy failure block with 2 error listings; replaced with clean output at `3ab0ded68`.
+4. Test counts updated: 132 → 133 lib; 141 → 142 total for `onnx-runtime-ep-plugin`.
+5. Security table: M2-1 (MEDIUM) and M2-2 (LOW) moved from "Open findings" to "Resolved findings" with Leon as fixer, commit `3ab0ded68`, and evidence (double-free analysis, Drop counter regression test, comment correction).
+6. Holden's verdict: 🟡 YELLOW retained; added honest note that M2-1/M2-2 are resolved but Holden did not re-verify at `3ab0ded68`.
+7. Engineer status table: Leon row updated from 🔴 NOT YET DONE → ✅ DONE.
+8. Known Limitations: removed "M2 clippy regression" bullet.
+9. Follow-Ups 5/6/7: marked as DONE (strikethrough).
+10. Process section: added M2-1 Reviewer Rejection Protocol note (Nabil locked out; Leon fixed) and Deckard clippy fix.
+11. M2 commits paragraph updated to include `3ab0ded68`.
+
+**Things confirmed unchanged (per instructions — must stay honest):**
+- Native nxrt dynamic ABI: still 🔴 Not implemented in §524 table.
+- CUDA EP: still blocked (no toolkit/GPU + design work remaining); mock-tested surfaces are genuine progress but not a working CUDA EP.
+- f16/bf16: distinction preserved — our EP claims and executes, ORT does not fall back.

@@ -5,12 +5,12 @@
 | Branch | Milestone | Status |
 |---|---|---|
 | `squad/ep-plugin-export` | M1 — CPU EP fully exported as ORT plugin | 🟡 YELLOW — may ship (all CRITICAL/HIGH cleared) |
-| `squad/ep-plugin-parity-cuda` | M2 — trait↔C-ABI parity proven, f16/bf16 end-to-end, device/allocator/stream surfaces, CUDA shim | 🟡 YELLOW — may ship (one MEDIUM resource-leak and one LOW doc advisory open; clippy regression must be fixed before merge) |
+| `squad/ep-plugin-parity-cuda` | M2 — trait↔C-ABI parity proven, f16/bf16 end-to-end, device/allocator/stream surfaces, CUDA shim | 🟡 YELLOW — may ship (all findings resolved; Holden's re-verification was not separately run) |
 
 **Recommendation: two stacked PRs, not one.**
 M1 (`squad/ep-plugin-export`) is independently correct and mergeable; merging it now unblocks downstream tooling without waiting for M2. M2 (`squad/ep-plugin-parity-cuda`) adds parity tests, dtype routing, and device surfaces that are genuinely additive; they depend on M1's adapter but don't affect M1 correctness. Squashing them into one PR would make the review surface larger with no benefit. Stack PR2 on PR1 with a base-branch dependency in the PR description.
 
-**One M2 pre-merge blocker:** `cargo clippy -p onnx-runtime-ep-plugin --all-targets -- -D warnings` fails with 2 lint errors at `ep.rs:1041,1047` (`needless_borrows_for_generic_args`). These are trivial to fix (remove `&` on `format!` arguments) but must be resolved before the M2 PR is opened. Owner: last committer on M2 (`5a5b40877`).
+**Both M1 and M2 are now green and mergeable** as two stacked PRs. All CRITICAL/HIGH/MEDIUM/LOW findings are resolved; clippy is clean. See Validation below.
 
 **Push is blocked:** No `GH_TOKEN`/`GITHUB_TOKEN`, no SSH private key, and GCM cache is empty on this host. `git ls-remote origin refs/heads/squad/ep-plugin-export` returned empty — neither branch exists remotely. A user or CI runner with write credentials must push and open the PRs.
 
@@ -18,7 +18,7 @@ M1 (`squad/ep-plugin-export`) is independently correct and mergeable; merging it
 
 **M1 commits:** `526a883`, `f81d98d`, `09635cd`, `c92838d`, `2fb7150`, `bad3682`, `415289bc`, `5fa8cb2a`
 
-**M2 commits (stacked on M1):** `2da0c4e7f`, `577047a74`, `5a5b40877`
+**M2 commits (stacked on M1):** `2da0c4e7f`, `577047a74`, `5a5b40877`, `3ab0ded68`
 
 ---
 
@@ -136,39 +136,26 @@ Integration tests covering:
 
 ## Validation
 
-All commands run by Roy on `squad/ep-plugin-parity-cuda` at commit `5a5b40877`,
-2026-08-10T23:52Z. Output is quoted verbatim.
+All commands run by Roy on `squad/ep-plugin-parity-cuda` at commit `3ab0ded68`,
+2026-08-11T00:00Z. Output is quoted verbatim.
 
 ### `cargo clippy -p onnx-runtime-ep-plugin --all-targets -- -D warnings`
 
 ```
-error: the borrowed expression implements the required traits
-  --> crates/onnx-runtime-ep-plugin/src/ep.rs:1041:48
-   |
-   | let vid = g.create_named_value(&format!("in_{dt:?}"), dt, ...);
-   |                                ^^^^^^^^^^^^^^^^^^^^^ help: change this to: `format!("in_{dt:?}")`
-   = note: -D clippy::needless-borrows-for-generic-args
-
-error: the borrowed expression implements the required traits
-  --> crates/onnx-runtime-ep-plugin/src/ep.rs:1047:45
-   |
-   | .map(|&dt| g.create_named_value(&format!("out_{dt:?}"), ...))
-   |                                 ^^^^^^^^^^^^^^^^^^^^^^ help: change this to: `format!("out_{dt:?}")`
-
-error: could not compile `onnx-runtime-ep-plugin` (lib test) due to 2 previous errors
+Checking onnx-runtime-ep-cpu v0.1.0-dev.5 (.../crates/onnx-runtime-ep-cpu)
+Checking onnx-runtime-ep-plugin v0.1.0-dev.5 (.../crates/onnx-runtime-ep-plugin)
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.56s
 ```
 
-**⚠️ M2 CLIPPY REGRESSION — 2 errors in `ep.rs:1041,1047`.** Both are trivial
-`needless_borrows_for_generic_args` fixes (remove `&` from `format!` arguments).
-Must be resolved before the M2 PR is opened. This is a pre-merge blocker for M2
-only; M1 (`squad/ep-plugin-export`) was clippy-clean at its own HEAD.
+**Clean — 0 errors, 0 warnings.** The two `needless_borrows_for_generic_args` lint
+errors at `ep.rs:1041,1047` that blocked M2 at `5a5b40877` are resolved (fixed by
+Deckard in `3ab0ded68`).
 
 ### `cargo test -p onnx-runtime-ep-plugin`
 
 ```
-running 132 tests
-... [all lib tests] ...
-test result: ok. 132 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+running 133 tests
+test result: ok. 133 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
 
 running 9 tests
 test capability_parity_supported_but_shape_declined ... ok
@@ -185,7 +172,9 @@ test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 Doc-tests: 0 passed; 0 failed; 1 ignored
 ```
 
-132 lib tests + 9 trait↔C-ABI parity tests = **141 total**, zero failures.
+133 lib tests + 9 trait↔C-ABI parity tests = **142 total**, zero failures.
+(Lib count moved 132 → 133: Leon's new `stream_release_reclaims_owned_ep_no_leak`
+regression test for M2-1.)
 
 ### `cargo test -p onnx-runtime-ep-cpu-plugin`
 
@@ -226,7 +215,7 @@ bus; it does not affect correctness.
 ### `cargo check --workspace`
 
 ```
-Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.38s
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.25s
 ```
 
 Workspace compiles cleanly (warnings in unrelated `onnx-genai-bench/src/bin/compare.rs`
@@ -241,6 +230,8 @@ workspace-level build.
 
 Holden's **milestone 2 verdict: 🟡 YELLOW — May ship**
 (`docs/EP_PLUGIN_EXPORT_SECURITY_AUDIT.md`, 2026-08-10T23:09:23Z).
+Both findings Holden raised (M2-1 and M2-2) are now resolved; a separate
+re-verification by Holden was not run after `3ab0ded68`.
 
 ### Resolved findings (all ship-blockers cleared — both milestones)
 
@@ -255,13 +246,8 @@ Holden's **milestone 2 verdict: 🟡 YELLOW — May ship**
 | UAF | `OrtMemoryInfo` released while ORT holds pointer (CRITICAL) | Deckard | **RESOLVED** — `c92838d` |
 | NEW-1 | `compute_release_state` lacks `catch_unwind` | Leon | **RESOLVED** — `compute.rs:1563`; present in M1 code, not post-merge. |
 | NEW-2 | `ep_compile_inner` does not clean up `out_infos[0..i]` on mid-loop failure | Deckard | **RESOLVED** — `cleanup_partial_infos` helper + `ep_compile_inner` error paths; verified by Holden. |
-
-### Open findings (post-merge advisories — do not block M2 merge)
-
-| ID | Finding | Severity | Owner | Status |
-|----|---------|----------|-------|--------|
-| M2-1 | EP instance leaked in `stream_release` (`factory.rs:667` / `device.rs:228`) | MEDIUM | Leon | **OPEN** — `DeviceSyncStream` has no `Drop` impl; `ep: *const dyn ExecutionProvider` set via `Box::into_raw` at `factory.rs:666–667` is never freed when the stream is released. Compare with `factory_release_allocator` which correctly calls `Box::from_raw` on its EP pointer. **Leon must fix before M2 merge.** |
-| M2-2 | Misleading doc on `DeviceAllocator::memory_info` ownership | LOW | Leon | **OPEN** — `device.rs:86` still says "Owned by this allocator; freed on drop." Actual behavior is correct (not freeing), but the comment is wrong. **Leon must fix before M2 merge.** |
+| M2-1 | EP instance leaked in `stream_release` (MEDIUM) | Leon | **RESOLVED** — `Box::from_raw` behind null guard in `stream_release`; null-checked to avoid double-free (ORT calls `Release` exactly once per stream; allocator path owns a separate EP instance — confirmed in `onnxruntime_ep_c_api.h:207-216`). Regression test `stream_release_reclaims_owned_ep_no_leak` (Drop counter) asserts drop runs. Fixed in `3ab0ded68`; Nabil locked out under the Reviewer Rejection Protocol. |
+| M2-2 | Misleading doc on `DeviceAllocator::memory_info` ownership (LOW) | Leon | **RESOLVED** — `device.rs:86` comment corrected to "Borrowed from ORT; NOT freed by this allocator." Fixed in `3ab0ded68`. |
 
 ---
 
@@ -280,12 +266,15 @@ The Reviewer Rejection Protocol was enforced throughout this branch:
   capability-claiming code was rejected.
 - **`conformance_two_sessions` assertion bug** — reassigned to Pris (tester);
   fixed and now passing.
+- **M2-1 (`stream_release` EP leak)** — Nabil locked out; Leon fixed via
+  `Box::from_raw` with null guard in `3ab0ded68`.
+- **M2 clippy (`ep.rs:1041,1047`)** — fixed by Deckard in `3ab0ded68`.
 
 ---
 
 ## Milestone 2 — What landed (branch `squad/ep-plugin-parity-cuda`)
 
-Three commits on top of M1: `2da0c4e7f`, `577047a74`, `5a5b40877`.
+Three commits on top of M1: `2da0c4e7f`, `577047a74`, `5a5b40877`. A fourth commit `3ab0ded68` resolved the remaining M2-1 leak, M2-2 doc, and clippy regressions.
 
 ### Trait↔C-ABI parity — PROVEN (Pris)
 
@@ -348,7 +337,7 @@ toolkit because the default feature set excludes it.
 | Pris | Trait↔C-ABI parity tests | ✅ **DONE** — 9 tests in `tests/trait_cabi_parity.rs`; all pass |
 | Deckard | Dtype filter + `GetKernelRegistry` + NEW-2 cleanup | ✅ **DONE** — `node_passes_dtype_filter`, `build_cpu_registry_with_descriptors`, `cleanup_partial_infos` |
 | Nabil | Device/allocator/stream surfaces + CUDA shim crate | ✅ **DONE** (surfaces exist and are tested; CUDA shim is a workspace-member scaffold, not a complete CUDA EP) |
-| Leon | M2-1 EP leak in `stream_release` + M2-2 doc fix | 🔴 **NOT YET DONE** — neither fix is in the code at `5a5b40877`. Both are required before M2 merge. |
+| Leon | M2-1 EP leak in `stream_release` + M2-2 doc fix | ✅ **DONE** — `Box::from_raw` null-guarded in `stream_release`; `memory_info` comment corrected; regression test added. Fixed in `3ab0ded68` (Nabil locked out under Reviewer Rejection Protocol). |
 
 ---
 
@@ -369,7 +358,6 @@ toolkit because the default feature set excludes it.
 - **No GitHub push credentials:** This host has no `GH_TOKEN`/`GITHUB_TOKEN`, no
   SSH private key, and GCM cache is empty. The branch is committed locally. The PR
   must be opened by the user or a runner with credentials.
-- **M2 clippy regression:** `cargo clippy -p onnx-runtime-ep-plugin --all-targets -- -D warnings` fails with 2 trivial lint errors in `ep.rs:1041,1047`. Must be fixed before the M2 PR is opened.
 
 ---
 
@@ -402,8 +390,8 @@ sync; the ORT ABI evolves toward nxrt; fail closed on unsupported capabilities.
 2. ~~**Deckard:** NEW-2 `ep_compile_inner` cleanup~~ — **DONE** (`cleanup_partial_infos`).
 3. ~~**Deckard/Nabil:** Wire `GetKernelRegistry` for f16/bf16~~ — **DONE** (`build_cpu_registry_with_descriptors`).
 4. ~~**Pris:** Trait↔C-ABI parity tests~~ — **DONE** (9 tests in `trait_cabi_parity.rs`).
-5. **Leon (pre-M2-merge):** Fix M2-1 EP leak in `stream_release` — add `Box::from_raw` for the EP pointer or implement `Drop for DeviceSyncStream`.
-6. **Leon (pre-M2-merge):** Fix M2-2 misleading doc on `DeviceAllocator::memory_info:86` — change to "Borrowed from ORT; NOT owned by this allocator."
-7. **Any M2 committer (pre-M2-merge):** Fix clippy regression in `ep.rs:1041,1047` — remove `&` from the two `format!()` arguments.
+5. ~~**Leon (pre-M2-merge):** Fix M2-1 EP leak in `stream_release`~~ — **DONE** (`3ab0ded68`).
+6. ~~**Leon (pre-M2-merge):** Fix M2-2 misleading doc on `DeviceAllocator::memory_info:86`~~ — **DONE** (`3ab0ded68`).
+7. ~~**Any M2 committer (pre-M2-merge):** Fix clippy regression in `ep.rs:1041,1047`~~ — **DONE** by Deckard (`3ab0ded68`).
 8. **CUDA EP work (post-both-PRs):** `onnx-runtime-ep-cuda-plugin` shim + real device-pointer/stream/allocator integration — hardware-gated; requires CUDA toolkit and GPU.
 9. **Native nxrt dynamic ABI:** Design and implement a first-class native nxrt `extern "C"` ABI to complete §524 compliance.
