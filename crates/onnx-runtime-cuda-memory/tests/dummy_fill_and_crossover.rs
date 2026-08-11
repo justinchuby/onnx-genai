@@ -43,10 +43,43 @@
 //! from the real KV binding geometry of qwen2.5-0.5b and qwen14b (read from
 //! their `genai_config.json`), with the closed form
 //! `crossover ~= objects x granule / kv_bytes_per_token = granule / (head_dim x elem)`.
+//!
+//! ## The crossover is model-size independent, and the granule is its lever
+//!
+//! Because `objects = layers x 2 x kv_heads` cancels the identical factor in
+//! `kv_bytes_per_token = objects x head_dim x elem`, the crossover reduces to
+//! `granule / (head_dim x elem)` — it depends only on the granule, the head
+//! dimension and the KV dtype, *never on model size*.
+//! [`crossover_is_model_size_independent`] verifies the cancellation against a
+//! toy 480x size range and the two real models, and
+//! [`granularity_is_the_crossover_lever`] publishes the crossover as a table
+//! over {MINIMUM, RECOMMENDED} granule x head_dim x KV dtype. The consequence:
+//! at the 2 MiB RECOMMENDED granule the crossover is 8K-16K tokens (a high bar),
+//! and a 64 KiB minimum granule *would* collapse it ~32x into the low hundreds —
+//! **but `vmm_granularity_gpu` measured this device's MINIMUM granule at 2 MiB,
+//! equal to RECOMMENDED, so that lever is unavailable here.** The 64 KiB row is
+//! therefore a counterfactual: it shows the win a finer-granule device would
+//! get, not one this box can realize.
 
 /// The VMM allocation granule measured on this hardware by the sibling GPU
-/// tests (`vmm_graph_remap_gpu`, `vmm_kv_contiguous_tail_gpu`): 2 MiB.
+/// tests (`vmm_graph_remap_gpu`, `vmm_kv_contiguous_tail_gpu`): 2 MiB. This is
+/// CUDA's `CU_MEM_ALLOC_GRANULARITY_RECOMMENDED` **and, as `vmm_granularity_gpu`
+/// measured on this device, its `MINIMUM` too** — the two are equal at 2 MiB
+/// here, so the granule cannot be reduced on this box. The crossover scales
+/// linearly with the granule actually mapped at, so
+/// [`crossover_is_model_size_independent`] and
+/// [`granularity_is_the_crossover_lever`] also evaluate a hypothetical finer
+/// 64 KiB granule ([`MIN_GRANULE`]) to show what a device that *offered* it
+/// would gain.
 const GRANULE: usize = 2 * 1024 * 1024;
+
+/// A hypothetical finer VMM granule. **Measured reality on this device:
+/// `CU_MEM_ALLOC_GRANULARITY_MINIMUM` == `RECOMMENDED` == 2 MiB** (printed by
+/// `vmm_granularity_gpu::report_both_allocation_granularities`), so the finer
+/// granule the owner hoped would pull the crossover down ~32x is **not available
+/// here**. 64 KiB is kept only to publish what the crossover *would* be on a
+/// device whose minimum granule is 64 KiB — a counterfactual, not this box.
+const MIN_GRANULE: usize = 64 * 1024;
 
 /// KV cache geometry taken verbatim from a model's `genai_config.json`.
 struct KvGeometry {
@@ -95,9 +128,19 @@ impl KvGeometry {
     }
 
     /// Tokens at which fixed-stride+dummy's constant floor is matched by bucket
-    /// growth's live content.
+    /// growth's live content, at the 2 MiB RECOMMENDED granule.
     fn crossover_tokens(&self) -> usize {
         self.floor_bytes() / self.kv_bytes_per_token()
+    }
+
+    /// The same crossover at an arbitrary granule. The closed form
+    /// `objects x granule / kv_bytes_per_token` reduces to
+    /// `granule / (head_dim x elem_bytes)` because `objects` cancels the
+    /// `objects` inside `kv_bytes_per_token` — so it depends only on the granule,
+    /// the head dimension and the KV element size, never on `layers` or
+    /// `kv_heads`, i.e. never on model size.
+    fn crossover_tokens_at(&self, granule: usize) -> usize {
+        (self.objects() * granule) / self.kv_bytes_per_token()
     }
 }
 
@@ -265,4 +308,115 @@ fn fixed_stride_plus_dummy_crossover_vs_bucket_growth() {
     );
     assert_eq!(big.crossover_tokens(), 8192);
     assert_eq!(big.crossover_tokens(), big.context_length);
+}
+
+/// The owner's key derivation, verified: the crossover is **model-size
+/// independent**. `objects = layers x 2 x kv_heads` cancels the identical factor
+/// inside `kv_bytes_per_token = objects x head_dim x elem`, leaving
+/// `crossover = granule / (head_dim x elem)`. So two models with wildly
+/// different layer and head counts but the same head_dim and KV dtype share a
+/// crossover — it is a property of the *layout unit*, not the model.
+#[test]
+fn crossover_is_model_size_independent() {
+    // A deliberately tiny model and a huge one, same head_dim (64) and fp16.
+    let tiny = KvGeometry {
+        name: "tiny",
+        num_hidden_layers: 4,
+        num_key_value_heads: 1,
+        head_dim: 64,
+        elem_bytes: 2,
+        context_length: 4096,
+    };
+    let huge = KvGeometry {
+        name: "huge",
+        num_hidden_layers: 120,
+        num_key_value_heads: 16,
+        head_dim: 64,
+        elem_bytes: 2,
+        context_length: 131072,
+    };
+
+    // Despite 480x the objects, identical crossover at any granule.
+    assert_eq!(tiny.objects() * 480, huge.objects());
+    for granule in [MIN_GRANULE, GRANULE] {
+        let expected = granule / (64 * 2);
+        assert_eq!(tiny.crossover_tokens_at(granule), expected);
+        assert_eq!(huge.crossover_tokens_at(granule), expected);
+        assert_eq!(
+            tiny.crossover_tokens_at(granule),
+            huge.crossover_tokens_at(granule),
+            "layers and kv_heads cancel; crossover depends only on granule/(head_dim x elem)"
+        );
+    }
+
+    // The cancellation is exact for the two real models too: qwen2.5-0.5b
+    // (head_dim 64) and qwen14b (head_dim 128) differ in crossover ONLY because
+    // their head_dim differs, not because one is 28x the other in size.
+    assert_eq!(
+        qwen2_5_0_5b().crossover_tokens_at(GRANULE),
+        GRANULE / (64 * 2)
+    );
+    assert_eq!(qwen14b().crossover_tokens_at(GRANULE), GRANULE / (128 * 2));
+
+    eprintln!(
+        "Crossover is model-size independent: crossover = granule / (head_dim x elem). \
+         layers and kv_heads cancel (tiny objects {} vs huge objects {} -> same crossover).",
+        tiny.objects(),
+        huge.objects()
+    );
+}
+
+/// The granule is the crossover lever. Publish the crossover as a table over
+/// {MINIMUM, RECOMMENDED} granule x {head_dim 64, 128} x {fp16, fp8/int8}, so it
+/// can be applied to any model without re-measuring. Quantized KV halves bytes
+/// per token, which *doubles* the crossover in tokens.
+#[test]
+fn granularity_is_the_crossover_lever() {
+    let crossover = |granule: usize, head_dim: usize, elem: usize| granule / (head_dim * elem);
+
+    eprintln!(
+        "\nCrossover table (tokens) = granule / (head_dim x elem_bytes), model-size independent:\n  \
+         granule    | hd64 fp16 | hd64 fp8 | hd128 fp16 | hd128 fp8\n  \
+         MIN  {:>4} KiB | {:>9} | {:>8} | {:>10} | {:>9}\n  \
+         REC  {:>4} KiB | {:>9} | {:>8} | {:>10} | {:>9}\n  \
+         (fp8/int8 halves bytes/token, so it doubles the crossover in tokens.)",
+        MIN_GRANULE / 1024,
+        crossover(MIN_GRANULE, 64, 2),
+        crossover(MIN_GRANULE, 64, 1),
+        crossover(MIN_GRANULE, 128, 2),
+        crossover(MIN_GRANULE, 128, 1),
+        GRANULE / 1024,
+        crossover(GRANULE, 64, 2),
+        crossover(GRANULE, 64, 1),
+        crossover(GRANULE, 128, 2),
+        crossover(GRANULE, 128, 1),
+    );
+
+    // At the RECOMMENDED 2 MiB granule the crossover is 8K-16K tokens: a high
+    // bar that loses in most serving windows. (On THIS device the MINIMUM
+    // granule is also 2 MiB -- see vmm_granularity_gpu -- so the coarse row is
+    // the only one realizable here; the fine row below is a counterfactual.)
+    assert_eq!(crossover(GRANULE, 64, 2), 16384);
+    assert_eq!(crossover(GRANULE, 128, 2), 8192);
+
+    // At a 64 KiB MINIMUM granule the crossover WOULD collapse ~32x, into the
+    // low hundreds -- fixed-stride+dummy would then win in essentially every
+    // realistic context. This device does not expose a granule that fine, so
+    // this is what a finer-granule device would gain, not this box.
+    assert_eq!(crossover(MIN_GRANULE, 64, 2), 512);
+    assert_eq!(crossover(MIN_GRANULE, 128, 2), 256);
+    assert_eq!(GRANULE / MIN_GRANULE, 32);
+    assert_eq!(
+        crossover(GRANULE, 128, 2) / crossover(MIN_GRANULE, 128, 2),
+        32,
+        "the crossover scales linearly with the granule"
+    );
+
+    // Quantized KV doubles the crossover (halved bytes/token), tempering the
+    // win at the fine granule but not reversing it.
+    assert_eq!(crossover(MIN_GRANULE, 128, 1), 512);
+    assert_eq!(
+        crossover(MIN_GRANULE, 128, 1),
+        2 * crossover(MIN_GRANULE, 128, 2)
+    );
 }
