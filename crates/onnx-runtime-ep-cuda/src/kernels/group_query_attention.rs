@@ -2365,6 +2365,7 @@ impl GroupQueryAttentionKernel {
                 query_starts_gpu,
                 local_window_i,
                 self.softcap,
+                None,
             )?;
         }
 
