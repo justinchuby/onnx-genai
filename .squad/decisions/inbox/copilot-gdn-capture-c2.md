@@ -1,4 +1,0 @@
-### 2026-08-10: LinearAttention trailing sync is not load-bearing
-**By:** Copilot
-**What:** Make LinearAttention's trailing stream synchronization capture-aware. A direct CUDA capture reproduced `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`; a capture/replay regression then proved four in-place recurrent-state decode steps byte-identical to eager execution with no capture-time allocations.
-**Why:** LinearAttention launches one same-stream kernel that reads each state column before overwriting it, so stream ordering is sufficient. The sync only surfaced eager launch errors and caused the 33 `CaptureRecordingFailed` seams reported by #728. The real 35B artifact was unavailable on this 8 GB Windows host, so its expected 34→1 segment collapse still needs the same-model H200 measurement before merging.

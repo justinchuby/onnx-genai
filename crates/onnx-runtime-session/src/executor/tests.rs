@@ -4,6 +4,7 @@ use onnx_runtime_ep_api::{
     CaptureSupport, Cost, EpConfig, EpError, ExecutionProviderCapabilities, Fence, Kernel,
     NegotiatedWeight,
 };
+use onnx_runtime_memory_governor::MemoryRole;
 
 use super::*;
 
@@ -2021,6 +2022,53 @@ impl Kernel for WeightDeliveryKernel {
     }
 }
 
+struct WorkspaceOnlyKernel {
+    bytes: u64,
+}
+
+impl Kernel for WorkspaceOnlyKernel {
+    fn workspace_requirement(
+        &self,
+        _inputs: &[TensorMetadata<'_>],
+    ) -> onnx_runtime_ep_api::Result<WorkspaceRequirement> {
+        Ok(WorkspaceRequirement {
+            bytes: self.bytes,
+            alignment: 256,
+            lifetime: WorkspaceLifetime::SessionPersistent,
+            role: MemoryRole::Workspace { step_scoped: false },
+        })
+    }
+
+    fn execute(
+        &self,
+        _inputs: &[TensorView],
+        _outputs: &mut [TensorMut],
+    ) -> onnx_runtime_ep_api::Result<()> {
+        Err(EpError::KernelFailed(
+            "test workspace-only kernel requires prepared workspace".into(),
+        ))
+    }
+
+    fn execute_with_workspace(
+        &self,
+        _inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        let workspace =
+            workspace.ok_or_else(|| EpError::KernelFailed("missing test workspace".into()))?;
+        if workspace.bytes() < self.bytes as usize {
+            return Err(EpError::KernelFailed(
+                "test workspace was undersized".into(),
+            ));
+        }
+        unsafe {
+            std::ptr::write_bytes(outputs[0].data.0.cast::<u8>(), 0, outputs[0].byte_size());
+        }
+        Ok(())
+    }
+}
+
 struct WeightDeliveryEp {
     cpu: CpuExecutionProvider,
     lazy: bool,
@@ -2031,6 +2079,7 @@ struct WeightDeliveryEp {
     host_uploads: Arc<AtomicUsize>,
     workspace_bytes: u64,
     workspace_bytes_per_row: u64,
+    support_index_share_workspace: bool,
     fail_next_allocation: Arc<AtomicBool>,
     fail_allocation_size: Arc<AtomicUsize>,
 }
@@ -2080,6 +2129,7 @@ impl WeightDeliveryEp {
             host_uploads,
             workspace_bytes: 0,
             workspace_bytes_per_row: 0,
+            support_index_share_workspace: false,
             fail_next_allocation: Arc::new(AtomicBool::new(false)),
             fail_allocation_size: Arc::new(AtomicUsize::new(0)),
         }
@@ -2153,6 +2203,16 @@ impl ExecutionProvider for WeightDeliveryEp {
                 "OptionalContract requires [Float32, Undefined, Bool] input dtypes, got {input_dtypes:?}"
             ));
         }
+        if self.support_index_share_workspace
+            && op.domain == onnx_runtime_ir::RUNTIME_DOMAIN
+            && op.op_type == "IndexShare"
+        {
+            return KernelMatch::Supported {
+                cost: Cost::ZERO,
+                required_input_layouts: None,
+                output_layouts: vec![TensorLayout::contiguous()],
+            };
+        }
         if LazyWeightBoundary::BlockQuantizedMoe.matches(&op.domain, &op.op_type)
             || LazyWeightBoundary::MatMulNBits.matches(&op.domain, &op.op_type)
             || (op.is_default_domain() && op.op_type == "Identity")
@@ -2173,10 +2233,18 @@ impl ExecutionProvider for WeightDeliveryEp {
 
     fn get_kernel(
         &self,
-        _op: &Node,
+        op: &Node,
         _shapes: &[Vec<usize>],
         _opset: u64,
     ) -> onnx_runtime_ep_api::Result<Box<dyn Kernel>> {
+        if self.support_index_share_workspace
+            && op.domain == onnx_runtime_ir::RUNTIME_DOMAIN
+            && op.op_type == "IndexShare"
+        {
+            return Ok(Box::new(WorkspaceOnlyKernel {
+                bytes: self.workspace_bytes,
+            }));
+        }
         Ok(Box::new(WeightDeliveryKernel {
             deliveries: Arc::clone(&self.deliveries),
             workspace_bytes: self.workspace_bytes,
@@ -2287,6 +2355,34 @@ impl ExecutionProvider for WeightDeliveryEp {
     ) -> onnx_runtime_ep_api::Result<bool> {
         self.deliveries.lock().unwrap().push("prefetch");
         Ok(true)
+    }
+
+    fn reserve_workspace(
+        &self,
+        bytes: u64,
+        role: onnx_runtime_memory_governor::MemoryRole,
+    ) -> onnx_runtime_ep_api::Result<Option<onnx_runtime_memory_governor::MemoryLease>> {
+        assert_eq!(role, MemoryRole::Workspace { step_scoped: false });
+        self.deliveries.lock().unwrap().push("reserve_workspace");
+        // Static-bytes fixtures reserve exactly `workspace_bytes`. The per-row
+        // fixture (`workspace_bytes_per_row != 0`, e.g.
+        // `inference_session_fallback_workspace_grows_retries_and_reuses`)
+        // reserves `rows * per_row`, so the governed reservation legitimately
+        // scales with the input row count — 2048 for 2 rows, 4096 for 4. This
+        // method has no row count to recompute the exact figure, so it asserts
+        // the non-vacuous invariant that the reservation is a positive multiple
+        // of the per-row size (the exact bytes are separately pinned at each
+        // call site). A zero or mis-sized reservation still fails here.
+        if self.workspace_bytes_per_row == 0 {
+            assert_eq!(bytes, self.workspace_bytes);
+        } else {
+            assert!(
+                bytes != 0 && bytes.is_multiple_of(self.workspace_bytes_per_row),
+                "per-row workspace reservation {bytes} must be a positive multiple of {}",
+                self.workspace_bytes_per_row
+            );
+        }
+        Ok(None)
     }
 }
 
@@ -2401,6 +2497,64 @@ fn prepare_reserves_static_nested_qmoe_workspace_and_child_reuses_it() {
 
     let output = executor.run(&[("cond", &cond)]).unwrap();
     assert_eq!(output[0].to_vec_f32(), vec![1.0, 2.0, 3.0, 4.0]);
+}
+
+#[test]
+fn prepare_reserves_static_index_share_workspace() {
+    let mut graph = Graph::new();
+    graph
+        .opset_imports
+        .insert(onnx_runtime_ir::RUNTIME_DOMAIN.into(), 1);
+    let q = graph.create_named_value("q", DataType::Float32, static_shape([1, 2, 3, 4]));
+    let k = graph.create_named_value("k", DataType::Float32, static_shape([1, 1, 3, 4]));
+    let v = graph.create_named_value("v", DataType::Float32, static_shape([1, 1, 3, 4]));
+    let selected =
+        graph.create_named_value("selected", DataType::Int64, static_shape([1, 1, 3, 2]));
+    for input in [q, k, v, selected] {
+        graph.add_input(input);
+    }
+    let out = graph.create_named_value("out", DataType::Float32, static_shape([1, 2, 3, 4]));
+    graph.add_output(out);
+    let mut node = Node::new(
+        NodeId(0),
+        "IndexShare",
+        vec![Some(q), Some(k), Some(v), None, None, Some(selected)],
+        vec![out],
+    );
+    node.domain = onnx_runtime_ir::RUNTIME_DOMAIN.into();
+    graph.insert_node(node);
+
+    let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut ep = WeightDeliveryEp::new(false, Arc::clone(&deliveries));
+    ep.support_index_share_workspace = true;
+    ep.workspace_bytes = 768;
+    let mut executor = Executor::build(graph, Arc::new(WeightStore::new()), Arc::new(ep)).unwrap();
+    let q_tensor = Tensor::zeros(DataType::Float32, vec![1, 2, 3, 4]).unwrap();
+    let k_tensor = Tensor::zeros(DataType::Float32, vec![1, 1, 3, 4]).unwrap();
+    let v_tensor = Tensor::zeros(DataType::Float32, vec![1, 1, 3, 4]).unwrap();
+    let selected_tensor = Tensor::from_i64(&[1, 1, 3, 2], &[0, 1, 0, 1, 0, 1]).unwrap();
+    let requirement = executor
+        .prepare_with_device_bindings(
+            &[
+                ("q", &q_tensor),
+                ("k", &k_tensor),
+                ("v", &v_tensor),
+                ("selected", &selected_tensor),
+            ],
+            &mut [],
+        )
+        .unwrap();
+    assert_eq!(requirement.bytes, 768);
+    assert_eq!(
+        requirement.role,
+        MemoryRole::Workspace { step_scoped: false }
+    );
+    assert_eq!(executor.persistent_workspace.as_ref().unwrap().bytes, 768);
+    assert_eq!(
+        deliveries.lock().unwrap().as_slice(),
+        ["reserve_workspace"],
+        "IndexShare prepare must use the governed workspace path instead of an internal raw allocation"
+    );
 }
 
 #[test]
