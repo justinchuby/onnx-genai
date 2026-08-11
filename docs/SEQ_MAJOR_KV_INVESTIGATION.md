@@ -2,8 +2,9 @@
 
 Status: investigation + measurement + narrow prototype. **No production kernel
 conversion in this round.** References #750 (multi-request batching), #759 (VMM
-dummy-page / unified KV strategy), and **#777 (page-level prefix sharing)**;
-builds on #522 and #726 (per-backend KV ownership), and on #727 / #740 / #745
+dummy-page / unified KV strategy), **#776 (granularity probe — granule lever
+dead)**, and **#777 (page-level prefix sharing)**; builds on #522 and #726
+(per-backend KV ownership), and on #727 / #740 / #745
 (VMM multi-map proof, physical-handle pool, granule-ref accounting).
 
 **Reordered per owner priority (#777):** page-level prefix sharing is now the
@@ -29,6 +30,34 @@ prefix of all heads is one contiguous region, commit is
 `ceil(live_bytes / granule)`, and the token stride (`kv_heads × head_dim`) is
 independent of sequence length, so growth never moves an offset and never
 invalidates a captured CUDA graph.
+
+**The granule lever is dead on this hardware (#776 / draft #776,
+`vmm_granularity_gpu.rs`).** The parallel #759 probe queried both granularities
+for the exact production allocation properties and found
+`CU_MEM_ALLOC_GRANULARITY_MINIMUM == CU_MEM_ALLOC_GRANULARITY_RECOMMENDED ==
+2 MiB` — **there is no 64 KiB device granule.** So the alternative fix for the
+`objects × granule` floor — shrink the granule and collapse the crossover ~32×
+into the low hundreds of tokens — **cannot be pulled.** The crossover stays at
+8,192 tokens (head_dim 128/fp16) and 16,384 (head_dim 64/fp16). The same probe
+hardware-verified the crossover derivation across a 480× model-size range plus
+both real models: the floor unit is genuinely per-head-stripe, `layers` and
+`kv_heads` cancel, and `crossover = granule / (head_dim × sizeof(dtype))` holds.
+
+**Quantized KV makes the head-major floor worse, not better.** fp8/int8 halves
+bytes per token, which *doubles* the crossover in tokens (fewer live bytes fill
+each granule more slowly). Since we are independently moving toward quantized KV,
+the two optimizations fight each other under head-major — but not under
+seq-major, which removes the floor concept entirely. And §2 shows the strided
+read stays free even at quantized (32 B) run sizes, so seq-major is compatible
+with the quantized-KV direction while head-major is antagonistic to it.
+
+**Consequence:** seq-major is no longer one of two candidate fixes for the
+granule floor — it is the **only** one, and it does not merely shrink the floor,
+it removes the concept (commit becomes `ceil(live_bytes / granule)` total, no
+crossover at all). Combined with #777 prefix sharing (practical only under
+seq-major), this is the single convergence point for three goals: lower
+committed bytes, no CUDA-graph re-capture on growth, and cross-request prefix
+sharing. This investigation is therefore **decision-critical**, not exploratory.
 
 ---
 
@@ -133,23 +162,32 @@ Median seq/head-major time ratio (>1.0 = seq-major slower):
 
 | config (kv_heads, head_dim, layers) | contig run | L=512 | L=2048 | L=8192 | L=32768 |
 |---|---|---|---|---|---|
-| **head_dim=32 danger** (8, 32, 40) | 64 B | 0.991 | 0.965 | 0.994 | 0.996 |
+| **q-run 32 B — int4 KV** (8, hd=16, 40) | 32 B | 1.003 | 0.833 | 0.988 | 1.001 |
+| **head_dim=32 danger** (8, 32, 40) | 64 B | 1.002 | 0.949 | 0.998 | 0.999 |
 | qwen0.5b (2, 64, 24) | 128 B | 0.995 | 1.003 | 0.999 | 0.998 |
 | kv8 (8, 64, 40) | 128 B | 0.810 | 0.980 | 0.988 | 0.993 |
-| qwen14b (8, 128, 48) | 256 B | 1.003 | 1.019 | 1.008 | 1.005 |
+| qwen14b (8, 128, 48) | 256 B | 1.014 | 1.016 | 1.006 | 1.006 |
 
-Seq-major is within ±2% of head-major everywhere, and *faster* in the kv8/hd64
-cases. **The predicted `head_dim × dtype < 128 B` cache-line-halving does not
-occur.** Reason: heads are contiguous in the seq-major layout, so a 128 B cache
-line that holds head *h*'s 64 B token run also holds head *h+1*'s 64 B run, and
-all heads of a layer are read by concurrent warps — L2 recovers the neighbor
-half. The contiguous run being smaller than a cache line is harmless as long as
-the adjacent head is co-resident and co-read, which it always is.
+Seq-major is within ±2% of head-major everywhere (and *faster* in several
+cases). **The predicted `head_dim × dtype < 128 B` cache-line-halving does not
+occur — not even for a 32 B contiguous run** (int4 KV at head_dim 64, or fp8 at
+head_dim 32), which is a quarter of a 128 B cache line. Reason: heads are
+contiguous in the seq-major layout, so a cache line holding head *h*'s partial
+run also holds head *h+1*'s run, and all heads of a layer are read by concurrent
+warps — L2 recovers the neighbor. The contiguous run being smaller than a cache
+line is harmless as long as the adjacent head is co-resident and co-read, which
+it always is.
 
-**Danger-case reach:** the flagged case needs `head_dim × sizeof(dtype) < 128 B`,
-i.e. head_dim < 32 at fp16 (head_dim 32 = exactly 64 B, already tested clean).
-No model we target has head_dim < 64: Qwen2.5 uses 64/128, Llama/Mistral 128.
-head_dim 32 fp16 is already covered above with zero penalty. **Not a real risk.**
+**Quantized KV covered.** The bench's `head_dim` is the count of contiguous
+fp16 elements per token run, so a `B`-byte run is modelled by `head_dim = B/2`;
+the 32 B and 64 B rows above stand in for int4/fp8 KV whose runs shrink below
+64 B. This matters because we are independently moving toward quantized KV
+(§ intro), and the result says the strided read stays free there too.
+
+**Decode-step cost, not just synthetic bandwidth.** The reported ratio is the
+end-to-end kernel time of a faithful fused decode step (K+V read once, softmax,
+weighted V), interleaved H/S — i.e. the decode-step cost difference is what is
+tabled, and it is ≤2%.
 
 Caveat: absolute GB/s here (10–225 GB/s) is below peak DRAM because the
 single-warp-per-head fused kernel is latency/occupancy-bound at these block
@@ -346,8 +384,14 @@ it needs a layout tag, not a structural change.
 
 ## 5. Recommendation and smallest next increment
 
-**Recommendation: pursue seq-major on the native backend, as a per-backend
-capability.** The two falsification risks are cleared:
+**GO / NO-GO: GO** for seq-major on the native backend, as a per-backend
+capability. Both falsifiers that could have blocked it are cleared, and the
+granule lever being dead (#776, 2 MiB min == recommended) means seq-major is the
+**only** remaining fix for the granule floor — it is now the single convergence
+point for three separate goals (lower committed bytes, no CUDA-graph re-capture
+on growth, cross-request prefix sharing), not an optional optimization.
+
+The two falsification risks are cleared:
 1. ORT compatibility is preserved *by divergence*, not by a bridge — ORT stays
    BNSH, native goes seq-major, neither reads the other's KV bytes (§1, §4c). No
    unacceptable contract break; only a layout tag on the (already per-backend) KV
@@ -369,6 +413,17 @@ Caveat surfaced by this round: page sharing has its own **granule floor** — it
 saves nothing when the per-(layer,side) shared stripe is sub-granule
 (P < ~1K tok on 14B, < 8K tok on 0.5b), so the prize is a large-model /
 long-prefix win, not universal (§3.1).
+
+**Relationship to the #759 fixed-stride + dummy-tail design.** Because the
+granule lever is dead (#776), the #759 fixed-stride + dummy-page design is a
+**long-context-only** optimization under head-major — it beats bucket growth only
+*above* the 8K/16K crossover, where content finally fills the reserved granules.
+Seq-major makes that same benefit **unconditional** (no crossover at all). The
+two coexist and are complementary: the #759 dummy page remains valuable
+independent of layout for fault safety (a read-only tail page faults loudly
+instead of reading stale KV) and for enabling under-commitment; seq-major removes
+the floor while #759 hardens the tail. Nothing here supersedes #759 — it
+reframes it as a long-context hardening layer rather than the primary floor fix.
 
 **Smallest next increment** (one reviewable PR, not a fleet-wide conversion):
 1. Add a `KvLayout` tag to the native KV store / `KvPageStore` (default
@@ -394,8 +449,9 @@ kernel rewrite.
 ### Reproduction
 
 ```
-# from this worktree, with the CUDA PATH prepended (see below)
-cargo run --release -p bench-seqmajor   # prints the §2 strided-read table
+# the bench is its own workspace; run it from inside its directory
+cd bench-seqmajor
+cargo run --release            # prints the §2 strided-read table
 ```
 The §2 strided-read numbers come from `bench-seqmajor/` (GPU). The §3.1/§3.2
 prefix-sharing and capacity tables are closed-form from

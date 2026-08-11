@@ -20,11 +20,14 @@ use cudarc::nvrtc::Ptx;
 const SRC: &str = r#"
 #include <cuda_fp16.h>
 
-// One warp (32 lanes) per (head). Each lane owns head_dim/32 dims (head_dim a
-// multiple of 32). Fused online-softmax single pass over L tokens: read K row,
-// warp-shuffle dot with query, softmax update, read V row, accumulate. Reads K
-// and V exactly once each -> faithful decode KV traffic, warp-shuffle reduction
-// (matches gqa_decode_fp16). Only the token address stride differs by layout.
+// One warp (32 lanes) per (head). Each lane owns ceil(head_dim/32) dims (lanes
+// with index >= head_dim are masked, so head_dim < 32 is supported to model the
+// small contiguous runs of quantized KV). Fused online-softmax single pass over
+// L tokens: read K row, warp-shuffle dot with query, softmax update, read V row,
+// accumulate. Reads K and V exactly once each -> faithful decode KV traffic,
+// warp-shuffle reduction (matches gqa_decode_fp16). Only the token address
+// stride differs by layout. `head_dim` here is the number of contiguous fp16
+// elements per token run; a run of B bytes is modelled with head_dim = B/2.
 
 #define DEF_KERNEL(NAME, BASE)                                               \
 extern "C" __global__ void NAME(                                            \
@@ -35,19 +38,23 @@ extern "C" __global__ void NAME(                                            \
     const int group = blockIdx.x / heads;                                    \
     const int head = blockIdx.x % heads;                                     \
     const int lane = threadIdx.x;                                            \
-    const int per = head_dim / 32;                                           \
+    const int per = (head_dim + 31) / 32;                                     \
     const long gbase = (long)group * L * heads * head_dim;                    \
     float qd[8];                                                             \
-    for (int i = 0; i < per; ++i)                                            \
-        qd[i] = __half2float(q[head * head_dim + lane + i * 32]);            \
+    for (int i = 0; i < per; ++i) {                                          \
+        int d = lane + i * 32;                                               \
+        qd[i] = (d < head_dim) ? __half2float(q[head * head_dim + d]) : 0.f; \
+    }                                                                        \
     float m = -1e30f, l = 0.f;                                               \
     float acc[8];                                                            \
     for (int i = 0; i < per; ++i) acc[i] = 0.f;                             \
     for (int t = 0; t < L; ++t) {                                            \
         long base = gbase + (BASE);                                          \
         float dot = 0.f;                                                     \
-        for (int i = 0; i < per; ++i)                                        \
-            dot += qd[i] * __half2float(k[base + lane + i * 32]);            \
+        for (int i = 0; i < per; ++i) {                                      \
+            int d = lane + i * 32;                                           \
+            if (d < head_dim) dot += qd[i] * __half2float(k[base + d]);      \
+        }                                                                    \
         for (int s = 16; s > 0; s >>= 1)                                     \
             dot += __shfl_xor_sync(0xffffffffu, dot, s);                     \
         float score = dot * 0.125f;                                          \
@@ -55,12 +62,18 @@ extern "C" __global__ void NAME(                                            \
         float corr = __expf(m - nm);                                         \
         float p = __expf(score - nm);                                        \
         l = l * corr + p;                                                    \
-        for (int i = 0; i < per; ++i)                                        \
-            acc[i] = acc[i] * corr + p * __half2float(v[base + lane + i * 32]); \
+        for (int i = 0; i < per; ++i) {                                      \
+            int d = lane + i * 32;                                           \
+            if (d < head_dim)                                                \
+                acc[i] = acc[i] * corr + p * __half2float(v[base + d]);      \
+        }                                                                    \
         m = nm;                                                              \
     }                                                                        \
-    for (int i = 0; i < per; ++i)                                            \
-        out[(group * heads + head) * head_dim + lane + i * 32] = acc[i] / (l + 1e-9f); \
+    for (int i = 0; i < per; ++i) {                                          \
+        int d = lane + i * 32;                                               \
+        if (d < head_dim)                                                    \
+            out[(group * heads + head) * head_dim + d] = acc[i] / (l + 1e-9f); \
+    }                                                                        \
 }
 
 DEF_KERNEL(read_head_major, ((long)(head * L + t) * head_dim))
@@ -136,10 +149,14 @@ fn main() {
     let f_seq = module.load_function("read_seq_major").unwrap();
 
     // Realistic decode configs: (kv_heads_per_layer, head_dim, layers).
-    // qwen2.5-0.5b: kv_heads=2, head_dim=64, 24 layers.
-    // qwen14b-ish : kv_heads=8, head_dim=128, 48 layers.
-    // head_dim=32 danger case (contiguous run 64B < 128B cache line).
+    // head_dim is the count of contiguous fp16 elements per token run; a run of
+    // B bytes is modelled with head_dim = B/2, so smaller head_dim also stands in
+    // for QUANTIZED KV (fp8/int4) whose contiguous run shrinks below 64 B:
+    //   head_dim=16 -> 32 B run  (int4 hd64, or fp8 hd32)  -- worst quantized case
+    //   head_dim=32 -> 64 B run  (fp16 hd32, fp8 hd64, int4 hd128)
+    //   head_dim=64 -> 128 B run (fp16 hd64) ...
     let configs: &[(&str, i32, i32, i32)] = &[
+        ("q-run32B (int4)", 8, 16, 40),
         ("dhd32-kv8", 8, 32, 40),
         ("qwen0.5b", 2, 64, 24),
         ("kv8-hd64", 8, 64, 40),
