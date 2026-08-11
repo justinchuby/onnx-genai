@@ -303,3 +303,25 @@ Follow-Ups item 9, decisions inbox).
 **Still incomplete:**
 - Pris's fixture isolation fix for `full_lifecycle_negotiate_create_release`.
 - Hardware GPU validation (no GPU on this host; conformance runner exits 2 = UNVALIDATED).
+
+---
+
+### 2026-08-11T01:08Z — Stale-claims sweep of docs (HEAD `087d34888`)
+
+**Stale claims removed:**
+- **Delivery/push:** "Push is blocked", "no GH_TOKEN/GITHUB_TOKEN", "SSH private key", "GCM cache empty", "branch is committed locally", "PR must be opened by user" — all replaced with confirmation that PR #762 is open on origin.
+- **nxrt status:** "1 round-trip test failing", "9/10 passing", "Pris fixture-isolation fix pending/not yet landed", "env-var race" as a current problem, "PR stays draft until that test is green" — replaced with 10/10 green, ENV_MUTEX fix landed.
+- **SHAs:** All references to `99560c876` updated to `087d34888` (current HEAD). Old commit `3ab0ded68` reference in validation section updated.
+- **§524 table:** nxrt row changed from 🟡 to ✅ GREEN.
+
+**Files edited:**
+- `docs/EP_PLUGIN_EXPORT_PR.md` (header, branch table, push section, validation section, §524 table, §524 status, follow-ups 9+10, new appendix)
+- `docs/NXRT_ABI.md` (HEAD SHA, preamble table, §6 heading, §6.3 version, §6.10 test results, §7 running tests)
+- `docs/CUDA_EP_STATUS.md` (HEAD SHA, conformance runner line)
+- `.squad/decisions/inbox/roy-nxrt-and-cuda-status.md` (full refresh)
+
+**Validated at `087d34888`:** clippy clean (4 crates), 230 tests / 0 failures, `cargo check --workspace` clean, CUDA conformance runner exits 2 (UNVALIDATED — no GPU).
+
+**`docs/NXRT_ABI.md` links:** Confirmed intact at lines ~35 and in the §524 table. Not removed or mangled.
+
+**CUDA honest status:** UNVALIDATED. No self-hosted GPU workflow exists in this repo. `prefetch_lazy_weight` is a deliberate `Ok(false)` stub.

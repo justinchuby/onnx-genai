@@ -3,7 +3,7 @@
 **Author:** Roy (Lead)
 **Date:** 2026-08-11
 **Branch:** `squad/ep-plugin-parity-cuda` (draft PR #762)
-**HEAD at time of writing:** `99560c876`
+**HEAD at time of writing:** `087d34888`
 
 ---
 
@@ -88,7 +88,7 @@ scope.
 
 ## Running the Hardware Conformance Runner
 
-**`scripts/cuda_conformance_runner.sh` is committed at HEAD `99560c876`.**
+**`scripts/cuda_conformance_runner.sh` is committed at HEAD `087d34888`.**
 
 ### Preconditions (runner validates these before testing)
 

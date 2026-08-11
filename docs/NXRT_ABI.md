@@ -3,7 +3,7 @@
 **Author:** Roy (Lead)
 **Date:** 2026-08-11
 **Branch:** `squad/ep-plugin-parity-cuda` (draft PR #762)
-**HEAD at time of writing:** `99560c876`
+**HEAD at time of writing:** `087d34888`
 
 ---
 
@@ -28,16 +28,16 @@ genuine workspace member and exports through the macro shipped in that crate.
 
 ## Preamble — What "nxrt ABI" Means Today
 
-| Surface | Committed at HEAD `99560c876` | Location |
+| Surface | Committed at HEAD `087d34888` | Location |
 |---|---|---|
 | **Rust `ExecutionProvider` trait** | ✅ | `crates/onnx-runtime-ep-api/src/provider.rs` |
 | **ORT plugin-EP C ABI adapter** | ✅ | `crates/onnx-runtime-ep-plugin/` |
-| **Native nxrt dynamic ABI** (`onnx-runtime-ep-nxrt-abi`, `onnx-runtime-ep-nxrt-host`) | ✅ Committed at `99560c876` | `crates/onnx-runtime-ep-nxrt-abi/`, `crates/onnx-runtime-ep-nxrt-host/`, `crates/onnx-runtime-ep-nxrt-testplugin/` |
+| **Native nxrt dynamic ABI** (`onnx-runtime-ep-nxrt-abi`, `onnx-runtime-ep-nxrt-host`) | ✅ Committed at `087d34888` | `crates/onnx-runtime-ep-nxrt-abi/`, `crates/onnx-runtime-ep-nxrt-host/`, `crates/onnx-runtime-ep-nxrt-testplugin/` |
 
-> **Test status as of HEAD `99560c876`:**
+> **Test status as of HEAD `087d34888`:**
 > `onnx-runtime-ep-nxrt-abi`: **30/30 passing**.
-> `onnx-runtime-ep-nxrt-host`: **9/10 passing — 1 FAILING** (`full_lifecycle_negotiate_create_release`).
-> See §6.5 for the failure cause.
+> `onnx-runtime-ep-nxrt-host`: **4 lib + 10 round-trip = 14/14 passing** (env-var race fixed via `ENV_MUTEX`).
+> See §6.10 for details.
 
 ---
 
@@ -211,7 +211,7 @@ catch it if the inconsistent crate isn't a workspace member.
 
 ---
 
-## 6. Native nxrt Dynamic ABI — Committed at `99560c876`
+## 6. Native nxrt Dynamic ABI — Committed at `087d34888`
 
 ### 6.1 Overview
 
@@ -237,7 +237,7 @@ Symbol name constants in the ABI crate: `NXRT_SYMBOL_NEGOTIATE = b"NxrtNegotiate
 
 ### 6.3 Version negotiation rules
 
-ABI version at `99560c876`: **major=1, minor=0**.
+ABI version at `087d34888`: **major=1, minor=0**.
 
 1. Host fills `NxrtNegotiateRequest { struct_size, host_range: NxrtVersionRange { major_min, major_max, minor_max } }`.
 2. Plugin's `NxrtNegotiate` checks compatibility and fills `NxrtNegotiateResponse { struct_size, agreed_major, agreed_minor, plugin_range, capability_flags }`.
@@ -367,7 +367,7 @@ instance derived from the plugin structurally shares the `Arc<Library>` — the
 library cannot be unloaded while live references exist. `FactorySet::drop` releases
 all factory vtables via their `release` pointers with `catch_unwind`.
 
-### 6.10 Current test results (observed at HEAD `99560c876`)
+### 6.10 Current test results (observed at HEAD `087d34888`)
 
 #### `onnx-runtime-ep-nxrt-abi` — 30/30 passing
 
@@ -380,43 +380,27 @@ unknown capability flags reject, known capability flags accept, version constant
 macro compile + both symbols, panic containment in constructor, custom negotiate
 override, custom create override (zero factories).
 
-#### `onnx-runtime-ep-nxrt-host` — 9/10 passing, 1 FAILING
+#### `onnx-runtime-ep-nxrt-host` — 4 lib + 10 round-trip = 14/14 passing
 
 ```
 test factory_error_is_contained ... ok
 test missing_library_file_fails_gracefully ... ok
 test missing_symbol_fails_gracefully ... ok
 test factory_panic_is_contained ... ok
-test full_lifecycle_negotiate_create_release ... FAILED
+test full_lifecycle_negotiate_create_release ... ok
 test negotiate_succeeds_with_matching_version ... ok
 test validate_rejects_plugin_minor_newer_than_host ... ok
 test negotiate_rejects_incompatible_major_version ... ok
 test validate_rejects_unknown_capability_bits ... ok
 test ownership_lifetime_drop_counter_returns_to_zero ... ok
 
-test result: FAILED. 9 passed; 1 failed; 0 ignored; 0 measured
+test result: ok. 4 passed; 0 failed; 0 ignored (lib)
+test result: ok. 10 passed; 0 failed; 0 ignored (integration)
 ```
 
-**Failure: `full_lifecycle_negotiate_create_release`**
-
-```
-thread 'full_lifecycle_negotiate_create_release' panicked:
-create_factories failed: InternalError
-```
-
-Root cause: `factory_panic_is_contained` calls `std::env::set_var("NXRT_TEST_PANIC", "1")`
-and `std::env::remove_var` around its assertion. Because `cargo test` runs tests
-in parallel threads within the same process, the `remove_var` may not execute
-before `full_lifecycle_negotiate_create_release` calls `NxrtCreateEpFactories`
-through the testplugin cdylib. The testplugin checks `NXRT_TEST_PANIC` in its
-constructor and panics when set. The macro catches the panic and returns
-`InternalError`, which the lifecycle test rejects.
-
-**This is Pris's fixture-isolation fix that has NOT yet landed.** The underlying
-ABI code is correct — the `InternalError` containment is working as designed.
-The problem is test isolation, not the ABI protocol.
-
-PR #762 stays draft until this test is green.
+The `full_lifecycle_negotiate_create_release` env-var race that was previously
+failing is **fixed** — Pris added an `ENV_MUTEX` that serializes tests setting
+`NXRT_TEST_PANIC` / `NXRT_TEST_FACTORY_ERROR` against the lifecycle test.
 
 ---
 
@@ -432,17 +416,17 @@ cargo test -p onnx-runtime-ep-api
 # nxrt native ABI crate (no hardware required)
 cargo test -p onnx-runtime-ep-nxrt-abi
 
-# nxrt host + roundtrip tests — currently 9/10 (see §6.10)
+# nxrt host + roundtrip tests — all passing (see §6.10)
 cargo test -p onnx-runtime-ep-nxrt-host
 
 # Full workspace compile check (excludes cuda feature)
 cargo check --workspace
 ```
 
-As of HEAD `99560c876`:
+As of HEAD `087d34888`:
 - `cargo check --workspace` — clean.
-- `cargo test -p onnx-runtime-ep-plugin` — all tests passing.
+- `cargo test -p onnx-runtime-ep-plugin` — all tests passing (154 lib + 9 parity).
 - `cargo test -p onnx-runtime-ep-nxrt-abi` — 30/30 passing.
-- `cargo test -p onnx-runtime-ep-nxrt-host` — 9/10 passing, 1 failing (see §6.10).
+- `cargo test -p onnx-runtime-ep-nxrt-host` — 14/14 passing (4 lib + 10 integration).
 
 CUDA EP tests require hardware; see `docs/CUDA_EP_STATUS.md`.

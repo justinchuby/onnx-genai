@@ -32,3 +32,13 @@ Separately: confirmed rubber-duck's empty-answer diagnosis — `quick --greedy
 
 Inbox drop `gaff-review-reasoning-fixture.md` was lost when the worktree was deleted
 before Scribe ran; content reconstructed into `.squad/decisions.md`.
+
+## 2026-08-11 — env var verifier: filename-reference false-positive fix
+
+CI job 93646716235 failed because `verify_documented_env_vars.py` matched
+`NXRT_ABI` from the filename `docs/NXRT_ABI.md` referenced in
+`EP_PLUGIN_EXPORT_PR.md`. Added a negative lookahead `(?!\.(?:md|rst|toml)\b)`
+to `ENV_PATTERN` so documentation cross-references are not mistaken for
+environment variables. Updated the module docstring to explain the exclusion.
+Re-proved the gate still catches genuinely undocumented variables (`NXRT_FAKE_KNOB`
+experiment passed).
