@@ -727,6 +727,7 @@ mod tests {
                 totals_dev,
                 0,
                 0.0,
+                0,
             )
             .unwrap();
 
@@ -754,6 +755,7 @@ mod tests {
                 totals_dev,
                 0,
                 0.0,
+                0,
             )
             .unwrap();
             let mut repeated_f16 = vec![f16::ZERO; num_heads * head_dim];
@@ -815,6 +817,7 @@ mod tests {
             totals_dev,
             0,
             0.0,
+            0,
         )
         .unwrap();
         runtime.end_graph_capture().unwrap();
@@ -956,6 +959,7 @@ mod tests {
                     totals_dev,
                     0,
                     0.0,
+                    0,
                 )
                 .unwrap();
                 let mut got = vec![f16::ZERO; num_heads * head_dim];
