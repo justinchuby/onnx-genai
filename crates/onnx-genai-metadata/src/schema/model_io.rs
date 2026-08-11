@@ -63,6 +63,14 @@ pub struct ModelIoSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_ownership: Option<KvOwnership>,
 
+    /// Physical layout of this backend's KV cache tensors (`head_major_bnsh` or
+    /// `seq_major_bsnh`). This is a per-backend capability — each backend owns
+    /// its KV buffers and never reads the other's KV bytes — so the ORT backend
+    /// stays head-major while the native backend may declare seq-major. Absent
+    /// preserves the historical head-major (BNSH) behavior. See [`KvLayout`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_layout: Option<KvLayout>,
+
     /// Token-id input (e.g. `input_ids`).
     ///
     /// A graph MAY declare this together with `inputs_embeds_input`: some fused
@@ -309,6 +317,46 @@ pub enum KvOwnership {
     Owned,
     /// The graph reads references to KV owned and advanced by another decoder.
     Shared,
+}
+
+/// Physical memory layout of a backend's KV cache tensors.
+///
+/// This is a **per-backend capability**, not a cross-backend constant: the two
+/// backends own their KV buffers independently and never read each other's KV
+/// bytes, so they may store the cache differently. The ONNX Runtime backend
+/// requires head-major BNSH (`[batch, kv_heads, seq, head_dim]`) because ORT's
+/// GroupQueryAttention past/present is BNSH on every dispatch path (Flash,
+/// cuDNN SDPA, memory-efficient, XQA). The native backend additionally supports
+/// seq-major BSNH (`[batch, seq, kv_heads, head_dim]`), which makes each token's
+/// live prefix contiguous across heads — shrinking the VMM granule floor by the
+/// `kv_heads` factor, removing growth-triggered graph re-capture (the append
+/// stride is sequence-length independent), and making page-level prefix sharing
+/// (#777) practical. Absent preserves the historical head-major behavior.
+///
+/// On-device, the native backend selects the layout by stamping the `kv_layout`
+/// attribute (`0` = BNSH, `1` = BSNH) on its GroupQueryAttention nodes; the
+/// CUDA EP honors it on the fused fp16 single-token decode pair. Seq-major is
+/// only enabled end-to-end once the prefill (flash) read is also converted, so
+/// the two never disagree about how a shared cache is physically laid out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum KvLayout {
+    /// Head-major BNSH `[batch, kv_heads, seq, head_dim]`. ORT-compatible; the
+    /// default for both backends.
+    HeadMajorBnsh,
+    /// Seq-major BSNH `[batch, seq, kv_heads, head_dim]`. Native backend only.
+    SeqMajorBsnh,
+}
+
+impl KvLayout {
+    /// The `kv_layout` GroupQueryAttention attribute value the native backend
+    /// stamps for this layout (`0` = BNSH, `1` = BSNH).
+    pub fn gqa_attribute_value(self) -> i64 {
+        match self {
+            KvLayout::HeadMajorBnsh => 0,
+            KvLayout::SeqMajorBsnh => 1,
+        }
+    }
 }
 
 /// One fixed-shape loop-carried recurrent-state port pair.
