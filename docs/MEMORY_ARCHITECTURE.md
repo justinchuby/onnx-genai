@@ -145,54 +145,304 @@ pooled dense-attention scores slot — govern `standard_attention.rs:602` and
 same `workspace_requirement` + prepared-workspace contract, then fold in the
 legacy `attention.rs:711` per-call path.
 
-### KV reservation geometry: the crossover, the granule floor, and read-bounded commit
+### KV layout and residency
 
-This is the single home for the KV VMM geometry. Other documents should link
-here rather than restate it, because the numbers below were each measured to
-overturn an earlier plausible-looking claim, and a copied number drifts.
+This is the single authoritative home for KV layout, VMM geometry, residency,
+and the measurements behind the design. Investigation notes link here rather
+than copying conclusions, following the anti-staleness rule established in
+#781.
 
-**The granule floor is per-object, not per-token (#776).** KV is stored
-per-binding, head-major, so a fixed full-context stride commits `objects ×
-granule`, not `ceil(content / granule)`. There is no "tokens per granule": you
-cannot pack multiple tokens of one head-stripe into a shared granule when each
-head-stripe is its own binding with the full-context stride. Measured on
-qwen2.5-0.5b: **96 head-stripes × 2 MiB = 192 MiB physically committed to hold
-~12 KiB of live content.** An earlier `docs/DESIGN.md` §39.5 table framed this as
-"~1024 tokens per 2 MiB granule" and floored a sequence at `num_layers × 2 ×
-2 MiB`; that reasoning was wrong and was publicly corrected.
+**Status, as of 2026-08-11:**
 
-**The crossover is `granule / (head_dim × sizeof(dtype))` and is model-size
-independent (#776).** Under head-major layout, `layers` and `kv_heads` cancel
-between the full-context-VA cost and bucket-growth cost, so the context length at
-which a stable full-context VA commits *less* than power-of-two bucket growth
-depends only on the granule, the head dimension, and the KV element size:
+- **Implemented:** head-major BNSH remains the default. PR #782 added a
+  per-backend `KvLayout` tag (default `HeadMajorBnsh`) and landed the
+  seq-major BSNH fused fp16 single-token decode append/read pair. Seq-major is
+  hard-gated to those converted paths; unsupported readers and writers fail
+  rather than silently mis-index. It is not yet an end-to-end layout for every
+  attention path.
+- **Measured, not implemented:** token-major across all layers. Its residency
+  floor and 192 KiB-stride read cost were measured in #787, but no production
+  kernel or binding layout uses it.
+- **Proposed, in progress:** replace the growing layout enum with a stride
+  descriptor and make layout selection a per-EP, per-platform capability
+  (#783). The descriptor, binding views, layout negotiation, prefix multi-map,
+  staggering, and commit-ahead policy described below are design intent, not
+  present-tense capabilities.
+
+#### Governing rule: layout controls residency
+
+`cuMemMap` maps a whole granule-aligned **window** of virtual address space onto
+a whole physical granule. Partial mapping does not exist:
 
 ```
-crossover_tokens = granule / (head_dim × sizeof(dtype))
+VA: |<------ granule ------>|<------ granule ------>|<------ granule ------>|
+       window 0                 window 1                 window 2
+       mapped or not            mapped or not            mapped or not
+
+committed bytes = granule × (number of windows containing at least one live byte)
 ```
 
-On this device (2 MiB granule): ~**8,192 tokens** at head_dim 128 / fp16,
-~**16,384 tokens** at head_dim 64 / fp16. Verified on hardware across a **480×
-model-size range** (PR #776). Quantized KV makes the crossover *worse*: fp8/int8
-halves bytes-per-element and therefore **doubles** the crossover in tokens, so a
-full-context VA is the wrong default for exactly the long-context/quantized-KV
-regime it looks most attractive for. Below the crossover a stable full-context VA
-over-commits; above it, virtual contiguity wins and growth becomes remap rather
-than copy.
+The allocator cannot compact live bytes that the tensor layout scattered across
+VA windows. This is the same unsurprising behavior as a sparse file: writing one
+byte at offsets 0, 1 MiB, and 2 MiB can consume three filesystem blocks for
+three live bytes. Nothing is malfunctioning; the placement selected three
+allocation units.
 
-**`CU_MEM_ALLOC_GRANULARITY_MINIMUM == RECOMMENDED == 2 MiB` on this device
-(#776).** There is no finer device granule available here, so "shrink the
-granule" is not an available lever on this hardware — the 2 MiB floor is a
-hardware constant to design around, not a tunable.
+In the diagrams below, `X` is live KV, `.` is reserved but not live, and each
+bracketed span is one physical-mapping window.
 
-**The read pattern forces the commit, not the reservation (#772).** A read
-bounded to the live length leaves the reservation tail *uncommitted*, including
-under captured replay; reading one byte past the live length faults
-`CUDA_ERROR_INVALID_VALUE`. So a stable full-context VA does not itself commit
-the tail — an over-broad read does. This is the correct attribution of the #721
-stage-4 **32× regression**: a stable full-context VA committed **1.5 GB** where
-bucket growth commits **48 MB**, because the read spanned the full context rather
-than the live prefix. Bound the read to the live length and the tail stays free.
+**Head-major BNSH scatters one live prefix per head stripe:**
+
+```
+one layer-side buffer, four heads shown:
+
+ head 0              head 1              head 2              head 3
+|X.................|X.................|X.................|X.................|
+[==== window 0 ====][==== window 1 ====][==== window 2 ====][==== window 3 ====]
+      COMMIT               COMMIT               COMMIT               COMMIT
+
+Four tiny live fragments open four complete physical windows.
+```
+
+Each head owns its full `max_seq × head_dim` stripe. Across the model, the
+near-empty floor is therefore `layers × 2 × kv_heads` windows.
+
+**Seq-major BSNH is dense within each buffer, but K and V remain separate for
+every layer:**
+
+```
+one layer-side buffer:
+
+|XXXXXXXX........................................................|
+[==== window 0 ====][==== window 1 ====][==== window 2 ====]
+      COMMIT              unmapped              unmapped
+
+all layer-side buffers:
+
+layer 0 K: [X...][ ][ ]  COMMIT
+layer 0 V: [X...][ ][ ]  COMMIT
+layer 1 K: [X...][ ][ ]  COMMIT
+...
+layer 47 V:[X...][ ][ ]  COMMIT        (96 independent buffers on qwen14b)
+```
+
+The live prefix is dense, but every independent reservation has its own window
+zero. The floor is `layers × 2` windows.
+
+**Token-major across all layers makes the complete sequence one dense run:**
+
+```
+one reservation, with every layer's K and V interleaved by token:
+
+| token 0: all layers | token 1: all layers | token 2 ...               |
+|XXXXXXXXXXXXXXXXXXXXXX..................................................|
+[========== window 0 ==========][========== window 1 ==========]
+             COMMIT                           unmapped
+```
+
+The per-layer bindings become views into that reservation. The floor is one
+window per sequence. This was measured, but that binding model is not built
+(#787).
+
+**A paged-attention block is fully allocated regardless of its internal
+layout:**
+
+```
+pre-committed block pool:
+ [ blk 0 ][ blk 1 ][ blk 2 ][ blk 3 ] ...
+     ^        ^                 ^
+   seq A    seq B             seq A       (selected through a block table)
+
+inside any allocated block, the same bytes are occupied:
+ BNHS [head][dim][token]   BNSH [head][token][dim]   BSNH [token][head][dim]
+```
+
+Paging therefore decouples physical residency from internal layout: layout is a
+compute-side choice because the allocation unit is already fully used. Flat VA
+plus VMM couples them: a window is only as full as the layout makes it (#783).
+
+#### Measured floor progression
+
+For qwen14b (`48` layers, K+V, `8` KV heads, head dimension `128`, fp16) on the
+measured 2 MiB CUDA granule:
+
+| Layout | Floor unit | Near-empty floor | Evidence/status |
+|---|---:|---:|---|
+| BNSH head-major | `layers × 2 × kv_heads = 768` | ~1.5 GiB | Default; geometry measured in #772/#776/#787 |
+| BSNH seq-major | `layers × 2 = 96` | ~192 MiB | Decode pair landed in #782 |
+| token-major across all layers | `1` per sequence | ~2 MiB | **768× measured reduction**, #787; not implemented |
+
+The small-model measurement makes the waste concrete: qwen2.5-0.5b committed
+**96 head stripes × 2 MiB = 192 MiB to hold about 12 KiB** of live KV (#772).
+The token-major probe repeated the comparison on qwen14b: the identical
+196,608-byte one-token payload committed **1,536 MiB head-major versus 2 MiB
+token-major**, the measured 768× reduction (#787).
+
+This also preserves an important historical correction. The earlier
+"tokens per granule" model was **wrong for head-major** and was publicly
+retracted in #776: independently strided heads cannot pool their sub-granule
+live bytes. The same model is **exactly right for token-major**, where all KV for
+a token is contiguous in one reservation (#787). The granule, model, and VMM
+are unchanged; only layout changes. That is the clearest demonstration that
+layout is the governing variable.
+
+#### Crossover against bucket growth
+
+The crossover is the context length below which a fixed full-context stride
+commits more physical memory than growing a packed bucket. For head-major:
+
+```
+crossover_head_major = granule / (head_dim × sizeof(dtype))
+```
+
+`layers` and `kv_heads` cancel, so this crossover is **model-size independent**.
+Hardware probes spanning a 480× model-size range measured about **8,192 tokens**
+at head dimension 128/fp16 and **16,384 tokens** at head dimension 64/fp16
+(#776).
+
+Seq-major changes the unit:
+
+```
+crossover_seq_major = granule / (kv_heads × head_dim × sizeof(dtype))
+```
+
+It is no longer model-independent: it scales with `kv_heads`. With the measured
+2 MiB granule it is **1,024 tokens on qwen14b** and **8,192 on
+qwen2.5-0.5b** (#778). Token-major has **no crossover**: packed growth and the
+fixed flat view occupy the same dense byte stream, rounded once per sequence
+(#787).
+
+A live-length-bounded read leaves the reserved tail physically uncommitted,
+including under captured graph replay; reading one byte into an uncommitted
+tail faults. Thus reservation alone does not force commitment (#772). Layout
+decides which windows the bounded live prefix touches, while an over-broad read
+can additionally force the tail.
+
+#### Granularity is the coupling, and it is platform-specific
+
+On the development GPU,
+`CU_MEM_ALLOC_GRANULARITY_MINIMUM == CU_MEM_ALLOC_GRANULARITY_RECOMMENDED ==
+2 MiB`; no finer device granule is available (#776). If the granule were one
+byte, layout would be irrelevant to residency. On this CUDA device, the floor
+must therefore be fixed by layout rather than by tuning the allocator.
+
+Reported minimum mapping units span roughly 500× across relevant APIs (#783):
+
+| Platform/API | Typical minimum unit | Consequence |
+|---|---:|---|
+| CUDA VMM | ~2 MiB, measured here | Layout severity described above |
+| HIP VMM | commonly ~2 MiB; must be queried | Re-derive for #731; do not inherit CUDA's answer |
+| Level Zero / Intel device-local | ~64 KiB | Much smaller layout penalty |
+| Vulkan sparse buffers | ~64 KiB | Much smaller layout penalty |
+| CPU `mmap` | 4 KiB | Usually negligible |
+| Metal / Apple Silicon | no direct equivalent; unified-memory regime | Re-derive residency semantics (#608) |
+
+At 64 KiB, the head-major head-dimension-128/fp16 crossover is about **256
+tokens**, so realistic contexts generally exceed it (#783). Intel's reported
+BNHS preference is therefore coherent with Level Zero's much finer pages: a
+layout that is severe on this CUDA device can be reasonable on Intel.
+
+**Design intent:** granularity must be queried as a device property and feed
+memory-strategy inference (#735), not be hardcoded. Layout follows from
+`(platform granularity, EP capability, model geometry)`. HIP support (#731)
+must measure and re-derive rather than copy the CUDA choice.
+
+#### Read and remap costs
+
+**Measured read cost is not the obstacle.** Seq-major/head-major decode-read
+ratios were **0.80-1.02 (within 2%)** for sequence lengths 512 through 32K
+(#778). The token-major probe then held bytes and occupancy constant while
+raising the token stride to 192 KiB: at a 6 GiB working set the bandwidth ratio
+was **1.000**, about **207 GB/s (~80% of peak)** (#787). On this device the reads
+are DRAM-bandwidth-bound independently of stride; 2 MiB-backed device memory
+keeps the 192 KiB stride within TLB reach.
+
+**Measured remap cost is a burst, not a per-token tax.** A granule supplies
+about 8,192 tokens of headroom per head-major stripe or 1,024 per seq-major
+buffer on qwen14b. Amortizing remaps across those tokens yields about 0.1% of a
+step, but hides the user-visible event: all aligned buffers cross together on
+one token. The measured qwen14b boundary burst was **49.5 ms head-major versus
+4.5 ms seq-major** (#778).
+
+Lockstep is an alignment artifact, not an inherent VMM requirement.
+**Proposed, not built:** stagger buffer phases or commit ahead of the write
+frontier. Commit-ahead is graph-safe because VMM preserves the virtual address;
+bucket growth changes the address/stride and forces graph re-capture (#778).
+
+#### Paged attention is the alternative architecture
+
+Paged attention avoids layout-dependent residency by making every kernel follow
+a block table. Its per-sequence allocation quantum is not merely one small
+per-layer block: a vLLM-style 16-token growth step needs a block in every layer.
+For qwen14b:
+
+```
+196,608 bytes/token × 16 tokens = 3 MiB per sequence
+```
+
+The equivalent VMM calculation is:
+
+| Model | `granule / KV bytes per token` | 16-token paged quantum | Token-major VMM quantum |
+|---|---:|---:|---:|
+| qwen14b | 10.67 tokens | ~3 MiB | 2 MiB |
+| qwen2.5-0.5b | 170.67 tokens | ~0.19 MiB | 2 MiB |
+
+These arithmetic comparisons were verified in #787. Token-major plus VMM
+matches or slightly beats the paged quantum for qwen14b without adding a block
+table to every kernel, but is honestly coarser on the small model. It also keeps
+physical memory returnable. The compared vLLM policy pre-commits a pool (about
+90% of VRAM by default) for the process lifetime rather than returning unused
+capacity to the system (#783).
+
+#### Quantization is a split result
+
+Because VMM's quantum is byte-denominated, token-major density automatically
+scales with quantization on qwen14b: **10.7, 21.3, and 42.7 tokens per granule**
+for fp16, fp8, and int4, with no tuning (#787). However, the per-sequence
+**byte** floor stays 2 MiB at every dtype, while the waste in a token-denominated
+16-token paged design shrinks with bytes per token. Under aggressive
+quantization, paging can therefore have the smaller partial-allocation waste.
+
+The durable design conclusion is narrower:
+
+- Head-major makes KV quantization and residency **antagonistic**: halving bytes
+  per token doubles the crossover in tokens (#776/#787).
+- Token-major makes them **independent**: there is no crossover; the one-window
+  floor remains one window at any dtype (#787).
+
+#### Prefix sharing is the concurrency-scaled prize
+
+The floor is a constant that amortizes with context length. Shared-prefix
+savings scale with concurrent requests, the axis multi-request serving in #750
+cares about:
+
+- Head-major: a prefix is `layers × 2 × kv_heads` scattered fragments.
+- Seq-major: it is `layers × 2` contiguous layer-side ranges.
+- Token-major: it is **one contiguous range covering every layer**, shareable
+  with one physical-handle multi-map.
+
+For a 2,000-token shared prompt and eight concurrent qwen14b requests, avoiding
+the seven duplicate copies saves about **2.56 GiB** (#777/#787). This uses the
+multi-map primitive proven in #727, but detection, lifetime, read-only/COW
+enforcement, and 1:N handle bookkeeping are **not yet implemented**.
+
+#### Layout belongs to the KV owner
+
+Layout is a per-EP, per-platform capability, not a global constant (#783).
+ONNX Runtime GQA is BNSH-only on every dispatch path:
+`group_query_attention_helper.h` hardcodes
+`past_kv_format = Q_K_V_BNSH`. The native backend may use seq-major while ORT
+remains BNSH because each backend owns its KV buffers and neither reads the
+other's bytes (#522, #726).
+
+A per-step transpose bridge is disqualified: decode reads the complete live KV
+every step, so a bridge adds a second full KV pass on the hot path (#783). For
+heterogeneous multi-EP placement (#603), the design rule is therefore:
+**the owner of the KV buffer chooses the layout; another EP must accept that
+layout or not participate in that KV.** The proposed stride descriptor and
+capability negotiation are tracked in #783. The fixed-stride/dummy-tail work in
+#759 remains complementary fault-safety machinery; it cannot repair residency
+that a layout has already scattered.
 
 **Weight offload and CUDA graph capture are mutually exclusive today.** The
 pager's alloc/copy/free operations are capture-illegal, so enabling offload
