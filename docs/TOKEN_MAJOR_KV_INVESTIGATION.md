@@ -28,9 +28,14 @@ And on memory *granularity* token-major is **equivalent-or-finer than vLLM
 paging** (§6): vLLM's real per-sequence allocation quantum is `block_size × all
 layers` = **~3 MiB** on qwen14b (16 tokens), versus token-major's **2 MiB**
 granule (~10.7 tokens) — same order, and token-major keeps flat kernels (no page
-walk) and returns physical memory on demand. Quantized KV makes token-major
-*denser* (21.3 tokens/granule at fp8) while making head-major's crossover
-*worse* — the asymmetry reinforces the quantized-KV direction.
+walk) and returns physical memory on demand. Quantization is a *split* result
+(§6, both verified): it auto-scales tokens-per-granule up (fp8 21.3, int4 42.7)
+with no tuning, but token-major's per-sequence **byte** floor stays a fixed 2 MiB
+at any dtype, so under aggressive quantization a token-denominated paged design
+wastes *fewer* bytes than we do. The claim that survives intact is the important
+one: **head-major makes quantization and residency antagonistic** (its crossover
+doubles as bytes halve), **while token-major makes them independent** (no
+crossover — the floor is already one granule per sequence).
 
 The smallest next increment is **not** a kernel rewrite: it is a `KvLayout`
 stride-descriptor (§4, siding with #783 over a third enum variant) plus binding
@@ -265,31 +270,79 @@ General formulas (reproducible for any model):
 | vLLM paging | `block_size × kv_bytes_per_token` (**~3 MiB** qwen14b) | **yes** | no — pool pre-committed |
 | **token-major + VMM** | **1 granule = 2 MiB** (~**10.7** tokens qwen14b) | **no** | **yes** |
 
-### Internal fragmentation per sequence
-- **token-major:** at most **one partial granule** = **≤ 2 MiB** wasted per
-  sequence, *model-independent* (the last granule holds the write frontier;
-  everything before it is dense).
-- **paged:** at most **one partial block** = `≤ block_size × kv_bytes_per_token`,
-  which *scales with the model* — 3 MiB on qwen14b, 0.19 MiB on qwen0.5b.
+### Internal fragmentation per sequence — same units, both designs
+Stated so the two are directly comparable (bytes wasted per sequence, worst case):
 
-**Honest reading, both directions.** On qwen14b token-major is *slightly finer*
-(2 MiB vs 3 MiB bound; 10.7 vs 16 tokens/quantum) — equivalent-or-better, as
-claimed. But the bound cuts the other way on small models: on qwen0.5b the 2 MiB
-granule holds 170 tokens, so token-major's ≤ 2 MiB waste is *coarser* than paged's
-≤ 0.19 MiB. This is the same amortizes-with-model-size theme as the floor
-(#778): token-major's granularity story is strong exactly where multi-request
-serving cares — large models — and the absolute waste is one 2 MiB granule per
-sequence regardless (≈16 MiB across 8 concurrent sequences), which is negligible.
+- **token-major:** at most **one partial granule** = **≤ 2 MiB**,
+  *model- and dtype-independent* (the last granule holds the write frontier;
+  everything before it is dense). The 2 MiB bound is **hardware-imposed** — it is
+  the CUDA device granule, measured by #776 as `MINIMUM == RECOMMENDED == 2 MiB`,
+  with no finer granule available on this device.
+- **paged:** at most **one partial block** = `≤ block_size × kv_bytes_per_token`.
+  The `block_size` (16 tokens) is a **design choice**, so this bound is
+  token-denominated and *scales with the model and the dtype* — 3 MiB on qwen14b
+  fp16, 0.19 MiB on qwen0.5b fp16.
 
-### Quantized KV flips the asymmetry the right way
-Halving bytes per token (fp16 → fp8/int8) **halves `kv_bytes_per_token`, doubling
-tokens per granule** under token-major: qwen14b 10.67 → **21.33**, qwen0.5b
-170.67 → **341.33** — token-major gets *denser* and its fragmentation ratio
-*improves*. The opposite happens to the **head-major** granule crossover
-`granule / (head_dim × dtype)`, which *doubles* in tokens (8,192 → 16,384 on
-qwen14b) — the floor dominates *longer*. Since we are independently moving toward
-quantized KV, this asymmetry matters: quantization and token-major reinforce each
-other, whereas quantization and head-major fight.
+**Honest reading, both directions.** On qwen14b fp16 token-major is *slightly
+finer* (2 MiB vs 3 MiB bound; 10.7 vs 16 tokens/quantum). But the bound cuts the
+other way on small models: on qwen0.5b the 2 MiB granule holds 170 tokens, so
+token-major's ≤ 2 MiB waste is *coarser* than paged's ≤ 0.19 MiB. The absolute
+waste is one 2 MiB granule per sequence regardless (≈16 MiB across 8 concurrent
+sequences), so this is a nuance, not a threat.
+
+### Quantized KV — corrected, two separate claims
+My earlier "quantization is a uniform win for token-major" was half right. Split
+honestly (both tables verified on both models at fp16/fp8/int4):
+
+**Claim 1 (true, and good): tokens-per-granule auto-scales with quantization,
+with no tuning,** because our quantum is *byte-denominated* (the hardware 2 MiB
+granule):
+
+| qwen14b | kv_bytes_per_token | token-major tokens/granule |
+|---|---|---|
+| fp16 | 196,608 B | **10.7** |
+| fp8  |  98,304 B | **21.3** |
+| int4 |  49,152 B | **42.7** |
+
+(qwen0.5b: 170.7 → 341.3 → 682.7 for fp16/fp8/int4.)
+
+**Claim 2 (also true, and it cuts against us): the per-sequence byte floor does
+NOT shrink with quantization — it stays one granule, 2 MiB, always.** A paged
+design's quantum is *token-denominated* (`block_size` tokens), so its byte waste
+*does* shrink as the model is quantized. Worst-case wasted bytes per sequence:
+
+| | Quantum type | fp16 | fp8 | int4 |
+|---|---|---|---|---|
+| Paged (token-denominated, block=16) | scales | ~3 MiB | ~1.5 MiB | ~0.75 MiB |
+| **token-major + VMM** (byte-denominated, 2 MiB granule) | fixed | **2 MiB** | **2 MiB** | **2 MiB** |
+
+So at fp16 token-major wastes less; **under aggressive KV quantization a
+token-denominated (paged) design wastes fewer bytes per sequence than we do.**
+Stated plainly rather than hidden — though the absolute numbers are small (≤ one
+partial granule, ~16 MiB at 8 concurrent), so it is a nuance, not a threat.
+
+**The claim that survives intact — and is the one worth emphasising:** under
+**head-major**, KV quantization and memory efficiency *fight each other*. The
+head-major granule crossover `granule / (head_dim × sizeof(dtype))` *doubles* in
+tokens as bytes halve (qwen14b hd128: **8,192 → 16,384 → 32,768** for
+fp16/fp8/int4), so a quantized model needs an even *longer* context before a fixed
+stride stops losing to bucket growth. Under **token-major there is no crossover at
+all**, because the floor is already one granule per sequence at any dtype. The
+correct statement is therefore: **head-major makes quantization and residency
+antagonistic; token-major makes them independent** (and, per Claim 1, throws in
+free extra tokens-per-granule as a bonus).
+
+### Hardware-imposed vs design choice — so the comparison is fair
+- **Hardware-imposed:** the **2 MiB granule** (#776: `MINIMUM == RECOMMENDED`, no
+  finer granule on this device) — this fixes token-major's per-sequence byte
+  floor and is not tunable without a driver patch we do not take (the vAttention
+  64 KiB UVM patch, rejected in `vmm_allocator.rs` rationale).
+- **Design choices:** vLLM's **`block_size`** (16 tokens) — freely tunable, which
+  is exactly why paged waste is token-denominated and shrinks under quantization;
+  and token-major's decision to keep **one flat contiguous VA** (so kernels never
+  walk a page table), which is what forces the byte-denominated 2 MiB quantum in
+  the first place. The trade is explicit: token-major spends a fixed ≤ 2 MiB/seq
+  of internal fragmentation to buy page-table-free kernels and on-demand release.
 
 ### Historical note — layout is the whole story
 The "≈10.7 tokens per granule" figure was computed early in this work, applied to
@@ -300,7 +353,8 @@ arithmetic does not hold. Under **token-major** that same arithmetic is *exactly
 correct, because the token's bytes are one contiguous 192 KiB run. Same granule,
 same model, same VMM — **only the layout differs.** That is the entire thesis of
 this line of work, restated as a single number that is false one way and true the
-other. (Verified: `python` check of both models, reproduced in the commit.)
+other. (Verified: `python` check of both models at fp16/fp8/int4, reproduced in
+the commit.)
 
 ---
 
