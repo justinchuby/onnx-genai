@@ -15,6 +15,7 @@ use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, Ten
 use onnx_runtime_ir::{DataType, Node};
 
 use crate::error::driver_err;
+use crate::kernels::kv_stride::KvCacheStrides;
 use crate::runtime::{CudaRuntime, cuptr};
 
 use super::attention::{AttentionDtype, run_attention_phase2a};
@@ -23,6 +24,14 @@ use super::gqa_decode;
 use super::gqa_decode_fp16;
 
 const PREP_SRC: &str = r#"
+// Default (head-major BNSH) KV-cache append destination index. A non-default
+// layout (seq-major BSNH) prepends its own `#define GQA_KV_DST` before this
+// source, and this `#ifndef` guard yields to it, so the fused prep write indexes
+// from the KV stride descriptor with no runtime layout branch.
+#ifndef GQA_KV_DST
+#define GQA_KV_DST(b, h, slot) \
+    ( ((long)((b) * kv_heads + (h)) * present_capacity + (slot)) * dim )
+#endif
 extern "C" __global__ void gqa_transpose_bsh_to_bnsh(
     const float* src, float* dst, int batch, int seq, int heads, int dim)
 {
@@ -346,7 +355,7 @@ extern "C" __global__ void gqa_fuse_decode_prep(
     const float* cos_cache, const float* sin_cache,
     const long long* position_ids, int batch, int q_heads, int kv_heads, int dim,
     int rotary_dim, int present_capacity, int cache_rows, int do_rotary,
-    int interleaved, int cache_is_half, int kv_layout)
+    int interleaved, int cache_is_half)
 {
     (void)cache_is_half;
     const int head_half = dim / 2;
@@ -400,9 +409,7 @@ extern "C" __global__ void gqa_fuse_decode_prep(
         return;
     }
     if (past < 0 || past >= present_capacity) return;
-    const long dst = (kv_layout == 0)
-        ? ((long)(b * kv_heads + h) * present_capacity + past) * dim
-        : ((long)(b * present_capacity + past) * kv_heads + h) * dim;
+    const long dst = GQA_KV_DST(b, h, past);
     if (region == 1) {
         const long src = (long)b * (packed ? packed_hidden : kv_hidden)
                        + (packed ? q_hidden : 0) + (long)h * dim;
@@ -429,6 +436,13 @@ extern "C" __global__ void gqa_fuse_decode_prep(
 const PREP_HALF_SRC: &str = r#"
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+
+// Default (head-major BNSH) KV-cache append destination index; a seq-major
+// layout prepends its own `#define GQA_KV_DST` and this guard yields to it.
+#ifndef GQA_KV_DST
+#define GQA_KV_DST(b, h, slot) \
+    ( ((long)((b) * kv_heads + (h)) * present_capacity + (slot)) * dim )
+#endif
 
 __device__ __forceinline__ int gqa_prepare_metadata_batch1(
     const int* seqlens_k, int* total_lengths, int* past_lengths,
@@ -637,7 +651,7 @@ __device__ void gqa_fuse_decode_prep_body(
     const void* cos_cache, const void* sin_cache,
     const long long* position_ids, int batch, int q_heads, int kv_heads, int dim,
     int rotary_dim, int present_capacity, int cache_rows, int do_rotary,
-    int interleaved, int cache_is_half, int kv_layout)
+    int interleaved, int cache_is_half)
 {
     const int head_half = dim / 2;
     const int rotary_half = rotary_dim / 2;
@@ -690,9 +704,7 @@ __device__ void gqa_fuse_decode_prep_body(
         return;
     }
     if (past < 0 || past >= present_capacity) return;
-    const long dst = (kv_layout == 0)
-        ? ((long)(b * kv_heads + h) * present_capacity + past) * dim
-        : ((long)(b * present_capacity + past) * kv_heads + h) * dim;
+    const long dst = GQA_KV_DST(b, h, past);
     if (region == 1) {
         const long src = (long)b * (packed ? packed_hidden : kv_hidden)
                        + (packed ? q_hidden : 0) + (long)h * dim;
@@ -760,20 +772,20 @@ extern "C" __global__ void gqa_fuse_decode_prep_##SUFFIX( \
     const void* cos_cache, const void* sin_cache, \
     const long long* position_ids, int batch, int q_heads, int kv_heads, int dim, \
     int rotary_dim, int present_capacity, int cache_rows, int do_rotary, \
-    int interleaved, int cache_is_half, int kv_layout) { \
+    int interleaved, int cache_is_half) { \
     gqa_fuse_decode_prep_body<TYPE>(q_src, k_src, v_src, packed, q_bnsh, present_k, \
         present_v, seqlens_k, total_lengths, past_lengths, query_starts, past_capacity, \
         error_flag, derive_metadata, cos_cache, sin_cache, position_ids, batch, \
         q_heads, kv_heads, dim, rotary_dim, present_capacity, cache_rows, do_rotary, \
-        interleaved, cache_is_half, kv_layout); \
+        interleaved, cache_is_half); \
 }
 
 DEFINE_GQA_HALF_KERNELS(__half, f16)
 DEFINE_GQA_HALF_KERNELS(__nv_bfloat16, bf16)
 "#;
 
-const PREP_MODULE: &str = "group_query_attention_prep_v2_seqmajor";
-const PREP_HALF_MODULE: &str = "group_query_attention_prep_half_v2_seqmajor";
+const PREP_MODULE: &str = "group_query_attention_prep_v3";
+const PREP_HALF_MODULE: &str = "group_query_attention_prep_half_v3";
 const BLOCK: u32 = 256;
 const WS_TOTALS: usize = 0;
 const WS_PAST_LENGTHS: usize = 1;
@@ -856,14 +868,11 @@ impl KernelFactory for GroupQueryAttentionFactory {
             ));
         }
         let kv_layout = node.attr("kv_layout").and_then(|a| a.as_int()).unwrap_or(0);
-        if kv_layout != 0 && kv_layout != 1 {
-            return Err(EpError::KernelFailed(format!(
-                "cuda_ep GroupQueryAttention: kv_layout {kv_layout} must be 0 (BNSH) or 1 (BSNH)"
-            )));
-        }
-        let kv_layout_i = i32::try_from(kv_layout).map_err(|_| {
-            EpError::KernelFailed("cuda_ep GroupQueryAttention: kv_layout exceeds i32".into())
-        })?;
+        // Build the KV stride descriptor the native backend's `kv_layout`
+        // attribute selects. `from_attribute` rejects any value other than
+        // 0 (head-major BNSH) or 1 (seq-major BSNH) — the wire attribute carries
+        // only the two named layouts.
+        let kv_strides = KvCacheStrides::from_attribute(kv_layout)?;
         Ok(Box::new(
             GroupQueryAttentionKernel::new(
                 self.runtime.clone(),
@@ -880,7 +889,7 @@ impl KernelFactory for GroupQueryAttentionFactory {
                     .unwrap_or(-1),
                 softcap,
             )?
-            .with_kv_layout(kv_layout_i),
+            .with_kv_strides(kv_strides),
         ))
     }
 }
@@ -904,12 +913,14 @@ pub struct GroupQueryAttentionKernel {
     softcap: f32,
     backend: GroupQueryAttentionBackend,
     prep_fusion_disabled: bool,
-    /// KV cache physical layout: 0 = head-major BNSH (default, ORT-compatible),
-    /// 1 = seq-major BSNH. Stamped by the native backend on its own GQA nodes
-    /// (`kv_layout` attribute) since the native path owns its KV buffers and no
-    /// other consumer reads them on-device. Seq-major is only honored on the
-    /// fused fp16 single-token decode path; any other path rejects it.
-    kv_layout: i32,
+    /// KV cache physical layout as a stride descriptor. The default is
+    /// head-major BNSH (ORT-compatible), which every reader and writer honors.
+    /// The native backend sets this to seq-major BSNH on GQA nodes whose KV it
+    /// exclusively owns; a non-default layout is honored solely on the fused
+    /// fp16 single-token decode path, and any other path rejects it. The
+    /// converted kernels generate their index arithmetic from this descriptor at
+    /// NVRTC module-build time, so there is no runtime layout branch.
+    kv_strides: KvCacheStrides,
     workspace: Mutex<GqaWorkspace>,
     last_capture_safe_signature: Mutex<Option<GqaCaptureSignature>>,
 }
@@ -1178,7 +1189,7 @@ impl GroupQueryAttentionKernel {
             softcap,
             backend: GroupQueryAttentionBackend::Auto,
             prep_fusion_disabled: false,
-            kv_layout: 0,
+            kv_strides: KvCacheStrides::head_major_bnsh(),
             last_capture_safe_signature: Mutex::new(None),
         })
     }
@@ -1188,13 +1199,22 @@ impl GroupQueryAttentionKernel {
         self
     }
 
-    /// Select the KV cache physical layout (0 = head-major BNSH, 1 = seq-major
-    /// BSNH). Only the native backend sets this to 1, on GQA nodes whose KV it
-    /// exclusively owns; seq-major is honored solely on the fused fp16 decode
+    /// Select the KV cache stride descriptor. The native backend sets a
+    /// non-default (seq-major) descriptor on GQA nodes whose KV it exclusively
+    /// owns; a non-default layout is honored solely on the fused fp16 decode
     /// path (see [`Self::run`]).
-    pub fn with_kv_layout(mut self, kv_layout: i32) -> Self {
-        self.kv_layout = kv_layout;
+    pub(crate) fn with_kv_strides(mut self, kv_strides: KvCacheStrides) -> Self {
+        self.kv_strides = kv_strides;
         self
+    }
+
+    /// Select the KV cache layout by its wire attribute value (0 = head-major
+    /// BNSH, 1 = seq-major BSNH). A thin adapter over [`Self::with_kv_strides`]
+    /// for callers that only have the integer attribute.
+    pub fn with_kv_layout(self, kv_layout: i32) -> Self {
+        let kv_strides = KvCacheStrides::from_attribute(i64::from(kv_layout))
+            .unwrap_or_else(|_| KvCacheStrides::head_major_bnsh());
+        self.with_kv_strides(kv_strides)
     }
 
     /// Forces the unfused per-op decode prep chain (split, transpose, append,
@@ -1778,13 +1798,14 @@ impl GroupQueryAttentionKernel {
             && !self.prep_fusion_disabled;
         let fuse_metadata = fuse_prep && batch == 1;
 
-        // Seq-major (BSNH) KV is a native-backend-only capability wired through
-        // exactly one path in this increment: the fused fp16 single-token decode
-        // prep write plus the fp16 split-K decode read. Every other prep path
-        // (unfused append/build/RoPE) and every other reader (flash / f32 decode
-        // / reference / phase2a) still assumes head-major BNSH, so reject a
-        // seq-major cache that would reach them rather than silently corrupt it.
-        if self.kv_layout == 1 && !(fuse_prep && q.dtype == DataType::Float16) {
+        // A non-default (seq-major BSNH) KV layout is a native-backend-only
+        // capability wired through exactly one path in this increment: the fused
+        // fp16 single-token decode prep write plus the fp16 split-K decode read.
+        // Every other prep path (unfused append/build/RoPE) and every other
+        // reader (flash / f32 decode / reference / phase2a) still assumes
+        // head-major BNSH, so reject a non-default cache that would reach them
+        // rather than silently corrupt it.
+        if !self.kv_strides.is_head_major() && !(fuse_prep && q.dtype == DataType::Float16) {
             return Err(EpError::KernelFailed(
                 "cuda_ep GroupQueryAttention: seq-major (BSNH) KV requires the fused fp16 \
                  single-token decode prep path (aliased in-place cache, past==present capacity, \
@@ -1878,7 +1899,6 @@ impl GroupQueryAttentionKernel {
         let dim_i = checked_i32(dim, "head_size")?;
         let past_capacity_i = checked_i32(past_capacity, "past capacity")?;
         let present_capacity_i = checked_i32(present_capacity, "present capacity")?;
-        let kv_layout_i: i32 = self.kv_layout;
         let local_window_i = i32::try_from(self.local_window_size.max(0)).map_err(|_| {
             EpError::KernelFailed(
                 "cuda_ep GroupQueryAttention: local_window_size exceeds i32".into(),
@@ -1962,10 +1982,25 @@ impl GroupQueryAttentionKernel {
             let do_rotary_i: i32 = self.do_rotary.into();
             let derive_metadata_i: i32 = fuse_metadata.into();
             let fused_count = batch * (self.num_heads + 2 * self.kv_num_heads) * (dim / 2);
+            // The fused write indexes the KV cache from the stride descriptor.
+            // Head-major reuses the shared prep module (its `#ifndef GQA_KV_DST`
+            // default write formula); a seq-major layout prepends a specialized
+            // `GQA_KV_DST` prelude and loads a distinct, per-layout module.
+            let fuse_src_owned: String;
+            let (fuse_module, fuse_src): (&str, &str) = if self.kv_strides.is_head_major() {
+                (prep_module, prep_src)
+            } else {
+                self.kv_strides.require_converted_path_support()?;
+                fuse_src_owned = format!("{}{}", self.kv_strides.prep_prelude(), prep_src);
+                (
+                    self.kv_strides.prep_half_module_key()?,
+                    fuse_src_owned.as_str(),
+                )
+            };
             launch_1d!(
                 self.runtime,
-                prep_module,
-                prep_src,
+                fuse_module,
+                fuse_src,
                 fuse_entry,
                 fused_count,
                 builder,
@@ -1997,8 +2032,7 @@ impl GroupQueryAttentionKernel {
                         .arg(&cache_rows)
                         .arg(&do_rotary_i)
                         .arg(&interleaved_i)
-                        .arg(&rope_cache_is_half)
-                        .arg(&kv_layout_i);
+                        .arg(&rope_cache_is_half);
                 }
             );
         } else {
@@ -2210,7 +2244,9 @@ impl GroupQueryAttentionKernel {
                 .saturating_add(softmax_flops)
         });
         let use_fused = selected_backend == GroupQueryAttentionBackend::Fused;
-        if self.kv_layout == 1 && !(!use_fused && gqa_decode_fp16::supported(q_seq, dim)) {
+        if !self.kv_strides.is_head_major()
+            && !(!use_fused && gqa_decode_fp16::supported(q_seq, dim))
+        {
             return Err(EpError::KernelFailed(
                 "cuda_ep GroupQueryAttention: seq-major (BSNH) KV must read through the \
                  capture-safe fp16 split-K decode kernel; the selected reader (fused flash / \
@@ -2319,7 +2355,7 @@ impl GroupQueryAttentionKernel {
                 totals_gpu,
                 local_window_i,
                 self.softcap,
-                kv_layout_i,
+                &self.kv_strides,
             )?;
         } else if q.dtype == DataType::Float32 {
             onnx_runtime_ep_api::record_kernel_variant!(
