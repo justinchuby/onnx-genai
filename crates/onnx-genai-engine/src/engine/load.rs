@@ -784,6 +784,7 @@ fn maybe_fill_hybrid_io_from_graph(metadata: &mut InferenceMetadata, model_path:
     let io = ModelIoSpec {
         sequence_source: None,
         kv_ownership: None,
+        kv_layout: None,
         token_input: present_input("input_ids"),
         inputs_embeds_input: None,
         attention_mask_input: present_input("attention_mask"),

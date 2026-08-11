@@ -1493,6 +1493,7 @@ impl Engine {
             && state.decode_state.use_kv
             && self.kv_model.is_some()
             && self.kv_cache.page_table.tensor_config.is_some()
+            && !self.ort_session_has_recurrent_state()
         {
             let matched = self
                 .prefix_cache
@@ -1785,6 +1786,23 @@ impl Engine {
         self.session
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))
+    }
+
+    /// Whether the loaded ORT decoder declares loop-carried recurrent state, in
+    /// which case paged / materialized-past prefix reuse must be declined and a
+    /// full recompute forced (#701), mirroring the native `has_recurrent_state`
+    /// gate (#700). Returns `false` when no ORT session is loaded — the paged
+    /// reuse path requires one, so the guard cannot suppress a legitimate reuse.
+    fn ort_session_has_recurrent_state(&self) -> bool {
+        let Some(session) = self.session.as_deref() else {
+            return false;
+        };
+        let io = self
+            .metadata
+            .model
+            .as_ref()
+            .and_then(|model| model.io.as_ref());
+        ort_session_has_recurrent_state(session, io)
     }
 
     fn ensure_session_kv_current(
