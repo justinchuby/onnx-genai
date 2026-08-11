@@ -17,8 +17,8 @@ use std::ffi::c_void;
 
 use onnx_genai_ort_sys as ort;
 use onnx_runtime_ep_api::kernel::Kernel;
-use onnx_runtime_ep_api::tensor::{DevicePtr, TensorView};
-use onnx_runtime_ir::{DataType, Node};
+use onnx_runtime_ep_api::tensor::{DevicePtr, DevicePtrMut, TensorMut, TensorView};
+use onnx_runtime_ir::{DataType, DeviceId, Node};
 
 use crate::kernel_ctx::{allocate_output, read_inputs};
 use crate::status::{fail_status, ok_status};
@@ -599,6 +599,8 @@ pub enum NodeInputSource {
     Ort(usize),
     /// Take from an intermediate buffer written by an earlier node.
     Buffer(usize),
+    /// The input is absent (omitted optional). Must not be read by the kernel.
+    Absent,
 }
 
 /// Where a node's i-th output tensor goes in a fused multi-node subgraph.
@@ -789,6 +791,12 @@ unsafe extern "C" fn compute_execute(
                             let view: TensorView<'static> = unsafe { std::mem::transmute(view) };
                             kernel_inputs.push(view);
                         }
+                        NodeInputSource::Absent => {
+                            // Absent optional input — provide a null-backed
+                            // sentinel TensorView so the kernel can detect it
+                            // via `view.is_absent()`.
+                            kernel_inputs.push(TensorView::absent(DataType::Undefined));
+                        }
                     }
                 }
 
@@ -808,13 +816,21 @@ unsafe extern "C" fn compute_execute(
 
                 // We need to know which output slot → which sink.
                 for (out_slot, (shape, sink)) in output_shapes.iter().zip(sinks).enumerate() {
+                    let out_dtype = match entry.output_dtypes.get(out_slot).copied() {
+                        Some(DataType::Undefined) => {
+                            // Absent output slot — skip allocation entirely.
+                            continue;
+                        }
+                        Some(dt) => dt,
+                        None => {
+                            return fail_status(&format!(
+                                "Compute: output slot {out_slot} has no declared dtype \
+                                 (output_dtypes vec is too short)"
+                            ));
+                        }
+                    };
                     match sink {
                         NodeOutputSink::Ort(ort_idx) => {
-                            let out_dtype = entry
-                                .output_dtypes
-                                .get(out_slot)
-                                .copied()
-                                .unwrap_or(DataType::Float32);
                             match unsafe {
                                 allocate_output(api_ref, kernel_context, *ort_idx, shape, out_dtype)
                             } {
@@ -826,11 +842,6 @@ unsafe extern "C" fn compute_execute(
                             let _ = out_slot;
                         }
                         NodeOutputSink::Buffer(buf_idx) => {
-                            let out_dtype = entry
-                                .output_dtypes
-                                .get(out_slot)
-                                .copied()
-                                .unwrap_or(DataType::Float32);
                             buf_writes.push((*buf_idx, shape.clone(), out_dtype));
                         }
                     }
@@ -901,20 +912,87 @@ unsafe extern "C" fn compute_execute(
                     return fail_status(&format!("Compute: shape inference failed: {e}"));
                 }
             };
-            let mut owned_outputs = Vec::with_capacity(entry.num_outputs);
-            for (out_idx, shape) in output_shapes.iter().enumerate() {
-                let out_dtype = entry
-                    .output_dtypes
-                    .get(out_idx)
-                    .copied()
-                    .unwrap_or(DataType::Float32);
-                match unsafe { allocate_output(api_ref, kernel_context, out_idx, shape, out_dtype) }
-                {
-                    Ok(out) => owned_outputs.push(out),
+            // Allocate outputs. Absent slots (DataType::Undefined) get a
+            // local scratch buffer so the kernel sees the full output arity
+            // and can index by position, while only present slots are
+            // allocated through ORT's kernel context (sequential ORT indices).
+            let mut owned_outputs: Vec<crate::kernel_ctx::OwnedOutput> = Vec::new();
+            let mut absent_bufs: Vec<Vec<u8>> = Vec::new();
+            // Track whether each node output slot is ORT-allocated or absent.
+            enum SlotKind {
+                Ort,           // present, comes from ORT
+                Absent(usize), // index into absent_bufs
+            }
+            let mut slot_map: Vec<SlotKind> = Vec::with_capacity(entry.num_outputs);
+            let mut ort_out_idx: usize = 0;
+
+            for (out_slot, shape) in output_shapes.iter().enumerate() {
+                let out_dtype = match entry.output_dtypes.get(out_slot).copied() {
+                    Some(DataType::Undefined) => {
+                        // Absent output slot — allocate scratch buffer.
+                        // Use the inferred shape (may be reduced dims) so the
+                        // kernel can write without bounds error, but the data
+                        // is discarded.
+                        let numel: usize = shape.iter().product::<usize>().max(1);
+                        // Use Float32 byte size for the scratch — kernels
+                        // write f32 for mean/inv_std in LayerNorm.
+                        let buf = vec![0u8; numel * 4];
+                        let idx = absent_bufs.len();
+                        absent_bufs.push(buf);
+                        slot_map.push(SlotKind::Absent(idx));
+                        continue;
+                    }
+                    Some(dt) => dt,
+                    None => {
+                        return fail_status(&format!(
+                            "Compute: output slot {out_slot} has no declared dtype \
+                             (output_dtypes vec is too short)"
+                        ));
+                    }
+                };
+                match unsafe {
+                    allocate_output(api_ref, kernel_context, ort_out_idx, shape, out_dtype)
+                } {
+                    Ok(out) => {
+                        owned_outputs.push(out);
+                        slot_map.push(SlotKind::Ort);
+                    }
                     Err(e) => return fail_status(&format!("Compute: {e}")),
                 }
+                ort_out_idx += 1;
             }
-            let mut output_views: Vec<_> = owned_outputs.iter_mut().map(|o| o.view_mut()).collect();
+            // Build output views in node-output order so the kernel sees the
+            // full arity including absent scratch slots.
+            let absent_shapes: Vec<Vec<usize>> = output_shapes.clone();
+            let absent_strides_storage: Vec<Vec<i64>> = absent_shapes
+                .iter()
+                .map(|s| contiguous_strides(s))
+                .collect();
+            // First, get mutable views of all ORT outputs in order.
+            let mut ort_views: Vec<TensorMut<'_>> =
+                owned_outputs.iter_mut().map(|o| o.view_mut()).collect();
+            let mut ort_view_iter = ort_views.drain(..);
+            let mut output_views: Vec<TensorMut<'_>> = Vec::with_capacity(slot_map.len());
+            for (slot_idx, kind) in slot_map.iter().enumerate() {
+                match kind {
+                    SlotKind::Ort => {
+                        output_views.push(ort_view_iter.next().unwrap());
+                    }
+                    SlotKind::Absent(idx) => {
+                        let buf = &mut absent_bufs[*idx];
+                        let shape = &absent_shapes[slot_idx];
+                        let strides = &absent_strides_storage[slot_idx];
+                        let view = TensorMut::new(
+                            DevicePtrMut(buf.as_mut_ptr().cast()),
+                            DataType::Float32,
+                            unsafe { std::mem::transmute::<&[usize], &[usize]>(shape.as_slice()) },
+                            unsafe { std::mem::transmute::<&[i64], &[i64]>(strides.as_slice()) },
+                            DeviceId::cpu(),
+                        );
+                        output_views.push(view);
+                    }
+                }
+            }
             if let Err(e) = entry.kernel.execute(&kernel_inputs, &mut output_views) {
                 return fail_status(&format!("Compute: kernel execution failed: {e}"));
             }

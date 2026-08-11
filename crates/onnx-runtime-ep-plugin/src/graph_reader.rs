@@ -172,13 +172,26 @@ impl OutboundGraphReader {
                 })
                 .collect();
 
+            // Preserve positional output slots: ONNX addresses outputs by
+            // position, so omitted optional outputs (empty name) must remain
+            // as placeholder ValueIds with DataType::Undefined rather than
+            // being compacted away, which would shift downstream positions.
             let outputs: Vec<ValueId> = node_output_names[i]
                 .iter()
-                .filter_map(|n| {
+                .enumerate()
+                .map(|(slot, n)| {
                     if n.is_empty() {
-                        None
+                        // Absent output slot — create a sentinel value so the
+                        // position is preserved in the IR node's output list.
+                        ir_graph.create_named_value(
+                            format!("__absent_output_{i}_{slot}"),
+                            DataType::Undefined,
+                            vec![],
+                        )
                     } else {
-                        value_map.get(n).copied()
+                        *value_map.get(n).unwrap_or_else(|| {
+                            panic!("BUG: output name {n:?} not found in value_map")
+                        })
                     }
                 })
                 .collect();
