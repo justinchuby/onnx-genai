@@ -851,6 +851,13 @@ impl GenAiConfig {
             processor_program_json(&processor, vision, vision_pixel_info, vision_grid_info)?;
 
         let mut decoder_io = Map::new();
+        // The split-VLM decoder is driven by `inputs_embeds` produced by the
+        // embedding component (the vision encoder raises image features into the
+        // same embedding stream); it declares no token-id input. Declare the
+        // sequence source explicitly so decode resolves the embeds input rather
+        // than defaulting to a (non-existent) token input. This mirrors the
+        // text-only fallback (`to_strict_text_only_pipeline_metadata`).
+        decoder_io.insert("sequence_source".into(), json!("inputs_embeds"));
         if let Some(token) = self.model.decoder.inputs.input_ids.as_deref() {
             require_graph_input(&graphs.decoder, token, "decoder")?;
             decoder_io.insert("token_input".into(), json!(token));
