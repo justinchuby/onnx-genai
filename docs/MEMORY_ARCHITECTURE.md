@@ -104,12 +104,46 @@ call; it owns the governed workspace preparation path
 | `weight_paging.rs:479` | staged async lazy weight page upload | `len` | weight tensor storage | weight residency/page lifetime | governed by weight residency budget, not workspace contract |
 | `weight_paging.rs:643` | multi-region lazy QMoE weight binding | `weight.region_bytes_len()` | weight tensor storage | weight binding/page lifetime | governed by weight residency budget, not workspace contract |
 
-The largest demonstrably live non-QMoE scratch bypass in this audit was
-`IndexShare`: on GLM/DSA it can reserve two present-cache staging buffers plus a
-score matrix proportional to `B * heads * q_seq * selected_width`, and it is on
-the native CUDA decode path. This increment routes that slice through
+This increment governs the `IndexShare` slice — routing it through
 `Kernel::workspace_requirement`, prepare-only planning, `reserve_workspace`, and
-`MappedGrowthGrant` rather than through a kernel-owned raw scratch pool.
+`MappedGrowthGrant` rather than a kernel-owned raw scratch pool. `IndexShare` is
+a real but **low-byte** governed slice, not the largest live bypass in this
+table. Its two `present_key`/`present_value` staging segments (the largest part
+of its reservation) are *reserved-but-unused* on the common decode path: the
+layout always reserves them (`kernels/index_share.rs:615-616`), but when present
+outputs are requested — `want_present = outputs.len() == 3`
+(`kernels/index_share.rs:847`) — the kernel writes present K/V directly to the
+output tensors, not the workspace (`kernels/index_share.rs:871-879`). On that
+path only the `scores` segment is consumed, and in decode `q_seq == 1` with a
+sparse `selected_width`, so the live bytes are small. `IndexShare` is also a
+`pkg.nxrt` custom op used only by GLM/DSA sparse-attention families, so it is not
+on the hot path for dense models. It was governed first because it cleanly
+mirrors the QMoE contract, not because it is the largest or hottest bypass.
+
+#### Next slice (chosen from this table): dense-attention quadratic score buffers
+
+The genuinely large, always-live non-QMoE bypasses are the dense-attention score
+buffers, which scale **quadratically** with sequence length and are live on
+every dense decode/prefill step:
+
+| candidate | byte formula | why always live |
+|---|---|---|
+| `kernels/attention.rs:711` | `batch * num_heads * sq * sk * elem_size` | legacy `Attention` phase-2 scores; allocated on every `execute`, request/prefill-dependent, quadratic in `sq*sk`. |
+| `kernels/group_query_attention.rs:945` | pooled `scores` slot ≈ `batch * num_heads * sq * sk * elem_size` | `GroupQueryAttention` pooled scratch; grown to the largest score matrix seen and kept session-persistent, so it holds the quadratic peak. |
+| `kernels/standard_attention.rs:602` | pooled `scores` slot ≈ `batch * num_heads * sq * sk * elem_size` | default-domain `Attention` pooled scratch; same quadratic scores slot, session-persistent. |
+
+All three carry the same quadratic `batch * num_heads * sq * sk * elem_size`
+score term (e.g. `B=1, H=32, sq=sk=2048, fp16` ≈ 256 MB), which dwarfs
+`IndexShare`'s live bytes at realistic shapes. On prefill the three are
+comparable in peak bytes; the two pooled variants
+(`group_query_attention.rs:945`, `standard_attention.rs:602`) are the higher-value
+target because their session-persistent growable pools **retain** the quadratic
+peak across steps rather than freeing it each `execute`, so they hold resident
+bytes for the whole session. The recommended next increment is therefore the
+pooled dense-attention scores slot — govern `standard_attention.rs:602` and
+`group_query_attention.rs:945` (which share the pooled-scratch shape) through the
+same `workspace_requirement` + prepared-workspace contract, then fold in the
+legacy `attention.rs:711` per-call path.
 
 ### The platform is part of the memory system
 
