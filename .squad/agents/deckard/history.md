@@ -68,3 +68,27 @@ Pre-2026-08-10 entries moved to `history-archive.md`. Covers: kernel pre-binding
 - **`prefetch_lazy_weight`**: Left as `Ok(false)` stub. No `try_without_eviction` API on `CudaWeightResidency`; implementing prefetch that may evict violates the standing directive. Proper fix requires a new residency method + GPU validation.
 - **Unvalidated**: Runtime EP construction, ORT session execution, allocator/transfer/stream, kernel routing, and `page_lazy_weight` — all require a real GPU host.
 - **Validation**: `cargo check --workspace` ✅, `cargo clippy -p onnx-runtime-ep-plugin --all-targets -- -D warnings` ✅, `cargo test -p onnx-runtime-ep-cuda-plugin` → 3 passed, `cargo test -p onnx-runtime-ep-cpu-plugin` → 23 passed.
+
+## 2026-08-11 — PR #762 CI unblock: clippy Range::contains lint
+
+**Branch:** `squad/ep-plugin-parity-cuda`
+
+**Fix:** `crates/onnx-runtime-ep-cpu/src/kernels/mod.rs:2293` — replaced `delta >= 0 && delta < 50` with `(0..50).contains(&delta)` (clippy `manual_range_contains`, fatal under `RUSTFLAGS="-D warnings"`).
+
+**Assertion verdict: NOT flaky.** The assertion bounds a structural count difference (`reg.len() as isize - descriptors.len() as isize`) between two static in-memory registries built from code. There is no wall-clock timing, no I/O, no concurrency. The bound of 50 is generous slack for CNN-registered ops. Cannot flake on a loaded CI runner.
+
+**Other lint cleared:** None. Both `onnx-runtime-ep-api` and `onnx-runtime-ep-cpu` passed `RUSTFLAGS="-D warnings" cargo clippy --locked --all-targets` with zero warnings after the single-line fix.
+
+**Validation output (all passing):**
+```
+RUSTFLAGS="-D warnings" cargo clippy --locked --all-targets -p onnx-runtime-ep-api -p onnx-runtime-ep-cpu
+→ Finished `dev` profile [unoptimized + debuginfo] target(s) in 11.17s  ✅
+
+RUSTFLAGS="-D warnings" cargo clippy --locked --all-targets -p onnx-runtime-session -p onnx-runtime-eager
+→ Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.40s   ✅
+
+cargo fmt --all -- --check                                                ✅
+
+cargo test -p onnx-runtime-ep-cpu
+→ 6 passed (shared_allocator integration tests), 0 failed               ✅
+```

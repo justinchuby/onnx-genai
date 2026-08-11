@@ -2290,7 +2290,7 @@ mod tests {
         // Descriptors should be close to registry len; CNN ops are the delta.
         let delta = reg.len() as isize - descriptors.len() as isize;
         assert!(
-            delta >= 0 && delta < 50,
+            (0..50).contains(&delta),
             "descriptor count ({}) should be close to registry len ({}), delta={}",
             descriptors.len(),
             reg.len(),
