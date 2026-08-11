@@ -596,8 +596,18 @@ impl Kernel for TopKKernel {
         let mut indices = vec![0i64; out_len];
         for outer in 0..numel(&inputs[0].shape[..axis]) {
             for i in 0..inner {
+                if k == 0 {
+                    continue;
+                }
                 let mut candidates: Vec<usize> = (0..width).collect();
-                candidates.sort_by(|&a, &b| {
+                // `topk_order` is a total order (ties broken by index), so we do
+                // not need to fully sort the whole axis. Partition once to move
+                // the k winners to the front in O(width) average (introselect,
+                // the same `select_nth_unstable_by` technique the sampler's
+                // `top_k_threshold` uses), then sort only those k in O(k log k).
+                // For k << width (e.g. k=40 over a 152k-wide vocab axis) this is
+                // an order-of-magnitude fewer comparisons than a full sort.
+                let cmp = |&a: &usize, &b: &usize| {
                     topk_order(
                         x[(outer * width + a) * inner + i],
                         x[(outer * width + b) * inner + i],
@@ -605,8 +615,13 @@ impl Kernel for TopKKernel {
                         b,
                         self.largest,
                     )
-                });
-                for (rank, d) in candidates.into_iter().take(k).enumerate() {
+                };
+                if k < width {
+                    candidates.select_nth_unstable_by(k - 1, &cmp);
+                    candidates.truncate(k);
+                }
+                candidates.sort_by(&cmp);
+                for (rank, d) in candidates.into_iter().enumerate() {
                     let dst = (outer * k + rank) * inner + i;
                     values[dst] = x[(outer * width + d) * inner + i];
                     indices[dst] = d as i64;
@@ -1039,6 +1054,44 @@ mod tests {
         .unwrap();
         assert_eq!(v.to_f32(), vec![4., 5., 2., 3.]);
         assert_eq!(i.to_i64(), vec![1, 0, 0, 2]);
+    }
+
+    #[test]
+    fn topk_partial_select_breaks_ties_by_index() {
+        // k < width with duplicate values forces the introselect partition to
+        // resolve ties: ONNX requires the lower index to win. Shape [1,6], k=3.
+        // Values [5,5,5,5,1,2] -> top3 must be indices [0,1,2] (the three
+        // lowest indices among the tied 5.0s), NOT any partition-dependent set.
+        let x = Owned::f32(&[1, 6], &[5., 5., 5., 5., 1., 2.]);
+        let k = Owned::i64(&[], &[3]);
+        let mut v = Owned::zeros_f32(&[1, 3]);
+        let mut i = Owned::zeros(DataType::Int64, &[1, 3]);
+        TopKKernel {
+            axis: 1,
+            largest: true,
+        }
+        .execute(&[x.view(), k.view()], &mut [v.view_mut(), i.view_mut()])
+        .unwrap();
+        assert_eq!(v.to_f32(), vec![5., 5., 5.]);
+        assert_eq!(i.to_i64(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn topk_smallest_partial_select() {
+        // largest=false with k < width, exercising the ascending partition.
+        // [7,3,9,1,5] -> smallest 2 are [1,3] at indices [3,1].
+        let x = Owned::f32(&[1, 5], &[7., 3., 9., 1., 5.]);
+        let k = Owned::i64(&[], &[2]);
+        let mut v = Owned::zeros_f32(&[1, 2]);
+        let mut i = Owned::zeros(DataType::Int64, &[1, 2]);
+        TopKKernel {
+            axis: 1,
+            largest: false,
+        }
+        .execute(&[x.view(), k.view()], &mut [v.view_mut(), i.view_mut()])
+        .unwrap();
+        assert_eq!(v.to_f32(), vec![1., 3.]);
+        assert_eq!(i.to_i64(), vec![3, 1]);
     }
 
     #[test]
