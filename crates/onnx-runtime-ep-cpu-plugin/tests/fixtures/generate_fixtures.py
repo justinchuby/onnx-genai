@@ -205,6 +205,78 @@ def gen_nonzero_1x4():
     save(model, "nonzero_1x4")
 
 
+# ── cast_f32_to_i64 ──────────────────────────────────────────────────────────
+# Cast f32 [2,3] → i64.  Output dtype differs from input dtype.
+# This is the B1 regression test: output_dtypes must read from the ORT graph's
+# value info, not from the first input's dtype.
+# X = [[1.5, 2.7, 3.0], [4.9, 5.1, 6.0]]
+# Expected Y = [[1, 2, 3], [4, 5, 6]] (truncated toward zero)
+def gen_cast_f32_to_i64():
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [2, 3])
+    Y = helper.make_tensor_value_info("Y", TensorProto.INT64, [2, 3])
+    node = helper.make_node("Cast", inputs=["X"], outputs=["Y"], to=TensorProto.INT64)
+    graph = helper.make_graph([node], "cast_f32_to_i64", [X], [Y])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    save(model, "cast_f32_to_i64")
+
+
+# ── where_bool_f32 ───────────────────────────────────────────────────────────
+# Where(condition, X, Y) → f32.  First input is bool, output is f32.
+# This is the B1 regression test: output_dtypes must NOT guess from the first
+# input (bool) — the output dtype is f32.
+# condition = [[true, false], [false, true]]
+# X = [[1.0, 2.0], [3.0, 4.0]]
+# Y = [[10.0, 20.0], [30.0, 40.0]]
+# Expected Z = [[1.0, 20.0], [30.0, 4.0]]
+def gen_where_bool_f32():
+    C = helper.make_tensor_value_info("C", TensorProto.BOOL, [2, 2])
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [2, 2])
+    Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [2, 2])
+    Z = helper.make_tensor_value_info("Z", TensorProto.FLOAT, [2, 2])
+    node = helper.make_node("Where", inputs=["C", "X", "Y"], outputs=["Z"])
+    graph = helper.make_graph([node], "where_bool_f32", [C, X, Y], [Z])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    save(model, "where_bool_f32")
+
+
+# ── shape_f32 ────────────────────────────────────────────────────────────────
+# Shape(f32 [3,4,5]) → i64 [3] with value [3,4,5].
+# Output dtype is i64 regardless of input dtype.
+def gen_shape_f32():
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [3, 4, 5])
+    Y = helper.make_tensor_value_info("Y", TensorProto.INT64, [3])
+    node = helper.make_node("Shape", inputs=["X"], outputs=["Y"])
+    graph = helper.make_graph([node], "shape_f32", [X], [Y])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    save(model, "shape_f32")
+
+
+# ── layer_norm_f32 ───────────────────────────────────────────────────────────
+# LayerNormalization(X [2,4], scale [4]) → 3 outputs (Y, Mean, InvStdDev).
+# All outputs are f32. This tests multi-output dtype handling.
+def gen_layer_norm_f32():
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT, [2, 4])
+    scale = helper.make_tensor_value_info("Scale", TensorProto.FLOAT, [4])
+    Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [2, 4])
+    Mean = helper.make_tensor_value_info("Mean", TensorProto.FLOAT, [2, 1])
+    InvStdDev = helper.make_tensor_value_info("InvStdDev", TensorProto.FLOAT, [2, 1])
+    node = helper.make_node(
+        "LayerNormalization",
+        inputs=["X", "Scale"],
+        outputs=["Y", "Mean", "InvStdDev"],
+        axis=-1,
+    )
+    graph = helper.make_graph(
+        [node], "layer_norm_f32", [X, scale], [Y, Mean, InvStdDev]
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    save(model, "layer_norm_f32")
+
+
 if __name__ == "__main__":
     print("Generating ONNX conformance fixtures …")
     gen_add_broadcast()
@@ -218,4 +290,8 @@ if __name__ == "__main__":
     gen_add_float16()
     gen_add_bfloat16()
     gen_nonzero_1x4()
+    gen_cast_f32_to_i64()
+    gen_where_bool_f32()
+    gen_shape_f32()
+    gen_layer_norm_f32()
     print("Done.")

@@ -2030,3 +2030,410 @@ fn conformance_add_bfloat16() {
         eprintln!("\n✅ conformance_add_bfloat16: PASSED");
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// B1 dtype conformance suite
+//
+// These tests prove the B1 fix (per-output dtypes from ORT graph value info).
+// Each test uses an op whose output dtype differs from its first input dtype,
+// exactly the scenario that was silently corrupted before the fix.
+//
+// The `conformance_setup` helper already asserts `provider == cpu_ep` by
+// verifying our EP appears in GetEpDevices and is appended to the session.
+// If ORT silently fell back to its default EP, conformance_setup would fail
+// at the device lookup assertion.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Assert the element type of an ORT output tensor.
+///
+/// # Safety
+/// `api` and `output` must be valid pointers.
+unsafe fn assert_output_dtype(
+    api: *const ort::OrtApi,
+    output: *const ort::OrtValue,
+    expected: ort::ONNXTensorElementDataType,
+    label: &str,
+) {
+    let get_type_shape =
+        unsafe { (*api).GetTensorTypeAndShape }.expect("GetTensorTypeAndShape not in OrtApi");
+    let get_elem_type =
+        unsafe { (*api).GetTensorElementType }.expect("GetTensorElementType not in OrtApi");
+    let release_info = unsafe { (*api).ReleaseTensorTypeAndShapeInfo }
+        .expect("ReleaseTensorTypeAndShapeInfo not in OrtApi");
+
+    let mut info: *mut ort::OrtTensorTypeAndShapeInfo = ptr::null_mut();
+    let status = unsafe { get_type_shape(output, &mut info) };
+    unsafe { check_status(api, status, &format!("GetTensorTypeAndShape({label})")) };
+
+    let mut elem_type: ort::ONNXTensorElementDataType = 0;
+    let status = unsafe { get_elem_type(info, &mut elem_type) };
+    unsafe { check_status(api, status, &format!("GetTensorElementType({label})")) };
+    unsafe { release_info(info) };
+
+    assert_eq!(
+        elem_type, expected,
+        "{label}: output dtype mismatch: got {elem_type}, expected {expected}"
+    );
+    eprintln!("  ✓ {label}: dtype={elem_type} (matches expected {expected})");
+}
+
+// ─── B1 dtype: Cast (f32 → i64) ─────────────────────────────────────────────
+
+/// Cast f32 [2,3] → i64.  Output dtype must be INT64, not FLOAT.
+/// X = [[1.5, 2.7, 3.0], [4.9, 5.1, 6.0]]
+/// Expected Y = [[1, 2, 3], [4, 5, 6]] (truncated toward zero)
+#[test]
+fn conformance_cast_f32_to_i64() {
+    let _lock = lock_ort_ep();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/cast_f32_to_i64/model.onnx");
+
+    let Some((_lib, api, env, opts, session)) =
+        (unsafe { conformance_setup("cpu_ep_cast", &model_path) })
+    else {
+        eprintln!("*** SKIPPED: conformance_cast_f32_to_i64 — ORT or EP cdylib not found ***");
+        return;
+    };
+
+    unsafe {
+        let mut x_data: [f32; 6] = [1.5, 2.7, 3.0, 4.9, 5.1, 6.0];
+        let x_shape: [i64; 2] = [2, 3];
+        let x_val = make_float_tensor(api, &mut x_data, &x_shape);
+
+        let input_names = [c"X".as_ptr()];
+        let output_names = [c"Y".as_ptr()];
+        let inputs: [*const ort::OrtValue; 1] = [x_val];
+        let mut output: *mut ort::OrtValue = ptr::null_mut();
+
+        let status = ((*api).Run.unwrap())(
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs.as_ptr(),
+            1,
+            output_names.as_ptr(),
+            1,
+            &mut output,
+        );
+        check_status(api, status, "Run(cast_f32_to_i64)");
+        assert!(!output.is_null());
+
+        // Assert output dtype is INT64, not FLOAT (the B1 bug would give FLOAT)
+        assert_output_dtype(
+            api,
+            output,
+            ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
+            "cast_f32_to_i64",
+        );
+
+        // Assert output values
+        let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
+        let status = ((*api).GetTensorMutableData.unwrap())(output, &mut data_ptr);
+        check_status(api, status, "GetTensorMutableData(cast)");
+        let result = std::slice::from_raw_parts(data_ptr as *const i64, 6);
+        let expected: [i64; 6] = [1, 2, 3, 4, 5, 6];
+        eprintln!("  Got:      {result:?}");
+        eprintln!("  Expected: {expected:?}");
+        for (i, (got, want)) in result.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(got, want, "cast output[{i}] = {got}, want {want}");
+        }
+
+        ((*api).ReleaseValue.unwrap())(output);
+        ((*api).ReleaseValue.unwrap())(x_val);
+        conformance_teardown(api, env, opts, session, "cpu_ep_cast");
+        eprintln!("\n✅ conformance_cast_f32_to_i64: PASSED — output is i64, values correct");
+    }
+}
+
+// ─── B1 dtype: Where (bool, f32, f32 → f32) ─────────────────────────────────
+
+/// Where(condition=bool, X=f32, Y=f32) → f32.
+/// The first input is bool but the output must be f32.
+///
+/// condition = [[true, false], [false, true]]
+/// X = [[1.0, 2.0], [3.0, 4.0]]
+/// Y = [[10.0, 20.0], [30.0, 40.0]]
+/// Expected Z = [[1.0, 20.0], [30.0, 4.0]]
+#[test]
+fn conformance_where_bool_f32() {
+    let _lock = lock_ort_ep();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/where_bool_f32/model.onnx");
+
+    let Some((_lib, api, env, opts, session)) =
+        (unsafe { conformance_setup("cpu_ep_where", &model_path) })
+    else {
+        eprintln!("*** SKIPPED: conformance_where_bool_f32 — ORT or EP cdylib not found ***");
+        return;
+    };
+
+    unsafe {
+        // Create bool tensor for condition
+        let mut cond_data: [u8; 4] = [1, 0, 0, 1]; // true, false, false, true
+        let cond_shape: [i64; 2] = [2, 2];
+        let mut mem_info: *mut ort::OrtMemoryInfo = ptr::null_mut();
+        let status = ((*api).CreateCpuMemoryInfo.unwrap())(
+            ort::OrtDeviceAllocator,
+            ort::OrtMemTypeDefault,
+            &mut mem_info,
+        );
+        check_status(api, status, "CreateCpuMemoryInfo(bool)");
+        let mut cond_val: *mut ort::OrtValue = ptr::null_mut();
+        let status = ((*api).CreateTensorWithDataAsOrtValue.unwrap())(
+            mem_info,
+            cond_data.as_mut_ptr().cast(),
+            std::mem::size_of_val(&cond_data),
+            cond_shape.as_ptr(),
+            2,
+            ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL,
+            &mut cond_val,
+        );
+        check_status(api, status, "CreateTensor(bool)");
+        ((*api).ReleaseMemoryInfo.unwrap())(mem_info);
+
+        let mut x_data: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+        let mut y_data: [f32; 4] = [10.0, 20.0, 30.0, 40.0];
+        let shape: [i64; 2] = [2, 2];
+        let x_val = make_float_tensor(api, &mut x_data, &shape);
+        let y_val = make_float_tensor(api, &mut y_data, &shape);
+
+        let input_names = [c"C".as_ptr(), c"X".as_ptr(), c"Y".as_ptr()];
+        let output_names = [c"Z".as_ptr()];
+        let inputs: [*const ort::OrtValue; 3] = [cond_val, x_val, y_val];
+        let mut output: *mut ort::OrtValue = ptr::null_mut();
+
+        let status = ((*api).Run.unwrap())(
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs.as_ptr(),
+            3,
+            output_names.as_ptr(),
+            1,
+            &mut output,
+        );
+        check_status(api, status, "Run(where_bool_f32)");
+        assert!(!output.is_null());
+
+        // Assert output dtype is FLOAT, not BOOL (the B1 bug would give BOOL)
+        assert_output_dtype(
+            api,
+            output,
+            ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+            "where_bool_f32",
+        );
+
+        let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
+        let status = ((*api).GetTensorMutableData.unwrap())(output, &mut data_ptr);
+        check_status(api, status, "GetTensorMutableData(where)");
+        let result = std::slice::from_raw_parts(data_ptr as *const f32, 4);
+        let expected: [f32; 4] = [1.0, 20.0, 30.0, 4.0];
+        eprintln!("  Got:      {result:?}");
+        eprintln!("  Expected: {expected:?}");
+        for (i, (got, want)) in result.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "where output[{i}] = {got}, want {want}"
+            );
+        }
+
+        ((*api).ReleaseValue.unwrap())(output);
+        ((*api).ReleaseValue.unwrap())(cond_val);
+        ((*api).ReleaseValue.unwrap())(x_val);
+        ((*api).ReleaseValue.unwrap())(y_val);
+        conformance_teardown(api, env, opts, session, "cpu_ep_where");
+        eprintln!("\n✅ conformance_where_bool_f32: PASSED — output is f32, values correct");
+    }
+}
+
+// ─── B1 dtype: Shape (f32 → i64) ────────────────────────────────────────────
+
+/// Shape(f32 [3,4,5]) → i64 [3] with value [3,4,5].
+/// Output dtype is always INT64 regardless of input dtype.
+#[test]
+fn conformance_shape_f32() {
+    let _lock = lock_ort_ep();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/shape_f32/model.onnx");
+
+    let Some((_lib, api, env, opts, session)) =
+        (unsafe { conformance_setup("cpu_ep_shape", &model_path) })
+    else {
+        eprintln!("*** SKIPPED: conformance_shape_f32 — ORT or EP cdylib not found ***");
+        return;
+    };
+
+    unsafe {
+        // Create a dummy f32 tensor with shape [3,4,5] (60 elements)
+        let mut x_data = vec![0.0f32; 60];
+        let x_shape: [i64; 3] = [3, 4, 5];
+        let x_val = make_float_tensor(api, &mut x_data, &x_shape);
+
+        let input_names = [c"X".as_ptr()];
+        let output_names = [c"Y".as_ptr()];
+        let inputs: [*const ort::OrtValue; 1] = [x_val];
+        let mut output: *mut ort::OrtValue = ptr::null_mut();
+
+        let status = ((*api).Run.unwrap())(
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs.as_ptr(),
+            1,
+            output_names.as_ptr(),
+            1,
+            &mut output,
+        );
+        check_status(api, status, "Run(shape_f32)");
+        assert!(!output.is_null());
+
+        // Assert output dtype is INT64
+        assert_output_dtype(
+            api,
+            output,
+            ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
+            "shape_f32",
+        );
+
+        // Assert output values = [3, 4, 5]
+        let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
+        let status = ((*api).GetTensorMutableData.unwrap())(output, &mut data_ptr);
+        check_status(api, status, "GetTensorMutableData(shape)");
+        let result = std::slice::from_raw_parts(data_ptr as *const i64, 3);
+        let expected: [i64; 3] = [3, 4, 5];
+        eprintln!("  Got:      {result:?}");
+        eprintln!("  Expected: {expected:?}");
+        for (i, (got, want)) in result.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(got, want, "shape output[{i}] = {got}, want {want}");
+        }
+
+        ((*api).ReleaseValue.unwrap())(output);
+        ((*api).ReleaseValue.unwrap())(x_val);
+        conformance_teardown(api, env, opts, session, "cpu_ep_shape");
+        eprintln!("\n✅ conformance_shape_f32: PASSED — output is i64, value [3,4,5]");
+    }
+}
+
+// ─── B1 dtype: LayerNormalization (multi-output) ─────────────────────────────
+
+/// LayerNormalization(X [2,4], Scale [4]) → 3 outputs (Y, Mean, InvStdDev).
+/// All outputs must be f32 and must have 3 separate outputs.
+///
+/// BUG FOUND: our EP's shape inference for LayerNormalization Mean/InvStdDev
+/// outputs produces shape [2,4] instead of [2,1], causing an element-count
+/// mismatch at Compute time. The kernel correctly produces 2 mean values but
+/// ORT allocates an 8-element buffer based on the wrong shape inference.
+/// Owner: Batty (crates/onnx-runtime-ep-plugin/src/compute.rs or
+///        crates/onnx-runtime-ep-cpu/src/kernels/layernorm.rs — shape inference).
+#[test]
+#[ignore = "B1-layernorm: EP shape inference bug — Mean shape [2,4] vs kernel output 2 elements. \
+            Owner: Batty (compute.rs / layernorm.rs shape inference)"]
+fn conformance_layer_norm_multi_output() {
+    let _lock = lock_ort_ep();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/layer_norm_f32/model.onnx");
+
+    let Some((_lib, api, env, opts, session)) =
+        (unsafe { conformance_setup("cpu_ep_ln", &model_path) })
+    else {
+        eprintln!(
+            "*** SKIPPED: conformance_layer_norm_multi_output — ORT or EP cdylib not found ***"
+        );
+        return;
+    };
+
+    unsafe {
+        // X = [[1,2,3,4],[5,6,7,8]]  Scale = [1,1,1,1]
+        let mut x_data: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let mut scale_data: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+        let x_shape: [i64; 2] = [2, 4];
+        let s_shape: [i64; 1] = [4];
+        let x_val = make_float_tensor(api, &mut x_data, &x_shape);
+        let s_val = make_float_tensor(api, &mut scale_data, &s_shape);
+
+        let input_names = [c"X".as_ptr(), c"Scale".as_ptr()];
+        let output_names = [c"Y".as_ptr(), c"Mean".as_ptr(), c"InvStdDev".as_ptr()];
+        let inputs: [*const ort::OrtValue; 2] = [x_val, s_val];
+        let mut outputs: [*mut ort::OrtValue; 3] = [ptr::null_mut(); 3];
+
+        let status = ((*api).Run.unwrap())(
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs.as_ptr(),
+            2,
+            output_names.as_ptr(),
+            3,
+            outputs.as_mut_ptr(),
+        );
+        check_status(api, status, "Run(layer_norm)");
+
+        // All 3 outputs must be non-null
+        for (i, out) in outputs.iter().enumerate() {
+            assert!(!out.is_null(), "LayerNorm output[{i}] is null");
+        }
+
+        // Assert all 3 outputs have dtype FLOAT
+        assert_output_dtype(
+            api,
+            outputs[0],
+            ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+            "layer_norm_Y",
+        );
+        assert_output_dtype(
+            api,
+            outputs[1],
+            ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+            "layer_norm_Mean",
+        );
+        assert_output_dtype(
+            api,
+            outputs[2],
+            ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+            "layer_norm_InvStdDev",
+        );
+
+        // Check Y values (layer-norm of [1,2,3,4] with scale=[1,1,1,1]):
+        // mean=2.5, var=1.25, invstd=1/sqrt(1.25+eps)
+        // Y = (X - mean) * invstd * scale
+        let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
+        let status = ((*api).GetTensorMutableData.unwrap())(outputs[0], &mut data_ptr);
+        check_status(api, status, "GetTensorMutableData(Y)");
+        let y_result = std::slice::from_raw_parts(data_ptr as *const f32, 8);
+        eprintln!("  Y output: {y_result:?}");
+
+        // Verify Y is normalized: for each row, mean≈0 and std≈1
+        for row in 0..2 {
+            let row_slice = &y_result[row * 4..(row + 1) * 4];
+            let mean: f32 = row_slice.iter().sum::<f32>() / 4.0;
+            assert!(
+                mean.abs() < 1e-4,
+                "LayerNorm Y row {row} mean={mean}, expected ~0"
+            );
+        }
+
+        // Check Mean output
+        let status = ((*api).GetTensorMutableData.unwrap())(outputs[1], &mut data_ptr);
+        check_status(api, status, "GetTensorMutableData(Mean)");
+        let mean_result = std::slice::from_raw_parts(data_ptr as *const f32, 2);
+        eprintln!("  Mean output: {mean_result:?}");
+        assert!(
+            (mean_result[0] - 2.5).abs() < 1e-4,
+            "Mean[0]={}, want 2.5",
+            mean_result[0]
+        );
+        assert!(
+            (mean_result[1] - 6.5).abs() < 1e-4,
+            "Mean[1]={}, want 6.5",
+            mean_result[1]
+        );
+
+        for out in &outputs {
+            ((*api).ReleaseValue.unwrap())(*out);
+        }
+        ((*api).ReleaseValue.unwrap())(x_val);
+        ((*api).ReleaseValue.unwrap())(s_val);
+        conformance_teardown(api, env, opts, session, "cpu_ep_ln");
+        eprintln!("\n✅ conformance_layer_norm_multi_output: PASSED — 3 outputs, all f32");
+    }
+}

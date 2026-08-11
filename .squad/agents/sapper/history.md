@@ -42,4 +42,13 @@
 - CPU and CUDA hand-written shims still return `void` — owners must update (not my files).
 - Told Chew to update ABI test type alias to `-> *mut ort::OrtStatus`.
 
+## 2026-08-11 — B2 follow-up: CPU shim ReleaseEpFactory fixed
+
+- Updated hand-written `ReleaseEpFactory` in `crates/onnx-runtime-ep-cpu-plugin/src/lib.rs` to return `*mut OrtStatus` (was `void`).
+- Panic path now surfaces as `panic_to_fail_status(...)` rather than being silently swallowed.
+- Shim stays hand-written because `CreateEpFactories` calls `create_ep_factories_with_registry` (not exposed via the macro); annotated with keep-in-sync comment mirroring the macro arm.
+- Audited `CreateEpFactories` — already returned `*mut OrtStatus`, no drift found.
+- CUDA shim is Iran's file; not touched.
+- Build: `cargo build -p onnx-runtime-ep-cpu-plugin` ✓. Tests: 154 lib + 9 parity ✓. Clippy clean ✓. fmt clean ✓.
+
 Full pre-compaction history in `history-archive.md`.

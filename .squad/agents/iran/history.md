@@ -48,3 +48,11 @@
 - **device_free defect #4:** Documented the `size=0` contract violation with fix specification (allocation size tracking side-table).
 - **Validation:** `cargo check --workspace` ✓, `cargo check -p onnx-runtime-ep-cuda-plugin --features cuda` ✓, ep-plugin 154+9 tests ✓, clippy clean ✓, fmt clean ✓.
 - **Key correction:** CUDA is implementation-blocked, not hardware-blocked. Even with a GPU, this code cannot work as written.
+
+### 2026-08-11 — ReleaseEpFactory ABI fix (follow-up to B4, reported by Sapper)
+- **Bug:** CUDA shim's hand-written `ReleaseEpFactory` returned `void`; correct ABI is `OrtStatus*` per `onnxruntime_ep_c_api.h:2669`.
+- **Fix:** Updated return type to `*mut OrtStatus`. On normal release returns null (success); on panic catches unwind and returns actionable status via `panic_to_fail_status`.
+- **Macro not used:** `export_ep_factories!` emits both symbols as one expansion; CUDA shim needs custom `CreateEpFactories`, so macro would conflict. Commented in file explaining why it is hand-written and must stay in sync with the macro's `ReleaseEpFactory` arm.
+- **CreateEpFactories drift check:** Signature matches `CreateEpApiFactoriesFn` at header line 2654 — no drift.
+- **Fail-closed unchanged:** Both configs still return 0 factories + error status.
+- **Validation:** `cargo check --workspace` ✓, `cargo check -p onnx-runtime-ep-cuda-plugin --features cuda` ✓, ep-plugin 9 tests ✓, clippy clean ✓, fmt clean ✓.

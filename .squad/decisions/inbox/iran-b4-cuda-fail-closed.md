@@ -49,3 +49,35 @@ For the CUDA plugin fail-closed behavior, tests should verify:
 ## Note for Sapper (factory.rs)
 
 No changes needed in `factory.rs` for fail-closed — the gate is in the CUDA plugin's `CreateEpFactories` which now never calls `create_ep_factories_with_device_support`. The factory code remains correct for when a working EP is eventually wired.
+
+---
+
+## Follow-up: ReleaseEpFactory ABI fix (2026-08-11)
+
+**Filed by:** Iran (follow-up to Sapper's B2 investigation)
+
+### Problem
+The CUDA shim had a hand-written `ReleaseEpFactory` returning `void`. Per `onnxruntime_ep_c_api.h:2669`:
+```c
+typedef OrtStatus* (*ReleaseEpApiFactoryFn)(_In_ OrtEpFactory* factory);
+```
+The correct return type is `OrtStatus*`. The CPU shim had the same bug; Sapper owns that fix.
+
+### Fix
+Updated `crates/onnx-runtime-ep-cuda-plugin/src/lib.rs`: `ReleaseEpFactory` now returns `*mut OrtStatus`. On success (factory released), returns `nullptr`. On panic, catches the unwind and returns an actionable error status via `panic_to_fail_status`.
+
+### Why the macro is not used
+`export_ep_factories!` emits both `CreateEpFactories` and `ReleaseEpFactory` as a single expansion. The CUDA shim needs a custom `CreateEpFactories` (fail-closed implementation gate), so invoking the macro would produce a duplicate symbol conflict. Once the four implementation defects are resolved, the shim should be collapsed to a single `export_ep_factories!` invocation. Until then, a comment in the file explains why it is hand-written and that it must stay in sync with the macro.
+
+### `CreateEpFactories` drift check
+The CUDA shim's `CreateEpFactories` signature matches `CreateEpApiFactoriesFn` (header line 2654): same parameter order, same `OrtStatus*` return type. No drift.
+
+### Fail-closed behaviour unchanged
+Both feature configurations (`cuda` ON and OFF) still return 0 factories + error status. `ReleaseEpFactory` is now reachable-but-trivial (zero factories were ever issued, so ORT will never call it in practice) and correctly typed.
+
+### Validation (all passed)
+- `cargo check --workspace` ✓
+- `cargo check -p onnx-runtime-ep-cuda-plugin --features cuda` ✓
+- `cargo test -p onnx-runtime-ep-plugin` ✓ (9 passed)
+- `RUSTFLAGS="-D warnings" cargo clippy --locked --all-targets -p onnx-runtime-ep-plugin` ✓
+- `cargo fmt --all -- --check` ✓

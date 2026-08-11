@@ -14,7 +14,7 @@ Fixed `ReleaseEpFactory` in the `export_ep_factories!` macro to return
 typedef OrtStatus* (*ReleaseEpApiFactoryFn)(_In_ OrtEpFactory* factory);
 ```
 
-## What changed
+## What changed (B2 first pass — macro only)
 
 - **`lib.rs` macro**: `ReleaseEpFactory` now returns `-> *mut OrtStatus`.
   On success, returns the status from `factory::release_ep_factory` (nullptr).
@@ -22,21 +22,26 @@ typedef OrtStatus* (*ReleaseEpApiFactoryFn)(_In_ OrtEpFactory* factory);
   of silently swallowing.
 - **`status.rs`**: Clarified `fail_status` doc re: null-as-success pre-init window.
 
-## What still needs fixing (not my files)
+## What still needed fixing — CPU shim (B2 follow-up, now complete)
 
-The CPU shim (`crates/onnx-runtime-ep-cpu-plugin/src/lib.rs:98`) and CUDA shim
-(`crates/onnx-runtime-ep-cuda-plugin/src/lib.rs:163`) have hand-written
-`ReleaseEpFactory` with `void` return. They do NOT use the macro. Their owners
-must update to `-> *mut OrtStatus` and propagate the `release_ep_factory` return.
+### `ReleaseEpFactory` — FIXED (2026-08-11)
 
-## CreateEpFactories verification
+`crates/onnx-runtime-ep-cpu-plugin/src/lib.rs`: hand-written `ReleaseEpFactory`
+returned `void`. Updated to return `*mut OrtStatus`, catching panics and
+surfacing them as error statuses. The function stays hand-written (cannot use
+the macro because `CreateEpFactories` calls
+`factory::create_ep_factories_with_registry`, a path not covered by the macro).
+A comment marks the body as a mirror of the macro arm with a keep-in-sync note.
 
-`CreateEpFactories` in the macro already matches the header parameter-for-parameter:
-```
-Header:  OrtStatus* (const char*, const OrtApiBase*, const OrtLogger*, OrtEpFactory**, size_t, size_t*)
-Macro:   *mut OrtStatus (c_char, OrtApiBase, OrtLogger, *mut OrtEpFactory, usize, *mut usize)
-```
-No second mismatch found. ✓
+### `CreateEpFactories` — signature verified, no fix needed
+
+The hand-written `CreateEpFactories` already returned `*mut OrtStatus` and its
+parameter list matches the macro and header exactly. No drift found.
+
+## CUDA shim (Iran's file — not touched)
+
+`crates/onnx-runtime-ep-cuda-plugin/src/lib.rs` still has the same void-return
+bug. Iran owns that file and is fixing it separately.
 
 ## Chew — ABI test update needed
 

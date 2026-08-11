@@ -170,7 +170,7 @@ fn full_lifecycle_negotiate_create_release() {
     );
 
     // Read factory name
-    let name = unsafe { CStr::from_ptr(factory.name as *const i8) };
+    let name = unsafe { CStr::from_ptr(factory.name as *const std::ffi::c_char) };
     assert_eq!(name.to_str().unwrap(), "NxrtTestPlugin");
 
     // Step 3: Create EP via factory
@@ -184,7 +184,7 @@ fn full_lifecycle_negotiate_create_release() {
     assert_eq!(ep.device_type, 0);
 
     // Read EP name
-    let ep_name = unsafe { CStr::from_ptr(ep.name as *const i8) };
+    let ep_name = unsafe { CStr::from_ptr(ep.name as *const std::ffi::c_char) };
     assert_eq!(ep_name.to_str().unwrap(), "NxrtTestPlugin");
 
     // Step 4: Get capability (should claim nothing — fail closed)
@@ -349,6 +349,19 @@ fn factory_panic_is_contained() {
     let status = unsafe { create_factories(&mut factory_ptr, 1, &mut num) };
     assert_eq!(status.code, NxrtStatusCode::InternalError);
     assert_eq!(num, 0, "num must be zeroed on panic");
+
+    // B3: Verify the inline message buffer survives the cdylib boundary.
+    // NxrtStatus.message is now a fixed [u8; 256] inline buffer (not heap-allocated),
+    // so the message is readable in the host without cross-CRT free issues.
+    let msg = status.message_str();
+    assert!(
+        msg.is_some(),
+        "message_str() must return Some for an InternalError from the plugin cdylib"
+    );
+    eprintln!(
+        "  B3 inline-buffer message across cdylib boundary: {:?}",
+        msg.unwrap()
+    );
 
     std::env::remove_var("NXRT_TEST_PANIC");
 }

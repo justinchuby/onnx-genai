@@ -40,6 +40,10 @@ models/
 !crates/onnx-runtime-ep-cpu-plugin/tests/fixtures/matmul_batched_nd/model.onnx
 !crates/onnx-runtime-ep-cpu-plugin/tests/fixtures/mixed_partition/model.onnx
 !crates/onnx-runtime-ep-cpu-plugin/tests/fixtures/nonzero_1x4/model.onnx
+!crates/onnx-runtime-ep-cpu-plugin/tests/fixtures/cast_f32_to_i64/model.onnx
+!crates/onnx-runtime-ep-cpu-plugin/tests/fixtures/where_bool_f32/model.onnx
+!crates/onnx-runtime-ep-cpu-plugin/tests/fixtures/shape_f32/model.onnx
+!crates/onnx-runtime-ep-cpu-plugin/tests/fixtures/layer_norm_f32/model.onnx
 *.safetensors
 .DS_Store
 

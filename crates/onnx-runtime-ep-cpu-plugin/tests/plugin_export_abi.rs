@@ -68,7 +68,12 @@ fn dlopen_and_create_factory() {
         *mut usize,
     ) -> *mut ort::OrtStatus;
 
-    type ReleaseEpFactory = unsafe extern "C" fn(*mut ort::OrtEpFactory);
+    // ReleaseEpFactory returns OrtStatus* per onnxruntime_ep_c_api.h:2669,
+    // NOT void. We previously broke this assertion ourselves on arm64/macOS
+    // (changed the test to match a wrong implementation). This restores the
+    // correct ABI signature. Do NOT "fix" it back to void — the *implementation*
+    // was wrong, not this test.
+    type ReleaseEpFactory = unsafe extern "C" fn(*mut ort::OrtEpFactory) -> *mut ort::OrtStatus;
 
     let create: libloading::Symbol<'_, CreateEpFactories> =
         unsafe { lib.get(b"CreateEpFactories") }.expect("CreateEpFactories symbol not found");
@@ -115,8 +120,12 @@ fn dlopen_and_create_factory() {
     let name = unsafe { CStr::from_ptr(name_ptr) }.to_string_lossy();
     assert_eq!(name, "cpu_ep", "EP name mismatch");
 
-    // Release factory — ReleaseEpFactory returns void (no status).
-    unsafe { release(factory) };
+    // Release factory — ReleaseEpFactory returns OrtStatus* (null on success).
+    let release_status = unsafe { release(factory) };
+    assert!(
+        release_status.is_null(),
+        "ReleaseEpFactory returned non-null status (error) on success"
+    );
 }
 
 // ─── L2 Compute test: actual tensor in, actual tensor out ────────────────────
@@ -360,7 +369,7 @@ fn compute_add_end_to_end() {
         kernel: Box::new(AddKernel),
         num_inputs: 2,
         num_outputs: 1,
-        output_dtype: DataType::Float32,
+        output_dtypes: vec![DataType::Float32],
         shape_inference: ShapeInference::ElementwiseBroadcast,
     };
     let mut info = ExportedComputeInfo::new(vec![entry]);
@@ -426,7 +435,7 @@ fn compute_add_broadcast() {
         kernel: Box::new(AddKernel),
         num_inputs: 2,
         num_outputs: 1,
-        output_dtype: DataType::Float32,
+        output_dtypes: vec![DataType::Float32],
         shape_inference: ShapeInference::ElementwiseBroadcast,
     };
     let mut info = ExportedComputeInfo::new(vec![entry]);

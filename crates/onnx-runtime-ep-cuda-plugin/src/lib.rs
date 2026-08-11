@@ -186,17 +186,50 @@ pub unsafe extern "C" fn CreateEpFactories(
 
 /// ORT plugin-EP entry point: release an EP factory.
 ///
+/// # ABI reference
+///
+/// `onnxruntime_ep_c_api.h:2669`:
+/// ```c
+/// typedef OrtStatus* (*ReleaseEpApiFactoryFn)(_In_ OrtEpFactory* factory);
+/// ```
+///
+/// Returns `nullptr` on success or an `OrtStatus*` error — **not `void`**.
+///
+/// # Why this is hand-written instead of using `export_ep_factories!`
+///
+/// The `export_ep_factories!` macro emits *both* `CreateEpFactories` and
+/// `ReleaseEpFactory` as a single expansion. The CUDA shim needs a custom
+/// `CreateEpFactories` (fail-closed implementation gate with four blocking
+/// defects), so invoking the macro would conflict with the hand-written
+/// `CreateEpFactories` above. Until the four CUDA defects are resolved and
+/// the shim can delegate to `export_ep_factories!`, this function must be
+/// kept in sync with the macro's `ReleaseEpFactory` arm in
+/// `onnx-runtime-ep-plugin/src/lib.rs`.
+///
 /// # Safety
 ///
 /// `factory` must be a pointer returned by `CreateEpFactories` from this
 /// library, and must not be used after this call.
+///
+/// # Panic safety
+///
+/// Any panic inside the release path is caught and surfaced as a failure
+/// `OrtStatus`. Unwinding into ORT would be undefined behaviour.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ReleaseEpFactory(
     factory: *mut onnx_runtime_ep_plugin::onnx_genai_ort_sys::OrtEpFactory,
-) {
-    let _ = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-        unsafe { onnx_runtime_ep_plugin::factory::release_ep_factory(factory) };
+) -> *mut onnx_runtime_ep_plugin::onnx_genai_ort_sys::OrtStatus {
+    let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+        // SAFETY: caller guarantees the pointer was returned by
+        // CreateEpFactories from this library.
+        unsafe { onnx_runtime_ep_plugin::factory::release_ep_factory(factory) }
     }));
+    match result {
+        Ok(status) => status,
+        Err(_panic_payload) => onnx_runtime_ep_plugin::panic_to_fail_status(
+            "ReleaseEpFactory: panic during factory release (fail-closed)",
+        ),
+    }
 }
 
 #[cfg(test)]

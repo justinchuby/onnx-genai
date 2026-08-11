@@ -88,3 +88,20 @@ Added an explanatory block comment above `ReferenceLayerNorm` covering two point
 [==========] 40 tests from 3 test suites ran. (4 ms total)
 [  PASSED  ] 40 tests.
 ```
+
+## 2026-08-11 — #762 Test Repair (Corrective Wave)
+
+All four blocker test repairs completed:
+- B1: Fixed compile errors (output_dtype→output_dtypes), added 4 dtype conformance tests (Cast, Where, Shape, LayerNorm). LayerNorm `#[ignore]`d — found real shape inference bug (owner: Batty).
+- B2: Restored correct `ReleaseEpFactory -> *mut OrtStatus` signature + null assertion.
+- B3: Fixed `*const i8` → `*const c_char` portability, added message_str() cdylib boundary assertion.
+- B4: Created `cuda_fail_closed.rs` with 3 tests asserting zero factories and error status.
+
+All suites green:
+- `onnx-runtime-ep-plugin`: 154 passed, 0 failed
+- `onnx-runtime-ep-cpu-plugin`: 20 passed, 1 ignored (LayerNorm shape bug), 0 failed
+- `onnx-runtime-ep-nxrt-abi`: 32 passed, 0 failed
+- `onnx-runtime-ep-nxrt-host`: 10 passed, 0 failed
+- `onnx-runtime-ep-cuda-plugin`: 6 passed (3 unit + 3 integration), 0 failed
+- clippy: clean (warnings as errors)
+- fmt: clean

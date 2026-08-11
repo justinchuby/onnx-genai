@@ -42,6 +42,17 @@ fn leak_str(s: &str) -> &'static str {
 /// ORT plugin-EP entry point: create EP factories with kernel-registry type
 /// constraints for f16/bf16 routing.
 ///
+/// # Why hand-written (not `export_ep_factories!`)
+///
+/// The macro calls `factory::create_ep_factories`, which does not accept a
+/// kernel-registry slice. This shim needs
+/// `factory::create_ep_factories_with_registry` to advertise typed dtype
+/// constraints to ORT. There is no macro variant for that path yet, so the
+/// function is written explicitly here. The signature MUST remain identical
+/// to the `CreateEpFactories` arm of `export_ep_factories!` in
+/// `onnx-runtime-ep-plugin/src/lib.rs`; if that macro arm changes, update
+/// this function in lockstep.
+///
 /// # Safety
 ///
 /// Called by ORT's plugin loader. All pointer arguments must be valid per the
@@ -90,15 +101,44 @@ pub unsafe extern "C" fn CreateEpFactories(
 
 /// ORT plugin-EP entry point: release an EP factory.
 ///
+/// # ABI reference
+///
+/// `onnxruntime_ep_c_api.h:2669`:
+/// ```c
+/// typedef OrtStatus* (*ReleaseEpApiFactoryFn)(_In_ OrtEpFactory* factory);
+/// ```
+/// Returns `nullptr` on success or a non-null `OrtStatus*` on error/panic.
+///
 /// # Safety
 ///
 /// `factory` must be a pointer returned by `CreateEpFactories` from this
 /// library, and must not be used after this call.
+///
+/// # Panic safety
+///
+/// Any panic inside the release path is caught and surfaced as a failure
+/// `OrtStatus`. Unwinding into ORT would be undefined behaviour.
+///
+/// # Kept in sync with `export_ep_factories!`
+///
+/// This shim stays hand-written because `CreateEpFactories` above calls
+/// `create_ep_factories_with_registry` (not available in the macro). The body
+/// below is intentionally identical to the `ReleaseEpFactory` arm of the
+/// `export_ep_factories!` macro in `onnx-runtime-ep-plugin/src/lib.rs`.
+/// If that macro arm changes, this must change in lockstep.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ReleaseEpFactory(
     factory: *mut onnx_runtime_ep_plugin::onnx_genai_ort_sys::OrtEpFactory,
-) {
-    let _ = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-        unsafe { onnx_runtime_ep_plugin::factory::release_ep_factory(factory) };
+) -> *mut onnx_runtime_ep_plugin::onnx_genai_ort_sys::OrtStatus {
+    let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+        // SAFETY: caller guarantees the pointer was returned by
+        // CreateEpFactories from this library.
+        unsafe { onnx_runtime_ep_plugin::factory::release_ep_factory(factory) }
     }));
+    match result {
+        ::std::result::Result::Ok(status) => status,
+        ::std::result::Result::Err(_panic_payload) => onnx_runtime_ep_plugin::panic_to_fail_status(
+            "ReleaseEpFactory: panic during factory release (fail-closed)",
+        ),
+    }
 }
