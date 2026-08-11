@@ -54,7 +54,7 @@ use onnx_runtime_ep_api::{EpError, Result};
 use crate::error::driver_err;
 use crate::runtime::CudaRuntime;
 
-const MODULE_KEY: &str = "gqa_decode_attention_f16_v6";
+const MODULE_KEY: &str = "gqa_decode_attention_f16_v7";
 const ENTRY: &str = "gqa_decode_attention_f16";
 const MERGE_ENTRY: &str = "gqa_decode_attention_f16_merge";
 
@@ -134,7 +134,8 @@ extern "C" __global__ void gqa_decode_attention_f16(
     const int local_window,
     const float softcap,
     const int single_split_direct,
-    const int split_fill)
+    const int split_fill,
+    const int kv_layout)   // 0 = head-major BNSH, 1 = seq-major BSNH
 {
     // Dynamic shared layout: warp_max[warps], warp_sum[warps], then
     // warp_acc[warps * head_size] (fp32 partial value accumulators per warp).
@@ -177,8 +178,22 @@ extern "C" __global__ void gqa_decode_attention_f16(
     const long q_base =
         ((long)(batch_index * query_heads + query_head) * query_seq + query_pos)
             * (long)head_size;
-    const long kv_plane =
-        (long)(batch_index * kv_heads + kv_head) * (long)cache_capacity * (long)head_size;
+    // KV cache base offset and per-token stride for this (batch, kv_head).
+    //   head-major BNSH  [b, kv_heads, cap, head]: base=(b*kv_heads+h)*cap*head,
+    //                    stride=head (tokens contiguous within a head plane);
+    //   seq-major  BSNH  [b, cap, kv_heads, head]: base=(b*cap*kv_heads+h)*head,
+    //                    stride=kv_heads*head (tokens strided by all heads).
+    long kv_base;
+    long kv_stride;
+    if (kv_layout == 0) {
+        kv_base = (long)(batch_index * kv_heads + kv_head)
+            * (long)cache_capacity * (long)head_size;
+        kv_stride = (long)head_size;
+    } else {
+        kv_base = ((long)batch_index * (long)cache_capacity * (long)kv_heads
+            + (long)kv_head) * (long)head_size;
+        kv_stride = (long)kv_heads * (long)head_size;
+    }
 
     const int h2 = head_size >> 1;   // number of half2 elements per row
     const half2* q2 = reinterpret_cast<const half2*>(query + q_base);
@@ -200,7 +215,7 @@ extern "C" __global__ void gqa_decode_attention_f16(
     // CTA's contiguous sequence slice.
     for (int key_pos = split_start + warp_in_block; key_pos < split_end;
          key_pos += warps_per_block) {
-        const long kv_off = kv_plane + (long)key_pos * (long)head_size;
+        const long kv_off = kv_base + (long)key_pos * kv_stride;
         const half2* k2 = reinterpret_cast<const half2*>(key + kv_off);
         float partial = 0.0f;
 #pragma unroll
@@ -372,11 +387,13 @@ extern "C" __global__ void gqa_decode_attention_f16_merge(
 
 /// Launch the capture-safe fp16 flash-decode kernel.
 ///
-/// Present K/V live in `[batch, kv_heads, cache_capacity, head_dim]` fp16 with
-/// RoPE already applied to stored keys at their absolute positions;
-/// `query`/`output` are BNSH fp16 with `query_seq == 1`. The valid length per
-/// batch is read on the device from `total_lengths` (never from
-/// `cache_capacity`), so the launch geometry is fixed for capture/replay.
+/// Present K/V live in `[batch, kv_heads, cache_capacity, head_dim]` (head-major
+/// BNSH, `kv_layout == 0`) or `[batch, cache_capacity, kv_heads, head_dim]`
+/// (seq-major BSNH, `kv_layout == 1`) fp16 with RoPE already applied to stored
+/// keys at their absolute positions; `query`/`output` are BNSH fp16 with
+/// `query_seq == 1`. The valid length per batch is read on the device from
+/// `total_lengths` (never from `cache_capacity`), so the launch geometry is
+/// fixed for capture/replay.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run(
     runtime: &CudaRuntime,
@@ -395,6 +412,7 @@ pub(super) fn run(
     total_lengths: CUdeviceptr,
     local_window: i32,
     softcap: f32,
+    kv_layout: i32,
 ) -> Result<()> {
     runtime.require_nvrtc_half_headers("gqa_decode_attention_f16")?;
 
@@ -481,7 +499,8 @@ pub(super) fn run(
         .arg(&local_window)
         .arg(&softcap)
         .arg(&single_split_direct)
-        .arg(&split_fill_i);
+        .arg(&split_fill_i)
+        .arg(&kv_layout);
     // SAFETY: `ENTRY` matches this argument ABI; all buffers were sized by the
     // caller (present K/V span `cache_capacity` rows, query/output span
     // `query_seq` tokens). Scratch is fixed module-global plus dynamic shared
