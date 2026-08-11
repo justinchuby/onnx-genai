@@ -86,6 +86,26 @@ Two structural notes that are not merely "not done yet":
   past dedicated VRAM into system RAM and `cuMemGetInfo` cannot see it. Device
   capacity is therefore not a number we can read, and floor comparisons taken on
   such a machine do not mean what they appear to ([#704]).
+- **Weight offload and CUDA graph capture are mutually exclusive today.** The
+  pager's alloc/copy/free operations are capture-illegal, so enabling offload
+  disables capture (module docs in
+  `crates/onnx-genai-engine/src/native_decode/cuda.rs`). Large models that need
+  offload therefore forfeit **all** of the capture-fragmentation wins #708/#728
+  landed (35B-A3B decode from **154 to 34** graph segments). The fix is **#716**
+  — page weights under a stable virtual address so page-in remaps physical
+  granules at the same VA (survivable per #727) rather than returning a new
+  pointer. Until it lands, offload-on implies capture-off, which is a large part
+  of why managed offload trails WDDM demand paging.
+- **The residency cache had a 0% hit rate for its entire life** — `evict_to_fit`
+  was a plain LRU evicting against a cyclic sequential layer scan, so it always
+  evicted the page needed soonest (0 hits across 6,936 page-ins, at both 3 GB and
+  6 GB budgets). Fixed by a scan-resistant stable-subset policy in **PR #723**
+  (74.18% hit rate; evictions 6,286 → 0). This is the named mechanism behind the
+  "beats the OS" failure. See [`MEMORY_ARCHITECTURE.md`](./MEMORY_ARCHITECTURE.md).
+- **Public budgets are committed physical bytes, not nominal content bytes.** A
+  nominal 6 GB content budget was measured to physically consume ~**6.51 GB**
+  (~8.5% hidden), because reservation is committed at the 2 MiB granule. Size and
+  report budgets in committed bytes.
 
 What is confirmed working, and worth not re-litigating: **prefix reuse**, and
 **multi-request concurrency** up to the point where admission becomes the limit.
@@ -418,8 +438,13 @@ binding.
 - Keep compressed blocks in VRAM unless a measured device kernel requires another
   representation.
 - Keep a bounded pinned-host staging ring.
-- Prefetch the next exact/predicted expert wave on a transfer stream while the current
-  wave computes.
+- ~~Prefetch the next exact/predicted expert wave on a transfer stream while the current
+  wave computes.~~ **Superseded (#715, #718):** sequential weight prefetch was
+  implemented and measured to produce no usable compute/transfer overlap on the
+  dev box, and was removed in PR #715; AirLLM's own analysis (#718) attributes
+  the cost to disk/transfer bandwidth rather than missing overlap. Do not present
+  prefetch as an existing lever. Expert-wave prefetch remains a *design proposal*
+  contingent on a measured win — see Phase 4.
 - If all planned weights fit, eagerly load and pin them, disable eviction, and match a
   conventional resident runtime's hot path.
 
@@ -625,12 +650,25 @@ VRAM. On a fitting model, fully resident performance must remain near baseline.
 
 ### Phase 4 — asynchronous and predictive prefetch
 
-**Ship independently:**
+> **Status: design proposal, and its central premise is measured false so far.**
+> Sequential weight prefetch was implemented and **removed in PR #715** because it
+> produced no usable compute/transfer overlap on the dev box; AirLLM's own
+> analysis (#718) independently attributes the cost to disk/transfer bandwidth,
+> not to a lack of overlap, and rates prefetch at ~10% by their own account. On a
+> model that does not fit there is not enough independent compute to hide the
+> transfer behind. Treat everything below as a proposal that must clear a measured
+> end-to-end win before it is built, not as a planned or landed capability. The
+> "landed" annotations below refer only to the low-level plumbing (stream-ordered
+> H2D, awaitable fences, a standalone double-buffer scheduler), **not** to
+> prefetch producing a throughput gain.
+
+**Ship independently (plumbing only; predictive prefetch itself is unproven):**
 
 - implement true stream-ordered H2D and awaitable fences; **[landed — issue #87]**
 - double-buffer expert panels; **[strategy landed as a standalone, unit-tested
   scheduler; live MoE wiring pending Phase-3b device binding]**
-- add exact-next-wave, heat-based, then opt-in router-predicted prefetch;
+- add exact-next-wave, heat-based, then opt-in router-predicted prefetch
+  — **only if measured to help; sequential prefetch was measured not to (#715)**;
 - budget reservations and cancel low-value work under pressure.
 
 **Measure:** prefetch hit/late/waste, hidden transfer percentage, p50/p99 token latency,
