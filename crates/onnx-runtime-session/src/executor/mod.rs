@@ -52,7 +52,7 @@ use onnx_runtime_ep_api::{
     CaptureRegionShapeStatus, DeviceBuffer, DevicePtr, DevicePtrMut, EpError, ExecutionProvider,
     ExternalMmapRegion, Kernel, KernelInput, KernelMatch, LazyWeight, LazyWeightBoundary,
     ResidentWeight, StructuralCaptureDecline, TensorBacking, TensorMetadata, TensorMut, TensorView,
-    WeightHandle, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
+    WeightHandle, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView, lazy_weight_candidates,
 };
 
 type OptionalTensorSpecs = Vec<Option<(DataType, Vec<usize>)>>;

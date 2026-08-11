@@ -49,12 +49,13 @@ pub use crate::config::{
     EngineConfigError, EngineDecodeBackend, FinishReason, GenerateConstraint, GenerateOptions,
     GeneratePrompt, GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback,
     GenerationBudgetCap, KvConnectorBackend, KvConnectorConfig, LayerWeightBytes, LimitParseError,
-    MemoryStrategy, MemoryStrategyDecision, MemoryStrategyPlan, MirostatConfig, MirostatVersion,
-    MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource, PrioritizedGenerateRequest,
-    PrioritizedGenerateResult, RecurrentPrefixCacheStats, RewindTokenCount, SamplingOverrides,
-    ScheduledGenerateArrival, SessionCheckpoint, SessionForkCapability, SessionId, SessionPosition,
-    SharedKvBinding, SharedKvProposerConfig, SpeculativeMode, TokenLogprob, WeightAccessPattern,
-    WeightPlacementReport, XtcConfig, parse_device_policy, parse_resource_limit,
+    MemoryPolicyApplication, MemoryStrategy, MemoryStrategyDecision, MemoryStrategyPlan,
+    MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource,
+    PrioritizedGenerateRequest, PrioritizedGenerateResult, RecurrentPrefixCacheStats,
+    RewindTokenCount, SamplingOverrides, ScheduledGenerateArrival, SessionCheckpoint,
+    SessionForkCapability, SessionId, SessionPosition, SharedKvBinding, SharedKvProposerConfig,
+    SpeculativeMode, TokenLogprob, WeightAccessPattern, WeightPlacementReport, XtcConfig,
+    parse_device_policy, parse_resource_limit,
 };
 pub use crate::connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 pub(crate) use crate::speculative::{
@@ -87,7 +88,7 @@ pub(crate) use metadata::*;
 pub use model::Engine;
 pub(crate) use model::*;
 #[cfg(feature = "native-backend")]
-pub(crate) use placement::{plan_static_weight_placement, qmoe_layer_weight_bytes};
+pub(crate) use placement::plan_static_weight_placement;
 pub(crate) use speculative_load::*;
 
 #[cfg(test)]

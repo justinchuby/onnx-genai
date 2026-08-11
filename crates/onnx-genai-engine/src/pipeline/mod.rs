@@ -1,12 +1,14 @@
 //! Multi-model pipeline orchestrator.
 
+use crate::MemoryStrategyPlan;
 use crate::decode::{
     DecodeState, apply_paged_sliding_window, clone_value, run_decode_step_with_extra,
 };
 use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState, run_decode_loop};
 use crate::engine::{
-    Engine, EngineConfig, EngineResourceGovernor, component_governor, infer_memory_strategy_plan,
-    log_memory_strategy_plan, model_requires_native_backend, requested_decode_backend,
+    Engine, EngineConfig, EngineResourceGovernor, MemoryStrategyPlanInput, analyze_model_memory,
+    build_memory_strategy_plan, combine_graph_memory, component_governor, log_memory_strategy_plan,
+    model_requires_native_backend, requested_decode_backend, resolve_vram_limit_bytes,
 };
 use crate::kv_bridge::{
     KvModelInfo, attach_pages_to_sequence, infer_kv_model_info, load_materialized_past,
@@ -14,8 +16,6 @@ use crate::kv_bridge::{
 };
 use crate::logits::TokenId;
 use crate::memory_authority::{MemoryAuthorityProvider, SharedMemoryAuthorityProvider};
-use crate::{MemoryStrategyPlan, WeightAccessPattern};
-use onnx_genai_scheduler::ModelKvConfig;
 
 use crate::pipeline_cache::{
     ComponentOutputCache, Digest, DigestBuilder, PREFIX_KEY_PREAMBLE, PipelineCacheStats,
@@ -521,12 +521,15 @@ fn build_native_pipeline_decoder(
     models: &PipelineModels,
     decoder: &str,
     config_device: Option<&crate::native_decode_device::NativeDecodeDevice>,
+    memory_strategy_plan: &MemoryStrategyPlan,
     #[cfg(feature = "cuda")] governor: std::sync::Arc<
         dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync,
     >,
 ) -> anyhow::Result<Box<dyn PipelineDecoderComponent + 'static>> {
     #[cfg(feature = "native-backend")]
     {
+        #[cfg(not(feature = "cuda"))]
+        let _ = memory_strategy_plan;
         let path =
             models.directory.model_paths.get(decoder).with_context(|| {
                 format!("native pipeline decoder '{decoder}' has no model path")
@@ -550,6 +553,8 @@ fn build_native_pipeline_decoder(
             native_decoder_device(config_device),
             io,
             #[cfg(feature = "cuda")]
+            crate::engine::cuda_policy_from_memory_strategy_plan(memory_strategy_plan),
+            #[cfg(feature = "cuda")]
             governor,
         )?;
         Ok(Box::new(native))
@@ -558,6 +563,7 @@ fn build_native_pipeline_decoder(
     {
         let _ = models;
         let _ = config_device;
+        let _ = memory_strategy_plan;
         anyhow::bail!(
             "decoder '{decoder}' was requested on the native backend via \
              ONNX_GENAI_PIPELINE_NATIVE_DECODER, but this build was compiled without the \
@@ -775,6 +781,97 @@ impl PipelineEngine {
             EngineDecodeBackend::Native => PipelineBackend::Native,
             EngineDecodeBackend::Auto => resolve_auto_pipeline_backend(&directory)?,
         };
+        let plan = PipelinePlan::from_spec(&directory.spec, schedulers)?;
+        let graph_memory = combine_graph_memory(
+            directory
+                .model_paths
+                .values()
+                .map(|path| analyze_model_memory(path)),
+            matches!(&plan, PipelinePlan::Iterative(_)),
+        );
+        let minimum_useful_weight_budget_bytes = graph_memory
+            .per_layer_weight_bytes
+            .iter()
+            .map(|layer| layer.bytes)
+            .max()
+            .unwrap_or(0);
+        let memory_strategy_kv_config = match &plan {
+            PipelinePlan::Autoregressive(ar) => {
+                let path = directory.model_paths.get(&ar.decoder).with_context(|| {
+                    format!("pipeline decoder '{}' has no model path", ar.decoder)
+                })?;
+                let decoder_io = directory
+                    .spec
+                    .models
+                    .get(&ar.decoder)
+                    .and_then(|component| component.io.as_ref());
+                let kv_inputs = decoder_io
+                    .and_then(|io| io.kv_inputs.clone())
+                    .unwrap_or_default();
+                let kv_outputs = decoder_io
+                    .and_then(|io| io.kv_outputs.clone())
+                    .unwrap_or_default();
+                let graph_io = onnx_genai_ort::graph_io_from_model_path_for_kv_pairs(
+                    path,
+                    &kv_inputs,
+                    &kv_outputs,
+                )
+                .with_context(|| {
+                    format!(
+                        "failed to read pipeline decoder '{}' KV graph I/O",
+                        ar.decoder
+                    )
+                })?;
+                let kv_model = infer_kv_model_info(
+                    &graph_io,
+                    decoder_io,
+                    config.page_size,
+                    config.kv_cache_dtype,
+                )?;
+                match kv_model.as_ref() {
+                    Some(kv_model) => crate::engine::governor_kv_config(Some(kv_model), &config)?,
+                    None => crate::engine::governor_no_paged_kv_config(&config)?,
+                }
+            }
+            _ => crate::engine::governor_no_paged_kv_config(&config)?,
+        };
+        let resolved_vram_bytes = resolve_vram_limit_bytes(&config.limits)?;
+        #[cfg(feature = "cuda")]
+        let memory_strategy_overrides = crate::engine::memory_strategy_overrides_from_cuda_env(
+            onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env(),
+        );
+        #[cfg(not(feature = "cuda"))]
+        let memory_strategy_overrides = crate::engine::MemoryStrategyOverrides::default();
+        #[cfg(all(feature = "cuda", feature = "native-backend"))]
+        let native_cuda_plan = backend == PipelineBackend::Native
+            && matches!(
+                native_decoder_device(config.native_device.as_ref()),
+                crate::native_decode_device::NativeDecodeDevice::Cuda { .. }
+            );
+        #[cfg(not(all(feature = "cuda", feature = "native-backend")))]
+        let native_cuda_plan = false;
+        let memory_strategy_plan = build_memory_strategy_plan(MemoryStrategyPlanInput {
+            config: &config,
+            resolved_vram_bytes,
+            model_weight_bytes: model_weights_bytes,
+            kv_config: memory_strategy_kv_config,
+            graph: graph_memory,
+            required_device_non_weight_bytes: 0,
+            minimum_useful_weight_budget_bytes,
+            #[cfg(feature = "cuda")]
+            default_dynamic_device_budget_bytes: Some(
+                onnx_runtime_ep_cuda::DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES,
+            ),
+            #[cfg(not(feature = "cuda"))]
+            default_dynamic_device_budget_bytes: None,
+            inferred_policy_enabled: matches!(
+                config.limits.vram_limit,
+                crate::ResourceLimit::Bytes(_)
+            ),
+            overrides: memory_strategy_overrides,
+            advisory_only: !native_cuda_plan,
+        });
+        log_memory_strategy_plan(&memory_strategy_plan, "pipeline");
         #[cfg(all(feature = "cuda", feature = "native-backend"))]
         let authority_domain = if backend == PipelineBackend::Native {
             match native_decoder_device(config.native_device.as_ref()) {
@@ -827,10 +924,10 @@ impl PipelineEngine {
             // the plan is known (below), rather than at construction.
         }
         let native_ort_skips = if backend == PipelineBackend::Native {
-            match PipelinePlan::from_spec(&directory.spec, schedulers)? {
+            match &plan {
                 PipelinePlan::Autoregressive(ar) => {
-                    let mut skips = BTreeSet::from([ar.decoder]);
-                    skips.extend(ar.step_components);
+                    let mut skips = BTreeSet::from([ar.decoder.clone()]);
+                    skips.extend(ar.step_components.iter().cloned());
                     skips
                 }
                 _ => BTreeSet::new(),
@@ -851,7 +948,6 @@ impl PipelineEngine {
             PipelineModels::load_with_options(pipeline_dir, session_options)
         }
         .map_err(|e| anyhow::anyhow!("Failed to load pipeline models: {e}"))?;
-        let plan = PipelinePlan::from_spec(&models.directory.spec, schedulers)?;
         // GAP-3 Inc-A wires native decode only for the flat autoregressive plan.
         // Any other strategy on the native backend is surfaced with a precise,
         // actionable error naming the still-unwired path (rather than a blanket
@@ -866,7 +962,6 @@ impl PipelineEngine {
         // iterative (diffusion) pipelines run tensors through `run_pipeline`.
         let mut paged: Option<PipelinePagedKv> = None;
         let mut kv_governor = None;
-        let mut memory_strategy_kv_config = None;
         let (decoder_state, tokenizer_component, fixed_state_budget_bytes) = match &plan {
             PipelinePlan::Autoregressive(ar) => {
                 let decoder = models
@@ -888,7 +983,6 @@ impl PipelineEngine {
                     Some(kv_model) => crate::engine::governor_kv_config(Some(kv_model), &config)?,
                     None => crate::engine::governor_no_paged_kv_config(&config)?,
                 };
-                memory_strategy_kv_config = Some(kv_config);
                 let component_governor = EngineResourceGovernor::new_for_shared_pipeline_kv(
                     config.limits.clone(),
                     config.allow_runtime_override,
@@ -979,22 +1073,6 @@ impl PipelineEngine {
                 0,
             ),
         };
-        let memory_strategy_plan = infer_memory_strategy_plan(
-            &config,
-            resource_governor.snapshot().resolved_limits.vram_bytes,
-            model_weights_bytes,
-            memory_strategy_kv_config.unwrap_or_else(|| {
-                ModelKvConfig::unknown(u64::try_from(config.page_size).unwrap_or(0))
-            }),
-            match &plan {
-                PipelinePlan::Autoregressive(_) => WeightAccessPattern::SequentialDense,
-                PipelinePlan::Iterative(_) => WeightAccessPattern::Iterative,
-                _ => WeightAccessPattern::Unknown,
-            },
-            Vec::new(),
-            None,
-        );
-        log_memory_strategy_plan(&memory_strategy_plan);
         Ok(Self {
             models,
             resource_governor,

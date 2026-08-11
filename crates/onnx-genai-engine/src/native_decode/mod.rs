@@ -28,6 +28,8 @@ mod load;
 mod paged_gqa;
 mod proposer;
 mod tensor;
+#[cfg(feature = "cuda")]
+pub(crate) use tensor::recurrent_state_bytes_from_graph;
 #[cfg(test)]
 mod tests;
 
@@ -37,6 +39,11 @@ use cpu::*;
 use cuda::DecodeCudaState;
 use cuda::*;
 pub use cuda::{CudaGraphDebugStats, CudaKvDebugStats};
+
+#[cfg(feature = "cuda")]
+pub(crate) fn configured_cuda_kv_max_len() -> anyhow::Result<Option<usize>> {
+    cuda::cuda_kv_max_len_from_env()
+}
 use io::*;
 pub(crate) use load::NativeDecodeLoadOptions;
 pub use paged_gqa::{

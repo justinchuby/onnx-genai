@@ -47,12 +47,12 @@ pub use engine::{
     EngineConfig, EngineConfigError, EngineDecodeBackend, EngineGovernorError,
     EngineResourceGovernor, FinishReason, GenerateConstraint, GenerateOptions, GeneratePrompt,
     GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback, GenerationBudgetCap,
-    KvConnectorBackend, KvConnectorConfig, LayerWeightBytes, LimitParseError, MemoryStrategy,
-    MemoryStrategyDecision, MemoryStrategyPlan, MirostatConfig, MirostatVersion, MtpCacheScope,
-    MtpConfig, MtpHiddenLayout, MtpWeightSource, PrioritizedGenerateRequest,
-    PrioritizedGenerateResult, RewindTokenCount, SamplingOverrides, ScheduledGenerateArrival,
-    SessionCheckpoint, SessionForkCapability, SessionId, SessionPosition, SharedKvBinding,
-    SharedKvProposerConfig, SpeculativeMode, TokenLogprob, WeightAccessPattern,
+    KvConnectorBackend, KvConnectorConfig, LayerWeightBytes, LimitParseError,
+    MemoryPolicyApplication, MemoryStrategy, MemoryStrategyDecision, MemoryStrategyPlan,
+    MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource,
+    PrioritizedGenerateRequest, PrioritizedGenerateResult, RewindTokenCount, SamplingOverrides,
+    ScheduledGenerateArrival, SessionCheckpoint, SessionForkCapability, SessionId, SessionPosition,
+    SharedKvBinding, SharedKvProposerConfig, SpeculativeMode, TokenLogprob, WeightAccessPattern,
     WeightPlacementReport, XtcConfig, parse_device_policy, parse_resource_limit,
 };
 pub use fim::{FimConfig, FimFormat};
