@@ -21,7 +21,7 @@ impl Executor {
         fn collect(graph: &Graph, scope: &str, out: &mut Vec<String>) {
             for (node_id, node) in graph.nodes.iter() {
                 if node.domain == onnx_runtime_ir::RUNTIME_DOMAIN
-                    && node.op_type == "BlockQuantizedMoE"
+                    && matches!(node.op_type.as_str(), "BlockQuantizedMoE" | "IndexShare")
                 {
                     out.push(format!(
                         "{scope}node#{} '{}::{}'",
@@ -58,7 +58,8 @@ impl Executor {
         for pi in 0..self.plan.len() {
             let node_id = self.plan[pi].node_id;
             let node = self.graph.node(node_id);
-            if node.domain != onnx_runtime_ir::RUNTIME_DOMAIN || node.op_type != "BlockQuantizedMoE"
+            if node.domain != onnx_runtime_ir::RUNTIME_DOMAIN
+                || !matches!(node.op_type.as_str(), "BlockQuantizedMoE" | "IndexShare")
             {
                 continue;
             }

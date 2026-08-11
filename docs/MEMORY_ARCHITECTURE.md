@@ -44,6 +44,107 @@ when in fact it is 1955 lines.
 | Prefix reuse | — | **implemented and measured** | The one part of this document with an unambiguous end-to-end win. On qwen2.5-0.5b with a 5,122-token shared prefix, a warm request prefilled **9 tokens instead of 5,131** and TTFT fell from 137,850 ms to **2,758 ms** — a 44x reduction. Served by native-session KV rewind; the recurrent-state snapshots of #650/#672 are a separate path that native CUDA does not currently hit (`lookups=0`). Confirmed on the HTTP server too: hit rate **0.9886** across a concurrency sweep |
 | Paged attention (vLLM-style) | — | **not built, and not the plan** | Verified against the tree: `block_table` does not appear in any CUDA attention kernel. `GroupQueryAttention` takes `past_key`/`past_value` as ordinary contiguous tensors and `CompressedSparseAttention` reads a flat pointer with a computed stride, so there is no input through which a page index could be passed. Making every kernel walk a block table cannot be made uniform across backends — we do not own ORT's kernels — so vAttention-style commit-on-demand under a contiguous virtual range is the chosen route instead (#656) |
 
+### CUDA raw allocation audit (#736, 2026-08-10)
+
+Scope: production code in `crates/onnx-runtime-ep-cuda`,
+`crates/onnx-runtime-session`, and CUDA kernel launch support. Test-only
+`alloc_raw` calls under `#[cfg(test)]` are excluded. The only direct `cuMemAlloc`
+entry point in this scope remains `CudaRuntime::alloc_raw`
+(`crates/onnx-runtime-ep-cuda/src/runtime.rs:898`); the replaceable
+`CudaDeviceAllocator`/VMM allocator path is the EP allocation authority seam, not
+a kernel scratch bypass. `crates/onnx-runtime-session` has no CUDA raw allocation
+call; it owns the governed workspace preparation path
+(`executor/bindings.rs:47`, `executor/dispatch.rs:1432`).
+
+| file/line | owner | byte formula | size source | lifetime class | status |
+|---|---|---|---|---|---|
+| `kernels/attention.rs:711` | legacy `Attention` phase-2 scores | `batch * num_heads * sq * sk * elem_size` | prompt/cache dependent | request/prefill-dependent | raw bypass |
+| `kernels/attention.rs:712` | legacy `Attention` cuBLASLt workspace | `WORKSPACE_BYTES` | static/configured | step-scoped | raw bypass |
+| `kernels/csa_checkpoint.rs:126` | CSA checkpoint main carry snapshot | `main_carry_bytes.max(1)` | config/state shape | session-persistent | raw bypass |
+| `kernels/csa_checkpoint.rs:127` | CSA checkpoint index carry snapshot | `index_carry_bytes.max(1)` | config/state shape | session-persistent | raw bypass |
+| `kernels/csa_device_state.rs:160` | CSA device-state allocation/growth | `size` | config/state shape | session-persistent | raw bypass |
+| `kernels/csa_device_state.rs:169` | CSA device-state replacement | `size.max(1)` | config/state shape | session-persistent | raw bypass |
+| `kernels/elementwise.rs:699` | elementwise scalar/shape metadata upload | `metadata_bytes.len()` | op arity/rank | step-scoped | raw bypass |
+| `kernels/fused_gemm.rs:236` | fused GEMM cuBLASLt workspace | `WORKSPACE_BYTES` | static/configured | step-scoped | raw bypass |
+| `kernels/gemm.rs:268` | GEMM cuBLASLt workspace | `WORKSPACE_BYTES` | static/configured | step-scoped | raw bypass |
+| `kernels/group_query_attention.rs:945` | `GroupQueryAttention` pooled slots | slot-specific `bytes.max(1)` (QKV/present/scores/mask helpers) | prompt/cache dependent, then reused | session-persistent growable scratch | raw bypass |
+| `kernels/index_share.rs:688` | `pkg.nxrt::IndexShare` selected-token attention workspace | aligned sum of `2 * B * kv_heads * cache_seq * head_size * elem_size`, `B * q_heads * q_seq * selected_width * 4`, optional `2 * B * sizeof(i64)` | prompt/cache dependent | session-persistent | **governed in this increment** via `workspace_requirement` + prepared workspace |
+| `kernels/index_transform.rs:150` | index-transform metadata | `bytes.len()` | op/rank/config | step-scoped | raw bypass |
+| `kernels/indexing.rs:410` | indexing metadata | `bytes.len().max(1)` | op/rank/config | step-scoped | raw bypass |
+| `kernels/matmul.rs:219` | MatMul plan workspace | `plan.workspace_bytes` | shape/algorithm dependent | session-persistent cached plan scratch | raw bypass |
+| `kernels/matmul.rs:464` | MatMul cuBLASLt workspace | `WORKSPACE_BYTES` | static/configured | step-scoped | raw bypass |
+| `kernels/matmul_nbits.rs:3599` | `MatMulNBits` accuracy-4 decode activation quantization | `padded_k + (padded_k / block_size) * sizeof(f32)` | model config (`K`, `block_size`) | model-lifetime fixed scratch | raw bypass |
+| `kernels/matmul_nbits.rs:3980` | `MatMulNBits` f32 dequantized weight fallback | `K * N * 4` | model config (`K`, `N`) | step-scoped/prefill fallback | raw bypass |
+| `kernels/matmul_nbits.rs:3981` | `MatMulNBits` f32 cuBLASLt workspace | `WORKSPACE_BYTES` | static/configured | step-scoped | raw bypass |
+| `kernels/matmul_nbits.rs:4425` | `MatMulNBits` RMSNorm prefill activation scratch | `M * K * sizeof(f16)` | prompt-dependent (`M`) and model config (`K`) | request/prefill-dependent | raw bypass |
+| `kernels/matmul_nbits.rs:4942` | `MatMulNBits` decomposed SiLU scratch | `output.byte_size()` | output shape/prompt dependent | step-scoped | raw bypass |
+| `kernels/matmul_nbits.rs:5200` | `MatMulNBits` gate/up RMSNorm prefill scratch | `M * K * sizeof(f16)` | prompt-dependent (`M`) and model config (`K`) | request/prefill-dependent | raw bypass |
+| `kernels/mod_op.rs:222` | Mod metadata | `metadata_bytes.len().max(1)` | op/rank/config | step-scoped | raw bypass |
+| `kernels/movement.rs:239` | movement op metadata | `bytes.len()` | op/rank/config | step-scoped | raw bypass |
+| `kernels/nary.rs:264` | N-ary fp32 scratch | `n * sizeof(f32)` | output element count | step-scoped | raw bypass |
+| `kernels/nary.rs:271` | N-ary metadata | `metadata_bytes.len().max(1)` | op arity/rank | step-scoped | raw bypass |
+| `kernels/nonzero.rs:99` | NonZero strides metadata | `bytes.len()` | input rank | step-scoped | raw bypass |
+| `kernels/normalization.rs:1563` | normalization metadata | `metadata_bytes.len()` | op/rank/config | step-scoped | raw bypass |
+| `kernels/packed_varlen_attention.rs:581` | packed-varlen metadata | `bytes.max(1)` | batch/sequence metadata | step-scoped | raw bypass |
+| `kernels/pad.rs:292` | Pad metadata | `metadata.len()` | rank/pads config | step-scoped | raw bypass |
+| `kernels/pooling.rs:538` | pooling metadata | `bytes.len()` | rank/kernel config | step-scoped | raw bypass |
+| `kernels/qlinear_matmul.rs:299` | QLinearMatMul metadata | `bytes.len()` | rank/quantization params | step-scoped | raw bypass |
+| `kernels/qmoe.rs:1956` | legacy QMoE pooled scratch | slot-specific `bytes` | prompt/expert dependent | session-persistent growable scratch | raw bypass; separate from governed `BlockQuantizedMoE` path |
+| `kernels/reduce.rs:711` | reduce base shape metadata | `base_bytes.len().max(1)` | rank/config | step-scoped | raw bypass |
+| `kernels/reduce.rs:712` | reduce delta shape metadata | `delta_bytes.len().max(1)` | rank/config | step-scoped | raw bypass |
+| `kernels/reduce.rs:720` | reduce axes metadata | `axes_bytes.len().max(1)` | rank/axes config | step-scoped | raw bypass |
+| `kernels/resize.rs:259` | Resize metadata | `bytes.len()` | rank/scales/sizes config | step-scoped | raw bypass |
+| `kernels/standard_attention.rs:602` | default-domain Attention pooled slots | slot-specific `bytes.max(1)` (scores, offsets, pad limits, staged K/V) | prompt/cache dependent, then reused | session-persistent growable scratch | raw bypass |
+| `kernels/standard_attention.rs:1269` | standard-attention small metadata upload | `bytes.max(1)` | mask/length metadata | step-scoped | raw bypass |
+| `kernels/varlen_attention.rs:531` | varlen attention metadata buffer | `bytes.max(1)` | batch/sequence metadata | step-scoped | raw bypass |
+| `kernels/where_op.rs:123` | Where metadata | `metadata_bytes.len()` | broadcast rank/config | step-scoped | raw bypass |
+| `runtime.rs:391` | capture-error latch | `sizeof(u32)` | static | session-persistent | raw bypass |
+| `weight_paging.rs:377` | lazy weight page upload | `bytes.len()` | weight tensor storage | already-governed tensor/output allocation? no; weight paging has separate residency accounting | session-persistent until page eviction |
+| `weight_paging.rs:424` | async lazy weight page upload | `bytes.len()` | weight tensor storage | weight residency/page lifetime | governed by weight residency budget, not workspace contract |
+| `weight_paging.rs:479` | staged async lazy weight page upload | `len` | weight tensor storage | weight residency/page lifetime | governed by weight residency budget, not workspace contract |
+| `weight_paging.rs:643` | multi-region lazy QMoE weight binding | `weight.region_bytes_len()` | weight tensor storage | weight binding/page lifetime | governed by weight residency budget, not workspace contract |
+
+This increment governs the `IndexShare` slice — routing it through
+`Kernel::workspace_requirement`, prepare-only planning, `reserve_workspace`, and
+`MappedGrowthGrant` rather than a kernel-owned raw scratch pool. `IndexShare` is
+a real but **low-byte** governed slice, not the largest live bypass in this
+table. Its two `present_key`/`present_value` staging segments (the largest part
+of its reservation) are *reserved-but-unused* on the common decode path: the
+layout always reserves them (`kernels/index_share.rs:615-616`), but when present
+outputs are requested — `want_present = outputs.len() == 3`
+(`kernels/index_share.rs:847`) — the kernel writes present K/V directly to the
+output tensors, not the workspace (`kernels/index_share.rs:871-879`). On that
+path only the `scores` segment is consumed, and in decode `q_seq == 1` with a
+sparse `selected_width`, so the live bytes are small. `IndexShare` is also a
+`pkg.nxrt` custom op used only by GLM/DSA sparse-attention families, so it is not
+on the hot path for dense models. It was governed first because it cleanly
+mirrors the QMoE contract, not because it is the largest or hottest bypass.
+
+#### Next slice (chosen from this table): dense-attention quadratic score buffers
+
+The genuinely large, always-live non-QMoE bypasses are the dense-attention score
+buffers, which scale **quadratically** with sequence length and are live on
+every dense decode/prefill step:
+
+| candidate | byte formula | why always live |
+|---|---|---|
+| `kernels/attention.rs:711` | `batch * num_heads * sq * sk * elem_size` | legacy `Attention` phase-2 scores; allocated on every `execute`, request/prefill-dependent, quadratic in `sq*sk`. |
+| `kernels/group_query_attention.rs:945` | pooled `scores` slot ≈ `batch * num_heads * sq * sk * elem_size` | `GroupQueryAttention` pooled scratch; grown to the largest score matrix seen and kept session-persistent, so it holds the quadratic peak. |
+| `kernels/standard_attention.rs:602` | pooled `scores` slot ≈ `batch * num_heads * sq * sk * elem_size` | default-domain `Attention` pooled scratch; same quadratic scores slot, session-persistent. |
+
+All three carry the same quadratic `batch * num_heads * sq * sk * elem_size`
+score term (e.g. `B=1, H=32, sq=sk=2048, fp16` ≈ 256 MB), which dwarfs
+`IndexShare`'s live bytes at realistic shapes. On prefill the three are
+comparable in peak bytes; the two pooled variants
+(`group_query_attention.rs:945`, `standard_attention.rs:602`) are the higher-value
+target because their session-persistent growable pools **retain** the quadratic
+peak across steps rather than freeing it each `execute`, so they hold resident
+bytes for the whole session. The recommended next increment is therefore the
+pooled dense-attention scores slot — govern `standard_attention.rs:602` and
+`group_query_attention.rs:945` (which share the pooled-scratch shape) through the
+same `workspace_requirement` + prepared-workspace contract, then fold in the
+legacy `attention.rs:711` per-call path.
+
 ### The platform is part of the memory system
 
 On Windows WDDM, `cudaMalloc` does not fail when it exceeds dedicated VRAM — the
