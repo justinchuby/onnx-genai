@@ -31,6 +31,8 @@
 //! No env vars required — the test resolves ORT from the ort-sys build output.
 //! Skips loudly if ORT or the EP cdylib is absent.
 
+mod cdylib_resolve;
+
 use std::ffi::{CStr, CString};
 use std::path::PathBuf;
 use std::ptr;
@@ -81,17 +83,7 @@ fn find_ort_lib_dir() -> Option<PathBuf> {
 
 /// Find the EP cdylib produced by this crate.
 fn find_ep_cdylib() -> Option<PathBuf> {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let workspace_root = std::path::Path::new(manifest_dir)
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap();
-    let candidates = [
-        workspace_root.join("target/debug/libonnx_runtime_ep_cpu_plugin.so"),
-        workspace_root.join("target/release/libonnx_runtime_ep_cpu_plugin.so"),
-    ];
-    candidates.into_iter().find(|p| p.exists())
+    cdylib_resolve::find_cpu_plugin_cdylib_optional()
 }
 
 /// Skip a test loudly when a required resource is missing.

@@ -5,6 +5,8 @@
 //! resolves the exported symbols, calls them, and verifies the factory vtable
 //! works correctly.
 
+mod cdylib_resolve;
+
 use std::ffi::CStr;
 use std::ptr;
 
@@ -13,29 +15,7 @@ use onnx_genai_ort_sys as ort;
 
 /// Find the cdylib produced by this crate's build.
 fn find_cdylib() -> std::path::PathBuf {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let workspace_root = std::path::Path::new(manifest_dir)
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap();
-
-    let candidates = [
-        workspace_root.join("target/debug/libonnx_runtime_ep_cpu_plugin.so"),
-        workspace_root.join("target/release/libonnx_runtime_ep_cpu_plugin.so"),
-    ];
-
-    for candidate in &candidates {
-        if candidate.exists() {
-            return candidate.clone();
-        }
-    }
-
-    panic!(
-        "Could not find libonnx_runtime_ep_cpu_plugin.so. Build with: \
-         cargo build -p onnx-runtime-ep-cpu-plugin\n\
-         Searched: {candidates:?}"
-    );
+    cdylib_resolve::find_cpu_plugin_cdylib()
 }
 
 // Minimal OrtApi with just CreateStatus for version negotiation.

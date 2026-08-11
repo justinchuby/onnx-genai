@@ -95,3 +95,41 @@ those vars from the shared library).
 - `onnx-runtime-ep-cpu-plugin`: 23 passed
 - Clean-state (rm cdylib → re-run): 10 passed (auto-build triggered)
 - **CUDA remains UNVALIDATED** — no GPU on this host.
+
+---
+
+## Update 2026-08-11T01:40:00Z — Stale-artifact false-pass eliminated from cpu-plugin tests
+
+### Problem
+
+Five CI lanes failed at `l1_nm_exported_symbols` because `plugin_export_abi.rs`
+and `plugin_ort_e2e.rs` used hardcoded `target/debug/*.so` / `target/release/*.so`
+paths — no `CARGO_TARGET_DIR` support, no profile-awareness, no auto-build, and
+Linux-only `.so` extension (would also fail on Windows `.dll` / macOS `.dylib`).
+
+Local passes were a false positive: a stale `libonnx_runtime_ep_cpu_plugin.so` from
+an earlier manual build was sitting in `target/debug/`. Removing it reproduced the
+CI failure exactly.
+
+### Fix — shared `cdylib_resolve` helper
+
+Created `crates/onnx-runtime-ep-cpu-plugin/tests/cdylib_resolve.rs` with the same
+resolution pattern already proven in nxrt's `testplugin_path()`:
+
+1. `NXRT_CPU_PLUGIN_PATH` env var (explicit override, asserts file exists)
+2. `CARGO_TARGET_DIR` / `$PROFILE` / platform-libname
+3. Workspace root / `target` / `$PROFILE` / platform-libname
+4. Auto-build via `cargo build -p onnx-runtime-ep-cpu-plugin`; panic if build fails
+
+Platform-appropriate filenames: `.so` (Linux), `.dylib` (macOS), `.dll` (Windows).
+
+Both `plugin_export_abi.rs` and `plugin_ort_e2e.rs` now `mod cdylib_resolve;` and
+delegate to the shared helper, eliminating the duplicated hardcoded logic.
+
+### Rule
+
+**Every test that loads a built artifact by path MUST:**
+- Honor `CARGO_TARGET_DIR` and `$PROFILE`
+- Use platform-appropriate library extensions
+- Auto-build when absent and fail loudly if the build itself fails
+- Never rely on stale artifacts from prior manual builds

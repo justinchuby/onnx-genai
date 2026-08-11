@@ -480,3 +480,32 @@ cargo test -p onnx-runtime-ep-plugin -p onnx-runtime-ep-nxrt-abi -p onnx-runtime
 
 cargo fmt --all -- --check → EXIT:0
 ```
+
+---
+
+## 2026-08-11T01:40:00Z — Stale-artifact false-pass fix for cpu-plugin tests
+
+### Context
+Five CI lanes failed (`Fast (Linux)`, `Rust (Windows ARM64)`, `Rust coverage` ×3) at
+`l1_nm_exported_symbols` because `plugin_export_abi.rs` and `plugin_ort_e2e.rs`
+hardcoded `target/debug/libonnx_runtime_ep_cpu_plugin.so` without CARGO_TARGET_DIR
+support, auto-build, or platform-aware extensions. Local "23 tests passing" was a
+false positive from a stale artifact.
+
+### Changes
+- Created `crates/onnx-runtime-ep-cpu-plugin/tests/cdylib_resolve.rs` — shared helper
+  with env override (`NXRT_CPU_PLUGIN_PATH`), `CARGO_TARGET_DIR`/`PROFILE` support,
+  platform lib names (`.so`/`.dylib`/`.dll`), and auto-build fallback.
+- Updated `plugin_export_abi.rs` and `plugin_ort_e2e.rs` to use `mod cdylib_resolve;`.
+
+### Audit
+- nxrt tests (`nxrt_abi_roundtrip.rs`): already correct (testplugin_path() pattern).
+- `trait_cabi_parity.rs`: no artifact loading (uses Rust types directly).
+- `onnx-genai-bench/tests/profile_native.rs`: has env override + graceful skip. OK.
+- No other tests under `tests/` reference `target/` for built artifacts.
+
+### Validation (clean state)
+- `rm -f target/debug/libonnx_runtime_ep_cpu_plugin.so` → `cargo test -p onnx-runtime-ep-cpu-plugin` → 23 passed (auto-build triggered).
+- `cargo test -p onnx-runtime-ep-plugin` → 154+9; `-p onnx-runtime-ep-nxrt-abi` → 30; `-p onnx-runtime-ep-nxrt-host` → 4+10.
+- `RUSTFLAGS="-D warnings" cargo clippy --locked --all-targets -p onnx-runtime-ep-cpu-plugin` → clean.
+- `cargo fmt --all -- --check` → clean.
