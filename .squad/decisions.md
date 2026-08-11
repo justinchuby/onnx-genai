@@ -303,7 +303,8 @@ Full narrative in `.squad/decisions-archive/2026-08.md` (DROP sections: copilot-
 
 **Scope NOT started:** Full fp16 arithmetic family (compiler-flag probe needed); ARM64 LayerNormF32 (separate PR); TransB M=1 SGEMV and P-core macOS thread count (benchmark-gated, no Apple hardware).
 
-**Accelerate/BNNS/vDSP confirmed non-candidates for upstream MLAS.**
+**~~Accelerate/BNNS/vDSP confirmed non-candidates for upstream MLAS.~~**
+⚠️ **SUPERSEDED — 2026-08-12T02:00:00Z.** This conclusion was wrong and must not be cited. See "2026-08-12 — Apple proprietary framework paths ARE eligible for upstream MLAS" below.
 
 ### Durable lessons from Apple MLAS f16 cast wave
 
@@ -345,3 +346,56 @@ Full narrative in `.squad/decisions-archive/2026-08.md` (DROP sections: copilot-
 - **An occupancy change must not become a routing change.** Selecting 4 or 2 columns per CTA silently widened the accepted-shape set. Pin the accepted set with an exhaustive test so it cannot drift.
 - **Hardware absence is a legitimate stop.** No GPU and no AMX on this host (AMD EPYC 9V74), so CUDA numbers cannot be measured and the AMX-vs-VNNI comparison cannot be run — hence no AMX PR.
 - **Reviewer lockout held:** Cohaagen (author) and Sebastian (reviewer) were both barred from the revision; Chew did it; Gaff reviewed fresh.
+
+## Current active wave — 2026-08-12 (Apple framework infrastructure + TensorRT fix)
+
+### 2026-08-12 — Apple proprietary framework paths ARE eligible for upstream MLAS
+
+**By:** @justinchuby (policy), Luba (PR #32001 initial), Luv (review), Isidore (lockout revision), Leon (TensorRT fix), Deckard (CI triage)
+
+**⚠️ SUPERSEDES** the earlier conclusion (from the Apple MLAS f16 cast wave, ~2026-08-11) that "Accelerate/BNNS/vDSP are non-candidates for upstream MLAS." That exclusion was wrong and **must not be cited.** The stale line has been struck above.
+
+**What:** Apple proprietary framework backends — Accelerate (cblas/vecLib), BNNS, vDSP — are **eligible** for upstream contribution to ONNX Runtime MLAS when:
+1. Gated behind an **Apple-only, opt-in compile option** (narrowly named; default OFF).
+2. Backed by a **portable MLAS fallback** as the default path.
+3. **No behaviour change when the option is disabled** (provably — all side effects guarded).
+
+**PR structure (separate PRs, never bundled):**
+- **PR A (infrastructure) = #32001** (`nxrt/mlas-apple-framework-option`): `onnxruntime_USE_APPLE_ACCELERATE` CMake option, default OFF, Apple-only, `find_library(Accelerate)` linkage, `build.py --use_apple_accelerate` argument. 23 lines, 2 files. Draft.
+- **PR B** (Accelerate cblas SGEMM/SDPA), **C** (BNNS), **D** (vDSP) — prepared but not started; require Apple-hardware benchmarks unavailable on this host.
+
+**Hard constraints:**
+- **Do not hand-declare private or unstable BNNS struct layouts upstream.** Public SDK headers/APIs only, or reject that candidate.
+- Each kernel PR requires: portable fallback, reachability tests, numeric parity, Apple hardware benchmarks, arm64/universal2/iOS validation, fresh Opus review.
+
+**Known blocker for B/C/D:** This host is Linux x86-64 (AMD EPYC) with no Apple hardware. Only PR A can be completed locally; it is behaviour-neutral when disabled and validates via upstream Apple CI.
+
+### PR #32001 — review fixes (S1/S2/S3, Isidore under lockout)
+
+**By:** Luba (author, locked out of revision), Luv (reviewer, locked out), Isidore (lockout revision)
+
+**Fixes:**
+- **S1:** Replaced `FATAL_ERROR` with `message(WARNING ...) + set(onnxruntime_USE_APPLE_ACCELERATE OFF)` on non-Apple — matches `onnxruntime_USE_SVE` / `onnxruntime_USE_KLEIDIAI` idiom.
+- **S2:** Added `--use_apple_accelerate` argument to `build.py` / `build_args.py`, forwarding as `-Donnxruntime_USE_APPLE_ACCELERATE=ON`.
+- **S3:** Removed `target_compile_definitions(onnxruntime_mlas PRIVATE MLAS_USE_APPLE_ACCELERATE=1)` — no consumer exists yet; avoids upstream static-analysis noise.
+- Head: `d16a108252`. PR remains draft.
+
+### PR #31988 — TensorRT build fix (OURS, not inherited)
+
+**By:** Leon (fix), Deckard (initial diagnosis, disproved)
+
+**Root cause:** `matmul_nbits_cols_per_block_test.cc` (host `.cc`) included `matmul_4bits_common.cuh`, which pulls `<cuda_bf16.h>` → CUB device headers. Host compiler receives ~40 `'blockIdx' was not declared` errors.
+
+**Cross-PR evidence:** PR #31678 (unrelated) had TensorRT green; ours red — proves the break was introduced by our change. Deckard's earlier assumption that these were CUDA-13 base-codebase issues was disproved.
+
+**Fix (Leon):** Extracted `SelectColsPerBlock`, `kColsPerThreadBlock`, and `kTargetCtasPerSm` into `matmul_4bits_cols_per_block.h` — a host-only header with no CUDA device includes. Test uses only this header; `.cuh` re-exports via `#include`. Head: `34fe91e8dd`.
+
+### Durable lessons from this wave
+
+- **Apple Accelerate/BNNS/vDSP ARE upstream-eligible** when gated behind an Apple-only opt-in compile option with a portable MLAS fallback. The earlier blanket exclusion does not hold once both portability objections (implicit behaviour change, non-portable) are addressed by opt-in gating.
+- **Never hand-declare private or unstable BNNS struct layouts upstream.** Use public SDK headers/APIs only, or reject the candidate outright.
+- **A build option nothing can set is half-finished.** `onnxruntime_USE_APPLE_ACCELERATE` existed in CMake but had no `build.py` argument; upstream contributors had no standard path to enable it.
+- **Match upstream's failure idiom for mis-set platform options:** warn and disable (per `onnxruntime_USE_SVE`, `onnxruntime_USE_KLEIDIAI`), not `FATAL_ERROR`.
+- **Host-only test code must not include CUDA `.cuh` headers.** `matmul_4bits_common.cuh` from a `.cc` pulled CUB via `<cuda_bf16.h>`, breaking TensorRT with ~40 device-intrinsic errors in host context.
+- **Cross-PR comparison is the fastest way to settle CI failure ownership.** #31678 green vs ours red proved the TensorRT break was ours; a docs-only control PR at 86/86 green proved Apple download failures were infra.
+- **Reviewer lockout held:** Luba (author) and Luv (reviewer) were both barred from #32001 revision; Isidore did it.

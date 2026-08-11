@@ -20,3 +20,22 @@ Holden reviewed `nxrt/mlas-apple-f16-cast` @ `df162d9`. All gating confirmed cor
 ## Archive pointer
 
 Older entries in `history-archive.md`.
+
+## 2026-08-11T23:55Z — PR A: Apple Accelerate infrastructure option
+
+- **PR:** https://github.com/microsoft/onnxruntime/pull/32001 (draft)
+- **Branch:** `nxrt/mlas-apple-framework-option`
+- **Option:** `onnxruntime_USE_APPLE_ACCELERATE` (default OFF, FATAL_ERROR on non-Apple)
+- **Linkage:** `find_library(Accelerate)` → system framework (macOS/iOS/universal2)
+- **Verified:** Default-OFF configure on Linux x86-64 is behaviour-identical to upstream/main
+- **Cannot verify here:** Apple SDK resolution, actual linking on Apple targets
+- **Next:** PR B (Accelerate cblas SGEMM/SDPA), separate branch, needs Apple hardware
+
+## 2026-08-12 — PR #32001 review fixes (Isidore under lockout)
+
+- Luv reviewed PR #32001 and found three substantive issues: S1 (FATAL_ERROR wrong idiom), S2 (no `build.py` argument), S3 (dangling compile definition).
+- **Luba and Luv both locked out** of the revision. Isidore revised all three.
+- S1: `message(WARNING ...) + set(onnxruntime_USE_APPLE_ACCELERATE OFF)` matching SVE/KleidiAI idiom.
+- S2: `--use_apple_accelerate` plumbed through `build_args.py` + `build.py`.
+- S3: `target_compile_definitions` line removed — no consumer exists yet.
+- Head: `d16a108252`. PR remains draft. @justinchuby directed PR A stay separate from kernel PRs.

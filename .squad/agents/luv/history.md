@@ -94,3 +94,11 @@ Re-reviewed commit `142cb563c5` for @justinchuby. Verdict: APPROVE. The fix corr
 ## 2026-08-11 (upstream CI correction wave) — Review PR #31985
 
 Adversarial review of one-line `docs/ContribOperators.md` fix. Confirmed `mrope_section` is required (no default in `bert_defs.cc:2046–2051`). Hand edit byte-exact to schema text. Single-file, single-line commit; no leaks, no scope creep. **Verdict: NITS only — ready to leave draft.** PR subsequently reached 86/86 CI green.
+
+## 2026-08-12 — Review PR #32001 (Apple Accelerate CMake option)
+
+Rubber-duck review of infrastructure-only PR adding `onnxruntime_USE_APPLE_ACCELERATE` (23 lines, 2 files). No-behaviour-change-when-disabled provable: every side-effectful statement is guarded. Found three substantive issues:
+- **S1:** `FATAL_ERROR` wrong for MLAS-level option; upstream idiom is warn+disable (`onnxruntime_USE_SVE` line 581, `onnxruntime_USE_KLEIDIAI` line 611).
+- **S2:** No `build.py` argument — option unreachable from standard path.
+- **S3:** `MLAS_USE_APPLE_ACCELERATE=1` defined but no consumer; deferred noise.
+No blocking issues. Recommended holding draft until first kernel. @justinchuby directed PR A stay separate. Wrote `.squad/decisions/inbox/luv-review-32001.md`. Reviewer lockout held: Luba and Luv both barred from revision; Isidore fixed.

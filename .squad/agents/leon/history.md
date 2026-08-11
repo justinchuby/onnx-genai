@@ -91,3 +91,21 @@ None inputs in `build_subgraph_routing`). Documented for Sebastian.
 **Outcome:** Fix correct at graph/compute level. However, Luv's review found the optional-slot conformance tests were vacuous — EP was declining the nodes at `ep.rs:275` (Undefined-dtype output check). BL2 fix was dead code in the ORT plugin path. Mariette corrected. Pris found BL1 regression test lacked fallback guard; Rachael hardened.
 
 **Lesson reinforced:** A passing test is not evidence the code under test ran. `disable_cpu_ep_fallback=1` + `Session_GetEpGraphAssignmentInfo` assertions are both required.
+
+## 2026-08-11 — PR #31988 TensorRT build fix
+
+- **Task**: Clear last real build blocker (Build Linux TensorRT x64 Release).
+- **Root cause**: `matmul_nbits_cols_per_block_test.cc` (host .cc) included `matmul_4bits_common.cuh` which pulls `<cuda_bf16.h>` → CUB device headers. Host compiler can't resolve `blockIdx`/`__threadfence`.
+- **Verdict**: OURS — PR #31678 (unrelated) has TensorRT green; ours red.
+- **Fix**: Extracted `SelectColsPerBlock` + constants to `matmul_4bits_cols_per_block.h` (host-only). Test uses host header; `.cuh` re-exports via include.
+- **nvcc local**: Installed (12.0). Full compile not feasible (gsl/onnxruntime deps missing) but host header verified standalone with g++.
+- **New head**: `34fe91e8dd`
+- **Invariants**: All four preserved — no reduction order/routing/wide-n/split-K changes; only header organization.
+
+## 2026-08-12 — PR #31988 TensorRT build fix
+
+- **Task**: Clear `Build Linux TensorRT x64 Release` blocker on PR #31988.
+- **Root cause**: `matmul_nbits_cols_per_block_test.cc` (host `.cc`) included `matmul_4bits_common.cuh`, which pulls `<cuda_bf16.h>` → CUB device headers. ~40 `'blockIdx' was not declared` errors in host compilation context.
+- **Verdict: OURS** (not inherited) — cross-PR comparison: #31678 (unrelated) TensorRT green; #31988 red. Disproved Deckard's initial "CUDA-13 base-codebase" assumption.
+- **Fix**: Extracted `SelectColsPerBlock`, `kColsPerThreadBlock`, `kTargetCtasPerSm` into `matmul_4bits_cols_per_block.h` (host-only, no device includes). Test uses only this header; `.cuh` re-exports via `#include`. All four invariants preserved (routing/output/wide-n/split-K unchanged).
+- **Head**: `34fe91e8dd`.

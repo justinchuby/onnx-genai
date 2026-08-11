@@ -50,3 +50,15 @@ Both upstream PRs marked ready-for-review. `.squad/` git history purge complete.
 ## 2026-08-11 (upstream CI correction wave) — PR #31985 (MRotaryEmbedding doc fix)
 
 Traced `Windows GPU Kernel Documentation Validation` CI failure to `docs/ContribOperators.md` stale text from upstream PR #31728 (`e415ef9afd`). Confirmed `mrope_section` is a required attribute (no default in `bert_defs.cc`); the phrase "(or omitting it)" was factually wrong, not just stale. Opened PR #31985 as a one-line hand-edit fix. PR reached 86/86 CI green and was marked ready for review.
+
+## 2026-08-12 — PR #31988 build fix (CUDA 13.0 -Werror)
+
+Fixed `-Werror=strict-aliasing` and `-Werror=unused-parameter` in `matmul_4bits_common.cuh`.
+Replaced `reinterpret_cast` type-punning with `memcpy`; added `(void)` casts for bf16
+params guarded by `__CUDA_ARCH__ >= 800`. Pushed `0ba804b7f7`.
+Could not compile locally (no nvcc). iPhone failure is a dep-download flake, left alone.
+
+## 2026-08-12 — PR #31988 TensorRT CI triage (initial assumption disproved)
+
+- Diagnosed CUDA 13.0 `-Werror=strict-aliasing` and `-Werror=unused-parameter` failures in `matmul_4bits_common.cuh`. Pushed `memcpy`-based punning and `(void)` casts (commit `0ba804b7f7`).
+- Initial assessment of `blockIdx`/`__threadfence` TensorRT errors: "CUDA-13 base-codebase incompatibilities, not ours." **This was disproved** by Leon's cross-PR comparison showing #31678 green / #31988 red. The errors were caused by our test's inclusion chain (`matmul_4bits_common.cuh` → CUB device headers from host `.cc`). Leon fixed by extracting a host-only header.
