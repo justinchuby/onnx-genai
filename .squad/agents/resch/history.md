@@ -50,3 +50,13 @@ Full pre-compaction history in `history-archive.md`.
 **Task 2 — Welford SIMD (option a):** Replaced two-pass variance with Welford's online algorithm using 8 parallel AVX2 accumulators + pairwise merge. 5-7× faster than scalar Welford at typical sizes (128-4096). Confirmed two-pass suffers catastrophic cancellation on adversarial inputs (mean~1e6: output error 4.18 vs Welford SIMD 0.049). RMSNorm unchanged (sum-of-squares has no cancellation risk).
 
 **Needs from Chew:** (1) Update test assertions for N<8, (2) fix `worst_welford` unused-variable build error, (3) adversarial precision tests at various mean offsets.
+
+## 2026-08-11 — BFloat16 CPU LayerNorm/RMSNorm Registration
+
+**Task:** Register BFloat16 on CPU for LayerNormalization, SimplifiedLayerNormalization, SkipLayerNormalization, SkipSimplifiedLayerNormalization — closing the CPU/CUDA asymmetry.
+
+**Approach:** Shared fp16 path via `is_narrow_float_v<T>` trait. All arithmetic is f32; BFloat16 is storage only. No MLAS kernel, no AVX512-BF16. Round-to-nearest-even via upstream `BFloat16(float)` constructor.
+
+**Files:** 6 files modified in `/workspace/upstream/ort-bf16` (branch `nxrt/mlas-bf16-layernorm`). No MLAS, no CMake changes. Zero overlap with PR #31973.
+
+**Status:** Code complete, not build-verified. Welford semantics preserved.

@@ -651,3 +651,27 @@ tested locally.
 **What's NOT validated:** Actual CUDA kernel execution (3 GPU-required stubs skip loudly). Registration checks require USE_CUDA build. Compilation requires ORT cmake build with gtest.
 
 **File ownership:** `onnxruntime/test/contrib_ops/cuda_kernels/cuda_candidate_cpu_reference_test.cc` in `/workspace/upstream/ort-cuda`
+
+### 2026-08-11 — BF16 CPU Op-Level Tests
+
+**Task:** Write operator-level tests proving bf16 LayerNorm/RMSNorm routes to CPU EP.
+
+**Gap confirmed:** No BFloat16 registration in CPU EP for LayerNormalization (cpu_execution_provider.cc:1080-1082), SimplifiedLayerNormalization (cpu_contrib_kernels.cc:159-161), or SkipSimplifiedLayerNormalization (cpu_contrib_kernels.cc:165-167). Schema permits bf16. CUDA has it. CPU does not.
+
+**Created:** `onnxruntime/test/contrib_ops/layer_norm_bf16_cpu_test.cc` — 10 tests across 3 ops (LayerNorm17, SimplifiedLayerNorm, SkipSimplifiedLayerNorm). Coverage: with/without bias, NormSizes 3/4/5/7/128/256 (including non-SIMD-aligned), multi-row, random data.
+
+**Anti-fallback:** Each test restricts to CPU EP only via ConfigEp(). No second EP → no fallback → no silent Cast. If bf16 kernel unregistered, session build fails.
+
+**Tolerance:** 0.1 abs (bf16 has ~8-bit mantissa; 10x wider than fp16's 0.01).
+
+**Build status:** Could not build — Resch's WIP kernel code has compile error in skip_layer_norm.cc. Tests are unexecuted. No pass/fail claim made.
+
+**UNVALIDATED:** Test execution, tolerance calibration vs Chew's measurements, AVX512-BF16 path (host has no AVX-512).
+
+## 2026-08-11T05:04 — BFloat16 CPU LayerNorm test fixes (ort-bf16)
+
+- Fixed compile errors: `{norm_size}` brace-init-list → named `gamma_dims` vector for `gsl::span` compatibility; `int hidden_size` → `int64_t` (3 sites, 4 Uniform calls total)
+- Tightened tolerance: 0.1f → 0.016f (2 bf16 ULP), justified by Chew's empirical measurements
+- Anti-fallback: argued by construction (single-EP ConfigEp pattern), not demonstrated against upstream main
+- Build: `ninja onnxruntime_provider_test` — clean compile, link succeeded
+- Tests: 10/10 passed (`./onnxruntime_provider_test --gtest_filter="LayerNormBFloat16*"`)
