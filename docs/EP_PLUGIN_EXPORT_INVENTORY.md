@@ -168,7 +168,7 @@ Evidence:
 
 ---
 
-## 6. Roy Verification Note — Updated for B1-B4 corrective wave (2026-08-11 @ 62f23440f)
+## 6. Roy Verification Note — Updated for B1-B4 corrective wave (2026-08-11 @ c1d2556b5)
 
 Re-ran `grep -rn "impl ExecutionProvider" crates/` independently. Results match Deckard's
 inventory exactly: 2 production EPs (CPU + CUDA), 2 inbound adapters, 7 test/mock

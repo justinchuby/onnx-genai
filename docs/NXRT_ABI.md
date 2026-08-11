@@ -3,7 +3,7 @@
 **Author:** Roy (Lead)
 **Date:** 2026-08-11
 **Branch:** `squad/ep-plugin-parity-cuda` (draft PR #762)
-**HEAD at time of writing:** `fb9d757b3`
+**HEAD at time of writing:** `c1d2556b5`
 
 ---
 
@@ -28,13 +28,13 @@ genuine workspace member and exports through the macro shipped in that crate.
 
 ## Preamble — What "nxrt ABI" Means Today
 
-| Surface | Committed at HEAD `fb9d757b3` | Location |
+| Surface | Committed at HEAD `c1d2556b5` | Location |
 |---|---|---|
 | **Rust `ExecutionProvider` trait** | ✅ | `crates/onnx-runtime-ep-api/src/provider.rs` |
 | **ORT plugin-EP C ABI adapter** | ✅ | `crates/onnx-runtime-ep-plugin/` |
-| **Native nxrt dynamic ABI** (`onnx-runtime-ep-nxrt-abi`, `onnx-runtime-ep-nxrt-host`) | ✅ Committed at `62f23440f` | `crates/onnx-runtime-ep-nxrt-abi/`, `crates/onnx-runtime-ep-nxrt-host/`, `crates/onnx-runtime-ep-nxrt-testplugin/` |
+| **Native nxrt dynamic ABI** (`onnx-runtime-ep-nxrt-abi`, `onnx-runtime-ep-nxrt-host`) | ✅ Committed | `crates/onnx-runtime-ep-nxrt-abi/`, `crates/onnx-runtime-ep-nxrt-host/`, `crates/onnx-runtime-ep-nxrt-testplugin/` |
 
-> **Test status as of HEAD `62f23440f`:**
+> **Test status as of HEAD `c1d2556b5`:**
 > `onnx-runtime-ep-nxrt-abi`: **32/32 passing** (4 ignored doc-tests).
 > `onnx-runtime-ep-nxrt-host`: **10/10 round-trip passing** (env-var race fixed via `ENV_MUTEX`).
 > See §6.10 for details.
@@ -236,7 +236,7 @@ misdiagnosed as an ORT ABI discrepancy) and once in nxrt status handling (B3).
 
 ---
 
-## 6. Native nxrt Dynamic ABI — Committed at `fb9d757b3`
+## 6. Native nxrt Dynamic ABI — Committed at `c1d2556b5`
 
 ### 6.1 Overview
 
@@ -262,7 +262,7 @@ Symbol name constants in the ABI crate: `NXRT_SYMBOL_NEGOTIATE = b"NxrtNegotiate
 
 ### 6.3 Version negotiation rules
 
-ABI version at `fb9d757b3`: **major=1, minor=0**.
+ABI version at `c1d2556b5`: **major=1, minor=0**.
 
 1. Host fills `NxrtNegotiateRequest { struct_size, host_range: NxrtVersionRange { major_min, major_max, minor_max } }`.
 2. Plugin's `NxrtNegotiate` checks compatibility and fills `NxrtNegotiateResponse { struct_size, agreed_major, agreed_minor, plugin_range, capability_flags }`.
@@ -392,7 +392,7 @@ instance derived from the plugin structurally shares the `Arc<Library>` — the
 library cannot be unloaded while live references exist. `FactorySet::drop` releases
 all factory vtables via their `release` pointers with `catch_unwind`.
 
-### 6.10 Current test results (observed at HEAD `62f23440f`)
+### 6.10 Current test results (observed at HEAD `c1d2556b5`)
 
 #### `onnx-runtime-ep-nxrt-abi` — 32/32 passing (4 ignored doc-tests)
 
@@ -437,7 +437,7 @@ cargo test -p onnx-runtime-ep-nxrt-host
 cargo check --workspace
 ```
 
-As of HEAD `62f23440f`:
+As of HEAD `c1d2556b5`:
 - `cargo check --workspace` — clean.
 - `cargo test -p onnx-runtime-ep-plugin` — all tests passing (154 lib + 9 parity).
 - `cargo test -p onnx-runtime-ep-nxrt-abi` — 32/32 passing.

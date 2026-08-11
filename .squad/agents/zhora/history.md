@@ -35,3 +35,9 @@ Scribe note: the CLI dev-tool charter and prioritized backlog from the merged CL
 #364 merged after the implementation was corrected to use prefetch only in eviction-neutral cache regimes.
 
 Full pre-compaction history in `history-archive.md`.
+
+### 2026-08-11T19:30:00Z — PR #762 documentation accuracy pass
+- Rewrote the PR body for #762 (`squad/ep-plugin-parity-cuda`): replaced stale M1/M2 description with accurate account of 6 review rounds, 3 late-breaking blockers fixed, strengthened test story (EP assignment proof), exact test numbers (269/0 EP crates).
+- Swept docs: updated 8 stale SHA refs in `NXRT_ABI.md`, stale commit in `EP_PLUGIN_EXPORT.md`, rewrote header in `EP_PLUGIN_EXPORT_PR.md`, updated `EP_PLUGIN_EXPORT_INVENTORY.md`.
+- `CUDA_EP_STATUS.md` was already accurate — no changes needed.
+- No code modified. PR remains draft. Decision record at `.squad/decisions/inbox/zhora-final-docs-762.md`.

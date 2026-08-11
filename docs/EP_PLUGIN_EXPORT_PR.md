@@ -1,11 +1,13 @@
 # PR: ORT Plugin EP Export — Rust CPU EP via upstream ORT 1.27.0 (Milestone 1) + Parity, f16/bf16, Device Surfaces & CUDA Prep (Milestone 2)
 
-> ## ⚠️ PR #762 REJECTED — Corrective Wave Applied
+> ## ⚠️ PR #762 — Six Review Rounds Complete; Draft Pending Final Doc Pass
 >
-> **Status as of 2026-08-11, HEAD `62f23440f`:** PR #762 was **rejected** by an
-> Opus rubber-duck review with **four blockers (B1–B4)**. All four have been
-> corrected in commits `fcaa01b0a` (fixes) and `62f23440f` (test repair). The
-> PR remains draft.
+> **Status as of 2026-08-11, HEAD `c1d2556b5`:** PR #762 went through six
+> independent adversarial review rounds. Three late-breaking blockers (optional
+> slot fidelity, LayerNorm axis resolution, forgeable absent-output sentinel)
+> were found and fixed. The test story was substantially strengthened: 14 tests
+> now prove EP assignment via `Session_GetEpGraphAssignmentInfo` and
+> `disable_cpu_ep_fallback`. EP crates: 269 passed, 0 failed. PR remains draft.
 >
 > **What is genuinely working:** The CPU EP plugin is the end-to-end success
 > story: 154 lib + 9 parity + 6 ABI + 20 ORT e2e tests pass (1 ignored — see
@@ -231,7 +233,7 @@ Integration tests covering:
 
 ## Validation
 
-All commands run by Roy on `squad/ep-plugin-parity-cuda` at commit `fb9d757b3`,
+All commands run by Roy on `squad/ep-plugin-parity-cuda` at commit `c1d2556b5`,
 2026-08-11T01:08Z. Output is quoted verbatim.
 
 ### `cargo clippy -p onnx-runtime-ep-plugin --all-targets -- -D warnings`
@@ -489,9 +491,9 @@ sync; the ORT ABI evolves toward nxrt; fail closed on unsupported capabilities.
 
 ---
 
-## Appendix: Fresh Validation (Roy, 2026-08-11T06:34Z at `62f23440f`)
+## Appendix: Fresh Validation (Roy, 2026-08-11T06:34Z at `c1d2556b5`)
 
-All commands re-run by Roy at HEAD `62f23440f` (confirmed via `git rev-parse --short HEAD`).
+All commands re-run by Roy at HEAD `c1d2556b5` (confirmed via `git rev-parse --short HEAD`).
 
 ### Tests (post-B1-B4 corrective wave)
 

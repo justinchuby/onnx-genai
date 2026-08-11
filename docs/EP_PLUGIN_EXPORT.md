@@ -30,7 +30,7 @@ These facts were verified personally by running the commands below on the branch
 | `GetEpDevices` finds `cpu_ep` | `ort_register_ep_library` passes |
 | Unsupported ops decline, not crash | `ort_unsupported_op_declines_not_crashes` passes |
 
-## CURRENT STATUS (as of 2026-08-10, commit `bad3682`)
+## CURRENT STATUS (as of 2026-08-11, commit `c1d2556b5`)
 
 | Item | Status |
 |------|--------|
