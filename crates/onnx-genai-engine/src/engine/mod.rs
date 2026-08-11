@@ -13,9 +13,10 @@ pub(crate) use crate::decode_loop::{
 pub(crate) use crate::kv_bridge::{
     KvModelInfo, PlacedPayload, RewindRequest, RewindRunnerPolicy, attach_pages_to_sequence,
     chunk_payload_from_exported, common_prefix_len, exported_layers_from_runner,
-    infer_kv_model_info, kv_model_past_is_f32, load_materialized_past, past_kv_from_payloads,
-    rewind_draft_state_to_len, rewind_target_state_to_len, sequence_pages_for_len,
-    validate_draft_state_rewind_to_len, validate_target_state_rewind_to_len,
+    infer_kv_model_info, kv_model_past_is_f32, load_materialized_past,
+    ort_session_has_recurrent_state, past_kv_from_payloads, rewind_draft_state_to_len,
+    rewind_target_state_to_len, sequence_pages_for_len, validate_draft_state_rewind_to_len,
+    validate_target_state_rewind_to_len,
 };
 pub(crate) use crate::logits::{StopSequence, TokenId};
 pub(crate) use crate::processors::{

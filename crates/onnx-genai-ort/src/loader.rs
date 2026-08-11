@@ -18,6 +18,17 @@ use crate::{
     TensorInfo, Tokenizer,
 };
 
+/// The canonical error for a model-load entry point invoked on a path that is
+/// not an existing directory. Hoisted to a single definition so the message is
+/// structurally one source of truth rather than three copies that merely happen
+/// to match today — callers that match on this text match one string.
+fn model_dir_missing_err(root: &Path) -> OrtError {
+    OrtError::InvalidArgument(format!(
+        "model directory does not exist: {}",
+        root.display()
+    ))
+}
+
 /// Resolved files needed to load a single ONNX text-generation model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelDirectory {
@@ -38,10 +49,7 @@ impl ModelDirectory {
     pub fn load(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
         if !root.is_dir() {
-            return Err(OrtError::InvalidArgument(format!(
-                "model directory does not exist: {}",
-                root.display()
-            )));
+            return Err(model_dir_missing_err(root));
         }
 
         if is_model_package_directory(root) {
@@ -234,10 +242,7 @@ impl PipelineModelDirectory {
     pub fn load_if_declared(root: impl AsRef<Path>) -> Result<Option<Self>> {
         let root = root.as_ref();
         if !root.is_dir() {
-            return Err(OrtError::InvalidArgument(format!(
-                "model directory does not exist: {}",
-                root.display()
-            )));
+            return Err(model_dir_missing_err(root));
         }
         if let Some(metadata_path) = find_metadata_path(root) {
             let metadata = load_metadata(&metadata_path)
@@ -269,10 +274,7 @@ impl PipelineModelDirectory {
     pub fn load(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
         if !root.is_dir() {
-            return Err(OrtError::InvalidArgument(format!(
-                "model directory does not exist: {}",
-                root.display()
-            )));
+            return Err(model_dir_missing_err(root));
         }
 
         let native_metadata_path = find_metadata_path(root);
