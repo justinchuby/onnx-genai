@@ -82,3 +82,60 @@ For normal-range inputs (mean~0, spread~1): all methods are within 1e-7, essenti
 
 - `onnxruntime/core/mlas/lib/layernorm.cpp` — NormSize < 8 threshold
 - `onnxruntime/core/mlas/lib/layernorm_kernel_avx2.cpp` — Welford SIMD for full LayerNorm, restructured RMSNorm path
+
+## Task 3: RMSNorm — Skip mean accumulation when MeanOut is null (Gaff S1)
+
+### Premise verification
+
+Confirmed: in the RMSNorm (Simplified) path, `vsum` accumulates the element sum
+purely to compute `mean_val`, which is **only** written to `*MeanOut` at the
+bottom of the function. The Simplified normalization pass multiplies
+`Input[i] * inv_denom * Scale[i]` — it never subtracts the mean. Therefore
+`vsum` is dead work when `MeanOut == nullptr`.
+
+### Change shape
+
+Per-row runtime check `if (MeanOut != nullptr)` **outside** the inner vector
+loop, splitting into two loop bodies:
+- **MeanOut requested:** accumulate both `vsum` and `vsumsq` (original behavior).
+- **MeanOut null:** accumulate `vsumsq` only, skip `vsum` + horizontal reduce.
+
+Rejected alternatives:
+- **Template/constexpr split:** Would require a second kernel symbol + dispatch
+  changes in `platform.cpp`/`mlasi.h`. Too invasive for one `vaddps`.
+- **Runtime branch inside inner loop:** Could cost more than the `vaddps` it
+  removes due to branch misprediction overhead.
+
+The per-row check is free — the function is called once per normalization row,
+so the branch is predicted correctly after the first row.
+
+### Measured speedup
+
+Micro-benchmark on AMD EPYC 9V74, 500k iterations, RMSNorm only:
+
+| NormSize | With MeanOut (ns) | Without MeanOut (ns) | Speedup |
+|----------|------------------|---------------------|---------|
+| 8        | 8.5              | 8.0                 | 6.0%    |
+| 16       | 9.6              | 8.9                 | 7.8%    |
+| 32       | 12.4             | 11.3                | 9.2%    |
+| 64       | 17.6             | 16.8                | 4.8%    |
+| 128      | 31.1             | 29.9                | 3.7%    |
+| 256      | 74.9             | 75.5                | -0.8%   |
+| 512      | 132.7            | 131.3               | 1.0%    |
+| 1024     | 254.7            | 253.6               | 0.4%    |
+| 4096     | 1166.7           | 1166.7              | 0.0%    |
+
+**Honest assessment:** Gaff's "~15%" estimate was overstated. The real speedup is
+**5-9% for small N (8-64), negligible (<1%) for N≥256.** At LLM-typical hidden
+dimensions (768-4096), the savings are in the noise. The change stands on
+**code clarity** — the intent that the sum is dead when MeanOut is null is now
+explicit — not on a performance claim.
+
+### N2: dispatch-contract assert
+
+The `assert(!Simplified || Bias == nullptr)` on line 47 is invisible in release
+builds. I agree with Gaff's observation and also agree it should stay as-is.
+This matches MLAS convention: `assert` documents the contract for developers;
+the dispatch layer in `layernorm.cpp` enforces it structurally by passing
+`nullptr` for Bias when Simplified is true. Adding a runtime check would
+penalise every call for a condition that's architecturally impossible.

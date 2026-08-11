@@ -42,3 +42,7 @@ Full pre-compaction history in `history-archive.md`.
 ## 2026-08-11 — Review PR #31974 (BFloat16 LayerNorm/RMSNorm CPU EP)
 
 Reviewed for @justinchuby. Verdict: CONDITIONAL APPROVE. One substantive finding (contrib U=BFloat16 schema mismatch — pre-existing pattern from MLFloat16). No blockers. 10 tests, clean anti-fallback design, correct rounding (RNE via BFloat16 constructor). Noted code duplication (NarrowToFloat/FloatToNarrow in two files, BFloat16 ComputeJob/BFloat16Math are near-clones of MLFloat16 versions). Full review at `.squad/decisions/inbox/luv-review-pr31974.md`.
+
+## 2026-08-11 — Re-Review PR #31974 (S1 fix: U=float for narrow-float contrib kernels)
+
+Re-reviewed commit `142cb563c5` for @justinchuby. Verdict: APPROVE. The fix correctly changes contrib macro to `(T, U)` and registers `MLFloat16,float` / `BFloat16,float`. Verified: (1) declaration-only, no runtime change — contrib LayerNorm constructor sets `contrib_op=false`, so `SrcDispatcher` always calls `ComputeImpl<T, float>`; (2) kernel matching improves for schema-compliant models, no breakage for existing valid models; (3) CUDA parity confirmed; (4) all 4 macro expansions correct; (5) recommended keeping MLFloat16 fix combined. 10 bf16 tests pass. Full re-review appended to `.squad/decisions/inbox/luv-review-pr31974.md`.

@@ -132,3 +132,21 @@ of our branch.
 - `RUSTFLAGS="-D warnings" cargo clippy -p onnx-runtime-ep-cpu -p onnx-runtime-ep-api` → clean
 - `cargo fmt --all -- --check` → clean
 - cpu-plugin 6+17, ep-plugin 154+9 → no regression
+
+## 2026-08-11 — BFloat16 contrib U type constraint fix
+
+**PR:** microsoft/onnxruntime#31974  
+**Task:** Investigate and fix the `U` type constraint mismatch in contrib CPU LayerNorm.
+
+**Facts established:**
+- Contrib schema constrains `U` to `{tensor(float)}` only.
+- The macro registered `U=T`, so for MLFloat16/BFloat16, `U=MLFloat16`/`U=BFloat16` — violating the schema.
+- This is pre-existing for MLFloat16; our PR widened it to BFloat16.
+- **No runtime correctness impact:** the contrib `LayerNorm` doesn't set `contrib_op=true`, so `SrcDispatcher` always uses `U=float`.
+- CUDA contrib already correctly registers `U=float` for narrow types.
+
+**Decision:** Option (b) — changed macro to two params `(T, U)`, registered narrow types with `U=float`. One-line semantic change, zero risk, aligns CPU with CUDA and schema.
+
+**Duplication nits:** deferred to follow-up — scope creep for a registration PR.
+
+**Validation:** Build succeeded, 10/10 `LayerNormBFloat16*` tests passed.

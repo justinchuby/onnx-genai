@@ -60,3 +60,15 @@ Full pre-compaction history in `history-archive.md`.
 **Files:** 6 files modified in `/workspace/upstream/ort-bf16` (branch `nxrt/mlas-bf16-layernorm`). No MLAS, no CMake changes. Zero overlap with PR #31973.
 
 **Status:** Code complete, not build-verified. Welford semantics preserved.
+
+### 2026-08-11T05:19:00+00:00 — RMSNorm: skip mean accumulation when MeanOut null (Gaff S1)
+
+**Finding:** Gaff identified that the RMSNorm path accumulates `vsum` for `MeanOut` even when `MeanOut == nullptr`. Confirmed the premise: `vsum` feeds only `mean_val`, which is only written to `*MeanOut` — the Simplified normalization path never subtracts the mean.
+
+**Change:** Per-row `if (MeanOut != nullptr)` check outside the inner loop, splitting into two loop bodies. When null, `vsum` + horizontal reduce are skipped entirely.
+
+**Measurement:** 5-9% speedup at small N (8-64), negligible at LLM-typical sizes (768+). Change justified on code clarity, not a performance claim.
+
+**N2 (assert in release):** Agreed with Gaff and agreed it should stay — matches MLAS convention. Dispatch layer enforces the contract structurally.
+
+**Tests:** 40/40 pass (unchanged).

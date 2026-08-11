@@ -76,3 +76,90 @@ Same pattern — could be templatized.
 
 - The 45 MLAS kernel tests and 10 operator tests claimed passing — not independently built/run (build infrastructure not available in this review environment).
 - PR text's claim about CUDA EP already having bf16 registration (`cuda_contrib_kernels.cc:178`) — not verified.
+
+---
+
+# Re-Review: S1 fix commit `142cb563c5` (Register U=float for narrow-float contrib kernels)
+
+**Reviewer:** Luv (Code Reviewer)
+**Date:** 2026-08-11
+**Verdict:** APPROVE — no blockers, no new substantive findings. S1 is fully resolved.
+
+## Change summary
+
+Commit `142cb563c5` modifies `contrib_ops/cpu/layer_norm.cc`:
+- Macro `REGISTER_CONTRIB_KERNELS(T)` → `REGISTER_CONTRIB_KERNELS(T, U)`, with `U` controlling the `.TypeConstraint("U", ...)` registration.
+- `float,float` and `double,double` retain `U=T` — no change.
+- `MLFloat16,float` and `BFloat16,float` now register `U=float` instead of `U=MLFloat16`/`U=BFloat16`.
+
+## Scrutiny results
+
+### 1. Is the "declaration-only, no runtime change" claim true? — **YES**
+
+Traced the full path:
+- Contrib `LayerNorm` constructor (`layer_norm.h:14-15`): calls `LayerNormImpl(op_kernel_info, simplified)` — **two args**, so `contrib_op` defaults to `false`.
+- `LayerNormImpl::Compute` (`layer_norm_impl.cc:697-703`): dispatches via `SrcDispatcher`.
+- `SrcDispatcher` (`layer_norm_impl.h:44-62`): checks `contrib_op`. When `contrib_op=false`, it calls `ComputeImpl<T, float>` regardless of the declared `U`.
+- Therefore for the contrib `LayerNorm<false/true>` kernel, `U` in the kernel def is **declaration-only** — it affects kernel matching but not runtime computation. `Mean`/`InvStdDev` outputs were always emitted as `float`.
+
+**Conclusion: no runtime behaviour change for any type, including MLFloat16.** The claim is accurate.
+
+### 2. Does the kernel registry key change? — **YES, but no breakage risk**
+
+The `U` TypeConstraint participates in kernel matching. For a model with opset 1-16 `LayerNormalization` where the graph has `T=MLFloat16`:
+- **Before:** kernel declared `U=MLFloat16`. If a model's `U` output edge was typed `float` (the schema-correct type), the kernel's `U=MLFloat16` constraint would *not match* — but this was already the case, so no regression.
+- **After:** kernel declares `U=float`. If a model's `U` output edge is typed `float`, the kernel now *correctly matches*.
+- If a model had `U=MLFloat16` edges (schema-violating), it previously matched and now won't. But such a model was already schema-violating, so this is a correctness improvement, not a regression.
+
+**Net effect: existing valid models that worked before will continue to work. Models with U outputs typed as float will now match correctly (an improvement). Schema-violating models may stop matching, which is the correct behaviour.**
+
+### 3. Is the CUDA parity claim accurate? — **YES**
+
+Verified in `contrib_ops/cuda/layer_norm.cc:30-35`:
+```
+REGISTER_KERNEL_TYPED(float, float, float)
+REGISTER_KERNEL_TYPED(double, double, double)
+REGISTER_KERNEL_TYPED(MLFloat16, float, MLFloat16)
+REGISTER_KERNEL_TYPED(float, float, MLFloat16)
+REGISTER_KERNEL_TYPED(MLFloat16, float, float)
+REGISTER_KERNEL_TYPED(BFloat16, float, BFloat16)
+```
+CUDA registers `U=float` for all narrow-float types. The CPU contrib fix now matches.
+
+### 4. Did the macro change miss or over-apply? — **NO**
+
+All four expansions verified:
+- `REGISTER_CONTRIB_KERNELS(float, float)` → U=float ✅ (same as before)
+- `REGISTER_CONTRIB_KERNELS(double, double)` → U=double ✅ (same as before)
+- `REGISTER_CONTRIB_KERNELS(MLFloat16, float)` → U=float ✅ (fixed)
+- `REGISTER_CONTRIB_KERNELS(BFloat16, float)` → U=float ✅ (fixed)
+
+The `SkipLayerNormalization`/`SkipSimplifiedLayerNormalization` macros (`skip_layer_norm.cc:17-35`) have no `U` constraint — unaffected. The ONNX-domain opset-17 kernel (`core/providers/cpu/nn/layer_norm.cc`) already hardcodes `U=float` — unaffected.
+
+### 5. Scope recommendation: **KEEP COMBINED**
+
+Reasons:
+- The bf16 registration *introduced* a schema-violating `U=BFloat16` that this commit fixes.
+- Fixing MLFloat16 in the same commit prevents inconsistency between two adjacent lines of the same macro.
+- The fix is 10 lines in one file with zero runtime impact — splitting it would add review overhead with no safety benefit.
+- An ORT maintainer who wants it separated can cherry-pick the commit trivially, but I recommend against it.
+
+### 6. Prior findings re-confirmed
+
+- **4 op registrations** (LayerNorm, SimplifiedLayerNorm, SkipLayerNorm, SkipSimplifiedLayerNorm): all bf16 registrations still present and correct.
+- **Prepacking:** `ConvertMLFloat16ToFloatIfNeeded` still handles BFloat16.
+- **Rounding:** BFloat16 constructor still uses RNE.
+- **Anti-fallback property:** verified by running tests — 10/10 pass.
+- **Tests:** `./onnxruntime_provider_test --gtest_filter="LayerNormBFloat16*"` — 10 tests passed independently.
+
+## Verified vs taken on trust
+
+**Verified directly:**
+- SrcDispatcher dispatch path (contrib_op=false → U=float always)
+- CUDA contrib registrations (U=float for narrow types)
+- All 4 macro expansions
+- 10 bf16 tests pass
+- No MLFloat16-specific tests exist in this test suite to exercise the changed registration
+
+**Taken on trust:**
+- No existing MLFloat16 LayerNorm tests break (full test suite not run — only bf16 filter). **Recommendation:** PR CI should confirm the full `LayerNormalization` test suite passes for MLFloat16.

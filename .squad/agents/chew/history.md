@@ -68,3 +68,23 @@ Full pre-compaction history in `history-archive.md`.
 - 2026-08-11: **AVX2 LayerNorm two-pass vs Welford precision audit** (PR #31973 on microsoft/onnxruntime). Built adversarial numeric tests in `test_layernorm.cpp`. Key finding: two-pass `E[x²] - mean²` suffers catastrophic cancellation when mean is large and variance is small (inv_std_dev error = 100% at base=1e7). Realistic LLM activations are fine (≤3e-05 rel error). Verdict: **two-pass is not acceptable for full LayerNorm; recommend Welford-preserving SIMD**. RMSNorm unaffected. 3 passing tests added + 1 DISABLED comparison report. All 39 tests green. Filed to `.squad/decisions/inbox/chew-layernorm-numerics.md`.
 - 2026-08-11: **Test contract update for Welford SIMD + NormSize<8 threshold** (same PR). Resch replaced two-pass with Welford-preserving SIMD and added dispatch threshold. Fixed 9 failing tests by encoding conditional dispatch contract: N≥8 → ASSERT_TRUE(used), N<8 → ASSERT_FALSE(used) with scalar fallback verification. Skip mean check for RMSNorm (not part of contract). Added committed `CatastrophicCancellationPasses` test asserting no NaN/Inf and exact parity with scalar Welford. Re-measured: Welford SIMD is 0.1–0.8× the error of scalar Welford (ratio < 1.0 everywhere). Worst output error 1.34e-05 at N=16384. Updated labels from "two-pass" to "Welford SIMD" throughout. All 40 tests green, 0 failures.
 - 2026-08-11: **BF16 LayerNorm/RMSNorm precision oracle** (branch `nxrt/mlas-bf16-layernorm`). Created `test_layernorm_bf16.cpp` (45 tests). Validated ORT's BFloat16 RNE rounding (336/336 tie-to-even, 672/672 directional). Measured bf16 representation-error floor: max_abs ≈ 3.9e-3 (0.5 ULP), max_ulp=0 across all N up to 65536. Simulated widen→f32-accumulate→narrow: ≤1 bf16 ULP above floor even at N=65536. BF16/FP16 ratio = 8.0× as expected (8 vs 11 mantissa bits). Catastrophic cancellation shape from #31973 does NOT apply to bf16 (coarse quantization makes variance relatively large). Recommended kernel tolerance: ≤2 bf16 ULP. Verdict: **ACCEPT** widen-accumulate-narrow approach. Kernel hook deferred until Resch's API lands. Report in `.squad/decisions/inbox/chew-bf16-numerics.md`.
+
+## 2026-08-11 — PR #31973 clarity pass (nxrt/mlas-avx2-layernorm)
+
+**S2 — ReferenceLayerNorm two-pass comment** (`test_layernorm.cpp` lines ~44–76):
+
+Added an explanatory block comment above `ReferenceLayerNorm` covering two points:
+
+1. *Why two-pass is safe in fp64.* At float32 magnitudes the subtracted terms `E[x²] - mean²` differ by at most ~2⁵³ ULPs in fp64, so cancellation error stays inside fp64's dynamic range and the result is accurate to single precision. The catastrophic cancellation that produced NaN / 100% error in fp32 does not occur here.
+
+2. *Why two-pass is deliberately kept rather than switched to Welford.* An independent algorithm in the reference cross-checks the kernel rather than repeating its logic. If both used Welford, a shared conceptual mistake (wrong initialisation, off-by-one in the running count) could produce identical wrong answers without being caught. The algebraic equivalence of the two formulas, combined with fp64 safety, makes two-pass the right oracle here. I left the reference on two-pass and noted explicitly that it should not be "fixed" to Welford.
+
+**N1 — dead `(void)0;` at line ~695:** Removed.
+
+**clang-format:** Run on `onnxruntime/test/mlas/unittest/test_layernorm.cpp`.
+
+**Validation:** 40/40 LayerNorm tests pass.
+```
+[==========] 40 tests from 3 test suites ran. (4 ms total)
+[  PASSED  ] 40 tests.
+```
