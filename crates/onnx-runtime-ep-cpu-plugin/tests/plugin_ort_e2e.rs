@@ -652,6 +652,7 @@ fn diag_ort_ep_api_nullcheck() {
 unsafe fn conformance_setup(
     reg_name: &str,
     model_path: &std::path::Path,
+    disable_fallback: bool,
 ) -> Option<(
     libloading::Library,
     *const ort::OrtApi,
@@ -721,6 +722,23 @@ unsafe fn conformance_setup(
     let mut session_options: *mut ort::OrtSessionOptions = ptr::null_mut();
     let status = unsafe { ((*api).CreateSessionOptions.unwrap())(&mut session_options) };
     unsafe { check_status(api, status, "CreateSessionOptions") };
+
+    // Disable ORT's built-in CPU EP fallback — forces failure if our plugin EP
+    // declines a node, proving the test is not vacuous.
+    if disable_fallback {
+        let key = CString::new("session.disable_cpu_ep_fallback").unwrap();
+        let val = CString::new("1").unwrap();
+        let add_config =
+            unsafe { (*api).AddSessionConfigEntry }.expect("AddSessionConfigEntry not in OrtApi");
+        let status = unsafe { add_config(session_options, key.as_ptr(), val.as_ptr()) };
+        unsafe {
+            check_status(
+                api,
+                status,
+                "AddSessionConfigEntry(disable_cpu_ep_fallback)",
+            )
+        };
+    }
 
     let devices_arr: [*const ort::OrtEpDevice; 1] = [our_device];
     let status = unsafe {
@@ -904,7 +922,7 @@ fn conformance_add_broadcast() {
     let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/add_broadcast/model.onnx");
 
     let Some((_lib, api, env, opts, session)) =
-        (unsafe { conformance_setup("cpu_ep_bc", &model_path) })
+        (unsafe { conformance_setup("cpu_ep_bc", &model_path, true) })
     else {
         eprintln!("*** SKIPPED: conformance_add_broadcast — ORT or EP cdylib not found ***");
         return;
@@ -977,7 +995,7 @@ fn conformance_chain_add_mul() {
     let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/chain_add_mul/model.onnx");
 
     let Some((_lib, api, env, opts, session)) =
-        (unsafe { conformance_setup("cpu_ep_chain", &model_path) })
+        (unsafe { conformance_setup("cpu_ep_chain", &model_path, true) })
     else {
         eprintln!("*** SKIPPED: conformance_chain_add_mul — ORT or EP cdylib not found ***");
         return;
@@ -1053,7 +1071,7 @@ fn conformance_matmul_2d() {
     let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/matmul_2d/model.onnx");
 
     let Some((_lib, api, env, opts, session)) =
-        (unsafe { conformance_setup("cpu_ep_mm", &model_path) })
+        (unsafe { conformance_setup("cpu_ep_mm", &model_path, true) })
     else {
         eprintln!("*** SKIPPED: conformance_matmul_2d — ORT or EP cdylib not found ***");
         return;
@@ -1125,7 +1143,7 @@ fn conformance_mixed_partition() {
     let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/mixed_partition/model.onnx");
 
     let Some((_lib, api, env, opts, session)) =
-        (unsafe { conformance_setup("cpu_ep_mix", &model_path) })
+        (unsafe { conformance_setup("cpu_ep_mix", &model_path, false) })
     else {
         eprintln!("*** SKIPPED: conformance_mixed_partition — ORT or EP cdylib not found ***");
         return;
@@ -1193,7 +1211,7 @@ fn conformance_add_int32() {
     let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/add_int32/model.onnx");
 
     let Some((_lib, api, env, opts, session)) =
-        (unsafe { conformance_setup("cpu_ep_i32", &model_path) })
+        (unsafe { conformance_setup("cpu_ep_i32", &model_path, true) })
     else {
         eprintln!("*** SKIPPED: conformance_add_int32 — ORT or EP cdylib not found ***");
         return;
@@ -1263,7 +1281,7 @@ fn conformance_add_dynamic_dim() {
     let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/add_dynamic_dim/model.onnx");
 
     let Some((_lib, api, env, opts, session)) =
-        (unsafe { conformance_setup("cpu_ep_dyn", &model_path) })
+        (unsafe { conformance_setup("cpu_ep_dyn", &model_path, true) })
     else {
         eprintln!("*** SKIPPED: conformance_add_dynamic_dim — ORT or EP cdylib not found ***");
         return;
@@ -1352,7 +1370,7 @@ fn conformance_multiple_run_calls() {
     let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/add_1x4/model.onnx");
 
     let Some((_lib, api, env, opts, session)) =
-        (unsafe { conformance_setup("cpu_ep_runs", &model_path) })
+        (unsafe { conformance_setup("cpu_ep_runs", &model_path, true) })
     else {
         eprintln!("*** SKIPPED: conformance_multiple_run_calls — ORT or EP cdylib not found ***");
         return;
@@ -1514,6 +1532,11 @@ fn conformance_two_sessions() {
         let mut opts_a: *mut ort::OrtSessionOptions = ptr::null_mut();
         let status = ((*api).CreateSessionOptions.unwrap())(&mut opts_a);
         check_status(api, status, "CreateSessionOptions(A)");
+        let key = CString::new("session.disable_cpu_ep_fallback").unwrap();
+        let val = CString::new("1").unwrap();
+        let add_config = (*api).AddSessionConfigEntry.expect("AddSessionConfigEntry");
+        let status = add_config(opts_a, key.as_ptr(), val.as_ptr());
+        check_status(api, status, "AddSessionConfigEntry(A)");
         let devs: [*const ort::OrtEpDevice; 1] = [our_device];
         let status = ((*api).SessionOptionsAppendExecutionProvider_V2.unwrap())(
             opts_a,
@@ -1535,6 +1558,8 @@ fn conformance_two_sessions() {
         let mut opts_b: *mut ort::OrtSessionOptions = ptr::null_mut();
         let status = ((*api).CreateSessionOptions.unwrap())(&mut opts_b);
         check_status(api, status, "CreateSessionOptions(B)");
+        let status = add_config(opts_b, key.as_ptr(), val.as_ptr());
+        check_status(api, status, "AddSessionConfigEntry(B)");
         let status = ((*api).SessionOptionsAppendExecutionProvider_V2.unwrap())(
             opts_b,
             env,
@@ -1656,7 +1681,7 @@ fn conformance_matmul_batched_nd() {
         PathBuf::from(manifest_dir).join("tests/fixtures/matmul_batched_nd/model.onnx");
 
     let Some((_lib, api, env, opts, session)) =
-        (unsafe { conformance_setup("cpu_ep_mm3d", &model_path) })
+        (unsafe { conformance_setup("cpu_ep_mm3d", &model_path, true) })
     else {
         eprintln!("*** SKIPPED: conformance_matmul_batched_nd — ORT or EP cdylib not found ***");
         return;
@@ -1900,7 +1925,7 @@ fn conformance_add_float16() {
     let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/add_float16/model.onnx");
 
     let Some((_lib, api, env, opts, session)) =
-        (unsafe { conformance_setup("cpu_ep_f16", &model_path) })
+        (unsafe { conformance_setup("cpu_ep_f16", &model_path, true) })
     else {
         eprintln!("*** SKIPPED: conformance_add_float16 — ORT or EP cdylib not found ***");
         return;
@@ -1973,7 +1998,7 @@ fn conformance_add_bfloat16() {
     let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/add_bfloat16/model.onnx");
 
     let Some((_lib, api, env, opts, session)) =
-        (unsafe { conformance_setup("cpu_ep_bf16", &model_path) })
+        (unsafe { conformance_setup("cpu_ep_bf16", &model_path, true) })
     else {
         eprintln!("*** SKIPPED: conformance_add_bfloat16 — ORT or EP cdylib not found ***");
         return;
@@ -2038,10 +2063,11 @@ fn conformance_add_bfloat16() {
 // Each test uses an op whose output dtype differs from its first input dtype,
 // exactly the scenario that was silently corrupted before the fix.
 //
-// The `conformance_setup` helper already asserts `provider == cpu_ep` by
-// verifying our EP appears in GetEpDevices and is appended to the session.
-// If ORT silently fell back to its default EP, conformance_setup would fail
-// at the device lookup assertion.
+// The `conformance_setup` helper proves node assignment via two mechanisms:
+// 1. `session.disable_cpu_ep_fallback=1` — ORT will error if any node cannot
+//    be placed on our EP, preventing silent fallback to the built-in CPU EP.
+// 2. Device lookup assertion — verifies our EP ("cpu_ep") appears in GetEpDevices
+//    and is appended to the session options.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Assert the element type of an ORT output tensor.
@@ -2125,7 +2151,7 @@ fn conformance_cast_f32_to_i64() {
     let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/cast_f32_to_i64/model.onnx");
 
     let Some((_lib, api, env, opts, session)) =
-        (unsafe { conformance_setup("cpu_ep_cast", &model_path) })
+        (unsafe { conformance_setup("cpu_ep_cast", &model_path, true) })
     else {
         eprintln!("*** SKIPPED: conformance_cast_f32_to_i64 — ORT or EP cdylib not found ***");
         return;
@@ -2197,7 +2223,7 @@ fn conformance_where_bool_f32() {
     let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/where_bool_f32/model.onnx");
 
     let Some((_lib, api, env, opts, session)) =
-        (unsafe { conformance_setup("cpu_ep_where", &model_path) })
+        (unsafe { conformance_setup("cpu_ep_where", &model_path, true) })
     else {
         eprintln!("*** SKIPPED: conformance_where_bool_f32 — ORT or EP cdylib not found ***");
         return;
@@ -2293,7 +2319,7 @@ fn conformance_shape_f32() {
     let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/shape_f32/model.onnx");
 
     let Some((_lib, api, env, opts, session)) =
-        (unsafe { conformance_setup("cpu_ep_shape", &model_path) })
+        (unsafe { conformance_setup("cpu_ep_shape", &model_path, true) })
     else {
         eprintln!("*** SKIPPED: conformance_shape_f32 — ORT or EP cdylib not found ***");
         return;
@@ -2363,7 +2389,7 @@ fn conformance_layer_norm_multi_output() {
     let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/layer_norm_f32/model.onnx");
 
     let Some((_lib, api, env, opts, session)) =
-        (unsafe { conformance_setup("cpu_ep_ln", &model_path) })
+        (unsafe { conformance_setup("cpu_ep_ln", &model_path, true) })
     else {
         eprintln!(
             "*** SKIPPED: conformance_layer_norm_multi_output — ORT or EP cdylib not found ***"
@@ -2506,7 +2532,7 @@ fn conformance_layer_norm_neg_axis() {
         PathBuf::from(manifest_dir).join("tests/fixtures/layer_norm_neg_axis_f32/model.onnx");
 
     let Some((_lib, api, env, opts, session)) =
-        (unsafe { conformance_setup("cpu_ep_ln_neg", &model_path) })
+        (unsafe { conformance_setup("cpu_ep_ln_neg", &model_path, true) })
     else {
         eprintln!("*** SKIPPED: conformance_layer_norm_neg_axis — ORT or EP cdylib not found ***");
         return;
@@ -2611,7 +2637,7 @@ fn conformance_rms_norm() {
         PathBuf::from(manifest_dir).join("tests/fixtures/simplified_layer_norm_f32/model.onnx");
 
     let Some((_lib, api, env, opts, session)) =
-        (unsafe { conformance_setup("cpu_ep_rms", &model_path) })
+        (unsafe { conformance_setup("cpu_ep_rms", &model_path, true) })
     else {
         eprintln!("*** SKIPPED: conformance_rms_norm — ORT or EP cdylib not found ***");
         return;

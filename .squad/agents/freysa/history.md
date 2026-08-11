@@ -22,3 +22,12 @@ WP-B landed: Freysa's raw-protobuf admission rejection was resolved in the final
 
 ## 2026-07-28T09-10-28+00-00 — PR #338 review
 - Approved Luv's #67 CUDA `Pad`/`Range` batch after H200 GPU 2 passed 174/174 parity cases, the coverage gate passed, a content-corrupting mutation probe failed as expected, and default-target warnings-denied Clippy was clean. PR #338 merged as `c59383db`.
+
+## 2026-08-11 — EP assignment proof (PR #762)
+
+- Added `session.disable_cpu_ep_fallback=1` to `conformance_setup()` in `plugin_ort_e2e.rs`
+- All 22 conformance tests (plus stress test) now prove our EP actually claimed nodes
+- `conformance_mixed_partition` exempted (intentionally tests partition with fallback)
+- Proved non-vacuity: with flag applied universally, mixed_partition correctly fails with ORT's "fallback disabled" error
+- Profiling assertion not practical: ORT 1.27 plugin-EP API has no post-session per-node provider query
+- 23 tests pass, 0 fail. No test count decrease.
