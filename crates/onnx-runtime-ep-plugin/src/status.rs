@@ -34,7 +34,7 @@ pub(crate) fn host_api() -> *const ort::OrtApi {
 /// If the host API is not available (should never happen after init), returns
 /// a null pointer which ORT interprets as success — but we document this path
 /// cannot be reached.
-pub(crate) fn fail_status(message: &str) -> *mut ort::OrtStatus {
+pub fn fail_status(message: &str) -> *mut ort::OrtStatus {
     status_with_code(ort::ORT_FAIL, message)
 }
 

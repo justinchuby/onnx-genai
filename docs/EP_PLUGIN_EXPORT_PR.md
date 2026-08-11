@@ -1,16 +1,35 @@
 # PR: ORT Plugin EP Export — Rust CPU EP via upstream ORT 1.27.0 (Milestone 1) + Parity, f16/bf16, Device Surfaces & CUDA Prep (Milestone 2)
 
+> **Status as of 2026-08-11, HEAD `4212e090e`:** M1 and M2 are complete. The
+> EP-compatibility milestone (native nxrt dynamic ABI) was opened but its new
+> crates (`onnx-runtime-ep-nxrt-abi`, `onnx-runtime-ep-nxrt-host`) have NOT
+> landed. §524 is still partially incomplete. See §524 table below.
+>
+> **This PR stays draft** until the milestone is complete. Justin's direction:
+> single draft PR, not two stacked PRs (supersedes the stacked-PR recommendation
+> below, which was recorded before the direction change).
+
 ## Branch structure
 
 | Branch | Milestone | Status |
 |---|---|---|
-| `squad/ep-plugin-export` | M1 — CPU EP fully exported as ORT plugin | 🟡 YELLOW — may ship (all CRITICAL/HIGH cleared) |
-| `squad/ep-plugin-parity-cuda` | M2 — trait↔C-ABI parity proven, f16/bf16 end-to-end, device/allocator/stream surfaces, CUDA shim | 🟡 YELLOW — may ship (all findings resolved; Holden's re-verification was not separately run) |
+| `squad/ep-plugin-export` | M1 — CPU EP fully exported as ORT plugin | ✅ Complete — superseded by M2 branch |
+| `squad/ep-plugin-parity-cuda` | M2 — trait↔C-ABI parity proven, f16/bf16 end-to-end, device/allocator/stream surfaces, CUDA shim | 🟡 YELLOW — M2 work complete; EP-compatibility milestone not yet landed |
 
-**Recommendation: two stacked PRs, not one.**
-M1 (`squad/ep-plugin-export`) is independently correct and mergeable; merging it now unblocks downstream tooling without waiting for M2. M2 (`squad/ep-plugin-parity-cuda`) adds parity tests, dtype routing, and device surfaces that are genuinely additive; they depend on M1's adapter but don't affect M1 correctness. Squashing them into one PR would make the review surface larger with no benefit. Stack PR2 on PR1 with a base-branch dependency in the PR description.
+**Earlier recommendation (superseded):** Two stacked PRs, not one.
+M1 (`squad/ep-plugin-export`) is independently correct and mergeable; merging it
+now unblocks downstream tooling without waiting for M2. M2
+(`squad/ep-plugin-parity-cuda`) adds parity tests, dtype routing, and device
+surfaces that are genuinely additive; they depend on M1's adapter but don't affect
+M1 correctness. Squashing them into one PR would make the review surface larger
+with no benefit. Stack PR2 on PR1 with a base-branch dependency in the PR description.
 
-**Both M1 and M2 are now green and mergeable** as two stacked PRs. All CRITICAL/HIGH/MEDIUM/LOW findings are resolved; clippy is clean. See Validation below.
+**Justin's direction (current):** Single draft PR #762. The stacked-PR
+recommendation is preserved for the record but does not apply. The PR stays draft
+until the full milestone is complete, including the native nxrt dynamic ABI.
+
+**M1 and M2 are green.** All CRITICAL/HIGH/MEDIUM/LOW findings are resolved;
+clippy is clean. See Validation below.
 
 **Push is blocked:** No `GH_TOKEN`/`GITHUB_TOKEN`, no SSH private key, and GCM cache is empty on this host. `git ls-remote origin refs/heads/squad/ep-plugin-export` returned empty — neither branch exists remotely. A user or CI runner with write credentials must push and open the PRs.
 
@@ -361,26 +380,26 @@ toolkit because the default feature set excludes it.
 
 ---
 
-## Architecture-Contract Compliance (Standing Directive §524) — Updated for M1+M2
+## Architecture-Contract Compliance (Standing Directive §524) — Updated for M1+M2+EP-Compat Milestone
 
 The standing directive requires: every extension seam exposes a stable C ABI with
 dynamic loading support **and** a first-class Rust trait; the two surfaces stay in
 sync; the ORT ABI evolves toward nxrt; fail closed on unsupported capabilities.
 
-| Requirement | M1 status | M2 status |
-|-------------|-----------|-----------|
-| Stable C ABI with dynamic loading | ✅ Complete — `CreateEpFactories`/`ReleaseEpFactory` exports; ORT `dlopen`s the cdylib | ✅ Unchanged |
-| First-class Rust trait (proven) | 🟡 Trait wired; only C ABI side verified by ORT conformance tests | ✅ **Proven** — 9 parity tests (`trait_cabi_parity.rs`) confirm trait↔C-ABI agreement on capabilities, errors, and numeric results |
-| Trait↔C-ABI parity rule | — | ✅ `C_ABI_claims = trait_claims ∩ { for_node != Declined }`. Pinned and tested. Declined set is smaller than originally assumed — Squeeze/ReduceMean/Conv resolve; confirmed Declined: NonZero, opset-13 data-dependent Unsqueeze. |
-| Fail closed on unsupported capabilities | ✅ `Declined` path; shape-inference rules | ✅ Strengthened — `node_passes_dtype_filter()` adds dtype-level fail-closed gating |
-| ORT ABI evolves toward nxrt | ✅ Plugin adapter is a thin shim | ✅ Unchanged |
-| **Native nxrt dynamic ABI** | 🔴 Not implemented | 🔴 **Not implemented.** No `extern "C"` nxrt-native ABI has been designed or implemented in either milestone. This is the remaining §524 gap. The good news in M2 (trait parity proven) does not close it. |
+| Requirement | M1 status | M2 status | EP-Compat milestone status |
+|-------------|-----------|-----------|---------------------------|
+| Stable C ABI with dynamic loading | ✅ Complete — `CreateEpFactories`/`ReleaseEpFactory` exports; ORT `dlopen`s the cdylib | ✅ Unchanged | ✅ Unchanged |
+| First-class Rust trait (proven) | 🟡 Trait wired; only C ABI side verified by ORT conformance tests | ✅ **Proven** — 9 parity tests (`trait_cabi_parity.rs`) confirm trait↔C-ABI agreement on capabilities, errors, and numeric results | ✅ Unchanged |
+| Trait↔C-ABI parity rule | — | ✅ `C_ABI_claims = trait_claims ∩ { for_node != Declined }`. Pinned and tested. Declined set is smaller than originally assumed — Squeeze/ReduceMean/Conv resolve; confirmed Declined: NonZero, opset-13 data-dependent Unsqueeze. | ✅ Unchanged |
+| Fail closed on unsupported capabilities | ✅ `Declined` path; shape-inference rules | ✅ Strengthened — `node_passes_dtype_filter()` adds dtype-level fail-closed gating | ✅ Unchanged |
+| ORT ABI evolves toward nxrt | ✅ Plugin adapter is a thin shim | ✅ Unchanged | ✅ Unchanged |
+| **Native nxrt dynamic ABI** | 🔴 Not implemented | 🔴 **Not implemented.** No `extern "C"` nxrt-native ABI has been designed or implemented in either milestone. | ⚠️ **In working tree, not committed.** `crates/onnx-runtime-ep-nxrt-abi/` (Nabil) and `crates/onnx-runtime-ep-nxrt-host/` (Isidore) exist as untracked files at HEAD `4212e090e`. **Integration gap:** Nabil exports `NxrtNegotiate`/`NxrtCreateEpFactories` (vtable model); Isidore's loader expects `nxrt_abi_version`/`nxrt_create_ep`/… (opaque-handle model). Protocols are incompatible. Reconciliation required before commit. |
 
-**Honest M2 §524 status:**
+**Honest §524 status as of HEAD `4212e090e`:**
 - C ABI: ✅ Complete and proven by 23 ORT conformance tests.
-- Rust trait: ✅ **Now proven** — 9 parity tests confirm agreement.
+- Rust trait: ✅ **Proven** — 9 parity tests confirm agreement.
 - Fail-closed: ✅ Complete — shape-inference Declined path + dtype filter.
-- **Native nxrt dynamic ABI: 🔴 Not implemented.** No nxrt-native `extern "C"` ABI exists in either milestone. Tracking required.
+- **Native nxrt dynamic ABI: ⚠️ In working tree, not committed. Has a symbol-protocol integration gap between the plugin-side ABI crate (Nabil) and the host loader (Isidore). Reconciliation required; PR stays draft.**
 
 ---
 
@@ -393,5 +412,6 @@ sync; the ORT ABI evolves toward nxrt; fail closed on unsupported capabilities.
 5. ~~**Leon (pre-M2-merge):** Fix M2-1 EP leak in `stream_release`~~ — **DONE** (`3ab0ded68`).
 6. ~~**Leon (pre-M2-merge):** Fix M2-2 misleading doc on `DeviceAllocator::memory_info:86`~~ — **DONE** (`3ab0ded68`).
 7. ~~**Any M2 committer (pre-M2-merge):** Fix clippy regression in `ep.rs:1041,1047`~~ — **DONE** by Deckard (`3ab0ded68`).
-8. **CUDA EP work (post-both-PRs):** `onnx-runtime-ep-cuda-plugin` shim + real device-pointer/stream/allocator integration — hardware-gated; requires CUDA toolkit and GPU.
-9. **Native nxrt dynamic ABI:** Design and implement a first-class native nxrt `extern "C"` ABI to complete §524 compliance.
+8. **CUDA EP work (post-both-PRs):** `onnx-runtime-ep-cuda-plugin` shim + real device-pointer/stream/allocator integration — hardware-gated AND design-gated; requires CUDA toolkit, GPU, and resolution of context/stream sharing design. See `docs/CUDA_EP_STATUS.md` for full blocker list.
+9. **Native nxrt dynamic ABI — reconciliation needed:** `crates/onnx-runtime-ep-nxrt-abi/` (Nabil) and `crates/onnx-runtime-ep-nxrt-host/` (Isidore) exist in working tree but have incompatible symbol protocols. Nabil exports `NxrtNegotiate`/`NxrtCreateEpFactories` (vtable model); Isidore's loader expects `nxrt_abi_version`/`nxrt_create_ep`/… (opaque-handle model). Nabil and Isidore must reconcile, then commit, to complete §524.
+10. **CUDA hardware conformance runner (Pris):** Not yet committed. Required before any hardware-validated claim can be made. See `docs/CUDA_EP_STATUS.md`.

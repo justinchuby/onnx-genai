@@ -48,7 +48,7 @@ Results (non-test, non-mock):
 | **Op coverage** | **166 entries** registered in `src/kernels/mod.rs` (verified with `grep -c "reg.register"` → 166). Domains: standard ONNX (`""`, opset-versioned: MatMul, Gemm, Softmax, LayerNorm, GatherND, Reshape, Cast, Conv, …), `com.microsoft` (MatMulNBits, QMoE, GatherBlockQuantized, FusedGemm, MultiHeadAttention, GQA, SkipSimplifiedLayerNorm, CausalConvWithState, RotaryEmbedding, …), `pkg.nxrt` (BlockQuantizedMatMul, BlockQuantizedMoE, IndexShare, VarlenAttention, PackedVarlenAttention, CompressedSparseAttention, …). |
 | **Device / memory model** | Host-only. Buffers are `malloc`/`free` via `onnx_runtime_memory_governor::HostAllocator` (swappable). All pointers are dereferenceable host pointers. No streams, no device context, no fences at runtime. |
 | **Build deps** | Pure-Rust by default; `--no-default-features` builds cleanly. Optional `mlas` feature adds `mlas-sys` and requires a C++ toolchain + cc crate. No CUDA toolkit. |
-| **Readiness for outbound ORT plugin export** | **NEAR** — fully implemented trait with real op coverage and no stubs. Blocked only on the missing `as_ort_plugin` adapter (`provider.rs:943` returns `None`; the `OrtPluginExport` struct at `provider.rs:311` is a name-only marker). Everything below the adapter is solid. |
+| **Readiness for outbound ORT plugin export** | ✅ **DONE (M1+M2)** — exported via `export_ep_factories!` macro in `crates/onnx-runtime-ep-cpu-plugin/`. The `as_ort_plugin()` hook in `provider.rs` still returns `None` (not used); the export path goes through the plugin cdylib crate, not through the trait hook. 23 ORT conformance tests pass including f16/bf16; dtype-aware capability claiming wired. |
 
 ---
 
@@ -121,19 +121,19 @@ Evidence:
 
 ### Q3: `ExecutionProvider` trait gaps for the ORT plugin-EP lifecycle
 
-**Missing or wrong-shaped methods:**
+**Missing or wrong-shaped methods (status updated for M1+M2):**
 
-| Gap | Evidence | Severity |
-|---|---|---|
-| `as_ort_plugin()` returns `None` by default; no EP overrides it | `provider.rs:942–944` | **Blocking** — this is the only outbound export hook and it's unimplemented in both real EPs |
-| `OrtPluginExport` struct carries only `register_symbol: String` | `provider.rs:309–313` | **Blocking** — does not carry function pointers, `OrtEpFactory` ptr, or version info; the struct needs to become the actual export surface or a builder for it |
-| No method for `GetSupportedDevices` (ORT lifecycle step 1) | Absent from trait | **Gap** — ORT calls this before `CreateEp` to know which device ordinals the EP can use; currently there is no trait hook for this |
-| No method for capability-claim graph walk (ORT lifecycle step 2: `GetCapabilities`) | The inbound direction is handled by `abi/mod.rs`'s subgraph claim code; the outbound direction has no trait method | **Gap** |
-| `KernelMatch` → Rust enum, cannot cross FFI | `provider.rs` returns `KernelMatch::Supported { cost, … }` | **ABI-safety** — must be projected to a C struct before crossing the plugin boundary |
-| `EpError` / `Result<T, EpError>` → Rust enum, cannot cross FFI | Every required method returns `Result<_, EpError>` | **ABI-safety** — must become `*mut OrtStatus` + error-code at the boundary |
-| `Kernel` trait (returned by `get_kernel`) → Rust vtable, cannot cross FFI | `Box<dyn Kernel>` at `provider.rs` / kernel.rs | **ABI-safety** — ORT wants `OrtNodeComputeInfo` (C function pointer + user_data); adapter must wrap each `Box<dyn Kernel>` |
-| `DeviceBuffer` struct itself cannot cross FFI | Contains `NonNull<c_void>`, `usize`, `usize`, `BufferOwner` (private enum) | **ABI-safety** — only the `ptr`/`size`/`align` triple should cross; `BufferOwner` stays internal |
-| Lifetimes in `supports_op`/`get_kernel` (`&Node`, `&[Shape]`, etc.) | These are Rust-lifetime-bearing references that would need to be projected to C structs with explicit ownership | **ABI-shape** — mechanical but not free |
+| Gap | Evidence | Severity | M1+M2 status |
+|---|---|---|---|
+| `as_ort_plugin()` returns `None` by default; no EP overrides it | `provider.rs:942–944` | ~~Blocking~~ | ✅ **Resolved.** Export goes through `export_ep_factories!` macro in `onnx-runtime-ep-cpu-plugin`; the trait hook is not used. |
+| `OrtPluginExport` struct carries only `register_symbol: String` | `provider.rs:309–313` | ~~Blocking~~ | ✅ **Resolved.** CPU EP export path does not use `OrtPluginExport`. The plugin cdylib is authoritative. |
+| No method for `GetSupportedDevices` (ORT lifecycle step 1) | Absent from trait | **Gap** | ✅ Resolved — `factory.rs` + `device.rs` implement `GetSupportedDevices` in the plugin adapter. |
+| No method for capability-claim graph walk (ORT lifecycle step 2: `GetCapabilities`) | The inbound direction is handled by `abi/mod.rs`'s subgraph claim code; the outbound direction has no trait method | **Gap** | ✅ Resolved — `ep.rs` implements `GetCapability` by calling `supports_op`/`supports_node` through the `ShapeInference` filter. |
+| `KernelMatch` → Rust enum, cannot cross FFI | `provider.rs` returns `KernelMatch::Supported { cost, … }` | **ABI-safety** | ✅ Resolved in `ep.rs` — mapped to `OrtNodeComputeInfo`. |
+| `EpError` / `Result<T, EpError>` → Rust enum, cannot cross FFI | Every required method returns `Result<_, EpError>` | **ABI-safety** | ✅ Resolved in `status.rs` — `fail_status(msg)` converts to `*mut OrtStatus`. |
+| `Kernel` trait (returned by `get_kernel`) → Rust vtable, cannot cross FFI | `Box<dyn Kernel>` at `provider.rs` / kernel.rs | **ABI-safety** | ✅ Resolved in `compute.rs` — `ComputeState` wraps kernels; `CreateState`/`Compute`/`ReleaseState` expose `OrtNodeComputeInfo`. |
+| `DeviceBuffer` struct itself cannot cross FFI | Contains `NonNull<c_void>`, `usize`, `usize`, `BufferOwner` (private enum) | **ABI-safety** | ✅ Resolved for CPU. CUDA path (device pointers) still blocked — see `docs/CUDA_EP_STATUS.md`. |
+| Lifetimes in `supports_op`/`get_kernel` (`&Node`, `&[Shape]`, etc.) | These are Rust-lifetime-bearing references that would need to be projected to C structs with explicit ownership | **ABI-shape** | ✅ Resolved — graph is constructed in `ep.rs` from ORT's `OrtGraph` callbacks; lifetimes stay within the callback frame. |
 
 **Not missing, will work as-is:**
 - `initialize` / `shutdown` lifecycle maps cleanly to `CreateEp` / `ReleaseEp`.
@@ -143,13 +143,13 @@ Evidence:
 
 ### Q4: Placeholder honesty check
 
-**Stubs pretending to be complete:**
+**Stubs pretending to be complete (updated for M1+M2):**
 
-| Location | What it looks like | What it really is |
-|---|---|---|
-| `provider.rs:309–313` (`OrtPluginExport`) | A named struct suggesting "this EP exports as an ORT plugin" | A marker with only a `register_symbol: String` field. No C function pointers. No factory wiring. No EP in the repo returns anything other than `None` from `as_ort_plugin`. The "Phase 2" label in the comment is aspirational, not a status. |
-| `crates/onnx-runtime-ep-cuda/src/provider.rs:564–573` (`prefetch_lazy_weight`) | A method on the CUDA EP trait impl | Body is `let _ = (self, key, weight, source); Ok(false)`. Returns "no prefetch enqueued" unconditionally. This disables the whole double-buffer prefetch pipeline for CUDA weight paging even when offload is enabled. Not a benign no-op. |
-| `as_ort_plugin()` default in both real EPs | Trait method exists, EPs appear to have a path to export | Default returns `None`; neither `CpuExecutionProvider` nor `CudaExecutionProvider` overrides it. The outbound ORT plugin ABI path does not exist. |
+| Location | What it looks like | What it really is | Status |
+|---|---|---|---|
+| `provider.rs:309–313` (`OrtPluginExport`) | A named struct suggesting "this EP exports as an ORT plugin" | A marker with only a `register_symbol: String` field. No C function pointers. No factory wiring. | ✅ Not the export path. CPU EP uses `export_ep_factories!` macro in plugin cdylib. CUDA EP still has no working export. |
+| `crates/onnx-runtime-ep-cuda/src/provider.rs:564–573` (`prefetch_lazy_weight`) | A method on the CUDA EP trait impl | Body is `let _ = (self, key, weight, source); Ok(false)`. Returns "no prefetch enqueued" unconditionally. Disables double-buffer prefetch for CUDA weight paging even when offload is enabled. Deckard decision: deferred to post-Phase-2a. | 🔴 Still a stub. No change. |
+| `as_ort_plugin()` default in both real EPs | Trait method exists, EPs appear to have a path to export | Default returns `None`; neither EP overrides it. | ✅ CPU EP export is done via plugin cdylib. CUDA EP export is incomplete — `onnx-runtime-ep-cuda-plugin` exists as scaffold only. |
 
 **Nothing found that claims op support it does not have.** Both `supports_op` implementations guard unsupported paths with actionable `deny!()` calls. The `registry.supports(...)` check in both EPs is the single authoritative gate. No silent fallback, no fake `Supported` return.
 

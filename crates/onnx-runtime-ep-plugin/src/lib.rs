@@ -34,6 +34,7 @@ pub mod factory;
 pub mod graph_reader;
 pub mod kernel_ctx;
 pub mod status;
+pub mod transfer;
 
 pub use ep::ExportedEp;
 pub use factory::ExportedFactory;

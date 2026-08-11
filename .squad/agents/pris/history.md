@@ -340,3 +340,23 @@ New ignored tests:
 - New helpers `make_float16_tensor` / `make_bfloat16_tensor` added to the test file
 
 **Decision updated:** `.squad/decisions/inbox/pris-trait-cabi-parity.md`
+
+## 2026-08-11 — nxrt ABI round-trip tests + CUDA conformance runner
+
+**Branch:** `squad/ep-plugin-parity-cuda` (PR #762)
+
+**Delivered:**
+- 10 nxrt ABI integration tests (`crates/onnx-runtime-ep-nxrt-abi/tests/nxrt_roundtrip.rs`)
+  - Round-trip happy path, ownership/lifetime (Drop counter → 0), library-outlives-EP
+  - Negative: version mismatch, missing symbol, missing library, factory error, zero devices, panic containment, null handle
+- Test fixture plugin (`crates/onnx-runtime-ep-nxrt-testplugin/`) — standalone cdylib with env-var-controlled failure modes
+- CUDA conformance runner (`scripts/cuda_conformance_runner.sh`) — single command, exit 0/1/2 (validated/failed/unvalidated)
+- Created nxrt-abi submodules (`version.rs`, `vtable.rs`) so the workspace compiles — Nabil will replace with full implementations
+
+**Bugs found:**
+- `onnx-runtime-ep-nxrt-host/src/provider_adapter.rs:90` — missing `sync` method on `impl ExecutionProvider for NxrtExecutionProvider` (owner: Isidore)
+- nxrt ABI contract mismatch: abi crate exports `NxrtNegotiate`/`NxrtCreateEpFactories` while host expects `nxrt_abi_version`/`nxrt_create_ep`/etc (owners: Nabil + Isidore)
+
+**Test counts:** ep-plugin 154+9, nxrt-abi 19+10 = 192 pass, 0 fail. CUDA UNVALIDATED (no GPU).
+
+**Decision:** `.squad/decisions/inbox/pris-nxrt-and-cuda-runner.md`

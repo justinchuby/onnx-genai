@@ -60,6 +60,10 @@ members = [
     "crates/onnx-runtime-ep-cpu-plugin",
     "crates/onnx-runtime-ep-cuda-plugin",
 
+    # ── Native nxrt dynamic EP ABI (§524 native half) ──
+    "crates/onnx-runtime-ep-nxrt-abi",
+    "crates/onnx-runtime-ep-nxrt-host",
+
     # ── Vendored ONNX Runtime MLAS bindings ──
     # Registered as a member so `cargo build -p mlas-sys` resolves. Crates that
     # enable the CPU EP's default `mlas` feature pull this in transitively; use
@@ -177,6 +181,8 @@ onnx-std = { path = "crates/onnx-std", version = "=0.1.0-dev.5" }
 onnx-runtime-ep-plugin = { path = "crates/onnx-runtime-ep-plugin", version = "=0.1.0-dev.5" }
 onnx-runtime-ep-cpu-plugin = { path = "crates/onnx-runtime-ep-cpu-plugin", version = "=0.1.0-dev.5" }
 onnx-runtime-ep-cuda-plugin = { path = "crates/onnx-runtime-ep-cuda-plugin", version = "=0.1.0-dev.5" }
+onnx-runtime-ep-nxrt-abi = { path = "crates/onnx-runtime-ep-nxrt-abi", version = "=0.1.0-dev.5" }
+onnx-runtime-ep-nxrt-host = { path = "crates/onnx-runtime-ep-nxrt-host", version = "=0.1.0-dev.5" }
 
 # External
 # `default` pulls `onig` (a vendored C regex engine), `esaxx_fast` (a C++ suffix

@@ -47,3 +47,7 @@ Clippy `--all-targets` flagged two more `forget_non_drop` errors (device.rs:465 
 - `cargo test -p onnx-runtime-ep-plugin --lib` → **127 passed; 0 failed**.
 - `cargo test -p onnx-runtime-ep-cpu-plugin` → **23 passed; 0 failed** (6 ABI + 17 conformance).
 - `cargo check --workspace` → **Finished** without CUDA.
+
+## 2026-08-11 — Implemented native nxrt dynamic EP ABI (§524)
+
+Designed and implemented `crates/onnx-runtime-ep-nxrt-abi/` — the native half of the §524 extension contract. Full ABI surface: version negotiation (`NxrtNegotiate`), factory creation (`NxrtCreateEpFactories`), vtable-based lifecycle for factory/EP/kernel/allocator, explicit ownership rules, panic containment via `catch_status_panic`/`catch_void_panic`, and the `export_nxrt_ep_factories!` macro. All 19 unit tests pass. Clippy clean. Workspace check green. Added both `-nxrt-abi` and `-nxrt-host` to workspace members for Isidore's concurrent work.

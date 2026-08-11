@@ -59,3 +59,12 @@ Pre-2026-08-10 entries moved to `history-archive.md`. Covers: kernel pre-binding
 - **What**: Removed two `&` in `graph_with_node` test helper (ep.rs:1041, ep.rs:1047). `format!()` returns `String`, which already implements the required trait; the borrow was redundant (`needless_borrows_for_generic_args`).
 - **Assertion sanity check**: Reviewed all five `node_passes_dtype_filter` call sites (lines 1067, 1083, 1098, 1113, and the `&entries` calls). All assertions are meaningful: they test distinct, real cases (f32 claimed, Int64 rejected, Undefined rejected, unknown-op rejected, empty-entries bypass). No vacuous assertion found — each test constructs a unique graph type and asserts the correct boolean outcome.
 - **Validation**: `cargo clippy -p onnx-runtime-ep-plugin --all-targets -- -D warnings` → clean (no errors). `cargo test -p onnx-runtime-ep-plugin --lib` → 132 passed. `cargo test -p onnx-runtime-ep-cpu-plugin --all-targets` → 23 passed including `conformance_add_float16` and `conformance_add_bfloat16`.
+
+## 2026-08-11 — CUDA plugin wiring: real EP behind feature gates
+
+- **What**: Rewrote `onnx-runtime-ep-cuda-plugin/src/lib.rs` from a stub that panics to a real plugin that constructs `CudaExecutionProvider::new_default()` with GPU `DeviceSupport`, kernel registry entries from `CUDA_COVERED_OPS`, and fail-closed error paths. Made `fail_status` pub in `status.rs`.
+- **Feature gate**: `cuda` feature off → zero factories + error status. `cuda` on → real EP construction attempted; GPU-absent hosts get a clean error, not a panic.
+- **Compile-check results**: Both `cargo check -p onnx-runtime-ep-cuda-plugin` (no feature) and `--features cuda` succeed on this CUDA-less host (cudarc uses dynamic-loading).
+- **`prefetch_lazy_weight`**: Left as `Ok(false)` stub. No `try_without_eviction` API on `CudaWeightResidency`; implementing prefetch that may evict violates the standing directive. Proper fix requires a new residency method + GPU validation.
+- **Unvalidated**: Runtime EP construction, ORT session execution, allocator/transfer/stream, kernel routing, and `page_lazy_weight` — all require a real GPU host.
+- **Validation**: `cargo check --workspace` ✅, `cargo clippy -p onnx-runtime-ep-plugin --all-targets -- -D warnings` ✅, `cargo test -p onnx-runtime-ep-cuda-plugin` → 3 passed, `cargo test -p onnx-runtime-ep-cpu-plugin` → 23 passed.

@@ -184,3 +184,25 @@ or `stream_release`. No factory.rs change needed for this fix.
 - `cargo test -p onnx-runtime-ep-plugin --lib` → 133 passed (132 + 1 new)
 - `cargo test -p onnx-runtime-ep-cpu-plugin --all-targets` → 17 passed
 - `cargo check --workspace` → success
+
+## 2026-08-11 — Device data-transfer contract (`transfer.rs`)
+
+**Branch:** `squad/ep-plugin-parity-cuda` (PR #762)
+
+**Created:** `crates/onnx-runtime-ep-plugin/src/transfer.rs` — ORT `OrtDataTransferImpl` adapter.
+
+**What:**
+- `DeviceDataTransfer` (basic) and `DeviceDataTransferFull` (with OrtApi) adapters
+- Copy-direction matrix: H→D, D→H, D→D(same) supported; cross-device + H→H rejected
+- Stream-ordered copy via `copy_async` + `Fence` + `wait_fence`
+- Ownership: Box::into_raw/from_raw lifecycle, EP borrowed not owned
+- Mock device EP with non-host-dereferenceable address space for testing
+- 21 new tests covering direction matrix, fail-closed CanCopy, ownership/leak detection, device-pointer guards
+
+**Validation:**
+- `cargo clippy -p onnx-runtime-ep-plugin --all-targets -- -D warnings` → clean
+- `cargo test -p onnx-runtime-ep-plugin` → 154 lib + 9 parity passed
+- `cargo test -p onnx-runtime-ep-cpu-plugin` → 23 passed
+- `cargo check --workspace` → success
+
+**Not proven:** Nothing here proves CUDA works. Hardware-gated.

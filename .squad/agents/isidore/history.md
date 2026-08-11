@@ -79,3 +79,23 @@ already resolved concurrently and does not appear.
 **Test results**:
 - `cargo test -p onnx-runtime-ep-plugin --lib` → 82 passed, 0 failed
 - `cargo test -p onnx-runtime-ep-cpu-plugin` → 21 passed (6+15), 0 failed
+
+---
+
+## 2026-08-11 — nxrt Host Loader (§524)
+
+Implemented `crates/onnx-runtime-ep-nxrt-host/` — the inbound dynamic-loading half of the nxrt plugin ABI.
+
+**Delivered:**
+- Cross-platform `dlopen` via `libloading` with `Arc<Library>` lifetime safety
+- Version negotiation (fail closed on major mismatch)
+- `NxrtExecutionProvider` implementing full `ExecutionProvider` trait
+- Panic containment at C boundary via `catch_unwind`
+- 6 negative-path error variants, all actionable
+
+**Test results:**
+- `cargo test -p onnx-runtime-ep-nxrt-host` → 4 passed, 0 failed
+- `cargo clippy -p onnx-runtime-ep-nxrt-host --all-targets -- -D warnings` → clean
+- Existing tests unaffected (`onnx-runtime-ep-plugin`, `onnx-runtime-ep-cpu-plugin`)
+
+**Needs from Nabil:** ABI type exports in `onnx-runtime-ep-nxrt-abi`; once landed, replace local `abi_contract` module.

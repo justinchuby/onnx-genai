@@ -220,3 +220,62 @@ Full pre-compaction history in `history-archive.md`.
 - Native nxrt dynamic ABI: still 🔴 Not implemented in §524 table.
 - CUDA EP: still blocked (no toolkit/GPU + design work remaining); mock-tested surfaces are genuine progress but not a working CUDA EP.
 - f16/bf16: distinction preserved — our EP claims and executes, ORT does not fall back.
+
+---
+
+## 2026-08-11 — NXRT ABI doc + CUDA honest status (HEAD: `4212e090e`)
+
+**Task:** Document nxrt ABI and honest CUDA status; fold EP-compatibility milestone into PR #762 docs; sweep for staleness.
+
+**Finding — EP-compatibility milestone did NOT land:**
+
+The task prompt described four engineers (Nabil, Isidore, Leon, Deckard, Pris) completing the EP-compatibility milestone with new crates `onnx-runtime-ep-nxrt-abi` and `onnx-runtime-ep-nxrt-host`. On inspection of HEAD `4212e090e`, neither crate exists. The git log shows only M1+M2 commits; the most recent is `4212e090e` ("docs(squad): record EP export delivery as draft PR #762"). No nxrt-abi or nxrt-host crate appears in `crates/`. Code wins; milestone is incomplete.
+
+What actually landed (confirmed from source):
+- M1: ORT C ABI adapter (`onnx-runtime-ep-plugin`) with `export_ep_factories!` macro, panic containment, version negotiation, 23 ORT conformance tests.
+- M2: trait↔C-ABI parity (9 tests), f16/bf16 end-to-end, device surfaces (`DeviceAllocator`, `DeviceSyncStream`, `DeviceSupport`), CUDA plugin scaffold (`onnx-runtime-ep-cuda-plugin`, feature-gated).
+- Leon's `device.rs` (device/transfer/stream contracts) — committed in `2da0c4e7f`/`3ab0ded68`.
+
+What did NOT land:
+- `crates/onnx-runtime-ep-nxrt-abi/` — ABSENT
+- `crates/onnx-runtime-ep-nxrt-host/` — ABSENT
+- Native nxrt dynamic ABI (`extern "C"` nxrt-to-nxrt surface) — NOT IMPLEMENTED
+- Pris's CUDA hardware conformance runner — NOT COMMITTED
+- Any GPU hardware validation — NONE
+
+**Docs written:**
+- `docs/NXRT_ABI.md` — new; documents the Rust trait + ORT C ABI adapter as the actual nxrt ABI; §6 explicitly states the native nxrt dynamic ABI is unimplemented
+- `docs/CUDA_EP_STATUS.md` — new; three-column IMPLEMENTED/COMPILE-CHECKED/VALIDATED-ON-HARDWARE table; all hardware column entries ❌
+
+**Docs updated:**
+- `docs/EP_PLUGIN_EXPORT_PR.md` — header callout added; §524 table refreshed with EP-compat milestone column (all 🔴); stacked-PR note kept but superseded note added; follow-ups 9/10 updated
+- `docs/EP_PLUGIN_EXPORT_INVENTORY.md` — CPU EP readiness changed from NEAR to ✅ DONE; gap table updated with M1+M2 resolution status; Q4 stubs table updated
+
+**CUDA honest position:**
+- Nothing validated on hardware. Every capability in the CUDA EP is IMPLEMENTED (developer claim) and COMPILE-CHECKED (no-toolkit path via `cargo check`). VALIDATED-ON-HARDWARE: zero.
+- `prefetch_lazy_weight` is a stub (Deckard decision, explicit deferral).
+- Working CUDA ORT plugin blocked by five hard design gaps in addition to hardware.
+
+**§524 completion status:**
+- C ABI: ✅
+- Rust trait: ✅
+- Fail-closed: ✅
+- Native nxrt dynamic ABI: 🔴 Not implemented. PR stays draft.
+
+**Correction (after working-tree inspection):**
+
+After writing the first draft, I inspected the working tree and found untracked
+files from parallel agents: `crates/onnx-runtime-ep-nxrt-abi/` (Nabil),
+`crates/onnx-runtime-ep-nxrt-host/` (Isidore), `crates/onnx-runtime-ep-nxrt-testplugin/`,
+and `crates/onnx-runtime-ep-plugin/src/transfer.rs` (Leon). These exist but are
+NOT committed to HEAD `4212e090e`.
+
+Critical integration gap found: Nabil's crate exports `NxrtNegotiate` /
+`NxrtCreateEpFactories` with a vtable-based ownership model. Isidore's host loader
+expects `nxrt_abi_version` / `nxrt_create_ep` / `nxrt_destroy_ep` / `nxrt_ep_name` /
+`nxrt_device_count` with an opaque-handle model. Incompatible protocols; cannot
+be loaded. Isidore's `abi_contract.rs` even notes "replace with Nabil's crate when
+it lands." A reconciliation pass is the immediate blocker before either crate is committed.
+
+Docs updated accordingly (NXRT_ABI.md §6.3, EP_PLUGIN_EXPORT_PR.md §524 table and
+Follow-Ups item 9, decisions inbox).
