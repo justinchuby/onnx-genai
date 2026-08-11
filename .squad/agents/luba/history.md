@@ -29,3 +29,22 @@ Cast into the CPU & Edge pod. Standing directive: optimizations must be portable
 **Tests:** 32 nxrt-abi unit tests pass, 4 nxrt-host unit + 10 roundtrip tests pass. Clippy + fmt clean.
 
 **Note for Chew:** Two `as *const i8` casts remain in `tests/nxrt_abi_roundtrip.rs:173,187` — need the same `c_char` fix.
+
+---
+
+## 2026-08-11 — Apple/ARM CI failure triage for #31973 and #31974
+
+**Task:** Investigate three CI failures on upstream PRs to determine if caused by our code.
+
+**Findings:** All three failures are **infra flakes**, not caused by our code:
+1. PR #31973 `coreml / build-and-test` — FetchContent download of cpuinfo.zip failed (CDN timeout)
+2. PR #31974 `iphone_simulator (arm64)` — FetchContent download of XNNPACK.zip failed
+3. PR #31974 `Build Linux arm64 Debug` — Job timeout at link step 1453/1459, no compile error
+
+**Control:** PR #31985 (docs-only, same main) passed all these jobs at the same time, confirming transient infra issues.
+
+**Action:** No code changes. Recommend re-running failed jobs.
+
+## 2026-08-11 (upstream CI correction wave) — Apple/arm64 CI triage
+
+Pulled real logs for all Apple/arm64 failures on #31973 and #31974. All three failures occur before compilation: (1) cpuinfo archive download failure (#31973 coreml), (2) XNNPACK archive download failure (#31974 iphone_simulator), (3) job timeout at step 1453/1459 during `onnxruntime_mlas_test` link (#31974 arm64 Debug). All confirmed infra flakes via control PR #31985. `gh run rerun` refuses fork-PR jobs; only retrigger is a push.

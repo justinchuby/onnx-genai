@@ -141,3 +141,14 @@ cargo fmt --check                        → clean
 **Sweep:** All 8 PR-touched files checked — no other `-Werror` issues.
 **Validation:** `build.py --config Debug --target onnxruntime_mlas_test` (no `--compile_no_warning_as_error`) → clean build. 45/45 BF16 MLAS tests pass.
 **Lesson:** Never validate with `--compile_no_warning_as_error` — it masks the exact class of failure that blocks upstream CI.
+
+## 2026-08-11 — Leak fix on PR #31973
+
+- Scrubbed two internal agent-name references ("Iran's", "Pris's") from `test_layernorm.cpp` comments.
+- Full sweep: no other leaks in branch diff, tree, or commit messages.
+- History rewritten (interactive rebase, amend two commits), force-pushed. New HEAD: `2989cf5fd0`.
+- Build passes with warnings-as-errors. 42/42 tests green.
+
+## 2026-08-11 (upstream CI correction wave) — Leak scrub on PR #31973 (lockout enforcement)
+
+Holden's re-review of #31973 found two agent names in source comments: "Iran's" (test_layernorm.cpp:1191) and "Pris's" (test_layernorm.cpp:492). Iran and Pris were barred from fixing their own lines (reviewer lockout). Replaced comments with technical descriptions; rewrote history via interactive rebase (amended two commits); force-pushed. New HEAD: `9c1c8f96b180`. Full branch diff grep confirmed no other leaks. Build passes with warnings-as-errors; 42/42 tests green.

@@ -38,3 +38,15 @@ All failures are INFRA FLAKES: Gradle CDN timeout (#31973 coreml Debug), pytorch
 
 ### 2026-08-11 — Session update (Scribe append)
 Both upstream PRs marked ready-for-review. `.squad/` git history purge complete.
+
+## 2026-08-11 — Fix stale MRotaryEmbedding doc upstream
+
+- **PR:** https://github.com/microsoft/onnxruntime/pull/31985 (draft)
+- **Branch:** `nxrt/fix-mrope-contrib-doc` on `justinchuby/onnxruntime`
+- **Fix:** Removed inaccurate `(or omitting it)` from `docs/ContribOperators.md` to match schema in `bert_defs.cc`. `mrope_section` is required so the phrase was wrong.
+- **Origin:** #31728 introduced the mismatch; CI has been red since.
+- **Scope:** Single 1-line change, hand-edited to match generator output.
+
+## 2026-08-11 (upstream CI correction wave) — PR #31985 (MRotaryEmbedding doc fix)
+
+Traced `Windows GPU Kernel Documentation Validation` CI failure to `docs/ContribOperators.md` stale text from upstream PR #31728 (`e415ef9afd`). Confirmed `mrope_section` is a required attribute (no default in `bert_defs.cc`); the phrase "(or omitting it)" was factually wrong, not just stale. Opened PR #31985 as a one-line hand-edit fix. PR reached 86/86 CI green and was marked ready for review.

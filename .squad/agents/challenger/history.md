@@ -65,3 +65,11 @@ unblocked for e2e testing.
 - S3: `input_slots` logic verified correct for all-present/absent-interior/trailing cases.
 
 Coco fixed both blockers.
+
+## 2026-08-11 — Re-review PR #31974 (BFloat16 CPU EP LayerNorm)
+
+Post-rebase fresh review. All 6 original blockers verified as still fixed. No new issues found. 17 tests are non-vacuous (anti-fallback ConfigEp design, tight stat tolerance catches B5 regression). Two cosmetic nits in narrow_float_utils.h comments. **Verdict: ready to leave draft once CI is green.**
+
+## 2026-08-11 (upstream CI correction wave) — Re-review PR #31974
+
+Post-rebase fresh adversarial review. All six original blockers still fixed. Stat tests genuinely fail against pre-B5 code (bf16 quantization step ~3.9e-3 at unit scale; tolerance is 1e-5 — ~390× tighter). Anti-fallback `ConfigEp(DefaultCpuExecutionProvider())` design confirmed non-vacuous. Two cosmetic nits in `narrow_float_utils.h`. **Verdict: 0 blocking, 0 substantive, 2 nits. Ready to leave draft once CI is green.**

@@ -90,3 +90,9 @@ Build clean, 17/17 BFloat16 LayerNorm tests pass, 96/96 `*LayerNorm*` pass, clan
 **LayerNorm B1/B2 kernel fix (#31973):** Welford → centered two-pass + double-precision first-pass sum. Worst-case: 5.95e-03 vs 28.2% for old Welford. 14.3× faster than scalar. `NormSize < 8` gate moved inside x86-only guard (was blocking RVV).
 
 **NarrowToFloat dedup (commit `6dd19a6f56`, #31974):** `onnxruntime/core/util/narrow_float_utils.h` created. Helpers removed from both source files.
+
+**Rebase PR #31973 (2026-08-11):** Rebased 7 commits onto upstream/main (`86d38813a8`). Zero conflicts. Build clean (no warning suppression). 42/42 MLAS LayerNorm tests pass (43 with disabled). New HEAD `6ef1f61f88`. All 5 preserved properties confirmed intact. ContribOperators.md CI failure expected (not ours, covered by #31985).
+
+## 2026-08-11 (upstream CI correction wave) — Rebase PR #31973
+
+Rebased `nxrt/mlas-avx2-layernorm` (7 commits) from `16b486a2` onto `upstream/main` at `86d38813a8`. Zero conflicts. Build clean (warnings-as-errors). 42 MLAS LayerNorm tests pass. All five preserved properties intact. Force-pushed. New HEAD: `6ef1f61f88`. PR remains draft per user instruction (correct posture: draft until CI board is green).

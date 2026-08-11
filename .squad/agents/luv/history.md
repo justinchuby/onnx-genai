@@ -78,3 +78,19 @@ Re-reviewed commit `142cb563c5` for @justinchuby. Verdict: APPROVE. The fix corr
 - Confirmed Isidore's ABI fixes, Freysa's fallback disable, Sebastian's runtime axis genuine.
 
 **Outcome:** S1 confirmed by Mariette. Fixes landed via Mariette, Challenger, Coco, Resch, Rachael chain. Reviewer lockout held.
+
+## 2026-08-11 — Review PR #31985 (ort-docfix, MRotaryEmbedding doc)
+
+**Task:** Adversarial review of one-line doc fix removing "(or omitting it)" from ContribOperators.md.
+
+**Findings:**
+- `mrope_section` confirmed required (`AttributeProto::INTS`, no default, description says "Required.")
+- Hand edit is byte-exact to schema text at bert_defs.cc:2008
+- No leaks, no scope creep, single-file single-line commit
+- PR body accurate: names #31728, explains hand-edit reasoning
+
+**Verdict:** NITS only. Ready to leave draft.
+
+## 2026-08-11 (upstream CI correction wave) — Review PR #31985
+
+Adversarial review of one-line `docs/ContribOperators.md` fix. Confirmed `mrope_section` is required (no default in `bert_defs.cc:2046–2051`). Hand edit byte-exact to schema text. Single-file, single-line commit; no leaks, no scope creep. **Verdict: NITS only — ready to leave draft.** PR subsequently reached 86/86 CI green.

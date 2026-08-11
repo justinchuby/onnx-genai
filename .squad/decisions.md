@@ -258,3 +258,29 @@ Full narrative in `.squad/decisions-archive/2026-08.md` (DROP sections: copilot-
 - **`filter_map` is wrong wherever position or rank is load-bearing.** It caused four separate bugs here: compacted output slots, compacted input slots, truncated rank for axis resolution, and truncated rank at two further sites. Use `map` to `Option<T>` and preserve length.
 - **Verify an API's absence before deferring on it.** Two deferrals were justified by ORT APIs that existed: `MemoryDevice_GetDeviceId` (1.27) and `Session_GetEpGraphAssignmentInfo` (since 1.24). Check the generated bindings before filing a deferral.
 - **Reviewer lockout held across seven rounds.** Chain above closed cleanly; no author revised their own rejected artifact.
+
+## Current active wave — 2026-08-11 (Upstream CI correction wave)
+
+### PRs #31973, #31974, #31985 — upstream ORT rebase and CI unblock
+
+**By:** Deckard (doc-fix PR), Iran (rebase #31973), Sapper (rebase #31974 + conflict), Luba (Apple/arm64 CI triage), Holden (re-review #31973), Chew (leak scrub under lockout), Challenger (re-review #31974), Luv (review #31985)
+
+**#31985 (mrope doc fix):** One-line removal of `(or omitting it)` from `docs/ContribOperators.md`. `mrope_section` is a required attribute (no default in `bert_defs.cc`); the phrase was factually wrong, not merely stale. PR reached **86/86 CI green** and was marked **ready for review**.
+
+**#31973 rebase (Iran):** Rebased 7 commits onto `upstream/main` (`86d38813a8`). Zero conflicts. 42 MLAS LayerNorm tests pass. All five preserved properties intact.
+
+**#31974 rebase (Sapper):** First attempt clean. Second rebase hit semantic conflict with upstream #31676 ("Validate SkipLayerNorm prepacked lengths") in `skip_layer_norm.cc`. Resolved by keeping upstream's `tensor_size > 0` guard and extending it to our bf16 path. Upstream's validation still covers bf16 because `ConvertMLFloat16ToFloatIfNeeded` handles bf16. 17 bf16 + 103 LayerNorm + 6 upstream prepacked tests pass.
+
+**Persona name leaks (Holden → Chew):** Holden's re-review of #31973 found two agent names in C++ test comments ("Iran", "Pris"). Iran and Pris were barred under reviewer lockout. Chew replaced comments with technical descriptions and rewrote history (interactive rebase, amend two commits). Force-pushed; strings unreachable in any reachable commit.
+
+**Apple/arm64 CI (Luba):** All failures occur before compilation. `cpuinfo` and `XNNPACK` archive download failures on #31973/#31974; job timeout at step 1453/1459 on #31974. Same jobs passed on control PR #31985 at the same time. All confirmed infra flakes. `gh run rerun` refused for fork-PR jobs — only retrigger is a push.
+
+**Re-reviews:** Challenger re-reviewed #31974 — 0 blocking, 0 substantive, 2 cosmetic nits. Stat tests genuinely fail against pre-B5 code (bf16 quantization step is ~390× coarser than 1e-5 tolerance). Both #31973 and #31974 converted **back to draft** per user instruction — correct posture is draft until CI board is green.
+
+### Durable lessons from upstream CI correction wave
+
+- **Leak scans must cover committed source content, not just `.squad/` paths and commit messages.** Two prior sweeps passed while persona names sat in C++ comments in a public upstream PR, forcing a third history rewrite. Grep the diff for agent names.
+- **"Not caused by us" is not the same as "safe to mark ready."** Marking two upstream PRs ready while red — reasoning that failures were inherited or infra — was wrong. The correct posture is draft until the board is green.
+- **A clean control PR is the cheapest way to separate infra from code.** PR #31985 — one line, docs-only, same `main` — reached 86/86 green while ours were red, both refuting and confirming flakiness faster than log-reading alone.
+- **Apple/arm64 fork-PR jobs fail frequently at dependency download** (cpuinfo, XNNPACK, eigen3, protoc), always before compilation. `gh run rerun` refuses fork-PR jobs; only retrigger available is a push.
+- **Reviewer lockout held:** Iran and Pris were barred from fixing the persona-name comments they authored; Chew did it.
