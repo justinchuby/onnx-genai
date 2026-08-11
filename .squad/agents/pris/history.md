@@ -712,3 +712,15 @@ Result: **41/41 tests pass**, no kernel code touched.
 - **S2**: Fixed `DISABLED_AdversarialPrecisionReport` — excluded Scenario 6 (near-fp32-max overflow, unreasonable input), separated catastrophic-cancellation tracking (10% gate), enabled the test. Both invocations green (42/42 normal, 43/43 with disabled).
 - **Nit**: Updated stale "Welford SIMD" labels → "centered two-pass".
 - **Iran finding**: RMSNorm + MeanOut may do unnecessary mean pass in kernel.
+
+## 2026-08-11 — Sixth Review Pass (PR #762, test-integrity audit)
+
+- **Verdict:** YES to leaving draft, with one substantive reservation.
+- Audited all 28 real-ORT tests + 6 CUDA tests. Classified each by assignment-proof strength (a/b/c).
+- **8 assignment assertions verified genuine** — `Session_GetEpGraphAssignmentInfo` is real, `"cpu_ep"` has no collision with ORT's `"CPUExecutionProvider"`.
+- **1 category (c) test found:** `layernorm_dynamic_axis_mean_invstddev_shape` — the BL1 regression test has NO `disable_cpu_ep_fallback` and NO assignment assertion. Could pass entirely on ORT's built-in CPU EP.
+- **5/6 historical bugs regression-covered.** Gap: no test for forgeable name-based sentinels.
+- `conformance_shape_f32` is a soft-check (ORT may constant-fold Shape) — acceptable.
+- `conformance_mixed_partition` partition claim is aspirational (ORT may not partition).
+- f16/bf16 tests lack assignment assertions (have fallback-disable, so category b not c).
+- Did NOT reproduce forced-failure (read-only audit, no build env).

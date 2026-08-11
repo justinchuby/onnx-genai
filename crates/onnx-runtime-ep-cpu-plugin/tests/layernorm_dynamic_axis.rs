@@ -17,7 +17,7 @@
 mod cdylib_resolve;
 mod ort_path;
 
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::{Mutex, MutexGuard};
@@ -144,6 +144,68 @@ unsafe fn get_output_shape(api: *const ort::OrtApi, output: *const ort::OrtValue
     dims
 }
 
+/// Assert that a specific op type is assigned to "cpu_ep" via
+/// `Session_GetEpGraphAssignmentInfo`. Requires `session.record_ep_graph_assignment_info=1`.
+unsafe fn assert_op_assigned_to_our_ep(
+    api: *const ort::OrtApi,
+    session: *mut ort::OrtSession,
+    expected_op: &str,
+    test_label: &str,
+) {
+    let get_info = unsafe { (*api).Session_GetEpGraphAssignmentInfo }
+        .expect("Session_GetEpGraphAssignmentInfo not in OrtApi — requires ORT ≥1.24");
+    let get_ep_name =
+        unsafe { (*api).EpAssignedSubgraph_GetEpName }.expect("EpAssignedSubgraph_GetEpName");
+    let get_nodes =
+        unsafe { (*api).EpAssignedSubgraph_GetNodes }.expect("EpAssignedSubgraph_GetNodes");
+    let get_op_type =
+        unsafe { (*api).EpAssignedNode_GetOperatorType }.expect("EpAssignedNode_GetOperatorType");
+
+    let mut ep_subgraphs: *const *const ort::OrtEpAssignedSubgraph = ptr::null();
+    let mut num_subgraphs: usize = 0;
+    let status = unsafe { get_info(session, &mut ep_subgraphs, &mut num_subgraphs) };
+    unsafe { check_status(api, status, "Session_GetEpGraphAssignmentInfo") };
+
+    let mut assignments: Vec<(String, String)> = Vec::new();
+    for i in 0..num_subgraphs {
+        let subgraph = unsafe { *ep_subgraphs.add(i) };
+        let mut ep_name_ptr: *const std::os::raw::c_char = ptr::null();
+        let status = unsafe { get_ep_name(subgraph, &mut ep_name_ptr) };
+        unsafe { check_status(api, status, "EpAssignedSubgraph_GetEpName") };
+        let ep_name = unsafe { CStr::from_ptr(ep_name_ptr) }
+            .to_string_lossy()
+            .into_owned();
+
+        let mut ep_nodes: *const *const ort::OrtEpAssignedNode = ptr::null();
+        let mut num_nodes: usize = 0;
+        let status = unsafe { get_nodes(subgraph, &mut ep_nodes, &mut num_nodes) };
+        unsafe { check_status(api, status, "EpAssignedSubgraph_GetNodes") };
+
+        for j in 0..num_nodes {
+            let node = unsafe { *ep_nodes.add(j) };
+            let mut op_type_ptr: *const std::os::raw::c_char = ptr::null();
+            let status = unsafe { get_op_type(node, &mut op_type_ptr) };
+            unsafe { check_status(api, status, "EpAssignedNode_GetOperatorType") };
+            let op_type = unsafe { CStr::from_ptr(op_type_ptr) }
+                .to_string_lossy()
+                .into_owned();
+            assignments.push((ep_name.clone(), op_type));
+        }
+    }
+
+    let ours: Vec<&str> = assignments
+        .iter()
+        .filter(|(ep, _)| ep == "cpu_ep")
+        .map(|(_, op)| op.as_str())
+        .collect();
+    eprintln!("  [{test_label}] EP assignment: ours={ours:?}");
+    assert!(
+        ours.contains(&expected_op),
+        "[{test_label}] Expected op '{expected_op}' assigned to cpu_ep, \
+         but assignment was: {assignments:?}"
+    );
+}
+
 /// BL1 regression: LayerNorm axis=-1 on dynamic [B, S, H] must produce
 /// Mean/InvStdDev with shape [B, S, 1], not a truncated form.
 ///
@@ -217,6 +279,28 @@ fn layernorm_dynamic_axis_mean_invstddev_shape() {
         let status = ((*api).CreateSessionOptions.unwrap())(&mut session_options);
         check_status(api, status, "CreateSessionOptions");
 
+        // Disable CPU EP fallback — if our EP declines the node, the test must fail.
+        let key = CString::new("session.disable_cpu_ep_fallback").unwrap();
+        let val = CString::new("1").unwrap();
+        let status =
+            ((*api).AddSessionConfigEntry.unwrap())(session_options, key.as_ptr(), val.as_ptr());
+        check_status(
+            api,
+            status,
+            "AddSessionConfigEntry(disable_cpu_ep_fallback)",
+        );
+
+        // Record EP graph assignment info for direct assertion.
+        let key = CString::new("session.record_ep_graph_assignment_info").unwrap();
+        let val = CString::new("1").unwrap();
+        let status =
+            ((*api).AddSessionConfigEntry.unwrap())(session_options, key.as_ptr(), val.as_ptr());
+        check_status(
+            api,
+            status,
+            "AddSessionConfigEntry(record_ep_graph_assignment_info)",
+        );
+
         let devices_arr: [*const ort::OrtEpDevice; 1] = [our_device];
         let status = ((*api).SessionOptionsAppendExecutionProvider_V2.unwrap())(
             session_options,
@@ -234,6 +318,9 @@ fn layernorm_dynamic_axis_mean_invstddev_shape() {
         let status =
             ((*api).CreateSession.unwrap())(env, model_c.as_ptr(), session_options, &mut session);
         check_status(api, status, "CreateSession");
+
+        // Assert that LayerNormalization is owned by our EP, not the built-in CPU EP.
+        assert_op_assigned_to_our_ep(api, session, "LayerNormalization", "layernorm_dynamic_axis");
 
         // Run with concrete shape [2, 3, 4] (B=2, S=3, H=4)
         let mut x_data: Vec<f32> = (1..=24).map(|x| x as f32).collect();

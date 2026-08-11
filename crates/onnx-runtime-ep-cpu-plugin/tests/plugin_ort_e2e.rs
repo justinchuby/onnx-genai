@@ -2144,6 +2144,7 @@ fn conformance_add_float16() {
         ((*api).ReleaseValue.unwrap())(output);
         ((*api).ReleaseValue.unwrap())(x_val);
         ((*api).ReleaseValue.unwrap())(y_val);
+        assert_ops_assigned_to_our_ep(api, session, &["Add"], "conformance_add_float16");
         conformance_teardown(api, env, opts, session, "cpu_ep_f16");
         eprintln!("\n✅ conformance_add_float16: PASSED");
     }
@@ -2218,6 +2219,7 @@ fn conformance_add_bfloat16() {
         ((*api).ReleaseValue.unwrap())(output);
         ((*api).ReleaseValue.unwrap())(x_val);
         ((*api).ReleaseValue.unwrap())(y_val);
+        assert_ops_assigned_to_our_ep(api, session, &["Add"], "conformance_add_bfloat16");
         conformance_teardown(api, env, opts, session, "cpu_ep_bf16");
         eprintln!("\n✅ conformance_add_bfloat16: PASSED");
     }
@@ -2699,6 +2701,12 @@ fn conformance_layer_norm_multi_output() {
         }
         ((*api).ReleaseValue.unwrap())(x_val);
         ((*api).ReleaseValue.unwrap())(s_val);
+        assert_ops_assigned_to_our_ep(
+            api,
+            session,
+            &["LayerNormalization"],
+            "layer_norm_multi_output",
+        );
         conformance_teardown(api, env, opts, session, "cpu_ep_ln");
         eprintln!(
             "\n✅ conformance_layer_norm_multi_output: PASSED — shapes [2,1] and values verified"
@@ -2804,6 +2812,7 @@ fn conformance_layer_norm_neg_axis() {
         }
         ((*api).ReleaseValue.unwrap())(x_val);
         ((*api).ReleaseValue.unwrap())(s_val);
+        assert_ops_assigned_to_our_ep(api, session, &["LayerNormalization"], "layer_norm_neg_axis");
         conformance_teardown(api, env, opts, session, "cpu_ep_ln_neg");
         eprintln!(
             "\n✅ conformance_layer_norm_neg_axis: PASSED — Mean/InvStdDev shape [2,3,1], values verified"
@@ -2899,6 +2908,7 @@ fn conformance_rms_norm() {
         ((*api).ReleaseValue.unwrap())(outputs[0]);
         ((*api).ReleaseValue.unwrap())(x_val);
         ((*api).ReleaseValue.unwrap())(s_val);
+        assert_ops_assigned_to_our_ep(api, session, &["RMSNormalization"], "rms_norm");
         conformance_teardown(api, env, opts, session, "cpu_ep_rms");
         eprintln!("\n✅ conformance_rms_norm: PASSED — Y shape [2,4], rms(Y row)≈1.0");
     }
