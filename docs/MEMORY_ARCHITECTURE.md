@@ -36,7 +36,7 @@ when in fact it is 1955 lines.
 | Weight offload vs the OS | — | **27x slower than doing nothing; cause identified 2026-08-06** | WDDM demand-paging reaches 6.01 tok/s on a model that does not fit; our managed offload path is far behind. The gap now has a named mechanism rather than a mystery: the residency cache never served a single weight without copying it (see the row below), so every decode step re-staged 7.33 GiB and paid 6,936 `cuMemAlloc`/`cuMemFree` pairs. Measured with CUDA events, that places **~39% of step time downstream of one eviction-policy defect** — `h2d_copy` 18.8%, `staging_fill` 9.0%, `vram_free` 9.0%, `vram_alloc` 2.3%. The remainder is not yet accounted for, and graph capture — worth **2.6x** in isolation, ranges non-overlapping — is disabled on **every** offload runffload reaches 0.22. The largest known cause is stated only in a warning: *"weight offload is incompatible with CUDA graph capture; capture disabled"*. On a Windows consumer GPU a user is currently better off leaving offload off (#705) |
 | `--vram-limit` | — | **enforced; explicit bytes select managed no-spill mode** | The limit is resolved before native CUDA session construction. If package weights exceed it, weight offload is enabled and its allowance is derived as `limit − governed device state`; the same authority owns physical VMM handles, mapped weights, KV, and workspace. A 6 GiB qwen2.5-14b int4 live run loaded, generated the expected `Paris`, stayed at 5,534,384,128 owned bytes, rejected an 8K request pre-header with 429, and completed four queued short requests without overlap-only rejection. Crossing the first physical KV-growth boundary transferred 201,326,592 bytes through one grant and reported 201,326,592 mapped KV bytes; later governed capacity exhaustion returned 429 rather than 500/OOM. Managed initialization failure is an early arithmetic/provider error, while `ONNX_GENAI_DYNAMIC_KV_WEIGHT_LENDING=0` restores the prior non-VMM/WDDM-capable compatibility fallback. Limitation: the native server's FIFO per-request engine queue verified ordering and absence of overlap-only rejection, but did not demonstrate simultaneous live KV accumulation. Caveat carried, not closed: `activations_bytes=unknown` and `runtime_overhead_bytes=unknown` are not subtracted (#514). PRs #717, #736. |
 | Weight residency cache (CUDA) | — | **had a 0% hit rate for its entire life; fixed 2026-08-06** | `evict_to_fit` was a plain LRU evicting from the least-recently-used end, while the decode weight walk is a **cyclic sequential scan** over the layers — the pessimal pairing, which returns the hit rate to zero at *every* capacity. Measured: **6,936 page-ins, 0 hits, at both 3 GB and 6 GB budgets**, with staged bytes identical (7,870,916,608 per step) because miss traffic under this pathology is invariant to capacity. Rivals eliminated on hardware: the budget knob works (peak resident 3.0 vs 6.0 GB) and staged bytes reconcile with `page_ins × page size`. A stable-resident-subset policy measures **74.18%** against a `B/W ≈ 76%` ceiling, page-ins 6,936 → 1,791, evictions 6,286 → **0**. #720, PR #723 |
-| KV page storage | — | **contract opened 2026-08-06; still host-only** | `onnx-genai-kv` implements paging, ref-counting/CoW, prefix sharing and quantization layout, and **never touched device memory**: storage was host `Vec`, `Device::Gpu(0)` a label on a struct field, and a tier migration one enum assignment moving zero bytes. Documented as a placeholder in `tiered.rs` from the start — the seam was designed in and the GPU backend behind it was never built. `PageTable` now holds `Box<dyn KvPageStore>` so a third party can supply a store without patching the crate; host stores expose slices, device stores expose an opaque span, and a host view of a device page requires explicit materialization. Stages 2–5 in #721. PR #726 |
+| KV page storage | — | **contract opened 2026-08-06; still host-only** | `onnx-genai-kv` implements paging, ref-counting/CoW, prefix sharing and quantization layout, and **never touched device memory**: storage was host `Vec`, `Device::Gpu(0)` a label on a struct field, and a tier migration one enum assignment moving zero bytes. Documented as a placeholder in `tiered.rs` from the start — the seam was designed in and the GPU backend behind it was never built. `PageTable` now holds `Box<dyn KvPageStore>` so a third party can supply a store without patching the crate; host stores expose slices, device stores expose an opaque span, and a host view of a device page requires explicit materialization. Stages 2–5 in #721. PR #726. Device KV paging is **not** owned by `onnx-genai-kv`: under the VMM design it is owned by the CUDA VMM layer (`CudaVmmAllocator`, the #740 physical-handle pool), with committed-granule admission (#745) and growth grants (#748). `native_decode/cuda.rs` still has no `PageTable`/`PagedKvCache` consumer, and `paged_gqa.rs` is a batch-1 CPU primitive. |
 | Captured graphs across a VMM remap | — | **verified on hardware 2026-08-06** | A CUDA graph instantiated before `cuMemUnmap`/`cuMemCreate`/`cuMemMap` at the same virtual address replays correctly afterwards and writes into the **new** physical pages — sentinel-proven, closing the page-recycling confound. The growth-shaped case passes, and one physical handle mapped at two virtual addresses is readable by captured work through either. Untested and treated as unsafe: unmapping while a replay is in flight. `cuMemMap` during capture returns `CUDA_SUCCESS` but is **not** proven replayable, so growth is issued outside the captured segment. This is the premise under #721 stage 4 and under re-scoping #716, and its stated falsifier did not fire. PR #727 |
 | Activation planning | — | **wired for measurement; not yet allocating** | `crates/onnx-runtime-memory` now has a consumer: the session executor builds a `ViewMap`, runs the planner, and reports peak vs naive. Measured 2.4x-2.7x on qwen2.5-0.5b, though see #671 for a review finding that may inflate that. Sharing slots for real is #670 |
 | Native KV page size | — | **wrong unit** | `governor_kv_config` puts a token count in `page_size_bytes` when the geometry is unknown, so the native `bytes_per_token` is 1 (#628) |
@@ -144,6 +144,78 @@ pooled dense-attention scores slot — govern `standard_attention.rs:602` and
 `group_query_attention.rs:945` (which share the pooled-scratch shape) through the
 same `workspace_requirement` + prepared-workspace contract, then fold in the
 legacy `attention.rs:711` per-call path.
+
+### KV reservation geometry: the crossover, the granule floor, and read-bounded commit
+
+This is the single home for the KV VMM geometry. Other documents should link
+here rather than restate it, because the numbers below were each measured to
+overturn an earlier plausible-looking claim, and a copied number drifts.
+
+**The granule floor is per-object, not per-token (#776).** KV is stored
+per-binding, head-major, so a fixed full-context stride commits `objects ×
+granule`, not `ceil(content / granule)`. There is no "tokens per granule": you
+cannot pack multiple tokens of one head-stripe into a shared granule when each
+head-stripe is its own binding with the full-context stride. Measured on
+qwen2.5-0.5b: **96 head-stripes × 2 MiB = 192 MiB physically committed to hold
+~12 KiB of live content.** An earlier `docs/DESIGN.md` §39.5 table framed this as
+"~1024 tokens per 2 MiB granule" and floored a sequence at `num_layers × 2 ×
+2 MiB`; that reasoning was wrong and was publicly corrected.
+
+**The crossover is `granule / (head_dim × sizeof(dtype))` and is model-size
+independent (#776).** Under head-major layout, `layers` and `kv_heads` cancel
+between the full-context-VA cost and bucket-growth cost, so the context length at
+which a stable full-context VA commits *less* than power-of-two bucket growth
+depends only on the granule, the head dimension, and the KV element size:
+
+```
+crossover_tokens = granule / (head_dim × sizeof(dtype))
+```
+
+On this device (2 MiB granule): ~**8,192 tokens** at head_dim 128 / fp16,
+~**16,384 tokens** at head_dim 64 / fp16. Verified on hardware across a **480×
+model-size range** (PR #776). Quantized KV makes the crossover *worse*: fp8/int8
+halves bytes-per-element and therefore **doubles** the crossover in tokens, so a
+full-context VA is the wrong default for exactly the long-context/quantized-KV
+regime it looks most attractive for. Below the crossover a stable full-context VA
+over-commits; above it, virtual contiguity wins and growth becomes remap rather
+than copy.
+
+**`CU_MEM_ALLOC_GRANULARITY_MINIMUM == RECOMMENDED == 2 MiB` on this device
+(#776).** There is no finer device granule available here, so "shrink the
+granule" is not an available lever on this hardware — the 2 MiB floor is a
+hardware constant to design around, not a tunable.
+
+**The read pattern forces the commit, not the reservation (#772).** A read
+bounded to the live length leaves the reservation tail *uncommitted*, including
+under captured replay; reading one byte past the live length faults
+`CUDA_ERROR_INVALID_VALUE`. So a stable full-context VA does not itself commit
+the tail — an over-broad read does. This is the correct attribution of the #721
+stage-4 **32× regression**: a stable full-context VA committed **1.5 GB** where
+bucket growth commits **48 MB**, because the read spanned the full context rather
+than the live prefix. Bound the read to the live length and the tail stays free.
+
+**Weight offload and CUDA graph capture are mutually exclusive today.** The
+pager's alloc/copy/free operations are capture-illegal, so enabling offload
+disables capture (see the module docs in
+`crates/onnx-genai-engine/src/native_decode/cuda.rs`). Large models that need
+offload therefore get **none** of the capture-fragmentation wins that #708 and
+#728 landed — those took 35B-A3B decode from **154 to 34** graph segments. The
+fix is **#716**: page weights under a stable virtual address so page-in remaps
+physical granules at the same VA (proven survivable, #727 — see the status
+table) instead of returning a new pointer that would invalidate the capture.
+Until #716 lands, offload-on implies capture-off, and that is a large part of why
+managed offload trails WDDM demand paging on a model that does not fit.
+
+**Sequential weight prefetch does not work and was deleted (#715, #718).** It was
+implemented, measured to produce no usable compute/transfer overlap on the dev
+box, and removed in PR #715. AirLLM's own analysis (#718) reaches the same
+conclusion independently — the bottleneck is disk/transfer bandwidth, not a lack
+of overlap — and rates prefetch at ~10% by their own account. On a model that
+does not fit there is not enough independent compute to hide the transfer behind,
+so any doc presenting prefetch/compute overlap as the plan, the lever, or an
+existing capability is stale. The withdrawn `h2d_enqueue_copy_ms` = 1.7% figure
+that once retired this line of work is corrected to **18.8%** by CUDA-event
+measurement (see the instrument-failure narrative below).
 
 ### The platform is part of the memory system
 
@@ -299,6 +371,26 @@ After the third instance the response should be a guard, not more vigilance.
 
 The `Challenger` role (`.squad/agents/challenger/charter.md`) exists to apply
 this systematically to any result that would change technical direction.
+
+### Keeping the documentation from going stale
+
+The same discipline applies to the prose, not just the code and the counters.
+Most of the staleness this subsystem accumulates is a *performance claim written
+in the present tense that a later measurement overturned* — prefetch overlap
+(#715), the 1.7% h2d figure (#718), the 0% residency cache (#723), the
+"tokens per granule" KV framing (#776). Three rules keep it from recurring:
+
+- **A performance claim in docs must cite the measurement that produced it.** A
+  number with no PR/issue behind it is a guess, and a guess ages into a false
+  fact. If you cannot name where it was measured, mark it as an estimate.
+- **When measurement overturns a claim, correct it in place and say what
+  superseded it** — do not silently delete the old claim. A reader who remembers
+  the old number must be able to see it was tested and retired, with the PR/issue
+  that did it. That traceability is what makes the docs trustworthy.
+- **Distinguish measured fact from design intent from not-yet-built.** Aspirational
+  design written in the present tense is the most common failure mode: a design
+  document may describe an intended design, but must not claim it is implemented
+  or measured when it is not.
 
 The last five rows are newer than the layers above them and move fastest, so
 each says where it actually is. "Decided" and "in `main`" are different states
