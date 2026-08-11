@@ -60,6 +60,7 @@ pub mod hardmax;
 pub mod index_share;
 pub mod index_transform;
 pub mod indexing;
+pub(crate) mod kv_stride;
 pub mod linear_attention;
 pub mod log_softmax;
 pub mod matmul;
