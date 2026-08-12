@@ -158,7 +158,10 @@ impl Engine {
             required_device_non_weight_bytes: 0,
             minimum_useful_weight_budget_bytes,
             default_dynamic_device_budget_bytes: None,
+            // ORT backend: managed no-spill VMM is not available here, so the
+            // plan stays keyed on an explicit byte limit as before #755.
             inferred_policy_enabled: matches!(config.limits.vram_limit, ResourceLimit::Bytes(_)),
+            managed_vmm: matches!(config.limits.vram_limit, ResourceLimit::Bytes(_)),
             overrides: MemoryStrategyOverrides::default(),
             advisory_only: true,
         });
@@ -431,6 +434,23 @@ impl Engine {
         let memory_strategy_overrides = memory_strategy_overrides_from_cuda_env(cuda_env_policy);
         #[cfg(not(feature = "cuda"))]
         let memory_strategy_overrides = MemoryStrategyOverrides::default();
+        let native_cuda_load = matches!(
+            native_device,
+            crate::native_decode::NativeDecodeDevice::Cuda { .. }
+        );
+        let explicit_vram_bytes = matches!(config.limits.vram_limit, ResourceLimit::Bytes(_));
+        // #755: managed no-spill VMM is the default on the native CUDA path
+        // (unless the legacy allocator opt-out is set). On other backends the
+        // managed path is unavailable, so it stays keyed on an explicit byte
+        // limit as before.
+        #[cfg(all(feature = "cuda", feature = "native-backend"))]
+        let managed_vmm = if native_cuda_load {
+            managed_vmm_default_enabled()
+        } else {
+            explicit_vram_bytes
+        };
+        #[cfg(not(all(feature = "cuda", feature = "native-backend")))]
+        let managed_vmm = explicit_vram_bytes;
         let memory_strategy_plan = build_memory_strategy_plan(MemoryStrategyPlanInput {
             config: &config,
             resolved_vram_bytes,
@@ -445,12 +465,10 @@ impl Engine {
             ),
             #[cfg(not(feature = "cuda"))]
             default_dynamic_device_budget_bytes: None,
-            inferred_policy_enabled: matches!(config.limits.vram_limit, ResourceLimit::Bytes(_)),
+            inferred_policy_enabled: managed_vmm || explicit_vram_bytes,
+            managed_vmm,
             overrides: memory_strategy_overrides,
-            advisory_only: !matches!(
-                native_device,
-                crate::native_decode::NativeDecodeDevice::Cuda { .. }
-            ),
+            advisory_only: !native_cuda_load,
         });
         log_memory_strategy_plan(&memory_strategy_plan, "single_model_native");
         #[cfg(feature = "cuda")]
@@ -1298,6 +1316,25 @@ fn dynamic_lending_enabled() -> bool {
     })
 }
 
+/// Whether the managed no-spill VMM allocator is the default for this process.
+///
+/// Since #755 managed VMM is on without a flag on the native CUDA path. The
+/// legacy ungoverned allocator remains reachable for one release through an
+/// explicit opt-out: `ONNX_GENAI_LEGACY_ALLOCATOR=1` (the documented #755 knob),
+/// or the pre-#755 `ONNX_GENAI_DYNAMIC_KV_WEIGHT_LENDING=0`, which also restored
+/// the compatibility fallback and is honored for back-compat.
+#[cfg(all(feature = "cuda", feature = "native-backend"))]
+pub(crate) fn managed_vmm_default_enabled() -> bool {
+    let legacy_allocator_opt_out =
+        std::env::var("ONNX_GENAI_LEGACY_ALLOCATOR").is_ok_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        });
+    !legacy_allocator_opt_out && dynamic_lending_enabled()
+}
+
 #[cfg(all(feature = "cuda", feature = "native-backend"))]
 fn uses_governed_physical_pool(
     resolution: Option<CudaOffloadResolution>,
@@ -1444,7 +1481,7 @@ fn reconcile_cuda_offload_budget_after_native_load(
             recurrent_state_bytes = recurrent_device_bytes,
             minimum_useful_weight_budget_bytes,
             offload_device_budget_bytes = adopted,
-            "enabled CUDA weight offload because model weights exceed the VRAM limit"
+            "enabled CUDA weight offload because model weights exceed the resolved device budget"
         );
     }
 

@@ -158,7 +158,9 @@ pub(crate) async fn resources(
         .await
         .map_err(|err| ApiError::internal(format!("resource snapshot failed: {err}")))?;
     Ok(Json(
-        ResourcesResponse::from(snapshot).with_batching(handle.engine.batching()),
+        ResourcesResponse::from(snapshot)
+            .with_batching(handle.engine.batching())
+            .with_memory_strategy(&handle.engine.memory_strategy_plan()),
     ))
 }
 
@@ -497,6 +499,7 @@ impl From<GovernorSnapshot> for ResourcesResponse {
             host_ram: ResourceTier::from(snapshot.host_ram),
             disk_spill: snapshot.disk_spill.map(ResourceTier::from),
             batching: None,
+            memory_strategy: None,
         }
     }
 }
@@ -510,6 +513,23 @@ impl ResourcesResponse {
             requested_max_batch: batching.requested_max_batch as u64,
             effective_max_batch: batching.effective_max_batch as u64,
             reason: batching.reason.clone(),
+        });
+        self
+    }
+
+    /// Attach the model's resolved memory strategy so `/v1/resources` reports the
+    /// chosen strategy, offload state, managed no-spill VMM state, and resolved
+    /// budget directly, making the #755 managed VMM default observable.
+    fn with_memory_strategy(mut self, plan: &onnx_genai_engine::MemoryStrategyPlan) -> Self {
+        let application = plan.runtime_application();
+        self.memory_strategy = Some(MemoryStrategyInfo {
+            strategy: format!("{:?}", plan.strategy),
+            weight_offload_enabled: application.weight_offload_enabled,
+            managed_no_spill: application.managed_no_spill,
+            auto_enabled: application.auto_enabled_from_vram_limit,
+            resolved_device_budget_bytes: plan.resolved_device_budget_bytes,
+            managed_limit_bytes: application.managed_limit_bytes,
+            fits_resolved_device_budget: plan.fits_resolved_device_budget,
         });
         self
     }
