@@ -223,9 +223,18 @@ fn download_prebuilt(target_dir: &Path) {
         .args([
             "-sSL",
             "--retry",
-            "3",
+            "5",
             "--retry-delay",
             "2",
+            // curl exit 52 (empty reply) and TLS/connection-reset flakes are
+            // NOT in curl's default retryable set; --retry-all-errors makes
+            // plain --retry cover them too (curl >=7.71.0).
+            "--retry-all-errors",
+            // Bound each attempt so a hung connection can't consume the job.
+            "--connect-timeout",
+            "30",
+            "--max-time",
+            "300",
             "-w",
             "%{http_code}",
             "-o",
