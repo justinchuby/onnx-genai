@@ -41,3 +41,16 @@ Persona name leaks found only after two prior diff sweeps. Rule confirmed: grep 
 **Lockout:** Holden barred from revision after authoring the review; Freysa revised.
 
 **Output:** `.squad/decisions/inbox/holden-review-31993.md` (now merged)
+
+## 2026-08-12 — Delta review PR #31974 (commit a12c7ddde3)
+
+Focused delta re-review of three new BF16 tests and comment hygiene. All three tests verified non-vacuous: PrePack tests compare against independent f32 reference, GenericBroadcast confirmed to trigger `outer_dep=true` via scale_dims padding. Tolerance comment now exactly matches `checkers.cc` implementation — numpy.isclose semantics with correct defaults. Stat tests retain 36× margin to detect pre-fix bf16 round-trip bug. No internal vocabulary, no weakened assertions. 20 BF16, 106 LayerNorm, 7 SkipLayerNormPrePack tests all green. No blockers — ready to leave draft.
+
+## 2026-08-12 — Delta re-review PR #31974 (commit a12c7ddde3)
+
+- **Task:** Focused adversarial delta review of three new BF16 tests and comment hygiene.
+- **Verdict:** No blockers. All three tests verified non-vacuous (traced PrePack path at `layer_norm_impl.cc:678-693, 720-755`; confirmed `outer_dep=true` via `layer_norm_helper.h:132-142`).
+- **Tolerance:** Verified `checkers.cc:117-120` — `absolute + relative × |expected|`. Stat tests retain 36× margin over pre-fix bug (0.00011 effective vs 0.004 pre-fix error).
+- **Hygiene:** Clean sweep — no internal vocabulary in branch diff or commit messages.
+- **Test counts:** 20/20 BF16, 106/106 LayerNorm suite, 7/7 SkipLayerNormPrePack.
+- **Nit (non-blocking):** `GenericBroadcast` test reference comment slightly imprecise — scale's dim-0 is broadcast-expanded, not "outer dim broadcast."

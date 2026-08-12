@@ -41,3 +41,21 @@ _Pre-2026-08-11 dated entries archived to `history-archive.md`. 2026-08-11 detai
 - **Tests:** `SelectColsPerBlock_OnlyMod8Accepted` (exhaustive n∈[1..256] × 5 SM counts) and `SelectColsPerBlock_RoutingInvariance_NMod8Required`.
 - **Template cost documented:** 24 → 72 instantiations, ~38 KB, all reachable.
 - **Commit:** a4aa076657. Chew barred Sebastian from revising his own rejected finding.
+
+### 2026-08-12 — PR #31974 coverage strengthening
+
+- **Task:** Add PrePack and generic-broadcast BF16 test coverage; remove internal labels; fix comments.
+- **Tests added:** `LayerNorm17_PrePack_ScaleBiasInitializers`, `SkipLayerNorm_PrePack_GammaBetaInitializers`, `LayerNorm17_GenericBroadcast`.
+- **Coverage:** 17 → 20 BF16 tests, 103 → 106 total LayerNorm suite. All pass.
+- **Internal labels removed:** 2× "B5" in test comments.
+- **SrcDispatcher comment fixed:** now accurately describes `if constexpr` preventing `ComputeImpl<NarrowType, NarrowType>` instantiation.
+- **Tolerance comments fixed:** aligned with actual checker semantics (`tolerance = absolute + relative * |expected|`, numpy.isclose style).
+- **Commit:** `a12c7ddde3` on `nxrt/mlas-bf16-layernorm`. PR stays draft.
+
+## 2026-08-12 — PR #31974 Opus v2 coverage wave
+
+- **Task:** Add PrePack and generic-broadcast BF16 test coverage; remove internal labels; fix comments.
+- **Tests added:** `LayerNorm17_PrePack_ScaleBiasInitializers` (`is_initializer=true`, lines 717-718), `SkipLayerNorm_PrePack_GammaBetaInitializers` (`is_initializer=true`, lines 752-753), `LayerNorm17_GenericBroadcast` (X={2,2,2}, scale={2,2} → `use_generic_broadcast=true`).
+- **Coverage:** 17 → 20 BF16 tests, 103 → 106 total LayerNorm suite. All pass.
+- **Hygiene:** Removed 2× "B5" internal labels; fixed SrcDispatcher comment; aligned tolerance comments with checker reality (`absolute + relative × |expected|`, numpy.isclose).
+- **Commit:** `a12c7ddde3`. Delta review by Holden: no blockers. PR remains draft (vcpkg bootstrap TLS infra flake in CI).
