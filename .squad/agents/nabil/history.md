@@ -77,3 +77,13 @@ Under reviewer lockout after Sapper's rejection. Fixed:
 - **B2 deferred** citing `MemoryDevice_GetDeviceId` "may not exist" — this was factually wrong (API present at `bindings.rs:6309`). B2 assigned to Batty.
 
 **Durable lesson:** Deferrals must be backed by evidence, not assumption. Verify before deferring.
+
+---
+
+### 2026-08-12 — B1+B2 memory-safety fix (PR #762, commit af45043fd)
+
+**B1 (heap buffer overflow):** Scratch buffers for absent optional outputs were sized using the slot's dtype byte size (2 for f16/bf16) but the TensorMut was hardcoded to Float32, causing 2× heap overflow. Fixed: scratch dtype derived from `output_dtypes[slot]`, buffer sized at `max(byte_size, 8)` per element, `TensorMut.absent` flag added so kernels skip dtype validation for absent outputs, fail-closed on Undefined dtype.
+
+**B2 (routed path misroutes):** Fused multi-node path skipped allocation for absent slots but iterated all sinks via shortened iterators — positional compaction bug. Fixed: `RoutedSlotKind` enum (Ort/Buffer/Absent) keeps every slot index aligned through allocation and view construction.
+
+**Evidence:** 2 canary tests (f16/bf16) pass under Miri. 5 integration tests (f16/bf16 SkipLayerNorm, f16/bf16 LayerNorm, Add→SkipLayerNorm→Mul routed). 277 passed / 0 failed (baseline 269). Clippy + fmt clean. ASAN not attempted (requires libstd rebuild). Miri cannot cross FFI boundary — integration tests not coverable by Miri.
