@@ -1232,6 +1232,12 @@ from that arena, so KV and workspace content metrics remain distinct while
 their physical mapped attribution uses the same arena-zone allowance. Weight
 paging has separate storage and mapped attribution.
 
+Transactional mapped growth assigns authority capacity that belongs to no
+mapped zone before asking a registered holder to shrink or reclaim. A failed or
+overestimated grant returns that newly assigned allowance, while committed
+growth keeps it with the mapped zone until that zone is dropped (or, for a zone
+registered as reclaimable, a later request transfers it).
+
 Mapped-zone refund is an allocator/provider responsibility, not a workspace
 caller responsibility. Every VMM deallocation observes the arena's actual
 global granule transition `1→0` and refunds the canonical arena allowance
