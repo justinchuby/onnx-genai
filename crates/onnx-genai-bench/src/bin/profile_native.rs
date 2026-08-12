@@ -12,10 +12,29 @@ use onnx_genai_engine::logits::{
 use onnx_genai_engine::{
     DecodePrecision, Engine, EngineConfig, EngineDecodeBackend, GenerateOptions, GenerateRequest,
     NativeDecodeDevice, NativeDecodeSession, PipelineEngine, PipelineGenerateRequest,
-    ProcessorChain,
+    ProcessorChain, parse_resource_limit,
 };
 use onnx_genai_ort::{Tokenizer, available_execution_providers, profile};
 use onnx_runtime_session::InferenceSession;
+
+/// Honor `ONNX_GENAI_VRAM_LIMIT` in the profiler, mirroring the server CLI.
+///
+/// The real fix for large-model residency is real CUDA device-capacity
+/// detection in the governor (so the default `Fraction(0.90)` just works), but
+/// this convenience lets an operator pin an explicit ceiling (bytes, `8GiB`,
+/// `0.9`, or `auto`) without going through the server.
+fn apply_vram_limit_env(config: &mut EngineConfig) -> Result<()> {
+    match std::env::var("ONNX_GENAI_VRAM_LIMIT") {
+        Ok(raw) if !raw.trim().is_empty() => {
+            let limit = parse_resource_limit(raw.trim())
+                .map_err(|error| anyhow::anyhow!("invalid ONNX_GENAI_VRAM_LIMIT: {error}"))?;
+            eprintln!("profile_native: ONNX_GENAI_VRAM_LIMIT -> vram_limit={limit:?}");
+            config.limits.vram_limit = limit;
+        }
+        _ => {}
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum ExecutionProvider {
@@ -490,6 +509,7 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
         ..EngineConfig::default()
     };
     config.native_device = Some(device);
+    apply_vram_limit_env(&mut config)?;
     let mut engine = Engine::from_dir(model_dir, config).with_context(|| {
         format!(
             "load {} engine {}",
@@ -634,6 +654,7 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
         ExecutionProvider::Cpu => NativeDecodeDevice::Cpu,
         ExecutionProvider::Cuda => NativeDecodeDevice::Cuda { index: None },
     });
+    apply_vram_limit_env(&mut config)?;
     let mut engine = PipelineEngine::from_dir_with_config(model_dir, config)
         .with_context(|| format!("load pipeline engine {}", model_dir.display()))?;
     for _ in 0..args.warmups {
