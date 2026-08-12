@@ -28,3 +28,14 @@
 (1) EP assignment assertion added — `add_skip_layer_norm_mul_routed` proves Add/SkipLayerNormalization/Mul assigned to `cpu_ep`. (2) `end_version: since` → `i32::MAX`. (3) `struct_size` loader validation. (4) `NXRT_REQUIRE_ORT_TESTS=1` gate. (5) `matmul_initializer_weights` fixture. (6) 5 `.gitignore` negations. 278 passed / 0 failed.
 
 Full pre-compaction history in `history-archive.md`.
+
+## 2026-08-12 — PR #32003 narrative fix + PTX evidence (confirmed ready for review)
+
+- Corrected three overstated claims in PR body (unused-param not reproduced,
+  aliasing scope narrowed, template-instantiations wording removed).
+- Produced PTX codegen-neutral evidence: 12/12 pairs byte-identical across
+  sm_53/70/75/80/86/90 × {-O0, -O3}. No normalisation required.
+- Updated PR body via GitHub REST API.
+- clang-format passes; leak check clean.
+- Coordinator independently reproduced PTX result: byte-identical confirms
+  codegen-neutral status. PR marked ready for review.

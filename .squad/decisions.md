@@ -260,3 +260,31 @@ All wave narratives from 2026-08-10 (EP plugin export), 2026-08-11 (PR #762 pari
 - `freysa-762-final.md` — `tests/common/ort_discovery.rs` via `#[path]`; `validate_write_dtype` documented as test-only.
 - `iran-762-clippy.md` — clippy identical-branch fix in `loader.rs`; `||` merge preserving `struct_size` short-circuit.
 
+## 2026-08-12 — PR #32003 CUDA matmul_4bits_common.cuh narrative fix + PTX evidence (Batty)
+
+**By:** Batty (corrections), Coordinator (independent PTX verification)
+**PR:** microsoft/onnxruntime#32003
+
+### Corrections made to PR body
+
+1. **`(void)` unused-parameter guards — labelled "defensive; not reproduced locally".** `nvcc 12.0 --compiler-options="-Wall -Wextra -Wunused-parameter"` at sm_53 and sm_80 produced zero diagnostics. `cudafe` strips the dead `#else` host body before the host compiler runs, so the guard cannot be shown to suppress anything.
+
+2. **Strict-aliasing claim narrowed to specific component reads.** The pun fixed is `uint32_t` member → `half2`/`__nv_bfloat162` lvalue. `reinterpret_cast<half2*>(sums)` (same-type vectorised access) is deliberately retained and explicitly noted; the PR body no longer implies the file is pun-free.
+
+3. **"New template instantiations" wording removed.** That framing was a leftover from the parent PR this was split out of; it does not apply to this standalone one-file fix.
+
+### PTX codegen-equivalence evidence (Coordinator-verified)
+
+Compiled minimal TU (base and head copies of `matmul_4bits_common.cuh` with `GPU_WARP_SIZE` shim, instantiating `half` + `__nv_bfloat16` overloads) for **sm_53, 70, 75, 80, 86, 90 × {-O0, -O3}**. Result: **12/12 pairs raw byte-identical**, no normalisation required. Toolchain: nvcc CUDA 12.0 V12.0.140.
+
+### Durable lessons
+
+- **PTX equivalence is a cheap, strong argument for a "codegen-neutral" refactor.** Compiling base and head to PTX across target architectures at -O0 and -O3 and diffing turns "this should be equivalent" into evidence. It needs only `nvcc`, no GPU. 12/12 pairs were raw byte-identical here.
+- **Do not claim a warning was fixed without the exact diagnostic.** The `(void)` guards could not be shown to suppress anything: `cudafe` strips the dead `#else` host body before the host compiler runs. "Defensive; not reproduced" is the honest wording.
+- **Narrow a safety claim to what was actually fixed.** Equivalent-looking `reinterpret_cast<half2*>(sums)` array access was deliberately kept as the canonical CUDA vectorised idiom, so claiming the file is now free of type-punning would have been false.
+- **Wording inherited from a parent PR goes stale on a split.** "New template instantiations" made sense in the PR this was split out of and was simply wrong in a standalone one-file fix — re-read the whole body after splitting.
+
+**Status:** PR #32003 marked ready for review.
+
+Last consolidated: 2026-08-12T08:30:00Z (Scribe #32003 PTX-evidence wave; 1 inbox drop merged: batty-32003-ptx.md)
+
