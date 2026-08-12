@@ -306,6 +306,132 @@ fn print_backend_label(backend: DecodeBackend) {
     }
 }
 
+fn print_memory_observability(engine: &Engine) {
+    let plan = engine.memory_strategy_plan();
+    let application = plan.runtime_application();
+    println!(
+        "memory_strategy: strategy={:?} inferred={:?} access={:?} total_weight_bytes={} \
+         kv_bytes_per_token={:?} resolved_device_budget_bytes={:?} \
+         fits_resolved_device_budget={:?}",
+        plan.strategy,
+        plan.inferred_strategy,
+        plan.weight_access_pattern,
+        plan.total_weight_bytes,
+        plan.kv_bytes_per_token,
+        plan.resolved_device_budget_bytes,
+        plan.fits_resolved_device_budget
+    );
+    println!(
+        "memory_policy: weight_offload_enabled={} managed_no_spill={} \
+         scan_resistant_dense={} device_budget_bytes={:?} managed_limit_bytes={:?} \
+         auto_enabled_from_vram_limit={}",
+        application.weight_offload_enabled,
+        application.managed_no_spill,
+        application.scan_resistant_dense,
+        application.device_budget_bytes,
+        application.managed_limit_bytes,
+        application.auto_enabled_from_vram_limit
+    );
+    let resources = engine.resource_snapshot();
+    println!(
+        "resource_vram: used_bytes={} limit_bytes={} headroom_bytes={} oversubscribed_bytes={}",
+        resources.vram.used,
+        resources.vram.limit,
+        resources.vram.headroom,
+        engine.device_oversubscribed_bytes()
+    );
+}
+
+fn print_cuda_observability(
+    engine: &Engine,
+    before: Option<&onnx_genai_engine::native_decode::CudaKvDebugStats>,
+) {
+    if let Some(stats) = engine.native_cuda_debug_stats() {
+        println!(
+            "cuda_graph: enabled={} captures={} replays={} fallbacks={} invalidations={}",
+            stats.graph.enabled,
+            stats.graph.captures,
+            stats.graph.replays,
+            stats.graph.fallbacks,
+            stats.graph.invalidations
+        );
+        if let Some(before) = before {
+            println!(
+                "cuda_graph_measured: captures={} replays={} fallbacks={} invalidations={}",
+                stats.graph.captures.saturating_sub(before.graph.captures),
+                stats.graph.replays.saturating_sub(before.graph.replays),
+                stats.graph.fallbacks.saturating_sub(before.graph.fallbacks),
+                stats
+                    .graph
+                    .invalidations
+                    .saturating_sub(before.graph.invalidations)
+            );
+        }
+        if let Some(reason) = &stats.graph.decline_reason {
+            println!("cuda_graph_decline_reason: {reason}");
+        }
+        if let Some(reason) = &stats.graph.growth_decision {
+            println!("cuda_graph_growth_decision: {reason}");
+        }
+        if let Some(report) = &stats.graph.fallback_report {
+            println!("cuda_graph_fallback_report: {report}");
+        }
+    }
+}
+
+fn weight_offload_hit_rate(stats: &onnx_runtime_ep_cuda::GlobalOffloadStats) -> Option<f64> {
+    let lookups = stats.page_ins.saturating_add(stats.hits);
+    (lookups > 0).then(|| stats.hits as f64 / lookups as f64 * 100.0)
+}
+
+fn print_weight_offload_observability() {
+    let stats = onnx_runtime_ep_cuda::global_offload_stats();
+    let hit_rate = weight_offload_hit_rate(&stats)
+        .map(|rate| format!("{rate:.2}%"))
+        .unwrap_or_else(|| "n/a".to_string());
+    println!(
+        "weight_offload_cache: page_ins={} hits={} hit_rate={} evictions={} \
+         bypassed_page_ins={}",
+        stats.page_ins, stats.hits, hit_rate, stats.evictions, stats.bypassed_page_ins
+    );
+    println!(
+        "weight_offload_timing: materialize_ms={:.3} htod_ms={:.3} \
+         admit_sync_ms={:.3} vram_alloc_ms={:.3} vram_free_ms={:.3}",
+        stats.materialize_ns as f64 / 1_000_000.0,
+        stats.htod_ns as f64 / 1_000_000.0,
+        stats.admit_sync_ns as f64 / 1_000_000.0,
+        stats.vram_alloc_ns as f64 / 1_000_000.0,
+        stats.vram_free_ns as f64 / 1_000_000.0
+    );
+    println!(
+        "weight_offload_physical: budget_bytes={} mapped_physical_bytes={} \
+         physical_owned_bytes={} htod_bytes={}",
+        stats.budget_bytes,
+        stats.mapped_physical_bytes,
+        stats.physical_owned_bytes,
+        stats.htod_bytes
+    );
+}
+
+fn print_vmm_observability(engine: &Engine) {
+    if let Some(stats) = engine.vmm_arena_stats() {
+        println!(
+            "vmm_arena: committed_physical_bytes={} reserved_va_bytes={} \
+             peak_committed_physical_bytes={} commits={} releases={} allocations={} \
+             ref_underflows={} byte_underflows={} unaccounted_committed_bytes={}",
+            stats.committed_bytes,
+            stats.reserved_bytes,
+            stats.peak_committed_bytes,
+            stats.commits,
+            stats.releases,
+            stats.allocations,
+            stats.ref_underflows,
+            stats.byte_underflows,
+            stats.unaccounted_committed_bytes
+        );
+    }
+}
+
 fn configure_ort_provider(args: &Args) -> Result<()> {
     let requested_provider = match args.ep {
         ExecutionProvider::Cpu => "cpu",
@@ -387,6 +513,7 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
             }
         );
     }
+    print_memory_observability(&engine);
 
     for _ in 0..args.warmups {
         std::hint::black_box(
@@ -399,6 +526,7 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
     onnx_runtime_session::reset_exec_phase_profile();
     onnx_runtime_session::reset_dense_prefetch_gap_stats();
     onnx_runtime_ep_cuda::reset_global_offload_stats();
+    let cuda_before = engine.native_cuda_debug_stats();
 
     let mut prefills_ms = Vec::with_capacity(args.runs);
     let mut decode_ms_per_token = Vec::with_capacity(args.runs);
@@ -464,11 +592,9 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
     if let Some(tokens) = reference_tokens {
         println!("generated_token_ids: {tokens:?}");
     }
-    let offload = onnx_runtime_ep_cuda::global_offload_stats();
-    println!(
-        "weight_offload_cache: page_ins={} hits={} evictions={}",
-        offload.page_ins, offload.hits, offload.evictions
-    );
+    print_cuda_observability(&engine, cuda_before.as_ref());
+    print_weight_offload_observability();
+    print_vmm_observability(&engine);
     if profile::enabled() {
         println!("{}", profile::report(generated as u64));
     }
@@ -910,6 +1036,20 @@ mod tests {
                 .unwrap();
             assert_eq!(args.backend, expected);
         }
+    }
+
+    #[test]
+    fn weight_offload_hit_rate_counts_hits_and_misses() {
+        let stats = onnx_runtime_ep_cuda::GlobalOffloadStats {
+            page_ins: 7,
+            hits: 21,
+            ..Default::default()
+        };
+        assert_eq!(weight_offload_hit_rate(&stats), Some(75.0));
+        assert_eq!(
+            weight_offload_hit_rate(&onnx_runtime_ep_cuda::GlobalOffloadStats::default()),
+            None
+        );
     }
 
     #[test]
