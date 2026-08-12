@@ -35,6 +35,7 @@ use std::sync::Arc;
 
 use cudarc::driver::CudaContext;
 use cudarc::driver::sys as cu;
+use onnx_runtime_cuda_memory::test_support::TestStream;
 
 const SENTINEL: u8 = 0x5a;
 
@@ -72,24 +73,6 @@ fn granularity(device_ordinal: i32) -> usize {
     check("cuMemGetAllocationGranularity", result);
     assert_ne!(granularity, 0, "CUDA reported zero VMM granularity");
     granularity
-}
-
-fn create_stream() -> cu::CUstream {
-    let mut stream = std::ptr::null_mut();
-    let result = unsafe {
-        cu::cuStreamCreate(
-            &mut stream,
-            cu::CUstream_flags::CU_STREAM_NON_BLOCKING as u32,
-        )
-    };
-    check("cuStreamCreate", result);
-    stream
-}
-
-fn destroy_stream(stream: cu::CUstream) {
-    if !stream.is_null() {
-        let _ = unsafe { cu::cuStreamDestroy_v2(stream) };
-    }
 }
 
 fn reserve(size: usize) -> cu::CUdeviceptr {
@@ -149,38 +132,6 @@ fn read_host(address: cu::CUdeviceptr, len: usize) -> Vec<u8> {
     let mut bytes = vec![0u8; len];
     let result = unsafe { cu::cuMemcpyDtoH_v2(bytes.as_mut_ptr().cast(), address, bytes.len()) };
     check("cuMemcpyDtoH_v2", result);
-    bytes
-}
-
-/// Fill `len` bytes at `address` with `value`, ordered on `stream`.
-///
-/// The captured-graph test must keep its baseline write, its captured memset,
-/// and its readback on a single stream. A created non-blocking stream is exempt
-/// from implicit synchronization with the legacy default stream that
-/// `write_host`/`read_host` use, so mixing default-stream copies with a
-/// non-blocking-stream graph launch let the readback race an in-flight memset on
-/// a cold context (observed as all-zero or partial fills with no CUDA error).
-/// Issuing every device operation on the same stream makes the ordering a
-/// linear timeline that a single `cuStreamSynchronize` fully resolves.
-fn fill_dev(stream: cu::CUstream, address: cu::CUdeviceptr, value: u8, len: usize) {
-    check("cuMemsetD8Async fill", unsafe {
-        cu::cuMemsetD8Async(address, value, len, stream)
-    });
-    check("cuStreamSynchronize after fill", unsafe {
-        cu::cuStreamSynchronize(stream)
-    });
-}
-
-/// Read `len` bytes from `address` to the host, ordered on `stream` (see
-/// [`fill_dev`] for why single-stream ordering is required here).
-fn read_dev(stream: cu::CUstream, address: cu::CUdeviceptr, len: usize) -> Vec<u8> {
-    let mut bytes = vec![0u8; len];
-    check("cuMemcpyDtoHAsync_v2", unsafe {
-        cu::cuMemcpyDtoHAsync_v2(bytes.as_mut_ptr().cast(), address, len, stream)
-    });
-    check("cuStreamSynchronize after read", unsafe {
-        cu::cuStreamSynchronize(stream)
-    });
     bytes
 }
 
@@ -486,7 +437,13 @@ fn seq_major_fixed_stride_grows_under_captured_replay_without_recapture() {
     const RESERVED_GRANULES: usize = 8;
     let reserved = granule * RESERVED_GRANULES;
     let base = reserve(reserved);
-    let stream = create_stream();
+    // Single-stream discipline (#797): every device operation below — the
+    // baseline zero-fill, the captured memset, its replays, the readbacks, and
+    // the tail write — flows through this one non-blocking stream, so a single
+    // `sync` is a total order. Mixing in a default-stream copy here would
+    // reintroduce the cold-context race this test was flaky on.
+    let test_stream = TestStream::with_context(context.clone());
+    let stream = test_stream.raw();
 
     // valid_len chosen so the dense prefix is under one granule (near-empty).
     let short_valid = 100usize;
@@ -497,10 +454,10 @@ fn seq_major_fixed_stride_grows_under_captured_replay_without_recapture() {
         // Commit the first granule (holds the short dense prefix) and capture a
         // graph that writes the live prefix — the decode step in miniature.
         handles.push(commit_granule(device, base, granule));
-        fill_dev(stream, base, 0, short_bytes);
+        test_stream.fill(base, 0, short_bytes);
         let captured = CapturedMemset::capture(stream, base, SENTINEL, short_bytes);
         captured.replay(stream);
-        let seen = read_dev(stream, base, short_bytes);
+        let seen = test_stream.read(base, short_bytes);
         assert!(
             seen.iter().all(|&b| b == SENTINEL),
             "captured replay must fill the committed dense prefix: {}",
@@ -520,7 +477,7 @@ fn seq_major_fixed_stride_grows_under_captured_replay_without_recapture() {
         // stable stride did not invalidate it. This is the property bucket
         // growth cannot offer.
         captured.replay(stream);
-        let seen_after = read_dev(stream, base, short_bytes);
+        let seen_after = test_stream.read(base, short_bytes);
         assert!(
             seen_after.iter().all(|&b| b == SENTINEL),
             "the pre-growth captured graph must replay unchanged after tail growth: {}",
@@ -529,8 +486,8 @@ fn seq_major_fixed_stride_grows_under_captured_replay_without_recapture() {
 
         // And the newly committed tail is usable by a fresh write, proving the
         // growth actually extended residency at the same VA.
-        fill_dev(stream, base + granule as u64, SENTINEL, 64);
-        let tail = read_dev(stream, base + granule as u64, 64);
+        test_stream.fill(base + granule as u64, SENTINEL, 64);
+        let tail = test_stream.read(base + granule as u64, 64);
         assert!(
             tail.iter().all(|&b| b == SENTINEL),
             "grown tail granule must be resident at the stable VA"
@@ -544,7 +501,7 @@ fn seq_major_fixed_stride_grows_under_captured_replay_without_recapture() {
         release_handle(handle);
     }
     free_reservation(base, reserved);
-    destroy_stream(stream);
+    drop(test_stream);
     let last_granule = match result {
         Ok(value) => value,
         Err(payload) => std::panic::resume_unwind(payload),

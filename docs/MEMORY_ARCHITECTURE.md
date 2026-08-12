@@ -47,7 +47,8 @@ when in fact it is 1955 lines.
 
 ### CUDA raw allocation audit (#736, 2026-08-10)
 
-Updated through #736 (default-domain `Attention` scores) on 2026-08-11.
+Updated through #736 (`GroupQueryAttention` BNSH transpose scratch) on
+2026-08-12; the default-domain `Attention` scores slice landed 2026-08-11.
 
 Scope: production code in `crates/onnx-runtime-ep-cuda`,
 `crates/onnx-runtime-session`, and CUDA kernel launch support. Test-only
@@ -57,7 +58,7 @@ entry point in this scope remains `CudaRuntime::alloc_raw`
 `CudaDeviceAllocator`/VMM allocator path is the EP allocation authority seam, not
 a kernel scratch bypass. `crates/onnx-runtime-session` has no CUDA raw allocation
 call; it owns the governed workspace preparation path
-(`executor/bindings.rs:47`, `executor/dispatch.rs:1432`).
+(`executor/bindings.rs:16`, `executor/dispatch.rs:1538`).
 
 | file/line | owner | byte formula | size source | lifetime class | status |
 |---|---|---|---|---|---|
@@ -69,8 +70,10 @@ call; it owns the governed workspace preparation path
 | `kernels/elementwise.rs:699` | elementwise scalar/shape metadata upload | `metadata_bytes.len()` | op arity/rank | step-scoped | raw bypass |
 | `kernels/fused_gemm.rs` | fused GEMM cuBLASLt workspace | selected heuristic `workspaceSize` (ceiling `WORKSPACE_BYTES`) | shape/dtype/algorithm dependent | session-persistent shared peak | **governed by #799** via the shared exact plan/execute helper + prepared workspace |
 | `kernels/gemm.rs` | GEMM cuBLASLt workspace | selected heuristic `workspaceSize` (ceiling `WORKSPACE_BYTES`) | shape/dtype/algorithm dependent | session-persistent shared peak | **governed by #799** via the shared exact plan/execute helper + prepared workspace |
-| `kernels/group_query_attention.rs:2443-2465 (WS_SCORES slot)` | `GroupQueryAttention` f32 reference score buffer | `batch * num_heads * sq * present_capacity * sizeof(f32)` | prompt/cache dependent (`sq * present_capacity`) | session-persistent | **governed by #795** via `workspace_requirement` + prepared workspace, reserved only on the f32 reference path |
-| `kernels/group_query_attention.rs:1033` | `GroupQueryAttention` remaining pooled slots (QKV/present/BNSH/metadata) | slot-specific `bytes.max(1)` | prompt/cache dependent, then reused | session-persistent growable scratch | raw bypass; `WS_SCORES` is excluded and governed by #795 |
+| `kernels/group_query_attention.rs` `workspace_requirement`, scores region carved at `:2774` (`WS_SCORES` region) | `GroupQueryAttention` f32 reference score buffer | `batch * num_heads * sq * present_capacity * sizeof(f32)` | prompt/cache dependent (`sq * present_capacity`) | session-persistent | **governed by #795** via `workspace_requirement` + prepared workspace, reserved only on the f32 reference path (now the score region of the #736 composite) |
+| `kernels/group_query_attention.rs` `workspace_requirement` (packed Q/K/V staging region) | `GroupQueryAttention` packed QKV-projection staging | `align256(B·sq·num_heads·head_dim·elem) + 2·align256(B·sq·kv_num_heads·head_dim·elem)`, only when a packed QKV tensor is split | prompt-dependent (`sq`), elem = `dtype.byte_size()` (f32=4, f16/bf16=2) | session-persistent | **governed by #736** via `workspace_requirement` + prepared composite workspace, sized through the shared `gqa_workspace_layout`/`gqa_packed_staging_bytes` helpers; reserved only on the packed-input split route, `NONE` when Q/K/V arrive separately |
+| `kernels/group_query_attention.rs` `gqa_transpose_scratch` + `gqa_workspace_layout` (`WS_Q_BNSH` / `WS_OUT_BNSH`) | `GroupQueryAttention` Q/output BNSH transpose scratch | Q: `align256(B·sq·num_heads·head_dim·elem)` when `sq>1`, packed input, or RoPE; output: the same aligned bytes only when `sq>1` | prompt/dtype/route dependent | session-persistent | **governed by #736** in the existing GQA composite; unpacked non-RoPE `sq==1` uses Q/output directly and charges `NONE` absent another region; packed `sq==1` overlays Q extraction with packed-Q staging |
+| `kernels/group_query_attention.rs` `GqaWorkspace::reserve` | `GroupQueryAttention` remaining pooled slots (present K/V / metadata) | slot-specific `bytes.max(1)` | cache/batch dependent, then reused | session-persistent growable state | raw bypass; scores, packed Q/K/V staging, and BNSH transpose slots are excluded — carved from the prepared composite on governed execution |
 | `kernels/index_share.rs:708` | `pkg.nxrt::IndexShare` selected-token attention workspace | aligned sum of reachable present staging, `B * q_heads * q_seq * selected_width * 4`, and optional `2 * B * sizeof(i64)` | prompt/cache dependent | session-persistent | **governed by #751** via `workspace_requirement` + prepared workspace |
 | `kernels/index_transform.rs:150` | index-transform metadata | `bytes.len()` | op/rank/config | step-scoped | raw bypass |
 | `kernels/indexing.rs:410` | indexing metadata | `bytes.len().max(1)` | op/rank/config | step-scoped | raw bypass |
@@ -238,20 +241,124 @@ capture-metadata slots (`:702,1396`) — is a genuinely different lifetime/geome
 from the scores and did not fall out of this change, so it is left raw and
 tracked as the next candidate below.
 
-#### Next slice (chosen from this table): `GroupQueryAttention` remaining pooled slots
+#### Governed by #736: `GroupQueryAttention` QKV-projection staging
 
-With the three quadratic score matrices now governed (Phase-2a #753, GQA
-`WS_SCORES` #795, default-domain `Attention` #736), the largest remaining
-evidenced non-QMoE workspace bypass is the **`GroupQueryAttention` pooled
-QKV-projection staging** (`group_query_attention.rs:1033`): the packed Q/K/V
-buffers are `batch * seq * hidden * elem`, prompt-dependent and session-persistent
-(grown and retained by the same slot allocator that already isolates the governed
-`WS_SCORES`), so they map cleanly onto `workspace_requirement`. The default-domain
-`Attention` staged-K/V slots (`standard_attention.rs:702,1396`) are the same class
-at smaller scale. Present K/V in those pooled allocators is a KV-cache residency
-concern, not workspace — govern it through the
-[KV layout and residency](#kv-layout-and-residency) contract (#791), not this
-table. The three 32 MiB cuBLASLt GEMM blobs are already governed (#799).
+With the three quadratic score matrices governed (Phase-2a #753, GQA `WS_SCORES`
+#795, default-domain `Attention` #736), the largest remaining evidenced non-QMoE
+workspace bypass — the **`GroupQueryAttention` packed QKV-projection staging** —
+is now governed. When Q/K/V arrive **packed** (both key/value inputs absent), the
+unfused prep path splits the interleaved `[B, S, (H + 2·Hkv)·D]` query tensor
+into three device staging buffers before the BSH→BNSH transpose and cache append.
+Those buffers cost
+`align256(B·sq·num_heads·head_dim·elem) + 2·align256(B·sq·kv_num_heads·head_dim·elem)`,
+with `elem = dtype.byte_size()` (f32=4, f16/bf16=2). They now share the GQA
+session-persistent composite workspace with the #795 `WS_SCORES` region: the
+executor reserves one slot per lifetime class and hands the kernel one view, and
+the f32 *reference prefill* route needs both the staging and the score matrix
+live at once, so they occupy disjoint regions of the same reservation. The
+staging regions come first (offsets depend only on shape metadata, so planning
+and execution agree exactly); the capacity-dependent score matrix is last and
+unpadded, so its exact geometry extends into the reserved peak without perturbing
+the staging offsets, and the composite total equals exactly the score bytes when
+no staging is present (preserving the #795 accounting). Planning
+(`workspace_requirement`) and execution (`execute_with_workspace` → the split
+branch of `run`) size every region through the **same**
+`gqa_workspace_layout`/`gqa_packed_staging_bytes`/`gqa_reference_scores_bytes`
+helpers, and `gqa_carve` refuses a short view deterministically rather than
+under-allocating. Growth, 429 refusal (`TierExhausted`/`CapacityUnavailable`,
+#743 via `MappedGrowthGrant` #748) and the self-owned compatibility/opt-out
+pooled fallback behave exactly as for `WS_SCORES`.
+
+**Lifetime — session-persistent, verified against code, not the table.** The
+staging buffers are reserved from the same `GqaWorkspace` slot allocator that
+grows each slot to the largest geometry seen and **retains** it across
+decode/prefill steps (`group_query_attention.rs:1191`), so — like `WS_SCORES` —
+the composite is charged `WorkspaceLifetime::SessionPersistent`, a single class
+(the audit table's "session-persistent growable scratch" is correct here; unlike
+the default-domain `Attention` scores — whose lifetime is route-dependent and
+needed both classes modelled — this lifetime is **not** route-dependent, so one
+class models the truth).
+
+**Over-reservation found (the #751 defect class).** Staging is materialized on
+**exactly one** family of routes — a *packed* QKV tensor split on the unfused
+prep path (`packed_qkv && !fuse_prep`). Two evidenced routes charge **zero** for
+it:
+
+- **Unpacked inputs** (Q/K/V arrive as three separate tensors) never split, so
+  `want_staging` is false and the staging regions are zero-length. This is the
+  primary "size from use" finding: the pre-#736 pooled allocator would grow
+  `WS_PACKED_Q/K/V` on any path that reached `reserve`, but the separate-input
+  route writes Q/K/V straight through and touches none of them.
+- **fp16/bf16 fused decode** (`q_seq == 1` with an aliased device KV cache) fuses
+  the prep into the decode kernel and never splits. Because that fusion is a
+  runtime pointer comparison (`fuse_prep` aliases the present cache), it is
+  **not** visible at planning time, so planning conservatively reserves staging
+  for every packed dispatch; on fused decode the reserved region is tiny
+  (`q_seq == 1`) and left untouched rather than corrupting. Every packed
+  *prefill* genuinely splits, so this is a fallback-of-a-fallback idle, not the
+  common case.
+
+The requirement therefore reports `WorkspaceRequirement::NONE` when neither
+staging nor the f32 reference scores are needed (e.g. an unpacked-input fp16/bf16
+dispatch), charging the device authority nothing.
+
+**Derived bytes.** At `B=1, num_heads=32, head_dim=128` (so `q_hidden=4096`),
+`kv_num_heads=8` (`k_hidden=1024`), `sq=1024`: f32 packed prefill stages
+16 MiB (Q) + 2·4 MiB (K,V) = **24 MiB**, plus the ~128 MiB f32 reference score
+region when that route is taken; fp16/bf16 packed prefill halves the staging to
+**12 MiB** and charges **0** scores; unpacked-input and fused-decode routes charge
+**0** for staging.
+
+#### Governed by #736: `GroupQueryAttention` BNSH transpose scratch
+
+The `WS_Q_BNSH` and `WS_OUT_BNSH` roles now join the existing GQA prepared
+composite. Planning and execution both call `gqa_transpose_scratch` and
+`gqa_workspace_layout`; `gqa_carve` rejects a short prepared view instead of
+falling back to an invisible allocation. Direct `Kernel::execute` remains the
+compatibility/opt-out path and retains self-owned pooled slots.
+
+**Route result — partial over-reservation, not a blanket decode `NONE`.**
+`Sq==1` makes the BSH↔BNSH index transform an identity, and output already
+writes directly to BSH, so `WS_OUT_BNSH` is genuinely needed only for
+multi-token routes. Query has two additional roles beyond transpose:
+
+- unpacked, non-RoPE `Sq==1` reads the input Q directly and now charges zero for
+  both transpose regions (and reports `WorkspaceRequirement::NONE` when staging
+  and scores are also absent);
+- unpacked RoPE decode needs one writable Q copy, so its query bytes are
+  genuine even though the transpose itself is an identity;
+- packed decode must extract Q. Fused prep writes that extraction into the Q
+  region; unfused prep consumes/rotates packed-Q staging in place. The layout
+  overlays those mutually-exclusive `Sq==1` roles instead of summing them;
+- every `Sq>1` route needs both Q BSH→BNSH and output BNSH→BSH buffers.
+
+Seq-major BSNH changes only KV-cache physical strides; all attention consumers
+still take Q/output in BNSH internally, so it removes neither transpose.
+
+**Lifetime — session-persistent, verified from `GqaWorkspace`.** The old
+`WS_Q_BNSH`/`WS_OUT_BNSH` slots grew to the largest geometry and were retained
+by the kernel across calls. The governed replacement therefore stays in the
+same `WorkspaceLifetime::SessionPersistent` class as the other GQA composite
+regions; capture, success, error, and cancellation release remain owned by the
+executor's prepared-workspace grant.
+
+**Derived bytes (not measured).** For `B=1, H=32, head_dim=128, sq=1024`,
+Q and output each cost 16 MiB f32 or 8 MiB fp16/bf16, so transpose scratch is
+**32 MiB f32** or **16 MiB fp16/bf16**. At `sq=1`, unpacked non-RoPE costs
+**0**; unpacked RoPE costs 16 KiB f32 or 8 KiB fp16/bf16 for Q only. These are
+derived from `dtype.byte_size()` and the code formula, not allocator telemetry.
+
+#### Next slice (chosen from this table): default-domain `Attention` staged K/V
+
+The next evidenced non-QMoE workspace bypass is
+`standard_attention.rs` `WS_STAGE_KEY` / `WS_STAGE_VALUE`. Aliased dense KV
+growth must rebuild into disjoint `present_*_expected · element_bytes` buffers
+before copying back, while fixed-capacity append routes set `stage_key` /
+`stage_value` false and use no staging. It is route-dependent and has both
+per-call and capture-retained ownership in the current allocator, so the next
+slice must establish both lifetime classes from use. Present K/V residency
+itself remains governed by [KV layout and residency](#kv-layout-and-residency);
+this candidate is only the disjoint rebuild scratch.
 
 ### KV layout and residency
 
@@ -656,8 +763,38 @@ real #740 ledger, non-sticky/non-corrupting write protection, coexistence with
 the #759 dummy page, and a one-time ~5.5 ms pooled copy-on-write at the boundary.
 Measured answers, the concurrency/saving and capacity tables, and the design for
 an explicit pinned-prefix API (the smallest next increment) are in
-[`PREFIX_SHARE_INVESTIGATION.md`](./PREFIX_SHARE_INVESTIGATION.md). Integration
-remains unbuilt.
+[`PREFIX_SHARE_INVESTIGATION.md`](./PREFIX_SHARE_INVESTIGATION.md).
+
+**First production consumer landed (#777).** The prefix-sharing primitive
+(`create_shared_prefix`/`commit_shared_prefix`, #803) previously had no live
+caller — only its definition and GPU tests. It is now reachable from production
+code through an allocator-agnostic seam on the `DeviceAllocator` trait
+(`create_shared_prefix` / `incremental_owned_bytes_for_shared_prefix` /
+`commit_shared_prefix`, returning an opaque `dyn SharedDevicePrefix`), so a
+caller holding only `dyn DeviceAllocator` can pin a token prefix once and have
+subsequent sequences map it. Non-VMM allocators keep the default impls, which
+refuse (`InvalidRequest`) rather than mis-map. The **seq-major** fused fp16 GQA
+decode kernel is the first consumer: a GPU parity test
+(`crates/onnx-runtime-ep-cuda/tests/gqa_shared_prefix_parity_gpu.rs`) drives the
+real kernel over shared-prefix VMM KV and proves two sequences sharing one pinned
+seq-major prefix (`layers × 2` contiguous ranges) produce **byte-identical**
+output to two independent sequences. Measured at KV_HEADS=8, HEAD_DIM=128, f16,
+1024-token prefix + 1024-token private tail per sequence: independent = 8
+granules (16,777,216 B), shared = 6 granules (12,582,912 B); the prefix is
+charged **once** (`incremental_owned_bytes_for_shared_prefix` = 0) and the second
+sharer's admission is **only its private bytes** (4,194,304 B = its two private
+tails), so sharing removes `(C−1)×(K_prefix+V_prefix)` = 2 granules.
+
+**What remains structural.** The *engine generation loop* cannot yet call this
+seam automatically: `persistent_state_shapes` in
+`native_decode/cuda.rs` builds a hard-coded BNSH physical KV shape and no model
+declares a seq-major end-to-end fixed-stride physical shape (#794 showed
+seq-major changed only kernel indexing, not commit geometry). A BNSH/seq-major
+fixed-stride physical-shape build is therefore the prerequisite for auto engine
+use. Hash-based automatic detection, token-major (one multi-map per sequence),
+and copy-on-write at divergence remain the later increments named below. The
+delivered consumer is explicit (a caller declares the shared prefix) and is
+restricted to prefixes that are read-only for the sharers' lifetime.
 
 #### Layout belongs to the KV owner
 
@@ -877,6 +1014,67 @@ After the third instance the response should be a guard, not more vigilance.
 
 The `Challenger` role (`.squad/agents/challenger/charter.md`) exists to apply
 this systematically to any result that would change technical direction.
+
+### A fourth failure mode: order-dependent test state
+
+The three above are about telemetry that never reaches the operator. There is a
+fourth that reaches the operator loud and clear, and is worse for it: **a test
+result that depends on the order the tests ran in, reported as a real finding.**
+Because the memory and capture work is measurement-driven, a wrong number does
+not merely fail — it redirects the design. Two of these landed in one week.
+
+**#804 (carried into #794 / #801): process-frozen configuration.**
+`RuntimeConfig` is a process-wide snapshot frozen on first read (an `OnceLock` in
+`onnx-genai-runtime-config`). A capture-OFF phase set `ONNX_GENAI_CUDA_GRAPH=0`
+*after* that snapshot was already frozen, so the mutation had no effect and every
+later phase in the same process inherited the frozen policy. The forced-growth
+harness then reported `captures=0` and it was attributed — in a merged PR body —
+to the model *structurally declining* CUDA graph capture. It does not: with each
+policy phase isolated in its own process, the model captures (`captures=4`). Two
+PRs (#794, #801) failed to reproduce an end-to-end measurement on this exact
+mistake before #804 found it.
+
+**#797: a context warmed by an earlier sibling subtest.** A residency GPU test
+failed ~50% of the time on a *cold* CUDA context and passed otherwise. It looked
+exactly like a correctness bug in growth-under-capture. The cause was a
+test-harness ordering defect: the baseline fill and the readback ran on the
+legacy **default stream** while the captured memset ran on a created
+**non-blocking stream**, and those two are *mutually exempt from implicit
+synchronization* — so the readback raced the memset and returned partial fills
+**with no CUDA error**. `cuCtxSynchronize` did **not** fix it (synchronizing the
+context imposes no order between two mutually-exempt streams), which is what
+refuted the obvious race theory. It had only ever "passed" because an
+alphabetically-earlier sibling subtest warmed the context first.
+
+Both are the same family: **state that is frozen or warmed once per process,
+making a result depend on test order.** The two remedies are as specific as the
+two mechanisms:
+
+- **Process isolation for anything that reads process-frozen config.** A test
+  phase that needs a different `RuntimeConfig` value must run in its own process
+  — set the environment, then spawn a child that reads it fresh — never mutate
+  the environment after the snapshot may have frozen. `mobius_seqmajor_growth_
+  parity_native_cuda.rs` does this (child-process-per-mode); it is the pattern,
+  not the exception.
+- **Single-stream discipline for device tests.** Route *every* device operation
+  a test performs — baseline fills, captured-graph launches, memsets, readbacks,
+  tail writes — through one stream, so a single `cuStreamSynchronize` is a total
+  order. `onnx-runtime-cuda-memory::test_support::TestStream` makes this the easy
+  path and documents the default-vs-non-blocking exemption at the call site.
+
+After the second instance in a week the response is, again, a guard rather than
+more vigilance. `runtime_config()` records the environment it froze from and, in
+debug/test builds only (`debug_assertions`, so the release path is untouched and
+cost-free), **panics loudly** if any variable that fed the frozen snapshot is
+later observed to differ — a test can no longer silently believe it set a knob
+that was already frozen (`onnx-genai-runtime-config`, this PR). The single-stream
+helper is the guard for the second mechanism: a test written against `TestStream`
+cannot reintroduce the default-stream/non-blocking split.
+
+The discipline that catches both before they mislead is one line: **run any test
+you touch in isolation as well as in the full suite, and confirm both pass.** An
+order-dependent result is exactly the one that passes in a suite and fails alone
+(or the reverse), so this is the property that names the defect.
 
 ### Keeping the documentation from going stale
 
@@ -1282,13 +1480,17 @@ There are two ways a CUDA kernel can obtain device scratch:
   `activations_bytes=unknown` (#514) and can drive a late device OOM instead
   of a clean 429.
 
-**Measured finding: size from use, not allocation.** Three consecutive slices
-found over-reservation rather than the ungoverned allocation the audit was
-framed to find: IndexShare reserved unreachable present-K/V staging (#751), GQA
-reserved `WS_SCORES` outside its sole f32 reference route (#795), and cuBLASLt
-callers treated a 32 MiB heuristic ceiling as demand although measured
-algorithms required 0–96 bytes (#799). The detailed byte accounting remains in
-the [site-by-site audit](#cuda-raw-allocation-audit-736-2026-08-10) above.
+**Measured finding: size from use, not allocation.** Five of six slices found
+over-reservation rather than only an ungoverned allocation: IndexShare reserved
+unreachable present-K/V staging (#751), GQA reserved `WS_SCORES` outside its f32
+reference route (#795), cuBLASLt treated a 32 MiB ceiling as demand although
+measured algorithms used 0–96 bytes (#799), GQA packed QKV staging is populated
+only when a packed tensor is split (#736), and GQA's query BNSH slot was
+unnecessary for unpacked non-RoPE `Sq==1` while its output slot is never needed
+for `Sq==1` (#736). The default-domain `Attention` scores were the genuine-use
+exception: every route stages fp32 scores, so none reports `NONE` (#736). The
+detailed byte accounting remains in the
+[site-by-site audit](#cuda-raw-allocation-audit-736-2026-08-10) above.
 
 **Audit guidance (design intent, derived from #751, #795, and #799):**
 
@@ -1311,8 +1513,10 @@ concurrency on the multi-request-serving axis measured by #750 and #777.
 **Implemented today.** The executor has one central
 `is_planned_workspace_node` predicate
 (`crates/onnx-runtime-session/src/executor/bindings.rs`) covering QMoE,
-IndexShare, Attention Phase-2a, GQA, the default-domain `Attention` scores, and
-the standard/fused GEMM family
+IndexShare, Attention Phase-2a, GQA (`WS_SCORES`, packed QKV-projection staging,
+and BNSH-transpose scratch folded into one composite
+reservation), the
+default-domain `Attention` scores, and the standard/fused GEMM family
 (#747, #751, #753, #795, #799, #736), rather than parallel per-feature checks.
 Prepare-only planning tracks and reserves one peak per lifetime class
 (`SessionPersistent` and `StepScoped`), so a graph mixing the two governs both
@@ -1326,6 +1530,8 @@ without summing sequential users of the same slot (#753).
 | `pkg.nxrt::IndexShare` | `index_share.rs` `workspace_requirement` | selected-token scores plus only the staging actually reachable for the path | prompt/cache dependent | session-persistent | #751 + prepared workspace |
 | `com.microsoft::Attention` Phase-2a | `attention.rs` `run_attention_phase2a` (governed branch) | `align256(batch·num_heads·sq·sk·elem) + 32 MiB` cuBLASLt workspace | prompt-dependent; score matrix is ~256–512 MiB at B=1/H=32/S=2048 | step-scoped | #753 + prepared workspace |
 | `com.microsoft::GroupQueryAttention` f32 reference scores | `group_query_attention.rs` `workspace_requirement` | `batch·heads·sq·present_capacity·sizeof(f32)` only on the path that materializes scores | prompt/cache dependent | session-persistent | #795 + prepared workspace |
+| `com.microsoft::GroupQueryAttention` packed QKV staging | `group_query_attention.rs` `workspace_requirement` | `align256(B·sq·num_heads·head_dim·elem) + 2·align256(B·sq·kv_num_heads·head_dim·elem)` only when a packed QKV tensor is split | prompt-dependent; ~24 MiB (f32) / 12 MiB (fp16) at B=1/H=32/hd=128/Hkv=8/sq=1024; `NONE` on unpacked/fused-decode routes | session-persistent | #736 + prepared composite workspace (shares the `WS_SCORES` slot) |
+| `com.microsoft::GroupQueryAttention` BNSH transpose scratch | `group_query_attention.rs` `gqa_transpose_scratch` / `gqa_workspace_layout` | Q: `align256(B·sq·num_heads·head_dim·elem)` for `sq>1`, packed Q, or RoPE; output: same only for `sq>1`; packed `sq==1` Q overlays packed-Q staging | prompt/route dependent; derived 32 MiB f32 / 16 MiB fp16 at B=1/H=32/hd=128/sq=1024; unpacked non-RoPE decode charges 0, RoPE decode Q-only | session-persistent | #736 + existing prepared GQA composite |
 | `Attention` (default domain) f32 scores | `standard_attention.rs` `workspace_requirement` | `batch·q_heads·q_seq·total_seq·sizeof(f32)` on **every** route (no flash/shared-mem route; always fp32) | prompt/cache dependent; ~512 MiB at B=1/H=32/S=2048 | step-scoped (per-call prefill/batched) **and** session-persistent (capture-eligible single-token decode) | #736 + prepared workspace |
 | `MatMul`, `Gemm`, `MatMulNBits`, `FusedMatMulBias`, `FusedGemm` cuBLASLt scratch | `blas.rs` shared planner; `fused_gemm.rs`, `gemm.rs`, `matmul.rs`, `matmul_nbits.rs` | selected heuristic `workspaceSize`, bounded by the 32 MiB preference ceiling | measured 0–96 bytes on #799 shapes; algorithm dependent | session-persistent shared peak | #799 exact plan/execute helper + prepared workspace |
 

@@ -389,17 +389,36 @@ divergence past the shared region. Those are the increments below.
 
 ## Smallest next increment
 
-1. **KV-path integration (the immediate next step named by evidence).** Wire
-   `commit_shared_prefix` into the token-major KV reservation so a sequence's KV
-   is constructed as a shared read-only prefix head followed by its private
-   read/write live region (the composition Q4 already proved sound in one
-   reservation). Validate it end-to-end on the existing output-level parity
-   oracle: two concurrent sequences sharing a pinned prefix must produce identical
-   logits to two independent sequences, at the measured physical saving. This is
-   the smallest step that turns the landed primitive into an observable capacity
-   win; it depends on the token-major KV shape/stride work (#783/#787) landing
-   first, since § "Layout dependency" shows only token-major reduces the prefix to
-   a **single** multi-map per sequence.
+1. **KV-path integration (first production consumer — landed for seq-major,
+   #777).** The landed primitive previously had no live caller. It is now
+   reachable from production through an allocator-agnostic seam on the
+   `DeviceAllocator` trait (`create_shared_prefix` /
+   `incremental_owned_bytes_for_shared_prefix` / `commit_shared_prefix`, yielding
+   an opaque `dyn SharedDevicePrefix`); non-VMM allocators keep default impls that
+   refuse rather than mis-map. The first consumer is the **seq-major** fused fp16
+   GQA decode kernel: a caller pins a token prefix once and a second sequence maps
+   it, then the real kernel reads it. Validated on the output-level parity oracle
+   in `crates/onnx-runtime-ep-cuda/tests/gqa_shared_prefix_parity_gpu.rs`: two
+   sequences sharing one pinned seq-major prefix (`layers × 2` contiguous ranges)
+   produce **byte-identical** output to two independent sequences. Measured
+   (KV_HEADS=8, HEAD_DIM=128, f16, 1024-token prefix + 1024-token private tail):
+   independent = 8 granules (16,777,216 B), shared = 6 granules (12,582,912 B);
+   prefix charged **once** (`incremental_owned_bytes_for_shared_prefix` = 0),
+   second sharer's admission = **private bytes only** (4,194,304 B), saving
+   `(C−1)×(K_prefix+V_prefix)` = 2 granules. This is deliberately restricted to
+   the **explicit** case (a caller declares the shared prefix) and to prefixes
+   **provably read-only for the sharers' lifetime** — divergence/COW is out of
+   scope here (layer 3 below).
+
+   Seq-major accepts `layers × 2` multi-maps per sequence rather than the single
+   multi-map that only token-major (#783/#787) achieves; token-major is measured
+   but not built. **Structural blocker for auto engine use:** the engine
+   generation loop cannot call this seam yet because
+   `persistent_state_shapes` in `native_decode/cuda.rs` builds a hard-coded BNSH
+   physical KV shape and no model declares a seq-major end-to-end fixed-stride
+   physical shape (#794 showed seq-major changed only kernel indexing, not commit
+   geometry). A BNSH/seq-major fixed-stride physical-shape build is the
+   prerequisite for wiring the primitive into the automatic decode path.
 2. Then: hash-based automatic detection (layer 2) — a rolling-hash prefix
    registry keyed to the same handle, once the explicit path is proven
    end-to-end.
