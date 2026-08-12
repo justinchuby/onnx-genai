@@ -2739,6 +2739,27 @@ impl DecodeCudaState {
         else {
             return Ok(None);
         };
+        // The device present-KV read-out below strides the padded buffer with
+        // hard-coded head-major (BNSH) arithmetic: `capacity_head_stride =
+        // physical_shape[2] * head_dim * elem` with a per-head compaction. Under
+        // a seq-major (BSNH) physical buffer the same offsets index the wrong
+        // bytes (heads are interleaved per token, not laid out as capacity
+        // stripes), so this host mirror would silently return mis-indexed KV.
+        // Only our own GQA kernel understands the seq-major byte geometry; a
+        // host mirror / paged-prefix consumer of `present_*` is a fourth place
+        // the layout lives that the seq-major byte geometry does not yet honor.
+        // Refuse rather than mis-map (the runtime's hard "error, never
+        // mis-index" gate for the converted path).
+        if self.kv_layout.is_seq_major() {
+            bail!(
+                "device present-KV read-out for '{past_name}' is unavailable under the seq-major \
+                 (BSNH) KV layout: the host mirror strides the padded buffer with head-major \
+                 (BNSH) arithmetic and would mis-index the interleaved seq-major bytes. Seq-major \
+                 is supported only on the pure decode path where our GQA kernel is the sole \
+                 consumer of the device KV; host-mirror / paged-prefix reuse must run under \
+                 head-major KV."
+            );
+        }
         let binding = &mut self.bindings[index];
         let dtype = binding.dtype;
         let mut physical_shape = binding.physical_shape().to_vec();
@@ -2795,6 +2816,22 @@ impl DecodeCudaState {
     ) -> anyhow::Result<()> {
         if seq_len == 0 {
             bail!("device paged prefix reuse requires a non-empty prefix");
+        }
+        // The device seed below writes each head into its own capacity-offset
+        // slot (`head * capacity_head_stride`), i.e. head-major (BNSH) byte
+        // arithmetic. Under a seq-major (BSNH) physical buffer that offset
+        // addresses the wrong bytes, so a shared-prefix seed would corrupt the
+        // KV. Prefix sharing therefore does not "fall out" under seq-major with
+        // the current device seed: refuse rather than mis-map (the runtime's
+        // hard "error, never mis-index" gate for the converted path).
+        if self.kv_layout.is_seq_major() {
+            bail!(
+                "device paged prefix reuse is unavailable under the seq-major (BSNH) KV layout: \
+                 the device seed writes each head at a head-major (BNSH) capacity offset and would \
+                 mis-index the interleaved seq-major bytes. Seq-major is supported only on the \
+                 pure decode path where our GQA kernel is the sole consumer of the device KV; \
+                 prefix reuse must run under head-major KV."
+            );
         }
         self.ensure_capacity(session, seq_len)?;
         for (name, data, shape) in entries {

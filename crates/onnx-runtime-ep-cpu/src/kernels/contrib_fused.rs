@@ -53,6 +53,9 @@ fn require_skip_layer_norm_dtype(inputs: &[TensorView], outputs: &[TensorMut]) -
         )));
     }
     for (index, output) in outputs.iter().enumerate() {
+        if output.is_absent() {
+            continue;
+        }
         let expected = if matches!(index, 1 | 2) {
             DataType::Float32
         } else {

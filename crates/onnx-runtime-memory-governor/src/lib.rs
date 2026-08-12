@@ -71,10 +71,15 @@
 //! a budget. Live state is never taken to make room.
 
 pub mod allocator;
+pub mod shareability;
 
 pub use allocator::{
     AllocationCommitRange, DeviceAllocator, DeviceKey, HostAllocator, MappedAllocation,
     SharedDevicePrefix, SharedPrefixCommitInfo,
+};
+pub use shareability::{
+    KvFragmentation, ModelKvGeometry, PrefixShareability, evaluate_geometry_shareability,
+    evaluate_prefix_shareability,
 };
 
 use std::collections::{BTreeMap, VecDeque};
@@ -507,6 +512,16 @@ impl LeaseLedger {
             Ordering::Acquire,
             |reserved| Some(reserved.saturating_sub(bytes)),
         );
+    }
+
+    fn reserve_unassigned_mapped_allowance(&self, tier: Tier, bytes: u64) -> u64 {
+        let _gate = self.claim_gate(tier);
+        let index = tier.index();
+        let reserved = self.mapped_allowance_reserved[index].load(Ordering::Acquire);
+        let limit = self.limits[index].load(Ordering::Acquire);
+        let granted = bytes.min(limit.saturating_sub(reserved));
+        self.mapped_allowance_reserved[index].store(reserved + granted, Ordering::Release);
+        granted
     }
 
     fn reserve_mapped_growth(
@@ -1130,6 +1145,7 @@ impl MappedGrowthAuthority {
                 owner_id: Arc::as_ptr(&requester.inner) as usize,
                 remaining: physical_reserved,
             },
+            unassigned_bytes: 0,
             transferred_bytes: 0,
             victims: Vec::new(),
             operation: Some(operation),
@@ -1142,6 +1158,36 @@ impl MappedGrowthAuthority {
             return Err(error);
         }
         let mut remaining = bytes.saturating_sub(own_unused);
+        if remaining == 0 {
+            return Ok(grant);
+        }
+
+        // Capacity not assigned to any mapped zone is available before asking
+        // a live holder to shrink or reclaim. This is what lets one arena zone
+        // grow from its first allocation to a second concurrent allocation.
+        let unassigned = self
+            .inner
+            .ledger
+            .reserve_unassigned_mapped_allowance(Tier::Device, remaining);
+        if unassigned > 0 {
+            if let Err(error) = requester.add_limit_transferred(unassigned) {
+                self.inner
+                    .ledger
+                    .release_mapped_allowance(Tier::Device, unassigned);
+                grant.rollback();
+                return Err(error);
+            }
+            if let Err(error) = requester.reserve_growth(unassigned) {
+                let _ = requester.subtract_limit_transferred(unassigned);
+                self.inner
+                    .ledger
+                    .release_mapped_allowance(Tier::Device, unassigned);
+                grant.rollback();
+                return Err(error);
+            }
+            grant.unassigned_bytes = unassigned;
+            remaining -= unassigned;
+        }
         if remaining == 0 {
             return Ok(grant);
         }
@@ -1370,6 +1416,7 @@ pub struct MappedGrowthGrant {
     requester: MappedAllowance,
     requested_bytes: u64,
     physical_capacity: MappedPhysicalCapacityToken,
+    unassigned_bytes: u64,
     transferred_bytes: u64,
     victims: Vec<(MappedAllowance, u64)>,
     operation: Option<MappedGrowthOperationGuard>,
@@ -1457,6 +1504,15 @@ impl MappedGrowthGrant {
                 self.victims.pop();
             }
         }
+        let released_unassigned = excess.min(self.unassigned_bytes);
+        if released_unassigned > 0 {
+            self.requester
+                .subtract_limit_transferred(released_unassigned)?;
+            self.authority
+                .ledger
+                .release_mapped_allowance(Tier::Device, released_unassigned);
+            self.unassigned_bytes -= released_unassigned;
+        }
         self.requested_bytes = actual;
         Ok(())
     }
@@ -1473,6 +1529,15 @@ impl MappedGrowthGrant {
         }
         for (victim, bytes) in self.victims.drain(..).rev() {
             let _ = victim.add_limit_transferred(bytes);
+        }
+        if self.unassigned_bytes > 0 {
+            let _ = self
+                .requester
+                .subtract_limit_transferred(self.unassigned_bytes);
+            self.authority
+                .ledger
+                .release_mapped_allowance(Tier::Device, self.unassigned_bytes);
+            self.unassigned_bytes = 0;
         }
         self.physical_capacity.release_remaining();
         self.authority
@@ -2138,6 +2203,107 @@ mod tests {
     }
 
     #[test]
+    fn mapped_growth_claims_unassigned_allowance_for_sequential_arena_allocations() {
+        let governor = LedgerGovernor::new(LeaseLedger::new(100, 0, 0));
+        let requester = mapped_allowance(
+            &governor,
+            0,
+            MemoryRole::Workspace { step_scoped: false },
+            2,
+        );
+
+        let first = governor
+            .prepare_mapped_growth(&requester, 20)
+            .expect("first arena growth uses unassigned mapped capacity");
+        assert_eq!(first.transferred_bytes(), 0);
+        first.commit().expect("commit first arena growth");
+        assert_eq!(requester.limit(), 20);
+        assert_eq!(requester.mapped_bytes(), 20);
+
+        let second = governor
+            .prepare_mapped_growth(&requester, 20)
+            .expect("second arena growth expands the same mapped zone");
+        assert_eq!(second.transferred_bytes(), 0);
+        second.commit().expect("commit second arena growth");
+        assert_eq!(requester.limit(), 40);
+        assert_eq!(requester.mapped_bytes(), 40);
+
+        drop(requester);
+        governor
+            .reserve_mapped_allowance(
+                Tier::Device,
+                100,
+                MemoryRole::Workspace { step_scoped: false },
+                HolderId::new(3),
+            )
+            .expect("dropping the expanded zone returns all mapped allowance");
+    }
+
+    #[test]
+    fn unused_mapped_growth_returns_new_unassigned_allowance() {
+        let governor = LedgerGovernor::new(LeaseLedger::new(100, 0, 0));
+        let requester = mapped_allowance(
+            &governor,
+            0,
+            MemoryRole::Workspace { step_scoped: false },
+            2,
+        );
+
+        governor
+            .prepare_mapped_growth(&requester, 20)
+            .expect("prepare arena growth")
+            .commit_bytes(0)
+            .expect("allocator reused an already mapped granule");
+        assert_eq!(requester.limit(), 0);
+        drop(
+            governor
+                .prepare_mapped_growth(&requester, 20)
+                .expect("prepare rolled-back arena growth"),
+        );
+        assert_eq!(requester.limit(), 0);
+        governor
+            .reserve_mapped_allowance(
+                Tier::Device,
+                100,
+                MemoryRole::Workspace { step_scoped: false },
+                HolderId::new(3),
+            )
+            .expect("rolled-back growth returns unassigned mapped allowance");
+    }
+
+    #[test]
+    fn mapped_growth_refuses_after_unassigned_allowance_is_exhausted() {
+        let governor = LedgerGovernor::new(LeaseLedger::new(20, 0, 0));
+        let requester = mapped_allowance(
+            &governor,
+            0,
+            MemoryRole::Workspace { step_scoped: false },
+            2,
+        );
+        governor
+            .prepare_mapped_growth(&requester, 20)
+            .expect("claim all mapped capacity")
+            .commit()
+            .expect("commit mapped capacity");
+
+        let error = match governor.prepare_mapped_growth(&requester, 1) {
+            Ok(_) => panic!("growth beyond the authority limit must be refused"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            MemoryError::TierExhausted {
+                requested: 1,
+                available: 0,
+                role: MemoryRole::Workspace { step_scoped: false },
+                ..
+            }
+        ));
+        assert_eq!(requester.limit(), 20);
+        assert_eq!(requester.mapped_bytes(), 20);
+    }
+
+    #[test]
     fn failed_pinned_reclaim_rolls_back_allowances_and_reservation() {
         let governor = LedgerGovernor::new(LeaseLedger::new(100, 0, 0));
         let victim = Arc::new(TestMappedHolder::new(
@@ -2461,8 +2627,6 @@ mod tests {
             .register_reclaimable_mapped_holder(&first_dyn)
             .expect("first register");
         drop(first_registration);
-        drop(first_dyn);
-        drop(first);
 
         governor
             .prepare_mapped_growth(&requester, 10)
@@ -2472,9 +2636,11 @@ mod tests {
         assert_eq!(slow.targets.lock().expect("targets").as_slice(), &[10]);
         let metrics = governor.mapped_growth_metrics().expect("metrics");
         assert_eq!(metrics.live_holders, 1);
-        assert_eq!(metrics.weight_mapped, 30);
+        assert_eq!(metrics.weight_mapped, 70);
         assert_eq!(metrics.kv_mapped, 30);
         assert_eq!(metrics.workspace_mapped, 0);
+        drop(first_dyn);
+        drop(first);
         drop(slow_registration);
         assert_eq!(
             governor

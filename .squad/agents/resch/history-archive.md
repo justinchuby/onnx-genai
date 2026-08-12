@@ -85,3 +85,30 @@ catches `cfg(target_os)` gating errors that the `x86_64-apple-darwin` recipe mis
 - Guard-break proofs: (1) renamed POOL_BNNS_TEST_HITS → lint failed naming MaxPool/aarch64/tier1; (2) added fake counter → inverse check failed naming file and counter.
 - 973 CPU EP tests pass; all 4 lints green; cargo fmt clean.
 - Filed to `.squad/decisions/inbox/resch-manifest-backfill.md`.
+
+---
+## ARCHIVED 2026-08-12T09:45:00Z (Scribe compaction — wave Jul-27 and Aug-11 early)
+
+### 2026-07-27T10:40:00-07:00 — Platform-naming lint + x86 GEMM renames (PR #278)
+Renamed `simd_gemm.rs` → `x86_sgemm.rs` and `bf16_gemm.rs` → `x86_bf16.rs` with zero behavior change. Added `scripts/check_platform_naming.py`. Guard-break restored old names and failed; 945 tests passed, clippy green.
+
+### 2026-07-27 — Cross-Target Compilation Check (PR #319)
+Added `scripts/check_cross_compile.sh`. Known gaps: ep-cpu from macOS, runtime dispatch, Windows cfg via portable matrix.
+
+### 2026-07-27T22:05:00-07:00 — Dispatch manifest lint
+Created `dispatch_manifest.toml` plus `scripts/check_dispatch_manifest.py`. Seeded claims, documented exclusions, proved guard-break.
+
+### 2026-07-27T23:13:00-07:00 — Manifest backfill + inverse check
+Backfilled PR #324 claims; inverse checking so any counter without a manifest row fails CI. 973 tests, 4 lints, fmt green.
+
+### 2026-08-11T03:27:00+00:00 — Upstream CPU pilot: AVX2 LayerNorm kernel
+Traced x86 fp16 MatMul (not viable for GEMM). Chose AVX2 LayerNorm/RMSNorm. Implemented `layernorm_kernel_avx2.cpp` (two-pass, FMA3). Full library compiled, zero warnings.
+
+## 2026-08-11: AVX2 LayerNorm Hardening (PR #31973)
+Task 1 — small-N threshold (`NormSize < 8`); Task 2 — Welford SIMD (8 parallel AVX2 accumulators). 5-7× faster at typical sizes. RMSNorm unchanged.
+
+## 2026-08-11 — BFloat16 CPU LayerNorm/RMSNorm Registration
+Registered BFloat16 on CPU via `is_narrow_float_v<T>`. All arithmetic f32. 6 files in upstream/ort-bf16. Code complete, not build-verified.
+
+### 2026-08-11T05:19:00+00:00 — RMSNorm: skip mean accumulation when MeanOut null (Gaff S1)
+Added `if (MeanOut != nullptr)` check outside inner loop. 5-9% speedup at small N. 40/40 tests pass.

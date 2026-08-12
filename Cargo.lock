@@ -2402,6 +2402,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "onnx-runtime-ep-cpu-plugin"
+version = "0.1.0-dev.5"
+dependencies = [
+ "libloading 0.8.9",
+ "onnx-genai-ort-sys",
+ "onnx-runtime-ep-api",
+ "onnx-runtime-ep-cpu",
+ "onnx-runtime-ep-plugin",
+ "onnx-runtime-ir",
+]
+
+[[package]]
 name = "onnx-runtime-ep-cuda"
 version = "0.1.0-dev.5"
 dependencies = [
@@ -2419,6 +2431,59 @@ dependencies = [
  "onnx-runtime-quantization",
  "onnx-runtime-virtual-memory",
  "thiserror 2.0.19",
+]
+
+[[package]]
+name = "onnx-runtime-ep-cuda-plugin"
+version = "0.1.0-dev.5"
+dependencies = [
+ "onnx-genai-ort-sys",
+ "onnx-runtime-ep-api",
+ "onnx-runtime-ep-cuda",
+ "onnx-runtime-ep-plugin",
+ "onnx-runtime-ir",
+]
+
+[[package]]
+name = "onnx-runtime-ep-nxrt-abi"
+version = "0.1.0-dev.5"
+dependencies = [
+ "libloading 0.8.9",
+ "onnx-runtime-ep-api",
+ "onnx-runtime-ep-cpu",
+ "onnx-runtime-ir",
+]
+
+[[package]]
+name = "onnx-runtime-ep-nxrt-host"
+version = "0.1.0"
+dependencies = [
+ "libloading 0.8.9",
+ "onnx-runtime-ep-api",
+ "onnx-runtime-ep-nxrt-abi",
+ "onnx-runtime-ep-nxrt-testplugin",
+ "onnx-runtime-ir",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "onnx-runtime-ep-nxrt-testplugin"
+version = "0.1.0-dev.5"
+dependencies = [
+ "onnx-runtime-ep-api",
+ "onnx-runtime-ep-nxrt-abi",
+ "onnx-runtime-ir",
+]
+
+[[package]]
+name = "onnx-runtime-ep-plugin"
+version = "0.1.0-dev.5"
+dependencies = [
+ "libloading 0.8.9",
+ "onnx-genai-ort-sys",
+ "onnx-runtime-ep-api",
+ "onnx-runtime-ep-cpu",
+ "onnx-runtime-ir",
 ]
 
 [[package]]

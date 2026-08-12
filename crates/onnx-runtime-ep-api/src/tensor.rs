@@ -247,6 +247,10 @@ pub struct TensorMut<'a> {
     /// Offset in **bytes** of the element origin from `data` (DLPack semantics).
     pub byte_offset: usize,
     pub device: DeviceId,
+    /// Whether this output slot is absent (scratch buffer for an omitted
+    /// optional output). Kernels should skip dtype validation and treat
+    /// writes as discarded.
+    pub absent: bool,
     _marker: PhantomData<&'a mut ()>,
 }
 
@@ -267,6 +271,7 @@ impl<'a> TensorMut<'a> {
             strides,
             byte_offset: 0,
             device,
+            absent: false,
             _marker: PhantomData,
         }
     }
@@ -275,6 +280,70 @@ impl<'a> TensorMut<'a> {
     pub fn with_byte_offset(mut self, byte_offset: usize) -> Self {
         self.byte_offset = byte_offset;
         self
+    }
+
+    /// Mark this TensorMut as absent (scratch buffer for an omitted optional
+    /// output).
+    ///
+    /// # SAFETY INVARIANT
+    ///
+    /// The scratch buffer is allocated with `numel * max(byte_size, 8)` bytes.
+    /// This padding tolerates writes up to 8 bytes/element (e.g., Float64),
+    /// but **the `dtype` field still carries the slot's declared dtype**. Any
+    /// kernel writing a wider type than `dtype` relies solely on the padding —
+    /// there is no runtime enforcement. If future dtypes exceed 8 bytes/element,
+    /// the `max(byte_size, 8)` constant in `compute.rs` must be updated.
+    ///
+    /// Kernels should call [`TensorMut::is_absent`] before writing and treat
+    /// absent outputs as discard targets. Writes of a mismatched dtype are
+    /// **tolerated** by the padding but are **not silently correct** — they
+    /// are a sign that the kernel's output dtype disagrees with the graph's
+    /// declared dtype.
+    pub fn mark_absent(mut self) -> Self {
+        self.absent = true;
+        self
+    }
+
+    /// Whether this output is an absent optional (scratch buffer whose data
+    /// is discarded).
+    pub fn is_absent(&self) -> bool {
+        self.absent
+    }
+
+    /// Validate that a write of `write_dtype` to this tensor is type-compatible.
+    /// For absent outputs, warns (returns `Err`) if the write dtype exceeds
+    /// the buffer's padding capacity (`max(declared_byte_size, 8)` bytes/elem).
+    /// For present outputs, the dtypes must match exactly.
+    ///
+    /// **Note:** This is a contract-documenting helper exercised by tests — it is
+    /// *not* called on the production write path. The actual runtime guard against
+    /// oversized writes is `scratch_alloc_bytes` in `compute.rs`, which sizes
+    /// scratch buffers based on `output_dtypes[slot]`. This function exists to
+    /// make the dtype contract explicit and testable, not to enforce it at runtime.
+    pub fn validate_write_dtype(&self, write_dtype: DataType) -> Result<()> {
+        if self.absent {
+            let capacity_per_elem = self.dtype.byte_size().max(8);
+            let write_size = write_dtype.byte_size();
+            if write_size > capacity_per_elem {
+                return Err(EpError::InvalidTensorView {
+                    reason: format!(
+                        "absent scratch buffer overflow: declared dtype {:?} \
+                         (capacity {} bytes/elem) but write dtype {:?} requires {} bytes/elem",
+                        self.dtype, capacity_per_elem, write_dtype, write_size
+                    ),
+                });
+            }
+            Ok(())
+        } else if self.dtype != write_dtype {
+            Err(EpError::InvalidTensorView {
+                reason: format!(
+                    "dtype mismatch: tensor declared as {:?} but write uses {:?}",
+                    self.dtype, write_dtype
+                ),
+            })
+        } else {
+            Ok(())
+        }
     }
 
     /// Check the view's invariants (rank, dtype, offset alignment).

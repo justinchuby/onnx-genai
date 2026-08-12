@@ -35,6 +35,21 @@ _Archived by Scribe round 9, 2026-07-31T10:24:07Z._
 - E2e decode still BLOCKED on the loader: `Engine::from_dir` rejects the 3-onnx split; `from_pipeline_dir` refuses during vision `smart_resize` admission. Parity harness `qwen35_0_8b_hybrid_native_cuda_e2e` graceful-skips until fixed.
 - In flight (cohaagen-4): loader-unblock — admit the text-only split hybrid for decode, flip the e2e parity harness active.
 
+## Archived from live history (Scribe compaction 2026-08-12T00:15:00Z)
+
+Entries 2026-07-31T03:03:15Z through 2026-08-07 moved here. Summary:
+- PR #535 text-only pipeline synthesis; #544 async page-in; #552 observability; GQA capture.
+- 27B roofline profile: Scan 56.5%; MatMulNBits already at roofline. o_proj split-K (K_SPLIT=2) regressed −0.59% — do NOT retry.
+- #594/#592 fused LinearAttention merged; 27B 40.8 ms/tok.
+- Foundry sweep: native ahead on all dense models. DeepSeek/GLM sweep corrected stale metadata.
+- Thread-3 hetero legalization #602 (locked out, Deckard revised) and #606 scaffold merged.
+- 35B-A3B: PackedMHA root cause (mobius export bug); fairness vet; fp16 TopK PR #612.
+- PR #616 35B-A3B native GPU unblock: cuDNN reduce fix, 2726 ms/tok corrected.
+- PR #618 Lever A reduce capture: 2726 → 405 ms/tok.
+- PR #625 + #676: 35B-A3B native sparse QMoE shipped ~12.5–14.8× over ORT dense stack.
+- PR #700 hybrid Mamba cache correctness.
+- PR #684 QMoE router parallelization: 30.99 → 16.14 ms/tok, ~62 tok/s.
+- PR #708/C3 CUDA-graph capture: 13.415 → 12.132 ms/tok; C1 classifier shelved behind #722.
 ## 2026-08-11T03:25:00Z: Scribe compaction from live history
 
 ## 2026-07-31T03:03:15Z — PR #535 merged: text-only decode pipeline synthesis (hybrid loader unblock)

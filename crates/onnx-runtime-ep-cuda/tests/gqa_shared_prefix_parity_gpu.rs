@@ -56,8 +56,9 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_ep_cuda::{CudaExecutionProvider, GroupQueryAttentionKernel};
 use onnx_runtime_ir::{DataType, compute_contiguous_strides};
 use onnx_runtime_memory_governor::{
-    DeviceAllocator, DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryGovernor, MemoryRole,
-    SharedDevicePrefix, Tier,
+    DeviceAllocator, DeviceKey, HolderId, KvFragmentation, LeaseLedger, LedgerGovernor,
+    MemoryGovernor, MemoryRole, ModelKvGeometry, SharedDevicePrefix, Tier,
+    evaluate_prefix_shareability,
 };
 
 const BATCH: usize = 1;
@@ -438,6 +439,32 @@ fn two_sequences_sharing_a_pinned_prefix_match_two_independent_sequences() {
     let past_len = prefix_tokens;
     let alloc_bytes = capacity * BYTES_PER_TOKEN;
     assert_eq!(alloc_bytes, 2 * granule);
+
+    // Drive the share decision through the layout-general arithmetic predicate
+    // (#777), not a hard-coded "seq-major is shareable" assumption. This binding
+    // is one seq-major (BSNH) layer's KV: each of K and V is one contiguous
+    // fragment of `KV_HEADS x HEAD_DIM` bytes per token, so a one-granule prefix
+    // reaches exactly one shareable granule per fragment and two multi-map ops
+    // (K and V) — which is precisely what this test then performs. If the
+    // arithmetic ever says this configuration is not shareable, refuse loudly
+    // here rather than mis-map.
+    let share = evaluate_prefix_shareability(
+        KvFragmentation::seq_major_bsnh(ModelKvGeometry {
+            layers: 1,
+            kv_heads: KV_HEADS as u64,
+            head_dim: HEAD_DIM as u64,
+            dtype_bytes: ELEM as u64,
+        }),
+        prefix_tokens as u64,
+        granule as u64,
+    );
+    assert!(
+        share.shareable,
+        "arithmetic predicate must admit this prefix before we share it: {:?}",
+        share.refusal_reason()
+    );
+    assert_eq!(share.shareable_granules_per_fragment, 1);
+    assert_eq!(share.multi_map_ops, 2, "one shared map for each of K and V");
 
     // Deterministic shared prefix content: positions 0..past_len, identical for
     // every sequence (a pinned system prompt).

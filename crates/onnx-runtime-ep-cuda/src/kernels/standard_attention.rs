@@ -531,6 +531,10 @@ pub struct StandardAttentionKernel {
     qk_matmul_output_mode: i64,
     /// Softcap value; `0.0` disables it.
     softcap: f32,
+    /// Static node output arity. Present-key/value staging is reachable only
+    /// when output slots 1/2 exist, so prepare-only planning must not charge
+    /// their bytes for one-output attention nodes.
+    output_count: usize,
     /// The registered opset version this kernel serves (23, or 24 for 24–26).
     /// Controls `nonpad_kv_seqlen` acceptance (opset 24+ only).
     since_version: u32,
@@ -571,6 +575,24 @@ const WS_COUNT: usize = 6;
 /// matching the executor's 256-byte device-allocation granularity.
 const STD_SCORES_ALIGN: usize = 256;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StdAttentionWorkspaceLayout {
+    scores_offset: usize,
+    scores_bytes: usize,
+    stage_key_offset: Option<usize>,
+    stage_key_bytes: usize,
+    stage_value_offset: Option<usize>,
+    stage_value_bytes: usize,
+    total_bytes: usize,
+}
+
+fn std_attention_align_up(value: usize) -> Result<usize> {
+    value
+        .checked_add(STD_SCORES_ALIGN - 1)
+        .map(|value| value / STD_SCORES_ALIGN * STD_SCORES_ALIGN)
+        .ok_or_else(|| EpError::KernelFailed("Attention: workspace alignment overflow".into()))
+}
+
 /// Byte size of the governed default-domain `Attention` f32 score matrix for one
 /// concrete geometry: `batch·q_heads·q_seq·total_seq` fp32 scores. Prepare-only
 /// planning (`Kernel::workspace_requirement`) and execution (`run`) size the
@@ -596,57 +618,245 @@ fn std_attention_scores_bytes(
         .ok_or_else(|| EpError::KernelFailed("Attention: score scratch byte count overflow".into()))
 }
 
-/// Report the exact fp32 score-matrix scratch a default-domain `Attention`
-/// dispatch will materialize (#736), for prepare-only planning. The kernel has
+fn std_attention_stage_bytes(elements: usize, element_bytes: usize) -> Result<usize> {
+    elements
+        .checked_mul(element_bytes)
+        .map(|bytes| bytes.max(1))
+        .ok_or_else(|| EpError::KernelFailed("Attention: staged KV byte count overflow".into()))
+}
+
+/// Shared layout for the default-domain `Attention` governed composite:
+/// always-materialized fp32 scores followed by only the dense aliased K/V
+/// staging regions this route can use. Planning and execution both call this
+/// helper, so their byte formulas and offsets cannot drift.
+#[allow(clippy::too_many_arguments)]
+fn std_attention_workspace_layout(
+    batch: usize,
+    q_heads: usize,
+    q_seq: usize,
+    total_seq: usize,
+    kv_heads: usize,
+    key_seq: usize,
+    head_size: usize,
+    value_seq: usize,
+    value_head_size: usize,
+    element_bytes: usize,
+    stage_key: bool,
+    stage_value: bool,
+) -> Result<StdAttentionWorkspaceLayout> {
+    let scores_bytes = std_attention_scores_bytes(batch, q_heads, q_seq, total_seq)?;
+    let mut total_bytes = scores_bytes;
+
+    let key_elements = batch
+        .checked_mul(kv_heads)
+        .and_then(|value| value.checked_mul(key_seq))
+        .and_then(|value| value.checked_mul(head_size))
+        .ok_or_else(|| EpError::KernelFailed("Attention: staged key size overflow".into()))?;
+    let stage_key_bytes = if stage_key {
+        std_attention_stage_bytes(key_elements, element_bytes)?
+    } else {
+        0
+    };
+    let stage_key_offset = if stage_key {
+        total_bytes = std_attention_align_up(total_bytes)?;
+        let offset = total_bytes;
+        total_bytes = total_bytes.checked_add(stage_key_bytes).ok_or_else(|| {
+            EpError::KernelFailed("Attention: staged key workspace overflow".into())
+        })?;
+        Some(offset)
+    } else {
+        None
+    };
+
+    let value_elements = batch
+        .checked_mul(kv_heads)
+        .and_then(|value| value.checked_mul(value_seq))
+        .and_then(|value| value.checked_mul(value_head_size))
+        .ok_or_else(|| EpError::KernelFailed("Attention: staged value size overflow".into()))?;
+    let stage_value_bytes = if stage_value {
+        std_attention_stage_bytes(value_elements, element_bytes)?
+    } else {
+        0
+    };
+    let stage_value_offset = if stage_value {
+        total_bytes = std_attention_align_up(total_bytes)?;
+        let offset = total_bytes;
+        total_bytes = total_bytes.checked_add(stage_value_bytes).ok_or_else(|| {
+            EpError::KernelFailed("Attention: staged value workspace overflow".into())
+        })?;
+        Some(offset)
+    } else {
+        None
+    };
+
+    Ok(StdAttentionWorkspaceLayout {
+        scores_offset: 0,
+        scores_bytes,
+        stage_key_offset,
+        stage_key_bytes,
+        stage_value_offset,
+        stage_value_bytes,
+        total_bytes,
+    })
+}
+
+fn std_attention_carve(
+    workspace: WorkspaceView,
+    offset: usize,
+    bytes: usize,
+    region: &str,
+) -> Result<CUdeviceptr> {
+    let end = offset.checked_add(bytes).ok_or_else(|| {
+        EpError::KernelFailed(format!(
+            "Attention: prepared {region} workspace offset overflow"
+        ))
+    })?;
+    if end > workspace.bytes() {
+        return Err(EpError::KernelFailed(format!(
+            "Attention: prepared workspace {} bytes is smaller than the {end} bytes required for \
+             {region}",
+            workspace.bytes()
+        )));
+    }
+    let base = cuptr(workspace.ptr().0.cast_const());
+    Ok(base + offset as u64)
+}
+
+/// Static route signal for staged dense KV growth. On the session's
+/// mask-driven, non-causal fixed-capacity decode contract, the mask key width
+/// and past-cache sequence extent are the same physical capacity, so execution
+/// takes the fixed-stride append path (`stage_key/value == false`). Other
+/// in-op-cache routes may grow a dense aliased cache and reserve only the
+/// present outputs that actually exist. Actual pointer aliasing is checked by
+/// `run`; a non-aliased dispatch can safely consume less than this conservative
+/// dense-route reservation.
+fn std_attention_staging_route(
+    inputs: &[TensorMetadata<'_>],
+    is_causal: bool,
+    output_count: usize,
+) -> (bool, bool) {
+    let has_past_key = inputs.get(4).is_some_and(|input| input.present);
+    let has_past_value = inputs.get(5).is_some_and(|input| input.present);
+    if !has_past_key || !has_past_value {
+        return (false, false);
+    }
+    let past_key_capacity = inputs
+        .get(4)
+        .and_then(|past| past.shape.len().checked_sub(2).map(|axis| past.shape[axis]));
+    let past_value_capacity = inputs
+        .get(5)
+        .and_then(|past| past.shape.len().checked_sub(2).map(|axis| past.shape[axis]));
+    let mask_key_capacity = inputs
+        .get(3)
+        .filter(|mask| mask.present)
+        .and_then(|mask| mask.shape.last().copied());
+    let fixed_capacity_append = !is_causal
+        && past_key_capacity.is_some()
+        && past_key_capacity == past_value_capacity
+        && past_key_capacity == mask_key_capacity;
+    if fixed_capacity_append {
+        return (false, false);
+    }
+    (output_count >= 2, output_count >= 3)
+}
+
+/// Report the exact governed composite scratch a default-domain `Attention`
+/// dispatch can materialize (#736), for prepare-only planning. The kernel has
 /// **no** shared-memory/flash route: `attention_row` always stages the
 /// `batch·q_heads·q_seq·total_seq` scores in device memory (fp32 accumulate,
-/// regardless of the f32/f16/bf16 operand dtype), so — unlike GQA/Phase-2a —
-/// every valid route reserves and none reports NONE. Only unresolvable or
-/// non-float input metadata returns NONE, letting `run` raise the precise error.
+/// regardless of the f32/f16/bf16 operand dtype). Dense aliased K/V growth adds
+/// disjoint `present_*_expected·element_bytes` regions; fixed-capacity append,
+/// no-past, and absent-present-output routes add zero staging bytes. Only
+/// unresolvable or non-float input metadata returns NONE, letting `run` raise the
+/// precise error.
 ///
-/// The score matrix's lifetime is route-dependent, so this models both classes
-/// truthfully: a single-token decode (`batch==1 && q_seq==1`) is the only shape
-/// that can take the capture-eligible pooled route whose buffer is retained
-/// across steps, charged `SessionPersistent`; every multi-token prefill (the
-/// 512-MiB-class quadratic worst case) and batched dispatch takes the per-call
-/// route whose scratch is freed on each exit, charged `StepScoped`. This is a
-/// free function so it is exercised by CPU-only unit tests without a GPU.
-fn std_attention_scores_requirement(
+/// The composite lifetime is route-dependent, so this models both classes
+/// truthfully: single-token decode (`batch==1 && q_seq==1`) can take the
+/// capture-eligible retained route, charged `SessionPersistent`; multi-token
+/// prefill and batched dispatch take the per-call route, charged `StepScoped`.
+fn std_attention_workspace_requirement(
     inputs: &[TensorMetadata<'_>],
     q_num_heads: Option<usize>,
     kv_num_heads: Option<usize>,
+    is_causal: bool,
+    output_count: usize,
 ) -> Result<WorkspaceRequirement> {
-    let (Some(q), Some(k)) = (inputs.first(), inputs.get(1)) else {
+    let (Some(q), Some(k), Some(v)) = (inputs.first(), inputs.get(1), inputs.get(2)) else {
         return Ok(WorkspaceRequirement::NONE);
     };
     if !matches!(
         q.dtype,
         DataType::Float32 | DataType::Float16 | DataType::BFloat16
-    ) {
+    ) || k.dtype != q.dtype
+        || v.dtype != q.dtype
+    {
         return Ok(WorkspaceRequirement::NONE);
     }
-    let Some((batch, q_heads, q_seq, _)) = bhsd_from_meta(q.shape, q_num_heads) else {
+    let Some((batch, q_heads, q_seq, head_size)) = bhsd_from_meta(q.shape, q_num_heads) else {
         return Ok(WorkspaceRequirement::NONE);
     };
-    let Some((_, _, k_seq, _)) = bhsd_from_meta(k.shape, kv_num_heads) else {
+    let Some((k_batch, kv_heads, k_seq, k_head_size)) = bhsd_from_meta(k.shape, kv_num_heads)
+    else {
         return Ok(WorkspaceRequirement::NONE);
     };
+    let Some((v_batch, v_heads, v_seq, value_head_size)) = bhsd_from_meta(v.shape, kv_num_heads)
+    else {
+        return Ok(WorkspaceRequirement::NONE);
+    };
+    if k_batch != batch
+        || v_batch != batch
+        || v_heads != kv_heads
+        || k_head_size != head_size
+        || k_seq != v_seq
+    {
+        return Ok(WorkspaceRequirement::NONE);
+    }
     // Total attended length = past-cache length + current key length. The past
     // key (input 4) is optional; when a frozen fixed-capacity cache binds it at
     // physical capacity this over-estimates the valid length by the padding
     // rows, which is safe (reserve ≥ consume) — execution re-derives the exact
     // size through the same helper and refuses on any shortfall, so it never
     // silently under-allocates.
-    let past_seq = inputs
+    let past_key = inputs
         .get(4)
         .filter(|past| past.present)
-        .and_then(|past| bhsd_from_meta(past.shape, kv_num_heads))
-        .map(|(_, _, seq, _)| seq)
-        .unwrap_or(0);
-    let total_seq = past_seq
+        .and_then(|past| bhsd_from_meta(past.shape, kv_num_heads));
+    let past_value = inputs
+        .get(5)
+        .filter(|past| past.present)
+        .and_then(|past| bhsd_from_meta(past.shape, kv_num_heads));
+    if inputs.get(4).is_some_and(|past| past.present) != past_key.is_some()
+        || inputs.get(5).is_some_and(|past| past.present) != past_value.is_some()
+        || past_key.is_some() != past_value.is_some()
+    {
+        return Ok(WorkspaceRequirement::NONE);
+    }
+    let key_past_seq = past_key.map(|(_, _, seq, _)| seq).unwrap_or(0);
+    let value_past_seq = past_value.map(|(_, _, seq, _)| seq).unwrap_or(0);
+    let total_seq = key_past_seq
         .checked_add(k_seq)
         .ok_or_else(|| EpError::KernelFailed("Attention: total attended length overflow".into()))?;
-    let bytes = std_attention_scores_bytes(batch, q_heads, q_seq, total_seq)?;
+    let value_total_seq = value_past_seq.checked_add(v_seq).ok_or_else(|| {
+        EpError::KernelFailed("Attention: total value-cache length overflow".into())
+    })?;
+    if total_seq != value_total_seq {
+        return Ok(WorkspaceRequirement::NONE);
+    }
+    let (stage_key, stage_value) = std_attention_staging_route(inputs, is_causal, output_count);
+    let layout = std_attention_workspace_layout(
+        batch,
+        q_heads,
+        q_seq,
+        total_seq,
+        kv_heads,
+        total_seq,
+        head_size,
+        value_total_seq,
+        value_head_size,
+        q.dtype.byte_size(),
+        stage_key,
+        stage_value,
+    )?;
     let step_scoped = !(batch == 1 && q_seq == 1);
     let lifetime = if step_scoped {
         WorkspaceLifetime::StepScoped
@@ -654,8 +864,8 @@ fn std_attention_scores_requirement(
         WorkspaceLifetime::SessionPersistent
     };
     Ok(WorkspaceRequirement {
-        bytes: u64::try_from(bytes).map_err(|_| {
-            EpError::KernelFailed("Attention: score workspace does not fit u64".into())
+        bytes: u64::try_from(layout.total_bytes).map_err(|_| {
+            EpError::KernelFailed("Attention: composite workspace does not fit u64".into())
         })?,
         alignment: STD_SCORES_ALIGN,
         lifetime,
@@ -769,6 +979,7 @@ impl KernelFactory for StandardAttentionFactory {
             kv_num_heads,
             qk_matmul_output_mode,
             softcap,
+            output_count: node.outputs.len(),
             since_version: self.since_version,
             workspace: Mutex::new(StdAttnWorkspace::new(self.runtime.clone())),
             last_capture_safe_signature: Mutex::new(None),
@@ -1476,55 +1687,90 @@ impl StandardAttentionKernel {
             } else {
                 None
             };
-            let scores_bytes = std_attention_scores_bytes(batch, q_heads, q_seq, total_seq)?;
+            let workspace_layout = std_attention_workspace_layout(
+                batch,
+                q_heads,
+                q_seq,
+                total_seq,
+                kv_heads,
+                key_cap,
+                head_size,
+                value_cap,
+                v_head_size,
+                element_bytes,
+                stage_key,
+                stage_value,
+            )?;
+            if let Some(view) = prepared
+                && view.bytes() < workspace_layout.total_bytes
+            {
+                return Err(EpError::KernelFailed(format!(
+                    "Attention: prepared workspace {} bytes is smaller than the {} bytes this \
+                     dispatch requires",
+                    view.bytes(),
+                    workspace_layout.total_bytes
+                )));
+            }
             let scores_ptr = match prepared {
-                Some(view) => {
-                    // Governed slice (#736): the executor reserved this score
-                    // buffer against the device authority during prepare-only
-                    // planning, sized through the same `std_attention_scores_bytes`
-                    // helper. Refuse deterministically on a shortfall rather than
-                    // silently under-allocating or reintroducing a raw allocation
-                    // that bypasses the authority.
-                    if view.bytes() < scores_bytes {
-                        return Err(EpError::KernelFailed(format!(
-                            "Attention: prepared score workspace {} bytes is smaller than the \
-                             {scores_bytes} bytes this dispatch requires",
-                            view.bytes()
-                        )));
-                    }
-                    cuptr(view.ptr().0.cast_const())
-                }
+                Some(view) => std_attention_carve(
+                    view,
+                    workspace_layout.scores_offset,
+                    workspace_layout.scores_bytes,
+                    "score matrix",
+                )?,
                 // Compatibility/opt-out path (direct `execute`, e.g. unit tests):
                 // no executor-prepared workspace, so the score scratch stays
                 // self-owned — pooled on the capture-eligible route, per-call
                 // otherwise.
                 None => match ws.as_mut() {
-                    Some(ws) => ws.reserve(WS_SCORES, scores_bytes)?,
-                    None => alloc(&self.runtime, &mut owned, scores_bytes)?,
+                    Some(ws) => ws.reserve(WS_SCORES, workspace_layout.scores_bytes)?,
+                    None => alloc(&self.runtime, &mut owned, workspace_layout.scores_bytes)?,
                 },
             };
             let key_kv_ptr = if stage_key {
-                match ws.as_mut() {
-                    Some(ws) => ws.reserve(WS_STAGE_KEY, present_key_expected * element_bytes)?,
-                    None => alloc(
-                        &self.runtime,
-                        &mut owned,
-                        present_key_expected * element_bytes,
+                match prepared {
+                    Some(view) => std_attention_carve(
+                        view,
+                        workspace_layout.stage_key_offset.ok_or_else(|| {
+                            EpError::KernelFailed(
+                                "Attention: staged-key workspace layout is missing its offset"
+                                    .into(),
+                            )
+                        })?,
+                        workspace_layout.stage_key_bytes,
+                        "staged key",
                     )?,
+                    None => match ws.as_mut() {
+                        Some(ws) => ws.reserve(WS_STAGE_KEY, workspace_layout.stage_key_bytes)?,
+                        None => alloc(&self.runtime, &mut owned, workspace_layout.stage_key_bytes)?,
+                    },
                 }
             } else {
                 present_key_ptr
             };
             let value_kv_ptr = if stage_value {
-                match ws.as_mut() {
-                    Some(ws) => {
-                        ws.reserve(WS_STAGE_VALUE, present_value_expected * element_bytes)?
-                    }
-                    None => alloc(
-                        &self.runtime,
-                        &mut owned,
-                        present_value_expected * element_bytes,
+                match prepared {
+                    Some(view) => std_attention_carve(
+                        view,
+                        workspace_layout.stage_value_offset.ok_or_else(|| {
+                            EpError::KernelFailed(
+                                "Attention: staged-value workspace layout is missing its offset"
+                                    .into(),
+                            )
+                        })?,
+                        workspace_layout.stage_value_bytes,
+                        "staged value",
                     )?,
+                    None => match ws.as_mut() {
+                        Some(ws) => {
+                            ws.reserve(WS_STAGE_VALUE, workspace_layout.stage_value_bytes)?
+                        }
+                        None => alloc(
+                            &self.runtime,
+                            &mut owned,
+                            workspace_layout.stage_value_bytes,
+                        )?,
+                    },
                 }
             } else {
                 present_value_ptr
@@ -1760,27 +2006,33 @@ impl StandardAttentionKernel {
         result.and(free_result)
     }
 
-    /// Report the exact fp32 score-matrix scratch this dispatch will materialize
-    /// (#736), for prepare-only planning. Delegates to the free
-    /// [`std_attention_scores_requirement`] so the route/lifetime classifier is
-    /// covered by CPU-only unit tests without a GPU.
-    fn reference_scores_requirement(
+    /// Report the exact score + route-required staged-K/V composite this
+    /// dispatch can materialize (#736). The free helper is covered by CPU-only
+    /// tests so planning and execution remain aligned without a GPU.
+    fn composite_workspace_requirement(
         &self,
         inputs: &[TensorMetadata<'_>],
     ) -> Result<WorkspaceRequirement> {
-        std_attention_scores_requirement(inputs, self.q_num_heads, self.kv_num_heads)
+        std_attention_workspace_requirement(
+            inputs,
+            self.q_num_heads,
+            self.kv_num_heads,
+            self.is_causal,
+            self.output_count,
+        )
     }
 }
 
 impl Kernel for StandardAttentionKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         // Compatibility/opt-out path: no executor-prepared workspace, so the
-        // score scratch stays self-owned (pooled or per-call inside `run`).
+        // score + staged-K/V scratch stays self-owned (pooled or per-call inside
+        // `run`).
         self.run(inputs, outputs, None)
     }
 
     fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
-        self.reference_scores_requirement(inputs)
+        self.composite_workspace_requirement(inputs)
     }
 
     fn execute_with_workspace(
@@ -1889,14 +2141,16 @@ mod alias_tests {
             kv_num_heads: Some(heads),
             qk_matmul_output_mode: 0,
             softcap: 0.0,
+            output_count: 3,
             since_version: 24,
             workspace: Mutex::new(StdAttnWorkspace::new(rt.clone())),
             last_capture_safe_signature: Mutex::new(None),
         };
 
         // Runs one decode step; when `alias` the present KV outputs share the
-        // past KV buffers. Returns the attention output Y as f32.
-        let run = |alias: bool| -> Vec<f32> {
+        // past KV buffers. `governed` routes the score + staged K/V composite
+        // through an executor-shaped prepared workspace.
+        let run = |alias: bool, governed: bool| -> Vec<f32> {
             let q_sh = [1usize, heads, qlen, kdim];
             let kcur_sh = [1usize, heads, qlen, kdim];
             let vcur_sh = [1usize, heads, qlen, vdim];
@@ -1944,6 +2198,23 @@ mod alias_tests {
                     )
                 };
                 let y_buf = rt.alloc_raw(heads * qlen * vdim * 4).unwrap();
+                let workspace_layout = std_attention_workspace_layout(
+                    1,
+                    heads,
+                    qlen,
+                    total,
+                    heads,
+                    total,
+                    kdim,
+                    total,
+                    vdim,
+                    std::mem::size_of::<f32>(),
+                    alias,
+                    alias,
+                )
+                .unwrap();
+                let workspace_buf =
+                    governed.then(|| rt.alloc_raw(workspace_layout.total_bytes).unwrap());
 
                 let dp = |p: CUdeviceptr| DevicePtr(p as *const c_void);
                 let dpm = |p: CUdeviceptr| DevicePtrMut(p as *mut c_void);
@@ -1974,7 +2245,20 @@ mod alias_tests {
                     ),
                 ];
 
-                kernel.execute(&inputs, &mut outputs).unwrap();
+                if let Some(workspace_buf) = workspace_buf {
+                    kernel
+                        .execute_with_workspace(
+                            &inputs,
+                            &mut outputs,
+                            Some(WorkspaceView::new(
+                                dpm(workspace_buf),
+                                workspace_layout.total_bytes,
+                            )),
+                        )
+                        .unwrap();
+                } else {
+                    kernel.execute(&inputs, &mut outputs).unwrap();
+                }
 
                 let mut y_bytes = vec![0u8; heads * qlen * vdim * 4];
                 rt.dtoh(&mut y_bytes, y_buf).unwrap();
@@ -1989,21 +2273,30 @@ mod alias_tests {
                     rt.free_raw(presk_buf).unwrap();
                     rt.free_raw(presv_buf).unwrap();
                 }
+                if let Some(workspace_buf) = workspace_buf {
+                    rt.free_raw(workspace_buf).unwrap();
+                }
                 bytes_f32(&y_bytes)
             }
         };
 
         // Non-aliased present/past buffers give the race-free ground truth.
-        let reference = run(false);
-        // In-place growth must reproduce it exactly and be stable across runs.
-        let aliased = run(true);
+        let reference = run(false, false);
+        // Both the compatibility fallback and governed prepared composite must
+        // reproduce it exactly; the fallback remains stable across runs.
+        let aliased = run(true, false);
         assert_eq!(
             aliased, reference,
             "in-place KV-cache growth (present aliases past) must match the non-aliased reference"
         );
+        assert_eq!(
+            run(true, true),
+            reference,
+            "governed staged KV growth must match the non-aliased reference"
+        );
         for i in 0..4 {
             assert_eq!(
-                run(true),
+                run(true, false),
                 aliased,
                 "aliased KV-cache growth must be deterministic across runs (iteration {i})"
             );
@@ -2049,6 +2342,7 @@ mod alias_tests {
             kv_num_heads: Some(heads),
             qk_matmul_output_mode: 0,
             softcap: 0.0,
+            output_count: 3,
             since_version: 24,
             workspace: Mutex::new(StdAttnWorkspace::new(rt.clone())),
             last_capture_safe_signature: Mutex::new(None),
@@ -2218,6 +2512,7 @@ mod alias_tests {
             kv_num_heads: Some(1),
             qk_matmul_output_mode: 0,
             softcap: 0.0,
+            output_count: 1,
             since_version: 24,
             workspace: Mutex::new(StdAttnWorkspace::new(rt.clone())),
             last_capture_safe_signature: Mutex::new(None),
@@ -2297,6 +2592,7 @@ mod alias_tests {
             kv_num_heads: Some(1),
             qk_matmul_output_mode: 0,
             softcap: 0.0,
+            output_count: 1,
             since_version: 24,
             workspace: Mutex::new(StdAttnWorkspace::new(rt.clone())),
             last_capture_safe_signature: Mutex::new(None),
@@ -2333,13 +2629,33 @@ mod alias_tests {
 #[cfg(test)]
 mod workspace_governance_tests {
     //! CPU-only unit tests (no GPU needed) for the governed default-domain
-    //! `Attention` score matrix (#736): the shared byte helper and the
-    //! prepare-only route/lifetime classifier.
+    //! `Attention` score + staged-K/V composite (#736): shared sizing, route
+    //! split, and both lifetime classes.
     use super::*;
     use onnx_runtime_ep_api::TensorMetadata;
 
     fn meta(dtype: DataType, shape: &[usize]) -> TensorMetadata<'_> {
         TensorMetadata::new(dtype, shape, true)
+    }
+
+    fn dense_inputs(
+        dtype: DataType,
+        batch: usize,
+        q_seq: usize,
+        past_seq: usize,
+    ) -> Vec<TensorMetadata<'static>> {
+        let q = Box::leak(Box::new([batch, q_seq, 32 * 128]));
+        let kv = Box::leak(Box::new([batch, q_seq, 8 * 128]));
+        let absent_mask = Box::leak(Box::new([]));
+        let past = Box::leak(Box::new([batch, 8, past_seq, 128]));
+        vec![
+            meta(dtype, q),
+            meta(dtype, kv),
+            meta(dtype, kv),
+            TensorMetadata::new(DataType::Undefined, absent_mask, false),
+            meta(dtype, past),
+            meta(dtype, past),
+        ]
     }
 
     #[test]
@@ -2359,14 +2675,20 @@ mod workspace_governance_tests {
     }
 
     #[test]
-    fn prefill_scores_are_step_scoped_and_quadratic() {
+    fn prefill_without_past_charges_only_step_scoped_scores() {
         // Multi-token prefill (the 512-MiB-class worst case) is the per-call
-        // route: StepScoped, sized to `batch·heads·q_seq·(past+key)` fp32.
+        // route: StepScoped, sized to `batch·heads·q_seq·key` fp32. With no past
+        // cache there is no aliased growth to stage.
         let hidden = 32 * 128;
         let q = [1usize, 2048, hidden];
         let kv = [1usize, 2048, hidden];
-        let inputs = [meta(DataType::Float32, &q), meta(DataType::Float32, &kv)];
-        let req = std_attention_scores_requirement(&inputs, Some(32), Some(32)).unwrap();
+        let inputs = [
+            meta(DataType::Float32, &q),
+            meta(DataType::Float32, &kv),
+            meta(DataType::Float32, &kv),
+        ];
+        let req =
+            std_attention_workspace_requirement(&inputs, Some(32), Some(32), true, 3).unwrap();
         assert_eq!(req.bytes, 1u64 * 32 * 2048 * 2048 * 4);
         assert_eq!(req.lifetime, WorkspaceLifetime::StepScoped);
         assert!(matches!(
@@ -2377,24 +2699,16 @@ mod workspace_governance_tests {
     }
 
     #[test]
-    fn single_token_decode_scores_are_session_persistent() {
-        // Single-token decode is the only capture-eligible (pooled/retained)
-        // route: SessionPersistent, and linear in the past-cache capacity.
-        let hidden_q = 32 * 128;
-        let hidden_kv = 8 * 128;
-        let q = [1usize, 1, hidden_q];
-        let kv = [1usize, 1, hidden_kv];
-        let past = [1usize, 8, 2048, 128];
-        let inputs = [
-            meta(DataType::Float32, &q),
-            meta(DataType::Float32, &kv),
-            meta(DataType::Float32, &kv),
-            meta(DataType::Float32, &[1, 1, 1, 1]),
-            meta(DataType::Float32, &past),
-        ];
-        let req = std_attention_scores_requirement(&inputs, Some(32), Some(8)).unwrap();
-        // total_seq = past(2048) + current key(1) -> over-estimates by one row.
-        assert_eq!(req.bytes, 1u64 * 32 * 1 * (2048 + 1) * 4);
+    fn dense_single_token_growth_stages_both_as_session_persistent() {
+        let inputs = dense_inputs(DataType::Float16, 1, 1, 2048);
+        assert_eq!(std_attention_staging_route(&inputs, true, 3), (true, true));
+        let layout =
+            std_attention_workspace_layout(1, 32, 1, 2049, 8, 2049, 128, 2049, 128, 2, true, true)
+                .unwrap();
+        let req = std_attention_workspace_requirement(&inputs, Some(32), Some(8), true, 3).unwrap();
+        assert_eq!(req.bytes, layout.total_bytes as u64);
+        assert_eq!(layout.stage_key_bytes, 1 * 8 * 2049 * 128 * 2);
+        assert_eq!(layout.stage_value_bytes, 1 * 8 * 2049 * 128 * 2);
         assert_eq!(req.lifetime, WorkspaceLifetime::SessionPersistent);
         assert!(matches!(
             req.role,
@@ -2403,43 +2717,104 @@ mod workspace_governance_tests {
     }
 
     #[test]
+    fn dense_prefill_growth_stages_both_as_step_scoped() {
+        let inputs = dense_inputs(DataType::Float32, 2, 8, 128);
+        let layout =
+            std_attention_workspace_layout(2, 32, 8, 136, 8, 136, 128, 136, 128, 4, true, true)
+                .unwrap();
+        let req = std_attention_workspace_requirement(&inputs, Some(32), Some(8), true, 3).unwrap();
+        assert_eq!(req.bytes, layout.total_bytes as u64);
+        assert!(layout.stage_key_offset.is_some());
+        assert!(layout.stage_value_offset.is_some());
+        assert_eq!(req.lifetime, WorkspaceLifetime::StepScoped);
+        assert!(matches!(
+            req.role,
+            MemoryRole::Workspace { step_scoped: true }
+        ));
+    }
+
+    #[test]
+    fn fixed_capacity_append_and_missing_present_outputs_charge_zero_staging() {
+        let mut fixed = dense_inputs(DataType::Float16, 1, 1, 2048);
+        fixed[3] = meta(DataType::Float32, Box::leak(Box::new([1, 1, 1, 2048])));
+        assert_eq!(
+            std_attention_staging_route(&fixed, false, 3),
+            (false, false),
+            "mask-driven non-causal fixed-capacity append must report no staging"
+        );
+        let fixed_req =
+            std_attention_workspace_requirement(&fixed, Some(32), Some(8), false, 3).unwrap();
+        assert_eq!(
+            fixed_req.bytes,
+            std_attention_scores_bytes(1, 32, 1, 2049).unwrap() as u64,
+            "the composite keeps its always-live scores but charges zero staged-K/V bytes"
+        );
+
+        let mut dense = dense_inputs(DataType::Float16, 1, 1, 2048);
+        dense[3] = meta(DataType::Float32, Box::leak(Box::new([1, 1, 1, 2049])));
+        assert_eq!(
+            std_attention_staging_route(&dense, false, 3),
+            (true, true),
+            "a logical-width mask is not evidence of fixed-capacity append"
+        );
+        assert_eq!(
+            std_attention_staging_route(&dense, true, 1),
+            (false, false),
+            "a one-output Attention node has no present cache to stage"
+        );
+        let one_output_req =
+            std_attention_workspace_requirement(&dense, Some(32), Some(8), true, 1).unwrap();
+        assert_eq!(one_output_req.bytes, fixed_req.bytes);
+    }
+
+    #[test]
     fn non_float_or_unresolvable_metadata_reserves_nothing() {
         // Non-float operand: rejected by `run`, so charge nothing.
         let q_i = [1usize, 8, 256];
-        let int_inputs = [meta(DataType::Int32, &q_i), meta(DataType::Int32, &q_i)];
+        let int_inputs = [
+            meta(DataType::Int32, &q_i),
+            meta(DataType::Int32, &q_i),
+            meta(DataType::Int32, &q_i),
+        ];
         assert_eq!(
-            std_attention_scores_requirement(&int_inputs, Some(4), Some(4)).unwrap(),
+            std_attention_workspace_requirement(&int_inputs, Some(4), Some(4), true, 3).unwrap(),
             WorkspaceRequirement::NONE
         );
         // Rank-2 shape is not a resolvable attention operand.
         let bad = [8usize, 256];
-        let bad_inputs = [meta(DataType::Float32, &bad), meta(DataType::Float32, &bad)];
+        let bad_inputs = [
+            meta(DataType::Float32, &bad),
+            meta(DataType::Float32, &bad),
+            meta(DataType::Float32, &bad),
+        ];
         assert_eq!(
-            std_attention_scores_requirement(&bad_inputs, Some(4), Some(4)).unwrap(),
+            std_attention_workspace_requirement(&bad_inputs, Some(4), Some(4), true, 3).unwrap(),
             WorkspaceRequirement::NONE
         );
     }
 }
 
 /// Regression guard for issue #736: the governed default-domain `Attention`
-/// score matrix (`WS_SCORES`) is routed through `Kernel::workspace_requirement`
-/// + an executor-prepared workspace, consumed via `execute_with_workspace`. This
-/// CPU-only test fails if the score buffer reintroduces an unconditional raw
-/// (self-owned) allocation on the governed dispatch, bypassing the device
-/// authority. It runs on CI without a GPU, matching the #751/#795 bar (a source
-/// scan compiled into the test binary, not an external `Select-String`).
+/// score + staged-K/V composite is routed through `Kernel::workspace_requirement`
+/// + an executor-prepared workspace, consumed via `execute_with_workspace`.
+/// This CPU-only source scan fails if the governed dispatch reintroduces raw
+/// staged K/V allocation, and runs on CI without a GPU.
 #[cfg(test)]
 mod raw_allocation_guard {
     #[test]
-    fn std_attention_scores_slot_is_governed_not_raw_allocated() {
+    fn std_attention_composite_is_governed_not_raw_allocated() {
         const SOURCE: &str = include_str!("standard_attention.rs");
         assert!(
             SOURCE.contains("fn execute_with_workspace"),
             "default-domain Attention must stay wired into governed workspace preparation (#736)."
         );
         assert!(
-            SOURCE.contains("std_attention_scores_bytes"),
-            "the score buffer must be sized through the shared helper (#736)."
+            SOURCE.contains("std_attention_workspace_layout"),
+            "scores and staged K/V must be sized through the shared layout helper (#736)."
+        );
+        assert!(
+            SOURCE.contains("\"staged key\"") && SOURCE.contains("\"staged value\""),
+            "execute_with_workspace must carve both staged K/V regions from prepared memory."
         );
         // The pre-#736 seam sized the score slot as `qk_expected * 4` directly
         // in both the pooled and per-call branches. The needles are assembled at
@@ -2451,6 +2826,21 @@ mod raw_allocation_guard {
             "default-domain Attention must not reintroduce an unconditional raw allocation of the \
              governed score slot (#736); size it through `std_attention_scores_bytes` and consume \
              the executor-prepared workspace."
+        );
+        let raw_key = [
+            "ws.reserve(WS_STAGE_KEY, present_key_expected",
+            " * element_bytes)",
+        ]
+        .concat();
+        let raw_value = [
+            "ws.reserve(WS_STAGE_VALUE, present_value_expected",
+            " * element_bytes)",
+        ]
+        .concat();
+        assert!(
+            !SOURCE.contains(raw_key.as_str()) && !SOURCE.contains(raw_value.as_str()),
+            "default-domain Attention must not bypass the prepared composite with direct staged \
+             K/V slot sizing; use `std_attention_workspace_layout` for both planning and execution."
         );
     }
 }
