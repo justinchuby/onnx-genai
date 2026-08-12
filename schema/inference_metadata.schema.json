@@ -56,101 +56,6 @@
       ],
       "type": "string"
     },
-    "AdapterComponentContract": {
-      "description": "Stable semantic roles for versioned runtime adapter ABIs.",
-      "oneOf": [
-        {
-          "additionalProperties": false,
-          "properties": {
-            "action": {
-              "$ref": "#/$defs/GrammarGuidanceAction"
-            },
-            "consumed_length": {
-              "type": "string"
-            },
-            "effect": {
-              "type": "string"
-            },
-            "forced_length": {
-              "type": "string"
-            },
-            "forced_tokens": {
-              "type": "string"
-            },
-            "logits_mask": {
-              "type": "string"
-            },
-            "next_state": {
-              "type": "string"
-            },
-            "role": {
-              "const": "grammar_guidance",
-              "type": "string"
-            },
-            "state": {
-              "type": "string"
-            },
-            "tokens": {
-              "type": "string"
-            },
-            "transition_table": {
-              "type": "string"
-            },
-            "valid_length": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "role",
-            "action",
-            "state",
-            "tokens",
-            "valid_length",
-            "transition_table",
-            "next_state",
-            "consumed_length",
-            "logits_mask",
-            "forced_tokens",
-            "forced_length",
-            "effect"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "action": {
-              "$ref": "#/$defs/TelemetryAction"
-            },
-            "duration_ms": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "effect": {
-              "type": "string"
-            },
-            "role": {
-              "const": "telemetry",
-              "type": "string"
-            },
-            "timestamp": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          "required": [
-            "role",
-            "action",
-            "effect"
-          ],
-          "type": "object"
-        }
-      ]
-    },
     "AttentionConfig": {
       "description": "Build-time attention architecture and dimensions.",
       "properties": {
@@ -281,6 +186,39 @@
           ]
         }
       },
+      "type": "object"
+    },
+    "ComponentContract": {
+      "additionalProperties": false,
+      "properties": {
+        "bindings": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "Semantic role to concrete component port name.",
+          "type": "object"
+        },
+        "id": {
+          "description": "Versioned semantic capability identifier. It never selects execution behavior.",
+          "type": "string"
+        },
+        "parameters": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ScalarValue"
+          },
+          "default": {},
+          "description": "Contract parameters that are not tensor ports, such as adapter actions.",
+          "type": "object"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "version"
+      ],
       "type": "object"
     },
     "ComponentImplementation": {
@@ -502,22 +440,6 @@
       ],
       "type": "string"
     },
-    "EffectTransition": {
-      "additionalProperties": false,
-      "properties": {
-        "consumes": {
-          "type": "string"
-        },
-        "produces": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "consumes",
-        "produces"
-      ],
-      "type": "object"
-    },
     "ForkPrecisionPolicy": {
       "description": "KV fork-precision policy vocabulary.",
       "oneOf": [
@@ -656,14 +578,6 @@
         }
       },
       "type": "object"
-    },
-    "GrammarGuidanceAction": {
-      "enum": [
-        "clone",
-        "lookahead",
-        "commit"
-      ],
-      "type": "string"
     },
     "HardwareRequirements": {
       "description": "Model-side hardware requirements and distribution-matching hints.",
@@ -2225,332 +2139,6 @@
       ],
       "type": "object"
     },
-    "PolicyComponentContract": {
-      "description": "Stable semantic roles for ONNX policy-math components.\n\nFields map semantic roles to concrete ONNX port names. The corresponding\ntensor contracts live in [`WorkflowComponent::ports`].",
-      "oneOf": [
-        {
-          "additionalProperties": false,
-          "properties": {
-            "effect": {
-              "type": "string"
-            },
-            "logits": {
-              "type": "string"
-            },
-            "mode": {
-              "$ref": "#/$defs/SamplingPolicyMode"
-            },
-            "rng": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/RngPortContract"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "role": {
-              "const": "token_sampler",
-              "type": "string"
-            },
-            "temperature": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "token": {
-              "type": "string"
-            },
-            "top_k": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "top_p": {
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          "required": [
-            "role",
-            "mode",
-            "logits",
-            "token",
-            "effect"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "done": {
-              "type": "string"
-            },
-            "effect": {
-              "type": "string"
-            },
-            "eos_ids": {
-              "type": "string"
-            },
-            "iteration": {
-              "type": "string"
-            },
-            "max_iterations": {
-              "type": "string"
-            },
-            "role": {
-              "const": "termination_predicate",
-              "type": "string"
-            },
-            "tokens": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "role",
-            "tokens",
-            "eos_ids",
-            "iteration",
-            "max_iterations",
-            "done",
-            "effect"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "effect": {
-              "type": "string"
-            },
-            "estimate": {
-              "type": "string"
-            },
-            "next_state": {
-              "type": "string"
-            },
-            "role": {
-              "const": "solver_step",
-              "type": "string"
-            },
-            "schedule": {
-              "type": "string"
-            },
-            "state": {
-              "type": "string"
-            },
-            "step": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "role",
-            "state",
-            "estimate",
-            "step",
-            "schedule",
-            "next_state",
-            "effect"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "effect": {
-              "type": "string"
-            },
-            "mask": {
-              "type": "string"
-            },
-            "next_mask": {
-              "type": "string"
-            },
-            "next_state": {
-              "type": "string"
-            },
-            "proposal": {
-              "type": "string"
-            },
-            "rng": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/RngPortContract"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "role": {
-              "const": "masked_update",
-              "type": "string"
-            },
-            "state": {
-              "type": "string"
-            },
-            "step": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "role",
-            "state",
-            "proposal",
-            "mask",
-            "step",
-            "next_state",
-            "next_mask",
-            "effect"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "accepted_len": {
-              "type": "string"
-            },
-            "accepted_tokens": {
-              "type": "string"
-            },
-            "done": {
-              "type": "string"
-            },
-            "effect": {
-              "type": "string"
-            },
-            "proposal_scores": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "proposed_tokens": {
-              "type": "string"
-            },
-            "rng": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/RngPortContract"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "role": {
-              "const": "speculative_verifier",
-              "type": "string"
-            },
-            "target_scores": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "role",
-            "target_scores",
-            "proposed_tokens",
-            "accepted_tokens",
-            "accepted_len",
-            "done",
-            "effect"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "current": {
-              "type": "string"
-            },
-            "effect": {
-              "type": "string"
-            },
-            "next": {
-              "type": "string"
-            },
-            "role": {
-              "const": "state_update",
-              "type": "string"
-            },
-            "update": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "role",
-            "current",
-            "update",
-            "next",
-            "effect"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "accepted": {
-              "type": "string"
-            },
-            "committed_tokens": {
-              "type": "string"
-            },
-            "current_k": {
-              "type": "string"
-            },
-            "draft_ms": {
-              "type": "string"
-            },
-            "effect": {
-              "type": "string"
-            },
-            "estimates": {
-              "type": "string"
-            },
-            "evaluated": {
-              "type": "string"
-            },
-            "filled_proposal_budget": {
-              "type": "string"
-            },
-            "next_estimates": {
-              "type": "string"
-            },
-            "next_k": {
-              "type": "string"
-            },
-            "role": {
-              "const": "adaptive_proposal_budget",
-              "type": "string"
-            },
-            "target_ms": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "role",
-            "current_k",
-            "accepted",
-            "evaluated",
-            "committed_tokens",
-            "filled_proposal_budget",
-            "draft_ms",
-            "target_ms",
-            "estimates",
-            "next_k",
-            "next_estimates",
-            "effect"
-          ],
-          "type": "object"
-        }
-      ]
-    },
     "Precision": {
       "description": "Weight precision and quantization-recipe vocabulary.",
       "oneOf": [
@@ -2757,27 +2345,6 @@
       ],
       "type": "object"
     },
-    "RngPortContract": {
-      "additionalProperties": false,
-      "description": "Counter-based RNG state. Producers should use Philox or Threefry inside ONNX.",
-      "properties": {
-        "next_offset": {
-          "type": "string"
-        },
-        "offset": {
-          "type": "string"
-        },
-        "seed": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "seed",
-        "offset",
-        "next_offset"
-      ],
-      "type": "object"
-    },
     "RuntimeConfigurable": {
       "description": "Features whose concrete settings may be selected by the runtime.",
       "properties": {
@@ -2852,13 +2419,6 @@
         "dtype"
       ],
       "type": "object"
-    },
-    "SamplingPolicyMode": {
-      "enum": [
-        "greedy",
-        "seeded_stochastic"
-      ],
-      "type": "string"
     },
     "ScalarValue": {
       "anyOf": [
@@ -3745,13 +3305,6 @@
       },
       "type": "object"
     },
-    "TelemetryAction": {
-      "enum": [
-        "start",
-        "elapsed"
-      ],
-      "type": "string"
-    },
     "TensorContract": {
       "additionalProperties": false,
       "description": "Typed tensor contract used at package and component boundaries.",
@@ -3970,35 +3523,6 @@
         }
       ]
     },
-    "WorkflowBranchEffectMerge": {
-      "additionalProperties": false,
-      "properties": {
-        "cases": {
-          "additionalProperties": {
-            "type": "string"
-          },
-          "type": "object"
-        },
-        "default": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "incoming": {
-          "type": "string"
-        },
-        "produces": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "incoming",
-        "cases",
-        "produces"
-      ],
-      "type": "object"
-    },
     "WorkflowBranchOutput": {
       "additionalProperties": false,
       "properties": {
@@ -4020,13 +3544,35 @@
       ],
       "type": "object"
     },
+    "WorkflowCarry": {
+      "additionalProperties": false,
+      "properties": {
+        "cell": {
+          "type": "string"
+        },
+        "initial": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "next": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "cell",
+        "next"
+      ],
+      "type": "object"
+    },
     "WorkflowComponent": {
       "additionalProperties": false,
       "properties": {
-        "adapter": {
+        "contract": {
           "anyOf": [
             {
-              "$ref": "#/$defs/AdapterComponentContract"
+              "$ref": "#/$defs/ComponentContract"
             },
             {
               "type": "null"
@@ -4043,18 +3589,12 @@
         "implementation": {
           "$ref": "#/$defs/ComponentImplementation"
         },
-        "policy": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/PolicyComponentContract"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
         "ports": {
-          "$ref": "#/$defs/ComponentPorts"
+          "$ref": "#/$defs/ComponentPorts",
+          "default": {
+            "inputs": {},
+            "outputs": {}
+          }
         },
         "resources": {
           "anyOf": [
@@ -4068,8 +3608,7 @@
         }
       },
       "required": [
-        "implementation",
-        "ports"
+        "implementation"
       ],
       "type": "object"
     },
@@ -4183,42 +3722,6 @@
         }
       ]
     },
-    "WorkflowLoopCarry": {
-      "additionalProperties": false,
-      "properties": {
-        "body_input": {
-          "type": "string"
-        },
-        "body_output": {
-          "type": "string"
-        },
-        "cell": {
-          "type": "string"
-        },
-        "current": {
-          "type": "string"
-        },
-        "next": {
-          "type": "string"
-        },
-        "read_effect": {
-          "$ref": "#/$defs/EffectTransition"
-        },
-        "write_effect": {
-          "$ref": "#/$defs/EffectTransition"
-        }
-      },
-      "required": [
-        "cell",
-        "current",
-        "body_input",
-        "body_output",
-        "next",
-        "read_effect",
-        "write_effect"
-      ],
-      "type": "object"
-    },
     "WorkflowLoopIteration": {
       "additionalProperties": false,
       "properties": {
@@ -4288,228 +3791,6 @@
         "pinned"
       ],
       "type": "string"
-    },
-    "WorkflowNode": {
-      "oneOf": [
-        {
-          "additionalProperties": false,
-          "properties": {
-            "kind": {
-              "const": "sequence",
-              "type": "string"
-            },
-            "nodes": {
-              "items": {
-                "$ref": "#/$defs/WorkflowNode"
-              },
-              "type": "array"
-            }
-          },
-          "required": [
-            "kind",
-            "nodes"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "component": {
-              "type": "string"
-            },
-            "effects": {
-              "additionalProperties": {
-                "$ref": "#/$defs/EffectTransition"
-              },
-              "default": {},
-              "type": "object"
-            },
-            "inputs": {
-              "additionalProperties": {
-                "type": "string"
-              },
-              "default": {},
-              "type": "object"
-            },
-            "kind": {
-              "const": "invoke",
-              "type": "string"
-            },
-            "outputs": {
-              "additionalProperties": {
-                "type": "string"
-              },
-              "default": {},
-              "type": "object"
-            }
-          },
-          "required": [
-            "kind",
-            "component"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "body": {
-              "$ref": "#/$defs/WorkflowNode"
-            },
-            "carried": {
-              "default": [],
-              "items": {
-                "$ref": "#/$defs/WorkflowLoopCarry"
-              },
-              "type": "array"
-            },
-            "condition": {
-              "type": "string"
-            },
-            "iteration": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/WorkflowLoopIteration"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Optional zero-based induction value, scoped to this loop's body and condition."
-            },
-            "kind": {
-              "const": "loop",
-              "type": "string"
-            },
-            "max_iterations": {
-              "type": "string"
-            },
-            "setup": {
-              "$ref": "#/$defs/WorkflowNode"
-            }
-          },
-          "required": [
-            "kind",
-            "setup",
-            "body",
-            "condition",
-            "max_iterations"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "cases": {
-              "additionalProperties": {
-                "$ref": "#/$defs/WorkflowNode"
-              },
-              "type": "object"
-            },
-            "default": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/WorkflowNode"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "effects": {
-              "additionalProperties": {
-                "$ref": "#/$defs/WorkflowBranchEffectMerge"
-              },
-              "default": {},
-              "type": "object"
-            },
-            "kind": {
-              "const": "branch",
-              "type": "string"
-            },
-            "outputs": {
-              "additionalProperties": {
-                "$ref": "#/$defs/WorkflowBranchOutput"
-              },
-              "default": {},
-              "type": "object"
-            },
-            "predicate": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind",
-            "predicate",
-            "cases"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "effect": {
-              "$ref": "#/$defs/EffectTransition"
-            },
-            "effect_name": {
-              "type": "string"
-            },
-            "kind": {
-              "const": "emit",
-              "type": "string"
-            },
-            "mode": {
-              "$ref": "#/$defs/WorkflowEmitMode"
-            },
-            "output": {
-              "type": "string"
-            },
-            "valid_length": {
-              "description": "Optional scalar or rank-one integer SSA value limiting the emitted prefix\non the value's final axis. It must contain exactly one element at runtime.",
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "value": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind",
-            "value",
-            "output",
-            "mode",
-            "effect_name",
-            "effect"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "device": {
-              "$ref": "#/$defs/DeviceKind"
-            },
-            "input": {
-              "type": "string"
-            },
-            "kind": {
-              "const": "transfer",
-              "type": "string"
-            },
-            "output": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind",
-            "input",
-            "output",
-            "device"
-          ],
-          "type": "object"
-        }
-      ]
     },
     "WorkflowOutput": {
       "additionalProperties": false,
@@ -4593,16 +3874,6 @@
           },
           "type": "object"
         },
-        "graph": {
-          "$ref": "#/$defs/WorkflowNode"
-        },
-        "initial_effects": {
-          "additionalProperties": {
-            "type": "string"
-          },
-          "default": {},
-          "type": "object"
-        },
         "inputs": {
           "additionalProperties": {
             "$ref": "#/$defs/WorkflowInput"
@@ -4636,12 +3907,18 @@
           },
           "default": {},
           "type": "object"
+        },
+        "steps": {
+          "items": {
+            "$ref": "#/$defs/WorkflowStep"
+          },
+          "type": "array"
         }
       },
       "required": [
         "manifest",
         "components",
-        "graph"
+        "steps"
       ],
       "type": "object"
     },
@@ -4696,6 +3973,185 @@
         "session"
       ],
       "type": "string"
+    },
+    "WorkflowStep": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "sequence",
+              "type": "string"
+            },
+            "steps": {
+              "items": {
+                "$ref": "#/$defs/WorkflowStep"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "kind",
+            "steps"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "component": {
+              "type": "string"
+            },
+            "inputs": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {},
+              "type": "object"
+            },
+            "kind": {
+              "const": "invoke",
+              "type": "string"
+            },
+            "outputs": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {},
+              "type": "object"
+            }
+          },
+          "required": [
+            "kind",
+            "component"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "carried": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/WorkflowCarry"
+              },
+              "type": "array"
+            },
+            "condition": {
+              "type": "string"
+            },
+            "iteration": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/WorkflowLoopIteration"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "const": "loop",
+              "type": "string"
+            },
+            "max_iterations": {
+              "type": "string"
+            },
+            "setup": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/WorkflowStep"
+              },
+              "type": "array"
+            },
+            "steps": {
+              "items": {
+                "$ref": "#/$defs/WorkflowStep"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "kind",
+            "steps",
+            "condition",
+            "max_iterations"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "cases": {
+              "additionalProperties": {
+                "$ref": "#/$defs/WorkflowStep"
+              },
+              "type": "object"
+            },
+            "default": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/WorkflowStep"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "const": "branch",
+              "type": "string"
+            },
+            "outputs": {
+              "additionalProperties": {
+                "$ref": "#/$defs/WorkflowBranchOutput"
+              },
+              "default": {},
+              "type": "object"
+            },
+            "predicate": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "predicate",
+            "cases"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "emit",
+              "type": "string"
+            },
+            "mode": {
+              "$ref": "#/$defs/WorkflowEmitMode"
+            },
+            "output": {
+              "type": "string"
+            },
+            "valid_length": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "value",
+            "output",
+            "mode"
+          ],
+          "type": "object"
+        }
+      ]
     }
   },
   "$id": "https://github.com/onnx/onnx/issues/8184",

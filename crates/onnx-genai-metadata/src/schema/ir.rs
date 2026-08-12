@@ -2,7 +2,7 @@ use super::*;
 use std::collections::BTreeSet;
 
 /// Typed tensor contract used at package and component boundaries.
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TensorContract {
     #[schemars(with = "schema_vocabulary::TensorDType")]
@@ -48,78 +48,6 @@ pub struct ReducerSpec {
     pub axis: Option<i64>,
 }
 
-/// Generic package control-flow algebra.
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ControlFlow {
-    Sequence {
-        steps: Vec<ControlFlow>,
-    },
-    Invoke {
-        component: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        when: Option<Predicate>,
-    },
-    Loop {
-        body: Box<ControlFlow>,
-        #[serde(default)]
-        carried: Vec<LoopCarry>,
-        termination: Termination,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        step_program: Option<String>,
-    },
-    Branch {
-        predicate: Predicate,
-        cases: BTreeMap<String, ControlFlow>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        default: Option<Box<ControlFlow>>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct LoopCarry {
-    pub state: String,
-    pub from: String,
-    pub to: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Termination {
-    Iterations {
-        count: usize,
-        #[serde(default)]
-        start: usize,
-    },
-    Predicate {
-        condition: Predicate,
-        max_iterations: usize,
-    },
-}
-
-/// Data-only predicates for branch and loop termination.
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
-#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Predicate {
-    Present { input: String },
-    Bool { value: bool },
-    Not { value: Box<Predicate> },
-    All { values: Vec<Predicate> },
-    Any { values: Vec<Predicate> },
-    Equal { left: ScalarExpr, right: ScalarExpr },
-    Less { left: ScalarExpr, right: ScalarExpr },
-    LessEqual { left: ScalarExpr, right: ScalarExpr },
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ScalarExpr {
-    Literal { value: ScalarValue },
-    Value { source: String },
-    Iteration,
-}
-
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(untagged)]
 pub enum ScalarValue {
@@ -131,100 +59,6 @@ pub enum ScalarValue {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum StateScope {
-    Invocation,
-    Loop,
-    Request,
-    Session,
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum StateInit {
-    Zeros,
-    Ones,
-    Input { source: String },
-    Value { source: String },
-    Scalar { value: ScalarValue },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum StateUpdate {
-    Replace,
-    Append { axis: i64 },
-    Scatter { axis: i64, indices: String },
-    Accumulate,
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct StateDeclaration {
-    #[serde(rename = "type")]
-    pub contract: TensorContract,
-    pub init: StateInit,
-    pub update: StateUpdate,
-    pub scope: StateScope,
-}
-
-/// Generic tensor/scalar program executed between component invocations.
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct Program {
-    pub operations: Vec<ProgramOperation>,
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
-#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ProgramOperation {
-    Copy {
-        from: String,
-        to: String,
-    },
-    Cast {
-        input: String,
-        output: String,
-        #[schemars(with = "schema_vocabulary::TensorDType")]
-        dtype: String,
-    },
-    Sample {
-        logits: String,
-        output: String,
-        method: SamplingMethod,
-    },
-    SolverStep {
-        estimate: String,
-        state: String,
-        output: String,
-        solver: SolverSpec,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum SamplingMethod {
-    Greedy,
-    Categorical {
-        temperature: f32,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        top_k: Option<usize>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        top_p: Option<f32>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct SolverSpec {
-    pub algorithm: String,
-    #[serde(default)]
-    pub parameters: BTreeMap<String, f64>,
-    #[serde(default)]
-    pub schedule: Vec<f64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
 pub enum DeviceKind {
     Cpu,
     Cuda,
@@ -232,35 +66,6 @@ pub enum DeviceKind {
     CoreMl,
     WebGpu,
     Npu,
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ResourceContract {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub device: Option<DeviceKind>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub device_index: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory_bytes: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct BatchingContract {
-    pub batch_axis: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_batch_size: Option<usize>,
-    #[serde(default)]
-    pub continuous: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct PostprocessingSpec {
-    pub program: Program,
-    #[serde(default)]
-    pub outputs: BTreeMap<String, String>,
 }
 
 /// Sound, component-centric workflow IR. Tensor math lives in invoked components.
@@ -275,11 +80,9 @@ pub struct WorkflowSpec {
     pub components: BTreeMap<String, WorkflowComponent>,
     #[serde(default)]
     pub state: BTreeMap<String, WorkflowStateCell>,
-    #[serde(default)]
-    pub initial_effects: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serving: Option<ServingServiceContract>,
-    pub graph: WorkflowNode,
+    pub steps: Vec<WorkflowStep>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
@@ -373,154 +176,28 @@ pub enum OutputStage {
 #[serde(deny_unknown_fields)]
 pub struct WorkflowComponent {
     pub implementation: ComponentImplementation,
+    #[serde(default)]
     pub ports: ComponentPorts,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub policy: Option<PolicyComponentContract>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub adapter: Option<AdapterComponentContract>,
+    pub contract: Option<ComponentContract>,
     #[serde(default)]
     pub effects: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<WorkflowResourceContract>,
 }
 
-/// Stable semantic roles for ONNX policy-math components.
-///
-/// Fields map semantic roles to concrete ONNX port names. The corresponding
-/// tensor contracts live in [`WorkflowComponent::ports`].
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
-#[serde(tag = "role", rename_all = "snake_case", deny_unknown_fields)]
-pub enum PolicyComponentContract {
-    TokenSampler {
-        mode: SamplingPolicyMode,
-        logits: String,
-        token: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        temperature: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        top_k: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        top_p: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        rng: Option<RngPortContract>,
-        effect: String,
-    },
-    TerminationPredicate {
-        tokens: String,
-        eos_ids: String,
-        iteration: String,
-        max_iterations: String,
-        done: String,
-        effect: String,
-    },
-    SolverStep {
-        state: String,
-        estimate: String,
-        step: String,
-        schedule: String,
-        next_state: String,
-        effect: String,
-    },
-    MaskedUpdate {
-        state: String,
-        proposal: String,
-        mask: String,
-        step: String,
-        next_state: String,
-        next_mask: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        rng: Option<RngPortContract>,
-        effect: String,
-    },
-    SpeculativeVerifier {
-        target_scores: String,
-        proposed_tokens: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        proposal_scores: Option<String>,
-        accepted_tokens: String,
-        accepted_len: String,
-        done: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        rng: Option<RngPortContract>,
-        effect: String,
-    },
-    StateUpdate {
-        current: String,
-        update: String,
-        next: String,
-        effect: String,
-    },
-    AdaptiveProposalBudget {
-        current_k: String,
-        accepted: String,
-        evaluated: String,
-        committed_tokens: String,
-        filled_proposal_budget: String,
-        draft_ms: String,
-        target_ms: String,
-        estimates: String,
-        next_k: String,
-        next_estimates: String,
-        effect: String,
-    },
-}
-
-/// Stable semantic roles for versioned runtime adapter ABIs.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
-#[serde(tag = "role", rename_all = "snake_case", deny_unknown_fields)]
-pub enum AdapterComponentContract {
-    GrammarGuidance {
-        action: GrammarGuidanceAction,
-        state: String,
-        tokens: String,
-        valid_length: String,
-        transition_table: String,
-        next_state: String,
-        consumed_length: String,
-        logits_mask: String,
-        forced_tokens: String,
-        forced_length: String,
-        effect: String,
-    },
-    Telemetry {
-        action: TelemetryAction,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        timestamp: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        duration_ms: Option<String>,
-        effect: String,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum GrammarGuidanceAction {
-    Clone,
-    Lookahead,
-    Commit,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum TelemetryAction {
-    Start,
-    Elapsed,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum SamplingPolicyMode {
-    Greedy,
-    SeededStochastic,
-}
-
-/// Counter-based RNG state. Producers should use Philox or Threefry inside ONNX.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct RngPortContract {
-    pub seed: String,
-    pub offset: String,
-    pub next_offset: String,
+pub struct ComponentContract {
+    /// Versioned semantic capability identifier. It never selects execution behavior.
+    pub id: String,
+    pub version: String,
+    /// Semantic role to concrete component port name.
+    #[serde(default)]
+    pub bindings: BTreeMap<String, String>,
+    /// Contract parameters that are not tensor ports, such as adapter actions.
+    #[serde(default)]
+    pub parameters: BTreeMap<String, ScalarValue>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
@@ -540,8 +217,7 @@ pub enum ComponentImplementation {
     Binding,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectTransition {
     pub consumes: String,
     pub produces: String,
@@ -549,9 +225,9 @@ pub struct EffectTransition {
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum WorkflowNode {
+pub enum WorkflowStep {
     Sequence {
-        nodes: Vec<WorkflowNode>,
+        steps: Vec<WorkflowStep>,
     },
     Invoke {
         component: String,
@@ -559,7 +235,53 @@ pub enum WorkflowNode {
         inputs: BTreeMap<String, String>,
         #[serde(default)]
         outputs: BTreeMap<String, String>,
+    },
+    Loop {
         #[serde(default)]
+        setup: Vec<WorkflowStep>,
+        steps: Vec<WorkflowStep>,
+        condition: String,
+        max_iterations: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        iteration: Option<WorkflowLoopIteration>,
+        #[serde(default)]
+        carried: Vec<WorkflowCarry>,
+    },
+    Branch {
+        predicate: String,
+        cases: BTreeMap<String, WorkflowStep>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default: Option<Box<WorkflowStep>>,
+        #[serde(default)]
+        outputs: BTreeMap<String, WorkflowBranchOutput>,
+    },
+    Emit {
+        value: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        valid_length: Option<String>,
+        output: String,
+        mode: WorkflowEmitMode,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowCarry {
+    pub cell: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial: Option<String>,
+    pub next: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum WorkflowNode {
+    Sequence {
+        nodes: Vec<WorkflowNode>,
+    },
+    Invoke {
+        component: String,
+        inputs: BTreeMap<String, String>,
+        outputs: BTreeMap<String, String>,
         effects: BTreeMap<String, EffectTransition>,
     },
     Loop {
@@ -568,26 +290,21 @@ pub enum WorkflowNode {
         condition: String,
         max_iterations: String,
         /// Optional zero-based induction value, scoped to this loop's body and condition.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         iteration: Option<WorkflowLoopIteration>,
-        #[serde(default)]
         carried: Vec<WorkflowLoopCarry>,
+        effects: BTreeMap<String, WorkflowLoopEffect>,
     },
     Branch {
         predicate: String,
         cases: BTreeMap<String, WorkflowNode>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         default: Option<Box<WorkflowNode>>,
-        #[serde(default)]
         outputs: BTreeMap<String, WorkflowBranchOutput>,
-        #[serde(default)]
         effects: BTreeMap<String, WorkflowBranchEffectMerge>,
     },
     Emit {
         value: String,
         /// Optional scalar or rank-one integer SSA value limiting the emitted prefix
         /// on the value's final axis. It must contain exactly one element at runtime.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         valid_length: Option<String>,
         output: String,
         mode: WorkflowEmitMode,
@@ -618,18 +335,15 @@ pub struct WorkflowBranchOutput {
     pub default: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowBranchEffectMerge {
     pub incoming: String,
     pub cases: BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<String>,
     pub produces: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowLoopCarry {
     pub cell: String,
     pub current: String,
@@ -638,6 +352,14 @@ pub struct WorkflowLoopCarry {
     pub next: String,
     pub read_effect: EffectTransition,
     pub write_effect: EffectTransition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowLoopEffect {
+    pub incoming: String,
+    pub body_input: String,
+    pub body_output: String,
+    pub produces: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]

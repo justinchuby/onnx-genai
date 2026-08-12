@@ -484,7 +484,6 @@ pipeline:
             grid: { dtype: int64, rank: 2, shape: [1, 2] }
           outputs:
             image_features: { dtype: float32, rank: 4, shape: [batch, 3, 2, 2] }
-        effects: []
       embedding:
         implementation: { kind: onnx, artifact: embedding.onnx.textproto }
         ports:
@@ -492,7 +491,6 @@ pipeline:
             input: { dtype: float32, rank: 4, shape: [batch, 3, 2, 2] }
           outputs:
             output: { dtype: float32, rank: 4, shape: [batch, 3, 2, 2] }
-        effects: []
       decoder:
         implementation: { kind: onnx, artifact: decoder.onnx.textproto }
         ports:
@@ -500,37 +498,27 @@ pipeline:
             input: { dtype: float32, rank: 4, shape: [batch, 3, 2, 2] }
           outputs:
             output: { dtype: float32, rank: 4, shape: [batch, 3, 2, 2] }
-        effects: []
-    initial_effects: { stream: stream.0 }
-    graph:
-      kind: sequence
-      nodes:
+    steps:
         - kind: invoke
           component: preprocess
           inputs: { encoded: request.image }
           outputs: { pixel_values: image.pixel_values, grid: image.grid }
-          effects: {}
         - kind: invoke
           component: vision
           inputs: { pixel_values: image.pixel_values, grid: image.grid }
           outputs: { image_features: vision.features }
-          effects: {}
         - kind: invoke
           component: embedding
           inputs: { input: vision.features }
           outputs: { output: embedding.output }
-          effects: {}
         - kind: invoke
           component: decoder
           inputs: { input: embedding.output }
           outputs: { output: decoder.output }
-          effects: {}
         - kind: emit
           value: decoder.output
           output: result
           mode: replace
-          effect_name: stream
-          effect: { consumes: stream.0, produces: stream.1 }
 "#;
     let root = package(
         "image-adapter",
@@ -586,34 +574,38 @@ pipeline:
     components:
       sampler:
         implementation: { kind: onnx, artifact: sampler.onnx.textproto }
-        ports:
-          inputs:
-            logits: { dtype: float32, rank: 2, shape: [batch, vocabulary] }
-          outputs:
-            token_ids: { dtype: int64, rank: 1, shape: [batch] }
-        policy:
-          role: token_sampler
-          mode: greedy
-          logits: logits
-          token: token_ids
-          effect: sample
-        effects: [sample]
-    initial_effects: { sample: sample.0, stream: stream.0 }
-    graph:
-      kind: sequence
-      nodes:
+        contract:
+          id: onnx-genai.token-sampler
+          version: "1"
+          bindings:
+            logits: logits
+            token: token_ids
+          parameters:
+            mode: greedy
+    steps:
         - kind: invoke
           component: sampler
           inputs: { logits: logits }
           outputs: { token_ids: sampled }
-          effects: { sample: { consumes: sample.0, produces: sample.1 } }
         - kind: emit
           value: sampled
           output: token
           mode: replace
-          effect_name: stream
-          effect: { consumes: stream.0, produces: stream.1 }
 "#;
+    let invalid = metadata.replace(
+        "          outputs: { token_ids: sampled }",
+        "          outputs: { typo: sampled }",
+    );
+    let invalid_root = package(
+        "greedy-invalid-port",
+        &invalid,
+        &[("sampler.onnx.textproto", GREEDY)],
+    )?;
+    let error = Engine::from_pipeline_dir(&invalid_root, EngineConfig::default())
+        .err()
+        .expect("unknown inferred ONNX port must fail at load");
+    assert!(error.to_string().contains("unknown output port 'typo'"));
+
     let root = package("greedy", metadata, &[("sampler.onnx.textproto", GREEDY)])?;
     let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
     let request =
@@ -651,14 +643,11 @@ pipeline:
         role: tokens
         stage: pre_adapter
     components: {}
-    initial_effects: { stream: stream.0 }
-    graph:
-      kind: emit
-      value: eos
-      output: result
-      mode: replace
-      effect_name: stream
-      effect: { consumes: stream.0, produces: stream.1 }
+    steps:
+      - kind: emit
+        value: eos
+        output: result
+        mode: replace
 "#;
     let root = package("symbolic-literal", metadata, &[])?;
     let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
@@ -705,27 +694,19 @@ pipeline:
             input: { dtype: int64, rank: 2, shape: [batch, sequence] }
           outputs:
             output: { dtype: int64, rank: 2, shape: [batch, sequence] }
-        effects: []
-    initial_effects: { stream: stream.0 }
-    graph:
-      kind: sequence
-      nodes:
+    steps:
         - kind: invoke
           component: identity
           inputs: { input: prompt }
           outputs: { output: prompt.output }
-          effects: {}
         - kind: invoke
           component: identity
           inputs: { input: token }
           outputs: { output: token.output }
-          effects: {}
         - kind: emit
           value: token.output
           output: result
           mode: replace
-          effect_name: stream
-          effect: { consumes: stream.0, produces: stream.1 }
 "#;
     let root = package(
         "component-symbol-scope",
@@ -790,28 +771,21 @@ pipeline:
             right: { dtype: int64, rank: 2, shape: [batch, sequence] }
           outputs:
             output: { dtype: int64, rank: 2, shape: [batch, sequence] }
-        effects: []
     state:
       dummy:
         contract: { dtype: int64, rank: 2, shape: [batch, sequence] }
         scope: invocation
         initializer: prompt
         recurrence: { kind: growing, axis: 1, increment: one, max: maximum }
-    initial_effects: { stream: stream.0, "state:dummy": state.0 }
-    graph:
-      kind: sequence
-      nodes:
+    steps:
         - kind: invoke
           component: pair
           inputs: { left: prompt, right: token }
           outputs: { output: combined }
-          effects: {}
         - kind: emit
           value: combined
           output: result
           mode: replace
-          effect_name: stream
-          effect: { consumes: stream.0, produces: stream.1 }
 "#;
     let root = package(
         "component-dynamic-symbol-scope",
@@ -882,14 +856,14 @@ pipeline:
           outputs:
             token_ids: { dtype: int64, rank: 1, shape: [batch] }
             next_offset: { dtype: int64, rank: 1, shape: [batch] }
-        policy:
-          role: token_sampler
-          mode: seeded_stochastic
-          logits: logits
-          token: token_ids
-          rng: { seed: seed, offset: offset, next_offset: next_offset }
-          effect: rng
-        effects: [rng]
+        contract:
+          id: onnx-genai.token-sampler
+          version: "1"
+          bindings:
+            logits: logits
+            token: token_ids
+          parameters:
+            mode: seeded_stochastic
       termination:
         implementation: { kind: onnx, artifact: eos.onnx.textproto }
         ports:
@@ -900,75 +874,57 @@ pipeline:
             max_iterations: { dtype: int64, rank: 1, shape: [batch] }
           outputs:
             terminated: { dtype: bool, rank: 1, shape: [batch] }
-        policy:
-          role: termination_predicate
-          tokens: token_ids
-          eos_ids: eos_token_ids
-          iteration: iteration
-          max_iterations: max_iterations
-          done: terminated
-          effect: termination
-        effects: [termination]
+        contract:
+          id: onnx-genai.termination-predicate
+          version: "1"
+          bindings:
+            tokens: token_ids
+            eos_ids: eos_token_ids
+            iteration: iteration
+            max_iterations: max_iterations
+            done: terminated
       invert:
         implementation: { kind: onnx, artifact: not.onnx.textproto }
         ports:
           inputs: { done: { dtype: bool, rank: 1, shape: [batch] } }
-          outputs: { continue: { dtype: bool, rank: 1, shape: [batch] } }
+          outputs: { continue: { dtype: bool, rank: 1, shape: [1] } }
     state:
       rng:
         contract: { dtype: int64, rank: 1, shape: [batch] }
         scope: invocation
         initializer: offset
         recurrence: { kind: invariant }
-    initial_effects:
-      rng: rng.0
-      termination: termination.0
-      stream: stream.0
-      state:rng: state.0
-    graph:
-      kind: loop
-      setup:
-        kind: invoke
-        component: binding
-        inputs: { value: offset }
-        outputs: { value: rng.current }
-        effects: {}
-      body:
-        kind: sequence
-        nodes:
-          - kind: invoke
-            component: sampler
-            inputs: { logits: logits, seed: seed, offset: rng.body }
-            outputs: { token_ids: sampled, next_offset: rng.body_next }
-            effects: { rng: { consumes: rng.0, produces: rng.1 } }
-          - kind: invoke
-            component: termination
-            inputs: { token_ids: sampled, eos_token_ids: eos,
-                      iteration: iteration, max_iterations: max_iterations }
-            outputs: { terminated: done }
-            effects:
-              termination: { consumes: termination.0, produces: termination.1 }
-          - kind: invoke
-            component: invert
-            inputs: { done: done }
-            outputs: { continue: loop.continue }
-            effects: {}
-          - kind: emit
-            value: sampled
-            output: tokens
-            mode: append
-            effect_name: stream
-            effect: { consumes: stream.0, produces: stream.1 }
-      condition: loop.continue
-      max_iterations: iterations
-      carried:
-        - cell: rng
-          current: rng.current
-          body_input: rng.body
-          body_output: rng.body_next
-          next: rng.final
-          read_effect: { consumes: state.0, produces: state.1 }
-          write_effect: { consumes: state.1, produces: state.2 }
+    steps:
+      - kind: loop
+        setup:
+        - kind: invoke
+          component: binding
+          inputs: { value: offset }
+          outputs: { value: rng.current }
+        steps:
+            - kind: invoke
+              component: sampler
+              inputs: { logits: logits, seed: seed, offset: rng }
+              outputs: { token_ids: sampled, next_offset: rng.body_next }
+            - kind: invoke
+              component: termination
+              inputs: { token_ids: sampled, eos_token_ids: eos,
+                        iteration: iteration, max_iterations: max_iterations }
+              outputs: { terminated: done }
+            - kind: invoke
+              component: invert
+              inputs: { done: done }
+              outputs: { continue: loop.continue }
+            - kind: emit
+              value: sampled
+              output: tokens
+              mode: append
+        condition: loop.continue
+        max_iterations: iterations
+        carried:
+          - cell: rng
+            initial: rng.current
+            next: rng.body_next
 "#;
     let root = package(
         "autoregressive",
@@ -994,7 +950,6 @@ pipeline:
     .with_input("max_iterations", Value::from_slice_i64(&[10], &[1])?);
     let output = engine.run_pipeline(request)?;
     assert_eq!(output["tokens"].to_vec_i64()?, [1, 1, 1]);
-    assert_eq!(output["rng.final"].to_vec_i64()?, [3]);
     Ok(())
 }
 
@@ -1044,51 +999,38 @@ pipeline:
             schedule: { dtype: float32, rank: 1, shape: [schedule_length] }
           outputs:
             next_state: { dtype: float32, rank: 2, shape: [batch, width] }
-        policy:
-          role: solver_step
-          state: sample
-          estimate: derivative
-          step: step
-          schedule: schedule
-          next_state: next_state
-          effect: solver
-        effects: [solver]
+        contract:
+          id: onnx-genai.solver-step
+          version: "1"
+          bindings:
+            state: sample
+            estimate: derivative
+            step: step
+            schedule: schedule
+            next_state: next_state
     state:
       latent:
         contract: { dtype: float32, rank: 2, shape: [batch, width] }
         scope: invocation
         initializer: latent.current
         recurrence: { kind: invariant }
-    initial_effects:
-      solver: solver.0
-      stream: stream.0
-      step_stream: step_stream.0
-      state:latent: state:latent.0
-    graph:
-      kind: sequence
-      nodes:
+    steps:
         - kind: loop
           setup:
-            kind: invoke
-            component: sample_binding
-            inputs: { value: sample }
-            outputs: { value: latent.current }
-            effects: {}
-          body:
-            kind: sequence
-            nodes:
+            - kind: invoke
+              component: sample_binding
+              inputs: { value: sample }
+              outputs: { value: latent.current }
+          steps:
               - kind: invoke
                 component: solver
-                inputs: { sample: latent.body, derivative: derivative,
+                inputs: { sample: latent, derivative: derivative,
                           step: diffusion.step, schedule: schedule }
                 outputs: { next_state: latent.next }
-                effects: { solver: { consumes: solver.0, produces: solver.1 } }
               - kind: emit
                 value: diffusion.step
                 output: steps
                 mode: append
-                effect_name: step_stream
-                effect: { consumes: step_stream.0, produces: step_stream.1 }
           condition: continue
           max_iterations: iterations
           iteration:
@@ -1096,18 +1038,12 @@ pipeline:
             contract: { dtype: int64, rank: 1, shape: [batch] }
           carried:
             - cell: latent
-              current: latent.current
-              body_input: latent.body
-              body_output: latent.next
-              next: latent.final
-              read_effect: { consumes: state:latent.0, produces: state:latent.read }
-              write_effect: { consumes: state:latent.read, produces: state:latent.1 }
+              initial: latent.current
+              next: latent.next
         - kind: emit
-          value: latent.final
+          value: latent
           output: latent
           mode: replace
-          effect_name: stream
-          effect: { consumes: stream.0, produces: stream.1 }
 "#;
     let root = package("solver", metadata, &[("solver.onnx.textproto", EULER)])?;
     let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
@@ -1124,6 +1060,19 @@ pipeline:
     let output = engine.run_pipeline(request)?;
     assert_eq!(output["latent"].to_vec_f32()?, [-0.5, 1.25]);
     assert_eq!(output["steps"].to_vec_i64()?, [0, 1, 2]);
+    let zero = PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
+        .with_input("sample", Value::from_slice_f32(&[1.0, 2.0], &[1, 2])?)
+        .with_input("derivative", Value::from_slice_f32(&[0.5, 0.25], &[1, 2])?)
+        .with_input("schedule", Value::from_slice_f32(&[1.0, 0.0], &[2])?)
+        .with_input("iterations", Value::from_slice_i64(&[0], &[])?)
+        .with_input(
+            "continue",
+            Value::from_raw_bytes(vec![1], &[], DataType::Bool)?,
+        );
+    assert_eq!(
+        engine.run_pipeline(zero)?["latent"].to_vec_f32()?,
+        [1.0, 2.0]
+    );
     Ok(())
 }
 
@@ -1138,7 +1087,7 @@ pipeline:
       adapter_abis: {}
       custom_op_versions: {}
       capabilities: [workflow_ssa, linear_effects, typed_emit, nested_control_flow,
-                     loop_induction_values, explicit_transfer]
+                     loop_induction_values]
     inputs:
       outer_count: { contract: { dtype: int64, rank: 0, shape: [] },
                      role: { kind: opaque }, source: { kind: application, name: outer_count },
@@ -1155,40 +1104,31 @@ pipeline:
       inner_steps: { contract: { dtype: int64, rank: 1, shape: [inner_events] },
                      role: event, stage: pre_adapter }
     components: {}
-    initial_effects: { outer_stream: outer.0, inner_stream: inner.0 }
-    graph:
-      kind: loop
-      setup: { kind: transfer, input: outer_count, output: outer.setup, device: cpu }
-      body:
-        kind: sequence
-        nodes:
-          - kind: emit
-            value: outer.index
-            output: outer_steps
-            mode: append
-            effect_name: outer_stream
-            effect: { consumes: outer.0, produces: outer.1 }
-          - kind: loop
-            setup: { kind: transfer, input: inner_count, output: inner.setup, device: cpu }
-            body:
-              kind: emit
-              value: inner.index
-              output: inner_steps
+    steps:
+      - kind: loop
+        steps:
+            - kind: emit
+              value: outer.index
+              output: outer_steps
               mode: append
-              effect_name: inner_stream
-              effect: { consumes: inner.0, produces: inner.1 }
-            condition: continue
-            max_iterations: inner_count
-            iteration:
-              value: inner.index
-              contract: { dtype: int64, rank: 1, shape: [1] }
-            carried: []
-      condition: continue
-      max_iterations: outer_count
-      iteration:
-        value: outer.index
-        contract: { dtype: int64, rank: 1, shape: [1] }
-      carried: []
+            - kind: loop
+              steps:
+              - kind: emit
+                value: inner.index
+                output: inner_steps
+                mode: append
+              condition: continue
+              max_iterations: inner_count
+              iteration:
+                value: inner.index
+                contract: { dtype: int64, rank: 1, shape: [1] }
+              carried: []
+        condition: continue
+        max_iterations: outer_count
+        iteration:
+          value: outer.index
+          contract: { dtype: int64, rank: 1, shape: [1] }
+        carried: []
 "#;
     let root = package("nested-induction", metadata, &[])?;
     let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
@@ -1240,31 +1180,25 @@ pipeline:
           outputs:
             next_state: { dtype: int64, rank: 2, shape: [batch, sequence] }
             next_mask: { dtype: bool, rank: 2, shape: [batch, sequence] }
-        policy:
-          role: masked_update
-          state: current_tokens
-          proposal: proposed_tokens
-          mask: masked
-          step: step
-          next_state: next_state
-          next_mask: next_mask
-          effect: update
-        effects: [update]
-    initial_effects: { update: update.0, stream: stream.0 }
-    graph:
-      kind: sequence
-      nodes:
+        contract:
+          id: onnx-genai.masked-update
+          version: "1"
+          bindings:
+            state: current_tokens
+            proposal: proposed_tokens
+            mask: masked
+            step: step
+            next_state: next_state
+            next_mask: next_mask
+    steps:
         - kind: invoke
           component: update
           inputs: { current_tokens: current, proposed_tokens: proposed, masked: mask, step: step }
           outputs: { next_state: updated, next_mask: remaining }
-          effects: { update: { consumes: update.0, produces: update.1 } }
         - kind: emit
           value: updated
           output: tokens
           mode: replace
-          effect_name: stream
-          effect: { consumes: stream.0, produces: stream.1 }
 "#;
     let root = package(
         "masked",
@@ -1313,39 +1247,31 @@ pipeline:
             proposed_tokens: { dtype: int64, rank: 2, shape: [batch, draft] }
           outputs:
             accepted_tokens: { dtype: int64, rank: 2, shape: [batch, draft] }
-            accepted_count: { dtype: int64, rank: 1, shape: [batch] }
+            accepted_count: { dtype: int64, rank: 1, shape: [1] }
             done: { dtype: bool, rank: 1, shape: [batch] }
-        policy:
-          role: speculative_verifier
-          target_scores: target_scores
-          proposed_tokens: proposed_tokens
-          accepted_tokens: accepted_tokens
-          accepted_len: accepted_count
-          done: done
-          effect: verify
-        effects: [verify]
-    initial_effects: { verify: verify.0, stream: stream.0 }
-    graph:
-      kind: sequence
-      nodes:
+        contract:
+          id: onnx-genai.speculative-verifier
+          version: "1"
+          bindings:
+            target_scores: target_scores
+            proposed_tokens: proposed_tokens
+            accepted_tokens: accepted_tokens
+            accepted_len: accepted_count
+            done: done
+    steps:
         - kind: invoke
           component: verifier
           inputs: { target_scores: target, proposed_tokens: proposed }
           outputs: { accepted_tokens: accepted, accepted_count: count, done: done }
-          effects: { verify: { consumes: verify.0, produces: verify.1 } }
         - kind: emit
           value: accepted
           valid_length: count
           output: accepted_tokens
           mode: replace
-          effect_name: stream
-          effect: { consumes: stream.0, produces: stream.1 }
         - kind: emit
           value: count
           output: accepted_len
           mode: replace
-          effect_name: stream
-          effect: { consumes: stream.1, produces: stream.2 }
 "#;
     let root = package(
         "speculative",
@@ -1382,7 +1308,7 @@ pipeline:
         Ok(_) => anyhow::bail!("dense prefix emit accepted more than one runtime length"),
         Err(error) => format!("{error:#}"),
     };
-    assert!(error.contains("must contain exactly one value"), "{error}");
+    assert!(error.contains("axis 0 is 2, expected 1"), "{error}");
     Ok(())
 }
 
@@ -1430,7 +1356,6 @@ pipeline:
         ports:
           inputs: { input: { dtype: int64, rank: 2, shape: [batch, state] } }
           outputs: { output: { dtype: int64, rank: 2, shape: [batch, state] } }
-        effects: []
       accepted_prefix:
         implementation: { kind: onnx, artifact: prefix.onnx.textproto }
         ports:
@@ -1439,34 +1364,24 @@ pipeline:
             valid_length: { dtype: int64, rank: 1, shape: [1] }
           outputs:
             selected: { dtype: int64, rank: 2, shape: [batch, state] }
-        effects: []
     state:
       rollback:
         contract: { dtype: int64, rank: 2, shape: [batch, state] }
         scope: invocation
         initializer: rollback.current
         recurrence: { kind: bounded, axis: 1, max: max_context }
-    initial_effects:
-      "state:rollback": state.0
-      stream: stream.0
-    graph:
-      kind: sequence
-      nodes:
+    steps:
         - kind: loop
           setup:
-            kind: invoke
-            component: identity
-            inputs: { input: tentative }
-            outputs: { output: rollback.current }
-            effects: {}
-          body:
-            kind: sequence
-            nodes:
+            - kind: invoke
+              component: identity
+              inputs: { input: tentative }
+              outputs: { output: rollback.current }
+          steps:
               - kind: invoke
                 component: accepted_prefix
-                inputs: { state: rollback.body, valid_length: accepted_len }
+                inputs: { state: rollback, valid_length: accepted_len }
                 outputs: { selected: accepted.state }
-                effects: {}
               - kind: branch
                 predicate: accept
                 cases:
@@ -1475,38 +1390,28 @@ pipeline:
                     component: identity
                     inputs: { input: accepted.state }
                     outputs: { output: branch.accepted }
-                    effects: {}
                   "false":
                     kind: invoke
                     component: identity
                     inputs: { input: correction }
                     outputs: { output: branch.corrected }
-                    effects: {}
                 outputs:
                   selected:
                     cases: { "true": branch.accepted, "false": branch.corrected }
-                effects: {}
           condition: continue
           max_iterations: iterations
           carried:
             - cell: rollback
-              current: rollback.current
-              body_input: rollback.body
-              body_output: selected
-              next: rollback.final
-              read_effect: { consumes: state.0, produces: state.read }
-              write_effect: { consumes: state.read, produces: state.1 }
+              initial: rollback.current
+              next: selected
         - kind: invoke
           component: identity
-          inputs: { input: rollback.final }
+          inputs: { input: rollback }
           outputs: { output: observed }
-          effects: {}
         - kind: emit
           value: observed
           output: state
           mode: replace
-          effect_name: stream
-          effect: { consumes: stream.0, produces: stream.1 }
 "#;
     let root = package(
         "bounded-state-prefix",
@@ -1626,19 +1531,21 @@ pipeline:
         effects: []
       grammar_clone:
         implementation: { kind: adapter, abi: onnx-genai.grammar-guidance, version: "1" }
-        adapter:
-          role: grammar_guidance
-          action: clone
-          state: state
-          tokens: tokens
-          valid_length: valid_length
-          transition_table: transition_table
-          next_state: next_state
-          consumed_length: consumed_length
-          logits_mask: logits_mask
-          forced_tokens: forced_tokens
-          forced_length: forced_length
-          effect: grammar
+        contract:
+          id: onnx-genai.grammar-guidance
+          version: "1"
+          bindings:
+            state: state
+            tokens: tokens
+            valid_length: valid_length
+            transition_table: transition_table
+            next_state: next_state
+            consumed_length: consumed_length
+            logits_mask: logits_mask
+            forced_tokens: forced_tokens
+            forced_length: forced_length
+          parameters:
+            action: clone
         ports: &grammar_ports
           inputs:
             state: { dtype: int64, rank: 1, shape: [batch] }
@@ -1654,36 +1561,40 @@ pipeline:
         effects: [grammar]
       grammar_lookahead:
         implementation: { kind: adapter, abi: onnx-genai.grammar-guidance, version: "1" }
-        adapter:
-          role: grammar_guidance
-          action: lookahead
-          state: state
-          tokens: tokens
-          valid_length: valid_length
-          transition_table: transition_table
-          next_state: next_state
-          consumed_length: consumed_length
-          logits_mask: logits_mask
-          forced_tokens: forced_tokens
-          forced_length: forced_length
-          effect: grammar
+        contract:
+          id: onnx-genai.grammar-guidance
+          version: "1"
+          bindings:
+            state: state
+            tokens: tokens
+            valid_length: valid_length
+            transition_table: transition_table
+            next_state: next_state
+            consumed_length: consumed_length
+            logits_mask: logits_mask
+            forced_tokens: forced_tokens
+            forced_length: forced_length
+          parameters:
+            action: lookahead
         ports: *grammar_ports
         effects: [grammar]
       grammar_commit:
         implementation: { kind: adapter, abi: onnx-genai.grammar-guidance, version: "1" }
-        adapter:
-          role: grammar_guidance
-          action: commit
-          state: state
-          tokens: tokens
-          valid_length: valid_length
-          transition_table: transition_table
-          next_state: next_state
-          consumed_length: consumed_length
-          logits_mask: logits_mask
-          forced_tokens: forced_tokens
-          forced_length: forced_length
-          effect: grammar
+        contract:
+          id: onnx-genai.grammar-guidance
+          version: "1"
+          bindings:
+            state: state
+            tokens: tokens
+            valid_length: valid_length
+            transition_table: transition_table
+            next_state: next_state
+            consumed_length: consumed_length
+            logits_mask: logits_mask
+            forced_tokens: forced_tokens
+            forced_length: forced_length
+          parameters:
+            action: commit
         ports: *grammar_ports
         effects: [grammar]
       verifier:
@@ -1694,17 +1605,17 @@ pipeline:
             proposed_tokens: { dtype: int64, rank: 2, shape: [batch, proposal] }
           outputs:
             accepted_tokens: { dtype: int64, rank: 2, shape: [batch, proposal] }
-            accepted_count: { dtype: int64, rank: 1, shape: [batch] }
+            accepted_count: { dtype: int64, rank: 1, shape: [1] }
             done: { dtype: bool, rank: 1, shape: [batch] }
-        policy:
-          role: speculative_verifier
-          target_scores: target_scores
-          proposed_tokens: proposed_tokens
-          accepted_tokens: accepted_tokens
-          accepted_len: accepted_count
-          done: done
-          effect: verify
-        effects: [verify]
+        contract:
+          id: onnx-genai.speculative-verifier
+          version: "1"
+          bindings:
+            target_scores: target_scores
+            proposed_tokens: proposed_tokens
+            accepted_tokens: accepted_tokens
+            accepted_len: accepted_count
+            done: done
       min_length:
         implementation: { kind: onnx, artifact: min.onnx.textproto }
         ports:
@@ -1712,8 +1623,7 @@ pipeline:
             accepted: { dtype: int64, rank: 1, shape: [batch] }
             grammar: { dtype: int64, rank: 1, shape: [batch] }
           outputs:
-            length: { dtype: int64, rank: 1, shape: [batch] }
-        effects: []
+            length: { dtype: int64, rank: 1, shape: [1] }
       adaptive:
         implementation: { kind: onnx, artifact: adaptive.onnx.textproto }
         ports:
@@ -1729,20 +1639,20 @@ pipeline:
           outputs:
             next_k: { dtype: int64, rank: 1, shape: [batch] }
             next_estimates: { dtype: float32, rank: 2, shape: [batch, budget_slots] }
-        policy:
-          role: adaptive_proposal_budget
-          current_k: current_k
-          accepted: accepted
-          evaluated: evaluated
-          committed_tokens: committed_tokens
-          filled_proposal_budget: filled_proposal_budget
-          draft_ms: draft_ms
-          target_ms: target_ms
-          estimates: estimates
-          next_k: next_k
-          next_estimates: next_estimates
-          effect: adaptive
-        effects: [adaptive]
+        contract:
+          id: onnx-genai.adaptive-proposal-budget
+          version: "1"
+          bindings:
+            current_k: current_k
+            accepted: accepted
+            evaluated: evaluated
+            committed_tokens: committed_tokens
+            filled_proposal_budget: filled_proposal_budget
+            draft_ms: draft_ms
+            target_ms: target_ms
+            estimates: estimates
+            next_k: next_k
+            next_estimates: next_estimates
       guided_sampler:
         implementation: { kind: onnx, artifact: guided.onnx.textproto }
         ports:
@@ -1753,7 +1663,6 @@ pipeline:
             forced_length: { dtype: int64, rank: 1, shape: [batch] }
           outputs:
             token: { dtype: int64, rank: 2, shape: [batch, 1] }
-        effects: []
     state:
       grammar:
         contract: { dtype: int64, rank: 1, shape: [batch] }
@@ -1773,47 +1682,31 @@ pipeline:
         scope: invocation
         initializer: k.current
         recurrence: { kind: invariant }
-    initial_effects:
-      grammar: grammar.0
-      verify: verify.0
-      adaptive: adaptive.0
-      stream: stream.0
-      "state:grammar": state:grammar.0
-      "state:adaptive": state:adaptive.0
-      "state:proposal_k": state:proposal_k.0
-    graph:
-      kind: sequence
-      nodes:
+    steps:
         - kind: loop
           setup:
-            kind: sequence
-            nodes:
+            - kind: sequence
+              steps:
               - kind: invoke
                 component: bind_grammar
                 inputs: { value: grammar_state }
                 outputs: { value: grammar.current }
-                effects: {}
               - kind: invoke
                 component: bind_estimates
                 inputs: { value: estimates }
                 outputs: { value: adaptive.current }
-                effects: {}
               - kind: invoke
                 component: bind_k
                 inputs: { value: current_k }
                 outputs: { value: k.current }
-                effects: {}
-          body:
-            kind: sequence
-            nodes:
+          steps:
               - kind: invoke
                 component: grammar_clone
-                inputs: { state: grammar.body, tokens: proposed, valid_length: zero_length,
+                inputs: { state: grammar, tokens: proposed, valid_length: zero_length,
                           transition_table: transition_table }
                 outputs: { next_state: grammar.clone, consumed_length: clone.consumed,
                            logits_mask: clone.mask, forced_tokens: clone.forced,
                            forced_length: clone.forced_length }
-                effects: { grammar: { consumes: grammar.0, produces: grammar.clone } }
               - kind: invoke
                 component: grammar_lookahead
                 inputs: { state: grammar.clone, tokens: proposed, valid_length: evaluated,
@@ -1821,90 +1714,64 @@ pipeline:
                 outputs: { next_state: grammar.lookahead, consumed_length: grammar.valid,
                            logits_mask: lookahead.mask, forced_tokens: lookahead.forced,
                            forced_length: lookahead.forced_length }
-                effects: { grammar: { consumes: grammar.clone, produces: grammar.lookahead } }
               - kind: invoke
                 component: verifier
                 inputs: { target_scores: target, proposed_tokens: proposed }
                 outputs: { accepted_tokens: accepted.tokens, accepted_count: verifier.accepted,
                            done: verifier.done }
-                effects: { verify: { consumes: verify.0, produces: verify.1 } }
               - kind: invoke
                 component: min_length
                 inputs: { accepted: verifier.accepted, grammar: grammar.valid }
                 outputs: { length: committed.length }
-                effects: {}
               - kind: invoke
                 component: grammar_commit
-                inputs: { state: grammar.body, tokens: accepted.tokens,
+                inputs: { state: grammar, tokens: accepted.tokens,
                           valid_length: committed.length, transition_table: transition_table }
                 outputs: { next_state: grammar.next, consumed_length: grammar.committed,
                            logits_mask: grammar.mask, forced_tokens: grammar.forced,
                            forced_length: grammar.forced_length }
-                effects: { grammar: { consumes: grammar.lookahead, produces: grammar.commit } }
               - kind: invoke
                 component: adaptive
-                inputs: { current_k: k.body, accepted: committed.length,
+                inputs: { current_k: proposal_k, accepted: committed.length,
                           evaluated: evaluated, committed_tokens: committed.length,
                           filled_proposal_budget: filled, draft_ms: draft_ms,
-                          target_ms: target_ms, estimates: adaptive.body }
+                          target_ms: target_ms, estimates: adaptive }
                 outputs: { next_k: k.next, next_estimates: adaptive.next }
-                effects: { adaptive: { consumes: adaptive.0, produces: adaptive.1 } }
               - kind: invoke
                 component: guided_sampler
                 inputs: { logits: logits, logits_mask: grammar.mask,
                           forced_tokens: grammar.forced,
                           forced_length: grammar.forced_length }
                 outputs: { token: grammar.token }
-                effects: {}
               - kind: emit
                 value: accepted.tokens
                 valid_length: committed.length
                 output: tokens
                 mode: append
-                effect_name: stream
-                effect: { consumes: stream.0, produces: stream.1 }
               - kind: emit
                 value: grammar.token
                 output: tokens
                 mode: append
-                effect_name: stream
-                effect: { consumes: stream.1, produces: stream.2 }
           condition: continue
           max_iterations: iterations
           carried:
             - cell: grammar
-              current: grammar.current
-              body_input: grammar.body
-              body_output: grammar.next
-              next: grammar.final
-              read_effect: { consumes: state:grammar.0, produces: state:grammar.read }
-              write_effect: { consumes: state:grammar.read, produces: state:grammar.1 }
+              initial: grammar.current
+              next: grammar.next
             - cell: adaptive
-              current: adaptive.current
-              body_input: adaptive.body
-              body_output: adaptive.next
-              next: adaptive.final
-              read_effect: { consumes: state:adaptive.0, produces: state:adaptive.read }
-              write_effect: { consumes: state:adaptive.read, produces: state:adaptive.1 }
+              initial: adaptive.current
+              next: adaptive.next
             - cell: proposal_k
-              current: k.current
-              body_input: k.body
-              body_output: k.next
-              next: k.final
-              read_effect: { consumes: state:proposal_k.0, produces: state:proposal_k.read }
-              write_effect: { consumes: state:proposal_k.read, produces: state:proposal_k.1 }
+              initial: k.current
+              next: k.next
         - kind: emit
-          value: k.final
+          value: proposal_k
           output: next_k
           mode: replace
-          effect_name: stream
-          effect: { consumes: stream.2, produces: stream.3 }
         - kind: emit
-          value: grammar.final
+          value: grammar
           output: final_grammar_state
           mode: replace
-          effect_name: stream
-          effect: { consumes: stream.3, produces: stream.4 }
 "#;
     let root = package(
         "grammar-adaptive-speculative",
@@ -1985,47 +1852,44 @@ pipeline:
     components:
       clock_start:
         implementation: { kind: adapter, abi: onnx-genai.telemetry, version: "1" }
-        adapter:
-          role: telemetry
-          action: start
-          timestamp: timestamp
-          effect: telemetry
+        contract:
+          id: onnx-genai.telemetry
+          version: "1"
+          bindings:
+            timestamp: timestamp
+          parameters:
+            action: start
         ports:
           inputs: {}
           outputs: { timestamp: { dtype: int64, rank: 0, shape: [] } }
         effects: [telemetry]
       clock_elapsed:
         implementation: { kind: adapter, abi: onnx-genai.telemetry, version: "1" }
-        adapter:
-          role: telemetry
-          action: elapsed
-          timestamp: timestamp
-          duration_ms: duration_ms
-          effect: telemetry
+        contract:
+          id: onnx-genai.telemetry
+          version: "1"
+          bindings:
+            timestamp: timestamp
+            duration_ms: duration_ms
+          parameters:
+            action: elapsed
         ports:
           inputs: { timestamp: { dtype: int64, rank: 0, shape: [] } }
           outputs: { duration_ms: { dtype: float32, rank: 0, shape: [] } }
         effects: [telemetry]
-    initial_effects: { telemetry: telemetry.0, stream: stream.0 }
-    graph:
-      kind: sequence
-      nodes:
+    steps:
         - kind: invoke
           component: clock_start
           inputs: {}
           outputs: { timestamp: clock.started }
-          effects: { telemetry: { consumes: telemetry.0, produces: telemetry.1 } }
         - kind: invoke
           component: clock_elapsed
           inputs: { timestamp: clock.started }
           outputs: { duration_ms: clock.elapsed_ms }
-          effects: { telemetry: { consumes: telemetry.1, produces: telemetry.2 } }
         - kind: emit
           value: clock.elapsed_ms
           output: elapsed_ms
           mode: replace
-          effect_name: stream
-          effect: { consumes: stream.0, produces: stream.1 }
 "#;
     let root = package("telemetry-adapter", metadata, &[])?;
     let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
@@ -2080,13 +1944,13 @@ pipeline:
             update: { dtype: int64, rank: 0, shape: [] }
           outputs:
             next: { dtype: int64, rank: 0, shape: [] }
-        policy:
-          role: state_update
-          current: current
-          update: update
-          next: next
-          effect: update
-        effects: [update]
+        contract:
+          id: onnx-genai.state-update
+          version: "1"
+          bindings:
+            current: current
+            update: update
+            next: next
       predicate:
         implementation: { kind: onnx, artifact: less.onnx.textproto }
         ports:
@@ -2095,7 +1959,6 @@ pipeline:
             limit: { dtype: int64, rank: 0, shape: [] }
           outputs:
             continue: { dtype: bool, rank: 0, shape: [] }
-        effects: [predicate]
     state:
       world:
         contract: { dtype: int64, rank: 0, shape: [] }
@@ -2103,74 +1966,39 @@ pipeline:
         initializer: initial
         recurrence: { kind: invariant }
         session: { policy: exclusive }
-    initial_effects:
-      update: update.0
-      predicate: predicate.0
-      stream: stream.0
-      state:world: state.0
-    graph:
-      kind: sequence
-      nodes:
+    steps:
         - kind: branch
           predicate: run_branch
           cases:
             "true":
               kind: loop
               setup:
-                kind: invoke
-                component: binding
-                inputs: { value: initial }
-                outputs: { value: world.current }
-                effects: {}
-              body:
-                kind: sequence
-                nodes:
+                - kind: invoke
+                  component: binding
+                  inputs: { value: initial }
+                  outputs: { value: world.current }
+              steps:
                   - kind: invoke
                     component: update
-                    inputs: { current: world.body, update: increment }
+                    inputs: { current: world, update: increment }
                     outputs: { next: world.body_next }
-                    effects: { update: { consumes: update.0, produces: update.1 } }
                   - kind: invoke
                     component: predicate
                     inputs: { value: world.body_next, limit: limit }
                     outputs: { continue: loop.continue }
-                    effects: { predicate: { consumes: predicate.0, produces: predicate.1 } }
                   - kind: emit
                     value: world.body_next
                     output: events
                     mode: event
-                    effect_name: stream
-                    effect: { consumes: stream.0, produces: stream.1 }
               condition: loop.continue
               max_iterations: iterations
               carried:
                 - cell: world
-                  current: world.current
-                  body_input: world.body
-                  body_output: world.body_next
-                  next: world.final
-                  read_effect: { consumes: state.0, produces: state.1 }
-                  write_effect: { consumes: state.1, produces: state.2 }
+                  initial: world.current
+                  next: world.body_next
           outputs:
             world.selected:
-              cases: { "true": world.final }
-          effects:
-            update:
-              incoming: update.0
-              cases: { "true": update.1 }
-              produces: update.joined
-            predicate:
-              incoming: predicate.0
-              cases: { "true": predicate.1 }
-              produces: predicate.joined
-            stream:
-              incoming: stream.0
-              cases: { "true": stream.1 }
-              produces: stream.joined
-            "state:world":
-              incoming: state.0
-              cases: { "true": state.2 }
-              produces: state.joined
+              cases: { "true": world }
         - kind: branch
           predicate: world.selected
           cases:
@@ -2179,33 +2007,21 @@ pipeline:
               value: world.selected
               output: state
               mode: replace
-              effect_name: stream
-              effect: { consumes: stream.joined, produces: stream.2 }
             "5":
               kind: emit
               value: world.selected
               output: state
               mode: replace
-              effect_name: stream
-              effect: { consumes: stream.joined, produces: stream.2 }
           default:
             kind: emit
             value: world.selected
             output: state
             mode: replace
-            effect_name: stream
-            effect: { consumes: stream.joined, produces: stream.2 }
-          effects:
-            stream:
-              incoming: stream.joined
-              cases: { "3": stream.2, "5": stream.2 }
-              default: stream.2
-              produces: stream.after_branch
 "#;
     let invalid = metadata.replace(
         r#"          outputs:
             world.selected:
-              cases: { "true": world.final }
+              cases: { "true": world }
 "#,
         "          outputs: {}\n",
     );
@@ -2223,7 +2039,7 @@ pipeline:
     assert!(
         error
             .to_string()
-            .contains("updates session state 'world' to 'world.final'"),
+            .contains("updates session state 'world' to 'world'"),
         "{error}"
     );
 
@@ -2343,7 +2159,6 @@ pipeline:
             update: { dtype: int64, rank: 0, shape: [] }
           outputs:
             next: { dtype: int64, rank: 0, shape: [] }
-        effects: [observation]
       action_policy:
         implementation: { kind: onnx, artifact: action.onnx.textproto }
         ports:
@@ -2352,7 +2167,6 @@ pipeline:
             limit: { dtype: int64, rank: 0, shape: [] }
           outputs:
             continue: { dtype: bool, rank: 0, shape: [] }
-        effects: [action]
       environment_low:
         implementation: { kind: onnx, artifact: environment-low.onnx.textproto }
         ports:
@@ -2361,7 +2175,6 @@ pipeline:
             update: { dtype: int64, rank: 0, shape: [] }
           outputs:
             next: { dtype: int64, rank: 0, shape: [] }
-        effects: [environment]
       environment_high:
         implementation: { kind: onnx, artifact: environment-high.onnx.textproto }
         ports:
@@ -2370,7 +2183,6 @@ pipeline:
             update: { dtype: int64, rank: 0, shape: [] }
           outputs:
             next: { dtype: int64, rank: 0, shape: [] }
-        effects: [environment]
     state:
       latent:
         contract: { dtype: int64, rank: 0, shape: [] }
@@ -2379,42 +2191,26 @@ pipeline:
         initializer: initial
         recurrence: { kind: invariant }
         session: { policy: exclusive }
-    initial_effects:
-      observation: observation.0
-      action: action.0
-      environment: environment.0
-      stream: stream.0
-      "state:latent": state:latent.0
-    graph:
-      kind: sequence
-      nodes:
+    steps:
         - kind: loop
           setup:
-            kind: invoke
-            component: bind_state
-            inputs: { value: initial }
-            outputs: { value: latent.current }
-            effects: {}
-          body:
-            kind: sequence
-            nodes:
+            - kind: invoke
+              component: bind_state
+              inputs: { value: initial }
+              outputs: { value: latent.current }
+          steps:
               - kind: invoke
                 component: observation_encoder
-                inputs: { current: latent.body, update: observation }
+                inputs: { current: latent, update: observation }
                 outputs: { next: latent.observed }
-                effects:
-                  observation: { consumes: observation.0, produces: observation.1 }
               - kind: invoke
                 component: action_policy
                 inputs: { value: latent.observed, limit: action_threshold }
                 outputs: { continue: action.selected }
-                effects: { action: { consumes: action.0, produces: action.1 } }
               - kind: emit
                 value: action.selected
                 output: actions
                 mode: event
-                effect_name: stream
-                effect: { consumes: stream.0, produces: stream.1 }
               - kind: branch
                 predicate: action.selected
                 cases:
@@ -2423,42 +2219,24 @@ pipeline:
                     component: environment_low
                     inputs: { current: latent.observed, update: low_delta }
                     outputs: { next: environment.low }
-                    effects:
-                      environment:
-                        { consumes: environment.0, produces: environment.low.effect }
                   "false":
                     kind: invoke
                     component: environment_high
                     inputs: { current: latent.observed, update: high_delta }
                     outputs: { next: environment.high }
-                    effects:
-                      environment:
-                        { consumes: environment.0, produces: environment.high.effect }
                 outputs:
                   latent.next:
                     cases: { "true": environment.low, "false": environment.high }
-                effects:
-                  environment:
-                    incoming: environment.0
-                    cases:
-                      { "true": environment.low.effect, "false": environment.high.effect }
-                    produces: environment.joined
           condition: continue
           max_iterations: iterations
           carried:
             - cell: latent
-              current: latent.current
-              body_input: latent.body
-              body_output: latent.next
-              next: latent.final
-              read_effect: { consumes: state:latent.0, produces: state:latent.read }
-              write_effect: { consumes: state:latent.read, produces: state:latent.1 }
+              initial: latent.current
+              next: latent.next
         - kind: emit
-          value: latent.final
+          value: latent
           output: latent
           mode: replace
-          effect_name: stream
-          effect: { consumes: stream.1, produces: stream.2 }
 "#;
     let root = package(
         "world-model-checkpoint",
@@ -2597,77 +2375,56 @@ pipeline:
           inputs: { value: { dtype: int64, rank: 1, shape: [batch] } }
           outputs: { value: { dtype: int64, rank: 1, shape: [batch] } }
         effects: [rng]
-    initial_effects:
-      speculative: speculative.0
-      kv: kv.0
-      rng: rng.0
-      stream: stream.0
-    graph:
-      kind: sequence
-      nodes:
+    steps:
         - kind: branch
           predicate: accept
           cases:
             "true":
               kind: sequence
-              nodes:
+              steps:
                 - kind: invoke
                   component: token_binding
                   inputs: { value: accepted_tokens }
                   outputs: { value: accepted.tokens }
-                  effects:
-                    speculative: { consumes: speculative.0, produces: speculative.accepted }
                 - kind: invoke
                   component: kv_binding
                   inputs: { value: accepted_kv }
                   outputs: { value: accepted.kv }
-                  effects: { kv: { consumes: kv.0, produces: kv.accepted } }
                 - kind: invoke
                   component: rng_binding
                   inputs: { value: accepted_rng }
                   outputs: { value: accepted.rng }
-                  effects: { rng: { consumes: rng.0, produces: rng.accepted } }
                 - kind: emit
                   value: accepted.tokens
                   output: event
                   mode: event
-                  effect_name: stream
-                  effect: { consumes: stream.0, produces: stream.accepted }
                 - kind: invoke
                   component: plain_token_binding
                   inputs: { value: accepted_tokens }
                   outputs: { value: event.secret }
-                  effects: {}
             "false":
               kind: sequence
-              nodes:
+              steps:
                 - kind: invoke
                   component: token_binding
                   inputs: { value: corrected_tokens }
                   outputs: { value: corrected.tokens }
-                  effects:
-                    speculative: { consumes: speculative.0, produces: speculative.corrected }
                 - kind: invoke
                   component: kv_binding
                   inputs: { value: corrected_kv }
                   outputs: { value: corrected.kv }
-                  effects: { kv: { consumes: kv.0, produces: kv.corrected } }
                 - kind: invoke
                   component: rng_binding
                   inputs: { value: corrected_rng }
                   outputs: { value: corrected.rng }
-                  effects: { rng: { consumes: rng.0, produces: rng.corrected } }
                 - kind: emit
                   value: corrected.tokens
                   output: event
                   mode: event
-                  effect_name: stream
-                  effect: { consumes: stream.0, produces: stream.corrected }
                 - kind: invoke
                   component: plain_token_binding
                   inputs: { value: corrected_tokens }
                   outputs: { value: event.secret }
-                  effects: {}
           outputs:
             selected.tokens:
               cases: { "true": accepted.tokens, "false": corrected.tokens }
@@ -2675,29 +2432,10 @@ pipeline:
               cases: { "true": accepted.kv, "false": corrected.kv }
             selected.rng:
               cases: { "true": accepted.rng, "false": corrected.rng }
-          effects:
-            speculative:
-              incoming: speculative.0
-              cases: { "true": speculative.accepted, "false": speculative.corrected }
-              produces: speculative.joined
-            kv:
-              incoming: kv.0
-              cases: { "true": kv.accepted, "false": kv.corrected }
-              produces: kv.joined
-            rng:
-              incoming: rng.0
-              cases: { "true": rng.accepted, "false": rng.corrected }
-              produces: rng.joined
-            stream:
-              incoming: stream.0
-              cases: { "true": stream.accepted, "false": stream.corrected }
-              produces: stream.joined
         - kind: emit
           value: selected.tokens
           output: final
           mode: replace
-          effect_name: stream
-          effect: { consumes: stream.joined, produces: stream.final }
 "#;
     let root = package("speculative-branch", metadata, &[])?;
     let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;

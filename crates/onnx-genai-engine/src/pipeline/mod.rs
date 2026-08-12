@@ -13,9 +13,9 @@ use crate::{
 };
 use anyhow::Context;
 use onnx_genai_metadata::{
-    ComponentImplementation, DeviceKind, PreprocessingSpec, RuntimeInputRole, ScalarValue,
-    TensorContract, TensorDimension, WorkflowEmitMode, WorkflowInputSource, WorkflowNode,
-    WorkflowOutputRole, WorkflowSpec,
+    CompiledWorkflow, ComponentImplementation, DeviceKind, PreprocessingSpec, RuntimeInputRole,
+    ScalarValue, TensorContract, TensorDimension, WorkflowEmitMode, WorkflowInputSource,
+    WorkflowNode, WorkflowOutputRole, WorkflowSpec,
 };
 use onnx_genai_ort::{DataType, PipelineModelDirectory, PipelineModels, SessionOptions, Value};
 use std::cell::RefCell;
@@ -75,6 +75,7 @@ pub struct PipelineEngine {
     memory_strategy_plan: MemoryStrategyPlan,
     decode_backend: EngineDecodeBackend,
     workflow: WorkflowSpec,
+    compiled_workflow: CompiledWorkflow,
     workflow_session_state: RefCell<HashMap<(String, String), Value>>,
     preprocessing: Option<PreprocessingSpec>,
 }
@@ -231,12 +232,16 @@ impl PipelineEngine {
         let models = PipelineModels::load_with_options(pipeline_dir, session_options)
             .map_err(|error| anyhow::anyhow!("Failed to load workflow components: {error}"))?;
 
+        let workflow = directory.spec.workflow;
+        let compiled_workflow = onnx_genai_metadata::compile_workflow(&workflow)
+            .map_err(|error| anyhow::anyhow!("Failed to lower workflow metadata: {error}"))?;
         Ok(Self {
             models,
             resource_governor,
             memory_strategy_plan,
             decode_backend,
-            workflow: directory.spec.workflow,
+            workflow,
+            compiled_workflow,
             workflow_session_state: RefCell::new(HashMap::new()),
             preprocessing: directory.preprocessing,
         })
