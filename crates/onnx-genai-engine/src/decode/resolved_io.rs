@@ -24,18 +24,6 @@ pub(crate) struct ResolvedIo {
     pub(crate) kv_pairs: Vec<(String, String)>,
     /// Fixed loop-carried `(input, output)` pairs with replace semantics.
     pub(crate) state_pairs: Vec<(String, String)>,
-    /// Encoder-decoder cross-attention `(decoder_input, encoder_output)` pairs.
-    ///
-    /// The `input` is the decoder's `past_*_cross_%d` graph input; the `output`
-    /// names the ENCODER graph output (`present_*_cross_%d`) that produces the
-    /// value. The encoder runs once as a prompt-phase prologue and its cross-KV
-    /// outputs are STATIC for the whole decode: they encode the full audio/text
-    /// prompt and never grow or change across autoregressive steps, so the
-    /// pipeline binds them once and re-supplies the same tensors every step.
-    /// The output side is therefore intentionally NOT validated against the
-    /// decoder graph here (it is an encoder port, resolved from the shared pool
-    /// by the pipeline).
-    pub(crate) cross_kv_pairs: Vec<(String, String)>,
 }
 
 fn resolve_state_pairs(
@@ -172,50 +160,6 @@ fn resolve_state_pairs(
 /// Resolve encoder-decoder cross-attention KV bindings into
 /// `(decoder_input, encoder_output)` pairs.
 ///
-/// `inputs` are the decoder's `past_*_cross_%d` graph inputs and are validated
-/// against the decoder graph. `outputs` name the ENCODER graph outputs
-/// (`present_*_cross_%d`) that supply each value; they are deliberately NOT
-/// validated against the decoder graph here because they belong to a different
-/// component. The pipeline resolves them from the shared tensor pool after the
-/// encoder prologue and binds the resulting tensors as static decoder inputs on
-/// every step. Cross-KV is computed once from the whole prompt and never
-/// changes across decode steps, which is why it is carried separately from the
-/// growing self-attention `kv_pairs`.
-fn resolve_cross_kv_pairs(
-    session: &dyn GraphIo,
-    inputs: Option<&[String]>,
-    outputs: Option<&[String]>,
-) -> anyhow::Result<Vec<(String, String)>> {
-    match (inputs, outputs) {
-        (Some(inputs), Some(outputs)) => {
-            if inputs.len() != outputs.len() {
-                anyhow::bail!(
-                    "io.cross_kv_inputs ({}) and io.cross_kv_outputs ({}) must have equal length for positional pairing",
-                    inputs.len(),
-                    outputs.len()
-                );
-            }
-            for input in inputs {
-                if !session.inputs().iter().any(|info| info.name == *input) {
-                    anyhow::bail!(
-                        "io.cross_kv_inputs declares decoder input '{input}' but the graph does not expose it; graph inputs: {:?}",
-                        session.input_names()
-                    );
-                }
-            }
-            Ok(inputs
-                .iter()
-                .cloned()
-                .zip(outputs.iter().cloned())
-                .collect())
-        }
-        (None, None) => Ok(Vec::new()),
-        _ => anyhow::bail!(
-            "io.cross_kv_inputs and io.cross_kv_outputs must be declared together for positional pairing"
-        ),
-    }
-}
-
 fn resolve_position_program(
     session: &dyn GraphIo,
     io: &onnx_genai_metadata::ModelIoSpec,
@@ -390,7 +334,6 @@ impl ResolvedIo {
             hidden_output: None,
             kv_pairs: Vec::new(),
             state_pairs: Vec::new(),
-            cross_kv_pairs: Vec::new(),
         })
     }
 
@@ -556,12 +499,6 @@ impl ResolvedIo {
                 "io.kv_update declares unsupported update '{update}'; supported KV updates: append, shared_buffer"
             );
         }
-        let cross_kv_pairs = resolve_cross_kv_pairs(
-            session,
-            io.cross_kv_inputs.as_deref(),
-            io.cross_kv_outputs.as_deref(),
-        )?;
-
         let state_pairs = resolve_state_pairs(session, io.state_pairs.as_deref(), &kv_pairs)?;
         let position_ids_input = resolve_position_program(session, io, positions)?;
 
@@ -574,7 +511,6 @@ impl ResolvedIo {
             hidden_output: io.hidden_output.clone(),
             kv_pairs,
             state_pairs,
-            cross_kv_pairs,
         })
     }
 

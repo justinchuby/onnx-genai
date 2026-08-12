@@ -210,22 +210,6 @@ pub(crate) fn clone_value(value: &Value) -> anyhow::Result<Value> {
     }
 }
 
-/// The single axis of `shape` whose extent is `extent`, or `None` when no axis
-/// or more than one axis matches.
-pub(super) fn sole_axis_with_extent(shape: &[i64], extent: usize) -> Option<usize> {
-    let extent = i64::try_from(extent).ok()?;
-    let mut found = None;
-    for (axis, &dim) in shape.iter().enumerate() {
-        if dim == extent {
-            if found.is_some() {
-                return None;
-            }
-            found = Some(axis);
-        }
-    }
-    found
-}
-
 pub(super) fn slice_value_axis(
     value: &Value,
     axis: usize,

@@ -238,11 +238,10 @@ impl EngineResourceGovernor {
         allow_runtime_override: bool,
         kv_config: ModelKvConfig,
         model_weights_bytes: u64,
-        cuda_device_index: Option<u32>,
         provider: Option<&SharedMemoryAuthorityProvider>,
         domain: Option<&DeviceCompatibilityDomain>,
     ) -> Result<Self, ResourceError> {
-        let capacities = capacity_providers_for_device(&limits, cuda_device_index);
+        let capacities = fallback_capacity_providers(&limits);
         Self::new_with_capacities_and_authority(
             limits,
             allow_runtime_override,
@@ -255,24 +254,16 @@ impl EngineResourceGovernor {
     }
 
     #[cfg(feature = "native-backend")]
-    // Eight parameters (one over the lint's threshold) because this is
-    // `new_with_authority` plus an explicit reservation: #840 added
-    // `cuda_device_index` to fix a VRAM-capacity portability bug and pushed it
-    // over. Grouping them into a struct would buy nothing here — this is a
-    // crate-private constructor with exactly one caller (`engine::load`), and
-    // every argument is already a distinct type carrying its own meaning.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_authority_and_reservation(
         limits: ResourceLimits,
         allow_runtime_override: bool,
         kv_config: ModelKvConfig,
         model_weights_bytes: u64,
         reservation_bytes: u64,
-        cuda_device_index: Option<u32>,
         provider: Option<&SharedMemoryAuthorityProvider>,
         domain: Option<&DeviceCompatibilityDomain>,
     ) -> Result<Self, ResourceError> {
-        let capacities = capacity_providers_for_device(&limits, cuda_device_index);
+        let capacities = fallback_capacity_providers(&limits);
         Self::new_with_capacities_and_authority(
             limits,
             allow_runtime_override,
@@ -281,27 +272,6 @@ impl EngineResourceGovernor {
             (model_weights_bytes, reservation_bytes),
             provider,
             domain,
-        )
-    }
-
-    pub(crate) fn new_for_shared_pipeline_kv(
-        limits: ResourceLimits,
-        allow_runtime_override: bool,
-        kv_config: ModelKvConfig,
-        existing_device_usage_bytes: u64,
-        cuda_device_index: Option<u32>,
-        provider: Option<&SharedMemoryAuthorityProvider>,
-        domain: &DeviceCompatibilityDomain,
-    ) -> Result<Self, ResourceError> {
-        let capacities = capacity_providers_for_device(&limits, cuda_device_index);
-        Self::new_with_capacities_and_authority(
-            limits,
-            allow_runtime_override,
-            capacities,
-            kv_config,
-            (existing_device_usage_bytes, 0),
-            provider,
-            Some(domain),
         )
     }
 
@@ -1071,7 +1041,6 @@ pub(crate) fn component_governor(
     config: &EngineConfig,
     kv_model: Option<&KvModelInfo>,
     model_weights_bytes: u64,
-    cuda_device_index: Option<u32>,
     provider: Option<&crate::memory_authority::SharedMemoryAuthorityProvider>,
     domain: &crate::memory_authority::DeviceCompatibilityDomain,
 ) -> anyhow::Result<EngineResourceGovernor> {
@@ -1084,7 +1053,6 @@ pub(crate) fn component_governor(
         config.allow_runtime_override,
         kv_config,
         model_weights_bytes,
-        cuda_device_index,
         provider,
         Some(domain),
     )

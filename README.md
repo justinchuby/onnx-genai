@@ -454,21 +454,6 @@ a clean transcript. Tune segmentation with `--segment-seconds`,
 Whole-file transcription is also available over HTTP as
 `POST /v1/audio/transcriptions`.
 
-### Generate speech
-
-`generate --output-audio` synthesizes through a text-to-speech package — an
-autoregressive decoder that emits audio codes followed by a single-pass vocoder
-stage placed after the decoder in `pipeline.strategy`:
-
-```bash
-./target/release/onnx-genai generate models/my-tts "Hello from onnx-genai." \
-  --output-audio speech.wav
-```
-
-The output sample rate is declared by the package as `pipeline.audio.sample_rate`
-rather than assumed; a package that omits it is rejected with an error rather
-than played back at a guessed pitch (pass `--sample-rate` to supply one).
-
 The native CPU decode path also enables a steady-state **decode-plan memo** by
 default: it caches the per-step shape/buffer plan and replays it token-to-token
 (token-exact by construction, with an in-flight verify net and a graceful fall
