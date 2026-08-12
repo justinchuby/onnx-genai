@@ -96,3 +96,12 @@ Build clean, 17/17 BFloat16 LayerNorm tests pass, 96/96 `*LayerNorm*` pass, clan
 ## 2026-08-11 (upstream CI correction wave) — Rebase PR #31973
 
 Rebased `nxrt/mlas-avx2-layernorm` (7 commits) from `16b486a2` onto `upstream/main` at `86d38813a8`. Zero conflicts. Build clean (warnings-as-errors). 42 MLAS LayerNorm tests pass. All five preserved properties intact. Force-pushed. New HEAD: `6ef1f61f88`. PR remains draft per user instruction (correct posture: draft until CI board is green).
+
+## 2026-08-12 — PR #762 clippy fix
+
+- Collapsed identical `if`/`else if` blocks in `loader.rs:263` into single `||` condition.
+- Preserved short-circuit order: struct_size check before field access.
+- Added comment documenting the ordering invariant.
+- Tests: 280 passed, 0 failed. Clippy clean. Fmt clean.
+- CLI ORT (Linux x86_64) job log not available (run still in progress); could not diagnose.
+- Pushed `08a9105f8`.

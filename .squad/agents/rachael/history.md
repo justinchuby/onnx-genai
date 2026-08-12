@@ -91,3 +91,12 @@ Full pre-compaction history in `history-archive.md`.
 - Non-vacuity proved: forced `"Relu"` assertion in two tests produced correct failure messages.
 
 **Outcome:** Gaff's final review confirmed assertions real and falsifiable, EP name correct, BL1 logic preserved. PR marked ready for review.
+
+## 2026-08-12 — PR #762: Test-integrity gate hardening
+
+- Fixed `find_ort_lib_dir` to honour `CARGO_TARGET_DIR` (matching `cdylib_resolve.rs` logic)
+- Routed fixture-missing and dlopen-failure skip paths through the `NXRT_REQUIRE_ORT_TESTS` gate
+- Added `NXRT_REQUIRE_ORT_TESTS=1` to CI `CLI ORT (Linux x86_64)` lane + cpu-plugin test step
+- Proved: missing fixture panics, dlopen failure panics, CARGO_TARGET_DIR resolves correctly
+- Test counts: 40 passed, 0 failed (6 plugin_export_abi + 9 optional_slots + 1 layernorm + 24 e2e)
+- Commit: 88f9de8df
