@@ -751,6 +751,42 @@ fn f32_to_bf16(val: f32) -> u16 {
     (val.to_bits() >> 16) as u16
 }
 
+/// Widen an IEEE 754 binary16 value to f32. Handles normals, subnormals,
+/// zeros, and inf/NaN. Used to compare kernel output against an f32 oracle.
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 1) as u32;
+    let exp = ((bits >> 10) & 0x1F) as u32;
+    let mant = (bits & 0x3FF) as u32;
+    let f32_bits = if exp == 0 {
+        if mant == 0 {
+            sign << 31 // ±0
+        } else {
+            // Subnormal f16 → normalized f32.
+            let mut e: i32 = -1;
+            let mut m = mant;
+            loop {
+                e += 1;
+                m <<= 1;
+                if m & 0x400 != 0 {
+                    break;
+                }
+            }
+            let m = m & 0x3FF;
+            (sign << 31) | (((127 - 15 - e) as u32) << 23) | (m << 13)
+        }
+    } else if exp == 0x1F {
+        (sign << 31) | (0xFF << 23) | (mant << 13) // inf / NaN
+    } else {
+        (sign << 31) | (((exp as i32 - 15 + 127) as u32) << 23) | (mant << 13)
+    };
+    f32::from_bits(f32_bits)
+}
+
+/// Widen a bfloat16 value to f32 (bf16 is the top 16 bits of the f32 form).
+fn bf16_to_f32(bits: u16) -> f32 {
+    f32::from_bits((bits as u32) << 16)
+}
+
 unsafe fn make_float16_tensor(
     api: *const ort::OrtApi,
     data: &mut [u16],
@@ -1063,9 +1099,32 @@ fn layer_norm_f16_absent_output_no_overflow() {
         check_status(api, status, "Run(layer_norm_f16)");
         assert!(!output.is_null());
 
-        // Just verify the run succeeded without crash — the key assertion is
-        // that the scratch buffers for absent Mean/InvStdDev didn't overflow.
-        eprintln!("  layer_norm_f16: run completed without crash");
+        // Value oracle (not just crash-freedom): LayerNormalization over the
+        // last axis with Scale=1 and no bias produces the normalized rows.
+        //   X row0 = [1,2,3,4] → mean 2.5, var 1.25, invstd 1/sqrt(1.25+1e-5)
+        //   X row1 = [5,6,7,8] → mean 6.5, same deviations → identical Y row
+        //   Y = (X - mean) * invstd (Scale=1). Both rows equal:
+        //   [-1.3416394, -0.4472131, 0.4472131, 1.3416394]
+        // A scratch-buffer overflow that silently corrupted Y would fail here.
+        let mut y_ptr: *mut std::ffi::c_void = ptr::null_mut();
+        let status = ((*api).GetTensorMutableData.unwrap())(output, &mut y_ptr);
+        check_status(api, status, "GetTensorMutableData(layer_norm_f16)");
+        let result = std::slice::from_raw_parts(y_ptr as *const u16, 8);
+        let expected_y_f32: [f32; 8] = [
+            -1.3416394, -0.4472131, 0.4472131, 1.3416394, -1.3416394, -0.4472131, 0.4472131,
+            1.3416394,
+        ];
+        eprintln!("  layer_norm_f16 Y (raw u16): {result:?}");
+        // f16 has ~3 decimal digits; 0.02 absolute tolerance is well within f16
+        // rounding for |Y|≈0.4–1.3 yet tight enough to catch corruption.
+        for (i, (&got_u16, &want)) in result.iter().zip(expected_y_f32.iter()).enumerate() {
+            let got = f16_to_f32(got_u16);
+            assert!(
+                (got - want).abs() <= 0.02,
+                "Y[{i}]: got {got} (0x{got_u16:04X}), want ~{want} — \
+                 corrupted normalized value indicates a scratch buffer overflow"
+            );
+        }
 
         ((*api).ReleaseValue.unwrap())(output);
         ((*api).ReleaseValue.unwrap())(x_val);
@@ -1128,7 +1187,28 @@ fn layer_norm_bf16_absent_output_no_overflow() {
         check_status(api, status, "Run(layer_norm_bf16)");
         assert!(!output.is_null());
 
-        eprintln!("  layer_norm_bf16: run completed without crash");
+        // Value oracle (not just crash-freedom): same normalization as the f16
+        // case. Both rows equal [-1.3416394, -0.4472131, 0.4472131, 1.3416394].
+        // A scratch-buffer overflow that silently corrupted Y would fail here.
+        let mut y_ptr: *mut std::ffi::c_void = ptr::null_mut();
+        let status = ((*api).GetTensorMutableData.unwrap())(output, &mut y_ptr);
+        check_status(api, status, "GetTensorMutableData(layer_norm_bf16)");
+        let result = std::slice::from_raw_parts(y_ptr as *const u16, 8);
+        let expected_y_f32: [f32; 8] = [
+            -1.3416394, -0.4472131, 0.4472131, 1.3416394, -1.3416394, -0.4472131, 0.4472131,
+            1.3416394,
+        ];
+        eprintln!("  layer_norm_bf16 Y (raw u16): {result:?}");
+        // bf16 keeps only 7 mantissa bits; 0.05 absolute tolerance covers its
+        // coarse rounding for |Y|≈0.4–1.3 while still catching corruption.
+        for (i, (&got_u16, &want)) in result.iter().zip(expected_y_f32.iter()).enumerate() {
+            let got = bf16_to_f32(got_u16);
+            assert!(
+                (got - want).abs() <= 0.05,
+                "Y[{i}]: got {got} (0x{got_u16:04X}), want ~{want} — \
+                 corrupted normalized value indicates a scratch buffer overflow"
+            );
+        }
 
         ((*api).ReleaseValue.unwrap())(output);
         ((*api).ReleaseValue.unwrap())(x_val);
