@@ -725,6 +725,7 @@ impl Kernel for MatMulNBitsKernel {
             owned_result = vec![0.0f32; result_len];
             &mut owned_result
         };
+        let dot_kernel = selected_dot_kernel();
         if self.bits == 4
             && self.accuracy_level == 0
             && !self.weight_prepacked
@@ -746,6 +747,7 @@ impl Kernel for MatMulNBitsKernel {
                     self.k,
                     self.n,
                     self.block_size,
+                    dot_kernel,
                 );
             })?;
             return if direct_result {
@@ -776,7 +778,6 @@ impl Kernel for MatMulNBitsKernel {
                 return out;
             }
         }
-        let dot_kernel = selected_dot_kernel();
         if self.bits == 2 && !self.weight_prepacked && group_indices.is_none() {
             let owned_weight;
             let packed_weight = if can_prepack {
@@ -4894,6 +4895,7 @@ fn borrowed_affine_int4_matmul(
     k: usize,
     n: usize,
     block_size: usize,
+    dot_kernel: DotKernel,
 ) {
     debug_assert_eq!(activations.len(), m * k);
     debug_assert_eq!(result.len(), m * n);
@@ -4903,6 +4905,23 @@ fn borrowed_affine_int4_matmul(
     let packed_row_size = block_count * layout.packed_block_size();
     let zero_point_row_size = layout.zero_point_row_size(block_count);
     for (activation, output_row) in activations.chunks_exact(k).zip(result.chunks_exact_mut(n)) {
+        #[cfg(target_arch = "aarch64")]
+        if m == 1
+            && block_size == 32
+            && matches!(dot_kernel, DotKernel::NeonDot)
+            && DotKernel::arm64_int4_direct_enabled()
+        {
+            borrowed_affine_int4_matmul_m1_neon_dot(
+                activation,
+                packed,
+                &scales,
+                zero_points,
+                bias,
+                output_row,
+                k,
+            );
+            continue;
+        }
         let activation_sums = activation
             .chunks(block_size)
             .map(|block| block.iter().sum::<f32>())
@@ -4952,6 +4971,78 @@ fn borrowed_affine_int4_matmul(
         };
         parallel_output_rows(output_row, k, compute);
     }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+fn borrowed_affine_int4_matmul_m1_neon_dot(
+    activation: &[f32],
+    packed: &[u8],
+    scales: &BorrowedScales<'_>,
+    zero_points: &[u8],
+    bias: Option<&[f32]>,
+    result: &mut [f32],
+    k: usize,
+) {
+    let block_size = 32usize;
+    let block_count = k.div_ceil(block_size);
+    let padded_k = block_count * block_size;
+    let packed_row_size = block_count * (block_size / 2);
+    let zero_point_row_size = block_count.div_ceil(2);
+    let (activation, activation_scales) =
+        quantize_activation_signed(activation, padded_k, block_size);
+    let activation_sums = activation
+        .chunks_exact(block_size)
+        .map(|block| block.iter().map(|&value| value as i32).sum::<i32>())
+        .collect::<Vec<_>>();
+    let layout = NBitsLayout {
+        bits: 4,
+        block_size,
+    };
+    let compute = |output_start: usize, outputs: &mut [f32]| {
+        for (offset, output) in outputs.iter_mut().enumerate() {
+            let output_index = output_start + offset;
+            let packed_row =
+                &packed[output_index * packed_row_size..(output_index + 1) * packed_row_size];
+            let zp_row = &zero_points
+                [output_index * zero_point_row_size..(output_index + 1) * zero_point_row_size];
+            let mut sum = bias.map_or(0.0, |values| values[output_index]);
+            for block in 0..block_count {
+                let packed_block = &packed_row[block * 16..(block + 1) * 16];
+                let activation_block = &activation[block * block_size..(block + 1) * block_size];
+                // SAFETY: runtime dispatch selected FEAT_DotProd and both slices
+                // contain exactly one block32 payload.
+                let dot = unsafe { affine_int4_block32_sdot_neon(activation_block, packed_block) };
+                let zero_point = layout.zero_point(Some(zp_row), block) as i32;
+                let correction = (8 - zero_point) * activation_sums[block];
+                sum += (dot + correction) as f32
+                    * (activation_scales[block] * scales.get(output_index * block_count + block));
+            }
+            *output = sum;
+        }
+    };
+    parallel_output_rows(result, padded_k, compute);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+unsafe fn affine_int4_block32_sdot_neon(activation: &[i8], packed: &[u8]) -> i32 {
+    use std::arch::aarch64::*;
+
+    debug_assert_eq!(activation.len(), 32);
+    debug_assert_eq!(packed.len(), 16);
+    let bytes = unsafe { vld1q_u8(packed.as_ptr()) };
+    let low = vandq_u8(bytes, vdupq_n_u8(0x0f));
+    let high = vshrq_n_u8::<4>(bytes);
+    let midpoint = vdupq_n_s8(8);
+    let weights0 = vsubq_s8(vreinterpretq_s8_u8(vzip1q_u8(low, high)), midpoint);
+    let weights1 = vsubq_s8(vreinterpretq_s8_u8(vzip2q_u8(low, high)), midpoint);
+    let acts0 = unsafe { vld1q_s8(activation.as_ptr()) };
+    let acts1 = unsafe { vld1q_s8(activation.as_ptr().add(16)) };
+    let mut acc = vdupq_n_s32(0);
+    acc = unsafe { sdot_i8x16(acc, acts0, weights0) };
+    acc = unsafe { sdot_i8x16(acc, acts1, weights1) };
+    vaddvq_s32(acc)
 }
 
 #[cfg(target_arch = "aarch64")]
