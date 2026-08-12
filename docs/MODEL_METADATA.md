@@ -283,7 +283,11 @@ io.logits_output`; and expands the `past_key_names` / `past_value_names` /
 repeatable step; it was used to make the qwen14b export native-loadable for the
 KV-floor measurement
 (`crates/onnx-genai-engine/tests/qwen14b_kv_floor_sweep_native_cuda.rs`), and it
-reproduces that hand-written file byte-for-byte. It intentionally covers **only**
+reproduces that hand-written file exactly apart from a two-line provenance
+comment header that the generator prepends (verified: the emitted YAML is
+identical to the hand-written qwen14b-zp `inference_metadata.yaml` once the
+header is dropped and line endings are normalized). It intentionally covers
+**only**
 the derivable single-decoder case: hybrid linear-attention decoders with
 recurrent state ports still rely on the graph-derived `model.io` fallback above,
 and any package that already declares `model.io` should keep its authoritative

@@ -70,20 +70,40 @@
 //! ```
 //!
 //! Why (from the counters, asserted below): `growth_events == 0` and
-//! `committed_len == capacity` for **both** layouts — the engine commits the full
-//! KV bucket **eagerly** (flat commit), so the reservation *is* the commit and
-//! layout cannot change the total. Seq-major's fixed full-context stride is
-//! confirmed active (`max_len == 8192` at every capacity vs head-major's
-//! `max_len == capacity`), and the two token streams are byte-identical — so the
-//! seq-major kernel and layout resolution are correct. A fixed stride makes
-//! *growth* free (#797's 0 bytes moved) and keeps the captured graph across growth
-//! (#811/#812); it does **not** shrink an eagerly-committed full bucket. The
-//! 768-vs-96-granule (8x) floor stays a driver-level geometric property
-//! (`vmm_kv_layout_residency_gpu`), realized only by a live-prefix commit-on-
-//! demand, which this flat full-bucket reservation does not perform. This extends
-//! the #794/#827 "identical committed bytes" finding from qwen2.5-0.5b to qwen14b
-//! across a sweep that brackets the 2 MiB per-stripe granule threshold #827 showed
-//! 0.5b can never reach.
+//! `committed_len == capacity` for **both** layouts.
+//!
+//! **Do not read that as an engine property.** This harness sets
+//! `ONNX_GENAI_KV_MIN_BUCKET = capacity` at every swept point (see
+//! [`run_child_config`]), and `onnx_genai_kv::kv_capacity_bucket` is
+//! `len.next_power_of_two().max(min_bucket).min(hard_max)`. Pinning
+//! `min_bucket == capacity` therefore *forces* `initial_bucket_len == capacity`,
+//! which *forces* `committed_len == capacity`. The equality above is this knob's
+//! own output, not a discovery about the engine — and it disables the on-demand
+//! commit that is the only mechanism able to separate the layouts.
+//!
+//! Measured refutation: re-running this same child at the engine's **default**
+//! `ONNX_GENAI_KV_MIN_BUCKET=256` yields, for seq-major, `committed_len=256`
+//! with `max_len=8192` — a live-prefix commit far short of the full bucket. The
+//! engine does *not* commit the whole bucket eagerly.
+//!
+//! What this sweep therefore establishes is narrower but still real: at equal
+//! committed length the two layouts commit byte-identical physical bytes, and
+//! seq-major's fixed full-context stride is confirmed active (`max_len == 8192`
+//! at every capacity vs head-major's `max_len == capacity`) with byte-identical
+//! token streams, so the seq-major kernel and layout resolution are correct.
+//!
+//! Separation was never given a chance here, because it needs *both* of:
+//!   1. head-major capacity large enough that its per-head stripe reaches a
+//!      granule (capacity ~8192 => stripe = 2 MiB), **and**
+//!   2. the seq-major committed dense prefix left free to stay small — i.e.
+//!      `ONNX_GENAI_KV_MIN_BUCKET` *not* pinned to the capacity.
+//!
+//! At the swept points below, condition 2 is violated by construction. At the
+//! default bucket 256 both layouts commit 192 granules because condition 1 is
+//! then violated instead (a 256-token head stripe is 64 KiB, sub-granule). The
+//! regime where the 8x can appear — small bucket *and* long live prefix — is
+//! measured separately; a fixed stride makes *growth* free (#797's 0 bytes moved)
+//! and keeps the captured graph across growth (#811/#812).
 //!
 //! ## Layout levers (two, both required for a real seq-major run) — as #801/#805
 //!
@@ -419,20 +439,29 @@ fn qwen14b_kv_committed_floor_separates_head_from_seq_major() -> anyhow::Result<
                 "expected no KV growth at min_bucket == capacity {capacity}: {m:?}"
             );
         }
-        // 2. Both layouts commit the FULL bucket eagerly (`committed_len ==
-        //    capacity`), which is exactly why the committed physical bytes are
-        //    layout-independent below. Seq-major nonetheless resolves the fixed
-        //    full-context stride (`max_len == hard-max 8192`) while head-major's
-        //    stride is its bucket (`max_len == capacity`) — the stride differs,
-        //    the committed total does not.
+        // 2. Both layouts report `committed_len == capacity` — because this
+        //    harness pinned `ONNX_GENAI_KV_MIN_BUCKET = capacity`, which forces
+        //    `initial_bucket_len == capacity` through
+        //    `kv_capacity_bucket(len, hard_max) =
+        //     len.next_power_of_two().max(min_bucket).min(hard_max)`.
+        //    These two asserts therefore pin the HARNESS's own configuration, not
+        //    an engine property: they exist so that a future change to bucketing
+        //    that silently breaks this precondition turns the sweep red instead of
+        //    quietly comparing two different committed lengths. At the default
+        //    bucket (256) seq-major reports `committed_len=256` with
+        //    `max_len=8192`, i.e. the engine does NOT commit the bucket eagerly.
+        //    Seq-major resolves the fixed full-context stride (`max_len ==
+        //    hard-max 8192`) while head-major's stride is its bucket (`max_len ==
+        //    capacity`) — the stride differs, the committed total does not.
         assert_eq!(
             head.kv_committed_len, capacity,
-            "head-major committed the whole bucket (flat commit): {head:?}"
+            "harness precondition: min_bucket == capacity must pin head-major's \
+             committed length to the capacity: {head:?}"
         );
         assert_eq!(
             seq.kv_committed_len, capacity,
-            "seq-major committed the whole bucket (dense-prefix commit still fills \
-             the reserved min_bucket eagerly): {seq:?}"
+            "harness precondition: min_bucket == capacity must pin seq-major's \
+             committed length to the capacity: {seq:?}"
         );
         assert_eq!(
             head.max_len, capacity,
@@ -490,25 +519,27 @@ fn qwen14b_kv_committed_floor_separates_head_from_seq_major() -> anyhow::Result<
     eprintln!(
         "\nMeasured finding (this box, in-place VMM, capture OFF): head-major and seq-major \
          commit BYTE-IDENTICAL physical KV at every capacity (ratio 1.00x), ramping together \
-         192 -> 288 -> 480 -> 864 granules as the reserved bucket grows. The kv_heads x floor \
-         separation does NOT appear on the engine's initial-reservation path. Why, from the \
-         counters above: growth_events == 0 and committed_len == capacity for BOTH layouts, i.e. \
-         the engine commits the FULL KV bucket eagerly (flat commit), so the reservation IS the \
-         commit and layout cannot change the total. Seq-major's fixed full-context stride is \
-         confirmed present (max_len == 8192 at every capacity vs head-major's max_len == \
-         capacity) -- but a fixed stride makes GROWTH free (#797's 0 bytes moved) and keeps the \
-         captured graph across growth (#811/#812); it does not shrink an eagerly-committed full \
-         bucket. The 768-vs-96-granule (8x) floor remains a driver-level geometric property \
-         (vmm_kv_layout_residency_gpu) realized only by a live-prefix commit-on-demand, which \
-         this flat full-bucket reservation does not perform. This extends #794/#827 (identical \
-         committed bytes) from qwen2.5-0.5b to qwen14b across a sweep that brackets the 2 MiB \
-         per-stripe granule threshold -- the model geometry #827 showed 0.5b could never reach."
+         192 -> 288 -> 480 -> 864 granules as the reserved bucket grows, with byte-identical \
+         token streams and seq-major's fixed full-context stride confirmed active (max_len == \
+         8192 at every capacity vs head-major's max_len == capacity). \
+         CAVEAT ON SCOPE: this sweep pins ONNX_GENAI_KV_MIN_BUCKET = capacity, which FORCES \
+         committed_len == capacity via kv_capacity_bucket(len, hard_max) = \
+         len.next_power_of_two().max(min_bucket).min(hard_max). So the equal committed lengths \
+         are this harness's own configuration, NOT evidence that the engine commits eagerly -- \
+         at the default bucket 256 seq-major reports committed_len=256 with max_len=8192, i.e. a \
+         live-prefix commit well short of the bucket. What is established here is that AT EQUAL \
+         COMMITTED LENGTH the layouts commit identical physical bytes. Separation needs both (a) \
+         a head-major capacity whose per-head stripe reaches a 2 MiB granule (~8192) and (b) a \
+         small committed dense prefix -- i.e. min_bucket NOT pinned to capacity. Condition (b) is \
+         violated by construction here; at bucket 256 condition (a) is violated instead. The \
+         768-vs-96-granule (8x) regime is measured separately."
     );
 
-    // Deterministic, layout-defining evidence AND the committed-bytes-equality
-    // mechanism (growth_events, committed_len, head == seq committed) are
-    // asserted above per capacity. Per the #794/#812/#827 honest-reporting
-    // contract, the equality is the reported result: the floor does not move on
-    // the eager full-bucket reservation path, and the guard fires if it ever does.
+    // Deterministic, layout-defining evidence (token parity, resolved layout) and
+    // the harness preconditions (growth_events, committed_len == the pinned
+    // min_bucket, head == seq committed) are asserted above per capacity. Per the
+    // #794/#812/#827 honest-reporting contract, the equality is the reported
+    // result -- scoped to equal committed length, which is the condition this
+    // harness pins rather than discovers.
     Ok(())
 }

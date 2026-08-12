@@ -688,31 +688,51 @@ measured 2 MiB CUDA granule:
 >   | 4096 | 1,006,632,960 B (480 gr) | 1,006,632,960 B (480 gr) | 1.00× | byte-identical |
 >   | 8192 | 1,811,939,328 B (864 gr) | 1,811,939,328 B (864 gr) | 1.00× | byte-identical |
 >
->   The `kv_heads×` floor **does not separate on the engine's initial-reservation
->   path**: both layouts commit byte-identically, ramping together. The counters
->   say exactly why — `growth_events == 0` and `committed_len == capacity` for
->   **both** layouts, i.e. the engine commits the full KV bucket **eagerly** (flat
->   commit), so the reservation *is* the commit and layout cannot change the
->   total. Seq-major's fixed full-context stride is confirmed active (`max_len ==
->   8192` at every capacity vs head-major's `max_len == capacity`) and the token
->   streams match, so the seq-major kernel and layout resolution are correct; a
->   fixed stride makes *growth* free (#797's 0 bytes moved) and keeps the captured
->   graph (#811/#812) but does **not** shrink an eagerly-committed full bucket.
->   The head-major committed count is close to the predicted `layers × 2 ×
->   kv_heads = 768` granules at full context (measured 864, the extra ~96 being
->   non-granule-aligned reservation bases spanning one extra granule per binding),
->   but seq-major sits on the *same* number rather than on `layers × 2 = 96`,
->   because it too commits the full 8192-token bucket. **The 768-vs-96 (8×) floor
->   therefore remains a driver-level geometric property
->   (`vmm_kv_layout_residency_gpu`) realized only by a live-prefix commit-on-
->   demand; the engine's flat full-bucket KV reservation does not expose it.** This
->   extends #794/#827's "identical committed bytes" finding from qwen2.5-0.5b to
->   the one model geometry that reaches the granule, and localizes the remaining
->   work precisely: to land the floor end-to-end the KV binding must commit the
->   live prefix on demand instead of the whole bucket — a reservation/commit
->   change, not a stride or kernel change (both of which already work). The test
->   asserts this equality as a #812-style guard: if seq-major ever commits *less*,
->   the guard fires and this table must be updated — that would be the win.
+>   The `kv_heads×` floor **does not separate at equal committed length**: both
+>   layouts commit byte-identically, ramping together.
+>
+>   **The mechanism is a property of this harness, not of the engine — and the
+>   original write-up of this table got that wrong.** The sweep sets
+>   `ONNX_GENAI_KV_MIN_BUCKET = capacity` at every point, and
+>   `onnx_genai_kv::kv_capacity_bucket(len, hard_max)` is
+>   `len.next_power_of_two().max(min_bucket).min(hard_max)`. Pinning
+>   `min_bucket == capacity` *forces* `initial_bucket_len == capacity`, hence
+>   `committed_len == capacity`. Concluding from that same number that "the engine
+>   commits the full KV bucket eagerly" is circular: the knob produced the
+>   observation. Re-running the identical child at the engine's **default**
+>   `ONNX_GENAI_KV_MIN_BUCKET=256` yields, for seq-major, `committed_len = 256`
+>   with `max_len = 8192` — a live-prefix commit far short of the bucket. **The
+>   engine does commit on demand.**
+>
+>   Seq-major's fixed full-context stride is confirmed active (`max_len == 8192` at
+>   every capacity vs head-major's `max_len == capacity`) and the token streams
+>   match, so the seq-major kernel and layout resolution are correct; a fixed
+>   stride makes *growth* free (#797's 0 bytes moved) and keeps the captured graph
+>   (#811/#812). The head-major committed count is close to the predicted
+>   `layers × 2 × kv_heads = 768` granules at full context (measured 864, the extra
+>   ~96 being non-granule-aligned reservation bases spanning one extra granule per
+>   binding); seq-major sits on the *same* number only because this harness pinned
+>   it to the same committed length.
+>
+>   **Separation requires two conditions at once, and every measurement so far has
+>   violated one of them:**
+>   1. head-major capacity large enough that its per-head stripe reaches a granule
+>      (`capacity × head_dim × 2 ≥ 2 MiB`, i.e. capacity ≈ 8192), **and**
+>   2. the seq-major committed dense prefix left free to stay small — i.e.
+>      `ONNX_GENAI_KV_MIN_BUCKET` *not* pinned to the capacity.
+>
+>   The sweep above violates (2) by construction. At the default bucket 256 both
+>   layouts commit 192 granules because (1) is violated instead — a 256-token head
+>   stripe is 64 KiB, sub-granule. The regime where the 8× can appear is small
+>   bucket *and* long live prefix, and is measured separately. The test asserts
+>   the equality as a #812-style guard, with its `committed_len` assertions
+>   documented as *harness preconditions* rather than engine findings: if seq-major
+>   ever commits less, the guard fires and this table must be updated — that would
+>   be the win.
+>
+>   **Lesson (the third time this document has had to be corrected):** before
+>   attributing a measured number to the system, check that no knob you set is
+>   itself producing that number. See the "instrument itself" failure mode below.
 > * **A fourth place the layout lives — the engine-side non-kernel KV
 >   consumers — is now gated (#812, `seqmajor-physical-shape`).** Beyond kernel
 >   indexing, commit geometry, and growth byte geometry, the device
