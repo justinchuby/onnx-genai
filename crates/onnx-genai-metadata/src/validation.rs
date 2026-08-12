@@ -1322,12 +1322,14 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
                 predicate,
                 cases,
                 default,
+                outputs,
+                effects: merges,
             } => {
                 require_workflow_value(predicate, values, &format!("{path}.predicate"), errors);
                 if cases.is_empty() {
                     errors.push(format!("{path}.cases must not be empty"));
                 }
-                let mut resulting_effects = Vec::new();
+                let mut case_scopes = BTreeMap::new();
                 for (case, node) in cases {
                     let mut case_values = values.clone();
                     let mut case_contracts = value_contracts.clone();
@@ -1343,9 +1345,12 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
                         &format!("{path}.cases.{case}"),
                         errors,
                     );
-                    resulting_effects.push(case_effects);
+                    case_scopes.insert(
+                        case.clone(),
+                        (case_values, case_contracts, case_effects, case_tokens),
+                    );
                 }
-                if let Some(default) = default {
+                let default_scope = if let Some(default) = default {
                     let mut default_values = values.clone();
                     let mut default_contracts = value_contracts.clone();
                     let mut default_effects = effects.clone();
@@ -1360,15 +1365,195 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
                         &format!("{path}.default"),
                         errors,
                     );
-                    resulting_effects.push(default_effects);
-                }
-                if let Some(first) = resulting_effects.first() {
-                    if resulting_effects.iter().any(|result| result != first) {
+                    Some((
+                        default_values,
+                        default_contracts,
+                        default_effects,
+                        default_tokens,
+                    ))
+                } else {
+                    None
+                };
+
+                for (output, phi) in outputs {
+                    for case in cases.keys() {
+                        if !phi.cases.contains_key(case) {
+                            errors.push(format!(
+                                "{path}.outputs.{output} has no value for case '{case}'"
+                            ));
+                        }
+                    }
+                    for case in phi.cases.keys() {
+                        if !cases.contains_key(case) {
+                            errors.push(format!(
+                                "{path}.outputs.{output} references unknown case '{case}'"
+                            ));
+                        }
+                    }
+                    if default.is_some() != phi.default.is_some() {
                         errors.push(format!(
-                            "{path} has unordered side effects: every branch must produce identical effect tokens"
+                            "{path}.outputs.{output} must map the default branch exactly when one \
+                             is declared"
                         ));
-                    } else if let Some(result) = resulting_effects.pop() {
-                        *effects = result;
+                    }
+
+                    let mut contract = None;
+                    for (case, source) in &phi.cases {
+                        let Some((case_values, case_contracts, _, _)) = case_scopes.get(case)
+                        else {
+                            continue;
+                        };
+                        require_workflow_value(
+                            source,
+                            case_values,
+                            &format!("{path}.outputs.{output}.cases.{case}"),
+                            errors,
+                        );
+                        if let Some(source_contract) = case_contracts.get(source) {
+                            if let Some(expected) = &contract {
+                                require_compatible_contracts(
+                                    source_contract,
+                                    expected,
+                                    &format!("{path}.outputs.{output}.cases.{case}"),
+                                    errors,
+                                );
+                            } else {
+                                contract = Some(source_contract.clone());
+                            }
+                        }
+                    }
+                    if let (Some(source), Some((default_values, default_contracts, _, _))) =
+                        (&phi.default, &default_scope)
+                    {
+                        require_workflow_value(
+                            source,
+                            default_values,
+                            &format!("{path}.outputs.{output}.default"),
+                            errors,
+                        );
+                        if let Some(source_contract) = default_contracts.get(source) {
+                            if let Some(expected) = &contract {
+                                require_compatible_contracts(
+                                    source_contract,
+                                    expected,
+                                    &format!("{path}.outputs.{output}.default"),
+                                    errors,
+                                );
+                            } else {
+                                contract = Some(source_contract.clone());
+                            }
+                        }
+                    }
+                    define_workflow_value(
+                        output,
+                        values,
+                        &format!("{path}.outputs.{output}"),
+                        errors,
+                    );
+                    if let Some(contract) = contract {
+                        value_contracts.insert(output.clone(), contract);
+                    }
+                }
+
+                for (effect_name, merge) in merges {
+                    match effects.get(effect_name) {
+                        Some(incoming) if incoming == &merge.incoming => {}
+                        Some(incoming) => errors.push(format!(
+                            "{path}.effects.{effect_name} consumes '{}', but the incoming token is \
+                             '{incoming}'",
+                            merge.incoming
+                        )),
+                        None => errors.push(format!(
+                            "{path}.effects.{effect_name} references undeclared effect"
+                        )),
+                    }
+                    for case in cases.keys() {
+                        if !merge.cases.contains_key(case) {
+                            errors.push(format!(
+                                "{path}.effects.{effect_name} has no successor for case '{case}'"
+                            ));
+                        }
+                    }
+                    for case in merge.cases.keys() {
+                        if !cases.contains_key(case) {
+                            errors.push(format!(
+                                "{path}.effects.{effect_name} references unknown case '{case}'"
+                            ));
+                        }
+                    }
+                    if default.is_some() != merge.default.is_some() {
+                        errors.push(format!(
+                            "{path}.effects.{effect_name} must map the default branch exactly when \
+                             one is declared"
+                        ));
+                    }
+                    for (case, successor) in &merge.cases {
+                        if let Some((_, _, case_effects, _)) = case_scopes.get(case)
+                            && case_effects.get(effect_name) != Some(successor)
+                        {
+                            errors.push(format!(
+                                "{path}.effects.{effect_name}.cases.{case} declares successor \
+                                 '{successor}', but the case produces {:?}",
+                                case_effects.get(effect_name)
+                            ));
+                        }
+                    }
+                    if let (Some(successor), Some((_, _, default_effects, _))) =
+                        (&merge.default, &default_scope)
+                        && default_effects.get(effect_name) != Some(successor)
+                    {
+                        errors.push(format!(
+                            "{path}.effects.{effect_name}.default declares successor \
+                             '{successor}', but the default produces {:?}",
+                            default_effects.get(effect_name)
+                        ));
+                    }
+                    if merge.cases.values().any(|token| token == &merge.produces)
+                        || merge.default.as_ref() == Some(&merge.produces)
+                        || case_scopes
+                            .values()
+                            .any(|(_, _, _, tokens)| tokens.contains(&merge.produces))
+                        || default_scope
+                            .as_ref()
+                            .is_some_and(|(_, _, _, tokens)| tokens.contains(&merge.produces))
+                    {
+                        errors.push(format!(
+                            "{path}.effects.{effect_name} joined successor '{}' must be distinct \
+                             from every case-local successor",
+                            merge.produces
+                        ));
+                    }
+                    if !effect_tokens.insert(merge.produces.clone()) {
+                        errors.push(format!(
+                            "{path}.effects.{effect_name} produces duplicate effect token '{}'",
+                            merge.produces
+                        ));
+                    }
+                    effects.insert(effect_name.clone(), merge.produces.clone());
+                }
+
+                for (case, (_, _, case_effects, _)) in &case_scopes {
+                    for (effect_name, successor) in case_effects {
+                        if effects.get(effect_name) != Some(successor)
+                            && !merges.contains_key(effect_name)
+                        {
+                            errors.push(format!(
+                                "{path}.cases.{case} changes effect '{effect_name}' without an \
+                                 explicit branch merge"
+                            ));
+                        }
+                    }
+                }
+                if let Some((_, _, default_effects, _)) = &default_scope {
+                    for (effect_name, successor) in default_effects {
+                        if effects.get(effect_name) != Some(successor)
+                            && !merges.contains_key(effect_name)
+                        {
+                            errors.push(format!(
+                                "{path}.default changes effect '{effect_name}' without an explicit \
+                                 branch merge"
+                            ));
+                        }
                     }
                 }
             }

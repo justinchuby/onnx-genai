@@ -896,30 +896,70 @@ impl PipelineEngine {
                 predicate,
                 cases,
                 default,
+                outputs,
+                effects: _,
             } => {
                 let key = workflow_scalar_key(values, predicate)?;
-                if let Some(case) = cases.get(&key) {
-                    self.run_workflow_node(
-                        case,
-                        workflow,
-                        values,
-                        symbols,
-                        dynamic_symbols,
-                        emit_counts,
-                        final_state_refs,
-                    )?;
+                let (selected, is_default) = if let Some(case) = cases.get(&key) {
+                    (case, false)
                 } else if let Some(default) = default {
-                    self.run_workflow_node(
-                        default,
-                        workflow,
-                        values,
-                        symbols,
-                        dynamic_symbols,
-                        emit_counts,
-                        final_state_refs,
-                    )?;
+                    (default.as_ref(), true)
                 } else {
                     anyhow::bail!("workflow branch has no case '{key}' and no default");
+                };
+                let mut branch_values = clone_pipeline_tensors(values)?;
+                let mut branch_state_refs = final_state_refs.clone();
+                let emit_counts_before = emit_counts.clone();
+                self.run_workflow_node(
+                    selected,
+                    workflow,
+                    &mut branch_values,
+                    symbols,
+                    dynamic_symbols,
+                    emit_counts,
+                    &mut branch_state_refs,
+                )?;
+
+                // Emits are explicit side effects at the package boundary, so selected-branch
+                // output values and event records survive even though ordinary case SSA does not.
+                for output in workflow_emitted_outputs(selected) {
+                    if let Some(value) = branch_values.get(&output) {
+                        values.insert(output.clone(), clone_value(value)?);
+                    }
+                    let start = emit_counts_before.get(&output).copied().unwrap_or_default();
+                    let end = emit_counts.get(&output).copied().unwrap_or_default();
+                    for index in start..end {
+                        let event = format!("{output}.{index}");
+                        if let Some(value) = branch_values.get(&event) {
+                            values.insert(event, clone_value(value)?);
+                        }
+                    }
+                }
+
+                for (output, phi) in outputs {
+                    let source = if is_default {
+                        phi.default.as_ref().with_context(|| {
+                            format!("workflow branch output '{output}' has no default value")
+                        })?
+                    } else {
+                        phi.cases.get(&key).with_context(|| {
+                            format!(
+                                "workflow branch output '{output}' has no value for case '{key}'"
+                            )
+                        })?
+                    };
+                    let value = branch_values.get(source).with_context(|| {
+                        format!(
+                            "workflow branch output '{output}' selected unavailable value \
+                             '{source}'"
+                        )
+                    })?;
+                    values.insert(output.clone(), clone_value(value)?);
+                    for (cell, state_ref) in &branch_state_refs {
+                        if state_ref == source {
+                            final_state_refs.insert(cell.clone(), output.clone());
+                        }
+                    }
                 }
             }
             WorkflowNode::Emit {
@@ -1384,6 +1424,44 @@ fn validate_state_recurrence(
         }
     }
     Ok(())
+}
+
+fn clone_pipeline_tensors(values: &PipelineTensors) -> anyhow::Result<PipelineTensors> {
+    values
+        .iter()
+        .map(|(name, value)| Ok((name.clone(), clone_value(value)?)))
+        .collect()
+}
+
+fn workflow_emitted_outputs(node: &WorkflowNode) -> std::collections::HashSet<String> {
+    fn collect(node: &WorkflowNode, outputs: &mut std::collections::HashSet<String>) {
+        match node {
+            WorkflowNode::Sequence { nodes } => {
+                for node in nodes {
+                    collect(node, outputs);
+                }
+            }
+            WorkflowNode::Loop { setup, body, .. } => {
+                collect(setup, outputs);
+                collect(body, outputs);
+            }
+            WorkflowNode::Branch { cases, default, .. } => {
+                for case in cases.values() {
+                    collect(case, outputs);
+                }
+                if let Some(default) = default {
+                    collect(default, outputs);
+                }
+            }
+            WorkflowNode::Emit { output, .. } => {
+                outputs.insert(output.clone());
+            }
+            WorkflowNode::Invoke { .. } | WorkflowNode::Transfer { .. } => {}
+        }
+    }
+    let mut outputs = std::collections::HashSet::new();
+    collect(node, &mut outputs);
+    outputs
 }
 
 fn append_workflow_value(previous: &Value, next: &Value) -> anyhow::Result<Value> {

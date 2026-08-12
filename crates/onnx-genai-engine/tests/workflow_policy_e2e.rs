@@ -817,6 +817,12 @@ pipeline:
             mode: replace
             effect_name: stream
             effect: { consumes: stream.1, produces: stream.2 }
+          effects:
+            stream:
+              incoming: stream.1
+              cases: { "3": stream.2, "5": stream.2 }
+              default: stream.2
+              produces: stream.after_branch
 "#;
     let root = package(
         "world",
@@ -850,5 +856,228 @@ pipeline:
     .with_input("increment", Value::from_slice_i64(&[1], &[])?)
     .with_input("limit", Value::from_slice_i64(&[5], &[])?);
     assert_eq!(engine.run_pipeline(second)?["state"].to_vec_i64()?, [5]);
+    Ok(())
+}
+
+#[test]
+fn workflow_branch_joins_speculative_values_and_effects() -> anyhow::Result<()> {
+    let metadata = r#"
+pipeline:
+  workflow:
+    manifest:
+      ir_version: "1.0"
+      onnx_opsets: { ai.onnx: 24 }
+      adapter_abis: {}
+      custom_op_versions: {}
+      capabilities: [workflow_ssa, linear_effects, typed_emit, streaming_emit, nested_control_flow]
+    inputs:
+      accept:
+        contract: { dtype: bool, rank: 0, shape: [] }
+        role: { kind: opaque }
+        source: { kind: application, name: accept }
+        required: true
+      accepted_tokens:
+        contract: { dtype: int64, rank: 1, shape: [batch] }
+        role: { kind: opaque }
+        source: { kind: application, name: accepted_tokens }
+        required: true
+      corrected_tokens:
+        contract: { dtype: int64, rank: 1, shape: [batch] }
+        role: { kind: opaque }
+        source: { kind: application, name: corrected_tokens }
+        required: true
+      accepted_kv:
+        contract: { dtype: float32, rank: 2, shape: [batch, cache] }
+        role: { kind: opaque }
+        source: { kind: application, name: accepted_kv }
+        required: true
+      corrected_kv:
+        contract: { dtype: float32, rank: 2, shape: [batch, cache] }
+        role: { kind: opaque }
+        source: { kind: application, name: corrected_kv }
+        required: true
+      accepted_rng:
+        contract: { dtype: int64, rank: 1, shape: [batch] }
+        role: { kind: opaque }
+        source: { kind: application, name: accepted_rng }
+        required: true
+      corrected_rng:
+        contract: { dtype: int64, rank: 1, shape: [batch] }
+        role: { kind: opaque }
+        source: { kind: application, name: corrected_rng }
+        required: true
+    outputs:
+      event:
+        contract: { dtype: int64, rank: 1, shape: [batch] }
+        role: event
+        stage: pre_adapter
+      final:
+        contract: { dtype: int64, rank: 1, shape: [batch] }
+        role: tokens
+        stage: pre_adapter
+    components:
+      token_binding:
+        implementation: { kind: binding }
+        ports:
+          inputs: { value: { dtype: int64, rank: 1, shape: [batch] } }
+          outputs: { value: { dtype: int64, rank: 1, shape: [batch] } }
+        effects: [speculative]
+      plain_token_binding:
+        implementation: { kind: binding }
+        ports:
+          inputs: { value: { dtype: int64, rank: 1, shape: [batch] } }
+          outputs: { value: { dtype: int64, rank: 1, shape: [batch] } }
+        effects: []
+      kv_binding:
+        implementation: { kind: binding }
+        ports:
+          inputs: { value: { dtype: float32, rank: 2, shape: [batch, cache] } }
+          outputs: { value: { dtype: float32, rank: 2, shape: [batch, cache] } }
+        effects: [kv]
+      rng_binding:
+        implementation: { kind: binding }
+        ports:
+          inputs: { value: { dtype: int64, rank: 1, shape: [batch] } }
+          outputs: { value: { dtype: int64, rank: 1, shape: [batch] } }
+        effects: [rng]
+    initial_effects:
+      speculative: speculative.0
+      kv: kv.0
+      rng: rng.0
+      stream: stream.0
+    graph:
+      kind: sequence
+      nodes:
+        - kind: branch
+          predicate: accept
+          cases:
+            "true":
+              kind: sequence
+              nodes:
+                - kind: invoke
+                  component: token_binding
+                  inputs: { value: accepted_tokens }
+                  outputs: { value: accepted.tokens }
+                  effects:
+                    speculative: { consumes: speculative.0, produces: speculative.accepted }
+                - kind: invoke
+                  component: kv_binding
+                  inputs: { value: accepted_kv }
+                  outputs: { value: accepted.kv }
+                  effects: { kv: { consumes: kv.0, produces: kv.accepted } }
+                - kind: invoke
+                  component: rng_binding
+                  inputs: { value: accepted_rng }
+                  outputs: { value: accepted.rng }
+                  effects: { rng: { consumes: rng.0, produces: rng.accepted } }
+                - kind: emit
+                  value: accepted.tokens
+                  output: event
+                  mode: event
+                  effect_name: stream
+                  effect: { consumes: stream.0, produces: stream.accepted }
+                - kind: invoke
+                  component: plain_token_binding
+                  inputs: { value: accepted_tokens }
+                  outputs: { value: event.secret }
+                  effects: {}
+            "false":
+              kind: sequence
+              nodes:
+                - kind: invoke
+                  component: token_binding
+                  inputs: { value: corrected_tokens }
+                  outputs: { value: corrected.tokens }
+                  effects:
+                    speculative: { consumes: speculative.0, produces: speculative.corrected }
+                - kind: invoke
+                  component: kv_binding
+                  inputs: { value: corrected_kv }
+                  outputs: { value: corrected.kv }
+                  effects: { kv: { consumes: kv.0, produces: kv.corrected } }
+                - kind: invoke
+                  component: rng_binding
+                  inputs: { value: corrected_rng }
+                  outputs: { value: corrected.rng }
+                  effects: { rng: { consumes: rng.0, produces: rng.corrected } }
+                - kind: emit
+                  value: corrected.tokens
+                  output: event
+                  mode: event
+                  effect_name: stream
+                  effect: { consumes: stream.0, produces: stream.corrected }
+                - kind: invoke
+                  component: plain_token_binding
+                  inputs: { value: corrected_tokens }
+                  outputs: { value: event.secret }
+                  effects: {}
+          outputs:
+            selected.tokens:
+              cases: { "true": accepted.tokens, "false": corrected.tokens }
+            selected.kv:
+              cases: { "true": accepted.kv, "false": corrected.kv }
+            selected.rng:
+              cases: { "true": accepted.rng, "false": corrected.rng }
+          effects:
+            speculative:
+              incoming: speculative.0
+              cases: { "true": speculative.accepted, "false": speculative.corrected }
+              produces: speculative.joined
+            kv:
+              incoming: kv.0
+              cases: { "true": kv.accepted, "false": kv.corrected }
+              produces: kv.joined
+            rng:
+              incoming: rng.0
+              cases: { "true": rng.accepted, "false": rng.corrected }
+              produces: rng.joined
+            stream:
+              incoming: stream.0
+              cases: { "true": stream.accepted, "false": stream.corrected }
+              produces: stream.joined
+        - kind: emit
+          value: selected.tokens
+          output: final
+          mode: replace
+          effect_name: stream
+          effect: { consumes: stream.joined, produces: stream.final }
+"#;
+    let root = package("speculative-branch", metadata, &[])?;
+    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+
+    for (accept, tokens, kv, rng) in [
+        (true, vec![11], vec![1.0, 2.0], vec![4]),
+        (false, vec![22], vec![3.0, 4.0], vec![8]),
+    ] {
+        let request = PipelineGenerateRequest::new(GenerateRequest {
+            prompt: GeneratePrompt::TokenIds(vec![]),
+            options: Default::default(),
+        })
+        .with_input(
+            "accept",
+            Value::from_raw_bytes(vec![u8::from(accept)], &[], onnx_genai_ort::DataType::Bool)?,
+        )
+        .with_input("accepted_tokens", Value::from_slice_i64(&[11], &[1])?)
+        .with_input("corrected_tokens", Value::from_slice_i64(&[22], &[1])?)
+        .with_input("accepted_kv", Value::from_slice_f32(&[1.0, 2.0], &[1, 2])?)
+        .with_input("corrected_kv", Value::from_slice_f32(&[3.0, 4.0], &[1, 2])?)
+        .with_input("accepted_rng", Value::from_slice_i64(&[4], &[1])?)
+        .with_input("corrected_rng", Value::from_slice_i64(&[8], &[1])?);
+        let outputs = engine.run_pipeline(request)?;
+
+        assert_eq!(outputs["final"].to_vec_i64()?, tokens);
+        assert_eq!(outputs["event.0"].to_vec_i64()?, tokens);
+        assert_eq!(outputs["selected.kv"].to_vec_f32()?, kv);
+        assert_eq!(outputs["selected.rng"].to_vec_i64()?, rng);
+        assert!(!outputs.contains_key("event.secret"));
+        assert!(
+            !outputs.contains_key(if accept {
+                "corrected.tokens"
+            } else {
+                "accepted.tokens"
+            }),
+            "case-local SSA must not escape"
+        );
+    }
     Ok(())
 }

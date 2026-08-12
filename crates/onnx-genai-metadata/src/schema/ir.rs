@@ -518,6 +518,10 @@ pub enum WorkflowNode {
         cases: BTreeMap<String, WorkflowNode>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         default: Option<Box<WorkflowNode>>,
+        #[serde(default)]
+        outputs: BTreeMap<String, WorkflowBranchOutput>,
+        #[serde(default)]
+        effects: BTreeMap<String, WorkflowBranchEffectMerge>,
     },
     Emit {
         value: String,
@@ -531,6 +535,24 @@ pub enum WorkflowNode {
         output: String,
         device: DeviceKind,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowBranchOutput {
+    pub cases: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowBranchEffectMerge {
+    pub incoming: String,
+    pub cases: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    pub produces: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
