@@ -214,6 +214,68 @@
       },
       "type": "object"
     },
+    "ComponentImplementation": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "artifact": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "onnx",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "artifact"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "abi": {
+              "type": "string"
+            },
+            "custom_ops": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {},
+              "type": "object"
+            },
+            "kind": {
+              "const": "adapter",
+              "type": "string"
+            },
+            "version": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "abi",
+            "version"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "binding",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "ComponentPorts": {
       "additionalProperties": false,
       "description": "Explicit input/output ports of one executable component.",
@@ -563,6 +625,22 @@
         }
       ],
       "type": "string"
+    },
+    "EffectTransition": {
+      "additionalProperties": false,
+      "properties": {
+        "consumes": {
+          "type": "string"
+        },
+        "produces": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "consumes",
+        "produces"
+      ],
+      "type": "object"
     },
     "ForkPrecisionPolicy": {
       "description": "KV fork-precision policy vocabulary.",
@@ -1498,6 +1576,13 @@
         }
       ]
     },
+    "KvPagingMode": {
+      "enum": [
+        "none",
+        "paged"
+      ],
+      "type": "string"
+    },
     "KvQuantTolerance": {
       "description": "Precision tolerance for key and value cache components.",
       "properties": {
@@ -1524,6 +1609,26 @@
           "description": "Value-cache precision tolerance."
         }
       },
+      "type": "object"
+    },
+    "KvServiceContract": {
+      "additionalProperties": false,
+      "properties": {
+        "allocation": {
+          "$ref": "#/$defs/SlotAllocationMode"
+        },
+        "compaction": {
+          "default": false,
+          "type": "boolean"
+        },
+        "paging": {
+          "$ref": "#/$defs/KvPagingMode"
+        }
+      },
+      "required": [
+        "paging",
+        "allocation"
+      ],
       "type": "object"
     },
     "KvStrideDescriptor": {
@@ -2249,6 +2354,13 @@
       ],
       "type": "object"
     },
+    "OutputStage": {
+      "enum": [
+        "pre_adapter",
+        "post_adapter"
+      ],
+      "type": "string"
+    },
     "PerformanceHints": {
       "description": "Publisher-provided speculative decoding performance guidance.",
       "properties": {
@@ -2600,11 +2712,19 @@
             }
           ],
           "description": "Vision-language model token-expansion contract.\n\nWhen present, the engine uses these fields to replace each image\nplaceholder token in the prompt with the declared expanded image-token\nsequence before KV-cache allocation."
+        },
+        "workflow": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkflowSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "North-star component-centric SSA workflow."
         }
       },
-      "required": [
-        "models"
-      ],
       "type": "object"
     },
     "PipelineStrategy": {
@@ -3791,6 +3911,22 @@
       },
       "type": "object"
     },
+    "RuntimeInputRole": {
+      "enum": [
+        "prompt_text",
+        "prompt_tokens",
+        "media",
+        "max_iterations",
+        "max_output_tokens",
+        "seed",
+        "sampling_temperature",
+        "sampling_top_k",
+        "sampling_top_p",
+        "constraint",
+        "session_id"
+      ],
+      "type": "string"
+    },
     "RuntimeKvConfig": {
       "description": "Runtime-selectable KV-cache representations.",
       "properties": {
@@ -4036,6 +4172,44 @@
       ],
       "type": "object"
     },
+    "SemanticInputRole": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "runtime",
+              "type": "string"
+            },
+            "role": {
+              "$ref": "#/$defs/RuntimeInputRole"
+            },
+            "version": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "version",
+            "role"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "opaque",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "SequenceInputKind": {
       "description": "Primary autoregressive sequence source for a decoder or proposer graph.",
       "oneOf": [
@@ -4058,6 +4232,109 @@
           "const": "unit_batch",
           "description": "Interpret one rank-0 value as the canonical one-element vector only for\nan attention batch of exactly one.",
           "type": "string"
+        }
+      ]
+    },
+    "ServingServiceContract": {
+      "additionalProperties": false,
+      "properties": {
+        "accepted_len": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "active": {
+          "type": "string"
+        },
+        "done": {
+          "type": "string"
+        },
+        "kv_service": {
+          "$ref": "#/$defs/KvServiceContract"
+        },
+        "slot_ids": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "active",
+        "done",
+        "slot_ids",
+        "kv_service"
+      ],
+      "type": "object"
+    },
+    "SessionLeaseContract": {
+      "additionalProperties": false,
+      "properties": {
+        "optimistic_metadata_version": {
+          "default": false,
+          "type": "boolean"
+        },
+        "policy": {
+          "$ref": "#/$defs/SessionMutationPolicy",
+          "default": "exclusive"
+        },
+        "ttl_seconds": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "SessionMutationPolicy": {
+      "enum": [
+        "exclusive",
+        "copy_on_write"
+      ],
+      "type": "string"
+    },
+    "ShapeRecurrence": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "invariant",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "axis": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "increment": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "growing",
+              "type": "string"
+            },
+            "max": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "axis",
+            "increment",
+            "max"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -4111,6 +4388,13 @@
         "name"
       ],
       "type": "object"
+    },
+    "SlotAllocationMode": {
+      "enum": [
+        "static",
+        "runtime"
+      ],
+      "type": "string"
     },
     "SolverSpec": {
       "additionalProperties": false,
@@ -5159,6 +5443,655 @@
         }
       },
       "type": "object"
+    },
+    "WorkflowBatchingContract": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "none",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "axis": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "const": "stack",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "axis"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "ragged",
+              "type": "string"
+            },
+            "offsets": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "offsets"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "WorkflowComponent": {
+      "additionalProperties": false,
+      "properties": {
+        "effects": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "implementation": {
+          "$ref": "#/$defs/ComponentImplementation"
+        },
+        "ports": {
+          "$ref": "#/$defs/ComponentPorts"
+        },
+        "resources": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkflowResourceContract"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "implementation",
+        "ports"
+      ],
+      "type": "object"
+    },
+    "WorkflowEmitMode": {
+      "enum": [
+        "replace",
+        "append",
+        "event"
+      ],
+      "type": "string"
+    },
+    "WorkflowInput": {
+      "additionalProperties": false,
+      "properties": {
+        "contract": {
+          "$ref": "#/$defs/TensorContract"
+        },
+        "default": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ScalarValue"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "required": {
+          "default": false,
+          "type": "boolean"
+        },
+        "role": {
+          "$ref": "#/$defs/SemanticInputRole"
+        },
+        "source": {
+          "$ref": "#/$defs/WorkflowInputSource"
+        }
+      },
+      "required": [
+        "contract",
+        "role",
+        "source"
+      ],
+      "type": "object"
+    },
+    "WorkflowInputSource": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "field": {
+              "$ref": "#/$defs/RuntimeInputRole"
+            },
+            "kind": {
+              "const": "request",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "field"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "application",
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "name"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "literal",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "artifact",
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "path"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "WorkflowLoopCarry": {
+      "additionalProperties": false,
+      "properties": {
+        "body_input": {
+          "type": "string"
+        },
+        "body_output": {
+          "type": "string"
+        },
+        "cell": {
+          "type": "string"
+        },
+        "current": {
+          "type": "string"
+        },
+        "next": {
+          "type": "string"
+        },
+        "read_effect": {
+          "$ref": "#/$defs/EffectTransition"
+        },
+        "write_effect": {
+          "$ref": "#/$defs/EffectTransition"
+        }
+      },
+      "required": [
+        "cell",
+        "current",
+        "body_input",
+        "body_output",
+        "next",
+        "read_effect",
+        "write_effect"
+      ],
+      "type": "object"
+    },
+    "WorkflowManifest": {
+      "additionalProperties": false,
+      "properties": {
+        "adapter_abis": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "type": "object"
+        },
+        "capabilities": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "custom_op_versions": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "type": "object"
+        },
+        "ir_version": {
+          "type": "string"
+        },
+        "onnx_opsets": {
+          "additionalProperties": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "default": {},
+          "type": "object"
+        }
+      },
+      "required": [
+        "ir_version"
+      ],
+      "type": "object"
+    },
+    "WorkflowMemoryClass": {
+      "enum": [
+        "default",
+        "device",
+        "host",
+        "pinned"
+      ],
+      "type": "string"
+    },
+    "WorkflowNode": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "sequence",
+              "type": "string"
+            },
+            "nodes": {
+              "items": {
+                "$ref": "#/$defs/WorkflowNode"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "kind",
+            "nodes"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "component": {
+              "type": "string"
+            },
+            "effects": {
+              "additionalProperties": {
+                "$ref": "#/$defs/EffectTransition"
+              },
+              "default": {},
+              "type": "object"
+            },
+            "inputs": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {},
+              "type": "object"
+            },
+            "kind": {
+              "const": "invoke",
+              "type": "string"
+            },
+            "outputs": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "default": {},
+              "type": "object"
+            }
+          },
+          "required": [
+            "kind",
+            "component"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "body": {
+              "$ref": "#/$defs/WorkflowNode"
+            },
+            "carried": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/WorkflowLoopCarry"
+              },
+              "type": "array"
+            },
+            "condition": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "loop",
+              "type": "string"
+            },
+            "max_iterations": {
+              "type": "string"
+            },
+            "setup": {
+              "$ref": "#/$defs/WorkflowNode"
+            }
+          },
+          "required": [
+            "kind",
+            "setup",
+            "body",
+            "condition",
+            "max_iterations"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "cases": {
+              "additionalProperties": {
+                "$ref": "#/$defs/WorkflowNode"
+              },
+              "type": "object"
+            },
+            "default": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/WorkflowNode"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "kind": {
+              "const": "branch",
+              "type": "string"
+            },
+            "predicate": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "predicate",
+            "cases"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "effect": {
+              "$ref": "#/$defs/EffectTransition"
+            },
+            "effect_name": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "emit",
+              "type": "string"
+            },
+            "mode": {
+              "$ref": "#/$defs/WorkflowEmitMode"
+            },
+            "output": {
+              "type": "string"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "value",
+            "output",
+            "mode",
+            "effect_name",
+            "effect"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "device": {
+              "$ref": "#/$defs/DeviceKind"
+            },
+            "input": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "transfer",
+              "type": "string"
+            },
+            "output": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "input",
+            "output",
+            "device"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "WorkflowOutput": {
+      "additionalProperties": false,
+      "properties": {
+        "contract": {
+          "$ref": "#/$defs/TensorContract"
+        },
+        "role": {
+          "$ref": "#/$defs/WorkflowOutputRole"
+        },
+        "stage": {
+          "$ref": "#/$defs/OutputStage"
+        }
+      },
+      "required": [
+        "contract",
+        "role",
+        "stage"
+      ],
+      "type": "object"
+    },
+    "WorkflowOutputRole": {
+      "enum": [
+        "tokens",
+        "text",
+        "image",
+        "audio",
+        "tensor",
+        "event"
+      ],
+      "type": "string"
+    },
+    "WorkflowResourceContract": {
+      "additionalProperties": false,
+      "properties": {
+        "allowed_devices": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/DeviceKind"
+          },
+          "type": "array"
+        },
+        "batching": {
+          "$ref": "#/$defs/WorkflowBatchingContract"
+        },
+        "concurrency": {
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "memory_class": {
+          "$ref": "#/$defs/WorkflowMemoryClass"
+        },
+        "preferred_device": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeviceKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "memory_class",
+        "batching"
+      ],
+      "type": "object"
+    },
+    "WorkflowSpec": {
+      "additionalProperties": false,
+      "description": "Sound, component-centric workflow IR. Tensor math lives in invoked components.",
+      "properties": {
+        "components": {
+          "additionalProperties": {
+            "$ref": "#/$defs/WorkflowComponent"
+          },
+          "type": "object"
+        },
+        "graph": {
+          "$ref": "#/$defs/WorkflowNode"
+        },
+        "initial_effects": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "type": "object"
+        },
+        "inputs": {
+          "additionalProperties": {
+            "$ref": "#/$defs/WorkflowInput"
+          },
+          "default": {},
+          "type": "object"
+        },
+        "manifest": {
+          "$ref": "#/$defs/WorkflowManifest"
+        },
+        "outputs": {
+          "additionalProperties": {
+            "$ref": "#/$defs/WorkflowOutput"
+          },
+          "default": {},
+          "type": "object"
+        },
+        "serving": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ServingServiceContract"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "state": {
+          "additionalProperties": {
+            "$ref": "#/$defs/WorkflowStateCell"
+          },
+          "default": {},
+          "type": "object"
+        }
+      },
+      "required": [
+        "manifest",
+        "components",
+        "graph"
+      ],
+      "type": "object"
+    },
+    "WorkflowStateCell": {
+      "additionalProperties": false,
+      "properties": {
+        "contract": {
+          "$ref": "#/$defs/TensorContract"
+        },
+        "initializer": {
+          "type": "string"
+        },
+        "recurrence": {
+          "$ref": "#/$defs/ShapeRecurrence"
+        },
+        "scope": {
+          "$ref": "#/$defs/WorkflowStateScope"
+        },
+        "session": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionLeaseContract"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "contract",
+        "scope",
+        "initializer",
+        "recurrence"
+      ],
+      "type": "object"
+    },
+    "WorkflowStateScope": {
+      "enum": [
+        "invocation",
+        "session"
+      ],
+      "type": "string"
     }
   },
   "$id": "https://github.com/onnx/onnx/issues/8184",

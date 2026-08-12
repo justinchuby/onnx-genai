@@ -318,6 +318,130 @@ pipeline:
 }
 
 #[test]
+fn sound_workflow_manifest_ssa_and_effects_validate() {
+    let metadata: InferenceMetadata = serde_yaml::from_str(
+        r#"
+pipeline:
+  workflow:
+    manifest:
+      ir_version: "1.0"
+      onnx_opsets: { ai.onnx: 24 }
+      adapter_abis: {}
+      custom_op_versions: {}
+      capabilities: [workflow_ssa, linear_effects, typed_emit, streaming_emit]
+    inputs:
+      logits:
+        contract: { dtype: float32, rank: 2, shape: [batch, vocab] }
+        role: { kind: opaque }
+        source: { kind: application, name: logits }
+        required: true
+      predicate:
+        contract: { dtype: bool, rank: 0 }
+        role: { kind: runtime, version: v1, role: constraint }
+        source: { kind: application, name: predicate }
+        required: true
+    outputs:
+      token:
+        contract: { dtype: int64, rank: 1, shape: [batch] }
+        role: tokens
+        stage: pre_adapter
+    components:
+      sampler:
+        implementation: { kind: onnx, artifact: sampler.onnx }
+        ports:
+          inputs:
+            logits: { dtype: float32, rank: 2, shape: [batch, vocab] }
+          outputs:
+            token: { dtype: int64, rank: 1, shape: [batch] }
+        effects: [rng]
+    initial_effects: { rng: rng.0, stream: stream.0 }
+    graph:
+      kind: sequence
+      nodes:
+        - kind: invoke
+          component: sampler
+          inputs: { logits: logits }
+          outputs: { token: sampled_token }
+          effects:
+            rng: { consumes: rng.0, produces: rng.1 }
+        - kind: emit
+          value: sampled_token
+          output: token
+          mode: event
+          effect_name: stream
+          effect: { consumes: stream.0, produces: stream.1 }
+"#,
+    )
+    .expect("sound workflow parses");
+
+    validate_pipeline_spec(metadata.pipeline.as_ref().expect("pipeline"))
+        .expect("sound workflow validates");
+}
+
+#[test]
+fn workflow_rejects_unordered_branch_effects_without_panicking() {
+    let metadata: InferenceMetadata = serde_yaml::from_str(
+        r#"
+pipeline:
+  workflow:
+    manifest:
+      ir_version: "1.0"
+      onnx_opsets: { ai.onnx: 24 }
+      adapter_abis: {}
+      custom_op_versions: {}
+      capabilities: [workflow_ssa, linear_effects, typed_emit, streaming_emit, nested_control_flow]
+    inputs:
+      predicate:
+        contract: { dtype: bool, rank: 0 }
+        role: { kind: opaque }
+        source: { kind: application, name: predicate }
+        required: true
+      value:
+        contract: { dtype: int64, rank: 0 }
+        role: { kind: opaque }
+        source: { kind: application, name: value }
+        required: true
+    outputs:
+      event:
+        contract: { dtype: int64, rank: 0 }
+        role: event
+        stage: pre_adapter
+    components:
+      binding:
+        implementation: { kind: binding }
+        ports: { inputs: {}, outputs: {} }
+        effects: []
+    initial_effects: { stream: stream.0 }
+    graph:
+      kind: branch
+      predicate: predicate
+      cases:
+        "true":
+          kind: emit
+          value: value
+          output: event
+          mode: event
+          effect_name: stream
+          effect: { consumes: stream.0, produces: stream.1 }
+        "false":
+          kind: sequence
+          nodes:
+            - { kind: invoke, component: binding, inputs: {}, outputs: {}, effects: {} }
+"#,
+    )
+    .expect("workflow parses");
+
+    let error = validate_pipeline_spec(metadata.pipeline.as_ref().expect("pipeline"))
+        .expect_err("unordered effects must fail");
+    assert!(
+        error
+            .errors
+            .iter()
+            .any(|message| message.contains("unordered side effects"))
+    );
+}
+
+#[test]
 fn pipeline_strategy_stage_rejects_run_on() {
     let error = serde_yaml::from_str::<InferenceMetadata>(
         r#"
