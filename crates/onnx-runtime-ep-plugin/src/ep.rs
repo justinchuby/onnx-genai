@@ -637,7 +637,7 @@ fn ep_compile_inner(
         // For multi-node fused subgraphs, construct the SubgraphRouting so
         // intermediates are threaded correctly in topological order.
         if info.entries.len() > 1
-            && let Some(routing) = build_subgraph_routing(&view, ir_graph)
+            && let Some(routing) = build_subgraph_routing(&view, ir_graph, reader.absent_outputs())
         {
             info.set_routing(routing);
         }
@@ -656,6 +656,7 @@ fn ep_compile_inner(
 fn build_subgraph_routing(
     view: &onnx_runtime_ir::GraphView<'_>,
     graph: &onnx_runtime_ir::Graph,
+    absent_outputs: &std::collections::HashSet<onnx_runtime_ir::ValueId>,
 ) -> Option<crate::compute::SubgraphRouting> {
     use crate::compute::{NodeInputSource, NodeOutputSink};
     use std::collections::HashMap;
@@ -713,7 +714,11 @@ fn build_subgraph_routing(
         let mut sinks = Vec::with_capacity(node_outputs.len());
         for &val_idx in node_outputs {
             let vid = view.value_id(val_idx);
-            if let Some(&ort_idx) = output_index.get(&vid) {
+            if absent_outputs.contains(&vid) {
+                // Absent optional output — no buffer needed; scratch-allocated
+                // at compute time via absent_output_slots.
+                sinks.push(NodeOutputSink::Absent);
+            } else if let Some(&ort_idx) = output_index.get(&vid) {
                 sinks.push(NodeOutputSink::Ort(ort_idx));
             } else {
                 // Intermediate — assign a buffer.

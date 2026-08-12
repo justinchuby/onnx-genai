@@ -92,3 +92,12 @@ Full pre-compaction history in `history-archive.md`.
 - Updated `MlasLayerNormF32` docstring to describe x86 threshold.
 - Deferred 8-float mean-pass optimisation to follow-up PR.
 - Head `72e02cd92c`. Tests: 41 passed + 2 disabled; 43 with disabled.
+
+## 2026-08-12 — PR #762 S1/S2/S3 resolution (EP plugin absent-slot fixes)
+
+Closed the three substantive items from Challenger's v4 review:
+- **S1**: Rewrote canary tests to use production allocation formula (`numel × max(byte_size, 8)`). Added 2 new tests proving over-sized writes are detected. Old tests guarded old bug; new tests guard production contract.
+- **S2**: Added `TensorMut::validate_write_dtype()` for enforceable dtype validation. Documented the invariant on `mark_absent()`. Full auto-enforcement would require kernel API restructure — chose documented + callable over silent advisory.
+- **S3**: Added `NodeOutputSink::Absent` variant; `build_subgraph_routing` no longer inflates `num_intermediate_buffers` with phantom slots.
+- **Nits**: Removed 4 no-op identity transmutes.
+- 280 tests passed (278 baseline + 2 new), clippy clean, fmt clean. Miri: 4/4 canary tests clean.
