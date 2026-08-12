@@ -1,5 +1,6 @@
 # Decisions — live standing directives
 
+Last consolidated: 2026-08-12T15:52:00Z (Scribe nxrt-ep PyPI-publish session; 2 inbox drops merged — coordinator-nxrt-ep-cuda13 + copilot-vmm-push-summary; no dedup collisions. Size gate: 43,278 → ~50 KB, under 50 KB charter threshold, nothing archived.)
 Last consolidated: 2026-08-12T06:00:00Z (Scribe #762 memory-safety wave; 6 inbox drops merged; wave narratives archived to decisions-archive/2026-08.md; live file compacted)
 Last consolidated: 2026-08-12T04:30:00Z (Scribe #31974 coverage wave; 2 inbox drops merged; narrative waves from 2026-08-10 through 2026-08-12 archived to decisions-archive/2026-08.md; live file compacted from 50,788 bytes to ~19 KB)
 Last consolidated: 2026-08-11T17:55:00Z (Scribe issue-triage session + autonomous fixes; 7 inbox drops merged — 6 new: mobius io-metadata #477 + cosmos3-edge readiness assessment, GBQ zero-point #785, ORT recurrent guard/loader dedup #786, VLM fixture #788, DRY decoder-io #784, VMM contiguous-VA investigation; 1 deduped: qwen35-27b-native already recorded under #779. 30-day archive gate evaluated at 28KB: no dated entries older than 2026-07-12, so nothing archived. Prior: 2026-08-11T16:03:10Z Scribe TopK-perf + 27B-native batch; 37 inbox drops merged, full narrative archived to 2026-08.md)
@@ -12,6 +13,89 @@ Narrative waves through 2026-08-06 (hybrid Mamba #695/#700, QMoE #676, CUDA-grap
 ## Ledger health rule
 
 Archive by SIZE, not age. Age-only no-ops during high-volume campaigns because most entries are recent, so the live file can exceed spawn-budget while "older than N days" matches nothing. When over the gate, preserve full history in `.squad/decisions-archive/{YYYY-MM}.md`, dedupe rebase-reintroduced sections, and keep live `decisions.md` to standing directives plus pointers. Concurrent Scribe runs are a structural hazard; assemble from inbox drops and check `git log origin/main..HEAD` before committing.
+
+## nxrt EP plugins on PyPI + CUDA 13 target (2026-08-12)
+
+### 2026-08-12: EP plugin cdylibs published to PyPI as `nxrt-ep-cpu` / `nxrt-ep-cuda`
+**By:** Squad (Coordinator), req. by Justin (@justinchuby)
+**What:** The two ORT plugin-EP cdylibs are packaged and published to PyPI via
+`.github/workflows/publish-ep-plugins.yml` (PR #819) with `python/nxrt-ep-cpu/*` and
+`python/nxrt-ep-cuda/*`. Packaging uses **setuptools + plain cargo, NOT maturin** — the
+plugins are cdylibs exporting the ORT plugin-EP C ABI, not PyO3 modules. EP cdylibs must
+**NOT** link `libonnxruntime`. `nxrt-ep-cpu` 0.1.0.dev5 is LIVE (manylinux_2_28 +
+macosx_arm64 + win_amd64). CUDA wheel build (PR #824) switched the cuda job from
+`nvidia/cuda:13.0.0-devel-ubi9` to standard `quay.io/pypa/manylinux_2_28_x86_64`.
+**Why:** Ship the EP plugins as installable wheels consistent with the extension-contract
+directive (#524: stable C ABI + dynamic loading).
+
+### 2026-08-12: `nxrt-ep-cuda` needs no CUDA toolkit/GPU to build; NVIDIA runtime wheels are required deps
+**By:** Squad (Coordinator)
+**What:** `onnx-runtime-ep-cuda` uses cudarc `dynamic-loading`, so `cargo build --features
+cuda` needs **NO CUDA toolkit and NO GPU** — CUDA libs are `dlopen`'d at runtime
+(`readelf -d` confirmed the `.so` links zero CUDA libs). The four NVIDIA runtime wheels are
+**REQUIRED** deps pinned `>=13,<14` (unsuffixed names are the real CUDA 13 wheels;
+`-cu13`-suffixed are 0.0.1 stubs).
+**Why:** Removes the toolchain/GPU requirement from the CUDA wheel CI job and pins the EP
+wheel to CUDA 13 at runtime.
+
+### 2026-07-30: nxrt-ep-cuda wheel targets CUDA 13
+**By:** Squad (Coordinator), req. by Justin (@justinchuby)
+**What:** The `nxrt-ep-cuda` PyPI package must build against / target CUDA 13. Runtime NVIDIA
+deps use the CUDA 13 wheels (nvidia-cuda-runtime>=13, nvidia-cublas>=13,
+nvidia-cuda-nvrtc>=13, nvidia-cuda-cupti>=13), matching the existing `nxrt[cuda]` extra in
+crates/onnx-runtime-python/pyproject.toml.
+**Why:** User directive "记得用cuda 13"; keeps EP wheel consistent with the main nxrt CUDA
+wheel toolchain.
+
+## VMM / offload / streaming / batching push — durable results (2026-08-12)
+
+**By:** Copilot (coordinator). Every claim is backed by a merged, executable test;
+refutations are recorded alongside confirmations.
+
+**Governing rule (#772/#776/#787):** `cuMemMap` maps whole granule-aligned windows onto
+whole physical granules, so `committed bytes = granule × (windows containing ≥1 live byte)`.
+**Layout controls residency** — the allocator cannot compact what layout scattered.
+`CU_MEM_ALLOC_GRANULARITY_MINIMUM == RECOMMENDED == 2 MiB` here, so the floor is fixable
+only by layout, not by shrinking the granule. Minimum mapping granularity spans ~500× across
+platforms (Level Zero/Vulkan ~64 KiB, CPU mmap 4 KiB) → layout must be a queried per-EP,
+per-platform capability (#783), not a constant.
+
+**Confirmed:**
+- Floor is layout-determined: 768 granules (~1.5 GiB) head-major → 96 (~192 MiB) seq-major →
+  1/seq (~2 MiB) token-major = **768× reduction** (#787).
+- Strided reads are not the obstacle: seq/head bandwidth ratio 0.80–1.02; 192 KB token-major
+  stride measured 1.000 at 6 GiB working set — reads are DRAM-bound independent of stride
+  (device memory already 2 MiB-page backed) (#778/#787).
+- Offload and capture no longer mutually exclusive (#796): weights page under a stable VA;
+  page-in remaps physical granules instead of returning a new pointer. Unblocked #755.
+- Managed no-spill VMM is default, auto weight-streaming when a model exceeds budget (#798);
+  a fitting model does not page (`FullResident`, offload off, 0 page-ins).
+- Prefix sharing is sound (#793/#803): one handle maps into N=8 sequences under captured
+  replay; ledger charges once, alive until last sharer, additional sharer costs 0 bytes.
+
+**Refuted (and why it mattered):**
+- "seq-major landed ⇒ 8× floor realised" — false: #794 measured head-major and seq-major
+  committing identical bytes (bindings didn't consume the layout descriptor); fixed #797.
+- "decoder structurally declines capture" — false (#804): `captures=0` came from a cached
+  `ONNX_GENAI_CUDA_GRAPH=0` in a long-lived test process. #794/#801 misattributed it.
+- "fixed KV stride removes growth-triggered re-capture" — true in mechanism, irrelevant:
+  engine invalidates the graph unconditionally on growth (#805).
+- "tokens per granule" KV cost model — wrong for head-major (retracted), exactly right for
+  token-major. Layout is the whole story.
+
+**#736 audit recurring finding (six slices):** 4/5 completed slices found **over-reservation**
+(bytes charged on a path that never uses them), not ungoverned allocation — #751 IndexShare,
+#795 GQA WS_SCORES (~128 MiB f32-only), #799 cuBLASLt GEMM (32 MiB heuristic ceiling, measured
+0–96 B), #802 default-domain Attention scores (genuinely needed), #806 GQA QKV staging. Guidance
+in `MEMORY_ARCHITECTURE.md`: **start from use, not from allocation** — governing a bypass without
+sizing it to use converts invisible waste into charged waste (tightens #745 admission, reduces
+concurrency).
+
+**Method notes:** order-dependent test state cost two wrong conclusions this week
+(process-frozen `RuntimeConfig` #804; CUDA context warmed by alphabetically-earlier sibling
+#797) — #807 added a debug-only freeze guard, single-stream helper, and an inventory. Negative
+results delivered as first-class outcomes. Never extrapolate an unmeasured number (`qwen14b-zp`
+lacks `inference_metadata.yaml`, not native-loadable #384 — reported as not measured).
 
 ## Current active wave — 2026-08-12 (#762 Opus memory-safety wave)
 
