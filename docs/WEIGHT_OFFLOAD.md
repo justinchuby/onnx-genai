@@ -73,8 +73,8 @@ the design.
 | north-star property | status |
 |---|---|
 | 1. degrades into latency | **holds** — a model exceeding the card loads and answers correctly |
-| 2. one number | **fails** — `--vram-limit` does not bound weights, and offload needs two further opt-ins ([#712]) |
-| 3. beats the OS | **fails** — measurably slower than WDDM demand paging ([#705]) |
+| 2. one number | **now largely holds under #798/#755** — managed no-spill VMM is the default on native CUDA, `--vram-limit` **overrides** the inferred device budget rather than gating the managed path, and weight streaming auto-enables when weights exceed the budget (no separate offload opt-in). The legacy two-opt-in path ([#712]) remains only behind `ONNX_GENAI_LEGACY_ALLOCATOR=1` |
+| 3. beats the OS | **still fails, but a named cause was removed** — managed offload measured far behind WDDM demand paging ([#705]); the capture-off-under-offload contributor is fixed on the stable-VA path (#796), yet WDDM parity is unproven and remains separate work |
 | 4. one authority | **holds on the paths that are wired**; the platform itself can allocate behind our back on Windows ([#704]) |
 
 Two structural notes that are not merely "not done yet":
@@ -86,16 +86,18 @@ Two structural notes that are not merely "not done yet":
   past dedicated VRAM into system RAM and `cuMemGetInfo` cannot see it. Device
   capacity is therefore not a number we can read, and floor comparisons taken on
   such a machine do not mean what they appear to ([#704]).
-- **Weight offload and CUDA graph capture are mutually exclusive today.** The
-  pager's alloc/copy/free operations are capture-illegal, so enabling offload
-  disables capture (module docs in
-  `crates/onnx-genai-engine/src/native_decode/cuda.rs`). Large models that need
-  offload therefore forfeit **all** of the capture-fragmentation wins #708/#728
-  landed (35B-A3B decode from **154 to 34** graph segments). The fix is **#716**
-  — page weights under a stable virtual address so page-in remaps physical
-  granules at the same VA (survivable per #727) rather than returning a new
-  pointer. Until it lands, offload-on implies capture-off, which is a large part
-  of why managed offload trails WDDM demand paging.
+- **Weight offload and CUDA graph capture were mutually exclusive; #796 removed
+  that.** The pager's alloc/copy/free operations are capture-illegal, so under
+  the legacy pointer-returning pager, enabling offload disabled capture — and
+  large models that need offload forfeited **all** of the capture-fragmentation
+  wins #708/#728/#757 landed (35B-A3B decode from **154 to 34** graph segments).
+  #796 fixes it by paging weights under a **stable virtual address**: a page-in
+  remaps physical granules at the same VA (survivable per #727) instead of
+  returning a new pointer, so the captured graph is preserved. Capture-under-
+  offload is now gated on `weight_offload_enabled && !weight_offload_stable_va`,
+  i.e. allowed on the stable-VA path and pinned by the #796 unit tests. The
+  legacy pointer-returning pager still implies capture-off; the mutual exclusion
+  is a property of that path, not of offload as such.
 - **The residency cache had a 0% hit rate for its entire life** — `evict_to_fit`
   was a plain LRU evicting against a cyclic sequential layer scan, so it always
   evicted the page needed soonest (0 hits across 6,936 page-ins, at both 3 GB and
@@ -106,6 +108,16 @@ Two structural notes that are not merely "not done yet":
   nominal 6 GB content budget was measured to physically consume ~**6.51 GB**
   (~8.5% hidden), because reservation is committed at the 2 MiB granule. Size and
   report budgets in committed bytes.
+
+- **Managed no-spill VMM is now the default (#798), not an opt-in.** On native
+  CUDA the authority-governed VMM path is selected without a flag; a model that
+  fits stays `FullResident` and does **not** page (measured: offload off, **0
+  page-ins**), and weight streaming auto-engages only when the resolved budget
+  cannot hold the weights. The `ONNX_GENAI_WEIGHT_OFFLOAD=1` opt-in and the
+  phased rollout in §8/§10 below describe the **legacy** route-first pager, which
+  the managed default supersedes for the fitting and auto-streaming cases; treat
+  those sections as the pager mechanism, not the current default policy. See
+  [`MEMORY_ARCHITECTURE.md`](./MEMORY_ARCHITECTURE.md).
 
 What is confirmed working, and worth not re-litigating: **prefix reuse**, and
 **multi-request concurrency** up to the point where admission becomes the limit.
