@@ -70,6 +70,7 @@ pub struct VisionInputSpec {
     bindings: Vec<VisionOutputBinding>,
     preprocessor: ImagePreprocessor,
     expansion: Option<VisionExpansionSpec>,
+    presence_keys: Vec<String>,
 }
 
 impl VisionInputSpec {
@@ -87,6 +88,7 @@ impl VisionInputSpec {
             }],
             preprocessor,
             expansion: None,
+            presence_keys: Vec::new(),
         })
     }
 
@@ -95,6 +97,7 @@ impl VisionInputSpec {
         pixel_shape: &[i64],
         program: &ImagePreprocessingProgram,
         vision: &onnx_genai_metadata::PipelineVisionConfig,
+        presence_keys: Vec<String>,
     ) -> anyhow::Result<Self> {
         if bindings.is_empty() {
             anyhow::bail!(
@@ -110,7 +113,12 @@ impl VisionInputSpec {
             bindings,
             preprocessor,
             expansion,
+            presence_keys,
         })
+    }
+
+    pub fn presence_keys(&self) -> &[String] {
+        &self.presence_keys
     }
 
     /// The placeholder token this package expects, one per image.
