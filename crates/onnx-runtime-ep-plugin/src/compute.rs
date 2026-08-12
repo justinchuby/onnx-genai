@@ -15,9 +15,11 @@
 
 use std::collections::HashSet;
 use std::ffi::c_void;
+use std::sync::Arc;
 
 use onnx_genai_ort_sys as ort;
-use onnx_runtime_ep_api::kernel::Kernel;
+use onnx_runtime_ep_api::kernel::{Kernel, TensorMetadata, WorkspaceRequirement, WorkspaceView};
+use onnx_runtime_ep_api::provider::{DeviceBuffer, ExecutionProvider};
 use onnx_runtime_ep_api::tensor::{DevicePtr, DevicePtrMut, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, DeviceId, Node};
 
@@ -642,11 +644,19 @@ pub struct SubgraphRouting {
 }
 
 /// Heap-owned intermediate tensor buffer for multi-node subgraph execution.
+///
+/// The backing bytes come from [`ScratchBuf`], which allocates through the
+/// owning EP whenever one is available. On a non-host-accessible EP (CUDA)
+/// this is real device memory, so the `TensorView` handed to the next kernel
+/// names a device pointer tagged with that EP's [`DeviceId`] — never a host
+/// `Vec<u8>` masquerading as device memory.
 pub struct IntermediateBuf {
-    pub data: Vec<u8>,
+    pub data: ScratchBuf,
     pub shape: Vec<usize>,
     pub strides: Vec<i64>,
     pub dtype: DataType,
+    /// Device the backing allocation actually lives on.
+    pub device: DeviceId,
 }
 
 impl IntermediateBuf {
@@ -657,8 +667,186 @@ impl IntermediateBuf {
             self.dtype,
             &self.shape,
             &self.strides,
-            onnx_runtime_ir::DeviceId::cpu(),
+            self.device,
         )
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// EP-backed scratch allocation
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Minimum bytes handed to `ExecutionProvider::allocate`.
+///
+/// A zero-byte request is normalised to one byte so every scratch allocation
+/// yields a unique, non-null, freeable pointer regardless of what the backing
+/// allocator does with size 0. Mirrors the same normalisation applied at the
+/// `OrtAllocator` adapter boundary in `device.rs`.
+const MIN_SCRATCH_BYTES: usize = 1;
+
+/// An EP-owned allocation that frees itself on drop.
+///
+/// Used for kernel workspaces, absent-output scratch, and fused-subgraph
+/// intermediates. Every early return in `compute_execute` therefore releases
+/// device memory: there is no per-call leak path.
+pub struct EpAllocation {
+    ep: Arc<dyn ExecutionProvider>,
+    buffer: Option<DeviceBuffer>,
+}
+
+impl EpAllocation {
+    /// Allocate `bytes` from `ep` with `alignment`, failing closed on a bad
+    /// alignment, an allocator error, or a misaligned result.
+    fn new(
+        ep: &Arc<dyn ExecutionProvider>,
+        bytes: usize,
+        alignment: usize,
+        purpose: &str,
+    ) -> Result<Self, String> {
+        if alignment == 0 || !alignment.is_power_of_two() {
+            return Err(format!(
+                "{purpose}: requested alignment {alignment} is not a non-zero power of two"
+            ));
+        }
+        let request = bytes.max(MIN_SCRATCH_BYTES);
+        let buffer = ep
+            .allocate(request, alignment)
+            .map_err(|e| format!("{purpose}: EP allocation of {request} bytes failed: {e}"))?;
+        let addr = buffer.as_ptr() as usize;
+        if !addr.is_multiple_of(alignment) {
+            let _ = ep.deallocate(buffer);
+            return Err(format!(
+                "{purpose}: EP returned pointer {addr:#x} which is not {alignment}-byte aligned"
+            ));
+        }
+        let allocation = Self {
+            ep: Arc::clone(ep),
+            buffer: Some(buffer),
+        };
+        // Preserve the pre-existing zero-initialised semantics of the host
+        // scratch path. Device memory is left untouched: it is written by the
+        // producing kernel before any consumer reads it, and a host memset
+        // would be invalid on a device pointer.
+        if ep.device_id().is_host_accessible() {
+            unsafe { std::ptr::write_bytes(allocation.as_ptr(), 0u8, request) };
+        }
+        Ok(allocation)
+    }
+
+    fn as_ptr(&self) -> *mut u8 {
+        match &self.buffer {
+            Some(buffer) => buffer.as_ptr().cast::<u8>().cast_mut(),
+            None => std::ptr::null_mut(),
+        }
+    }
+}
+
+impl Drop for EpAllocation {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            let _ = self.ep.deallocate(buffer);
+        }
+    }
+}
+
+/// Scratch bytes for one tensor: EP-owned when an EP is available, otherwise a
+/// host `Vec`.
+///
+/// The host variant exists only for `ExportedComputeInfo::new`, the EP-less
+/// constructor used by unit tests. Every EP-backed compile path (`ep_compile`)
+/// produces the [`ScratchBuf::Ep`] variant, so a device kernel can never be
+/// handed a host pointer.
+pub enum ScratchBuf {
+    Host(Vec<u8>),
+    Ep(EpAllocation),
+}
+
+impl ScratchBuf {
+    fn as_ptr(&self) -> *mut u8 {
+        match self {
+            // `as_ptr()` on a Vec we exclusively own; cast to *mut is sound
+            // because every caller holds `&mut` on the owning buffer when it
+            // builds a mutable view.
+            Self::Host(v) => v.as_ptr() as *mut u8,
+            Self::Ep(a) => a.as_ptr(),
+        }
+    }
+}
+
+/// Allocates scratch/intermediate tensors for one `Compute` call.
+///
+/// Carries the EP the subgraph was compiled for (when there is one) so every
+/// buffer is allocated on, and tagged with, the device the kernels actually
+/// run on.
+struct ScratchAllocator<'a> {
+    ep: Option<&'a Arc<dyn ExecutionProvider>>,
+    device: DeviceId,
+}
+
+impl<'a> ScratchAllocator<'a> {
+    fn new(ep: Option<&'a Arc<dyn ExecutionProvider>>) -> Self {
+        let device = ep.map_or_else(DeviceId::cpu, |ep| ep.device_id());
+        Self { ep, device }
+    }
+
+    /// Allocate `bytes` of scratch, 64-byte aligned (the widest alignment any
+    /// of our vector kernels requires of an output buffer).
+    fn allocate(&self, bytes: usize, purpose: &str) -> Result<ScratchBuf, String> {
+        match self.ep {
+            Some(ep) => Ok(ScratchBuf::Ep(EpAllocation::new(ep, bytes, 64, purpose)?)),
+            None => Ok(ScratchBuf::Host(vec![0u8; bytes.max(MIN_SCRATCH_BYTES)])),
+        }
+    }
+
+    /// Resolve a kernel's workspace request for this dispatch.
+    ///
+    /// Returns the RAII allocation (kept alive by the caller for the duration
+    /// of `execute_with_workspace`) and the [`WorkspaceView`] handed to the
+    /// kernel. `Ok((None, None))` means the kernel declared
+    /// [`WorkspaceRequirement::NONE`].
+    ///
+    /// Fails closed when a kernel asks for workspace and no EP allocator is
+    /// available: handing a device kernel a host `Vec` is exactly the defect
+    /// this seam exists to prevent.
+    fn prepare_workspace(
+        &self,
+        kernel: &dyn Kernel,
+        inputs: &[TensorView<'_>],
+        node_label: &str,
+    ) -> Result<(Option<EpAllocation>, Option<WorkspaceView>), String> {
+        let metadata: Vec<TensorMetadata<'_>> = inputs
+            .iter()
+            .map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()))
+            .collect();
+        let requirement: WorkspaceRequirement = kernel
+            .workspace_requirement(&metadata)
+            .map_err(|e| format!("{node_label}: workspace_requirement failed: {e}"))?;
+        if requirement.bytes == 0 {
+            return Ok((None, None));
+        }
+        let bytes = usize::try_from(requirement.bytes).map_err(|_| {
+            format!(
+                "{node_label}: workspace requirement of {} bytes exceeds usize",
+                requirement.bytes
+            )
+        })?;
+        let Some(ep) = self.ep else {
+            return Err(format!(
+                "{node_label}: kernel requires {bytes} bytes of {}-byte-aligned workspace on \
+                 {:?}, but this subgraph was compiled without an EP allocator. Construct the \
+                 compute info with ExportedComputeInfo::new_with_ep so workspace is allocated \
+                 on the kernel's own device (fail closed rather than pass host memory).",
+                requirement.alignment, self.device
+            ));
+        };
+        let allocation = EpAllocation::new(
+            ep,
+            bytes,
+            requirement.alignment,
+            &format!("{node_label}: kernel workspace"),
+        )?;
+        let view = WorkspaceView::new(DevicePtrMut(allocation.as_ptr().cast()), bytes);
+        Ok((Some(allocation), Some(view)))
     }
 }
 
@@ -677,6 +865,15 @@ pub struct ExportedComputeInfo {
     pub entries: Vec<CompiledKernelEntry>,
     /// Optional routing table for multi-node fused subgraphs.
     pub routing: Option<SubgraphRouting>,
+    /// The EP these kernels were compiled for.
+    ///
+    /// `Compute` allocates kernel workspaces, absent-output scratch, and fused
+    /// subgraph intermediates through this EP, so they live on the same device
+    /// as the kernels. `None` only for [`ExportedComputeInfo::new`], the
+    /// EP-less constructor used by unit tests; in that mode workspace-requiring
+    /// kernels and non-host-accessible routing fail closed rather than being
+    /// handed host memory.
+    pub ep: Option<Arc<dyn ExecutionProvider>>,
 }
 
 /// Per-session state created by `CreateState`.
@@ -685,6 +882,8 @@ struct ComputeState {
 }
 
 impl ExportedComputeInfo {
+    /// Construct without an EP. Host-only: kernels that request a workspace,
+    /// and multi-node routing for a non-host-accessible device, fail closed.
     pub fn new(entries: Vec<CompiledKernelEntry>) -> Self {
         Self {
             vtable: ort::OrtNodeComputeInfo {
@@ -695,12 +894,30 @@ impl ExportedComputeInfo {
             },
             entries,
             routing: None,
+            ep: None,
         }
+    }
+
+    /// Construct bound to the EP whose `get_kernel` produced `entries`.
+    ///
+    /// This is the production constructor: it is what makes governed kernel
+    /// workspaces and device-resident subgraph intermediates possible.
+    pub fn new_with_ep(entries: Vec<CompiledKernelEntry>, ep: Arc<dyn ExecutionProvider>) -> Self {
+        let mut info = Self::new(entries);
+        info.ep = Some(ep);
+        info
     }
 
     /// Attach a subgraph routing table (for multi-node fused subgraphs).
     pub fn set_routing(&mut self, routing: SubgraphRouting) {
         self.routing = Some(routing);
+    }
+
+    /// Device the compiled kernels execute on (`CPU:0` when EP-less).
+    pub fn device(&self) -> DeviceId {
+        self.ep
+            .as_ref()
+            .map_or_else(DeviceId::cpu, |ep| ep.device_id())
     }
 }
 
@@ -724,10 +941,19 @@ unsafe extern "C" fn compute_create_state(
 /// Compute: execute the kernel(s) for this subgraph.
 ///
 /// For single-node subgraphs (the common case for CPU EP), this calls
-/// `kernel.execute()` once. For multi-node fused subgraphs with a
-/// `SubgraphRouting` table, it allocates intermediate buffers, threads them
+/// `kernel.execute_with_workspace()` once. For multi-node fused subgraphs with
+/// a `SubgraphRouting` table, it allocates intermediate buffers, threads them
 /// between nodes in topological order, and writes only true subgraph outputs
 /// back to ORT.
+///
+/// # Workspace contract
+///
+/// Every dispatch goes through [`prepare_workspace`] →
+/// [`Kernel::execute_with_workspace`], never bare [`Kernel::execute`]. A kernel
+/// that declares a non-zero [`WorkspaceRequirement`] (CUDA cuBLASLt GEMM,
+/// staged Attention, block-quantised MoE) gets EP-allocated, correctly aligned
+/// scratch on its own device; the allocation is RAII-scoped to the dispatch so
+/// no early return leaks it.
 ///
 /// # Safety
 ///
@@ -755,7 +981,10 @@ unsafe extern "C" fn compute_execute(
         }
         let api_ref = unsafe { &*api };
 
-        let inputs = match unsafe { read_inputs(api_ref, kernel_context) } {
+        let device = exported.device();
+        let scratch = ScratchAllocator::new(exported.ep.as_ref());
+
+        let inputs = match unsafe { read_inputs(api_ref, kernel_context, device) } {
             Ok(v) => v,
             Err(e) => return fail_status(&format!("Compute: {e}")),
         };
@@ -827,12 +1056,13 @@ unsafe extern "C" fn compute_execute(
                 };
 
                 // Execute — dispatch based on sinks.
-                // For outputs going to ORT we allocate via ORT API;
-                // for outputs going to intermediate buffers we allocate on heap;
-                // for absent slots we allocate a scratch buffer.
+                // Outputs going to ORT are allocated via the ORT API; outputs
+                // going to intermediate buffers and absent slots are allocated
+                // through the EP so they live on the kernel's own device.
                 let mut ort_outputs: Vec<crate::kernel_ctx::OwnedOutput> = Vec::new();
                 let mut buf_writes: Vec<(usize, Vec<usize>, DataType)> = Vec::new();
-                let mut absent_scratch: Vec<(usize, Vec<u8>, DataType)> = Vec::new(); // (slot, buf, dtype)
+                // (slot, EP-owned scratch, dtype)
+                let mut absent_scratch: Vec<(usize, ScratchBuf, DataType)> = Vec::new();
 
                 // Per-slot view map to keep positions aligned end-to-end.
                 enum RoutedSlotKind {
@@ -857,7 +1087,13 @@ unsafe extern "C" fn compute_execute(
                             }
                         };
                         let numel: usize = shape.iter().product::<usize>().max(1);
-                        let buf = vec![0u8; scratch_alloc_bytes(numel, scratch_dtype)];
+                        let buf = match scratch.allocate(
+                            scratch_alloc_bytes(numel, scratch_dtype),
+                            &format!("Compute: node {node_idx} absent output slot {out_slot}"),
+                        ) {
+                            Ok(b) => b,
+                            Err(e) => return fail_status(&e),
+                        };
                         let idx = absent_scratch.len();
                         absent_scratch.push((out_slot, buf, scratch_dtype));
                         slot_kinds.push(RoutedSlotKind::Absent(idx));
@@ -883,7 +1119,14 @@ unsafe extern "C" fn compute_execute(
                     match sink {
                         NodeOutputSink::Ort(ort_idx) => {
                             match unsafe {
-                                allocate_output(api_ref, kernel_context, *ort_idx, shape, out_dtype)
+                                allocate_output(
+                                    api_ref,
+                                    kernel_context,
+                                    *ort_idx,
+                                    shape,
+                                    out_dtype,
+                                    device,
+                                )
                             } {
                                 Ok(out) => ort_outputs.push(out),
                                 Err(e) => {
@@ -912,13 +1155,19 @@ unsafe extern "C" fn compute_execute(
                 let mut ort_out_views: Vec<_> =
                     ort_outputs.iter_mut().map(|o| o.view_mut()).collect();
 
-                // For buffer-sink outputs, allocate the IntermediateBuf and get a
-                // mutable pointer into it.
+                // For buffer-sink outputs, allocate the IntermediateBuf through
+                // the EP so the bytes live on the device the kernels run on.
                 let mut new_bufs: Vec<(usize, IntermediateBuf)> = Vec::new();
                 for (buf_idx, shape, dtype) in &buf_writes {
                     let numel: usize = shape.iter().product();
-                    let byte_len = dtype.byte_size() * numel;
-                    let data = vec![0u8; byte_len];
+                    let byte_len = scratch_alloc_bytes(numel, *dtype);
+                    let data = match scratch.allocate(
+                        byte_len,
+                        &format!("Compute: node {node_idx} intermediate buffer {buf_idx}"),
+                    ) {
+                        Ok(b) => b,
+                        Err(e) => return fail_status(&e),
+                    };
                     let strides = contiguous_strides(shape);
                     new_bufs.push((
                         *buf_idx,
@@ -927,6 +1176,7 @@ unsafe extern "C" fn compute_execute(
                             shape: shape.clone(),
                             strides,
                             dtype: *dtype,
+                            device: scratch.device,
                         },
                     ));
                 }
@@ -955,11 +1205,11 @@ unsafe extern "C" fn compute_execute(
                                 let shape = &absent_shapes[slot_idx];
                                 let strides = &absent_strides_storage[slot_idx];
                                 TensorMut::new(
-                                    DevicePtrMut(scratch_buf.as_mut_ptr().cast()),
+                                    DevicePtrMut(scratch_buf.as_ptr().cast()),
                                     *dtype,
                                     shape.as_slice(),
                                     strides.as_slice(),
-                                    DeviceId::cpu(),
+                                    scratch.device,
                                 )
                                 .mark_absent()
                             }
@@ -967,9 +1217,21 @@ unsafe extern "C" fn compute_execute(
                         .collect()
                 };
 
-                if let Err(e) = entry.kernel.execute(&kernel_inputs, &mut all_output_views) {
+                let node_label = format!("Compute: node {node_idx}");
+                let (_workspace_guard, workspace) =
+                    match scratch.prepare_workspace(&*entry.kernel, &kernel_inputs, &node_label) {
+                        Ok(w) => w,
+                        Err(e) => return fail_status(&e),
+                    };
+
+                if let Err(e) = entry.kernel.execute_with_workspace(
+                    &kernel_inputs,
+                    &mut all_output_views,
+                    workspace,
+                ) {
                     return fail_status(&format!("Compute: kernel execution failed: {e}"));
                 }
+                drop(all_output_views);
 
                 // Store new intermediate buffers.
                 for (buf_idx, buf) in new_bufs {
@@ -1005,7 +1267,7 @@ unsafe extern "C" fn compute_execute(
             // while only present slots are allocated through ORT's kernel
             // context (sequential ORT indices).
             let mut owned_outputs: Vec<crate::kernel_ctx::OwnedOutput> = Vec::new();
-            let mut absent_bufs: Vec<Vec<u8>> = Vec::new();
+            let mut absent_bufs: Vec<ScratchBuf> = Vec::new();
             // Track whether each node output slot is ORT-allocated or absent.
             enum SlotKind {
                 Ort,           // present, comes from ORT
@@ -1031,7 +1293,13 @@ unsafe extern "C" fn compute_execute(
                         }
                     };
                     let numel: usize = shape.iter().product::<usize>().max(1);
-                    let buf = vec![0u8; scratch_alloc_bytes(numel, scratch_dtype)];
+                    let buf = match scratch.allocate(
+                        scratch_alloc_bytes(numel, scratch_dtype),
+                        &format!("Compute: absent output slot {out_slot}"),
+                    ) {
+                        Ok(b) => b,
+                        Err(e) => return fail_status(&e),
+                    };
                     let idx = absent_bufs.len();
                     absent_bufs.push(buf);
                     absent_dtypes.push(scratch_dtype);
@@ -1048,7 +1316,14 @@ unsafe extern "C" fn compute_execute(
                     }
                 };
                 match unsafe {
-                    allocate_output(api_ref, kernel_context, ort_out_idx, shape, out_dtype)
+                    allocate_output(
+                        api_ref,
+                        kernel_context,
+                        ort_out_idx,
+                        shape,
+                        out_dtype,
+                        device,
+                    )
                 } {
                     Ok(out) => {
                         owned_outputs.push(out);
@@ -1081,18 +1356,30 @@ unsafe extern "C" fn compute_execute(
                         let strides = &absent_strides_storage[slot_idx];
                         let scratch_dtype = absent_dtypes[*idx];
                         let view = TensorMut::new(
-                            DevicePtrMut(buf.as_mut_ptr().cast()),
+                            DevicePtrMut(buf.as_ptr().cast()),
                             scratch_dtype,
                             shape.as_slice(),
                             strides.as_slice(),
-                            DeviceId::cpu(),
+                            scratch.device,
                         )
                         .mark_absent();
                         output_views.push(view);
                     }
                 }
             }
-            if let Err(e) = entry.kernel.execute(&kernel_inputs, &mut output_views) {
+            let (_workspace_guard, workspace) = match scratch.prepare_workspace(
+                &*entry.kernel,
+                &kernel_inputs,
+                "Compute: node 0",
+            ) {
+                Ok(w) => w,
+                Err(e) => return fail_status(&e),
+            };
+            if let Err(e) =
+                entry
+                    .kernel
+                    .execute_with_workspace(&kernel_inputs, &mut output_views, workspace)
+            {
                 return fail_status(&format!("Compute: kernel execution failed: {e}"));
             }
         } else {
@@ -1121,11 +1408,11 @@ fn contiguous_strides(shape: &[usize]) -> Vec<i64> {
 fn buf_view_mut(buf: &mut IntermediateBuf) -> onnx_runtime_ep_api::tensor::TensorMut<'_> {
     use onnx_runtime_ep_api::tensor::{DevicePtrMut, TensorMut};
     TensorMut::new(
-        DevicePtrMut(buf.data.as_mut_ptr().cast()),
+        DevicePtrMut(buf.data.as_ptr().cast()),
         buf.dtype,
         &buf.shape,
         &buf.strides,
-        onnx_runtime_ir::DeviceId::cpu(),
+        buf.device,
     )
 }
 
@@ -1762,6 +2049,16 @@ unsafe fn read_i64_tensor(view: &TensorView<'_>) -> Result<Vec<i64>, String> {
     }
     if view.data.is_null() {
         return Err("tensor data pointer is null".into());
+    }
+    // Data-dependent shape inference (Reshape/Slice/reduction axes) must read
+    // the tensor's bytes on the host. Dereferencing a device pointer here would
+    // be undefined behaviour, so fail closed with an actionable message rather
+    // than reading whatever the address happens to alias in this process.
+    if !view.device.is_host_accessible() {
+        return Err(format!(
+            "data-dependent shape inference needs to read this Int64 tensor on the host, but              it lives on {:?}. Keep shape-carrying inputs on CPU (declare a CPU input memory              type for this operand) or decline the node so ORT places it elsewhere.",
+            view.device
+        ));
     }
     let numel: usize = view.shape.iter().product();
     let ptr = view.data.0.cast::<i64>();
@@ -2552,7 +2849,7 @@ mod tests {
 
     #[test]
     fn intermediate_buf_view_roundtrip() {
-        let data = vec![0u8; 12 * 4]; // 12 f32 elements
+        let data = ScratchBuf::Host(vec![0u8; 12 * 4]); // 12 f32 elements
         let shape = vec![3usize, 4];
         let strides = onnx_runtime_ir::compute_contiguous_strides(&shape);
         let buf = IntermediateBuf {
@@ -2560,6 +2857,7 @@ mod tests {
             shape: shape.clone(),
             strides,
             dtype: DataType::Float32,
+            device: DeviceId::cpu(),
         };
         let v = buf.view();
         assert_eq!(v.shape, &shape[..]);

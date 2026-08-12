@@ -110,6 +110,12 @@ pub(crate) struct OwnedInput {
     pub dtype: DataType,
     pub shape: Vec<usize>,
     pub strides: Vec<i64>,
+    /// Device this tensor's bytes actually live on, as reported by ORT
+    /// (`Value_GetMemoryDevice`) for non-host-accessible EPs. Views handed to
+    /// kernels carry this so a device kernel is never told a device pointer is
+    /// host memory, and so host-side readers (data-dependent shape inference)
+    /// can fail closed instead of dereferencing a device address.
+    pub device: DeviceId,
 }
 
 impl OwnedInput {
@@ -120,7 +126,7 @@ impl OwnedInput {
             self.dtype,
             &self.shape,
             &self.strides,
-            DeviceId::cpu(),
+            self.device,
         )
     }
 }
@@ -131,6 +137,8 @@ pub(crate) struct OwnedOutput {
     pub dtype: DataType,
     pub shape: Vec<usize>,
     pub strides: Vec<i64>,
+    /// Device the ORT-allocated output buffer lives on (see [`OwnedInput`]).
+    pub device: DeviceId,
 }
 
 impl OwnedOutput {
@@ -141,12 +149,76 @@ impl OwnedOutput {
             self.dtype,
             &self.shape,
             &self.strides,
-            DeviceId::cpu(),
+            self.device,
         )
     }
 }
 
+/// Classify which device an `OrtValue`'s bytes live on.
+///
+/// For a host-accessible EP (the CPU EP) the answer is always `CPU:0` and no
+/// ORT call is made — behaviour is byte-identical to before this seam existed.
+///
+/// For a device EP we ask ORT directly (`Value_GetMemoryDevice` +
+/// `MemoryDevice_GetDeviceType`/`GetDeviceId`) rather than assuming every
+/// tensor is on the EP's device: ORT legitimately keeps some operands (shape
+/// tensors, for example) in CPU memory. If those entry points are unavailable
+/// we **fail closed**, because the alternative — defaulting to `CPU:0` — is
+/// what let device pointers be handed to kernels as host memory.
+///
+/// # Safety
+///
+/// `api` must be valid and `value` a live `OrtValue*`.
+pub(crate) unsafe fn classify_value_device(
+    api: &ort::OrtApi,
+    value: *const ort::OrtValue,
+    ep_device: DeviceId,
+    context: &str,
+) -> Result<DeviceId, String> {
+    if ep_device.is_host_accessible() {
+        return Ok(DeviceId::cpu());
+    }
+    let get_ep_api = api.GetEpApi.ok_or_else(|| {
+        format!(
+            "{context}: OrtApi.GetEpApi is null; cannot classify tensor memory device (fail closed)"
+        )
+    })?;
+    let ep_api = unsafe { get_ep_api() };
+    if ep_api.is_null() {
+        return Err(format!(
+            "{context}: OrtEpApi unavailable; cannot classify tensor memory device (fail closed)"
+        ));
+    }
+    let ep_api = unsafe { &*ep_api };
+    let value_get_mem_device = ep_api.Value_GetMemoryDevice.ok_or_else(|| {
+        format!("{context}: OrtEpApi.Value_GetMemoryDevice is null (fail closed)")
+    })?;
+    let get_dev_type = ep_api.MemoryDevice_GetDeviceType.ok_or_else(|| {
+        format!("{context}: OrtEpApi.MemoryDevice_GetDeviceType is null (fail closed)")
+    })?;
+    let mem_device = unsafe { value_get_mem_device(value) };
+    if mem_device.is_null() {
+        return Err(format!(
+            "{context}: Value_GetMemoryDevice returned null (fail closed)"
+        ));
+    }
+    let dev_type = unsafe { get_dev_type(mem_device) };
+    if dev_type == ort::OrtMemoryInfoDeviceType_CPU {
+        return Ok(DeviceId::cpu());
+    }
+    // Non-CPU: it belongs to our EP's device class. Take the ordinal from ORT
+    // when it can tell us, otherwise keep the EP's own ordinal.
+    let index = match ep_api.MemoryDevice_GetDeviceId {
+        Some(get_id) => unsafe { get_id(mem_device) },
+        None => ep_device.index,
+    };
+    Ok(DeviceId::new(ep_device.device_type, index))
+}
+
 /// Read all inputs from an `OrtKernelContext` using the host `OrtApi`.
+///
+/// `ep_device` is the device the compiled kernels run on; it selects the
+/// classification policy in [`classify_value_device`].
 ///
 /// # Safety
 ///
@@ -154,6 +226,7 @@ impl OwnedOutput {
 pub(crate) unsafe fn read_inputs(
     api: &ort::OrtApi,
     ctx: *mut ort::OrtKernelContext,
+    ep_device: DeviceId,
 ) -> Result<Vec<OwnedInput>, String> {
     let get_input_count = api
         .KernelContext_GetInputCount
@@ -196,6 +269,7 @@ pub(crate) unsafe fn read_inputs(
                 dtype: DataType::Float32,
                 shape: vec![],
                 strides: vec![],
+                device: ep_device,
             });
             continue;
         }
@@ -248,11 +322,15 @@ pub(crate) unsafe fn read_inputs(
             ));
         }
 
+        let device =
+            unsafe { classify_value_device(api, value, ep_device, &format!("input {i}")) }?;
+
         inputs.push(OwnedInput {
             data_ptr: data,
             dtype,
             shape,
             strides,
+            device,
         });
     }
 
@@ -270,6 +348,7 @@ pub(crate) unsafe fn allocate_output(
     index: usize,
     shape: &[usize],
     dtype: DataType,
+    ep_device: DeviceId,
 ) -> Result<OwnedOutput, String> {
     let get_output = api
         .KernelContext_GetOutput
@@ -299,12 +378,16 @@ pub(crate) unsafe fn allocate_output(
         ));
     }
 
+    let device =
+        unsafe { classify_value_device(api, value, ep_device, &format!("output {index}")) }?;
+
     let strides = onnx_runtime_ir::compute_contiguous_strides(shape);
     Ok(OwnedOutput {
         data_ptr: data,
         dtype,
         shape: shape.to_vec(),
         strides,
+        device,
     })
 }
 
@@ -321,6 +404,7 @@ mod tests {
             dtype: DataType::Float32,
             shape: vec![2, 2],
             strides: vec![2, 1],
+            device: DeviceId::cpu(),
         };
         let view = input.view();
         assert_eq!(view.shape, &[2, 2]);
@@ -335,6 +419,7 @@ mod tests {
             dtype: DataType::Float32,
             shape: vec![2, 3],
             strides: vec![3, 1],
+            device: DeviceId::cpu(),
         };
         let view = output.view_mut();
         assert_eq!(view.shape, &[2, 3]);
@@ -348,6 +433,7 @@ mod tests {
             dtype: DataType::Float32,
             shape: vec![],
             strides: vec![],
+            device: DeviceId::cpu(),
         };
         let view = input.view();
         assert_eq!(view.shape, &[] as &[usize]);

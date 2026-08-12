@@ -645,8 +645,10 @@ fn ep_compile_inner(
             continue;
         }
 
-        // Wrap kernels in OrtNodeComputeInfo.
-        let mut info = ExportedComputeInfo::new(entries);
+        // Wrap kernels in OrtNodeComputeInfo, bound to the EP that produced
+        // them so `Compute` can allocate kernel workspaces and fused-subgraph
+        // intermediates on the same device the kernels run on.
+        let mut info = ExportedComputeInfo::new_with_ep(entries, Arc::clone(&exported.ep));
 
         // For multi-node fused subgraphs, construct the SubgraphRouting so
         // intermediates are threaded correctly in topological order.

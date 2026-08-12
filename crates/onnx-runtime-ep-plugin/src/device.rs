@@ -207,6 +207,34 @@ impl DeviceAllocator {
     }
 }
 
+/// Alignment every `OrtAllocator::Alloc` request is made with.
+pub const DEVICE_ALLOC_ALIGNMENT: usize = 16;
+
+/// Bytes actually requested from the EP for a zero-byte `Alloc`.
+///
+/// ORT's `OrtAllocator` contract requires `Alloc` to return a **unique,
+/// non-null, freeable** pointer, and callers legitimately ask for zero bytes
+/// (an empty tensor). Backing allocators disagree about size 0: `std::alloc`
+/// makes it undefined behaviour, `cudaMalloc`/`cuMemAlloc` return null with
+/// success, and a substituted CUDA allocator may reject it outright. Rather
+/// than depend on any of them, the adapter normalises size 0 to one byte
+/// here — the single boundary every EP's allocator is reached through — and
+/// records the **normalised** size so `Free` returns the same
+/// `(ptr, size, alignment)` triple the EP handed out.
+///
+/// Do not push this normalisation down into individual allocators: an
+/// alternate CUDA allocator installed later would silently regress it.
+pub const ZERO_SIZE_ALLOC_BYTES: usize = 1;
+
+/// Bytes to request from the EP for a caller-requested `size`.
+pub const fn normalize_alloc_size(size: usize) -> usize {
+    if size == 0 {
+        ZERO_SIZE_ALLOC_BYTES
+    } else {
+        size
+    }
+}
+
 unsafe extern "C" fn device_alloc(
     this: *mut ort::OrtAllocator,
     size: usize,
@@ -216,11 +244,24 @@ unsafe extern "C" fn device_alloc(
             return ptr::null_mut();
         }
         let alloc = unsafe { &*(this.cast::<DeviceAllocator>()) };
-        match alloc.ep_ref.with_ep(|ep| ep.allocate(size, 16)) {
+        // Normalise at the adapter boundary — see `ZERO_SIZE_ALLOC_BYTES`.
+        let request = normalize_alloc_size(size);
+        match alloc
+            .ep_ref
+            .with_ep(|ep| ep.allocate(request, DEVICE_ALLOC_ALIGNMENT))
+        {
             Ok(Ok(buf)) => {
                 let p = buf.as_ptr() as *mut std::os::raw::c_void;
+                if p.is_null() {
+                    // An allocator that reports success with a null pointer
+                    // would make `Free` unable to distinguish "empty tensor"
+                    // from "failure". Fail the allocation instead.
+                    return ptr::null_mut();
+                }
                 if let Ok(mut sizes) = alloc.alloc_sizes.lock() {
-                    sizes.insert(p as usize, size);
+                    // Record what we actually asked the EP for, so `Free`
+                    // returns the identical size.
+                    sizes.insert(p as usize, request);
                 }
                 p
             }
@@ -254,7 +295,7 @@ unsafe extern "C" fn device_free(this: *mut ort::OrtAllocator, p: *mut std::os::
                     p,
                     ep.device_id(),
                     size,
-                    16,
+                    DEVICE_ALLOC_ALIGNMENT,
                 )
             };
             let _ = ep.deallocate(buf);

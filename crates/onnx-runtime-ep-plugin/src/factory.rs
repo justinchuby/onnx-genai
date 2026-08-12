@@ -365,20 +365,95 @@ pub unsafe fn create_ep_factories_for_shared_ep(
     ok_status()
 }
 
+/// Outcome of the explicit shared-EP teardown attempted by
+/// [`release_ep_factory`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SharedEpTeardown {
+    /// There was no shared EP (the owned/CPU path).
+    NotShared,
+    /// The factory held the last reference and `shutdown()` was called here.
+    ShutdownCalled,
+    /// `shutdown()` failed; the EP is still dropped.
+    ShutdownFailed,
+    /// Other surfaces (allocators, sync streams, `OrtEp`s) were still alive, so
+    /// `shutdown()` could not run. The EP's `Drop` releases its resources once
+    /// the last surface goes away.
+    StillReferenced { strong_count: usize },
+}
+
+/// Explicitly tear down a factory's shared EP, then drop the factory.
+///
+/// # Shutdown semantics for shared EPs
+///
+/// A shared EP is reachable from four kinds of ORT-owned surface: the
+/// `OrtAllocator`, the `OrtSyncStreamImpl`, the `OrtDataTransferImpl`, and one
+/// `OrtEp` per session. Each holds an `Arc` clone, so **no single `Release*`
+/// callback may call `shutdown()`** — doing so would tear down the CUDA
+/// runtime/context another live session still needs. `factory_release_ep`
+/// therefore only shuts down when its `ExportedEp` is the sole owner, which is
+/// never true for a shared EP.
+///
+/// `ReleaseEpFactory` is the one point in the ORT lifecycle that happens after
+/// every other surface has been released, so it is where explicit shutdown
+/// belongs. When the factory holds the last reference we call `shutdown()`
+/// here — the explicit, documented cleanup path for normal teardown.
+///
+/// When surfaces are somehow still alive (an ORT contract violation, or an
+/// embedder that leaked a handle) we do **not** shut down out from under them.
+/// The invariant then in force is **Drop-only**: `Arc` drops the EP when the
+/// last surface releases it, and the EP's own `Drop` frees its device
+/// resources. Both paths are covered by tests in this module and by
+/// `shared_ep_ort_e2e.rs`.
+///
+/// # Safety
+///
+/// `factory` must be a pointer returned by `create_ep_factories*`.
+pub unsafe fn release_ep_factory_with_teardown(
+    factory: *mut ort::OrtEpFactory,
+) -> (SharedEpTeardown, *mut ort::OrtStatus) {
+    if factory.is_null() {
+        return (SharedEpTeardown::NotShared, ok_status());
+    }
+    // SAFETY: The pointer was created by Box::into_raw in create_ep_factories.
+    let mut exported = unsafe { Box::from_raw(factory.cast::<ExportedFactory>()) };
+
+    let outcome = match exported.shared_ep.take() {
+        None => SharedEpTeardown::NotShared,
+        Some(mut shared) => match Arc::get_mut(&mut shared) {
+            Some(ep) => match ep.shutdown() {
+                Ok(()) => SharedEpTeardown::ShutdownCalled,
+                Err(e) => {
+                    eprintln!(
+                        "nxrt ep plugin: shared EP shutdown() failed during ReleaseEpFactory: {e}"
+                    );
+                    SharedEpTeardown::ShutdownFailed
+                }
+            },
+            None => {
+                let strong_count = Arc::strong_count(&shared);
+                eprintln!(
+                    "nxrt ep plugin: ReleaseEpFactory called while {} other reference(s) to the                      shared EP are still alive (allocator / sync stream / data transfer / OrtEp).                      ORT should release those before releasing the factory. Skipping explicit                      shutdown() and falling back to the Drop-only invariant: the EP is released                      when the last surface goes away.",
+                    strong_count - 1
+                );
+                SharedEpTeardown::StillReferenced { strong_count }
+            }
+        },
+    };
+
+    drop(exported);
+    (outcome, ok_status())
+}
+
 /// Implementation of `ReleaseEpFactory`.
+///
+/// Thin wrapper over [`release_ep_factory_with_teardown`] that discards the
+/// teardown outcome (which exists so tests can assert on it).
 ///
 /// # Safety
 ///
 /// `factory` must be a pointer returned by `create_ep_factories`.
 pub unsafe fn release_ep_factory(factory: *mut ort::OrtEpFactory) -> *mut ort::OrtStatus {
-    if factory.is_null() {
-        return ok_status();
-    }
-    // SAFETY: The pointer was created by Box::into_raw in create_ep_factories.
-    unsafe {
-        drop(Box::from_raw(factory.cast::<ExportedFactory>()));
-    }
-    ok_status()
+    unsafe { release_ep_factory_with_teardown(factory) }.1
 }
 
 // ─── OrtEpFactory callbacks ─────────────────────────────────────────────────
@@ -674,6 +749,10 @@ unsafe extern "C" fn factory_release_ep(_factory: *mut ort::OrtEpFactory, ep: *m
             // surfaces still depend on. For an owned/fresh EP (e.g. CPU),
             // this `ExportedEp` is the only owner, so `Arc::get_mut` succeeds
             // and `shutdown()` runs exactly as before.
+            //
+            // Shared EPs are shut down later, in `release_ep_factory`, which
+            // ORT calls after every surface has been released — see
+            // `release_ep_factory_with_teardown` for the full contract.
             if let Some(ep_mut) = Arc::get_mut(&mut exported_ep.ep) {
                 let _ = ep_mut.shutdown();
             }
