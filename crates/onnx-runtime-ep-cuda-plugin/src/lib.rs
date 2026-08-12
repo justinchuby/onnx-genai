@@ -194,10 +194,7 @@ pub unsafe extern "C" fn CreateEpFactories(
                     *out_num_raw = 0;
                 }
             }
-            onnx_runtime_ep_plugin::panic_to_fail_status(
-                "onnx-runtime-ep-cuda-plugin built without `cuda` feature; \
-                 CUDA EP is not available. Rebuild with --features cuda on a CUDA-capable host.",
-            )
+            onnx_runtime_ep_plugin::panic_to_fail_status(NO_CUDA_FEATURE_DIAGNOSTIC)
         }
     }));
     match result {
@@ -263,6 +260,46 @@ pub unsafe extern "C" fn ReleaseEpFactory(
 
 // Re-export panic_to_fail_status for tests (mirrors the macro pattern).
 pub use onnx_runtime_ep_plugin::panic_to_fail_status;
+
+/// The diagnostic message emitted when the plugin is built **without** the
+/// `cuda` feature. This is the exact string passed to `panic_to_fail_status`
+/// on the fail-closed path in [`CreateEpFactories`]; it is defined here (rather
+/// than inline) so tests can assert on the real diagnostic content.
+#[cfg(not(feature = "cuda"))]
+pub(crate) const NO_CUDA_FEATURE_DIAGNOSTIC: &str = "onnx-runtime-ep-cuda-plugin built without `cuda` feature; \
+     CUDA EP is not available. Rebuild with --features cuda on a CUDA-capable host.";
+
+/// Return the actionable diagnostic message the plugin emits on its
+/// fail-closed path (zero factories), or `None` when a real CUDA factory would
+/// be created (a GPU is available and the `cuda` feature is on).
+///
+/// This exposes the plugin's **actual** diagnostic string — the same text that
+/// `CreateEpFactories` hands to `fail_status`/`panic_to_fail_status`. Tests can
+/// assert on this without a live ORT host, because materializing an `OrtStatus`
+/// (via the host `CreateStatus`) requires the ORT API pointer, whereas the
+/// message content is produced entirely by this crate.
+///
+/// - Without the `cuda` feature: always returns the compile-time
+///   "built without `cuda` feature" diagnostic.
+/// - With the `cuda` feature but no GPU/driver: returns the construction
+///   failure diagnostic produced by `construct_ep_with_stream`.
+/// - With the `cuda` feature and a working GPU: returns `None` (a factory is
+///   advertised, so there is no fail-closed diagnostic).
+pub fn fail_closed_diagnostic() -> Option<String> {
+    #[cfg(not(feature = "cuda"))]
+    {
+        Some(NO_CUDA_FEATURE_DIAGNOSTIC.to_string())
+    }
+    #[cfg(feature = "cuda")]
+    {
+        match cuda_impl::construct_ep_with_stream() {
+            Ok(_) => None,
+            Err(msg) => Some(format!(
+                "onnx-runtime-ep-cuda-plugin: {msg}. Zero factories returned."
+            )),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
