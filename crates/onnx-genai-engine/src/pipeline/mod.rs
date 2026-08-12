@@ -32,7 +32,8 @@ use onnx_genai_kv::{PagedKvCache, PrefixCache, SequenceId};
 use onnx_genai_metadata::{
     AbsentInputKind, ComponentImplementation, ControlFlow, DataflowEdge, DeviceKind, ModelIoSpec,
     PhaseRunOn, PipelineSpec, PipelineStrategy, PipelineStrategyKind, PipelineVisionConfig,
-    Predicate, RuntimeInputRole, ScalarValue, SchedulerSpec, SequenceInputKind, TensorContract,
+    Predicate, PreprocessingSpec, RuntimeInputRole, ScalarValue, SchedulerSpec, SequenceInputKind,
+    TensorContract,
     TensorDimension, Termination, WorkflowEmitMode, WorkflowInputSource, WorkflowNode,
     WorkflowSpec,
 };
@@ -261,6 +262,7 @@ pub struct PipelineEngine {
     /// from `&self` paths (single-pass, iterative) as well as `&mut self` ones.
     component_cache: RefCell<ComponentOutputCache>,
     workflow_session_state: RefCell<HashMap<(String, String), Value>>,
+    preprocessing: Option<PreprocessingSpec>,
     /// Components whose graphs contain only deterministic operators, and whose
     /// outputs may therefore be memoized. Computed once at load.
     memoizable_components: BTreeSet<String>,
@@ -922,10 +924,19 @@ impl PipelineEngine {
         )?;
         let directory = PipelineModelDirectory::load(pipeline_dir)
             .map_err(|e| anyhow::anyhow!("Failed to resolve pipeline models: {e}"))?;
-        let prefill_chunk_size = pipeline_metadata_prefill_chunk_size(&directory);
-        let generation_defaults = pipeline_metadata_generation_defaults(&directory);
-        let max_sequence_length = pipeline_metadata_max_len(&directory);
-        let eos_token_ids = pipeline_metadata_eos_token_ids(&directory);
+        if let Some(workflow) = &directory.spec.workflow {
+            for (component, declaration) in &workflow.components {
+                if let ComponentImplementation::Adapter { abi, version, .. } =
+                    &declaration.implementation
+                    && !iterative::supports_workflow_adapter(abi, version)
+                {
+                    anyhow::bail!(
+                        "workflow adapter '{component}' requires unsupported ABI {abi}@{version}; \
+                         install a runtime that registers this exact adapter ABI version"
+                    );
+                }
+            }
+        }
         let model_weights_bytes =
             directory
                 .model_paths
@@ -1357,6 +1368,7 @@ impl PipelineEngine {
                 usize::try_from(config.pipeline_cache_bytes).unwrap_or(usize::MAX),
             )),
             workflow_session_state: RefCell::new(HashMap::new()),
+            preprocessing: directory.preprocessing.clone(),
             memoizable_components,
             retained: None,
             native_retained_decoder: None,

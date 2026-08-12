@@ -195,11 +195,183 @@ pub fn validate_metadata(metadata: &InferenceMetadata) -> Result<(), Vec<String>
     {
         errors.extend(error.errors);
     }
+    validate_preprocessing_workflow(metadata, &mut errors);
 
     if errors.is_empty() {
         Ok(())
     } else {
         Err(errors)
+    }
+}
+
+fn validate_preprocessing_workflow(metadata: &InferenceMetadata, errors: &mut Vec<String>) {
+    const IMAGE_ABI: &str = "onnx-genai.image-preprocess";
+    const IMAGE_ABI_VERSION: &str = "1";
+
+    let Some(workflow) = metadata
+        .pipeline
+        .as_ref()
+        .and_then(|pipeline| pipeline.workflow.as_ref())
+    else {
+        return;
+    };
+    let image = metadata
+        .preprocessing
+        .as_ref()
+        .and_then(|spec| spec.image.as_ref());
+    let adapters = workflow
+        .components
+        .iter()
+        .filter(|(_, component)| {
+            matches!(
+                &component.implementation,
+                crate::schema::ComponentImplementation::Adapter { abi, version, .. }
+                    if abi == IMAGE_ABI && version == IMAGE_ABI_VERSION
+            )
+        })
+        .collect::<Vec<_>>();
+    if image.is_none() && !adapters.is_empty() {
+        errors.push(format!(
+            "workflow adapter components using {IMAGE_ABI}@{IMAGE_ABI_VERSION} require \
+                 preprocessing.image metadata"
+        ));
+        return;
+    }
+    let Some(image) = image else {
+        return;
+    };
+    if adapters.len() != 1 {
+        errors.push(format!(
+            "preprocessing.image requires exactly one workflow adapter component using \
+                 {IMAGE_ABI}@{IMAGE_ABI_VERSION}, found {}",
+            adapters.len()
+        ));
+        return;
+    }
+    let (adapter_name, adapter) = adapters[0];
+    match adapter.ports.inputs.get("encoded") {
+        Some(contract) if contract.dtype == "uint8" && contract.rank == 1 => {}
+        Some(contract) => errors.push(format!(
+            "workflow image preprocessing adapter '{adapter_name}' input 'encoded' must be uint8 \
+                 rank 1, got {} rank {}",
+            contract.dtype, contract.rank
+        )),
+        None => errors.push(format!(
+            "workflow image preprocessing adapter '{adapter_name}' must declare input 'encoded'"
+        )),
+    }
+
+    fn collect_invocations<'a>(
+        node: &'a WorkflowNode,
+        component: &str,
+        outputs: &mut Vec<&'a BTreeMap<String, String>>,
+    ) {
+        match node {
+            WorkflowNode::Sequence { nodes } => {
+                for node in nodes {
+                    collect_invocations(node, component, outputs);
+                }
+            }
+            WorkflowNode::Invoke {
+                component: invoked,
+                outputs: invoked_outputs,
+                ..
+            } if invoked == component => outputs.push(invoked_outputs),
+            WorkflowNode::Loop { setup, body, .. } => {
+                collect_invocations(setup, component, outputs);
+                collect_invocations(body, component, outputs);
+            }
+            WorkflowNode::Branch { cases, default, .. } => {
+                for case in cases.values() {
+                    collect_invocations(case, component, outputs);
+                }
+                if let Some(default) = default {
+                    collect_invocations(default, component, outputs);
+                }
+            }
+            WorkflowNode::Invoke { .. }
+            | WorkflowNode::Emit { .. }
+            | WorkflowNode::Transfer { .. } => {}
+        }
+    }
+    let mut invocations = Vec::new();
+    collect_invocations(&workflow.graph, adapter_name, &mut invocations);
+    if invocations.len() != 1 {
+        errors.push(format!(
+            "workflow image preprocessing adapter '{adapter_name}' must be invoked exactly once, \
+                 found {} invocations",
+            invocations.len()
+        ));
+        return;
+    }
+    let invocation_outputs = invocations[0];
+    for output in &image.outputs {
+        if output.optional.unwrap_or(false) {
+            errors.push(format!(
+                "preprocessing.image output '{}' cannot be optional in a workflow; every declared \
+                 adapter SSA output must be materialized",
+                output.name
+            ));
+        }
+        let Some(contract) = &output.contract else {
+            errors.push(format!(
+                "preprocessing.image output '{}' must declare a TensorContract for workflow use",
+                output.name
+            ));
+            continue;
+        };
+        if contract.dtype != output.dtype {
+            errors.push(format!(
+                "preprocessing.image output '{}' dtype '{}' disagrees with its TensorContract '{}'",
+                output.name, output.dtype, contract.dtype
+            ));
+        }
+        let port = invocation_outputs
+            .iter()
+            .find_map(|(port, value)| (value == &output.name).then_some(port));
+        let Some(port) = port else {
+            errors.push(format!(
+                "preprocessing.image output '{}' must be a declared SSA output of adapter \
+                     invocation '{adapter_name}'",
+                output.name
+            ));
+            continue;
+        };
+        match adapter.ports.outputs.get(port) {
+            Some(port_contract) => require_compatible_tensor_contracts(
+                contract,
+                port_contract,
+                &format!("preprocessing.image output '{}'", output.name),
+                errors,
+            ),
+            None => errors.push(format!(
+                "workflow image preprocessing adapter '{adapter_name}' has no output port '{port}'"
+            )),
+        }
+    }
+}
+
+fn require_compatible_tensor_contracts(
+    source: &crate::schema::TensorContract,
+    target: &crate::schema::TensorContract,
+    path: &str,
+    errors: &mut Vec<String>,
+) {
+    fn normalize(dtype: &str) -> &str {
+        match dtype {
+            "fp32" => "float32",
+            "fp16" => "float16",
+            "bf16" => "bfloat16",
+            other => other,
+        }
+    }
+    if normalize(&source.dtype) != normalize(&target.dtype)
+        || source.rank != target.rank
+        || source.shape != target.shape
+    {
+        errors.push(format!(
+            "{path} has a contract incompatible with its adapter output port"
+        ));
     }
 }
 

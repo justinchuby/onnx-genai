@@ -38,6 +38,54 @@ effects:
   policy_effect: { consumes: effect.0, produces: effect.1 }
 ```
 
+## Versioned adapter invocation
+
+Pre/post-processing adapters are ordinary workflow components, not out-of-band
+bindings. Their `implementation.kind` is `adapter`; `abi` and `version` must be
+pinned identically in `manifest.adapter_abis`. Inputs and outputs use the same
+typed port maps, SSA scoping, state cells, and effect transitions as ONNX
+components. Opaque application inputs are passed only through explicitly named
+workflow inputs.
+
+The runtime registry currently provides `onnx-genai.image-preprocess@1`:
+
+| Port | Direction | Contract |
+|---|---|---|
+| `encoded` | input | `uint8[encoded_bytes]`, one encoded image |
+| producer-declared ports | output | exact `TensorContract` from `preprocessing.image.outputs[].contract` |
+
+Each `preprocessing.image.outputs[]` entry names its processor-local `source`
+and the workflow SSA value in `name`. The adapter invoke maps a physical output
+port to that same SSA name. Legacy `component.input` endpoint binding is invalid
+in workflow documents.
+
+```yaml
+preprocessing:
+  image:
+    transforms:
+      - { op: decode, outputs: [decoded] }
+      - { op: convert_rgb, inputs: [decoded], outputs: [rgb] }
+      - { op: resize, inputs: [rgb], outputs: [pixels], size: 224,
+          mode: stretch, interpolation: bilinear }
+    outputs:
+      - { source: pixels, name: image.pixel_values, content: pixels,
+          dtype: float32,
+          contract: { dtype: float32, rank: 4, shape: [1, 3, 224, 224] } }
+# manifest.adapter_abis: { onnx-genai.image-preprocess: "1" }
+# graph:
+- kind: invoke
+  component: image_preprocess
+  inputs: { encoded: request.image }
+  outputs: { pixel_values: image.pixel_values }
+  effects: {}
+```
+
+Stateful streaming tokenizer/media adapters declare state ports/cells and
+linear effect transitions. Other media codecs and postprocessors must be ONNX
+components or separately versioned registered ABIs; the runtime does not infer
+semantics or provide model-specific host fallbacks. Public outputs should be
+emitted after the post-adapter invoke and declare `stage: post_adapter`.
+
 ## Token sampler
 
 `role: token_sampler`

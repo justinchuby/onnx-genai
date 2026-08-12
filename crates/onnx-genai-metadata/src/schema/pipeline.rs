@@ -279,21 +279,22 @@ pub struct PreprocessingSpec {
 }
 
 /// Generic image preprocessing program: an ordered transform pipeline plus the
-/// named tensor outputs it emits.
+/// named workflow SSA tensor outputs it emits.
 ///
 /// The program is expressed entirely as parameterized, architecture-neutral
 /// data. Transform operations are generic (decode, resize, rescale, normalize,
-/// tile, patchify, pad); outputs bind a produced tensor to an ARBITRARY pipeline
-/// endpoint name with a DECLARED dtype. A model may name an output
-/// `pixel_position_ids`, `image_grid_thw`, or anything else — that string is
-/// data carried in the model's metadata, never a branch in the runtime.
+/// tile, patchify, pad). In workflow metadata, outputs are materialized by a
+/// manifest-pinned preprocessing adapter invocation and bind processor-local
+/// values to typed SSA names. A package may name an output `pixel_position_ids`,
+/// `image_grid_thw`, or anything else without introducing runtime model-family
+/// dispatch.
 #[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
 pub struct ImagePreprocessingProgram {
     /// Ordered list of generic transform operations applied to decoded pixels.
     #[serde(default)]
     pub transforms: Vec<ImageTransform>,
 
-    /// Named tensor outputs the program emits, each bound to a pipeline endpoint.
+    /// Named tensor outputs the program emits, each bound to a workflow SSA value.
     #[schemars(length(min = 1))]
     pub outputs: Vec<ImageOutputBinding>,
 }
@@ -478,20 +479,16 @@ pub enum ImageSizeSpec {
 
 /// One named tensor output produced by an image preprocessing program.
 ///
-/// The output binds a generic content role to an ARBITRARY endpoint name with a
-/// DECLARED dtype. Neither the name nor the content role is inferred from a model
-/// identity, and the dtype is always explicit rather than derived from the model.
+/// The output binds a processor-local value to a typed workflow SSA name.
+/// Neither the name nor the content role is inferred from a model identity.
 #[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
 pub struct ImageOutputBinding {
-    /// Named value produced by a transform.
-    ///
-    /// Absent preserves the legacy content-derived binding behavior.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Named processor-local value produced by a transform.
     #[schemars(length(min = 1))]
-    pub source: Option<String>,
+    pub source: String,
 
-    /// Arbitrary pipeline endpoint name this tensor is bound to (model DATA).
-    #[schemars(length(min = 1), example = &"vision_encoder.pixel_values")]
+    /// Workflow SSA value produced by the preprocessing adapter invocation.
+    #[schemars(length(min = 1), example = &"image.pixel_values")]
     pub name: String,
 
     /// Generic content role this tensor carries (pixels, coordinates, grid,
@@ -502,6 +499,10 @@ pub struct ImageOutputBinding {
     /// Declared output dtype. Always explicit; never inferred from the model.
     #[schemars(with = "schema_vocabulary::TensorDType")]
     pub dtype: String,
+
+    /// Full workflow tensor contract. Required when `pipeline.workflow` is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract: Option<crate::schema::TensorContract>,
 
     /// Optional sentinel/pad value for padded entries (e.g. `-1` coordinates).
     #[serde(default, skip_serializing_if = "Option::is_none")]

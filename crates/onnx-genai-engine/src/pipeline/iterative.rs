@@ -6,6 +6,34 @@
 
 use super::*;
 
+type WorkflowAdapterExecutor = fn(
+    &PipelineEngine,
+    &str,
+    &std::collections::BTreeMap<String, String>,
+    &std::collections::BTreeMap<String, String>,
+    &onnx_genai_metadata::WorkflowComponent,
+    &mut PipelineTensors,
+    &mut HashMap<String, i64>,
+    &std::collections::HashSet<String>,
+) -> anyhow::Result<()>;
+
+fn workflow_adapter_registry()
+-> &'static HashMap<(&'static str, &'static str), WorkflowAdapterExecutor> {
+    static REGISTRY: std::sync::LazyLock<
+        HashMap<(&'static str, &'static str), WorkflowAdapterExecutor>,
+    > = std::sync::LazyLock::new(|| {
+        HashMap::from([(
+            ("onnx-genai.image-preprocess", "1"),
+            PipelineEngine::run_image_preprocess_adapter as WorkflowAdapterExecutor,
+        )])
+    });
+    &REGISTRY
+}
+
+pub(super) fn supports_workflow_adapter(abi: &str, version: &str) -> bool {
+    workflow_adapter_registry().contains_key(&(abi, version))
+}
+
 /// Bundled inputs for [`PipelineEngine::run_denoiser_pass`]: the denoiser
 /// session, the iterative plan and its start step, the constant conditioning
 /// tensors and loop-carried values, the current step index and timestep, and
@@ -829,9 +857,25 @@ impl PipelineEngine {
                         }
                     }
                     ComponentImplementation::Adapter { abi, version, .. } => {
-                        anyhow::bail!(
-                            "workflow adapter '{component}' requires unsupported ABI {abi}@{version}"
-                        );
+                        if let Some(execute) =
+                            workflow_adapter_registry().get(&(abi.as_str(), version.as_str()))
+                        {
+                            execute(
+                                self,
+                                component,
+                                inputs,
+                                outputs,
+                                declaration,
+                                values,
+                                symbols,
+                                dynamic_symbols,
+                            )?;
+                        } else {
+                            anyhow::bail!(
+                                "workflow adapter '{component}' requires unsupported ABI \
+                                 {abi}@{version}"
+                            );
+                        }
                     }
                 }
             }
@@ -1017,6 +1061,91 @@ impl PipelineEngine {
                     .with_context(|| format!("workflow transfer value '{input}' is unavailable"))?;
                 values.insert(output.clone(), clone_value(tensor)?);
             }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_image_preprocess_adapter(
+        &self,
+        component: &str,
+        inputs: &std::collections::BTreeMap<String, String>,
+        outputs: &std::collections::BTreeMap<String, String>,
+        declaration: &onnx_genai_metadata::WorkflowComponent,
+        values: &mut PipelineTensors,
+        symbols: &mut HashMap<String, i64>,
+        dynamic_symbols: &std::collections::HashSet<String>,
+    ) -> anyhow::Result<()> {
+        let program = self
+            .preprocessing
+            .as_ref()
+            .and_then(|spec| spec.image.as_ref())
+            .with_context(|| {
+                format!(
+                    "workflow image preprocessing adapter '{component}' requires \
+                     preprocessing.image metadata"
+                )
+            })?;
+        let encoded_ref = inputs.get("encoded").with_context(|| {
+            format!("workflow image preprocessing adapter '{component}' requires input 'encoded'")
+        })?;
+        let encoded = values
+            .get(encoded_ref)
+            .with_context(|| format!("workflow value '{encoded_ref}' is unavailable"))?;
+        if encoded.dtype() != DataType::Uint8 || encoded.shape().len() != 1 {
+            anyhow::bail!(
+                "workflow image preprocessing adapter '{component}' input 'encoded' must be \
+                 uint8 rank 1"
+            );
+        }
+        let pixels = program
+            .outputs
+            .iter()
+            .find(|output| output.content == "pixels")
+            .context("preprocessing.image must declare a pixels output")?;
+        let pixel_contract = pixels.contract.as_ref().with_context(|| {
+            format!(
+                "preprocessing.image output '{}' must declare a TensorContract",
+                pixels.name
+            )
+        })?;
+        let target_shape = resolve_workflow_shape(pixel_contract, symbols)?;
+        let processor = onnx_genai_preprocess::image::ImagePreprocessor::from_input_and_program(
+            &target_shape,
+            program,
+        )?;
+        let encoded_bytes = encoded.as_raw_bytes()?;
+        let mut tensors = processor
+            .preprocess_encoded([encoded_bytes])?
+            .tensors
+            .into_iter()
+            .map(|tensor| (tensor.name.clone(), tensor))
+            .collect::<HashMap<_, _>>();
+        for (port, value_ref) in outputs {
+            let tensor = tensors.remove(value_ref).with_context(|| {
+                format!(
+                    "image preprocessing adapter '{component}' did not produce declared SSA \
+                     output '{value_ref}'"
+                )
+            })?;
+            let contract = declaration.ports.outputs.get(port).with_context(|| {
+                format!(
+                    "workflow image preprocessing adapter '{component}' has no declared output \
+                     port '{port}'"
+                )
+            })?;
+            let value = image_tensor_to_value(tensor)?;
+            validate_workflow_value(value_ref, &value, contract, symbols, dynamic_symbols)?;
+            values.insert(value_ref.clone(), value);
+        }
+        if !tensors.is_empty() {
+            let mut unbound = tensors.into_keys().collect::<Vec<_>>();
+            unbound.sort();
+            anyhow::bail!(
+                "image preprocessing adapter '{component}' produced outputs without workflow \
+                 bindings: {}",
+                unbound.join(", ")
+            );
         }
         Ok(())
     }
@@ -1278,6 +1407,66 @@ fn scalar_or_batch_shape(contract: &TensorContract) -> anyhow::Result<Vec<i64>> 
         1 => Ok(vec![1]),
         rank => anyhow::bail!("request scalar binding requires rank 0 or 1, got {rank}"),
     }
+}
+
+fn resolve_workflow_shape(
+    contract: &TensorContract,
+    symbols: &HashMap<String, i64>,
+) -> anyhow::Result<Vec<i64>> {
+    let shape = contract
+        .shape
+        .as_ref()
+        .context("workflow adapter output requires a declared shape")?;
+    shape
+        .iter()
+        .map(|dimension| match dimension {
+            TensorDimension::Fixed(value) => Ok(*value),
+            TensorDimension::Symbol(symbol) => symbols.get(symbol).copied().with_context(|| {
+                format!(
+                    "workflow adapter output requires unresolved dimension '{symbol}' for allocation"
+                )
+            }),
+        })
+        .collect()
+}
+
+fn image_tensor_to_value(
+    tensor: onnx_genai_preprocess::image::NamedImageTensor,
+) -> anyhow::Result<Value> {
+    use onnx_genai_preprocess::image::ImageTensorData;
+
+    let shape = &tensor.shape;
+    match tensor.data {
+        ImageTensorData::Fp32(data) => Value::from_vec_f32(data, shape).map_err(Into::into),
+        ImageTensorData::Fp16(data) => Value::from_vec_f16_bits(data, shape).map_err(Into::into),
+        ImageTensorData::Bf16(data) => Value::from_vec_bf16_bits(data, shape).map_err(Into::into),
+        ImageTensorData::Int64(data) => Value::from_vec_i64(data, shape).map_err(Into::into),
+        ImageTensorData::Int32(data) => {
+            typed_image_bytes(data, shape, DataType::Int32, i32::to_ne_bytes)
+        }
+        ImageTensorData::Int8(data) => Value::from_raw_bytes(
+            data.into_iter().map(|value| value as u8).collect(),
+            shape,
+            DataType::Int8,
+        )
+        .map_err(Into::into),
+        ImageTensorData::Uint8(data) => {
+            Value::from_raw_bytes(data, shape, DataType::Uint8).map_err(Into::into)
+        }
+        ImageTensorData::Bool(data) => {
+            Value::from_raw_bytes(data, shape, DataType::Bool).map_err(Into::into)
+        }
+    }
+}
+
+fn typed_image_bytes<T, const N: usize>(
+    data: Vec<T>,
+    shape: &[i64],
+    dtype: DataType,
+    to_bytes: impl Fn(T) -> [u8; N],
+) -> anyhow::Result<Value> {
+    let bytes = data.into_iter().flat_map(to_bytes).collect::<Vec<u8>>();
+    Value::from_raw_bytes(bytes, shape, dtype).map_err(Into::into)
 }
 
 fn literal_shape(contract: &TensorContract) -> anyhow::Result<Vec<i64>> {
