@@ -172,6 +172,13 @@ impl EngineResourceGovernor {
     }
 
     #[cfg(feature = "native-backend")]
+    // Eight parameters (one over the lint's threshold) because this is
+    // `new_with_authority` plus an explicit reservation: #840 added
+    // `cuda_device_index` to fix a VRAM-capacity portability bug and pushed it
+    // over. Grouping them into a struct would buy nothing here — this is a
+    // crate-private constructor with exactly one caller (`engine::load`), and
+    // every argument is already a distinct type carrying its own meaning.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_authority_and_reservation(
         limits: ResourceLimits,
         allow_runtime_override: bool,
