@@ -8,7 +8,9 @@
 //! shape/stride build corrects. This harness forces growth with a tiny
 //! `ONNX_GENAI_KV_MIN_BUCKET` and asserts the head-major and seq-major token
 //! streams are byte-identical across several growth events, capture ON and OFF,
-//! under both KV growth mechanisms.
+//! under both KV growth mechanisms. Each phase runs in its own process because
+//! `ONNX_GENAI_CUDA_GRAPH` is a process-wide `RuntimeConfig` value parsed once;
+//! mutating the environment after the first engine load does not change policy.
 //!
 //! ## The two decoupled seq-major levers
 //!
@@ -62,6 +64,7 @@
 #![cfg(all(feature = "cuda", feature = "native-backend"))]
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Instant;
 
 use onnx_genai_engine::{
@@ -122,6 +125,8 @@ struct Mode {
     capture: bool,
     vmm_arena: bool,
 }
+
+const CHILD_MODE_ENV: &str = "MOBIUS_SEQMAJOR_CHILD_MODE";
 
 /// Generate greedily on `dir` under `mode`. `ONNX_GENAI_KV_MIN_BUCKET` is set on
 /// every run so both layouts exercise the same growth schedule.
@@ -184,7 +189,7 @@ fn report(label: &str, run: &Run) {
     if let Some(s) = &run.stats {
         eprint!(
             " seq_major={} committed_bytes={} growth_events={} d2d_copy_bytes={} \
-             captures={} invalidations={} replays={} max_len={}",
+             captures={} invalidations={} replays={} max_len={} decline_reason={:?}",
             s.kv_layout_seq_major,
             s.kv_committed_bytes,
             s.kv_growth_events,
@@ -193,6 +198,7 @@ fn report(label: &str, run: &Run) {
             s.graph.invalidations,
             s.graph.replays,
             s.max_len,
+            s.graph.decline_reason.as_deref(),
         );
     } else {
         eprint!(" (no native CUDA stats)");
@@ -261,6 +267,32 @@ fn parity_phase(
     Ok((head.stats, seq.stats))
 }
 
+fn child_mode_label(vmm_arena: bool, capture: bool) -> &'static str {
+    match (vmm_arena, capture) {
+        (true, false) => "vmm-off",
+        (true, true) => "vmm-on",
+        (false, false) => "realloc-off",
+        (false, true) => "realloc-on",
+    }
+}
+
+fn run_child_phase(vmm_arena: bool, capture: bool) -> anyhow::Result<()> {
+    let exe = std::env::current_exe()?;
+    let status = Command::new(exe)
+        .arg("--exact")
+        .arg("mobius_seq_major_growth_is_bit_identical_to_head_major")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .env(CHILD_MODE_ENV, child_mode_label(vmm_arena, capture))
+        .status()?;
+    anyhow::ensure!(
+        status.success(),
+        "mobius child phase {} failed with {status}",
+        child_mode_label(vmm_arena, capture)
+    );
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires the stock + kv_layout=1 mobius exports and a CUDA device"]
 fn mobius_seq_major_growth_is_bit_identical_to_head_major() -> anyhow::Result<()> {
@@ -275,42 +307,53 @@ fn mobius_seq_major_growth_is_bit_identical_to_head_major() -> anyhow::Result<()
         return Ok(());
     }
 
-    // Phase 1 — in-place VMM growth (the default since #798's managed no-spill
-    // VMM). This is the path the engine shape/stride change primarily targets:
-    // the seq-major fixed stride keeps the live prefix at its byte offsets, so
-    // growth copies **zero** KV bytes, while head-major re-strides its head
-    // stripes. Core correctness too: byte-identical output, capture OFF then ON.
-    let (head_vmm_off, seq_vmm_off) = parity_phase(&head_dir, &seq_dir, true, false)?;
-    parity_phase(&head_dir, &seq_dir, true, true)?;
-    if let (Some(h), Some(s)) = (&head_vmm_off, &seq_vmm_off) {
-        assert_eq!(
-            s.kv_growth_d2d_copy_bytes, 0,
-            "in-place VMM seq-major growth must move zero KV bytes (fixed stride), got {}",
-            s.kv_growth_d2d_copy_bytes
-        );
-        assert!(
-            h.kv_growth_d2d_copy_bytes > 0,
-            "in-place VMM head-major growth must re-stride its head stripes (copy > 0), got {}",
-            h.kv_growth_d2d_copy_bytes
-        );
-        eprintln!(
-            "FIXED-STRIDE RESULT: in-place VMM growth d2d KV bytes head-major={} vs seq-major={} \
-             (0 = no data moved)",
-            h.kv_growth_d2d_copy_bytes, s.kv_growth_d2d_copy_bytes
-        );
+    if let Ok(mode) = std::env::var(CHILD_MODE_ENV) {
+        let (vmm_arena, capture) = match mode.as_str() {
+            "vmm-off" => (true, false),
+            "vmm-on" => (true, true),
+            "realloc-off" => (false, false),
+            "realloc-on" => (false, true),
+            _ => anyhow::bail!("unknown {CHILD_MODE_ENV} value {mode:?}"),
+        };
+        let (head, seq) = parity_phase(&head_dir, &seq_dir, vmm_arena, capture)?;
+        if let (Some(h), Some(s)) = (&head, &seq) {
+            if capture {
+                assert!(h.graph.enabled && s.graph.enabled);
+                assert!(
+                    h.graph.captures > 0 && s.graph.captures > 0,
+                    "capture=ON child must actually capture: head={:?} seq={:?}",
+                    h.graph,
+                    s.graph
+                );
+                assert!(h.graph.decline_reason.is_none());
+                assert!(s.graph.decline_reason.is_none());
+            } else {
+                for stats in [h, s] {
+                    assert!(!stats.graph.enabled);
+                    let reason = stats
+                        .graph
+                        .decline_reason
+                        .as_deref()
+                        .expect("capture=OFF must report the named declining predicate");
+                    assert!(
+                        reason.contains("predicate `ONNX_GENAI_CUDA_GRAPH`"),
+                        "{reason}"
+                    );
+                }
+            }
+            if vmm_arena && !capture {
+                assert_eq!(s.kv_growth_d2d_copy_bytes, 0);
+                assert!(h.kv_growth_d2d_copy_bytes > 0);
+            }
+            if !vmm_arena && !capture {
+                assert_eq!(s.kv_growth_d2d_copy_bytes, h.kv_growth_d2d_copy_bytes);
+            }
+        }
+        return Ok(());
     }
 
-    // Phase 2 — legacy reallocation growth (ONNX_GENAI_LEGACY_ALLOCATOR=1, the
-    // #755 opt-out). A fresh buffer is filled on every growth, so seq-major
-    // copies the same byte count as head-major (differing only in fragmentation).
-    // Kept to prove token parity holds under the legacy allocator too.
-    let (head_re_off, seq_re_off) = parity_phase(&head_dir, &seq_dir, false, false)?;
-    if let (Some(h), Some(s)) = (&head_re_off, &seq_re_off) {
-        assert_eq!(
-            s.kv_growth_d2d_copy_bytes, h.kv_growth_d2d_copy_bytes,
-            "reallocation growth fills a fresh buffer either way; seq-major should copy the same \
-             byte count as head-major, differing only in fragmentation"
-        );
-    }
+    run_child_phase(true, false)?;
+    run_child_phase(true, true)?;
+    run_child_phase(false, false)?;
     Ok(())
 }

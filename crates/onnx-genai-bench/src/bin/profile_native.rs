@@ -843,6 +843,9 @@ fn main() -> Result<()> {
             stats.graph.fallbacks - before.graph.fallbacks,
             stats.graph.invalidations - before.graph.invalidations
         );
+        if let Some(reason) = &stats.graph.decline_reason {
+            println!("cuda_graph_decline_reason: {reason}");
+        }
         println!(
             "cuda_kv_growth_measured: events={} d2d_copy_bytes={}",
             stats.kv_growth_events - before.kv_growth_events,

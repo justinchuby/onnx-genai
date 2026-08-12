@@ -45,8 +45,52 @@ pub(crate) struct GraphCaptureStructuralSafety {
 
 impl GraphCaptureStructuralSafety {
     /// True when structural conditions make whole-step capture safe to attempt.
+    #[cfg(test)]
     pub(crate) fn is_capture_safe(self) -> bool {
         self.device_is_cuda && self.kv_ownership == KvOwnership::Owned
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GraphCaptureDecision {
+    enabled: bool,
+    decline_reason: Option<String>,
+}
+
+impl GraphCaptureDecision {
+    fn enabled() -> Self {
+        Self {
+            enabled: true,
+            decline_reason: None,
+        }
+    }
+
+    fn declined(predicate: &str, detail: impl std::fmt::Display) -> Self {
+        Self {
+            enabled: false,
+            decline_reason: Some(format!(
+                "predicate `{predicate}` declined capture: {detail}"
+            )),
+        }
+    }
+
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    #[cfg(test)]
+    pub(crate) fn decline_reason(&self) -> Option<&str> {
+        self.decline_reason.as_deref()
+    }
+
+    fn decline_if_enabled(&mut self, predicate: &str, detail: impl std::fmt::Display) {
+        if self.enabled {
+            *self = Self::declined(predicate, detail);
+        }
+    }
+
+    fn into_decline_reason(self) -> Option<String> {
+        self.decline_reason
     }
 }
 
@@ -59,7 +103,7 @@ impl GraphCaptureStructuralSafety {
 ///    **only when its paging path is not stable-VA**. The legacy pager's
 ///    alloc/copy/free ops return a different device pointer per page-in, and a
 ///    captured graph bakes pointers into its recorded nodes, so the two are
-///    mutually exclusive on that path (a one-time notice explains the decline).
+///    mutually exclusive on that path (the decision records the named predicate).
 ///    When offload runs on the stable virtual-address VMM path (issue #716),
 ///    every retained weight keeps a reserved-once device VA whose physical
 ///    granules are remapped underneath, which is capture-safe, so this no longer
@@ -69,6 +113,59 @@ impl GraphCaptureStructuralSafety {
 ///    forces ON) is honored next.
 /// 3. When neither is set, auto-decide from `structural` safety: attempt capture
 ///    only when the decode topology is structurally graph-safe.
+pub(crate) fn resolve_graph_capture_decision(
+    programmatic: Option<bool>,
+    env_explicit: bool,
+    env_value: bool,
+    structural: GraphCaptureStructuralSafety,
+    weight_offload_enabled: bool,
+    weight_offload_stable_va: bool,
+) -> GraphCaptureDecision {
+    if weight_offload_enabled && !weight_offload_stable_va {
+        return GraphCaptureDecision::declined(
+            "weight_offload_enabled && !weight_offload_stable_va",
+            "weight offload is using the pointer-unstable paging path",
+        );
+    }
+    if let Some(explicit) = programmatic {
+        return if explicit {
+            GraphCaptureDecision::enabled()
+        } else {
+            GraphCaptureDecision::declined(
+                "NativeDecodeCudaOptions::graph_capture",
+                "the programmatic override is Some(false)",
+            )
+        };
+    }
+    if env_explicit {
+        return if env_value {
+            GraphCaptureDecision::enabled()
+        } else {
+            GraphCaptureDecision::declined(
+                "ONNX_GENAI_CUDA_GRAPH",
+                "the process-wide runtime configuration captured an explicit value of 0 on first use",
+            )
+        };
+    }
+    if !structural.device_is_cuda {
+        return GraphCaptureDecision::declined(
+            "GraphCaptureStructuralSafety::device_is_cuda",
+            "the decode device is not CUDA",
+        );
+    }
+    if structural.kv_ownership != KvOwnership::Owned {
+        return GraphCaptureDecision::declined(
+            "GraphCaptureStructuralSafety::kv_ownership",
+            format_args!(
+                "KV ownership is {:?}, but capture requires Owned",
+                structural.kv_ownership
+            ),
+        );
+    }
+    GraphCaptureDecision::enabled()
+}
+
+#[cfg(test)]
 pub(crate) fn resolve_graph_capture_enabled(
     programmatic: Option<bool>,
     env_explicit: bool,
@@ -77,30 +174,15 @@ pub(crate) fn resolve_graph_capture_enabled(
     weight_offload_enabled: bool,
     weight_offload_stable_va: bool,
 ) -> bool {
-    if weight_offload_enabled && !weight_offload_stable_va {
-        log_weight_offload_capture_exclusion();
-        return false;
-    }
-    if let Some(explicit) = programmatic {
-        return explicit;
-    }
-    if env_explicit {
-        return env_value;
-    }
-    structural.is_capture_safe()
-}
-
-/// Emit the offload/capture mutual-exclusion notice at most once per process, so
-/// operators who enable both on the pointer-unstable (non stable-VA) paging path
-/// learn capture was declined without log spam.
-fn log_weight_offload_capture_exclusion() {
-    static NOTICE: std::sync::Once = std::sync::Once::new();
-    NOTICE.call_once(|| {
-        tracing::warn!(
-            "weight offload on the non stable-VA paging path is incompatible with CUDA graph \
-             capture; capture disabled (issue #716: managed no-spill offload keeps capture on)"
-        );
-    });
+    resolve_graph_capture_decision(
+        programmatic,
+        env_explicit,
+        env_value,
+        structural,
+        weight_offload_enabled,
+        weight_offload_stable_va,
+    )
+    .is_enabled()
 }
 
 fn cuda_step_profile_enabled() -> bool {
@@ -315,6 +397,9 @@ pub struct CudaGraphDebugStats {
     pub fallbacks: u64,
     pub invalidations: u64,
     pub allocation_counts: DeviceAllocationCounts,
+    /// Named decode-level predicate that declined capture, whether before the
+    /// first attempt or during the runtime capture audit.
+    pub decline_reason: Option<String>,
     /// Structured reasons from the most recent capture fallback.
     pub fallback_report: Option<CaptureDeclineReport>,
 }
@@ -402,6 +487,7 @@ pub(crate) struct DecodeCudaState {
     /// seq-major's live prefix is one dense contiguous run, so its committed
     /// windows follow `ceil(live_bytes / granule)` rather than a flat bucket.
     kv_layout: KvCommitLayout,
+    pub(crate) graph_decline_reason: Option<String>,
     pub(crate) graph_fallback_reason: Option<String>,
     pub(crate) graph_fallback_report: Option<CaptureDeclineReport>,
     /// Structural reasons, recorded at binding time, why one or more auxiliary
@@ -1762,7 +1848,7 @@ impl DecodeCudaState {
         present_to_past: &HashMap<String, String>,
         fixed_state_inputs: &HashSet<String>,
         capacity: CudaKvCapacity,
-        graph_enabled: bool,
+        mut graph_capture: GraphCaptureDecision,
         position_rank: usize,
         kv_layout: KvCommitLayout,
     ) -> anyhow::Result<Self> {
@@ -2020,11 +2106,14 @@ impl DecodeCudaState {
         // host mid-capture). Decline capture up front, with a clear structural
         // reason, and fall back to the eager device path — which still decodes
         // correctly by dynamically allocating the unbindable output each step.
-        let graph_enabled = if !declined_auxiliary.is_empty() {
-            if graph_enabled {
-                tracing::warn!(
-                    "native CUDA decode graph capture disabled: auxiliary output(s) {} carry unresolved symbolic dimensions that cannot be collapsed to a fixed persistent device binding; decode continues eagerly with dynamic allocation for those outputs",
-                    declined_auxiliary.join(", ")
+        if !declined_auxiliary.is_empty() {
+            if graph_capture.is_enabled() {
+                graph_capture.decline_if_enabled(
+                    "auxiliary_outputs_have_fixed_persistent_shapes",
+                    format_args!(
+                        "auxiliary output(s) {} carry unresolved symbolic dimensions",
+                        declined_auxiliary.join(", ")
+                    ),
                 );
             } else {
                 tracing::debug!(
@@ -2032,10 +2121,7 @@ impl DecodeCudaState {
                     declined_auxiliary.join(", ")
                 );
             }
-            false
-        } else {
-            graph_enabled
-        };
+        }
 
         let input_ids_binding = bindings.len();
         if let Some(embeds) = &io.inputs_embeds {
@@ -2132,9 +2218,9 @@ impl DecodeCudaState {
 
         // A graph records launch geometry, so replay is unsafe when a persistent
         // binding exposes a growing logical prefix instead of fixed capacity.
-        // Surfacing *which* bindings force the eager fallback (previously a
-        // silent `graph_enabled = false`) is essential for capture bring-up of
-        // new architectures — enable with `RUST_LOG=onnx_genai_engine=debug`.
+        // Surfacing *which* bindings force the eager fallback is essential for
+        // capture bring-up of new architectures, so the decision below retains
+        // their names for the session warning and debug/profile statistics.
         let dynamic_logical: Vec<String> = bindings
             .iter()
             .filter(|binding| binding.has_dynamic_logical_input_shape())
@@ -2147,10 +2233,13 @@ impl DecodeCudaState {
                 )
             })
             .collect();
-        if graph_enabled && !dynamic_logical.is_empty() {
-            tracing::debug!(
-                "native CUDA decode graph capture disabled: input binding(s) {} expose a growing logical prefix instead of fixed capacity (their consumers are not capacity-aware kernels); decode continues eagerly",
-                dynamic_logical.join(", ")
+        if graph_capture.is_enabled() && !dynamic_logical.is_empty() {
+            graph_capture.decline_if_enabled(
+                "persistent_inputs_have_fixed_logical_shapes",
+                format_args!(
+                    "input binding(s) {} expose a growing logical prefix instead of fixed capacity",
+                    dynamic_logical.join(", ")
+                ),
             );
         }
         // The attention-mask binding (bindings[0]) is allocated with the
@@ -2167,13 +2256,22 @@ impl DecodeCudaState {
         let mask_exposes_logical = bindings
             .first()
             .is_some_and(DeviceIoBinding::exposes_logical_input_shape);
-        if graph_enabled && mask_exposes_logical {
-            tracing::debug!(
-                "native CUDA decode graph capture disabled: attention-mask binding '{}' exposes its logical valid length to a non-capacity-aware consumer (e.g. an indexer arithmetic branch); single-token decode uses the growing logical mask width and continues eagerly",
-                bindings[0].input_name()
+        if graph_capture.is_enabled() && mask_exposes_logical {
+            graph_capture.decline_if_enabled(
+                "attention_mask_consumers_are_capacity_aware",
+                format_args!(
+                    "attention-mask binding '{}' exposes its logical valid length to a non-capacity-aware consumer",
+                    bindings[0].input_name()
+                ),
             );
         }
-        let graph_enabled = graph_enabled && dynamic_logical.is_empty() && !mask_exposes_logical;
+        let graph_enabled = graph_capture.is_enabled();
+        let graph_decline_reason = graph_capture.into_decline_reason();
+        if let Some(reason) = &graph_decline_reason {
+            tracing::warn!(
+                "native CUDA decode graph capture disabled: {reason}; decode continues eagerly"
+            );
+        }
 
         // Inc3c: enable the captured per-step-input path when (a) graph capture
         // is structurally available (`graph_enabled`), (b) the decoder actually
@@ -2218,6 +2316,7 @@ impl DecodeCudaState {
             capacity,
             kv_commits_on_demand,
             kv_layout,
+            graph_decline_reason,
             graph_fallback_reason: None,
             graph_fallback_report: None,
             auxiliary_bind_declines: declined_auxiliary,
@@ -2567,6 +2666,7 @@ impl DecodeCudaState {
                         self.graph_phase = DecodeCudaGraphPhase::Unsupported;
                         trace_capture_declines(trace, &report);
                         let reason = report.to_string();
+                        self.graph_decline_reason = Some(reason.clone());
                         self.graph_fallback_reason = Some(reason.clone());
                         self.graph_fallback_report = Some(report);
                         tracing::warn!(
@@ -2650,6 +2750,7 @@ impl DecodeCudaState {
                         self.inline_graph_phase = DecodeCudaGraphPhase::Unsupported;
                         trace_capture_declines(trace, &report);
                         let reason = report.to_string();
+                        self.graph_decline_reason = Some(reason.clone());
                         self.graph_fallback_reason = Some(reason.clone());
                         self.graph_fallback_report = Some(report);
                         tracing::warn!(
@@ -2788,6 +2889,7 @@ impl DecodeCudaState {
                 fallbacks: self.graph_fallbacks,
                 invalidations: self.graph_invalidations,
                 allocation_counts: session.device_allocation_counts().unwrap_or_default(),
+                decline_reason: self.graph_decline_reason.clone(),
                 fallback_report: self.graph_fallback_report.clone(),
             },
         }
