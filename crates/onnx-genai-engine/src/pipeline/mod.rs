@@ -850,6 +850,18 @@ impl PipelineEngine {
             );
         #[cfg(not(all(feature = "cuda", feature = "native-backend")))]
         let native_cuda_plan = false;
+        // #755: managed no-spill VMM is the default on the native CUDA pipeline
+        // path unless the legacy allocator opt-out is set. Other backends keep
+        // the pre-#755 explicit-byte-limit trigger.
+        #[cfg(all(feature = "cuda", feature = "native-backend"))]
+        let pipeline_managed_vmm = if native_cuda_plan {
+            crate::engine::managed_vmm_default_enabled()
+        } else {
+            matches!(config.limits.vram_limit, crate::ResourceLimit::Bytes(_))
+        };
+        #[cfg(not(all(feature = "cuda", feature = "native-backend")))]
+        let pipeline_managed_vmm =
+            matches!(config.limits.vram_limit, crate::ResourceLimit::Bytes(_));
         let memory_strategy_plan = build_memory_strategy_plan(MemoryStrategyPlanInput {
             config: &config,
             resolved_vram_bytes,
@@ -864,10 +876,9 @@ impl PipelineEngine {
             ),
             #[cfg(not(feature = "cuda"))]
             default_dynamic_device_budget_bytes: None,
-            inferred_policy_enabled: matches!(
-                config.limits.vram_limit,
-                crate::ResourceLimit::Bytes(_)
-            ),
+            inferred_policy_enabled: pipeline_managed_vmm
+                || matches!(config.limits.vram_limit, crate::ResourceLimit::Bytes(_)),
+            managed_vmm: pipeline_managed_vmm,
             overrides: memory_strategy_overrides,
             advisory_only: !native_cuda_plan,
         });

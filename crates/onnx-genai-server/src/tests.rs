@@ -1772,6 +1772,26 @@ async fn resources_get_and_admin_vram_override_report_governor_state() {
         );
     }
 
+    // #755: the resolved memory strategy (strategy, offload state, managed
+    // no-spill VMM state, resolved budget) must be observable over /v1/resources.
+    let memory_strategy = body
+        .get("memory_strategy")
+        .expect("resources must report the resolved memory strategy");
+    for key in [
+        "strategy",
+        "weight_offload_enabled",
+        "managed_no_spill",
+        "auto_enabled",
+    ] {
+        assert!(
+            memory_strategy.get(key).is_some(),
+            "missing memory_strategy key {key}"
+        );
+    }
+    assert!(
+        memory_strategy["strategy"].is_string(),
+        "memory strategy must be named: {body}"
+    );
     let impossible = router
         .clone()
         .oneshot(
