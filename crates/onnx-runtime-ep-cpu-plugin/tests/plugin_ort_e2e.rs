@@ -62,7 +62,7 @@ fn lock_ort_ep() -> MutexGuard<'static, ()> {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Resolve the directory containing `libonnxruntime.so`.
+/// Resolve the directory containing the platform ORT shared library.
 fn find_ort_lib_dir() -> Option<PathBuf> {
     ort_discovery::find_ort_lib_dir()
 }
@@ -152,7 +152,7 @@ fn ort_api_sanity() {
         find_ort_lib_dir(),
         "ort_api_sanity: ORT not found; run `cargo build -p onnx-genai-ort-sys` first"
     );
-    let ort_lib_path = ort_lib_dir.join("libonnxruntime.so");
+    let ort_lib_path = ort_lib_dir.join(ort_discovery::ort_lib_name());
 
     let lib = unsafe { libloading::Library::new(&ort_lib_path) }
         .unwrap_or_else(|e| panic!("Failed to dlopen {}: {e}", ort_lib_path.display()));
@@ -208,7 +208,7 @@ fn ort_register_ep_library() {
         "ort_register_ep_library: EP cdylib not found; run cargo build -p onnx-runtime-ep-cpu-plugin"
     );
 
-    let ort_lib_path = ort_lib_dir.join("libonnxruntime.so");
+    let ort_lib_path = ort_lib_dir.join(ort_discovery::ort_lib_name());
     let lib = unsafe { libloading::Library::new(&ort_lib_path) }.expect("dlopen ORT failed");
     let api = unsafe { get_ort_api(&lib) };
 
@@ -259,7 +259,7 @@ fn ort_loads_our_ep_and_runs_model() {
         model_path.display()
     );
 
-    let ort_lib_path = ort_lib_dir.join("libonnxruntime.so");
+    let ort_lib_path = ort_lib_dir.join(ort_discovery::ort_lib_name());
     let lib = unsafe { libloading::Library::new(&ort_lib_path) }.expect("dlopen ORT");
     let api = unsafe { get_ort_api(&lib) };
 
@@ -451,7 +451,7 @@ fn ort_unsupported_op_declines_not_crashes() {
         return;
     }
 
-    let ort_lib_path = ort_lib_dir.join("libonnxruntime.so");
+    let ort_lib_path = ort_lib_dir.join(ort_discovery::ort_lib_name());
     let lib = unsafe { libloading::Library::new(&ort_lib_path) }.expect("dlopen ORT");
     let api = unsafe { get_ort_api(&lib) };
 
@@ -575,15 +575,13 @@ fn ort_unsupported_op_declines_not_crashes() {
 /// Diagnostic: print which ORT EP API function pointers are non-null.
 #[test]
 fn diag_ort_ep_api_nullcheck() {
-    let ort_lib_dir = match find_ort_lib_dir() {
-        Some(d) => d,
-        None => {
-            eprintln!("SKIPPED: no ORT lib dir found");
-            return;
-        }
-    };
-    let ort_lib_path = ort_lib_dir.join("libonnxruntime.so");
-    let lib = unsafe { libloading::Library::new(&ort_lib_path) }.unwrap();
+    let ort_lib_dir = skip_if_missing!(
+        find_ort_lib_dir(),
+        "diag_ort_ep_api_nullcheck: ORT not found"
+    );
+    let ort_lib_path = ort_lib_dir.join(ort_discovery::ort_lib_name());
+    let lib = unsafe { libloading::Library::new(&ort_lib_path) }
+        .unwrap_or_else(|e| panic!("Failed to load ORT at {}: {e}", ort_lib_path.display()));
     let api = unsafe { get_ort_api(&lib) };
     macro_rules! check_fn {
         ($field:ident) => {
@@ -1683,7 +1681,7 @@ fn conformance_two_sessions() {
         return;
     }
 
-    let ort_lib_path = ort_lib_dir.join("libonnxruntime.so");
+    let ort_lib_path = ort_lib_dir.join(ort_discovery::ort_lib_name());
 
     unsafe {
         let lib = libloading::Library::new(&ort_lib_path).expect("dlopen ORT");
@@ -1982,7 +1980,7 @@ fn stress_register_run_unregister_cycles() {
         return;
     }
 
-    let ort_lib_path = ort_lib_dir.join("libonnxruntime.so");
+    let ort_lib_path = ort_lib_dir.join(ort_discovery::ort_lib_name());
     // Keep the library loaded for the whole test — dlopen reference-counts.
     let lib = unsafe { libloading::Library::new(&ort_lib_path) }.expect("dlopen ORT");
     let api = unsafe { get_ort_api(&lib) };
