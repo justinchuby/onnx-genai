@@ -2938,6 +2938,65 @@ fn decode_inline_never_routes_when_disabled_or_unbuilt() {
     ));
 }
 
+/// The native CUDA KV-cache layout is resolved from the model's declared
+/// `kv_layout` descriptor, with an environment override for residency
+/// diagnostics. Absent metadata means head-major — exactly the historical
+/// behavior — so no currently-loadable model changes its committed geometry.
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_kv_layout_resolves_from_metadata_with_env_override() {
+    use super::cuda::resolve_cuda_kv_layout;
+    use super::kv_commit::KvCommitLayout;
+    use onnx_genai_metadata::KvCacheLayout;
+
+    let _guard = env_lock().lock().unwrap();
+
+    // Absent metadata → head-major (the historical default, byte-identical).
+    {
+        let _env = EnvVarGuard::set("ONNX_GENAI_CUDA_KV_LAYOUT", "");
+        // A truly-empty value is not one of the recognized tokens, so it is
+        // ignored and the metadata (here `None`) decides.
+        unsafe {
+            std::env::remove_var("ONNX_GENAI_CUDA_KV_LAYOUT");
+        }
+        assert_eq!(resolve_cuda_kv_layout(None), KvCommitLayout::HeadMajor);
+        assert_eq!(
+            resolve_cuda_kv_layout(Some(&KvCacheLayout::head_major_bnsh())),
+            KvCommitLayout::HeadMajor
+        );
+        // A declared seq-major descriptor selects seq-major.
+        assert_eq!(
+            resolve_cuda_kv_layout(Some(&KvCacheLayout::seq_major_bsnh())),
+            KvCommitLayout::SeqMajor
+        );
+    }
+
+    // The env override wins over the descriptor, in both directions, so a
+    // residency measurement can pin the layout regardless of the model.
+    {
+        let _env = EnvVarGuard::set("ONNX_GENAI_CUDA_KV_LAYOUT", "seq_major");
+        assert_eq!(
+            resolve_cuda_kv_layout(Some(&KvCacheLayout::head_major_bnsh())),
+            KvCommitLayout::SeqMajor
+        );
+    }
+    {
+        let _env = EnvVarGuard::set("ONNX_GENAI_CUDA_KV_LAYOUT", "head_major");
+        assert_eq!(
+            resolve_cuda_kv_layout(Some(&KvCacheLayout::seq_major_bsnh())),
+            KvCommitLayout::HeadMajor
+        );
+    }
+    // An unrecognized override token is ignored (falls back to the descriptor).
+    {
+        let _env = EnvVarGuard::set("ONNX_GENAI_CUDA_KV_LAYOUT", "nonsense");
+        assert_eq!(
+            resolve_cuda_kv_layout(Some(&KvCacheLayout::seq_major_bsnh())),
+            KvCommitLayout::SeqMajor
+        );
+    }
+}
+
 /// Fixed recurrent state is sized from the graph, per sequence.
 ///
 /// It is a per-sequence cost that scales exactly the way KV does, and it was
