@@ -143,7 +143,9 @@ struct Measurement {
     captures: u64,
     replays: u64,
     invalidations: u64,
+    growth_keeps: u64,
     decline_reason: Option<String>,
+    growth_decision: Option<String>,
 }
 
 const CHILD_LAYOUT_ENV: &str = "MOBIUS_SEQMAJOR_CHILD_LAYOUT";
@@ -207,16 +209,19 @@ fn report(label: &str, run: &Run) {
     if let Some(s) = &run.stats {
         eprint!(
             " seq_major={} physical_committed_bytes={} growth_events={} kv_bytes_moved={} \
-             captures={} invalidations={} replays={} max_len={} decline_reason={:?}",
+             captures={} invalidations={} growth_keeps={} replays={} max_len={} decline_reason={:?} \
+             growth_decision={:?}",
             s.kv_layout_seq_major,
             s.kv_committed_bytes,
             s.kv_growth_events,
             s.kv_growth_d2d_copy_bytes,
             s.graph.captures,
             s.graph.invalidations,
+            s.graph.growth_keeps,
             s.graph.replays,
             s.max_len,
             s.graph.decline_reason.as_deref(),
+            s.graph.growth_decision.as_deref(),
         );
     } else {
         eprint!(" (no native CUDA stats)");
@@ -239,7 +244,9 @@ fn measurement(label: String, run: Run) -> anyhow::Result<Measurement> {
         captures: stats.graph.captures,
         replays: stats.graph.replays,
         invalidations: stats.graph.invalidations,
+        growth_keeps: stats.graph.growth_keeps,
         decline_reason: stats.graph.decline_reason,
+        growth_decision: stats.graph.growth_decision,
     })
 }
 
@@ -397,29 +404,161 @@ fn mobius_seq_major_growth_is_bit_identical_to_head_major() -> anyhow::Result<()
     );
     assert_eq!(seq_realloc.kv_bytes_moved, head_realloc.kv_bytes_moved);
 
-    for (growth, control) in [(&head_on, &head_control), (&seq_on, &seq_control)] {
-        assert_eq!(control.growth_events, 0);
-        assert_eq!(control.kv_bytes_moved, 0);
-        assert_eq!(
-            growth.invalidations - control.invalidations,
-            growth.growth_events,
-            "each forced bucket growth must account for the measured extra invalidation: \
-             growth={growth:?}, control={control:?}"
-        );
-        assert_eq!(
-            growth.captures - control.captures,
-            growth.growth_events,
-            "each growth invalidation must force one measured re-capture: \
-             growth={growth:?}, control={control:?}"
-        );
-    }
+    // Head-major genuinely re-strides every head stripe on growth (it moves
+    // 688,576 bytes above), so it MUST keep invalidating and re-capturing: one
+    // extra invalidation and one extra capture per growth, and it never keeps a
+    // captured graph across a growth.
+    assert_eq!(head_control.growth_events, 0);
+    assert_eq!(head_control.kv_bytes_moved, 0);
+    assert_eq!(
+        head_on.growth_keeps, 0,
+        "head-major must never keep a captured graph across growth: growth={head_on:?}"
+    );
+    assert_eq!(
+        head_on.invalidations - head_control.invalidations,
+        head_on.growth_events,
+        "each head-major bucket growth must invalidate the captured graph: \
+         growth={head_on:?}, control={head_control:?}"
+    );
+    assert_eq!(
+        head_on.captures - head_control.captures,
+        head_on.growth_events,
+        "each head-major growth invalidation must force one measured re-capture: \
+         growth={head_on:?}, control={head_control:?}"
+    );
+
+    // Seq-major uses a fixed full-context stride: growth commits token stripes on
+    // demand without moving KV bytes or changing any dependency the captured
+    // graph baked in (device pointers, physical shapes, capacity-independent
+    // batch-0 addressing), so the captured decode graph is KEPT. That means zero
+    // growth-attributable invalidations, zero growth-attributable re-captures,
+    // and exactly one recorded keep per growth — the headline of this change.
+    assert_eq!(seq_control.growth_events, 0);
+    assert_eq!(seq_control.kv_bytes_moved, 0);
+    assert_eq!(
+        seq_on.invalidations - seq_control.invalidations,
+        0,
+        "seq-major growth must NOT invalidate the captured graph: \
+         growth={seq_on:?}, control={seq_control:?}"
+    );
+    assert_eq!(
+        seq_on.captures - seq_control.captures,
+        0,
+        "seq-major growth must NOT force any re-capture: \
+         growth={seq_on:?}, control={seq_control:?}"
+    );
+    assert_eq!(
+        seq_on.growth_keeps - seq_control.growth_keeps,
+        seq_on.growth_events,
+        "each seq-major growth must record exactly one kept captured graph: \
+         growth={seq_on:?}, control={seq_control:?}"
+    );
+    assert!(
+        seq_on
+            .growth_decision
+            .as_deref()
+            .is_some_and(|decision| decision.starts_with("kept")),
+        "seq-major must report the named keep decision through #804 reporting: {seq_on:?}"
+    );
+
+    // Before/after headline (measured, process-isolated, on this box): head-major
+    // holds at 4 invalidations / 4 captures because it moves bytes; seq-major
+    // keeps its captured graph across every growth, so its forced-growth graph
+    // accounting collapses onto the no-growth control — one initial capture,
+    // replayed thereafter, and the single baseline (non-growth) invalidation.
+    // Raw invalidations drop 4 -> 1 and captures drop 4 -> 1; the 3 eliminated
+    // invalidations are exactly the growth-attributable ones now recorded as keeps.
     assert_eq!(
         (head_on.captures, head_on.replays, head_on.invalidations),
-        (4, 39, 4)
+        (4, 39, 4),
+        "head-major graph accounting regressed: {head_on:?}"
     );
     assert_eq!(
         (seq_on.captures, seq_on.replays, seq_on.invalidations),
-        (4, 39, 4)
+        (
+            seq_control.captures,
+            seq_control.replays,
+            seq_control.invalidations
+        ),
+        "seq-major forced-growth graph accounting must match its no-growth control \
+         exactly (the captured graph is kept across every growth): \
+         growth={seq_on:?}, control={seq_control:?}"
+    );
+    assert_eq!(
+        (seq_on.captures, seq_on.replays, seq_on.invalidations),
+        (1, 45, 1),
+        "seq-major must keep its captured graph across all 3 growths: {seq_on:?}"
+    );
+    assert_eq!(
+        seq_on.growth_keeps, 3,
+        "seq-major must record one kept graph per growth (3 growths): {seq_on:?}"
+    );
+    Ok(())
+}
+
+/// Negative oracle for the conditional-keep decision — **the test that matters
+/// most**: it fails if a captured graph is kept across a growth that genuinely
+/// changed a dependency.
+///
+/// Head-major KV re-strides every head stripe on growth (the per-head stride is
+/// `cache_capacity`), so a bucket growth moves KV bytes and relocates the exact
+/// device addresses the captured decode graph baked into its recorded nodes.
+/// Keeping the graph in that case would replay into stale addresses and corrupt
+/// output. This test forces such a growth and asserts the graph is invalidated
+/// and re-captured — never kept (`growth_keeps == 0`). If a future change made
+/// the keep decision unsound for head-major, this test turns red instead of
+/// silently corrupting tokens.
+#[test]
+#[ignore = "requires the stock mobius export and a CUDA device"]
+fn head_major_growth_that_moves_addresses_must_invalidate_not_keep() -> anyhow::Result<()> {
+    // Guard: this is a parent-only orchestration test. When invoked as a spawned
+    // child worker (via the shared entrypoint), defer to that worker instead.
+    if std::env::var(CHILD_LAYOUT_ENV).is_ok() {
+        return mobius_seq_major_growth_is_bit_identical_to_head_major();
+    }
+    if let Err(error) = onnx_runtime_ep_cuda::CudaExecutionProvider::new(0) {
+        eprintln!("skipping head-major growth negative oracle: CUDA unavailable: {error}");
+        return Ok(());
+    }
+    if resolve_dir("MOBIUS_SEQMAJOR_HEAD_DIR", DEFAULT_HEAD_DIR).is_none() {
+        return Ok(());
+    }
+
+    // Head-major, in-place VMM, capture ON: force growth vs. a no-growth control.
+    let grew = run_child_config(false, true, true, FORCE_GROWTH_MIN_BUCKET)?;
+    let held = run_child_config(false, true, true, NO_GROWTH_MIN_BUCKET)?;
+    eprintln!("grew:  {grew:?}");
+    eprintln!("held:  {held:?}");
+
+    assert!(
+        grew.growth_events > 0,
+        "head-major forced-growth did not actually grow: {grew:?}"
+    );
+    assert!(
+        grew.kv_bytes_moved > 0,
+        "head-major growth must move KV bytes (device addresses changed): {grew:?}"
+    );
+    assert_eq!(
+        held.growth_events, 0,
+        "no-growth control unexpectedly grew: {held:?}"
+    );
+
+    // The dependency changed, so the graph must NOT be kept.
+    assert_eq!(
+        grew.growth_keeps, 0,
+        "a captured graph was KEPT across a growth that moved device addresses — \
+         this replays into stale pointers and corrupts output: {grew:?}"
+    );
+    assert_eq!(
+        grew.invalidations - held.invalidations,
+        grew.growth_events,
+        "each address-moving growth must invalidate the captured graph: \
+         grew={grew:?}, held={held:?}"
+    );
+    assert_eq!(
+        grew.captures - held.captures,
+        grew.growth_events,
+        "each address-moving growth must force one re-capture: grew={grew:?}, held={held:?}"
     );
     Ok(())
 }
