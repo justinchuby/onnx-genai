@@ -457,8 +457,8 @@ Whole-file transcription is also available over HTTP as
 ### Generate speech
 
 `generate --output-audio` synthesizes through a text-to-speech package — an
-autoregressive decoder that emits audio codes followed by a vocoder whose
-`pipeline.phases` entry declares `run_on: final_only`:
+autoregressive decoder that emits audio codes followed by a single-pass vocoder
+stage placed after the decoder in `pipeline.strategy`:
 
 ```bash
 ./target/release/onnx-genai generate models/my-tts "Hello from onnx-genai." \

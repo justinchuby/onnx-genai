@@ -567,9 +567,10 @@ impl GenAiConfig {
                 decoder_io,
             ),
         );
-        phases.insert("decoder".into(), run_on("every_step"));
-
         let strategy = composite_encode_decode(prompt_encoder.as_deref(), "decoder");
+        if let Some(prompt_encoder) = &prompt_encoder {
+            phases.remove(prompt_encoder);
+        }
 
         let mut pipeline = Map::new();
         pipeline.insert("models".into(), Value::Object(models));
@@ -622,9 +623,7 @@ impl GenAiConfig {
             &format!("decoder.{dec_hidden}"),
         )];
 
-        let mut phases = Map::new();
-        phases.insert("encoder".into(), run_on("prompt_only"));
-        phases.insert("decoder".into(), run_on("every_step"));
+        let phases = Map::new();
 
         let strategy = composite_encode_decode(Some("encoder"), "decoder");
 
@@ -923,9 +922,7 @@ impl GenAiConfig {
             ),
         ];
         let mut phases = Map::new();
-        phases.insert("vision_encoder".into(), run_on("prompt_only"));
         phases.insert("embedding".into(), run_on("every_step"));
-        phases.insert("decoder".into(), run_on("every_step"));
 
         let strategy = json!({
             "kind": "composite",
@@ -933,10 +930,6 @@ impl GenAiConfig {
                 {
                     "name": "encode_vision",
                     "strategy": { "kind": "single_pass", "model": "vision_encoder" }
-                },
-                {
-                    "name": "embed_tokens",
-                    "strategy": { "kind": "single_pass", "model": "embedding" }
                 },
                 {
                     "name": "decode",
@@ -1213,15 +1206,10 @@ impl GenAiConfig {
         )];
         let mut phases = Map::new();
         phases.insert("embedding".into(), run_on("every_step"));
-        phases.insert("decoder".into(), run_on("every_step"));
 
         let strategy = json!({
             "kind": "composite",
             "stages": [
-                {
-                    "name": "embed_tokens",
-                    "strategy": { "kind": "single_pass", "model": "embedding" }
-                },
                 {
                     "name": "decode",
                     "strategy": { "kind": "autoregressive", "decoder": "decoder" }
@@ -1495,9 +1483,7 @@ impl GenAiConfig {
             ),
         );
 
-        let mut phases = Map::new();
-        phases.insert("encoder".into(), run_on("prompt_only"));
-        phases.insert("decoder".into(), run_on("every_step"));
+        let phases = Map::new();
 
         let strategy = composite_encode_decode(Some("encoder"), "decoder");
 

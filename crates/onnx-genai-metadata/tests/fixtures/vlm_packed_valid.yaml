@@ -115,13 +115,6 @@ pipeline:
           kind: autoregressive
           decoder: decoder
           max_tokens: 16
-  phases:
-    vision_encoder:
-      run_on: prompt_only
-    embedding:
-      run_on: prompt_only
-    decoder:
-      run_on: every_step
   vision:
     image_placeholder_token_id: 262144
     image_token_id: 262145

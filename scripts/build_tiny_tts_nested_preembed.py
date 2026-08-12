@@ -594,14 +594,8 @@ pipeline:
           kind: single_pass
           model: vocoder
   phases:
-    talker:
-      run_on: every_step
     talker_step_embedder:
       run_on: on_demand
-    code_predictor:
-      run_on: every_step
-    vocoder:
-      run_on: final_only
 """
     )
 

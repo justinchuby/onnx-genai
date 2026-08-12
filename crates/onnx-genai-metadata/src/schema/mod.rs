@@ -480,9 +480,13 @@ mod schema_helpers {
             "Deprecated alias for `speculative`.",
         );
         forbid_both(schema, "speculative", "speculator_config");
-        schema.ensure_object().insert(
-            "allOf".into(),
-            json!([{
+        schema
+            .ensure_object()
+            .entry("allOf")
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .expect("allOf inserted as an array")
+            .push(json!({
                 "not": {
                     "required": ["pipeline", "model"],
                     "properties": {
@@ -491,8 +495,7 @@ mod schema_helpers {
                         }
                     }
                 }
-            }]),
-        );
+            }));
     }
 
     pub(super) fn speculator_config_aliases(schema: &mut Schema) {

@@ -170,8 +170,6 @@ fn autoregressive_metadata(optional: bool, routed_producer: bool) -> String {
   phases:
 {producer_phase}    embedding:
       run_on: every_step
-    decoder:
-      run_on: every_step
 "#
     )
 }
@@ -401,8 +399,6 @@ fn prompt_only_fixture(name: &str, optional: bool) -> anyhow::Result<PathBuf> {
   phases:
     encoder:
       run_on: prompt_only
-    vocoder:
-      run_on: every_step
 "#
     );
     fs::write(root.join("inference_metadata.yaml"), metadata)?;

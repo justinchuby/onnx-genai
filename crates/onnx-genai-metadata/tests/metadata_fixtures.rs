@@ -116,9 +116,6 @@ pipeline:
   strategy:
     kind: autoregressive
     decoder: decoder
-  phases:
-    decoder:
-      run_on: every_step
 "#;
     let metadata: InferenceMetadata = serde_yaml::from_str(yaml).expect("metadata parses");
     let errors = validate_metadata(&metadata).expect_err("duplicate composite I/O is rejected");
@@ -164,7 +161,7 @@ model:
 }
 
 #[test]
-fn pipeline_validation_requires_phase_for_every_model() {
+fn pipeline_validation_requires_phase_for_auxiliary_model() {
     let metadata: InferenceMetadata = serde_yaml::from_str(
         r#"
 pipeline:
@@ -178,9 +175,6 @@ pipeline:
   strategy:
     kind: autoregressive
     decoder: decoder
-  phases:
-    decoder:
-      run_on: every_step
 "#,
     )
     .expect("metadata parses");
@@ -188,7 +182,40 @@ pipeline:
         .expect_err("missing component phase is rejected");
     assert!(
         error.errors.iter().any(|error| {
-            error.contains("pipeline model encoder must have a pipeline.phases entry")
+            error.contains("auxiliary pipeline model encoder must have a pipeline.phases entry")
+        }),
+        "unexpected errors: {:?}",
+        error.errors
+    );
+}
+
+#[test]
+fn pipeline_validation_rejects_phase_for_nested_strategy_model() {
+    let metadata: InferenceMetadata = serde_yaml::from_str(
+        r#"
+pipeline:
+  models:
+    encoder:
+      filename: encoder.onnx
+      type: encoder
+  strategy:
+    kind: composite
+    stages:
+      - name: encode
+        strategy:
+          kind: single_pass
+          model: encoder
+  phases:
+    encoder:
+      run_on: prompt_only
+"#,
+    )
+    .expect("metadata parses");
+    let error = validate_pipeline_spec(metadata.pipeline.as_ref().expect("pipeline"))
+        .expect_err("strategy-owned component phase is rejected");
+    assert!(
+        error.errors.iter().any(|error| {
+            error.contains("pipeline.phases must not contain strategy-owned component encoder")
         }),
         "unexpected errors: {:?}",
         error.errors
@@ -631,8 +658,6 @@ pipeline:
   phases:
     encoder:
       run_on: prompt_only
-    decoder:
-      run_on: every_step
 ";
     let metadata: onnx_genai_metadata::InferenceMetadata =
         serde_yaml::from_str(yaml).expect("parses");
@@ -673,8 +698,6 @@ pipeline:
       run_on: prompt_only
     encoder_b:
       run_on: prompt_only
-    decoder:
-      run_on: every_step
 ";
     let metadata: onnx_genai_metadata::InferenceMetadata =
         serde_yaml::from_str(yaml).expect("parses");
@@ -739,9 +762,6 @@ pipeline:
   strategy:
     kind: autoregressive
     decoder: decoder
-  phases:
-    decoder:
-      run_on: every_step
   vision:
     image_placeholder_token_id: 32000
     tokens_per_tile: 256
@@ -777,9 +797,6 @@ pipeline:
     num_steps: 3
     timestep_input: t
     timesteps: [0.1, 0.2]
-  phases:
-    denoiser:
-      run_on: every_step
 ";
     let metadata: onnx_genai_metadata::InferenceMetadata =
         serde_yaml::from_str(yaml).expect("parses");
@@ -1006,9 +1023,6 @@ pipeline:
   strategy:
     kind: autoregressive
     decoder: decoder
-  phases:
-    decoder:
-      run_on: every_step
   positions:
     input: position_ids
     rank: 1

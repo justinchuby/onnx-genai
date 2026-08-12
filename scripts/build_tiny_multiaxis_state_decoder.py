@@ -370,8 +370,6 @@ pipeline:
   phases:
     embedding:
       run_on: prompt_only
-    decoder:
-      run_on: every_step
   positions:
     input: position_ids
     rank: 3

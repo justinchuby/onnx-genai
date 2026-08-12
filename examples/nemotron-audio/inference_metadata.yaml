@@ -79,45 +79,23 @@ pipeline:
     # has no layout-transform field. See README.md for this executable gap.
 
   # Ordered high-level plan; composite stages may use different loop strategies.
+  phases:
+    audio_encoder:
+      run_on: every_step
+    audio_features:
+      run_on: every_step
+    joiner:
+      run_on: every_step
   strategy:
     kind: composite # Execute the named child stages as one pipeline.
     stages:
-      - name: extract_audio_features # Unique descriptive stage name.
-        strategy:
-          kind: single_pass # One frontend invocation per scheduled audio chunk.
-          model: audio_features # Component name from `pipeline.models`.
       - name: voice_activity_detection # Optional speech-detection stage.
         strategy:
           kind: single_pass # Invoke the VAD graph once per explicit request.
           model: vad # Component name from `pipeline.models`.
-      - name: encode_audio_chunk # Acoustic encoding stage.
-        strategy:
-          kind: single_pass # One encoder invocation for each scheduled chunk.
-          model: audio_encoder # Component name from `pipeline.models`.
       - name: predict_transcript_symbol # RNN-T prediction-network stage.
         strategy:
           kind: autoregressive # Runtime-managed token/symbol loop declaration.
           decoder: prediction_network # Decoder component named above.
           max_tokens: 10 # Maximum generated symbols for this stage; count, not milliseconds.
-      - name: join_audio_and_symbol # Combine acoustic and prediction features.
-        strategy:
-          kind: single_pass # One joiner invocation when the stage is reached.
-          model: joiner # Component name from `pipeline.models`.
-
   # Component-level phase and request-presence gates.
-  phases:
-    audio_features:
-      run_on: every_step # Run for each scheduled streaming step.
-      when_present: audio # Opaque request key: skip unless audio input is present.
-    vad:
-      run_on: on_demand # Run only when explicitly requested.
-      when_present: audio # VAD also requires audio input.
-    audio_encoder:
-      run_on: every_step # Run for each scheduled streaming step.
-      when_present: audio # Acoustic encoder requires audio input.
-    prediction_network:
-      run_on: every_step # Prediction stage participates in each pipeline step.
-      when_present: audio # This example gates the ASR path on audio presence.
-    joiner:
-      run_on: every_step # Join acoustic/prediction features each pipeline step.
-      when_present: audio # This example gates the ASR path on audio presence.

@@ -44,9 +44,6 @@ pipeline:
   strategy:
     kind: autoregressive
     decoder: decoder
-  phases:
-    decoder:
-      run_on: every_step
 "#,
     )?;
     Ok(root)

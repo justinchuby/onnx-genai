@@ -14,9 +14,12 @@ pub struct PipelineSpec {
     /// Loop and execution strategy for the pipeline.
     pub strategy: PipelineStrategy,
 
-    /// Required per-component lifecycle scheduling, keyed by component name.
+    /// Auxiliary-component lifecycle scheduling, keyed by component name.
     ///
-    /// Every entry in `models` must have exactly one corresponding phase entry.
+    /// Models referenced directly by strategy control-flow fields (`decoder`,
+    /// `model`, `denoiser`, `outer`, or `inner`) must not appear here. Every
+    /// other model must have exactly one phase entry.
+    #[serde(default)]
     pub phases: BTreeMap<String, PhaseConfig>,
 
     /// Vision-language model token-expansion contract.

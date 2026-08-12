@@ -140,9 +140,6 @@ def main() -> int:
         "      beta_end: 0.012\n"
         "      beta_schedule: scaled_linear\n"
         "      prediction_type: epsilon\n"
-        "  phases:\n"
-        "    denoiser:\n"
-        "      run_on: every_step\n"
     )
 
     # Write raw-f32 inputs for the runner.

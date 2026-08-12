@@ -103,7 +103,7 @@ fn complete_config_synthesizes_typed_vlm_pipeline() {
     assert_eq!(pipeline.phases["embedding"].run_on, PhaseRunOn::EveryStep);
     assert_eq!(pipeline.dataflow.len(), 2);
     assert_eq!(pipeline.strategy.kind, PipelineStrategyKind::Composite);
-    assert_eq!(pipeline.strategy.stages[1].name, "embed_tokens");
+    assert_eq!(pipeline.strategy.stages[1].name, "decode");
     let positions = pipeline.positions.as_ref().expect("position program");
     assert_eq!(positions.rank, 3);
     assert_eq!(positions.dtype.as_deref(), Some("int64"));
@@ -186,9 +186,9 @@ fn unrepresentable_preprocessing_falls_back_to_text_only_pipeline() {
     // Only the embedding -> decoder embeds edge remains (no vision -> embedding).
     assert_eq!(pipeline.dataflow.len(), 1);
     assert_eq!(pipeline.strategy.kind, PipelineStrategyKind::Composite);
-    assert_eq!(pipeline.strategy.stages.len(), 2);
-    assert_eq!(pipeline.strategy.stages[0].name, "embed_tokens");
-    assert_eq!(pipeline.strategy.stages[1].name, "decode");
+    assert_eq!(pipeline.strategy.stages.len(), 1);
+    assert_eq!(pipeline.strategy.stages[0].name, "decode");
+    assert_eq!(pipeline.phases["embedding"].run_on, PhaseRunOn::EveryStep);
 
     // Pure-text positions advance every mrope axis with the sequence position.
     let positions = pipeline.positions.as_ref().expect("position program");

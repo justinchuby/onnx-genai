@@ -2284,7 +2284,8 @@
           "additionalProperties": {
             "$ref": "#/$defs/PhaseConfig"
           },
-          "description": "Required per-component lifecycle scheduling, keyed by component name.\n\nEvery entry in `models` must have exactly one corresponding phase entry.",
+          "default": {},
+          "description": "Auxiliary-component lifecycle scheduling, keyed by component name.\n\nModels referenced directly by strategy control-flow fields (`decoder`,\n`model`, `denoiser`, `outer`, or `inner`) must not appear here. Every\nother model must have exactly one phase entry.",
           "type": "object"
         },
         "positions": {
@@ -2316,8 +2317,7 @@
       },
       "required": [
         "models",
-        "strategy",
-        "phases"
+        "strategy"
       ],
       "type": "object"
     },
@@ -4099,6 +4099,14 @@
   "$id": "https://github.com/onnx/onnx/issues/8184",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "allOf": [
+    {
+      "not": {
+        "required": [
+          "speculative",
+          "speculator_config"
+        ]
+      }
+    },
     {
       "not": {
         "properties": {

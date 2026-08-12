@@ -127,6 +127,9 @@ pipeline:
       dtype: float32 # Boundary scalar dtype; both ports are f32.
 
   # Ordered execution plan composed from nested generic strategies.
+  phases:
+    token_embedding:
+      run_on: every_step
   strategy:
     kind: composite # Run the following named child stages in order.
     stages:
@@ -134,24 +137,12 @@ pipeline:
         strategy:
           kind: single_pass # Invoke one component once when its phase gate allows.
           model: vision_encoder # Component name from `pipeline.models`.
-      - name: embed_tokens # Stage that turns token IDs into hidden vectors.
-        strategy:
-          kind: single_pass # One embedding graph invocation per pipeline step.
-          model: token_embedding # Component name from `pipeline.models`.
       - name: decode # Stage that produces logits and advances KV state.
         strategy:
           kind: autoregressive # Runtime-managed token-by-token generation loop.
           decoder: decoder # Decoder component named above.
 
   # Per-component phase gates repeat the execution contract at component level.
-  phases:
-    vision_encoder:
-      run_on: prompt_only # Run only while processing the initial multimodal prompt.
-    token_embedding:
-      run_on: every_step # Run at every pipeline step.
-    decoder:
-      run_on: every_step # Run at every pipeline step.
-
   # Generic prompt image-placeholder expansion contract.
   vision:
     image_placeholder_token_id: 49190 # Token occurrence that marks where expansion happens.

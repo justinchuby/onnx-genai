@@ -150,11 +150,6 @@ pipeline:
         strategy:
           kind: single_pass
           model: vocoder
-  phases:
-    encoder:
-      run_on: prompt_only
-    vocoder:
-      run_on: prompt_only
 """
 
 
