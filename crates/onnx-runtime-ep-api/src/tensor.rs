@@ -314,6 +314,12 @@ impl<'a> TensorMut<'a> {
     /// For absent outputs, warns (returns `Err`) if the write dtype exceeds
     /// the buffer's padding capacity (`max(declared_byte_size, 8)` bytes/elem).
     /// For present outputs, the dtypes must match exactly.
+    ///
+    /// **Note:** This is a contract-documenting helper exercised by tests — it is
+    /// *not* called on the production write path. The actual runtime guard against
+    /// oversized writes is `scratch_alloc_bytes` in `compute.rs`, which sizes
+    /// scratch buffers based on `output_dtypes[slot]`. This function exists to
+    /// make the dtype contract explicit and testable, not to enforce it at runtime.
     pub fn validate_write_dtype(&self, write_dtype: DataType) -> Result<()> {
         if self.absent {
             let capacity_per_elem = self.dtype.byte_size().max(8);

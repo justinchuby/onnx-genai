@@ -45,3 +45,16 @@ _Pre-2026-08-11 detailed dated entries archived to `history-archive.md`._
 - Bit-identicality, routing invariance, wide-n invariance: all confirmed.
 - All 3 instantiations reachable; failsafe adequate.
 - Recommendation: keep draft until GPU benchmarks on ≥2 GPU generations.
+
+## 2026-08-12 — Delta review PR #762 (commits 2106ac0..3826e11 + 8b3197e)
+
+**Scope:** Focused delta on 7 test-integrity items closed by Rachael/Coco/Isidore.  
+**Verdict:** Ready to leave draft. No blockers.
+
+- Gate coverage: genuinely closed (all 4 panic conditions verified).
+- `scratch_alloc_bytes`: single source of truth, canaries prove correctness.
+- `validate_write_dtype`: dead in production (tests-only) — flagged as SUBSTANTIVE, not blocking.
+- `find_ort_lib_dir`: 3 copies, one already drifted — flagged as SUBSTANTIVE follow-up.
+- CUDA `i32::MAX`: safe for current op list; over-claim risk only on future additions.
+- Vtable negative test: non-vacuous (both arms of the atomic flag exercised).
+- Compile-time routing rejection: correct and conservative.

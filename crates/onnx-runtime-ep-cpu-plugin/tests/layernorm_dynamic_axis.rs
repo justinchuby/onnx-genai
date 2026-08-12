@@ -15,6 +15,8 @@
 //! Real ORT 1.27, not a mock.
 
 mod cdylib_resolve;
+#[path = "common/ort_discovery.rs"]
+mod ort_discovery;
 mod ort_path;
 
 use std::ffi::{CStr, CString};
@@ -31,33 +33,7 @@ fn lock_ort_ep() -> MutexGuard<'static, ()> {
 }
 
 fn find_ort_lib_dir() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("NXRT_ORT_LIB_DIR") {
-        let p = PathBuf::from(dir);
-        if p.join("libonnxruntime.so").exists() {
-            return Some(p);
-        }
-    }
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let workspace_root = std::path::Path::new(manifest_dir)
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap();
-    let build_dir = workspace_root.join("target/debug/build");
-    if build_dir.exists()
-        && let Ok(entries) = std::fs::read_dir(&build_dir)
-    {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            if name.to_string_lossy().starts_with("onnx-genai-ort-sys-") {
-                let lib_dir = entry.path().join("out/ort-prebuilt/lib");
-                if lib_dir.join("libonnxruntime.so").exists() {
-                    return Some(lib_dir);
-                }
-            }
-        }
-    }
-    None
+    ort_discovery::find_ort_lib_dir()
 }
 
 fn find_ep_cdylib() -> Option<PathBuf> {
@@ -242,7 +218,7 @@ fn layernorm_dynamic_axis_mean_invstddev_shape() {
     }
 
     unsafe {
-        let ort_lib_path = ort_lib_dir.join("libonnxruntime.so");
+        let ort_lib_path = ort_lib_dir.join(ort_discovery::ort_lib_name());
         let lib = libloading::Library::new(&ort_lib_path).expect("load libonnxruntime");
         let api = get_ort_api(&lib);
 
