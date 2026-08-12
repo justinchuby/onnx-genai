@@ -96,3 +96,56 @@ arithmetic path.
 - `cargo clippy -p onnx-runtime-ep-cpu --lib --tests`: clean (the single
   `dot_kernel` unused-variable warning in `matmul_nbits.rs` is pre-existing on
   `origin/main` and untouched by this change).
+
+## CPU instruction availability & graceful fallback (Justin's standing directive)
+
+> "CPU 要根据 instruction 的可用性兼容 — 有快的 instruction 要用快的，要是客户的
+> 机器没有也要优雅 fallback." (Use fast instructions when the host has them,
+> detected at runtime; degrade gracefully to a correct portable path otherwise.)
+
+This sweep is compliant **by construction** — it deliberately reuses the crate's
+existing runtime-dispatch machinery rather than inventing a new one, and every
+bf16 op has a guaranteed-correct portable path:
+
+- **The correctness baseline is compute-in-f32.** All ops read bf16 via
+  `to_dense_f32_widen` and write via `write_dense_f32_narrow` (or the
+  `dispatch_*` macros). bf16→f32 widen is an **exact scalar shift**
+  (`(bits as u32) << 16`) and bf16←f32 narrow is scalar `bf16::from_f32` — these
+  require **no CPU feature** and run correctly on every host (older x86 without
+  AVX-512, Windows ARM64, etc.). None of the four newly-widened ops (`DFT`,
+  `VarlenAttention`, `MoE`, `IndexShare`) reference `target_feature`,
+  `is_x86_feature_detected!`, `avx512*`, or any intrinsic — verified by grep.
+
+- **Fast bf16 instruction path (where it exists) is already runtime-gated with a
+  portable fallback.** The only native bf16 *arithmetic* instruction path in the
+  crate is the BF16×BF16→F32 GEMM in `kernels/x86_bf16.rs`
+  (`_mm512_dpbf16_ps`). `matmul.rs::half_gemm_dispatch` selects it only when
+  `x86_bf16::native_available()` (runtime `avx512bf16` + `avx512bw` + `avx512f`)
+  returns true, otherwise falls through to the portable `half_gemm::gemm` — which
+  is itself runtime-dispatched (AVX2/NEON widen + F16C for f16) with a **scalar
+  fallback**, and is cross-validated against the scalar path for bf16 in
+  `half_gemm::tests::runtime_simd_half_gemm_matches_scalar_for_square_skinny_and_tail_shapes`.
+  So the standard performance-critical ops in this sweep — `MatMul`, `Gemm`,
+  `FusedGemm`, `FusedMatMulBias` — automatically get the fast `_mm512_dpbf16_ps`
+  path on capable hosts and the correct portable path everywhere else.
+
+### Which ops got a fast bf16 instruction path vs. portable-only
+
+- **Fast bf16-native path (runtime-gated `_mm512_dpbf16_ps`, portable fallback):**
+  `MatMul`, `Gemm`, `FusedGemm`, `FusedMatMulBias` and any op routed through the
+  half-GEMM dispatch — pre-existing, unchanged, and exercised by the bf16
+  conformance sweep (this dev host has `avx512_bf16`, so the sweep ran the native
+  path; CI hosts without it run the proven scalar/portable path).
+- **Portable-only (compute-in-f32, correct on all hosts):** the four ops widened
+  in this change — `DFT`, `VarlenAttention`, `MoE`, `IndexShare` — plus the rest
+  of the elementwise/reduction/normalization/attention sweep. `MoE`/`IndexShare`
+  are **reference oracles**; their expert/attention GEMMs run in f32 after an
+  exact bf16 widen rather than routing operands through `_mm512_dpbf16_ps`. This
+  is a deliberate choice: the compute-in-f32 path *is* the mandated universal
+  fallback and keeps the oracle bit-stable across hosts. Routing the oracle GEMMs
+  through the native bf16 dot (a grouped-accumulation redesign with different
+  `dpbf16` rounding) is a possible future optimization, not a correctness gap —
+  no host is ever *required* to have the instruction.
+
+**Bottom line:** no bf16 op requires a CPU feature to function; the one existing
+fast bf16 instruction path is runtime-detected with a proven portable fallback.
