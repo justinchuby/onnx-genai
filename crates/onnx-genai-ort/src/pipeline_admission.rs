@@ -506,6 +506,12 @@ fn validate_image_program(
     preprocessing: Option<&PreprocessingSpec>,
     signatures: &BTreeMap<String, ComponentSignature>,
 ) -> Result<BTreeSet<String>> {
+    // Workflow documents materialize preprocessing outputs as typed SSA values
+    // through a manifest-pinned adapter invocation. Their closure is checked by
+    // workflow admission rather than legacy component.input endpoint binding.
+    if spec.workflow.is_some() {
+        return Ok(BTreeSet::new());
+    }
     let image_program = preprocessing.and_then(|preprocessing| preprocessing.image.as_ref());
     let mut bound = BTreeSet::new();
 

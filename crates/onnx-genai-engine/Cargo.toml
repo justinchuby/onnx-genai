@@ -121,6 +121,7 @@ cuda-13000 = [
 
 [dependencies]
 onnx-genai-metadata = { workspace = true }
+onnx-genai-preprocess = { workspace = true }
 onnx-genai-genai-config = { workspace = true }
 onnx-genai-kv = { workspace = true }
 onnx-runtime-memory-governor = { workspace = true }
@@ -151,7 +152,6 @@ llguidance = "1.7.6"
 toktrie_hf_tokenizers = "1.7.6"
 
 [dev-dependencies]
-onnx-genai-preprocess = { workspace = true }
 async-trait = { workspace = true }
 proptest = "1.9"
 

@@ -279,7 +279,7 @@ impl ImagePreprocessor {
 
     fn image_output_metadata(output: &ImageOutputBinding) -> ImageOutputMetadata {
         ImageOutputMetadata {
-            source: output.source.clone(),
+            source: Some(output.source.clone()),
             name: output.name.clone(),
             content: output.content.clone(),
             dtype: output.dtype.clone(),

@@ -553,6 +553,101 @@ fn all_policy_component_contracts_have_typed_schema() {
     }
 }
 
+const IMAGE_ADAPTER_WORKFLOW: &str = r#"
+preprocessing:
+  image:
+    transforms:
+      - { op: decode, outputs: [decoded] }
+      - { op: convert_rgb, inputs: [decoded], outputs: [rgb] }
+      - { op: resize, inputs: [rgb], outputs: [pixels], size: 2, mode: stretch,
+          interpolation: bilinear }
+    outputs:
+      - source: pixels
+        name: image.pixel_values
+        content: pixels
+        dtype: float32
+        contract: { dtype: float32, rank: 4, shape: [1, 3, 2, 2] }
+pipeline:
+  workflow:
+    manifest:
+      ir_version: "1.0"
+      onnx_opsets: { ai.onnx: 24 }
+      adapter_abis: { onnx-genai.image-preprocess: "1" }
+      custom_op_versions: {}
+      capabilities: [workflow_ssa, linear_effects]
+    inputs:
+      request.image:
+        contract: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+        role: { kind: opaque }
+        source: { kind: application, name: image }
+        required: true
+    outputs: {}
+    components:
+      image_preprocess:
+        implementation:
+          kind: adapter
+          abi: onnx-genai.image-preprocess
+          version: "1"
+        ports:
+          inputs:
+            encoded: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+          outputs:
+            pixel_values: { dtype: float32, rank: 4, shape: [1, 3, 2, 2] }
+        effects: []
+    initial_effects: {}
+    graph:
+      kind: invoke
+      component: image_preprocess
+      inputs: { encoded: request.image }
+      outputs: { pixel_values: image.pixel_values }
+      effects: {}
+"#;
+
+#[test]
+fn workflow_preprocessing_outputs_are_typed_adapter_ssa_values() {
+    let metadata: InferenceMetadata =
+        serde_yaml::from_str(IMAGE_ADAPTER_WORKFLOW).expect("image adapter workflow parses");
+    validate_metadata(&metadata).expect("typed preprocessing SSA contract validates");
+
+    let missing_contract =
+        IMAGE_ADAPTER_WORKFLOW.replace(
+            "        dtype: float32\n        contract: { dtype: float32, rank: 4, shape: [1, 3, 2, 2] }\n",
+            "        dtype: float32\n",
+        );
+    let metadata: InferenceMetadata =
+        serde_yaml::from_str(&missing_contract).expect("image adapter workflow parses");
+    let errors = validate_metadata(&metadata).expect_err("missing output contract fails");
+    assert!(
+        errors
+            .iter()
+            .any(|message| message.contains("must declare a TensorContract"))
+    );
+
+    let legacy_endpoint =
+        IMAGE_ADAPTER_WORKFLOW.replace("name: image.pixel_values", "name: vision.pixel_values");
+    let metadata: InferenceMetadata =
+        serde_yaml::from_str(&legacy_endpoint).expect("image adapter workflow parses");
+    let errors = validate_metadata(&metadata).expect_err("unmaterialized endpoint fails");
+    assert!(
+        errors
+            .iter()
+            .any(|message| message.contains("must be a declared SSA output"))
+    );
+
+    let optional = IMAGE_ADAPTER_WORKFLOW.replace(
+        "        dtype: float32\n        contract:",
+        "        dtype: float32\n        optional: true\n        contract:",
+    );
+    let metadata: InferenceMetadata =
+        serde_yaml::from_str(&optional).expect("image adapter workflow parses");
+    let errors = validate_metadata(&metadata).expect_err("optional SSA output fails");
+    assert!(
+        errors
+            .iter()
+            .any(|message| message.contains("cannot be optional in a workflow"))
+    );
+}
+
 #[test]
 fn workflow_rejects_unordered_branch_effects_without_panicking() {
     let metadata: InferenceMetadata = serde_yaml::from_str(
@@ -1341,14 +1436,11 @@ fn vlm_packed_fixture_deserializes_and_validates_against_schema() {
 
     // Exactly two packed image outputs, bound to arbitrary endpoint names.
     assert_eq!(image.outputs.len(), 2);
-    assert_eq!(image.outputs[0].source.as_deref(), Some("padded_patches"));
+    assert_eq!(image.outputs[0].source, "padded_patches");
     assert_eq!(image.outputs[0].name, "vision_encoder.pixel_values");
     assert_eq!(image.outputs[0].content, "pixels");
     assert_eq!(image.outputs[0].dtype, "float32");
-    assert_eq!(
-        image.outputs[1].source.as_deref(),
-        Some("padded_patch_coordinates")
-    );
+    assert_eq!(image.outputs[1].source, "padded_patch_coordinates");
     assert_eq!(image.outputs[1].name, "vision_encoder.pixel_position_ids");
     assert_eq!(image.outputs[1].content, "patch_coordinates");
     assert_eq!(image.outputs[1].dtype, "int64");

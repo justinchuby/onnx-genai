@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use onnx_genai_engine::{
     Engine, EngineConfig, GeneratePrompt, GenerateRequest, PipelineGenerateRequest,
 };
-use onnx_genai_ort::Value;
+use onnx_genai_ort::{DataType, Value};
 
 fn package(name: &str, metadata: &str, models: &[(&str, &str)]) -> anyhow::Result<PathBuf> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -226,6 +226,174 @@ graph {
 }
 opset_import { domain: "" version: 13 }
 "#;
+
+const VISION_IDENTITY: &str = r#"
+ir_version: 8
+graph {
+  node { input: "pixel_values" output: "image_features" op_type: "Identity" }
+  name: "vision_encoder"
+  input { name: "pixel_values" type { tensor_type { elem_type: 1 shape {
+    dim { dim_value: 1 } dim { dim_value: 3 } dim { dim_value: 2 } dim { dim_value: 2 }
+  }}}}
+  input { name: "grid" type { tensor_type { elem_type: 7 shape {
+    dim { dim_value: 1 } dim { dim_value: 2 }
+  }}}}
+  output { name: "image_features" type { tensor_type { elem_type: 1 shape {
+    dim { dim_value: 1 } dim { dim_value: 3 } dim { dim_value: 2 } dim { dim_value: 2 }
+  }}}}
+}
+opset_import { domain: "" version: 13 }
+"#;
+
+const FEATURE_IDENTITY: &str = r#"
+ir_version: 8
+graph {
+  node { input: "input" output: "output" op_type: "Identity" }
+  name: "feature_identity"
+  input { name: "input" type { tensor_type { elem_type: 1 shape {
+    dim { dim_value: 1 } dim { dim_value: 3 } dim { dim_value: 2 } dim { dim_value: 2 }
+  }}}}
+  output { name: "output" type { tensor_type { elem_type: 1 shape {
+    dim { dim_value: 1 } dim { dim_value: 3 } dim { dim_value: 2 } dim { dim_value: 2 }
+  }}}}
+}
+opset_import { domain: "" version: 13 }
+"#;
+
+#[test]
+fn workflow_materializes_image_adapter_outputs_as_ssa_values() -> anyhow::Result<()> {
+    let metadata = r#"
+preprocessing:
+  image:
+    transforms:
+      - { op: decode, outputs: [decoded] }
+      - { op: convert_rgb, inputs: [decoded], outputs: [rgb] }
+      - { op: resize, inputs: [rgb], outputs: [pixels], size: 2, mode: stretch,
+          interpolation: bilinear }
+      - { op: emit_original_size, inputs: [rgb], outputs: [grid] }
+    outputs:
+      - source: pixels
+        name: image.pixel_values
+        content: pixels
+        dtype: float32
+        contract: { dtype: float32, rank: 4, shape: [1, 3, 2, 2] }
+      - source: grid
+        name: image.grid
+        content: original_size
+        dtype: int64
+        contract: { dtype: int64, rank: 2, shape: [1, 2] }
+pipeline:
+  workflow:
+    manifest:
+      ir_version: "1.0"
+      onnx_opsets: { ai.onnx: 13 }
+      adapter_abis: { onnx-genai.image-preprocess: "1" }
+      custom_op_versions: {}
+      capabilities: [workflow_ssa, linear_effects, typed_emit]
+    inputs:
+      request.image:
+        contract: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+        role: { kind: opaque }
+        source: { kind: application, name: image }
+        required: true
+    outputs:
+      result:
+        contract: { dtype: float32, rank: 4, shape: [1, 3, 2, 2] }
+        role: image
+        stage: post_adapter
+    components:
+      preprocess:
+        implementation: { kind: adapter, abi: onnx-genai.image-preprocess, version: "1" }
+        ports:
+          inputs:
+            encoded: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+          outputs:
+            pixel_values: { dtype: float32, rank: 4, shape: [1, 3, 2, 2] }
+            grid: { dtype: int64, rank: 2, shape: [1, 2] }
+        effects: []
+      vision:
+        implementation: { kind: onnx, artifact: vision.onnx.textproto }
+        ports:
+          inputs:
+            pixel_values: { dtype: float32, rank: 4, shape: [1, 3, 2, 2] }
+            grid: { dtype: int64, rank: 2, shape: [1, 2] }
+          outputs:
+            image_features: { dtype: float32, rank: 4, shape: [1, 3, 2, 2] }
+        effects: []
+      embedding:
+        implementation: { kind: onnx, artifact: embedding.onnx.textproto }
+        ports:
+          inputs:
+            input: { dtype: float32, rank: 4, shape: [1, 3, 2, 2] }
+          outputs:
+            output: { dtype: float32, rank: 4, shape: [1, 3, 2, 2] }
+        effects: []
+      decoder:
+        implementation: { kind: onnx, artifact: decoder.onnx.textproto }
+        ports:
+          inputs:
+            input: { dtype: float32, rank: 4, shape: [1, 3, 2, 2] }
+          outputs:
+            output: { dtype: float32, rank: 4, shape: [1, 3, 2, 2] }
+        effects: []
+    initial_effects: { stream: stream.0 }
+    graph:
+      kind: sequence
+      nodes:
+        - kind: invoke
+          component: preprocess
+          inputs: { encoded: request.image }
+          outputs: { pixel_values: image.pixel_values, grid: image.grid }
+          effects: {}
+        - kind: invoke
+          component: vision
+          inputs: { pixel_values: image.pixel_values, grid: image.grid }
+          outputs: { image_features: vision.features }
+          effects: {}
+        - kind: invoke
+          component: embedding
+          inputs: { input: vision.features }
+          outputs: { output: embedding.output }
+          effects: {}
+        - kind: invoke
+          component: decoder
+          inputs: { input: embedding.output }
+          outputs: { output: decoder.output }
+          effects: {}
+        - kind: emit
+          value: decoder.output
+          output: result
+          mode: replace
+          effect_name: stream
+          effect: { consumes: stream.0, produces: stream.1 }
+"#;
+    let root = package(
+        "image-adapter",
+        metadata,
+        &[
+            ("vision.onnx.textproto", VISION_IDENTITY),
+            ("embedding.onnx.textproto", FEATURE_IDENTITY),
+            ("decoder.onnx.textproto", FEATURE_IDENTITY),
+        ],
+    )?;
+    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+    let png = vec![
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 2,
+        0, 0, 0, 144, 119, 83, 222, 0, 0, 0, 12, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192, 0, 0,
+        3, 1, 1, 0, 201, 254, 146, 239, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+    ];
+    let png_len = i64::try_from(png.len())?;
+    let request =
+        PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
+            .with_input(
+                "image",
+                Value::from_raw_bytes(png, &[png_len], DataType::Uint8)?,
+            );
+    let output = engine.run_pipeline(request)?;
+    assert_eq!(output["result"].shape(), [1, 3, 2, 2]);
+    assert_eq!(output["result"].to_vec_f32()?.len(), 12);
+    Ok(())
+}
 
 #[test]
 fn workflow_executes_real_greedy_policy_artifact() -> anyhow::Result<()> {
