@@ -951,6 +951,67 @@ After the third instance the response should be a guard, not more vigilance.
 The `Challenger` role (`.squad/agents/challenger/charter.md`) exists to apply
 this systematically to any result that would change technical direction.
 
+### A fourth failure mode: order-dependent test state
+
+The three above are about telemetry that never reaches the operator. There is a
+fourth that reaches the operator loud and clear, and is worse for it: **a test
+result that depends on the order the tests ran in, reported as a real finding.**
+Because the memory and capture work is measurement-driven, a wrong number does
+not merely fail — it redirects the design. Two of these landed in one week.
+
+**#804 (carried into #794 / #801): process-frozen configuration.**
+`RuntimeConfig` is a process-wide snapshot frozen on first read (an `OnceLock` in
+`onnx-genai-runtime-config`). A capture-OFF phase set `ONNX_GENAI_CUDA_GRAPH=0`
+*after* that snapshot was already frozen, so the mutation had no effect and every
+later phase in the same process inherited the frozen policy. The forced-growth
+harness then reported `captures=0` and it was attributed — in a merged PR body —
+to the model *structurally declining* CUDA graph capture. It does not: with each
+policy phase isolated in its own process, the model captures (`captures=4`). Two
+PRs (#794, #801) failed to reproduce an end-to-end measurement on this exact
+mistake before #804 found it.
+
+**#797: a context warmed by an earlier sibling subtest.** A residency GPU test
+failed ~50% of the time on a *cold* CUDA context and passed otherwise. It looked
+exactly like a correctness bug in growth-under-capture. The cause was a
+test-harness ordering defect: the baseline fill and the readback ran on the
+legacy **default stream** while the captured memset ran on a created
+**non-blocking stream**, and those two are *mutually exempt from implicit
+synchronization* — so the readback raced the memset and returned partial fills
+**with no CUDA error**. `cuCtxSynchronize` did **not** fix it (synchronizing the
+context imposes no order between two mutually-exempt streams), which is what
+refuted the obvious race theory. It had only ever "passed" because an
+alphabetically-earlier sibling subtest warmed the context first.
+
+Both are the same family: **state that is frozen or warmed once per process,
+making a result depend on test order.** The two remedies are as specific as the
+two mechanisms:
+
+- **Process isolation for anything that reads process-frozen config.** A test
+  phase that needs a different `RuntimeConfig` value must run in its own process
+  — set the environment, then spawn a child that reads it fresh — never mutate
+  the environment after the snapshot may have frozen. `mobius_seqmajor_growth_
+  parity_native_cuda.rs` does this (child-process-per-mode); it is the pattern,
+  not the exception.
+- **Single-stream discipline for device tests.** Route *every* device operation
+  a test performs — baseline fills, captured-graph launches, memsets, readbacks,
+  tail writes — through one stream, so a single `cuStreamSynchronize` is a total
+  order. `onnx-runtime-cuda-memory::test_support::TestStream` makes this the easy
+  path and documents the default-vs-non-blocking exemption at the call site.
+
+After the second instance in a week the response is, again, a guard rather than
+more vigilance. `runtime_config()` records the environment it froze from and, in
+debug/test builds only (`debug_assertions`, so the release path is untouched and
+cost-free), **panics loudly** if any variable that fed the frozen snapshot is
+later observed to differ — a test can no longer silently believe it set a knob
+that was already frozen (`onnx-genai-runtime-config`, this PR). The single-stream
+helper is the guard for the second mechanism: a test written against `TestStream`
+cannot reintroduce the default-stream/non-blocking split.
+
+The discipline that catches both before they mislead is one line: **run any test
+you touch in isolation as well as in the full suite, and confirm both pass.** An
+order-dependent result is exactly the one that passes in a suite and fails alone
+(or the reverse), so this is the property that names the defect.
+
 ### Keeping the documentation from going stale
 
 The same discipline applies to the prose, not just the code and the counters.
