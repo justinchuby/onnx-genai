@@ -262,11 +262,15 @@ impl NativeDecodeSession {
         path: impl AsRef<Path>,
         device: NativeDecodeDevice,
         io: Option<&ModelIoSpec>,
+        metadata_max_len: Option<usize>,
     ) -> anyhow::Result<Self> {
         Self::load_with_cuda_options_and_io(
             path,
             device,
-            NativeDecodeCudaOptions::default(),
+            NativeDecodeCudaOptions {
+                metadata_max_len,
+                ..NativeDecodeCudaOptions::default()
+            },
             io,
             None,
             None,
@@ -278,13 +282,17 @@ impl NativeDecodeSession {
         path: impl AsRef<Path>,
         device: NativeDecodeDevice,
         io: Option<&ModelIoSpec>,
+        metadata_max_len: Option<usize>,
         offload_policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy,
         governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
     ) -> anyhow::Result<Self> {
         Self::load_with_cuda_options_and_io(
             path,
             device,
-            NativeDecodeCudaOptions::default(),
+            NativeDecodeCudaOptions {
+                metadata_max_len,
+                ..NativeDecodeCudaOptions::default()
+            },
             io,
             Some(governor),
             Some(offload_policy),
@@ -667,9 +675,12 @@ impl NativeDecodeSession {
                     .with_context(|| {
                         format!("missing CUDA inputs_embeds input metadata for '{name}'")
                     })?;
-                if !matches!(meta.dtype, DataType::Float32 | DataType::Float16) {
+                if !matches!(
+                    meta.dtype,
+                    DataType::Float32 | DataType::Float16 | DataType::BFloat16
+                ) {
                     bail!(
-                        "native CUDA inputs_embeds input '{name}' must be f32 or f16, got {:?} {:?}",
+                        "native CUDA inputs_embeds input '{name}' must be f32, f16 or bf16, got {:?} {:?}",
                         meta.dtype,
                         meta.shape
                     );

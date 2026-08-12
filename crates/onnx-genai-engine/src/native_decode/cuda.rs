@@ -1390,10 +1390,13 @@ impl DecodeCudaState {
                 .iter()
                 .find(|meta| meta.name == *past)
                 .with_context(|| format!("missing CUDA KV input metadata for '{past}'"))?;
-            if !matches!(meta.dtype, DataType::Float32 | DataType::Float16) || meta.shape.len() != 4
+            if !matches!(
+                meta.dtype,
+                DataType::Float32 | DataType::Float16 | DataType::BFloat16
+            ) || meta.shape.len() != 4
             {
                 bail!(
-                    "CUDA KV input '{past}' must be rank-4 f32 or f16, got {:?} {:?}",
+                    "CUDA KV input '{past}' must be rank-4 f32, f16 or bf16, got {:?} {:?}",
                     meta.dtype,
                     meta.shape
                 );
@@ -1460,12 +1463,19 @@ impl DecodeCudaState {
         max_len: usize,
         fixed: bool,
     ) -> anyhow::Result<(Vec<usize>, Vec<usize>)> {
-        if !matches!(dtype, DataType::Float32 | DataType::Float16) {
-            bail!("CUDA decoder state input '{name}' must be f32 or f16, got {dtype:?} {shape:?}");
+        if !matches!(
+            dtype,
+            DataType::Float32 | DataType::Float16 | DataType::BFloat16
+        ) {
+            bail!(
+                "CUDA decoder state input '{name}' must be f32, f16 or bf16, got {dtype:?} {shape:?}"
+            );
         }
         if !fixed {
             if shape.len() != 4 {
-                bail!("CUDA KV input '{name}' must be rank-4 f32 or f16, got {dtype:?} {shape:?}");
+                bail!(
+                    "CUDA KV input '{name}' must be rank-4 f32, f16 or bf16, got {dtype:?} {shape:?}"
+                );
             }
             let mut physical_shape = Vec::with_capacity(4);
             for (axis, dim) in shape.iter().copied().enumerate() {
@@ -2339,11 +2349,13 @@ impl DecodeCudaState {
             .iter()
             .find(|meta| meta.name == io.logits)
             .with_context(|| format!("missing CUDA logits output metadata for '{}'", io.logits))?;
-        if !matches!(logits_meta.dtype, DataType::Float32 | DataType::Float16)
-            || logits_meta.shape.is_empty()
+        if !matches!(
+            logits_meta.dtype,
+            DataType::Float32 | DataType::Float16 | DataType::BFloat16
+        ) || logits_meta.shape.is_empty()
         {
             bail!(
-                "CUDA logits output '{}' must be non-scalar f32 or f16, got {:?} {:?}",
+                "CUDA logits output '{}' must be non-scalar f32, f16 or bf16, got {:?} {:?}",
                 io.logits,
                 logits_meta.dtype,
                 logits_meta.shape
