@@ -5,9 +5,11 @@ use super::*;
 /// device OOM. `BlockQuantizedMoE` (#747) reserves a session-persistent
 /// workspace; `IndexShare` (#751) reserves a session-persistent workspace;
 /// `com.microsoft::Attention` reserves a step-scoped Phase-2a scratch; the
-/// default-domain `Attention` (#736) reserves its always-materialized f32 score
-/// matrix — step-scoped on the per-call prefill route, session-persistent on the
-/// capture-eligible single-token decode route (both classes, sized to use);
+/// default-domain `Attention` (#736) reserves one route-sized composite covering
+/// its always-materialized f32 score matrix plus dense aliased K/V staging only
+/// when used — step-scoped on the per-call prefill/batched route,
+/// session-persistent on the capture-eligible single-token decode route (both
+/// classes, fixed-capacity append and absent present-output staging charge zero);
 /// `com.microsoft::GroupQueryAttention` (#736) reserves one session-persistent
 /// composite covering packed Q/K/V projection staging, route-required BSH↔BNSH
 /// transpose scratch, and its f32 reference score buffer; and the
