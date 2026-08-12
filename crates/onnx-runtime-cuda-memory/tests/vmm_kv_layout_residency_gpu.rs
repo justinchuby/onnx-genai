@@ -152,6 +152,60 @@ fn read_host(address: cu::CUdeviceptr, len: usize) -> Vec<u8> {
     bytes
 }
 
+/// Fill `len` bytes at `address` with `value`, ordered on `stream`.
+///
+/// The captured-graph test must keep its baseline write, its captured memset,
+/// and its readback on a single stream. A created non-blocking stream is exempt
+/// from implicit synchronization with the legacy default stream that
+/// `write_host`/`read_host` use, so mixing default-stream copies with a
+/// non-blocking-stream graph launch let the readback race an in-flight memset on
+/// a cold context (observed as all-zero or partial fills with no CUDA error).
+/// Issuing every device operation on the same stream makes the ordering a
+/// linear timeline that a single `cuStreamSynchronize` fully resolves.
+fn fill_dev(stream: cu::CUstream, address: cu::CUdeviceptr, value: u8, len: usize) {
+    check("cuMemsetD8Async fill", unsafe {
+        cu::cuMemsetD8Async(address, value, len, stream)
+    });
+    check("cuStreamSynchronize after fill", unsafe {
+        cu::cuStreamSynchronize(stream)
+    });
+}
+
+/// Read `len` bytes from `address` to the host, ordered on `stream` (see
+/// [`fill_dev`] for why single-stream ordering is required here).
+fn read_dev(stream: cu::CUstream, address: cu::CUdeviceptr, len: usize) -> Vec<u8> {
+    let mut bytes = vec![0u8; len];
+    check("cuMemcpyDtoHAsync_v2", unsafe {
+        cu::cuMemcpyDtoHAsync_v2(bytes.as_mut_ptr().cast(), address, len, stream)
+    });
+    check("cuStreamSynchronize after read", unsafe {
+        cu::cuStreamSynchronize(stream)
+    });
+    bytes
+}
+
+/// A one-line summary of how a readback deviates from an all-`want` buffer: the
+/// match count and the first mismatching offset/value. Distinguishes "the write
+/// never became visible" (all bytes are the pre-write value) from "a partial or
+/// torn write" (a prefix matches, then diverges) so a failure names its cause.
+fn mismatch_report(seen: &[u8], want: u8) -> String {
+    let matched = seen.iter().filter(|&&b| b == want).count();
+    let first = seen.iter().position(|&b| b != want);
+    match first {
+        None => format!(
+            "{}/{} bytes == 0x{want:02x} (full match)",
+            seen.len(),
+            seen.len()
+        ),
+        Some(off) => format!(
+            "{}/{} bytes == 0x{want:02x}; first mismatch at offset {off} = 0x{:02x}",
+            matched,
+            seen.len(),
+            seen[off]
+        ),
+    }
+}
+
 /// One binding's per-token KV geometry (a single `(layer, side)` key or value
 /// buffer).
 #[derive(Clone, Copy)]
@@ -245,7 +299,10 @@ fn commit_and_measure(
         release_handle(handle);
     }
     free_reservation(base, reserved);
-    result.unwrap()
+    match result {
+        Ok(value) => value,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
 }
 
 /// A captured graph that memsets `len` bytes at `address` — the decode hot path
@@ -272,6 +329,14 @@ impl CapturedMemset {
         check("cuMemsetD8Async during capture", record);
         check("cuStreamEndCapture", end);
         assert!(!graph.is_null(), "cuStreamEndCapture returned a null graph");
+        let mut node_count = 0usize;
+        check("cuGraphGetNodes", unsafe {
+            cu::cuGraphGetNodes(graph, std::ptr::null_mut(), &mut node_count)
+        });
+        assert_eq!(
+            node_count, 1,
+            "capture must record exactly the memset node, got {node_count} nodes"
+        );
         let inst = unsafe { cu::cuGraphInstantiateWithFlags(&mut exec, graph, 0) };
         check("cuGraphInstantiateWithFlags", inst);
         assert!(!exec.is_null(), "null graph exec");
@@ -431,13 +496,14 @@ fn seq_major_fixed_stride_grows_under_captured_replay_without_recapture() {
         // Commit the first granule (holds the short dense prefix) and capture a
         // graph that writes the live prefix — the decode step in miniature.
         handles.push(commit_granule(device, base, granule));
-        write_host(base, 0, short_bytes);
+        fill_dev(stream, base, 0, short_bytes);
         let captured = CapturedMemset::capture(stream, base, SENTINEL, short_bytes);
         captured.replay(stream);
-        let seen = read_host(base, short_bytes);
+        let seen = read_dev(stream, base, short_bytes);
         assert!(
             seen.iter().all(|&b| b == SENTINEL),
-            "captured replay must fill the committed dense prefix"
+            "captured replay must fill the committed dense prefix: {}",
+            mismatch_report(&seen, SENTINEL)
         );
 
         // Grow the live length past the first granule by committing tail
@@ -453,16 +519,17 @@ fn seq_major_fixed_stride_grows_under_captured_replay_without_recapture() {
         // stable stride did not invalidate it. This is the property bucket
         // growth cannot offer.
         captured.replay(stream);
-        let seen_after = read_host(base, short_bytes);
+        let seen_after = read_dev(stream, base, short_bytes);
         assert!(
             seen_after.iter().all(|&b| b == SENTINEL),
-            "the pre-growth captured graph must replay unchanged after tail growth"
+            "the pre-growth captured graph must replay unchanged after tail growth: {}",
+            mismatch_report(&seen_after, SENTINEL)
         );
 
         // And the newly committed tail is usable by a fresh write, proving the
         // growth actually extended residency at the same VA.
-        write_host(base + granule as u64, SENTINEL, 64);
-        let tail = read_host(base + granule as u64, 64);
+        fill_dev(stream, base + granule as u64, SENTINEL, 64);
+        let tail = read_dev(stream, base + granule as u64, 64);
         assert!(
             tail.iter().all(|&b| b == SENTINEL),
             "grown tail granule must be resident at the stable VA"
@@ -477,7 +544,10 @@ fn seq_major_fixed_stride_grows_under_captured_replay_without_recapture() {
     }
     free_reservation(base, reserved);
     destroy_stream(stream);
-    let last_granule = result.unwrap();
+    let last_granule = match result {
+        Ok(value) => value,
+        Err(payload) => std::panic::resume_unwind(payload),
+    };
     eprintln!(
         "seq-major fixed-stride growth: committed granule 0 then grew to granule {last_granule} \
          at a stable VA; the pre-growth captured graph replayed unchanged (0 re-captures)."
