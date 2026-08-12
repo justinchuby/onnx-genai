@@ -890,6 +890,110 @@ model:
     );
 }
 
+const NESTED_LOOP_INDUCTION_WORKFLOW: &str = r#"
+pipeline:
+  workflow:
+    manifest:
+      ir_version: "1.0"
+      onnx_opsets: { ai.onnx: 24 }
+      adapter_abis: {}
+      custom_op_versions: {}
+      capabilities: [workflow_ssa, linear_effects, nested_control_flow,
+                     loop_induction_values, explicit_transfer]
+    inputs:
+      outer_count: { contract: { dtype: int64, rank: 0, shape: [] },
+                     role: { kind: opaque }, source: { kind: application, name: outer_count },
+                     required: true }
+      inner_count: { contract: { dtype: int64, rank: 0, shape: [] },
+                     role: { kind: opaque }, source: { kind: application, name: inner_count },
+                     required: true }
+      continue: { contract: { dtype: bool, rank: 0, shape: [] },
+                  role: { kind: opaque }, source: { kind: application, name: continue },
+                  required: true }
+    outputs: {}
+    components: {}
+    initial_effects: {}
+    graph:
+      kind: sequence
+      nodes:
+        - kind: loop
+          setup: { kind: transfer, input: outer_count, output: outer.setup, device: cpu }
+          body:
+            kind: sequence
+            nodes:
+              - { kind: transfer, input: outer.index, output: outer.seen, device: cpu }
+              - kind: loop
+                setup: { kind: transfer, input: inner_count, output: inner.setup, device: cpu }
+                body: { kind: transfer, input: inner.index, output: inner.seen, device: cpu }
+                condition: continue
+                max_iterations: inner_count
+                iteration:
+                  value: inner.index
+                  contract: { dtype: int64, rank: 0, shape: [] }
+                carried: []
+          condition: continue
+          max_iterations: outer_count
+          iteration:
+            value: outer.index
+            contract: { dtype: int64, rank: 0, shape: [] }
+          carried: []
+        - { kind: transfer, input: outer_count, output: final, device: cpu }
+"#;
+
+#[test]
+fn workflow_loop_induction_is_typed_lexical_and_non_escaping() {
+    let metadata: InferenceMetadata =
+        serde_yaml::from_str(NESTED_LOOP_INDUCTION_WORKFLOW).expect("loop workflow parses");
+    validate_pipeline_spec(metadata.pipeline.as_ref().expect("pipeline"))
+        .expect("distinct nested induction values validate");
+
+    let shadowed =
+        NESTED_LOOP_INDUCTION_WORKFLOW.replace("value: inner.index", "value: outer.index");
+    let metadata: InferenceMetadata =
+        serde_yaml::from_str(&shadowed).expect("shadowed loop workflow parses");
+    let error = validate_pipeline_spec(metadata.pipeline.as_ref().expect("pipeline"))
+        .expect_err("nested induction shadowing fails");
+    assert!(
+        error
+            .errors
+            .iter()
+            .any(|message| message.contains("iteration") && message.contains("redefines SSA")),
+        "{:?}",
+        error.errors
+    );
+
+    let escaped = NESTED_LOOP_INDUCTION_WORKFLOW.replace(
+        "input: outer_count, output: final",
+        "input: outer.index, output: final",
+    );
+    let metadata: InferenceMetadata =
+        serde_yaml::from_str(&escaped).expect("escaping loop workflow parses");
+    let error = validate_pipeline_spec(metadata.pipeline.as_ref().expect("pipeline"))
+        .expect_err("induction escape fails");
+    assert!(
+        error
+            .errors
+            .iter()
+            .any(|message| message.contains("'outer.index'")
+                && message.contains("before definition"))
+    );
+
+    let invalid_contract = NESTED_LOOP_INDUCTION_WORKFLOW.replace(
+        "value: inner.index\n                  contract: { dtype: int64, rank: 0",
+        "value: inner.index\n                  contract: { dtype: float32, rank: 0",
+    );
+    let metadata: InferenceMetadata =
+        serde_yaml::from_str(&invalid_contract).expect("invalid loop workflow parses");
+    let error = validate_pipeline_spec(metadata.pipeline.as_ref().expect("pipeline"))
+        .expect_err("non-int64 induction fails");
+    assert!(
+        error
+            .errors
+            .iter()
+            .any(|message| message.contains("iteration must declare int64"))
+    );
+}
+
 #[test]
 fn mixture_of_experts_contract_parses_structurally() {
     let yaml = r#"
