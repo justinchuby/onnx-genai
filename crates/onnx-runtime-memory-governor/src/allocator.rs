@@ -34,6 +34,7 @@
 //! carries device, size, alignment and ownership. Raw is what both can express;
 //! each side wraps it in its own richer type on the way out.
 
+use std::any::Any;
 use std::fmt::Debug;
 use std::ptr::NonNull;
 
@@ -81,6 +82,56 @@ impl DeviceKey {
             index,
         }
     }
+}
+
+/// A pinned, read-only shared prefix: physical device memory created **once**
+/// and mappable into many allocations at **zero** incremental owned bytes
+/// (#777).
+///
+/// This is the allocator-agnostic handle a KV path holds when it declares "this
+/// token prefix is shared" and pins it once, then maps it into each subsequent
+/// sequence with [`DeviceAllocator::commit_shared_prefix`]. It is deliberately
+/// opaque: the concrete backing (CUDA VMM physical handles today) lives in the
+/// allocator crate, downcast through [`SharedDevicePrefix::as_any`] by the
+/// allocator that produced it. Detection (hashing) and copy-on-write at
+/// divergence are **not** part of this contract — a shared prefix is read-only
+/// for the union lifetime of its sharers.
+pub trait SharedDevicePrefix: Send + Sync + Debug {
+    /// Device address of the owner's writable window. The prefix content is
+    /// filled here **once**, before it is shared read-only into sequences.
+    fn device_ptr(&self) -> u64;
+
+    /// Physical device bytes this prefix owns — charged **once**, on the owned
+    /// axis, however many sequences share it. This is the reported *physical*
+    /// cost, never nominal content bytes.
+    fn committed_physical_bytes(&self) -> u64;
+
+    /// The granule-rounded byte length the prefix actually spans.
+    fn mapped_bytes(&self) -> usize;
+
+    /// Bytes requested at construction, before granule rounding.
+    fn requested_bytes(&self) -> usize;
+
+    /// Downcast hook: the allocator that produced this handle recovers its
+    /// concrete type to map it. A prefix presented to a different allocator is
+    /// refused rather than mis-mapped.
+    fn as_any(&self) -> &dyn Any;
+}
+
+/// The accounting outcome of mapping a [`SharedDevicePrefix`] into one
+/// allocation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SharedPrefixCommitInfo {
+    /// Physical bytes newly *owned* by mapping the prefix here.
+    ///
+    /// Always **zero**: the prefix's granules were charged once when it was
+    /// created, so admitting the Nth sharer costs only its *private* bytes.
+    pub additional_owned_bytes: u64,
+    /// Physical bytes newly *mapped* into this allocation's reservation — one
+    /// mapping of already-owned physical memory, reported on the mapped axis.
+    pub newly_mapped_bytes: u64,
+    /// Granules mapped read-only into the allocation.
+    pub granules: usize,
 }
 
 /// Somewhere raw memory comes from.
@@ -323,6 +374,64 @@ pub trait DeviceAllocator: Send + Sync + Debug {
         // SAFETY: forwarded under this method's identical contract.
         unsafe { self.deallocate(ptr, bytes, align) };
         0
+    }
+
+    /// Create a pinned, read-only shared prefix of `bytes`, charged **once** on
+    /// the owned axis, for mapping into many allocations with
+    /// [`commit_shared_prefix`](DeviceAllocator::commit_shared_prefix).
+    ///
+    /// The default refuses: a shared prefix is defined by physical-handle
+    /// identity across reservations, which only an allocator that owns its
+    /// physical granules (a CUDA VMM arena) can provide. Eager allocators — and
+    /// any allocator without a physical-handle pool — return an error here
+    /// rather than mis-map, so an unsupported request faults loudly at the seam
+    /// instead of silently producing private copies.
+    fn create_shared_prefix(
+        &self,
+        bytes: usize,
+    ) -> Result<Box<dyn SharedDevicePrefix>, MemoryError> {
+        Err(MemoryError::InvalidRequest {
+            tier: self.device().tier.name(),
+            requested: bytes as u64,
+            reason: "this allocator does not support shared prefixes; a pinned shared prefix \
+                     requires a physical-handle pool (the CUDA VMM arena)",
+        })
+    }
+
+    /// Estimate the incremental **owned** physical bytes to admit one more
+    /// sharer of `prefix` — zero for an allocator that already owns the prefix's
+    /// granules.
+    ///
+    /// This is the admission-facing statement (#745): the shared bytes are
+    /// charged once, so the Nth request costs only its private continuation.
+    fn incremental_owned_bytes_for_shared_prefix(&self, prefix: &dyn SharedDevicePrefix) -> u64 {
+        let _ = prefix;
+        0
+    }
+
+    /// Map `prefix` into the live allocation `ptr` at `byte_offset`,
+    /// **read-only**, taking one reference per shared granule.
+    ///
+    /// The prefix's physical memory is already owned, so this maps existing
+    /// memory: it charges **zero** incremental owned bytes and keeps the shared
+    /// granules alive until the last sharer (or the prefix owner) leaves. The
+    /// default refuses for the same reason [`create_shared_prefix`] does.
+    ///
+    /// [`create_shared_prefix`]: DeviceAllocator::create_shared_prefix
+    fn commit_shared_prefix(
+        &self,
+        prefix: &dyn SharedDevicePrefix,
+        ptr: NonNull<u8>,
+        allocation_bytes: usize,
+        byte_offset: usize,
+    ) -> Result<SharedPrefixCommitInfo, MemoryError> {
+        let _ = (prefix, ptr, byte_offset);
+        Err(MemoryError::InvalidRequest {
+            tier: self.device().tier.name(),
+            requested: allocation_bytes as u64,
+            reason: "this allocator does not support shared prefixes; a pinned shared prefix \
+                     requires a physical-handle pool (the CUDA VMM arena)",
+        })
     }
 
     /// Which device this allocator serves.
