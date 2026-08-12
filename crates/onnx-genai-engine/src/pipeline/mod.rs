@@ -29,13 +29,13 @@ use anyhow::Context;
 use onnx_genai_kv::{PagedKvCache, PrefixCache, SequenceId};
 use onnx_genai_metadata::{
     AbsentInputKind, DataflowEdge, ModelIoSpec, PhaseRunOn, PipelineSpec, PipelineStrategy,
-    PipelineStrategyKind, PipelineVisionConfig, SchedulerSpec, TensorDimension,
+    PipelineStrategyKind, PipelineVisionConfig, SchedulerSpec, SequenceInputKind, TensorDimension,
 };
 use onnx_genai_ort::{
     DataType, PipelineModelDirectory, PipelineModels, Session, SessionOptions, Tokenizer, Value,
 };
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -258,6 +258,14 @@ pub struct PipelineEngine {
     /// `--ep cuda`), honored by the native pipeline decoder when the
     /// `ONNX_GENAI_PIPELINE_NATIVE_DECODER_DEVICE` override is unset.
     native_device: Option<crate::native_decode_device::NativeDecodeDevice>,
+    /// Prompt-phase / post-decode component sessions loaded on the native
+    /// backend, built lazily by the prologue the first time an active component
+    /// with no ORT session runs. Empty on the ORT backend and for native
+    /// pipelines whose prompt components never activate (e.g. a text-only prompt
+    /// through a multimodal package never builds the vision encoder). Behind a
+    /// `RefCell` because the prologue runs from `&self` paths.
+    native_prompt_sessions:
+        RefCell<BTreeMap<String, Box<dyn onnx_genai_metadata::ComponentSession>>>,
     #[cfg(feature = "cuda")]
     native_cuda_authority: Option<crate::memory_authority::DeviceMemoryAuthority>,
 }
@@ -470,6 +478,8 @@ fn build_step_component_session<'a>(
     models: &'a PipelineModels,
     component: &str,
     native_components: &BTreeSet<String>,
+    #[cfg_attr(not(feature = "native-backend"), allow(unused_variables))]
+    native_device: &crate::native_decode_device::NativeDecodeDevice,
 ) -> anyhow::Result<Box<dyn onnx_genai_metadata::ComponentSession + 'a>> {
     if native_components.contains(component) {
         #[cfg(feature = "native-backend")]
@@ -481,14 +491,18 @@ fn build_step_component_session<'a>(
                 .with_context(|| {
                     format!("native every_step component '{component}' has no model path")
                 })?;
-            // The every_step slice (inc1) stages tensors through the host
-            // `ComponentTensor` seam, so the native component runs on CPU; device
-            // placement of the pipeline decoder is the later (inc2/inc3) work.
-            let native = crate::native_component::NativeComponentSession::load(
-                path,
-                crate::native_decode_device::NativeDecodeDevice::Cpu,
-            )
-            .with_context(|| format!("failed to load native every_step component '{component}'"))?;
+            // Run the native every_step component on the same device the native
+            // decoder targets: a CUDA pipeline keeps the embedder on the GPU (so
+            // an embeds-driven decoder's per-token embedding is a native CUDA EP
+            // forward, mirroring the `muse_decode` raw-session setup), while a
+            // CPU pipeline keeps it on CPU. Inputs/outputs still cross the host
+            // `ComponentTensor` seam, so only one small `inputs_embeds` row
+            // round-trips host<->device per step; the decoder's KV never does.
+            let native =
+                crate::native_component::NativeComponentSession::load(path, native_device.clone())
+                    .with_context(|| {
+                        format!("failed to load native every_step component '{component}'")
+                    })?;
             return Ok(Box::new(native));
         }
         #[cfg(not(feature = "native-backend"))]
@@ -506,6 +520,29 @@ fn build_step_component_session<'a>(
     Ok(Box::new(onnx_genai_ort::OrtComponentSessionRef::new(
         session,
     )))
+}
+
+/// Resolve the decoder's KV context ceiling for the native pipeline path.
+///
+/// The native decoder's per-directory model path (`.../decoder/model.onnx`) has
+/// no metadata sidecar of its own, so the single-decoder auto-resolution from
+/// the model directory cannot see the model's `max_sequence_length`. Without it
+/// the CUDA KV capacity falls back to `usize::MAX` and the mask reservation
+/// overflows before decode can start. Read the pipeline package's declared
+/// context length instead: the native `inference_metadata.{yaml,yml,json}`
+/// sidecar's `model.max_sequence_length` first, then the compatibility
+/// `genai_config.json` context length. `None` preserves the prior unbounded
+/// behavior for packages that declare neither.
+fn pipeline_metadata_max_len(directory: &onnx_genai_ort::PipelineModelDirectory) -> Option<usize> {
+    if let Some(path) = directory.metadata_path.as_ref()
+        && let Ok(metadata) = onnx_genai_metadata::load_metadata(path)
+        && let Some(len) = metadata.model.and_then(|model| model.max_sequence_length)
+    {
+        return Some(len);
+    }
+    onnx_genai_genai_config::find_in_dir(&directory.root)
+        .and_then(|path| onnx_genai_genai_config::load(&path).ok())
+        .and_then(|config| config.max_sequence_length())
 }
 
 /// Build the native device-KV [`PipelineDecoderComponent`] for `decoder`, loading
@@ -552,6 +589,7 @@ fn build_native_pipeline_decoder(
             path,
             native_decoder_device(config_device),
             io,
+            pipeline_metadata_max_len(&models.directory),
             #[cfg(feature = "cuda")]
             crate::engine::cuda_policy_from_memory_strategy_plan(memory_strategy_plan),
             #[cfg(feature = "cuda")]
@@ -949,22 +987,29 @@ impl PipelineEngine {
         }
         let native_ort_skips = if backend == PipelineBackend::Native {
             match &plan {
-                PipelinePlan::Autoregressive(ar) => {
-                    let mut skips = BTreeSet::from([ar.decoder.clone()]);
-                    skips.extend(ar.step_components.iter().cloned());
-                    skips
-                }
+                // The native backend runs every component through native nxrt
+                // sessions: the decoder and every_step components in the decode
+                // loop, and any prompt-phase component (e.g. a vision encoder or
+                // an embeds fuser) lazily in the prologue. Building ORT sessions
+                // for them would be redundant and, for graphs using native-only
+                // operators (bf16 `Where`, int4 `MatMulNBits`), would make ORT
+                // reject the model at load. So skip ORT for all of them and keep
+                // only their session-free graph I/O for decode resolution.
+                PipelinePlan::Autoregressive(_) => directory
+                    .model_paths
+                    .keys()
+                    .cloned()
+                    .collect::<BTreeSet<_>>(),
                 _ => BTreeSet::new(),
             }
         } else {
             BTreeSet::new()
         };
         let models = if backend == PipelineBackend::Native {
-            // The native flat-AR backend drives the decoder and every-step
-            // components through native nxrt sessions, so ORT sessions for those
-            // components would be redundant and can reject native-only operators.
-            // Prompt-only components still run through the existing ORT prologue,
-            // so keep their sessions loaded.
+            // The native flat-AR backend drives every component through native
+            // nxrt sessions, so ORT sessions would be redundant and can reject
+            // native-only operators. Prompt-phase components run natively in the
+            // prologue (built lazily by `run_prompt_phase_components`).
             PipelineModels::load_with_ort_session_filter(pipeline_dir, session_options, |name| {
                 !native_ort_skips.contains(name)
             })
@@ -1118,6 +1163,7 @@ impl PipelineEngine {
             retained: None,
             paged,
             native_device: config.native_device.clone(),
+            native_prompt_sessions: RefCell::new(BTreeMap::new()),
             #[cfg(feature = "cuda")]
             native_cuda_authority,
         })
@@ -2707,6 +2753,20 @@ fn require_component_logits_output(spec: &PipelineSpec, component: &str) -> anyh
 }
 
 fn component_phase(spec: &PipelineSpec, component: &str, decoder: &str) -> PhaseRunOn {
+    // An embeds-driven decoder (`sequence_source: inputs_embeds`) must be fed a
+    // fresh embedding for the single running token on every decode step, so the
+    // upstream component that produces its `inputs_embeds` runs `every_step`
+    // even when the model package labels it `prompt_only`. A prompt-only
+    // embedding would run once over the prompt and leave the decoder consuming
+    // stale prefill embeddings for every generated token (a shape mismatch at
+    // best, silently wrong output at worst). This mirrors the `muse_decode`
+    // harness, which re-embeds the running token each step. The reclassification
+    // is scoped to the single dataflow producer of the decoder's `inputs_embeds`
+    // port, so cached conditioning producers (e.g. a vision encoder feeding the
+    // embedder's image features) keep their declared `prompt_only` phase.
+    if decoder_embeds_producer(spec, decoder).as_deref() == Some(component) {
+        return PhaseRunOn::EveryStep;
+    }
     spec.phases
         .get(component)
         .map(|phase| phase.run_on.clone())
@@ -2717,6 +2777,32 @@ fn component_phase(spec: &PipelineSpec, component: &str, decoder: &str) -> Phase
                 PhaseRunOn::PromptOnly
             }
         })
+}
+
+/// The pipeline component that produces an embeds-driven `decoder`'s
+/// `inputs_embeds`, or `None` for a token-id-driven decoder (or when no dataflow
+/// edge feeds the embeds port).
+///
+/// Resolved structurally from metadata: the decoder must declare
+/// `sequence_source: inputs_embeds` with an `inputs_embeds_input` port, and some
+/// other component must feed that port over a dataflow edge. This is the single
+/// upstream embedder whose phase [`component_phase`] promotes to `every_step`.
+fn decoder_embeds_producer(spec: &PipelineSpec, decoder: &str) -> Option<String> {
+    let io = spec
+        .models
+        .get(decoder)
+        .and_then(|model| model.io.as_ref())?;
+    if io.sequence_source != Some(SequenceInputKind::InputsEmbeds) {
+        return None;
+    }
+    let embeds_port = io.inputs_embeds_input.as_deref()?;
+    let target = format!("{decoder}.{embeds_port}");
+    spec.dataflow
+        .iter()
+        .find(|edge| edge.to == target)
+        .and_then(|edge| endpoint_component(&edge.from))
+        .filter(|from| *from != decoder)
+        .map(str::to_string)
 }
 
 fn topological_components(spec: &PipelineSpec) -> anyhow::Result<Vec<String>> {
