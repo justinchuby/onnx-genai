@@ -23,18 +23,26 @@
 //! CUDA end event after the `cuMemcpyHtoDAsync` and **synchronizes that event on
 //! the host before returning** (see `cudarc` `Event::elapsed_ms`, which calls
 //! `end.synchronize()`). The copy's DMA read of the staging buffer is therefore
-//! complete on the host timeline before the fill/upload call returns. A buffer
-//! is only returned to this pool *after* that call returns — via
-//! [`PooledStaging`]'s `Drop`, or an explicit [`PinnedStagingPool::release`] on
-//! the non-VMM branch — so a returned buffer is provably no longer being read by
-//! any in-flight copy. If the page-in path is ever changed to a *non*-blocking
-//! `htod_async` + deferred fence, the return-to-pool must be re-ordered after
-//! that fence is awaited before this reasoning holds again.
+//! complete on the host timeline before the fill/upload call returns.
+//!
+//! This ordering is enforced **structurally, not by comment**. The reuse path
+//! ([`PinnedStagingPool::release`] and [`PooledStaging::retire`]) requires a
+//! [`CopyCompleted`] witness, and that witness can only be minted by a
+//! host-synchronizing copy primitive in the `runtime` module (today
+//! [`crate::runtime::CudaRuntime::htod_async_elapsed_ms`]). A buffer returns to
+//! the pool for reuse only by presenting that witness, so a future switch to a
+//! non-blocking `htod_async` + deferred fence produces no witness at the reuse
+//! site and **fails to compile** until the author threads a completion witness
+//! through after awaiting the fence. [`PooledStaging`]'s `Drop` is only a
+//! leak-safe fallback: it *frees* the buffer (never reuses it), so a dropped-
+//! without-witness buffer costs a re-allocation — caught by the
+//! `pinned_alloc_calls` counter and its regression test — but can never cause
+//! silent reuse-while-in-flight corruption.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::runtime::{CudaRuntime, PinnedStaging};
+use crate::runtime::{CopyCompleted, CudaRuntime, PinnedStaging};
 
 /// Number of times the pool actually called `cuMemHostAlloc` (a pinned-buffer
 /// page-lock), as opposed to satisfying a request from the free-list. A
@@ -152,18 +160,15 @@ impl PinnedStagingPool {
         })
     }
 
-    /// Return a raw staging buffer to the free-list, subject to the retention
-    /// bounds. A buffer that would exceed either bound is dropped, which frees
-    /// its pinned host pages.
+    /// Return a raw staging buffer to the free-list for reuse, subject to the
+    /// retention bounds. A buffer that would exceed either bound is dropped,
+    /// which frees its pinned host pages.
     ///
-    /// # Safety of reuse
-    ///
-    /// The caller MUST guarantee the buffer's most recent host→device copy has
-    /// completed (see the module-level fence-safety note). Every offload
-    /// page-in path satisfies this because it copies through
-    /// `htod_async_elapsed_ms`, which host-synchronizes the copy's completion
-    /// event before returning.
-    pub fn release(&self, staging: PinnedStaging) {
+    /// Consuming a [`CopyCompleted`] witness is the compile-time proof that the
+    /// buffer's most recent host→device copy has *completed* (not merely been
+    /// enqueued), so reuse cannot race an in-flight DMA read. The witness is
+    /// produced only by a host-synchronizing copy primitive in `runtime`.
+    pub fn release(&self, staging: PinnedStaging, _completed: CopyCompleted) {
         let mut free = self.free.lock().expect("pinned staging pool poisoned");
         let retained: usize = free.iter().map(PinnedStaging::len).sum();
         if free.len() < self.max_buffers && retained.saturating_add(staging.len()) <= self.max_bytes
@@ -193,12 +198,17 @@ impl PinnedStagingPool {
     }
 }
 
-/// A pinned staging buffer borrowed from a [`PinnedStagingPool`]. Returns itself
-/// to the pool on `Drop`.
+/// A pinned staging buffer borrowed from a [`PinnedStagingPool`].
 ///
-/// `Drop` performs only the return-to-pool and never asserts (an assert in
-/// `Drop` triggers `STATUS_STACK_BUFFER_OVERRUN` during unwind in this
-/// codebase).
+/// The buffer returns to the pool for reuse **only** via
+/// [`PooledStaging::retire`], which requires a [`CopyCompleted`] witness proving
+/// the buffer's host→device copy has completed. `Drop` is a leak-safe fallback:
+/// it *frees* the buffer rather than returning it to the pool, so forgetting to
+/// `retire` costs a re-allocation (observable via the `pinned_alloc_calls`
+/// counter) but can never reuse a buffer while a copy is still reading it.
+///
+/// `Drop` never asserts (an assert in `Drop` triggers
+/// `STATUS_STACK_BUFFER_OVERRUN` during unwind in this codebase).
 pub struct PooledStaging {
     pool: Arc<PinnedStagingPool>,
     staging: Option<PinnedStaging>,
@@ -209,32 +219,42 @@ impl PooledStaging {
     pub fn staging_mut(&mut self) -> &mut PinnedStaging {
         self.staging
             .as_mut()
-            .expect("pooled staging present until into_inner/Drop")
+            .expect("pooled staging present until into_inner/retire/Drop")
     }
 
     /// Read-only view of the pinned bytes.
     pub fn as_slice(&self) -> &[u8] {
         self.staging
             .as_ref()
-            .expect("pooled staging present until into_inner/Drop")
+            .expect("pooled staging present until into_inner/retire/Drop")
             .as_slice()
     }
 
-    /// Take ownership of the raw buffer, cancelling the automatic return. Used
-    /// by the non-VMM upload path, which consumes and hands the buffer back so
-    /// the caller can `release` it once the (host-blocking) upload completes.
+    /// Take ownership of the raw buffer, cancelling the automatic drop. Used by
+    /// the non-VMM upload path, which consumes and hands the buffer back so the
+    /// caller can `release` it (with a completion witness) after the copy.
     pub fn into_inner(mut self) -> PinnedStaging {
         self.staging
             .take()
-            .expect("pooled staging present until into_inner/Drop")
+            .expect("pooled staging present until into_inner/retire/Drop")
+    }
+
+    /// Return this buffer to the pool for reuse. Requires a [`CopyCompleted`]
+    /// witness proving the buffer's host→device copy has completed, so reuse is
+    /// structurally ordered after copy completion.
+    pub fn retire(mut self, completed: CopyCompleted) {
+        if let Some(staging) = self.staging.take() {
+            self.pool.release(staging, completed);
+        }
     }
 }
 
 impl Drop for PooledStaging {
     fn drop(&mut self) {
-        if let Some(staging) = self.staging.take() {
-            self.pool.release(staging);
-        }
+        // Leak-safe fallback only: free the buffer, never return it to the pool.
+        // Reuse must go through `retire`, which requires a `CopyCompleted`
+        // witness. Never assert here (STATUS_STACK_BUFFER_OVERRUN on unwind).
+        drop(self.staging.take());
     }
 }
 
@@ -263,7 +283,7 @@ mod tests {
             let mut staging = pool.acquire(len).unwrap();
             // Touch the buffer the way a page-in fills it before its copy.
             staging.staging_mut().as_mut_slice()[..len].fill(0xAB);
-            drop(staging); // returns to pool
+            staging.retire(CopyCompleted::new_for_test()); // returns to pool
         }
         assert_eq!(
             pool.alloc_calls(),
@@ -289,17 +309,17 @@ mod tests {
         };
         let pool = PinnedStagingPool::new(runtime);
         let big = pool.acquire(8 * 1024 * 1024).unwrap();
-        drop(big);
+        big.retire(CopyCompleted::new_for_test());
         assert_eq!(pool.alloc_calls(), 1);
         // Smaller request fits the retained 8 MiB buffer — reuse, no alloc.
         let small = pool.acquire(1024 * 1024).unwrap();
         assert_eq!(pool.alloc_calls(), 1);
         assert_eq!(pool.reuses(), 1);
-        drop(small);
+        small.retire(CopyCompleted::new_for_test());
         // A larger request cannot reuse the 8 MiB buffer — a fresh alloc.
         let bigger = pool.acquire(16 * 1024 * 1024).unwrap();
         assert_eq!(pool.alloc_calls(), 2);
-        drop(bigger);
+        bigger.retire(CopyCompleted::new_for_test());
     }
 
     /// Retention is bounded: releasing beyond `max_buffers` drops the surplus
@@ -317,9 +337,9 @@ mod tests {
         let a = pool.acquire(1024).unwrap();
         let b = pool.acquire(1024).unwrap();
         let c = pool.acquire(1024).unwrap();
-        drop(a);
-        drop(b);
-        drop(c);
+        a.retire(CopyCompleted::new_for_test());
+        b.retire(CopyCompleted::new_for_test());
+        c.retire(CopyCompleted::new_for_test());
         assert!(
             pool.free_len() <= max_buffers,
             "free-list grew past its bound: {} > {max_buffers}",
@@ -339,8 +359,8 @@ mod tests {
         let pool = PinnedStagingPool::with_bounds(runtime, 8, 1024 * 1024 + 1);
         let a = pool.acquire(1024 * 1024).unwrap();
         let b = pool.acquire(1024 * 1024).unwrap();
-        drop(a);
-        drop(b);
+        a.retire(CopyCompleted::new_for_test());
+        b.retire(CopyCompleted::new_for_test());
         assert_eq!(
             pool.free_len(),
             1,

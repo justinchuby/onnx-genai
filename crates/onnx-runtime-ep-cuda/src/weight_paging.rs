@@ -30,7 +30,7 @@ use onnx_runtime_ir::DataType;
 use onnx_runtime_memory_governor::{DeviceAllocator, Tier};
 
 use crate::pinned_pool::PinnedStagingPool;
-use crate::runtime::{CudaRuntime, PinnedStaging, raw_ptr};
+use crate::runtime::{CopyCompleted, CudaRuntime, PinnedStaging, raw_ptr};
 
 /// Alignment for stable-VA weight slots (issue #716). The VMM arena rounds
 /// commits to the 2 MiB device granule (#776) regardless, so this only governs
@@ -507,7 +507,7 @@ impl CudaWeightPage {
         shape: Vec<usize>,
         len: usize,
         staging: PinnedStaging,
-    ) -> Result<(Self, u64, PinnedStaging), WeightHandleError> {
+    ) -> Result<(Self, u64, PinnedStaging, CopyCompleted), WeightHandleError> {
         if len == 0 {
             return Err(WeightHandleError::MissingRegions);
         }
@@ -532,12 +532,13 @@ impl CudaWeightPage {
             shape,
         };
         let staged = &staging.as_slice()[..len];
-        let copy_ms = unsafe { runtime.htod_async_elapsed_ms(staged, ptr) }.map_err(|error| {
-            WeightHandleError::DeviceBinding(format!("measured H2D copy: {error}"))
-        })?;
+        let (copy_ms, completed) =
+            unsafe { runtime.htod_async_elapsed_ms(staged, ptr) }.map_err(|error| {
+                WeightHandleError::DeviceBinding(format!("measured H2D copy: {error}"))
+            })?;
         GLOBAL_HTOD_NS.fetch_add((copy_ms * 1_000_000.0) as u64, Ordering::Relaxed);
         GLOBAL_HTOD_BYTES.fetch_add(len as u64, Ordering::Relaxed);
-        Ok((page, 0, staging))
+        Ok((page, 0, staging, completed))
     }
 
     /// Opaque device pointer to the paged bytes, for a kernel `TensorView`.
@@ -1303,33 +1304,34 @@ impl CudaWeightResidency {
                 self.eviction_for(weight.boundary),
                 // `staging` (a `PooledStaging`) is moved into the fill closure.
                 // `htod_async_elapsed_ms` host-synchronizes the copy before it
-                // returns, so when this closure ends and drops `staging`, the
-                // DMA read has completed and returning the buffer to the pool
-                // cannot race an in-flight copy.
+                // returns and yields a `CopyCompleted` witness; `retire` consumes
+                // that witness to return the buffer to the pool, so reuse is
+                // structurally gated on the copy having completed.
                 move |runtime, ptr| {
                     let staged = &staging.as_slice()[..len];
-                    let copy_ms =
+                    let (copy_ms, completed) =
                         unsafe { runtime.htod_async_elapsed_ms(staged, ptr) }.map_err(|error| {
                             WeightHandleError::DeviceBinding(format!("measured H2D copy: {error}"))
                         })?;
                     GLOBAL_HTOD_NS.fetch_add((copy_ms * 1_000_000.0) as u64, Ordering::Relaxed);
                     GLOBAL_HTOD_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+                    staging.retire(completed);
                     Ok(())
                 },
             );
         }
         // Non-VMM branch: `upload_staged_async` consumes the buffer, performs a
-        // host-blocking copy, and hands it back. Return it to the pool only
-        // after that call returns (copy complete), then admit.
+        // host-blocking copy, and hands it back with a `CopyCompleted` witness.
+        // Return it to the pool with that witness (copy complete), then admit.
         let raw_staging = staging.into_inner();
-        let (page, _, raw_staging) = CudaWeightPage::upload_staged_async(
+        let (page, _, raw_staging, completed) = CudaWeightPage::upload_staged_async(
             &self.runtime,
             weight.dtype,
             weight.shape.clone(),
             len,
             raw_staging,
         )?;
-        self.staging_pool.release(raw_staging);
+        self.staging_pool.release(raw_staging, completed);
         self.admit(key, Arc::new(page), self.eviction_for(weight.boundary))
     }
 
