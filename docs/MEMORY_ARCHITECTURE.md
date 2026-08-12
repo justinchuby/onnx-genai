@@ -223,7 +223,14 @@ than copying conclusions, following the anti-staleness rule established in
   per-layout NVRTC specialization. Flash prefill now uses the same descriptor
   for cache preparation and reads, enabling full seq-major prefill + fp16
   decode generations when the fused-flash shape gate applies. Unsupported
-  readers and writers still fail rather than silently mis-index.
+  readers and writers still fail rather than silently mis-index. The engine KV
+  *growth byte geometry* is now layout-faithful (bsnh-fixed-stride): under
+  in-place VMM growth a seq-major buffer grows on its capacity-independent
+  `kv_heads × head_dim` stride and moves **0** KV bytes, measured end to end on a
+  real model (see "KV layout and residency" below). The BNSH binding *metadata*
+  shape is retained deliberately for both layouts — the GQA node and
+  `DeviceIoBinding` require it — so seq-major lives in the byte geometry, not a
+  permuted shape.
 - **Measured, not implemented:** token-major across all layers. Its residency
   floor and 192 KiB-stride read cost were measured in #787, but no production
   kernel or binding layout uses it.
@@ -363,15 +370,72 @@ measured 2 MiB CUDA granule:
 > replay** (granule 0 → 3 at a stable VA) and observes **0 re-captures** — the
 > stable-stride win #782 could not demonstrate end to end, shown here on hardware.
 >
-> The remaining gap is **structural, not measurement**: the engine's own commit
-> path (`native_decode/cuda.rs`) still grows a BNSH physical shape whose seq axis
-> (`persistent_state_shapes`) is hard-coded, and no model on record declares
-> seq-major, so there is no BSNH fixed-stride physical-shape build to hang the
-> dense-prefix commit on. The engine now *consumes* the `kv_layout` descriptor
-> (resolved to `KvCommitLayout`, surfaced in `CudaKvDebugStats.kv_layout_seq_major`),
-> and the geometry mechanism + driver measurement are in place; wiring the
-> dense-prefix commit into a seq-major generation is the documented next step
-> (it shares the BSNH shape-build prerequisite with token-major and #777).
+> **Update (bsnh-fixed-stride).** The engine growth *byte geometry* is now
+> layout-faithful, and a real seq-major generation runs end to end. Two findings
+> refine the earlier "structural gap" note precisely:
+>
+> 1. **The KV binding metadata shape must stay BNSH for both layouts.** The CUDA
+>    GQA node validates `past_key`/`past_value` as `[batch, kv_heads, seq,
+>    head_dim]` and reads `present_capacity` from axis 2 *regardless of the
+>    `kv_layout` attribute* (only the kernel's stride arithmetic re-specializes),
+>    and `DeviceIoBinding` requires the logical and physical shapes to share axis
+>    order. So `persistent_state_shapes` is *correctly* BNSH for seq-major too —
+>    a permuted binding shape cannot express seq-major. Seq-major is realized in
+>    the **growth/commit byte geometry** (`kv_growth_byte_layout`,
+>    `apply_vmm_growth`, `build_grown_buffers`), which now maps the BNSH shape to
+>    its BSNH byte layout `[batch, capacity, kv_heads, head_dim]` (grow axis 1)
+>    and drives the copy/zero primitives over that. Head-major is byte-identical
+>    to before (grow axis 2, one stripe per head).
+>
+> 2. **The "0 bytes moved on growth" fixed-stride property holds only on the
+>    in-place VMM growth path**, not on the default bucket-*reallocation* path. A
+>    reallocation fills a fresh buffer, so it copies the live prefix either way;
+>    seq-major's win there is one contiguous copy instead of `kv_heads` stripes,
+>    not a smaller byte count. Under `ONNX_GENAI_CUDA_VMM=1` (`commits_on_demand`,
+>    growth maps granules onto the same base VA) the capacity-independent
+>    `kv_heads × head_dim` per-token stride keeps the prefix in place.
+>
+> **Measured end to end** on `qwen2.5-0.5b-q4_0-mobius` (stock BNSH export vs a
+> copy whose 24 GQA nodes carry `kv_layout=1`), forcing growth with
+> `ONNX_GENAI_KV_MIN_BUCKET=8` and generating 48 greedy tokens (3 growth events,
+> 8→16→32→64), test
+> `crates/onnx-genai-engine/tests/mobius_seqmajor_growth_parity_native_cuda.rs`:
+>
+> | Growth path | Capture | Tokens | Committed bytes (head = seq) | d2d KV copy bytes head | d2d KV copy bytes seq |
+> |---|---|---|---:|---:|---:|
+> | in-place VMM (default since #798) | OFF | byte-identical | 100,663,296 | 688,576 | **0** |
+> | in-place VMM (default since #798) | ON (declined) | byte-identical | 100,663,296 | 688,576 | **0** |
+> | legacy realloc (`ONNX_GENAI_LEGACY_ALLOCATOR=1`) | OFF | byte-identical | 786,432 | 688,576 | 688,576 |
+>
+> The 48-token stream is byte-identical head-major vs seq-major in every row —
+> the first real seq-major generation that exercises *growth*. (#794's 32-token
+> run never crossed the 256-token bucket, so it validated kernel indexing only.)
+> Since #798 made managed no-spill VMM the default, the **default** growth path is
+> in-place VMM, so seq-major now grows moving **0 KV bytes by default**; the
+> legacy reallocation allocator (which copies the live prefix to a fresh buffer
+> either way) is reachable only via the #755 opt-out. Two honest caveats remain,
+> both orthogonal to this shape/stride change:
+>
+> * **Committed physical bytes are still equal head vs seq** (100,663,296 both
+>   under the default VMM arena; 786,432 both under legacy realloc), because the
+>   engine still commits flat bucket/granule ranges rather than the dense
+>   live-prefix ranges `kv_commit.rs::live_prefix_ranges` computes. The
+>   `kv_heads×` residency win is therefore still driver-level only
+>   (`vmm_kv_layout_residency_gpu`); wiring the dense-prefix commit into the live
+>   path is the documented next step (shared with token-major and #777).
+> * **Re-capture on growth was not exercised end to end**: this decoder's dynamic
+>   logical shape declines whole-step CUDA-graph capture (`captures = 0`), so the
+>   boundary-crossing step cost #778 measured in a microbenchmark could not be
+>   reproduced here — the same obstacle #794 hit. `invalidate_graph` still runs on
+>   every growth (an invariant retained because `present_capacity` is baked into
+>   any captured graph), so a capturing decoder would re-capture on each growth
+>   regardless of layout; the driver-level "0 re-captures" of #797 requires a
+>   fixed full-context stable-VA reservation the bucket-growth engine path does
+>   not inherit.
+>
+> Wall-clock is not reported: the box was contended and identical runs ranged
+> ~5 s to ~212 s across this session's re-runs, so no throughput number is
+> trustworthy and none is extrapolated.
 
 The small-model measurement makes the waste concrete: qwen2.5-0.5b committed
 **96 head stripes × 2 MiB = 192 MiB to hold about 12 KiB** of live KV (#772).
