@@ -4899,6 +4899,10 @@ fn borrowed_affine_int4_matmul(
 ) {
     debug_assert_eq!(activations.len(), m * k);
     debug_assert_eq!(result.len(), m * n);
+    // `dot_kernel` is consumed only by the `#[cfg(target_arch = "aarch64")]`
+    // fast paths below; discard it on other targets to avoid an unused-variable
+    // error under `-D warnings` (mirrors the sibling matmul helpers).
+    let _ = dot_kernel;
     let bits = 4usize;
     let layout = NBitsLayout { bits, block_size };
     let block_count = k.div_ceil(block_size);

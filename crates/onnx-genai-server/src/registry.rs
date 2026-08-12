@@ -1017,7 +1017,10 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(error.contains("committed bytes"));
+        assert!(
+            error.contains("cannot satisfy lowered resource limit"),
+            "expected a limit-rejection error, got: {error}"
+        );
         let after = handle.engine.resource_snapshot().await.unwrap();
         assert_eq!(after.vram.limit, before.vram.limit);
         assert_eq!(after.vram.used, before.vram.used);
