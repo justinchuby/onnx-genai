@@ -40,11 +40,76 @@ pub(crate) fn validate_pipeline_admission(
     model_paths: &BTreeMap<String, PathBuf>,
 ) -> Result<()> {
     let signatures = inspect_component_signatures(model_paths)?;
+    if let Some(workflow) = &spec.workflow {
+        return validate_workflow_signatures(workflow, &signatures);
+    }
     validate_edges(spec, &signatures)?;
     validate_optional_inputs(spec, &signatures)?;
 
     let preprocessed_inputs = validate_image_program(spec, preprocessing, &signatures)?;
     validate_input_closure(spec, &signatures, &preprocessed_inputs)
+}
+
+fn validate_workflow_signatures(
+    workflow: &onnx_genai_metadata::WorkflowSpec,
+    signatures: &BTreeMap<String, ComponentSignature>,
+) -> Result<()> {
+    for (component, declaration) in &workflow.components {
+        let onnx_genai_metadata::ComponentImplementation::Onnx { .. } = &declaration.implementation
+        else {
+            continue;
+        };
+        let signature = signatures.get(component).ok_or_else(|| {
+            OrtError::InvalidArgument(format!(
+                "workflow ONNX component '{component}' has no inspected model"
+            ))
+        })?;
+        for (direction, declared, actual) in [
+            ("input", &declaration.ports.inputs, &signature.inputs),
+            ("output", &declaration.ports.outputs, &signature.outputs),
+        ] {
+            for (port, contract) in declared {
+                let signature = actual.get(port).ok_or_else(|| {
+                    OrtError::InvalidArgument(format!(
+                        "workflow component '{component}' declares {direction} port '{port}', \
+                         but the ONNX graph does not expose it"
+                    ))
+                })?;
+                let dtype = parse_dtype(&contract.dtype).ok_or_else(|| {
+                    OrtError::InvalidArgument(format!(
+                        "workflow component '{component}' {direction} '{port}' has unsupported \
+                         dtype '{}'",
+                        contract.dtype
+                    ))
+                })?;
+                if dtype != signature.dtype {
+                    return Err(OrtError::InvalidArgument(format!(
+                        "workflow component '{component}' {direction} '{port}' declares dtype {}, \
+                         but the ONNX graph exposes {}",
+                        contract.dtype,
+                        dtype_name(signature.dtype)
+                    )));
+                }
+                if contract.rank != signature.rank() {
+                    return Err(OrtError::InvalidArgument(format!(
+                        "workflow component '{component}' {direction} '{port}' declares rank {}, \
+                         but the ONNX graph exposes rank {}",
+                        contract.rank,
+                        signature.rank()
+                    )));
+                }
+            }
+            for port in actual.keys() {
+                if !declared.contains_key(port) {
+                    return Err(OrtError::InvalidArgument(format!(
+                        "workflow component '{component}' ONNX graph exposes undeclared \
+                         {direction} port '{port}'"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn inspect_component_signatures(

@@ -355,6 +355,29 @@ impl PipelineModelDirectory {
                 );
             }
         }
+        if let Some(workflow) = &spec.workflow {
+            for (name, component) in &workflow.components {
+                match &component.implementation {
+                    onnx_genai_metadata::ComponentImplementation::Onnx { artifact } => {
+                        model_paths.insert(
+                            name.clone(),
+                            resolve_relative_file(root, artifact, "workflow ONNX component")?,
+                        );
+                    }
+                    onnx_genai_metadata::ComponentImplementation::Adapter {
+                        artifact: Some(artifact),
+                        ..
+                    } => {
+                        let _ = resolve_relative_file(root, artifact, "workflow adapter artifact")?;
+                    }
+                    onnx_genai_metadata::ComponentImplementation::Adapter {
+                        artifact: None,
+                        ..
+                    }
+                    | onnx_genai_metadata::ComponentImplementation::Binding => {}
+                }
+            }
+        }
 
         let shared_tokenizer = root.join("tokenizer.json");
         let tokenizer_paths = PipelineTokenizerPaths {

@@ -30,9 +30,10 @@ use crate::{
 use anyhow::Context;
 use onnx_genai_kv::{PagedKvCache, PrefixCache, SequenceId};
 use onnx_genai_metadata::{
-    AbsentInputKind, ControlFlow, DataflowEdge, ModelIoSpec, PhaseRunOn, PipelineSpec,
-    PipelineStrategy, PipelineStrategyKind, PipelineVisionConfig, Predicate, SchedulerSpec,
-    SequenceInputKind, TensorDimension, Termination,
+    AbsentInputKind, ComponentImplementation, ControlFlow, DataflowEdge, DeviceKind, ModelIoSpec,
+    PhaseRunOn, PipelineSpec, PipelineStrategy, PipelineStrategyKind, PipelineVisionConfig,
+    Predicate, SchedulerSpec, SequenceInputKind, TensorDimension, Termination, WorkflowNode,
+    WorkflowSpec,
 };
 use onnx_genai_ort::{
     DataType, PipelineModelDirectory, PipelineModels, Session, SessionOptions, Tokenizer, Value,
@@ -1973,6 +1974,7 @@ struct CompositePlan {
     stages: Vec<CompositeStage>,
     dataflow: Vec<DataflowEdge>,
     presence_conditions: HashMap<String, String>,
+    workflow: Option<WorkflowSpec>,
 }
 
 /// One stage of a [`CompositePlan`].
@@ -2313,6 +2315,14 @@ struct IterativePlan {
 
 impl PipelinePlan {
     fn from_spec(spec: &PipelineSpec, schedulers: &SchedulerRegistry) -> anyhow::Result<Self> {
+        if let Some(workflow) = &spec.workflow {
+            return Ok(Self::Composite(CompositePlan {
+                stages: Vec::new(),
+                dataflow: Vec::new(),
+                presence_conditions: HashMap::new(),
+                workflow: Some(workflow.clone()),
+            }));
+        }
         if let Some(control) = &spec.control {
             return from_control(spec, control);
         }
@@ -2447,6 +2457,7 @@ impl PipelinePlan {
                 stages,
                 dataflow,
                 presence_conditions,
+                workflow: None,
             }))
         }
         // A composite whose stages contain an autoregressive decoder is treated
@@ -2822,6 +2833,7 @@ impl PipelinePlan {
             stages,
             dataflow: spec.dataflow.clone(),
             presence_conditions: presence_conditions(spec),
+            workflow: None,
         }))
     }
 
@@ -3484,6 +3496,65 @@ mod tests {
         let error = PipelinePlan::from_spec(&spec, &SchedulerRegistry::builtin())
             .expect_err("unsupported predicate loops must fail while constructing the plan");
         assert!(error.to_string().contains("predicate-terminated"));
+    }
+
+    #[test]
+    fn sound_workflow_builds_recursive_executor_plan() -> anyhow::Result<()> {
+        let metadata: onnx_genai_metadata::InferenceMetadata = serde_yaml::from_str(
+            r#"
+pipeline:
+  workflow:
+    manifest:
+      ir_version: "1.0"
+      onnx_opsets: { ai.onnx: 24 }
+      adapter_abis: {}
+      custom_op_versions: {}
+      capabilities: [workflow_ssa, linear_effects, typed_emit]
+    inputs:
+      value:
+        contract: { dtype: int64, rank: 0 }
+        role: { kind: opaque }
+        source: { kind: application, name: value }
+        required: true
+    outputs:
+      result:
+        contract: { dtype: int64, rank: 0 }
+        role: tensor
+        stage: pre_adapter
+    components:
+      binding:
+        implementation: { kind: binding }
+        ports:
+          inputs: { value: { dtype: int64, rank: 0 } }
+          outputs: { value: { dtype: int64, rank: 0 } }
+        effects: []
+    initial_effects: { stream: stream.0 }
+    graph:
+      kind: sequence
+      nodes:
+        - kind: invoke
+          component: binding
+          inputs: { value: value }
+          outputs: { value: bound }
+          effects: {}
+        - kind: emit
+          value: bound
+          output: result
+          mode: replace
+          effect_name: stream
+          effect: { consumes: stream.0, produces: stream.1 }
+"#,
+        )?;
+        let plan = PipelinePlan::from_spec(
+            metadata.pipeline.as_ref().context("pipeline")?,
+            &SchedulerRegistry::builtin(),
+        )?;
+        let PipelinePlan::Composite(plan) = plan else {
+            panic!("workflow must use the recursive composite executor");
+        };
+        assert!(plan.workflow.is_some());
+        assert!(plan.stages.is_empty());
+        Ok(())
     }
 
     #[test]

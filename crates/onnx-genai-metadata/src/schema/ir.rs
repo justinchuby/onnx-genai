@@ -389,6 +389,8 @@ pub enum ComponentImplementation {
     Adapter {
         abi: String,
         version: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artifact: Option<String>,
         #[serde(default)]
         custom_ops: BTreeMap<String, String>,
     },
