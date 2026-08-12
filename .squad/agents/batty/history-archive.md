@@ -120,3 +120,26 @@ unclosed one does." / "A checked-in fixture must be reproducible from its genera
 
 Inbox drop `batty-reasoning-fixture-revision.md` was lost when the worktree was deleted
 before Scribe ran; content reconstructed into `.squad/decisions.md`.
+
+## ARCHIVED 2026-08-12T06:00:00Z (Scribe #762 memory-safety wave compaction)
+
+### 2026-08-11 — CUDA Upstream Audit: Both Candidates Dead
+MatMulNBits int4 block-128 GEMV and QMoE parallel routing already covered by upstream ORT main. No viable portable CUDA gap. No kernel implemented.
+
+### 2026-08-11 — B1: Output dtype fix (PR #762 reviewer rejection)
+`CompiledKernelEntry.output_dtype` changed to `output_dtypes: Vec<DataType>` from ORT graph value info. Added fail-closed Undefined-output-dtype filter.
+
+### 2026-08-11 — B1 follow-up: Multi-output shape inference for LayerNorm family
+Replaced `ShapePreservingNorm` with `LayerNorm { axis, num_outputs, full_shape_outputs }`. Outputs 1+ get reduced shape for LayerNormalization, SimplifiedLayerNormalization, RMSNormalization, SkipLayerNormalization, SkipSimplifiedLayerNormalization.
+
+### 2026-08-11 — ARM64 Debug CI failure diagnosis (#31973)
+Build reached [1452/1458] then died during 6 link steps — OOM-kill signature. No code bug; strong OOM evidence; recommended re-trigger.
+
+### 2026-08-11 — B2 Fix: Device-ID Comparison for D2D Copies
+Added `is_same_device()` to `transfer.rs` using `MemoryDevice_GetDeviceId`. 6 new tests. 161+9 tests pass.
+
+### 2026-08-11 — ARM64 CI diagnosis + B2 fix under lockout
+ARM64 OOM confirmed on re-run. B2 fix commit `fb9d757b3`: fast path pointer equality, null guard fail-closed, `MemoryDevice_GetDeviceId` (verified at bindings.rs:6309). 6 unit tests; 161+9 pass.
+
+### 2026-08-12 — PR #31988 Build Fix (sm_count mismatch)
+`TryMatMulNBits` gained `sm_count` parameter but `fpA_intB_gemm_kernel_test.cc` not updated. Fixed by passing `device_prop_.multiProcessorCount`. Commit `55e438ca6f`.
