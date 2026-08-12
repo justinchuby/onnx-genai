@@ -82,3 +82,18 @@ Removed the `#else` branch in `test_cast_fp16.cpp` that asserted null dispatch p
 ## 2026-08-12 — PR #31988 B1/B2/B3 fixes (admission separated, occupancy model)
 
 Fixed admission bug B1: shared-memory gate scaled with `cols_per_block` (2/4) instead of fixed 8, silently admitting large-K shapes upstream declines → fp16 GEMV on shapes intended for cuBLAS fp32. Admission now always uses `kColsPerThreadBlock`=8. Proved correct by sweeping 20,800 combinations. B2: replaced `kTargetCtasPerSm=12` with `cudaOccupancyMaxActiveBlocksPerMultiprocessor` per instantiation. B3: 6 new tests (2 GPU tests GTEST_SKIP'd). PR parked pending GPU access. Head `dc1e173e4b`.
+
+## 2026-08-12 — PR #31973 evidence-accuracy fix
+
+**Commit:** `fbf322f76b` on `nxrt/mlas-avx2-layernorm`
+
+Fixed evidence-accuracy rejection: replaced unreproducible B1 figures
+with independently measured numbers (scalar Welford 0.9357 vs kernel
+0.03298, 28.4× better at base=1e5/spread=1e-2/N=1024/eps=1e-6). Fixed
+RMSNorm benchmark to pass nullptr MeanOut matching production (speedups
+up ~15-30%). Added dispatch and non-zero-case assertions. Fixed stale
+labels and comments. Tests: 41 passed, 2 disabled, 43/43 total.
+
+## 2026-08-12 — PR #31973 evidence-accuracy fix (B1 + B2)
+
+Fixed both evidence-accuracy blockers. B1: replaced unreproducible accuracy headline (compared against deleted implementation) with figures printed by committed test — scalar Welford fp32 = 9.3573e-01 vs kernel = 3.2976e-02 (28.4× better), sweep 180 cases / 0 failures / worst 2.2318e-02. B2: fixed RMSNorm benchmark to pass `nullptr` MeanOut matching production (`layer_norm_impl.cc:507`); speedups rose ~15-30% at larger sizes. Added dispatch assertion on first warmup, non-zero case-count assertion, fixed stale label (`avx2_welford` → `avx2_centered`), corrected SCENARIO 3 comment, documented division disclosure. Head: `fbf322f76b`. Tests: 41 passed, 2 disabled, 43/43 total.

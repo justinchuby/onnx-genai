@@ -33,3 +33,7 @@ Validation: 222 passed, 0 failed; clippy clean; fmt clean; Miri clean (173 lib t
 Three test-integrity gaps closed. 283 passed / 0 failed; Miri clean. Gaff confirmed scratch_alloc_bytes and routing genuinely closed. PR #762 marked ready.
 
 *Full pre-2026-08-12 history in `history-archive.md`.*
+
+## 2026-08-12 — PR #32001 lint fix
+
+Fixed 3 ruff errors in `test_build_args.py` (PLC0415 ×2, SIM105). Hoisted `io` and `redirect_stderr` imports to top-level; replaced `try/except SystemExit: pass` with `contextlib.suppress(SystemExit)`. All 17 tests pass, ruff clean. Pushed `7a739d9a67`.

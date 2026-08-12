@@ -62,3 +62,11 @@ _Pre-2026-08-11 detailed dated entries archived to `history-archive.md`._
 ## 2026-08-12 — PR #762 delta review (focused, no blockers)
 
 Focused delta review of 5 commits. Verdict: ready to leave draft. Two substantive (non-blocking): `validate_write_dtype` dead in production; `find_ort_lib_dir` had one drifted copy in `layernorm_dynamic_axis.rs`. Both addressed by Freysa. Gate coverage, scratch_alloc_bytes, CUDA i32::MAX, vtable test, compile-time routing: all genuinely closed.
+
+## 2026-08-12 — PR #31973 evidence-accuracy review (focused delta)
+
+Reviewed HEAD `fbf322f76b` — the evidence-accuracy fix commit. Built from clean, ran all three validation commands. Accuracy figures (B1 regression, sweep) reproduced exactly. Benchmark `nullptr` MeanOut fix confirmed against production code. One nit: RMSNorm ~3.3x at NormSize 256 is optimistic (measured ~2.84x). NormSize 15 RMSNorm "~0.83x regression" measured as 1.00x — body is conservative, adequate. No persona leaks. 41/2/43 test counts confirmed. Verdict: ready to leave draft, no blockers.
+
+## 2026-08-12 — PR #31973 evidence-accuracy review (focused delta)
+
+Focused evidence review of Mariette's B1+B2 fixes (HEAD `fbf322f76b`). Reproduced all four accuracy figures to 4 significant figures. Confirmed `nullptr` MeanOut matches production. Dispatch assertion fires. No stale claims found. Test counts 41/2/43 confirmed on fresh build. One nit: RMSNorm ~3.3x at NormSize 256 is ~14% above measured ~2.84x; body says ~0.83x at NormSize 15, measured 1.00x (body is conservative). Coordinator widened variance disclosure to ~15%. Verdict: ready to leave draft, no blockers.

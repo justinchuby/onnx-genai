@@ -42,3 +42,11 @@ Wave coverage through 2026-07-28: CLI UX research, REPL redesign, Phase 1 TTY/pl
 All five red CI jobs trace to pre-existing `onnx-genai-server` failure on `main`; branch does not touch that crate. 283 passed / 0 failed. Gaff confirmed gate coverage genuinely closed. Freysa completed `find_ort_lib_dir` consolidation. PR #762 marked ready for review.
 
 *Full pre-2026-08-11 history in `history-archive.md`.*
+
+## 2026-08-12 — PR #32001 (microsoft/onnxruntime): Cross-target Accelerate blocker
+
+- Added `parser.error()` rejections for `--android`, `--build_wasm`, `--rv64` alongside `--use_apple_accelerate`.
+- Refactored all Apple Accelerate rejection tests to assert diagnostic message content (not bare SystemExit).
+- 4 new tests (android, build_wasm, build_wasm_static_lib, rv64). Test count: 13→17.
+- Documented Catalyst/macabi CMake limitation: `PLATFORM_NAME` comes from external toolchain, no reliable direct-CMake detection.
+- Commit: `184f76a00e`. PR left in draft for Opus review.

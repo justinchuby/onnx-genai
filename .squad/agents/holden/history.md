@@ -68,3 +68,25 @@ Focused delta re-review of three new BF16 tests and comment hygiene. All three t
 - Error messages now name the actual cause (non-macOS wording distinguishes wrong OS from wrong arch).
 - 13/13 tests pass; ruff clean; no persona leaks; body matches code.
 - PR #32001 confirmed **ready for review**.
+
+### 2026-08-12 — Final gate reviews: PR #32001 (184f76a00e) and PR #31993 (a0a9d98)
+
+**PR #32001 (Apple Accelerate infrastructure):**
+- Rejection set now complete: 17 tests covering non-macOS, iOS, tvOS, visionOS, Catalyst, Android, build_wasm, build_wasm_static_lib, rv64, non-arm64 arch. `--use_xnnpack`/`--use_qnn`/`--build_apple_framework` correctly NOT rejected (they don't change target away from macOS arm64).
+- Message assertions verified non-vacuous: each checks exit code 2 + distinctive substring in stderr. No shared-prefix false matches.
+- Catalyst decision honest: CMake comment accurately states PLATFORM_NAME unavailable in plain cmake; CLI rejects `--macos Catalyst`; gap is documented.
+- Single copy of rules confirmed: validation only in build_args.py:1103-1123; build.py:881-883 appends CMake define only.
+- All invariants unchanged: default OFF, PRIVATE define inside guarded block, arm64 detection with CMAKE_OSX_ARCHITECTURES fallback, universal2 absent.
+- Body matches code: parser.error() / exit status 2, no stale BuildError reference.
+- One substantive non-blocker: ruff check reports 3 lint diagnostics in test_build_args.py (PLC0415, SIM105).
+- **Verdict: READY to leave draft.**
+
+**PR #31993 (NEON f16↔f32 cast kernel):**
+- CI chain verified: mac.yml cpu job → machine=target=arm64 → build.py --test → onnxruntime_mlas_test runs natively.
+- NaN assertions verified non-vacuous: catch NaN→Inf, NaN→finite, sign flips. Payload deliberately unasserted (hardware vs scalar divergence). Both F16→F32 and F32→F16 directions covered.
+- QEMU correctly described as emulation. FEAT_FP16 correction accurate (vcvt is baseline ARMv8-A).
+- Gate: macOS-arm64-only via TARGET_OS_OSX; MLAS_CAST_F16_NEON_SUPPORTED separate from MLAS_F16VEC_INTRINSICS_SUPPORTED; no universal2; no x86_64.
+- Body disclosure honest: states tests run but per-test output unverifiable via gh.
+- **Verdict: READY to leave draft.**
+
+**Output:** `.squad/decisions/inbox/holden-final-two.md`

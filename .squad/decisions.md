@@ -385,3 +385,54 @@ Challenger (delta review) confirmed no blockers: guard correctly scoped, benchma
 - `deckard-31973-wording.md` — "x86" wording fix
 
 Last consolidated: 2026-08-12T11:30:00Z (Scribe #31973/#31974 ready wave; 3 inbox drops merged)
+
+## 2026-08-12 — PR #31973 evidence-accuracy wave (Mariette, Gaff, Coordinator)
+
+**By:** Mariette (kernel/numerics), Gaff (focused review), Coordinator (reproduction + correction)
+**PR:** microsoft/onnxruntime#31973 — MLAS AVX2 LayerNorm kernel
+**Head:** `fbf322f76b`
+
+### What happened
+
+Two evidence blockers were found and fixed by Mariette.
+
+**B1 — Accuracy headline was not reproducible.** The original body compared the production scalar path against a deleted implementation; no reader could re-run the comparison. Replaced with figures printed by the committed test:
+
+| Path | Error vs fp64 oracle |
+|------|---------------------|
+| Scalar Welford fp32 (baseline) | 9.3573e-01 |
+| AVX2 centered two-pass (kernel) | 3.2976e-02 |
+
+Kernel is **28.4× more accurate** at base=1e5, spread=1e-2, N=1024, eps=1e-6. Sweep: 180 cases / 0 failures / worst 2.2318e-02.
+
+**B2 — RMSNorm benchmark exercised dead work.** Benchmark passed non-null `MeanOut` for simplified mode; production always passes `nullptr`. Fixed. RMSNorm speedups rose ~15-30% at larger sizes.
+
+**Additional fixes:** dispatch assertion on first warmup iteration; non-zero case-count assertion on fp64 sweep; stale label (`avx2_welford` → `avx2_centered`); SCENARIO 3 comment corrected; scalar-vs-kernel division disclosure added.
+
+**Gaff review:** Reproduced all accuracy figures to 4 significant figures. Confirmed `nullptr` MeanOut matches production at `layer_norm_impl.cc:507`. One nit: RMSNorm ~3.3x at NormSize 256 is optimistic (Gaff measured ~2.84x, ~14% lower). NormSize 15 RMSNorm body says ~0.83x; Gaff measured 1.00x — body is conservative. No blockers.
+
+**Coordinator correction:** Coordinator had published benchmark figures (6.8x LayerNorm 128, prior RMSNorm values) before reproducing them. Shared-runner variance was ~15%, exceeding published precision. PR body was corrected to lead with reproducible accuracy figures, widen variance disclosure to ~15%, and round table to 1-2 significant figures.
+
+### Durable lessons
+
+- **Never publish a measurement a reader cannot re-run.** Evidence must come from committed code, printed by a test, with the exact command given. Comparing against a deleted implementation is not evidence.
+- **Benchmark the arguments production actually passes.** Check argument shapes against the real call site before trusting a ratio. Non-null `MeanOut` in simplified mode charged dead work and hid the fast path.
+- **Do not publish more precision than a shared runner supports.** 6.3x vs 6.8x (LayerNorm 128) and 2.84x vs 3.30x (RMSNorm 256) represent ~15% spread on the same host. Round, state the spread, and point at the reproduce command as source of truth.
+- **Assert that a benchmark dispatched what it claims to measure**, and that a parameter sweep generated a non-zero number of cases. Without these, a benchmark can silently time the fallback and a sweep can silently prove nothing.
+- **The coordinator published these errors.** They were caught by review, not self-check. When writing a PR body from agent-reported figures, reproduce the figures first — the same standard applied to agents applies to the coordinator.
+
+### Merged inbox drops
+
+- `mariette-31973-evidence.md` — B1/B2 fix decisions
+- `gaff-31973-evidence.md` — focused evidence review verdict
+
+Last consolidated: 2026-08-12T13:30:00Z (Scribe #31973 evidence-accuracy wave; 2 inbox drops merged)
+
+## Merged inbox drops (2026-08-12 prior waves, merged this session)
+
+- `coco-32001-lint.md` — ruff lint fixes for test_build_args.py (PR #32001)
+- `pris-31993-ctest.md` — macOS arm64 CI already runs tests; no add_test needed (PR #31993)
+- `rachael-32001-crosstarget.md` — cross-target rejection for --use_apple_accelerate (PR #32001)
+- `holden-final-two.md` — final review of PR #32001 and PR #31993; both ready to leave draft
+
+Last consolidated: 2026-08-12T13:30:00Z (4 additional prior-wave inbox drops merged)

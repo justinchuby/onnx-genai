@@ -42,3 +42,13 @@ Earlier detailed history archived in `history-archive.md`. Pre-compaction summar
 - `conformance_shape_f32` soft-check acceptable (ORT may constant-fold Shape before EP assignment).
 - `conformance_mixed_partition` partition claim aspirational — ORT 1.27 may not partition under `disable_fallback: false`.
 - 5/6 historical bugs regression-covered; gap: no test for forgeable name-based sentinels (Coco's fix is out-of-band, so no in-band attack surface to test).
+
+## 2026-08-12 — PR #31993 readiness blocker (macOS arm64 CI validation)
+
+**Task:** Resolve validation-honesty blocker. Determine whether macOS arm64 CI actually runs tests.
+
+**Finding:** The lane DOES run `onnxruntime_mlas_test` on native arm64 (macos-15 runners). `build.py --test` invokes the binary directly without ctest. No `add_test` registration needed.
+
+**Action:** Fixed stale FEAT_FP16 comment in `mlas.h`. Pushed commit `a0a9d98`. Proposed PR body rewrite.
+
+**Head SHA:** `a0a9d98`
