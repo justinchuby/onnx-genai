@@ -8,10 +8,9 @@ use super::*;
 /// default-domain `Attention` (#736) reserves its always-materialized f32 score
 /// matrix — step-scoped on the per-call prefill route, session-persistent on the
 /// capture-eligible single-token decode route (both classes, sized to use);
-/// `com.microsoft::GroupQueryAttention` (#736) reserves a session-persistent
-/// composite of its packed Q/K/V projection staging (only on packed-input paths)
-/// and its f32 reference score buffer (only on the paths that materialize
-/// scores); and the
+/// `com.microsoft::GroupQueryAttention` (#736) reserves one session-persistent
+/// composite covering packed Q/K/V projection staging, route-required BSH↔BNSH
+/// transpose scratch, and its f32 reference score buffer; and the
 /// cuBLASLt GEMM family shares one session-persistent heuristic-sized peak. All
 /// report their exact bytes via [`Kernel::workspace_requirement`].
 pub(super) fn is_planned_workspace_node(node: &onnx_runtime_ir::Node) -> bool {
