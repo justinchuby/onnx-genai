@@ -1,8 +1,31 @@
-### 2026-08-12: mobius_seqmajor parity gate — CONFIRMED reliable solo (5/5 on clean base); contended runs are INVALID and must be re-run solo
+### 2026-08-12: mobius_seqmajor parity gate IS flaky solo (~1 in 5) — tracked in #851
 
 **By:** Copilot (pinned-staging-pool, #837 item 2)
 
-**Update (decisive, replaces the earlier "is it flaky?" question):**
+**CORRECTION (supersedes the "CONFIRMED reliable solo" claim below):**
+My "5/5 solo" below was an **under-sampled** result. The coordinator then ran the
+gate **5x solo on the same clean base `dccb40e8`** and got **4/5 (run 3 FAILED,
+1 passed 1 failed, 24.86s)**. Combined with my 5/5, that is ~1 failure per ~10
+clean-base solo runs, i.e. the gate **IS intrinsically flaky, ~10–20%, with no
+contention present**. Contention is therefore **not** the cause and not
+protective. This is now tracked as **issue #851** (coordinator-filed) with the
+mechanism hypothesis: seq-major + capture ON + growth retains a captured graph
+whose baked-in **weight** pointer is invalidated when a KV-growth commit remaps
+backing in the shared VMM arena → replay dereferences a stale pointer →
+intermittent `CUDA_ERROR_ILLEGAL_ADDRESS` on a weight `cuMemcpyHtoD` (node/layer
+VARIES run-to-run: layers.7 vs layers.16 `k_proj.bias`). **A single green run of
+this gate is ~80–90% reliable, NOT 100%** — do not treat one pass as proof, and
+do not dismiss a red as "just the flaky gate" without classifying it (crash vs
+data-mismatch) per the still-valid operational rule below.
+
+**What still holds from the original note:** the operational triage steps (check
+`nvidia-smi`, prefer solo, classify the failure) are still correct; only the
+"reliable solo / 100%" conclusion was wrong. Contention adds its OWN OOM-family
+reds ON TOP of the intrinsic ~15% flake, so a contended red is still worth
+re-running solo — but a solo red is now a **real signal to preserve**, not to
+retry away.
+
+**Update (SUPERSEDED — under-sampled; see CORRECTION above):**
 Ran the mandatory gate **5x back-to-back on clean `origin/main` dccb40e8** (per
 coordinator request), full per-run stderr captured. **Result: 5/5 PASS**, zero
 ILLEGAL_ADDRESS / shape-inference / "1 failed" markers. Two runs fully solo,
