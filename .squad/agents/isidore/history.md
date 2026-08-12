@@ -146,3 +146,17 @@ grep for duplicate ABI symbols → none found
 ## 2026-08-12 — PR #32003 complete aliasing fix (4 vec_a sites)
 
 Under lockout revision (Deckard locked out as author). Fixed 4 remaining `reinterpret_cast<half2*>(&vec_a.{x,y,z,w})` dereferences in `__CUDA_ARCH__ < 530` fallback — identical UB to `vec_permuted` sites Deckard fixed. Replaced with `memcpy` into named `half2` locals. Left `reinterpret_cast<half2*>(sums)` alone: canonical CUDA vectorised-access idiom, not the flagged pattern. 0 member-punning sites remain. Head `23dcfddaaf`.
+
+## 2026-08-12 — PR #762 CUDA version bounds + nxrt struct_size hardening
+
+Two items closed:
+
+1. **CUDA registry end_version** changed from `99` to `i32::MAX`. Kernels are version-agnostic (IR resolves opset schemas before kernel dispatch). Per-family: standard ONNX ops have schema changes absorbed by IR; custom/contrib ops have no upstream evolution.
+
+2. **struct_size hardening:**
+   - `memoffset_of_create_ep()` replaced with `std::mem::offset_of!(NxrtEpFactoryVtable, create_ep)`.
+   - New release guard in `NxrtExecutionProvider::drop` — validates struct_size covers `release`+`ctx` before calling. Undersized → deliberate leak (not UB).
+   - Added `undersized_factory_vtable_skips_release` test: proves guard prevents release; proves unguarded path would call it.
+
+**Tests:** 283 passed, 0 failed across 5 EP crates.  
+**Commit:** `7a2268021` on `squad/ep-plugin-parity-cuda`. PR #762 stays draft.
