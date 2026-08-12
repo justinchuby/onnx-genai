@@ -37,3 +37,11 @@ Three test-integrity gaps closed. 283 passed / 0 failed; Miri clean. Gaff confir
 ## 2026-08-12 — PR #32001 lint fix
 
 Fixed 3 ruff errors in `test_build_args.py` (PLC0415 ×2, SIM105). Hoisted `io` and `redirect_stderr` imports to top-level; replaced `try/except SystemExit: pass` with `contextlib.suppress(SystemExit)`. All 17 tests pass, ruff clean. Pushed `7a739d9a67`.
+
+## 2026-08-12 — PR #31974 float LayerNorm regression fix
+
+Commit `59b84aca7a` flipped `is_packed` default from `false` to `true` in `PrePack`. For float inputs, `ConvertMLFloat16ToFloatIfNeeded` is a no-op so `is_packed` stayed `true`, causing "Missing Input: Scale" in 9 float LayerNorm tests. One-line fix: restored `is_packed = false`. BF16 filter: 21/21 pass. Full LayerNorm suite: 107/107 pass. SkipLayerNorm: 26/26 pass. Pushed `e036e53d31`.
+
+## 2026-08-12 — PR #31974 regression root-cause and fix
+
+Root-caused the regression introduced at `59b84aca7a`: `is_packed` default was flipped to `true` in `LayerNormImpl::PrePack`, but `ConvertMLFloat16ToFloatIfNeeded` only sets it inside narrow-float branches. Float inputs inherited a spurious `true`, skipped reading Scale/Bias, and failed with "Missing Input: Scale" across 9 `LayerNormTest` cases. One-line fix restoring `is_packed = false` before the conditional. Head `e036e53d31`. Coordinator confirmed from clean rebuild: 107 LayerNorm tests, 26 SkipLayerNorm tests, all green.

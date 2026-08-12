@@ -436,3 +436,26 @@ Last consolidated: 2026-08-12T13:30:00Z (Scribe #31973 evidence-accuracy wave; 2
 - `holden-final-two.md` — final review of PR #32001 and PR #31993; both ready to leave draft
 
 Last consolidated: 2026-08-12T13:30:00Z (4 additional prior-wave inbox drops merged)
+
+## 2026-08-12 — PR #31974 regression wave (Leon, Coco, Coordinator)
+
+**By:** Leon (cleanup commit `59b84aca7a`), Coco (fix `e036e53d31`), Coordinator (bisect + verification)
+**PR:** microsoft/onnxruntime#31974 — MLAS BF16 LayerNorm
+
+### What happened
+
+Leon's final-cleanup commit added PrePack counter assertions and an MLFloat16 stat test. It also flipped `is_packed`'s default from `false` to `true` in `LayerNormImpl::PrePack`. `ConvertMLFloat16ToFloatIfNeeded` only sets the flag inside narrow-float branches — for float inputs it is a no-op. Nine float `LayerNormTest` cases broke with "Missing Input: Scale". Coordinator bisected; Coco root-caused and fixed (one-line restore). Both PRs (#31973, #31974) now show 0 CI failures.
+
+### Durable lessons — #31974 regression wave
+
+- **A filtered test run hides regressions outside the filter.** `*LayerNormBFloat16*` stayed green at 21/21 while nine float `LayerNormTest` cases were broken. Always run the **full** relevant suite before reporting, not just the filter matching the feature under change.
+- **A flag that is only set on some code paths must default to the safe value.** `is_packed` was flipped to default `true`, but `ConvertMLFloat16ToFloatIfNeeded` only sets it inside narrow-float branches — so the float path inherited a `true` it never earned and skipped reading its inputs. Default to the conservative value and set it explicitly where the work actually happens.
+- **Verifying an assertion is non-vacuous can also surface unrelated breakage.** Forcing `is_packed = false` to test the counter assertion is what prompted the full-suite run that exposed the regression.
+- **Two coordinator-published numbers were wrong:** the stat round-trip cost was quoted as ~0.4% generally when that is the bf16 figure (fp16 is ~0.049%), and "780x the tolerance" ignored the checker's relative term — the honest margins are ~36x (bf16) and ~4.4x (fp16). Derive published figures from the actual checker semantics, not the bare tolerance constant.
+
+### Merged inbox drops
+
+- `leon-31974-prepack.md` — PrePack counter assertion and MLFloat16 stats coverage decisions
+- `coco-31974-regression.md` — float LayerNorm regression root-cause and fix
+
+Last consolidated: 2026-08-12T14:00:00Z (Scribe #31974 regression wave; 2 inbox drops merged)
