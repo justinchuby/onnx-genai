@@ -64,6 +64,14 @@ pub fn derived_capabilities(metadata: &InferenceMetadata) -> BTreeSet<String> {
     {
         capabilities.insert("session_state_lease".to_string());
     }
+    if workflow.state.values().any(|state| {
+        matches!(
+            state.recurrence,
+            crate::schema::ShapeRecurrence::Bounded { .. }
+        )
+    }) {
+        capabilities.insert("bounded_state_recurrence".to_string());
+    }
     collect_workflow_capabilities(&workflow.graph, &mut capabilities);
     capabilities
 }
@@ -102,10 +110,15 @@ fn collect_workflow_capabilities(node: &WorkflowNode, capabilities: &mut BTreeSe
                 collect_workflow_capabilities(default, capabilities);
             }
         }
-        WorkflowNode::Emit { mode, .. } => {
+        WorkflowNode::Emit {
+            mode, valid_length, ..
+        } => {
             capabilities.insert("typed_emit".to_string());
             if matches!(mode, crate::schema::WorkflowEmitMode::Event) {
                 capabilities.insert("streaming_emit".to_string());
+            }
+            if valid_length.is_some() {
+                capabilities.insert("emit_valid_length".to_string());
             }
         }
         WorkflowNode::Transfer { .. } => {
@@ -1085,11 +1098,16 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
             }
         }
 
-        if let crate::schema::ShapeRecurrence::Growing { axis, .. } = &state.recurrence
-            && *axis >= state.contract.rank
+        let dynamic_axis = match &state.recurrence {
+            crate::schema::ShapeRecurrence::Growing { axis, .. }
+            | crate::schema::ShapeRecurrence::Bounded { axis, .. } => Some(*axis),
+            crate::schema::ShapeRecurrence::Invariant => None,
+        };
+        if let Some(axis) = dynamic_axis
+            && axis >= state.contract.rank
         {
             errors.push(format!(
-                "workflow state '{name}' grows on axis {axis}, outside rank {}",
+                "workflow state '{name}' varies on axis {axis}, outside rank {}",
                 state.contract.rank
             ));
         }
@@ -1124,6 +1142,14 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
         .any(|state| state.scope == crate::schema::WorkflowStateScope::Session)
     {
         used.insert("session_state_lease".to_string());
+    }
+    if workflow.state.values().any(|state| {
+        matches!(
+            state.recurrence,
+            crate::schema::ShapeRecurrence::Bounded { .. }
+        )
+    }) {
+        used.insert("bounded_state_recurrence".to_string());
     }
     collect_workflow_capabilities(&workflow.graph, &mut used);
     for capability in used.difference(&workflow.manifest.capabilities) {
@@ -1402,6 +1428,23 @@ fn validate_workflow_node(
                     ));
                     continue;
                 };
+                let recurrence_values = match &state.recurrence {
+                    crate::schema::ShapeRecurrence::Invariant => Vec::new(),
+                    crate::schema::ShapeRecurrence::Growing { increment, max, .. } => {
+                        vec![("increment", increment), ("max", max)]
+                    }
+                    crate::schema::ShapeRecurrence::Bounded { max, .. } => {
+                        vec![("max", max)]
+                    }
+                };
+                for (name, value) in recurrence_values {
+                    let recurrence_path =
+                        format!("{path}.carried.{}.recurrence.{name}", carry.cell);
+                    require_workflow_value(value, values, &recurrence_path, errors);
+                    if let Some(contract) = value_contracts.get(value) {
+                        validate_integer_scalar_contract(contract, &recurrence_path, errors);
+                    }
+                }
                 require_workflow_value(
                     &state.initializer,
                     values,
@@ -1762,24 +1805,49 @@ fn validate_workflow_node(
         }
         WorkflowNode::Emit {
             value,
+            valid_length,
             output,
             effect_name,
             effect,
             ..
         } => {
             require_workflow_value(value, values, &format!("{path}.value"), errors);
+            if let Some(valid_length) = valid_length {
+                require_workflow_value(
+                    valid_length,
+                    values,
+                    &format!("{path}.valid_length"),
+                    errors,
+                );
+                if let Some(contract) = value_contracts.get(valid_length) {
+                    validate_integer_scalar_contract(
+                        contract,
+                        &format!("{path}.valid_length"),
+                        errors,
+                    );
+                }
+            }
             if !workflow.outputs.contains_key(output) {
                 errors.push(format!("{path} emits undeclared output '{output}'"));
             } else if let (Some(value_contract), Some(output_contract)) = (
                 value_contracts.get(value),
                 workflow.outputs.get(output).map(|output| &output.contract),
             ) {
-                require_compatible_contracts(
-                    value_contract,
-                    output_contract,
-                    &format!("{path}.output"),
-                    errors,
-                );
+                if valid_length.is_some() {
+                    require_emit_prefix_contracts(
+                        value_contract,
+                        output_contract,
+                        &format!("{path}.output"),
+                        errors,
+                    );
+                } else {
+                    require_compatible_contracts(
+                        value_contract,
+                        output_contract,
+                        &format!("{path}.output"),
+                        errors,
+                    );
+                }
             }
             apply_effect_transition(
                 effect_name,
@@ -1796,6 +1864,72 @@ fn validate_workflow_node(
             if let Some(contract) = value_contracts.get(input).cloned() {
                 value_contracts.insert(output.clone(), contract);
             }
+        }
+    }
+}
+
+fn validate_integer_scalar_contract(
+    contract: &crate::schema::TensorContract,
+    path: &str,
+    errors: &mut Vec<String>,
+) {
+    if !matches!(
+        contract.dtype.as_str(),
+        "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16" | "uint32" | "uint64"
+    ) {
+        errors.push(format!("{path} must have an integer dtype"));
+    }
+    match contract.rank {
+        0 => {
+            if contract
+                .shape
+                .as_ref()
+                .is_some_and(|shape| !shape.is_empty())
+            {
+                errors.push(format!("{path} rank-zero contract must have shape []"));
+            }
+        }
+        1 => {}
+        _ => errors.push(format!("{path} must be a scalar or rank-one tensor")),
+    }
+}
+
+fn require_emit_prefix_contracts(
+    actual: &crate::schema::TensorContract,
+    declared: &crate::schema::TensorContract,
+    path: &str,
+    errors: &mut Vec<String>,
+) {
+    if actual.rank == 0 || declared.rank == 0 {
+        errors.push(format!(
+            "{path} valid_length requires emitted value and output contracts with rank >= 1"
+        ));
+        return;
+    }
+    if actual.dtype != declared.dtype || actual.rank != declared.rank {
+        errors.push(format!(
+            "{path} has incompatible dtype or rank for prefix emission"
+        ));
+        return;
+    }
+    let (Some(actual_shape), Some(declared_shape)) = (&actual.shape, &declared.shape) else {
+        return;
+    };
+    let prefix_axis = actual.rank.saturating_sub(1);
+    for (axis, (actual, declared)) in actual_shape.iter().zip(declared_shape).enumerate() {
+        if axis != prefix_axis
+            && matches!(
+                (actual, declared),
+                (
+                    crate::schema::TensorDimension::Fixed(_),
+                    crate::schema::TensorDimension::Fixed(_)
+                )
+            )
+            && actual != declared
+        {
+            errors.push(format!(
+                "{path} has incompatible fixed dimension at axis {axis}"
+            ));
         }
     }
 }
@@ -1893,12 +2027,13 @@ fn require_state_contract(
     let (Some(actual_shape), Some(declared_shape)) = (&actual.shape, &declared.shape) else {
         return;
     };
-    let growing_axis = match recurrence {
+    let dynamic_axis = match recurrence {
         crate::schema::ShapeRecurrence::Growing { axis, .. } if next => Some(*axis),
+        crate::schema::ShapeRecurrence::Bounded { axis, .. } => Some(*axis),
         _ => None,
     };
     for (axis, (actual, declared)) in actual_shape.iter().zip(declared_shape).enumerate() {
-        if Some(axis) != growing_axis
+        if Some(axis) != dynamic_axis
             && matches!(
                 (actual, declared),
                 (

@@ -2865,6 +2865,30 @@
             "max"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The selected axis may grow or shrink between iterations, but never exceed `max`.",
+          "properties": {
+            "axis": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "const": "bounded",
+              "type": "string"
+            },
+            "max": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "axis",
+            "max"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -4245,6 +4269,13 @@
             },
             "output": {
               "type": "string"
+            },
+            "valid_length": {
+              "description": "Optional scalar or rank-one integer SSA value limiting the emitted prefix\non the value's final axis. It must contain exactly one element at runtime.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "value": {
               "type": "string"

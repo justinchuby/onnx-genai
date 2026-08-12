@@ -63,7 +63,8 @@ impl PipelineEngine {
             .state
             .values()
             .filter_map(|state| match &state.recurrence {
-                onnx_genai_metadata::ShapeRecurrence::Growing { axis, .. } => state
+                onnx_genai_metadata::ShapeRecurrence::Growing { axis, .. }
+                | onnx_genai_metadata::ShapeRecurrence::Bounded { axis, .. } => state
                     .contract
                     .shape
                     .as_ref()
@@ -97,6 +98,17 @@ impl PipelineEngine {
             &mut emit_counts,
             &mut final_state_refs,
         )?;
+        for output in workflow_emitted_outputs(&workflow.graph) {
+            let Some(value) = values.get(&output) else {
+                continue;
+            };
+            let contract = &workflow
+                .outputs
+                .get(&output)
+                .with_context(|| format!("workflow emitted undeclared output '{output}'"))?
+                .contract;
+            validate_workflow_value(&output, value, contract, &mut symbols, &dynamic_symbols)?;
+        }
         if let Some(session_id) = session_id {
             let mut updates = Vec::new();
             for (cell, state) in &workflow.state {
@@ -424,6 +436,7 @@ impl PipelineEngine {
             }
             WorkflowNode::Emit {
                 value,
+                valid_length,
                 output,
                 mode,
                 ..
@@ -434,14 +447,28 @@ impl PipelineEngine {
                 let output_contract = workflow.outputs.get(output).with_context(|| {
                     format!("workflow emit references undeclared output '{output}'")
                 })?;
+                let emitted = if let Some(valid_length) = valid_length {
+                    let length =
+                        workflow_scalar_usize(values, valid_length).with_context(|| {
+                            format!("workflow emit valid_length '{valid_length}' is invalid")
+                        })?;
+                    slice_workflow_prefix(tensor, length)?
+                } else {
+                    clone_value(tensor)?
+                };
+                let validation_contract =
+                    if valid_length.is_some() || matches!(mode, WorkflowEmitMode::Append) {
+                        emit_chunk_contract(&output_contract.contract, &emitted)?
+                    } else {
+                        output_contract.contract.clone()
+                    };
                 validate_workflow_value(
                     value,
-                    tensor,
-                    &output_contract.contract,
+                    &emitted,
+                    &validation_contract,
                     symbols,
                     dynamic_symbols,
                 )?;
-                let emitted = clone_value(tensor)?;
                 match mode {
                     WorkflowEmitMode::Replace => {
                         values.insert(output.clone(), emitted);
@@ -1030,6 +1057,30 @@ fn validate_state_recurrence(
                 );
             }
         }
+        onnx_genai_metadata::ShapeRecurrence::Bounded { axis, max } => {
+            for (index, (before, after)) in current.shape().iter().zip(next.shape()).enumerate() {
+                if index != *axis && before != after {
+                    anyhow::bail!(
+                        "workflow state '{cell}' changed non-bounded axis {index} from {before} \
+                         to {after}"
+                    );
+                }
+            }
+            let limit = i64::try_from(workflow_scalar_usize(values, max)?)
+                .context("workflow state bounded-axis limit exceeds i64")?;
+            let before = *current.shape().get(*axis).with_context(|| {
+                format!("workflow state '{cell}' bounded axis is outside its tensor rank")
+            })?;
+            let after = *next.shape().get(*axis).with_context(|| {
+                format!("workflow state '{cell}' bounded axis is outside its tensor rank")
+            })?;
+            if before > limit || after > limit {
+                anyhow::bail!(
+                    "workflow state '{cell}' bounded axis {axis} changed from {before} to {after}, \
+                     above maximum {limit}"
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -1113,18 +1164,90 @@ fn append_workflow_value(previous: &Value, next: &Value) -> anyhow::Result<Value
     Value::from_raw_bytes(data, &shape, dtype).map_err(Into::into)
 }
 
+fn emit_chunk_contract(
+    output: &onnx_genai_metadata::TensorContract,
+    emitted: &Value,
+) -> anyhow::Result<onnx_genai_metadata::TensorContract> {
+    let mut contract = output.clone();
+    if let Some(shape) = &mut contract.shape {
+        let dimension = shape
+            .last_mut()
+            .context("workflow prefix/append emit requires output rank >= 1")?;
+        *dimension = TensorDimension::Fixed(
+            *emitted
+                .shape()
+                .last()
+                .context("workflow prefix/append emit requires value rank >= 1")?,
+        );
+    }
+    Ok(contract)
+}
+
+fn slice_workflow_prefix(value: &Value, valid_length: usize) -> anyhow::Result<Value> {
+    let mut shape = value.shape().to_vec();
+    let rank = shape.len();
+    let width = shape
+        .last()
+        .context("workflow emit valid_length requires a value with rank >= 1")?;
+    let available = usize::try_from(*width).context("workflow emit has a negative final axis")?;
+    if valid_length > available {
+        anyhow::bail!(
+            "workflow emit valid_length {valid_length} exceeds final-axis extent {available}"
+        );
+    }
+    let outer = shape[..rank - 1]
+        .iter()
+        .map(|dimension| usize::try_from(*dimension))
+        .collect::<Result<Vec<_>, _>>()
+        .context("workflow emit has a negative dimension")?
+        .into_iter()
+        .product::<usize>();
+    let dtype = value.dtype();
+    let element_size = dtype.size_of();
+    let source = value.to_raw_bytes()?;
+    let mut data = Vec::with_capacity(outer * valid_length * element_size);
+    for row in 0..outer {
+        let start = row * available * element_size;
+        data.extend_from_slice(&source[start..start + valid_length * element_size]);
+    }
+    shape[rank - 1] =
+        i64::try_from(valid_length).context("workflow emit valid_length exceeds i64")?;
+    Value::from_raw_bytes(data, &shape, dtype).map_err(Into::into)
+}
+
 fn workflow_scalar_usize(values: &PipelineTensors, name: &str) -> anyhow::Result<usize> {
     let value = values
         .get(name)
         .with_context(|| format!("workflow scalar value '{name}' is unavailable"))?;
-    let data = value
-        .to_vec_i64()
-        .with_context(|| format!("workflow scalar '{name}' must be an integer tensor"))?;
-    let [scalar] = data.as_slice() else {
+    if value.shape().iter().try_fold(1usize, |size, dimension| {
+        usize::try_from(*dimension)
+            .ok()
+            .and_then(|dimension| size.checked_mul(dimension))
+    }) != Some(1)
+    {
         anyhow::bail!("workflow scalar '{name}' must contain exactly one value");
+    }
+    let data = value.to_raw_bytes()?;
+    let signed = |value: i128| {
+        usize::try_from(value)
+            .with_context(|| format!("workflow scalar '{name}' must be non-negative"))
     };
-    usize::try_from(*scalar)
-        .with_context(|| format!("workflow scalar '{name}' must be non-negative"))
+    let unsigned = |value: u128| {
+        usize::try_from(value).with_context(|| format!("workflow scalar '{name}' exceeds usize"))
+    };
+    match value.dtype() {
+        DataType::Int8 => signed(i8::from_ne_bytes([data[0]]) as i128),
+        DataType::Int16 => signed(i16::from_ne_bytes(data[..2].try_into()?) as i128),
+        DataType::Int32 => signed(i32::from_ne_bytes(data[..4].try_into()?) as i128),
+        DataType::Int64 => signed(i64::from_ne_bytes(data[..8].try_into()?) as i128),
+        DataType::Uint8 => unsigned(u8::from_ne_bytes([data[0]]) as u128),
+        DataType::Uint16 => unsigned(u16::from_ne_bytes(data[..2].try_into()?) as u128),
+        DataType::Uint32 => unsigned(u32::from_ne_bytes(data[..4].try_into()?) as u128),
+        DataType::Uint64 => unsigned(u64::from_ne_bytes(data[..8].try_into()?) as u128),
+        dtype => {
+            anyhow::bail!("workflow scalar '{name}' must have an integer dtype, got {dtype:?}")
+        }
+    }
 }
 
 fn workflow_scalar_bool(values: &PipelineTensors, name: &str) -> anyhow::Result<bool> {

@@ -260,6 +260,30 @@ graph {
 opset_import { domain: "" version: 13 }
 "#;
 
+const INT64_PREFIX: &str = r#"
+ir_version: 8
+graph {
+  node {
+    input: "state" input: "starts" input: "valid_length" input: "axes" input: "steps"
+    output: "selected" op_type: "Slice"
+  }
+  name: "int64_prefix"
+  initializer { dims: 1 data_type: 7 int64_data: 0 name: "starts" }
+  initializer { dims: 1 data_type: 7 int64_data: 1 name: "axes" }
+  initializer { dims: 1 data_type: 7 int64_data: 1 name: "steps" }
+  input { name: "state" type { tensor_type { elem_type: 7 shape {
+    dim { dim_param: "batch" } dim { dim_param: "sequence" }
+  }}}}
+  input { name: "valid_length" type { tensor_type { elem_type: 7 shape {
+    dim { dim_value: 1 }
+  }}}}
+  output { name: "selected" type { tensor_type { elem_type: 7 shape {
+    dim { dim_param: "batch" } dim { dim_param: "selected" }
+  }}}}
+}
+opset_import { domain: "" version: 13 }
+"#;
+
 const VISION_IDENTITY: &str = r#"
 ir_version: 8
 graph {
@@ -1167,7 +1191,7 @@ pipeline:
       onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
       custom_op_versions: {}
-      capabilities: [workflow_ssa, linear_effects, typed_emit]
+      capabilities: [workflow_ssa, linear_effects, typed_emit, emit_valid_length]
     inputs:
       target: { contract: { dtype: float32, rank: 3, shape: [batch, draft, vocabulary] }, role: { kind: opaque },
                 source: { kind: application, name: target }, required: true }
@@ -1175,6 +1199,8 @@ pipeline:
                   source: { kind: application, name: proposed }, required: true }
     outputs:
       accepted_len: { contract: { dtype: int64, rank: 1, shape: [batch] }, role: tensor, stage: pre_adapter }
+      accepted_tokens: { contract: { dtype: int64, rank: 2, shape: [batch, accepted] },
+                         role: tokens, stage: pre_adapter }
     components:
       verifier:
         implementation: { kind: onnx, artifact: verifier.onnx.textproto }
@@ -1205,11 +1231,18 @@ pipeline:
           outputs: { accepted_tokens: accepted, accepted_count: count, done: done }
           effects: { verify: { consumes: verify.0, produces: verify.1 } }
         - kind: emit
+          value: accepted
+          valid_length: count
+          output: accepted_tokens
+          mode: replace
+          effect_name: stream
+          effect: { consumes: stream.0, produces: stream.1 }
+        - kind: emit
           value: count
           output: accepted_len
           mode: replace
           effect_name: stream
-          effect: { consumes: stream.0, produces: stream.1 }
+          effect: { consumes: stream.1, produces: stream.2 }
 "#;
     let root = package(
         "speculative",
@@ -1224,10 +1257,184 @@ pipeline:
                 Value::from_slice_f32(&[0.1, 0.9, 0.8, 0.2, 0.7, 0.3], &[1, 3, 2])?,
             )
             .with_input("proposed", Value::from_slice_i64(&[1, 1, 0], &[1, 3])?);
-    assert_eq!(
-        engine.run_pipeline(request)?["accepted_len"].to_vec_i64()?,
-        [2]
-    );
+    let outputs = engine.run_pipeline(request)?;
+    assert_eq!(outputs["accepted_len"].to_vec_i64()?, [2]);
+    assert_eq!(outputs["accepted_tokens"].shape(), [1, 2]);
+    assert_eq!(outputs["accepted_tokens"].to_vec_i64()?, [1, 1]);
+
+    let batched_request =
+        PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
+            .with_input(
+                "target",
+                Value::from_slice_f32(
+                    &[0.1, 0.9, 0.8, 0.2, 0.7, 0.3, 0.1, 0.9, 0.8, 0.2, 0.7, 0.3],
+                    &[2, 3, 2],
+                )?,
+            )
+            .with_input(
+                "proposed",
+                Value::from_slice_i64(&[1, 1, 0, 1, 1, 0], &[2, 3])?,
+            );
+    let error = match engine.run_pipeline(batched_request) {
+        Ok(_) => anyhow::bail!("dense prefix emit accepted more than one runtime length"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(error.contains("must contain exactly one value"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn workflow_selects_bounded_state_prefix_through_branch_phi() -> anyhow::Result<()> {
+    let metadata = r#"
+pipeline:
+  workflow:
+    manifest:
+      ir_version: "1.0"
+      onnx_opsets: { ai.onnx: 13 }
+      adapter_abis: {}
+      custom_op_versions: {}
+      capabilities:
+        [workflow_ssa, linear_effects, typed_emit, nested_control_flow,
+         bounded_state_recurrence]
+    inputs:
+      tentative: { contract: { dtype: int64, rank: 2, shape: [batch, state] },
+                   role: { kind: opaque }, source: { kind: application, name: tentative },
+                   required: true }
+      correction: { contract: { dtype: int64, rank: 2, shape: [batch, state] },
+                    role: { kind: opaque }, source: { kind: application, name: correction },
+                    required: true }
+      accepted_len: { contract: { dtype: int64, rank: 1, shape: [1] },
+                      role: { kind: opaque }, source: { kind: application, name: accepted_len },
+                      required: true }
+      accept: { contract: { dtype: bool, rank: 0, shape: [] },
+                role: { kind: opaque }, source: { kind: application, name: accept },
+                required: true }
+      continue: { contract: { dtype: bool, rank: 0, shape: [] },
+                  role: { kind: opaque }, source: { kind: application, name: continue },
+                  required: true }
+      iterations: { contract: { dtype: int64, rank: 0, shape: [] },
+                    role: { kind: opaque }, source: { kind: application, name: iterations },
+                    required: true }
+      max_context: { contract: { dtype: int64, rank: 0, shape: [] },
+                     role: { kind: opaque }, source: { kind: application, name: max_context },
+                     required: true }
+    outputs:
+      state: { contract: { dtype: int64, rank: 2, shape: [batch, state] },
+               role: tensor, stage: pre_adapter }
+    components:
+      identity:
+        implementation: { kind: onnx, artifact: identity.onnx.textproto }
+        ports:
+          inputs: { input: { dtype: int64, rank: 2, shape: [batch, state] } }
+          outputs: { output: { dtype: int64, rank: 2, shape: [batch, state] } }
+        effects: []
+      accepted_prefix:
+        implementation: { kind: onnx, artifact: prefix.onnx.textproto }
+        ports:
+          inputs:
+            state: { dtype: int64, rank: 2, shape: [batch, tentative] }
+            valid_length: { dtype: int64, rank: 1, shape: [1] }
+          outputs:
+            selected: { dtype: int64, rank: 2, shape: [batch, state] }
+        effects: []
+    state:
+      rollback:
+        contract: { dtype: int64, rank: 2, shape: [batch, state] }
+        scope: invocation
+        initializer: rollback.current
+        recurrence: { kind: bounded, axis: 1, max: max_context }
+    initial_effects:
+      "state:rollback": state.0
+      stream: stream.0
+    graph:
+      kind: sequence
+      nodes:
+        - kind: loop
+          setup:
+            kind: invoke
+            component: identity
+            inputs: { input: tentative }
+            outputs: { output: rollback.current }
+            effects: {}
+          body:
+            kind: sequence
+            nodes:
+              - kind: invoke
+                component: accepted_prefix
+                inputs: { state: rollback.body, valid_length: accepted_len }
+                outputs: { selected: accepted.state }
+                effects: {}
+              - kind: branch
+                predicate: accept
+                cases:
+                  "true":
+                    kind: invoke
+                    component: identity
+                    inputs: { input: accepted.state }
+                    outputs: { output: branch.accepted }
+                    effects: {}
+                  "false":
+                    kind: invoke
+                    component: identity
+                    inputs: { input: correction }
+                    outputs: { output: branch.corrected }
+                    effects: {}
+                outputs:
+                  selected:
+                    cases: { "true": branch.accepted, "false": branch.corrected }
+                effects: {}
+          condition: continue
+          max_iterations: iterations
+          carried:
+            - cell: rollback
+              current: rollback.current
+              body_input: rollback.body
+              body_output: selected
+              next: rollback.final
+              read_effect: { consumes: state.0, produces: state.read }
+              write_effect: { consumes: state.read, produces: state.1 }
+        - kind: invoke
+          component: identity
+          inputs: { input: rollback.final }
+          outputs: { output: observed }
+          effects: {}
+        - kind: emit
+          value: observed
+          output: state
+          mode: replace
+          effect_name: stream
+          effect: { consumes: stream.0, produces: stream.1 }
+"#;
+    let root = package(
+        "bounded-state-prefix",
+        metadata,
+        &[
+            ("identity.onnx.textproto", INT64_MATRIX_IDENTITY),
+            ("prefix.onnx.textproto", INT64_PREFIX),
+        ],
+    )?;
+    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+    let request =
+        PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
+            .with_input(
+                "tentative",
+                Value::from_slice_i64(&[10, 11, 12, 13], &[1, 4])?,
+            )
+            .with_input("correction", Value::from_slice_i64(&[20, 21, 22], &[1, 3])?)
+            .with_input("accepted_len", Value::from_slice_i64(&[2], &[1])?)
+            .with_input(
+                "accept",
+                Value::from_raw_bytes(vec![1], &[], onnx_genai_ort::DataType::Bool)?,
+            )
+            .with_input(
+                "continue",
+                Value::from_raw_bytes(vec![1], &[], onnx_genai_ort::DataType::Bool)?,
+            )
+            .with_input("iterations", Value::from_slice_i64(&[1], &[])?)
+            .with_input("max_context", Value::from_slice_i64(&[4], &[])?);
+    let output = engine.run_pipeline(request)?;
+    assert_eq!(output["state"].shape(), [1, 2]);
+    assert_eq!(output["state"].to_vec_i64()?, [10, 11]);
     Ok(())
 }
 
