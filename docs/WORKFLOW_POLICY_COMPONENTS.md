@@ -446,6 +446,32 @@ Every state cell declares `class`:
 Both classes remain explicit loop-carried SSA with state read/write effects.
 Class does not authorize hidden host mutation.
 
+### Semantic checkpoint and replay
+
+The runtime exposes `checkpoint_session(session_id)` and
+`restore_session_checkpoint(session_id, checkpoint)`. A checkpoint contains
+only `class: semantic`, `scope: session` cells. Restoring first removes the
+session's current semantic cells and then installs cloned checkpoint values;
+advisory state is never captured or restored. Replaying the same workflow
+inputs from that checkpoint must reproduce semantic outputs.
+
+A world-model workflow uses no special runtime dispatch:
+
+```yaml
+- invoke observation encoder: observation + latent.body -> latent.observed
+- invoke action policy: latent.observed -> action.selected
+- branch action.selected:
+    true:  invoke environment step A -> environment.low
+    false: invoke environment step B -> environment.high
+  phi: latent.next
+- loop-carry latent.next as semantic session state
+- emit action events and final latent state
+```
+
+The executable conformance package covers observation ingestion, latent session
+state, action selection, environment branching, looping, event/final emission,
+checkpoint, state advancement, restore, and deterministic replay.
+
 ## Conditional joins
 
 `branch` keeps case-local SSA and effect tokens isolated. Values escape only through

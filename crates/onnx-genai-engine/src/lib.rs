@@ -163,7 +163,8 @@ pub struct VmmArenaStats {
 #[cfg(feature = "native-backend")]
 pub use onnx_runtime_session::DecodePrecision;
 pub use pipeline::{
-    PipelineEngine, PipelineGenerateRequest, PipelineTensors, validate_pipeline_backend_request,
+    PipelineEngine, PipelineGenerateRequest, PipelineTensors, WorkflowSessionCheckpoint,
+    validate_pipeline_backend_request,
 };
 pub use sampling::{CategoricalSampler, GreedySampler, Sampler};
 pub use speculative::{

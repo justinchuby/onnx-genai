@@ -2287,6 +2287,236 @@ pipeline:
 }
 
 #[test]
+fn workflow_world_model_checkpoints_and_replays_semantic_state() -> anyhow::Result<()> {
+    let metadata = r#"
+pipeline:
+  workflow:
+    manifest:
+      ir_version: "1.0"
+      onnx_opsets: { ai.onnx: 13 }
+      adapter_abis: {}
+      custom_op_versions: {}
+      capabilities:
+        [workflow_ssa, linear_effects, typed_emit, streaming_emit,
+         nested_control_flow, session_state_lease]
+    inputs:
+      initial: { contract: { dtype: int64, rank: 0, shape: [] },
+                 role: { kind: opaque }, source: { kind: application, name: initial },
+                 required: true }
+      observation: { contract: { dtype: int64, rank: 0, shape: [] },
+                     role: { kind: opaque },
+                     source: { kind: application, name: observation }, required: true }
+      action_threshold: { contract: { dtype: int64, rank: 0, shape: [] },
+                          role: { kind: opaque },
+                          source: { kind: application, name: action_threshold }, required: true }
+      low_delta: { contract: { dtype: int64, rank: 0, shape: [] },
+                   role: { kind: opaque }, source: { kind: application, name: low_delta },
+                   required: true }
+      high_delta: { contract: { dtype: int64, rank: 0, shape: [] },
+                    role: { kind: opaque }, source: { kind: application, name: high_delta },
+                    required: true }
+      continue: { contract: { dtype: bool, rank: 0, shape: [] },
+                  role: { kind: opaque }, source: { kind: application, name: continue },
+                  required: true }
+      iterations:
+        contract: { dtype: int64, rank: 0, shape: [] }
+        role: { kind: runtime, version: v1, role: max_iterations }
+        source: { kind: request, field: max_iterations }
+        required: true
+    outputs:
+      latent: { contract: { dtype: int64, rank: 0, shape: [] },
+                role: tensor, stage: pre_adapter }
+      actions: { contract: { dtype: bool, rank: 0, shape: [] },
+                 role: event, stage: pre_adapter }
+    components:
+      bind_state:
+        implementation: { kind: binding }
+        ports:
+          inputs: { value: { dtype: int64, rank: 0, shape: [] } }
+          outputs: { value: { dtype: int64, rank: 0, shape: [] } }
+        effects: []
+      observation_encoder:
+        implementation: { kind: onnx, artifact: observation.onnx.textproto }
+        ports:
+          inputs:
+            current: { dtype: int64, rank: 0, shape: [] }
+            update: { dtype: int64, rank: 0, shape: [] }
+          outputs:
+            next: { dtype: int64, rank: 0, shape: [] }
+        effects: [observation]
+      action_policy:
+        implementation: { kind: onnx, artifact: action.onnx.textproto }
+        ports:
+          inputs:
+            value: { dtype: int64, rank: 0, shape: [] }
+            limit: { dtype: int64, rank: 0, shape: [] }
+          outputs:
+            continue: { dtype: bool, rank: 0, shape: [] }
+        effects: [action]
+      environment_low:
+        implementation: { kind: onnx, artifact: environment-low.onnx.textproto }
+        ports:
+          inputs:
+            current: { dtype: int64, rank: 0, shape: [] }
+            update: { dtype: int64, rank: 0, shape: [] }
+          outputs:
+            next: { dtype: int64, rank: 0, shape: [] }
+        effects: [environment]
+      environment_high:
+        implementation: { kind: onnx, artifact: environment-high.onnx.textproto }
+        ports:
+          inputs:
+            current: { dtype: int64, rank: 0, shape: [] }
+            update: { dtype: int64, rank: 0, shape: [] }
+          outputs:
+            next: { dtype: int64, rank: 0, shape: [] }
+        effects: [environment]
+    state:
+      latent:
+        contract: { dtype: int64, rank: 0, shape: [] }
+        class: semantic
+        scope: session
+        initializer: initial
+        recurrence: { kind: invariant }
+        session: { policy: exclusive }
+    initial_effects:
+      observation: observation.0
+      action: action.0
+      environment: environment.0
+      stream: stream.0
+      "state:latent": state:latent.0
+    graph:
+      kind: sequence
+      nodes:
+        - kind: loop
+          setup:
+            kind: invoke
+            component: bind_state
+            inputs: { value: initial }
+            outputs: { value: latent.current }
+            effects: {}
+          body:
+            kind: sequence
+            nodes:
+              - kind: invoke
+                component: observation_encoder
+                inputs: { current: latent.body, update: observation }
+                outputs: { next: latent.observed }
+                effects:
+                  observation: { consumes: observation.0, produces: observation.1 }
+              - kind: invoke
+                component: action_policy
+                inputs: { value: latent.observed, limit: action_threshold }
+                outputs: { continue: action.selected }
+                effects: { action: { consumes: action.0, produces: action.1 } }
+              - kind: emit
+                value: action.selected
+                output: actions
+                mode: event
+                effect_name: stream
+                effect: { consumes: stream.0, produces: stream.1 }
+              - kind: branch
+                predicate: action.selected
+                cases:
+                  "true":
+                    kind: invoke
+                    component: environment_low
+                    inputs: { current: latent.observed, update: low_delta }
+                    outputs: { next: environment.low }
+                    effects:
+                      environment:
+                        { consumes: environment.0, produces: environment.low.effect }
+                  "false":
+                    kind: invoke
+                    component: environment_high
+                    inputs: { current: latent.observed, update: high_delta }
+                    outputs: { next: environment.high }
+                    effects:
+                      environment:
+                        { consumes: environment.0, produces: environment.high.effect }
+                outputs:
+                  latent.next:
+                    cases: { "true": environment.low, "false": environment.high }
+                effects:
+                  environment:
+                    incoming: environment.0
+                    cases:
+                      { "true": environment.low.effect, "false": environment.high.effect }
+                    produces: environment.joined
+          condition: continue
+          max_iterations: iterations
+          carried:
+            - cell: latent
+              current: latent.current
+              body_input: latent.body
+              body_output: latent.next
+              next: latent.final
+              read_effect: { consumes: state:latent.0, produces: state:latent.read }
+              write_effect: { consumes: state:latent.read, produces: state:latent.1 }
+        - kind: emit
+          value: latent.final
+          output: latent
+          mode: replace
+          effect_name: stream
+          effect: { consumes: stream.1, produces: stream.2 }
+"#;
+    let root = package(
+        "world-model-checkpoint",
+        metadata,
+        &[
+            ("observation.onnx.textproto", ADD_STATE),
+            ("action.onnx.textproto", LESS),
+            ("environment-low.onnx.textproto", ADD_STATE),
+            ("environment-high.onnx.textproto", ADD_STATE),
+        ],
+    )?;
+    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+
+    let request = |iterations, observation| {
+        let mut options = onnx_genai_engine::GenerateOptions::default();
+        options.max_new_tokens = iterations;
+        PipelineGenerateRequest::new(GenerateRequest {
+            prompt: GeneratePrompt::TokenIds(vec![]),
+            options,
+        })
+        .with_session_id("world-checkpoint")
+        .with_input("initial", Value::from_slice_i64(&[0], &[]).unwrap())
+        .with_input(
+            "observation",
+            Value::from_slice_i64(&[observation], &[]).unwrap(),
+        )
+        .with_input(
+            "action_threshold",
+            Value::from_slice_i64(&[3], &[]).unwrap(),
+        )
+        .with_input("low_delta", Value::from_slice_i64(&[1], &[]).unwrap())
+        .with_input("high_delta", Value::from_slice_i64(&[2], &[]).unwrap())
+        .with_input(
+            "continue",
+            Value::from_raw_bytes(vec![1], &[], onnx_genai_ort::DataType::Bool).unwrap(),
+        )
+    };
+
+    let first = engine.run_pipeline(request(2, 1))?;
+    assert_eq!(first["latent"].to_vec_i64()?, [5]);
+    assert_eq!(first["actions"].as_raw_bytes()?, [0]);
+    let checkpoint = engine.checkpoint_session("world-checkpoint")?;
+
+    let advanced = engine.run_pipeline(request(1, 2))?;
+    assert_eq!(advanced["latent"].to_vec_i64()?, [9]);
+    assert_eq!(advanced["actions"].as_raw_bytes()?, [0]);
+
+    engine.restore_session_checkpoint("world-checkpoint", &checkpoint)?;
+    let replayed = engine.run_pipeline(request(1, 2))?;
+    assert_eq!(replayed["latent"].to_vec_i64()?, [9]);
+    assert_eq!(
+        replayed["actions"].as_raw_bytes()?,
+        advanced["actions"].as_raw_bytes()?
+    );
+    Ok(())
+}
+
+#[test]
 fn workflow_branch_joins_speculative_values_and_effects() -> anyhow::Result<()> {
     let metadata = r#"
 pipeline:
