@@ -1,8 +1,28 @@
-### 2026-08-12: mobius_seqmajor parity gate is flaky under shared-GPU contention — isolate before treating a failure as a regression
+### 2026-08-12: mobius_seqmajor parity gate — CONFIRMED reliable solo (5/5 on clean base); contended runs are INVALID and must be re-run solo
 
 **By:** Copilot (pinned-staging-pool, #837 item 2)
 
-**What:**
+**Update (decisive, replaces the earlier "is it flaky?" question):**
+Ran the mandatory gate **5x back-to-back on clean `origin/main` dccb40e8** (per
+coordinator request), full per-run stderr captured. **Result: 5/5 PASS**, zero
+ILLEGAL_ADDRESS / shape-inference / "1 failed" markers. Two runs fully solo,
+three under mild concurrent load — all passed. Contention only inflated wall
+time (125s solo → 421s overlapped). So the gate is **NOT intrinsically
+nondeterministic**; a single **solo** green run is meaningful. The earlier reds
+(illegal-address, shape-inference, wrong-subtest) all occurred under **heavy**
+GPU saturation — multiple concurrent full qwen14b mobius runs on one 8 GB card —
+which is an OOM-family artifact, not a regression signal.
+
+**Operational rule (write this down):**
+- A **red** run of `mobius_seqmajor_growth_parity_native_cuda` under GPU
+  contention is **INVALID** — re-run it solo before drawing any conclusion.
+- Before treating any red as a regression: check `nvidia-smi
+  --query-compute-apps`; if any other compute PID is present, discard and re-run
+  in a verified-solo window (0 compute apps for a sustained period).
+- A **real** return-to-pool-before-fence corruption would fail the bit-identical
+  parity subtest *deterministically and solo* — not intermittently under load.
+
+**Why / how to act (original guidance retained):**
 The mandatory memory-governance gate
 `cargo test -p onnx-genai-engine --features cuda,native-backend --test
 mobius_seqmajor_growth_parity_native_cuda -- --ignored --test-threads=1`
