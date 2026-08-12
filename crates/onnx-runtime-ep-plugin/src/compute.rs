@@ -789,9 +789,42 @@ impl<'a> ScratchAllocator<'a> {
         Self { ep, device }
     }
 
+    /// Construct with an explicit device that may disagree with `ep`.
+    ///
+    /// Only used by tests, to build the "device kernels, no EP allocator"
+    /// combination the production constructors cannot currently produce, and
+    /// assert that it fails closed rather than silently handing out host
+    /// memory.
+    #[cfg(test)]
+    fn new_for_device(ep: Option<&'a Arc<dyn ExecutionProvider>>, device: DeviceId) -> Self {
+        Self { ep, device }
+    }
+
+    /// Fail closed when scratch is needed for a device we cannot allocate on.
+    ///
+    /// Without an EP the only backing store is a host `Vec`. Handing that
+    /// pointer to a kernel running on a non-host-accessible device is the
+    /// defect this seam exists to prevent, so it is rejected up front with an
+    /// actionable message instead of producing a plausible-looking
+    /// `TensorView` over host memory.
+    fn ensure_allocatable(&self, purpose: &str) -> Result<(), String> {
+        if self.ep.is_none() && !self.device.is_host_accessible() {
+            return Err(format!(
+                "{purpose}: this subgraph runs on {:?}, which is not host-accessible, but it was \
+                 compiled without an EP allocator. Intermediate and scratch buffers cannot be \
+                 placed on the kernels' device. Construct the compute info with \
+                 ExportedComputeInfo::new_with_ep (fail closed rather than pass host memory to a \
+                 device kernel).",
+                self.device
+            ));
+        }
+        Ok(())
+    }
+
     /// Allocate `bytes` of scratch, 64-byte aligned (the widest alignment any
     /// of our vector kernels requires of an output buffer).
     fn allocate(&self, bytes: usize, purpose: &str) -> Result<ScratchBuf, String> {
+        self.ensure_allocatable(purpose)?;
         match self.ep {
             Some(ep) => Ok(ScratchBuf::Ep(EpAllocation::new(ep, bytes, 64, purpose)?)),
             None => Ok(ScratchBuf::Host(vec![0u8; bytes.max(MIN_SCRATCH_BYTES)])),
@@ -991,6 +1024,12 @@ unsafe extern "C" fn compute_execute(
 
         if let Some(routing) = &exported.routing {
             // ── Routed multi-node path ────────────────────────────────────
+            // Reject before touching any kernel: routing needs intermediate
+            // buffers, and on a non-host-accessible device those must come
+            // from the EP.
+            if let Err(e) = scratch.ensure_allocatable("Compute: multi-node subgraph routing") {
+                return fail_status(&e);
+            }
             if routing.input_sources.len() != exported.entries.len()
                 || routing.output_sinks.len() != exported.entries.len()
             {
@@ -3576,6 +3615,62 @@ mod scratch_tests {
             err.contains("new_with_ep"),
             "error must be actionable: {err}"
         );
+    }
+
+    /// Scratch for a non-host-accessible device with no EP allocator must be
+    /// rejected outright. Without this guard the allocator would hand back a
+    /// host `Vec` and the caller would build a `TensorView` naming host memory
+    /// for a device kernel — the exact defect this seam exists to prevent.
+    #[test]
+    fn scratch_for_a_device_without_an_ep_allocator_fails_closed() {
+        let scratch = ScratchAllocator::new_for_device(None, DeviceId::cuda(0));
+
+        let err = match scratch.allocate(256, "Compute: node 0 intermediate") {
+            Ok(_) => panic!("host scratch must never back a device kernel"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("not host-accessible"),
+            "error must explain the cause: {err}"
+        );
+        assert!(
+            err.contains("new_with_ep"),
+            "error must be actionable: {err}"
+        );
+
+        let err = scratch
+            .ensure_allocatable("Compute: multi-node subgraph routing")
+            .expect_err("routing must be rejected before any kernel runs");
+        assert!(
+            err.contains("multi-node subgraph routing"),
+            "error must name the operation: {err}"
+        );
+    }
+
+    /// The same allocator *with* an EP is allowed, and tags the buffer with
+    /// the EP's device rather than `DeviceId::cpu()`.
+    #[test]
+    fn scratch_for_a_device_with_an_ep_allocator_is_permitted_and_device_tagged() {
+        let ep = MockEp::cuda();
+        let erased = erase(&ep);
+        let scratch = ScratchAllocator::new(Some(&erased));
+
+        scratch
+            .ensure_allocatable("Compute: multi-node subgraph routing")
+            .expect("an EP-backed device subgraph must be allowed to route");
+        let buf = scratch
+            .allocate(256, "Compute: node 0 intermediate")
+            .expect("EP-backed scratch must succeed");
+        assert!(
+            matches!(buf, ScratchBuf::Ep(_)),
+            "an EP-backed subgraph must never fall back to a host Vec"
+        );
+        assert_eq!(
+            scratch.device,
+            DeviceId::cuda(0),
+            "intermediates must be tagged with the EP's device, not CPU"
+        );
+        drop(buf);
     }
 
     /// An allocator that returns a pointer violating the requested alignment
