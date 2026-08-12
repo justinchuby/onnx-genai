@@ -4904,6 +4904,11 @@ fn borrowed_affine_int4_matmul(
     let block_count = k.div_ceil(block_size);
     let packed_row_size = block_count * layout.packed_block_size();
     let zero_point_row_size = layout.zero_point_row_size(block_count);
+    // On non-aarch64 targets `dot_kernel` is consumed only by the aarch64-gated
+    // NeonDot fast path below, matching the scalar-branch `let _ = dot_kernel;`
+    // guards in the sibling kernels.
+    #[cfg(not(target_arch = "aarch64"))]
+    let _ = dot_kernel;
     for (activation, output_row) in activations.chunks_exact(k).zip(result.chunks_exact_mut(n)) {
         #[cfg(target_arch = "aarch64")]
         if m == 1
