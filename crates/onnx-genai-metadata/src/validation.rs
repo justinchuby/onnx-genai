@@ -127,8 +127,16 @@ fn collect_workflow_capabilities(node: &WorkflowNode, capabilities: &mut BTreeSe
                 capabilities.insert("linear_effects".to_string());
             }
         }
-        WorkflowNode::Loop { setup, body, .. } => {
+        WorkflowNode::Loop {
+            setup,
+            body,
+            iteration,
+            ..
+        } => {
             capabilities.insert("nested_control_flow".to_string());
+            if iteration.is_some() {
+                capabilities.insert("loop_induction_values".to_string());
+            }
             collect_workflow_capabilities(setup, capabilities);
             collect_workflow_capabilities(body, capabilities);
         }
@@ -1378,6 +1386,7 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
                 body,
                 condition,
                 max_iterations,
+                iteration,
                 carried,
             } => {
                 validate_workflow_node(
@@ -1399,6 +1408,35 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
                 let mut body_values = values.clone();
                 let mut body_contracts = value_contracts.clone();
                 let mut body_effects = effects.clone();
+                if let Some(iteration) = iteration {
+                    if iteration.contract.dtype != "int64"
+                        || !matches!(iteration.contract.rank, 0 | 1)
+                    {
+                        errors.push(format!(
+                            "{path}.iteration must declare int64 rank 0 or rank 1, got {} rank {}",
+                            iteration.contract.dtype, iteration.contract.rank
+                        ));
+                    }
+                    match (iteration.contract.rank, iteration.contract.shape.as_ref()) {
+                        (0, Some(shape)) if !shape.is_empty() => errors.push(format!(
+                            "{path}.iteration scalar contract must have an empty shape"
+                        )),
+                        (1, Some(shape)) if shape.len() != 1 => errors.push(format!(
+                            "{path}.iteration rank-one broadcast contract must have one dimension"
+                        )),
+                        (1, None) => errors.push(format!(
+                            "{path}.iteration rank-one broadcast contract must declare its shape"
+                        )),
+                        _ => {}
+                    }
+                    define_workflow_value(
+                        &iteration.value,
+                        &mut body_values,
+                        &format!("{path}.iteration"),
+                        errors,
+                    );
+                    body_contracts.insert(iteration.value.clone(), iteration.contract.clone());
+                }
                 for carry in carried {
                     let Some(state) = workflow.state.get(&carry.cell) else {
                         errors.push(format!(

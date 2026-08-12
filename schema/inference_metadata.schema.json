@@ -6048,6 +6048,24 @@
       ],
       "type": "object"
     },
+    "WorkflowLoopIteration": {
+      "additionalProperties": false,
+      "properties": {
+        "contract": {
+          "$ref": "#/$defs/TensorContract",
+          "description": "`int64` scalar or rank-one broadcast contract."
+        },
+        "value": {
+          "description": "SSA value containing the current zero-based iteration.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "value",
+        "contract"
+      ],
+      "type": "object"
+    },
     "WorkflowManifest": {
       "additionalProperties": false,
       "properties": {
@@ -6175,6 +6193,17 @@
             },
             "condition": {
               "type": "string"
+            },
+            "iteration": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/WorkflowLoopIteration"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional zero-based induction value, scoped to this loop's body and condition."
             },
             "kind": {
               "const": "loop",

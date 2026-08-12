@@ -510,6 +510,9 @@ pub enum WorkflowNode {
         body: Box<WorkflowNode>,
         condition: String,
         max_iterations: String,
+        /// Optional zero-based induction value, scoped to this loop's body and condition.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        iteration: Option<WorkflowLoopIteration>,
         #[serde(default)]
         carried: Vec<WorkflowLoopCarry>,
     },
@@ -535,6 +538,15 @@ pub enum WorkflowNode {
         output: String,
         device: DeviceKind,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowLoopIteration {
+    /// SSA value containing the current zero-based iteration.
+    pub value: String,
+    /// `int64` scalar or rank-one broadcast contract.
+    pub contract: TensorContract,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]

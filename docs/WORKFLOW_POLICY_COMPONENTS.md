@@ -138,6 +138,30 @@ effects: { termination: { consumes: termination.0, produces: termination.1 } }
 The ONNX graph defines EOS and limit semantics. The loop condition reads the
 declared scalar or per-row done value according to the serving contract.
 
+## Loop induction SSA
+
+A loop may declare its zero-based current iteration as a typed SSA value:
+
+```yaml
+kind: loop
+setup: { ... }
+body: { ... }
+condition: loop.continue
+max_iterations: request.max_iterations
+iteration:
+  value: loop.i
+  contract: { dtype: int64, rank: 1, shape: [batch] }
+carried: [...]
+```
+
+The contract is `int64` rank 0, or rank 1 with an explicit broadcast shape.
+The executor materializes `0, 1, ...` before each body execution. The value is
+available to the body and its condition, including solver steps, schedules,
+RNG counters, and emit indices. It is not available in setup and does not
+escape the loop. Nested loops must use distinct names; lexical shadowing is
+rejected. Reverse indices, remaining counts, and other derived values are
+computed by an invoked ONNX component from this primitive induction value.
+
 ## Solver or scheduler step
 
 `role: solver_step`

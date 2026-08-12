@@ -884,6 +884,7 @@ impl PipelineEngine {
                 body,
                 condition,
                 max_iterations,
+                iteration,
                 carried,
             } => {
                 self.run_workflow_node(
@@ -915,7 +916,21 @@ impl PipelineEngine {
                     final_state_refs.insert(carry.cell.clone(), carry.current.clone());
                 }
                 let limit = workflow_scalar_usize(values, max_iterations)?;
-                for _ in 0..limit {
+                if let Some(iteration) = iteration
+                    && values.contains_key(&iteration.value)
+                {
+                    anyhow::bail!(
+                        "workflow loop iteration value '{}' shadows an existing SSA value",
+                        iteration.value
+                    );
+                }
+                for index in 0..limit {
+                    if let Some(iteration) = iteration {
+                        values.insert(
+                            iteration.value.clone(),
+                            workflow_iteration_value(index, &iteration.contract, symbols)?,
+                        );
+                    }
                     for carry in carried {
                         let current = values.get(&carry.current).with_context(|| {
                             format!("workflow loop value '{}' is unavailable", carry.current)
@@ -950,6 +965,9 @@ impl PipelineEngine {
                     if !workflow_scalar_bool(values, condition)? {
                         break;
                     }
+                }
+                if let Some(iteration) = iteration {
+                    values.remove(&iteration.value);
                 }
             }
             WorkflowNode::Branch {
@@ -1444,6 +1462,29 @@ fn resolve_workflow_shape(
             }),
         })
         .collect()
+}
+
+fn workflow_iteration_value(
+    index: usize,
+    contract: &TensorContract,
+    symbols: &HashMap<String, i64>,
+) -> anyhow::Result<Value> {
+    if contract.dtype != "int64" {
+        anyhow::bail!(
+            "workflow loop iteration requires dtype int64, got '{}'",
+            contract.dtype
+        );
+    }
+    let index = i64::try_from(index).context("workflow loop iteration exceeds int64")?;
+    match contract.rank {
+        0 => Value::from_slice_i64(&[index], &[]).map_err(Into::into),
+        1 => {
+            let shape = resolve_workflow_shape(contract, symbols)?;
+            let elements = shape_numel(&shape);
+            Value::from_vec_i64(vec![index; elements], &shape).map_err(Into::into)
+        }
+        rank => anyhow::bail!("workflow loop iteration requires rank 0 or rank 1, got rank {rank}"),
+    }
 }
 
 fn image_tensor_to_value(

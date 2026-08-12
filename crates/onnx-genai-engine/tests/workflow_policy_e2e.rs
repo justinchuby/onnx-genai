@@ -638,20 +638,32 @@ pipeline:
       onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
       custom_op_versions: {}
-      capabilities: [workflow_ssa, linear_effects, typed_emit]
+      capabilities: [workflow_ssa, linear_effects, typed_emit, nested_control_flow,
+                     loop_induction_values]
     inputs:
       sample: { contract: { dtype: float32, rank: 2, shape: [batch, width] },
                 role: { kind: opaque }, source: { kind: application, name: sample }, required: true }
       derivative: { contract: { dtype: float32, rank: 2, shape: [batch, width] },
                     role: { kind: opaque }, source: { kind: application, name: derivative }, required: true }
-      step: { contract: { dtype: int64, rank: 1, shape: [batch] },
-              role: { kind: opaque }, source: { kind: application, name: step }, required: true }
       schedule: { contract: { dtype: float32, rank: 1, shape: [schedule_length] },
                   role: { kind: opaque }, source: { kind: application, name: schedule }, required: true }
+      iterations: { contract: { dtype: int64, rank: 0, shape: [] },
+                    role: { kind: opaque }, source: { kind: application, name: iterations },
+                    required: true }
+      continue: { contract: { dtype: bool, rank: 0, shape: [] },
+                  role: { kind: opaque }, source: { kind: application, name: continue },
+                  required: true }
     outputs:
       latent: { contract: { dtype: float32, rank: 2, shape: [batch, width] },
                 role: tensor, stage: pre_adapter }
+      steps: { contract: { dtype: int64, rank: 1, shape: [generated] },
+               role: event, stage: pre_adapter }
     components:
+      sample_binding:
+        implementation: { kind: binding }
+        ports:
+          inputs: { value: { dtype: float32, rank: 2, shape: [batch, width] } }
+          outputs: { value: { dtype: float32, rank: 2, shape: [batch, width] } }
       solver:
         implementation: { kind: onnx, artifact: solver.onnx.textproto }
         ports:
@@ -671,17 +683,57 @@ pipeline:
           next_state: next_state
           effect: solver
         effects: [solver]
-    initial_effects: { solver: solver.0, stream: stream.0 }
+    state:
+      latent:
+        contract: { dtype: float32, rank: 2, shape: [batch, width] }
+        scope: invocation
+        initializer: latent.current
+        recurrence: { kind: invariant }
+    initial_effects:
+      solver: solver.0
+      stream: stream.0
+      step_stream: step_stream.0
+      state:latent: state:latent.0
     graph:
       kind: sequence
       nodes:
-        - kind: invoke
-          component: solver
-          inputs: { sample: sample, derivative: derivative, step: step, schedule: schedule }
-          outputs: { next_state: latent.next }
-          effects: { solver: { consumes: solver.0, produces: solver.1 } }
+        - kind: loop
+          setup:
+            kind: invoke
+            component: sample_binding
+            inputs: { value: sample }
+            outputs: { value: latent.current }
+            effects: {}
+          body:
+            kind: sequence
+            nodes:
+              - kind: invoke
+                component: solver
+                inputs: { sample: latent.body, derivative: derivative,
+                          step: diffusion.step, schedule: schedule }
+                outputs: { next_state: latent.next }
+                effects: { solver: { consumes: solver.0, produces: solver.1 } }
+              - kind: emit
+                value: diffusion.step
+                output: steps
+                mode: append
+                effect_name: step_stream
+                effect: { consumes: step_stream.0, produces: step_stream.1 }
+          condition: continue
+          max_iterations: iterations
+          iteration:
+            value: diffusion.step
+            contract: { dtype: int64, rank: 1, shape: [batch] }
+          carried:
+            - cell: latent
+              current: latent.current
+              body_input: latent.body
+              body_output: latent.next
+              next: latent.final
+              read_effect: { consumes: state:latent.0, produces: state:latent.read }
+              write_effect: { consumes: state:latent.read, produces: state:latent.1 }
         - kind: emit
-          value: latent.next
+          value: latent.final
           output: latent
           mode: replace
           effect_name: stream
@@ -693,10 +745,94 @@ pipeline:
         PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
             .with_input("sample", Value::from_slice_f32(&[1.0, 2.0], &[1, 2])?)
             .with_input("derivative", Value::from_slice_f32(&[0.5, 0.25], &[1, 2])?)
-            .with_input("step", Value::from_slice_i64(&[0], &[1])?)
-            .with_input("schedule", Value::from_slice_f32(&[1.0, 0.0], &[2])?);
+            .with_input("schedule", Value::from_slice_f32(&[1.0, 0.0], &[2])?)
+            .with_input("iterations", Value::from_slice_i64(&[3], &[])?)
+            .with_input(
+                "continue",
+                Value::from_raw_bytes(vec![1], &[], DataType::Bool)?,
+            );
     let output = engine.run_pipeline(request)?;
-    assert_eq!(output["latent"].to_vec_f32()?, [0.5, 1.75]);
+    assert_eq!(output["latent"].to_vec_f32()?, [-0.5, 1.25]);
+    assert_eq!(output["steps"].to_vec_i64()?, [0, 1, 2]);
+    Ok(())
+}
+
+#[test]
+fn workflow_nested_loops_materialize_lexical_induction_values() -> anyhow::Result<()> {
+    let metadata = r#"
+pipeline:
+  workflow:
+    manifest:
+      ir_version: "1.0"
+      onnx_opsets: { ai.onnx: 13 }
+      adapter_abis: {}
+      custom_op_versions: {}
+      capabilities: [workflow_ssa, linear_effects, typed_emit, nested_control_flow,
+                     loop_induction_values, explicit_transfer]
+    inputs:
+      outer_count: { contract: { dtype: int64, rank: 0, shape: [] },
+                     role: { kind: opaque }, source: { kind: application, name: outer_count },
+                     required: true }
+      inner_count: { contract: { dtype: int64, rank: 0, shape: [] },
+                     role: { kind: opaque }, source: { kind: application, name: inner_count },
+                     required: true }
+      continue: { contract: { dtype: bool, rank: 0, shape: [] },
+                  role: { kind: opaque }, source: { kind: application, name: continue },
+                  required: true }
+    outputs:
+      outer_steps: { contract: { dtype: int64, rank: 1, shape: [outer_events] },
+                     role: event, stage: pre_adapter }
+      inner_steps: { contract: { dtype: int64, rank: 1, shape: [inner_events] },
+                     role: event, stage: pre_adapter }
+    components: {}
+    initial_effects: { outer_stream: outer.0, inner_stream: inner.0 }
+    graph:
+      kind: loop
+      setup: { kind: transfer, input: outer_count, output: outer.setup, device: cpu }
+      body:
+        kind: sequence
+        nodes:
+          - kind: emit
+            value: outer.index
+            output: outer_steps
+            mode: append
+            effect_name: outer_stream
+            effect: { consumes: outer.0, produces: outer.1 }
+          - kind: loop
+            setup: { kind: transfer, input: inner_count, output: inner.setup, device: cpu }
+            body:
+              kind: emit
+              value: inner.index
+              output: inner_steps
+              mode: append
+              effect_name: inner_stream
+              effect: { consumes: inner.0, produces: inner.1 }
+            condition: continue
+            max_iterations: inner_count
+            iteration:
+              value: inner.index
+              contract: { dtype: int64, rank: 1, shape: [1] }
+            carried: []
+      condition: continue
+      max_iterations: outer_count
+      iteration:
+        value: outer.index
+        contract: { dtype: int64, rank: 1, shape: [1] }
+      carried: []
+"#;
+    let root = package("nested-induction", metadata, &[])?;
+    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+    let request =
+        PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
+            .with_input("outer_count", Value::from_slice_i64(&[2], &[])?)
+            .with_input("inner_count", Value::from_slice_i64(&[3], &[])?)
+            .with_input(
+                "continue",
+                Value::from_raw_bytes(vec![1], &[], DataType::Bool)?,
+            );
+    let output = engine.run_pipeline(request)?;
+    assert_eq!(output["outer_steps"].to_vec_i64()?, [0, 1]);
+    assert_eq!(output["inner_steps"].to_vec_i64()?, [0, 1, 2, 0, 1, 2]);
     Ok(())
 }
 
