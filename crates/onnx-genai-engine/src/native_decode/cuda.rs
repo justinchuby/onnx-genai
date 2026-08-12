@@ -2651,6 +2651,28 @@ impl DecodeCudaState {
         let capture_step_inputs =
             graph_enabled && !captured_step_inputs.is_empty() && capture_step_inputs_enabled();
 
+        // Pin the fixed-capacity KV sequence-axis symbols CONSTANT so CUDA-graph
+        // capture ADMITS the GroupQueryAttention (and capacity-Attention) nodes
+        // instead of vetoing each per-layer node as a growing-seq eager seam. The
+        // runtime has just bound fixed-capacity, device-resident KV at physical
+        // `[.., max_len, ..]` with the valid attended length read on-device, so
+        // the attention kernels' launch grids are capacity-sized (constant within
+        // a capture) and a captured replay is shape-static. Gated on
+        // `graph_enabled`: a growing/paged KV decoder clears it and never pins,
+        // preserving the classifier's growing-seq veto for those paths. KV growth
+        // / capacity-bucket rebucket invalidates and re-captures the graph, so a
+        // pinned symbol is never replayed against a stale grid.
+        if graph_enabled {
+            let pinned = session.pin_fixed_capacity_kv_capture_symbols();
+            if pinned > 0 {
+                tracing::debug!(
+                    max_len,
+                    pinned,
+                    "native CUDA decode: pinned fixed-capacity KV seq symbol(s) for graph capture"
+                );
+            }
+        }
+
         Ok(Self {
             logical_len: 0,
             max_len,
