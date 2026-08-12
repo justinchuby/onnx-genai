@@ -89,6 +89,15 @@ impl Tensor {
         Self::new(Storage::I32(values.to_vec()), DataType::Int32, shape)
     }
 
+    pub fn bool(shape: &[usize], values: &[bool]) -> Self {
+        assert_eq!(shape.iter().product::<usize>(), values.len());
+        Self::new(
+            Storage::U8(values.iter().map(|&b| b as u8).collect()),
+            DataType::Bool,
+            shape,
+        )
+    }
+
     fn new(storage: Storage, dtype: DataType, shape: &[usize]) -> Self {
         Self {
             storage,

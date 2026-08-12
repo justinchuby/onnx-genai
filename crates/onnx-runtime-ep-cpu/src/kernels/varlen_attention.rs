@@ -84,11 +84,17 @@ pub fn unsupported_reason(
         return fail("missing input shape or dtype metadata".into());
     }
     for index in 0..3 {
-        if input_dtypes[index] != DataType::Float32 {
+        if !matches!(
+            input_dtypes[index],
+            DataType::Float32 | DataType::Float16 | DataType::BFloat16
+        ) {
             return fail(format!(
-                "input {index} must be Float32, got {:?}",
+                "input {index} must be Float32, Float16, or BFloat16, got {:?}",
                 input_dtypes[index]
             ));
+        }
+        if input_dtypes[index] != input_dtypes[0] {
+            return fail("Q, K, and V must use the same floating dtype".into());
         }
         if shapes[index].len() != 3 {
             return fail(format!(
@@ -133,11 +139,17 @@ impl Kernel for VarlenAttentionKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity(OP, inputs, outputs, 5, 6, 1)?;
         for (index, input) in inputs.iter().take(3).enumerate() {
-            if input.dtype != DataType::Float32 {
+            if !matches!(
+                input.dtype,
+                DataType::Float32 | DataType::Float16 | DataType::BFloat16
+            ) {
                 return Err(error(format!(
-                    "input {index} must be Float32, got {:?}",
+                    "input {index} must be Float32, Float16, or BFloat16, got {:?}",
                     input.dtype
                 )));
+            }
+            if input.dtype != inputs[0].dtype {
+                return Err(error("Q, K, and V must use the same floating dtype"));
             }
             if input.shape.len() != 3 {
                 return Err(error(format!(

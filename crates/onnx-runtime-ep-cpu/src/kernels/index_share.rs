@@ -5,7 +5,8 @@ use std::borrow::Cow;
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node, Shape};
 
-use super::{check_arity, to_dense_f32, to_dense_i64, write_dense_f32};
+use super::{check_arity, to_dense_i64};
+use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 
 const OP: &str = "IndexShare";
 const INPUT_NAMES: [&str; 7] = [
@@ -120,11 +121,11 @@ impl Kernel for IndexShareKernel {
             return Err(error("past_key and past_value must be provided together"));
         }
         for &index in &[0, 1, 2] {
-            require_dtype(index, &inputs[index], DataType::Float32)?;
+            require_float_dtype(index, &inputs[index], inputs[0].dtype)?;
         }
         for index in [3, 4, 6] {
             if let Some(input) = optional_input(inputs, index) {
-                require_dtype(index, input, DataType::Float32)?;
+                require_float_dtype(index, input, inputs[0].dtype)?;
             }
         }
         if !matches!(inputs[5].dtype, DataType::Int32 | DataType::Int64) {
@@ -134,25 +135,29 @@ impl Kernel for IndexShareKernel {
             )));
         }
         for (index, output) in outputs.iter().enumerate() {
-            if output.dtype != DataType::Float32 {
+            if !is_supported_float(output.dtype) {
                 return Err(error(format!(
-                    "output {index} dtype {:?} unsupported; expected Float32",
+                    "output {index} dtype {:?} unsupported; expected Float32, Float16, or BFloat16",
                     output.dtype
                 )));
             }
         }
 
         let dims = validate_runtime_shapes(inputs, outputs, self)?;
-        let q = to_dense_f32(&inputs[0])?;
-        let current_k = to_dense_f32(&inputs[1])?;
-        let current_v = to_dense_f32(&inputs[2])?;
-        let past_k = optional_input(inputs, 3).map(to_dense_f32).transpose()?;
-        let past_v = optional_input(inputs, 4).map(to_dense_f32).transpose()?;
+        let q = to_dense_f32_widen(OP, &inputs[0])?.into_owned();
+        let current_k = to_dense_f32_widen(OP, &inputs[1])?.into_owned();
+        let current_v = to_dense_f32_widen(OP, &inputs[2])?.into_owned();
+        let past_k = optional_input(inputs, 3)
+            .map(|v| to_dense_f32_widen(OP, v).map(|c| c.into_owned()))
+            .transpose()?;
+        let past_v = optional_input(inputs, 4)
+            .map(|v| to_dense_f32_widen(OP, v).map(|c| c.into_owned()))
+            .transpose()?;
         let indices = to_dense_i64(&inputs[5])?;
         let bias = optional_input(inputs, 6)
             .map(|view| {
                 Ok::<Bias, EpError>(Bias {
-                    data: to_dense_f32(view)?,
+                    data: to_dense_f32_widen(OP, view)?.into_owned(),
                     shape: view.shape.to_vec(),
                 })
             })
@@ -196,9 +201,9 @@ impl Kernel for IndexShareKernel {
                 dims,
                 sqrt_scale,
             );
-            write_dense_f32(&mut outputs[0], &output)?;
-            write_dense_f32(&mut outputs[1], &present_k)?;
-            write_dense_f32(&mut outputs[2], &present_v)?;
+            write_dense_f32_narrow(OP, &mut outputs[0], &output)?;
+            write_dense_f32_narrow(OP, &mut outputs[1], &present_k)?;
+            write_dense_f32_narrow(OP, &mut outputs[2], &present_v)?;
             return Ok(());
         }
 
@@ -220,10 +225,10 @@ impl Kernel for IndexShareKernel {
             sqrt_scale,
         );
 
-        write_dense_f32(&mut outputs[0], &output)?;
+        write_dense_f32_narrow(OP, &mut outputs[0], &output)?;
         if outputs.len() == 3 {
-            write_dense_f32(&mut outputs[1], &present_k)?;
-            write_dense_f32(&mut outputs[2], &present_v)?;
+            write_dense_f32_narrow(OP, &mut outputs[1], &present_k)?;
+            write_dense_f32_narrow(OP, &mut outputs[2], &present_v)?;
         }
         Ok(())
     }
@@ -716,7 +721,7 @@ fn validate_claim_metadata(
         let valid = if index == 5 {
             matches!(dtypes[index], DataType::Int32 | DataType::Int64)
         } else {
-            dtypes[index] == DataType::Float32
+            is_supported_float(dtypes[index])
         };
         if !valid {
             return Err(format!(
@@ -909,10 +914,28 @@ fn require_rank(index: usize, shape: &[usize], expected: usize) -> Result<()> {
     Ok(())
 }
 
-fn require_dtype(index: usize, input: &TensorView, expected: DataType) -> Result<()> {
-    if input.dtype != expected {
+/// The float element types the `IndexShare` oracle computes over. All arithmetic
+/// runs in f32 (via `to_dense_f32_widen`/`write_dense_f32_narrow`), so f16 and
+/// bf16 are accepted natively — they widen to f32 for compute and narrow back.
+fn is_supported_float(dtype: DataType) -> bool {
+    matches!(
+        dtype,
+        DataType::Float32 | DataType::Float16 | DataType::BFloat16
+    )
+}
+
+/// Require `input` to be a supported float dtype and to match the anchor dtype
+/// (input 0) so Q/K/V/past/bias share one element type.
+fn require_float_dtype(index: usize, input: &TensorView, anchor: DataType) -> Result<()> {
+    if !is_supported_float(input.dtype) {
         return Err(error(format!(
-            "input {index} ('{}') dtype {:?} unsupported; expected {expected:?}",
+            "input {index} ('{}') dtype {:?} unsupported; expected Float32, Float16, or BFloat16",
+            INPUT_NAMES[index], input.dtype
+        )));
+    }
+    if input.dtype != anchor {
+        return Err(error(format!(
+            "input {index} ('{}') dtype {:?} must match query dtype {anchor:?}",
             INPUT_NAMES[index], input.dtype
         )));
     }
@@ -1190,6 +1213,131 @@ mod tests {
             ],
         )?;
         Ok((output.to_f32(), present_k.to_f32(), present_v.to_f32()))
+    }
+
+    /// bf16 counterpart of [`run`]: builds Q/K/V/past/bias and the three outputs
+    /// as `BFloat16`. IndexShare widens to f32 for compute and narrows on write,
+    /// so this exercises the native bf16 path end-to-end.
+    #[allow(clippy::too_many_arguments)]
+    fn run_bf16(
+        case: Case,
+        q: &[f32],
+        current_k: &[f32],
+        current_v: &[f32],
+        past_k: Option<&[f32]>,
+        past_v: Option<&[f32]>,
+        indices: &[i64],
+        bias: Option<&[f32]>,
+    ) -> Result<Vec<f32>> {
+        let (graph, id) = node(case, past_k.is_some(), bias.is_some(), 3);
+        let kernel = IndexShareFactory.create(graph.node(id), &[])?;
+        let q = Owned::bf16(&[case.batch, case.q_heads, case.q_seq, case.head_size], q);
+        let current_k = Owned::bf16(
+            &[case.batch, case.kv_heads, case.current_seq, case.head_size],
+            current_k,
+        );
+        let current_v = Owned::bf16(
+            &[case.batch, case.kv_heads, case.current_seq, case.head_size],
+            current_v,
+        );
+        let past_k = past_k.map(|data| {
+            Owned::bf16(
+                &[case.batch, case.kv_heads, case.past_seq, case.head_size],
+                data,
+            )
+        });
+        let past_v = past_v.map(|data| {
+            Owned::bf16(
+                &[case.batch, case.kv_heads, case.past_seq, case.head_size],
+                data,
+            )
+        });
+        let indices = Owned::i64(
+            &[case.batch, case.index_heads, case.q_seq, case.width],
+            indices,
+        );
+        let bias = bias.map(|data| {
+            Owned::bf16(
+                &[
+                    case.batch,
+                    case.q_heads,
+                    case.q_seq,
+                    case.past_seq + case.current_seq,
+                ],
+                data,
+            )
+        });
+        let absent = TensorView::absent(DataType::Undefined);
+        let inputs = vec![
+            q.view(),
+            current_k.view(),
+            current_v.view(),
+            past_k.as_ref().map_or(absent, Owned::view),
+            past_v.as_ref().map_or(absent, Owned::view),
+            indices.view(),
+            bias.as_ref().map_or(absent, Owned::view),
+        ];
+        let mut output = Owned::zeros(
+            DataType::BFloat16,
+            &[case.batch, case.q_heads, case.q_seq, case.head_size],
+        );
+        let mut present_k = Owned::zeros(
+            DataType::BFloat16,
+            &[
+                case.batch,
+                case.kv_heads,
+                case.past_seq + case.current_seq,
+                case.head_size,
+            ],
+        );
+        let mut present_v = Owned::zeros(
+            DataType::BFloat16,
+            &[
+                case.batch,
+                case.kv_heads,
+                case.past_seq + case.current_seq,
+                case.head_size,
+            ],
+        );
+        kernel.execute(
+            &inputs,
+            &mut [
+                output.view_mut(),
+                present_k.view_mut(),
+                present_v.view_mut(),
+            ],
+        )?;
+        Ok(output.to_bf16_as_f32())
+    }
+
+    #[test]
+    fn index_share_runs_natively_in_bf16_matching_f32() {
+        let case = Case {
+            batch: 1,
+            q_heads: 2,
+            kv_heads: 2,
+            q_seq: 1,
+            current_seq: 5,
+            past_seq: 0,
+            head_size: 3,
+            index_heads: 2,
+            width: 4,
+            scale: 0.5,
+        };
+        let q = sequence(6, -0.25);
+        let k = sequence(30, 0.125);
+        let v = sequence(30, -1.0);
+        let indices = [0, 2, 4, -1, 1, 3, -1, -1];
+        let (f32_out, _, _) = run(case, &q, &k, &v, None, None, &indices, None).unwrap();
+        let bf16_out = run_bf16(case, &q, &k, &v, None, None, &indices, None).unwrap();
+        assert_eq!(f32_out.len(), bf16_out.len());
+        for (i, (&r, &a)) in f32_out.iter().zip(&bf16_out).enumerate() {
+            let tol = 0.05 + 0.06 * r.abs();
+            assert!(
+                (r - a).abs() <= tol,
+                "index {i}: bf16 {a} vs f32 {r} exceeds tol {tol}"
+            );
+        }
     }
 
     fn sequence(count: usize, offset: f32) -> Vec<f32> {
