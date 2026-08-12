@@ -134,18 +134,35 @@ handed out.
 **Lifetime.** `StepScoped` is served as above. `SessionPersistent` is
 **declined** (`None`) — never downgraded. Serving it from scratch would hand the
 kernel a block ORT recycles when `Compute` returns, which a persistent consumer
-would then reuse on the next `Run`. Declining routes the kernel to its own
-self-owned scratch, which is what every persistent-declaring kernel in this repo
-already implements (`GroupQueryAttentionKernel::execute`'s pooled slot,
-`MatMulNBits`'s `Bf16Scratch` grow-only arena from #832). A kernel that truly
-cannot run without executor-provided persistent memory fails closed in its own
-`execute_with_workspace`, where it knows the answer.
+would then reuse on the next `Run`. Alignment is still validated before the
+decline, so a malformed requirement is an error rather than a silent `None`.
 
-> Declining rather than erroring is also what preserves #832's validated path:
-> on `main` the executor called bare `execute()`, which for a persistent
-> declarer *is* `execute_with_workspace(.., None)`. Hard-failing would have
-> broken every GQA-bearing model on the plugin path on hardware that runs it
-> today. A session-persistent device arena at this seam remains **future work**.
+Declining is **exactly behaviour-preserving against `main`**, which is why it is
+safe to ship without hardware: `main`'s executor calls bare `execute()` at both
+dispatch sites (`compute.rs:1080`, `:1205`), and the
+`Kernel::execute_with_workspace` default forwards to `execute()`, so passing
+`None` reproduces `main` node for node.
+
+What that behaviour *is* varies by kernel, and it is **not** uniformly a
+self-owned fallback. Of the five `SessionPersistent` declarers in
+`onnx-runtime-ep-cuda`:
+
+| Kernel | Behaviour when declined |
+|---|---|
+| `GroupQueryAttention` | Self-owned pooled score scratch (documented compatibility path) |
+| `StandardAttention` | Self-owned pooled/per-call score + staged-K/V scratch |
+| `MatMulNBits` (via `blas::governed_workspace_requirement`) | Self-owned `Bf16Scratch` for bf16 staging; the f32 dequant-cuBLASLt path errors in `governed_workspace_ptr` |
+| `BlockQuantizedMoE` | Hard error — no self-owned path |
+| `IndexShare` | Hard error — no self-owned path |
+
+The last two, and the `MatMulNBits` dequant-cuBLASLt path, **already fail this
+way on the plugin path on `main` today**. This executor neither fixes nor
+worsens them, and no claim is made here that they work. Making them work needs a
+real session-persistent device arena at this seam, which is **future work**.
+
+> Hard-failing on `SessionPersistent` instead of declining was tried and
+> rejected: it would have turned every GQA-bearing model into a plugin-path
+> error on the hardware #832 validated.
 
 ---
 
@@ -287,11 +304,13 @@ Everything in this list is about the PR #830 delta or was never in #832's scope:
   device, and whether ORT's CUDA-side scratch is arena-backed (if it is not,
   each request is a real `cuMemAlloc` and the capture-safety argument narrows to
   "no free", not "no allocation");
-- whether declining `SessionPersistent` leaves every persistent-declaring CUDA
-  kernel on a correct self-owned path under the plugin executor specifically
-  (#832 validated the *native* path for those kernels, and the plugin path for
-  `Add`/`Mul` and the 30B decoder, but not a plugin-path model that exercises
-  `GroupQueryAttention`);
+- whether declining `SessionPersistent` leaves `GroupQueryAttention`,
+  `StandardAttention` and `MatMulNBits` on a correct self-owned path under the
+  plugin executor specifically (#832 validated the *native* path for those
+  kernels, and the plugin path for `Add`/`Mul` and the 30B decoder, but not a
+  plugin-path model that exercises `GroupQueryAttention`). `BlockQuantizedMoE`
+  and `IndexShare` are known *not* to run on the plugin path either here or on
+  `main` — that is a stated gap, not an open question;
 - whether explicit `ReleaseEpFactory` shutdown ordering is correct against a
   live CUDA context with multiple sessions;
 - whether `CanCopy`'s `MemoryDevice_GetDeviceId` comparison behaves correctly

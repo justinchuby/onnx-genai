@@ -845,21 +845,26 @@ unsafe fn alloc_scratch(
 ///   (`Ok(None)`), never downgraded. ORT reclaims scratch when `Compute`
 ///   returns, so serving a persistent request from it would hand the kernel
 ///   memory that is recycled behind its back on the next `Run`. There is no
-///   session-persistent device arena at this seam, so the kernel is routed to
-///   its own documented self-owned scratch path — which is what every
-///   persistent-declaring kernel in this repo already implements (the cached
-///   grow-only arena pattern, e.g. `MatMulNBits`'s bf16 scratch from #832, and
-///   `GroupQueryAttentionKernel::execute`'s pooled reference-score slot). A
-///   kernel that genuinely cannot run without executor-provided persistent
-///   memory fails closed in its own `execute_with_workspace`, where it knows
-///   the answer; this seam must not guess.
+///   session-persistent device arena at this seam, so the request is passed
+///   through as `None` and the kernel decides: it either falls back to its own
+///   documented self-owned scratch (`GroupQueryAttentionKernel::execute`'s
+///   pooled reference-score slot, `StandardAttention`'s pooled score/staged-K/V
+///   scratch, `MatMulNBits`'s bf16 `Bf16Scratch` arena from #832) or fails
+///   closed in its own `execute_with_workspace`, where it knows the answer.
+///   This seam must not guess.
 ///
-///   Declining is also what preserves #832's H200-validated plugin path: on
-///   `main` the executor called bare `Kernel::execute`, which for a persistent
-///   declarer such as `GroupQueryAttention` is exactly
-///   `execute_with_workspace(.., None)`. Hard-failing here would have turned
-///   every GQA-bearing model into a plugin-path error on hardware that runs it
-///   today.
+///   Not every persistent declarer has a self-owned path: `BlockQuantizedMoE`
+///   and `IndexShare` hard-error without executor-provided persistent memory,
+///   as does `MatMulNBits`'s f32 dequant-cuBLASLt path. Those already fail this
+///   way on the plugin path on `main`, so declining neither fixes nor worsens
+///   them; supporting them requires a real persistent arena here.
+///
+///   Declining is what preserves #832's H200-validated plugin path: on `main`
+///   the executor called bare `Kernel::execute`, and
+///   [`Kernel::execute_with_workspace`] defaults to forwarding there, so `None`
+///   reproduces `main` node for node. Hard-failing here would instead have
+///   turned every GQA-bearing model into a plugin-path error on hardware that
+///   runs it today.
 ///
 /// `mem_info` is `None` when the memory device of the kernel's operands could
 /// not be read; a workspace request is then rejected rather than served from
