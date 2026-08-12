@@ -471,7 +471,10 @@ Four tiny live fragments open four complete physical windows.
 ```
 
 Each head owns its full `max_seq × head_dim` stripe. Across the model, the
-near-empty floor is therefore `layers × 2 × kv_heads` windows.
+near-empty floor is therefore `layers × 2 × kv_heads` windows — **but only when
+the per-head stride is a fixed full context.** The engine grows a packed bucket
+instead, so this figure does not describe its head-major path; see the floor
+table below and #841.
 
 **Seq-major BSNH is dense within each buffer, but K and V remain separate for
 every layer:**
@@ -534,9 +537,40 @@ measured 2 MiB CUDA granule:
 
 | Layout | Floor unit | Near-empty floor | Evidence/status |
 |---|---:|---:|---|
-| BNSH head-major | `layers × 2 × kv_heads = 768` | ~1.5 GiB | Default; geometry measured in #772/#776/#787 |
-| BSNH seq-major | `layers × 2 = 96` | ~192 MiB | **Driver-level residency measured** (`vmm_kv_layout_residency_gpu`); see below |
+| BNSH head-major, **fixed full-context stride** | `layers × 2 × kv_heads = 768` | ~1.5 GiB | Geometry measured in #772/#776/#787 — but **the engine never instantiates this stride**; see below |
+| BNSH head-major, **as the engine actually runs it** | `layers × 2 = 96` | ~192 MiB | **Measured on qwen14b** (#841): head-major grows a *packed* bucket, so it already sits on the dense floor |
+| BSNH seq-major | `layers × 2 = 96` | ~192 MiB | Driver-level residency (`vmm_kv_layout_residency_gpu`); **byte-identical to head-major end to end** (#841) |
 | token-major across all layers | `1` per sequence | ~2 MiB | **768× measured reduction**, #787; not implemented |
+
+> **The 768-granule head-major figure is the wrong baseline for the engine, and
+> the `kv_heads×` ("8×") saving seq-major was pursued for does not exist on the
+> path the engine actually runs.** Measured end to end on qwen14b in #841, with
+> on-demand commit *active* (`growth_events ≥ 1`, i.e. not the pinned-knob
+> artifact of #834): head-major and seq-major commit **byte-identical** physical
+> KV (402,653,184 B at both bucket 512 and 1024), with byte-identical tokens.
+>
+> The mechanism is in `native_decode/cuda.rs`: head-major sets
+> `new_shape[2] = new_capacity` on growth, so its per-head stride is *the current
+> bucket*, not a fixed full context. It therefore re-packs **dense** and lands on
+> the same `layers × 2` granules as seq-major. The 768-granule floor is a property
+> of a *fixed full-context-stride* head-major layout — each head stripe
+> `max_len × head_dim × elem` apart, so a short prefix scatters one granule per
+> head — and the engine deliberately never builds that. Head-major runs at
+> **0.25× of the 768 figure**, not 4× above the seq-major floor.
+>
+> **Seq-major's real, measured advantage is growth cost, not committed bytes:**
+> on the 512→1024 step head-major moved `kv_bytes_moved = 100,667,392 B` and
+> invalidated its captured graph, while seq-major moved **0 bytes** and kept the
+> capture (`growth_keeps`). That is what the layout chain (#782/#792/#794/#797/
+> #801/#812/#827) actually bought, and it is worth having — it is simply not a
+> residency saving.
+>
+> **Lesson.** The `layers × 2 × kv_heads` floor was derived from layout geometry
+> and then compared against the engine without first checking which stride the
+> engine builds. `cuda.rs` had said "head-major grows a *packed* bucket whose
+> per-head stride is `new_capacity` (the bucket, not a fixed full context)" since
+> #827 — the arithmetic was right, the baseline was not. Before quoting a floor,
+> confirm the code instantiates the geometry that floor assumes.
 
 > **These floors are properties of the layout geometry, not of what the runtime
 > currently commits on the end-to-end engine path.** Measured in #794 on both
@@ -561,6 +595,12 @@ measured 2 MiB CUDA granule:
 > |---|---:|---:|---:|---:|---:|
 > | qwen2.5-0.5b | 4 MiB (2 granules) | 2 MiB (1 granule) | **2× = kv_heads** | 192 MiB (96 granules) | 96 MiB (48 granules) |
 > | qwen14b | 16 MiB (8 granules) | 2 MiB (1 granule) | **8× = kv_heads** | 1536 MiB (768 granules) | 192 MiB (96 granules) |
+>
+> **This ratio is real but does not transfer to the engine.** It is measured on a
+> *fixed full-context stride*, as the paragraph above states. The engine's
+> head-major path grows a **packed** bucket instead (`new_shape[2] =
+> new_capacity`), so end to end the two layouts commit byte-identical physical KV
+> (#841). See the floor table earlier in this section.
 >
 > The same test also grows a seq-major fixed-stride binding **under a captured
 > replay** (granule 0 → 3 at a stable VA) and observes **0 re-captures** — the
