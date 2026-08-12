@@ -374,10 +374,96 @@ pub enum OutputStage {
 pub struct WorkflowComponent {
     pub implementation: ComponentImplementation,
     pub ports: ComponentPorts,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<PolicyComponentContract>,
     #[serde(default)]
     pub effects: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<WorkflowResourceContract>,
+}
+
+/// Stable semantic roles for ONNX policy-math components.
+///
+/// Fields map semantic roles to concrete ONNX port names. The corresponding
+/// tensor contracts live in [`WorkflowComponent::ports`].
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "role", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PolicyComponentContract {
+    TokenSampler {
+        mode: SamplingPolicyMode,
+        logits: String,
+        token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        temperature: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        top_k: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        top_p: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rng: Option<RngPortContract>,
+        effect: String,
+    },
+    TerminationPredicate {
+        tokens: String,
+        eos_ids: String,
+        iteration: String,
+        max_iterations: String,
+        done: String,
+        effect: String,
+    },
+    SolverStep {
+        state: String,
+        estimate: String,
+        step: String,
+        schedule: String,
+        next_state: String,
+        effect: String,
+    },
+    MaskedUpdate {
+        state: String,
+        proposal: String,
+        mask: String,
+        step: String,
+        next_state: String,
+        next_mask: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rng: Option<RngPortContract>,
+        effect: String,
+    },
+    SpeculativeVerifier {
+        target_scores: String,
+        proposed_tokens: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proposal_scores: Option<String>,
+        accepted_tokens: String,
+        accepted_len: String,
+        done: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rng: Option<RngPortContract>,
+        effect: String,
+    },
+    StateUpdate {
+        current: String,
+        update: String,
+        next: String,
+        effect: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SamplingPolicyMode {
+    Greedy,
+    SeededStochastic,
+}
+
+/// Counter-based RNG state. Producers should use Philox or Threefry inside ONNX.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RngPortContract {
+    pub seed: String,
+    pub offset: String,
+    pub next_offset: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
