@@ -376,6 +376,8 @@ pub struct WorkflowComponent {
     pub ports: ComponentPorts,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<PolicyComponentContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<AdapterComponentContract>,
     #[serde(default)]
     pub effects: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -448,6 +450,61 @@ pub enum PolicyComponentContract {
         next: String,
         effect: String,
     },
+    AdaptiveProposalBudget {
+        current_k: String,
+        accepted: String,
+        evaluated: String,
+        committed_tokens: String,
+        filled_proposal_budget: String,
+        draft_ms: String,
+        target_ms: String,
+        estimates: String,
+        next_k: String,
+        next_estimates: String,
+        effect: String,
+    },
+}
+
+/// Stable semantic roles for versioned runtime adapter ABIs.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "role", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AdapterComponentContract {
+    GrammarGuidance {
+        action: GrammarGuidanceAction,
+        state: String,
+        tokens: String,
+        valid_length: String,
+        transition_table: String,
+        next_state: String,
+        consumed_length: String,
+        logits_mask: String,
+        forced_tokens: String,
+        forced_length: String,
+        effect: String,
+    },
+    Telemetry {
+        action: TelemetryAction,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timestamp: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<String>,
+        effect: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GrammarGuidanceAction {
+    Clone,
+    Lookahead,
+    Commit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TelemetryAction {
+    Start,
+    Elapsed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
@@ -595,11 +652,21 @@ pub enum WorkflowEmitMode {
 #[serde(deny_unknown_fields)]
 pub struct WorkflowStateCell {
     pub contract: TensorContract,
+    #[serde(default)]
+    pub class: WorkflowStateClass,
     pub scope: WorkflowStateScope,
     pub initializer: String,
     pub recurrence: ShapeRecurrence,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<SessionLeaseContract>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowStateClass {
+    #[default]
+    Semantic,
+    Advisory,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]

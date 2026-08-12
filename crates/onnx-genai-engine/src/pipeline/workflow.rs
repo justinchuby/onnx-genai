@@ -19,10 +19,20 @@ fn workflow_adapter_registry()
     static REGISTRY: std::sync::LazyLock<
         HashMap<(&'static str, &'static str), WorkflowAdapterExecutor>,
     > = std::sync::LazyLock::new(|| {
-        HashMap::from([(
-            ("onnx-genai.image-preprocess", "1"),
-            PipelineEngine::run_image_preprocess_adapter as WorkflowAdapterExecutor,
-        )])
+        HashMap::from([
+            (
+                ("onnx-genai.image-preprocess", "1"),
+                PipelineEngine::run_image_preprocess_adapter as WorkflowAdapterExecutor,
+            ),
+            (
+                ("onnx-genai.grammar-guidance", "1"),
+                PipelineEngine::run_grammar_guidance_adapter as WorkflowAdapterExecutor,
+            ),
+            (
+                ("onnx-genai.telemetry", "1"),
+                PipelineEngine::run_telemetry_adapter as WorkflowAdapterExecutor,
+            ),
+        ])
     });
     &REGISTRY
 }
@@ -613,6 +623,258 @@ impl PipelineEngine {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn run_grammar_guidance_adapter(
+        &self,
+        component: &str,
+        inputs: &std::collections::BTreeMap<String, String>,
+        outputs: &std::collections::BTreeMap<String, String>,
+        declaration: &onnx_genai_metadata::WorkflowComponent,
+        values: &mut PipelineTensors,
+        _package_symbols: &HashMap<String, i64>,
+        component_symbols: &mut HashMap<String, i64>,
+    ) -> anyhow::Result<()> {
+        let onnx_genai_metadata::AdapterComponentContract::GrammarGuidance {
+            action,
+            state,
+            tokens,
+            valid_length,
+            transition_table,
+            next_state,
+            consumed_length,
+            logits_mask,
+            forced_tokens,
+            forced_length,
+            ..
+        } = declaration
+            .adapter
+            .as_ref()
+            .context("grammar guidance adapter is missing its typed adapter contract")?
+        else {
+            anyhow::bail!("workflow adapter '{component}' is not grammar guidance");
+        };
+
+        let state_value = workflow_adapter_input(component, state, inputs, values)?;
+        let token_value = workflow_adapter_input(component, tokens, inputs, values)?;
+        let length_value = workflow_adapter_input(component, valid_length, inputs, values)?;
+        let table_value = workflow_adapter_input(component, transition_table, inputs, values)?;
+        let states = state_value.to_vec_i64()?;
+        let token_data = token_value.to_vec_i64()?;
+        let lengths = length_value.to_vec_i64()?;
+        let transitions = table_value.to_vec_i64()?;
+        let batch = states.len();
+        let token_shape = token_value.shape();
+        let table_shape = table_value.shape();
+        if state_value.shape() != [batch as i64]
+            || token_shape.len() != 2
+            || token_shape[0] != batch as i64
+            || length_value.shape() != [batch as i64]
+            || table_shape.len() != 2
+        {
+            anyhow::bail!(
+                "workflow grammar adapter '{component}' received incompatible runtime shapes"
+            );
+        }
+        let token_width = usize::try_from(token_shape[1])?;
+        let state_count = usize::try_from(table_shape[0])?;
+        let vocabulary = usize::try_from(table_shape[1])?;
+        let transition_count = state_count
+            .checked_mul(vocabulary)
+            .context("workflow grammar transition-table shape overflows usize")?;
+        if transitions.len() != transition_count {
+            anyhow::bail!(
+                "workflow grammar adapter '{component}' transition table size is invalid"
+            );
+        }
+
+        let mut next_states = Vec::with_capacity(batch);
+        let mut consumed = Vec::with_capacity(batch);
+        let mut mask = Vec::with_capacity(batch * vocabulary);
+        let mut forced = Vec::with_capacity(batch);
+        let mut forced_lengths = Vec::with_capacity(batch);
+        for row in 0..batch {
+            let requested = if matches!(action, onnx_genai_metadata::GrammarGuidanceAction::Clone) {
+                0
+            } else {
+                usize::try_from(lengths[row]).with_context(|| {
+                    format!("grammar valid_length for row {row} must be non-negative")
+                })?
+            };
+            if requested > token_width {
+                anyhow::bail!(
+                    "workflow grammar adapter '{component}' row {row} valid_length {requested} \
+                     exceeds token width {token_width}"
+                );
+            }
+            let mut state_index = usize::try_from(states[row])
+                .with_context(|| format!("grammar state for row {row} must be non-negative"))?;
+            if state_index >= state_count {
+                anyhow::bail!(
+                    "workflow grammar adapter '{component}' row {row} state {state_index} is \
+                     outside {state_count} states"
+                );
+            }
+            let mut accepted = 0usize;
+            for column in 0..requested {
+                let token = usize::try_from(token_data[row * token_width + column])
+                    .with_context(|| format!("grammar token for row {row} must be non-negative"))?;
+                let next = token
+                    .checked_add(state_index * vocabulary)
+                    .filter(|index| *index < transitions.len())
+                    .map(|index| transitions[index])
+                    .unwrap_or(-1);
+                if next < 0 {
+                    if matches!(action, onnx_genai_metadata::GrammarGuidanceAction::Commit) {
+                        anyhow::bail!(
+                            "workflow grammar commit adapter '{component}' rejected token {token} \
+                             at row {row}, position {column}"
+                        );
+                    }
+                    break;
+                }
+                state_index = usize::try_from(next)?;
+                if state_index >= state_count {
+                    anyhow::bail!(
+                        "workflow grammar adapter '{component}' transition produced invalid \
+                         state {state_index}"
+                    );
+                }
+                accepted += 1;
+            }
+            next_states.push(i64::try_from(state_index)?);
+            consumed.push(i64::try_from(accepted)?);
+            let row_transitions =
+                &transitions[state_index * vocabulary..(state_index + 1) * vocabulary];
+            let mut only_token = None;
+            for (token, next) in row_transitions.iter().enumerate() {
+                let allowed = *next >= 0;
+                mask.push(u8::from(allowed));
+                if allowed {
+                    only_token = match only_token {
+                        None => Some(token),
+                        Some(_) => Some(vocabulary),
+                    };
+                }
+            }
+            if let Some(token) = only_token.filter(|token| *token < vocabulary) {
+                forced.push(i64::try_from(token)?);
+                forced_lengths.push(1);
+            } else {
+                forced.push(0);
+                forced_lengths.push(0);
+            }
+        }
+
+        let produced = [
+            (
+                next_state.as_str(),
+                Value::from_slice_i64(&next_states, &[batch as i64])?,
+            ),
+            (
+                consumed_length.as_str(),
+                Value::from_slice_i64(&consumed, &[batch as i64])?,
+            ),
+            (
+                logits_mask.as_str(),
+                Value::from_raw_bytes(mask, &[batch as i64, vocabulary as i64], DataType::Bool)?,
+            ),
+            (
+                forced_tokens.as_str(),
+                Value::from_slice_i64(&forced, &[batch as i64, 1])?,
+            ),
+            (
+                forced_length.as_str(),
+                Value::from_slice_i64(&forced_lengths, &[batch as i64])?,
+            ),
+        ];
+        for (port, value) in produced {
+            insert_workflow_adapter_output(
+                component,
+                port,
+                value,
+                outputs,
+                declaration,
+                values,
+                component_symbols,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_telemetry_adapter(
+        &self,
+        component: &str,
+        inputs: &std::collections::BTreeMap<String, String>,
+        outputs: &std::collections::BTreeMap<String, String>,
+        declaration: &onnx_genai_metadata::WorkflowComponent,
+        values: &mut PipelineTensors,
+        _package_symbols: &HashMap<String, i64>,
+        component_symbols: &mut HashMap<String, i64>,
+    ) -> anyhow::Result<()> {
+        static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let elapsed_ns = || {
+            i64::try_from(
+                EPOCH
+                    .get_or_init(std::time::Instant::now)
+                    .elapsed()
+                    .as_nanos(),
+            )
+            .context("workflow telemetry timestamp exceeds int64")
+        };
+        let onnx_genai_metadata::AdapterComponentContract::Telemetry {
+            action,
+            timestamp,
+            duration_ms,
+            ..
+        } = declaration
+            .adapter
+            .as_ref()
+            .context("telemetry adapter is missing its typed adapter contract")?
+        else {
+            anyhow::bail!("workflow adapter '{component}' is not telemetry");
+        };
+        match action {
+            onnx_genai_metadata::TelemetryAction::Start => {
+                let port = timestamp
+                    .as_deref()
+                    .context("telemetry start requires timestamp output")?;
+                insert_workflow_adapter_output(
+                    component,
+                    port,
+                    Value::from_slice_i64(&[elapsed_ns()?], &[])?,
+                    outputs,
+                    declaration,
+                    values,
+                    component_symbols,
+                )
+            }
+            onnx_genai_metadata::TelemetryAction::Elapsed => {
+                let timestamp_port = timestamp
+                    .as_deref()
+                    .context("telemetry elapsed requires timestamp input")?;
+                let started = workflow_adapter_input(component, timestamp_port, inputs, values)?
+                    .to_vec_i64()?;
+                let [started] = started.as_slice() else {
+                    anyhow::bail!("workflow telemetry timestamp must contain one value");
+                };
+                let duration = (elapsed_ns()? - *started).max(0) as f32 / 1_000_000.0;
+                let port = duration_ms
+                    .as_deref()
+                    .context("telemetry elapsed requires duration_ms output")?;
+                insert_workflow_adapter_output(
+                    component,
+                    port,
+                    Value::from_slice_f32(&[duration], &[])?,
+                    outputs,
+                    declaration,
+                    values,
+                    component_symbols,
+                )
+            }
+        }
+    }
+
     fn bind_workflow_inputs(
         &self,
         workflow: &WorkflowSpec,
@@ -831,6 +1093,47 @@ fn scalar_or_batch_shape(contract: &TensorContract) -> anyhow::Result<Vec<i64>> 
         1 => Ok(vec![1]),
         rank => anyhow::bail!("request scalar binding requires rank 0 or 1, got {rank}"),
     }
+}
+
+fn workflow_adapter_input<'a>(
+    component: &str,
+    port: &str,
+    inputs: &std::collections::BTreeMap<String, String>,
+    values: &'a PipelineTensors,
+) -> anyhow::Result<&'a Value> {
+    let value_ref = inputs
+        .get(port)
+        .with_context(|| format!("workflow adapter '{component}' requires input port '{port}'"))?;
+    values
+        .get(value_ref)
+        .with_context(|| format!("workflow adapter input value '{value_ref}' is unavailable"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_workflow_adapter_output(
+    component: &str,
+    port: &str,
+    value: Value,
+    outputs: &std::collections::BTreeMap<String, String>,
+    declaration: &onnx_genai_metadata::WorkflowComponent,
+    values: &mut PipelineTensors,
+    component_symbols: &mut HashMap<String, i64>,
+) -> anyhow::Result<()> {
+    let value_ref = outputs.get(port).with_context(|| {
+        format!("workflow adapter '{component}' requires output binding for port '{port}'")
+    })?;
+    let contract = declaration.ports.outputs.get(port).with_context(|| {
+        format!("workflow adapter '{component}' has no declared output port '{port}'")
+    })?;
+    validate_workflow_value(
+        value_ref,
+        &value,
+        contract,
+        component_symbols,
+        &std::collections::HashSet::new(),
+    )?;
+    values.insert(value_ref.clone(), value);
+    Ok(())
 }
 
 fn resolve_workflow_shape(

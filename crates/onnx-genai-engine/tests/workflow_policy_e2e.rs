@@ -284,6 +284,109 @@ graph {
 opset_import { domain: "" version: 13 }
 "#;
 
+const MIN_LENGTH: &str = r#"
+ir_version: 8
+graph {
+  node { input: "accepted" input: "grammar" output: "length" op_type: "Min" }
+  name: "min_length"
+  input { name: "accepted" type { tensor_type { elem_type: 7 shape {
+    dim { dim_param: "batch" }
+  }}}}
+  input { name: "grammar" type { tensor_type { elem_type: 7 shape {
+    dim { dim_param: "batch" }
+  }}}}
+  output { name: "length" type { tensor_type { elem_type: 7 shape {
+    dim { dim_param: "batch" }
+  }}}}
+}
+opset_import { domain: "" version: 13 }
+"#;
+
+const ADAPTIVE_PROPOSAL_BUDGET: &str = r#"
+ir_version: 8
+graph {
+  node { input: "current_k" input: "one" output: "increased" op_type: "Add" }
+  node {
+    input: "filled_proposal_budget" input: "increased" input: "current_k"
+    output: "next_k" op_type: "Where"
+  }
+  node { input: "estimates" output: "next_estimates" op_type: "Identity" }
+  name: "adaptive_proposal_budget"
+  initializer { dims: 1 data_type: 7 int64_data: 1 name: "one" }
+  input { name: "current_k" type { tensor_type { elem_type: 7 shape {
+    dim { dim_param: "batch" }
+  }}}}
+  input { name: "accepted" type { tensor_type { elem_type: 7 shape {
+    dim { dim_param: "batch" }
+  }}}}
+  input { name: "evaluated" type { tensor_type { elem_type: 7 shape {
+    dim { dim_param: "batch" }
+  }}}}
+  input { name: "committed_tokens" type { tensor_type { elem_type: 7 shape {
+    dim { dim_param: "batch" }
+  }}}}
+  input { name: "filled_proposal_budget" type { tensor_type { elem_type: 9 shape {
+    dim { dim_param: "batch" }
+  }}}}
+  input { name: "draft_ms" type { tensor_type { elem_type: 1 shape {
+    dim { dim_param: "batch" }
+  }}}}
+  input { name: "target_ms" type { tensor_type { elem_type: 1 shape {
+    dim { dim_param: "batch" }
+  }}}}
+  input { name: "estimates" type { tensor_type { elem_type: 1 shape {
+    dim { dim_param: "batch" } dim { dim_param: "budget_slots" }
+  }}}}
+  output { name: "next_k" type { tensor_type { elem_type: 7 shape {
+    dim { dim_param: "batch" }
+  }}}}
+  output { name: "next_estimates" type { tensor_type { elem_type: 1 shape {
+    dim { dim_param: "batch" } dim { dim_param: "budget_slots" }
+  }}}}
+}
+opset_import { domain: "" version: 13 }
+"#;
+
+const GUIDED_SAMPLER: &str = r#"
+ir_version: 8
+graph {
+  node {
+    input: "logits_mask" input: "logits" input: "negative"
+    output: "masked_logits" op_type: "Where"
+  }
+  node { input: "masked_logits" output: "sampled" op_type: "ArgMax"
+    attribute { name: "axis" i: 1 type: INT }
+    attribute { name: "keepdims" i: 1 type: INT }
+  }
+  node { input: "forced_length" input: "zero" output: "has_forced" op_type: "Greater" }
+  node { input: "has_forced" input: "axes" output: "has_forced_2d" op_type: "Unsqueeze" }
+  node {
+    input: "has_forced_2d" input: "forced_tokens" input: "sampled"
+    output: "token" op_type: "Where"
+  }
+  name: "guided_sampler"
+  initializer { data_type: 1 float_data: -1000000000 name: "negative" }
+  initializer { dims: 1 data_type: 7 int64_data: 1 name: "axes" }
+  initializer { dims: 1 data_type: 7 int64_data: 0 name: "zero" }
+  input { name: "logits" type { tensor_type { elem_type: 1 shape {
+    dim { dim_param: "batch" } dim { dim_param: "vocabulary" }
+  }}}}
+  input { name: "logits_mask" type { tensor_type { elem_type: 9 shape {
+    dim { dim_param: "batch" } dim { dim_param: "vocabulary" }
+  }}}}
+  input { name: "forced_tokens" type { tensor_type { elem_type: 7 shape {
+    dim { dim_param: "batch" } dim { dim_value: 1 }
+  }}}}
+  input { name: "forced_length" type { tensor_type { elem_type: 7 shape {
+    dim { dim_param: "batch" }
+  }}}}
+  output { name: "token" type { tensor_type { elem_type: 7 shape {
+    dim { dim_param: "batch" } dim { dim_value: 1 }
+  }}}}
+}
+opset_import { domain: "" version: 13 }
+"#;
+
 const VISION_IDENTITY: &str = r#"
 ir_version: 8
 graph {
@@ -1435,6 +1538,501 @@ pipeline:
     let output = engine.run_pipeline(request)?;
     assert_eq!(output["state"].shape(), [1, 2]);
     assert_eq!(output["state"].to_vec_i64()?, [10, 11]);
+    Ok(())
+}
+
+#[test]
+fn workflow_combines_speculation_grammar_and_adaptive_budget() -> anyhow::Result<()> {
+    let metadata = r#"
+pipeline:
+  workflow:
+    manifest:
+      ir_version: "1.0"
+      onnx_opsets: { ai.onnx: 13 }
+      adapter_abis: { onnx-genai.grammar-guidance: "1" }
+      custom_op_versions: {}
+      capabilities:
+        [workflow_ssa, linear_effects, typed_emit, emit_valid_length,
+         nested_control_flow, grammar_guidance_adapter, adaptive_proposal_budget,
+         advisory_state]
+    inputs:
+      proposed: { contract: { dtype: int64, rank: 2, shape: [batch, proposal] },
+                  role: { kind: opaque }, source: { kind: application, name: proposed },
+                  required: true }
+      target: { contract: { dtype: float32, rank: 3, shape: [batch, proposal, vocabulary] },
+                role: { kind: opaque }, source: { kind: application, name: target },
+                required: true }
+      logits: { contract: { dtype: float32, rank: 2, shape: [batch, vocabulary] },
+                role: { kind: opaque }, source: { kind: application, name: logits },
+                required: true }
+      grammar_state: { contract: { dtype: int64, rank: 1, shape: [batch] },
+                       role: { kind: opaque },
+                       source: { kind: application, name: grammar_state }, required: true }
+      transition_table: { contract: { dtype: int64, rank: 2, shape: [grammar_states, vocabulary] },
+                          role: { kind: opaque },
+                          source: { kind: application, name: transition_table }, required: true }
+      zero_length: { contract: { dtype: int64, rank: 1, shape: [batch] },
+                     role: { kind: opaque }, source: { kind: application, name: zero_length },
+                     required: true }
+      evaluated: { contract: { dtype: int64, rank: 1, shape: [batch] },
+                   role: { kind: opaque }, source: { kind: application, name: evaluated },
+                   required: true }
+      current_k: { contract: { dtype: int64, rank: 1, shape: [batch] },
+                   role: { kind: opaque }, source: { kind: application, name: current_k },
+                   required: true }
+      estimates: { contract: { dtype: float32, rank: 2, shape: [batch, budget_slots] },
+                   role: { kind: opaque }, source: { kind: application, name: estimates },
+                   required: true }
+      filled: { contract: { dtype: bool, rank: 1, shape: [batch] },
+                role: { kind: opaque }, source: { kind: application, name: filled },
+                required: true }
+      draft_ms: { contract: { dtype: float32, rank: 1, shape: [batch] },
+                  role: { kind: opaque }, source: { kind: application, name: draft_ms },
+                  required: true }
+      target_ms: { contract: { dtype: float32, rank: 1, shape: [batch] },
+                   role: { kind: opaque }, source: { kind: application, name: target_ms },
+                   required: true }
+      continue: { contract: { dtype: bool, rank: 0, shape: [] },
+                  role: { kind: opaque }, source: { kind: application, name: continue },
+                  required: true }
+      iterations: { contract: { dtype: int64, rank: 0, shape: [] },
+                    role: { kind: opaque }, source: { kind: application, name: iterations },
+                    required: true }
+    outputs:
+      tokens: { contract: { dtype: int64, rank: 2, shape: [batch, generated] },
+                role: tokens, stage: pre_adapter }
+      next_k: { contract: { dtype: int64, rank: 1, shape: [batch] },
+                role: tensor, stage: pre_adapter }
+      final_grammar_state: { contract: { dtype: int64, rank: 1, shape: [batch] },
+                             role: tensor, stage: pre_adapter }
+    components:
+      bind_grammar:
+        implementation: { kind: binding }
+        ports:
+          inputs: { value: { dtype: int64, rank: 1, shape: [batch] } }
+          outputs: { value: { dtype: int64, rank: 1, shape: [batch] } }
+        effects: []
+      bind_k:
+        implementation: { kind: binding }
+        ports:
+          inputs: { value: { dtype: int64, rank: 1, shape: [batch] } }
+          outputs: { value: { dtype: int64, rank: 1, shape: [batch] } }
+        effects: []
+      bind_estimates:
+        implementation: { kind: binding }
+        ports:
+          inputs: { value: { dtype: float32, rank: 2, shape: [batch, budget_slots] } }
+          outputs: { value: { dtype: float32, rank: 2, shape: [batch, budget_slots] } }
+        effects: []
+      grammar_clone:
+        implementation: { kind: adapter, abi: onnx-genai.grammar-guidance, version: "1" }
+        adapter:
+          role: grammar_guidance
+          action: clone
+          state: state
+          tokens: tokens
+          valid_length: valid_length
+          transition_table: transition_table
+          next_state: next_state
+          consumed_length: consumed_length
+          logits_mask: logits_mask
+          forced_tokens: forced_tokens
+          forced_length: forced_length
+          effect: grammar
+        ports: &grammar_ports
+          inputs:
+            state: { dtype: int64, rank: 1, shape: [batch] }
+            tokens: { dtype: int64, rank: 2, shape: [batch, proposal] }
+            valid_length: { dtype: int64, rank: 1, shape: [batch] }
+            transition_table: { dtype: int64, rank: 2, shape: [grammar_states, vocabulary] }
+          outputs:
+            next_state: { dtype: int64, rank: 1, shape: [batch] }
+            consumed_length: { dtype: int64, rank: 1, shape: [batch] }
+            logits_mask: { dtype: bool, rank: 2, shape: [batch, vocabulary] }
+            forced_tokens: { dtype: int64, rank: 2, shape: [batch, 1] }
+            forced_length: { dtype: int64, rank: 1, shape: [batch] }
+        effects: [grammar]
+      grammar_lookahead:
+        implementation: { kind: adapter, abi: onnx-genai.grammar-guidance, version: "1" }
+        adapter:
+          role: grammar_guidance
+          action: lookahead
+          state: state
+          tokens: tokens
+          valid_length: valid_length
+          transition_table: transition_table
+          next_state: next_state
+          consumed_length: consumed_length
+          logits_mask: logits_mask
+          forced_tokens: forced_tokens
+          forced_length: forced_length
+          effect: grammar
+        ports: *grammar_ports
+        effects: [grammar]
+      grammar_commit:
+        implementation: { kind: adapter, abi: onnx-genai.grammar-guidance, version: "1" }
+        adapter:
+          role: grammar_guidance
+          action: commit
+          state: state
+          tokens: tokens
+          valid_length: valid_length
+          transition_table: transition_table
+          next_state: next_state
+          consumed_length: consumed_length
+          logits_mask: logits_mask
+          forced_tokens: forced_tokens
+          forced_length: forced_length
+          effect: grammar
+        ports: *grammar_ports
+        effects: [grammar]
+      verifier:
+        implementation: { kind: onnx, artifact: verifier.onnx.textproto }
+        ports:
+          inputs:
+            target_scores: { dtype: float32, rank: 3, shape: [batch, proposal, vocabulary] }
+            proposed_tokens: { dtype: int64, rank: 2, shape: [batch, proposal] }
+          outputs:
+            accepted_tokens: { dtype: int64, rank: 2, shape: [batch, proposal] }
+            accepted_count: { dtype: int64, rank: 1, shape: [batch] }
+            done: { dtype: bool, rank: 1, shape: [batch] }
+        policy:
+          role: speculative_verifier
+          target_scores: target_scores
+          proposed_tokens: proposed_tokens
+          accepted_tokens: accepted_tokens
+          accepted_len: accepted_count
+          done: done
+          effect: verify
+        effects: [verify]
+      min_length:
+        implementation: { kind: onnx, artifact: min.onnx.textproto }
+        ports:
+          inputs:
+            accepted: { dtype: int64, rank: 1, shape: [batch] }
+            grammar: { dtype: int64, rank: 1, shape: [batch] }
+          outputs:
+            length: { dtype: int64, rank: 1, shape: [batch] }
+        effects: []
+      adaptive:
+        implementation: { kind: onnx, artifact: adaptive.onnx.textproto }
+        ports:
+          inputs:
+            current_k: { dtype: int64, rank: 1, shape: [batch] }
+            accepted: { dtype: int64, rank: 1, shape: [batch] }
+            evaluated: { dtype: int64, rank: 1, shape: [batch] }
+            committed_tokens: { dtype: int64, rank: 1, shape: [batch] }
+            filled_proposal_budget: { dtype: bool, rank: 1, shape: [batch] }
+            draft_ms: { dtype: float32, rank: 1, shape: [batch] }
+            target_ms: { dtype: float32, rank: 1, shape: [batch] }
+            estimates: { dtype: float32, rank: 2, shape: [batch, budget_slots] }
+          outputs:
+            next_k: { dtype: int64, rank: 1, shape: [batch] }
+            next_estimates: { dtype: float32, rank: 2, shape: [batch, budget_slots] }
+        policy:
+          role: adaptive_proposal_budget
+          current_k: current_k
+          accepted: accepted
+          evaluated: evaluated
+          committed_tokens: committed_tokens
+          filled_proposal_budget: filled_proposal_budget
+          draft_ms: draft_ms
+          target_ms: target_ms
+          estimates: estimates
+          next_k: next_k
+          next_estimates: next_estimates
+          effect: adaptive
+        effects: [adaptive]
+      guided_sampler:
+        implementation: { kind: onnx, artifact: guided.onnx.textproto }
+        ports:
+          inputs:
+            logits: { dtype: float32, rank: 2, shape: [batch, vocabulary] }
+            logits_mask: { dtype: bool, rank: 2, shape: [batch, vocabulary] }
+            forced_tokens: { dtype: int64, rank: 2, shape: [batch, 1] }
+            forced_length: { dtype: int64, rank: 1, shape: [batch] }
+          outputs:
+            token: { dtype: int64, rank: 2, shape: [batch, 1] }
+        effects: []
+    state:
+      grammar:
+        contract: { dtype: int64, rank: 1, shape: [batch] }
+        class: semantic
+        scope: invocation
+        initializer: grammar.current
+        recurrence: { kind: invariant }
+      adaptive:
+        contract: { dtype: float32, rank: 2, shape: [batch, budget_slots] }
+        class: advisory
+        scope: invocation
+        initializer: adaptive.current
+        recurrence: { kind: invariant }
+      proposal_k:
+        contract: { dtype: int64, rank: 1, shape: [batch] }
+        class: advisory
+        scope: invocation
+        initializer: k.current
+        recurrence: { kind: invariant }
+    initial_effects:
+      grammar: grammar.0
+      verify: verify.0
+      adaptive: adaptive.0
+      stream: stream.0
+      "state:grammar": state:grammar.0
+      "state:adaptive": state:adaptive.0
+      "state:proposal_k": state:proposal_k.0
+    graph:
+      kind: sequence
+      nodes:
+        - kind: loop
+          setup:
+            kind: sequence
+            nodes:
+              - kind: invoke
+                component: bind_grammar
+                inputs: { value: grammar_state }
+                outputs: { value: grammar.current }
+                effects: {}
+              - kind: invoke
+                component: bind_estimates
+                inputs: { value: estimates }
+                outputs: { value: adaptive.current }
+                effects: {}
+              - kind: invoke
+                component: bind_k
+                inputs: { value: current_k }
+                outputs: { value: k.current }
+                effects: {}
+          body:
+            kind: sequence
+            nodes:
+              - kind: invoke
+                component: grammar_clone
+                inputs: { state: grammar.body, tokens: proposed, valid_length: zero_length,
+                          transition_table: transition_table }
+                outputs: { next_state: grammar.clone, consumed_length: clone.consumed,
+                           logits_mask: clone.mask, forced_tokens: clone.forced,
+                           forced_length: clone.forced_length }
+                effects: { grammar: { consumes: grammar.0, produces: grammar.clone } }
+              - kind: invoke
+                component: grammar_lookahead
+                inputs: { state: grammar.clone, tokens: proposed, valid_length: evaluated,
+                          transition_table: transition_table }
+                outputs: { next_state: grammar.lookahead, consumed_length: grammar.valid,
+                           logits_mask: lookahead.mask, forced_tokens: lookahead.forced,
+                           forced_length: lookahead.forced_length }
+                effects: { grammar: { consumes: grammar.clone, produces: grammar.lookahead } }
+              - kind: invoke
+                component: verifier
+                inputs: { target_scores: target, proposed_tokens: proposed }
+                outputs: { accepted_tokens: accepted.tokens, accepted_count: verifier.accepted,
+                           done: verifier.done }
+                effects: { verify: { consumes: verify.0, produces: verify.1 } }
+              - kind: invoke
+                component: min_length
+                inputs: { accepted: verifier.accepted, grammar: grammar.valid }
+                outputs: { length: committed.length }
+                effects: {}
+              - kind: invoke
+                component: grammar_commit
+                inputs: { state: grammar.body, tokens: accepted.tokens,
+                          valid_length: committed.length, transition_table: transition_table }
+                outputs: { next_state: grammar.next, consumed_length: grammar.committed,
+                           logits_mask: grammar.mask, forced_tokens: grammar.forced,
+                           forced_length: grammar.forced_length }
+                effects: { grammar: { consumes: grammar.lookahead, produces: grammar.commit } }
+              - kind: invoke
+                component: adaptive
+                inputs: { current_k: k.body, accepted: committed.length,
+                          evaluated: evaluated, committed_tokens: committed.length,
+                          filled_proposal_budget: filled, draft_ms: draft_ms,
+                          target_ms: target_ms, estimates: adaptive.body }
+                outputs: { next_k: k.next, next_estimates: adaptive.next }
+                effects: { adaptive: { consumes: adaptive.0, produces: adaptive.1 } }
+              - kind: invoke
+                component: guided_sampler
+                inputs: { logits: logits, logits_mask: grammar.mask,
+                          forced_tokens: grammar.forced,
+                          forced_length: grammar.forced_length }
+                outputs: { token: grammar.token }
+                effects: {}
+              - kind: emit
+                value: accepted.tokens
+                valid_length: committed.length
+                output: tokens
+                mode: append
+                effect_name: stream
+                effect: { consumes: stream.0, produces: stream.1 }
+              - kind: emit
+                value: grammar.token
+                output: tokens
+                mode: append
+                effect_name: stream
+                effect: { consumes: stream.1, produces: stream.2 }
+          condition: continue
+          max_iterations: iterations
+          carried:
+            - cell: grammar
+              current: grammar.current
+              body_input: grammar.body
+              body_output: grammar.next
+              next: grammar.final
+              read_effect: { consumes: state:grammar.0, produces: state:grammar.read }
+              write_effect: { consumes: state:grammar.read, produces: state:grammar.1 }
+            - cell: adaptive
+              current: adaptive.current
+              body_input: adaptive.body
+              body_output: adaptive.next
+              next: adaptive.final
+              read_effect: { consumes: state:adaptive.0, produces: state:adaptive.read }
+              write_effect: { consumes: state:adaptive.read, produces: state:adaptive.1 }
+            - cell: proposal_k
+              current: k.current
+              body_input: k.body
+              body_output: k.next
+              next: k.final
+              read_effect: { consumes: state:proposal_k.0, produces: state:proposal_k.read }
+              write_effect: { consumes: state:proposal_k.read, produces: state:proposal_k.1 }
+        - kind: emit
+          value: k.final
+          output: next_k
+          mode: replace
+          effect_name: stream
+          effect: { consumes: stream.2, produces: stream.3 }
+        - kind: emit
+          value: grammar.final
+          output: final_grammar_state
+          mode: replace
+          effect_name: stream
+          effect: { consumes: stream.3, produces: stream.4 }
+"#;
+    let root = package(
+        "grammar-adaptive-speculative",
+        metadata,
+        &[
+            ("verifier.onnx.textproto", SPECULATIVE_ACCEPTANCE),
+            ("min.onnx.textproto", MIN_LENGTH),
+            ("adaptive.onnx.textproto", ADAPTIVE_PROPOSAL_BUDGET),
+            ("guided.onnx.textproto", GUIDED_SAMPLER),
+        ],
+    )?;
+    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+    let target = [
+        0.0, 1.0, 0.0, 0.0, 0.0, // token 1
+        0.0, 0.0, 1.0, 0.0, 0.0, // token 2
+        0.0, 0.0, 0.0, 0.0, 1.0, // token 4
+    ];
+    let transitions = [
+        -1, 1, -1, -1, -1, // state 0: token 1
+        -1, -1, 2, -1, -1, // state 1: token 2
+        -1, -1, -1, 3, -1, // state 2: token 3
+        -1, -1, -1, -1, 3, // state 3: token 4
+    ];
+    let request =
+        PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
+            .with_input("proposed", Value::from_slice_i64(&[1, 2, 4], &[1, 3])?)
+            .with_input("target", Value::from_slice_f32(&target, &[1, 3, 5])?)
+            .with_input(
+                "logits",
+                Value::from_slice_f32(&[9.0, 8.0, 7.0, 1.0, 6.0], &[1, 5])?,
+            )
+            .with_input("grammar_state", Value::from_slice_i64(&[0], &[1])?)
+            .with_input(
+                "transition_table",
+                Value::from_slice_i64(&transitions, &[4, 5])?,
+            )
+            .with_input("zero_length", Value::from_slice_i64(&[0], &[1])?)
+            .with_input("evaluated", Value::from_slice_i64(&[3], &[1])?)
+            .with_input("current_k", Value::from_slice_i64(&[2], &[1])?)
+            .with_input(
+                "estimates",
+                Value::from_slice_f32(&[0.0, 0.0, 0.0, 0.0], &[1, 4])?,
+            )
+            .with_input(
+                "filled",
+                Value::from_raw_bytes(vec![1], &[1], onnx_genai_ort::DataType::Bool)?,
+            )
+            .with_input("draft_ms", Value::from_slice_f32(&[1.0], &[1])?)
+            .with_input("target_ms", Value::from_slice_f32(&[2.0], &[1])?)
+            .with_input(
+                "continue",
+                Value::from_raw_bytes(vec![1], &[], onnx_genai_ort::DataType::Bool)?,
+            )
+            .with_input("iterations", Value::from_slice_i64(&[1], &[])?);
+    let output = engine.run_pipeline(request)?;
+    assert_eq!(output["tokens"].shape(), [1, 3]);
+    assert_eq!(output["tokens"].to_vec_i64()?, [1, 2, 3]);
+    assert_eq!(output["next_k"].to_vec_i64()?, [3]);
+    assert_eq!(output["final_grammar_state"].to_vec_i64()?, [2]);
+    Ok(())
+}
+
+#[test]
+fn workflow_executes_generic_telemetry_adapter() -> anyhow::Result<()> {
+    let metadata = r#"
+pipeline:
+  workflow:
+    manifest:
+      ir_version: "1.0"
+      onnx_opsets: { ai.onnx: 13 }
+      adapter_abis: { onnx-genai.telemetry: "1" }
+      custom_op_versions: {}
+      capabilities: [workflow_ssa, linear_effects, typed_emit, telemetry_adapter]
+    inputs: {}
+    outputs:
+      elapsed_ms: { contract: { dtype: float32, rank: 0, shape: [] },
+                    role: tensor, stage: pre_adapter }
+    components:
+      clock_start:
+        implementation: { kind: adapter, abi: onnx-genai.telemetry, version: "1" }
+        adapter:
+          role: telemetry
+          action: start
+          timestamp: timestamp
+          effect: telemetry
+        ports:
+          inputs: {}
+          outputs: { timestamp: { dtype: int64, rank: 0, shape: [] } }
+        effects: [telemetry]
+      clock_elapsed:
+        implementation: { kind: adapter, abi: onnx-genai.telemetry, version: "1" }
+        adapter:
+          role: telemetry
+          action: elapsed
+          timestamp: timestamp
+          duration_ms: duration_ms
+          effect: telemetry
+        ports:
+          inputs: { timestamp: { dtype: int64, rank: 0, shape: [] } }
+          outputs: { duration_ms: { dtype: float32, rank: 0, shape: [] } }
+        effects: [telemetry]
+    initial_effects: { telemetry: telemetry.0, stream: stream.0 }
+    graph:
+      kind: sequence
+      nodes:
+        - kind: invoke
+          component: clock_start
+          inputs: {}
+          outputs: { timestamp: clock.started }
+          effects: { telemetry: { consumes: telemetry.0, produces: telemetry.1 } }
+        - kind: invoke
+          component: clock_elapsed
+          inputs: { timestamp: clock.started }
+          outputs: { duration_ms: clock.elapsed_ms }
+          effects: { telemetry: { consumes: telemetry.1, produces: telemetry.2 } }
+        - kind: emit
+          value: clock.elapsed_ms
+          output: elapsed_ms
+          mode: replace
+          effect_name: stream
+          effect: { consumes: stream.0, produces: stream.1 }
+"#;
+    let root = package("telemetry-adapter", metadata, &[])?;
+    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+    let request =
+        PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])));
+    let output = engine.run_pipeline(request)?;
+    assert!(output["elapsed_ms"].to_vec_f32()?[0] >= 0.0);
     Ok(())
 }
 

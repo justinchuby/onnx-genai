@@ -72,6 +72,30 @@ pub fn derived_capabilities(metadata: &InferenceMetadata) -> BTreeSet<String> {
     }) {
         capabilities.insert("bounded_state_recurrence".to_string());
     }
+    if workflow
+        .state
+        .values()
+        .any(|state| state.class == crate::schema::WorkflowStateClass::Advisory)
+    {
+        capabilities.insert("advisory_state".to_string());
+    }
+    for component in workflow.components.values() {
+        match &component.policy {
+            Some(crate::schema::PolicyComponentContract::AdaptiveProposalBudget { .. }) => {
+                capabilities.insert("adaptive_proposal_budget".to_string());
+            }
+            _ => {}
+        }
+        match &component.adapter {
+            Some(crate::schema::AdapterComponentContract::GrammarGuidance { .. }) => {
+                capabilities.insert("grammar_guidance_adapter".to_string());
+            }
+            Some(crate::schema::AdapterComponentContract::Telemetry { .. }) => {
+                capabilities.insert("telemetry_adapter".to_string());
+            }
+            None => {}
+        }
+    }
     collect_workflow_capabilities(&workflow.graph, &mut capabilities);
     capabilities
 }
@@ -804,6 +828,312 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
                 require_same_contract(name, current, current_contract, next, next_contract, errors);
                 require_effect(effect, errors);
             }
+            Policy::AdaptiveProposalBudget {
+                current_k,
+                accepted,
+                evaluated,
+                committed_tokens,
+                filled_proposal_budget,
+                draft_ms,
+                target_ms,
+                estimates,
+                next_k,
+                next_estimates,
+                effect,
+            } => {
+                for port in [current_k, accepted, evaluated, committed_tokens] {
+                    if let Some(contract) = require_input(port, errors) {
+                        require_integer(name, port, contract, errors);
+                        require_rank(name, port, contract, 1, errors);
+                    }
+                }
+                if let Some(contract) = require_input(filled_proposal_budget, errors) {
+                    require_bool(name, filled_proposal_budget, contract, errors);
+                    require_rank(name, filled_proposal_budget, contract, 1, errors);
+                }
+                for port in [draft_ms, target_ms] {
+                    if let Some(contract) = require_input(port, errors) {
+                        require_floating(name, port, contract, errors);
+                        require_rank(name, port, contract, 1, errors);
+                    }
+                }
+                let estimates_contract = require_input(estimates, errors);
+                if let Some(contract) = estimates_contract {
+                    require_floating(name, estimates, contract, errors);
+                    require_rank(name, estimates, contract, 2, errors);
+                }
+                if let Some(contract) = require_output(next_k, errors) {
+                    require_integer(name, next_k, contract, errors);
+                    require_rank(name, next_k, contract, 1, errors);
+                }
+                let next_estimates_contract = require_output(next_estimates, errors);
+                if let Some(contract) = next_estimates_contract {
+                    require_floating(name, next_estimates, contract, errors);
+                    require_rank(name, next_estimates, contract, 2, errors);
+                }
+                require_same_contract(
+                    name,
+                    current_k,
+                    input(current_k),
+                    next_k,
+                    output(next_k),
+                    errors,
+                );
+                require_same_contract(
+                    name,
+                    estimates,
+                    estimates_contract,
+                    next_estimates,
+                    next_estimates_contract,
+                    errors,
+                );
+                for port in [
+                    accepted,
+                    evaluated,
+                    committed_tokens,
+                    filled_proposal_budget,
+                    draft_ms,
+                    target_ms,
+                    next_k,
+                ] {
+                    require_axis_equal(
+                        name,
+                        current_k,
+                        input(current_k),
+                        0,
+                        port,
+                        input(port).or_else(|| output(port)),
+                        0,
+                        errors,
+                    );
+                }
+                require_axis_equal(
+                    name,
+                    current_k,
+                    input(current_k),
+                    0,
+                    estimates,
+                    estimates_contract,
+                    0,
+                    errors,
+                );
+                require_effect(effect, errors);
+            }
+        }
+    }
+
+    fn validate_adapter_component(
+        name: &str,
+        component: &crate::schema::WorkflowComponent,
+        errors: &mut Vec<String>,
+    ) {
+        use crate::schema::{
+            AdapterComponentContract as Adapter, GrammarGuidanceAction, TelemetryAction,
+        };
+
+        let Some(adapter) = &component.adapter else {
+            return;
+        };
+        for (port, contract) in component
+            .ports
+            .inputs
+            .iter()
+            .chain(component.ports.outputs.iter())
+        {
+            require_declared_shape(name, port, contract, errors);
+        }
+        let input = |port: &str| component.ports.inputs.get(port);
+        let output = |port: &str| component.ports.outputs.get(port);
+        let require_input = |port: &str, errors: &mut Vec<String>| {
+            input(port).or_else(|| {
+                errors.push(format!(
+                    "workflow adapter component '{name}' references missing input port '{port}'"
+                ));
+                None
+            })
+        };
+        let require_output = |port: &str, errors: &mut Vec<String>| {
+            output(port).or_else(|| {
+                errors.push(format!(
+                    "workflow adapter component '{name}' references missing output port '{port}'"
+                ));
+                None
+            })
+        };
+        let require_effect = |effect: &str, errors: &mut Vec<String>| {
+            if !component.effects.iter().any(|declared| declared == effect) {
+                errors.push(format!(
+                    "workflow adapter component '{name}' references undeclared effect '{effect}'"
+                ));
+            }
+        };
+
+        match adapter {
+            Adapter::GrammarGuidance {
+                action,
+                state,
+                tokens,
+                valid_length,
+                transition_table,
+                next_state,
+                consumed_length,
+                logits_mask,
+                forced_tokens,
+                forced_length,
+                effect,
+            } => {
+                if !matches!(
+                    &component.implementation,
+                    crate::schema::ComponentImplementation::Adapter { abi, version, .. }
+                        if abi == "onnx-genai.grammar-guidance" && version == "1"
+                ) {
+                    errors.push(format!(
+                        "workflow grammar adapter component '{name}' requires \
+                         onnx-genai.grammar-guidance@1"
+                    ));
+                }
+                for port in [state, valid_length, transition_table] {
+                    if let Some(contract) = require_input(port, errors) {
+                        require_integer(name, port, contract, errors);
+                    }
+                }
+                if let Some(contract) = require_input(state, errors) {
+                    require_dtype_rank(name, state, contract, "int64", 1, errors);
+                }
+                if let Some(contract) = require_input(tokens, errors) {
+                    require_dtype_rank(name, tokens, contract, "int64", 2, errors);
+                }
+                if let Some(contract) = require_input(valid_length, errors) {
+                    require_dtype_rank(name, valid_length, contract, "int64", 1, errors);
+                }
+                if let Some(contract) = require_input(transition_table, errors) {
+                    require_dtype_rank(name, transition_table, contract, "int64", 2, errors);
+                }
+                for port in [next_state, consumed_length, forced_length] {
+                    if let Some(contract) = require_output(port, errors) {
+                        require_dtype_rank(name, port, contract, "int64", 1, errors);
+                    }
+                }
+                if let Some(contract) = require_output(logits_mask, errors) {
+                    require_dtype_rank(name, logits_mask, contract, "bool", 2, errors);
+                }
+                if let Some(contract) = require_output(forced_tokens, errors) {
+                    require_dtype_rank(name, forced_tokens, contract, "int64", 2, errors);
+                    if !matches!(
+                        contract.shape.as_deref(),
+                        Some([_, crate::schema::TensorDimension::Fixed(1)])
+                    ) {
+                        errors.push(format!(
+                            "workflow adapter component '{name}' forced-token port \
+                             '{forced_tokens}' must have shape [batch, 1]"
+                        ));
+                    }
+                }
+                require_same_contract(
+                    name,
+                    state,
+                    input(state),
+                    next_state,
+                    output(next_state),
+                    errors,
+                );
+                for port in [
+                    tokens,
+                    valid_length,
+                    next_state,
+                    consumed_length,
+                    logits_mask,
+                    forced_tokens,
+                    forced_length,
+                ] {
+                    require_axis_equal(
+                        name,
+                        state,
+                        input(state),
+                        0,
+                        port,
+                        input(port).or_else(|| output(port)),
+                        0,
+                        errors,
+                    );
+                }
+                require_axis_equal(
+                    name,
+                    transition_table,
+                    input(transition_table),
+                    1,
+                    logits_mask,
+                    output(logits_mask),
+                    1,
+                    errors,
+                );
+                if matches!(action, GrammarGuidanceAction::Clone) && input(valid_length).is_none() {
+                    errors.push(format!(
+                        "workflow grammar clone adapter '{name}' requires valid_length so clone \
+                         remains an explicit typed invocation"
+                    ));
+                }
+                require_effect(effect, errors);
+            }
+            Adapter::Telemetry {
+                action,
+                timestamp,
+                duration_ms,
+                effect,
+            } => {
+                if !matches!(
+                    &component.implementation,
+                    crate::schema::ComponentImplementation::Adapter { abi, version, .. }
+                        if abi == "onnx-genai.telemetry" && version == "1"
+                ) {
+                    errors.push(format!(
+                        "workflow telemetry adapter component '{name}' requires \
+                         onnx-genai.telemetry@1"
+                    ));
+                }
+                match action {
+                    TelemetryAction::Start => {
+                        if timestamp.as_ref().and_then(|port| output(port)).is_none() {
+                            errors.push(format!(
+                                "workflow telemetry start adapter '{name}' requires a timestamp \
+                                 output port"
+                            ));
+                        }
+                        if duration_ms.is_some() {
+                            errors.push(format!(
+                                "workflow telemetry start adapter '{name}' must not declare \
+                                 duration_ms"
+                            ));
+                        }
+                    }
+                    TelemetryAction::Elapsed => {
+                        if timestamp.as_ref().and_then(|port| input(port)).is_none() {
+                            errors.push(format!(
+                                "workflow telemetry elapsed adapter '{name}' requires a timestamp \
+                                 input port"
+                            ));
+                        }
+                        if duration_ms.as_ref().and_then(|port| output(port)).is_none() {
+                            errors.push(format!(
+                                "workflow telemetry elapsed adapter '{name}' requires a \
+                                 duration_ms output port"
+                            ));
+                        }
+                    }
+                }
+                if let Some(port) = timestamp {
+                    let contract = input(port).or_else(|| output(port));
+                    if let Some(contract) = contract {
+                        require_dtype_rank(name, port, contract, "int64", 0, errors);
+                    }
+                }
+                if let Some(port) = duration_ms
+                    && let Some(contract) = output(port)
+                {
+                    require_dtype_rank(name, port, contract, "float32", 0, errors);
+                }
+                require_effect(effect, errors);
+            }
         }
     }
 
@@ -1068,13 +1398,37 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
                 "workflow policy component '{name}' must use an ONNX implementation"
             ));
         }
+        if component.adapter.is_some()
+            && !matches!(
+                component.implementation,
+                crate::schema::ComponentImplementation::Adapter { .. }
+            )
+        {
+            errors.push(format!(
+                "workflow adapter component '{name}' must use an adapter implementation"
+            ));
+        }
+        if component.policy.is_some() && component.adapter.is_some() {
+            errors.push(format!(
+                "workflow component '{name}' cannot declare both policy and adapter contracts"
+            ));
+        }
         validate_policy_component(name, component, errors);
+        validate_adapter_component(name, component, errors);
     }
     for (name, state) in &workflow.state {
         validate_runtime_dtype(&format!("workflow state '{name}'"), &state.contract, errors);
         if state.scope == crate::schema::WorkflowStateScope::Invocation && state.session.is_some() {
             errors.push(format!(
                 "workflow state '{name}' has session lease settings but invocation scope"
+            ));
+        }
+        if state.class == crate::schema::WorkflowStateClass::Advisory
+            && state.scope != crate::schema::WorkflowStateScope::Invocation
+        {
+            errors.push(format!(
+                "workflow advisory state '{name}' must use invocation scope so it resets per \
+                 request and is never serialized as session state"
             ));
         }
         if let Some(session) = &state.session {
@@ -1150,6 +1504,30 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
         )
     }) {
         used.insert("bounded_state_recurrence".to_string());
+    }
+    if workflow
+        .state
+        .values()
+        .any(|state| state.class == crate::schema::WorkflowStateClass::Advisory)
+    {
+        used.insert("advisory_state".to_string());
+    }
+    for component in workflow.components.values() {
+        if matches!(
+            component.policy.as_ref(),
+            Some(crate::schema::PolicyComponentContract::AdaptiveProposalBudget { .. })
+        ) {
+            used.insert("adaptive_proposal_budget".to_string());
+        }
+        match component.adapter.as_ref() {
+            Some(crate::schema::AdapterComponentContract::GrammarGuidance { .. }) => {
+                used.insert("grammar_guidance_adapter".to_string());
+            }
+            Some(crate::schema::AdapterComponentContract::Telemetry { .. }) => {
+                used.insert("telemetry_adapter".to_string());
+            }
+            None => {}
+        }
     }
     collect_workflow_capabilities(&workflow.graph, &mut used);
     for capability in used.difference(&workflow.manifest.capabilities) {
@@ -1338,11 +1716,52 @@ fn validate_workflow_node(
                         ports
                     }
                     Policy::StateUpdate { next, .. } => vec![next],
+                    Policy::AdaptiveProposalBudget {
+                        next_k,
+                        next_estimates,
+                        ..
+                    } => vec![next_k, next_estimates],
                 };
                 for port in required_outputs {
                     if !outputs.contains_key(port) {
                         errors.push(format!(
                             "{path}.outputs is missing required policy output port '{port}'"
+                        ));
+                    }
+                }
+            }
+            if let Some(adapter) = &declaration.adapter {
+                use crate::schema::{AdapterComponentContract as Adapter, TelemetryAction};
+                let required_outputs: Vec<&str> = match adapter {
+                    Adapter::GrammarGuidance {
+                        next_state,
+                        consumed_length,
+                        logits_mask,
+                        forced_tokens,
+                        forced_length,
+                        ..
+                    } => vec![
+                        next_state,
+                        consumed_length,
+                        logits_mask,
+                        forced_tokens,
+                        forced_length,
+                    ],
+                    Adapter::Telemetry {
+                        action: TelemetryAction::Start,
+                        timestamp,
+                        ..
+                    } => timestamp.iter().map(String::as_str).collect(),
+                    Adapter::Telemetry {
+                        action: TelemetryAction::Elapsed,
+                        duration_ms,
+                        ..
+                    } => duration_ms.iter().map(String::as_str).collect(),
+                };
+                for port in required_outputs {
+                    if !outputs.contains_key(port) {
+                        errors.push(format!(
+                            "{path}.outputs is missing required adapter output port '{port}'"
                         ));
                     }
                 }
