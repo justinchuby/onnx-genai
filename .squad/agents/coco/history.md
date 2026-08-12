@@ -70,3 +70,13 @@ PR body updated. Pushed to `fork`, head `02a9f34`. PR remains draft — awaiting
 ## 2026-08-12 — PR #31993 NaN fix (hardware sNaN quieting)
 
 Fixed NaN blocker on Apple Silicon f16 cast test. NEON `FCVTL`/`FCVTN` quiet signalling NaNs; MLAS software reference does not → bit-exact comparison fails. New assertion: `isnan` + sign match + payload equality modulo quiet bit (bit 22 f32, bit 9 f16). Non-NaN: raw-bit equality preserved. Also: RNE tie input corrected to 1 + 2⁻¹¹ (genuine tie). Removed `-march=armv8.2-a+fp16` — conversion intrinsics are AArch64 baseline (`__ARM_FP & 2`), not guarded by `__ARM_FEATURE_FP16_VECTOR_ARITHMETIC`. macOS gate via `TARGET_OS_OSX`. Head `02a9f34`.
+
+## 2026-08-12 — PR #762: Three test-integrity gaps closed
+
+**Commit:** `2106ac0f7`
+
+- **ITEM 1 (validate_write_dtype):** Wired into two new tests exercising absent and present TensorMut validation. Cannot enforce at runtime without restructuring the raw-pointer Kernel trait; tests prove the mechanism and document the contract.
+- **ITEM 2 (scratch_alloc_bytes):** Extracted `pub fn scratch_alloc_bytes(numel, dtype)` as single source of truth. Both production sites (single-node, multi-node) and all canary tests call it directly. Former test copy (`production_scratch_alloc`) deleted.
+- **ITEM 3 (routing None → Compile failure):** `build_subgraph_routing` returning `None` now fails at Compile with explicit message. Dual-role slots (graph output consumed by downstream node) cannot be expressed in current `NodeOutputSink` enum; fail closed at Compile is the correct behavior.
+
+**Validation:** 222 passed, 0 failed; clippy clean; fmt clean; Miri clean on lib tests (173 passed). Pre-existing Miri UB in `trait_cabi_parity.rs` (not my code) unaffected.
