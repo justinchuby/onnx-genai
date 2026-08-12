@@ -4,13 +4,16 @@ use super::*;
 /// capacity refusal surfaces before request admission rather than as a late
 /// device OOM. `BlockQuantizedMoE` (#747) reserves a session-persistent
 /// workspace; `IndexShare` (#751) reserves a session-persistent workspace;
-/// `com.microsoft::Attention` reserves a step-scoped Phase-2a scratch;
+/// `com.microsoft::Attention` reserves a step-scoped Phase-2a scratch; the
+/// default-domain `Attention` (#736) reserves its always-materialized f32 score
+/// matrix — step-scoped on the per-call prefill route, session-persistent on the
+/// capture-eligible single-token decode route (both classes, sized to use);
 /// `com.microsoft::GroupQueryAttention` (#736) reserves a session-persistent f32
 /// reference score buffer (only on the paths that materialize scores); and the
 /// cuBLASLt GEMM family shares one session-persistent heuristic-sized peak. All
 /// report their exact bytes via [`Kernel::workspace_requirement`].
 pub(super) fn is_planned_workspace_node(node: &onnx_runtime_ir::Node) -> bool {
-    (node.domain.is_empty() && matches!(node.op_type.as_str(), "MatMul" | "Gemm"))
+    (node.domain.is_empty() && matches!(node.op_type.as_str(), "MatMul" | "Gemm" | "Attention"))
         || (node.domain == onnx_runtime_ir::RUNTIME_DOMAIN
             && matches!(node.op_type.as_str(), "BlockQuantizedMoE" | "IndexShare"))
         || (node.domain == "com.microsoft"
@@ -769,9 +772,12 @@ mod planned_workspace_node_tests {
         for (domain, op_type) in [
             ("", "MatMul"),
             ("", "Gemm"),
+            ("", "Attention"),
             ("com.microsoft", "MatMulNBits"),
             ("com.microsoft", "FusedMatMulBias"),
             ("com.microsoft", "FusedGemm"),
+            ("com.microsoft", "Attention"),
+            ("com.microsoft", "GroupQueryAttention"),
         ] {
             assert!(
                 is_planned_workspace_node(&node(domain, op_type)),

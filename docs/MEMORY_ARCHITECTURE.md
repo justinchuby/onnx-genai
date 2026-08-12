@@ -47,7 +47,7 @@ when in fact it is 1955 lines.
 
 ### CUDA raw allocation audit (#736, 2026-08-10)
 
-Updated through #799 on 2026-08-11.
+Updated through #736 (default-domain `Attention` scores) on 2026-08-11.
 
 Scope: production code in `crates/onnx-runtime-ep-cuda`,
 `crates/onnx-runtime-session`, and CUDA kernel launch support. Test-only
@@ -97,8 +97,8 @@ call; it owns the governed workspace preparation path
 | `kernels/reduce.rs:712` | reduce delta shape metadata | `delta_bytes.len().max(1)` | rank/config | step-scoped | raw bypass |
 | `kernels/reduce.rs:720` | reduce axes metadata | `axes_bytes.len().max(1)` | rank/axes config | step-scoped | raw bypass |
 | `kernels/resize.rs:259` | Resize metadata | `bytes.len()` | rank/scales/sizes config | step-scoped | raw bypass |
-| `kernels/standard_attention.rs:602,1269` (selected at `:1352-1355`) | default-domain `Attention` f32 scores | `batch * q_heads * q_seq * total_seq * sizeof(f32)` | prompt/cache dependent (quadratic in sequence length) | step-scoped on ordinary routes; retained in the kernel pool on capture-eligible routes | raw bypass |
-| `kernels/standard_attention.rs:602,1269` (selected at `:1356-1408`) | default-domain `Attention` staged K/V + capture metadata | slot-specific exact bytes | cache layout / batch dependent | step-scoped on ordinary routes; retained in the kernel pool on capture-eligible routes | raw bypass |
+| `kernels/standard_attention.rs:614` (`workspace_requirement`), selected at `:1480` | default-domain `Attention` f32 scores | `batch * q_heads * q_seq * total_seq * sizeof(f32)` | prompt/cache dependent (quadratic in sequence length) | step-scoped on the per-call prefill/eager route; session-persistent on the capture-eligible single-token-decode route | **governed by #736** via `workspace_requirement` + prepared workspace, sized through the shared `std_attention_scores_bytes` helper on **both** lifetime classes; every route materializes the fp32 scores (this kernel has no shared-memory/flash route) so none reports `NONE` |
+| `kernels/standard_attention.rs:702,1396` (staged K/V + metadata slots) | default-domain `Attention` staged K/V + capture metadata | slot-specific exact bytes (`present_expected * elem`, control arrays) | cache layout / batch dependent | step-scoped on the per-call route; retained in the kernel pool on the capture-eligible route | raw bypass; the `WS_SCORES` slot is excluded and governed by #736 |
 | `kernels/varlen_attention.rs:531` | varlen attention metadata buffer | `bytes.max(1)` | batch/sequence metadata | step-scoped | raw bypass |
 | `kernels/where_op.rs:123` | Where metadata | `metadata_bytes.len()` | broadcast rank/config | step-scoped | raw bypass |
 | `runtime.rs:391` | capture-error latch | `sizeof(u32)` | static | session-persistent | raw bypass |
@@ -191,22 +191,67 @@ raw fallback. The executor therefore shares exactly where the lifetimes and
 interface permit, rather than falsifying attribution to reach a nominal
 one-buffer result.
 
-#### Next slice (chosen from this table): default-domain `Attention` f32 scores
+#### Governed by #736: default-domain `Attention` f32 scores
 
-After #795 and #799, the largest evidenced non-QMoE score bypass is
-`standard_attention.rs:602,1269` (selected at `:1352-1355`): every
-default-domain `Attention` dispatch
-materializes `batch * q_heads * q_seq * total_seq * sizeof(f32)` scores. The
-allocation is per-call on ordinary routes and retained in the kernel pool only
-on capture-eligible routes; `B=1, H=32, q_seq=total_seq=2048` is **512 MiB** in
-either case. That is larger than the already-governed Phase-2a score range
-measured by #753 and remains invisible to the authority (#736).
+The largest evidenced non-QMoE score bypass after #795/#799 is now governed:
+`standard_attention.rs` (`workspace_requirement` at `:614`, consumed at `:1480`).
+Every default-domain `Attention` dispatch materializes
+`batch * q_heads * q_seq * total_seq * sizeof(f32)` scores in device memory
+(`attention_row` stages the row scores in global memory for softcap/mask/softmax/
+`probs·V`, in fp32 regardless of the f32/f16/bf16 operand dtype). At
+`B=1, H=32, q_seq=total_seq=2048` that is **512 MiB** — larger than the
+already-governed Phase-2a range (#753). It now routes through
+`Kernel::workspace_requirement`, prepare-only planning, and a prepared workspace
+consumed by `execute_with_workspace`; planning and execution size the reservation
+through the **same** `std_attention_scores_bytes` helper, so they cannot drift,
+and a shortfall errors deterministically rather than under-allocating. Capacity
+refusal surfaces as the pre-header **429** typed path (`TierExhausted` /
+`CapacityUnavailable`, #743) via `MappedGrowthGrant` (#748) against the device
+authority. The compatibility/opt-out path (direct `execute`, no
+executor-prepared workspace) keeps its self-owned scratch — pooled on the
+capture-eligible route, per-call otherwise.
 
-The next increment should govern that f32 score matrix through one shared
-planning/execution sizing helper, with the route/lifetime split made explicit
-before reservation (#751, #795, #799). The legacy `attention.rs` Phase-2a path
-is lower priority because its executor path is already governed; only its
-documented compatibility/opt-out fallback remains raw (#753).
+**Negative result — no route reports `NONE` (genuine use, unlike #751/#795).**
+`attention_row` has **no** shared-memory/flash route: it always stages the score
+matrix in global memory, so — unlike GQA's f32-reference-only `WS_SCORES` (#795)
+or the fused Attention prefill path (#753) — *every* valid dispatch materializes
+and reserves the fp32 scores; only unresolvable or non-float input metadata
+reports `NONE` (execution then raises the precise error). This is recorded so the
+next reader does not re-investigate expecting a route that charges zero.
+
+**Both lifetime classes, modelled truthfully.** The score matrix is
+route-dependent: a single-token decode (`batch == 1 && q_seq == 1`) is the only
+shape that can take the capture-eligible pooled route whose buffer is retained
+across steps, charged `WorkspaceLifetime::SessionPersistent` (small: linear in
+`total_seq`, ~256 KiB at the example shape); every multi-token prefill (the
+512-MiB-class quadratic worst case) and batched dispatch takes the per-call route
+whose scratch is freed on each exit, charged `WorkspaceLifetime::StepScoped`.
+Prepare-only planning reserves each class into its own executor slot (#753), so a
+graph mixing them governs both. The classifier keys the split on static input
+metadata (`batch`, `q_seq`), a conservative proxy for capture eligibility; the
+frozen fixed-capacity decode path over-estimates `total_seq` by the padding rows,
+which is safe (reserve ≥ consume) since execution re-derives the exact size
+through the same helper and refuses on any shortfall.
+
+**Over-reservation found: none.** The only sibling bypass — the staged-K/V and
+capture-metadata slots (`:702,1396`) — is a genuinely different lifetime/geometry
+from the scores and did not fall out of this change, so it is left raw and
+tracked as the next candidate below.
+
+#### Next slice (chosen from this table): `GroupQueryAttention` remaining pooled slots
+
+With the three quadratic score matrices now governed (Phase-2a #753, GQA
+`WS_SCORES` #795, default-domain `Attention` #736), the largest remaining
+evidenced non-QMoE workspace bypass is the **`GroupQueryAttention` pooled
+QKV-projection staging** (`group_query_attention.rs:1033`): the packed Q/K/V
+buffers are `batch * seq * hidden * elem`, prompt-dependent and session-persistent
+(grown and retained by the same slot allocator that already isolates the governed
+`WS_SCORES`), so they map cleanly onto `workspace_requirement`. The default-domain
+`Attention` staged-K/V slots (`standard_attention.rs:702,1396`) are the same class
+at smaller scale. Present K/V in those pooled allocators is a KV-cache residency
+concern, not workspace — govern it through the
+[KV layout and residency](#kv-layout-and-residency) contract (#791), not this
+table. The three 32 MiB cuBLASLt GEMM blobs are already governed (#799).
 
 ### KV layout and residency
 
@@ -1188,8 +1233,9 @@ concurrency on the multi-request-serving axis measured by #750 and #777.
 **Implemented today.** The executor has one central
 `is_planned_workspace_node` predicate
 (`crates/onnx-runtime-session/src/executor/bindings.rs`) covering QMoE,
-IndexShare, Attention Phase-2a, GQA, and the standard/fused GEMM family
-(#747, #751, #753, #795, #799), rather than parallel per-feature checks.
+IndexShare, Attention Phase-2a, GQA, the default-domain `Attention` scores, and
+the standard/fused GEMM family
+(#747, #751, #753, #795, #799, #736), rather than parallel per-feature checks.
 Prepare-only planning tracks and reserves one peak per lifetime class
 (`SessionPersistent` and `StepScoped`), so a graph mixing the two governs both
 without summing sequential users of the same slot (#753).
@@ -1202,11 +1248,16 @@ without summing sequential users of the same slot (#753).
 | `pkg.nxrt::IndexShare` | `index_share.rs` `workspace_requirement` | selected-token scores plus only the staging actually reachable for the path | prompt/cache dependent | session-persistent | #751 + prepared workspace |
 | `com.microsoft::Attention` Phase-2a | `attention.rs` `run_attention_phase2a` (governed branch) | `align256(batch·num_heads·sq·sk·elem) + 32 MiB` cuBLASLt workspace | prompt-dependent; score matrix is ~256–512 MiB at B=1/H=32/S=2048 | step-scoped | #753 + prepared workspace |
 | `com.microsoft::GroupQueryAttention` f32 reference scores | `group_query_attention.rs` `workspace_requirement` | `batch·heads·sq·present_capacity·sizeof(f32)` only on the path that materializes scores | prompt/cache dependent | session-persistent | #795 + prepared workspace |
+| `Attention` (default domain) f32 scores | `standard_attention.rs` `workspace_requirement` | `batch·q_heads·q_seq·total_seq·sizeof(f32)` on **every** route (no flash/shared-mem route; always fp32) | prompt/cache dependent; ~512 MiB at B=1/H=32/S=2048 | step-scoped (per-call prefill/batched) **and** session-persistent (capture-eligible single-token decode) | #736 + prepared workspace |
 | `MatMul`, `Gemm`, `MatMulNBits`, `FusedMatMulBias`, `FusedGemm` cuBLASLt scratch | `blas.rs` shared planner; `fused_gemm.rs`, `gemm.rs`, `matmul.rs`, `matmul_nbits.rs` | selected heuristic `workspaceSize`, bounded by the 32 MiB preference ceiling | measured 0–96 bytes on #799 shapes; algorithm dependent | session-persistent shared peak | #799 exact plan/execute helper + prepared workspace |
 
 The Attention **fused** (flash) prefill path uses shared memory only and
 allocates no device scratch, so `workspace_requirement` returns `NONE` for it —
-the executor reserves nothing (#753). `attention.rs` remains outside #799's
+the executor reserves nothing (#753). By contrast, the default-domain
+`Attention` kernel (`standard_attention.rs`) has **no** flash/shared-memory
+route: `attention_row` always stages the fp32 score matrix in global memory, so
+every valid dispatch reserves it and none reports `NONE` (#736) — a genuine-use
+result, not a missed optimization. `attention.rs` remains outside #799's
 shared cuBLASLt slot because its workspace is concurrent with the score matrix
 inside the StepScoped Phase-2a composite; direct `execute` keeps the documented
 self-owned compatibility/opt-out fallback (#753, #799).
