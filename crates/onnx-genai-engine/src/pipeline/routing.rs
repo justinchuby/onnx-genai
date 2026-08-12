@@ -510,12 +510,13 @@ impl PipelineEngine {
                 .plan
                 .dataflow()
                 .iter()
-                .find(|edge| {
+                .rev()
+                .filter(|edge| {
                     edge.to == endpoint
                         && endpoint_component(&edge.from)
                             .is_none_or(|source| self.plan.component_is_present(source, present))
                 })
-                .and_then(|edge| tensors.get(&edge.from));
+                .find_map(|edge| tensors.get(&edge.from));
             let value = tensors
                 .get(&endpoint)
                 .or(routed)

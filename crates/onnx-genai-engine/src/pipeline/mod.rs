@@ -30,8 +30,9 @@ use crate::{
 use anyhow::Context;
 use onnx_genai_kv::{PagedKvCache, PrefixCache, SequenceId};
 use onnx_genai_metadata::{
-    AbsentInputKind, DataflowEdge, ModelIoSpec, PhaseRunOn, PipelineSpec, PipelineStrategy,
-    PipelineStrategyKind, PipelineVisionConfig, SchedulerSpec, SequenceInputKind, TensorDimension,
+    AbsentInputKind, ControlFlow, DataflowEdge, ModelIoSpec, PhaseRunOn, PipelineSpec,
+    PipelineStrategy, PipelineStrategyKind, PipelineVisionConfig, Predicate, SchedulerSpec,
+    SequenceInputKind, TensorDimension, Termination,
 };
 use onnx_genai_ort::{
     DataType, PipelineModelDirectory, PipelineModels, Session, SessionOptions, Tokenizer, Value,
@@ -2312,11 +2313,141 @@ struct IterativePlan {
 
 impl PipelinePlan {
     fn from_spec(spec: &PipelineSpec, schedulers: &SchedulerRegistry) -> anyhow::Result<Self> {
+        if let Some(control) = &spec.control {
+            return from_control(spec, control);
+        }
         // A dual, hierarchically-nested AR pipeline (multi-decoder TTS) is
         // detected before the single-decoder AR path: its outer+inner decoders
         // are driven by a dedicated nested loop, not the flat AR decode driver.
         if let Some(stage) = nested_autoregressive_strategy(&spec.strategy) {
             return Self::nested_autoregressive(spec, stage);
+        }
+
+        fn from_control(
+            spec: &PipelineSpec,
+            control: &ControlFlow,
+        ) -> anyhow::Result<PipelinePlan> {
+            fn flatten(
+                control: &ControlFlow,
+                stages: &mut Vec<CompositeStage>,
+                presence: &mut HashMap<String, String>,
+                next_stage: &mut usize,
+            ) -> anyhow::Result<()> {
+                match control {
+                    ControlFlow::Sequence { steps } => {
+                        for step in steps {
+                            flatten(step, stages, presence, next_stage)?;
+                        }
+                    }
+                    ControlFlow::Invoke { component, when } => {
+                        match when {
+                            None | Some(Predicate::Bool { value: true }) => {}
+                            Some(Predicate::Present { input }) => {
+                                presence.insert(component.clone(), input.clone());
+                            }
+                            Some(Predicate::Bool { value: false }) => return Ok(()),
+                            Some(_) => anyhow::bail!(
+                                "pipeline control invoke predicate is not executable by this runtime; \
+                                 supported invoke predicates are 'present' and literal booleans"
+                            ),
+                        }
+                        let name = format!("control_{}_{}", *next_stage, component);
+                        *next_stage += 1;
+                        stages.push(CompositeStage {
+                            name,
+                            kind: CompositeStageKind::SinglePass {
+                                model: component.clone(),
+                            },
+                        });
+                    }
+                    ControlFlow::Loop {
+                        body,
+                        termination: Termination::Iterations { count, start },
+                        step_program,
+                        ..
+                    } => {
+                        if step_program.is_some() {
+                            anyhow::bail!(
+                                "pipeline control loop step_program is not executable by this runtime"
+                            );
+                        }
+                        for _ in *start..*count {
+                            flatten(body, stages, presence, next_stage)?;
+                        }
+                    }
+                    ControlFlow::Loop {
+                        termination: Termination::Predicate { .. },
+                        ..
+                    } => anyhow::bail!(
+                        "predicate-terminated generic control loops are not executable by this runtime"
+                    ),
+                    ControlFlow::Branch { .. } => {
+                        anyhow::bail!("generic control branches are not executable by this runtime")
+                    }
+                }
+                Ok(())
+            }
+
+            fn add_loop_carries(control: &ControlFlow, dataflow: &mut Vec<DataflowEdge>) {
+                match control {
+                    ControlFlow::Sequence { steps } => {
+                        for step in steps {
+                            add_loop_carries(step, dataflow);
+                        }
+                    }
+                    ControlFlow::Invoke { .. } => {}
+                    ControlFlow::Loop { body, carried, .. } => {
+                        for carry in carried {
+                            if !dataflow
+                                .iter()
+                                .any(|edge| edge.from == carry.from && edge.to == carry.to)
+                            {
+                                dataflow.push(DataflowEdge {
+                                    from: carry.from.clone(),
+                                    to: carry.to.clone(),
+                                    dtype: None,
+                                    device_transfer: None,
+                                });
+                            }
+                        }
+                        add_loop_carries(body, dataflow);
+                    }
+                    ControlFlow::Branch { cases, default, .. } => {
+                        for case in cases.values() {
+                            add_loop_carries(case, dataflow);
+                        }
+                        if let Some(default) = default {
+                            add_loop_carries(default, dataflow);
+                        }
+                    }
+                }
+            }
+
+            let mut stages = Vec::new();
+            let mut presence_conditions = HashMap::new();
+            let mut next_stage = 0;
+            flatten(
+                control,
+                &mut stages,
+                &mut presence_conditions,
+                &mut next_stage,
+            )?;
+            if stages.is_empty() {
+                anyhow::bail!("pipeline.control does not contain an executable invocation");
+            }
+            for stage in &stages {
+                let CompositeStageKind::SinglePass { model } = &stage.kind;
+                if !spec.models.contains_key(model) {
+                    anyhow::bail!("pipeline.control invokes undeclared component '{model}'");
+                }
+            }
+            let mut dataflow = spec.dataflow.clone();
+            add_loop_carries(control, &mut dataflow);
+            Ok(PipelinePlan::Composite(CompositePlan {
+                stages,
+                dataflow,
+                presence_conditions,
+            }))
         }
         // A composite whose stages contain an autoregressive decoder is treated
         // as an autoregressive text pipeline (unchanged legacy behavior). Pure
@@ -3199,6 +3330,7 @@ mod tests {
             device_preference: None,
             tokenizer: None,
             io: None,
+            ports: Default::default(),
         }
     }
 
@@ -3212,6 +3344,7 @@ mod tests {
             device_preference: None,
             tokenizer: None,
             io: Some(serde_json::from_value(io).expect("valid ModelIoSpec JSON")),
+            ports: Default::default(),
         }
     }
 
@@ -3292,6 +3425,65 @@ mod tests {
             other => panic!("expected a nested_autoregressive plan, got {other:?}"),
         }
         Ok(())
+    }
+
+    #[test]
+    fn generic_control_unrolls_fixed_loop_into_component_invocations() -> anyhow::Result<()> {
+        let spec = PipelineSpec {
+            models: BTreeMap::from([("transition".to_string(), component("transition"))]),
+            control: Some(ControlFlow::Loop {
+                body: Box::new(ControlFlow::Invoke {
+                    component: "transition".to_string(),
+                    when: None,
+                }),
+                carried: vec![onnx_genai_metadata::LoopCarry {
+                    state: "latent".to_string(),
+                    from: "transition.next_latent".to_string(),
+                    to: "transition.latent".to_string(),
+                }],
+                termination: Termination::Iterations { count: 3, start: 0 },
+                step_program: None,
+            }),
+            ..PipelineSpec::default()
+        };
+
+        let plan = PipelinePlan::from_spec(&spec, &SchedulerRegistry::builtin())?;
+        let PipelinePlan::Composite(plan) = plan else {
+            panic!("fixed generic loop must compile to a composite plan");
+        };
+        assert_eq!(plan.stages.len(), 3);
+        assert!(plan.stages.iter().all(|stage| matches!(
+            &stage.kind,
+            CompositeStageKind::SinglePass { model } if model == "transition"
+        )));
+        assert!(plan.dataflow.iter().any(|edge| {
+            edge.from == "transition.next_latent" && edge.to == "transition.latent"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn generic_control_rejects_unsupported_predicate_loop_at_load() {
+        let spec = PipelineSpec {
+            models: BTreeMap::from([("transition".to_string(), component("transition"))]),
+            control: Some(ControlFlow::Loop {
+                body: Box::new(ControlFlow::Invoke {
+                    component: "transition".to_string(),
+                    when: None,
+                }),
+                carried: Vec::new(),
+                termination: Termination::Predicate {
+                    condition: Predicate::Bool { value: true },
+                    max_iterations: 3,
+                },
+                step_program: None,
+            }),
+            ..PipelineSpec::default()
+        };
+
+        let error = PipelinePlan::from_spec(&spec, &SchedulerRegistry::builtin())
+            .expect_err("unsupported predicate loops must fail while constructing the plan");
+        assert!(error.to_string().contains("predicate-terminated"));
     }
 
     #[test]
@@ -3575,6 +3767,7 @@ pipeline:
             phases: BTreeMap::new(),
             vision: None,
             positions: None,
+            ..PipelineSpec::default()
         };
 
         let plan = PipelinePlan::from_spec(&spec, &SchedulerRegistry::builtin())?;
@@ -3656,6 +3849,7 @@ pipeline:
             phases: BTreeMap::new(),
             vision: None,
             positions: None,
+            ..PipelineSpec::default()
         };
 
         let plan = PipelinePlan::from_spec(&spec, &SchedulerRegistry::builtin())?;
@@ -3701,6 +3895,7 @@ pipeline:
             phases: BTreeMap::new(),
             vision: None,
             positions: None,
+            ..PipelineSpec::default()
         };
         let error = PipelinePlan::from_spec(&spec, &SchedulerRegistry::builtin()).unwrap_err();
         assert!(

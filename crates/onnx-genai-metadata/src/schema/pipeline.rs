@@ -3,6 +3,14 @@ use super::*;
 /// Multi-model pipeline represented as a directed acyclic dataflow graph.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct PipelineSpec {
+    /// Typed inputs exposed by the complete package.
+    #[serde(default)]
+    pub inputs: BTreeMap<String, TensorContract>,
+
+    /// Typed outputs produced by the complete package.
+    #[serde(default)]
+    pub outputs: BTreeMap<String, TensorContract>,
+
     /// Named model components in the pipeline DAG; at least one component is required.
     #[schemars(extend("minProperties" = 1))]
     pub models: BTreeMap<String, PipelineComponentSpec>,
@@ -11,7 +19,36 @@ pub struct PipelineSpec {
     #[serde(default)]
     pub dataflow: Vec<DataflowEdge>,
 
+    /// Explicit fan-in reducers keyed by destination endpoint.
+    #[serde(default)]
+    pub reducers: BTreeMap<String, ReducerSpec>,
+
+    /// Universal nested control-flow program.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control: Option<ControlFlow>,
+
+    /// General tensor state, including loop-carried and persistent session state.
+    #[serde(default)]
+    pub states: BTreeMap<String, StateDeclaration>,
+
+    /// Named data-only sampler, scheduler, solver, and tensor programs.
+    #[serde(default)]
+    pub programs: BTreeMap<String, Program>,
+
+    /// Typed resource contracts for named components.
+    #[serde(default)]
+    pub resources: BTreeMap<String, ResourceContract>,
+
+    /// Package batching contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batching: Option<BatchingContract>,
+
+    /// Declarative output materialization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub postprocessing: Option<PostprocessingSpec>,
+
     /// Loop and execution strategy for the pipeline.
+    #[serde(default)]
     pub strategy: PipelineStrategy,
 
     /// Auxiliary-component lifecycle scheduling, keyed by component name.
@@ -500,17 +537,21 @@ pub struct PipelineComponentSpec {
     /// naming the key to declare, and never guesses from a tensor name.
     #[serde(default)]
     pub io: Option<ModelIoSpec>,
+
+    /// Typed graph inputs and outputs exposed by this component.
+    #[serde(default)]
+    pub ports: ComponentPorts,
 }
 
 /// Directed connection between two pipeline component ports.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct DataflowEdge {
-    /// Source endpoint in `component.output_name` form.
-    #[schemars(regex(pattern = r"^[^.]+\.[^.]+$"), example = &"encoder.hidden_states")]
+    /// Source package input or endpoint in `component.output_name` form.
+    #[schemars(regex(pattern = r"^[^.]+(?:\.[^.]+)?$"), example = &"encoder.hidden_states")]
     pub from: String,
 
-    /// Destination endpoint in `component.input_name` form.
-    #[schemars(regex(pattern = r"^[^.]+\.[^.]+$"), example = &"decoder.encoder_hidden_states")]
+    /// Destination package output or endpoint in `component.input_name` form.
+    #[schemars(regex(pattern = r"^[^.]+(?:\.[^.]+)?$"), example = &"decoder.encoder_hidden_states")]
     pub to: String,
 
     /// Scalar or logical data type at the component boundary.

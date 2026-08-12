@@ -33,12 +33,14 @@ where
 
 mod generation;
 mod hardware;
+mod ir;
 mod model_io;
 mod pipeline;
 mod scheduler;
 
 pub use generation::*;
 pub use hardware::*;
+pub use ir::*;
 pub use model_io::*;
 pub use pipeline::*;
 pub use scheduler::*;

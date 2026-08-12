@@ -621,6 +621,13 @@ impl PipelineEngine {
                 }
             }
         }
+        for edge in &plan.dataflow {
+            if !edge.to.contains('.')
+                && let Some(value) = tensors.remove(&edge.from)
+            {
+                tensors.insert(edge.to.clone(), value);
+            }
+        }
         Ok(tensors)
     }
 

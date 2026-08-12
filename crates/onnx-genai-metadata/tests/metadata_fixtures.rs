@@ -223,6 +223,101 @@ pipeline:
 }
 
 #[test]
+fn generic_control_flow_and_typed_state_validate() {
+    let metadata: InferenceMetadata = serde_yaml::from_str(
+        r#"
+pipeline:
+  inputs:
+    initial_latent: { dtype: float32, rank: 3, shape: [batch, sequence, hidden] }
+  outputs:
+    final_latent: { dtype: float32, rank: 3, shape: [batch, sequence, hidden] }
+  models:
+    transition:
+      filename: transition.onnx
+      type: decoder
+      ports:
+        inputs:
+          latent: { dtype: float32, rank: 3, shape: [batch, sequence, hidden] }
+        outputs:
+          next_latent: { dtype: float32, rank: 3, shape: [batch, sequence, hidden] }
+  states:
+    latent:
+      type: { dtype: float32, rank: 3, shape: [batch, sequence, hidden] }
+      init: { kind: input, source: initial_latent }
+      update: { kind: replace }
+      scope: session
+  dataflow:
+    - { from: initial_latent, to: transition.latent }
+    - { from: transition.next_latent, to: final_latent }
+  control:
+    kind: loop
+    body: { kind: invoke, component: transition }
+    carried:
+      - { state: latent, from: transition.next_latent, to: transition.latent }
+    termination: { kind: iterations, count: 8 }
+"#,
+    )
+    .expect("generic IR parses");
+
+    validate_pipeline_spec(metadata.pipeline.as_ref().expect("pipeline"))
+        .expect("generic IR validates");
+    let capabilities = onnx_genai_metadata::derived_capabilities(&metadata);
+    assert!(capabilities.contains("control_flow_loop"));
+    assert!(capabilities.contains("persistent_session_state"));
+}
+
+#[test]
+fn generic_control_flow_rejects_unknown_invocation_without_panicking() {
+    let metadata: InferenceMetadata = serde_yaml::from_str(
+        r#"
+pipeline:
+  models:
+    encoder:
+      filename: encoder.onnx
+      type: encoder
+  control:
+    kind: sequence
+    steps:
+      - { kind: invoke, component: missing }
+"#,
+    )
+    .expect("generic IR parses");
+
+    let error = validate_pipeline_spec(metadata.pipeline.as_ref().expect("pipeline"))
+        .expect_err("unknown invocation is rejected");
+    assert!(
+        error
+            .errors
+            .iter()
+            .any(|error| error.contains("invokes unknown component 'missing'")),
+        "unexpected errors: {:?}",
+        error.errors
+    );
+}
+
+#[test]
+fn generic_control_flow_rejects_legacy_strategy_fields() {
+    let metadata: InferenceMetadata = serde_yaml::from_str(
+        r#"
+pipeline:
+  models:
+    decoder: { filename: decoder.onnx, type: decoder }
+  strategy: { kind: autoregressive, decoder: decoder }
+  control: { kind: invoke, component: decoder }
+"#,
+    )
+    .expect("mixed document parses before semantic validation");
+
+    let error = validate_pipeline_spec(metadata.pipeline.as_ref().expect("pipeline"))
+        .expect_err("mixed generic and legacy control must be rejected");
+    assert!(
+        error.errors.iter().any(|message| {
+            message.contains("cannot be combined with legacy pipeline.strategy")
+        })
+    );
+}
+
+#[test]
 fn pipeline_strategy_stage_rejects_run_on() {
     let error = serde_yaml::from_str::<InferenceMetadata>(
         r#"
