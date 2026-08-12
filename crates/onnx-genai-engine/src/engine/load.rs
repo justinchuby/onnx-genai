@@ -141,7 +141,9 @@ impl Engine {
             None => governor_kv_config(None, &config)?,
         };
         let model_weight_bytes = device_weight_package_bytes(&model_directory.model_path);
-        let resolved_vram_bytes = resolve_vram_limit_bytes(&config.limits)?;
+        // ORT backend manages its own device memory (advisory-only governor),
+        // so it has no native CUDA ordinal to resolve the VRAM fraction against.
+        let resolved_vram_bytes = resolve_vram_limit_bytes(&config.limits, None)?;
         let graph_memory = analyze_model_memory(&model_directory.model_path);
         let minimum_useful_weight_budget_bytes = graph_memory
             .per_layer_weight_bytes
@@ -399,7 +401,8 @@ impl Engine {
             .map(|layer| layer.bytes)
             .max()
             .unwrap_or(0);
-        let resolved_vram_bytes = resolve_vram_limit_bytes(&config.limits)?;
+        let resolved_vram_bytes =
+            resolve_vram_limit_bytes(&config.limits, native_device.cuda_index())?;
         #[cfg(feature = "cuda")]
         let required_device_non_weight_bytes = if matches!(
             native_device,
@@ -512,6 +515,7 @@ impl Engine {
                 governor_kv_config,
                 model_weight_bytes,
                 weight_reservation_bytes,
+                native_device.cuda_index(),
                 authority_provider,
                 Some(authority_domain),
             )
@@ -1000,6 +1004,7 @@ fn build_governor_and_scheduler(
             config.allow_runtime_override,
             governor_kv_config,
             device_weight_package_bytes(&model_directory.model_path),
+            None,
             authority_provider,
             Some(authority_domain),
         )

@@ -835,7 +835,19 @@ impl PipelineEngine {
             }
             _ => crate::engine::governor_no_paged_kv_config(&config)?,
         };
-        let resolved_vram_bytes = resolve_vram_limit_bytes(&config.limits)?;
+        // Resolve the fractional VRAM limit against the real device capacity
+        // when the native CUDA pipeline path is active; otherwise the
+        // provisional 8 GiB constant would cap leases far below a large model's
+        // resident weights on any GPU.
+        #[cfg(all(feature = "cuda", feature = "native-backend"))]
+        let pipeline_cuda_index = if backend == PipelineBackend::Native {
+            native_decoder_device(config.native_device.as_ref()).cuda_index()
+        } else {
+            None
+        };
+        #[cfg(not(all(feature = "cuda", feature = "native-backend")))]
+        let pipeline_cuda_index: Option<u32> = None;
+        let resolved_vram_bytes = resolve_vram_limit_bytes(&config.limits, pipeline_cuda_index)?;
         #[cfg(feature = "cuda")]
         let memory_strategy_overrides = crate::engine::memory_strategy_overrides_from_cuda_env(
             onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env(),
@@ -901,6 +913,7 @@ impl PipelineEngine {
             &config,
             None,
             model_weights_bytes,
+            pipeline_cuda_index,
             authority_provider.as_ref(),
             &authority_domain,
         )?;
@@ -999,6 +1012,7 @@ impl PipelineEngine {
                     config.allow_runtime_override,
                     kv_config,
                     resource_governor.snapshot().vram.used,
+                    pipeline_cuda_index,
                     authority_provider.as_ref(),
                     &authority_domain,
                 )

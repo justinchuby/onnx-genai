@@ -25,3 +25,20 @@ pub enum NativeDecodeDevice {
         provider_name: String,
     },
 }
+
+impl NativeDecodeDevice {
+    /// The CUDA device ordinal this decode session targets, if any.
+    ///
+    /// An unspecified index defaults to ordinal 0 (matching the load path,
+    /// which passes `index.unwrap_or(0)` to the CUDA execution provider).
+    /// Returns `None` for non-CUDA devices. Used to resolve fractional VRAM
+    /// limits against the device's *real* total memory instead of the
+    /// provisional capacity constant.
+    #[must_use]
+    pub fn cuda_index(&self) -> Option<u32> {
+        match self {
+            NativeDecodeDevice::Cuda { index } => Some(index.unwrap_or(0)),
+            NativeDecodeDevice::Cpu | NativeDecodeDevice::Plugin { .. } => None,
+        }
+    }
+}
