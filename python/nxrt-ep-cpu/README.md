@@ -38,8 +38,8 @@ installed it raises a clear `ImportError`.
 
 ## Platforms
 
-Linux (x86_64, manylinux), Windows (AMD64) and macOS (arm64). The wheel is
-platform-specific — it contains a compiled shared library and is not
+Linux (x86_64, manylinux), Windows (AMD64, ARM64) and macOS (arm64). The wheel
+is platform-specific — it contains a compiled shared library and is not
 pure-Python.
 
 ## License

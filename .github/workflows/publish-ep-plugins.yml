@@ -63,9 +63,25 @@ jobs:
           - name: macOS arm64
             os: macos-14
             archs: arm64
+          # Windows on ARM64: windows-11-arm is the GitHub-hosted Windows 11
+          # ARM64 runner. Official CPython has NO win_arm64 build for 3.10
+          # (ARM64 Windows CPython starts at 3.11), so the global cp310-*
+          # selector would match nothing here. Override to cp311-* for this row
+          # ONLY — the wheel is py3-none-win_arm64 (ABI-less), so any single
+          # CPython >=3.11 is enough to drive the build. setup-python is pinned
+          # to 3.11 for the same reason (no 3.10 arm64 build); cibuildwheel then
+          # provisions its own CPython for the actual wheel build.
+          - name: Windows ARM64
+            os: windows-11-arm
+            archs: ARM64
+            cibw_build: cp311-*
+            python_version: "3.11"
     runs-on: ${{ matrix.os }}
     env:
       CIBW_ARCHS: ${{ matrix.archs }}
+      # Per-row build selector: cp310-* everywhere except the Windows ARM64 row
+      # (cp311-*), because CPython has no win_arm64 build for 3.10.
+      CIBW_BUILD: ${{ matrix.cibw_build || 'cp310-*' }}
       CIBW_MANYLINUX_X86_64_IMAGE: quay.io/pypa/manylinux_2_28_x86_64:2026.07.25-1
       # DXCore is a Windows API set resolved by the OS loader, not a DLL to vendor.
       CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: >-
@@ -78,9 +94,12 @@ jobs:
           submodules: recursive
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          # 3.10 has no win_arm64 build; the ARM64 row pins 3.11 via the matrix.
+          python-version: ${{ matrix.python_version || '3.10' }}
       # Keep wheel publishing on Rust stable deliberately: this follows Rust's
-      # stability promise without freezing security fixes.
+      # stability promise without freezing security fixes. On windows-11-arm
+      # rustup installs the native aarch64-pc-windows-msvc toolchain, so the
+      # plugin is built natively (no cross-compilation).
       - name: Install Rust stable toolchain
         shell: bash
         run: |
