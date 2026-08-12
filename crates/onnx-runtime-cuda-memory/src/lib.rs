@@ -61,8 +61,9 @@ pub mod virtual_memory;
 pub mod vmm_allocator;
 
 /// Shared helpers for this crate's real-CUDA integration tests. Compiled only
-/// for the crate's own tests and under the `gpu-tests` feature, so it never
-/// reaches a production build. See [`test_support::TestStream`] for why device
-/// tests must keep every operation on one stream (#797).
-#[cfg(any(test, feature = "gpu-tests"))]
+/// under the `gpu-tests` feature so it never reaches a production build.
+/// Integration tests that use it must cfg-gate both the import and the body
+/// because `cfg(test)` does not propagate to integration test crates and
+/// Cargo silently ignores self dev-dependencies for feature resolution.
+#[cfg(feature = "gpu-tests")]
 pub mod test_support;
