@@ -66,40 +66,55 @@ fn cuda_plugin_always_zeros_out_num_on_failure() {
     );
 }
 
-/// The CUDA plugin's error message depends on the feature configuration.
-/// This test verifies the diagnostic *content* — it would fail if the
-/// diagnostic message were missing or contained the wrong reason.
+/// The CUDA plugin's fail-closed diagnostic must be actionable. This asserts
+/// on the plugin's *real* diagnostic output — the exact string
+/// `CreateEpFactories` hands to `fail_status`/`panic_to_fail_status` — obtained
+/// via the public `fail_closed_diagnostic()` accessor. It is NOT a copy of a
+/// literal defined in the test, so it fails if the real message loses its
+/// actionable content.
+///
+/// Note: on this (GPU-less) host the plugin always fails closed, so the
+/// diagnostic is always present in both feature configurations. The `OrtStatus`
+/// *string* itself requires a live ORT host to materialize (see
+/// `onnx-runtime-ep-plugin::status`), but the message *content* is produced
+/// entirely by this crate, which is what we assert on here.
 #[test]
 fn cuda_plugin_diagnostic_message_is_actionable() {
-    // With a real ORT API we'd read the OrtStatus message. Without one,
-    // we verify the Rust-level error path contains the expected diagnostic.
-    // The code under test: construct_ep_with_stream() returns Err(msg) where
-    // msg contains "CUDA EP construction failed" or the no-feature message.
+    let diagnostic = onnx_runtime_ep_cuda_plugin::fail_closed_diagnostic()
+        .expect("on a GPU-less host the plugin must fail closed with a diagnostic");
+
+    // Common actionability requirement: the diagnostic must name the EP crate
+    // so an operator can trace where zero factories came from.
+    assert!(
+        diagnostic.contains("onnx-runtime-ep-cuda-plugin"),
+        "diagnostic must name the plugin crate; got: {diagnostic}"
+    );
+
     #[cfg(feature = "cuda")]
     {
-        // We can call construct_ep_with_stream directly (it's pub(crate) but
-        // we're in the same crate's test). Instead, verify the formatted
-        // message that CreateEpFactories would pass to panic_to_fail_status.
-        // Since there's no GPU, the error must mention GPU/driver.
-        let msg = "CUDA EP construction failed";
+        // Built WITH cuda but no GPU: the message must point at the missing
+        // GPU/driver and mention the CUDA EP construction failure.
         assert!(
-            msg.contains("CUDA"),
-            "diagnostic must mention CUDA for actionability"
+            diagnostic.contains("CUDA EP construction failed"),
+            "cuda-feature diagnostic must report the construction failure; got: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("no GPU or driver unavailable"),
+            "cuda-feature diagnostic must explain the actionable cause; got: {diagnostic}"
         );
     }
+
     #[cfg(not(feature = "cuda"))]
     {
-        // Verify the compile-time message is actionable.
-        let expected_fragment = "without `cuda` feature";
-        let full_msg = "onnx-runtime-ep-cuda-plugin built without `cuda` feature; \
-                        CUDA EP is not available. Rebuild with --features cuda on a CUDA-capable host.";
+        // Built WITHOUT cuda: the message must name the feature gate and suggest
+        // the fix (rebuild with the feature).
         assert!(
-            full_msg.contains(expected_fragment),
-            "no-cuda diagnostic must mention the feature gate"
+            diagnostic.contains("without `cuda` feature"),
+            "no-cuda diagnostic must mention the feature gate; got: {diagnostic}"
         );
         assert!(
-            full_msg.contains("Rebuild"),
-            "no-cuda diagnostic must suggest a fix"
+            diagnostic.contains("Rebuild with --features cuda"),
+            "no-cuda diagnostic must suggest the fix; got: {diagnostic}"
         );
     }
 }
