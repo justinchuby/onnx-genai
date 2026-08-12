@@ -47,3 +47,23 @@ Full pre-compaction history in `history-archive.md`.
 **Fixes:** Claim filter carve-out for absent outputs; Clip added to `SameAsInput(0)`; `input_slots` mapping in fast path; axis bounds: `>= rank`; scratch buffer: `numel * primary_output.byte_size()`.
 
 **Outcome:** Challenger's review found the `__absent_output_*` sentinel was forgeable from model content. Locked out; Coco fixed.
+
+## 2026-08-12 — Scope correction on PR #31993
+
+**Task:** Rescope MLAS f16↔f32 cast kernel PR to macOS arm64 only.
+
+**Changes:**
+- Removed `#else` branch in `TestKernelIsDispatched()` (x86_64 Apple null-pointer assertions)
+- Rewrote first commit message: removed universal2/iOS/Intel references
+- Updated dispatch test comment to specify macOS arm64
+- Verified clang-format clean; ran leak check
+
+**Preserved:** Compile-time gate (`__APPLE__ && MLAS_TARGET_ARM64`), positive non-null dispatch assertion (non-vacuous), portable scalar fallback, numeric coverage (normals, denormals, ±0, ±Inf, qNaN, sNaN, RTE, non-aligned lengths).
+
+**New head:** `68ee0de`. Needs macOS arm64 CI to validate.
+
+---
+
+### 2026-08-12T02:30:00Z — PR #31993 lockout revision: rescoped to macOS arm64 only
+
+Removed the `#else` branch in `test_cast_fp16.cpp` that asserted null dispatch pointers on non-ARM64 Apple (x86_64 slice test). Rescoped commit messages and PR body from universal2/iOS/Intel to macOS arm64 only. Compile-time gate `#if defined(__APPLE__) && defined(MLAS_TARGET_ARM64)` unchanged. Positive dispatch assertions (`ASSERT_NE`) survive. Head: `68ee0de`. PR remains draft.

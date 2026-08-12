@@ -36,3 +36,19 @@ WP-B landed: Coco's initial WP-B3 admission work was superseded by raw-protobuf 
 - **B1:** `OutboundGraphReader` now maintains `absent_outputs: HashSet<ValueId>`. ValueIds are graph-internal arena indices — model content can influence names and shapes but never the arena index a value receives. String prefix `__absent_output_*` removed entirely.
 - **B2:** `filter_map(|d| d.as_static())` → `map(|d| d.as_static())` → `Vec<Option<usize>>` preserving rank at claim time. `get_kernel` trait receives `unwrap_or(0)` with `DIM_UNKNOWN` constant. `build_conv` fails closed (`return None` → `Declined`) on `None` dims.
 - `conformance_mixed_partition` assertion: added compiled-node counter via `dlsym` as best effort under ORT 1.27 API constraints.
+
+## 2026-08-12 — PR #32001 scope correction (macOS arm64 gate)
+
+**Commit:** `52db6351b5`
+
+- Added `onnxruntime_target_platform STREQUAL "arm64"` gate in `cmake/CMakeLists.txt:616` and updated comments in `cmake/onnxruntime_mlas.cmake:1172`.
+- Non-arm64 Apple → warn-and-disable (not FATAL_ERROR), matching SVE/KleidiAI idiom.
+- Removed universal2/iOS claims from MLAS cmake comments and `build_args.py` help text.
+- Validated: default Linux configure has zero Accelerate references; option ON on Linux warns and disables; `build.py --help` shows updated text.
+- Only macOS arm64 CI can confirm: `find_library(Accelerate)` succeeds and `target_link_libraries` actually links.
+
+---
+
+### 2026-08-12T02:30:00Z — PR #32001 lockout revision: rescoped to macOS arm64 only
+
+Added `onnxruntime_target_platform STREQUAL "arm64"` condition to `cmake/CMakeLists.txt` as `elseif` after the `if(NOT APPLE)` check, using warn-and-disable (matching SVE/KleidiAI idiom). Rescoped option description, MLAS comment, and `build_args.py` help text. Verified no-behaviour-change-when-disabled on Linux x86-64. Head: `52db6351b5`. PR remains draft.

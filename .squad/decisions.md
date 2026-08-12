@@ -399,3 +399,41 @@ Full narrative in `.squad/decisions-archive/2026-08.md` (DROP sections: copilot-
 - **Host-only test code must not include CUDA `.cuh` headers.** `matmul_4bits_common.cuh` from a `.cc` pulled CUB via `<cuda_bf16.h>`, breaking TensorRT with ~40 device-intrinsic errors in host context.
 - **Cross-PR comparison is the fastest way to settle CI failure ownership.** #31678 green vs ours red proved the TensorRT break was ours; a docs-only control PR at 86/86 green proved Apple download failures were infra.
 - **Reviewer lockout held:** Luba (author) and Luv (reviewer) were both barred from #32001 revision; Isidore did it.
+
+---
+
+## 2026-08-12 — Apple scope: macOS arm64 / Apple Silicon ONLY
+
+**By:** @justinchuby (scope correction), Mariette (PR #31993 lockout revision), Coco (PR #32001 lockout revision), Coordinator (verification)
+
+### ⚠️ STANDING CONSTRAINT — applies to ALL future Apple work
+
+**Apple scope is macOS arm64 / Apple Silicon ONLY.** Intel Mac and universal2 are out of scope. Gate with `APPLE + arm64/aarch64`. Do not add x86_64 Apple slices or Intel fallback tests. Do not let universal-binary concerns block enabling ARM kernels. Preserve the portable non-Apple fallback when the compile option is off. **iOS is not implied** — unless separately justified, Apple work stays scoped to macOS arm64.
+
+This **narrows** the earlier Apple framework policy entry (Accelerate/BNNS/vDSP eligible when Apple-only, opt-in, portable fallback): that policy still stands, but its platform scope is now macOS arm64 only. **Read both entries together — neither stands alone.**
+
+**Rescoping is not the same as removing a guard.** The `#if defined(__APPLE__) && defined(MLAS_TARGET_ARM64)` compile-time gate stays — it prevents the kernel reaching targets without FEAT_FP16. What was removed was the x86_64 *test slice*, not the *gate*.
+
+**Use the tree's existing arch idiom.** `onnxruntime_target_platform STREQUAL "arm64"` is the canonical upstream variable, already used at `cmake/CMakeLists.txt:567/575/589` — prefer it over inventing a new condition from `CMAKE_OSX_ARCHITECTURES`.
+
+### PR #31993 (Mariette, lockout revision) — rescoped to macOS arm64 only
+
+- Removed the `#else` branch in `test_cast_fp16.cpp` that asserted null dispatch pointers on non-ARM64 Apple (x86_64 slice test, now out of scope).
+- Rescoped commit messages and PR body from universal2/iOS/Intel to macOS arm64 only.
+- Compile-time gate `#if defined(__APPLE__) && defined(MLAS_TARGET_ARM64)` unchanged.
+- Positive `ASSERT_NE(...Kernel, nullptr)` dispatch assertions survive — test remains non-vacuous.
+- Head: `68ee0de`.
+
+### PR #32001 (Coco, lockout revision) — rescoped to macOS arm64 only
+
+- Added `onnxruntime_target_platform STREQUAL "arm64"` condition to `cmake/CMakeLists.txt`.
+- Implemented as `elseif` after the `if(NOT APPLE)` check, using warn-and-disable to match `onnxruntime_USE_SVE`/`onnxruntime_USE_KLEIDIAI`.
+- Rescoped option description, MLAS comment (removed "iOS 4.0+"/"macOS 10.3+") and `build_args.py` help text.
+- Verified no-behaviour-change-when-disabled on Linux x86-64.
+- Head: `52db6351b5`. PR remains draft.
+
+### Durable lessons
+
+- **Non-arm64 Apple slices are out of scope.** Do not add `#else` branches for x86_64 Apple test slices; do not reference universal2 or Intel Mac in commit messages or PR bodies for ARM kernel work.
+- **`onnxruntime_target_platform` is the canonical arch variable on Apple.** Already used at CMakeLists.txt:567/575/589; do not invent an alternative from `CMAKE_OSX_ARCHITECTURES`.
+- **warn-and-disable, not FATAL_ERROR**, for platform-check failures in optional ISA options (per SVE/KleidiAI idiom).
