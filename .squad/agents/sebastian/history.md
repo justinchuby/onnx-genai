@@ -69,3 +69,26 @@ Full pre-compaction history in `history-archive.md`.
 - Also claimed benchmark methodology was missing — this was incorrect; it was present in the PR body.
 - Barred from revision under reviewer lockout. Chew revised and confirmed the routing concern was real.
 - Lesson: a reviewer's "SAFE" is not proof; verify the load-bearing claim independently.
+
+### 2026-08-12 — PR #31973: Fix architecture-specific dispatch threshold in LayerNorm tests
+
+- **Blocker fixed:** `kAvx2DispatchThreshold = 8` was applied universally; RISC-V RVV dispatches for N < 8. Renamed to `kKernelDispatchThreshold` with `#if` guard matching production `layernorm.cpp`. Test and production share the same preprocessor condition.
+- **CatastrophicCancellationPasses:** Added scenarios with condition < 1e7 so the accuracy body is exercised (both prior scenarios had condition = 1e9, making accuracy unreachable).
+- **AdversarialPrecisionReport:** Marked `DISABLED_` to match its comment — it's a measurement tool, not a gate.
+- **Benchmark:** Removed N=7 (below x86 threshold; was timing the fallback, not the kernel).
+- **Denormals/LargeMagnitudes:** Clarified these are finiteness-only checks, not accuracy checks.
+- **MlasLayerNormF32 doc:** Updated to describe the x86 dispatch threshold.
+- **Optional perf (8-float mean pattern):** Deferred — risks complicating review of the blocker fix.
+- Tests: 41 pass + 2 disabled (baseline was 42 + 1; AdversarialPrecisionReport moved to DISABLED). 43 pass with `--gtest_also_run_disabled_tests`.
+- Head: `72e02cd92c`. PR stays draft; needs Opus re-approval.
+
+## 2026-08-12 — PR #31973 v2: architecture-specific dispatch threshold fix (blocker)
+
+- Renamed `kAvx2DispatchThreshold` → `kKernelDispatchThreshold`; made it `8` under `#if defined(MLAS_TARGET_AMD64) || defined(MLAS_TARGET_IX86)`, else `1`, matching production `layernorm.cpp` exactly.
+- Fixed `CatastrophicCancellation`: added scenarios with condition 1e4 and 1e5 so accuracy branch is reachable (prior scenarios had condition 1e9 — unreachable).
+- Renamed `AdversarialPrecisionReport` → `DISABLED_AdversarialPrecisionReport`.
+- Removed N=7 benchmark (below x86 threshold; was timing the scalar fallback).
+- Clarified `TestDenormals`/`TestLargeMagnitudes` as finiteness-only.
+- Updated `MlasLayerNormF32` docstring to describe x86 threshold.
+- Deferred 8-float mean-pass optimisation to follow-up PR.
+- Head `72e02cd92c`. Tests: 41 passed + 2 disabled; 43 with disabled.

@@ -449,3 +449,25 @@ Deckard split strict-aliasing/`-Werror` fixes from #31988 into standalone draft 
 | #31993 | Draft | `02a9f34` |
 | #32001 | Draft | `0d924a421b` |
 | #32003 | Draft | `23dcfddaaf` |
+
+## 2026-08-12 — PR #31973 LayerNorm test architecture threshold and comment accuracy
+
+### Architecture-specific logic applied universally is a five-time recurring defect
+
+The test applied the x86 dispatch threshold of 8 on every architecture. Production `layernorm.cpp` already had the `#if defined(MLAS_TARGET_AMD64) || defined(MLAS_TARGET_IX86)` guard. Without the matching guard in the test, test and production agreed on the wrong answer (both returning false for N < 8 on RVV), so the bug was invisible. The fix: `kKernelDispatchThreshold = 8` under the same `#if`, else `1`. When a constant is architecture-specific in production, the test must mirror the same `#if`, not restate a literal. This is the sixth instance of this defect class (production gate, compacted output slots, compacted input slots, `n % 8` acceptance, shared-memory admission scaling, and now the test threshold).
+
+### Rebuild before trusting test counts
+
+A stale binary reported 42 passed / 1 disabled. A fresh build gave 41 passed / 2 disabled. Stale artifacts have produced misleading results here more than once. Rebuild before interpreting pass/fail counts.
+
+### A test whose accuracy body is unreachable is worse than no test
+
+`CatastrophicCancellation` guarded its accuracy check behind `condition < 1e7` while every scenario had condition 1e9 — dead code wearing a meaningful name. The fix was two new scenarios with condition 1e4 and 1e5, making the body reachable. If a test's accuracy branch can never execute, it gives false confidence while testing nothing.
+
+### Comment rot is a correctness hazard when the algorithm changed for numerical reasons
+
+Four separate comment sites described the kernel as Welford after it was replaced by centered two-pass. Welford was not merely swapped out — it measured ~1000× worse than scalar for large-base/small-spread inputs and produces NaN at base 1e6 (uncentered identity catastrophically cancels). An Opus review found three sites; the coordinator found a fourth. Keep the centered vs uncentered two-pass distinction explicit; conflating them already cost one design detour.
+
+### Reviews miss things too
+
+An Opus review flagged three stale Welford comment sites. A fourth (the oracle block at test_layernorm.cpp:58-85) was found afterwards by the coordinator. Verify review completeness independently; do not assume a reviewer-flagged list is exhaustive.

@@ -24,3 +24,20 @@ Pre-2026-08-11 entries archived in `history-archive.md`.
 ## Archive pointer
 
 Older entries in `history-archive.md`.
+
+## 2026-08-12 — PR #31973 comment accuracy fix
+
+- Rewrote 3 stale Welford comments → centered two-pass description
+- Renamed 2 scenario names removing obsolete "two-pass=NaN/100%err" suffixes
+- Added cross-reference comments at both threshold sites
+- Made benchmark comment architecture-neutral
+- 41+2 disabled / 43 with disabled; clang-format clean; leak check clean
+- Head: `697189f2ae`
+
+## 2026-08-12 — PR #31973 lockout revision: stale Welford comments
+
+- Under reviewer lockout (Luv barred from revision), rewrote three stale Welford comment sites in `test_layernorm.cpp:275,646,1055` to describe centered two-pass.
+- Renamed scenario names: `"catastrophic_1e6 (two-pass=NaN)"` → `"catastrophic_1e6"`, `"catastrophic_1e7 (two-pass=100%err)"` → `"catastrophic_1e7"`.
+- Added "Keep in sync" cross-references at both threshold literal sites.
+- Changed benchmark comment "AVX2 kernel" → "SIMD kernel" for architecture neutrality.
+- Fresh build: 41 passed + 2 disabled; clang-format clean; no leaks. Head `697189f2ae`.

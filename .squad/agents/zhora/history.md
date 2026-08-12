@@ -54,3 +54,25 @@ Full pre-compaction history in `history-archive.md`.
 - No CUDA hardware claims made anywhere.
 
 **Outcome:** Gaff's final review confirmed doc accuracy. PR marked ready for review.
+
+### 2026-08-12 — PR #31973: Fix stale algorithm references in LayerNorm test comments
+
+**Task:** Rewrite the ReferenceLayerNorm oracle comment block which described the kernel as Welford (it is centered two-pass). Also fix ScalarFp32Baseline comment claiming to match current kernel.
+
+**Changes:** Comments only in `onnxruntime/test/mlas/unittest/test_layernorm.cpp`. Two sites updated:
+1. Lines 58-85: oracle block now names the kernel's actual algorithm, explains uncentered vs centered distinction, preserves independent-oracle argument.
+2. Line 436: ScalarFp32Baseline clarified as historical baseline.
+
+**Other stale references found:** ~30 other Welford mentions exist in the file (in disabled accuracy-comparison tests, WelfordFp64Reference helper, error-reporting labels). These are accurate in their own context — they describe the *historical* Welford baseline or the fp64 reference function, not the current kernel. No changes needed.
+
+**Validation:** Fresh build; 41 passed, 2 disabled; 43/43 with disabled. clang-format clean. No leaks. Pushed as `9a4fcaeaa4`.
+
+**Outcome:** PR remains draft, pending fresh Opus approval.
+
+## 2026-08-12 — PR #31973 lockout revision: oracle block and ScalarFp32Baseline comments
+
+- Coordinator found a fourth stale Welford comment site missed by Luv's review: oracle block at `test_layernorm.cpp:58-85`.
+- Rewrote oracle block to name centered two-pass, explain uncentered `E[x²] − mean²` reference form (fp64, safe only due to precision), preserve independent-oracle argument, replace "Do NOT fix this to Welford" with clearer directive.
+- Clarified `ScalarFp32Baseline` comment as historical baseline, not a mirror of current kernel.
+- Assessed ~30 other Welford mentions as accurate in context (Welford baseline history, fp64 helper).
+- Fresh build: 41 passed + 2 disabled; 43/43 with disabled; clang-format clean. Head `9a4fcaeaa4`. PR remains draft.
