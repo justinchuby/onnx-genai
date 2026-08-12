@@ -396,10 +396,23 @@ pub struct CudaGraphDebugStats {
     pub replays: u64,
     pub fallbacks: u64,
     pub invalidations: u64,
+    /// Number of KV-cache growth events that **kept** the captured graph instead
+    /// of invalidating it, because the growth provably changed none of the
+    /// captured graph's baked dependencies (seq-major fixed full-context stride:
+    /// stable device pointers, unchanged physical shapes, capacity-independent
+    /// addressing). Head-major and the legacy realloc path never keep — they are
+    /// counted under `invalidations`. Surfaced so an operator can attribute why a
+    /// graph survived a growth (#804-style named reporting).
+    pub growth_keeps: u64,
     pub allocation_counts: DeviceAllocationCounts,
     /// Named decode-level predicate that declined capture, whether before the
     /// first attempt or during the runtime capture audit.
     pub decline_reason: Option<String>,
+    /// The most recent KV-growth capture decision (kept vs invalidated) with the
+    /// named predicate that produced it, so an operator can see *why* a graph was
+    /// kept or invalidated across a growth — a silent "kept" is as dangerous as a
+    /// silent capture decline.
+    pub growth_decision: Option<String>,
     /// Structured reasons from the most recent capture fallback.
     pub fallback_report: Option<CaptureDeclineReport>,
 }
@@ -476,6 +489,17 @@ pub(crate) struct DecodeCudaState {
     graph_invalidations: u64,
     kv_growth_events: u64,
     kv_growth_d2d_copy_bytes: u64,
+    /// Count of KV-growth events that kept the captured graph (seq-major
+    /// fixed-stride commit-on-demand path). Mutually exclusive with the
+    /// growth-attributable slice of `graph_invalidations`.
+    graph_growth_keeps: u64,
+    /// Highest committed KV sequence length, in tokens. For the seq-major
+    /// fixed-stride path this is the commit high-water mark that advances on
+    /// growth **without** changing the reported physical shape; for head-major
+    /// and legacy realloc it tracks the reported physical capacity.
+    kv_committed_len: usize,
+    /// Named rationale for the most recent KV-growth capture decision.
+    graph_growth_decision: Option<String>,
     capacity: CudaKvCapacity,
     /// The KV bindings reserve their full context address range while the CUDA
     /// VMM allocator maps only the token stripes reached so far.
@@ -1516,11 +1540,241 @@ impl DecodeCudaState {
         )
     }
 
+    /// True when this session uses the seq-major fixed full-context stride path:
+    /// VMM commit-on-demand backing *and* a seq-major (BSNH) KV layout. On this
+    /// path the KV bindings report a physical shape pinned at the hard-max
+    /// context length while only the reached token stripes are committed, so
+    /// bucket growth changes no captured-graph dependency and the decode graph is
+    /// kept across growth. Head-major and the legacy realloc path return false.
+    fn seq_major_fixed_stride(&self) -> bool {
+        self.kv_commits_on_demand && self.kv_layout.is_seq_major()
+    }
+
+    /// A conservative signature of every binding's captured-graph dependencies
+    /// that KV growth could plausibly disturb: the device pointer (baked into
+    /// recorded graph nodes) and the reported physical shape (baked into kernel
+    /// argument extents / strides). If any entry differs across a growth commit,
+    /// the captured graph's assumptions changed and we must invalidate — this is
+    /// the defense-in-depth check behind the "provably unchanged -> keep" rule.
+    fn binding_growth_signature(&self) -> Vec<(usize, Vec<usize>)> {
+        self.bindings
+            .iter()
+            .map(|binding| {
+                (
+                    binding.device_ptr() as usize,
+                    binding.physical_shape().to_vec(),
+                )
+            })
+            .collect()
+    }
+
+    /// KV-only commit requests for the seq-major fixed path: commit the dense
+    /// token prefix `[0, committed_len)` for each KV binding. The mask is fully
+    /// committed at construction and never grows here, so — unlike
+    /// [`Self::vmm_growth_requests`] — no mask range is appended. Re-committing
+    /// the already-mapped prefix is idempotent; the governor only bills the newly
+    /// mapped granules.
+    fn seq_major_kv_commit_requests(
+        &self,
+        committed_len: usize,
+    ) -> anyhow::Result<Vec<(usize, usize, usize)>> {
+        let mut requested = Vec::<(usize, usize, usize)>::new();
+        for index in self.kv_binding_range.clone() {
+            let binding = &self.bindings[index];
+            let mut shape = binding.physical_shape().to_vec();
+            if shape.len() != 4 {
+                bail!(
+                    "seq-major VMM-backed CUDA KV binding '{}' must be rank 4, got {:?}",
+                    binding.input_name(),
+                    shape
+                );
+            }
+            // Seq-major bytes are token-contiguous, so the committed dense prefix
+            // of `committed_len` tokens is exactly the byte extent of a
+            // `[.., committed_len, ..]` shaped tensor.
+            shape[2] = committed_len;
+            let bytes = checked_shape_bytes(&shape, binding.dtype).with_context(|| {
+                format!(
+                    "seq-major VMM-backed CUDA KV '{}' commit size overflows for shape {:?}",
+                    binding.input_name(),
+                    shape
+                )
+            })?;
+            requested.push((index, 0, bytes));
+        }
+        Ok(requested)
+    }
+
+    fn seq_major_commit_mapped_bytes(&self, committed_len: usize) -> anyhow::Result<u64> {
+        let requested = self.seq_major_kv_commit_requests(committed_len)?;
+        let ranges = requested
+            .iter()
+            .map(|&(index, offset, bytes)| (&self.bindings[index], offset, bytes))
+            .collect::<Vec<_>>();
+        self.bindings[0]
+            .mapped_bytes_for_binding_ranges(&ranges)
+            .context("size seq-major native CUDA KV commit transaction")
+    }
+
+    fn commit_seq_major_kv(
+        &mut self,
+        committed_len: usize,
+        grant: Option<&mut onnx_runtime_memory_governor::MappedGrowthGrant>,
+    ) -> anyhow::Result<u64> {
+        let requested = self.seq_major_kv_commit_requests(committed_len)?;
+        let ranges = requested
+            .iter()
+            .map(|&(index, offset, bytes)| (&self.bindings[index], offset, bytes))
+            .collect::<Vec<_>>();
+        match grant {
+            Some(grant) => {
+                self.bindings[0].commit_binding_ranges_with_mapped_growth(&ranges, grant)
+            }
+            None => {
+                self.bindings[0].commit_binding_ranges(&ranges)?;
+                Ok(0)
+            }
+        }
+        .context("commit seq-major native CUDA KV binding ranges atomically")
+    }
+
+    /// Zero the newly committed dense token stripe `[old_committed, new_committed)`
+    /// on every KV binding. Not strictly required for correctness (the kernel
+    /// reads only `[0, total_lengths)`), but it keeps the padding suffix zeroed
+    /// exactly as the growing-bucket path does, guarding against any future
+    /// over-read touching uninitialized physical pages.
+    fn zero_seq_major_committed_tail(
+        &self,
+        old_committed: usize,
+        new_committed: usize,
+    ) -> anyhow::Result<()> {
+        for index in self.kv_binding_range.clone() {
+            let binding = &self.bindings[index];
+            let mut shape = binding.physical_shape().to_vec();
+            shape[2] = old_committed;
+            let old_bytes = checked_shape_bytes(&shape, binding.dtype)
+                .context("seq-major committed-tail old size overflow")?;
+            shape[2] = new_committed;
+            let new_bytes = checked_shape_bytes(&shape, binding.dtype)
+                .context("seq-major committed-tail new size overflow")?;
+            let ptr = binding.device_ptr() as usize;
+            native_cuda_memset_zero(ptr + old_bytes, new_bytes - old_bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Record and surface a KV-growth capture decision (kept vs invalidated) with
+    /// the named rationale, so an operator can attribute why a captured graph
+    /// survived or was discarded across a growth. A silent "kept" is as dangerous
+    /// as a silent capture decline, so every keep is both counted and logged.
+    fn record_growth_decision(&mut self, kept: bool, reason: &str) {
+        if kept {
+            self.graph_growth_keeps = self.graph_growth_keeps.saturating_add(1);
+        }
+        let verb = if kept { "kept" } else { "invalidated" };
+        tracing::info!(
+            kept,
+            reason,
+            growth_keeps = self.graph_growth_keeps,
+            invalidations = self.graph_invalidations,
+            "native CUDA decode graph {verb} across KV growth"
+        );
+        self.graph_growth_decision = Some(format!("{verb}: {reason}"));
+    }
+
+    /// Grow the seq-major fixed full-context stride KV cache by committing more
+    /// token stripes on demand, keeping the captured decode graph alive.
+    ///
+    /// The reported physical shape stays pinned at the hard maximum and every
+    /// device pointer stays fixed, so none of the captured graph's baked
+    /// dependencies change; we verify that invariant (device pointers + physical
+    /// shapes) before deciding to keep, and invalidate if anything moved. This is
+    /// the "provably unchanged -> keep" branch: seq-major addressing at batch
+    /// index 0 is capacity-independent (proven byte-identical with 0 bytes moved
+    /// by #805), so the graph replays correctly into the newly committed pages.
+    fn ensure_capacity_seq_major_fixed(
+        &mut self,
+        session: &mut InferenceSession,
+        required: usize,
+    ) -> anyhow::Result<bool> {
+        if required > self.capacity.max_len {
+            bail!("{}", self.capacity_exceeded_error(required));
+        }
+        if required <= self.kv_committed_len {
+            return Ok(false);
+        }
+        let old_committed = self.kv_committed_len;
+        let new_committed = onnx_genai_kv::kv_capacity_bucket(required, self.capacity.max_len);
+
+        // Defense in depth: snapshot the dependency signature before mutating any
+        // mapping so we can prove nothing the captured graph baked in moved.
+        let before = self.binding_growth_signature();
+
+        let mapped_growth_bytes = self.seq_major_commit_mapped_bytes(new_committed)?;
+        let mut grant = session
+            .prepare_mapped_growth(
+                mapped_growth_bytes,
+                onnx_runtime_memory_governor::MemoryRole::KvCache,
+            )
+            .context("prepare transactional seq-major native CUDA KV commit")?;
+        tracing::info!(
+            mapped_growth_bytes,
+            grant_prepared = grant.is_some(),
+            "prepared seq-major native CUDA KV commit transaction"
+        );
+        let actual_mapped_bytes = self
+            .commit_seq_major_kv(new_committed, grant.as_mut())
+            .map_err(|error| {
+                let memory = cuda_device_memory_snapshot(session.device_id().index as i32)
+                    .map_err(|error| error.to_string());
+                self.growth_failed_error(old_committed, new_committed, error, memory)
+            })?;
+        if let Some(grant) = grant {
+            grant
+                .commit_bytes(actual_mapped_bytes)
+                .context("commit seq-major native CUDA KV mapped-growth attribution")?;
+        }
+        native_cuda_device_barrier(session)?;
+        self.zero_seq_major_committed_tail(old_committed, new_committed)?;
+
+        // The reported physical shape and device pointers are unchanged by an
+        // on-demand commit; verify that before we keep the graph. If anything did
+        // move, default to invalidating — a wrong keep would corrupt output.
+        let after = self.binding_growth_signature();
+        if before == after {
+            self.record_growth_decision(
+                true,
+                "seq-major fixed full-context stride: device pointers and physical shapes unchanged, \
+                 batch-0 addressing capacity-independent, mask fully committed",
+            );
+        } else {
+            self.invalidate_graph(session)?;
+            self.record_growth_decision(
+                false,
+                "seq-major commit unexpectedly changed a binding device pointer or physical shape",
+            );
+        }
+
+        self.kv_committed_len = new_committed;
+        self.kv_growth_events += 1;
+        // Seq-major growth moves no KV bytes — the valid prefix keeps its offsets.
+        tracing::info!(
+            old_committed_len = old_committed,
+            new_committed_len = new_committed,
+            hard_max_len = self.capacity.max_len,
+            "committed seq-major native CUDA KV stripe on demand (fixed stride)"
+        );
+        Ok(true)
+    }
+
     pub(super) fn ensure_capacity(
         &mut self,
         session: &mut InferenceSession,
         required: usize,
     ) -> anyhow::Result<bool> {
+        if self.seq_major_fixed_stride() {
+            return self.ensure_capacity_seq_major_fixed(session, required);
+        }
         if self.kv_commits_on_demand {
             if required > self.capacity.max_len {
                 bail!("{}", self.capacity_exceeded_error(required));
@@ -1853,7 +2107,27 @@ impl DecodeCudaState {
         kv_layout: KvCommitLayout,
     ) -> anyhow::Result<Self> {
         let kv_commits_on_demand = session.commits_on_demand();
-        let max_len = onnx_genai_kv::kv_capacity_bucket(0, capacity.max_len);
+        // Seq-major KV addressing is capacity-independent at batch index 0 (the
+        // only index native decode uses): token `t` always lands at
+        // `t * kv_heads * head_dim`, and the baked `cache_capacity` scalar only
+        // scales the batch term (= 0 here). So a seq-major VMM binding can report
+        // a *fixed* full-context physical stride while committing token stripes
+        // on demand — growth then changes neither device pointer nor physical
+        // shape nor addressing, and the captured decode graph survives it. Head-
+        // major uses `cache_capacity` as the per-head stride, so its addressing
+        // shifts on growth and it must keep the growing-bucket (re-capture) model.
+        // The legacy realloc path (no VMM) also keeps the growing-bucket model.
+        let seq_major_fixed = kv_commits_on_demand && kv_layout.is_seq_major();
+        let initial_bucket_len = onnx_genai_kv::kv_capacity_bucket(0, capacity.max_len);
+        // The capacity reported to the bindings (physical axis-2 / mask island).
+        // Seq-major fixed stride pins this at the hard maximum from the start;
+        // everything else starts at the initial bucket and grows it.
+        let reported_len = if seq_major_fixed {
+            capacity.max_len
+        } else {
+            initial_bucket_len
+        };
+        let max_len = reported_len;
         let mask_bytes = max_len
             .checked_mul(std::mem::size_of::<i64>())
             .context("initial CUDA mask size overflow")?;
@@ -1861,8 +2135,16 @@ impl DecodeCudaState {
             .max_len
             .checked_mul(std::mem::size_of::<i64>())
             .context("full CUDA mask reservation size overflow")?;
+        // Seq-major fixed stride commits the whole (tiny) mask at construction so
+        // the mask island is shape-static at the hard max and never grows; every
+        // other path commits only the initial mask bucket and grows it in place.
+        let mask_committed_bytes = if seq_major_fixed {
+            full_mask_bytes
+        } else {
+            mask_bytes
+        };
         let mask = if kv_commits_on_demand {
-            let committed = std::iter::once(0..mask_bytes).collect::<Vec<_>>();
+            let committed = std::iter::once(0..mask_committed_bytes).collect::<Vec<_>>();
             session.allocate_device_binding_committed(
                 io.attention_mask,
                 None::<String>,
@@ -1881,7 +2163,7 @@ impl DecodeCudaState {
                 vec![1, max_len],
             )?
         };
-        native_cuda_memset_zero(mask.device_ptr() as usize, mask_bytes)?;
+        native_cuda_memset_zero(mask.device_ptr() as usize, mask_committed_bytes)?;
 
         let mut pairs = present_to_past
             .iter()
@@ -1912,11 +2194,20 @@ impl DecodeCudaState {
                 .with_context(|| {
                     format!("sizing full VMM-backed CUDA KV reservation for '{past}'")
                 })?;
-                let initial_range =
-                    Self::initial_vmm_kv_committed_range(&physical_shape, meta.dtype)
-                        .with_context(|| {
-                            format!("sizing initial VMM-backed CUDA KV bucket for '{past}'")
-                        })?;
+                let initial_range = if seq_major_fixed {
+                    // Physical shape is pinned at the hard max, but only the
+                    // initial dense token prefix is mapped; growth commits more
+                    // stripes without ever changing the reported shape.
+                    let mut initial_shape = physical_shape.clone();
+                    initial_shape[2] = initial_bucket_len;
+                    Self::initial_vmm_kv_committed_range(&initial_shape, meta.dtype).with_context(
+                        || format!("sizing initial VMM-backed CUDA KV bucket for '{past}'"),
+                    )?
+                } else {
+                    Self::initial_vmm_kv_committed_range(&physical_shape, meta.dtype).with_context(
+                        || format!("sizing initial VMM-backed CUDA KV bucket for '{past}'"),
+                    )?
+                };
                 session.allocate_device_binding_committed(
                     past.clone(),
                     Some(present.clone()),
@@ -1940,12 +2231,20 @@ impl DecodeCudaState {
         let kv_end = bindings.len();
         if kv_commits_on_demand {
             for binding in &mut bindings[kv_start..kv_end] {
-                let bytes = checked_shape_bytes(binding.physical_shape(), binding.dtype)
-                    .with_context(|| {
+                // Zero only the committed region. For seq-major fixed stride the
+                // physical shape is the hard max but only `initial_bucket_len`
+                // tokens are mapped, so zeroing the full shape would touch
+                // uncommitted pages and fault.
+                let mut committed_shape = binding.physical_shape().to_vec();
+                if seq_major_fixed {
+                    committed_shape[2] = initial_bucket_len;
+                }
+                let bytes =
+                    checked_shape_bytes(&committed_shape, binding.dtype).with_context(|| {
                         format!(
                             "initial VMM-backed CUDA KV '{}' bucket size overflows for shape {:?}",
                             binding.input_name(),
-                            binding.physical_shape()
+                            committed_shape
                         )
                     })?;
                 native_cuda_memset_zero(binding.device_ptr() as usize, bytes)?;
@@ -2313,6 +2612,16 @@ impl DecodeCudaState {
             graph_invalidations: 0,
             kv_growth_events: 0,
             kv_growth_d2d_copy_bytes: 0,
+            graph_growth_keeps: 0,
+            // Seq-major fixed stride starts with only the initial dense token
+            // prefix mapped; every other path reports its physical capacity as
+            // fully committed (head-major grows the bucket, legacy reallocates).
+            kv_committed_len: if seq_major_fixed {
+                initial_bucket_len
+            } else {
+                reported_len
+            },
+            graph_growth_decision: None,
             capacity,
             kv_commits_on_demand,
             kv_layout,
@@ -2872,7 +3181,7 @@ impl DecodeCudaState {
         CudaKvDebugStats {
             logical_len: self.logical_len,
             max_len: self.max_len,
-            kv_committed_len: self.max_len,
+            kv_committed_len: self.kv_committed_len,
             hard_max_len: self.capacity.max_len,
             max_len_source: self.capacity.source.clone(),
             device_ptrs,
@@ -2888,8 +3197,10 @@ impl DecodeCudaState {
                 replays: self.graph_replays,
                 fallbacks: self.graph_fallbacks,
                 invalidations: self.graph_invalidations,
+                growth_keeps: self.graph_growth_keeps,
                 allocation_counts: session.device_allocation_counts().unwrap_or_default(),
                 decline_reason: self.graph_decline_reason.clone(),
+                growth_decision: self.graph_growth_decision.clone(),
                 fallback_report: self.graph_fallback_report.clone(),
             },
         }
