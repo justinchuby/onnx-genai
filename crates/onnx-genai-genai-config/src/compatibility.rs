@@ -957,6 +957,7 @@ impl GenAiConfig {
                 "image_placeholder_token_id": image_token_id,
                 "image_token_id": image_token_id,
                 "token_count_source": "from_grid",
+                "token_count_summary": vision_grid,
                 "placeholder_per_image": true
             }),
         );

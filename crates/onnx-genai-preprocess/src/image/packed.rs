@@ -102,6 +102,10 @@ pub struct ImageExpansionSummary {
     pub tile_count: usize,
     /// Number of real patches, or the tile count for a rank-4 pixel output.
     pub expansion_count: usize,
+    /// Packed temporal/height/width patch grid, when patchification is enabled.
+    pub patch_grid: Option<[usize; 3]>,
+    /// Spatial patch-group edge used to merge patch features into image tokens.
+    pub spatial_merge_size: usize,
     /// Start of this image in the packed or padded pixel tensor.
     pub tensor_offset: usize,
     /// Number of entries reserved for this image, including padding.
@@ -333,7 +337,15 @@ pub(super) fn build_bundle(
         }
     }
 
-    let images = expansion_summaries(&prepared, packed.as_deref(), max_patches, padded)?;
+    let images = expansion_summaries(
+        &prepared,
+        packed.as_deref(),
+        spec.patchify
+            .as_ref()
+            .map_or(1, |patchify| patchify.merge_size),
+        max_patches,
+        padded,
+    )?;
     Ok(ImageTensorBundle {
         tensors,
         images,
@@ -1017,6 +1029,7 @@ fn build_validity_mask(
 fn expansion_summaries(
     prepared: &[PreparedImage],
     packed: Option<&[PackedImage]>,
+    spatial_merge_size: usize,
     max_patches: usize,
     padded: bool,
 ) -> anyhow::Result<Vec<ImageExpansionSummary>> {
@@ -1033,6 +1046,9 @@ fn expansion_summaries(
             tile_grid: image.tile_grid,
             tile_count: image.tiles.len(),
             expansion_count,
+            patch_grid: packed
+                .map(|packed| packed[image_index].grid.map(|dimension| dimension as usize)),
+            spatial_merge_size,
             tensor_offset: offset,
             tensor_length,
         });

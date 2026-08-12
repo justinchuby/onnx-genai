@@ -774,6 +774,8 @@ mod tests {
                 },
                 tile_count: 1,
                 expansion_count: 1,
+                patch_grid: None,
+                spatial_merge_size: 1,
                 tensor_offset: 0,
                 tensor_length: 1,
             }],
