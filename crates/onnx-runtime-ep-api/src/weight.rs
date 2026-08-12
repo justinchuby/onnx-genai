@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use onnx_runtime_ir::DataType;
+use onnx_runtime_ir::{DataType, Graph, NodeId, ValueId};
 
 use crate::ExternalMmapRegion;
 
@@ -140,6 +140,49 @@ impl LazyWeightBoundary {
     pub fn matches_any(domain: &str, op_type: &str) -> bool {
         Self::for_op(domain, op_type).is_some()
     }
+}
+
+/// An initializer the executor may expose as a lazy weight handle.
+///
+/// Strategy inference and executor construction share this classifier so the
+/// reported pageable geometry cannot drift from the weights the runtime pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LazyWeightCandidate {
+    pub value: ValueId,
+    pub boundary: LazyWeightBoundary,
+    pub first_consumer: NodeId,
+}
+
+pub fn lazy_weight_candidates(graph: &Graph) -> Vec<LazyWeightCandidate> {
+    let mut candidates = Vec::new();
+    for &value in graph.initializers.keys() {
+        let graph_value = graph.value(value);
+        let consumers = graph.consumers(value);
+        let Some(&first_consumer) = consumers.first() else {
+            continue;
+        };
+        let mut boundary = None;
+        let lazy_only = graph_value.producer.is_none()
+            && !graph.outputs.contains(&value)
+            && consumers.into_iter().all(|consumer| {
+                let node = graph.node(consumer);
+                match LazyWeightBoundary::for_op(&node.domain, &node.op_type) {
+                    Some(found) => {
+                        boundary.get_or_insert(found);
+                        true
+                    }
+                    None => false,
+                }
+            });
+        if let Some(boundary) = boundary.filter(|_| lazy_only) {
+            candidates.push(LazyWeightCandidate {
+                value,
+                boundary,
+                first_consumer,
+            });
+        }
+    }
+    candidates
 }
 
 pub trait ResidentWeightMaterializer: Send + Sync {

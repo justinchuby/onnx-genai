@@ -2088,6 +2088,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "onnx-genai-cuda-version-guard"
+version = "0.1.0-dev.5"
+
+[[package]]
 name = "onnx-genai-engine"
 version = "0.1.0-dev.5"
 dependencies = [
@@ -2169,6 +2173,7 @@ dependencies = [
  "libloading 0.8.9",
  "minijinja",
  "minijinja-contrib",
+ "onnx-genai-cuda-version-guard",
  "onnx-genai-genai-config",
  "onnx-genai-kv",
  "onnx-genai-metadata",
@@ -2415,6 +2420,7 @@ dependencies = [
  "cudarc",
  "half",
  "libloading 0.8.9",
+ "onnx-genai-cuda-version-guard",
  "onnx-runtime-cuda-memory",
  "onnx-runtime-ep-api",
  "onnx-runtime-ep-cpu",

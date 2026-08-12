@@ -1,5 +1,32 @@
 use super::*;
 
+use super::kv_commit::KvCommitLayout;
+
+/// Resolve the physical KV-cache layout for the native CUDA binding layer.
+///
+/// The authoritative source is the model's [`ModelIoSpec::kv_layout`] descriptor
+/// (a seq-major descriptor selects [`KvCommitLayout::SeqMajor`]). Absent metadata
+/// means head-major, preserving the historical behavior exactly. The
+/// `ONNX_GENAI_CUDA_KV_LAYOUT` environment variable (`seq_major` / `bsnh` vs
+/// `head_major` / `bnsh`) overrides the descriptor for residency diagnostics; it
+/// never changes which kernels run, only how the binding layer accounts for and
+/// commits residency.
+pub(crate) fn resolve_cuda_kv_layout(
+    metadata: Option<&onnx_genai_metadata::KvCacheLayout>,
+) -> KvCommitLayout {
+    if let Ok(value) = std::env::var("ONNX_GENAI_CUDA_KV_LAYOUT") {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "seq_major" | "seq-major" | "bsnh" => return KvCommitLayout::SeqMajor,
+            "head_major" | "head-major" | "bnsh" => return KvCommitLayout::HeadMajor,
+            _ => {}
+        }
+    }
+    match metadata.and_then(|layout| layout.gqa_attribute_value()) {
+        Some(1) => KvCommitLayout::SeqMajor,
+        _ => KvCommitLayout::HeadMajor,
+    }
+}
+
 /// Purely structural signals that gate whether whole-step CUDA graph capture is
 /// *auto-attempted* on the native decode path. Never derived from a model or
 /// architecture name (RULES.md §2/§2.1) — only from device placement and the
@@ -28,10 +55,15 @@ impl GraphCaptureStructuralSafety {
 /// auto-decision.
 ///
 /// Precedence:
-/// 0. Live weight offload (`ONNX_GENAI_WEIGHT_OFFLOAD=1`) always wins and forces
-///    capture OFF. The pager's alloc/copy/free ops are capture-illegal, so the
-///    two features are mutually exclusive; offload wins and capture is skipped
-///    with a one-time notice.
+/// 0. Live weight offload (`ONNX_GENAI_WEIGHT_OFFLOAD=1`) forces capture OFF
+///    **only when its paging path is not stable-VA**. The legacy pager's
+///    alloc/copy/free ops return a different device pointer per page-in, and a
+///    captured graph bakes pointers into its recorded nodes, so the two are
+///    mutually exclusive on that path (a one-time notice explains the decline).
+///    When offload runs on the stable virtual-address VMM path (issue #716),
+///    every retained weight keeps a reserved-once device VA whose physical
+///    granules are remapped underneath, which is capture-safe, so this no longer
+///    forces capture OFF and the normal precedence below applies.
 /// 1. Programmatic `NativeDecodeCudaOptions::graph_capture` (`Some`) wins next.
 /// 2. An explicitly-set `ONNX_GENAI_CUDA_GRAPH` env var (`=0` forces OFF, `=1`
 ///    forces ON) is honored next.
@@ -43,8 +75,9 @@ pub(crate) fn resolve_graph_capture_enabled(
     env_value: bool,
     structural: GraphCaptureStructuralSafety,
     weight_offload_enabled: bool,
+    weight_offload_stable_va: bool,
 ) -> bool {
-    if weight_offload_enabled {
+    if weight_offload_enabled && !weight_offload_stable_va {
         log_weight_offload_capture_exclusion();
         return false;
     }
@@ -58,11 +91,15 @@ pub(crate) fn resolve_graph_capture_enabled(
 }
 
 /// Emit the offload/capture mutual-exclusion notice at most once per process, so
-/// operators who enable both learn capture was declined without log spam.
+/// operators who enable both on the pointer-unstable (non stable-VA) paging path
+/// learn capture was declined without log spam.
 fn log_weight_offload_capture_exclusion() {
     static NOTICE: std::sync::Once = std::sync::Once::new();
     NOTICE.call_once(|| {
-        tracing::warn!("weight offload is incompatible with CUDA graph capture; capture disabled");
+        tracing::warn!(
+            "weight offload on the non stable-VA paging path is incompatible with CUDA graph \
+             capture; capture disabled (issue #716: managed no-spill offload keeps capture on)"
+        );
     });
 }
 
@@ -246,6 +283,12 @@ pub struct CudaKvDebugStats {
     pub kv_transfers: DeviceBindingTransferStats,
     pub kv_growth_events: u64,
     pub kv_growth_d2d_copy_bytes: u64,
+    /// `true` when the KV bindings are stored seq-major (BSNH) and the binding
+    /// layer accounts residency by the dense live-prefix rule; `false` for the
+    /// default head-major (BNSH) flat-bucket accounting. Surfaced so the
+    /// committed-bytes measurement can attribute a residency number to the
+    /// layout that produced it.
+    pub kv_layout_seq_major: bool,
     pub graph: CudaGraphDebugStats,
 }
 
@@ -352,6 +395,13 @@ pub(crate) struct DecodeCudaState {
     /// The KV bindings reserve their full context address range while the CUDA
     /// VMM allocator maps only the token stripes reached so far.
     kv_commits_on_demand: bool,
+    /// The physical KV-cache layout this session's bindings are stored in,
+    /// resolved from [`ModelIoSpec::kv_layout`] (absent = head-major, exactly
+    /// the historical behavior). Consumed by the residency accounting and the
+    /// commit-geometry decision so the binding layer is no longer layout-blind:
+    /// seq-major's live prefix is one dense contiguous run, so its committed
+    /// windows follow `ceil(live_bytes / granule)` rather than a flat bucket.
+    kv_layout: KvCommitLayout,
     pub(crate) graph_fallback_reason: Option<String>,
     pub(crate) graph_fallback_report: Option<CaptureDeclineReport>,
     /// Structural reasons, recorded at binding time, why one or more auxiliary
@@ -1675,6 +1725,7 @@ impl DecodeCudaState {
         Ok(shape)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         session: &mut InferenceSession,
         io: DecodeCudaIo<'_>,
@@ -1683,6 +1734,7 @@ impl DecodeCudaState {
         capacity: CudaKvCapacity,
         graph_enabled: bool,
         position_rank: usize,
+        kv_layout: KvCommitLayout,
     ) -> anyhow::Result<Self> {
         let kv_commits_on_demand = session.commits_on_demand();
         let max_len = onnx_genai_kv::kv_capacity_bucket(0, capacity.max_len);
@@ -2135,6 +2187,7 @@ impl DecodeCudaState {
             kv_growth_d2d_copy_bytes: 0,
             capacity,
             kv_commits_on_demand,
+            kv_layout,
             graph_fallback_reason: None,
             graph_fallback_report: None,
             auxiliary_bind_declines: declined_auxiliary,
@@ -2697,6 +2750,7 @@ impl DecodeCudaState {
             kv_transfers: transfers,
             kv_growth_events: self.kv_growth_events,
             kv_growth_d2d_copy_bytes: self.kv_growth_d2d_copy_bytes,
+            kv_layout_seq_major: self.kv_layout.is_seq_major(),
             graph: CudaGraphDebugStats {
                 enabled: self.graph_enabled,
                 captures: self.graph_captures,

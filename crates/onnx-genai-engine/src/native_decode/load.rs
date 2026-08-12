@@ -164,6 +164,18 @@ impl NativeDecodeSession {
                         None
                     }
                 },
+                weight_offload_stable_va: {
+                    #[cfg(feature = "cuda")]
+                    {
+                        options
+                            .cuda_offload_policy
+                            .map(|policy| policy.enabled && policy.managed_no_spill)
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    {
+                        None
+                    }
+                },
             },
             options.io,
         )
@@ -220,6 +232,7 @@ impl NativeDecodeSession {
                 metadata_max_len,
                 graph_capture: None,
                 weight_offload_enabled: None,
+                weight_offload_stable_va: None,
             },
         )
     }
@@ -265,6 +278,7 @@ impl NativeDecodeSession {
         path: impl AsRef<Path>,
         device: NativeDecodeDevice,
         io: Option<&ModelIoSpec>,
+        offload_policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy,
         governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
     ) -> anyhow::Result<Self> {
         Self::load_with_cuda_options_and_io(
@@ -273,7 +287,7 @@ impl NativeDecodeSession {
             NativeDecodeCudaOptions::default(),
             io,
             Some(governor),
-            None,
+            Some(offload_policy),
         )
     }
 
@@ -293,6 +307,15 @@ impl NativeDecodeSession {
     ) -> anyhow::Result<Self> {
         if options.metadata_max_len.is_none() {
             options.metadata_max_len = native_metadata_max_len_from_model_path(path.as_ref());
+        }
+        // Issue #716: the managed no-spill authority path installs the VMM arena
+        // and physical granule pool, so weight page-ins run on reserved-once
+        // stable virtual addresses. Record that here — where the effective
+        // offload policy is known — so the decode session can keep whole-step
+        // CUDA graph capture ON while offload is active.
+        #[cfg(feature = "cuda")]
+        if let Some(policy) = cuda_offload_policy {
+            options.weight_offload_stable_va = Some(policy.enabled && policy.managed_no_spill);
         }
         let preference = match device {
             NativeDecodeDevice::Cpu => DevicePreference::Cpu,
@@ -349,6 +372,7 @@ impl NativeDecodeSession {
                 metadata_max_len: None,
                 graph_capture: None,
                 weight_offload_enabled: None,
+                weight_offload_stable_va: None,
             },
             io,
         )
@@ -390,54 +414,7 @@ impl NativeDecodeSession {
             inputs: session.inputs().iter().map(to_graph_tensor).collect(),
             outputs: session.outputs().iter().map(to_graph_tensor).collect(),
         };
-        let derived = onnx_genai_genai_config::GenAiConfig::derive_decoder_io_from_graph(&graph)?;
-        // Safety gate: only the recurrent-hybrid case the shape-inference path
-        // cannot handle. Pure-dense decoders (no state pairs) keep `io = None`.
-        if derived.state_pairs.is_empty() {
-            return None;
-        }
-        let input_names: HashSet<&str> = session
-            .inputs()
-            .iter()
-            .map(|meta| meta.name.as_str())
-            .collect();
-        let output_names: HashSet<&str> = session
-            .outputs()
-            .iter()
-            .map(|meta| meta.name.as_str())
-            .collect();
-        let present_input = |name: &str| input_names.contains(name).then(|| name.to_owned());
-        let present_output = |name: &str| output_names.contains(name).then(|| name.to_owned());
-        let state_pairs = derived
-            .state_pairs
-            .into_iter()
-            .map(|pair| LoopStatePair {
-                input: pair.input,
-                output: pair.output,
-                init: Some("zeros".to_owned()),
-                update: Some("replace".to_owned()),
-            })
-            .collect::<Vec<_>>();
-        Some(ModelIoSpec {
-            sequence_source: None,
-            kv_ownership: None,
-            token_input: present_input("input_ids"),
-            inputs_embeds_input: None,
-            attention_mask_input: present_input("attention_mask"),
-            position_ids_input: present_input("position_ids"),
-            logits_output: present_output("logits"),
-            hidden_output: None,
-            kv_inputs: (!derived.kv_inputs.is_empty()).then_some(derived.kv_inputs),
-            kv_outputs: (!derived.kv_outputs.is_empty()).then_some(derived.kv_outputs),
-            encoder_hidden_states_input: None,
-            audio_features_input: None,
-            cross_kv_inputs: None,
-            cross_kv_outputs: None,
-            kv_update: None,
-            state_pairs: Some(state_pairs),
-            optional_inputs: BTreeMap::new(),
-            static_cache: None,
-        })
+        onnx_genai_genai_config::GenAiConfig::derive_model_io_spec_from_graph(&graph)
     }
 
     fn from_session_with_cuda_options_and_io(
@@ -782,6 +759,11 @@ impl NativeDecodeSession {
                 .unwrap_or_else(|| onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env().enabled);
             #[cfg(not(feature = "cuda"))]
             let weight_offload_enabled = false;
+            // Issue #716: offload no longer forces capture OFF when it runs on
+            // the stable-VA VMM paging path. Default to the conservative (unsafe)
+            // assumption so any path that has not proven pointer stability keeps
+            // the old mutual exclusion.
+            let weight_offload_stable_va = cuda_options.weight_offload_stable_va.unwrap_or(false);
             let graph_enabled = resolve_graph_capture_enabled(
                 cuda_options.graph_capture,
                 runtime_config.cuda_graph_explicit,
@@ -791,11 +773,15 @@ impl NativeDecodeSession {
                     kv_ownership,
                 },
                 weight_offload_enabled,
+                weight_offload_stable_va,
             );
             let mut span = onnx_genai_ort::prof_span!("native.cuda_kv_alloc");
             span.set_arg("max_len", capacity.max_len as u64);
             span.set_arg("kv_pairs", present_to_past.len() as u64);
             span.set_arg("graph_capture", graph_enabled);
+            let kv_layout = crate::native_decode::cuda::resolve_cuda_kv_layout(
+                io.and_then(|io| io.kv_layout.as_ref()),
+            );
             Some(DecodeCudaState::new(
                 &mut session,
                 DecodeCudaIo {
@@ -811,6 +797,7 @@ impl NativeDecodeSession {
                 capacity,
                 graph_enabled,
                 position_rank,
+                kv_layout,
             )?)
         } else {
             None

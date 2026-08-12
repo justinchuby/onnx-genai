@@ -162,7 +162,8 @@ which pulls `nvidia-*` wheels and dlopens them from `site-packages`.
 ### 4.1 Python deps — CUDA 13 runtime wheels
 
 Declare the NVIDIA-published redistributable wheels under the `cuda` extra
-(matching the `cudarc` `cuda-13000` pin). The CUDA EP currently dlopens only
+(matching the default `cudarc` `cuda-13000` selector; Cargo consumers can choose
+a different `cuda-*` selector with `--no-default-features`). The CUDA EP currently dlopens only
 the following runtime libraries:
 
 | Runtime lib (Linux soname) | PyPI wheel | Why we need it |

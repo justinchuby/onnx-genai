@@ -55,3 +55,28 @@ hybrids decline through the same structural gate until their capture lane lands.
 The process-global counter `NATIVE_DECODER_CAPTURED_STEP_INPUT_DECODES`
 increments once per captured routed decode step, providing a non-vacuous
 capture-hit signal for tests.
+
+## Interaction with weight offload and VMM remap
+
+Two measured facts constrain how capture composes with the memory system; the
+full analysis lives in
+[`MEMORY_ARCHITECTURE.md`](./MEMORY_ARCHITECTURE.md).
+
+- **Weight offload and CUDA graph capture are mutually exclusive today.** The
+  weight pager's alloc/copy/free operations are capture-illegal, so enabling
+  offload disables capture (module docs in
+  `crates/onnx-genai-engine/src/native_decode/cuda.rs`). A model large enough to
+  need offload therefore gets **none** of the capture-fragmentation wins that
+  #708 and #728 landed (they took 35B-A3B decode from **154 to 34** graph
+  segments). Issue **#716** is the fix: page weights under a stable virtual
+  address so page-in remaps physical granules at the same VA instead of returning
+  a new pointer that would invalidate the capture.
+- **A captured graph survives a VMM remap at the same virtual address (#727).**
+  A graph instantiated before `cuMemUnmap`/`cuMemCreate`/`cuMemMap` at the same
+  VA replays correctly afterwards and writes into the **new** physical pages —
+  sentinel-proven in
+  `crates/onnx-runtime-cuda-memory/tests/vmm_graph_remap_gpu.rs`; one physical
+  handle mapped at two VAs is readable through either. **Not proven, treated as
+  unsafe:** unmapping while a replay is in flight; and `cuMemMap` *during* capture
+  returns `CUDA_SUCCESS` but is not proven replayable, so growth is issued outside
+  the captured segment. This survivability is the premise under #716.

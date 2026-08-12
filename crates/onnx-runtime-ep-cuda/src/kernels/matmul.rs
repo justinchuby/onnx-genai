@@ -21,7 +21,10 @@ use std::sync::{Arc, Mutex};
 use cudarc::cublaslt::{result as cublaslt, sys as cublaslt_sys};
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
+    WorkspaceRequirement, WorkspaceView,
+};
 use onnx_runtime_ir::{DataType, Node};
 
 use crate::blas::{self, GemmDtype, GemmParams, WORKSPACE_BYTES};
@@ -381,8 +384,21 @@ fn inner_mismatch(a: &[usize], b: &[usize]) -> EpError {
     ))
 }
 
+fn uses_dense_gemv(plan: &MatMulPlan, dtype: GemmDtype) -> bool {
+    plan.m == 1
+        && plan.k > 0
+        && plan.n > 0
+        && plan.batch_shape.iter().product::<usize>() == 1
+        && matches!(dtype, GemmDtype::F16 | GemmDtype::F32)
+}
+
 impl MatMulKernel {
-    fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+    fn run(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
         if inputs.len() != 2 || outputs.len() != 1 {
             return Err(EpError::KernelFailed(format!(
                 "cuda_ep MatMul: expected 2 inputs and 1 output, got {} and {}",
@@ -442,11 +458,7 @@ impl MatMulKernel {
         // workspace selected once at warmup. Neither path allocates, queries a
         // heuristic, or synchronizes while capturing. The gate is purely
         // structural, never tied to a model dimension.
-        let single_gemv = plan.m == 1
-            && plan.k > 0
-            && plan.n > 0
-            && plan.batch_shape.iter().product::<usize>() == 1;
-        if single_gemv && matches!(dtype, GemmDtype::F16 | GemmDtype::F32) {
+        if uses_dense_gemv(&plan, dtype) {
             match dtype {
                 GemmDtype::F16 => {
                     self.launch_dense_gemv_f16(a_ptr, b_ptr, c_ptr, plan.k, plan.n)?
@@ -461,14 +473,12 @@ impl MatMulKernel {
         }
         self.last_call_capture_safe.store(false, Ordering::Relaxed);
 
-        let workspace = self.runtime.alloc_raw(WORKSPACE_BYTES)?;
         let elem_bytes = a.dtype.byte_size();
         let a_matrix_bytes = plan.m * plan.k * elem_bytes;
         let b_matrix_bytes = plan.k * plan.n * elem_bytes;
         let c_matrix_bytes = plan.m * plan.n * elem_bytes;
 
-        let result = plan
-            .batch_runs()
+        plan.batch_runs()
             .into_iter()
             .try_for_each(|run| {
                 let params = GemmParams {
@@ -487,12 +497,12 @@ impl MatMulKernel {
                 // SAFETY: the plan's broadcast offsets address complete matrices
                 // inside A/B/Y; workspace and stream remain live for every run.
                 unsafe {
-                    blas::gemm(
+                    blas::governed_gemm(
                         self.runtime.blas(),
                         self.runtime.stream_ptr(),
                         &params,
                         workspace,
-                        WORKSPACE_BYTES,
+                        "MatMul",
                     )
                 }
             })
@@ -502,12 +512,42 @@ impl MatMulKernel {
                 } else {
                     self.runtime.synchronize()
                 }
-            });
+            })
+    }
 
-        // Always release the workspace, even on failure.
-        // SAFETY: `workspace` came from the `alloc_raw` above and is freed once.
-        let free = unsafe { self.runtime.free_raw(workspace) };
-        result.and(free)
+    fn workspace_requirement_for(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+    ) -> Result<WorkspaceRequirement> {
+        let [a, b] = inputs else {
+            return Ok(WorkspaceRequirement::NONE);
+        };
+        if b.dtype != a.dtype {
+            return Ok(WorkspaceRequirement::NONE);
+        }
+        let dtype = gemm_dtype(a.dtype)?;
+        let plan = matmul_plan(a.shape, b.shape)?;
+        if uses_dense_gemv(&plan, dtype) {
+            return Ok(WorkspaceRequirement::NONE);
+        }
+        let mut peak = 0usize;
+        for run in plan.batch_runs() {
+            let params = GemmParams {
+                dtype,
+                a: 1,
+                b: 1,
+                c: 1,
+                m: plan.m,
+                k: plan.k,
+                n: plan.n,
+                batch: run.batch,
+                a_batch_stride: run.a_stride * plan.m * plan.k,
+                b_batch_stride: run.b_stride * plan.k * plan.n,
+                epilogue: None,
+            };
+            peak = peak.max(blas::gemm_workspace_bytes(self.runtime.blas(), &params)?);
+        }
+        Ok(blas::governed_workspace_requirement(peak))
     }
 
     /// Launch the dense fp16 GEMV (`GEMV_F16_SRC`) on the runtime stream.
@@ -603,7 +643,20 @@ impl MatMulKernel {
 
 impl Kernel for MatMulKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        self.run(inputs, outputs)
+        self.run(inputs, outputs, None)
+    }
+
+    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+        self.workspace_requirement_for(inputs)
+    }
+
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.run(inputs, outputs, workspace)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -620,7 +673,7 @@ impl Kernel for MatMulKernel {
         } else {
             onnx_runtime_ep_api::CaptureSupport::unsupported(
                 "requires a dense f32/fp16 M==1 GEMV fast path; the cuBLASLt path's \
-                 per-call workspace allocation/free and heuristic query are not capturable",
+                 per-call heuristic query and synchronization are not capturable",
             )
         }
     }

@@ -6,9 +6,7 @@ use crate::decode_loop::{DecodeLoopBackend, DecodeLoopState, run_decode_loop};
 use crate::logits::{ProcessorChain, TokenId};
 use crate::sampling::sample_greedy;
 use anyhow::{Context, bail};
-use onnx_genai_metadata::{
-    KvOwnership, LoopStatePair, ModelIoSpec, SequenceInputKind, SharedKvGroup,
-};
+use onnx_genai_metadata::{KvOwnership, ModelIoSpec, SequenceInputKind, SharedKvGroup};
 use onnx_genai_ort::Tokenizer;
 use onnx_runtime_ir::{DataType, DeviceType, Dim, SymbolId};
 use onnx_runtime_session::{
@@ -16,7 +14,7 @@ use onnx_runtime_session::{
     DeviceGraphCaptureResult, DeviceIoBinding, DevicePreference, InferenceSession, Tensor,
 };
 use onnx_runtime_tracer::{Args, TraceContext, capture_rejected};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -24,10 +22,13 @@ mod backend;
 mod cpu;
 mod cuda;
 mod io;
+mod kv_commit;
 mod load;
 mod paged_gqa;
 mod proposer;
 mod tensor;
+#[cfg(feature = "cuda")]
+pub(crate) use tensor::recurrent_state_bytes_from_graph;
 #[cfg(test)]
 mod tests;
 
@@ -37,6 +38,11 @@ use cpu::*;
 use cuda::DecodeCudaState;
 use cuda::*;
 pub use cuda::{CudaGraphDebugStats, CudaKvDebugStats};
+
+#[cfg(feature = "cuda")]
+pub(crate) fn configured_cuda_kv_max_len() -> anyhow::Result<Option<usize>> {
+    cuda::cuda_kv_max_len_from_env()
+}
 use io::*;
 pub(crate) use load::NativeDecodeLoadOptions;
 pub use paged_gqa::{
@@ -71,6 +77,15 @@ pub struct NativeDecodeCudaOptions {
     pub metadata_max_len: Option<usize>,
     pub graph_capture: Option<bool>,
     pub weight_offload_enabled: Option<bool>,
+    /// Whether live weight offload runs on the **stable virtual address** VMM
+    /// paging path (issue #716). When `Some(true)`, every retained weight is
+    /// served from a reserved-once device VA whose physical granules are
+    /// mapped/unmapped underneath, so a captured CUDA graph that baked a weight
+    /// pointer stays valid across evict→repage — which is what lets whole-step
+    /// graph capture stay ON while offload is active. `Some(false)`/`None` means
+    /// the pointer-unstable `alloc_raw`/`free_raw` path, so offload keeps forcing
+    /// capture OFF as before.
+    pub weight_offload_stable_va: Option<bool>,
 }
 
 /// Stateful decoder-with-past adapter over the pure-Rust native runtime.

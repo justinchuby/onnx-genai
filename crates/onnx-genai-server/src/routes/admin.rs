@@ -124,6 +124,7 @@ pub(crate) async fn debug_kv(
         .map_err(map_registry_error)?
         .ok_or_else(|| ApiError::internal("no model loaded"))?;
     let snapshot = crate::metrics::snapshot();
+    let batching = handle.engine.batching();
     let prefix_cache_hit_rate = if snapshot.prefix_cache_lookups == 0 {
         0.0
     } else {
@@ -138,6 +139,8 @@ pub(crate) async fn debug_kv(
         available_admission_slots: handle.engine.generation_capacity.available_permits(),
         rejected_requests: snapshot.rejections,
         engine_kv_introspection: "unavailable: engine does not yet expose KV page statistics",
+        batch_supported: batching.supported,
+        effective_max_batch: batching.effective_max_batch as u64,
     }))
 }
 
@@ -154,7 +157,11 @@ pub(crate) async fn resources(
         .resource_snapshot()
         .await
         .map_err(|err| ApiError::internal(format!("resource snapshot failed: {err}")))?;
-    Ok(Json(snapshot.into()))
+    Ok(Json(
+        ResourcesResponse::from(snapshot)
+            .with_batching(handle.engine.batching())
+            .with_memory_strategy(&handle.engine.memory_strategy_plan()),
+    ))
 }
 
 pub(crate) async fn admin_set_vram_limit(
@@ -174,7 +181,18 @@ pub(crate) async fn admin_set_vram_limit(
         }
     })?;
     Ok(match snapshot {
-        Some(snapshot) => Json(ResourcesResponse::from(snapshot)).into_response(),
+        Some(snapshot) => {
+            // Include the batching report for parity with `GET /v1/resources`.
+            // Resolving the default handle is best-effort here: a vram override
+            // succeeded, so a handle exists; if it cannot be resolved we still
+            // return the governor snapshot rather than failing the override.
+            let response = ResourcesResponse::from(snapshot);
+            let response = match state.registry.resolve("") {
+                Ok(Some(handle)) => response.with_batching(handle.engine.batching()),
+                _ => response,
+            };
+            Json(response).into_response()
+        }
         None => StatusCode::NO_CONTENT.into_response(),
     })
 }
@@ -190,7 +208,9 @@ pub(crate) async fn admin_set_vram_limit(
 /// follows the backend without this endpoint knowing which one is in use.
 /// Empty until `ONNX_GENAI_PROFILE` is set, and empty is reported as empty
 /// rather than fabricated.
-pub(crate) async fn debug_profile() -> Json<DebugProfileResponse> {
+pub(crate) async fn debug_profile(
+    State(state): State<AppState>,
+) -> Result<Json<DebugProfileResponse>, ApiError> {
     let stages = onnx_genai_ort::profile::snapshot()
         .into_iter()
         .map(|stage| ProfileStage {
@@ -204,11 +224,22 @@ pub(crate) async fn debug_profile() -> Json<DebugProfileResponse> {
             },
         })
         .collect::<Vec<_>>();
-    Json(DebugProfileResponse {
+    let memory_strategy_plans = state
+        .registry
+        .memory_strategy_plans()
+        .map_err(map_registry_error)?
+        .into_iter()
+        .map(|(model_id, plan)| ModelMemoryStrategyPlan {
+            model_id,
+            plan: (*plan).clone(),
+        })
+        .collect();
+    Ok(Json(DebugProfileResponse {
         collecting: onnx_genai_ort::profile::enabled(),
         note: "Stage totals accumulate across every request this process has served. Run with ONNX_GENAI_PROFILE=1 to collect them.",
         stages,
-    })
+        memory_strategy_plans,
+    }))
 }
 
 pub(crate) async fn debug_trace() -> Json<DebugTraceResponse> {
@@ -467,7 +498,40 @@ impl From<GovernorSnapshot> for ResourcesResponse {
             vram: ResourceTier::from(snapshot.vram),
             host_ram: ResourceTier::from(snapshot.host_ram),
             disk_spill: snapshot.disk_spill.map(ResourceTier::from),
+            batching: None,
+            memory_strategy: None,
         }
+    }
+}
+
+impl ResourcesResponse {
+    /// Attach the model handle's resolved batching capability so `/v1/resources`
+    /// reports `supported` / `effective_max_batch` directly (issue #750).
+    fn with_batching(mut self, batching: &crate::driver::BatchingReport) -> Self {
+        self.batching = Some(BatchingInfo {
+            supported: batching.supported,
+            requested_max_batch: batching.requested_max_batch as u64,
+            effective_max_batch: batching.effective_max_batch as u64,
+            reason: batching.reason.clone(),
+        });
+        self
+    }
+
+    /// Attach the model's resolved memory strategy so `/v1/resources` reports the
+    /// chosen strategy, offload state, managed no-spill VMM state, and resolved
+    /// budget directly, making the #755 managed VMM default observable.
+    fn with_memory_strategy(mut self, plan: &onnx_genai_engine::MemoryStrategyPlan) -> Self {
+        let application = plan.runtime_application();
+        self.memory_strategy = Some(MemoryStrategyInfo {
+            strategy: format!("{:?}", plan.strategy),
+            weight_offload_enabled: application.weight_offload_enabled,
+            managed_no_spill: application.managed_no_spill,
+            auto_enabled: application.auto_enabled_from_vram_limit,
+            resolved_device_budget_bytes: plan.resolved_device_budget_bytes,
+            managed_limit_bytes: application.managed_limit_bytes,
+            fits_resolved_device_budget: plan.fits_resolved_device_budget,
+        });
+        self
     }
 }
 

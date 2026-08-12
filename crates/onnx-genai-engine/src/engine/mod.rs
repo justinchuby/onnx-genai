@@ -13,9 +13,10 @@ pub(crate) use crate::decode_loop::{
 pub(crate) use crate::kv_bridge::{
     KvModelInfo, PlacedPayload, RewindRequest, RewindRunnerPolicy, attach_pages_to_sequence,
     chunk_payload_from_exported, common_prefix_len, exported_layers_from_runner,
-    infer_kv_model_info, kv_model_past_is_f32, load_materialized_past, past_kv_from_payloads,
-    rewind_draft_state_to_len, rewind_target_state_to_len, sequence_pages_for_len,
-    validate_draft_state_rewind_to_len, validate_target_state_rewind_to_len,
+    infer_kv_model_info, kv_model_past_is_f32, load_materialized_past,
+    ort_session_has_recurrent_state, past_kv_from_payloads, rewind_draft_state_to_len,
+    rewind_target_state_to_len, sequence_pages_for_len, validate_draft_state_rewind_to_len,
+    validate_target_state_rewind_to_len,
 };
 pub(crate) use crate::logits::{StopSequence, TokenId};
 pub(crate) use crate::processors::{
@@ -45,15 +46,17 @@ pub(crate) use std::path::Path;
 pub(crate) use std::sync::Arc;
 
 pub use crate::config::{
-    DevicePolicy, DevicePolicyParseError, DryConfig, Eagle3Config, EngineConfig, EngineConfigError,
-    EngineDecodeBackend, FinishReason, GenerateConstraint, GenerateOptions, GeneratePrompt,
-    GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback, GenerationBudgetCap,
-    KvConnectorBackend, KvConnectorConfig, LimitParseError, MirostatConfig, MirostatVersion,
-    MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource, PrioritizedGenerateRequest,
-    PrioritizedGenerateResult, RecurrentPrefixCacheStats, RewindTokenCount, SamplingOverrides,
-    ScheduledGenerateArrival, SessionCheckpoint, SessionForkCapability, SessionId, SessionPosition,
-    SharedKvBinding, SharedKvProposerConfig, SpeculativeMode, TokenLogprob, WeightPlacementReport,
-    XtcConfig, parse_device_policy, parse_resource_limit,
+    DecisionSource, DevicePolicy, DevicePolicyParseError, DryConfig, Eagle3Config, EngineConfig,
+    EngineConfigError, EngineDecodeBackend, FinishReason, GenerateConstraint, GenerateOptions,
+    GeneratePrompt, GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback,
+    GenerationBudgetCap, KvConnectorBackend, KvConnectorConfig, LayerWeightBytes, LimitParseError,
+    MemoryPolicyApplication, MemoryStrategy, MemoryStrategyDecision, MemoryStrategyPlan,
+    MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource,
+    PrioritizedGenerateRequest, PrioritizedGenerateResult, RecurrentPrefixCacheStats,
+    RewindTokenCount, SamplingOverrides, ScheduledGenerateArrival, SessionCheckpoint,
+    SessionForkCapability, SessionId, SessionPosition, SharedKvBinding, SharedKvProposerConfig,
+    SpeculativeMode, TokenLogprob, WeightAccessPattern, WeightPlacementReport, XtcConfig,
+    parse_device_policy, parse_resource_limit,
 };
 pub use crate::connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 pub(crate) use crate::speculative::{
@@ -65,6 +68,7 @@ mod decode_backend;
 mod governor;
 mod load;
 pub(crate) mod memory_plan;
+mod memory_strategy;
 mod metadata;
 mod model;
 #[cfg(feature = "native-backend")]
@@ -75,11 +79,14 @@ mod speculative_load;
 pub(crate) use decode_backend::*;
 pub(crate) use governor::*;
 pub use governor::{EngineGovernorError, EngineResourceGovernor};
+#[cfg(all(feature = "cuda", feature = "native-backend"))]
+pub(crate) use load::managed_vmm_default_enabled;
 pub(crate) use load::{
     kv_pages_for_budget, session_device_domain, validate_shared_authority_limit,
 };
 #[cfg(feature = "native-backend")]
 pub(crate) use memory_plan::Holder;
+pub(crate) use memory_strategy::*;
 pub(crate) use metadata::*;
 pub use model::Engine;
 pub(crate) use model::*;
@@ -213,6 +220,7 @@ mod tests {
             native_session: None,
             #[cfg(feature = "native-backend")]
             weight_placement: None,
+            memory_strategy_plan: MemoryStrategyPlan::unknown(0, None, "test engine fixture"),
             #[cfg(feature = "native-backend")]
             native_sessions: HashMap::new(),
             #[cfg(feature = "native-backend")]
@@ -588,6 +596,7 @@ mod tests {
         ModelIoSpec {
             sequence_source: Some(SequenceInputKind::TokenIds),
             kv_ownership: Some(KvOwnership::Owned),
+            kv_layout: None,
             token_input: Some("input_ids".into()),
             inputs_embeds_input: None,
             attention_mask_input: Some("attention_mask".into()),

@@ -61,7 +61,8 @@ crates, so it publishes any time after `onnx-runtime-ep-api` (it is placed right
 after `onnx-runtime-ep-cpu` above, mirroring the CPU EP). Its one notable
 external dependency is **`cudarc`** (pinned to the `0.19` line), used with
 `default-features = false` and the features
-`["std", "driver", "cublaslt", "f16", "cuda-13000", "dynamic-loading"]`:
+`["std", "driver", "cublaslt", "f16", "dynamic-loading"]` plus exactly one
+crate feature selecting the CUDA binding version:
 
 - **`dynamic-loading`** means the crate **builds with no CUDA toolkit present** —
   the CUDA driver and cuBLASLt are `dlopen`'d at *runtime*, not linked at build
@@ -70,11 +71,11 @@ external dependency is **`cudarc`** (pinned to the `0.19` line), used with
   (`libcuda`, `libcublasLt`) on the loader path (`LD_LIBRARY_PATH`) to actually
   execute on a GPU; without them the crate still compiles and its GPU tests
   self-skip.
-- **`cuda-13000`** pins the cuBLASLt/driver API surface to the CUDA 13.0 headers
-  (matching the target hosts' `libcublasLt.so.13`). Bumping the target CUDA
-  version is a one-line feature change; it does **not** require a toolkit because
-  of `dynamic-loading`. (Do **not** switch to `cuda-version-from-build-system`,
-  which would reintroduce a build-time CUDA dependency.)
+- **CUDA version selector:** `cuda-13000` is the default, matching CUDA 13.0
+  target hosts, but consumers can compile against `cuda-12060`, `cuda-12080`, or
+  `cuda-12090` by disabling default features and enabling exactly one selector.
+  Do **not** switch to `cuda-version-from-build-system`, which would reintroduce
+  a build-time CUDA dependency.
 - There is **no `build.rs` and no `nvcc` step** in this crate — the Phase-2a
   slice is cuBLASLt GEMM only. When Phase-2b custom `.cu`/CuTe kernels land they
   will introduce a compile step and a real build-host CUDA requirement; that
