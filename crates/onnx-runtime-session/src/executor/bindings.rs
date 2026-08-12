@@ -6,13 +6,22 @@ use super::*;
 /// workspace; `IndexShare` (#751) reserves a session-persistent workspace;
 /// `com.microsoft::Attention` reserves a step-scoped Phase-2a scratch;
 /// `com.microsoft::GroupQueryAttention` (#736) reserves a session-persistent f32
-/// reference score buffer (only on the paths that materialize scores). All
+/// reference score buffer (only on the paths that materialize scores); and the
+/// cuBLASLt GEMM family shares one session-persistent heuristic-sized peak. All
 /// report their exact bytes via [`Kernel::workspace_requirement`].
 pub(super) fn is_planned_workspace_node(node: &onnx_runtime_ir::Node) -> bool {
-    (node.domain == onnx_runtime_ir::RUNTIME_DOMAIN
-        && matches!(node.op_type.as_str(), "BlockQuantizedMoE" | "IndexShare"))
+    (node.domain.is_empty() && matches!(node.op_type.as_str(), "MatMul" | "Gemm"))
+        || (node.domain == onnx_runtime_ir::RUNTIME_DOMAIN
+            && matches!(node.op_type.as_str(), "BlockQuantizedMoE" | "IndexShare"))
         || (node.domain == "com.microsoft"
-            && matches!(node.op_type.as_str(), "Attention" | "GroupQueryAttention"))
+            && matches!(
+                node.op_type.as_str(),
+                "Attention"
+                    | "GroupQueryAttention"
+                    | "MatMulNBits"
+                    | "FusedMatMulBias"
+                    | "FusedGemm"
+            ))
 }
 
 /// Merge a per-node workspace requirement into the running peak for its
@@ -742,4 +751,48 @@ pub(super) fn required_binding_bytes(
             dims: physical_shape.to_vec(),
         }
     })
+}
+
+#[cfg(test)]
+mod planned_workspace_node_tests {
+    use super::*;
+    use onnx_runtime_ir::{Node, NodeId};
+
+    fn node(domain: &str, op_type: &str) -> Node {
+        let mut node = Node::new(NodeId(0), op_type, Vec::new(), Vec::new());
+        node.domain = domain.into();
+        node
+    }
+
+    #[test]
+    fn centralized_predicate_covers_the_governed_gemm_family() {
+        for (domain, op_type) in [
+            ("", "MatMul"),
+            ("", "Gemm"),
+            ("com.microsoft", "MatMulNBits"),
+            ("com.microsoft", "FusedMatMulBias"),
+            ("com.microsoft", "FusedGemm"),
+        ] {
+            assert!(
+                is_planned_workspace_node(&node(domain, op_type)),
+                "{domain}::{op_type} must be prepared before admission"
+            );
+        }
+        assert!(!is_planned_workspace_node(&node("", "Add")));
+    }
+
+    #[test]
+    fn same_lifetime_gemm_requirements_merge_as_one_peak_not_a_sum() {
+        let requirement = WorkspaceRequirement {
+            bytes: 32 * 1024 * 1024,
+            alignment: 256,
+            lifetime: WorkspaceLifetime::SessionPersistent,
+            role: onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: false },
+        };
+        let mut peak = WorkspaceRequirement::NONE;
+        for _ in 0..4 {
+            merge_workspace_peak(&mut peak, requirement);
+        }
+        assert_eq!(peak.bytes, requirement.bytes);
+    }
 }
