@@ -222,13 +222,68 @@ impl BuildLayout {
     }
 }
 
-/// A path component is a target triple if it looks like `arch-vendor-os[-env]`.
+/// Architectures that can start a Rust target triple.
 ///
-/// Cargo only inserts such a directory when `--target` was passed, and no
-/// profile directory name contains a `-` followed by another segment in this
-/// shape, so the check is unambiguous in practice.
+/// Matching the architecture — rather than merely counting `-` separators — is
+/// what keeps `cargo llvm-cov`'s `target/llvm-cov-target/<profile>` layout from
+/// being misread: `llvm-cov-target` has three dash-separated segments and would
+/// otherwise be mistaken for a triple, making the nested build pass
+/// `--target llvm-cov-target` and fail with *"could not find specification for
+/// target"*.
+const TRIPLE_ARCHES: &[&str] = &[
+    "aarch64",
+    "arm",
+    "armebv7r",
+    "armv5te",
+    "armv7",
+    "armv7a",
+    "armv7r",
+    "i586",
+    "i686",
+    "loongarch64",
+    "m68k",
+    "mips",
+    "mips64",
+    "mips64el",
+    "mipsel",
+    "nvptx64",
+    "powerpc",
+    "powerpc64",
+    "powerpc64le",
+    "riscv32i",
+    "riscv32im",
+    "riscv32imac",
+    "riscv32imc",
+    "riscv64gc",
+    "riscv64imac",
+    "s390x",
+    "sparc64",
+    "sparcv9",
+    "thumbv6m",
+    "thumbv7em",
+    "thumbv7m",
+    "thumbv7neon",
+    "wasm32",
+    "wasm64",
+    "x86_64",
+    "x86_64h",
+];
+
+/// A path component is a target triple if it is `arch-vendor-os[-env]` and
+/// `arch` is a real Rust target architecture.
 fn looks_like_triple(component: &str) -> bool {
-    component.split('-').count() >= 3 && !component.contains(' ')
+    let mut parts = component.split('-');
+    let Some(arch) = parts.next() else {
+        return false;
+    };
+    TRIPLE_ARCHES.contains(&arch) && parts.count() >= 2
+}
+
+/// Cargo writes `CACHEDIR.TAG` at the root of a target directory, which is the
+/// only structural (rather than name-based) way to tell a target root from an
+/// intervening `--target <triple>` directory.
+fn is_target_root(dir: &Path) -> bool {
+    dir.join("CACHEDIR.TAG").is_file()
 }
 
 /// Derive [`BuildLayout`] from the running test binary.
@@ -248,7 +303,16 @@ pub fn build_layout() -> Option<BuildLayout> {
     let profile_dir_name = profile_dir.file_name()?.to_str()?.to_string();
     let parent = profile_dir.parent()?;
     let parent_name = parent.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    let (target_dir, target_triple) = if looks_like_triple(parent_name) {
+    // `CACHEDIR.TAG` is authoritative; the name check is only the fallback for
+    // a target dir that lacks one.
+    let cross_compiled = if is_target_root(parent) {
+        false
+    } else if parent.parent().map(is_target_root).unwrap_or(false) {
+        true
+    } else {
+        looks_like_triple(parent_name)
+    };
+    let (target_dir, target_triple) = if cross_compiled {
         (
             parent.parent()?.to_path_buf(),
             Some(parent_name.to_string()),
@@ -540,13 +604,39 @@ mod tests {
     }
 
     #[test]
-    fn triple_detection_accepts_triples_and_rejects_profile_names() {
+    fn triple_detection_accepts_triples_and_rejects_lookalikes() {
         assert!(looks_like_triple("x86_64-unknown-linux-gnu"));
         assert!(looks_like_triple("aarch64-apple-darwin"));
         assert!(looks_like_triple("x86_64-pc-windows-msvc"));
+        assert!(looks_like_triple("wasm32-unknown-unknown"));
         assert!(!looks_like_triple("debug"));
         assert!(!looks_like_triple("release"));
         assert!(!looks_like_triple("bench-fast"));
+        // `cargo llvm-cov` builds into `target/llvm-cov-target/<profile>`. That
+        // name has a triple's shape but no architecture; reading it as one made
+        // the nested build pass `--target llvm-cov-target`, which rustc rejects
+        // with "could not find specification for target".
+        assert!(!looks_like_triple("llvm-cov-target"));
+        assert!(!looks_like_triple("some-other-dir"));
+    }
+
+    /// Whatever runner this suite is under — plain `cargo test`, `cargo
+    /// llvm-cov`, or a cross build — the derived target dir must be a real
+    /// cargo target root, not an intermediate directory.
+    #[test]
+    fn derived_target_dir_is_an_actual_cargo_target_root() {
+        let layout = build_layout().expect("build_layout");
+        assert!(
+            is_target_root(&layout.target_dir),
+            "{:?} has no CACHEDIR.TAG, so it is not a cargo target root",
+            layout.target_dir
+        );
+        if let Some(triple) = &layout.target_triple {
+            assert!(
+                looks_like_triple(triple),
+                "derived --target {triple} is not a target triple"
+            );
+        }
     }
 
     /// The first cdylib candidate must sit next to this test binary's `deps`
