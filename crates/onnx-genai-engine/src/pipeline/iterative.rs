@@ -896,6 +896,22 @@ impl PipelineEngine {
                     final_state_refs,
                 )?;
                 for carry in carried {
+                    let state = workflow.state.get(&carry.cell).with_context(|| {
+                        format!("workflow loop carries undeclared state '{}'", carry.cell)
+                    })?;
+                    let initializer = values.get(&state.initializer).with_context(|| {
+                        format!(
+                            "workflow state '{}' initializer '{}' is unavailable after loop setup",
+                            carry.cell, state.initializer
+                        )
+                    })?;
+                    validate_workflow_value(
+                        &state.initializer,
+                        initializer,
+                        &state.contract,
+                        symbols,
+                        dynamic_symbols,
+                    )?;
                     final_state_refs.insert(carry.cell.clone(), carry.current.clone());
                 }
                 let limit = workflow_scalar_usize(values, max_iterations)?;

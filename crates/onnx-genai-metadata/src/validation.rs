@@ -1408,6 +1408,22 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
                         continue;
                     };
                     require_workflow_value(
+                        &state.initializer,
+                        values,
+                        &format!("{path}.carried.initializer"),
+                        errors,
+                    );
+                    if let Some(initializer_contract) = value_contracts.get(&state.initializer) {
+                        require_state_contract(
+                            initializer_contract,
+                            &state.contract,
+                            &state.recurrence,
+                            false,
+                            &format!("{path}.carried.initializer"),
+                            errors,
+                        );
+                    }
+                    require_workflow_value(
                         &carry.current,
                         values,
                         &format!("{path}.carried.current"),
