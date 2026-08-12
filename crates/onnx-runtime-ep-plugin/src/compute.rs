@@ -642,18 +642,47 @@ pub struct SubgraphRouting {
 }
 
 /// Heap-owned intermediate tensor buffer for multi-node subgraph execution.
+///
+/// The backing bytes are either owned on the host (`data`, used by unit tests
+/// and as a fallback) or borrowed from an ORT scratch allocation (`scratch_ptr`,
+/// non-null). For device EPs (CUDA) the scratch allocation lives in device
+/// memory, so kernels can read/write intermediates directly on the GPU without
+/// an illegal host-pointer dereference. ORT owns scratch memory for the
+/// duration of the `Compute` call, which exactly matches an intermediate's
+/// lifetime, so `IntermediateBuf` never frees `scratch_ptr`.
 pub struct IntermediateBuf {
     pub data: Vec<u8>,
+    /// When non-null, the buffer is backed by ORT scratch memory (possibly on
+    /// device) instead of the host `data` vector. Not owned — never freed here.
+    pub scratch_ptr: *mut u8,
     pub shape: Vec<usize>,
     pub strides: Vec<i64>,
     pub dtype: DataType,
 }
 
 impl IntermediateBuf {
+    /// Raw const pointer to the backing bytes (scratch if set, else host `data`).
+    fn ptr(&self) -> *const u8 {
+        if self.scratch_ptr.is_null() {
+            self.data.as_ptr()
+        } else {
+            self.scratch_ptr.cast_const()
+        }
+    }
+
+    /// Raw mutable pointer to the backing bytes (scratch if set, else host).
+    fn ptr_mut(&mut self) -> *mut u8 {
+        if self.scratch_ptr.is_null() {
+            self.data.as_mut_ptr()
+        } else {
+            self.scratch_ptr
+        }
+    }
+
     /// Immutable view backed by this buffer.
     pub fn view(&self) -> TensorView<'_> {
         TensorView::new(
-            DevicePtr(self.data.as_ptr().cast()),
+            DevicePtr(self.ptr().cast()),
             self.dtype,
             &self.shape,
             &self.strides,
@@ -721,6 +750,63 @@ unsafe extern "C" fn compute_create_state(
     result.unwrap_or_else(|_| fail_status("CreateState: internal panic"))
 }
 
+/// Returns the `OrtMemoryInfo*` of the EP's tensor memory, read from input 0's
+/// `OrtValue`. For a device EP (CUDA) this is device memory; for the CPU EP it
+/// is host memory. Used to allocate intermediate scratch on the correct device
+/// so multi-node fused subgraphs keep their intermediates where the kernels run.
+///
+/// Returns `None` when there are no inputs or the memory info cannot be read; in
+/// that case callers fall back to host-owned intermediate buffers.
+///
+/// # Safety
+///
+/// `api` must be valid and `ctx` a valid `OrtKernelContext*`.
+unsafe fn device_mem_info(
+    api: &ort::OrtApi,
+    ctx: *mut ort::OrtKernelContext,
+) -> Option<*const ort::OrtMemoryInfo> {
+    let get_input = api.KernelContext_GetInput?;
+    let get_mem_info = api.GetTensorMemoryInfo?;
+    let mut value: *const ort::OrtValue = std::ptr::null();
+    let status = unsafe { get_input(ctx, 0, &mut value) };
+    if !status.is_null() || value.is_null() {
+        return None;
+    }
+    let mut mem_info: *const ort::OrtMemoryInfo = std::ptr::null();
+    let status = unsafe { get_mem_info(value, &mut mem_info) };
+    if !status.is_null() || mem_info.is_null() {
+        return None;
+    }
+    Some(mem_info)
+}
+
+/// Allocates `bytes` of scratch memory via ORT for the given `mem_info`. The
+/// memory is owned by ORT for the duration of the `Compute` call — never freed
+/// by the caller. For a device EP this returns device memory.
+///
+/// # Safety
+///
+/// `api`, `ctx`, and `mem_info` must be valid.
+unsafe fn alloc_scratch(
+    api: &ort::OrtApi,
+    ctx: *mut ort::OrtKernelContext,
+    mem_info: *const ort::OrtMemoryInfo,
+    bytes: usize,
+) -> Result<*mut c_void, String> {
+    let get_scratch = api
+        .KernelContext_GetScratchBuffer
+        .ok_or("OrtApi.KernelContext_GetScratchBuffer is null")?;
+    let mut out: *mut c_void = std::ptr::null_mut();
+    let status = unsafe { get_scratch(ctx, mem_info, bytes.max(1), &mut out) };
+    if !status.is_null() {
+        return Err("KernelContext_GetScratchBuffer failed".into());
+    }
+    if out.is_null() {
+        return Err("KernelContext_GetScratchBuffer returned null".into());
+    }
+    Ok(out)
+}
+
 /// Compute: execute the kernel(s) for this subgraph.
 ///
 /// For single-node subgraphs (the common case for CPU EP), this calls
@@ -754,6 +840,12 @@ unsafe extern "C" fn compute_execute(
             return fail_status("Compute: host ORT API not available");
         }
         let api_ref = unsafe { &*api };
+
+        // Memory info for intermediate scratch. On a device EP this is device
+        // memory, so multi-node intermediates stay on the GPU (a host buffer
+        // would make the next kernel dereference a host pointer as device →
+        // CUDA_ERROR_ILLEGAL_ADDRESS). `None` falls back to host buffers.
+        let scratch_mem_info = unsafe { device_mem_info(api_ref, kernel_context) };
 
         let inputs = match unsafe { read_inputs(api_ref, kernel_context) } {
             Ok(v) => v,
@@ -913,17 +1005,35 @@ unsafe extern "C" fn compute_execute(
                     ort_outputs.iter_mut().map(|o| o.view_mut()).collect();
 
                 // For buffer-sink outputs, allocate the IntermediateBuf and get a
-                // mutable pointer into it.
+                // mutable pointer into it. Prefer ORT scratch memory (device
+                // memory on a device EP) so intermediates live where the kernels
+                // execute; fall back to a host buffer only when no device memory
+                // info is available (e.g. the CPU EP or an input-less subgraph).
                 let mut new_bufs: Vec<(usize, IntermediateBuf)> = Vec::new();
                 for (buf_idx, shape, dtype) in &buf_writes {
                     let numel: usize = shape.iter().product();
                     let byte_len = dtype.byte_size() * numel;
-                    let data = vec![0u8; byte_len];
                     let strides = contiguous_strides(shape);
+                    let (data, scratch_ptr) = match scratch_mem_info {
+                        Some(mem_info) => {
+                            match unsafe {
+                                alloc_scratch(api_ref, kernel_context, mem_info, byte_len)
+                            } {
+                                Ok(ptr) => (Vec::new(), ptr.cast::<u8>()),
+                                Err(e) => {
+                                    return fail_status(&format!(
+                                        "Compute: intermediate scratch alloc failed: {e}"
+                                    ));
+                                }
+                            }
+                        }
+                        None => (vec![0u8; byte_len], std::ptr::null_mut()),
+                    };
                     new_bufs.push((
                         *buf_idx,
                         IntermediateBuf {
                             data,
+                            scratch_ptr,
                             shape: shape.clone(),
                             strides,
                             dtype: *dtype,
@@ -1120,8 +1230,11 @@ fn contiguous_strides(shape: &[usize]) -> Vec<i64> {
 /// exclusive access and lifetime correctness).
 fn buf_view_mut(buf: &mut IntermediateBuf) -> onnx_runtime_ep_api::tensor::TensorMut<'_> {
     use onnx_runtime_ep_api::tensor::{DevicePtrMut, TensorMut};
+    // `ptr_mut` returns a Copy raw pointer, so its mutable borrow ends here and
+    // does not conflict with the immutable borrows of shape/strides below.
+    let ptr = buf.ptr_mut();
     TensorMut::new(
-        DevicePtrMut(buf.data.as_mut_ptr().cast()),
+        DevicePtrMut(ptr.cast()),
         buf.dtype,
         &buf.shape,
         &buf.strides,
@@ -2557,6 +2670,7 @@ mod tests {
         let strides = onnx_runtime_ir::compute_contiguous_strides(&shape);
         let buf = IntermediateBuf {
             data,
+            scratch_ptr: std::ptr::null_mut(),
             shape: shape.clone(),
             strides,
             dtype: DataType::Float32,

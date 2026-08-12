@@ -7,10 +7,53 @@ use std::collections::HashSet;
 use std::panic::AssertUnwindSafe;
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use onnx_genai_ort_sys as ort;
 use onnx_runtime_ep_api::provider::ExecutionProvider;
 use onnx_runtime_ir::{DataType, ValueId};
+
+/// How an [`ExportedEp`] holds its backing Rust [`ExecutionProvider`].
+///
+/// Device EPs (CUDA) advertise a *shared* EP: the same instance backs the
+/// factory's allocator, stream, and data-transfer, so `CreateEp` must reuse it
+/// (rather than constructing a fresh EP whose stream/allocator would not match
+/// the memory ORT allocated through the factory). CPU EPs own their instance.
+pub enum EpHandle {
+    /// The EP is owned exclusively by this `ExportedEp` (CPU plugin path).
+    Owned(Box<dyn ExecutionProvider>),
+    /// The EP is shared with the factory's allocator/stream/data-transfer
+    /// (CUDA plugin path). `ExportedEp` must not shut it down on release.
+    Shared(Arc<Mutex<Box<dyn ExecutionProvider + Send>>>),
+}
+
+impl EpHandle {
+    /// Runs `f` with a shared reference to the backing EP. For the shared
+    /// variant the mutex is locked only for the duration of `f`; callers must
+    /// not re-enter ORT (allocator/stream) while inside `f`.
+    pub fn with<R>(&self, f: impl FnOnce(&dyn ExecutionProvider) -> R) -> R {
+        match self {
+            EpHandle::Owned(ep) => f(ep.as_ref()),
+            EpHandle::Shared(shared) => {
+                let guard = shared.lock().unwrap_or_else(|p| p.into_inner());
+                f(guard.as_ref())
+            }
+        }
+    }
+
+    /// Returns the EP name.
+    pub fn name(&self) -> String {
+        self.with(|ep| ep.name().to_string())
+    }
+
+    /// Shuts down the EP only if it is exclusively owned. Shared EPs are owned
+    /// by the factory and are shut down when the factory is released.
+    pub fn shutdown_if_owned(&mut self) {
+        if let EpHandle::Owned(ep) = self {
+            let _ = ep.shutdown();
+        }
+    }
+}
 
 /// Global counter of nodes compiled by this EP (across all subgraphs).
 /// Incremented in `ep_compile` for each kernel entry. Used for test
@@ -59,8 +102,8 @@ pub struct KernelRegistryEntry {
 pub struct ExportedEp {
     /// The vtable ORT reads through the `OrtEp*` pointer.
     pub vtable: ort::OrtEp,
-    /// The Rust EP instance.
-    pub ep: Box<dyn ExecutionProvider>,
+    /// The Rust EP instance (owned for CPU, shared for CUDA device EPs).
+    pub ep: EpHandle,
     /// EP name kept alive for `GetName` callback.
     pub name_cstr: std::ffi::CString,
     /// ORT kernel registry built from [`KernelRegistryEntry`] slices.
@@ -138,7 +181,31 @@ impl ExportedEp {
         registry: Option<OrtKernelRegistryHolder>,
         entries: Vec<KernelRegistryEntry>,
     ) -> Self {
-        let name_cstr = std::ffi::CString::new(ep.name())
+        let name = ep.name().to_string();
+        Self::from_handle(EpHandle::Owned(ep), &name, registry, entries)
+    }
+
+    /// Construct an `ExportedEp` that reuses a *shared* EP (device/CUDA path).
+    ///
+    /// The shared EP is the same instance the factory hands to its allocator,
+    /// stream, and data-transfer, so a graph compiled here allocates and runs
+    /// on the exact context ORT already uses for memory transfers.
+    pub fn new_shared(
+        ep: Arc<Mutex<Box<dyn ExecutionProvider + Send>>>,
+        name: &str,
+        registry: Option<OrtKernelRegistryHolder>,
+        entries: Vec<KernelRegistryEntry>,
+    ) -> Self {
+        Self::from_handle(EpHandle::Shared(ep), name, registry, entries)
+    }
+
+    fn from_handle(
+        ep: EpHandle,
+        name: &str,
+        registry: Option<OrtKernelRegistryHolder>,
+        entries: Vec<KernelRegistryEntry>,
+    ) -> Self {
+        let name_cstr = std::ffi::CString::new(name)
             .unwrap_or_else(|_| std::ffi::CString::new("nxrt_ep").unwrap());
         let has_registry = registry.is_some();
         Self {
@@ -230,7 +297,7 @@ fn ep_get_capability_inner(
     };
     let view = onnx_runtime_ir::GraphView::new(ir_graph, &cache);
     let ort_view = onnx_runtime_ep_api::abi::OrtGraphView::new(&view);
-    let claims = ort_view.query_capabilities(exported.ep.as_ref());
+    let claims = exported.ep.with(|ep| ort_view.query_capabilities(ep));
 
     if claims.is_empty() {
         return ok_status();
@@ -529,7 +596,7 @@ fn ep_compile_inner(
 
             let opset = ir_graph.effective_opset(node).unwrap_or(0);
 
-            match exported.ep.get_kernel(node, &shapes, opset) {
+            match exported.ep.with(|ep| ep.get_kernel(node, &shapes, opset)) {
                 Ok(kernel) => {
                     let num_inputs = view.node_inputs(node_idx).len();
                     let num_outputs = view.node_outputs(node_idx).len();

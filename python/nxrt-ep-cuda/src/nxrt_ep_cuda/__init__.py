@@ -1,7 +1,10 @@
 """nxrt-ep-cuda — bundled ONNX Runtime plugin-EP (CUDA) shared library.
 
-EXPERIMENTAL / PRE-RELEASE: the CUDA execution provider is not yet validated on
-physical CUDA hardware (see issue #768). This package vendors the compiled
+EXPERIMENTAL / PRE-RELEASE: the CUDA execution provider has been validated on
+physical CUDA hardware (NVIDIA H200, CUDA 13.0) — it runs the Muse-Glimmer-30B
+(int4) decoder end-to-end with zero CPU fallbacks, and the bundled cdylib
+registers and executes ONNX graphs through ONNX Runtime on-device — but APIs and
+packaging may still change without notice. This package vendors the compiled
 ``onnx-runtime-ep-cuda-plugin`` cdylib (built with the ``cuda`` cargo feature,
 CUDA 13) and exposes the absolute path to it, plus a thin helper to register it
 with an installed ``onnxruntime`` via ``register_execution_provider_library``.

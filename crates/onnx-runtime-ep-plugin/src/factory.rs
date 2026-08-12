@@ -600,32 +600,6 @@ unsafe extern "C" fn factory_create_ep(
 
         let exported = unsafe { &*(factory.cast::<ExportedFactory>()) };
 
-        // S3 fix: if a shared EP exists, wrap it (non-owning) rather than
-        // calling the constructor (which may be a panic bomb for device EPs).
-        let ep: Box<dyn ExecutionProvider> = if let Some(ref shared) = exported.shared_ep {
-            match shared.lock() {
-                Ok(_guard) => {
-                    // We can't move the EP out of the Arc, so for CreateEp with
-                    // a shared EP we return an error — the shared EP is used
-                    // directly by allocator/stream/transfer, not via CreateEp.
-                    return fail_status(
-                        "CreateEp: shared EP is owned by the factory; \
-                         allocator, stream, and data transfer use it directly",
-                    );
-                }
-                Err(_) => {
-                    return fail_status("CreateEp: shared EP mutex poisoned");
-                }
-            }
-        } else {
-            let mut ep = (exported.constructor)();
-            let config = onnx_runtime_ep_api::provider::EpConfig::default();
-            if let Err(e) = ep.initialize(&config) {
-                return fail_status(&format!("CreateEp: EP initialization failed: {e}"));
-            }
-            ep
-        };
-
         let registry_outcome = crate::ep::build_ort_kernel_registry(
             &exported.kernel_registry_entries,
             exported.name_cstr.to_str().unwrap_or("nxrt_ep"),
@@ -637,11 +611,31 @@ unsafe extern "C" fn factory_create_ep(
                 registry_outcome.failures.join("; ")
             ));
         }
-        let exported_ep = Box::new(ExportedEp::new_with_registry_and_entries(
-            ep,
-            registry_outcome.registry,
-            exported.kernel_registry_entries.clone(),
-        ));
+
+        // Device EPs (CUDA) advertise a shared EP: the same instance already
+        // backs the factory's allocator, stream, and data transfer. `CreateEp`
+        // must reuse it so the compiled graph runs on the exact CUDA context
+        // ORT uses for host<->device transfers. CPU EPs construct a fresh,
+        // owned instance.
+        let exported_ep = if let Some(ref shared) = exported.shared_ep {
+            Box::new(ExportedEp::new_shared(
+                std::sync::Arc::clone(shared),
+                exported.name_cstr.to_str().unwrap_or("nxrt_ep"),
+                registry_outcome.registry,
+                exported.kernel_registry_entries.clone(),
+            ))
+        } else {
+            let mut ep = (exported.constructor)();
+            let config = onnx_runtime_ep_api::provider::EpConfig::default();
+            if let Err(e) = ep.initialize(&config) {
+                return fail_status(&format!("CreateEp: EP initialization failed: {e}"));
+            }
+            Box::new(ExportedEp::new_with_registry_and_entries(
+                ep,
+                registry_outcome.registry,
+                exported.kernel_registry_entries.clone(),
+            ))
+        };
         let ep_ptr = Box::into_raw(exported_ep);
         unsafe { *out_ep = ep_ptr.cast::<ort::OrtEp>() };
         ok_status()
@@ -657,8 +651,9 @@ unsafe extern "C" fn factory_release_ep(_factory: *mut ort::OrtEpFactory, ep: *m
         // SAFETY: ep was created by factory_create_ep via Box::into_raw.
         unsafe {
             let mut exported_ep = Box::from_raw(ep.cast::<ExportedEp>());
-            // Best-effort shutdown.
-            let _ = exported_ep.ep.shutdown();
+            // Best-effort shutdown — only for owned EPs. A shared EP belongs to
+            // the factory and is shut down when the factory is released.
+            exported_ep.ep.shutdown_if_owned();
         }
     }));
 }
