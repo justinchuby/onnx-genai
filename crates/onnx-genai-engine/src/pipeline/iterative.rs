@@ -606,6 +606,11 @@ impl PipelineEngine {
         let PipelinePlan::Composite(plan) = &self.plan else {
             anyhow::bail!("internal error: run_composite on a non-composite plan");
         };
+        if let Some(workflow) = &plan.workflow {
+            let mut values = request.inputs;
+            self.run_workflow_node(&workflow.graph, workflow, &mut values)?;
+            return Ok(values);
+        }
         let present = request.present;
         let mut tensors = self.prepare_request_tensors(request.inputs, &present)?;
         for stage in &plan.stages {
@@ -629,6 +634,147 @@ impl PipelineEngine {
             }
         }
         Ok(tensors)
+    }
+
+    fn run_workflow_node(
+        &self,
+        node: &WorkflowNode,
+        workflow: &WorkflowSpec,
+        values: &mut PipelineTensors,
+    ) -> anyhow::Result<()> {
+        match node {
+            WorkflowNode::Sequence { nodes } => {
+                for node in nodes {
+                    self.run_workflow_node(node, workflow, values)?;
+                }
+            }
+            WorkflowNode::Invoke {
+                component,
+                inputs,
+                outputs,
+                ..
+            } => {
+                let declaration = workflow
+                    .components
+                    .get(component)
+                    .with_context(|| format!("workflow component '{component}' is undeclared"))?;
+                match &declaration.implementation {
+                    ComponentImplementation::Onnx { .. } => {
+                        let session = self.models.session(component).with_context(|| {
+                            format!("workflow ONNX component '{component}' was not loaded")
+                        })?;
+                        let resolved = inputs
+                            .iter()
+                            .map(|(port, value)| {
+                                values
+                                    .get(value)
+                                    .with_context(|| {
+                                        format!(
+                                            "workflow component '{component}' input '{port}' \
+                                             references unavailable value '{value}'"
+                                        )
+                                    })
+                                    .map(|tensor| (port.as_str(), tensor))
+                            })
+                            .collect::<anyhow::Result<Vec<_>>>()?;
+                        let produced = session.run(&resolved)?;
+                        for (port, tensor) in session.output_names().iter().zip(produced) {
+                            let value = outputs.get(port).with_context(|| {
+                                format!(
+                                    "workflow component '{component}' output '{port}' has no SSA binding"
+                                )
+                            })?;
+                            values.insert(value.clone(), tensor);
+                        }
+                    }
+                    ComponentImplementation::Binding => {
+                        for (port, output) in outputs {
+                            let source = inputs.get(port).with_context(|| {
+                                format!(
+                                    "binding component '{component}' output '{port}' requires \
+                                     an input with the same port name"
+                                )
+                            })?;
+                            let tensor = values.get(source).with_context(|| {
+                                format!("binding source value '{source}' is unavailable")
+                            })?;
+                            values.insert(output.clone(), clone_value(tensor)?);
+                        }
+                    }
+                    ComponentImplementation::Adapter { abi, version, .. } => {
+                        anyhow::bail!(
+                            "workflow adapter '{component}' requires unsupported ABI {abi}@{version}"
+                        );
+                    }
+                }
+            }
+            WorkflowNode::Loop {
+                setup,
+                body,
+                condition,
+                max_iterations,
+                carried,
+            } => {
+                self.run_workflow_node(setup, workflow, values)?;
+                let limit = workflow_scalar_usize(values, max_iterations)?;
+                for _ in 0..limit {
+                    for carry in carried {
+                        let current = values.get(&carry.current).with_context(|| {
+                            format!("workflow loop value '{}' is unavailable", carry.current)
+                        })?;
+                        values.insert(carry.body_input.clone(), clone_value(current)?);
+                    }
+                    self.run_workflow_node(body, workflow, values)?;
+                    for carry in carried {
+                        let next = values.get(&carry.body_output).with_context(|| {
+                            format!("workflow loop body did not produce '{}'", carry.body_output)
+                        })?;
+                        let next_value = clone_value(next)?;
+                        values.insert(carry.current.clone(), clone_value(&next_value)?);
+                        values.insert(carry.next.clone(), next_value);
+                    }
+                    if !workflow_scalar_bool(values, condition)? {
+                        break;
+                    }
+                }
+            }
+            WorkflowNode::Branch {
+                predicate,
+                cases,
+                default,
+            } => {
+                let key = workflow_scalar_key(values, predicate)?;
+                if let Some(case) = cases.get(&key) {
+                    self.run_workflow_node(case, workflow, values)?;
+                } else if let Some(default) = default {
+                    self.run_workflow_node(default, workflow, values)?;
+                } else {
+                    anyhow::bail!("workflow branch has no case '{key}' and no default");
+                }
+            }
+            WorkflowNode::Emit { value, output, .. } => {
+                let tensor = values
+                    .get(value)
+                    .with_context(|| format!("workflow emit value '{value}' is unavailable"))?;
+                values.insert(output.clone(), clone_value(tensor)?);
+            }
+            WorkflowNode::Transfer {
+                input,
+                output,
+                device,
+            } => {
+                if *device != DeviceKind::Cpu {
+                    anyhow::bail!(
+                        "workflow transfer to {device:?} requires a device allocator contract"
+                    );
+                }
+                let tensor = values
+                    .get(input)
+                    .with_context(|| format!("workflow transfer value '{input}' is unavailable"))?;
+                values.insert(output.clone(), clone_value(tensor)?);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn run_single_pass(
@@ -669,6 +815,56 @@ impl PipelineEngine {
         }
         Ok(tensors)
     }
+}
+
+fn workflow_scalar_usize(values: &PipelineTensors, name: &str) -> anyhow::Result<usize> {
+    let value = values
+        .get(name)
+        .with_context(|| format!("workflow scalar value '{name}' is unavailable"))?;
+    let data = value
+        .to_vec_i64()
+        .with_context(|| format!("workflow scalar '{name}' must be an integer tensor"))?;
+    let scalar = data
+        .first()
+        .copied()
+        .context("workflow scalar tensor must contain one value")?;
+    usize::try_from(scalar)
+        .with_context(|| format!("workflow scalar '{name}' must be non-negative"))
+}
+
+fn workflow_scalar_bool(values: &PipelineTensors, name: &str) -> anyhow::Result<bool> {
+    let value = values
+        .get(name)
+        .with_context(|| format!("workflow predicate value '{name}' is unavailable"))?;
+    match value.dtype() {
+        DataType::Bool => value
+            .to_raw_bytes()?
+            .first()
+            .copied()
+            .map(|value| value != 0)
+            .context("workflow bool predicate tensor must contain one value"),
+        _ => value
+            .to_vec_i64()?
+            .first()
+            .copied()
+            .map(|value| value != 0)
+            .context("workflow integer predicate tensor must contain one value"),
+    }
+}
+
+fn workflow_scalar_key(values: &PipelineTensors, name: &str) -> anyhow::Result<String> {
+    let value = values
+        .get(name)
+        .with_context(|| format!("workflow branch value '{name}' is unavailable"))?;
+    if value.dtype() == DataType::Bool {
+        return Ok(workflow_scalar_bool(values, name)?.to_string());
+    }
+    value
+        .to_vec_i64()?
+        .first()
+        .copied()
+        .map(|value| value.to_string())
+        .context("workflow branch tensor must contain one bool or integer value")
 }
 
 /// Dump one iterative step's loop-carried tensor to `ONNX_GENAI_STEP_DUMP_DIR`

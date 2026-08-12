@@ -287,6 +287,7 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
                 crate::schema::ComponentImplementation::Adapter {
                     abi,
                     version,
+                    artifact: _,
                     custom_ops,
                 } => {
                     match workflow.manifest.adapter_abis.get(abi) {
