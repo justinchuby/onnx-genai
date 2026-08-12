@@ -48,3 +48,7 @@ Older entries in `history-archive.md`.
 - Documented `validate_write_dtype` as test-only contract helper; named `scratch_alloc_bytes` as actual guard.
 - 283 passed, 0 failed; clippy clean; fmt clean.
 - Commit `5258e0281`.
+
+## 2026-08-12 — PR #762 final items (ort_discovery + validate_write_dtype docs)
+
+Consolidated `find_ort_lib_dir` into `tests/common/ort_discovery.rs`; all three integration test files use `#[path]` include. `validate_write_dtype` documented as test-only contract helper. 283 passed / 0 failed; clippy clean; fmt clean. Closed both substantive items Gaff flagged. PR #762 marked ready for review.

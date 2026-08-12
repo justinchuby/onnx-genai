@@ -30,3 +30,28 @@ behaviour.
 ## 2026-08-10 — Clippy lint cleanup (lib.rs test body)
 
 Removed `mut` from unused-mut binding; replaced typed diverging `let` with bare `panic!()`. Macro body untouched. Tests: 82 passed / 0 failed (ep-plugin), 21 passed (ep-cpu-plugin).
+
+---
+
+## ARCHIVED 2026-08-12 (compaction wave)
+
+### 2026-08-11 — nxrt Host Loader (§524)
+Implemented `crates/onnx-runtime-ep-nxrt-host/`. dlopen via `libloading`, version negotiation, `NxrtExecutionProvider` implementing `ExecutionProvider`, panic containment. 4 passed, 0 failed.
+
+### 2026-08-11 — nxrt Host Loader ABI Reconciliation
+Deleted `src/abi_contract.rs`. Rewrote to real protocol: `NxrtNegotiate` → `NxrtCreateEpFactories`. `provider_adapter.rs` holds `*mut NxrtEpVtable`. Borrowed-pointer rules: EP `name` copied to owned String. 14 passed (4 unit + 10 integration).
+
+### 2026-08-11 — ABI correctness: enum UB, struct_size, CUDA status loss
+Commit `94bbbe545`. `NxrtStatus.code` → raw `u32`. struct_size checked before vtable access. CUDA `set_host_api(api)` before diagnostics. Vacuous CUDA tests replaced. 264 tests, 0 failures.
+
+### 2026-08-11 — PR #762 third corrective wave: ABI safety
+Commits `94bbbe545`, `24ba2fe31`. All three ABI issues genuinely fixed. Verified by Luv. Struct size 264 bytes unchanged.
+
+### 2026-08-12 — iOS_CI_on_Mac failure triage
+INFRA FLAKE. SSL cert failure (libcurl status 60) downloading FXdiv. No code change. Re-run recommended.
+
+### 2026-08-12 — PR #32001 lockout revision (S1/S2/S3)
+warn-and-disable (not FATAL_ERROR); `--use_apple_accelerate` added to build_args.py/build.py; removed dangling `MLAS_USE_APPLE_ACCELERATE` define. Head `d16a108252`.
+
+### 2026-08-12 — PR #32003: Complete strict-aliasing fix
+Fixed 4 remaining `reinterpret_cast<half2*>(&vec_a.member)` sites in `__CUDA_ARCH__ < 530` fallback. 0 member-punning sites remain. Commit `23dcfddaaf`.

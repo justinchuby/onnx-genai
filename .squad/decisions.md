@@ -232,3 +232,31 @@ All wave narratives from 2026-08-10 (EP plugin export), 2026-08-11 (PR #762 pari
 - 106/106 LayerNorm suite tests pass (was 103)
 - 7/7 SkipLayerNorm PrePack validation tests pass
 
+
+---
+
+## 2026-08-12 — PR #762 EP plugin parity: ready-for-review lessons
+
+**By:** Rachael, Coco, Isidore, Gaff, Freysa, Coordinator
+
+### Durable lessons
+
+- **#762 reached ready after five full Opus reviews plus a focused delta.** Each round found real defects: guessed output dtypes, a use-after-free, a panic bomb making the success path unreachable, compacted optional slots, a forgeable name-based sentinel, and a 2× heap buffer overflow. Rounds four and five found progressively smaller issues — the rate of discovery, not the absence of findings, is what signalled readiness.
+
+- **Extract shared helpers rather than "keeping copies in sync".** Two `find_ort_lib_dir` copies had already diverged before anyone noticed; a `tests/common/` module plus `#[path]` includes made drift impossible. The same reasoning applied to `scratch_alloc_bytes`, where drift meant a heap overflow.
+
+- **A validator nothing calls is a claim, not a mechanism.** `validate_write_dtype` had no production caller; the honest resolution was to document it as a test-exercised contract helper and name the real guard, not to leave it implying runtime enforcement.
+
+- **Prefer leaking to calling through an unvalidated vtable pointer.** An undersized `struct_size` means `release` may not exist; jumping through whatever follows is arbitrary code execution from a malformed plugin.
+
+- **Marking ready over red CI requires documented baseline comparison.** Identify the shared root cause, reproduce it on `main` in a clean worktree, and show the branch does not touch the implicated crate. Always measure with `--no-fail-fast` and rebuilt binaries — the plain command truncates totals and stale binaries report stale counts.
+
+### Merged inbox drops
+
+- `rachael-762-gate.md` — `NXRT_REQUIRE_ORT_TESTS` gate hardening: `find_ort_lib_dir` honours `CARGO_TARGET_DIR`; all skip paths through gate; CI lane enabled.
+- `coco-762-scratch.md` — `scratch_alloc_bytes` single source of truth; `validate_write_dtype` wired into tests; unroutable graphs fail at Compile.
+- `isidore-762-abi.md` — CUDA `end_version i32::MAX` per-family; `offset_of!` for vtable offsets; undersized-vtable guard (leak-not-UB policy).
+- `gaff-762-delta.md` — delta review; no blockers; two substantive follow-ups (both addressed by Freysa).
+- `freysa-762-final.md` — `tests/common/ort_discovery.rs` via `#[path]`; `validate_write_dtype` documented as test-only.
+- `iran-762-clippy.md` — clippy identical-branch fix in `loader.rs`; `||` merge preserving `struct_size` short-circuit.
+

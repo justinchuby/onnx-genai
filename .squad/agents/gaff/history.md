@@ -58,3 +58,7 @@ _Pre-2026-08-11 detailed dated entries archived to `history-archive.md`._
 - CUDA `i32::MAX`: safe for current op list; over-claim risk only on future additions.
 - Vtable negative test: non-vacuous (both arms of the atomic flag exercised).
 - Compile-time routing rejection: correct and conservative.
+
+## 2026-08-12 — PR #762 delta review (focused, no blockers)
+
+Focused delta review of 5 commits. Verdict: ready to leave draft. Two substantive (non-blocking): `validate_write_dtype` dead in production; `find_ort_lib_dir` had one drifted copy in `layernorm_dynamic_axis.rs`. Both addressed by Freysa. Gate coverage, scratch_alloc_bytes, CUDA i32::MAX, vtable test, compile-time routing: all genuinely closed.
