@@ -393,6 +393,7 @@ const QWEN05B: Geometry = Geometry {
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
+#[allow(clippy::identity_op)] // `bindings * 1 * granule` mirrors the `* kv_heads *` shape above
 fn layout_decides_committed_bytes_at_the_near_empty_floor() {
     let context = require_cuda();
     context.bind_to_thread().expect("bind CUDA context");

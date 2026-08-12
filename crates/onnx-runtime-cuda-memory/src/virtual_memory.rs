@@ -215,6 +215,171 @@ impl CudaVirtualBacking {
         )
     }
 
+    /// Reserve a private window and create + map `granule_count` physical
+    /// handles into it read/write — the physical body of one pinned shared
+    /// prefix (#777).
+    ///
+    /// The handles are created **once** through the #740 pool (charged on the
+    /// owned axis) and registered as shared, so mapping them into any number of
+    /// sharers afterwards costs zero incremental owned bytes and none is
+    /// released until the last mapping — the owner's here or any sharer's — is
+    /// gone. Returns the writable owner reservation (the caller fills the
+    /// prefix through it), the handles to map into sharers, and the physical
+    /// bytes newly owned.
+    ///
+    /// Requires the production physical-handle pool: a shared prefix is defined
+    /// by handle identity across reservations, which only the pool provides.
+    pub(crate) fn reserve_and_map_shared_prefix(
+        &self,
+        granule_count: usize,
+    ) -> Result<SharedPrefixReservation, VirtualMemoryError> {
+        let pool = self.pool.as_ref().ok_or_else(|| VirtualMemoryError::Os {
+            operation: "reserving a shared prefix",
+            reason: String::from(
+                "shared prefixes require the production physical-handle pool; construct the \
+                 allocator with a non-zero pool bound",
+            ),
+            code: 0,
+        })?;
+        if granule_count == 0 {
+            return Err(VirtualMemoryError::Os {
+                operation: "reserving a shared prefix",
+                reason: String::from("a shared prefix must cover at least one granule"),
+                code: 0,
+            });
+        }
+        self.bind("reserving a shared prefix")?;
+        let granularity = pool.granularity;
+        let len = granule_count * granularity;
+        let mut reservation = <Self as VirtualBacking>::reserve(self, len)?;
+
+        // Acquire every handle first, so a shortfall fails before any mapping
+        // exists to unwind.
+        let mut checkouts = Vec::with_capacity(granule_count);
+        let mut additional_owned = 0_u64;
+        for _ in 0..granule_count {
+            match pool.acquire_with_owned_limit(u64::MAX, None) {
+                Ok((checkout, created)) => {
+                    checkouts.push(checkout);
+                    additional_owned = additional_owned.saturating_add(created);
+                }
+                Err(error) => {
+                    for checkout in checkouts.drain(..) {
+                        pool.rollback_checkout(checkout, false);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
+        let unwind =
+            |pool: &PhysicalHandlePool,
+             reservation: &CudaReservation,
+             mapped: &mut Vec<(usize, usize, cu::CUmemGenericAllocationHandle)>| {
+                for (offset, len, handle) in mapped.drain(..).rev() {
+                    if unsafe { cu::cuMemUnmap(reservation.base + offset as u64, len) }
+                        == cu::CUresult::CUDA_SUCCESS
+                    {
+                        let _ = pool.return_after_unmap(handle, true);
+                    }
+                }
+            };
+
+        let mut handles = Vec::with_capacity(granule_count);
+        let mut mapped: Vec<(usize, usize, cu::CUmemGenericAllocationHandle)> = Vec::new();
+        for (index, checkout) in checkouts.iter().copied().enumerate() {
+            let offset = index * granularity;
+            let address = reservation.base + offset as u64;
+            if let Err(error) = Self::check("cuMemMap", unsafe {
+                cu::cuMemMap(address, granularity, 0, checkout.handle, 0)
+            }) {
+                pool.rollback_checkout(checkout, false);
+                for &remaining in &checkouts[index + 1..] {
+                    pool.rollback_checkout(remaining, false);
+                }
+                unwind(pool, &reservation, &mut mapped);
+                return Err(error);
+            }
+            pool.note_mapped();
+            pool.note_shared_map(checkout.handle);
+            mapped.push((offset, granularity, checkout.handle));
+
+            let mut access: cu::CUmemAccessDesc = unsafe { std::mem::zeroed() };
+            access.location.type_ = cu::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
+            access.location.id = self.device_ordinal;
+            access.flags = cu::CUmemAccess_flags::CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+            if let Err(error) = Self::check("cuMemSetAccess", unsafe {
+                cu::cuMemSetAccess(address, granularity, &access, 1)
+            }) {
+                for &remaining in &checkouts[index + 1..] {
+                    pool.rollback_checkout(remaining, false);
+                }
+                unwind(pool, &reservation, &mut mapped);
+                return Err(error);
+            }
+            handles.push(checkout.handle);
+        }
+        reservation.blocks.extend(
+            mapped
+                .iter()
+                .map(|&(offset, len, handle)| (offset, len, handle)),
+        );
+        Ok(SharedPrefixReservation {
+            reservation,
+            handles,
+            granularity,
+            owned_bytes: additional_owned,
+        })
+    }
+
+    /// Map one already-owned shared prefix handle into `reservation` at
+    /// `offset`, **read-only**, taking one more reference to it.
+    ///
+    /// Read-only by construction (`CU_MEM_ACCESS_FLAGS_PROT_READ`): a sharer
+    /// reads a prefix it does not own, and a mis-targeted store into it must
+    /// fault loudly (Q3) rather than silently corrupt every other sharer's KV
+    /// through the same physical page. The handle is not checked out — it
+    /// belongs to the shared prefix — so a failed `cuMemSetAccess` only undoes
+    /// this mapping and never returns the handle to the pool.
+    pub(crate) fn map_shared_prefix_readonly(
+        &self,
+        reservation: &mut CudaReservation,
+        offset: usize,
+        handle: cu::CUmemGenericAllocationHandle,
+    ) -> Result<(), VirtualMemoryError> {
+        let pool = self.pool.as_ref().ok_or_else(|| VirtualMemoryError::Os {
+            operation: "mapping a shared prefix",
+            reason: String::from("shared prefixes require the production physical-handle pool"),
+            code: 0,
+        })?;
+        self.bind("mapping a shared prefix")?;
+        let granularity = pool.granularity;
+        let address = reservation.base + offset as u64;
+        Self::check("cuMemMap", unsafe {
+            cu::cuMemMap(address, granularity, 0, handle, 0)
+        })?;
+        pool.note_mapped();
+
+        let mut access: cu::CUmemAccessDesc = unsafe { std::mem::zeroed() };
+        access.location.type_ = cu::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
+        access.location.id = self.device_ordinal;
+        access.flags = cu::CUmemAccess_flags::CU_MEM_ACCESS_FLAGS_PROT_READ;
+        if let Err(error) = Self::check("cuMemSetAccess", unsafe {
+            cu::cuMemSetAccess(address, granularity, &access, 1)
+        }) {
+            // The handle stays owned by the shared prefix; only take this
+            // mapping back off the address space and the mapped-bytes gauge.
+            unsafe {
+                let _ = cu::cuMemUnmap(address, granularity);
+            }
+            pool.note_unmapped();
+            return Err(error);
+        }
+        pool.note_shared_map(handle);
+        reservation.blocks.push((offset, granularity, handle));
+        Ok(())
+    }
+
     /// Reserve and map in `context`.
     ///
     /// Takes a context rather than the execution provider's full runtime
@@ -346,6 +511,17 @@ struct PoolState {
     available: Vec<cu::CUmemGenericAllocationHandle>,
     lease: Option<MemoryLease>,
     pending_lease_shrink: u64,
+    /// Live mappings, per handle, for handles mapped into more than one
+    /// reservation at once — the cross-reservation prefix-share case (#777).
+    ///
+    /// A normal pooled handle is mapped into exactly one reservation and never
+    /// appears here: it is checked out, mapped, and returned as a unit. A
+    /// shared prefix granule is different — one physical handle mapped into the
+    /// owner's writable window *and* every sharer's read-only window at the
+    /// same time. This counts those live mappings so the handle is retained
+    /// (its lifetime is the **union** of all sharers) and returned to the pool
+    /// only when the **last** mapping is unmapped, never before.
+    shared: HashMap<cu::CUmemGenericAllocationHandle, u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -487,6 +663,7 @@ impl PhysicalHandlePool {
                 available: Vec::new(),
                 lease: Some(lease),
                 pending_lease_shrink: 0,
+                shared: HashMap::new(),
             }),
             lease_checkout: Mutex::new(()),
             counters: Arc::new(PoolCounters::default()),
@@ -716,6 +893,28 @@ impl PhysicalHandlePool {
             .fetch_add(self.granularity as u64, Ordering::AcqRel);
     }
 
+    /// Record that one more mapping of `handle` now exists, across any number
+    /// of reservations. Paired one-for-one with the [`return_after_unmap`] that
+    /// eventually removes that mapping.
+    ///
+    /// [`return_after_unmap`]: Self::return_after_unmap
+    pub(crate) fn note_shared_map(&self, handle: cu::CUmemGenericAllocationHandle) {
+        let mut state = self.lock();
+        *state.shared.entry(handle).or_insert(0) += 1;
+    }
+
+    /// Undo a mapped-bytes gauge bump without returning the handle to the pool.
+    ///
+    /// Used only to unwind a shared mapping whose `cuMemSetAccess` failed after
+    /// its `cuMemMap` succeeded: the physical handle is still owned by its
+    /// shared-prefix owner and must not be returned here, but its transient
+    /// mapping must be taken back off the gauge.
+    pub(crate) fn note_unmapped(&self) {
+        self.counters
+            .mapped_bytes
+            .fetch_sub(self.granularity as u64, Ordering::AcqRel);
+    }
+
     fn return_after_unmap(
         &self,
         handle: cu::CUmemGenericAllocationHandle,
@@ -729,6 +928,20 @@ impl PhysicalHandlePool {
             self.counters
                 .mapped_bytes
                 .fetch_sub(self.granularity as u64, Ordering::AcqRel);
+        }
+
+        // A shared prefix granule stays owned while any other reservation still
+        // maps it. Only the last mapping to leave falls through to the normal
+        // retain-or-release path below; earlier ones just decrement the count.
+        {
+            let mut state = self.lock();
+            if let Some(count) = state.shared.get_mut(&handle) {
+                *count -= 1;
+                if *count > 0 {
+                    return Ok(());
+                }
+                state.shared.remove(&handle);
+            }
         }
 
         let retain = {
@@ -964,6 +1177,62 @@ pub struct CudaReservation {
     teardown_synchronizer: Option<TeardownSynchronizer>,
     /// `(offset, len, handle)` for every mapped block.
     blocks: Vec<(usize, usize, cu::CUmemGenericAllocationHandle)>,
+}
+
+/// The physical body of one pinned shared prefix: a private writable window
+/// over granules that are created once and mapped, read-only, into any number
+/// of sharers (#777).
+///
+/// Its `Drop` (the reservation's) unmaps the owner's window and returns each
+/// handle to the pool — but a handle mapped into live sharers is retained by
+/// the shared refcount until the last sharer leaves, so the prefix's owner
+/// reference can go away first without pulling memory out from under a request
+/// still reading it. The lifetime of the physical granules is the **union** of
+/// the owner and every sharer.
+pub struct SharedPrefixReservation {
+    reservation: CudaReservation,
+    handles: Vec<cu::CUmemGenericAllocationHandle>,
+    granularity: usize,
+    owned_bytes: u64,
+}
+
+impl std::fmt::Debug for SharedPrefixReservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SharedPrefixReservation")
+            .field("base", &self.reservation.base)
+            .field("granules", &self.handles.len())
+            .field("owned_bytes", &self.owned_bytes)
+            .finish()
+    }
+}
+
+impl SharedPrefixReservation {
+    /// Device address of the owner's writable window, where the prefix content
+    /// is filled once before it is shared read-only.
+    pub fn base(&self) -> usize {
+        self.reservation.base as usize
+    }
+
+    /// Number of physical granules the prefix spans.
+    pub fn granule_count(&self) -> usize {
+        self.handles.len()
+    }
+
+    /// Granule size these handles were created at.
+    pub fn granularity(&self) -> usize {
+        self.granularity
+    }
+
+    /// Physical bytes this prefix newly owns — charged once, on the owned axis.
+    pub fn owned_bytes(&self) -> u64 {
+        self.owned_bytes
+    }
+
+    /// The `granule`-th shared handle, for mapping into a sharer's reservation.
+    pub(crate) fn handle(&self, granule: usize) -> Option<cu::CUmemGenericAllocationHandle> {
+        self.handles.get(granule).copied()
+    }
 }
 
 impl std::fmt::Debug for CudaReservation {
