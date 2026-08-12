@@ -582,6 +582,17 @@ pub fn widen_f16_slice_into(src: &[u16], dst: &mut [f32]) {
     }
 }
 
+/// Widen contiguous `bf16` bit patterns into `f32`.
+///
+/// BF16 is the high 16 bits of IEEE f32, so widening is an exact shift with no
+/// floating-point conversion or rounding.
+pub fn widen_bf16_slice_into(src: &[u16], dst: &mut [f32]) {
+    debug_assert_eq!(src.len(), dst.len());
+    for (d, &s) in dst.iter_mut().zip(src) {
+        *d = f32::from_bits((s as u32) << 16);
+    }
+}
+
 /// Borrow a contiguous f32 view zero-copy, or materialize/widen any other
 /// supported float view (`f16`/`bf16`/`f64` or strided f32) into dense f32.
 /// Rejects non-float dtypes with a RULE #1 error.

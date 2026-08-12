@@ -401,7 +401,7 @@ and the measurements behind the design. Investigation notes link here rather
 than copying conclusions, following the anti-staleness rule established in
 #781.
 
-**Status, as of 2026-08-11:**
+**Status, as of 2026-08-12:**
 
 - **Implemented:** head-major BNSH remains the default. PR #782 landed the
   seq-major BSNH fused fp16 single-token decode append/read pair, and #792
@@ -414,12 +414,19 @@ than copying conclusions, following the anti-staleness rule established in
   in-place VMM growth a seq-major buffer grows on its capacity-independent
   `kv_heads × head_dim` stride and moves **0** KV bytes, measured end to end on a
   real model (see "KV layout and residency" below). The BNSH binding *metadata*
-  shape is retained deliberately for both layouts — the GQA node and
-  `DeviceIoBinding` require it — so seq-major lives in the byte geometry, not a
-  permuted shape. Process-isolated end-to-end capture measurement also shows
-  that fixed stride alone does **not** yet remove growth re-capture: the current
-  engine explicitly invalidates the graph on every KV bucket growth for both
-  layouts.
+  shape is retained deliberately for both layouts — the GQA node reads
+  `present_capacity` from BNSH axis 2 regardless of the `kv_layout` attribute and
+  `DeviceIoBinding` requires matching axis order (#801) — so seq-major lives in
+  the byte geometry, not a permuted shape. Growth invalidation is now
+  **conditional** (#811): the engine no longer invalidates the captured graph on
+  every KV bucket growth. Seq-major fixed-stride growth **keeps** the captured
+  graph — device pointers and physical shapes are unchanged, batch-0 addressing
+  is capacity-independent, and the mask is fully committed — so its
+  growth-attributable invalidations fall **3 → 0**. Head-major still invalidates,
+  correctly, because it re-strides every head stripe and moves 688,576 bytes on
+  growth. Both are proven by the process-isolated parity test
+  (`mobius_seqmajor_growth_parity_native_cuda.rs`), including a negative oracle
+  that fails if a graph is kept across a growth that genuinely moved bytes.
 - **Measured, not implemented:** token-major across all layers. Its residency
   floor and 192 KiB-stride read cost were measured in #787, but no production
   kernel or binding layout uses it.
@@ -598,24 +605,32 @@ measured 2 MiB CUDA granule:
 >
 > The capture-ON default-VMM row was measured with **every layout/configuration
 > in its own process**, interleaving head-major then seq-major in the same
-> session:
+> session. Since #811 made growth invalidation **conditional**, the two layouts
+> no longer share a row:
 >
-> | Layout | Growth events | Captures | Replays | Invalidations |
-> |---|---:|---:|---:|---:|
-> | head-major | 3 | 4 | 39 | 4 |
-> | seq-major | 3 | 4 | 39 | 4 |
+> | Layout | Growth events | Captures | Replays | Invalidations | Growth keeps |
+> |---|---:|---:|---:|---:|---:|
+> | head-major | 3 | 4 | 39 | 4 | 0 |
+> | seq-major | 3 | 1 | 45 | 1 | 3 |
 >
 > A same-generation, no-growth control (`min_bucket=64`) measured `1 capture,
-> 45 replays, 1 invalidation` for each layout. Therefore the three bucket
-> growths account for exactly three additional invalidations and three
-> additional captures in both rows. This is attributable in code as well as by
-> counter delta: `DecodeCudaState::ensure_capacity` calls `invalidate_graph`
-> unconditionally after `apply_vmm_growth`, before branching on layout for the
-> moved-byte accounting. The seq-major fixed stride really does keep KV offsets
-> stable (`0` bytes moved), but the engine does not yet use that fact to retain
-> the captured graph. Thus #797's driver-level `0 re-captures` result is **not
-> demonstrated end to end** by the current bucket-growth path; the remaining
-> invalidator is the engine's explicit growth policy, not an unknown model gate.
+> 45 replays, 1 invalidation` for each layout. Head-major's three bucket growths
+> therefore add exactly three invalidations and three captures (it moves 688,576
+> bytes per growth and must re-capture). Seq-major's forced-growth accounting now
+> collapses **onto that no-growth control** — `1 capture, 45 replays, 1
+> invalidation` — because #811 keeps the captured graph across every growth and
+> records one `growth_keep` per growth (3 total). This is attributable in code as
+> well as by counter delta: after `apply_vmm_growth`,
+> `DecodeCudaState::ensure_capacity` compares a `binding_growth_signature`
+> (device pointer + physical shape per binding) before and after the commit; on
+> the seq-major fixed-stride path the signature is unchanged, so it calls
+> `record_growth_decision(true, …)` with the named reason ("seq-major fixed
+> full-context stride: device pointers and physical shapes unchanged, batch-0
+> addressing capacity-independent, mask fully committed") and **keeps** the graph;
+> head-major (and any signature change) invalidates. #797's driver-level `0
+> re-captures` result is thus now **demonstrated end to end** through the engine's
+> bucket-growth path. A negative oracle in the same test fails if a graph is ever
+> kept across a growth that genuinely moved bytes.
 >
 > The 48-token stream is byte-identical head-major vs seq-major in every row —
 > the first real seq-major generation that exercises *growth*. (#794's 32-token
@@ -657,7 +672,7 @@ measured 2 MiB CUDA granule:
 >   context whose per-head stripe exceeds a granule (large `head_dim`/context),
 >   not a change to this commit path.
 > * **A fourth place the layout lives — the engine-side non-kernel KV
->   consumers — is now gated (`seqmajor-physical-shape`).** Beyond kernel
+>   consumers — is now gated (#812, `seqmajor-physical-shape`).** Beyond kernel
 >   indexing, commit geometry, and growth byte geometry, the device
 >   present-KV host mirror (`DecodeCudaState::read_present_kv`) and the paged
 >   prefix-reuse seed (`DecodeCudaState::seed_prefix`) stride the padded buffer
@@ -839,7 +854,8 @@ multi_map_ops  = fragments × floor(fragment_bytes / granule)
 
 Layout sets `fragment_bytes` (and the cost) but **not** the possibility. The two
 genuine requirements are a **VMM-backed** KV buffer and `fragment_bytes ≥
-granule` on the platform. This is a tested predicate,
+granule` on the platform, with the granule **queried** from the driver rather
+than assumed (#822). This is a tested predicate,
 `onnx_runtime_memory_governor::shareability::evaluate_prefix_shareability`, that
 replaces any "is this seq-major" check; a KV path refuses with a reason when the
 arithmetic says a configuration is not shareable rather than making N private
@@ -1458,6 +1474,19 @@ Two things about the ORT side are not obvious and cost real time to discover:
   OrtDeviceAllocator even if the provided allocator has arena logic built-in"*.
   Whatever is registered **is** the per-request path, and has to be fast enough
   to be there.
+- **The ORT backend's KV does not route through an allocator we can back with
+  VMM.** `CreateAllocator` selects by *device*, not by implementation
+  (`crates/onnx-genai-ort/src/allocator.rs:232`, `for_session_device` wraps the
+  session's own EP allocator), the dynamic decode path lets ORT allocate
+  `present.*` itself, and `RegisterAllocator` is fronted by ORT's BFC arena
+  (§1.3). So the VMM residency and prefix-sharing wins land on the **native**
+  backend; on the ORT backend the one viable route is a VMM-arena KV buffer bound
+  via `CreateTensorWithDataAsOrtValue` + `IoBinding`. That route is **scoped, not
+  implemented**. Running our own Rust EPs *inside* upstream ORT through the
+  plugin-EP C ABI (`RegisterExecutionProviderLibrary`) landed for the CPU EP in
+  **#762** (merged); the CUDA plugin shim compiles but is unvalidated on
+  hardware, so plugin-EP-hosted VMM KV remains in-progress design intent, not a
+  shipped capability.
 
 ### 1.3 Why the host allocator has no arena, and the device one will need one
 
@@ -1609,6 +1638,20 @@ for `Sq==1` (#736). The default-domain `Attention` scores were the genuine-use
 exception: every route stages fp32 scores, so none reports `NONE` (#736). The
 detailed byte accounting remains in the
 [site-by-site audit](#cuda-raw-allocation-audit-736-2026-08-10) above.
+
+**Per-slice issue map and a correction to this document (#800/#802).** The
+#736 governance epic ran as seven route-conditional slices, each threading a
+static signal through the shared sizing helper rather than deleting bytes: the
+f32-only GQA `WS_SCORES` (#795), the packed-input-only GQA QKV staging (#806),
+the prefill-only staging (#810), and the dense-alias-only default-domain
+`Attention` staged K/V (#813) were the over-reservation slices; the
+default-domain `Attention` fp32 scores were the one slice where the bytes are
+**genuinely needed** on every route (#802). Recorded so the next audit does not
+re-derive it: #800 found **this document** had been wrong — it described the
+Attention Phase-2a scores as fp16-sized when the kernel sizes them from the
+tensor dtype (`elem_size = dtype.element_size()`,
+`crates/onnx-runtime-ep-cuda/src/kernels/attention.rs:368`); the audit table and
+formulas above now carry `elem_size`, not a fixed fp16 width.
 
 **Audit guidance (design intent, derived from #751, #795, and #799):**
 

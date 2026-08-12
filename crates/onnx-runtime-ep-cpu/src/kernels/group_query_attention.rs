@@ -32,7 +32,7 @@ use super::sdpa::{
     DecodePartial, SoftmaxExp, combine_decode_partials, sdpa_decode_partial, sdpa_decode_row,
 };
 use super::{check_arity, to_dense_i64};
-use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
+use crate::dtype::{to_dense_f32_widen, widen_bf16_slice_into, write_dense_f32_narrow};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::Node;
 
@@ -475,6 +475,14 @@ fn widen_rotary_prefix(op: &str, view: &TensorView, rows: usize, half: usize) ->
         let src = unsafe { std::slice::from_raw_parts(view.data_ptr::<u16>(), count) };
         let mut dst = vec![0.0f32; count];
         crate::dtype::widen_f16_slice_into(src, &mut dst);
+        return Ok(dst);
+    }
+    if view.dtype == onnx_runtime_ir::DataType::BFloat16 && view.is_contiguous() {
+        // SAFETY: a validated contiguous BFloat16 view addresses `numel() >= count`
+        // 2-byte elements; BF16 widening is the exact high-half f32 bit shift.
+        let src = unsafe { std::slice::from_raw_parts(view.data_ptr::<u16>(), count) };
+        let mut dst = vec![0.0f32; count];
+        widen_bf16_slice_into(src, &mut dst);
         return Ok(dst);
     }
     if view.dtype == onnx_runtime_ir::DataType::Float32 && view.is_contiguous() {
@@ -2775,6 +2783,7 @@ mod tests {
         for (i, slot) in data.iter_mut().enumerate() {
             *slot = (i as f32) * 0.25 - 3.0;
         }
+
         for slot in data.iter_mut().skip(rows * half_dim) {
             *slot = f32::NAN;
         }
@@ -2783,6 +2792,31 @@ mod tests {
         assert_eq!(prefix.len(), rows * half_dim);
         for k in 0..rows * half_dim {
             let expected = half::f16::from_f32(data[k]).to_f32();
+            assert_eq!(prefix[k], expected, "prefix element {k}");
+        }
+        assert!(
+            prefix.iter().all(|v| v.is_finite()),
+            "poisoned tail rows leaked into the widened prefix"
+        );
+    }
+
+    #[test]
+    fn widen_rotary_prefix_bounds_bf16_to_row_prefix() {
+        let half_dim = 3usize;
+        let cache_rows = 40usize;
+        let rows = 4usize;
+        let mut data = vec![0.0f32; cache_rows * half_dim];
+        for (i, slot) in data.iter_mut().enumerate() {
+            *slot = (i as f32) * 0.25 - 3.0;
+        }
+        for slot in data.iter_mut().skip(rows * half_dim) {
+            *slot = f32::NAN;
+        }
+        let cache = Owned::bf16(&[cache_rows, half_dim], &data);
+        let prefix = super::widen_rotary_prefix("test", &cache.view(), rows, half_dim).unwrap();
+        assert_eq!(prefix.len(), rows * half_dim);
+        for k in 0..rows * half_dim {
+            let expected = half::bf16::from_f32(data[k]).to_f32();
             assert_eq!(prefix[k], expected, "prefix element {k}");
         }
         assert!(

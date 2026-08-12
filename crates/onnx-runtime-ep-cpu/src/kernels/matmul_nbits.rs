@@ -373,7 +373,6 @@ static N16_SDOT_M1_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 static KAI_SDOT_M1_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(all(test, feature = "mlas"))]
 static MLAS_SQNBIT_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
-
 /// Standard ONNX row-major packed NBits weight with affine block metadata.
 ///
 /// This preserves the wire layout instead of expanding it to f32. Direct
@@ -383,6 +382,23 @@ struct PackedNBitsWeight {
     values: Vec<u8>,
     scales: Vec<f32>,
     zero_points: Option<Vec<u8>>,
+}
+
+enum BorrowedScales<'a> {
+    F32(&'a [f32]),
+    F16(&'a [half::f16]),
+    Bf16(&'a [half::bf16]),
+}
+
+impl BorrowedScales<'_> {
+    #[inline]
+    fn get(&self, index: usize) -> f32 {
+        match self {
+            Self::F32(values) => values[index],
+            Self::F16(values) => values[index].to_f32(),
+            Self::Bf16(values) => values[index].to_f32(),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -709,6 +725,37 @@ impl Kernel for MatMulNBitsKernel {
             owned_result = vec![0.0f32; result_len];
             &mut owned_result
         };
+        let dot_kernel = selected_dot_kernel();
+        if self.bits == 4
+            && self.accuracy_level == 0
+            && !self.weight_prepacked
+            && group_indices.is_none()
+            && let Some(zero_points) = zero_points
+            && let Some(packed) = contiguous_host_slice::<u8>(&inputs[1])
+            && let Some(scales) = borrowed_scales(&inputs[2])
+            && let Some(zero_points) = contiguous_host_slice::<u8>(zero_points)
+        {
+            with_decode_pool(|| {
+                borrowed_affine_int4_matmul(
+                    &activations,
+                    packed,
+                    scales,
+                    zero_points,
+                    bias.as_deref(),
+                    result,
+                    m,
+                    self.k,
+                    self.n,
+                    self.block_size,
+                    dot_kernel,
+                );
+            })?;
+            return if direct_result {
+                Ok(())
+            } else {
+                write_compute_f32(&mut outputs[0], result)
+            };
+        }
         #[cfg(feature = "mlas")]
         {
             if let Some(()) = self.try_mlas_sqnbit(
@@ -731,7 +778,6 @@ impl Kernel for MatMulNBitsKernel {
                 return out;
             }
         }
-        let dot_kernel = selected_dot_kernel();
         if self.bits == 2 && !self.weight_prepacked && group_indices.is_none() {
             let owned_weight;
             let packed_weight = if can_prepack {
@@ -4817,6 +4863,217 @@ fn packed_nbits_output_row(
     } else {
         compute(0, result);
     }
+}
+
+fn contiguous_host_slice<'a, T>(view: &TensorView<'a>) -> Option<&'a [T]> {
+    if !view.device.is_host_accessible() || !view.is_contiguous() {
+        return None;
+    }
+    // SAFETY: the executor guarantees the TensorView backing is valid for `'a`; callers validate
+    // the dtype before selecting T, and contiguous views contain exactly `numel` elements.
+    Some(unsafe { std::slice::from_raw_parts(view.data_ptr::<T>(), view.numel()) })
+}
+
+fn borrowed_scales<'a>(view: &TensorView<'a>) -> Option<BorrowedScales<'a>> {
+    match view.dtype {
+        DataType::Float32 => contiguous_host_slice(view).map(BorrowedScales::F32),
+        DataType::Float16 => contiguous_host_slice(view).map(BorrowedScales::F16),
+        DataType::BFloat16 => contiguous_host_slice(view).map(BorrowedScales::Bf16),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn borrowed_affine_int4_matmul(
+    activations: &[f32],
+    packed: &[u8],
+    scales: BorrowedScales<'_>,
+    zero_points: &[u8],
+    bias: Option<&[f32]>,
+    result: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    block_size: usize,
+    dot_kernel: DotKernel,
+) {
+    debug_assert_eq!(activations.len(), m * k);
+    debug_assert_eq!(result.len(), m * n);
+    let bits = 4usize;
+    let layout = NBitsLayout { bits, block_size };
+    let block_count = k.div_ceil(block_size);
+    let packed_row_size = block_count * layout.packed_block_size();
+    let zero_point_row_size = layout.zero_point_row_size(block_count);
+    for (activation, output_row) in activations.chunks_exact(k).zip(result.chunks_exact_mut(n)) {
+        #[cfg(target_arch = "aarch64")]
+        if m == 1
+            && block_size == 32
+            && matches!(dot_kernel, DotKernel::NeonDot)
+            && DotKernel::arm64_int4_direct_enabled()
+        {
+            borrowed_affine_int4_matmul_m1_neon_dot(
+                activation,
+                packed,
+                &scales,
+                zero_points,
+                bias,
+                output_row,
+                k,
+            );
+            continue;
+        }
+        let activation_sums = activation
+            .chunks(block_size)
+            .map(|block| block.iter().sum::<f32>())
+            .collect::<Vec<_>>();
+        let compute = |output_start: usize, outputs: &mut [f32]| {
+            for (offset, output) in outputs.iter_mut().enumerate() {
+                let output_index = output_start + offset;
+                let packed_row =
+                    &packed[output_index * packed_row_size..(output_index + 1) * packed_row_size];
+                let zp_row = &zero_points
+                    [output_index * zero_point_row_size..(output_index + 1) * zero_point_row_size];
+                let mut sum = bias.map_or(0.0, |values| values[output_index]);
+                for block in 0..block_count {
+                    let depth_start = block * block_size;
+                    let valid = k.saturating_sub(depth_start).min(block_size);
+                    let block_values = &packed_row[block * layout.packed_block_size()
+                        ..(block + 1) * layout.packed_block_size()];
+                    let scale = scales.get(output_index * block_count + block);
+                    let zero_point = layout.zero_point(Some(zp_row), block) as f32;
+                    let mut dot;
+                    #[cfg(target_arch = "aarch64")]
+                    if valid == 32 && block_size == 32 {
+                        // SAFETY: AArch64 guarantees NEON, and both slices contain one full block.
+                        dot = unsafe {
+                            affine_int4_block32_dot_neon(
+                                &activation[depth_start..depth_start + 32],
+                                block_values,
+                            )
+                        };
+                        sum += (dot - activation_sums[block] * zero_point) * scale;
+                        continue;
+                    }
+                    dot = 0.0;
+                    for (byte_index, &byte) in block_values.iter().enumerate() {
+                        let within = byte_index * 2;
+                        if within < valid {
+                            dot += activation[depth_start + within] * (byte & 0x0f) as f32;
+                        }
+                        if within + 1 < valid {
+                            dot += activation[depth_start + within + 1] * (byte >> 4) as f32;
+                        }
+                    }
+                    sum += (dot - activation_sums[block] * zero_point) * scale;
+                }
+                *output = sum;
+            }
+        };
+        parallel_output_rows(output_row, k, compute);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+fn borrowed_affine_int4_matmul_m1_neon_dot(
+    activation: &[f32],
+    packed: &[u8],
+    scales: &BorrowedScales<'_>,
+    zero_points: &[u8],
+    bias: Option<&[f32]>,
+    result: &mut [f32],
+    k: usize,
+) {
+    let block_size = 32usize;
+    let block_count = k.div_ceil(block_size);
+    let padded_k = block_count * block_size;
+    let packed_row_size = block_count * (block_size / 2);
+    let zero_point_row_size = block_count.div_ceil(2);
+    let (activation, activation_scales) =
+        quantize_activation_signed(activation, padded_k, block_size);
+    let activation_sums = activation
+        .chunks_exact(block_size)
+        .map(|block| block.iter().map(|&value| value as i32).sum::<i32>())
+        .collect::<Vec<_>>();
+    let layout = NBitsLayout {
+        bits: 4,
+        block_size,
+    };
+    let compute = |output_start: usize, outputs: &mut [f32]| {
+        for (offset, output) in outputs.iter_mut().enumerate() {
+            let output_index = output_start + offset;
+            let packed_row =
+                &packed[output_index * packed_row_size..(output_index + 1) * packed_row_size];
+            let zp_row = &zero_points
+                [output_index * zero_point_row_size..(output_index + 1) * zero_point_row_size];
+            let mut sum = bias.map_or(0.0, |values| values[output_index]);
+            for block in 0..block_count {
+                let packed_block = &packed_row[block * 16..(block + 1) * 16];
+                let activation_block = &activation[block * block_size..(block + 1) * block_size];
+                // SAFETY: runtime dispatch selected FEAT_DotProd and both slices
+                // contain exactly one block32 payload.
+                let dot = unsafe { affine_int4_block32_sdot_neon(activation_block, packed_block) };
+                let zero_point = layout.zero_point(Some(zp_row), block) as i32;
+                let correction = (8 - zero_point) * activation_sums[block];
+                sum += (dot + correction) as f32
+                    * (activation_scales[block] * scales.get(output_index * block_count + block));
+            }
+            *output = sum;
+        }
+    };
+    parallel_output_rows(result, padded_k, compute);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+unsafe fn affine_int4_block32_sdot_neon(activation: &[i8], packed: &[u8]) -> i32 {
+    use std::arch::aarch64::*;
+
+    debug_assert_eq!(activation.len(), 32);
+    debug_assert_eq!(packed.len(), 16);
+    let bytes = unsafe { vld1q_u8(packed.as_ptr()) };
+    let low = vandq_u8(bytes, vdupq_n_u8(0x0f));
+    let high = vshrq_n_u8::<4>(bytes);
+    let midpoint = vdupq_n_s8(8);
+    let weights0 = vsubq_s8(vreinterpretq_s8_u8(vzip1q_u8(low, high)), midpoint);
+    let weights1 = vsubq_s8(vreinterpretq_s8_u8(vzip2q_u8(low, high)), midpoint);
+    let acts0 = unsafe { vld1q_s8(activation.as_ptr()) };
+    let acts1 = unsafe { vld1q_s8(activation.as_ptr().add(16)) };
+    let mut acc = vdupq_n_s32(0);
+    acc = unsafe { sdot_i8x16(acc, acts0, weights0) };
+    acc = unsafe { sdot_i8x16(acc, acts1, weights1) };
+    vaddvq_s32(acc)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn affine_int4_block32_dot_neon(activation: &[f32], packed: &[u8]) -> f32 {
+    use std::arch::aarch64::*;
+
+    debug_assert_eq!(activation.len(), 32);
+    debug_assert_eq!(packed.len(), 16);
+    let bytes = unsafe { vld1q_u8(packed.as_ptr()) };
+    let low = vandq_u8(bytes, vdupq_n_u8(0x0f));
+    let high = vshrq_n_u8::<4>(bytes);
+    let values = [vzip1q_u8(low, high), vzip2q_u8(low, high)];
+    let mut acc = vdupq_n_f32(0.0);
+    for (half_index, values) in values.into_iter().enumerate() {
+        let lo16 = vmovl_u8(vget_low_u8(values));
+        let hi16 = vmovl_high_u8(values);
+        let groups = [
+            vmovl_u16(vget_low_u16(lo16)),
+            vmovl_high_u16(lo16),
+            vmovl_u16(vget_low_u16(hi16)),
+            vmovl_high_u16(hi16),
+        ];
+        for (group_index, values) in groups.into_iter().enumerate() {
+            let weights = vcvtq_f32_u32(values);
+            let activation_offset = half_index * 16 + group_index * 4;
+            let acts = unsafe { vld1q_f32(activation.as_ptr().add(activation_offset)) };
+            acc = vmlaq_f32(acc, acts, weights);
+        }
+    }
+    vaddvq_f32(acc)
 }
 
 /// Deinterleave int8 activations for the SIMD int4 kernels. Within each
@@ -10364,20 +10621,7 @@ mod tests {
             .collect();
         let (packed, scales, zero_points, dequantized) = quantize(&weights, n, k, block_size, true);
         let zero_points = zero_points.unwrap();
-        let (graph, node) = model_node(
-            &[2, 3, k],
-            &[n, 3, 8],
-            &[n * 3],
-            Some(&[n, 2]),
-            &[2, 3, n],
-            k,
-            n,
-            block_size,
-        );
-        let model = Model::new(&graph);
-        let kernel = CpuExecutionProvider::new()
-            .get_kernel(model.graph.node(node), &[], 1)
-            .unwrap();
+        let kernel = test_kernel(k, n, block_size);
         let a = Owned::f32(&[2, 3, k], &a);
         let b = Owned::u8(&[n, 3, 8], &packed);
         let scales = Owned::f32(&[n * 3], &scales);
@@ -10390,6 +10634,63 @@ mod tests {
             )
             .unwrap();
         assert_close(&y.to_f32(), &reference(&a.to_f32(), &dequantized, m, k, n));
+        assert!(
+            kernel.weight_nk.get().is_none(),
+            "batched asymmetric INT4 must not expand the weight to f32"
+        );
+    }
+
+    #[test]
+    fn matmulnbits_bf16_asymmetric_decode_keeps_int4_packed() {
+        let (m, k, n, block_size) = (1, 64, 7, 32);
+        let a_values: Vec<f32> = (0..k)
+            .map(|i| ((i * 17 % 41) as f32 - 20.0) / 13.0)
+            .collect();
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 19 % 37) as f32 - 18.0) / 11.0)
+            .collect();
+        let (packed, scales, zero_points, _) = quantize(&weights, n, k, block_size, true);
+        let zero_points = zero_points.unwrap();
+        let rounded_scales: Vec<f32> = scales
+            .iter()
+            .map(|&value| half::bf16::from_f32(value).to_f32())
+            .collect();
+        let dequantized = dequantize_reference(
+            &packed,
+            &rounded_scales,
+            Some(&zero_points),
+            n,
+            k,
+            block_size,
+        );
+        let kernel = test_kernel(k, n, block_size);
+        let a = Owned::bf16(&[m, k], &a_values);
+        let b = Owned::u8(&[n, 2, 16], &packed);
+        let scales = Owned::bf16(&[n, 2], &rounded_scales);
+        let zero_points = Owned::u8(&[n, 1], &zero_points);
+        let mut y = Owned::zeros(DataType::BFloat16, &[m, n]);
+        kernel
+            .execute(
+                &[a.view(), b.view(), scales.view(), zero_points.view()],
+                &mut [y.view_mut()],
+            )
+            .unwrap();
+        assert!(
+            kernel.weight_nk.get().is_none(),
+            "Muse-style decode must not expand the INT4 initializer to f32"
+        );
+        let rounded_a: Vec<f32> = a_values
+            .iter()
+            .map(|&value| half::bf16::from_f32(value).to_f32())
+            .collect();
+        let expected = reference(&rounded_a, &dequantized, m, k, n);
+        let actual = y.to_bf16_as_f32();
+        for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 0.02_f32.max(0.02 * expected.abs()),
+                "index {index}: actual={actual}, expected={expected}"
+            );
+        }
     }
 
     #[test]
@@ -10440,7 +10741,7 @@ mod tests {
     }
 
     #[test]
-    fn matmulnbits_prepacked_m1_block128_explicit_zp_partial_block_matches_reference() {
+    fn matmulnbits_borrowed_m1_block128_explicit_zp_partial_block_matches_reference() {
         let (k, n, block_size) = (141, 7, 128);
         let a_values: Vec<f32> = (0..k)
             .map(|i| ((i * 11 % 41) as f32 - 20.0) / 13.0)
@@ -10469,8 +10770,8 @@ mod tests {
 
         assert_close(&y.to_f32(), &reference(&a_values, &dequantized, 1, k, n));
         assert!(
-            prepack_cache_populated(&kernel),
-            "M=1 constant B/scales/zero-points must take a prepacked path"
+            !prepack_cache_populated(&kernel),
+            "asymmetric INT4 must borrow packed inputs instead of building a weight cache"
         );
     }
 

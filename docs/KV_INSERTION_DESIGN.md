@@ -19,6 +19,39 @@ docs/DESIGN.md §40 (SWA/sinks), tiered-memory epic (paged/spillable KV), in-fli
 
 ---
 
+> **Synchronization note (2026-08-12).** This memo predates the entire KV
+> *layout / residency* line and does not mention BNSH/BSNH, seq-major,
+> token-major, VMM commit geometry, the 2 MiB granule, or the stride descriptor.
+> Those facts, and the measurements behind them, now live in
+> [`MEMORY_ARCHITECTURE.md`](./MEMORY_ARCHITECTURE.md) → "KV layout and
+> residency", which is the **single source** for KV geometry; read it before
+> relying on any residency or paging claim below. Three points update this memo
+> without changing its recommendation:
+>
+> - The residency win this memo attributes to *paging* was realised through a
+>   **different** mechanism than the block-table decomposition it proposes:
+>   commit-on-demand VMM under a contiguous virtual range, with the KV *layout*
+>   (seq-major/token-major) controlling how many 2 MiB granules a live prefix
+>   touches. The floor progresses head-major `layers×2×kv_heads` (768) → seq-major
+>   `layers×2` (96) → token-major 1 per sequence, a measured **768×** reduction
+>   (#787). `KvLayout` was replaced by a symbolic **stride descriptor** with
+>   static per-layout NVRTC specialisation and no runtime branch (#792/#794);
+>   unsupported descriptors **error rather than mis-index**.
+> - The **prefix sharing** this memo lists as a future benefit of paging is a
+>   **proven, landed primitive** (#777/#793/#803) with a first production
+>   consumer via the `DeviceAllocator` seam (#809): one handle maps into N
+>   sequences under captured replay, charged **once**, additional sharers cost
+>   **0** incremental bytes. Shareability is **arithmetic, not layout** —
+>   shareable when `fragment_bytes ≥ granule`, granule queried (#822).
+> - **Path B / Option 3 (block-table-aware functional paged attention) remains a
+>   proposal, not built.** Verified against the tree: no CUDA attention kernel
+>   takes a `block_table`; GQA consumes contiguous `past_key`/`past_value`. The
+>   chosen route is commit-on-demand VMM under a contiguous VA, not per-kernel
+>   block-table walking (see `MEMORY_ARCHITECTURE.md`, "Paged attention"). The
+>   §8.7 sequencing below is retained as design intent, labelled here as such.
+
+---
+
 ## 1. The proposal
 
 > Move KV-cache **write** responsibility out of the attention operator and into the
