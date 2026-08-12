@@ -1,8 +1,12 @@
 # nxrt-ep-cuda (EXPERIMENTAL / PRE-RELEASE)
 
-> ⚠️ **Experimental.** The CUDA execution provider bundled here has **not** been
-> validated on physical CUDA hardware yet (tracked by issue #768). Do not rely
-> on it for production. APIs and packaging may change without notice.
+> ⚠️ **Experimental.** The CUDA execution provider bundled here has been
+> validated on physical CUDA hardware (NVIDIA H200, driver 580.105.08,
+> CUDA 13.0): it loads and runs the Muse-Glimmer-30B (int4) decoder end-to-end
+> with **zero CPU fallbacks**, and the bundled plugin `.so` registers and
+> executes ONNX graphs through ONNX Runtime on-device. It remains
+> **pre-release**: APIs and packaging may change without notice, and it is not
+> yet recommended for production.
 
 A pip-installable **ONNX Runtime plugin execution provider (CUDA 13)**. The
 wheel bundles the compiled `onnx-runtime-ep-cuda-plugin` shared library

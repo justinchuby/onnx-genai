@@ -519,9 +519,15 @@ template <> __device__ __forceinline__ __nv_bfloat16 gqa_store<__nv_bfloat16>(fl
 
 __device__ __forceinline__ float gqa_load_cache(
     const void* cache, int index, int cache_is_half) {
-    return cache_is_half
-        ? __half2float(reinterpret_cast<const __half*>(cache)[index])
-        : reinterpret_cast<const float*>(cache)[index];
+    // `cache_is_half` is a tri-state cache-dtype tag: 0 = float32, 1 = float16,
+    // 2 = bfloat16. All three decode to a float rotary coefficient.
+    if (cache_is_half == 1) {
+        return __half2float(reinterpret_cast<const __half*>(cache)[index]);
+    }
+    if (cache_is_half == 2) {
+        return __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(cache)[index]);
+    }
+    return reinterpret_cast<const float*>(cache)[index];
 }
 
 template <typename T>
@@ -1826,16 +1832,23 @@ impl GroupQueryAttentionKernel {
                     )
                 })?;
             require_dense(cos, "cos_cache", DataType::Float32)
-                .or_else(|_| require_dense(cos, "cos_cache", DataType::Float16))?;
+                .or_else(|_| require_dense(cos, "cos_cache", DataType::Float16))
+                .or_else(|_| require_dense(cos, "cos_cache", DataType::BFloat16))?;
             let cache_dtype = cos.dtype;
+            // Tri-state cache-dtype tag consumed by `gqa_load_cache`:
+            // 0 = Float32, 1 = Float16, 2 = BFloat16. Half/bf16 caches are only
+            // valid alongside half-precision (Float16/BFloat16) queries.
             let cache_is_half = match cache_dtype {
                 DataType::Float32 => 0i32,
                 DataType::Float16 if matches!(q.dtype, DataType::Float16 | DataType::BFloat16) => {
                     1i32
                 }
+                DataType::BFloat16 if matches!(q.dtype, DataType::Float16 | DataType::BFloat16) => {
+                    2i32
+                }
                 other => {
                     return Err(EpError::KernelFailed(format!(
-                        "cuda_ep GroupQueryAttention: cos_cache/sin_cache dtype {other:?} unsupported for query dtype {:?}; expected Float32, or Float16 with half-precision queries",
+                        "cuda_ep GroupQueryAttention: cos_cache/sin_cache dtype {other:?} unsupported for query dtype {:?}; expected Float32, or Float16/BFloat16 with half-precision queries",
                         q.dtype
                     )));
                 }
