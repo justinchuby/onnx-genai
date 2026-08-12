@@ -52,7 +52,7 @@
 //! `Release`.
 
 use std::ffi::c_void;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use onnx_genai_ort_sys as ort;
 use onnx_runtime_ep_api::provider::ExecutionProvider;
@@ -384,8 +384,10 @@ unsafe extern "C" fn transfer_copy_tensors(
 /// Full-featured data-transfer adapter that stores the ORT API pointer,
 /// enabling actual tensor data extraction and copy operations.
 ///
-/// **B1 fix:** The EP is held via `EpRef` — either an `Arc<Mutex<..>>` clone
-/// (shared) or an owned raw pointer. No dangling pointers.
+/// **B1 fix:** The EP is held via `EpRef` — either a lock-free
+/// `Arc<dyn ExecutionProvider>` clone (shared) or an owned raw pointer. No
+/// dangling pointers, and no mutex contention between concurrent transfer,
+/// allocator, stream, and compute callbacks.
 ///
 /// **B3 fix:** `CopyTensors` uses `ep_api` to classify each tensor's memory
 /// device type and dispatches to the correct copy method.
@@ -421,7 +423,7 @@ impl DeviceDataTransferFull {
     ///
     /// `api` and `ep_api` must remain valid until ORT calls `Release`.
     pub unsafe fn new_shared(
-        shared: Arc<Mutex<Box<dyn ExecutionProvider + Send>>>,
+        shared: Arc<dyn ExecutionProvider>,
         support: DeviceSupport,
         api: *const ort::OrtApi,
         ep_api: *const ort::OrtEpApi,
@@ -1350,13 +1352,13 @@ mod tests {
     #[test]
     fn transfer_full_create_and_release_no_leak() {
         let dc = DropCounter::new();
-        let ep: Box<dyn ExecutionProvider + Send> = Box::new(MockDeviceEp::new(dc.clone()));
-        let shared = Arc::new(Mutex::new(ep));
+        let ep: Box<dyn ExecutionProvider> = Box::new(MockDeviceEp::new(dc.clone()));
+        let shared: Arc<dyn ExecutionProvider> = Arc::from(ep);
         let support = DeviceSupport::gpu("MockGpu", 0);
 
         let transfer = unsafe {
             DeviceDataTransferFull::new_shared(
-                shared.clone(),
+                Arc::clone(&shared),
                 support,
                 std::ptr::null(),
                 std::ptr::null(),
@@ -1366,9 +1368,8 @@ mod tests {
 
         // Release.
         unsafe { transfer_full_release(raw) };
-        // EP still alive via `shared` Arc.
-        let guard = shared.lock().unwrap();
-        assert_eq!(guard.name(), "mock_device_ep");
+        // EP still alive via `shared` Arc — no lock needed anymore.
+        assert_eq!(shared.name(), "mock_device_ep");
     }
 
     // ─── Ownership: drop counter verifies no leaks ───────────────────────────

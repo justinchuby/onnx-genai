@@ -76,31 +76,38 @@ pub fn ep_supports_hardware_type(
 /// How a component references the EP. Shared holds an `Arc` clone (B1 fix);
 /// Owned holds a raw pointer that will be freed on drop.
 pub(crate) enum EpRef {
-    /// Shared EP backed by an `Arc<Mutex<..>>`. Each use locks the mutex.
-    /// The strong reference keeps the EP alive for the component's lifetime.
-    Shared(Arc<Mutex<Box<dyn ExecutionProvider + Send>>>),
+    /// Shared EP backed by a lock-free `Arc<dyn ExecutionProvider>` clone.
+    /// The strong reference keeps the EP (and its runtime/context) alive for
+    /// the component's lifetime. No mutex is needed: every
+    /// `ExecutionProvider` method used post-construction (`allocate`,
+    /// `deallocate`, `copy`, `copy_async`, `sync`, `get_kernel`,
+    /// `supports_op`, ...) takes `&self`, so concurrent callers (allocator,
+    /// stream, data transfer, and the compiled `OrtEp`) can all hold and use
+    /// the same `Arc` simultaneously without contending on a lock.
+    Shared(Arc<dyn ExecutionProvider>),
     /// Owned raw pointer — the component will reconstruct and drop the `Box`
     /// on release. Used only for the non-shared (fresh constructor) path.
     Owned(*const dyn ExecutionProvider),
 }
 
-// SAFETY: Both variants are Send+Sync — Arc is inherently so, and the raw
-// pointer behind Owned is Send+Sync per the ExecutionProvider trait bounds.
+// SAFETY: Both variants are Send+Sync — Arc<dyn ExecutionProvider> is
+// Send+Sync because ExecutionProvider: Send + Sync, and the raw pointer
+// behind Owned is Send+Sync per the same trait bounds.
 unsafe impl Send for EpRef {}
 unsafe impl Sync for EpRef {}
 
 impl EpRef {
-    /// Execute `f` with a reference to the EP. For `Shared`, locks the mutex.
-    /// Returns `Err` if the mutex is poisoned (S2 fix: no `.unwrap()` across FFI).
+    /// Execute `f` with a reference to the EP.
+    ///
+    /// Always succeeds for `Shared` (no lock to poison). Returns `Err` only
+    /// for `Owned` with a null pointer (should not happen in practice, but
+    /// checked defensively since this crosses the ORT FFI boundary).
     pub(crate) fn with_ep<R>(
         &self,
         f: impl FnOnce(&dyn ExecutionProvider) -> R,
     ) -> Result<R, &'static str> {
         match self {
-            EpRef::Shared(arc) => {
-                let guard = arc.lock().map_err(|_| "EP mutex poisoned")?;
-                Ok(f(&**guard))
-            }
+            EpRef::Shared(arc) => Ok(f(&**arc)),
             EpRef::Owned(ptr) => {
                 if ptr.is_null() {
                     return Err("EP pointer is null");
@@ -170,7 +177,7 @@ impl DeviceAllocator {
     ///
     /// `memory_info` must be a valid ORT-owned pointer.
     pub unsafe fn new_shared(
-        shared: Arc<Mutex<Box<dyn ExecutionProvider + Send>>>,
+        shared: Arc<dyn ExecutionProvider>,
         memory_info: *const ort::OrtMemoryInfo,
     ) -> Box<Self> {
         Box::new(Self {
@@ -304,7 +311,7 @@ impl DeviceSyncStream {
 
     /// Create a sync stream backed by a shared EP (`Arc` clone).
     pub fn new_shared(
-        shared: Arc<Mutex<Box<dyn ExecutionProvider + Send>>>,
+        shared: Arc<dyn ExecutionProvider>,
         stream_handle: *mut std::os::raw::c_void,
     ) -> Box<Self> {
         Box::new(Self {
@@ -911,8 +918,8 @@ mod tests {
 
     #[test]
     fn device_sync_stream_flush_succeeds() {
-        let ep: Box<dyn ExecutionProvider + Send> = Box::new(MockGpuEp);
-        let shared = Arc::new(Mutex::new(ep));
+        let ep: Box<dyn ExecutionProvider> = Box::new(MockGpuEp);
+        let shared: Arc<dyn ExecutionProvider> = Arc::from(ep);
         let stream = DeviceSyncStream::new_shared(shared, ptr::null_mut());
         let stream_ptr = Box::into_raw(stream);
 
@@ -930,8 +937,8 @@ mod tests {
 
     #[test]
     fn device_sync_stream_get_handle_returns_null_for_mock() {
-        let ep: Box<dyn ExecutionProvider + Send> = Box::new(MockGpuEp);
-        let shared = Arc::new(Mutex::new(ep));
+        let ep: Box<dyn ExecutionProvider> = Box::new(MockGpuEp);
+        let shared: Arc<dyn ExecutionProvider> = Arc::from(ep);
         let stream = DeviceSyncStream::new_shared(shared, ptr::null_mut());
         let stream_ptr = Box::into_raw(stream);
 
@@ -943,8 +950,8 @@ mod tests {
 
     #[test]
     fn device_sync_stream_release_does_not_panic() {
-        let ep: Box<dyn ExecutionProvider + Send> = Box::new(MockGpuEp);
-        let shared = Arc::new(Mutex::new(ep));
+        let ep: Box<dyn ExecutionProvider> = Box::new(MockGpuEp);
+        let shared: Arc<dyn ExecutionProvider> = Arc::from(ep);
         let stream = DeviceSyncStream::new_shared(shared, ptr::null_mut());
         let stream_ptr = Box::into_raw(stream);
         unsafe { stream_release(stream_ptr.cast()) };

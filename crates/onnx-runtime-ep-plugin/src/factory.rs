@@ -6,7 +6,7 @@
 use std::ffi::{CString, c_char};
 use std::panic::AssertUnwindSafe;
 use std::ptr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use onnx_genai_ort_sys as ort;
 use onnx_runtime_ep_api::provider::ExecutionProvider;
@@ -39,21 +39,30 @@ pub struct ExportedFactory {
     /// Device support configuration for generalized enumeration.
     pub device_support: DeviceSupport,
     /// Optional shared EP instance for device EPs that require a single
-    /// runtime/context shared across allocator, stream, and data transfer.
+    /// runtime/context shared across allocator, stream, data transfer, AND
+    /// `CreateEp` (fixes defect #1: separate CUDA runtime/context, plus the
+    /// `CreateEp`-always-fails gap that blocked all compute on shared EPs).
     /// When set, factory callbacks use this instead of calling `constructor`
-    /// for each component. (Fixes defect #1: separate CUDA runtime/context.)
+    /// for each component.
     ///
-    /// The EP is wrapped in `Arc<Mutex<..>>` so multiple ORT callbacks can
-    /// borrow it safely. The `Mutex` is only held briefly during each callback.
-    pub shared_ep: Option<Arc<Mutex<Box<dyn ExecutionProvider + Send>>>>,
+    /// The EP is held as a lock-free `Arc<dyn ExecutionProvider>` so multiple
+    /// ORT callbacks (allocator, stream, transfer, and every `OrtEp` returned
+    /// by `CreateEp`) can hold and use it concurrently. No mutex is needed:
+    /// every method used post-construction takes `&self` on the
+    /// `ExecutionProvider` trait — only `initialize`/`shutdown` need
+    /// `&mut self`, and those are called before the EP is wrapped in the
+    /// `Arc` (see `create_ep_factories_for_shared_ep`) or, for `shutdown`,
+    /// skipped for shared EPs via `Arc::get_mut` in `factory_release_ep`.
+    pub shared_ep: Option<Arc<dyn ExecutionProvider>>,
     /// Optional native stream handle for device EPs. Returned from
     /// `DeviceSyncStream::GetHandle`. For CUDA, this would be `cudaStream_t`.
     pub stream_handle: *mut std::os::raw::c_void,
 }
 
 // SAFETY: The raw stream_handle pointer is only accessed from ORT callbacks
-// which are single-threaded per factory. The Arc<Mutex<..>> for shared_ep is
-// inherently Send+Sync. All other fields are Send+Sync by construction.
+// which are single-threaded per factory. The Arc<dyn ExecutionProvider> for
+// shared_ep is inherently Send+Sync (ExecutionProvider: Send + Sync). All
+// other fields are Send+Sync by construction.
 unsafe impl Send for ExportedFactory {}
 unsafe impl Sync for ExportedFactory {}
 
@@ -302,7 +311,11 @@ where
 /// This avoids the S4 problem where the constructor is a panic bomb.
 ///
 /// The shared EP is set directly on the factory; callbacks that need the EP
-/// clone the `Arc` rather than extracting a raw pointer from a `MutexGuard`.
+/// clone the `Arc<dyn ExecutionProvider>` directly — no mutex, no
+/// `MutexGuard` lifetime to reason about. The caller must have already
+/// called `ep.initialize(..)` before constructing the `Arc` passed here,
+/// since `initialize` takes `&mut self` and cannot be called once the EP is
+/// shared (see `ExecutionProvider::initialize`).
 ///
 /// # Safety
 ///
@@ -314,7 +327,7 @@ pub unsafe fn create_ep_factories_for_shared_ep(
     max_factories: usize,
     out_num: *mut usize,
     ep_name: &str,
-    shared_ep: Arc<Mutex<Box<dyn ExecutionProvider + Send>>>,
+    shared_ep: Arc<dyn ExecutionProvider>,
     entries: Vec<crate::ep::KernelRegistryEntry>,
     support: DeviceSupport,
     stream_handle: *mut std::os::raw::c_void,
@@ -600,30 +613,24 @@ unsafe extern "C" fn factory_create_ep(
 
         let exported = unsafe { &*(factory.cast::<ExportedFactory>()) };
 
-        // S3 fix: if a shared EP exists, wrap it (non-owning) rather than
-        // calling the constructor (which may be a panic bomb for device EPs).
-        let ep: Box<dyn ExecutionProvider> = if let Some(ref shared) = exported.shared_ep {
-            match shared.lock() {
-                Ok(_guard) => {
-                    // We can't move the EP out of the Arc, so for CreateEp with
-                    // a shared EP we return an error — the shared EP is used
-                    // directly by allocator/stream/transfer, not via CreateEp.
-                    return fail_status(
-                        "CreateEp: shared EP is owned by the factory; \
-                         allocator, stream, and data transfer use it directly",
-                    );
-                }
-                Err(_) => {
-                    return fail_status("CreateEp: shared EP mutex poisoned");
-                }
-            }
+        // B4/CreateEp fix: when a shared EP exists, clone the `Arc` directly
+        // rather than failing. `ExportedEp::ep` is itself an
+        // `Arc<dyn ExecutionProvider>`, so the same runtime/context instance
+        // that backs the allocator, sync stream, and data transfer now also
+        // backs graph compilation and kernel dispatch (`GetCapability`,
+        // `Compile`) for this `OrtEp`. This is required for ORT to ever
+        // actually run inference through a shared-EP factory (e.g. CUDA) —
+        // previously this branch unconditionally failed, so no session could
+        // execute a compiled subgraph on such an EP even with hardware present.
+        let ep: Arc<dyn ExecutionProvider> = if let Some(ref shared) = exported.shared_ep {
+            Arc::clone(shared)
         } else {
             let mut ep = (exported.constructor)();
             let config = onnx_runtime_ep_api::provider::EpConfig::default();
             if let Err(e) = ep.initialize(&config) {
                 return fail_status(&format!("CreateEp: EP initialization failed: {e}"));
             }
-            ep
+            Arc::from(ep)
         };
 
         let registry_outcome = crate::ep::build_ort_kernel_registry(
@@ -657,8 +664,19 @@ unsafe extern "C" fn factory_release_ep(_factory: *mut ort::OrtEpFactory, ep: *m
         // SAFETY: ep was created by factory_create_ep via Box::into_raw.
         unsafe {
             let mut exported_ep = Box::from_raw(ep.cast::<ExportedEp>());
-            // Best-effort shutdown.
-            let _ = exported_ep.ep.shutdown();
+            // Best-effort shutdown — but only when this `ExportedEp` holds
+            // the *sole* strong reference to the underlying EP. For a shared
+            // EP (e.g. CUDA), the factory's allocator/stream/data-transfer
+            // surfaces (and potentially other sessions' `OrtEp` instances)
+            // hold other `Arc` clones, so `Arc::get_mut` returns `None` and
+            // we correctly skip `shutdown()` — releasing one session's `OrtEp`
+            // must not tear down the shared runtime/context that other
+            // surfaces still depend on. For an owned/fresh EP (e.g. CPU),
+            // this `ExportedEp` is the only owner, so `Arc::get_mut` succeeds
+            // and `shutdown()` runs exactly as before.
+            if let Some(ep_mut) = Arc::get_mut(&mut exported_ep.ep) {
+                let _ = ep_mut.shutdown();
+            }
         }
     }));
 }
@@ -666,9 +684,11 @@ unsafe extern "C" fn factory_release_ep(_factory: *mut ort::OrtEpFactory, ep: *m
 /// Creates an allocator. For CPU EPs, uses ORT's default CPU allocator.
 /// For device EPs (GPU/NPU), creates a DeviceAllocator backed by the EP.
 ///
-/// **B1 fix:** When `shared_ep` is set, the `Arc` is cloned and stored in the
-/// `DeviceAllocator`. The allocator locks the `Arc<Mutex<..>>` on each use,
-/// so the EP pointer is always valid while being dereferenced.
+/// **B1 fix:** When `shared_ep` is set, the `Arc<dyn ExecutionProvider>` is
+/// cloned and stored in the `DeviceAllocator`. No mutex is involved — the
+/// EP pointer behind the `Arc` is always valid while being dereferenced,
+/// and concurrent use by the allocator, stream, transfer, and any `OrtEp`
+/// does not contend on a lock.
 unsafe extern "C" fn factory_create_allocator(
     factory: *mut ort::OrtEpFactory,
     memory_info: *const ort::OrtMemoryInfo,
@@ -764,8 +784,8 @@ unsafe extern "C" fn factory_is_stream_aware(factory: *const ort::OrtEpFactory) 
 
 /// Creates data transfer for device EPs. CPU EPs don't need data transfer.
 ///
-/// **B1 fix:** When `shared_ep` is set, the `Arc` is cloned and stored in the
-/// `DeviceDataTransferFull`. The transfer locks the `Arc` on each use.
+/// **B1 fix:** When `shared_ep` is set, the `Arc<dyn ExecutionProvider>` is
+/// cloned and stored in the `DeviceDataTransferFull`. No mutex is involved.
 unsafe extern "C" fn factory_create_data_transfer(
     factory: *mut ort::OrtEpFactory,
     data_transfer: *mut *mut ort::OrtDataTransferImpl,
@@ -846,8 +866,8 @@ unsafe extern "C" fn factory_create_data_transfer(
 /// Creates a sync stream. For non-stream-aware EPs (CPU), returns null (no-op).
 /// For stream-aware EPs (GPU/NPU), creates a DeviceSyncStream.
 ///
-/// **B1 fix:** When `shared_ep` is set, the `Arc` is cloned and stored in the
-/// `DeviceSyncStream`. The stream locks the `Arc` on each use.
+/// **B1 fix:** When `shared_ep` is set, the `Arc<dyn ExecutionProvider>` is
+/// cloned and stored in the `DeviceSyncStream`. No mutex is involved.
 unsafe extern "C" fn factory_create_sync_stream(
     factory: *mut ort::OrtEpFactory,
     _memory_device: *const ort::OrtMemoryDevice,

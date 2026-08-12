@@ -142,11 +142,11 @@ fn cuda_plugin_exports_create_and_release_symbols() {
     eprintln!("✓ cuda_plugin_exports_create_and_release_symbols: both ABI symbols present");
 }
 
-// ─── B1 regression: EP outliving the MutexGuard ──────────────────────────────
+// ─── B1 regression: EP outliving the original Arc reference ─────────────────
 
 /// Verify that creating a shared-EP-backed allocator does not produce a
 /// dangling pointer. The allocator must hold a strong `Arc` reference to the
-/// EP, not a raw pointer extracted from a dropped `MutexGuard`.
+/// EP, so it stays valid even after the factory's own `Arc` clone is dropped.
 ///
 /// This test exercises the ownership model: the allocator works correctly even
 /// after the original `Arc` clone is dropped (simulating the factory releasing
@@ -154,7 +154,7 @@ fn cuda_plugin_exports_create_and_release_symbols() {
 #[test]
 fn shared_ep_allocator_outlives_original_arc() {
     use onnx_runtime_ep_plugin::device::DeviceAllocator;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     // Minimal mock EP for allocation testing.
     struct AllocEp;
@@ -247,8 +247,8 @@ fn shared_ep_allocator_outlives_original_arc() {
         }
     }
 
-    let ep: Box<dyn onnx_runtime_ep_api::provider::ExecutionProvider + Send> = Box::new(AllocEp);
-    let shared = Arc::new(Mutex::new(ep));
+    let ep: Box<dyn onnx_runtime_ep_api::provider::ExecutionProvider> = Box::new(AllocEp);
+    let shared: Arc<dyn onnx_runtime_ep_api::provider::ExecutionProvider> = Arc::from(ep);
 
     // Create allocator with a clone of the Arc.
     let alloc = unsafe { DeviceAllocator::new_shared(Arc::clone(&shared), ptr::null()) };

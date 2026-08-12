@@ -6,6 +6,7 @@
 use std::collections::HashSet;
 use std::panic::AssertUnwindSafe;
 use std::ptr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use onnx_genai_ort_sys as ort;
@@ -60,7 +61,14 @@ pub struct ExportedEp {
     /// The vtable ORT reads through the `OrtEp*` pointer.
     pub vtable: ort::OrtEp,
     /// The Rust EP instance.
-    pub ep: Box<dyn ExecutionProvider>,
+    ///
+    /// Held as `Arc<dyn ExecutionProvider>` (not `Box`) so a single runtime
+    /// instance can be shared with the allocator, sync stream, and data
+    /// transfer surfaces created by the same factory (see
+    /// `ExportedFactory::shared_ep`). For non-shared (e.g. CPU) EPs, this is
+    /// simply an `Arc` with a strong count of 1, constructed fresh per
+    /// `CreateEp` call — behaviourally identical to the old `Box` ownership.
+    pub ep: Arc<dyn ExecutionProvider>,
     /// EP name kept alive for `GetName` callback.
     pub name_cstr: std::ffi::CString,
     /// ORT kernel registry built from [`KernelRegistryEntry`] slices.
@@ -110,7 +118,7 @@ impl Drop for OrtKernelRegistryHolder {
 }
 
 impl ExportedEp {
-    pub fn new(ep: Box<dyn ExecutionProvider>) -> Self {
+    pub fn new(ep: Arc<dyn ExecutionProvider>) -> Self {
         Self::new_with_registry(ep, None)
     }
 
@@ -121,7 +129,7 @@ impl ExportedEp {
     /// and ORT assumes all types are handled (per header: "If set to NULL, ORT
     /// assumes the EP compiles nodes").
     pub fn new_with_registry(
-        ep: Box<dyn ExecutionProvider>,
+        ep: Arc<dyn ExecutionProvider>,
         registry: Option<OrtKernelRegistryHolder>,
     ) -> Self {
         Self::new_with_registry_and_entries(ep, registry, Vec::new())
@@ -133,8 +141,14 @@ impl ExportedEp {
     /// `entries` are the same descriptors used to build `registry`. Keeping
     /// them here ensures the claim predicate and the advertised type constraints
     /// agree **by construction** — no independently maintained list to drift.
+    ///
+    /// `ep` is an `Arc<dyn ExecutionProvider>` so the same runtime instance
+    /// can be shared with the factory's allocator/stream/data-transfer
+    /// surfaces (device EPs like CUDA) or be a freshly-constructed,
+    /// exclusively-owned instance (CPU EP path) — both are represented
+    /// uniformly.
     pub fn new_with_registry_and_entries(
-        ep: Box<dyn ExecutionProvider>,
+        ep: Arc<dyn ExecutionProvider>,
         registry: Option<OrtKernelRegistryHolder>,
         entries: Vec<KernelRegistryEntry>,
     ) -> Self {
