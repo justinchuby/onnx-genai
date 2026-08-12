@@ -56,6 +56,101 @@
       ],
       "type": "string"
     },
+    "AdapterComponentContract": {
+      "description": "Stable semantic roles for versioned runtime adapter ABIs.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "$ref": "#/$defs/GrammarGuidanceAction"
+            },
+            "consumed_length": {
+              "type": "string"
+            },
+            "effect": {
+              "type": "string"
+            },
+            "forced_length": {
+              "type": "string"
+            },
+            "forced_tokens": {
+              "type": "string"
+            },
+            "logits_mask": {
+              "type": "string"
+            },
+            "next_state": {
+              "type": "string"
+            },
+            "role": {
+              "const": "grammar_guidance",
+              "type": "string"
+            },
+            "state": {
+              "type": "string"
+            },
+            "tokens": {
+              "type": "string"
+            },
+            "transition_table": {
+              "type": "string"
+            },
+            "valid_length": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "role",
+            "action",
+            "state",
+            "tokens",
+            "valid_length",
+            "transition_table",
+            "next_state",
+            "consumed_length",
+            "logits_mask",
+            "forced_tokens",
+            "forced_length",
+            "effect"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "$ref": "#/$defs/TelemetryAction"
+            },
+            "duration_ms": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "effect": {
+              "type": "string"
+            },
+            "role": {
+              "const": "telemetry",
+              "type": "string"
+            },
+            "timestamp": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "role",
+            "action",
+            "effect"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "AttentionConfig": {
       "description": "Build-time attention architecture and dimensions.",
       "properties": {
@@ -561,6 +656,14 @@
         }
       },
       "type": "object"
+    },
+    "GrammarGuidanceAction": {
+      "enum": [
+        "clone",
+        "lookahead",
+        "commit"
+      ],
+      "type": "string"
     },
     "HardwareRequirements": {
       "description": "Model-side hardware requirements and distribution-matching hints.",
@@ -2372,6 +2475,63 @@
             "effect"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "accepted": {
+              "type": "string"
+            },
+            "committed_tokens": {
+              "type": "string"
+            },
+            "current_k": {
+              "type": "string"
+            },
+            "draft_ms": {
+              "type": "string"
+            },
+            "effect": {
+              "type": "string"
+            },
+            "estimates": {
+              "type": "string"
+            },
+            "evaluated": {
+              "type": "string"
+            },
+            "filled_proposal_budget": {
+              "type": "string"
+            },
+            "next_estimates": {
+              "type": "string"
+            },
+            "next_k": {
+              "type": "string"
+            },
+            "role": {
+              "const": "adaptive_proposal_budget",
+              "type": "string"
+            },
+            "target_ms": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "role",
+            "current_k",
+            "accepted",
+            "evaluated",
+            "committed_tokens",
+            "filled_proposal_budget",
+            "draft_ms",
+            "target_ms",
+            "estimates",
+            "next_k",
+            "next_estimates",
+            "effect"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -3569,6 +3729,13 @@
       },
       "type": "object"
     },
+    "TelemetryAction": {
+      "enum": [
+        "start",
+        "elapsed"
+      ],
+      "type": "string"
+    },
     "TensorContract": {
       "additionalProperties": false,
       "description": "Typed tensor contract used at package and component boundaries.",
@@ -3840,6 +4007,16 @@
     "WorkflowComponent": {
       "additionalProperties": false,
       "properties": {
+        "adapter": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AdapterComponentContract"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "effects": {
           "default": [],
           "items": {
@@ -4455,6 +4632,10 @@
     "WorkflowStateCell": {
       "additionalProperties": false,
       "properties": {
+        "class": {
+          "$ref": "#/$defs/WorkflowStateClass",
+          "default": "semantic"
+        },
         "contract": {
           "$ref": "#/$defs/TensorContract"
         },
@@ -4485,6 +4666,13 @@
         "recurrence"
       ],
       "type": "object"
+    },
+    "WorkflowStateClass": {
+      "enum": [
+        "semantic",
+        "advisory"
+      ],
+      "type": "string"
     },
     "WorkflowStateScope": {
       "enum": [

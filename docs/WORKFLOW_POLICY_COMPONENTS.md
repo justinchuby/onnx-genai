@@ -86,6 +86,61 @@ components or separately versioned registered ABIs; the runtime does not infer
 semantics or provide model-specific host fallbacks. Public outputs should be
 emitted after the post-adapter invoke and declare `stage: post_adapter`.
 
+## Grammar guidance adapter
+
+Grammar is the versioned stateful adapter ABI
+`onnx-genai.grammar-guidance@1`, reusable by every workflow. Producers compile
+the grammar to a dense DFA transition tensor. The runtime adapter advances or
+clones semantic grammar state; it never samples or edits logits.
+
+Each grammar component declares `adapter.role: grammar_guidance` and one
+`action`: `clone`, `lookahead`, or `commit`.
+
+| Semantic port | Direction | Contract |
+|---|---|---|
+| `state` | input | `int64[B]`, current DFA state |
+| `tokens` | input | `int64[B,T]` |
+| `valid_length` | input | `int64[B]`, requested token prefix |
+| `transition_table` | input | `int64[S,V]`; `-1` is invalid, otherwise next state |
+| `next_state` | output | `int64[B]` |
+| `consumed_length` | output | `int64[B]`, valid prefix consumed |
+| `logits_mask` | output | `bool[B,V]` for the resulting state |
+| `forced_tokens` | output | `int64[B,1]` |
+| `forced_length` | output | `int64[B]`, zero or one |
+
+`clone` ignores tokens, copies the state, and emits guidance for that state;
+bind `valid_length` to an explicit zero tensor. `lookahead` advances a clone
+until the first invalid token and reports the consumed prefix without changing
+the committed cell. `commit` advances committed state and fails if any token in
+the requested prefix is invalid. Every action consumes and produces the
+declared grammar effect token.
+
+```yaml
+- kind: invoke
+  component: grammar_clone
+  inputs: { state: grammar.body, tokens: proposal.tokens,
+            valid_length: zero, transition_table: grammar.transitions }
+  outputs: { next_state: grammar.clone, consumed_length: clone.consumed,
+             logits_mask: clone.mask, forced_tokens: clone.forced,
+             forced_length: clone.forced_length }
+  effects: { grammar: { consumes: grammar.0, produces: grammar.clone_effect } }
+- kind: invoke
+  component: grammar_lookahead
+  inputs: { state: grammar.clone, tokens: proposal.tokens,
+            valid_length: proposal.length, transition_table: grammar.transitions }
+  outputs: { next_state: grammar.lookahead, consumed_length: grammar.valid_length,
+             logits_mask: grammar.lookahead_mask,
+             forced_tokens: grammar.lookahead_forced,
+             forced_length: grammar.lookahead_forced_length }
+  effects:
+    grammar: { consumes: grammar.clone_effect, produces: grammar.lookahead_effect }
+```
+
+An ONNX component combines `grammar.valid_length` with verifier acceptance,
+applies `logits_mask`, and honors `forced_tokens`. After verification, invoke
+`commit` from the original committed state with the final accepted prefix. There
+is no speculative-specific grammar runtime path.
+
 ## Token sampler
 
 `role: token_sampler`
@@ -241,6 +296,46 @@ effects: { verify: { consumes: verify.0, produces: verify.1 } }
 Acceptance and correction-token math belongs entirely to the artifact.
 `accepted_len` may also drive the generic serving service's row/KV bookkeeping.
 
+## Adaptive proposal budget
+
+`role: adaptive_proposal_budget` is ONNX policy math. It observes the same typed
+signals as adaptive speculative scheduling without introducing a host
+`AdaptiveKController`:
+
+| Semantic port | Direction | Contract |
+|---|---|---|
+| `current_k` | input | integer `[B]` |
+| `accepted` | input | integer `[B]` |
+| `evaluated` | input | integer `[B]` |
+| `committed_tokens` | input | integer `[B]` |
+| `filled_proposal_budget` | input | `bool[B]` |
+| `draft_ms`, `target_ms` | input | float `[B]` |
+| `estimates` | input | float `[B,K_slots]` advisory estimator state |
+| `next_k` | output | integer `[B]` |
+| `next_estimates` | output | same contract as `estimates` |
+
+The artifact may estimate per-K throughput and probe adjacent K values. Both
+`current_k` and `estimates` are loop-carried `class: advisory` state. They may
+control proposal work/budget only; they must not feed token selection, grammar,
+RNG, verifier acceptance, or any path that changes output correctness or
+distribution.
+
+```yaml
+kind: invoke
+component: adaptive_budget
+inputs: { current_k: proposal_k.body, accepted: verifier.accepted,
+          evaluated: verifier.evaluated, committed_tokens: committed.length,
+          filled_proposal_budget: proposal.filled, draft_ms: telemetry.draft_ms,
+          target_ms: telemetry.target_ms, estimates: adaptive.body }
+outputs: { next_k: proposal_k.next, next_estimates: adaptive.next }
+effects: { adaptive: { consumes: adaptive.0, produces: adaptive.1 } }
+```
+
+Timing may be supplied by the application or by the optional generic
+`onnx-genai.telemetry@1` adapter. `action: start` produces an `int64` scalar
+monotonic timestamp; `action: elapsed` consumes it and produces a `float32`
+scalar duration in milliseconds. Any batching/broadcast is explicit ONNX math.
+
 ### Runtime-length emission
 
 An `emit` may name `valid_length`, an integer scalar or rank-one SSA value. At
@@ -336,6 +431,20 @@ shrink between iterations, both the current and next extent must be at most the
 non-negative integer `max` SSA value, and dtype, rank, and every other axis remain
 invariant. Packages using it declare `bounded_state_recurrence`. The invoked
 component performs all truncation, gathering, or compaction.
+
+## Semantic and advisory state
+
+Every state cell declares `class`:
+
+- `semantic` (the default): KV, RNG, grammar, and any value that can affect
+  outputs. It participates in checkpoint/replay and may use invocation or
+  session scope. Session mutation remains lease-ordered.
+- `advisory`: telemetry-derived estimates and proposal budgets that affect only
+  work scheduling. Advisory cells must use invocation scope, reset on every
+  request, and are never serialized as session state.
+
+Both classes remain explicit loop-carried SSA with state read/write effects.
+Class does not authorize hidden host mutation.
 
 ## Conditional joins
 

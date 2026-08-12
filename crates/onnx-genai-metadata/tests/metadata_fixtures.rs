@@ -95,3 +95,46 @@ pipeline:
             .any(|error| error.contains("must be a scalar or rank-one tensor"))
     );
 }
+
+#[test]
+fn advisory_state_cannot_be_session_persistent() {
+    let metadata: InferenceMetadata = serde_yaml::from_str(
+        r#"
+pipeline:
+  workflow:
+    manifest:
+      ir_version: "1.0"
+      onnx_opsets: { ai.onnx: 24 }
+      capabilities: [workflow_ssa, linear_effects, advisory_state]
+    inputs:
+      estimate:
+        contract: { dtype: float32, rank: 1, shape: [batch] }
+        role: { kind: opaque }
+        source: { kind: application, name: estimate }
+        required: true
+    outputs: {}
+    components:
+      noop:
+        implementation: { kind: binding }
+        ports: {}
+    state:
+      estimate:
+        contract: { dtype: float32, rank: 1, shape: [batch] }
+        class: advisory
+        scope: session
+        initializer: estimate
+        recurrence: { kind: invariant }
+    graph:
+      kind: invoke
+      component: noop
+"#,
+    )
+    .expect("workflow metadata parses");
+    let errors = validate_metadata(&metadata).expect_err("advisory session state must fail");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("must use invocation scope")),
+        "{errors:?}"
+    );
+}
