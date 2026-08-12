@@ -149,10 +149,19 @@ jobs:
           skip-existing: true
 
   # ── nxrt-ep-cuda (EXPERIMENTAL) ────────────────────────────────────────────
-  # Fully independent of the cpu job. Built inside a CUDA 13 toolkit container so
-  # the `cuda` cargo feature compiles (no GPU needed to build). Gated on
-  # publish_cuda for PyPI upload, but the BUILD runs on every dispatch/tag so the
-  # wheel is always exercised.
+  # Fully independent of the cpu job. Uses the SAME PyPA manylinux image as the
+  # cpu job (it ships the /opt/python CPython builds cibuildwheel requires — the
+  # plain nvidia/cuda base image does NOT, which is why the earlier cuda build
+  # failed with "'/opt/python/cp310-cp310/bin/python' executable doesn't exist").
+  #
+  # No CUDA toolkit is installed: onnx-runtime-ep-cuda binds CUDA via cudarc's
+  # `dynamic-loading` feature, so `cargo build --features cuda` needs NO nvcc /
+  # toolkit and NO GPU — libcuda / cuBLASLt / nvrtc are dlopen'd at runtime. This
+  # was verified by building the plugin inside this exact manylinux image with no
+  # toolkit present (see .squad/decisions/inbox/sebastian-nxrt-ep-cuda-wheelfix.md).
+  # The before-all (clang-devel + Rust, in pyproject.toml) matches the cpu job.
+  # Gated on publish_cuda for PyPI upload, but the BUILD runs on every
+  # dispatch/tag so the wheel is always exercised.
   cuda:
     name: nxrt-ep-cuda wheel (${{ matrix.name }})
     strategy:
@@ -165,14 +174,15 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       CIBW_ARCHS: ${{ matrix.archs }}
-      # Build the manylinux wheel inside NVIDIA's CUDA 13 devel image so nvcc /
-      # the CUDA toolkit are present. It is manylinux_2_28-compatible (AlmaLinux
-      # 9 / glibc 2.34). auditwheel then repairs the wheel manylinux-compliant.
-      CIBW_MANYLINUX_X86_64_IMAGE: nvidia/cuda:13.0.0-devel-ubi9
-      CIBW_MANYLINUX_X86_64_MOUNT_HOST_DXCORE: "false"
-      # UBI9-based CUDA image installs deps via dnf (see cibuildwheel before-all
-      # in pyproject.toml). Exclude the CUDA runtime libs from the repaired wheel:
-      # they are provided by the nvidia-*-cu13 pip dependencies at runtime.
+      # Same image as the cpu job: it has the /opt/python CPython toolchains
+      # cibuildwheel needs. auditwheel then repairs the wheel manylinux-compliant.
+      CIBW_MANYLINUX_X86_64_IMAGE: quay.io/pypa/manylinux_2_28_x86_64:2026.07.25-1
+      # Defensive excludes: with cudarc dynamic-loading the built .so links NO
+      # CUDA libraries (verified: its only NEEDED entries are libc/libm/libdl/
+      # libgcc_s/libpthread), so auditwheel finds nothing to vendor and these
+      # never match. They are kept so the wheel stays CUDA-runtime-free even if a
+      # future kernel starts link-time-referencing a CUDA lib — those libs are
+      # provided by the nvidia-*-cu13 pip dependencies at runtime, not bundled.
       CIBW_REPAIR_WHEEL_COMMAND_LINUX: >-
         auditwheel repair
         --exclude libcudart.so.13 --exclude libcublas.so.13
@@ -195,20 +205,21 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
-      - name: Pull CUDA 13 manylinux image with retries
+      - name: Pull manylinux image with retries
         shell: bash
         run: |
           image="$CIBW_MANYLINUX_X86_64_IMAGE"
           for attempt in 1 2 3; do
             docker pull "$image" && exit 0
-            echo "CUDA manylinux image pull attempt $attempt failed"
+            echo "manylinux image pull attempt $attempt failed"
             sleep $((attempt * 10))
           done
           exit 1
 
-      # The CUDA EP dynamically loads CUDA, so compilation needs no GPU. Release
-      # promotion still requires CUDA-enabled runners to validate the driver /
-      # toolkit and the nvidia-*-cu13 dependency set end to end (issue #768).
+      # The CUDA EP binds CUDA via cudarc dynamic-loading, so compilation needs
+      # neither the CUDA toolkit nor a GPU (libs are dlopen'd at runtime). Release
+      # promotion still requires CUDA-enabled runners to validate the driver and
+      # the nvidia-*-cu13 dependency set end to end (issue #768).
       - name: Build and import-test nxrt-ep-cuda wheel
         uses: pypa/cibuildwheel@v4.1.0
         with:
