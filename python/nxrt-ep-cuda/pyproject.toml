@@ -36,14 +36,22 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 # CUDA 13 runtime NVIDIA libraries (mirrors crates/onnx-runtime-python's [cuda]
-# extra). These are always required for the CUDA EP to load at runtime; the CUDA
-# driver (libcuda.so.1) remains a host prerequisite. These wheels target
-# Linux/Windows only.
+# set). REQUIRED deps (not an extra): `pip install nxrt-ep-cuda` must pull them
+# so the EP's dlopen'd libs (libcudart / libcublas(+Lt) / libnvrtc / libcupti,
+# which auditwheel excludes from the wheel) resolve at runtime. The CUDA driver
+# (libcuda.so.1) remains a host prerequisite. These wheels target Linux/Windows.
+#
+# Use the UNSUFFIXED names: as of 2026-08-12 they ARE the real CUDA 13 wheels
+# (nvidia-cuda-runtime 13.3.29, nvidia-cublas 13.6.1.10, nvidia-cuda-nvrtc
+# 13.3.33, nvidia-cuda-cupti 13.3.75). The `-cu13`-suffixed names are only 0.0.1
+# placeholder stubs — do NOT use them. `>=13,<14` locks the CUDA 13 major so a
+# future CUDA 14 release under the same rolling name can't be pulled against our
+# CUDA-13-built cdylib.
 dependencies = [
-    "nvidia-cuda-runtime>=13",
-    "nvidia-cublas>=13",       # libcublas + libcublasLt (cuBLASLt MatMul)
-    "nvidia-cuda-nvrtc>=13",   # runtime NVRTC compilation of fused/pointwise kernels
-    "nvidia-cuda-cupti>=13",   # GPU kernel tracing
+    "nvidia-cuda-runtime>=13,<14",
+    "nvidia-cublas>=13,<14",       # libcublas + libcublasLt (cuBLASLt MatMul)
+    "nvidia-cuda-nvrtc>=13,<14",   # runtime NVRTC compilation of fused/pointwise kernels
+    "nvidia-cuda-cupti>=13,<14",   # GPU kernel tracing
 ]
 
 [project.optional-dependencies]
@@ -72,7 +80,9 @@ skip = "*-musllinux_*"
 test-command = 'python -c "import nxrt_ep_cuda, os; p=nxrt_ep_cuda.get_library_path(); assert os.path.exists(p), p; print(\"OK\", p)"'
 
 [tool.cibuildwheel.linux]
-# manylinux container needs libclang (bindgen) + Rust. The CUDA 13 toolkit is
-# provided by the workflow's container image (see publish-ep-plugins.yml).
+# manylinux container needs libclang (bindgen) + Rust. NO CUDA toolkit is
+# required: onnx-runtime-ep-cuda uses cudarc's `dynamic-loading`, so
+# `cargo build --features cuda` compiles without nvcc/headers and without a GPU
+# (CUDA libs are dlopen'd at runtime). Matches the nxrt-ep-cpu before-all.
 before-all = "dnf install -y clang-devel && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal"
 environment = { PATH = "$HOME/.cargo/bin:$PATH" }
