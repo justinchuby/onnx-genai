@@ -636,10 +636,22 @@ fn ep_compile_inner(
 
         // For multi-node fused subgraphs, construct the SubgraphRouting so
         // intermediates are threaded correctly in topological order.
-        if info.entries.len() > 1
-            && let Some(routing) = build_subgraph_routing(&view, ir_graph, reader.absent_outputs())
-        {
-            info.set_routing(routing);
+        // Fail at Compile (not Run) if the graph is unroutable — ORT can still
+        // fall back cleanly at this stage, whereas a Run-time failure is much
+        // harder for users to diagnose.
+        if info.entries.len() > 1 {
+            match build_subgraph_routing(&view, ir_graph, reader.absent_outputs()) {
+                Some(routing) => info.set_routing(routing),
+                None => {
+                    cleanup_partial_infos(out_infos, i);
+                    return fail_status(
+                        "Compile: multi-node subgraph has unroutable graph \
+                         (a node input is not reachable from graph inputs or \
+                         prior node outputs). Declining subgraph so ORT can \
+                         fall back.",
+                    );
+                }
+            }
         }
 
         let info_ptr = Box::into_raw(Box::new(info));

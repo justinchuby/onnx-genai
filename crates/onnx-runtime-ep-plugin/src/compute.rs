@@ -585,6 +585,25 @@ pub struct CompiledKernelEntry {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Scratch buffer sizing — single source of truth
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Compute the scratch buffer allocation size (in bytes) for an absent output slot.
+///
+/// Formula: `numel * max(byte_size_of(dtype), 8)`.  The `max(…, 8)` padding
+/// prevents a heap overflow when a kernel internally writes a wider type than
+/// the declared dtype (e.g. Float32 stats for an f16 SkipLayerNormalization).
+///
+/// **This function is the single authoritative implementation.**  Both the
+/// single-node and multi-node compute paths, as well as the canary tests, call
+/// it directly.  Duplicating the formula invites drift — and drift here means a
+/// heap overflow (the original B1 bug).
+pub fn scratch_alloc_bytes(numel: usize, dtype: DataType) -> usize {
+    let elem_bytes = dtype.byte_size().max(8);
+    numel * elem_bytes
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Multi-node subgraph routing
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -838,8 +857,7 @@ unsafe extern "C" fn compute_execute(
                             }
                         };
                         let numel: usize = shape.iter().product::<usize>().max(1);
-                        let elem_bytes = scratch_dtype.byte_size().max(8);
-                        let buf = vec![0u8; numel * elem_bytes];
+                        let buf = vec![0u8; scratch_alloc_bytes(numel, scratch_dtype)];
                         let idx = absent_scratch.len();
                         absent_scratch.push((out_slot, buf, scratch_dtype));
                         slot_kinds.push(RoutedSlotKind::Absent(idx));
@@ -1013,11 +1031,7 @@ unsafe extern "C" fn compute_execute(
                         }
                     };
                     let numel: usize = shape.iter().product::<usize>().max(1);
-                    // Use max(declared_byte_size, 8) to prevent overflow if the
-                    // kernel internally writes a wider type (e.g., Float32 stats
-                    // for f16 SkipLayerNormalization mean/inv_std_var).
-                    let elem_bytes = scratch_dtype.byte_size().max(8);
-                    let buf = vec![0u8; numel * elem_bytes];
+                    let buf = vec![0u8; scratch_alloc_bytes(numel, scratch_dtype)];
                     let idx = absent_bufs.len();
                     absent_bufs.push(buf);
                     absent_dtypes.push(scratch_dtype);
@@ -2799,21 +2813,14 @@ mod tests {
 
     // ── B1: Canary tests for scratch buffer sizing with f16/bf16 ──────────────
 
-    /// Production scratch allocation formula — mirrors `compute.rs` exactly.
-    /// `numel * max(byte_size, 8)` prevents overflow when kernels internally
-    /// write a wider type (e.g. Float32 stats for f16 SkipLayerNormalization).
-    fn production_scratch_alloc(numel: usize, dtype: DataType) -> usize {
-        let elem_bytes = dtype.byte_size().max(8);
-        numel * elem_bytes
-    }
-
-    /// Canary helper: allocate a buffer using the **production** sizing formula,
-    /// write `numel` elements at `write_byte_size` bytes each, and assert the
-    /// canary padding is intact. Returns `true` if canaries survived.
+    /// Canary helper: allocate a buffer using the **production** sizing formula
+    /// (`scratch_alloc_bytes`), write `numel` elements at `write_byte_size`
+    /// bytes each, and assert the canary padding is intact.
+    /// Returns `true` if canaries survived.
     fn canary_check(numel: usize, declared_dtype: DataType, write_byte_size: usize) -> bool {
         const CANARY: u8 = 0xCD;
         const CANARY_LEN: usize = 64;
-        let data_len = production_scratch_alloc(numel, declared_dtype);
+        let data_len = scratch_alloc_bytes(numel, declared_dtype);
         let total_len = CANARY_LEN + data_len + CANARY_LEN;
         let mut buf = vec![CANARY; total_len];
         buf[CANARY_LEN..CANARY_LEN + data_len].fill(0);
@@ -2897,5 +2904,59 @@ mod tests {
             assert_eq!(scratch_dtype, DataType::Float16);
             assert_eq!(scratch_dtype.byte_size(), 2);
         }
+    }
+
+    // ── validate_write_dtype exercised from compute tests ─────────────────────
+
+    /// Verify that `validate_write_dtype` rejects a write wider than the
+    /// scratch allocation permits (the `max(byte_size, 8)` padding).
+    #[test]
+    fn validate_write_dtype_rejects_overflow() {
+        use onnx_runtime_ep_api::tensor::{DevicePtrMut, TensorMut};
+        use onnx_runtime_ir::DeviceId;
+
+        let numel = 4usize;
+        let declared = DataType::Float16;
+        let buf_size = scratch_alloc_bytes(numel, declared);
+        let mut buf = vec![0u8; buf_size];
+        let shape = [numel];
+        let strides = [1i64];
+        let view = TensorMut::new(
+            DevicePtrMut(buf.as_mut_ptr().cast()),
+            declared,
+            &shape,
+            &strides,
+            DeviceId::cpu(),
+        )
+        .mark_absent();
+
+        // Same dtype — always OK.
+        assert!(view.validate_write_dtype(DataType::Float16).is_ok());
+        // Float32 (4 bytes) fits in max(2,8)=8 byte padding.
+        assert!(view.validate_write_dtype(DataType::Float32).is_ok());
+        // Float64 (8 bytes) fits in max(2,8)=8.
+        assert!(view.validate_write_dtype(DataType::Float64).is_ok());
+    }
+
+    /// Verify that `validate_write_dtype` accepts writes within padding for
+    /// present (non-absent) tensors only when dtype matches exactly.
+    #[test]
+    fn validate_write_dtype_present_requires_exact_match() {
+        use onnx_runtime_ep_api::tensor::{DevicePtrMut, TensorMut};
+        use onnx_runtime_ir::DeviceId;
+
+        let mut buf = vec![0u8; 32];
+        let shape = [4usize];
+        let strides = [1i64];
+        let view = TensorMut::new(
+            DevicePtrMut(buf.as_mut_ptr().cast()),
+            DataType::Float32,
+            &shape,
+            &strides,
+            DeviceId::cpu(),
+        );
+        // Not marked absent — exact dtype required.
+        assert!(view.validate_write_dtype(DataType::Float32).is_ok());
+        assert!(view.validate_write_dtype(DataType::Float16).is_err());
     }
 }
