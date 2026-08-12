@@ -136,6 +136,7 @@ pub fn admit_attachments(
 pub struct MultimodalInput {
     tensors: Vec<PreparedTensor>,
     image_summaries: Vec<ImageExpansionSummary>,
+    presence_keys: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -193,6 +194,7 @@ impl MultimodalInput {
                 .map(PreparedTensor::Image)
                 .collect(),
             image_summaries: bundle.images,
+            presence_keys: spec.presence_keys().to_vec(),
         })
     }
 
@@ -201,6 +203,7 @@ impl MultimodalInput {
         Ok(Self {
             tensors: vec![PreparedTensor::Audio(preprocess_wav(bytes, spec)?)],
             image_summaries: Vec::new(),
+            presence_keys: Vec::new(),
         })
     }
 
@@ -217,6 +220,7 @@ impl MultimodalInput {
                 spec,
             )?)],
             image_summaries: Vec::new(),
+            presence_keys: Vec::new(),
         })
     }
 
@@ -226,6 +230,7 @@ impl MultimodalInput {
         self,
         mut request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineGenerateRequest> {
+        let has_images = !self.image_summaries.is_empty();
         for (prompt_index, summary) in self.image_summaries.iter().enumerate() {
             if summary.image_index != prompt_index {
                 anyhow::bail!(
@@ -247,6 +252,11 @@ impl MultimodalInput {
                 );
             }
             request = request.with_input(endpoint, tensor.into_value()?);
+        }
+        if has_images {
+            for key in self.presence_keys {
+                request = request.with_presence(key);
+            }
         }
         Ok(request)
     }
@@ -523,7 +533,42 @@ fn build_vision(
          Why: preprocessing.image.outputs has no resolved content='pixels' endpoint with an expected dtype/shape. \
          How: declare a pixels output bound to the pipeline's primary image tensor input.",
     )?;
-    VisionInputSpec::from_program(bindings, &pixel_shape, program, vision).map(Some)
+    let presence_keys = image_presence_keys(directory, &bindings)?;
+    VisionInputSpec::from_program(bindings, &pixel_shape, program, vision, presence_keys).map(Some)
+}
+
+fn image_presence_keys(
+    directory: &PipelineModelDirectory,
+    bindings: &[VisionOutputBinding],
+) -> anyhow::Result<Vec<String>> {
+    let mut keys = std::collections::BTreeSet::new();
+    for binding in bindings {
+        let (component, input) = binding.endpoint.split_once('.').with_context(|| {
+            format!(
+                "image preprocessing endpoint '{}' is not component.input",
+                binding.endpoint
+            )
+        })?;
+        if let Some(key) = directory
+            .spec
+            .phases
+            .get(component)
+            .and_then(|phase| phase.when_present.as_ref())
+        {
+            keys.insert(key.clone());
+        }
+        if let Some(key) = directory
+            .spec
+            .models
+            .get(component)
+            .and_then(|model| model.io.as_ref())
+            .and_then(|io| io.optional_inputs.get(input))
+            .map(|optional| &optional.presence)
+        {
+            keys.insert(key.clone());
+        }
+    }
+    Ok(keys.into_iter().collect())
 }
 
 fn build_audio(
@@ -714,6 +759,36 @@ mod tests {
         assert!(ensure_placeholders(&spec, &mut prompt, 2).is_ok());
         // Without a declared placeholder the prompt is left untouched.
         assert_eq!(prompt, vec![10, 11]);
+    }
+
+    #[test]
+    fn binding_images_activates_the_image_presence_key() {
+        let input = MultimodalInput {
+            tensors: Vec::new(),
+            image_summaries: vec![ImageExpansionSummary {
+                image_index: 0,
+                original_size: (1, 1),
+                tile_grid: onnx_genai_preprocess::image::TileGrid {
+                    columns: 1,
+                    rows: 1,
+                },
+                tile_count: 1,
+                expansion_count: 1,
+                patch_grid: None,
+                spatial_merge_size: 1,
+                tensor_offset: 0,
+                tensor_length: 1,
+            }],
+            presence_keys: vec!["image_features".to_string()],
+        };
+        let request = input
+            .bind(PipelineGenerateRequest::new(
+                onnx_genai::GenerateRequest::new(onnx_genai::GeneratePrompt::TokenIds(vec![0])),
+            ))
+            .expect("image presence is bound");
+
+        assert!(request.present.contains("image_features"));
+        assert!(!request.present.contains("image"));
     }
 
     #[test]

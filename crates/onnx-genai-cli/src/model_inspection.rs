@@ -1,13 +1,35 @@
 use std::path::Path;
 
 use onnx_genai::metadata::load_metadata;
-use onnx_genai::ort::ModelDirectory;
+use onnx_genai::ort::{ModelDirectory, PipelineModelDirectory};
 use onnx_genai_server::from_models_dir;
 
 use super::resolve_model_dir;
 
 pub(super) fn show(model: &Path) -> anyhow::Result<()> {
     let model_dir = resolve_model_dir(model);
+    if let Some(directory) = PipelineModelDirectory::load_if_declared(&model_dir)? {
+        println!("model directory: {}", directory.root.display());
+        println!(
+            "pipeline:        {} component(s)",
+            directory.model_paths.len()
+        );
+        for (name, path) in &directory.model_paths {
+            println!("  {name}: {}", path.display());
+        }
+        match &directory.metadata_path {
+            Some(path) => println!("metadata:        {}", path.display()),
+            None => println!("metadata:        (compatibility config)"),
+        }
+        let genai_config = model_dir.join("genai_config.json");
+        if genai_config.is_file() {
+            println!("genai config:    {}", genai_config.display());
+        }
+        if let Some(metadata_path) = &directory.metadata_path {
+            show_metadata(metadata_path)?;
+        }
+        return Ok(());
+    }
     let directory = ModelDirectory::load(&model_dir)?;
 
     println!("model directory: {}", directory.root.display());
@@ -26,24 +48,29 @@ pub(super) fn show(model: &Path) -> anyhow::Result<()> {
     }
 
     if let Some(metadata_path) = &directory.metadata_path {
-        let metadata = load_metadata(metadata_path)?;
-        if !metadata.required_capabilities.is_empty() {
-            println!(
-                "capabilities:    {}",
-                metadata.required_capabilities.join(", ")
-            );
+        show_metadata(metadata_path)?;
+    }
+    Ok(())
+}
+
+fn show_metadata(metadata_path: &Path) -> anyhow::Result<()> {
+    let metadata = load_metadata(metadata_path)?;
+    if !metadata.required_capabilities.is_empty() {
+        println!(
+            "capabilities:    {}",
+            metadata.required_capabilities.join(", ")
+        );
+    }
+    if let Some(model_caps) = &metadata.model {
+        if let Some(max_len) = model_caps.max_sequence_length {
+            println!("max sequence:    {max_len}");
         }
-        if let Some(model_caps) = &metadata.model {
-            if let Some(max_len) = model_caps.max_sequence_length {
-                println!("max sequence:    {max_len}");
-            }
-            if let Some(attention) = &model_caps.attention {
-                println!("attention:       {attention:?}");
-            }
+        if let Some(attention) = &model_caps.attention {
+            println!("attention:       {attention:?}");
         }
-        if let Some(quantization) = &metadata.quantization {
-            println!("quantization:    {quantization:?}");
-        }
+    }
+    if let Some(quantization) = &metadata.quantization {
+        println!("quantization:    {quantization:?}");
     }
     Ok(())
 }

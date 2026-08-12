@@ -224,6 +224,16 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "PackedMultiHeadAttention"
+            && op.domain == "com.microsoft"
+            && let Some(reason) = crate::kernels::packed_multi_head_attention::unsupported_reason(
+                op,
+                shapes,
+                input_dtypes,
+            )
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if op.op_type == "ScatterND"
             && (op.domain.is_empty() || op.domain == "ai.onnx")
             && let Some(reason) =
