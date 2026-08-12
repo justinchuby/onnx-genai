@@ -607,8 +607,91 @@ impl PipelineEngine {
             anyhow::bail!("internal error: run_composite on a non-composite plan");
         };
         if let Some(workflow) = &plan.workflow {
-            let mut values = request.inputs;
-            self.run_workflow_node(&workflow.graph, workflow, &mut values)?;
+            let PipelineGenerateRequest {
+                request,
+                inputs,
+                present: _,
+                num_image_tiles: _,
+                iterative_overrides: _,
+                session_id,
+            } = request;
+            let mut values = self.bind_workflow_inputs(workflow, &request, inputs)?;
+            for (cell, state) in &workflow.state {
+                if state.scope != onnx_genai_metadata::WorkflowStateScope::Session {
+                    continue;
+                }
+                let session_id = session_id.as_ref().with_context(|| {
+                    format!("session-scoped workflow state '{cell}' requires a session id")
+                })?;
+                if let Some(value) = self
+                    .workflow_session_state
+                    .borrow()
+                    .get(&(session_id.clone(), cell.clone()))
+                {
+                    values.insert(state.initializer.clone(), clone_value(value)?);
+                }
+            }
+            let mut symbols = HashMap::new();
+            let dynamic_symbols = workflow
+                .state
+                .values()
+                .filter_map(|state| match &state.recurrence {
+                    onnx_genai_metadata::ShapeRecurrence::Growing { axis, .. } => state
+                        .contract
+                        .shape
+                        .as_ref()
+                        .and_then(|shape| shape.get(*axis))
+                        .and_then(|dimension| match dimension {
+                            TensorDimension::Symbol(symbol) => Some(symbol.clone()),
+                            TensorDimension::Fixed(_) => None,
+                        }),
+                    onnx_genai_metadata::ShapeRecurrence::Invariant => None,
+                })
+                .collect::<std::collections::HashSet<_>>();
+            for (name, input) in &workflow.inputs {
+                if let Some(value) = values.get(name) {
+                    validate_workflow_value(
+                        name,
+                        value,
+                        &input.contract,
+                        &mut symbols,
+                        &dynamic_symbols,
+                    )?;
+                }
+            }
+            let mut emit_counts = HashMap::new();
+            let mut final_state_refs = HashMap::new();
+            self.run_workflow_node(
+                &workflow.graph,
+                workflow,
+                &mut values,
+                &mut symbols,
+                &dynamic_symbols,
+                &mut emit_counts,
+                &mut final_state_refs,
+            )?;
+            if let Some(session_id) = session_id {
+                let mut updates = Vec::new();
+                for (cell, state) in &workflow.state {
+                    if state.scope != onnx_genai_metadata::WorkflowStateScope::Session {
+                        continue;
+                    }
+                    let value_ref = final_state_refs
+                        .get(cell)
+                        .map(String::as_str)
+                        .unwrap_or(&state.initializer);
+                    let value = values.get(value_ref).with_context(|| {
+                        format!(
+                            "session-scoped workflow state '{cell}' has no final value '{value_ref}'"
+                        )
+                    })?;
+                    updates.push(((session_id.clone(), cell.clone()), clone_value(value)?));
+                }
+                let mut session_state = self.workflow_session_state.borrow_mut();
+                for (key, value) in updates {
+                    session_state.insert(key, value);
+                }
+            }
             return Ok(values);
         }
         let present = request.present;
@@ -641,11 +724,23 @@ impl PipelineEngine {
         node: &WorkflowNode,
         workflow: &WorkflowSpec,
         values: &mut PipelineTensors,
+        symbols: &mut HashMap<String, i64>,
+        dynamic_symbols: &std::collections::HashSet<String>,
+        emit_counts: &mut HashMap<String, usize>,
+        final_state_refs: &mut HashMap<String, String>,
     ) -> anyhow::Result<()> {
         match node {
             WorkflowNode::Sequence { nodes } => {
                 for node in nodes {
-                    self.run_workflow_node(node, workflow, values)?;
+                    self.run_workflow_node(
+                        node,
+                        workflow,
+                        values,
+                        symbols,
+                        dynamic_symbols,
+                        emit_counts,
+                        final_state_refs,
+                    )?;
                 }
             }
             WorkflowNode::Invoke {
@@ -674,7 +769,25 @@ impl PipelineEngine {
                                              references unavailable value '{value}'"
                                         )
                                     })
-                                    .map(|tensor| (port.as_str(), tensor))
+                                    .and_then(|tensor| {
+                                        let contract =
+                                            declaration.ports.inputs.get(port).with_context(
+                                                || {
+                                                    format!(
+                                                        "workflow component '{component}' has no \
+                                                     declared input port '{port}'"
+                                                    )
+                                                },
+                                            )?;
+                                        validate_workflow_value(
+                                            value,
+                                            tensor,
+                                            contract,
+                                            symbols,
+                                            dynamic_symbols,
+                                        )?;
+                                        Ok((port.as_str(), tensor))
+                                    })
                             })
                             .collect::<anyhow::Result<Vec<_>>>()?;
                         let produced = session.run(&resolved)?;
@@ -684,6 +797,20 @@ impl PipelineEngine {
                                     "workflow component '{component}' output '{port}' has no SSA binding"
                                 )
                             })?;
+                            let contract =
+                                declaration.ports.outputs.get(port).with_context(|| {
+                                    format!(
+                                        "workflow component '{component}' has no declared output \
+                                         port '{port}'"
+                                    )
+                                })?;
+                            validate_workflow_value(
+                                value,
+                                &tensor,
+                                contract,
+                                symbols,
+                                dynamic_symbols,
+                            )?;
                             values.insert(value.clone(), tensor);
                         }
                     }
@@ -715,7 +842,18 @@ impl PipelineEngine {
                 max_iterations,
                 carried,
             } => {
-                self.run_workflow_node(setup, workflow, values)?;
+                self.run_workflow_node(
+                    setup,
+                    workflow,
+                    values,
+                    symbols,
+                    dynamic_symbols,
+                    emit_counts,
+                    final_state_refs,
+                )?;
+                for carry in carried {
+                    final_state_refs.insert(carry.cell.clone(), carry.current.clone());
+                }
                 let limit = workflow_scalar_usize(values, max_iterations)?;
                 for _ in 0..limit {
                     for carry in carried {
@@ -724,14 +862,30 @@ impl PipelineEngine {
                         })?;
                         values.insert(carry.body_input.clone(), clone_value(current)?);
                     }
-                    self.run_workflow_node(body, workflow, values)?;
+                    self.run_workflow_node(
+                        body,
+                        workflow,
+                        values,
+                        symbols,
+                        dynamic_symbols,
+                        emit_counts,
+                        final_state_refs,
+                    )?;
                     for carry in carried {
+                        let current = values.get(&carry.current).with_context(|| {
+                            format!("workflow loop value '{}' is unavailable", carry.current)
+                        })?;
                         let next = values.get(&carry.body_output).with_context(|| {
                             format!("workflow loop body did not produce '{}'", carry.body_output)
                         })?;
+                        let state = workflow.state.get(&carry.cell).with_context(|| {
+                            format!("workflow loop carries undeclared state '{}'", carry.cell)
+                        })?;
+                        validate_state_recurrence(&carry.cell, current, next, state, values)?;
                         let next_value = clone_value(next)?;
                         values.insert(carry.current.clone(), clone_value(&next_value)?);
                         values.insert(carry.next.clone(), next_value);
+                        final_state_refs.insert(carry.cell.clone(), carry.current.clone());
                     }
                     if !workflow_scalar_bool(values, condition)? {
                         break;
@@ -745,18 +899,68 @@ impl PipelineEngine {
             } => {
                 let key = workflow_scalar_key(values, predicate)?;
                 if let Some(case) = cases.get(&key) {
-                    self.run_workflow_node(case, workflow, values)?;
+                    self.run_workflow_node(
+                        case,
+                        workflow,
+                        values,
+                        symbols,
+                        dynamic_symbols,
+                        emit_counts,
+                        final_state_refs,
+                    )?;
                 } else if let Some(default) = default {
-                    self.run_workflow_node(default, workflow, values)?;
+                    self.run_workflow_node(
+                        default,
+                        workflow,
+                        values,
+                        symbols,
+                        dynamic_symbols,
+                        emit_counts,
+                        final_state_refs,
+                    )?;
                 } else {
                     anyhow::bail!("workflow branch has no case '{key}' and no default");
                 }
             }
-            WorkflowNode::Emit { value, output, .. } => {
+            WorkflowNode::Emit {
+                value,
+                output,
+                mode,
+                ..
+            } => {
                 let tensor = values
                     .get(value)
                     .with_context(|| format!("workflow emit value '{value}' is unavailable"))?;
-                values.insert(output.clone(), clone_value(tensor)?);
+                let output_contract = workflow.outputs.get(output).with_context(|| {
+                    format!("workflow emit references undeclared output '{output}'")
+                })?;
+                validate_workflow_value(
+                    value,
+                    tensor,
+                    &output_contract.contract,
+                    symbols,
+                    dynamic_symbols,
+                )?;
+                let emitted = clone_value(tensor)?;
+                match mode {
+                    WorkflowEmitMode::Replace => {
+                        values.insert(output.clone(), emitted);
+                    }
+                    WorkflowEmitMode::Append => {
+                        let appended = if let Some(previous) = values.get(output) {
+                            append_workflow_value(previous, &emitted)?
+                        } else {
+                            emitted
+                        };
+                        values.insert(output.clone(), appended);
+                    }
+                    WorkflowEmitMode::Event => {
+                        let index = emit_counts.entry(output.clone()).or_default();
+                        values.insert(format!("{output}.{index}"), clone_value(&emitted)?);
+                        *index += 1;
+                        values.insert(output.clone(), emitted);
+                    }
+                }
             }
             WorkflowNode::Transfer {
                 input,
@@ -775,6 +979,62 @@ impl PipelineEngine {
             }
         }
         Ok(())
+    }
+
+    fn bind_workflow_inputs(
+        &self,
+        workflow: &WorkflowSpec,
+        request: &GenerateRequest,
+        mut provided: PipelineTensors,
+    ) -> anyhow::Result<PipelineTensors> {
+        let mut values = HashMap::new();
+        for (name, input) in &workflow.inputs {
+            let supplied = provided.remove(name).or_else(|| match &input.source {
+                WorkflowInputSource::Application { name } => provided.remove(name),
+                _ => None,
+            });
+            let value = if let Some(value) = supplied {
+                Some(value)
+            } else {
+                match &input.source {
+                    WorkflowInputSource::Request { field } => {
+                        workflow_request_value(field, request, &input.contract)?
+                    }
+                    WorkflowInputSource::Literal => input
+                        .default
+                        .as_ref()
+                        .map(|value| workflow_literal_value(value, &input.contract))
+                        .transpose()?,
+                    WorkflowInputSource::Application { .. } => input
+                        .default
+                        .as_ref()
+                        .map(|value| workflow_literal_value(value, &input.contract))
+                        .transpose()?,
+                    WorkflowInputSource::Artifact { path } => {
+                        anyhow::bail!(
+                            "workflow input '{name}' requires artifact binding '{path}', which \
+                             is not a tensor request input"
+                        )
+                    }
+                }
+            };
+            match value {
+                Some(value) => {
+                    values.insert(name.clone(), value);
+                }
+                None if input.required => {
+                    anyhow::bail!("required workflow package input '{name}' was not supplied")
+                }
+                None => {}
+            }
+        }
+        if !provided.is_empty() {
+            anyhow::bail!(
+                "workflow request supplied undeclared application inputs: {:?}",
+                provided.keys().collect::<Vec<_>>()
+            );
+        }
+        Ok(values)
     }
 
     pub(crate) fn run_single_pass(
@@ -817,6 +1077,356 @@ impl PipelineEngine {
     }
 }
 
+fn workflow_request_value(
+    field: &RuntimeInputRole,
+    request: &GenerateRequest,
+    contract: &TensorContract,
+) -> anyhow::Result<Option<Value>> {
+    let scalar_i64 = |value: i64| {
+        let shape = scalar_or_batch_shape(contract)?;
+        Value::from_slice_i64(&vec![value; shape_numel(&shape)], &shape).map_err(Into::into)
+    };
+    let scalar_f32 = |value: f32| {
+        let shape = scalar_or_batch_shape(contract)?;
+        Value::from_slice_f32(&vec![value; shape_numel(&shape)], &shape).map_err(Into::into)
+    };
+    match field {
+        RuntimeInputRole::PromptTokens => match &request.prompt {
+            GeneratePrompt::TokenIds(tokens) => {
+                let data = tokens
+                    .iter()
+                    .map(|token| i64::from(*token))
+                    .collect::<Vec<_>>();
+                let shape = match contract.rank {
+                    1 => vec![data.len() as i64],
+                    2 => vec![1, data.len() as i64],
+                    rank => anyhow::bail!(
+                        "prompt token workflow input must have rank 1 or 2, got {rank}"
+                    ),
+                };
+                Ok(Some(Value::from_slice_i64(&data, &shape)?))
+            }
+            GeneratePrompt::Text(_) => anyhow::bail!(
+                "prompt_tokens request binding requires token ids; use a tokenizer adapter for text"
+            ),
+        },
+        RuntimeInputRole::PromptText => {
+            anyhow::bail!("prompt_text request binding requires a versioned tokenizer adapter")
+        }
+        RuntimeInputRole::MaxIterations | RuntimeInputRole::MaxOutputTokens => {
+            scalar_i64(request.options.max_new_tokens as i64).map(Some)
+        }
+        RuntimeInputRole::Seed => {
+            scalar_i64(request.options.seed.unwrap_or_default() as i64).map(Some)
+        }
+        RuntimeInputRole::SamplingTemperature => scalar_f32(request.options.temperature).map(Some),
+        RuntimeInputRole::SamplingTopK => scalar_i64(request.options.top_k as i64).map(Some),
+        RuntimeInputRole::SamplingTopP => scalar_f32(request.options.top_p).map(Some),
+        RuntimeInputRole::Media | RuntimeInputRole::Constraint | RuntimeInputRole::SessionId => {
+            Ok(None)
+        }
+    }
+}
+
+fn workflow_literal_value(
+    scalar: &ScalarValue,
+    contract: &TensorContract,
+) -> anyhow::Result<Value> {
+    let shape = literal_shape(contract)?;
+    let numel = shape_numel(&shape);
+    match scalar {
+        ScalarValue::Integer(value) => {
+            let (bytes, dtype) = match contract.dtype.as_str() {
+                "int64" => (value.to_le_bytes().repeat(numel), DataType::Int64),
+                "int32" => (
+                    i32::try_from(*value)
+                        .context("integer literal exceeds int32")?
+                        .to_le_bytes()
+                        .repeat(numel),
+                    DataType::Int32,
+                ),
+                "int16" => (
+                    i16::try_from(*value)
+                        .context("integer literal exceeds int16")?
+                        .to_le_bytes()
+                        .repeat(numel),
+                    DataType::Int16,
+                ),
+                "int8" => (
+                    vec![
+                        i8::try_from(*value).context("integer literal exceeds int8")? as u8;
+                        numel
+                    ],
+                    DataType::Int8,
+                ),
+                "uint64" => (
+                    u64::try_from(*value)
+                        .context("integer literal is negative")?
+                        .to_le_bytes()
+                        .repeat(numel),
+                    DataType::Uint64,
+                ),
+                "uint32" => (
+                    u32::try_from(*value)
+                        .context("integer literal exceeds uint32")?
+                        .to_le_bytes()
+                        .repeat(numel),
+                    DataType::Uint32,
+                ),
+                "uint16" => (
+                    u16::try_from(*value)
+                        .context("integer literal exceeds uint16")?
+                        .to_le_bytes()
+                        .repeat(numel),
+                    DataType::Uint16,
+                ),
+                "uint8" => (
+                    vec![u8::try_from(*value).context("integer literal exceeds uint8")?; numel],
+                    DataType::Uint8,
+                ),
+                _ => anyhow::bail!(
+                    "integer workflow literal is incompatible with declared dtype '{}'",
+                    contract.dtype
+                ),
+            };
+            Value::from_raw_bytes(bytes, &shape, dtype).map_err(Into::into)
+        }
+        ScalarValue::Float(value) => {
+            let (bytes, dtype) = match contract.dtype.as_str() {
+                "float32" | "fp32" => (
+                    (*value as f32).to_le_bytes().repeat(numel),
+                    DataType::Float32,
+                ),
+                "float16" | "fp16" => (
+                    half::f16::from_f64(*value)
+                        .to_bits()
+                        .to_le_bytes()
+                        .repeat(numel),
+                    DataType::Float16,
+                ),
+                "bfloat16" | "bf16" => (
+                    half::bf16::from_f64(*value)
+                        .to_bits()
+                        .to_le_bytes()
+                        .repeat(numel),
+                    DataType::BFloat16,
+                ),
+                _ => anyhow::bail!(
+                    "floating-point workflow literal is incompatible with declared dtype '{}'",
+                    contract.dtype
+                ),
+            };
+            Value::from_raw_bytes(bytes, &shape, dtype).map_err(Into::into)
+        }
+        ScalarValue::Bool(value) if contract.dtype == "bool" => {
+            Value::from_raw_bytes(vec![u8::from(*value); numel], &shape, DataType::Bool)
+                .map_err(Into::into)
+        }
+        ScalarValue::String(_) => {
+            anyhow::bail!("string literal workflow inputs require an adapter binding")
+        }
+        _ => anyhow::bail!(
+            "workflow literal is incompatible with declared dtype '{}'",
+            contract.dtype
+        ),
+    }
+}
+
+fn scalar_or_batch_shape(contract: &TensorContract) -> anyhow::Result<Vec<i64>> {
+    match contract.rank {
+        0 => Ok(Vec::new()),
+        1 => Ok(vec![1]),
+        rank => anyhow::bail!("request scalar binding requires rank 0 or 1, got {rank}"),
+    }
+}
+
+fn literal_shape(contract: &TensorContract) -> anyhow::Result<Vec<i64>> {
+    let Some(shape) = &contract.shape else {
+        if contract.rank == 0 {
+            return Ok(Vec::new());
+        }
+        anyhow::bail!("literal workflow input requires a fully declared shape");
+    };
+    shape
+        .iter()
+        .map(|dimension| match dimension {
+            TensorDimension::Fixed(value) => Ok(*value),
+            TensorDimension::Symbol(symbol) if symbol == "batch" => Ok(1),
+            TensorDimension::Symbol(symbol) => {
+                anyhow::bail!("literal workflow input has unresolved dimension '{symbol}'")
+            }
+        })
+        .collect()
+}
+
+fn shape_numel(shape: &[i64]) -> usize {
+    shape.iter().map(|dimension| *dimension as usize).product()
+}
+
+fn validate_workflow_value(
+    name: &str,
+    value: &Value,
+    contract: &TensorContract,
+    symbols: &mut HashMap<String, i64>,
+    dynamic_symbols: &std::collections::HashSet<String>,
+) -> anyhow::Result<()> {
+    let expected_dtype = match contract.dtype.as_str() {
+        "float32" | "fp32" => DataType::Float32,
+        "float16" | "fp16" => DataType::Float16,
+        "bfloat16" | "bf16" => DataType::BFloat16,
+        "int64" => DataType::Int64,
+        "int32" => DataType::Int32,
+        "int16" => DataType::Int16,
+        "int8" => DataType::Int8,
+        "uint64" => DataType::Uint64,
+        "uint32" => DataType::Uint32,
+        "uint16" => DataType::Uint16,
+        "uint8" => DataType::Uint8,
+        "bool" => DataType::Bool,
+        dtype => anyhow::bail!("workflow value '{name}' uses unsupported dtype '{dtype}'"),
+    };
+    if value.dtype() != expected_dtype {
+        anyhow::bail!(
+            "workflow value '{name}' has dtype {:?}, expected {}",
+            value.dtype(),
+            contract.dtype
+        );
+    }
+    if value.shape().len() != contract.rank {
+        anyhow::bail!(
+            "workflow value '{name}' has rank {}, expected {}",
+            value.shape().len(),
+            contract.rank
+        );
+    }
+    if let Some(shape) = &contract.shape {
+        for (axis, (declared, actual)) in shape.iter().zip(value.shape()).enumerate() {
+            match declared {
+                TensorDimension::Fixed(expected) if expected != actual => anyhow::bail!(
+                    "workflow value '{name}' axis {axis} is {actual}, expected {expected}"
+                ),
+                TensorDimension::Symbol(symbol) if dynamic_symbols.contains(symbol) => {}
+                TensorDimension::Symbol(symbol) => match symbols.get(symbol) {
+                    Some(expected) if expected != actual => anyhow::bail!(
+                        "workflow value '{name}' axis {axis} binds symbol '{symbol}' to {actual}, \
+                         but it was already {expected}"
+                    ),
+                    Some(_) => {}
+                    None => {
+                        symbols.insert(symbol.clone(), *actual);
+                    }
+                },
+                TensorDimension::Fixed(_) => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_state_recurrence(
+    cell: &str,
+    current: &Value,
+    next: &Value,
+    state: &onnx_genai_metadata::WorkflowStateCell,
+    values: &PipelineTensors,
+) -> anyhow::Result<()> {
+    if current.dtype() != next.dtype() || current.shape().len() != next.shape().len() {
+        anyhow::bail!("workflow state '{cell}' update must preserve dtype and rank");
+    }
+    match &state.recurrence {
+        onnx_genai_metadata::ShapeRecurrence::Invariant => {
+            if current.shape() != next.shape() {
+                anyhow::bail!(
+                    "workflow state '{cell}' is invariant but changed shape from {:?} to {:?}",
+                    current.shape(),
+                    next.shape()
+                );
+            }
+        }
+        onnx_genai_metadata::ShapeRecurrence::Growing {
+            axis,
+            increment,
+            max,
+        } => {
+            for (index, (before, after)) in current.shape().iter().zip(next.shape()).enumerate() {
+                if index != *axis && before != after {
+                    anyhow::bail!(
+                        "workflow state '{cell}' changed non-growing axis {index} from {before} \
+                         to {after}"
+                    );
+                }
+            }
+            let growth = i64::try_from(workflow_scalar_usize(values, increment)?)
+                .context("workflow state growth increment exceeds i64")?;
+            let limit = i64::try_from(workflow_scalar_usize(values, max)?)
+                .context("workflow state growth limit exceeds i64")?;
+            let before = *current.shape().get(*axis).with_context(|| {
+                format!("workflow state '{cell}' grows outside its tensor rank")
+            })?;
+            let after = *next.shape().get(*axis).with_context(|| {
+                format!("workflow state '{cell}' grows outside its tensor rank")
+            })?;
+            let expected = before
+                .checked_add(growth)
+                .with_context(|| format!("workflow state '{cell}' shape growth overflowed"))?;
+            if after != expected {
+                anyhow::bail!(
+                    "workflow state '{cell}' growing axis {axis} changed from {before} to {after}, \
+                     expected {expected}"
+                );
+            }
+            if after > limit {
+                anyhow::bail!(
+                    "workflow state '{cell}' growing axis {axis} reached {after}, above maximum \
+                     {limit}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn append_workflow_value(previous: &Value, next: &Value) -> anyhow::Result<Value> {
+    if previous.dtype() != next.dtype() || previous.shape().len() != next.shape().len() {
+        anyhow::bail!("workflow append emit requires matching dtype and rank");
+    }
+    let mut shape = previous.shape().to_vec();
+    let Some(last) = shape.last_mut() else {
+        anyhow::bail!("workflow append emit requires rank >= 1");
+    };
+    for (left, right) in previous
+        .shape()
+        .iter()
+        .zip(next.shape())
+        .take(previous.shape().len() - 1)
+    {
+        if left != right {
+            anyhow::bail!("workflow append emit requires equal non-appended dimensions");
+        }
+    }
+    let left_width = *last as usize;
+    let right_width = next.shape().last().copied().unwrap_or_default() as usize;
+    let outer = previous.shape()[..previous.shape().len() - 1]
+        .iter()
+        .map(|dimension| *dimension as usize)
+        .product::<usize>();
+    *last += right_width as i64;
+    let dtype = previous.dtype();
+    let element_size = dtype.size_of();
+    let left = previous.to_raw_bytes()?;
+    let right = next.to_raw_bytes()?;
+    let mut data = Vec::with_capacity(left.len() + right.len());
+    for row in 0..outer {
+        data.extend_from_slice(
+            &left[row * left_width * element_size..(row + 1) * left_width * element_size],
+        );
+        data.extend_from_slice(
+            &right[row * right_width * element_size..(row + 1) * right_width * element_size],
+        );
+    }
+    Value::from_raw_bytes(data, &shape, dtype).map_err(Into::into)
+}
+
 fn workflow_scalar_usize(values: &PipelineTensors, name: &str) -> anyhow::Result<usize> {
     let value = values
         .get(name)
@@ -824,11 +1434,10 @@ fn workflow_scalar_usize(values: &PipelineTensors, name: &str) -> anyhow::Result
     let data = value
         .to_vec_i64()
         .with_context(|| format!("workflow scalar '{name}' must be an integer tensor"))?;
-    let scalar = data
-        .first()
-        .copied()
-        .context("workflow scalar tensor must contain one value")?;
-    usize::try_from(scalar)
+    let [scalar] = data.as_slice() else {
+        anyhow::bail!("workflow scalar '{name}' must contain exactly one value");
+    };
+    usize::try_from(*scalar)
         .with_context(|| format!("workflow scalar '{name}' must be non-negative"))
 }
 
@@ -837,18 +1446,20 @@ fn workflow_scalar_bool(values: &PipelineTensors, name: &str) -> anyhow::Result<
         .get(name)
         .with_context(|| format!("workflow predicate value '{name}' is unavailable"))?;
     match value.dtype() {
-        DataType::Bool => value
-            .to_raw_bytes()?
-            .first()
-            .copied()
-            .map(|value| value != 0)
-            .context("workflow bool predicate tensor must contain one value"),
-        _ => value
-            .to_vec_i64()?
-            .first()
-            .copied()
-            .map(|value| value != 0)
-            .context("workflow integer predicate tensor must contain one value"),
+        DataType::Bool => {
+            let data = value.to_raw_bytes()?;
+            let [scalar] = data.as_slice() else {
+                anyhow::bail!("workflow bool predicate '{name}' must contain exactly one value");
+            };
+            Ok(*scalar != 0)
+        }
+        _ => {
+            let data = value.to_vec_i64()?;
+            let [scalar] = data.as_slice() else {
+                anyhow::bail!("workflow integer predicate '{name}' must contain exactly one value");
+            };
+            Ok(*scalar != 0)
+        }
     }
 }
 
@@ -859,12 +1470,106 @@ fn workflow_scalar_key(values: &PipelineTensors, name: &str) -> anyhow::Result<S
     if value.dtype() == DataType::Bool {
         return Ok(workflow_scalar_bool(values, name)?.to_string());
     }
-    value
-        .to_vec_i64()?
-        .first()
-        .copied()
-        .map(|value| value.to_string())
-        .context("workflow branch tensor must contain one bool or integer value")
+    let data = value.to_vec_i64()?;
+    let [scalar] = data.as_slice() else {
+        anyhow::bail!("workflow branch tensor '{name}' must contain exactly one value");
+    };
+    Ok(scalar.to_string())
+}
+
+#[cfg(test)]
+mod workflow_scalar_tests {
+    use super::*;
+
+    #[test]
+    fn batched_predicate_is_not_silently_reduced() {
+        let mut values = PipelineTensors::new();
+        values.insert(
+            "done".to_string(),
+            Value::from_raw_bytes(vec![0, 1], &[2], DataType::Bool).expect("bool tensor"),
+        );
+
+        let error = workflow_scalar_bool(&values, "done").expect_err("batched predicate fails");
+        assert!(error.to_string().contains("exactly one value"));
+    }
+
+    #[test]
+    fn batched_branch_key_is_not_silently_reduced() {
+        let mut values = PipelineTensors::new();
+        values.insert(
+            "case".to_string(),
+            Value::from_slice_i64(&[0, 1], &[2]).expect("integer tensor"),
+        );
+
+        let error = workflow_scalar_key(&values, "case").expect_err("batched branch key fails");
+        assert!(error.to_string().contains("exactly one value"));
+    }
+
+    #[test]
+    fn growing_state_uses_recurrence_instead_of_freezing_its_symbol() {
+        let contract: TensorContract =
+            serde_yaml::from_str("{ dtype: int64, rank: 2, shape: [batch, sequence] }")
+                .expect("contract");
+        let mut symbols = HashMap::new();
+        let dynamic_symbols = std::collections::HashSet::from(["sequence".to_string()]);
+        let current = Value::from_slice_i64(&[1, 2], &[1, 2]).expect("current");
+        let next = Value::from_slice_i64(&[1, 2, 3], &[1, 3]).expect("next");
+        validate_workflow_value(
+            "current",
+            &current,
+            &contract,
+            &mut symbols,
+            &dynamic_symbols,
+        )
+        .expect("current contract");
+        validate_workflow_value("next", &next, &contract, &mut symbols, &dynamic_symbols)
+            .expect("growing symbol remains dynamic");
+
+        let state: onnx_genai_metadata::WorkflowStateCell = serde_yaml::from_str(
+            r#"
+contract: { dtype: int64, rank: 2, shape: [batch, sequence] }
+scope: invocation
+initializer: initial
+recurrence: { kind: growing, axis: 1, increment: accepted, max: max_context }
+"#,
+        )
+        .expect("state");
+        let mut values = PipelineTensors::new();
+        values.insert(
+            "accepted".to_string(),
+            Value::from_slice_i64(&[1], &[]).expect("increment"),
+        );
+        values.insert(
+            "max_context".to_string(),
+            Value::from_slice_i64(&[4], &[]).expect("limit"),
+        );
+        validate_state_recurrence("tokens", &current, &next, &state, &values)
+            .expect("bounded growth validates");
+
+        let invalid = Value::from_slice_i64(&[1, 2, 3, 4], &[1, 4]).expect("invalid next");
+        let error = validate_state_recurrence("tokens", &current, &invalid, &state, &values)
+            .expect_err("wrong increment fails");
+        assert!(error.to_string().contains("expected 3"));
+    }
+
+    #[test]
+    fn literals_and_append_support_declared_runtime_dtypes() {
+        let int_contract: TensorContract =
+            serde_yaml::from_str("{ dtype: int16, rank: 1, shape: [2] }").expect("contract");
+        let integer =
+            workflow_literal_value(&ScalarValue::Integer(7), &int_contract).expect("int16 literal");
+        assert_eq!(integer.dtype(), DataType::Int16);
+
+        let half_contract: TensorContract =
+            serde_yaml::from_str("{ dtype: float16, rank: 1, shape: [2] }").expect("contract");
+        let left =
+            workflow_literal_value(&ScalarValue::Float(1.0), &half_contract).expect("half literal");
+        let right =
+            workflow_literal_value(&ScalarValue::Float(2.0), &half_contract).expect("half literal");
+        let appended = append_workflow_value(&left, &right).expect("half append");
+        assert_eq!(appended.dtype(), DataType::Float16);
+        assert_eq!(appended.shape(), &[4]);
+    }
 }
 
 /// Dump one iterative step's loop-carried tensor to `ONNX_GENAI_STEP_DUMP_DIR`

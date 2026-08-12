@@ -98,6 +98,20 @@ fn validate_workflow_signatures(
                         signature.rank()
                     )));
                 }
+                if let Some(shape) = &contract.shape {
+                    for (axis, (declared, actual)) in shape.iter().zip(&signature.shape).enumerate()
+                    {
+                        if let (TensorDimension::Fixed(declared), PortDimension::Static(actual)) =
+                            (declared, actual)
+                            && usize::try_from(*declared).ok() != Some(*actual)
+                        {
+                            return Err(OrtError::InvalidArgument(format!(
+                                "workflow component '{component}' {direction} '{port}' axis \
+                                 {axis} declares {declared}, but the ONNX graph exposes {actual}"
+                            )));
+                        }
+                    }
+                }
             }
             for port in actual.keys() {
                 if !declared.contains_key(port) {
