@@ -548,6 +548,8 @@ pub fn validate_stream_request(support: &DeviceSupport) -> *mut ort::OrtStatus {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use onnx_runtime_ep_api::{EpError, Kernel, KernelMatch, Result as EpResult};
     use onnx_runtime_ir::{DataType, DeviceId, DeviceType, Node, Shape, TensorLayout};
@@ -1006,8 +1008,6 @@ mod tests {
 
     #[test]
     fn stream_release_reclaims_owned_ep_no_leak() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
         static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
 
         /// An EP whose Drop increments a counter, proving the EP is reclaimed.
@@ -1201,5 +1201,183 @@ mod tests {
 
         let gpu = DeviceSupport::gpu("Cuda", 0x10DE);
         assert!(gpu.stream_aware, "GPU EP must be stream-aware");
+    }
+
+    // ─── Size-zero normalisation at the adapter boundary ─────────────────────
+
+    /// An EP whose allocator rejects a zero-byte request, exactly like a
+    /// hardened CUDA allocator that refuses `cudaMalloc(0)`. If the adapter
+    /// ever stops normalising, `Alloc(0)` starts returning null and every
+    /// empty-tensor model breaks.
+    struct ZeroHostileEp {
+        zero_requests: AtomicUsize,
+    }
+
+    impl ExecutionProvider for ZeroHostileEp {
+        fn name(&self) -> &str {
+            "zero_hostile_ep"
+        }
+        fn device_type(&self) -> DeviceType {
+            DeviceType::Cuda
+        }
+        fn device_id(&self) -> DeviceId {
+            DeviceId::cuda(0)
+        }
+        fn initialize(
+            &mut self,
+            _config: &onnx_runtime_ep_api::provider::EpConfig,
+        ) -> EpResult<()> {
+            Ok(())
+        }
+        fn shutdown(&mut self) -> EpResult<()> {
+            Ok(())
+        }
+        fn supports_op(
+            &self,
+            _op: &Node,
+            _opset: u64,
+            _shapes: &[Shape],
+            _input_dtypes: &[DataType],
+            _layouts: &[TensorLayout],
+        ) -> KernelMatch {
+            KernelMatch::Unsupported {
+                reason: "mock".into(),
+            }
+        }
+        fn get_kernel(
+            &self,
+            _op: &Node,
+            _shapes: &[Vec<usize>],
+            _opset: u64,
+        ) -> EpResult<Box<dyn Kernel>> {
+            Err(EpError::KernelFailed("mock".into()))
+        }
+
+        fn allocate(
+            &self,
+            size: usize,
+            _alignment: usize,
+        ) -> EpResult<onnx_runtime_ep_api::provider::DeviceBuffer> {
+            if size == 0 {
+                self.zero_requests.fetch_add(1, Ordering::SeqCst);
+                return Err(EpError::OutOfMemory {
+                    requested: 0,
+                    available: 0,
+                });
+            }
+            let layout = std::alloc::Layout::from_size_align(size, 16).unwrap();
+            let ptr = unsafe { std::alloc::alloc(layout) };
+            if ptr.is_null() {
+                return Err(EpError::OutOfMemory {
+                    requested: size,
+                    available: 0,
+                });
+            }
+            Ok(unsafe {
+                onnx_runtime_ep_api::provider::DeviceBuffer::from_raw_parts(
+                    ptr.cast(),
+                    DeviceId::cuda(0),
+                    size,
+                    16,
+                )
+            })
+        }
+
+        fn deallocate(&self, buffer: onnx_runtime_ep_api::provider::DeviceBuffer) -> EpResult<()> {
+            let ptr = buffer.as_ptr();
+            let size = buffer.len();
+            assert_ne!(
+                size, 0,
+                "Free must return the normalised size the EP was given, never 0"
+            );
+            if !ptr.is_null() {
+                let layout = std::alloc::Layout::from_size_align(size, 16).unwrap();
+                unsafe { std::alloc::dealloc(ptr as *mut u8, layout) };
+            }
+            Ok(())
+        }
+
+        fn copy(
+            &self,
+            _src: &onnx_runtime_ep_api::provider::DeviceBuffer,
+            _dst: &mut onnx_runtime_ep_api::provider::DeviceBuffer,
+            _size: usize,
+        ) -> EpResult<()> {
+            Ok(())
+        }
+        fn copy_async(
+            &self,
+            _src: &onnx_runtime_ep_api::provider::DeviceBuffer,
+            _dst: &mut onnx_runtime_ep_api::provider::DeviceBuffer,
+            _size: usize,
+        ) -> EpResult<onnx_runtime_ep_api::provider::Fence> {
+            Ok(onnx_runtime_ep_api::provider::Fence::signalled())
+        }
+        fn sync(&self) -> EpResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn normalize_alloc_size_only_rewrites_zero() {
+        assert_eq!(normalize_alloc_size(0), ZERO_SIZE_ALLOC_BYTES);
+        assert_eq!(normalize_alloc_size(1), 1);
+        assert_eq!(normalize_alloc_size(4096), 4096);
+        const {
+            assert!(
+                ZERO_SIZE_ALLOC_BYTES > 0,
+                "the normalised size must be allocatable"
+            )
+        };
+    }
+
+    /// `Alloc(0)` must return a unique, non-null, freeable pointer even when
+    /// the backing allocator refuses zero-byte requests — the adapter, not the
+    /// allocator, owns this normalisation.
+    #[test]
+    fn zero_size_alloc_is_normalised_at_the_adapter_boundary() {
+        let ep = ZeroHostileEp {
+            zero_requests: AtomicUsize::new(0),
+        };
+        let ep_ptr = Box::into_raw(Box::new(ep) as Box<dyn ExecutionProvider>);
+        let alloc = unsafe { DeviceAllocator::new_owned(ep_ptr, ptr::null()) };
+        let alloc_ptr = Box::into_raw(alloc);
+
+        let a = unsafe { device_alloc(alloc_ptr.cast(), 0) };
+        let b = unsafe { device_alloc(alloc_ptr.cast(), 0) };
+        assert!(
+            !a.is_null() && !b.is_null(),
+            "Alloc(0) must not return null — an alternate CUDA allocator that \
+             rejects cudaMalloc(0) must not be able to regress this"
+        );
+        assert_ne!(a, b, "distinct zero-size allocations must not alias");
+
+        // `deallocate` asserts the size is non-zero, so this also proves Free
+        // returns the normalised size rather than the caller's 0.
+        unsafe { device_free(alloc_ptr.cast(), a) };
+        unsafe { device_free(alloc_ptr.cast(), b) };
+
+        unsafe { drop(Box::from_raw(alloc_ptr)) };
+    }
+
+    /// A non-zero request must be passed through untouched.
+    #[test]
+    fn non_zero_alloc_size_is_passed_through_unchanged() {
+        let ep = ZeroHostileEp {
+            zero_requests: AtomicUsize::new(0),
+        };
+        let ep_ptr = Box::into_raw(Box::new(ep) as Box<dyn ExecutionProvider>);
+        let alloc = unsafe { DeviceAllocator::new_owned(ep_ptr, ptr::null()) };
+        let alloc_ptr = Box::into_raw(alloc);
+
+        let p = unsafe { device_alloc(alloc_ptr.cast(), 256) };
+        assert!(!p.is_null());
+        let recorded = {
+            let a = unsafe { &*(alloc_ptr.cast::<DeviceAllocator>()) };
+            *a.alloc_sizes.lock().unwrap().get(&(p as usize)).unwrap()
+        };
+        assert_eq!(recorded, 256);
+        unsafe { device_free(alloc_ptr.cast(), p) };
+        unsafe { drop(Box::from_raw(alloc_ptr)) };
     }
 }

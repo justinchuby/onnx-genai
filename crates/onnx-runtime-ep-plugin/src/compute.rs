@@ -3258,3 +3258,499 @@ mod tests {
         assert!(view.validate_write_dtype(DataType::Float16).is_err());
     }
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Scratch / workspace unit tests
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod scratch_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use onnx_runtime_ep_api::kernel::{
+        Kernel, KernelMatch, TensorMetadata, WorkspaceLifetime, WorkspaceRequirement,
+    };
+    use onnx_runtime_ep_api::provider::{DeviceBuffer, EpConfig, ExecutionProvider, Fence};
+    use onnx_runtime_ep_api::tensor::{DevicePtr, TensorMut, TensorView};
+    use onnx_runtime_ep_api::{EpError, Result as EpResult};
+    use onnx_runtime_ir::{DataType, DeviceId, DeviceType, Node, Shape, TensorLayout};
+
+    use super::{EpAllocation, IntermediateBuf, ScratchAllocator, ScratchBuf};
+
+    /// Byte pattern the mock allocator pre-fills every allocation with, so a
+    /// test can tell whether the scratch layer memset it afterwards.
+    const POISON: u8 = 0xAB;
+
+    /// How the mock allocator should misbehave.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum AllocBehaviour {
+        Honest,
+        /// Return a pointer deliberately offset off the requested alignment.
+        Misaligned,
+        /// Fail every allocation.
+        Fail,
+    }
+
+    struct MockEp {
+        device: DeviceId,
+        device_type: DeviceType,
+        behaviour: AllocBehaviour,
+        allocs: AtomicUsize,
+        deallocs: AtomicUsize,
+        last_request: AtomicUsize,
+    }
+
+    impl MockEp {
+        fn new(device: DeviceId, device_type: DeviceType, behaviour: AllocBehaviour) -> Arc<Self> {
+            Arc::new(Self {
+                device,
+                device_type,
+                behaviour,
+                allocs: AtomicUsize::new(0),
+                deallocs: AtomicUsize::new(0),
+                last_request: AtomicUsize::new(0),
+            })
+        }
+
+        fn cuda() -> Arc<Self> {
+            Self::new(DeviceId::cuda(0), DeviceType::Cuda, AllocBehaviour::Honest)
+        }
+
+        fn cpu() -> Arc<Self> {
+            Self::new(DeviceId::cpu(), DeviceType::Cpu, AllocBehaviour::Honest)
+        }
+
+        fn live(&self) -> usize {
+            self.allocs.load(Ordering::SeqCst) - self.deallocs.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Over-allocate so a deliberately misaligned pointer still points inside
+    /// a real allocation; the extra byte is reclaimed with the same layout.
+    fn mock_layout(bytes: usize, alignment: usize) -> std::alloc::Layout {
+        std::alloc::Layout::from_size_align(bytes.max(1) + alignment, alignment.max(1)).unwrap()
+    }
+
+    impl ExecutionProvider for MockEp {
+        fn name(&self) -> &str {
+            "mock_scratch_ep"
+        }
+        fn device_type(&self) -> DeviceType {
+            self.device_type
+        }
+        fn device_id(&self) -> DeviceId {
+            self.device
+        }
+        fn initialize(&mut self, _config: &EpConfig) -> EpResult<()> {
+            Ok(())
+        }
+        fn shutdown(&mut self) -> EpResult<()> {
+            Ok(())
+        }
+        fn supports_op(
+            &self,
+            _op: &Node,
+            _opset: u64,
+            _shapes: &[Shape],
+            _input_dtypes: &[DataType],
+            _layouts: &[TensorLayout],
+        ) -> KernelMatch {
+            KernelMatch::unsupported("mock")
+        }
+        fn get_kernel(
+            &self,
+            _op: &Node,
+            _shapes: &[Vec<usize>],
+            _opset: u64,
+        ) -> EpResult<Box<dyn Kernel>> {
+            Err(EpError::KernelFailed("mock".into()))
+        }
+
+        fn allocate(&self, size: usize, alignment: usize) -> EpResult<DeviceBuffer> {
+            if self.behaviour == AllocBehaviour::Fail {
+                return Err(EpError::OutOfMemory {
+                    requested: size,
+                    available: 0,
+                });
+            }
+            let layout = mock_layout(size, alignment);
+            // SAFETY: `layout` always has non-zero size.
+            let base = unsafe { std::alloc::alloc(layout) };
+            assert!(!base.is_null(), "test allocator OOM");
+            // SAFETY: the allocation covers `size + alignment` bytes.
+            unsafe { std::ptr::write_bytes(base, POISON, layout.size()) };
+            let ptr = if self.behaviour == AllocBehaviour::Misaligned {
+                // SAFETY: still inside the over-allocated block.
+                unsafe { base.add(1) }
+            } else {
+                base
+            };
+            self.allocs.fetch_add(1, Ordering::SeqCst);
+            self.last_request.store(size, Ordering::SeqCst);
+            // SAFETY: `ptr` is live for `size` bytes.
+            Ok(unsafe { DeviceBuffer::from_raw_parts(ptr.cast(), self.device, size, alignment) })
+        }
+
+        fn deallocate(&self, buffer: DeviceBuffer) -> EpResult<()> {
+            let ptr = buffer.as_ptr() as *mut u8;
+            let size = buffer.len();
+            let alignment = buffer.alignment();
+            if !ptr.is_null() {
+                let base = if self.behaviour == AllocBehaviour::Misaligned {
+                    // SAFETY: undoes the +1 applied in `allocate`.
+                    unsafe { ptr.sub(1) }
+                } else {
+                    ptr
+                };
+                // SAFETY: identical layout to the one used in `allocate`.
+                unsafe { std::alloc::dealloc(base, mock_layout(size, alignment)) };
+            }
+            self.deallocs.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn copy(&self, _s: &DeviceBuffer, _d: &mut DeviceBuffer, _n: usize) -> EpResult<()> {
+            Ok(())
+        }
+        fn copy_async(
+            &self,
+            _s: &DeviceBuffer,
+            _d: &mut DeviceBuffer,
+            _n: usize,
+        ) -> EpResult<Fence> {
+            Ok(Fence::signalled())
+        }
+        fn sync(&self) -> EpResult<()> {
+            Ok(())
+        }
+    }
+
+    /// A kernel that demands `bytes` of `alignment`-aligned workspace.
+    struct WorkspaceKernel {
+        bytes: u64,
+        alignment: usize,
+    }
+
+    impl Kernel for WorkspaceKernel {
+        fn execute(&self, _i: &[TensorView], _o: &mut [TensorMut]) -> EpResult<()> {
+            Err(EpError::KernelFailed(
+                "WorkspaceKernel requires execute_with_workspace".into(),
+            ))
+        }
+
+        fn workspace_requirement(
+            &self,
+            _inputs: &[TensorMetadata<'_>],
+        ) -> EpResult<WorkspaceRequirement> {
+            Ok(WorkspaceRequirement {
+                bytes: self.bytes,
+                alignment: self.alignment,
+                lifetime: WorkspaceLifetime::StepScoped,
+                // Reuse the canonical role so this test does not need a direct
+                // dependency on the memory governor crate.
+                role: WorkspaceRequirement::NONE.role,
+            })
+        }
+    }
+
+    /// A kernel that needs no workspace at all.
+    struct NoWorkspaceKernel;
+
+    impl Kernel for NoWorkspaceKernel {
+        fn execute(&self, _i: &[TensorView], _o: &mut [TensorMut]) -> EpResult<()> {
+            Ok(())
+        }
+    }
+
+    fn f32_input<'a>(shape: &'a [usize], strides: &'a [i64]) -> TensorView<'a> {
+        TensorView::new(
+            DevicePtr(std::ptr::dangling()),
+            DataType::Float32,
+            shape,
+            strides,
+            DeviceId::cpu(),
+        )
+    }
+
+    fn erase(ep: &Arc<MockEp>) -> Arc<dyn ExecutionProvider> {
+        Arc::clone(ep) as Arc<dyn ExecutionProvider>
+    }
+
+    /// `EpAllocation` deliberately has no `Debug` (it owns a raw device
+    /// pointer), so `expect_err` is unavailable — unwrap the error by hand.
+    fn expect_err(
+        result: Result<(Option<EpAllocation>, Option<super::WorkspaceView>), String>,
+        why: &str,
+    ) -> String {
+        match result {
+            Ok(_) => panic!("{why}"),
+            Err(e) => e,
+        }
+    }
+
+    // ── Blocker 1: kernel workspaces ─────────────────────────────────────────
+
+    /// A kernel's `WorkspaceRequirement` must be satisfied out of the EP's own
+    /// allocator, at the exact size and alignment it asked for.
+    #[test]
+    fn workspace_is_allocated_on_the_ep_with_the_requested_size_and_alignment() {
+        let ep = MockEp::cuda();
+        let erased = erase(&ep);
+        let scratch = ScratchAllocator::new(Some(&erased));
+        let shape = [4usize];
+        let strides = [1i64];
+        let inputs = [f32_input(&shape, &strides)];
+        let kernel = WorkspaceKernel {
+            bytes: 100,
+            alignment: 256,
+        };
+
+        let (guard, view) = scratch
+            .prepare_workspace(&kernel, &inputs, "test node")
+            .expect("workspace must be provisioned");
+        let view = view.expect("a non-zero requirement must yield a WorkspaceView");
+        let guard = guard.expect("a non-zero requirement must yield an owning allocation");
+
+        assert_eq!(view.bytes(), 100, "kernel must see the size it asked for");
+        let addr = view.ptr().as_ptr::<u8>() as usize;
+        assert_ne!(addr, 0, "workspace pointer must be non-null");
+        assert!(
+            addr.is_multiple_of(256),
+            "workspace at {addr:#x} does not honour the kernel's 256-byte alignment"
+        );
+        assert_eq!(ep.allocs.load(Ordering::SeqCst), 1);
+        assert_eq!(ep.last_request.load(Ordering::SeqCst), 100);
+        assert_eq!(ep.live(), 1, "workspace must still be live while in use");
+
+        drop(guard);
+        assert_eq!(
+            ep.live(),
+            0,
+            "dropping the workspace guard must free the EP allocation — otherwise every \
+             dispatch leaks device memory"
+        );
+    }
+
+    /// `WorkspaceRequirement::NONE` must not allocate anything.
+    #[test]
+    fn zero_workspace_requirement_allocates_nothing() {
+        let ep = MockEp::cuda();
+        let erased = erase(&ep);
+        let scratch = ScratchAllocator::new(Some(&erased));
+        let shape = [4usize];
+        let strides = [1i64];
+        let inputs = [f32_input(&shape, &strides)];
+
+        let (guard, view) = scratch
+            .prepare_workspace(&NoWorkspaceKernel, &inputs, "test node")
+            .expect("a zero requirement must succeed");
+        assert!(guard.is_none());
+        assert!(view.is_none());
+        assert_eq!(ep.allocs.load(Ordering::SeqCst), 0);
+    }
+
+    /// Without an EP allocator, a workspace-requiring kernel must fail closed
+    /// rather than be handed host memory.
+    #[test]
+    fn workspace_without_an_ep_fails_closed() {
+        let scratch = ScratchAllocator::new(None);
+        let shape = [4usize];
+        let strides = [1i64];
+        let inputs = [f32_input(&shape, &strides)];
+        let kernel = WorkspaceKernel {
+            bytes: 64,
+            alignment: 64,
+        };
+
+        let err = expect_err(
+            scratch.prepare_workspace(&kernel, &inputs, "node 3"),
+            "a workspace request with no allocator must fail",
+        );
+        assert!(err.contains("node 3"), "error must name the node: {err}");
+        assert!(
+            err.contains("without an EP allocator"),
+            "error must explain the cause: {err}"
+        );
+        assert!(
+            err.contains("new_with_ep"),
+            "error must be actionable: {err}"
+        );
+    }
+
+    /// An allocator that returns a pointer violating the requested alignment
+    /// must be rejected — and the bad allocation must still be released.
+    #[test]
+    fn misaligned_allocator_result_is_rejected_without_leaking() {
+        let ep = MockEp::new(
+            DeviceId::cuda(0),
+            DeviceType::Cuda,
+            AllocBehaviour::Misaligned,
+        );
+        let erased = erase(&ep);
+        let scratch = ScratchAllocator::new(Some(&erased));
+        let shape = [4usize];
+        let strides = [1i64];
+        let inputs = [f32_input(&shape, &strides)];
+        let kernel = WorkspaceKernel {
+            bytes: 128,
+            alignment: 256,
+        };
+
+        let err = expect_err(
+            scratch.prepare_workspace(&kernel, &inputs, "node 0"),
+            "a misaligned allocation must be rejected",
+        );
+        assert!(err.contains("aligned"), "{err}");
+        assert_eq!(
+            ep.live(),
+            0,
+            "the rejected allocation must be freed, not leaked"
+        );
+    }
+
+    /// A failing allocator must surface an actionable error, not panic.
+    #[test]
+    fn allocator_failure_is_reported_not_panicked() {
+        let ep = MockEp::new(DeviceId::cuda(0), DeviceType::Cuda, AllocBehaviour::Fail);
+        let erased = erase(&ep);
+        let scratch = ScratchAllocator::new(Some(&erased));
+        let shape = [4usize];
+        let strides = [1i64];
+        let inputs = [f32_input(&shape, &strides)];
+        let kernel = WorkspaceKernel {
+            bytes: 512,
+            alignment: 64,
+        };
+
+        let err = expect_err(
+            scratch.prepare_workspace(&kernel, &inputs, "node 7"),
+            "allocator failure must propagate",
+        );
+        assert!(err.contains("node 7"), "{err}");
+        assert!(err.contains("EP allocation"), "{err}");
+    }
+
+    /// A non-power-of-two alignment request must be rejected before it reaches
+    /// the allocator.
+    #[test]
+    fn non_power_of_two_workspace_alignment_is_rejected() {
+        let ep = MockEp::cuda();
+        let erased = erase(&ep);
+        let scratch = ScratchAllocator::new(Some(&erased));
+        let shape = [4usize];
+        let strides = [1i64];
+        let inputs = [f32_input(&shape, &strides)];
+        let kernel = WorkspaceKernel {
+            bytes: 32,
+            alignment: 96,
+        };
+
+        let err = expect_err(
+            scratch.prepare_workspace(&kernel, &inputs, "node 1"),
+            "a non-power-of-two alignment must be rejected",
+        );
+        assert!(err.contains("power of two"), "{err}");
+        assert_eq!(ep.allocs.load(Ordering::SeqCst), 0);
+    }
+
+    // ── Blocker 2: subgraph intermediates ────────────────────────────────────
+
+    /// Fused-subgraph intermediates must be allocated on the EP and tagged with
+    /// the EP's `DeviceId`, so the next kernel receives a device pointer that
+    /// truthfully names its device — never a host `Vec` tagged `CPU:0`.
+    #[test]
+    fn intermediates_are_ep_allocated_and_tagged_with_the_ep_device() {
+        let ep = MockEp::cuda();
+        let erased = erase(&ep);
+        let scratch = ScratchAllocator::new(Some(&erased));
+
+        let data = scratch
+            .allocate(4 * 4, "intermediate 0")
+            .expect("intermediate allocation must succeed");
+        assert!(
+            matches!(data, ScratchBuf::Ep(_)),
+            "an EP-backed subgraph must not fall back to a host Vec"
+        );
+        let buf = IntermediateBuf {
+            data,
+            shape: vec![4],
+            strides: vec![1],
+            dtype: DataType::Float32,
+            device: scratch.device,
+        };
+
+        assert_eq!(
+            buf.view().device,
+            DeviceId::cuda(0),
+            "intermediate views must carry the EP's device, not DeviceId::cpu()"
+        );
+        assert_eq!(ep.allocs.load(Ordering::SeqCst), 1);
+
+        drop(buf);
+        assert_eq!(ep.live(), 0, "intermediates must be freed via RAII");
+    }
+
+    /// Device memory must not be host-memset: a `write_bytes` through a real
+    /// CUDA pointer is undefined behaviour.
+    #[test]
+    fn device_scratch_is_not_host_zero_filled() {
+        let ep = MockEp::cuda();
+        let erased = erase(&ep);
+        let scratch = ScratchAllocator::new(Some(&erased));
+        let buf = scratch.allocate(16, "device scratch").unwrap();
+        // SAFETY: the mock EP's "device" memory is really host memory, so the
+        // test can inspect it; production CUDA memory is never touched here.
+        let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr(), 16) };
+        assert!(
+            bytes.iter().all(|b| *b == POISON),
+            "scratch on a non-host-accessible EP was host-memset — that is UB on real device memory"
+        );
+    }
+
+    /// Host-accessible EPs keep the historical zero-initialised scratch
+    /// semantics.
+    #[test]
+    fn host_accessible_scratch_is_zero_filled() {
+        let ep = MockEp::cpu();
+        let erased = erase(&ep);
+        let scratch = ScratchAllocator::new(Some(&erased));
+        let buf = scratch.allocate(16, "host scratch").unwrap();
+        // SAFETY: host-accessible allocation of at least 16 bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr(), 16) };
+        assert!(
+            bytes.iter().all(|b| *b == 0),
+            "host scratch must stay zero-initialised"
+        );
+    }
+
+    /// A zero-byte intermediate must still produce a unique, freeable,
+    /// non-null pointer.
+    #[test]
+    fn zero_byte_scratch_yields_a_non_null_pointer() {
+        let ep = MockEp::cuda();
+        let erased = erase(&ep);
+        let scratch = ScratchAllocator::new(Some(&erased));
+        let a = scratch.allocate(0, "empty a").unwrap();
+        let b = scratch.allocate(0, "empty b").unwrap();
+        assert!(!a.as_ptr().is_null());
+        assert!(!b.as_ptr().is_null());
+        assert_ne!(
+            a.as_ptr(),
+            b.as_ptr(),
+            "distinct zero-size allocations must not alias"
+        );
+        drop(a);
+        drop(b);
+        assert_eq!(ep.live(), 0);
+    }
+
+    /// The EP-less constructor stays host-backed for unit tests.
+    #[test]
+    fn scratch_without_an_ep_is_host_backed_and_cpu_tagged() {
+        let scratch = ScratchAllocator::new(None);
+        assert_eq!(scratch.device, DeviceId::cpu());
+        let buf = scratch.allocate(8, "host").unwrap();
+        assert!(matches!(buf, ScratchBuf::Host(_)));
+    }
+}

@@ -432,7 +432,11 @@ pub unsafe fn release_ep_factory_with_teardown(
             None => {
                 let strong_count = Arc::strong_count(&shared);
                 eprintln!(
-                    "nxrt ep plugin: ReleaseEpFactory called while {} other reference(s) to the                      shared EP are still alive (allocator / sync stream / data transfer / OrtEp).                      ORT should release those before releasing the factory. Skipping explicit                      shutdown() and falling back to the Drop-only invariant: the EP is released                      when the last surface goes away.",
+                    "nxrt ep plugin: ReleaseEpFactory called while {} other reference(s) to \
+                     the shared EP are still alive (allocator / sync stream / data transfer / \
+                     OrtEp). ORT should release those before releasing the factory. Skipping \
+                     explicit shutdown() and falling back to the Drop-only invariant: the EP \
+                     is released when the last surface goes away.",
                     strong_count - 1
                 );
                 SharedEpTeardown::StillReferenced { strong_count }
@@ -1069,4 +1073,278 @@ unsafe extern "C" fn factory_deinit_graphics_interop(
     _ep_device: *const ort::OrtEpDevice,
 ) -> *mut ort::OrtStatus {
     ok_status()
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use onnx_runtime_ep_api::provider::{DeviceBuffer, EpConfig, Fence};
+    use onnx_runtime_ep_api::{EpError, Kernel, KernelMatch, Result as EpResult};
+    use onnx_runtime_ir::{DataType, DeviceId, DeviceType, Node, Shape, TensorLayout};
+
+    use super::*;
+
+    /// Counts `shutdown()` and `Drop` so a test can tell the explicit teardown
+    /// path apart from the Drop-only fallback.
+    struct CountingEp {
+        shutdowns: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for CountingEp {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl ExecutionProvider for CountingEp {
+        fn name(&self) -> &str {
+            "counting_ep"
+        }
+        fn device_type(&self) -> DeviceType {
+            DeviceType::Cuda
+        }
+        fn device_id(&self) -> DeviceId {
+            DeviceId::cuda(0)
+        }
+        fn initialize(&mut self, _config: &EpConfig) -> EpResult<()> {
+            Ok(())
+        }
+        fn shutdown(&mut self) -> EpResult<()> {
+            self.shutdowns.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn supports_op(
+            &self,
+            _op: &Node,
+            _opset: u64,
+            _shapes: &[Shape],
+            _input_dtypes: &[DataType],
+            _layouts: &[TensorLayout],
+        ) -> KernelMatch {
+            KernelMatch::unsupported("mock")
+        }
+        fn get_kernel(
+            &self,
+            _op: &Node,
+            _shapes: &[Vec<usize>],
+            _opset: u64,
+        ) -> EpResult<Box<dyn Kernel>> {
+            Err(EpError::KernelFailed("mock".into()))
+        }
+        fn allocate(&self, _size: usize, _alignment: usize) -> EpResult<DeviceBuffer> {
+            Err(EpError::OutOfMemory {
+                requested: 0,
+                available: 0,
+            })
+        }
+        fn deallocate(&self, _buffer: DeviceBuffer) -> EpResult<()> {
+            Ok(())
+        }
+        fn copy(&self, _s: &DeviceBuffer, _d: &mut DeviceBuffer, _n: usize) -> EpResult<()> {
+            Ok(())
+        }
+        fn copy_async(
+            &self,
+            _s: &DeviceBuffer,
+            _d: &mut DeviceBuffer,
+            _n: usize,
+        ) -> EpResult<Fence> {
+            Ok(Fence::signalled())
+        }
+        fn sync(&self) -> EpResult<()> {
+            Ok(())
+        }
+    }
+
+    /// An EP whose `shutdown()` fails, to prove the factory still drops it.
+    struct FailingShutdownEp {
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for FailingShutdownEp {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl ExecutionProvider for FailingShutdownEp {
+        fn name(&self) -> &str {
+            "failing_shutdown_ep"
+        }
+        fn device_type(&self) -> DeviceType {
+            DeviceType::Cuda
+        }
+        fn device_id(&self) -> DeviceId {
+            DeviceId::cuda(0)
+        }
+        fn initialize(&mut self, _config: &EpConfig) -> EpResult<()> {
+            Ok(())
+        }
+        fn shutdown(&mut self) -> EpResult<()> {
+            Err(EpError::KernelFailed("shutdown refused".into()))
+        }
+        fn supports_op(
+            &self,
+            _op: &Node,
+            _opset: u64,
+            _shapes: &[Shape],
+            _input_dtypes: &[DataType],
+            _layouts: &[TensorLayout],
+        ) -> KernelMatch {
+            KernelMatch::unsupported("mock")
+        }
+        fn get_kernel(
+            &self,
+            _op: &Node,
+            _shapes: &[Vec<usize>],
+            _opset: u64,
+        ) -> EpResult<Box<dyn Kernel>> {
+            Err(EpError::KernelFailed("mock".into()))
+        }
+        fn allocate(&self, _size: usize, _alignment: usize) -> EpResult<DeviceBuffer> {
+            Err(EpError::OutOfMemory {
+                requested: 0,
+                available: 0,
+            })
+        }
+        fn deallocate(&self, _buffer: DeviceBuffer) -> EpResult<()> {
+            Ok(())
+        }
+        fn copy(&self, _s: &DeviceBuffer, _d: &mut DeviceBuffer, _n: usize) -> EpResult<()> {
+            Ok(())
+        }
+        fn copy_async(
+            &self,
+            _s: &DeviceBuffer,
+            _d: &mut DeviceBuffer,
+            _n: usize,
+        ) -> EpResult<Fence> {
+            Ok(Fence::signalled())
+        }
+        fn sync(&self) -> EpResult<()> {
+            Ok(())
+        }
+    }
+
+    /// Build a bare factory carrying `shared_ep`, bypassing `init_host_api`
+    /// (which needs a live ORT). Returns the raw pointer
+    /// `release_ep_factory_with_teardown` expects.
+    fn raw_shared_factory(shared: Option<Arc<dyn ExecutionProvider>>) -> *mut ort::OrtEpFactory {
+        let mut factory = build_factory(
+            CString::new("test_factory").unwrap(),
+            Box::new(|| unreachable!("shared EP factories never call the constructor")),
+        );
+        factory.shared_ep = shared;
+        Box::into_raw(factory).cast::<ort::OrtEpFactory>()
+    }
+
+    /// Normal teardown: ORT releases every other surface first, so the factory
+    /// is the last owner and must run the explicit `shutdown()`.
+    #[test]
+    fn releasing_the_factory_shuts_down_a_solely_owned_shared_ep() {
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let ep: Arc<dyn ExecutionProvider> = Arc::new(CountingEp {
+            shutdowns: Arc::clone(&shutdowns),
+            drops: Arc::clone(&drops),
+        });
+        let raw = raw_shared_factory(Some(ep));
+
+        let (outcome, status) = unsafe { release_ep_factory_with_teardown(raw) };
+        assert_eq!(
+            outcome,
+            SharedEpTeardown::ShutdownCalled,
+            "normal teardown must take the explicit shutdown path, not Drop-only"
+        );
+        assert!(status.is_null(), "release must report success");
+        assert_eq!(
+            shutdowns.load(Ordering::SeqCst),
+            1,
+            "shutdown() must run once"
+        );
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "the EP must also be dropped"
+        );
+    }
+
+    /// A surface that outlives the factory (ORT contract violation or a leaked
+    /// handle) must NOT be shut down out from under: the documented fallback is
+    /// the Drop-only invariant.
+    #[test]
+    fn releasing_the_factory_defers_to_drop_when_surfaces_are_still_alive() {
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let ep: Arc<dyn ExecutionProvider> = Arc::new(CountingEp {
+            shutdowns: Arc::clone(&shutdowns),
+            drops: Arc::clone(&drops),
+        });
+        // Stand-in for a still-live allocator / sync stream / OrtEp.
+        let surface = Arc::clone(&ep);
+        let raw = raw_shared_factory(Some(ep));
+
+        let (outcome, status) = unsafe { release_ep_factory_with_teardown(raw) };
+        assert_eq!(
+            outcome,
+            SharedEpTeardown::StillReferenced { strong_count: 2 },
+            "a shared EP with a live surface must not be shut down"
+        );
+        assert!(status.is_null());
+        assert_eq!(
+            shutdowns.load(Ordering::SeqCst),
+            0,
+            "shutting down here would tear down a runtime the surviving surface still uses"
+        );
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "the EP must still be alive"
+        );
+
+        drop(surface);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "Drop-only invariant: releasing the last surface must release the EP"
+        );
+    }
+
+    /// A failing `shutdown()` must be reported, not swallowed — and must not
+    /// prevent the EP from being dropped.
+    #[test]
+    fn failing_shutdown_is_reported_and_the_ep_is_still_dropped() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let ep: Arc<dyn ExecutionProvider> = Arc::new(FailingShutdownEp {
+            drops: Arc::clone(&drops),
+        });
+        let raw = raw_shared_factory(Some(ep));
+
+        let (outcome, status) = unsafe { release_ep_factory_with_teardown(raw) };
+        assert_eq!(outcome, SharedEpTeardown::ShutdownFailed);
+        assert!(status.is_null());
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    /// The owned (non-shared, e.g. CPU) path is unchanged.
+    #[test]
+    fn releasing_a_non_shared_factory_reports_not_shared() {
+        let raw = raw_shared_factory(None);
+        let (outcome, status) = unsafe { release_ep_factory_with_teardown(raw) };
+        assert_eq!(outcome, SharedEpTeardown::NotShared);
+        assert!(status.is_null());
+    }
+
+    /// A null factory pointer must be tolerated (ORT may call release twice on
+    /// a failed registration).
+    #[test]
+    fn releasing_a_null_factory_is_a_no_op() {
+        let (outcome, status) = unsafe { release_ep_factory_with_teardown(ptr::null_mut()) };
+        assert_eq!(outcome, SharedEpTeardown::NotShared);
+        assert!(status.is_null());
+    }
 }
