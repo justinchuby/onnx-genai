@@ -48,8 +48,9 @@
 //!    surfaces) still hold `Arc` clones — releasing one `OrtEp` must never
 //!    tear down a runtime other surfaces depend on.
 
-#[path = "common/ort_discovery.rs"]
-mod ort_discovery;
+/// Canonical ORT discovery lives in the `onnx-runtime-ort-testkit` crate —
+/// aliased here so existing `ort_discovery::` call sites keep working.
+use onnx_runtime_ort_testkit as ort_discovery;
 
 use std::ffi::CString;
 use std::os::raw::c_void;

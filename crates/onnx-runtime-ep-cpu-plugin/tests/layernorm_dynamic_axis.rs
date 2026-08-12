@@ -15,9 +15,10 @@
 //! Real ORT 1.27, not a mock.
 
 mod cdylib_resolve;
-#[path = "common/ort_discovery.rs"]
-mod ort_discovery;
-mod ort_path;
+/// Canonical ORT discovery lives in the `onnx-runtime-ort-testkit` crate —
+/// aliased here so existing `ort_discovery::` call sites keep working.
+use onnx_runtime_ort_testkit as ort_discovery;
+use onnx_runtime_ort_testkit as ort_path;
 
 use std::ffi::{CStr, CString};
 use std::path::PathBuf;

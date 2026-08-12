@@ -2411,6 +2411,7 @@ dependencies = [
  "onnx-runtime-ep-cpu",
  "onnx-runtime-ep-plugin",
  "onnx-runtime-ir",
+ "onnx-runtime-ort-testkit",
 ]
 
 [[package]]
@@ -2484,6 +2485,20 @@ dependencies = [
  "onnx-runtime-ep-api",
  "onnx-runtime-ep-cpu",
  "onnx-runtime-ir",
+ "onnx-runtime-ort-testkit",
+]
+
+[[package]]
+name = "onnx-runtime-ep-shared-mock-plugin"
+version = "0.1.0-dev.5"
+dependencies = [
+ "libloading 0.8.9",
+ "onnx-genai-ort-sys",
+ "onnx-runtime-ep-api",
+ "onnx-runtime-ep-plugin",
+ "onnx-runtime-ir",
+ "onnx-runtime-memory-governor",
+ "onnx-runtime-ort-testkit",
 ]
 
 [[package]]
@@ -2536,6 +2551,10 @@ dependencies = [
  "onnx-runtime-tracer",
  "thiserror 2.0.19",
 ]
+
+[[package]]
+name = "onnx-runtime-ort-testkit"
+version = "0.1.0-dev.5"
 
 [[package]]
 name = "onnx-runtime-protocol-trace"

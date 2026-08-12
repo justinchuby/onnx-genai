@@ -60,6 +60,11 @@ members = [
     "crates/onnx-runtime-ep-plugin",
     "crates/onnx-runtime-ep-cpu-plugin",
     "crates/onnx-runtime-ep-cuda-plugin",
+    # Test-only: CPU-backed shared-EP plugin used for real-ORT conformance of
+    # the shared-EP (CUDA-shaped) ownership path on GPU-less hosts.
+    "crates/onnx-runtime-ep-shared-mock-plugin",
+    # Test-only helper crate (publish = false): real-ORT + cdylib discovery.
+    "crates/onnx-runtime-ort-testkit",
 
     # ── Native nxrt dynamic EP ABI (§524 native half) ──
     "crates/onnx-runtime-ep-nxrt-abi",
@@ -186,6 +191,9 @@ onnx-runtime-ep-cuda-plugin = { path = "crates/onnx-runtime-ep-cuda-plugin", ver
 onnx-runtime-ep-nxrt-abi = { path = "crates/onnx-runtime-ep-nxrt-abi", version = "=0.1.0-dev.5" }
 onnx-runtime-ep-nxrt-host = { path = "crates/onnx-runtime-ep-nxrt-host", version = "=0.1.0-dev.5" }
 onnx-runtime-ep-nxrt-testplugin = { path = "crates/onnx-runtime-ep-nxrt-testplugin", version = "=0.1.0-dev.5" }
+
+# Test-only helper crate (publish = false, no version pin needed).
+onnx-runtime-ort-testkit = { path = "crates/onnx-runtime-ort-testkit" }
 
 # External
 # `default` pulls `onig` (a vendored C regex engine), `esaxx_fast` (a C++ suffix
