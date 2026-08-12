@@ -196,6 +196,36 @@ pub(crate) struct ResourcesResponse {
     /// when the response is built without a resolved engine handle.
     #[serde(skip_serializing_if = "Option::is_none")]
     batching: Option<BatchingInfo>,
+    /// Resolved memory strategy for this model: the chosen strategy, whether
+    /// weight streaming/offload is active, whether the managed no-spill VMM path
+    /// is the allocator, and the resolved device budget. Makes the #755 managed
+    /// VMM default observable rather than implicit. `None` when built without a
+    /// resolved engine handle.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory_strategy: Option<MemoryStrategyInfo>,
+}
+
+/// Operator-facing memory strategy report for `/v1/resources` (issue #755).
+#[derive(Debug, Serialize)]
+pub(crate) struct MemoryStrategyInfo {
+    /// Effective strategy the runtime applied (e.g. `FullResident`,
+    /// `DynamicWeightResidency`, `MoeRoutingAware`, `Compatibility`).
+    pub(crate) strategy: String,
+    /// Whether weight streaming/offload is active for this load.
+    pub(crate) weight_offload_enabled: bool,
+    /// Whether the managed no-spill VMM path (authority-scoped physical-handle
+    /// pool, committed-granule admission, no WDDM shared-memory spill) is the
+    /// allocator. `true` by default on native CUDA since #755.
+    pub(crate) managed_no_spill: bool,
+    /// Whether offload was auto-enabled by inference (model exceeds the resolved
+    /// device budget) rather than requested by an explicit override.
+    pub(crate) auto_enabled: bool,
+    /// The resolved device budget in bytes (committed physical bytes cap).
+    pub(crate) resolved_device_budget_bytes: Option<u64>,
+    /// The managed VMM committed-byte ceiling, when the managed path is active.
+    pub(crate) managed_limit_bytes: Option<u64>,
+    /// Whether the model weights fit the resolved device budget.
+    pub(crate) fits_resolved_device_budget: Option<bool>,
 }
 
 /// Operator-facing batching capability report for `/v1/resources`.
