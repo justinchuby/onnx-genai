@@ -660,11 +660,16 @@ impl GenAiConfig {
 
         let decoder = last_stage.unwrap_or_else(|| "decoder".into());
         let strategy = json!({ "kind": "autoregressive", "decoder": decoder });
+        let phases = models
+            .keys()
+            .map(|name| (name.clone(), run_on("every_step")))
+            .collect();
 
         let mut pipeline = Map::new();
         pipeline.insert("models".into(), Value::Object(models));
         pipeline.insert("dataflow".into(), Value::Array(Vec::new()));
         pipeline.insert("strategy".into(), strategy);
+        pipeline.insert("phases".into(), Value::Object(phases));
         Value::Object(pipeline)
     }
 
@@ -927,17 +932,14 @@ impl GenAiConfig {
             "stages": [
                 {
                     "name": "encode_vision",
-                    "run_on": "prompt_only",
                     "strategy": { "kind": "single_pass", "model": "vision_encoder" }
                 },
                 {
                     "name": "embed_tokens",
-                    "run_on": "every_step",
                     "strategy": { "kind": "single_pass", "model": "embedding" }
                 },
                 {
                     "name": "decode",
-                    "run_on": "every_step",
                     "strategy": { "kind": "autoregressive", "decoder": "decoder" }
                 }
             ]
@@ -1218,12 +1220,10 @@ impl GenAiConfig {
             "stages": [
                 {
                     "name": "embed_tokens",
-                    "run_on": "every_step",
                     "strategy": { "kind": "single_pass", "model": "embedding" }
                 },
                 {
                     "name": "decode",
-                    "run_on": "every_step",
                     "strategy": { "kind": "autoregressive", "decoder": "decoder" }
                 }
             ]

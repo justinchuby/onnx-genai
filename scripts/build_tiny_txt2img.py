@@ -235,6 +235,8 @@ METADATA = f"""pipeline:
   phases:
     text_encoder:
       run_on: prompt_only
+    denoiser:
+      run_on: every_step
     vae:
       run_on: final_only
 """

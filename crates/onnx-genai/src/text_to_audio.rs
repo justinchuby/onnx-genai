@@ -340,7 +340,6 @@ mod tests {
                         max_tokens: Some(4),
                         ..Default::default()
                     }),
-                    run_on: Some(PhaseRunOn::EveryStep),
                 }],
                 ..Default::default()
             },

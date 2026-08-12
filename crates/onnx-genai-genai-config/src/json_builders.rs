@@ -286,13 +286,11 @@ pub(crate) fn composite_encode_decode(prompt_component: Option<&str>, decoder: &
     if let Some(component) = prompt_component {
         stages.push(json!({
             "name": "encode",
-            "run_on": "prompt_only",
             "strategy": { "kind": "single_pass", "model": component },
         }));
     }
     stages.push(json!({
         "name": "decode",
-        "run_on": "every_step",
         "strategy": { "kind": "autoregressive", "decoder": decoder },
     }));
     json!({ "kind": "composite", "stages": stages })

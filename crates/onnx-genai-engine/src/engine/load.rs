@@ -360,8 +360,8 @@ impl Engine {
         // existing load path unchanged. See #384 and the qwen3.5-27B enablement.
         maybe_fill_hybrid_io_from_graph(&mut metadata, &model_directory.model_path);
         let runtime_caps = onnx_genai_metadata::RuntimeCapabilities::default();
-        if let Err(unsupported) = onnx_genai_metadata::validate(&metadata, &runtime_caps) {
-            anyhow::bail!("Unsupported capabilities: {unsupported:?}");
+        if let Err(errors) = onnx_genai_metadata::validate(&metadata, &runtime_caps) {
+            anyhow::bail!("Invalid inference metadata: {errors:?}");
         }
         let tokenizer = {
             let _span = onnx_genai_ort::prof_span!("engine.tokenizer_load");
@@ -951,8 +951,8 @@ fn resolve_metadata_and_decode_path(
 ) -> anyhow::Result<MetadataResolution> {
     // Validate capabilities
     let runtime_caps = onnx_genai_metadata::RuntimeCapabilities::default();
-    if let Err(unsupported) = onnx_genai_metadata::validate(&metadata, &runtime_caps) {
-        anyhow::bail!("Unsupported capabilities: {unsupported:?}");
+    if let Err(errors) = onnx_genai_metadata::validate(&metadata, &runtime_caps) {
+        anyhow::bail!("Invalid inference metadata: {errors:?}");
     }
 
     // Optional explicit cap on runtime-owned KV growth. Foundry /

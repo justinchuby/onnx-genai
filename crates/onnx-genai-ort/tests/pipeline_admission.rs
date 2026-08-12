@@ -343,17 +343,14 @@ pipeline:
         strategy:
           kind: single_pass
           model: source
-        run_on: prompt_only
       - name: embedding
         strategy:
           kind: single_pass
           model: embedding
-        run_on: {embedding_phase}
       - name: decode
         strategy:
           kind: autoregressive
           decoder: decoder
-        run_on: every_step
   phases:
     source:
       run_on: prompt_only
@@ -584,12 +581,10 @@ pipeline:
         strategy:
           kind: single_pass
           model: producer
-        run_on: prompt_only
       - name: consumer
         strategy:
           kind: single_pass
           model: consumer
-        run_on: prompt_only
   phases:
     producer:
       run_on: prompt_only
@@ -708,17 +703,14 @@ pipeline:
         strategy:
           kind: single_pass
           model: conditioning
-        run_on: prompt_only
       - name: embedding
         strategy:
           kind: single_pass
           model: embedding
-        run_on: every_step
       - name: decode
         strategy:
           kind: autoregressive
           decoder: decoder
-        run_on: every_step
   phases:
     conditioning:
       run_on: prompt_only
@@ -788,12 +780,10 @@ pipeline:
         strategy:
           kind: single_pass
           model: producer
-        run_on: prompt_only
       - name: consumer
         strategy:
           kind: single_pass
           model: consumer
-        run_on: prompt_only
   phases:
     producer:
       run_on: prompt_only
@@ -872,6 +862,9 @@ pipeline:
   strategy:
     kind: autoregressive
     decoder: decoder
+  phases:
+    decoder:
+      run_on: every_step
 "#,
     )?;
 

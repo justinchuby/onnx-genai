@@ -1,11 +1,13 @@
+model:
+  io:
+    token_input: input_ids
 pipeline:
   models:
     decoder:
       filename: decoder.onnx
       type: decoder
-  dataflow:
-    - from: encoder.hidden
-      to: decoder.encoder_hidden_states
+      io:
+        token_input: input_ids
   strategy:
     kind: autoregressive
     decoder: decoder

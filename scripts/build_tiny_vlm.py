@@ -292,7 +292,7 @@ def write_tokenizer(path: Path) -> None:
 
 def write_metadata(path: Path) -> None:
     path.write_text(
-        """pipeline:\n  models:\n    encoder:\n      filename: encoder.onnx.textproto\n      type: encoder\n    decoder:\n      filename: decoder.onnx.textproto\n      type: decoder\n      tokenizer: tokenizer.json\n  dataflow:\n    - from: encoder.image_features\n      to: decoder.image_features\n      dtype: fp32\n      device_transfer: false\n  strategy:\n    kind: composite\n    stages:\n      - name: encode_image\n        strategy:\n          kind: single_pass\n          model: encoder\n        run_on: prompt_only\n      - name: decode_text\n        strategy:\n          kind: autoregressive\n          decoder: decoder\n          max_tokens: 4\n        run_on: every_step\n  phases:\n    encoder:\n      run_on: prompt_only\n    decoder:\n      run_on: every_step\n"""
+        """pipeline:\n  models:\n    encoder:\n      filename: encoder.onnx.textproto\n      type: encoder\n    decoder:\n      filename: decoder.onnx.textproto\n      type: decoder\n      tokenizer: tokenizer.json\n  dataflow:\n    - from: encoder.image_features\n      to: decoder.image_features\n      dtype: fp32\n      device_transfer: false\n  strategy:\n    kind: composite\n    stages:\n      - name: encode_image\n        strategy:\n          kind: single_pass\n          model: encoder\n      - name: decode_text\n        strategy:\n          kind: autoregressive\n          decoder: decoder\n          max_tokens: 4\n  phases:\n    encoder:\n      run_on: prompt_only\n    decoder:\n      run_on: every_step\n"""
     )
 
 

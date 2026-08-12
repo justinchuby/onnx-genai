@@ -45,7 +45,8 @@ pub use parser::{
 };
 pub use schema::*;
 pub use validation::{
-    PipelineValidationError, RuntimeCapabilities, validate, validate_pipeline_spec,
+    PipelineValidationError, RuntimeCapabilities, validate, validate_metadata,
+    validate_pipeline_spec,
 };
 
 /// Generates the inference-metadata JSON Schema with deterministic object-key ordering.

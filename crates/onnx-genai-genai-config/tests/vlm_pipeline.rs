@@ -104,10 +104,6 @@ fn complete_config_synthesizes_typed_vlm_pipeline() {
     assert_eq!(pipeline.dataflow.len(), 2);
     assert_eq!(pipeline.strategy.kind, PipelineStrategyKind::Composite);
     assert_eq!(pipeline.strategy.stages[1].name, "embed_tokens");
-    assert_eq!(
-        pipeline.strategy.stages[1].run_on,
-        Some(PhaseRunOn::EveryStep)
-    );
     let positions = pipeline.positions.as_ref().expect("position program");
     assert_eq!(positions.rank, 3);
     assert_eq!(positions.dtype.as_deref(), Some("int64"));

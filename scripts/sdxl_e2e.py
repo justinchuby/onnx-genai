@@ -169,7 +169,8 @@ def main() -> int:
         "    timesteps:\n" + ts_yaml +
         "    scheduler_config:\n      kind: dpmpp_2m\n      num_train_timesteps: 1000\n"
         "      beta_start: 0.00085\n      beta_end: 0.012\n      beta_schedule: scaled_linear\n"
-        "  phases:\n    text_encoder:\n      run_on: prompt_only\n    vae:\n      run_on: final_only\n"
+        "  phases:\n    text_encoder:\n      run_on: prompt_only\n"
+        "    denoiser:\n      run_on: every_step\n    vae:\n      run_on: final_only\n"
     )
 
     # --- runtime inputs ---
