@@ -348,7 +348,10 @@ than copying conclusions, following the anti-staleness rule established in
   real model (see "KV layout and residency" below). The BNSH binding *metadata*
   shape is retained deliberately for both layouts — the GQA node and
   `DeviceIoBinding` require it — so seq-major lives in the byte geometry, not a
-  permuted shape.
+  permuted shape. Process-isolated end-to-end capture measurement also shows
+  that fixed stride alone does **not** yet remove growth re-capture: the current
+  engine explicitly invalidates the graph on every KV bucket growth for both
+  layouts.
 - **Measured, not implemented:** token-major across all layers. Its residency
   floor and 192 KiB-stride read cost were measured in #787, but no production
   kernel or binding layout uses it.
@@ -519,11 +522,32 @@ measured 2 MiB CUDA granule:
 > 8→16→32→64), test
 > `crates/onnx-genai-engine/tests/mobius_seqmajor_growth_parity_native_cuda.rs`:
 >
-> | Growth path | Capture | Tokens | Committed bytes (head = seq) | d2d KV copy bytes head | d2d KV copy bytes seq |
+> | Growth path | Capture | Tokens | Physical committed bytes (head = seq) | d2d KV copy bytes head | d2d KV copy bytes seq |
 > |---|---|---|---:|---:|---:|
 > | in-place VMM (default since #798) | OFF | byte-identical | 100,663,296 | 688,576 | **0** |
-> | in-place VMM (default since #798) | ON (declined) | byte-identical | 100,663,296 | 688,576 | **0** |
+> | in-place VMM (default since #798) | ON | byte-identical | 100,663,296 | 688,576 | **0** |
 > | legacy realloc (`ONNX_GENAI_LEGACY_ALLOCATOR=1`) | OFF | byte-identical | 786,432 | 688,576 | 688,576 |
+>
+> The capture-ON default-VMM row was measured with **every layout/configuration
+> in its own process**, interleaving head-major then seq-major in the same
+> session:
+>
+> | Layout | Growth events | Captures | Replays | Invalidations |
+> |---|---:|---:|---:|---:|
+> | head-major | 3 | 4 | 39 | 4 |
+> | seq-major | 3 | 4 | 39 | 4 |
+>
+> A same-generation, no-growth control (`min_bucket=64`) measured `1 capture,
+> 45 replays, 1 invalidation` for each layout. Therefore the three bucket
+> growths account for exactly three additional invalidations and three
+> additional captures in both rows. This is attributable in code as well as by
+> counter delta: `DecodeCudaState::ensure_capacity` calls `invalidate_graph`
+> unconditionally after `apply_vmm_growth`, before branching on layout for the
+> moved-byte accounting. The seq-major fixed stride really does keep KV offsets
+> stable (`0` bytes moved), but the engine does not yet use that fact to retain
+> the captured graph. Thus #797's driver-level `0 re-captures` result is **not
+> demonstrated end to end** by the current bucket-growth path; the remaining
+> invalidator is the engine's explicit growth policy, not an unknown model gate.
 >
 > The 48-token stream is byte-identical head-major vs seq-major in every row —
 > the first real seq-major generation that exercises *growth*. (#794's 32-token
@@ -531,8 +555,8 @@ measured 2 MiB CUDA granule:
 > Since #798 made managed no-spill VMM the default, the **default** growth path is
 > in-place VMM, so seq-major now grows moving **0 KV bytes by default**; the
 > legacy reallocation allocator (which copies the live prefix to a fresh buffer
-> either way) is reachable only via the #755 opt-out. Two honest caveats remain,
-> both orthogonal to this shape/stride change:
+> either way) is reachable only via the #755 opt-out. One residency caveat
+> remains orthogonal to this shape/stride change:
 >
 > * **Committed physical bytes are still equal head vs seq** (100,663,296 both
 >   under the default VMM arena; 786,432 both under legacy realloc), because the
@@ -541,19 +565,9 @@ measured 2 MiB CUDA granule:
 >   `kv_heads×` residency win is therefore still driver-level only
 >   (`vmm_kv_layout_residency_gpu`); wiring the dense-prefix commit into the live
 >   path is the documented next step (shared with token-major and #777).
-> * **Re-capture on growth was not exercised end to end**: this decoder's dynamic
->   logical shape declines whole-step CUDA-graph capture (`captures = 0`), so the
->   boundary-crossing step cost #778 measured in a microbenchmark could not be
->   reproduced here — the same obstacle #794 hit. `invalidate_graph` still runs on
->   every growth (an invariant retained because `present_capacity` is baked into
->   any captured graph), so a capturing decoder would re-capture on each growth
->   regardless of layout; the driver-level "0 re-captures" of #797 requires a
->   fixed full-context stable-VA reservation the bucket-growth engine path does
->   not inherit.
 >
-> Wall-clock is not reported: the box was contended and identical runs ranged
-> ~5 s to ~212 s across this session's re-runs, so no throughput number is
-> trustworthy and none is extrapolated.
+> Wall-clock is intentionally not reported: deterministic counters answer the
+> invalidation question, while this shared box has shown large timing variance.
 
 The small-model measurement makes the waste concrete: qwen2.5-0.5b committed
 **96 head stripes × 2 MiB = 192 MiB to hold about 12 KiB** of live KV (#772).

@@ -91,6 +91,56 @@ fn graph_capture_auto_enables_for_owned_cuda_kv() {
 }
 
 #[test]
+fn every_decode_level_capture_decline_names_its_predicate() {
+    let owned_cuda = GraphCaptureStructuralSafety {
+        device_is_cuda: true,
+        kv_ownership: KvOwnership::Owned,
+    };
+    let cases = [
+        resolve_graph_capture_decision(None, false, false, owned_cuda, true, false),
+        resolve_graph_capture_decision(Some(false), false, false, owned_cuda, false, false),
+        resolve_graph_capture_decision(None, true, false, owned_cuda, false, false),
+        resolve_graph_capture_decision(
+            None,
+            false,
+            false,
+            GraphCaptureStructuralSafety {
+                device_is_cuda: false,
+                kv_ownership: KvOwnership::Owned,
+            },
+            false,
+            false,
+        ),
+        resolve_graph_capture_decision(
+            None,
+            false,
+            false,
+            GraphCaptureStructuralSafety {
+                device_is_cuda: true,
+                kv_ownership: KvOwnership::Shared,
+            },
+            false,
+            false,
+        ),
+    ];
+
+    for decision in cases {
+        assert!(!decision.is_enabled());
+        let reason = decision
+            .decline_reason()
+            .expect("a disabled capture decision must always carry a reason");
+        assert!(
+            reason.starts_with("predicate `"),
+            "decline must name its predicate: {reason}"
+        );
+    }
+
+    let enabled = resolve_graph_capture_decision(None, false, false, owned_cuda, false, false);
+    assert!(enabled.is_enabled());
+    assert!(enabled.decline_reason().is_none());
+}
+
+#[test]
 fn weight_offload_forces_graph_capture_off() {
     let safe = GraphCaptureStructuralSafety {
         device_is_cuda: true,
@@ -2334,6 +2384,15 @@ fn native_cuda_symbolic_total_seq_aux_declines_capture_but_decodes_eagerly() -> 
     assert_eq!(stats.graph.captures, 0);
     assert_eq!(stats.graph.replays, 0);
     assert_eq!(stats.graph.fallbacks, 0);
+    let reason = stats
+        .graph
+        .decline_reason
+        .as_deref()
+        .expect("a binding-time capture decline must be observable");
+    assert!(
+        reason.contains("predicate `auxiliary_outputs_have_fixed_persistent_shapes`"),
+        "{reason}"
+    );
 
     // Decode is bit-exact with a plain eager (graph_capture=false) run — the
     // unresolved aux output changes nothing about the decode result.

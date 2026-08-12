@@ -542,6 +542,14 @@ impl NativeDecodeSession {
             .and_then(|state| state.graph_fallback_reason.as_deref())
     }
 
+    /// Named decode-level predicate that declined CUDA graph capture, either
+    /// before the first attempt or during the runtime capture audit.
+    pub fn cuda_graph_decline_reason(&self) -> Option<&str> {
+        self.cuda
+            .as_ref()
+            .and_then(|state| state.graph_decline_reason.as_deref())
+    }
+
     /// Structural reasons, if any, why CUDA graph capture was declined at
     /// binding time because an auxiliary graph output carries an unresolved
     /// symbolic dimension (not batch or query-seq) that cannot be collapsed to
