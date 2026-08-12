@@ -317,10 +317,7 @@ pipeline:
     );
 }
 
-#[test]
-fn sound_workflow_manifest_ssa_and_effects_validate() {
-    let metadata: InferenceMetadata = serde_yaml::from_str(
-        r#"
+const SOUND_POLICY_WORKFLOW: &str = r#"
 pipeline:
   workflow:
     manifest:
@@ -353,6 +350,12 @@ pipeline:
             logits: { dtype: float32, rank: 2, shape: [batch, vocab] }
           outputs:
             token: { dtype: int64, rank: 1, shape: [batch] }
+        policy:
+          role: token_sampler
+          mode: greedy
+          logits: logits
+          token: token
+          effect: rng
         effects: [rng]
     initial_effects: { rng: rng.0, stream: stream.0 }
     graph:
@@ -370,12 +373,133 @@ pipeline:
           mode: event
           effect_name: stream
           effect: { consumes: stream.0, produces: stream.1 }
-"#,
-    )
-    .expect("sound workflow parses");
+"#;
+
+#[test]
+fn sound_workflow_manifest_ssa_and_effects_validate() {
+    let metadata: InferenceMetadata =
+        serde_yaml::from_str(SOUND_POLICY_WORKFLOW).expect("sound workflow parses");
 
     validate_pipeline_spec(metadata.pipeline.as_ref().expect("pipeline"))
         .expect("sound workflow validates");
+}
+
+#[test]
+fn workflow_policy_requires_onnx_rank_contracts_and_outputs() {
+    let mut metadata: InferenceMetadata =
+        serde_yaml::from_str(SOUND_POLICY_WORKFLOW).expect("sound workflow parses");
+    let pipeline = metadata.pipeline.as_mut().expect("pipeline");
+    let workflow = pipeline.workflow.as_mut().expect("workflow");
+
+    workflow
+        .components
+        .get_mut("sampler")
+        .expect("sampler")
+        .implementation = onnx_genai_metadata::ComponentImplementation::Binding;
+    let error = validate_pipeline_spec(pipeline).expect_err("binding policy must fail");
+    assert!(
+        error
+            .errors
+            .iter()
+            .any(|message| message.contains("must use an ONNX implementation"))
+    );
+
+    let mut metadata: InferenceMetadata =
+        serde_yaml::from_str(SOUND_POLICY_WORKFLOW).expect("sound workflow parses");
+    let pipeline = metadata.pipeline.as_mut().expect("pipeline");
+    pipeline
+        .workflow
+        .as_mut()
+        .expect("workflow")
+        .components
+        .get_mut("sampler")
+        .expect("sampler")
+        .ports
+        .inputs
+        .get_mut("logits")
+        .expect("logits")
+        .rank = 1;
+    let error = validate_pipeline_spec(pipeline).expect_err("rank mismatch must fail");
+    assert!(
+        error
+            .errors
+            .iter()
+            .any(|message| message.contains("must have rank 2"))
+    );
+
+    let mut metadata: InferenceMetadata =
+        serde_yaml::from_str(SOUND_POLICY_WORKFLOW).expect("sound workflow parses");
+    let pipeline = metadata.pipeline.as_mut().expect("pipeline");
+    pipeline
+        .workflow
+        .as_mut()
+        .expect("workflow")
+        .components
+        .get_mut("sampler")
+        .expect("sampler")
+        .ports
+        .outputs
+        .get_mut("token")
+        .expect("token")
+        .shape
+        .as_mut()
+        .expect("token shape")[0] =
+        onnx_genai_metadata::TensorDimension::Symbol("other_batch".to_string());
+    let error = validate_pipeline_spec(pipeline).expect_err("batch symbol mismatch must fail");
+    assert!(
+        error
+            .errors
+            .iter()
+            .any(|message| message.contains("must use the same dimension"))
+    );
+
+    let mut metadata: InferenceMetadata =
+        serde_yaml::from_str(SOUND_POLICY_WORKFLOW).expect("sound workflow parses");
+    let pipeline = metadata.pipeline.as_mut().expect("pipeline");
+    let workflow = pipeline.workflow.as_mut().expect("workflow");
+    let onnx_genai_metadata::WorkflowNode::Sequence { nodes } = &mut workflow.graph else {
+        panic!("test workflow graph is a sequence");
+    };
+    let onnx_genai_metadata::WorkflowNode::Invoke { outputs, .. } = &mut nodes[0] else {
+        panic!("first workflow node is an invoke");
+    };
+    outputs.clear();
+    let error = validate_pipeline_spec(pipeline).expect_err("missing policy output must fail");
+    assert!(error.errors.iter().any(|message| {
+        message.contains("outputs is missing required policy output port 'token'")
+    }));
+}
+
+#[test]
+fn all_policy_component_contracts_have_typed_schema() {
+    use onnx_genai_metadata::PolicyComponentContract;
+
+    let contracts = [
+        r#"{ role: token_sampler, mode: seeded_stochastic, logits: logits, token: token,
+             temperature: temperature, top_k: top_k, top_p: top_p,
+             rng: { seed: seed, offset: offset, next_offset: next_offset }, effect: rng }"#,
+        r#"{ role: termination_predicate, tokens: tokens, eos_ids: eos_ids,
+             iteration: iteration, max_iterations: max_iterations, done: done,
+             effect: termination }"#,
+        r#"{ role: solver_step, state: state, estimate: estimate, step: step,
+             schedule: schedule, next_state: next_state, effect: solver }"#,
+        r#"{ role: masked_update, state: state, proposal: proposal, mask: mask,
+             step: step, next_state: next_state, next_mask: next_mask,
+             rng: { seed: seed, offset: offset, next_offset: next_offset },
+             effect: update }"#,
+        r#"{ role: speculative_verifier, target_scores: target_scores,
+             proposed_tokens: proposed_tokens, proposal_scores: proposal_scores,
+             accepted_tokens: accepted_tokens, accepted_len: accepted_len, done: done,
+             rng: { seed: seed, offset: offset, next_offset: next_offset },
+             effect: verify }"#,
+        r#"{ role: state_update, current: current, update: update, next: next,
+             effect: state }"#,
+    ];
+
+    for contract in contracts {
+        serde_yaml::from_str::<PolicyComponentContract>(contract)
+            .expect("policy component contract parses");
+    }
 }
 
 #[test]

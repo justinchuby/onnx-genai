@@ -272,6 +272,617 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
                 ));
             }
         }
+        fn validate_policy_component(
+            name: &str,
+            component: &crate::schema::WorkflowComponent,
+            errors: &mut Vec<String>,
+        ) {
+            use crate::schema::{PolicyComponentContract as Policy, SamplingPolicyMode};
+
+            let Some(policy) = &component.policy else {
+                return;
+            };
+            for (port, contract) in component
+                .ports
+                .inputs
+                .iter()
+                .chain(component.ports.outputs.iter())
+            {
+                require_declared_shape(name, port, contract, errors);
+            }
+            let input = |port: &str| component.ports.inputs.get(port);
+            let output = |port: &str| component.ports.outputs.get(port);
+            let require_input = |port: &str, errors: &mut Vec<String>| {
+                input(port).or_else(|| {
+                    errors.push(format!(
+                        "workflow policy component '{name}' references missing input port '{port}'"
+                    ));
+                    None
+                })
+            };
+            let require_output = |port: &str, errors: &mut Vec<String>| {
+                output(port).or_else(|| {
+                    errors.push(format!(
+                        "workflow policy component '{name}' references missing output port '{port}'"
+                    ));
+                    None
+                })
+            };
+            let require_effect = |effect: &str, errors: &mut Vec<String>| {
+                if !component.effects.iter().any(|declared| declared == effect) {
+                    errors.push(format!(
+                        "workflow policy component '{name}' references undeclared effect '{effect}'"
+                    ));
+                }
+            };
+            let validate_rng = |rng: &crate::schema::RngPortContract, errors: &mut Vec<String>| {
+                for port in [&rng.seed, &rng.offset] {
+                    if let Some(contract) = require_input(port, errors) {
+                        require_dtype_rank(name, port, contract, "int64", 1, errors);
+                    }
+                }
+                if let Some(contract) = require_output(&rng.next_offset, errors) {
+                    require_dtype_rank(name, &rng.next_offset, contract, "int64", 1, errors);
+                }
+                require_same_contract(
+                    name,
+                    &rng.seed,
+                    input(&rng.seed),
+                    &rng.offset,
+                    input(&rng.offset),
+                    errors,
+                );
+                require_same_contract(
+                    name,
+                    &rng.seed,
+                    input(&rng.seed),
+                    &rng.next_offset,
+                    output(&rng.next_offset),
+                    errors,
+                );
+            };
+
+            match policy {
+                Policy::TokenSampler {
+                    mode,
+                    logits,
+                    token,
+                    temperature,
+                    top_k,
+                    top_p,
+                    rng,
+                    effect,
+                } => {
+                    if let Some(contract) = require_input(logits, errors) {
+                        require_floating(name, logits, contract, errors);
+                        require_rank(name, logits, contract, 2, errors);
+                    }
+                    if let Some(contract) = require_output(token, errors) {
+                        require_integer(name, token, contract, errors);
+                        require_rank(name, token, contract, 1, errors);
+                    }
+                    require_axis_equal(
+                        name,
+                        logits,
+                        input(logits),
+                        0,
+                        token,
+                        output(token),
+                        0,
+                        errors,
+                    );
+                    for port in [temperature.as_ref(), top_p.as_ref()].into_iter().flatten() {
+                        if let Some(contract) = require_input(port, errors) {
+                            require_floating(name, port, contract, errors);
+                            require_rank(name, port, contract, 1, errors);
+                            require_axis_equal(
+                                name,
+                                logits,
+                                input(logits),
+                                0,
+                                port,
+                                Some(contract),
+                                0,
+                                errors,
+                            );
+                        }
+                    }
+                    if let Some(port) = top_k
+                        && let Some(contract) = require_input(port, errors)
+                    {
+                        require_integer(name, port, contract, errors);
+                        require_rank(name, port, contract, 1, errors);
+                        require_axis_equal(
+                            name,
+                            logits,
+                            input(logits),
+                            0,
+                            port,
+                            Some(contract),
+                            0,
+                            errors,
+                        );
+                    }
+                    match (mode, rng) {
+                    (SamplingPolicyMode::Greedy, Some(_)) => errors.push(format!(
+                        "workflow policy component '{name}' greedy sampler must not declare RNG ports"
+                    )),
+                    (SamplingPolicyMode::SeededStochastic, None) => errors.push(format!(
+                        "workflow policy component '{name}' seeded stochastic sampler requires RNG ports"
+                    )),
+                    (_, Some(rng)) => validate_rng(rng, errors),
+                    (_, None) => {}
+                }
+                    if let Some(rng) = rng {
+                        require_axis_equal(
+                            name,
+                            logits,
+                            input(logits),
+                            0,
+                            &rng.seed,
+                            input(&rng.seed),
+                            0,
+                            errors,
+                        );
+                    }
+                    require_effect(effect, errors);
+                }
+                Policy::TerminationPredicate {
+                    tokens,
+                    eos_ids,
+                    iteration,
+                    max_iterations,
+                    done,
+                    effect,
+                } => {
+                    for port in [tokens, eos_ids, iteration, max_iterations] {
+                        if let Some(contract) = require_input(port, errors) {
+                            require_integer(name, port, contract, errors);
+                            require_rank(name, port, contract, 1, errors);
+                        }
+                    }
+                    if let Some(contract) = require_output(done, errors) {
+                        require_bool(name, done, contract, errors);
+                        require_rank(name, done, contract, 1, errors);
+                    }
+                    for port in [iteration, max_iterations, done] {
+                        require_axis_equal(
+                            name,
+                            tokens,
+                            input(tokens),
+                            0,
+                            port,
+                            input(port).or_else(|| output(port)),
+                            0,
+                            errors,
+                        );
+                    }
+                    require_effect(effect, errors);
+                }
+                Policy::SolverStep {
+                    state,
+                    estimate,
+                    step,
+                    schedule,
+                    next_state,
+                    effect,
+                } => {
+                    let state_contract = require_input(state, errors);
+                    let estimate_contract = require_input(estimate, errors);
+                    let next_contract = require_output(next_state, errors);
+                    for (port, contract) in [(state, state_contract), (estimate, estimate_contract)]
+                    {
+                        if let Some(contract) = contract {
+                            require_floating(name, port, contract, errors);
+                        }
+                    }
+                    require_same_contract(
+                        name,
+                        state,
+                        state_contract,
+                        estimate,
+                        estimate_contract,
+                        errors,
+                    );
+                    if let Some(contract) = require_input(step, errors) {
+                        require_integer(name, step, contract, errors);
+                        require_rank(name, step, contract, 1, errors);
+                        require_axis_equal(
+                            name,
+                            state,
+                            state_contract,
+                            0,
+                            step,
+                            Some(contract),
+                            0,
+                            errors,
+                        );
+                    }
+                    if let Some(contract) = require_input(schedule, errors) {
+                        require_floating(name, schedule, contract, errors);
+                        if contract.rank != 1 {
+                            errors.push(format!(
+                            "workflow policy component '{name}' schedule port '{schedule}' must have rank 1"
+                        ));
+                        }
+                    }
+                    require_same_contract(
+                        name,
+                        state,
+                        state_contract,
+                        next_state,
+                        next_contract,
+                        errors,
+                    );
+                    require_effect(effect, errors);
+                }
+                Policy::MaskedUpdate {
+                    state,
+                    proposal,
+                    mask,
+                    step,
+                    next_state,
+                    next_mask,
+                    rng,
+                    effect,
+                } => {
+                    let state_contract = require_input(state, errors);
+                    let proposal_contract = require_input(proposal, errors);
+                    let next_contract = require_output(next_state, errors);
+                    for (port, contract) in [(state, state_contract), (proposal, proposal_contract)]
+                    {
+                        if let Some(contract) = contract {
+                            require_integer(name, port, contract, errors);
+                            require_rank(name, port, contract, 2, errors);
+                        }
+                    }
+                    require_same_contract(
+                        name,
+                        state,
+                        state_contract,
+                        proposal,
+                        proposal_contract,
+                        errors,
+                    );
+                    require_same_contract(
+                        name,
+                        state,
+                        state_contract,
+                        next_state,
+                        next_contract,
+                        errors,
+                    );
+                    if let Some(contract) = require_input(mask, errors) {
+                        require_bool(name, mask, contract, errors);
+                        require_rank(name, mask, contract, 2, errors);
+                        require_same_shape(
+                            name,
+                            state,
+                            state_contract,
+                            mask,
+                            Some(contract),
+                            errors,
+                        );
+                    }
+                    if let Some(contract) = require_output(next_mask, errors) {
+                        require_bool(name, next_mask, contract, errors);
+                        require_rank(name, next_mask, contract, 2, errors);
+                        require_same_shape(
+                            name,
+                            state,
+                            state_contract,
+                            next_mask,
+                            Some(contract),
+                            errors,
+                        );
+                    }
+                    if let Some(contract) = require_input(step, errors) {
+                        require_integer(name, step, contract, errors);
+                        require_rank(name, step, contract, 1, errors);
+                        require_axis_equal(
+                            name,
+                            state,
+                            state_contract,
+                            0,
+                            step,
+                            Some(contract),
+                            0,
+                            errors,
+                        );
+                    }
+                    if let Some(rng) = rng {
+                        validate_rng(rng, errors);
+                        require_axis_equal(
+                            name,
+                            state,
+                            state_contract,
+                            0,
+                            &rng.seed,
+                            input(&rng.seed),
+                            0,
+                            errors,
+                        );
+                    }
+                    require_effect(effect, errors);
+                }
+                Policy::SpeculativeVerifier {
+                    target_scores,
+                    proposed_tokens,
+                    proposal_scores,
+                    accepted_tokens,
+                    accepted_len,
+                    done,
+                    rng,
+                    effect,
+                } => {
+                    if let Some(contract) = require_input(target_scores, errors) {
+                        require_floating(name, target_scores, contract, errors);
+                        require_rank(name, target_scores, contract, 3, errors);
+                    }
+                    if let Some(port) = proposal_scores
+                        && let Some(contract) = require_input(port, errors)
+                    {
+                        require_floating(name, port, contract, errors);
+                        require_rank(name, port, contract, 3, errors);
+                        require_same_contract(
+                            name,
+                            target_scores,
+                            input(target_scores),
+                            port,
+                            Some(contract),
+                            errors,
+                        );
+                    }
+                    for (port, contract) in [
+                        (proposed_tokens, require_input(proposed_tokens, errors)),
+                        (accepted_tokens, require_output(accepted_tokens, errors)),
+                        (accepted_len, require_output(accepted_len, errors)),
+                    ] {
+                        if let Some(contract) = contract {
+                            require_integer(name, port, contract, errors);
+                            require_rank(
+                                name,
+                                port,
+                                contract,
+                                if port == accepted_len { 1 } else { 2 },
+                                errors,
+                            );
+                        }
+                    }
+                    if let Some(contract) = require_output(done, errors) {
+                        require_bool(name, done, contract, errors);
+                        require_rank(name, done, contract, 1, errors);
+                    }
+                    require_same_contract(
+                        name,
+                        proposed_tokens,
+                        input(proposed_tokens),
+                        accepted_tokens,
+                        output(accepted_tokens),
+                        errors,
+                    );
+                    for port in [accepted_len, done] {
+                        require_axis_equal(
+                            name,
+                            proposed_tokens,
+                            input(proposed_tokens),
+                            0,
+                            port,
+                            output(port),
+                            0,
+                            errors,
+                        );
+                    }
+                    for (left_axis, right_axis) in [(0, 0), (1, 1)] {
+                        require_axis_equal(
+                            name,
+                            target_scores,
+                            input(target_scores),
+                            left_axis,
+                            proposed_tokens,
+                            input(proposed_tokens),
+                            right_axis,
+                            errors,
+                        );
+                    }
+                    if let Some(rng) = rng {
+                        validate_rng(rng, errors);
+                        require_axis_equal(
+                            name,
+                            proposed_tokens,
+                            input(proposed_tokens),
+                            0,
+                            &rng.seed,
+                            input(&rng.seed),
+                            0,
+                            errors,
+                        );
+                    }
+                    require_effect(effect, errors);
+                }
+                Policy::StateUpdate {
+                    current,
+                    update,
+                    next,
+                    effect,
+                } => {
+                    let current_contract = require_input(current, errors);
+                    let _ = require_input(update, errors);
+                    let next_contract = require_output(next, errors);
+                    require_same_contract(
+                        name,
+                        current,
+                        current_contract,
+                        next,
+                        next_contract,
+                        errors,
+                    );
+                    require_effect(effect, errors);
+                }
+            }
+        }
+
+        fn require_dtype_rank(
+            component: &str,
+            port: &str,
+            contract: &crate::schema::TensorContract,
+            dtype: &str,
+            rank: usize,
+            errors: &mut Vec<String>,
+        ) {
+            if contract.dtype != dtype || contract.rank != rank {
+                errors.push(format!(
+                "workflow policy component '{component}' port '{port}' must be {dtype} rank {rank}, \
+                 got {} rank {}",
+                contract.dtype, contract.rank
+            ));
+            }
+        }
+
+        fn require_floating(
+            component: &str,
+            port: &str,
+            contract: &crate::schema::TensorContract,
+            errors: &mut Vec<String>,
+        ) {
+            if !matches!(
+                contract.dtype.as_str(),
+                "float16" | "float32" | "float64" | "bfloat16"
+            ) {
+                errors.push(format!(
+                    "workflow policy component '{component}' port '{port}' must be floating point"
+                ));
+            }
+        }
+
+        fn require_rank(
+            component: &str,
+            port: &str,
+            contract: &crate::schema::TensorContract,
+            rank: usize,
+            errors: &mut Vec<String>,
+        ) {
+            if contract.rank != rank {
+                errors.push(format!(
+                    "workflow policy component '{component}' port '{port}' must have rank {rank}, \
+                         got {}",
+                    contract.rank
+                ));
+            }
+        }
+
+        fn require_declared_shape(
+            component: &str,
+            port: &str,
+            contract: &crate::schema::TensorContract,
+            errors: &mut Vec<String>,
+        ) {
+            match &contract.shape {
+                Some(shape) if shape.len() == contract.rank => {}
+                Some(shape) => errors.push(format!(
+                    "workflow policy component '{component}' port '{port}' declares rank {} \
+                     but has {} shape dimensions",
+                    contract.rank,
+                    shape.len()
+                )),
+                None => errors.push(format!(
+                    "workflow policy component '{component}' port '{port}' must declare its shape"
+                )),
+            }
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn require_axis_equal(
+            component: &str,
+            left_port: &str,
+            left: Option<&crate::schema::TensorContract>,
+            left_axis: usize,
+            right_port: &str,
+            right: Option<&crate::schema::TensorContract>,
+            right_axis: usize,
+            errors: &mut Vec<String>,
+        ) {
+            let left_dimension = left
+                .and_then(|contract| contract.shape.as_ref())
+                .and_then(|shape| shape.get(left_axis));
+            let right_dimension = right
+                .and_then(|contract| contract.shape.as_ref())
+                .and_then(|shape| shape.get(right_axis));
+            if let (Some(left_dimension), Some(right_dimension)) = (left_dimension, right_dimension)
+                && left_dimension != right_dimension
+            {
+                errors.push(format!(
+                    "workflow policy component '{component}' ports '{left_port}' axis \
+                     {left_axis} and '{right_port}' axis {right_axis} must use the same dimension"
+                ));
+            }
+        }
+
+        fn require_integer(
+            component: &str,
+            port: &str,
+            contract: &crate::schema::TensorContract,
+            errors: &mut Vec<String>,
+        ) {
+            if !matches!(
+                contract.dtype.as_str(),
+                "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16" | "uint32" | "uint64"
+            ) {
+                errors.push(format!(
+                    "workflow policy component '{component}' port '{port}' must be integer"
+                ));
+            }
+        }
+
+        fn require_bool(
+            component: &str,
+            port: &str,
+            contract: &crate::schema::TensorContract,
+            errors: &mut Vec<String>,
+        ) {
+            if contract.dtype != "bool" {
+                errors.push(format!(
+                    "workflow policy component '{component}' port '{port}' must be bool"
+                ));
+            }
+        }
+
+        fn require_same_contract(
+            component: &str,
+            left_port: &str,
+            left: Option<&crate::schema::TensorContract>,
+            right_port: &str,
+            right: Option<&crate::schema::TensorContract>,
+            errors: &mut Vec<String>,
+        ) {
+            if let (Some(left), Some(right)) = (left, right)
+                && left != right
+            {
+                errors.push(format!(
+                "workflow policy component '{component}' ports '{left_port}' and '{right_port}' \
+                 must have identical tensor contracts"
+            ));
+            }
+        }
+
+        fn require_same_shape(
+            component: &str,
+            left_port: &str,
+            left: Option<&crate::schema::TensorContract>,
+            right_port: &str,
+            right: Option<&crate::schema::TensorContract>,
+            errors: &mut Vec<String>,
+        ) {
+            if let (Some(left), Some(right)) = (left, right)
+                && (left.rank != right.rank || left.shape != right.shape)
+            {
+                errors.push(format!(
+                    "workflow policy component '{component}' ports '{left_port}' and \
+                     '{right_port}' must have identical tensor shapes"
+                ));
+            }
+        }
+
         for (name, component) in &workflow.components {
             if name.trim().is_empty() || name.contains('.') {
                 errors.push(format!("workflow component name is invalid: '{name}'"));
@@ -308,6 +919,17 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
                 }
                 crate::schema::ComponentImplementation::Binding => {}
             }
+            if component.policy.is_some()
+                && !matches!(
+                    component.implementation,
+                    crate::schema::ComponentImplementation::Onnx { .. }
+                )
+            {
+                errors.push(format!(
+                    "workflow policy component '{name}' must use an ONNX implementation"
+                ));
+            }
+            validate_policy_component(name, component, errors);
         }
         for (name, state) in &workflow.state {
             if state.scope == crate::schema::WorkflowStateScope::Invocation
@@ -317,6 +939,7 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
                     "workflow state '{name}' has session lease settings but invocation scope"
                 ));
             }
+
             if let crate::schema::ShapeRecurrence::Growing { axis, .. } = &state.recurrence
                 && *axis >= state.contract.rank
             {
@@ -411,6 +1034,57 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
                         errors.push(format!("{path}.outputs has unknown port '{port}'"));
                     }
                     define_workflow_value(value, values, &format!("{path}.outputs.{port}"), errors);
+                }
+                if let Some(policy) = &declaration.policy {
+                    use crate::schema::PolicyComponentContract as Policy;
+                    let required_outputs: Vec<&str> = match policy {
+                        Policy::TokenSampler { token, rng, .. } => {
+                            let mut ports = vec![token.as_str()];
+                            if let Some(rng) = rng {
+                                ports.push(rng.next_offset.as_str());
+                            }
+                            ports
+                        }
+                        Policy::TerminationPredicate { done, .. } => vec![done],
+                        Policy::SolverStep { next_state, .. } => vec![next_state],
+                        Policy::MaskedUpdate {
+                            next_state,
+                            next_mask,
+                            rng,
+                            ..
+                        } => {
+                            let mut ports = vec![next_state.as_str(), next_mask.as_str()];
+                            if let Some(rng) = rng {
+                                ports.push(rng.next_offset.as_str());
+                            }
+                            ports
+                        }
+                        Policy::SpeculativeVerifier {
+                            accepted_tokens,
+                            accepted_len,
+                            done,
+                            rng,
+                            ..
+                        } => {
+                            let mut ports = vec![
+                                accepted_tokens.as_str(),
+                                accepted_len.as_str(),
+                                done.as_str(),
+                            ];
+                            if let Some(rng) = rng {
+                                ports.push(rng.next_offset.as_str());
+                            }
+                            ports
+                        }
+                        Policy::StateUpdate { next, .. } => vec![next],
+                    };
+                    for port in required_outputs {
+                        if !outputs.contains_key(port) {
+                            errors.push(format!(
+                                "{path}.outputs is missing required policy output port '{port}'"
+                            ));
+                        }
+                    }
                 }
                 for effect in &declaration.effects {
                     if !transitions.contains_key(effect) {

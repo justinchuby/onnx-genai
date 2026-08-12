@@ -46,6 +46,9 @@ package boundaries and cross-component relations, including bounded recurrence f
 loop state. RNG is explicit counter-based loop-carried state; packages must not rely on
 implementation-defined ONNX random-number generator state.
 
+The exact producer-facing ONNX policy roles, ports, and invocation mappings are
+specified in [WORKFLOW_POLICY_COMPONENTS.md](WORKFLOW_POLICY_COMPONENTS.md).
+
 ### Non-Goals
 
 - Writing custom CUDA/Metal kernels (ORT handles this via Execution Providers)

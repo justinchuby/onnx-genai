@@ -3085,6 +3085,275 @@
       },
       "type": "object"
     },
+    "PolicyComponentContract": {
+      "description": "Stable semantic roles for ONNX policy-math components.\n\nFields map semantic roles to concrete ONNX port names. The corresponding\ntensor contracts live in [`WorkflowComponent::ports`].",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "effect": {
+              "type": "string"
+            },
+            "logits": {
+              "type": "string"
+            },
+            "mode": {
+              "$ref": "#/$defs/SamplingPolicyMode"
+            },
+            "rng": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/RngPortContract"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "role": {
+              "const": "token_sampler",
+              "type": "string"
+            },
+            "temperature": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "token": {
+              "type": "string"
+            },
+            "top_k": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "top_p": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "role",
+            "mode",
+            "logits",
+            "token",
+            "effect"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "done": {
+              "type": "string"
+            },
+            "effect": {
+              "type": "string"
+            },
+            "eos_ids": {
+              "type": "string"
+            },
+            "iteration": {
+              "type": "string"
+            },
+            "max_iterations": {
+              "type": "string"
+            },
+            "role": {
+              "const": "termination_predicate",
+              "type": "string"
+            },
+            "tokens": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "role",
+            "tokens",
+            "eos_ids",
+            "iteration",
+            "max_iterations",
+            "done",
+            "effect"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "effect": {
+              "type": "string"
+            },
+            "estimate": {
+              "type": "string"
+            },
+            "next_state": {
+              "type": "string"
+            },
+            "role": {
+              "const": "solver_step",
+              "type": "string"
+            },
+            "schedule": {
+              "type": "string"
+            },
+            "state": {
+              "type": "string"
+            },
+            "step": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "role",
+            "state",
+            "estimate",
+            "step",
+            "schedule",
+            "next_state",
+            "effect"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "effect": {
+              "type": "string"
+            },
+            "mask": {
+              "type": "string"
+            },
+            "next_mask": {
+              "type": "string"
+            },
+            "next_state": {
+              "type": "string"
+            },
+            "proposal": {
+              "type": "string"
+            },
+            "rng": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/RngPortContract"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "role": {
+              "const": "masked_update",
+              "type": "string"
+            },
+            "state": {
+              "type": "string"
+            },
+            "step": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "role",
+            "state",
+            "proposal",
+            "mask",
+            "step",
+            "next_state",
+            "next_mask",
+            "effect"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "accepted_len": {
+              "type": "string"
+            },
+            "accepted_tokens": {
+              "type": "string"
+            },
+            "done": {
+              "type": "string"
+            },
+            "effect": {
+              "type": "string"
+            },
+            "proposal_scores": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "proposed_tokens": {
+              "type": "string"
+            },
+            "rng": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/RngPortContract"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "role": {
+              "const": "speculative_verifier",
+              "type": "string"
+            },
+            "target_scores": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "role",
+            "target_scores",
+            "proposed_tokens",
+            "accepted_tokens",
+            "accepted_len",
+            "done",
+            "effect"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "current": {
+              "type": "string"
+            },
+            "effect": {
+              "type": "string"
+            },
+            "next": {
+              "type": "string"
+            },
+            "role": {
+              "const": "state_update",
+              "type": "string"
+            },
+            "update": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "role",
+            "current",
+            "update",
+            "next",
+            "effect"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "PositionContinuation": {
       "description": "Prefill→decode position-continuation vocabulary.",
       "oneOf": [
@@ -3859,6 +4128,27 @@
       },
       "type": "object"
     },
+    "RngPortContract": {
+      "additionalProperties": false,
+      "description": "Counter-based RNG state. Producers should use Philox or Threefry inside ONNX.",
+      "properties": {
+        "next_offset": {
+          "type": "string"
+        },
+        "offset": {
+          "type": "string"
+        },
+        "seed": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "seed",
+        "offset",
+        "next_offset"
+      ],
+      "type": "object"
+    },
     "RuntimeConfigurable": {
       "description": "Features whose concrete settings may be selected by the runtime.",
       "properties": {
@@ -3983,6 +4273,13 @@
           "type": "object"
         }
       ]
+    },
+    "SamplingPolicyMode": {
+      "enum": [
+        "greedy",
+        "seeded_stochastic"
+      ],
+      "type": "string"
     },
     "ScalarExpr": {
       "oneOf": [
@@ -5499,6 +5796,16 @@
         },
         "implementation": {
           "$ref": "#/$defs/ComponentImplementation"
+        },
+        "policy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PolicyComponentContract"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "ports": {
           "$ref": "#/$defs/ComponentPorts"
