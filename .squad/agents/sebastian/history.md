@@ -22,4 +22,18 @@ S3: `NodeOutputSink::Absent` variant — `build_subgraph_routing` no longer allo
 Nits: removed 4 no-op identity transmutes.
 280 passed / 0 failed. Clippy clean. fmt clean. Miri: 4/4 canary tests clean.
 
+### 2026-08-12 — PR #832 H200 CUDA validation build fix (MERGED `2b62c620`)
+Added the missing `bf16_scratch` field (`Mutex<Bf16Scratch>`, `Mutex::new(Bf16Scratch::new(runtime.clone()))`) to 11 `MatMulNBitsKernel` test initializers in `crates/onnx-runtime-ep-cuda/src/kernels/matmul_nbits.rs`. Verified `cargo test --no-run -p onnx-runtime-ep-cuda --features cuda` green. Merged as part of the H200 (Muse-Glimmer-30B) CUDA EP validation wave.
+
 Full pre-compaction history in `history-archive.md`.
+
+### 2026-08-12 — CUDA-graph capture escalation (background, agent sebastian-3)
+Redirected post-#840 to investigate why CUDA-graph capture does not engage for
+Muse-Glimmer native decode. Delivered a cross-domain escalation: **3 stacked
+blockers** — (1) LOAD (engine native pipeline can't load the model), (2) CLASSIFY
+(vestigial SWA mis-classification on decode path), (3) CAPTURE (infra proven, gated
+behind 1+2). No perf PR (model can't load on engine native path yet). Coordinator
+dispatched Batty (LOAD) + Deckard (CLASSIFY); I pair on CAPTURE + re-measure once
+unblocked. Shared team goal: **beat ORT 40 tok/s via CUDA-graph capture**. Prior
+#840 (629fbf90) merged: real cudaMemGetInfo device-capacity + CudaFoldConstantCast,
+native decode 10.2→11.4 tok/s (+11.8%).

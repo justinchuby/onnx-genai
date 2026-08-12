@@ -90,3 +90,10 @@ in `mlas.h` doxygen comment; "x86" in shorter inline comments and six `GTEST_SKI
 in `test_layernorm.cpp` and `layernorm_kernel_avx2.cpp`. Comment-only; build verified 41/2.
 Commit `4a16925a88`. Irony: a prior readability fix ("AMD64/IX86" → "x86-64") made the
 comment less accurate.
+
+## 2026-08-12 — Assigned Blocker 2 (CLASSIFY) of the CUDA-capture escalation
+Branch `squad/decode-path-swa-classify`. Remove/correct the vestigial SWA
+(sliding-window attention) classification on the native decode path so the decode
+graph classifies correctly — precondition (with Batty's LOAD fix) for CUDA-graph
+capture engaging. Part of Sebastian's 3-blocker escalation. Shared team goal:
+**beat ORT 40 tok/s via CUDA-graph capture**. In progress.

@@ -55,3 +55,10 @@ Deckard corrected "x86-64" → "x86 (32-bit and 64-bit)" in `mlas.h`, `layernorm
 and six `GTEST_SKIP` messages after Challenger's delta review flagged the inaccuracy. Batty's
 implementation was correct; only the comment wording was stale. Head `4a16925a88`. PR #31973
 marked ready for review.
+
+## 2026-08-12 — Assigned Blocker 1 (LOAD) of the CUDA-capture escalation
+Branch `squad/native-pipeline-embedding`. Fix the native pipeline embedding / load
+path so Muse-Glimmer loads resident on the engine native decode path — precondition
+for CUDA-graph capture engaging. Part of Sebastian's 3-blocker escalation (LOAD +
+CLASSIFY [Deckard] + CAPTURE [Sebastian]). Shared team goal: **beat ORT 40 tok/s via
+CUDA-graph capture**. In progress.
