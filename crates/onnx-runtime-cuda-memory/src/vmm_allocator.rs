@@ -125,13 +125,13 @@ const TIER: &str = "device";
 /// already answers the same question the same way for weight offload
 /// (`global_offload_stats`).
 ///
-/// # Why a quantity and not an event
+/// # Why byte gauges accompany operation counts
 ///
 /// The arena was once installed, logged that it was installed, and committed
 /// **zero bytes** for an entire generation (#659). The log line was true and
-/// useless: it could not be told apart from a hook that never fired. Only a
-/// byte count could, and only after someone printed one. These exist so that
-/// "is the arena doing anything" is a reading rather than an argument.
+/// useless: it could not be told apart from a hook that never fired. The byte
+/// gauges answer whether memory is really mapped; the operation counts answer
+/// whether the driver is being called too often.
 static GLOBAL_COMMITS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_RELEASES: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_COMMITTED_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -189,9 +189,12 @@ fn subtract_counted(counter: &AtomicU64, amount: u64) {
 /// Snapshot of the process-global VMM arena counters.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GlobalVmmStats {
-    /// Granules mapped since the process started.
+    /// `cuMemMap` operations since the process started. Physical handles are
+    /// currently one granule each, so this is also the number of granules
+    /// mapped.
     pub commits: u64,
-    /// Granules unmapped since the process started.
+    /// Contiguous `cuMemUnmap` runs since the process started. One run may
+    /// release several adjacent granules.
     pub releases: u64,
     /// Physical bytes mapped right now.
     pub committed_bytes: u64,
@@ -275,18 +278,29 @@ fn note_commit(granularity: usize) {
     );
 }
 
-fn note_release(granularity: usize) {
+fn note_release(bytes: usize) {
     GLOBAL_RELEASES.fetch_add(1, Ordering::Relaxed);
-    subtract_counted(&GLOBAL_COMMITTED_BYTES, granularity as u64);
+    subtract_counted(&GLOBAL_COMMITTED_BYTES, bytes as u64);
     let now = GLOBAL_COMMITTED_BYTES.load(Ordering::Relaxed);
     let _ = now;
     #[cfg(feature = "tracing")]
     tracing::debug!(
         target: "onnx_runtime::cuda::vmm",
-        granule_bytes = granularity,
+        released_bytes = bytes,
         committed_bytes = now,
-        "vmm arena released a granule"
+        "vmm arena released a contiguous granule run"
     );
+}
+
+fn contiguous_granule_runs(granules: impl IntoIterator<Item = usize>) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    for granule in granules {
+        match runs.last_mut() {
+            Some((_, end)) if *end == granule => *end += 1,
+            _ => runs.push((granule, granule + 1)),
+        }
+    }
+    runs
 }
 
 fn invalid(requested: usize, reason: String) -> MemoryError {
@@ -1045,23 +1059,11 @@ impl CudaVmmAllocator {
     fn release_granules_report(&self, arena: &mut Arena, granules: &BTreeSet<usize>) -> u64 {
         let granularity = arena.spans.granularity;
         let mut unmapped = 0_u64;
-        for &granule in granules.iter().rev() {
+        let mut releasable = Vec::new();
+        for &granule in granules {
             match arena.spans.granule_refs[granule].checked_sub(1) {
                 Some(0) => {
-                    arena.spans.granule_refs[granule] = 0;
-                    let offset = granule * granularity;
-                    if self
-                        .backing
-                        .release(&mut arena.reservation, offset, granularity)
-                        .is_err()
-                    {
-                        arena.spans.granule_refs[granule] = 1;
-                        continue;
-                    }
-                    arena.spans.committed -= granularity;
-                    note_release(granularity);
-                    self.give_back_lease(arena, granularity);
-                    unmapped = unmapped.saturating_add(granularity as u64);
+                    releasable.push(granule);
                 }
                 Some(remaining) => arena.spans.granule_refs[granule] = remaining,
                 None => {
@@ -1082,6 +1084,23 @@ impl CudaVmmAllocator {
                     );
                 }
             }
+        }
+        for (start, end) in contiguous_granule_runs(releasable) {
+            let bytes = (end - start) * granularity;
+            if self
+                .backing
+                .release(&mut arena.reservation, start * granularity, bytes)
+                .is_err()
+            {
+                continue;
+            }
+            for granule in start..end {
+                arena.spans.granule_refs[granule] = 0;
+            }
+            arena.spans.committed -= bytes;
+            note_release(bytes);
+            self.give_back_lease(arena, bytes);
+            unmapped = unmapped.saturating_add(bytes as u64);
         }
         unmapped
     }
@@ -2044,6 +2063,25 @@ impl Drop for CudaVmmAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn weight_page_release_churn_is_one_run_per_page_not_one_per_granule() {
+        const TOKENS: usize = 16;
+        const GRANULES_PER_PAGE: usize = 10;
+
+        let releases = (0..TOKENS)
+            .map(|token| {
+                let first = token * GRANULES_PER_PAGE;
+                contiguous_granule_runs(first..first + GRANULES_PER_PAGE).len()
+            })
+            .sum::<usize>();
+
+        assert_eq!(releases, TOKENS);
+        assert!(
+            releases < TOKENS * GRANULES_PER_PAGE,
+            "a contiguous weight page must not regress to one release call per granule"
+        );
+    }
 
     #[test]
     fn batched_ranges_union_shared_granule_identity_once() {

@@ -1423,6 +1423,38 @@ unsafe impl VirtualBacking for CudaVirtualBacking {
     ) -> Result<(), VirtualMemoryError> {
         self.bind("releasing CUDA memory")?;
         let end = offset.saturating_add(requested_len);
+        let mut blocks = reservation
+            .blocks
+            .iter()
+            .copied()
+            .filter(|&(at, len, _)| at >= offset && at + len <= end)
+            .collect::<Vec<_>>();
+        blocks.sort_unstable_by_key(|&(at, _, _)| at);
+        let covers_full_range = blocks.first().is_some_and(|&(at, _, _)| at == offset)
+            && blocks.last().is_some_and(|&(at, len, _)| at + len == end)
+            && blocks
+                .windows(2)
+                .all(|pair| pair[0].0 + pair[0].1 == pair[1].0);
+        if covers_full_range {
+            // CUDA permits one cuMemUnmap over adjacent mappings even when
+            // those mappings came from distinct physical handles. Weight
+            // pages commonly span several 2 MiB handles, so unmapping the run
+            // once avoids a driver round-trip per granule.
+            Self::check("cuMemUnmap", unsafe {
+                cu::cuMemUnmap(reservation.base + offset as u64, requested_len)
+            })?;
+            reservation
+                .blocks
+                .retain(|&(at, len, _)| !(at >= offset && at + len <= end));
+            for (_, _, handle) in blocks {
+                if let Some(pool) = &self.pool {
+                    pool.return_after_unmap(handle, true)?;
+                } else {
+                    Self::check("cuMemRelease", unsafe { cu::cuMemRelease(handle) })?;
+                }
+            }
+            return Ok(());
+        }
         loop {
             let Some(index) = reservation
                 .blocks

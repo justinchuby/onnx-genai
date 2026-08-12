@@ -379,6 +379,7 @@ pub struct CudaWeightPage {
 
 enum WeightAllocation {
     Runtime,
+    Retired,
     Vmm {
         allocator: Arc<crate::vmm_allocator::CudaVmmAllocator>,
         allowance: onnx_runtime_memory_governor::MappedAllowance,
@@ -406,6 +407,65 @@ struct StableWeightSlot {
 }
 
 impl CudaWeightPage {
+    fn release_allocation(&mut self, synchronize_streams: bool) {
+        let allocation = std::mem::replace(&mut self.allocation, WeightAllocation::Retired);
+        match allocation {
+            WeightAllocation::Runtime => {
+                let _ = unsafe { self.runtime.free_raw(self.ptr) };
+            }
+            WeightAllocation::Retired => {}
+            WeightAllocation::Vmm {
+                allocator,
+                allowance,
+                stable_slot,
+            } => {
+                // VMM unmap does not wait for users of the VA. Normal Drop
+                // drains both streams; the eviction batch may do that once
+                // up front and retire several pages without repeating it.
+                if synchronize_streams
+                    && (self.runtime.synchronize().is_err()
+                        || self.runtime.copy_stream().synchronize().is_err())
+                {
+                    self.allocation = WeightAllocation::Vmm {
+                        allocator,
+                        allowance,
+                        stable_slot,
+                    };
+                    return;
+                }
+                if let Some(ptr) = NonNull::new(self.ptr as *mut u8) {
+                    // Stable slots retain VA for graph-baked pointers. Never
+                    // assert here: this remains reachable from Drop.
+                    let unmapped = if stable_slot {
+                        allocator
+                            .decommit_allocation_range(
+                                ptr,
+                                self.len,
+                                WEIGHT_SLOT_ALIGN,
+                                0,
+                                self.len,
+                            )
+                            .unwrap_or(0)
+                    } else {
+                        allocator.deallocate_span(ptr)
+                    };
+                    allowance.unmap(unmapped);
+                    let _ = GLOBAL_WEIGHT_MAPPED_BYTES.fetch_update(
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        |current| Some(current.saturating_sub(unmapped)),
+                    );
+                }
+            }
+        }
+    }
+
+    fn retire_after_stream_sync(&mut self) {
+        let free_start = std::time::Instant::now();
+        self.release_allocation(false);
+        add_duration(&GLOBAL_VRAM_FREE_NS, free_start.elapsed());
+    }
+
     /// Allocate a VRAM page and copy `bytes` host→device into it. The bytes are
     /// the canonical (compressed) backing of the tensor, so the page is
     /// byte-identical to a resident upload. Frees the allocation on copy failure.
@@ -622,53 +682,7 @@ impl Drop for CudaWeightPage {
         // SAFETY: `ptr` came from this runtime's `alloc_raw` in `bind_block_quantized_moe`
         // and is freed exactly once here; no alias to it escapes `CudaWeightPage`.
         let free_start = std::time::Instant::now();
-        match &self.allocation {
-            WeightAllocation::Runtime => {
-                let _ = unsafe { self.runtime.free_raw(self.ptr) };
-            }
-            WeightAllocation::Vmm {
-                allocator,
-                allowance,
-                stable_slot,
-            } => {
-                // Unlike cuMemFree, unmapping a VMM span does not implicitly
-                // wait for kernels that still reference its virtual address.
-                // Retire the mapping only after both CUDA streams are idle so
-                // a pooled handle cannot be recycled under in-flight work.
-                if self.runtime.synchronize().is_err()
-                    || self.runtime.copy_stream().synchronize().is_err()
-                {
-                    return;
-                }
-                if let Some(ptr) = NonNull::new(self.ptr as *mut u8) {
-                    // A stable slot (issue #716) unmaps only the physical
-                    // granules and KEEPS the reserved VA so the next page-in of
-                    // this key reuses the identical device pointer a captured
-                    // graph baked. A transient bypass page frees its throwaway
-                    // VA outright. Never assert in Drop (STATUS_STACK_BUFFER_-
-                    // OVERRUN on Windows): decommit failures fall back to zero.
-                    let unmapped = if *stable_slot {
-                        allocator
-                            .decommit_allocation_range(
-                                ptr,
-                                self.len,
-                                WEIGHT_SLOT_ALIGN,
-                                0,
-                                self.len,
-                            )
-                            .unwrap_or(0)
-                    } else {
-                        allocator.deallocate_span(ptr)
-                    };
-                    allowance.unmap(unmapped);
-                    let _ = GLOBAL_WEIGHT_MAPPED_BYTES.fetch_update(
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                        |current| Some(current.saturating_sub(unmapped)),
-                    );
-                }
-            }
-        }
+        self.release_allocation(true);
         add_duration(&GLOBAL_VRAM_FREE_NS, free_start.elapsed());
     }
 }
@@ -1496,6 +1510,7 @@ impl CudaWeightResidency {
         let max_evictions = inner.pages.len();
         let mut evictions = 0usize;
         let mut bypass = false;
+        let mut streams_drained = false;
         loop {
             let required_owned = physical
                 .allocator
@@ -1579,7 +1594,18 @@ impl CudaWeightResidency {
                      headroom, and no page is evictable"
                 )));
             };
-            inner.remove_page(evicted_key);
+            if !streams_drained {
+                let sync_start = std::time::Instant::now();
+                self.runtime.synchronize().map_err(|error| {
+                    WeightHandleError::DeviceBinding(format!("compute stream sync: {error}"))
+                })?;
+                self.runtime.copy_stream().synchronize().map_err(|error| {
+                    WeightHandleError::DeviceBinding(format!("copy stream sync: {error}"))
+                })?;
+                add_duration(&GLOBAL_ADMIT_SYNC_NS, sync_start.elapsed());
+                streams_drained = true;
+            }
+            inner.remove_page_after_stream_sync(evicted_key);
             evictions += 1;
             let after_owned = physical
                 .allocator
@@ -1901,6 +1927,24 @@ impl ResidencyInner {
         if self.pages.remove(&key).is_some()
             && let Some(bytes) = self.policy.remove_page(key)
         {
+            let _ = GLOBAL_CONTENT_RESIDENT_BYTES.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |current| Some(current.saturating_sub(bytes)),
+            );
+            GLOBAL_EVICTIONS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn remove_page_after_stream_sync(&mut self, key: u64) {
+        let Some(page) = self.pages.remove(&key) else {
+            return;
+        };
+        let bytes = self.policy.remove_page(key);
+        if let Ok(mut page) = Arc::try_unwrap(page) {
+            page.retire_after_stream_sync();
+        }
+        if let Some(bytes) = bytes {
             let _ = GLOBAL_CONTENT_RESIDENT_BYTES.fetch_update(
                 Ordering::Relaxed,
                 Ordering::Relaxed,
