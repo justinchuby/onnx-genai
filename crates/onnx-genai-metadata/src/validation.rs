@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::schema::{
     ControlFlow, InferenceMetadata, PipelineSpec, PipelineStrategy, PipelineStrategyKind,
-    ProgramOperation, StateScope, Termination,
+    ProgramOperation, StateScope, Termination, WorkflowNode, WorkflowSpec,
 };
 
 /// Capabilities this runtime supports.
@@ -53,9 +53,27 @@ pub fn derived_capabilities(metadata: &InferenceMetadata) -> BTreeSet<String> {
     let Some(pipeline) = &metadata.pipeline else {
         return capabilities;
     };
+    if let Some(workflow) = &pipeline.workflow {
+        capabilities.extend(workflow.manifest.capabilities.iter().cloned());
+        capabilities.insert("workflow_ssa".to_string());
+        capabilities.insert("linear_effects".to_string());
+        if workflow.serving.is_some() {
+            capabilities.insert("serving_service_contract".to_string());
+        }
+        if workflow
+            .state
+            .values()
+            .any(|state| state.scope == crate::schema::WorkflowStateScope::Session)
+        {
+            capabilities.insert("session_state_lease".to_string());
+        }
+        collect_workflow_capabilities(&workflow.graph, &mut capabilities);
+        return capabilities;
+    }
     if let Some(control) = &pipeline.control {
         collect_control_capabilities(control, &mut capabilities);
     }
+
     if pipeline.reducers.values().any(|reducer| {
         !matches!(
             reducer.kind,
@@ -95,6 +113,44 @@ pub fn derived_capabilities(metadata: &InferenceMetadata) -> BTreeSet<String> {
         capabilities.insert("postprocessing_program".to_string());
     }
     capabilities
+}
+
+fn collect_workflow_capabilities(node: &WorkflowNode, capabilities: &mut BTreeSet<String>) {
+    match node {
+        WorkflowNode::Sequence { nodes } => {
+            for node in nodes {
+                collect_workflow_capabilities(node, capabilities);
+            }
+        }
+        WorkflowNode::Invoke { effects, .. } => {
+            if !effects.is_empty() {
+                capabilities.insert("linear_effects".to_string());
+            }
+        }
+        WorkflowNode::Loop { setup, body, .. } => {
+            capabilities.insert("nested_control_flow".to_string());
+            collect_workflow_capabilities(setup, capabilities);
+            collect_workflow_capabilities(body, capabilities);
+        }
+        WorkflowNode::Branch { cases, default, .. } => {
+            capabilities.insert("nested_control_flow".to_string());
+            for case in cases.values() {
+                collect_workflow_capabilities(case, capabilities);
+            }
+            if let Some(default) = default {
+                collect_workflow_capabilities(default, capabilities);
+            }
+        }
+        WorkflowNode::Emit { mode, .. } => {
+            capabilities.insert("typed_emit".to_string());
+            if matches!(mode, crate::schema::WorkflowEmitMode::Event) {
+                capabilities.insert("streaming_emit".to_string());
+            }
+        }
+        WorkflowNode::Transfer { .. } => {
+            capabilities.insert("explicit_transfer".to_string());
+        }
+    }
 }
 
 fn collect_control_capabilities(control: &ControlFlow, capabilities: &mut BTreeSet<String>) {
@@ -176,8 +232,411 @@ pub struct PipelineValidationError {
 pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidationError> {
     let mut errors = Vec::new();
 
+    if let Some(workflow) = &spec.workflow {
+        if !spec.models.is_empty()
+            || !spec.dataflow.is_empty()
+            || spec.control.is_some()
+            || !spec.phases.is_empty()
+        {
+            errors.push(
+                "pipeline.workflow is exclusive; legacy models/dataflow/control/phases must be removed"
+                    .to_string(),
+            );
+        }
+        validate_workflow(workflow, &mut errors);
+        return if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(PipelineValidationError { errors })
+        };
+    }
+
     if spec.models.is_empty() {
         errors.push("pipeline.models must contain at least one component".to_string());
+    }
+
+    fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
+        if workflow.manifest.ir_version != "1.0" {
+            errors.push(format!(
+                "unsupported pipeline.workflow.manifest.ir_version '{}'; this runtime supports 1.0",
+                workflow.manifest.ir_version
+            ));
+        }
+        if workflow.manifest.onnx_opsets.is_empty() {
+            errors.push("pipeline.workflow.manifest.onnx_opsets must not be empty".to_string());
+        }
+        for (domain, version) in &workflow.manifest.onnx_opsets {
+            if domain.trim().is_empty() || *version == 0 {
+                errors.push(format!(
+                    "pipeline.workflow.manifest.onnx_opsets contains invalid {domain:?}@{version}"
+                ));
+            }
+        }
+        for (name, component) in &workflow.components {
+            if name.trim().is_empty() || name.contains('.') {
+                errors.push(format!("workflow component name is invalid: '{name}'"));
+            }
+            match &component.implementation {
+                crate::schema::ComponentImplementation::Onnx { artifact } => {
+                    if artifact.trim().is_empty() {
+                        errors.push(format!(
+                            "workflow component '{name}' has an empty ONNX artifact"
+                        ));
+                    }
+                }
+                crate::schema::ComponentImplementation::Adapter {
+                    abi,
+                    version,
+                    custom_ops,
+                } => {
+                    match workflow.manifest.adapter_abis.get(abi) {
+                        Some(pinned) if pinned == version => {}
+                        _ => errors.push(format!(
+                            "workflow component '{name}' requires adapter ABI {abi}@{version}, \
+                             but the manifest does not pin that exact version"
+                        )),
+                    }
+                    for (domain, version) in custom_ops {
+                        if workflow.manifest.custom_op_versions.get(domain) != Some(version) {
+                            errors.push(format!(
+                                "workflow component '{name}' requires custom-op domain \
+                                 {domain}@{version}, but the manifest does not pin it"
+                            ));
+                        }
+                    }
+                }
+                crate::schema::ComponentImplementation::Binding => {}
+            }
+        }
+        for (name, state) in &workflow.state {
+            if state.scope == crate::schema::WorkflowStateScope::Invocation
+                && state.session.is_some()
+            {
+                errors.push(format!(
+                    "workflow state '{name}' has session lease settings but invocation scope"
+                ));
+            }
+            if let crate::schema::ShapeRecurrence::Growing { axis, .. } = &state.recurrence
+                && *axis >= state.contract.rank
+            {
+                errors.push(format!(
+                    "workflow state '{name}' grows on axis {axis}, outside rank {}",
+                    state.contract.rank
+                ));
+            }
+        }
+
+        let mut values = workflow.inputs.keys().cloned().collect::<BTreeSet<_>>();
+        let mut effects = workflow.initial_effects.clone();
+        let mut effect_tokens = effects.values().cloned().collect::<BTreeSet<_>>();
+        validate_workflow_node(
+            &workflow.graph,
+            workflow,
+            &mut values,
+            &mut effects,
+            &mut effect_tokens,
+            "pipeline.workflow.graph",
+            errors,
+        );
+
+        let mut used = BTreeSet::from(["workflow_ssa".to_string(), "linear_effects".to_string()]);
+        if workflow.serving.is_some() {
+            used.insert("serving_service_contract".to_string());
+        }
+        if workflow
+            .state
+            .values()
+            .any(|state| state.scope == crate::schema::WorkflowStateScope::Session)
+        {
+            used.insert("session_state_lease".to_string());
+        }
+        collect_workflow_capabilities(&workflow.graph, &mut used);
+        for capability in used.difference(&workflow.manifest.capabilities) {
+            errors.push(format!(
+                "pipeline.workflow.manifest.capabilities is missing used capability '{capability}'"
+            ));
+        }
+    }
+
+    fn validate_workflow_node(
+        node: &WorkflowNode,
+        workflow: &WorkflowSpec,
+        values: &mut BTreeSet<String>,
+        effects: &mut BTreeMap<String, String>,
+        effect_tokens: &mut BTreeSet<String>,
+        path: &str,
+        errors: &mut Vec<String>,
+    ) {
+        match node {
+            WorkflowNode::Sequence { nodes } => {
+                if nodes.is_empty() {
+                    errors.push(format!("{path}.nodes must not be empty"));
+                }
+                for (index, node) in nodes.iter().enumerate() {
+                    validate_workflow_node(
+                        node,
+                        workflow,
+                        values,
+                        effects,
+                        effect_tokens,
+                        &format!("{path}.nodes[{index}]"),
+                        errors,
+                    );
+                }
+            }
+            WorkflowNode::Invoke {
+                component,
+                inputs,
+                outputs,
+                effects: transitions,
+            } => {
+                let Some(declaration) = workflow.components.get(component) else {
+                    errors.push(format!("{path} invokes unknown component '{component}'"));
+                    return;
+                };
+                for (port, value) in inputs {
+                    if !declaration.ports.inputs.contains_key(port) {
+                        errors.push(format!("{path}.inputs has unknown port '{port}'"));
+                    }
+                    require_workflow_value(value, values, &format!("{path}.inputs.{port}"), errors);
+                }
+                for port in declaration.ports.inputs.keys() {
+                    if !inputs.contains_key(port) {
+                        errors.push(format!("{path}.inputs is missing port '{port}'"));
+                    }
+                }
+                for (port, value) in outputs {
+                    if !declaration.ports.outputs.contains_key(port) {
+                        errors.push(format!("{path}.outputs has unknown port '{port}'"));
+                    }
+                    define_workflow_value(value, values, &format!("{path}.outputs.{port}"), errors);
+                }
+                for effect in &declaration.effects {
+                    if !transitions.contains_key(effect) {
+                        errors.push(format!(
+                            "{path}.effects is missing declared effect '{effect}'"
+                        ));
+                    }
+                }
+                for (effect, transition) in transitions {
+                    apply_effect_transition(
+                        effect,
+                        transition,
+                        effects,
+                        effect_tokens,
+                        &format!("{path}.effects.{effect}"),
+                        errors,
+                    );
+                }
+            }
+            WorkflowNode::Loop {
+                setup,
+                body,
+                condition,
+                max_iterations,
+                carried,
+            } => {
+                validate_workflow_node(
+                    setup,
+                    workflow,
+                    values,
+                    effects,
+                    effect_tokens,
+                    &format!("{path}.setup"),
+                    errors,
+                );
+                require_workflow_value(
+                    max_iterations,
+                    values,
+                    &format!("{path}.max_iterations"),
+                    errors,
+                );
+                let mut body_values = values.clone();
+                let mut body_effects = effects.clone();
+                for carry in carried {
+                    if !workflow.state.contains_key(&carry.cell) {
+                        errors.push(format!(
+                            "{path}.carried references unknown cell '{}'",
+                            carry.cell
+                        ));
+                    }
+                    require_workflow_value(
+                        &carry.current,
+                        values,
+                        &format!("{path}.carried.current"),
+                        errors,
+                    );
+                    body_values.insert(carry.body_input.clone());
+                    apply_effect_transition(
+                        &format!("state:{}", carry.cell),
+                        &carry.read_effect,
+                        &mut body_effects,
+                        effect_tokens,
+                        &format!("{path}.carried.read_effect"),
+                        errors,
+                    );
+                }
+                validate_workflow_node(
+                    body,
+                    workflow,
+                    &mut body_values,
+                    &mut body_effects,
+                    effect_tokens,
+                    &format!("{path}.body"),
+                    errors,
+                );
+                require_workflow_value(
+                    condition,
+                    &body_values,
+                    &format!("{path}.condition"),
+                    errors,
+                );
+                for carry in carried {
+                    require_workflow_value(
+                        &carry.body_output,
+                        &body_values,
+                        &format!("{path}.carried.body_output"),
+                        errors,
+                    );
+                    apply_effect_transition(
+                        &format!("state:{}", carry.cell),
+                        &carry.write_effect,
+                        &mut body_effects,
+                        effect_tokens,
+                        &format!("{path}.carried.write_effect"),
+                        errors,
+                    );
+                    define_workflow_value(
+                        &carry.next,
+                        values,
+                        &format!("{path}.carried.next"),
+                        errors,
+                    );
+                }
+                *effects = body_effects;
+            }
+            WorkflowNode::Branch {
+                predicate,
+                cases,
+                default,
+            } => {
+                require_workflow_value(predicate, values, &format!("{path}.predicate"), errors);
+                if cases.is_empty() {
+                    errors.push(format!("{path}.cases must not be empty"));
+                }
+                let mut resulting_effects = Vec::new();
+                for (case, node) in cases {
+                    let mut case_values = values.clone();
+                    let mut case_effects = effects.clone();
+                    validate_workflow_node(
+                        node,
+                        workflow,
+                        &mut case_values,
+                        &mut case_effects,
+                        effect_tokens,
+                        &format!("{path}.cases.{case}"),
+                        errors,
+                    );
+                    resulting_effects.push(case_effects);
+                }
+                if let Some(default) = default {
+                    let mut default_values = values.clone();
+                    let mut default_effects = effects.clone();
+                    validate_workflow_node(
+                        default,
+                        workflow,
+                        &mut default_values,
+                        &mut default_effects,
+                        effect_tokens,
+                        &format!("{path}.default"),
+                        errors,
+                    );
+                    resulting_effects.push(default_effects);
+                }
+                if let Some(first) = resulting_effects.first() {
+                    if resulting_effects.iter().any(|result| result != first) {
+                        errors.push(format!(
+                            "{path} has unordered side effects: every branch must produce identical effect tokens"
+                        ));
+                    } else if let Some(result) = resulting_effects.pop() {
+                        *effects = result;
+                    }
+                }
+            }
+            WorkflowNode::Emit {
+                value,
+                output,
+                effect_name,
+                effect,
+                ..
+            } => {
+                require_workflow_value(value, values, &format!("{path}.value"), errors);
+                if !workflow.outputs.contains_key(output) {
+                    errors.push(format!("{path} emits undeclared output '{output}'"));
+                }
+                apply_effect_transition(
+                    effect_name,
+                    effect,
+                    effects,
+                    effect_tokens,
+                    &format!("{path}.effect"),
+                    errors,
+                );
+            }
+            WorkflowNode::Transfer { input, output, .. } => {
+                require_workflow_value(input, values, &format!("{path}.input"), errors);
+                define_workflow_value(output, values, &format!("{path}.output"), errors);
+            }
+        }
+    }
+
+    fn require_workflow_value(
+        value: &str,
+        values: &BTreeSet<String>,
+        path: &str,
+        errors: &mut Vec<String>,
+    ) {
+        if !values.contains(value) {
+            errors.push(format!(
+                "{path} references value '{value}' before definition"
+            ));
+        }
+    }
+
+    fn define_workflow_value(
+        value: &str,
+        values: &mut BTreeSet<String>,
+        path: &str,
+        errors: &mut Vec<String>,
+    ) {
+        if !values.insert(value.to_string()) {
+            errors.push(format!("{path} redefines SSA value '{value}'"));
+        }
+    }
+
+    fn apply_effect_transition(
+        effect: &str,
+        transition: &crate::schema::EffectTransition,
+        effects: &mut BTreeMap<String, String>,
+        tokens: &mut BTreeSet<String>,
+        path: &str,
+        errors: &mut Vec<String>,
+    ) {
+        match effects.get(effect) {
+            Some(current) if current == &transition.consumes => {}
+            Some(current) => errors.push(format!(
+                "{path} consumes effect token '{}', but current token is '{current}'",
+                transition.consumes
+            )),
+            None => errors.push(format!("{path} references undeclared effect '{effect}'")),
+        }
+        if !tokens.insert(transition.produces.clone()) {
+            errors.push(format!(
+                "{path} produces duplicate effect token '{}'",
+                transition.produces
+            ));
+        }
+        effects.insert(effect.to_string(), transition.produces.clone());
     }
 
     for (name, component) in &spec.models {

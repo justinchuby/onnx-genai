@@ -3,6 +3,10 @@ use super::*;
 /// Multi-model pipeline represented as a directed acyclic dataflow graph.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct PipelineSpec {
+    /// North-star component-centric SSA workflow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<WorkflowSpec>,
+
     /// Typed inputs exposed by the complete package.
     #[serde(default)]
     pub inputs: BTreeMap<String, TensorContract>,
@@ -12,6 +16,7 @@ pub struct PipelineSpec {
     pub outputs: BTreeMap<String, TensorContract>,
 
     /// Named model components in the pipeline DAG; at least one component is required.
+    #[serde(default)]
     #[schemars(extend("minProperties" = 1))]
     pub models: BTreeMap<String, PipelineComponentSpec>,
 

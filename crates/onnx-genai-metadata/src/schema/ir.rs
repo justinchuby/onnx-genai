@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::BTreeSet;
 
 /// Typed tensor contract used at package and component boundaries.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
@@ -260,4 +261,318 @@ pub struct PostprocessingSpec {
     pub program: Program,
     #[serde(default)]
     pub outputs: BTreeMap<String, String>,
+}
+
+/// Sound, component-centric workflow IR. Tensor math lives in invoked components.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowSpec {
+    pub manifest: WorkflowManifest,
+    #[serde(default)]
+    pub inputs: BTreeMap<String, WorkflowInput>,
+    #[serde(default)]
+    pub outputs: BTreeMap<String, WorkflowOutput>,
+    pub components: BTreeMap<String, WorkflowComponent>,
+    #[serde(default)]
+    pub state: BTreeMap<String, WorkflowStateCell>,
+    #[serde(default)]
+    pub initial_effects: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serving: Option<ServingServiceContract>,
+    pub graph: WorkflowNode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowManifest {
+    pub ir_version: String,
+    #[serde(default)]
+    pub onnx_opsets: BTreeMap<String, u32>,
+    #[serde(default)]
+    pub adapter_abis: BTreeMap<String, String>,
+    #[serde(default)]
+    pub custom_op_versions: BTreeMap<String, String>,
+    #[serde(default)]
+    pub capabilities: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowInput {
+    pub contract: TensorContract,
+    pub role: SemanticInputRole,
+    pub source: WorkflowInputSource,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<ScalarValue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SemanticInputRole {
+    Runtime {
+        version: String,
+        role: RuntimeInputRole,
+    },
+    Opaque,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeInputRole {
+    PromptText,
+    PromptTokens,
+    Media,
+    MaxIterations,
+    MaxOutputTokens,
+    Seed,
+    SamplingTemperature,
+    SamplingTopK,
+    SamplingTopP,
+    Constraint,
+    SessionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkflowInputSource {
+    Request { field: RuntimeInputRole },
+    Application { name: String },
+    Literal,
+    Artifact { path: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowOutput {
+    pub contract: TensorContract,
+    pub role: WorkflowOutputRole,
+    pub stage: OutputStage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowOutputRole {
+    Tokens,
+    Text,
+    Image,
+    Audio,
+    Tensor,
+    Event,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputStage {
+    PreAdapter,
+    PostAdapter,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowComponent {
+    pub implementation: ComponentImplementation,
+    pub ports: ComponentPorts,
+    #[serde(default)]
+    pub effects: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<WorkflowResourceContract>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ComponentImplementation {
+    Onnx {
+        artifact: String,
+    },
+    Adapter {
+        abi: String,
+        version: String,
+        #[serde(default)]
+        custom_ops: BTreeMap<String, String>,
+    },
+    Binding,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EffectTransition {
+    pub consumes: String,
+    pub produces: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkflowNode {
+    Sequence {
+        nodes: Vec<WorkflowNode>,
+    },
+    Invoke {
+        component: String,
+        #[serde(default)]
+        inputs: BTreeMap<String, String>,
+        #[serde(default)]
+        outputs: BTreeMap<String, String>,
+        #[serde(default)]
+        effects: BTreeMap<String, EffectTransition>,
+    },
+    Loop {
+        setup: Box<WorkflowNode>,
+        body: Box<WorkflowNode>,
+        condition: String,
+        max_iterations: String,
+        #[serde(default)]
+        carried: Vec<WorkflowLoopCarry>,
+    },
+    Branch {
+        predicate: String,
+        cases: BTreeMap<String, WorkflowNode>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default: Option<Box<WorkflowNode>>,
+    },
+    Emit {
+        value: String,
+        output: String,
+        mode: WorkflowEmitMode,
+        effect_name: String,
+        effect: EffectTransition,
+    },
+    Transfer {
+        input: String,
+        output: String,
+        device: DeviceKind,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowLoopCarry {
+    pub cell: String,
+    pub current: String,
+    pub body_input: String,
+    pub body_output: String,
+    pub next: String,
+    pub read_effect: EffectTransition,
+    pub write_effect: EffectTransition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowEmitMode {
+    Replace,
+    Append,
+    Event,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowStateCell {
+    pub contract: TensorContract,
+    pub scope: WorkflowStateScope,
+    pub initializer: String,
+    pub recurrence: ShapeRecurrence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionLeaseContract>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowStateScope {
+    Invocation,
+    Session,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ShapeRecurrence {
+    Invariant,
+    Growing {
+        axis: usize,
+        increment: String,
+        max: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionLeaseContract {
+    #[serde(default)]
+    pub policy: SessionMutationPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_seconds: Option<u64>,
+    #[serde(default)]
+    pub optimistic_metadata_version: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMutationPolicy {
+    #[default]
+    Exclusive,
+    CopyOnWrite,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ServingServiceContract {
+    pub active: String,
+    pub done: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_len: Option<String>,
+    pub slot_ids: String,
+    pub kv_service: KvServiceContract,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct KvServiceContract {
+    pub paging: KvPagingMode,
+    pub allocation: SlotAllocationMode,
+    #[serde(default)]
+    pub compaction: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum KvPagingMode {
+    None,
+    Paged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SlotAllocationMode {
+    Static,
+    Runtime,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowResourceContract {
+    #[serde(default)]
+    pub allowed_devices: Vec<DeviceKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_device: Option<DeviceKind>,
+    pub memory_class: WorkflowMemoryClass,
+    pub batching: WorkflowBatchingContract,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowMemoryClass {
+    Default,
+    Device,
+    Host,
+    Pinned,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkflowBatchingContract {
+    None,
+    Stack { axis: usize },
+    Ragged { offsets: String },
 }

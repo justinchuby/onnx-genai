@@ -22,6 +22,30 @@ A Rust-native generative AI runtime built on ONNX Runtime, implementing the infe
 - Standard-driven: behavior derived from inference metadata declarations, not hardcoded model-type dispatch
 - ORT as execution backend: delegate all NN computation to ONNX Runtime; this project manages everything above the session level
 
+### 1.1 Universal workflow metadata
+
+The north-star package representation is `pipeline.workflow`, a typed SSA workflow whose
+only orchestration nodes are component invocation, sequence, loop, branch, transfer, and
+emit. Model-specific sampler, scheduler, solver, verifier, and state-update math is supplied
+as ONNX components. The host owns only stable mechanisms: ONNX invocation, versioned adapter
+ABIs, explicit transfer, linear effect ordering, session leases, and serving services.
+
+Every workflow carries a fail-closed manifest: IR version, ONNX opsets, adapter ABI versions,
+custom-op versions, and required generic capabilities. Components expose typed ports;
+invocations map those ports to named SSA values. State and emits consume and produce linear
+effect tokens, so replay and stream ordering are explicit and validation rejects unordered
+side effects.
+
+Continuous batching, admission, compaction, KV paging, and slot allocation remain runtime
+services. Metadata binds their generic per-row values (`active`, `done`, `accepted_len`, and
+`slot_ids`) instead of attempting to encode serving allocation inside static ONNX loops.
+Session generation holds a pessimistic lease with either exclusive or copy-on-write mutation.
+
+Tensor-local shape facts come from ONNX shape inference. Metadata shape declarations cover
+package boundaries and cross-component relations, including bounded recurrence for growing
+loop state. RNG is explicit counter-based loop-carried state; packages must not rely on
+implementation-defined ONNX random-number generator state.
+
 ### Non-Goals
 
 - Writing custom CUDA/Metal kernels (ORT handles this via Execution Providers)
