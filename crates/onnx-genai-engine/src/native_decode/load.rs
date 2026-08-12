@@ -750,6 +750,9 @@ impl NativeDecodeSession {
             span.set_arg("max_len", capacity.max_len as u64);
             span.set_arg("kv_pairs", present_to_past.len() as u64);
             span.set_arg("graph_capture", graph_enabled);
+            let kv_layout = crate::native_decode::cuda::resolve_cuda_kv_layout(
+                io.and_then(|io| io.kv_layout.as_ref()),
+            );
             Some(DecodeCudaState::new(
                 &mut session,
                 DecodeCudaIo {
@@ -765,6 +768,7 @@ impl NativeDecodeSession {
                 capacity,
                 graph_enabled,
                 position_rank,
+                kv_layout,
             )?)
         } else {
             None

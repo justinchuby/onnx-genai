@@ -314,19 +314,46 @@ measured 2 MiB CUDA granule:
 | Layout | Floor unit | Near-empty floor | Evidence/status |
 |---|---:|---:|---|
 | BNSH head-major | `layers × 2 × kv_heads = 768` | ~1.5 GiB | Default; geometry measured in #772/#776/#787 |
-| BSNH seq-major | `layers × 2 = 96` | ~192 MiB | Geometry only — **not realized today**, see below |
+| BSNH seq-major | `layers × 2 = 96` | ~192 MiB | **Driver-level residency measured** (`vmm_kv_layout_residency_gpu`); see below |
 | token-major across all layers | `1` per sequence | ~2 MiB | **768× measured reduction**, #787; not implemented |
 
 > **These floors are properties of the layout geometry, not of what the runtime
-> currently commits.** Measured in #794 on both qwen2.5-0.5b and qwen14b,
-> head-major and seq-major commit **identical** physical bytes (100,663,296 B and
-> 402,653,184 B respectively). The reason is that the native CUDA bindings still
-> allocate bucket-sized packed shapes and commit flat bucket ranges without
-> consuming the KV layout metadata, so seq-major currently changes **kernel
-> indexing only** — not reservation or commit geometry. Realizing the `layers × 2`
-> floor requires layout-aware binding and residency allocation, which is the
-> binding-views work still outstanding. #787 reached the same conclusion from the
-> other direction: the read path is free, and the cost sits on the binding layer.
+> currently commits on the end-to-end engine path.** Measured in #794 on both
+> qwen2.5-0.5b and qwen14b, head-major and seq-major commit **identical**
+> physical bytes (100,663,296 B and 402,653,184 B respectively), because the
+> native CUDA bindings allocated bucket-sized packed shapes and committed flat
+> bucket ranges without consuming the KV layout metadata — so seq-major changed
+> **kernel indexing only**, not reservation or commit geometry. #787 reached the
+> same conclusion from the other direction: the read path is free, and the cost
+> sits on the binding layer.
+>
+> **Update (kv-binding-views).** The layout-aware commit *geometry* is now built
+> and measured directly at the driver level. A `KvCommitLayout`-driven commit
+> path (`crates/onnx-genai-engine/src/native_decode/kv_commit.rs`, unit-tested)
+> computes, per binding, the live-prefix commit ranges the layout implies on a
+> **fixed full-context stride**: seq-major is one dense run
+> `0..ceil(live_bytes/granule)`; head-major stays one live fragment per head
+> stripe. The GPU test `vmm_kv_layout_residency_gpu` (in `onnx-runtime-cuda-memory`)
+> maps those ranges on the real 2 MiB granule and confirms, deterministically:
+>
+> | Model | Per-binding head-major | Per-binding seq-major | Ratio | Model-wide head-major | Model-wide seq-major |
+> |---|---:|---:|---:|---:|---:|
+> | qwen2.5-0.5b | 4 MiB (2 granules) | 2 MiB (1 granule) | **2× = kv_heads** | 192 MiB (96 granules) | 96 MiB (48 granules) |
+> | qwen14b | 16 MiB (8 granules) | 2 MiB (1 granule) | **8× = kv_heads** | 1536 MiB (768 granules) | 192 MiB (96 granules) |
+>
+> The same test also grows a seq-major fixed-stride binding **under a captured
+> replay** (granule 0 → 3 at a stable VA) and observes **0 re-captures** — the
+> stable-stride win #782 could not demonstrate end to end, shown here on hardware.
+>
+> The remaining gap is **structural, not measurement**: the engine's own commit
+> path (`native_decode/cuda.rs`) still grows a BNSH physical shape whose seq axis
+> (`persistent_state_shapes`) is hard-coded, and no model on record declares
+> seq-major, so there is no BSNH fixed-stride physical-shape build to hang the
+> dense-prefix commit on. The engine now *consumes* the `kv_layout` descriptor
+> (resolved to `KvCommitLayout`, surfaced in `CudaKvDebugStats.kv_layout_seq_major`),
+> and the geometry mechanism + driver measurement are in place; wiring the
+> dense-prefix commit into a seq-major generation is the documented next step
+> (it shares the BSNH shape-build prerequisite with token-major and #777).
 
 The small-model measurement makes the waste concrete: qwen2.5-0.5b committed
 **96 head stripes × 2 MiB = 192 MiB to hold about 12 KiB** of live KV (#772).

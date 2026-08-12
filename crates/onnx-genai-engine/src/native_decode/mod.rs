@@ -22,6 +22,7 @@ mod backend;
 mod cpu;
 mod cuda;
 mod io;
+mod kv_commit;
 mod load;
 mod paged_gqa;
 mod proposer;
