@@ -56,7 +56,8 @@ use std::sync::{Arc, Mutex};
 
 use onnx_runtime_memory_governor::{
     AllocationCommitRange, DeviceAllocator, DeviceKey, HolderId, MappedPhysicalCapacityToken,
-    MemoryAuthorityId, MemoryError, MemoryGovernor, MemoryLease, MemoryRole, Tier,
+    MemoryAuthorityId, MemoryError, MemoryGovernor, MemoryLease, MemoryRole, SharedDevicePrefix,
+    SharedPrefixCommitInfo, Tier,
 };
 use onnx_runtime_virtual_memory::{PhysicalMemoryAccounting, VirtualBacking};
 
@@ -512,6 +513,28 @@ impl SharedPrefix {
 
     fn granularity(&self) -> usize {
         self.reservation.granularity()
+    }
+}
+
+impl SharedDevicePrefix for SharedPrefix {
+    fn device_ptr(&self) -> u64 {
+        SharedPrefix::device_ptr(self)
+    }
+
+    fn committed_physical_bytes(&self) -> u64 {
+        SharedPrefix::committed_physical_bytes(self)
+    }
+
+    fn mapped_bytes(&self) -> usize {
+        SharedPrefix::mapped_bytes(self)
+    }
+
+    fn requested_bytes(&self) -> usize {
+        SharedPrefix::requested_bytes(self)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
@@ -1924,6 +1947,57 @@ impl DeviceAllocator for CudaVmmAllocator {
 
     fn device(&self) -> DeviceKey {
         self.device
+    }
+
+    fn create_shared_prefix(
+        &self,
+        bytes: usize,
+    ) -> Result<Box<dyn SharedDevicePrefix>, MemoryError> {
+        let prefix = CudaVmmAllocator::create_shared_prefix(self, bytes)?;
+        Ok(Box::new(prefix))
+    }
+
+    fn incremental_owned_bytes_for_shared_prefix(&self, prefix: &dyn SharedDevicePrefix) -> u64 {
+        // A prefix from another allocator kind cannot be mapped here, so its
+        // incremental owned cost is not this allocator's to estimate; treat the
+        // unmappable case as "not free" so a caller never admits against a
+        // prefix `commit_shared_prefix` will refuse.
+        match prefix.as_any().downcast_ref::<SharedPrefix>() {
+            Some(prefix) => {
+                CudaVmmAllocator::incremental_owned_bytes_for_shared_prefix(self, prefix)
+            }
+            None => prefix.committed_physical_bytes(),
+        }
+    }
+
+    fn commit_shared_prefix(
+        &self,
+        prefix: &dyn SharedDevicePrefix,
+        ptr: NonNull<u8>,
+        allocation_bytes: usize,
+        byte_offset: usize,
+    ) -> Result<SharedPrefixCommitInfo, MemoryError> {
+        let prefix = prefix.as_any().downcast_ref::<SharedPrefix>().ok_or_else(|| {
+            invalid(
+                allocation_bytes,
+                String::from(
+                    "shared prefix was not created by a CUDA VMM allocator; it cannot be mapped \
+                     here",
+                ),
+            )
+        })?;
+        let commit = CudaVmmAllocator::commit_shared_prefix(
+            self,
+            prefix,
+            ptr,
+            allocation_bytes,
+            byte_offset,
+        )?;
+        Ok(SharedPrefixCommitInfo {
+            additional_owned_bytes: commit.additional_owned_bytes,
+            newly_mapped_bytes: commit.newly_mapped_bytes,
+            granules: commit.granules,
+        })
     }
 }
 

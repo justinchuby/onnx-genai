@@ -642,8 +642,38 @@ real #740 ledger, non-sticky/non-corrupting write protection, coexistence with
 the #759 dummy page, and a one-time ~5.5 ms pooled copy-on-write at the boundary.
 Measured answers, the concurrency/saving and capacity tables, and the design for
 an explicit pinned-prefix API (the smallest next increment) are in
-[`PREFIX_SHARE_INVESTIGATION.md`](./PREFIX_SHARE_INVESTIGATION.md). Integration
-remains unbuilt.
+[`PREFIX_SHARE_INVESTIGATION.md`](./PREFIX_SHARE_INVESTIGATION.md).
+
+**First production consumer landed (#777).** The prefix-sharing primitive
+(`create_shared_prefix`/`commit_shared_prefix`, #803) previously had no live
+caller — only its definition and GPU tests. It is now reachable from production
+code through an allocator-agnostic seam on the `DeviceAllocator` trait
+(`create_shared_prefix` / `incremental_owned_bytes_for_shared_prefix` /
+`commit_shared_prefix`, returning an opaque `dyn SharedDevicePrefix`), so a
+caller holding only `dyn DeviceAllocator` can pin a token prefix once and have
+subsequent sequences map it. Non-VMM allocators keep the default impls, which
+refuse (`InvalidRequest`) rather than mis-map. The **seq-major** fused fp16 GQA
+decode kernel is the first consumer: a GPU parity test
+(`crates/onnx-runtime-ep-cuda/tests/gqa_shared_prefix_parity_gpu.rs`) drives the
+real kernel over shared-prefix VMM KV and proves two sequences sharing one pinned
+seq-major prefix (`layers × 2` contiguous ranges) produce **byte-identical**
+output to two independent sequences. Measured at KV_HEADS=8, HEAD_DIM=128, f16,
+1024-token prefix + 1024-token private tail per sequence: independent = 8
+granules (16,777,216 B), shared = 6 granules (12,582,912 B); the prefix is
+charged **once** (`incremental_owned_bytes_for_shared_prefix` = 0) and the second
+sharer's admission is **only its private bytes** (4,194,304 B = its two private
+tails), so sharing removes `(C−1)×(K_prefix+V_prefix)` = 2 granules.
+
+**What remains structural.** The *engine generation loop* cannot yet call this
+seam automatically: `persistent_state_shapes` in
+`native_decode/cuda.rs` builds a hard-coded BNSH physical KV shape and no model
+declares a seq-major end-to-end fixed-stride physical shape (#794 showed
+seq-major changed only kernel indexing, not commit geometry). A BNSH/seq-major
+fixed-stride physical-shape build is therefore the prerequisite for auto engine
+use. Hash-based automatic detection, token-major (one multi-map per sequence),
+and copy-on-write at divergence remain the later increments named below. The
+delivered consumer is explicit (a caller declares the shared prefix) and is
+restricted to prefixes that are read-only for the sharers' lifetime.
 
 #### Layout belongs to the KV owner
 
