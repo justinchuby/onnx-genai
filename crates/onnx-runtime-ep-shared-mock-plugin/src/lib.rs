@@ -40,9 +40,13 @@
 //!
 //! Setting [`nxrt_mock_shared_ep_set_persistent_workspace`] flips the `Add`
 //! kernel's declared lifetime to [`WorkspaceLifetime::SessionPersistent`],
-//! which the executor cannot honour. The falsifier for "never silently
-//! downgrade" is that `Run()` then **fails** and
-//! `nxrt_mock_shared_ep_persistent_dispatched` stays `0`.
+//! which the executor has no arena for. It must then pass `None` — routing the
+//! kernel to its own self-owned scratch — and must **never** hand over a
+//! step-scoped block that ORT recycles when `Compute` returns. The falsifier is
+//! `nxrt_mock_shared_ep_persistent_downgraded == 0` while
+//! `nxrt_mock_shared_ep_persistent_declined > 0`: any executor that "helpfully"
+//! serves the persistent request from scratch memory flips the first counter
+//! and fails the test.
 //!
 //! All observable state is exported through `#[no_mangle]` C accessors so the
 //! integration test — which reaches this library through ORT's `dlopen` — can
@@ -83,7 +87,8 @@ static KERNEL_WORKSPACE_OK: AtomicUsize = AtomicUsize::new(0);
 static KERNEL_WORKSPACE_MISSING: AtomicUsize = AtomicUsize::new(0);
 static KERNEL_EXECUTE_WITHOUT_WORKSPACE: AtomicUsize = AtomicUsize::new(0);
 static KERNEL_MUL_EXECUTED: AtomicUsize = AtomicUsize::new(0);
-static KERNEL_PERSISTENT_DISPATCHED: AtomicUsize = AtomicUsize::new(0);
+static KERNEL_PERSISTENT_DECLINED: AtomicUsize = AtomicUsize::new(0);
+static KERNEL_PERSISTENT_DOWNGRADED: AtomicUsize = AtomicUsize::new(0);
 
 /// When set, `WorkspaceAddKernel` declares a `SessionPersistent` workspace.
 static PERSISTENT_WORKSPACE: AtomicBool = AtomicBool::new(false);
@@ -157,21 +162,28 @@ counter_export!(
     "Dispatches of the zero-workspace `Mul` kernel."
 );
 counter_export!(
-    nxrt_mock_shared_ep_persistent_dispatched,
-    KERNEL_PERSISTENT_DISPATCHED,
-    "Dispatches that reached the kernel while it declared a `SessionPersistent` \
-     workspace. Must stay `0`: the executor has no persistent device arena, so \
-     serving such a request from step-scoped scratch would be a silent \
-     downgrade."
+    nxrt_mock_shared_ep_persistent_declined,
+    KERNEL_PERSISTENT_DECLINED,
+    "Dispatches where the kernel declared a `SessionPersistent` workspace and \
+     the executor correctly passed `None`, routing it to its own self-owned \
+     scratch. Must be `> 0` in the persistent scenario."
+);
+counter_export!(
+    nxrt_mock_shared_ep_persistent_downgraded,
+    KERNEL_PERSISTENT_DOWNGRADED,
+    "Dispatches where the kernel declared a `SessionPersistent` workspace and \
+     the executor handed over a workspace anyway. Must stay `0`: ORT reclaims \
+     `KernelContext_GetScratchBuffer` memory when `Compute` returns, so that \
+     block is recycled behind the kernel's back on the next `Run`."
 );
 
 /// Select the workspace lifetime the mock `Add` kernel declares.
 ///
-/// `0` = `StepScoped` (the honourable request), anything else =
-/// `SessionPersistent` (the request the executor must reject rather than
-/// silently downgrade). Call before `CreateSession`, since
-/// `workspace_requirement` is consulted per dispatch but the kernel is built
-/// at compile time.
+/// `0` = `StepScoped` (the request the executor serves from ORT scratch),
+/// anything else = `SessionPersistent` (the request the executor must decline
+/// with `None` rather than silently downgrade). Call before `CreateSession`,
+/// since `workspace_requirement` is consulted per dispatch but the kernel is
+/// built at compile time.
 #[unsafe(no_mangle)]
 pub extern "C" fn nxrt_mock_shared_ep_set_persistent_workspace(on: usize) {
     PERSISTENT_WORKSPACE.store(on != 0, Ordering::SeqCst);
@@ -187,7 +199,8 @@ pub extern "C" fn nxrt_mock_shared_ep_reset_counters() {
         &KERNEL_WORKSPACE_MISSING,
         &KERNEL_EXECUTE_WITHOUT_WORKSPACE,
         &KERNEL_MUL_EXECUTED,
-        &KERNEL_PERSISTENT_DISPATCHED,
+        &KERNEL_PERSISTENT_DECLINED,
+        &KERNEL_PERSISTENT_DOWNGRADED,
     ] {
         c.store(0, Ordering::SeqCst);
     }
@@ -434,13 +447,41 @@ impl Kernel for WorkspaceAddKernel {
         workspace: Option<WorkspaceView>,
     ) -> EpResult<()> {
         if PERSISTENT_WORKSPACE.load(Ordering::SeqCst) {
-            KERNEL_PERSISTENT_DISPATCHED.fetch_add(1, Ordering::SeqCst);
-            return Err(EpError::KernelFailed(
-                "WorkspaceAddKernel: dispatched while declaring a SessionPersistent workspace. \
-                 The executor silently downgraded a persistent request to step-scoped scratch \
-                 instead of failing closed."
-                    .to_string(),
-            ));
+            // Mirrors a real persistent-declaring kernel (GroupQueryAttention,
+            // MatMulNBits' bf16 arena): the executor has no session-persistent
+            // device arena, so it must decline with `None` and let the kernel
+            // fall back to scratch it owns and controls the lifetime of.
+            if workspace.is_some() {
+                KERNEL_PERSISTENT_DOWNGRADED.fetch_add(1, Ordering::SeqCst);
+                return Err(EpError::KernelFailed(
+                    "WorkspaceAddKernel: the executor served a SessionPersistent workspace \
+                     request from step-scoped memory. ORT reclaims that block when Compute \
+                     returns, so the kernel would reuse recycled memory on the next Run."
+                        .to_string(),
+                ));
+            }
+            KERNEL_PERSISTENT_DECLINED.fetch_add(1, Ordering::SeqCst);
+            let (a, b, numel) = f32_operands(inputs, "Add")?;
+            if outputs.len() != 1 {
+                return Err(EpError::KernelFailed(format!(
+                    "Add: expected 1 output, got {}",
+                    outputs.len()
+                )));
+            }
+            // Self-owned scratch, allocated and freed by the kernel.
+            let mut owned = vec![0f32; numel];
+            // SAFETY: this EP is CPU-typed, so operand pointers are host
+            // resident, and `f32_operands` checked the element count.
+            unsafe {
+                let ap = a.data_ptr::<f32>();
+                let bp = b.data_ptr::<f32>();
+                for (i, slot) in owned.iter_mut().enumerate() {
+                    *slot = *ap.add(i) + *bp.add(i);
+                }
+                let out = outputs[0].data_ptr_mut::<f32>();
+                std::ptr::copy_nonoverlapping(owned.as_ptr(), out, numel);
+            }
+            return Ok(());
         }
         let (a, b, numel) = f32_operands(inputs, "Add")?;
         let need = numel * std::mem::size_of::<f32>();

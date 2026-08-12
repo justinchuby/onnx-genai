@@ -776,19 +776,29 @@ fn shared_ep_shutdown_runs_once_at_library_unregister() {
     }
 }
 
-/// `WorkspaceLifetime::SessionPersistent` must fail closed, never be silently
-/// downgraded to the step-scoped ORT scratch this executor can actually serve.
+/// `WorkspaceLifetime::SessionPersistent` must be **declined** (`None`), never
+/// served from the step-scoped ORT scratch this executor can actually provide.
 ///
 /// ORT reclaims `KernelContext_GetScratchBuffer` memory when `Compute` returns,
-/// so handing it to a kernel that asked for session-persistent scratch would
-/// give it memory recycled behind its back — a silent correctness bug on the
-/// second decode step. The falsifier: the same model that succeeds with a
-/// step-scoped request must **fail** with a persistent one, and the kernel must
-/// never be dispatched.
+/// so handing that block to a kernel that asked for session-persistent scratch
+/// gives it memory recycled behind its back on the next `Run` — a silent
+/// correctness bug on the second decode step, not a loud one.
+///
+/// Declining is also the behaviour `main` (#832, H200-validated) has today: the
+/// executor called bare `Kernel::execute`, which for a persistent declarer such
+/// as `GroupQueryAttention` is exactly `execute_with_workspace(.., None)` and
+/// routes it to its own pooled scratch. Hard-failing instead would turn every
+/// GQA-bearing model into a plugin-path error on hardware that runs it today,
+/// so the contract is: decline, never downgrade, and let a kernel that truly
+/// cannot cope fail closed itself.
+///
+/// Falsifier: `persistent_downgraded` must be `0` (nobody handed over recycled
+/// memory) while `persistent_declined` must be `> 0` (the path was actually
+/// exercised, so the test cannot pass vacuously).
 #[test]
-fn session_persistent_workspace_fails_closed_instead_of_downgrading() {
+fn session_persistent_workspace_is_declined_not_downgraded() {
     let _lock = lock_ort_ep();
-    let Some(fx) = Fixture::acquire("session_persistent_workspace_fails_closed") else {
+    let Some(fx) = Fixture::acquire("session_persistent_workspace_is_declined") else {
         return;
     };
     fx.reset_counters();
@@ -810,28 +820,38 @@ fn session_persistent_workspace_fails_closed_instead_of_downgrading() {
             c"Z",
         );
 
-        let err = match outcome {
-            Ok(values) => panic!(
-                "Run() succeeded ({values:?}) for a SessionPersistent workspace request — the \
-                 executor silently downgraded it to step-scoped ORT scratch, which ORT recycles \
-                 when Compute returns"
+        match outcome {
+            Ok(values) => assert_close(values, [6.0, 8.0, 10.0, 12.0], "add_1x4 (persistent)"),
+            Err(msg) => panic!(
+                "Run() failed for a SessionPersistent request ({msg}). Declining must route the \
+                 kernel to its own self-owned scratch, not break a model that runs on main"
             ),
-            Err(msg) => msg,
-        };
+        }
+
+        assert_eq!(
+            fx.counter("nxrt_mock_shared_ep_persistent_downgraded"),
+            0,
+            "the executor served a SessionPersistent request from step-scoped ORT scratch — that \
+             block is recycled when Compute returns"
+        );
         assert!(
-            err.contains("SessionPersistent"),
-            "the failure must name the unsupported lifetime so a kernel author can act on it; \
-             got: {err}"
+            fx.counter("nxrt_mock_shared_ep_persistent_declined") >= 1,
+            "the persistent path was never exercised, so this test proves nothing"
         );
         assert_eq!(
-            fx.counter("nxrt_mock_shared_ep_persistent_dispatched"),
+            fx.counter("nxrt_mock_shared_ep_execute_without_workspace"),
             0,
-            "the kernel was dispatched despite an unservable workspace request"
+            "declining a workspace must still go through execute_with_workspace()"
         );
         assert_eq!(
             fx.counter("nxrt_mock_shared_ep_workspace_ok"),
             0,
-            "no dispatch may have been served while the persistent request was in force"
+            "no workspace may have been served while the persistent request was in force"
+        );
+        assert_eq!(
+            fx.counter("nxrt_mock_shared_ep_alloc_calls"),
+            0,
+            "declining must not fall back to per-dispatch EP allocate/free"
         );
 
         ((*api).ReleaseSession.unwrap())(session);

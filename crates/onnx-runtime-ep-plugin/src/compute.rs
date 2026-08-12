@@ -841,13 +841,25 @@ unsafe fn alloc_scratch(
 /// # Lifetimes
 ///
 /// * [`WorkspaceLifetime::StepScoped`] — served from ORT scratch, as above.
-/// * [`WorkspaceLifetime::SessionPersistent`] — **fails closed**. ORT reclaims
-///   scratch when `Compute` returns, so serving a persistent request from it
-///   would hand the kernel memory that is recycled behind its back. There is
-///   no session-persistent device arena at this seam yet; a kernel that needs
-///   one owns a cached grow-only arena itself (see `MatMulNBits`'s bf16 scratch
-///   in #832). Silently downgrading to step-scoped is the failure mode this
-///   branch exists to prevent.
+/// * [`WorkspaceLifetime::SessionPersistent`] — **explicitly declined**
+///   (`Ok(None)`), never downgraded. ORT reclaims scratch when `Compute`
+///   returns, so serving a persistent request from it would hand the kernel
+///   memory that is recycled behind its back on the next `Run`. There is no
+///   session-persistent device arena at this seam, so the kernel is routed to
+///   its own documented self-owned scratch path — which is what every
+///   persistent-declaring kernel in this repo already implements (the cached
+///   grow-only arena pattern, e.g. `MatMulNBits`'s bf16 scratch from #832, and
+///   `GroupQueryAttentionKernel::execute`'s pooled reference-score slot). A
+///   kernel that genuinely cannot run without executor-provided persistent
+///   memory fails closed in its own `execute_with_workspace`, where it knows
+///   the answer; this seam must not guess.
+///
+///   Declining is also what preserves #832's H200-validated plugin path: on
+///   `main` the executor called bare `Kernel::execute`, which for a persistent
+///   declarer such as `GroupQueryAttention` is exactly
+///   `execute_with_workspace(.., None)`. Hard-failing here would have turned
+///   every GQA-bearing model into a plugin-path error on hardware that runs it
+///   today.
 ///
 /// `mem_info` is `None` when the memory device of the kernel's operands could
 /// not be read; a workspace request is then rejected rather than served from
@@ -883,14 +895,12 @@ unsafe fn prepare_workspace(
         ));
     }
     if requirement.lifetime != WorkspaceLifetime::StepScoped {
-        return Err(format!(
-            "{node_label}: kernel requested a {:?} workspace of {} bytes. This executor can only \
-             serve step-scoped workspace (ORT reclaims KernelContext_GetScratchBuffer memory when \
-             Compute returns), and downgrading a session-persistent request to step-scoped would \
-             hand the kernel memory that is recycled behind its back. A kernel needing persistent \
-             device scratch must own a cached grow-only arena itself.",
-            requirement.lifetime, requirement.bytes
-        ));
+        // Explicit decline, never a downgrade. ORT reclaims a
+        // `KernelContext_GetScratchBuffer` block when `Compute` returns, so
+        // serving a `SessionPersistent` request from it would hand the kernel
+        // memory that is recycled behind its back the moment it reuses the
+        // pointer on the next `Run`.
+        return Ok(None);
     }
 
     let bytes = usize::try_from(requirement.bytes).map_err(|_| {
@@ -899,13 +909,8 @@ unsafe fn prepare_workspace(
             requirement.bytes
         )
     })?;
-    // Over-allocate so align-up always lands inside the block.
-    let total = bytes.checked_add(alignment - 1).ok_or_else(|| {
-        format!(
-            "{node_label}: workspace request of {bytes} bytes over-aligned to {alignment} \
-             overflows usize"
-        )
-    })?;
+    let total =
+        workspace_block_bytes(bytes, alignment).map_err(|e| format!("{node_label}: {e}"))?;
 
     let mem_info = mem_info.ok_or_else(|| {
         format!(
@@ -919,28 +924,58 @@ unsafe fn prepare_workspace(
     let base = unsafe { alloc_scratch(api, ctx, mem_info, total) }
         .map_err(|e| format!("{node_label}: workspace scratch allocation failed: {e}"))?;
 
-    let addr = base as usize;
-    let aligned = addr
-        .checked_add(alignment - 1)
-        .map(|a| a & !(alignment - 1))
-        .ok_or_else(|| format!("{node_label}: aligning workspace pointer overflows usize"))?;
-    let end = aligned
-        .checked_add(bytes)
-        .ok_or_else(|| format!("{node_label}: workspace end address overflows usize"))?;
-    let block_end = addr
-        .checked_add(total)
-        .ok_or_else(|| format!("{node_label}: workspace block end overflows usize"))?;
-    if end > block_end {
+    if base.is_null() {
         return Err(format!(
-            "{node_label}: aligned workspace [{aligned:#x}, {end:#x}) escapes the \
-             {total}-byte scratch block at {addr:#x}"
+            "{node_label}: workspace scratch allocation returned a null pointer"
         ));
     }
+    let aligned = align_workspace_window(base as usize, total, bytes, alignment)
+        .map_err(|e| format!("{node_label}: {e}"))?;
 
     Ok(Some(WorkspaceView::new(
         DevicePtrMut(aligned as *mut c_void),
         bytes,
     )))
+}
+
+/// Bytes to request so that aligning up to `alignment` always lands inside the
+/// block. Split out from [`prepare_workspace`] so the overflow behaviour is
+/// unit-testable without an ORT kernel context.
+fn workspace_block_bytes(bytes: usize, alignment: usize) -> Result<usize, String> {
+    bytes.checked_add(alignment - 1).ok_or_else(|| {
+        format!("workspace request of {bytes} bytes over-aligned to {alignment} overflows usize")
+    })
+}
+
+/// Align `base` up to `alignment` and prove the resulting `bytes`-long window
+/// lies inside the `total`-byte block starting at `base`.
+///
+/// Split out from [`prepare_workspace`] so the alignment and overflow rules are
+/// unit-testable without an ORT kernel context. Every step is checked: a
+/// wrapping add here would hand a kernel a pointer outside the allocation.
+fn align_workspace_window(
+    base: usize,
+    total: usize,
+    bytes: usize,
+    alignment: usize,
+) -> Result<usize, String> {
+    let aligned = base
+        .checked_add(alignment - 1)
+        .map(|a| a & !(alignment - 1))
+        .ok_or("aligning workspace pointer overflows usize")?;
+    let end = aligned
+        .checked_add(bytes)
+        .ok_or("workspace end address overflows usize")?;
+    let block_end = base
+        .checked_add(total)
+        .ok_or("workspace block end overflows usize")?;
+    if end > block_end {
+        return Err(format!(
+            "aligned workspace [{aligned:#x}, {end:#x}) escapes the {total}-byte scratch \
+             block at {base:#x}"
+        ));
+    }
+    Ok(aligned)
 }
 
 /// Compute: execute the kernel(s) for this subgraph.
@@ -955,11 +990,14 @@ unsafe fn prepare_workspace(
 ///
 /// Every dispatch goes through [`prepare_workspace`] →
 /// [`Kernel::execute_with_workspace`], never bare [`Kernel::execute`]. A kernel
-/// declaring a non-zero [`WorkspaceRequirement`] gets correctly-aligned scratch
-/// on the same memory device as its operands, taken from ORT
-/// (`KernelContext_GetScratchBuffer`) and reclaimed by ORT when `Compute`
-/// returns. Kernels declaring [`WorkspaceRequirement::NONE`] behave exactly as
-/// before: `execute_with_workspace`'s default forwards to `execute`.
+/// declaring a non-zero [`WorkspaceLifetime::StepScoped`] requirement gets
+/// correctly-aligned scratch on the same memory device as its operands, taken
+/// from ORT (`KernelContext_GetScratchBuffer`) and reclaimed by ORT when
+/// `Compute` returns — the same mechanism #832 validated on an H200 for fused
+/// subgraph intermediates. A [`WorkspaceLifetime::SessionPersistent`] request
+/// is **declined** (`None`), never downgraded to recycled step-scoped memory.
+/// Kernels declaring [`WorkspaceRequirement::NONE`] behave exactly as before:
+/// `execute_with_workspace`'s default forwards to `execute`.
 ///
 /// # Safety
 ///
@@ -3254,5 +3292,69 @@ mod tests {
         // Not marked absent — exact dtype required.
         assert!(view.validate_write_dtype(DataType::Float32).is_ok());
         assert!(view.validate_write_dtype(DataType::Float16).is_err());
+    }
+}
+
+#[cfg(test)]
+mod workspace_math_tests {
+    use super::{align_workspace_window, workspace_block_bytes};
+
+    /// The over-allocation must be exactly enough that align-up always fits —
+    /// no more (wasted device memory per dispatch) and no less (out-of-bounds).
+    #[test]
+    fn block_size_covers_the_worst_case_misalignment() {
+        for alignment in [1usize, 8, 64, 256, 4096] {
+            let total = workspace_block_bytes(1000, alignment).expect("no overflow");
+            assert_eq!(total, 1000 + alignment - 1);
+            // Worst case: the allocator returns a block one byte past alignment.
+            let base = alignment * 4 + 1;
+            let aligned = align_workspace_window(base, total, 1000, alignment).expect("must fit");
+            assert!(aligned >= base, "aligned pointer moved backwards");
+            assert!(
+                aligned.is_multiple_of(alignment),
+                "aligned pointer {aligned:#x} does not satisfy {alignment}"
+            );
+            assert!(
+                aligned + 1000 <= base + total,
+                "aligned window escapes the block"
+            );
+        }
+    }
+
+    /// An already-aligned base must not be moved — otherwise every dispatch
+    /// silently wastes up to `alignment - 1` bytes it did not need to.
+    #[test]
+    fn an_aligned_base_is_returned_unchanged() {
+        let aligned = align_workspace_window(4096, 4096 + 255, 4096, 256).expect("must fit");
+        assert_eq!(aligned, 4096);
+    }
+
+    /// A request whose padded size cannot be represented must be rejected
+    /// rather than wrapping to a tiny allocation the kernel then overruns.
+    #[test]
+    fn an_overflowing_request_is_rejected_not_wrapped() {
+        let err = workspace_block_bytes(usize::MAX, 256).expect_err("must reject");
+        assert!(err.contains("overflows usize"), "got: {err}");
+    }
+
+    /// Aligning a pointer near the top of the address space must fail closed,
+    /// not wrap around to a low address.
+    #[test]
+    fn aligning_near_the_address_space_top_is_rejected() {
+        let err = align_workspace_window(usize::MAX - 8, 8, 8, 256).expect_err("must reject");
+        assert!(
+            err.contains("overflows usize") || err.contains("escapes"),
+            "got: {err}"
+        );
+    }
+
+    /// The containment check is the last line of defence: if the block is too
+    /// small for the aligned window, no pointer may be handed out.
+    #[test]
+    fn a_window_escaping_the_block_is_rejected() {
+        // 64 bytes requested from a 64-byte block whose base is misaligned:
+        // aligning up leaves fewer than 64 bytes.
+        let err = align_workspace_window(0x1001, 64, 64, 256).expect_err("must reject");
+        assert!(err.contains("escapes"), "got: {err}");
     }
 }
