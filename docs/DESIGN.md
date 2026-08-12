@@ -8030,6 +8030,18 @@ Both are standard ONNX ops. No custom ops needed. The "paging" is expressed pure
 > [`MEMORY_ARCHITECTURE.md`](./MEMORY_ARCHITECTURE.md) for the full KV-geometry
 > analysis and the read-bounded-commit result (PR #772).
 >
+> **Update — layout, not just length, moves the crossover (#787/#792).** The
+> analysis above frames residency as head-major-only, where the only lever is
+> context length vs. the crossover. Since then the KV *layout* itself has become
+> the primary residency lever: seq-major (`layers×2`) and token-major (1 per
+> sequence) lower the committed-granule floor by construction, an end-to-end
+> measured **768×** reduction to ~2 MiB (#787), and `KvLayout` was replaced by a
+> symbolic stride descriptor with static per-layout NVRTC specialisation (#792).
+> The head-major 8,192-token crossover at a 2 MiB granule is unchanged and still
+> correct, but it is now one row of a layout × granule × prefix grid rather than
+> the whole story. `MEMORY_ARCHITECTURE.md` → "KV layout and residency" is the
+> single authoritative source.
+>
 > **Phase 3 is dropped.** ORT's `PagedAttention`
 > (`contrib_ops/cuda/bert/paged_attention.*`) exists, but it is CUDA-only — zero
 > hits under `contrib_ops/cpu` — and it is a *graph operator*, so a stock

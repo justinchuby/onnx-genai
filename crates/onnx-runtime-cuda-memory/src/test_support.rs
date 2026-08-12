@@ -1,8 +1,12 @@
 //! Shared helpers for the crate's real-CUDA integration tests (`tests/vmm_*`).
 //!
-//! This module only exists for tests: it is compiled behind the `gpu-tests`
-//! feature (and the crate's own `cfg(test)`), so it never reaches a production
-//! build. Its whole reason to exist is [`TestStream`], which makes the one thing
+//! This module only exists for tests: it is compiled purely behind the
+//! `gpu-tests` feature, so it never reaches a production build. `cfg(test)`
+//! does NOT gate it (and never did usefully) — `cfg(test)` only applies when
+//! this crate is compiled as its own unit-test binary, not when integration
+//! tests under `tests/*.rs` link it as a regular dependency, so an integration
+//! test needing this module must build with `--features gpu-tests` explicitly.
+//! Its whole reason to exist is [`TestStream`], which makes the one thing
 //! every device test must get right — *stream discipline* — the easy path.
 //!
 //! # Why single-stream discipline is not optional (#797)

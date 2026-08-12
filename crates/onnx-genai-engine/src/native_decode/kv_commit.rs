@@ -34,13 +34,16 @@
 // `live_prefix_committed_bytes`, and `KvBindingGeometry`) are the layout-aware
 // commit mechanism. They are exercised by this module's unit tests and mirrored
 // by the driver-level GPU residency measurement in `onnx-runtime-cuda-memory`
-// (`vmm_kv_layout_residency_gpu`). The engine's own commit path cannot consume
-// them yet: it commits flat bucket ranges over a BNSH physical shape whose seq
-// axis grows, and there is no seq-major (BSNH) fixed-stride physical-shape build
-// to hang the dense-prefix commit on. That build is the documented structural
-// follow-on (see `docs/MEMORY_ARCHITECTURE.md`, "KV layout and residency"), so
-// under a non-test build these helpers are compiled but not yet called.
-#![cfg_attr(not(test), allow(dead_code))]
+// (`vmm_kv_layout_residency_gpu`). The engine's own seq-major fixed-stride
+// commit path now consumes `live_prefix_ranges` directly
+// (`DecodeCudaState::seq_major_kv_commit_requests`), so the live commit geometry
+// and the measured residency floor are single-sourced here and cannot drift. The
+// seq-major (BSNH) fixed-stride physical-shape build that hangs the dense-prefix
+// commit on this geometry landed with #801/#812 (see
+// `docs/MEMORY_ARCHITECTURE.md`, "KV layout and residency"). The residency
+// projection helpers `committed_granules` / `live_prefix_committed_bytes` remain
+// measurement-only (they model the granule floor the driver test verifies), so
+// they carry a scoped dead-code allowance for non-test builds.
 
 use std::ops::Range;
 
@@ -133,6 +136,7 @@ pub(crate) fn live_prefix_ranges(
 /// committed physical bytes divided by the granule size. Two ranges that share a
 /// granule window count that window once (this is why seq-major's dense run is
 /// so much cheaper than head-major's scattered fragments at the same content).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn committed_granules(ranges: &[Range<usize>], granule: usize) -> usize {
     assert!(granule > 0, "granule size must be non-zero");
     let mut windows: Vec<(usize, usize)> = ranges
@@ -166,6 +170,7 @@ pub(crate) fn committed_granules(ranges: &[Range<usize>], granule: usize) -> usi
 /// Committed physical bytes for the live prefix of one binding under `layout`,
 /// on a fixed full-context stride, rounded up to the granule. `None` on
 /// overflow.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn live_prefix_committed_bytes(
     layout: KvCommitLayout,
     geometry: KvBindingGeometry,
