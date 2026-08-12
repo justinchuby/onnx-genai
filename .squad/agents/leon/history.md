@@ -109,3 +109,13 @@ None inputs in `build_subgraph_routing`). Documented for Sebastian.
 - **Verdict: OURS** (not inherited) — cross-PR comparison: #31678 (unrelated) TensorRT green; #31988 red. Disproved Deckard's initial "CUDA-13 base-codebase" assumption.
 - **Fix**: Extracted `SelectColsPerBlock`, `kColsPerThreadBlock`, `kTargetCtasPerSm` into `matmul_4bits_cols_per_block.h` (host-only, no device includes). Test uses only this header; `.cuh` re-exports via `#include`. All four invariants preserved (routing/output/wide-n/split-K unchanged).
 - **Head**: `34fe91e8dd`.
+
+## 2026-08-12 — PR #32001 rejection fixes
+
+Fixed all rejection items (B1, B2, N1–N4) for the Apple Accelerate infrastructure PR. Robust arm64 detection, Darwin-only gating, reinstated MLAS_USE_APPLE_ACCELERATE=1 compile definition, loud CLI failure, CPU EP group placement, and PR body rewrite. Pushed `0d924a421b`. PR stays draft pending Opus re-review.
+
+## 2026-08-12 — PR #32001 rejection fixes (arm64 detection B1 + N1–N4)
+
+Fixed all rejected items on Apple Accelerate infrastructure PR #32001. B1: `CMAKE_OSX_ARCHITECTURES` defined-but-empty + `onnxruntime_target_platform` unset → feature silently disabled on own Apple Silicon hardware. Fixed by reading `CMAKE_OSX_ARCHITECTURES` for arm64/arm64e first, falling back to `CMAKE_SYSTEM_PROCESSOR`. Coordinator proved regression with 5-case standalone CMake harness. N1: Darwin-only gate (`CMAKE_SYSTEM_NAME STREQUAL "Darwin"`). N2: `MLAS_USE_APPLE_ACCELERATE=1` observable contract reinstated. N3: Loud `BuildError` on CLI opt-in; tolerant CMake (warn-and-disable). N4: Flag in CPU EP argument group. B2: PR body rewritten to match reality. Head `0d924a421b`.
+
+Challenger's B-NEW-1 (`add_argument` missing) was a false positive — disproved by `build.py --help`. Lesson: reviewer blockers need the same verification as author claims.

@@ -52,3 +52,21 @@ WP-B landed: Coco's initial WP-B3 admission work was superseded by raw-protobuf 
 ### 2026-08-12T02:30:00Z — PR #32001 lockout revision: rescoped to macOS arm64 only
 
 Added `onnxruntime_target_platform STREQUAL "arm64"` condition to `cmake/CMakeLists.txt` as `elseif` after the `if(NOT APPLE)` check, using warn-and-disable (matching SVE/KleidiAI idiom). Rescoped option description, MLAS comment, and `build_args.py` help text. Verified no-behaviour-change-when-disabled on Linux x86-64. Head: `52db6351b5`. PR remains draft.
+
+---
+
+### 2026-08-12T01:35:00Z — PR #31993 revision: NaN assertions, RNE tie, macOS gating, -march removal
+
+Fixed four issues in the MLAS f16↔f32 cast PR:
+1. **NaN assertions**: replaced bit-exact `ASSERT_EQ` with sign+payload-modulo-quiet-bit check, tolerating NEON sNaN quieting while still pinning sign and payload.
+2. **RNE tie**: replaced 1.0009765625f (not a tie) with 1.00048828125f (genuine halfway value between fp16 0x3C00 and 0x3C01).
+3. **macOS-only gating**: `TARGET_OS_OSX` in C++, `CMAKE_SYSTEM_NAME STREQUAL "Darwin"` in CMake — excludes iOS/tvOS/visionOS.
+4. **Dropped `-march=armv8.2-a+fp16`**: vcvt_f32_f16/vcvt_f16_f32 are baseline ARMv8-A conversions (guarded by `__ARM_FP & 2` in arm_neon.h), no +fp16 needed.
+
+Evidence for -march removal: clang's `arm_neon.h` guards vcvt_f32_f16/vcvt_f16_f32 under `#if (__ARM_FP & 2)`, not `__ARM_FEATURE_FP16_VECTOR_ARITHMETIC`. Could not empirically cross-compile (no AArch64 sysroot on host), but the header evidence is conclusive.
+
+PR body updated. Pushed to `fork`, head `02a9f34`. PR remains draft — awaiting Opus review.
+
+## 2026-08-12 — PR #31993 NaN fix (hardware sNaN quieting)
+
+Fixed NaN blocker on Apple Silicon f16 cast test. NEON `FCVTL`/`FCVTN` quiet signalling NaNs; MLAS software reference does not → bit-exact comparison fails. New assertion: `isnan` + sign match + payload equality modulo quiet bit (bit 22 f32, bit 9 f16). Non-NaN: raw-bit equality preserved. Also: RNE tie input corrected to 1 + 2⁻¹¹ (genuine tie). Removed `-march=armv8.2-a+fp16` — conversion intrinsics are AArch64 baseline (`__ARM_FP & 2`), not guarded by `__ARM_FEATURE_FP16_VECTOR_ARITHMETIC`. macOS gate via `TARGET_OS_OSX`. Head `02a9f34`.

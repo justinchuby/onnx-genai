@@ -143,3 +143,19 @@ hardware (blocked on #768).
 **Output dtype B1 / LayerNorm shape:** `output_dtypes: Vec<DataType>` per-output. `ShapeInference::LayerNorm { axis, num_outputs, full_shape_outputs }` — output 0 full shape, 1+ reduced. Negative axis handled. All five norm ops covered.
 
 **CUDA upstream audit:** Both candidates (MatMulNBits int4 block-128 GEMV, QMoE parallel routing) already covered by upstream ORT `main`. No portable gap. Not ready for upstream PR.
+
+## 2026-08-12 — PR #31988 Build Fix (sm_count mismatch)
+
+**Task**: Settle recurring build failures on PR #31988 (Build Linux CUDA x64 Release + Build Linux TensorRT x64 Release).
+
+**Root cause**: `TryMatMulNBits` gained an `sm_count` parameter but `fpA_intB_gemm_kernel_test.cc` was not updated — 13 args vs 14 required.
+
+**Fix**: Added `device_prop_.multiProcessorCount` to the test call site. Commit `55e438ca6f`, pushed to `nxrt/cuda-matmulnbits-sm-cols`.
+
+**Local compile**: `g++ -fsyntax-only` ran clean but lacked CUDA headers to be a meaningful reproduction. The diagnostic was unambiguous from CI logs alone.
+
+**Verdict**: OURS — parameter added by our diff, test not updated.
+
+## 2026-08-12 — PR #31988 build fix (sm_count parameter mismatch)
+
+Build Linux CUDA x64 and TensorRT x64 both failed: `TryMatMulNBits` gained `sm_count` parameter (our diff) but `fpA_intB_gemm_kernel_test.cc` not updated (13 args vs 14). Fixed by passing `device_prop_.multiProcessorCount`. Commit `55e438ca6f`. Verdict: OURS.

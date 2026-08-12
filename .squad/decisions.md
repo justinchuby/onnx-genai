@@ -5,54 +5,12 @@ Last consolidated: 2026-08-10T21:09:11Z (Scribe EP plugin export wave; 35 inbox 
 Standing governance rules and active directives. Full narrative is archived in `.squad/decisions-archive/2026-07.md`, `.squad/decisions-archive/2026-08.md`, and older `.squad/decisions/archive/` files.
 
 This compaction preserved the complete pre-compaction live file in `.squad/decisions-archive/2026-08.md` under "Live decisions snapshot before #695/#700 compaction". Processed inbox drops archived there: cohaagen-695-hybrid-cache-fix.md, cohaagen-qmoe-route-parallel.md, copilot-contract-decisions-q2-q12.md, copilot-plugin-c-abi-everywhere.md, deckard-645-cached-dense-identity.md, harry-700-hybrid-cache-review.md, quaid-676-oracle-testfix.md.
+Narrative waves through 2026-08-06 (hybrid Mamba #695/#700, QMoE #676, CUDA-graph #708, C1 capture) archived to `.squad/decisions-archive/2026-08.md`.
 
 ## Ledger health rule
 
 Archive by SIZE, not age. Age-only no-ops during high-volume campaigns because most entries are recent, so the live file can exceed spawn-budget while "older than N days" matches nothing. When over the gate, preserve full history in `.squad/decisions-archive/{YYYY-MM}.md`, dedupe rebase-reintroduced sections, and keep live `decisions.md` to standing directives plus pointers. Concurrent Scribe runs are a structural hazard; assemble from inbox drops and check `git log origin/main..HEAD` before committing.
 
-## Current active wave — 2026-08-06
-
-### Hybrid Mamba continuation correctness fixed (#695/#700); ORT follow-up #701
-
-**By:** Cohaagen (fix), Harry (review), Coordinator (merge/follow-up)
-
-**What:** PR #700 fixed issue #695 by making native host/device KV-mirror prefix reuse unsupported whenever the decoder has recurrent state. `supports_host_kv_mirror` and `supports_device_kv_mirror` now return false for `has_recurrent_state()`, forcing full recompute for hybrid Mamba/attention models instead of reusing attention KV without the recurrent state. Single-shot behavior stays byte-identical. Tests added: always-on gate unit coverage plus an env-gated GPU continuation regression where reused argmax matches the fresh oracle token `33803`.
-
-**Review:** Harry approved #700. Minor residual: the ORT paged-reuse path has a similar hybrid guard concern (`kv_bridge.rs:407`); coordinator filed tracking issue #701.
-
-### 35B-A3B QMoE performance and oracle follow-ups
-
-**By:** Cohaagen, Quaid, Harry, Coordinator
-
-- Native sparse QMoE for 35B-A3B shipped via #625/#676. The correct QMoE continuation token is `33803`; dense int4 token `5342` is the low-precision outlier.
-- QMoE router parallelization (`qmoe_route`) changes top-k routing from row-serial single-thread to block-cooperative reduction with the same total-order tie rule, preserving byte-exact selected experts while raising 35B-A3B QMoE decode to about 62 tok/s (#684 context).
-- Quaid's #676 follow-up fixes an unsound teacher-forced sub-assertion: reproduced serial and parallel kernels agreed, proving the failing teacher-forced argmax was a test oracle issue rather than a QMoE kernel bug.
-- Deckard's cached-dense identity rule: bounded dense-weight memoization uses kernel-local immutable constant-slot identity, mmap metadata when present, one-time hashing per packed matrix/expert slice, and mutex single-flight expansion.
-
-### 35B-A3B CUDA-graph capture fragmentation wave (#708 + follow-ups)
-
-**By:** Cohaagen (investigation/fix), Harry (review)
-
-**What:** CUDA-graph capture repair should target the GatedDeltaNet/runtime seams that actually fragment steady decode. PR #708 shipped the low-risk C3 fix: CUDA Split now derives split sizes from already-resolved output shapes instead of host-reading the split tensor, making GatedDeltaNet Split capture-safe with no host sync. Measured 35B-A3B QMoE hybrid decode improved from 13.415 to 12.132 ms/tok (74.5 to 82.4 tok/s), capture segments dropped 184 to 154, and token@119 stayed byte-exact at `33803`.
-
-**Why:** Steady-state profiling corrected the initial matmul hypothesis: `matmul_nbits` was already 99.8% captured, so a workspace-pool PR would be a no-op and is deprioritized. The true residual fragmentation is in GatedDeltaNet eager islands. C2, eliding the LinearAttention trailing `synchronize()`, was rejected because it changed decode token 33803 to 46283; that barrier is load-bearing. Strict C1 (only `Dim::Static` capture eligibility) was also proven a no-op because GDN pointwise ops carry symbolic batch/sequence dims. The next real fix is executor-context symbol classification: treat batch and decode-step singleton sequence as pinned for capture, while leaving truly growing symbols capture-ineligible.
-
-**Review:** Harry approved #708 after verifying Split sizes come only from static shape inference, cold-kernel `Unsupported`-until-warmed behavior is correct, and copy semantics are unchanged. Nits only: remove/dead-code the obsolete `None` fallback documentation and avoid redundant per-execute re-locking in a later cleanup.
-
-### C1 pointwise capture collapse is mechanically valid but blocked by fp16 oracle lock (#722)
-
-**By:** Cohaagen
-
-**What:** The build-time growing-symbol classifier for C1 is preserved on `squad/elementwise-capture-seqindep` at `36cdd3aa`, but is a NO-GO for shipping until issue #722 is resolved. It mechanically collapses 35B-A3B QMoE hybrid CUDA-graph decode from 154 to 34 captured segments and improves steady decode from 12.263 to 11.763 ms/tok (+4.3% tok/s, 81.5 to 85.0). Capture==eager is byte-exact for both the 35B hybrid and pure-attention qwen2.5-0.5b.
-
-**Why:** The 35B hybrid has a latent fp16 near-tie where baseline captured decode and eager decode diverge around token 20. Heavy accumulators are already fp32; the divergence is an inter-layer fp16 reassociation/rounding coin-flip, not a reduction bug. The current oracle lock passes only on the baseline captured path, while C1 moves the captured stream onto the eager stream and fails the lock. Issue #722 tracks the correction; recommended unblock is to re-anchor the oracle on fp32 teacher-forced adjudication, which both paths satisfy, rather than on one autoregressive captured-path landing.
-
-### VMM KV and dense prefetch standing notes
-
-**By:** Copilot
-
-- Dense prefetch stays eviction-neutral: executor-driven lazy-weight prefetch is scoped to dense MatMulNBits weights, and CUDA admits prefetch only when it fits without eviction or lease growth so MoE behavior and cache-victim selection are unchanged.
-- Native CUDA KV bindings may reserve the full-context VMM address range while exposing bucketed physical strides; growth commits the next bucket and repacks valid prefixes in place. Full-context strides committed one granule per head and worsened arena pressure, so floor claims must wait for #694 because ledger-refusal passes made the sweep non-monotonic.
 
 ## Extension contract standing directive (#524)
 
@@ -437,3 +395,57 @@ This **narrows** the earlier Apple framework policy entry (Accelerate/BNNS/vDSP 
 - **Non-arm64 Apple slices are out of scope.** Do not add `#else` branches for x86_64 Apple test slices; do not reference universal2 or Intel Mac in commit messages or PR bodies for ARM kernel work.
 - **`onnxruntime_target_platform` is the canonical arch variable on Apple.** Already used at CMakeLists.txt:567/575/589; do not invent an alternative from `CMAKE_OSX_ARCHITECTURES`.
 - **warn-and-disable, not FATAL_ERROR**, for platform-check failures in optional ISA options (per SVE/KleidiAI idiom).
+
+---
+
+## 2026-08-12 — Rejection-response wave: upstream merge, B-fixes, aliasing split
+
+**By:** Leon (#32001 B1+N1-N4), Mariette (#31988 B1-B3), Coco (#31993 NaN fix), Deckard (#32003 draft), Isidore (#32003 complete), Batty (#31988 build fix), Challenger (re-review #32001), Coordinator (harness + PR body rewrite)
+
+### First upstream contribution merged — PR #31985
+
+PR #31985 (`f2dfa4e9eb`, merged 2026-08-12T00:49:43Z) is the first landed contribution to `microsoft/onnxruntime`. It cleared an inherited doc-validation failure. PRs #31973 and #31974 were rebased onto it.
+
+### PR #32001 — Apple Accelerate arm64 detection (B1 fix, Leon)
+
+`CMAKE_OSX_ARCHITECTURES` defined-but-empty + `onnxruntime_target_platform` unset → feature silently disabled on Apple Silicon with a plain `cmake` configure. Fix: check `CMAKE_OSX_ARCHITECTURES` (single-value) for `arm64`/`arm64e` first; fall back to `CMAKE_SYSTEM_PROCESSOR` when unset or empty. Coordinator proved the regression with a 5-case standalone harness. Also: N1 Darwin-only gate, N2 `MLAS_USE_APPLE_ACCELERATE=1` reinstated as observable contract, N3 loud `BuildError` on explicit CLI opt-in (tolerant CMake), N4 CPU EP argument group. Head `0d924a421b`.
+
+**Challenger re-review claimed `add_argument` was missing (B-NEW-1 BLOCKING).** `python3 tools/ci_build/build.py --help` exits 0 with the flag listed under "CPU Execution Provider" — false positive. Verify reviewer blockers with the same rigor as author claims. Coordinator rewrote the PR body (B2 original): it still claimed `FATAL_ERROR`, x86_64, universal2, iOS — all contradicted by the code.
+
+### PR #31988 — MatMulNBits admission separated from launch (B1, Mariette)
+
+Shared-memory gate scaled with `cols_per_block` (2/4), silently admitting large-K shapes that upstream declines at `cols=8` — moving them from cuBLAS fp32 to fp16 GEMV (accuracy regression). Fix: admission always uses `kColsPerThreadBlock`=8; launch uses the selected `cols_per_block`. Proven by 20,800-combination acceptance-set regression. B2: `cudaOccupancyMaxActiveBlocksPerMultiprocessor` per instantiation replaces fixed `kTargetCtasPerSm=12`. B3: forcing hook, acceptance-set regression, wide-N cols=8 coverage, GPU parity (GTEST_SKIP'd). **Parked pending GPU access.** Head `dc1e173e4b`.
+
+### PR #31993 — Hardware quiets sNaN (NaN fix, Coco)
+
+NEON `FCVTL`/`FCVTN` quiet signalling NaNs; MLAS software reference does not. Bit-exact comparison fails on Apple Silicon. Fix: assert `isnan` + sign + payload-modulo-quiet-bit for NaN; raw-bit equality for non-NaN. Also: RNE tie input corrected to 1 + 2⁻¹¹ (genuine tie). Removed `-march=armv8.2-a+fp16` — clang's `arm_neon.h` guards `vcvt_f32_f16`/`vcvt_f16_f32` under `#if (__ARM_FP & 2)` (AArch64 baseline), not `__ARM_FEATURE_FP16_VECTOR_ARITHMETIC`. macOS-only gate via `TARGET_OS_OSX`. Head `02a9f34`.
+
+### PR #32003 — Strict-aliasing split (Deckard draft, Isidore complete)
+
+Deckard split strict-aliasing/`-Werror` fixes from #31988 into standalone draft PR #32003. Coordinator found the fix incomplete: `vec_permuted` overload fixed but 4 identical `vec_a` punning sites (lines 117–120) missed. Isidore fixed all 4 sites under lockout; justified leaving `reinterpret_cast<half2*>(sums)` (canonical CUDA vectorised-access idiom) alone. 0 member-punning `reinterpret_cast` sites remain. Head `23dcfddaaf`.
+
+### PR #31988 build fix (Batty)
+
+`TryMatMulNBits` gained `sm_count` parameter; `fpA_intB_gemm_kernel_test.cc` not updated (13 args vs 14). Fixed by passing `device_prop_.multiProcessorCount`. Commit `55e438ca6f`.
+
+### Durable lessons
+
+- **First upstream contribution merged:** microsoft/onnxruntime #31985.
+- **The same bug class recurred on a fourth axis.** Compaction/scaling that silently widens an accepted-shape set has appeared as: compacted output slots, compacted input slots, `n % 8` acceptance, and shared-memory admission scaling with columns-per-CTA. **Separate admission from launch**, and pin the accepted set with an exhaustive regression test.
+- **A reviewer's blocker can be a false positive.** Challenger claimed missing `add_argument` would crash the CLI; `build.py --help` exits 0 with the flag in the right group. Verify reviewer claims the same way we verify author claims.
+- **Correcting a claim can itself be wrong.** An earlier round "corrected" the brief to say the f16 cast kernel needs `-march=armv8.2-a+fp16`. Clang's `arm_neon.h` guards the conversion intrinsics under `#if (__ARM_FP & 2)` (AArch64 baseline); `+fp16` is for fp16 *arithmetic*. The original brief was right and the flag was removed.
+- **Hardware quiets signalling NaNs; software references may not.** `FCVTL`/`FCVTN` quiet sNaN, so bit-exact comparison against a software reference fails. Assert `isnan` + sign + payload-modulo-quiet-bit for NaN; raw-bit equality only for non-NaN.
+- **Check a fix was applied everywhere.** A strict-aliasing fix landed on one overload and missed four identical sites in another; grep for the pattern, do not assume completeness.
+- **Reviewer lockout held:** Luba/Isidore/Coco → Leon on #32001; Luba/Holden/Freysa/Mariette → Coco on #31993; Cohaagen/Sebastian/Chew/Deckard/Leon/Batty → Mariette on #31988; Deckard → Isidore on #32003.
+
+### Status snapshot (2026-08-12T03:00:00Z)
+
+| PR | Status | Head |
+|----|--------|------|
+| #31985 | **MERGED** `f2dfa4e9eb` | — |
+| #31973 | Draft (rebased onto #31985) | — |
+| #31974 | Draft (rebased onto #31985) | — |
+| #31988 | Draft — **parked pending GPU** | `dc1e173e4b` |
+| #31993 | Draft | `02a9f34` |
+| #32001 | Draft | `0d924a421b` |
+| #32003 | Draft | `23dcfddaaf` |

@@ -67,3 +67,18 @@ Full pre-compaction history in `history-archive.md`.
 ### 2026-08-12T02:30:00Z — PR #31993 lockout revision: rescoped to macOS arm64 only
 
 Removed the `#else` branch in `test_cast_fp16.cpp` that asserted null dispatch pointers on non-ARM64 Apple (x86_64 slice test). Rescoped commit messages and PR body from universal2/iOS/Intel to macOS arm64 only. Compile-time gate `#if defined(__APPLE__) && defined(MLAS_TARGET_ARM64)` unchanged. Positive dispatch assertions (`ASSERT_NE`) survive. Head: `68ee0de`. PR remains draft.
+
+## 2026-08-12 — PR #31988 B1/B2/B3 fixes
+
+- **B1 fixed:** Separated admission (cols=8 shared-mem gate) from launch (selected cols_per_block). Accepted-shape set is provably identical to upstream. Regression test added.
+- **B2 fixed:** Replaced `kTargetCtasPerSm = 12` with `cudaOccupancyMaxActiveBlocksPerMultiprocessor` per-instantiation queries. Falls back to conservative host heuristic. Cannot validate without GPU.
+- **B3 fixed:** Added acceptance-set regression test, wide-N coverage, forcing hook test, structured GPU parity/occupancy tests (GTEST_SKIP'd).
+- **Reverted** memcpy/strict-aliasing changes from common.cuh (separate concern).
+- **Simplified** no-op else-if nesting in TryMatMul4Bits.
+- **Added** explicit else-if dispatch with ORT_THROW for unexpected cols_per_block.
+- **#29469 overlap:** Mechanical signature conflict (both add params to TryMatMul4Bits), no semantic overlap.
+- **Recommendation:** Park until GPU access. Head: `dc1e173e4b`.
+
+## 2026-08-12 — PR #31988 B1/B2/B3 fixes (admission separated, occupancy model)
+
+Fixed admission bug B1: shared-memory gate scaled with `cols_per_block` (2/4) instead of fixed 8, silently admitting large-K shapes upstream declines → fp16 GEMV on shapes intended for cuBLAS fp32. Admission now always uses `kColsPerThreadBlock`=8. Proved correct by sweeping 20,800 combinations. B2: replaced `kTargetCtasPerSm=12` with `cudaOccupancyMaxActiveBlocksPerMultiprocessor` per instantiation. B3: 6 new tests (2 GPU tests GTEST_SKIP'd). PR parked pending GPU access. Head `dc1e173e4b`.

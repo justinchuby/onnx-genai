@@ -73,3 +73,11 @@ Post-rebase fresh review. All 6 original blockers verified as still fixed. No ne
 ## 2026-08-11 (upstream CI correction wave) — Re-review PR #31974
 
 Post-rebase fresh adversarial review. All six original blockers still fixed. Stat tests genuinely fail against pre-B5 code (bf16 quantization step ~3.9e-3 at unit scale; tolerance is 1e-5 — ~390× tighter). Anti-fallback `ConfigEp(DefaultCpuExecutionProvider())` design confirmed non-vacuous. Two cosmetic nits in `narrow_float_utils.h`. **Verdict: 0 blocking, 0 substantive, 2 nits. Ready to leave draft once CI is green.**
+
+## 2026-08-12 — Adversarial re-review PR #32001 (Apple Accelerate infrastructure)
+
+Fresh review after rejection was addressed. Found **1 new BLOCKING bug**: `build.py` references `args.use_apple_accelerate` but never defines the argument via `add_argument` — the CLI plumbing crashes with `AttributeError`. Also found B2 is **not fixed**: PR body still claims `FATAL_ERROR`, iOS/universal2/x86_64 support, contradicting the actual warn-and-disable + macOS-arm64-only code. Detection logic (B1, N1) is genuinely fixed. `MLAS_USE_APPLE_ACCELERATE=1` define is observable (N2 fixed). **Verdict: not ready to leave draft. Two items block: missing add_argument and inaccurate PR body.**
+
+## 2026-08-12 — Re-review PR #32001 (false positive B-NEW-1)
+
+Re-reviewed #32001 after Leon's fixes. Claimed `add_argument("--use_apple_accelerate")` missing → CLI would crash at runtime (B-NEW-1 BLOCKING). Disproved: `python3 tools/ci_build/build.py --help` exits 0 with flag listed under CPU Execution Provider. N4 was already done. False positive. B2 (PR body) still required correction — coordinator handled that. Lesson applied: reviewer blockers must be verified with same standard as author claims.

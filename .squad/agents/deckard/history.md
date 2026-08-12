@@ -62,3 +62,15 @@ Could not compile locally (no nvcc). iPhone failure is a dep-download flake, lef
 
 - Diagnosed CUDA 13.0 `-Werror=strict-aliasing` and `-Werror=unused-parameter` failures in `matmul_4bits_common.cuh`. Pushed `memcpy`-based punning and `(void)` casts (commit `0ba804b7f7`).
 - Initial assessment of `blockIdx`/`__threadfence` TensorRT errors: "CUDA-13 base-codebase incompatibilities, not ours." **This was disproved** by Leon's cross-PR comparison showing #31678 green / #31988 red. The errors were caused by our test's inclusion chain (`matmul_4bits_common.cuh` → CUB device headers from host `.cc`). Leon fixed by extracting a host-only header.
+
+## 2026-08-12 — PR #32003 strict-aliasing standalone split
+
+- Split strict-aliasing / unused-parameter fix out of #31988 into standalone draft PR #32003.
+- Scope: single file `matmul_4bits_common.cuh` — `memcpy` replacements, `(void)` casts, `#include <cstring>`.
+- Worktree: `/workspace/upstream/ort-aliasing`, branch `nxrt/cuda-matmul4bits-strict-aliasing`.
+- Leak check clean. clang-format passes. nvcc parse-check OK (full compile blocked by missing gsl deps).
+- PR URL: https://github.com/microsoft/onnxruntime/pull/32003
+
+## 2026-08-12 — PR #32003 draft (strict-aliasing split from #31988)
+
+Split strict-aliasing/`-Werror` `memcpy` fixes from #31988 into standalone draft PR #32003. Fixed `vec_permuted` overload and bf16 overload. Coordinator found 4 missed identical sites in `vec_a` (`__CUDA_ARCH__ < 530` fallback, lines 117–120). Isidore completed those under lockout. Lesson: grep for the full pattern when fixing aliasing, not just the first overload.

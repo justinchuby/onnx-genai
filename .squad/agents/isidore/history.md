@@ -127,3 +127,22 @@ grep for duplicate ABI symbols → none found
 **Verified on Linux x86-64:** default configure shows zero Accelerate references; ON warns and disables on Linux; `build.py --help` shows new flag.
 
 **What cannot be confirmed here:** `find_library(Accelerate)` resolution and actual linking on Apple SDKs — requires Apple CI.
+
+---
+
+### 2026-08-12 — PR #32003: Complete strict-aliasing fix in matmul_4bits_common.cuh
+
+**Session:** S4 — Complete partially-applied `memcpy` fix for strict-aliasing UB.
+
+**What was done:**
+- Fixed 4 remaining `reinterpret_cast<half2*>(&vec_a.member)` sites in the `__CUDA_ARCH__ < 530` fallback overload, replacing with `memcpy` into named locals matching the existing style.
+- Swept the file: 0 member-punning reinterpret_cast sites remain.
+- Left `half2* sums_half2 = reinterpret_cast<half2*>(sums)` alone (array reinterpretation, not member-punning; idiomatic CUDA; not flagged by compiler).
+- Passed `clang-format --dry-run --Werror`.
+- Full `nvcc` compile blocked by missing ORT deps (expected on this host).
+
+**Commit:** `23dcfddaaf` on `nxrt/cuda-matmul4bits-strict-aliasing`. PR #32003 remains draft.
+
+## 2026-08-12 — PR #32003 complete aliasing fix (4 vec_a sites)
+
+Under lockout revision (Deckard locked out as author). Fixed 4 remaining `reinterpret_cast<half2*>(&vec_a.{x,y,z,w})` dereferences in `__CUDA_ARCH__ < 530` fallback — identical UB to `vec_permuted` sites Deckard fixed. Replaced with `memcpy` into named `half2` locals. Left `reinterpret_cast<half2*>(sums)` alone: canonical CUDA vectorised-access idiom, not the flagged pattern. 0 member-punning sites remain. Head `23dcfddaaf`.
