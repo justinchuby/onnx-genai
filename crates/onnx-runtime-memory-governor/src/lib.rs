@@ -509,6 +509,23 @@ impl LeaseLedger {
         );
     }
 
+    /// Tier budget that no live holder owns: the limit less committed usage,
+    /// less budget already sliced into mapped allowances, less in-flight growth
+    /// reservations. This is the headroom a fresh mapped allowance may claim to
+    /// back a new reservation without evicting anyone (G3).
+    fn free_mapped_allowance_budget(&self, tier: Tier) -> u64 {
+        let _gate = self.claim_gate(tier);
+        let index = tier.index();
+        let limit = self.limits[index].load(Ordering::Acquire);
+        let used = self.used[index].load(Ordering::Acquire);
+        let allowance_reserved = self.mapped_allowance_reserved[index].load(Ordering::Acquire);
+        let growth_reserved = self.mapped_growth_reserved[index].load(Ordering::Acquire);
+        limit.saturating_sub(
+            used.saturating_add(allowance_reserved)
+                .saturating_add(growth_reserved),
+        )
+    }
+
     fn reserve_mapped_growth(
         &self,
         tier: Tier,
@@ -1135,6 +1152,38 @@ impl MappedGrowthAuthority {
             operation: Some(operation),
             active: true,
         };
+
+        // Back the reservation with genuinely-free tier budget before evicting
+        // any live holder. A session-persistent workspace peak (#810) is charged
+        // against a fresh arena-zone allowance whose limit starts at zero; on
+        // configs that map weights directly and register no reclaimable
+        // weight/KV holder to lend from, the only capacity that can back it is
+        // the tier budget no one else owns. Growing the requester's own
+        // allowance from that free headroom keeps eviction (below) as the
+        // fallback for a truly full tier, where a genuine shortage still
+        // surfaces as `TierExhausted` -- the typed pre-header 429 path (#743).
+        let shortfall = bytes.saturating_sub(requester.available());
+        if shortfall > 0 {
+            let free = self.inner.ledger.free_mapped_allowance_budget(Tier::Device);
+            let claim = shortfall.min(free);
+            if claim > 0 {
+                if let Err(error) = self.inner.ledger.try_reserve_mapped_allowance(
+                    Tier::Device,
+                    claim,
+                    requester.role(),
+                ) {
+                    grant.rollback();
+                    return Err(error);
+                }
+                if let Err(error) = requester.add_limit_transferred(claim) {
+                    self.inner
+                        .ledger
+                        .release_mapped_allowance(Tier::Device, claim);
+                    grant.rollback();
+                    return Err(error);
+                }
+            }
+        }
 
         let own_unused = bytes.min(requester.available());
         if let Err(error) = requester.reserve_growth(own_unused) {
@@ -2138,6 +2187,72 @@ mod tests {
     }
 
     #[test]
+    fn mapped_growth_claims_free_tier_budget_when_no_holder_can_lend() {
+        // A session-persistent workspace peak (#810) is charged against a fresh
+        // arena-zone allowance whose limit starts at zero, on a managed-no-spill
+        // config that maps weights directly into tier usage and registers no
+        // reclaimable weight/KV holder to lend from. The tier still owns budget
+        // nobody else holds, so the reservation must succeed by growing the
+        // requester's own allowance from that free headroom -- not fail with a
+        // spurious capacity refusal.
+        let governor = LedgerGovernor::new(LeaseLedger::new(100, 0, 0));
+        let _weights = governor
+            .reserve(Tier::Device, 40, MemoryRole::Weights, HolderId::new(1))
+            .expect("resident weights");
+        let requester = mapped_allowance(
+            &governor,
+            0,
+            MemoryRole::Workspace { step_scoped: false },
+            66,
+        );
+
+        let grant = governor
+            .prepare_mapped_growth(&requester, 30)
+            .expect("free-budget-backed workspace growth");
+        assert_eq!(grant.transferred_bytes(), 0, "no live holder was evicted");
+        assert!(
+            requester.limit() >= 30,
+            "the requester grew its own allowance from free tier budget"
+        );
+        grant.commit().expect("commit");
+        assert_eq!(requester.mapped_bytes(), 30);
+    }
+
+    #[test]
+    fn mapped_growth_free_budget_exhaustion_still_refuses_typed() {
+        // When neither free tier budget nor an evictable holder can back the
+        // request, the typed pre-header capacity refusal (#743) must still
+        // surface, and a failed claim leaves the allowance untouched (G4).
+        let governor = LedgerGovernor::new(LeaseLedger::new(100, 0, 0));
+        let _weights = governor
+            .reserve(Tier::Device, 90, MemoryRole::Weights, HolderId::new(1))
+            .expect("resident weights");
+        let requester = mapped_allowance(
+            &governor,
+            0,
+            MemoryRole::Workspace { step_scoped: false },
+            66,
+        );
+
+        let error = match governor.prepare_mapped_growth(&requester, 30) {
+            Ok(_) => panic!("no capacity for the workspace peak"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            MemoryError::TierExhausted {
+                role: MemoryRole::Workspace { step_scoped: false },
+                ..
+            }
+        ));
+        assert_eq!(
+            requester.limit(),
+            0,
+            "a refused claim leaves the allowance limit untouched"
+        );
+    }
+
+    #[test]
     fn failed_pinned_reclaim_rolls_back_allowances_and_reservation() {
         let governor = LedgerGovernor::new(LeaseLedger::new(100, 0, 0));
         let victim = Arc::new(TestMappedHolder::new(
@@ -2463,6 +2578,15 @@ mod tests {
         drop(first_registration);
         drop(first_dyn);
         drop(first);
+
+        // Consume the budget freed by dropping `first` so the growth genuinely
+        // requires eviction rather than free tier headroom. Without this the
+        // requester now backs its reservation from the freed slack (preferring
+        // free budget over evicting a live holder, per G3), and no victim is
+        // selected -- which would no longer exercise priority-ordered reclaim.
+        let _full = governor
+            .reserve(Tier::Device, 40, MemoryRole::Activation, HolderId::new(9))
+            .expect("consume freed budget");
 
         governor
             .prepare_mapped_growth(&requester, 10)

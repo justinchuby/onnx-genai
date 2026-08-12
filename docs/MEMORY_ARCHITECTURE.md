@@ -1207,6 +1207,21 @@ workspace cleanup must not issue a second refund. Retained physical-pool
 handles remain authority-owned—the refund concerns virtual mapped-zone
 attribution only.
 
+**A fresh arena-zone allowance backs its first reservation from genuinely-free
+tier budget before evicting anyone.** The `WorkspaceZone` allowance is created
+lazily with a zero limit and grows on demand. On a managed no-spill run whose
+model fits in VRAM, weights are committed directly into tier usage and no
+reclaimable weight/KV holder is registered to lend from, so mapped-growth
+lending has no victim to borrow limit from. The governor therefore first grows
+the requester's own allowance from the device budget no live holder owns
+(`limit − used − allowance_reserved − growth_reserved`), and only then falls
+back to evicting a registered holder — never taking live state while free
+capacity remains (G3). This is what provisions headroom for the session-
+persistent GQA BSH↔BNSH transpose workspace (#810): its first prefill grant
+was refused with a budget of zero because it was the first consumer of the
+arena zone on that path and lending saw no victim. A genuinely full tier still
+surfaces the typed pre-header 429 capacity refusal (#743), not a late 500/OOM.
+
 ### 1.1 The lease contract, and who may replace it
 
 Memory management in onnx-genai is organized as a five-layer hierarchy. Each layer
