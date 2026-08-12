@@ -4903,6 +4903,10 @@ fn borrowed_affine_int4_matmul(
     let packed_row_size = block_count * layout.packed_block_size();
     let zero_point_row_size = layout.zero_point_row_size(block_count);
     for (activation, output_row) in activations.chunks_exact(k).zip(result.chunks_exact_mut(n)) {
+        let activation_sums = activation
+            .chunks(block_size)
+            .map(|block| block.iter().sum::<f32>())
+            .collect::<Vec<_>>();
         let compute = |output_start: usize, outputs: &mut [f32]| {
             for (offset, output) in outputs.iter_mut().enumerate() {
                 let output_index = output_start + offset;
@@ -4918,31 +4922,30 @@ fn borrowed_affine_int4_matmul(
                         ..(block + 1) * layout.packed_block_size()];
                     let scale = scales.get(output_index * block_count + block);
                     let zero_point = layout.zero_point(Some(zp_row), block) as f32;
+                    let mut dot;
                     #[cfg(target_arch = "aarch64")]
                     if valid == 32 && block_size == 32 {
                         // SAFETY: AArch64 guarantees NEON, and both slices contain one full block.
-                        sum += unsafe {
+                        dot = unsafe {
                             affine_int4_block32_dot_neon(
                                 &activation[depth_start..depth_start + 32],
                                 block_values,
-                                zero_point,
                             )
-                        } * scale;
+                        };
+                        sum += (dot - activation_sums[block] * zero_point) * scale;
                         continue;
                     }
+                    dot = 0.0;
                     for (byte_index, &byte) in block_values.iter().enumerate() {
                         let within = byte_index * 2;
                         if within < valid {
-                            sum += activation[depth_start + within]
-                                * ((byte & 0x0f) as f32 - zero_point)
-                                * scale;
+                            dot += activation[depth_start + within] * (byte & 0x0f) as f32;
                         }
                         if within + 1 < valid {
-                            sum += activation[depth_start + within + 1]
-                                * ((byte >> 4) as f32 - zero_point)
-                                * scale;
+                            dot += activation[depth_start + within + 1] * (byte >> 4) as f32;
                         }
                     }
+                    sum += (dot - activation_sums[block] * zero_point) * scale;
                 }
                 *output = sum;
             }
@@ -4953,7 +4956,7 @@ fn borrowed_affine_int4_matmul(
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn affine_int4_block32_dot_neon(activation: &[f32], packed: &[u8], zero_point: f32) -> f32 {
+unsafe fn affine_int4_block32_dot_neon(activation: &[f32], packed: &[u8]) -> f32 {
     use std::arch::aarch64::*;
 
     debug_assert_eq!(activation.len(), 32);
@@ -4962,7 +4965,6 @@ unsafe fn affine_int4_block32_dot_neon(activation: &[f32], packed: &[u8], zero_p
     let low = vandq_u8(bytes, vdupq_n_u8(0x0f));
     let high = vshrq_n_u8::<4>(bytes);
     let values = [vzip1q_u8(low, high), vzip2q_u8(low, high)];
-    let zp = vdupq_n_f32(zero_point);
     let mut acc = vdupq_n_f32(0.0);
     for (half_index, values) in values.into_iter().enumerate() {
         let lo16 = vmovl_u8(vget_low_u8(values));
@@ -4974,7 +4976,7 @@ unsafe fn affine_int4_block32_dot_neon(activation: &[f32], packed: &[u8], zero_p
             vmovl_high_u16(hi16),
         ];
         for (group_index, values) in groups.into_iter().enumerate() {
-            let weights = vsubq_f32(vcvtq_f32_u32(values), zp);
+            let weights = vcvtq_f32_u32(values);
             let activation_offset = half_index * 16 + group_index * 4;
             let acts = unsafe { vld1q_f32(activation.as_ptr().add(activation_offset)) };
             acc = vmlaq_f32(acc, acts, weights);
