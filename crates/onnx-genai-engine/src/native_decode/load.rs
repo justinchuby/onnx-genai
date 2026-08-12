@@ -764,7 +764,7 @@ impl NativeDecodeSession {
             // assumption so any path that has not proven pointer stability keeps
             // the old mutual exclusion.
             let weight_offload_stable_va = cuda_options.weight_offload_stable_va.unwrap_or(false);
-            let graph_enabled = resolve_graph_capture_enabled(
+            let graph_capture = resolve_graph_capture_decision(
                 cuda_options.graph_capture,
                 runtime_config.cuda_graph_explicit,
                 runtime_config.cuda_graph,
@@ -778,7 +778,7 @@ impl NativeDecodeSession {
             let mut span = onnx_genai_ort::prof_span!("native.cuda_kv_alloc");
             span.set_arg("max_len", capacity.max_len as u64);
             span.set_arg("kv_pairs", present_to_past.len() as u64);
-            span.set_arg("graph_capture", graph_enabled);
+            span.set_arg("graph_capture", graph_capture.is_enabled());
             let kv_layout = crate::native_decode::cuda::resolve_cuda_kv_layout(
                 io.and_then(|io| io.kv_layout.as_ref()),
             );
@@ -795,7 +795,7 @@ impl NativeDecodeSession {
                 &present_to_past,
                 &fixed_state_inputs,
                 capacity,
-                graph_enabled,
+                graph_capture,
                 position_rank,
                 kv_layout,
             )?)
