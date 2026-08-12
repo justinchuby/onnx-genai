@@ -100,7 +100,7 @@ impl PipelineEngine {
         let mut emit_counts = HashMap::new();
         let mut final_state_refs = HashMap::new();
         self.run_workflow_node(
-            &workflow.graph,
+            &self.compiled_workflow.graph,
             workflow,
             &mut values,
             &mut symbols,
@@ -108,7 +108,7 @@ impl PipelineEngine {
             &mut emit_counts,
             &mut final_state_refs,
         )?;
-        for output in workflow_emitted_outputs(&workflow.graph) {
+        for output in workflow_emitted_outputs(&self.compiled_workflow.graph) {
             let Some(value) = values.get(&output) else {
                 continue;
             };
@@ -201,47 +201,33 @@ impl PipelineEngine {
                                         )
                                     })
                                     .and_then(|tensor| {
-                                        let contract =
-                                            declaration.ports.inputs.get(port).with_context(
-                                                || {
-                                                    format!(
-                                                        "workflow component '{component}' has no \
-                                                     declared input port '{port}'"
-                                                    )
-                                                },
+                                        if let Some(contract) = declaration.ports.inputs.get(port) {
+                                            validate_workflow_value(
+                                                value,
+                                                tensor,
+                                                contract,
+                                                &mut component_symbols,
+                                                &component_dynamic_symbols,
                                             )?;
-                                        validate_workflow_value(
-                                            value,
-                                            tensor,
-                                            contract,
-                                            &mut component_symbols,
-                                            &component_dynamic_symbols,
-                                        )?;
+                                        }
                                         Ok((port.as_str(), tensor))
                                     })
                             })
                             .collect::<anyhow::Result<Vec<_>>>()?;
                         let produced = session.run(&resolved)?;
                         for (port, tensor) in session.output_names().iter().zip(produced) {
-                            let value = outputs.get(port).with_context(|| {
-                                format!(
-                                    "workflow component '{component}' output '{port}' has no SSA binding"
-                                )
-                            })?;
-                            let contract =
-                                declaration.ports.outputs.get(port).with_context(|| {
-                                    format!(
-                                        "workflow component '{component}' has no declared output \
-                                         port '{port}'"
-                                    )
-                                })?;
-                            validate_workflow_value(
-                                value,
-                                &tensor,
-                                contract,
-                                &mut component_symbols,
-                                &component_dynamic_symbols,
-                            )?;
+                            let Some(value) = outputs.get(port) else {
+                                continue;
+                            };
+                            if let Some(contract) = declaration.ports.outputs.get(port) {
+                                validate_workflow_value(
+                                    value,
+                                    &tensor,
+                                    contract,
+                                    &mut component_symbols,
+                                    &component_dynamic_symbols,
+                                )?;
+                            }
                             values.insert(value.clone(), tensor);
                         }
                     }
@@ -290,6 +276,7 @@ impl PipelineEngine {
                 max_iterations,
                 iteration,
                 carried,
+                effects: _,
             } => {
                 self.run_workflow_node(
                     setup,
@@ -317,7 +304,9 @@ impl PipelineEngine {
                         symbols,
                         dynamic_symbols,
                     )?;
-                    final_state_refs.insert(carry.cell.clone(), carry.current.clone());
+                    let initial_value = clone_value(initializer)?;
+                    values.insert(carry.next.clone(), initial_value);
+                    final_state_refs.insert(carry.cell.clone(), carry.next.clone());
                 }
                 let limit = workflow_scalar_usize(values, max_iterations)?;
                 if let Some(iteration) = iteration
@@ -634,25 +623,24 @@ impl PipelineEngine {
         _package_symbols: &HashMap<String, i64>,
         component_symbols: &mut HashMap<String, i64>,
     ) -> anyhow::Result<()> {
-        let onnx_genai_metadata::AdapterComponentContract::GrammarGuidance {
-            action,
-            state,
-            tokens,
-            valid_length,
-            transition_table,
-            next_state,
-            consumed_length,
-            logits_mask,
-            forced_tokens,
-            forced_length,
-            ..
-        } = declaration
-            .adapter
+        let contract = declaration
+            .contract
             .as_ref()
-            .context("grammar guidance adapter is missing its typed adapter contract")?
-        else {
-            anyhow::bail!("workflow adapter '{component}' is not grammar guidance");
-        };
+            .filter(|contract| contract.id == "onnx-genai.grammar-guidance")
+            .context("grammar guidance adapter is missing its versioned contract")?;
+        let action = workflow_contract_parameter(contract, "action")?;
+        if !matches!(action, "clone" | "lookahead" | "commit") {
+            anyhow::bail!("workflow grammar adapter has unknown action '{action}'");
+        }
+        let state = workflow_contract_binding(contract, "state")?;
+        let tokens = workflow_contract_binding(contract, "tokens")?;
+        let valid_length = workflow_contract_binding(contract, "valid_length")?;
+        let transition_table = workflow_contract_binding(contract, "transition_table")?;
+        let next_state = workflow_contract_binding(contract, "next_state")?;
+        let consumed_length = workflow_contract_binding(contract, "consumed_length")?;
+        let logits_mask = workflow_contract_binding(contract, "logits_mask")?;
+        let forced_tokens = workflow_contract_binding(contract, "forced_tokens")?;
+        let forced_length = workflow_contract_binding(contract, "forced_length")?;
 
         let state_value = workflow_adapter_input(component, state, inputs, values)?;
         let token_value = workflow_adapter_input(component, tokens, inputs, values)?;
@@ -693,7 +681,7 @@ impl PipelineEngine {
         let mut forced = Vec::with_capacity(batch);
         let mut forced_lengths = Vec::with_capacity(batch);
         for row in 0..batch {
-            let requested = if matches!(action, onnx_genai_metadata::GrammarGuidanceAction::Clone) {
+            let requested = if action == "clone" {
                 0
             } else {
                 usize::try_from(lengths[row]).with_context(|| {
@@ -724,7 +712,7 @@ impl PipelineEngine {
                     .map(|index| transitions[index])
                     .unwrap_or(-1);
                 if next < 0 {
-                    if matches!(action, onnx_genai_metadata::GrammarGuidanceAction::Commit) {
+                    if action == "commit" {
                         anyhow::bail!(
                             "workflow grammar commit adapter '{component}' rejected token {token} \
                              at row {row}, position {column}"
@@ -767,23 +755,23 @@ impl PipelineEngine {
 
         let produced = [
             (
-                next_state.as_str(),
+                next_state,
                 Value::from_slice_i64(&next_states, &[batch as i64])?,
             ),
             (
-                consumed_length.as_str(),
+                consumed_length,
                 Value::from_slice_i64(&consumed, &[batch as i64])?,
             ),
             (
-                logits_mask.as_str(),
+                logits_mask,
                 Value::from_raw_bytes(mask, &[batch as i64, vocabulary as i64], DataType::Bool)?,
             ),
             (
-                forced_tokens.as_str(),
+                forced_tokens,
                 Value::from_slice_i64(&forced, &[batch as i64, 1])?,
             ),
             (
-                forced_length.as_str(),
+                forced_length,
                 Value::from_slice_i64(&forced_lengths, &[batch as i64])?,
             ),
         ];
@@ -822,23 +810,14 @@ impl PipelineEngine {
             )
             .context("workflow telemetry timestamp exceeds int64")
         };
-        let onnx_genai_metadata::AdapterComponentContract::Telemetry {
-            action,
-            timestamp,
-            duration_ms,
-            ..
-        } = declaration
-            .adapter
+        let contract = declaration
+            .contract
             .as_ref()
-            .context("telemetry adapter is missing its typed adapter contract")?
-        else {
-            anyhow::bail!("workflow adapter '{component}' is not telemetry");
-        };
-        match action {
-            onnx_genai_metadata::TelemetryAction::Start => {
-                let port = timestamp
-                    .as_deref()
-                    .context("telemetry start requires timestamp output")?;
+            .filter(|contract| contract.id == "onnx-genai.telemetry")
+            .context("telemetry adapter is missing its versioned contract")?;
+        match workflow_contract_parameter(contract, "action")? {
+            "start" => {
+                let port = workflow_contract_binding(contract, "timestamp")?;
                 insert_workflow_adapter_output(
                     component,
                     port,
@@ -849,19 +828,15 @@ impl PipelineEngine {
                     component_symbols,
                 )
             }
-            onnx_genai_metadata::TelemetryAction::Elapsed => {
-                let timestamp_port = timestamp
-                    .as_deref()
-                    .context("telemetry elapsed requires timestamp input")?;
+            "elapsed" => {
+                let timestamp_port = workflow_contract_binding(contract, "timestamp")?;
                 let started = workflow_adapter_input(component, timestamp_port, inputs, values)?
                     .to_vec_i64()?;
                 let [started] = started.as_slice() else {
                     anyhow::bail!("workflow telemetry timestamp must contain one value");
                 };
                 let duration = (elapsed_ns()? - *started).max(0) as f32 / 1_000_000.0;
-                let port = duration_ms
-                    .as_deref()
-                    .context("telemetry elapsed requires duration_ms output")?;
+                let port = workflow_contract_binding(contract, "duration_ms")?;
                 insert_workflow_adapter_output(
                     component,
                     port,
@@ -872,6 +847,7 @@ impl PipelineEngine {
                     component_symbols,
                 )
             }
+            action => anyhow::bail!("workflow telemetry adapter has unknown action '{action}'"),
         }
     }
 
@@ -1092,6 +1068,35 @@ fn scalar_or_batch_shape(contract: &TensorContract) -> anyhow::Result<Vec<i64>> 
         0 => Ok(Vec::new()),
         1 => Ok(vec![1]),
         rank => anyhow::bail!("request scalar binding requires rank 0 or 1, got {rank}"),
+    }
+}
+
+fn workflow_contract_binding<'a>(
+    contract: &'a onnx_genai_metadata::ComponentContract,
+    role: &str,
+) -> anyhow::Result<&'a str> {
+    contract
+        .bindings
+        .get(role)
+        .map(String::as_str)
+        .with_context(|| {
+            format!(
+                "workflow contract '{}' has no '{role}' binding",
+                contract.id
+            )
+        })
+}
+
+fn workflow_contract_parameter<'a>(
+    contract: &'a onnx_genai_metadata::ComponentContract,
+    name: &str,
+) -> anyhow::Result<&'a str> {
+    match contract.parameters.get(name) {
+        Some(ScalarValue::String(value)) => Ok(value),
+        _ => anyhow::bail!(
+            "workflow contract '{}' requires string parameter '{name}'",
+            contract.id
+        ),
     }
 }
 

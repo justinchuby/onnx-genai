@@ -17,9 +17,9 @@ pipeline:
         implementation:
           kind: binding
         ports: {}
-    graph:
-      kind: invoke
-      component: noop
+    steps:
+      - kind: invoke
+        component: noop
 "#,
     )
     .expect("workflow metadata parses");
@@ -39,6 +39,31 @@ pipeline:
     .expect_err("legacy strategy/phases must not deserialize");
     let message = error.to_string();
     assert!(message.contains("unknown field") || message.contains("missing field `workflow`"));
+}
+
+#[test]
+fn serialized_compiler_bookkeeping_is_rejected() {
+    for field in [
+        "graph: { kind: sequence, steps: [] }",
+        "initial_effects: { stream: stream.0 }",
+    ] {
+        let document = format!(
+            r#"
+pipeline:
+  workflow:
+    manifest:
+      ir_version: "1.0"
+      onnx_opsets: {{ ai.onnx: 24 }}
+      capabilities: []
+    components: {{}}
+    steps: []
+    {field}
+"#
+        );
+        let error = serde_yaml::from_str::<InferenceMetadata>(&document)
+            .expect_err("compiler bookkeeping must not deserialize");
+        assert!(error.to_string().contains("unknown field"));
+    }
 }
 
 #[test]
@@ -69,15 +94,12 @@ pipeline:
         role: tokens
         stage: pre_adapter
     components: {{}}
-    initial_effects: {{ stream: stream.0 }}
-    graph:
-      kind: emit
-      value: value
-      valid_length: length
-      output: result
-      mode: replace
-      effect_name: stream
-      effect: {{ consumes: stream.0, produces: stream.1 }}
+    steps:
+      - kind: emit
+        value: value
+        valid_length: length
+        output: result
+        mode: replace
 "#
         ))
         .expect("workflow metadata parses");
@@ -124,9 +146,9 @@ pipeline:
         scope: session
         initializer: estimate
         recurrence: { kind: invariant }
-    graph:
-      kind: invoke
-      component: noop
+    steps:
+      - kind: invoke
+        component: noop
 "#,
     )
     .expect("workflow metadata parses");
@@ -135,6 +157,40 @@ pipeline:
         errors
             .iter()
             .any(|error| error.contains("must use invocation scope")),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn versioned_adapter_contract_rejects_unknown_action() {
+    let metadata: InferenceMetadata = serde_yaml::from_str(
+        r#"
+pipeline:
+  workflow:
+    manifest:
+      ir_version: "1.0"
+      onnx_opsets: { ai.onnx: 24 }
+      adapter_abis: { onnx-genai.grammar-guidance: "1" }
+      capabilities: []
+    components:
+      grammar:
+        implementation:
+          kind: adapter
+          abi: onnx-genai.grammar-guidance
+          version: "1"
+        contract:
+          id: onnx-genai.grammar-guidance
+          version: "1"
+          parameters: { action: typo }
+    steps: []
+"#,
+    )
+    .expect("workflow metadata parses");
+    let errors = validate_metadata(&metadata).expect_err("unknown adapter action must fail");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("unsupported action")),
         "{errors:?}"
     );
 }

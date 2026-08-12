@@ -48,12 +48,33 @@ fn generated_schema_preserves_all_root_constraints() {
         "PhaseConfig",
         "PhaseRunOn",
         "SchedulerSpec",
+        "PolicyComponentContract",
+        "AdapterComponentContract",
+        "ProgramOperation",
+        "ControlFlow",
+        "WorkflowNode",
+        "WorkflowLoopCarry",
+        "EffectTransition",
     ] {
         assert!(
             !serialized.contains(removed),
             "generated schema still exposes removed legacy definition {removed}"
         );
     }
+    for compiler_field in [
+        "initial_effects",
+        "effect_name",
+        "read_effect",
+        "write_effect",
+        "body_input",
+        "body_output",
+    ] {
+        assert!(
+            !serialized.contains(&format!("\"{compiler_field}\"")),
+            "generated schema exposes compiler bookkeeping field {compiler_field}"
+        );
+    }
+    assert!(!serialized.contains("\"kind\":{\"const\":\"transfer\""));
 }
 
 fn schema_path() -> PathBuf {

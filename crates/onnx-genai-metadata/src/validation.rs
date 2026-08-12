@@ -80,23 +80,26 @@ pub fn derived_capabilities(metadata: &InferenceMetadata) -> BTreeSet<String> {
         capabilities.insert("advisory_state".to_string());
     }
     for component in workflow.components.values() {
-        match &component.policy {
-            Some(crate::schema::PolicyComponentContract::AdaptiveProposalBudget { .. }) => {
+        match component
+            .contract
+            .as_ref()
+            .map(|contract| contract.id.as_str())
+        {
+            Some("onnx-genai.adaptive-proposal-budget") => {
                 capabilities.insert("adaptive_proposal_budget".to_string());
+            }
+            Some("onnx-genai.grammar-guidance") => {
+                capabilities.insert("grammar_guidance_adapter".to_string());
+            }
+            Some("onnx-genai.telemetry") => {
+                capabilities.insert("telemetry_adapter".to_string());
             }
             _ => {}
         }
-        match &component.adapter {
-            Some(crate::schema::AdapterComponentContract::GrammarGuidance { .. }) => {
-                capabilities.insert("grammar_guidance_adapter".to_string());
-            }
-            Some(crate::schema::AdapterComponentContract::Telemetry { .. }) => {
-                capabilities.insert("telemetry_adapter".to_string());
-            }
-            None => {}
-        }
     }
-    collect_workflow_capabilities(&workflow.graph, &mut capabilities);
+    if let Ok(compiled) = crate::compile_workflow(workflow) {
+        collect_workflow_capabilities(&compiled.graph, &mut capabilities);
+    }
     capabilities
 }
 
@@ -263,8 +266,11 @@ fn validate_preprocessing_workflow(metadata: &InferenceMetadata, errors: &mut Ve
             | WorkflowNode::Transfer { .. } => {}
         }
     }
+    let Ok(compiled) = crate::compile_workflow(workflow) else {
+        return;
+    };
     let mut invocations = Vec::new();
-    collect_invocations(&workflow.graph, adapter_name, &mut invocations);
+    collect_invocations(&compiled.graph, adapter_name, &mut invocations);
     if invocations.len() != 1 {
         errors.push(format!(
             "workflow image preprocessing adapter '{adapter_name}' must be invoked exactly once, \
@@ -381,6 +387,13 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
 }
 
 fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
+    let compiled = match crate::compile_workflow(workflow) {
+        Ok(compiled) => compiled,
+        Err(error) => {
+            errors.push(format!("pipeline.workflow lowering failed: {error}"));
+            return;
+        }
+    };
     if workflow.manifest.ir_version != "1.0" {
         errors.push(format!(
             "unsupported pipeline.workflow.manifest.ir_version '{}'; this runtime supports 1.0",
@@ -397,912 +410,22 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
             ));
         }
     }
-    fn validate_policy_component(
-        name: &str,
-        component: &crate::schema::WorkflowComponent,
-        errors: &mut Vec<String>,
-    ) {
-        use crate::schema::{PolicyComponentContract as Policy, SamplingPolicyMode};
-
-        let Some(policy) = &component.policy else {
-            return;
-        };
-        for (port, contract) in component
-            .ports
-            .inputs
-            .iter()
-            .chain(component.ports.outputs.iter())
-        {
-            require_declared_shape(name, port, contract, errors);
-        }
-        let input = |port: &str| component.ports.inputs.get(port);
-        let output = |port: &str| component.ports.outputs.get(port);
-        let require_input = |port: &str, errors: &mut Vec<String>| {
-            input(port).or_else(|| {
-                errors.push(format!(
-                    "workflow policy component '{name}' references missing input port '{port}'"
-                ));
-                None
-            })
-        };
-        let require_output = |port: &str, errors: &mut Vec<String>| {
-            output(port).or_else(|| {
-                errors.push(format!(
-                    "workflow policy component '{name}' references missing output port '{port}'"
-                ));
-                None
-            })
-        };
-        let require_effect = |effect: &str, errors: &mut Vec<String>| {
-            if !component.effects.iter().any(|declared| declared == effect) {
-                errors.push(format!(
-                    "workflow policy component '{name}' references undeclared effect '{effect}'"
-                ));
-            }
-        };
-        let validate_rng = |rng: &crate::schema::RngPortContract, errors: &mut Vec<String>| {
-            for port in [&rng.seed, &rng.offset] {
-                if let Some(contract) = require_input(port, errors) {
-                    require_dtype_rank(name, port, contract, "int64", 1, errors);
-                }
-            }
-            if let Some(contract) = require_output(&rng.next_offset, errors) {
-                require_dtype_rank(name, &rng.next_offset, contract, "int64", 1, errors);
-            }
-            require_same_contract(
-                name,
-                &rng.seed,
-                input(&rng.seed),
-                &rng.offset,
-                input(&rng.offset),
-                errors,
-            );
-            require_same_contract(
-                name,
-                &rng.seed,
-                input(&rng.seed),
-                &rng.next_offset,
-                output(&rng.next_offset),
-                errors,
-            );
-        };
-
-        match policy {
-            Policy::TokenSampler {
-                mode,
-                logits,
-                token,
-                temperature,
-                top_k,
-                top_p,
-                rng,
-                effect,
-            } => {
-                if let Some(contract) = require_input(logits, errors) {
-                    require_floating(name, logits, contract, errors);
-                    require_rank(name, logits, contract, 2, errors);
-                }
-                if let Some(contract) = require_output(token, errors) {
-                    require_integer(name, token, contract, errors);
-                    require_rank(name, token, contract, 1, errors);
-                }
-                require_axis_equal(
-                    name,
-                    logits,
-                    input(logits),
-                    0,
-                    token,
-                    output(token),
-                    0,
-                    errors,
-                );
-                for port in [temperature.as_ref(), top_p.as_ref()].into_iter().flatten() {
-                    if let Some(contract) = require_input(port, errors) {
-                        require_floating(name, port, contract, errors);
-                        require_rank(name, port, contract, 1, errors);
-                        require_axis_equal(
-                            name,
-                            logits,
-                            input(logits),
-                            0,
-                            port,
-                            Some(contract),
-                            0,
-                            errors,
-                        );
-                    }
-                }
-                if let Some(port) = top_k
-                    && let Some(contract) = require_input(port, errors)
-                {
-                    require_integer(name, port, contract, errors);
-                    require_rank(name, port, contract, 1, errors);
-                    require_axis_equal(
-                        name,
-                        logits,
-                        input(logits),
-                        0,
-                        port,
-                        Some(contract),
-                        0,
-                        errors,
-                    );
-                }
-                match (mode, rng) {
-                (SamplingPolicyMode::Greedy, Some(_)) => errors.push(format!(
-                    "workflow policy component '{name}' greedy sampler must not declare RNG ports"
-                )),
-                (SamplingPolicyMode::SeededStochastic, None) => errors.push(format!(
-                    "workflow policy component '{name}' seeded stochastic sampler requires RNG ports"
-                )),
-                (_, Some(rng)) => validate_rng(rng, errors),
-                (_, None) => {}
-            }
-                if let Some(rng) = rng {
-                    require_axis_equal(
-                        name,
-                        logits,
-                        input(logits),
-                        0,
-                        &rng.seed,
-                        input(&rng.seed),
-                        0,
-                        errors,
-                    );
-                }
-                require_effect(effect, errors);
-            }
-            Policy::TerminationPredicate {
-                tokens,
-                eos_ids,
-                iteration,
-                max_iterations,
-                done,
-                effect,
-            } => {
-                for port in [tokens, eos_ids, iteration, max_iterations] {
-                    if let Some(contract) = require_input(port, errors) {
-                        require_integer(name, port, contract, errors);
-                        require_rank(name, port, contract, 1, errors);
-                    }
-                }
-                if let Some(contract) = require_output(done, errors) {
-                    require_bool(name, done, contract, errors);
-                    require_rank(name, done, contract, 1, errors);
-                }
-                for port in [iteration, max_iterations, done] {
-                    require_axis_equal(
-                        name,
-                        tokens,
-                        input(tokens),
-                        0,
-                        port,
-                        input(port).or_else(|| output(port)),
-                        0,
-                        errors,
-                    );
-                }
-                require_effect(effect, errors);
-            }
-            Policy::SolverStep {
-                state,
-                estimate,
-                step,
-                schedule,
-                next_state,
-                effect,
-            } => {
-                let state_contract = require_input(state, errors);
-                let estimate_contract = require_input(estimate, errors);
-                let next_contract = require_output(next_state, errors);
-                for (port, contract) in [(state, state_contract), (estimate, estimate_contract)] {
-                    if let Some(contract) = contract {
-                        require_floating(name, port, contract, errors);
-                    }
-                }
-                require_same_contract(
-                    name,
-                    state,
-                    state_contract,
-                    estimate,
-                    estimate_contract,
-                    errors,
-                );
-                if let Some(contract) = require_input(step, errors) {
-                    require_integer(name, step, contract, errors);
-                    require_rank(name, step, contract, 1, errors);
-                    require_axis_equal(
-                        name,
-                        state,
-                        state_contract,
-                        0,
-                        step,
-                        Some(contract),
-                        0,
-                        errors,
-                    );
-                }
-                if let Some(contract) = require_input(schedule, errors) {
-                    require_floating(name, schedule, contract, errors);
-                    if contract.rank != 1 {
-                        errors.push(format!(
-                        "workflow policy component '{name}' schedule port '{schedule}' must have rank 1"
-                    ));
-                    }
-                }
-                require_same_contract(
-                    name,
-                    state,
-                    state_contract,
-                    next_state,
-                    next_contract,
-                    errors,
-                );
-                require_effect(effect, errors);
-            }
-            Policy::MaskedUpdate {
-                state,
-                proposal,
-                mask,
-                step,
-                next_state,
-                next_mask,
-                rng,
-                effect,
-            } => {
-                let state_contract = require_input(state, errors);
-                let proposal_contract = require_input(proposal, errors);
-                let next_contract = require_output(next_state, errors);
-                for (port, contract) in [(state, state_contract), (proposal, proposal_contract)] {
-                    if let Some(contract) = contract {
-                        require_integer(name, port, contract, errors);
-                        require_rank(name, port, contract, 2, errors);
-                    }
-                }
-                require_same_contract(
-                    name,
-                    state,
-                    state_contract,
-                    proposal,
-                    proposal_contract,
-                    errors,
-                );
-                require_same_contract(
-                    name,
-                    state,
-                    state_contract,
-                    next_state,
-                    next_contract,
-                    errors,
-                );
-                if let Some(contract) = require_input(mask, errors) {
-                    require_bool(name, mask, contract, errors);
-                    require_rank(name, mask, contract, 2, errors);
-                    require_same_shape(name, state, state_contract, mask, Some(contract), errors);
-                }
-                if let Some(contract) = require_output(next_mask, errors) {
-                    require_bool(name, next_mask, contract, errors);
-                    require_rank(name, next_mask, contract, 2, errors);
-                    require_same_shape(
-                        name,
-                        state,
-                        state_contract,
-                        next_mask,
-                        Some(contract),
-                        errors,
-                    );
-                }
-                if let Some(contract) = require_input(step, errors) {
-                    require_integer(name, step, contract, errors);
-                    require_rank(name, step, contract, 1, errors);
-                    require_axis_equal(
-                        name,
-                        state,
-                        state_contract,
-                        0,
-                        step,
-                        Some(contract),
-                        0,
-                        errors,
-                    );
-                }
-                if let Some(rng) = rng {
-                    validate_rng(rng, errors);
-                    require_axis_equal(
-                        name,
-                        state,
-                        state_contract,
-                        0,
-                        &rng.seed,
-                        input(&rng.seed),
-                        0,
-                        errors,
-                    );
-                }
-                require_effect(effect, errors);
-            }
-            Policy::SpeculativeVerifier {
-                target_scores,
-                proposed_tokens,
-                proposal_scores,
-                accepted_tokens,
-                accepted_len,
-                done,
-                rng,
-                effect,
-            } => {
-                if let Some(contract) = require_input(target_scores, errors) {
-                    require_floating(name, target_scores, contract, errors);
-                    require_rank(name, target_scores, contract, 3, errors);
-                }
-                if let Some(port) = proposal_scores
-                    && let Some(contract) = require_input(port, errors)
-                {
-                    require_floating(name, port, contract, errors);
-                    require_rank(name, port, contract, 3, errors);
-                    require_same_contract(
-                        name,
-                        target_scores,
-                        input(target_scores),
-                        port,
-                        Some(contract),
-                        errors,
-                    );
-                }
-                for (port, contract) in [
-                    (proposed_tokens, require_input(proposed_tokens, errors)),
-                    (accepted_tokens, require_output(accepted_tokens, errors)),
-                    (accepted_len, require_output(accepted_len, errors)),
-                ] {
-                    if let Some(contract) = contract {
-                        require_integer(name, port, contract, errors);
-                        require_rank(
-                            name,
-                            port,
-                            contract,
-                            if port == accepted_len { 1 } else { 2 },
-                            errors,
-                        );
-                    }
-                }
-                if let Some(contract) = require_output(done, errors) {
-                    require_bool(name, done, contract, errors);
-                    require_rank(name, done, contract, 1, errors);
-                }
-                require_same_contract(
-                    name,
-                    proposed_tokens,
-                    input(proposed_tokens),
-                    accepted_tokens,
-                    output(accepted_tokens),
-                    errors,
-                );
-                for port in [accepted_len, done] {
-                    require_axis_equal(
-                        name,
-                        proposed_tokens,
-                        input(proposed_tokens),
-                        0,
-                        port,
-                        output(port),
-                        0,
-                        errors,
-                    );
-                }
-                for (left_axis, right_axis) in [(0, 0), (1, 1)] {
-                    require_axis_equal(
-                        name,
-                        target_scores,
-                        input(target_scores),
-                        left_axis,
-                        proposed_tokens,
-                        input(proposed_tokens),
-                        right_axis,
-                        errors,
-                    );
-                }
-                if let Some(rng) = rng {
-                    validate_rng(rng, errors);
-                    require_axis_equal(
-                        name,
-                        proposed_tokens,
-                        input(proposed_tokens),
-                        0,
-                        &rng.seed,
-                        input(&rng.seed),
-                        0,
-                        errors,
-                    );
-                }
-                require_effect(effect, errors);
-            }
-            Policy::StateUpdate {
-                current,
-                update,
-                next,
-                effect,
-            } => {
-                let current_contract = require_input(current, errors);
-                let _ = require_input(update, errors);
-                let next_contract = require_output(next, errors);
-                require_same_contract(name, current, current_contract, next, next_contract, errors);
-                require_effect(effect, errors);
-            }
-            Policy::AdaptiveProposalBudget {
-                current_k,
-                accepted,
-                evaluated,
-                committed_tokens,
-                filled_proposal_budget,
-                draft_ms,
-                target_ms,
-                estimates,
-                next_k,
-                next_estimates,
-                effect,
-            } => {
-                for port in [current_k, accepted, evaluated, committed_tokens] {
-                    if let Some(contract) = require_input(port, errors) {
-                        require_integer(name, port, contract, errors);
-                        require_rank(name, port, contract, 1, errors);
-                    }
-                }
-                if let Some(contract) = require_input(filled_proposal_budget, errors) {
-                    require_bool(name, filled_proposal_budget, contract, errors);
-                    require_rank(name, filled_proposal_budget, contract, 1, errors);
-                }
-                for port in [draft_ms, target_ms] {
-                    if let Some(contract) = require_input(port, errors) {
-                        require_floating(name, port, contract, errors);
-                        require_rank(name, port, contract, 1, errors);
-                    }
-                }
-                let estimates_contract = require_input(estimates, errors);
-                if let Some(contract) = estimates_contract {
-                    require_floating(name, estimates, contract, errors);
-                    require_rank(name, estimates, contract, 2, errors);
-                }
-                if let Some(contract) = require_output(next_k, errors) {
-                    require_integer(name, next_k, contract, errors);
-                    require_rank(name, next_k, contract, 1, errors);
-                }
-                let next_estimates_contract = require_output(next_estimates, errors);
-                if let Some(contract) = next_estimates_contract {
-                    require_floating(name, next_estimates, contract, errors);
-                    require_rank(name, next_estimates, contract, 2, errors);
-                }
-                require_same_contract(
-                    name,
-                    current_k,
-                    input(current_k),
-                    next_k,
-                    output(next_k),
-                    errors,
-                );
-                require_same_contract(
-                    name,
-                    estimates,
-                    estimates_contract,
-                    next_estimates,
-                    next_estimates_contract,
-                    errors,
-                );
-                for port in [
-                    accepted,
-                    evaluated,
-                    committed_tokens,
-                    filled_proposal_budget,
-                    draft_ms,
-                    target_ms,
-                    next_k,
-                ] {
-                    require_axis_equal(
-                        name,
-                        current_k,
-                        input(current_k),
-                        0,
-                        port,
-                        input(port).or_else(|| output(port)),
-                        0,
-                        errors,
-                    );
-                }
-                require_axis_equal(
-                    name,
-                    current_k,
-                    input(current_k),
-                    0,
-                    estimates,
-                    estimates_contract,
-                    0,
-                    errors,
-                );
-                require_effect(effect, errors);
-            }
-        }
-    }
-
-    fn validate_adapter_component(
-        name: &str,
-        component: &crate::schema::WorkflowComponent,
-        errors: &mut Vec<String>,
-    ) {
-        use crate::schema::{
-            AdapterComponentContract as Adapter, GrammarGuidanceAction, TelemetryAction,
-        };
-
-        let Some(adapter) = &component.adapter else {
-            return;
-        };
-        for (port, contract) in component
-            .ports
-            .inputs
-            .iter()
-            .chain(component.ports.outputs.iter())
-        {
-            require_declared_shape(name, port, contract, errors);
-        }
-        let input = |port: &str| component.ports.inputs.get(port);
-        let output = |port: &str| component.ports.outputs.get(port);
-        let require_input = |port: &str, errors: &mut Vec<String>| {
-            input(port).or_else(|| {
-                errors.push(format!(
-                    "workflow adapter component '{name}' references missing input port '{port}'"
-                ));
-                None
-            })
-        };
-        let require_output = |port: &str, errors: &mut Vec<String>| {
-            output(port).or_else(|| {
-                errors.push(format!(
-                    "workflow adapter component '{name}' references missing output port '{port}'"
-                ));
-                None
-            })
-        };
-        let require_effect = |effect: &str, errors: &mut Vec<String>| {
-            if !component.effects.iter().any(|declared| declared == effect) {
-                errors.push(format!(
-                    "workflow adapter component '{name}' references undeclared effect '{effect}'"
-                ));
-            }
-        };
-
-        match adapter {
-            Adapter::GrammarGuidance {
-                action,
-                state,
-                tokens,
-                valid_length,
-                transition_table,
-                next_state,
-                consumed_length,
-                logits_mask,
-                forced_tokens,
-                forced_length,
-                effect,
-            } => {
-                if !matches!(
-                    &component.implementation,
-                    crate::schema::ComponentImplementation::Adapter { abi, version, .. }
-                        if abi == "onnx-genai.grammar-guidance" && version == "1"
-                ) {
-                    errors.push(format!(
-                        "workflow grammar adapter component '{name}' requires \
-                         onnx-genai.grammar-guidance@1"
-                    ));
-                }
-                for port in [state, valid_length, transition_table] {
-                    if let Some(contract) = require_input(port, errors) {
-                        require_integer(name, port, contract, errors);
-                    }
-                }
-                if let Some(contract) = require_input(state, errors) {
-                    require_dtype_rank(name, state, contract, "int64", 1, errors);
-                }
-                if let Some(contract) = require_input(tokens, errors) {
-                    require_dtype_rank(name, tokens, contract, "int64", 2, errors);
-                }
-                if let Some(contract) = require_input(valid_length, errors) {
-                    require_dtype_rank(name, valid_length, contract, "int64", 1, errors);
-                }
-                if let Some(contract) = require_input(transition_table, errors) {
-                    require_dtype_rank(name, transition_table, contract, "int64", 2, errors);
-                }
-                for port in [next_state, consumed_length, forced_length] {
-                    if let Some(contract) = require_output(port, errors) {
-                        require_dtype_rank(name, port, contract, "int64", 1, errors);
-                    }
-                }
-                if let Some(contract) = require_output(logits_mask, errors) {
-                    require_dtype_rank(name, logits_mask, contract, "bool", 2, errors);
-                }
-                if let Some(contract) = require_output(forced_tokens, errors) {
-                    require_dtype_rank(name, forced_tokens, contract, "int64", 2, errors);
-                    if !matches!(
-                        contract.shape.as_deref(),
-                        Some([_, crate::schema::TensorDimension::Fixed(1)])
-                    ) {
-                        errors.push(format!(
-                            "workflow adapter component '{name}' forced-token port \
-                             '{forced_tokens}' must have shape [batch, 1]"
-                        ));
-                    }
-                }
-                require_same_contract(
-                    name,
-                    state,
-                    input(state),
-                    next_state,
-                    output(next_state),
-                    errors,
-                );
-                for port in [
-                    tokens,
-                    valid_length,
-                    next_state,
-                    consumed_length,
-                    logits_mask,
-                    forced_tokens,
-                    forced_length,
-                ] {
-                    require_axis_equal(
-                        name,
-                        state,
-                        input(state),
-                        0,
-                        port,
-                        input(port).or_else(|| output(port)),
-                        0,
-                        errors,
-                    );
-                }
-                require_axis_equal(
-                    name,
-                    transition_table,
-                    input(transition_table),
-                    1,
-                    logits_mask,
-                    output(logits_mask),
-                    1,
-                    errors,
-                );
-                if matches!(action, GrammarGuidanceAction::Clone) && input(valid_length).is_none() {
-                    errors.push(format!(
-                        "workflow grammar clone adapter '{name}' requires valid_length so clone \
-                         remains an explicit typed invocation"
-                    ));
-                }
-                require_effect(effect, errors);
-            }
-            Adapter::Telemetry {
-                action,
-                timestamp,
-                duration_ms,
-                effect,
-            } => {
-                if !matches!(
-                    &component.implementation,
-                    crate::schema::ComponentImplementation::Adapter { abi, version, .. }
-                        if abi == "onnx-genai.telemetry" && version == "1"
-                ) {
-                    errors.push(format!(
-                        "workflow telemetry adapter component '{name}' requires \
-                         onnx-genai.telemetry@1"
-                    ));
-                }
-                match action {
-                    TelemetryAction::Start => {
-                        if timestamp.as_ref().and_then(|port| output(port)).is_none() {
-                            errors.push(format!(
-                                "workflow telemetry start adapter '{name}' requires a timestamp \
-                                 output port"
-                            ));
-                        }
-                        if duration_ms.is_some() {
-                            errors.push(format!(
-                                "workflow telemetry start adapter '{name}' must not declare \
-                                 duration_ms"
-                            ));
-                        }
-                    }
-                    TelemetryAction::Elapsed => {
-                        if timestamp.as_ref().and_then(|port| input(port)).is_none() {
-                            errors.push(format!(
-                                "workflow telemetry elapsed adapter '{name}' requires a timestamp \
-                                 input port"
-                            ));
-                        }
-                        if duration_ms.as_ref().and_then(|port| output(port)).is_none() {
-                            errors.push(format!(
-                                "workflow telemetry elapsed adapter '{name}' requires a \
-                                 duration_ms output port"
-                            ));
-                        }
-                    }
-                }
-                if let Some(port) = timestamp {
-                    let contract = input(port).or_else(|| output(port));
-                    if let Some(contract) = contract {
-                        require_dtype_rank(name, port, contract, "int64", 0, errors);
-                    }
-                }
-                if let Some(port) = duration_ms
-                    && let Some(contract) = output(port)
-                {
-                    require_dtype_rank(name, port, contract, "float32", 0, errors);
-                }
-                require_effect(effect, errors);
-            }
-        }
-    }
-
-    fn require_dtype_rank(
-        component: &str,
-        port: &str,
-        contract: &crate::schema::TensorContract,
-        dtype: &str,
-        rank: usize,
-        errors: &mut Vec<String>,
-    ) {
-        if contract.dtype != dtype || contract.rank != rank {
-            errors.push(format!(
-            "workflow policy component '{component}' port '{port}' must be {dtype} rank {rank}, \
-             got {} rank {}",
-            contract.dtype, contract.rank
-        ));
-        }
-    }
-
-    fn require_floating(
-        component: &str,
-        port: &str,
-        contract: &crate::schema::TensorContract,
-        errors: &mut Vec<String>,
-    ) {
-        if !matches!(
-            contract.dtype.as_str(),
-            "float16" | "fp16" | "float32" | "fp32" | "float64" | "bfloat16" | "bf16"
-        ) {
-            errors.push(format!(
-                "workflow policy component '{component}' port '{port}' must be floating point"
-            ));
-        }
-    }
-
-    fn require_rank(
-        component: &str,
-        port: &str,
-        contract: &crate::schema::TensorContract,
-        rank: usize,
-        errors: &mut Vec<String>,
-    ) {
-        if contract.rank != rank {
-            errors.push(format!(
-                "workflow policy component '{component}' port '{port}' must have rank {rank}, \
-                     got {}",
-                contract.rank
-            ));
-        }
-    }
-
-    fn require_declared_shape(
-        component: &str,
-        port: &str,
-        contract: &crate::schema::TensorContract,
-        errors: &mut Vec<String>,
-    ) {
-        match &contract.shape {
-            Some(shape) if shape.len() == contract.rank => {}
-            Some(shape) => errors.push(format!(
-                "workflow policy component '{component}' port '{port}' declares rank {} \
-                 but has {} shape dimensions",
-                contract.rank,
-                shape.len()
-            )),
-            None => errors.push(format!(
-                "workflow policy component '{component}' port '{port}' must declare its shape"
-            )),
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn require_axis_equal(
-        component: &str,
-        left_port: &str,
-        left: Option<&crate::schema::TensorContract>,
-        left_axis: usize,
-        right_port: &str,
-        right: Option<&crate::schema::TensorContract>,
-        right_axis: usize,
-        errors: &mut Vec<String>,
-    ) {
-        let left_dimension = left
-            .and_then(|contract| contract.shape.as_ref())
-            .and_then(|shape| shape.get(left_axis));
-        let right_dimension = right
-            .and_then(|contract| contract.shape.as_ref())
-            .and_then(|shape| shape.get(right_axis));
-        if let (Some(left_dimension), Some(right_dimension)) = (left_dimension, right_dimension)
-            && left_dimension != right_dimension
-        {
-            errors.push(format!(
-                "workflow policy component '{component}' ports '{left_port}' axis \
-                 {left_axis} and '{right_port}' axis {right_axis} must use the same dimension"
-            ));
-        }
-    }
-
-    fn require_integer(
-        component: &str,
-        port: &str,
-        contract: &crate::schema::TensorContract,
-        errors: &mut Vec<String>,
-    ) {
-        if !matches!(
-            contract.dtype.as_str(),
-            "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16" | "uint32" | "uint64"
-        ) {
-            errors.push(format!(
-                "workflow policy component '{component}' port '{port}' must be integer"
-            ));
-        }
-    }
-
-    fn require_bool(
-        component: &str,
-        port: &str,
-        contract: &crate::schema::TensorContract,
-        errors: &mut Vec<String>,
-    ) {
-        if contract.dtype != "bool" {
-            errors.push(format!(
-                "workflow policy component '{component}' port '{port}' must be bool"
-            ));
-        }
-    }
-
-    fn require_same_contract(
-        component: &str,
-        left_port: &str,
-        left: Option<&crate::schema::TensorContract>,
-        right_port: &str,
-        right: Option<&crate::schema::TensorContract>,
-        errors: &mut Vec<String>,
-    ) {
-        if let (Some(left), Some(right)) = (left, right)
-            && left != right
-        {
-            errors.push(format!(
-                "workflow policy component '{component}' ports '{left_port}' and '{right_port}' \
-             must have identical tensor contracts"
-            ));
-        }
-    }
-
-    fn require_same_shape(
-        component: &str,
-        left_port: &str,
-        left: Option<&crate::schema::TensorContract>,
-        right_port: &str,
-        right: Option<&crate::schema::TensorContract>,
-        errors: &mut Vec<String>,
-    ) {
-        if let (Some(left), Some(right)) = (left, right)
-            && (left.rank != right.rank || left.shape != right.shape)
-        {
-            errors.push(format!(
-                "workflow policy component '{component}' ports '{left_port}' and \
-                 '{right_port}' must have identical tensor shapes"
-            ));
-        }
-    }
-
     fn validate_runtime_dtype(
         path: &str,
         contract: &crate::schema::TensorContract,
         errors: &mut Vec<String>,
     ) {
+        if contract
+            .shape
+            .as_ref()
+            .is_some_and(|shape| shape.len() != contract.rank)
+        {
+            errors.push(format!(
+                "{path} declares rank {} but has {} shape dimensions",
+                contract.rank,
+                contract.shape.as_ref().map_or(0, Vec::len)
+            ));
+        }
         if !matches!(
             contract.dtype.as_str(),
             "float16"
@@ -1388,33 +511,115 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
                 errors,
             );
         }
-        if component.policy.is_some()
-            && !matches!(
-                component.implementation,
-                crate::schema::ComponentImplementation::Onnx { .. }
-            )
-        {
-            errors.push(format!(
-                "workflow policy component '{name}' must use an ONNX implementation"
-            ));
+        if let Some(contract) = &component.contract {
+            if contract.id.trim().is_empty() || contract.version.trim().is_empty() {
+                errors.push(format!(
+                    "workflow component '{name}' contract id and version must not be empty"
+                ));
+            }
+            if !(component.ports.inputs.is_empty() && component.ports.outputs.is_empty()) {
+                for (role, port) in &contract.bindings {
+                    if role.trim().is_empty()
+                        || (!component.ports.inputs.contains_key(port)
+                            && !component.ports.outputs.contains_key(port))
+                    {
+                        errors.push(format!(
+                            "workflow component '{name}' contract binding '{role}' references \
+                             unknown port '{port}'"
+                        ));
+                    }
+                }
+            }
+            if let crate::schema::ComponentImplementation::Adapter { abi, version, .. } =
+                &component.implementation
+            {
+                if contract.id != *abi || contract.version != *version {
+                    errors.push(format!(
+                        "workflow adapter component '{name}' contract {}@{} must match its ABI \
+                             {abi}@{version}",
+                        contract.id, contract.version
+                    ));
+                }
+                let action = match contract.parameters.get("action") {
+                    Some(crate::schema::ScalarValue::String(action)) => Some(action.as_str()),
+                    _ => None,
+                };
+                let supported = match contract.id.as_str() {
+                    "onnx-genai.grammar-guidance" => {
+                        matches!(action, Some("clone" | "lookahead" | "commit"))
+                    }
+                    "onnx-genai.telemetry" => matches!(action, Some("start" | "elapsed")),
+                    _ => true,
+                };
+                if !supported {
+                    errors.push(format!(
+                        "workflow adapter component '{name}' has unsupported action {:?} for \
+                             contract {}@{}",
+                        action, contract.id, contract.version
+                    ));
+                }
+                let required_bindings: &[&str] = match (contract.id.as_str(), action) {
+                    ("onnx-genai.grammar-guidance", _) => &[
+                        "state",
+                        "tokens",
+                        "valid_length",
+                        "transition_table",
+                        "next_state",
+                        "consumed_length",
+                        "logits_mask",
+                        "forced_tokens",
+                        "forced_length",
+                    ],
+                    ("onnx-genai.telemetry", Some("start")) => &["timestamp"],
+                    ("onnx-genai.telemetry", Some("elapsed")) => &["timestamp", "duration_ms"],
+                    _ => &[],
+                };
+                for role in required_bindings {
+                    if !contract.bindings.contains_key(*role) {
+                        errors.push(format!(
+                            "workflow adapter component '{name}' contract {}@{} is missing \
+                             required binding '{role}'",
+                            contract.id, contract.version
+                        ));
+                    }
+                }
+                let (input_roles, output_roles): (&[&str], &[&str]) =
+                    match (contract.id.as_str(), action) {
+                        ("onnx-genai.grammar-guidance", _) => (
+                            &["state", "tokens", "valid_length", "transition_table"],
+                            &[
+                                "next_state",
+                                "consumed_length",
+                                "logits_mask",
+                                "forced_tokens",
+                                "forced_length",
+                            ],
+                        ),
+                        ("onnx-genai.telemetry", Some("start")) => (&[], &["timestamp"]),
+                        ("onnx-genai.telemetry", Some("elapsed")) => {
+                            (&["timestamp"], &["duration_ms"])
+                        }
+                        _ => (&[], &[]),
+                    };
+                for (direction, roles, ports) in [
+                    ("input", input_roles, &component.ports.inputs),
+                    ("output", output_roles, &component.ports.outputs),
+                ] {
+                    for role in roles {
+                        if contract
+                            .bindings
+                            .get(*role)
+                            .is_some_and(|port| !ports.contains_key(port))
+                        {
+                            errors.push(format!(
+                                "workflow adapter component '{name}' contract role '{role}' must \
+                                 bind an {direction} port"
+                            ));
+                        }
+                    }
+                }
+            }
         }
-        if component.adapter.is_some()
-            && !matches!(
-                component.implementation,
-                crate::schema::ComponentImplementation::Adapter { .. }
-            )
-        {
-            errors.push(format!(
-                "workflow adapter component '{name}' must use an adapter implementation"
-            ));
-        }
-        if component.policy.is_some() && component.adapter.is_some() {
-            errors.push(format!(
-                "workflow component '{name}' cannot declare both policy and adapter contracts"
-            ));
-        }
-        validate_policy_component(name, component, errors);
-        validate_adapter_component(name, component, errors);
     }
     for (name, state) in &workflow.state {
         validate_runtime_dtype(&format!("workflow state '{name}'"), &state.contract, errors);
@@ -1473,16 +678,16 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
         .iter()
         .map(|(name, input)| (name.clone(), input.contract.clone()))
         .collect::<BTreeMap<_, _>>();
-    let mut effects = workflow.initial_effects.clone();
+    let mut effects = compiled.initial_effects.clone();
     let mut effect_tokens = effects.values().cloned().collect::<BTreeSet<_>>();
     validate_workflow_node(
-        &workflow.graph,
+        &compiled.graph,
         workflow,
         &mut values,
         &mut value_contracts,
         &mut effects,
         &mut effect_tokens,
-        "pipeline.workflow.graph",
+        "pipeline.workflow.steps",
         errors,
     );
 
@@ -1513,23 +718,24 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
         used.insert("advisory_state".to_string());
     }
     for component in workflow.components.values() {
-        if matches!(
-            component.policy.as_ref(),
-            Some(crate::schema::PolicyComponentContract::AdaptiveProposalBudget { .. })
-        ) {
-            used.insert("adaptive_proposal_budget".to_string());
-        }
-        match component.adapter.as_ref() {
-            Some(crate::schema::AdapterComponentContract::GrammarGuidance { .. }) => {
+        match component
+            .contract
+            .as_ref()
+            .map(|contract| contract.id.as_str())
+        {
+            Some("onnx-genai.adaptive-proposal-budget") => {
+                used.insert("adaptive_proposal_budget".to_string());
+            }
+            Some("onnx-genai.grammar-guidance") => {
                 used.insert("grammar_guidance_adapter".to_string());
             }
-            Some(crate::schema::AdapterComponentContract::Telemetry { .. }) => {
+            Some("onnx-genai.telemetry") => {
                 used.insert("telemetry_adapter".to_string());
             }
-            None => {}
+            _ => {}
         }
     }
-    collect_workflow_capabilities(&workflow.graph, &mut used);
+    collect_workflow_capabilities(&compiled.graph, &mut used);
     for capability in used.difference(&workflow.manifest.capabilities) {
         errors.push(format!(
             "pipeline.workflow.manifest.capabilities is missing used capability '{capability}'"
@@ -1617,7 +823,7 @@ fn validate_workflow_node(
 ) {
     match node {
         WorkflowNode::Sequence { nodes } => {
-            if nodes.is_empty() {
+            if nodes.is_empty() && !path.ends_with(".setup") {
                 errors.push(format!("{path}.nodes must not be empty"));
             }
             for (index, node) in nodes.iter().enumerate() {
@@ -1643,8 +849,14 @@ fn validate_workflow_node(
                 errors.push(format!("{path} invokes unknown component '{component}'"));
                 return;
             };
+            let inferred_onnx_ports = declaration.ports.inputs.is_empty()
+                && declaration.ports.outputs.is_empty()
+                && matches!(
+                    declaration.implementation,
+                    crate::schema::ComponentImplementation::Onnx { .. }
+                );
             for (port, value) in inputs {
-                if !declaration.ports.inputs.contains_key(port) {
+                if !inferred_onnx_ports && !declaration.ports.inputs.contains_key(port) {
                     errors.push(format!("{path}.inputs has unknown port '{port}'"));
                 }
                 require_workflow_value(value, values, &format!("{path}.inputs.{port}"), errors);
@@ -1660,13 +872,15 @@ fn validate_workflow_node(
                     );
                 }
             }
-            for port in declaration.ports.inputs.keys() {
-                if !inputs.contains_key(port) {
-                    errors.push(format!("{path}.inputs is missing port '{port}'"));
+            if !inferred_onnx_ports {
+                for (port, contract) in &declaration.ports.inputs {
+                    if !contract.optional && !inputs.contains_key(port) {
+                        errors.push(format!("{path}.inputs is missing port '{port}'"));
+                    }
                 }
             }
             for (port, value) in outputs {
-                if !declaration.ports.outputs.contains_key(port) {
+                if !inferred_onnx_ports && !declaration.ports.outputs.contains_key(port) {
                     errors.push(format!("{path}.outputs has unknown port '{port}'"));
                 }
                 define_workflow_value(value, values, &format!("{path}.outputs.{port}"), errors);
@@ -1674,95 +888,10 @@ fn validate_workflow_node(
                     value_contracts.insert(value.clone(), contract.clone());
                 }
             }
-            if let Some(policy) = &declaration.policy {
-                use crate::schema::PolicyComponentContract as Policy;
-                let required_outputs: Vec<&str> = match policy {
-                    Policy::TokenSampler { token, rng, .. } => {
-                        let mut ports = vec![token.as_str()];
-                        if let Some(rng) = rng {
-                            ports.push(rng.next_offset.as_str());
-                        }
-                        ports
-                    }
-                    Policy::TerminationPredicate { done, .. } => vec![done],
-                    Policy::SolverStep { next_state, .. } => vec![next_state],
-                    Policy::MaskedUpdate {
-                        next_state,
-                        next_mask,
-                        rng,
-                        ..
-                    } => {
-                        let mut ports = vec![next_state.as_str(), next_mask.as_str()];
-                        if let Some(rng) = rng {
-                            ports.push(rng.next_offset.as_str());
-                        }
-                        ports
-                    }
-                    Policy::SpeculativeVerifier {
-                        accepted_tokens,
-                        accepted_len,
-                        done,
-                        rng,
-                        ..
-                    } => {
-                        let mut ports = vec![
-                            accepted_tokens.as_str(),
-                            accepted_len.as_str(),
-                            done.as_str(),
-                        ];
-                        if let Some(rng) = rng {
-                            ports.push(rng.next_offset.as_str());
-                        }
-                        ports
-                    }
-                    Policy::StateUpdate { next, .. } => vec![next],
-                    Policy::AdaptiveProposalBudget {
-                        next_k,
-                        next_estimates,
-                        ..
-                    } => vec![next_k, next_estimates],
-                };
-                for port in required_outputs {
-                    if !outputs.contains_key(port) {
-                        errors.push(format!(
-                            "{path}.outputs is missing required policy output port '{port}'"
-                        ));
-                    }
-                }
-            }
-            if let Some(adapter) = &declaration.adapter {
-                use crate::schema::{AdapterComponentContract as Adapter, TelemetryAction};
-                let required_outputs: Vec<&str> = match adapter {
-                    Adapter::GrammarGuidance {
-                        next_state,
-                        consumed_length,
-                        logits_mask,
-                        forced_tokens,
-                        forced_length,
-                        ..
-                    } => vec![
-                        next_state,
-                        consumed_length,
-                        logits_mask,
-                        forced_tokens,
-                        forced_length,
-                    ],
-                    Adapter::Telemetry {
-                        action: TelemetryAction::Start,
-                        timestamp,
-                        ..
-                    } => timestamp.iter().map(String::as_str).collect(),
-                    Adapter::Telemetry {
-                        action: TelemetryAction::Elapsed,
-                        duration_ms,
-                        ..
-                    } => duration_ms.iter().map(String::as_str).collect(),
-                };
-                for port in required_outputs {
-                    if !outputs.contains_key(port) {
-                        errors.push(format!(
-                            "{path}.outputs is missing required adapter output port '{port}'"
-                        ));
+            if !inferred_onnx_ports {
+                for (port, contract) in &declaration.ports.outputs {
+                    if !contract.optional && !outputs.contains_key(port) {
+                        errors.push(format!("{path}.outputs is missing port '{port}'"));
                     }
                 }
             }
@@ -1791,6 +920,7 @@ fn validate_workflow_node(
             max_iterations,
             iteration,
             carried,
+            effects: loop_effects,
         } => {
             validate_workflow_node(
                 setup,
@@ -1808,9 +938,36 @@ fn validate_workflow_node(
                 &format!("{path}.max_iterations"),
                 errors,
             );
+            if let Some(contract) = value_contracts.get(max_iterations) {
+                validate_integer_scalar_contract(
+                    contract,
+                    &format!("{path}.max_iterations"),
+                    errors,
+                );
+            }
             let mut body_values = values.clone();
             let mut body_contracts = value_contracts.clone();
             let mut body_effects = effects.clone();
+            for (domain, merge) in loop_effects {
+                match effects.get(domain) {
+                    Some(incoming) if incoming == &merge.incoming => {}
+                    Some(incoming) => errors.push(format!(
+                        "{path}.effects.{domain} consumes '{}', but the incoming token is \
+                         '{incoming}'",
+                        merge.incoming
+                    )),
+                    None => errors.push(format!(
+                        "{path}.effects.{domain} references undeclared effect"
+                    )),
+                }
+                if !effect_tokens.insert(merge.body_input.clone()) {
+                    errors.push(format!(
+                        "{path}.effects.{domain}.body_input '{}' is already produced",
+                        merge.body_input
+                    ));
+                }
+                body_effects.insert(domain.clone(), merge.body_input.clone());
+            }
             if let Some(iteration) = iteration {
                 if iteration.contract.dtype != "int64" || !matches!(iteration.contract.rank, 0 | 1)
                 {
@@ -1923,6 +1080,9 @@ fn validate_workflow_node(
                 &format!("{path}.condition"),
                 errors,
             );
+            if let Some(contract) = body_contracts.get(condition) {
+                validate_predicate_contract(contract, &format!("{path}.condition"), errors);
+            }
             for carry in carried {
                 require_workflow_value(
                     &carry.body_output,
@@ -1956,7 +1116,23 @@ fn validate_workflow_node(
                     value_contracts.insert(carry.next.clone(), contract.clone());
                 }
             }
-            *effects = body_effects;
+            for (domain, merge) in loop_effects {
+                if body_effects.get(domain) != Some(&merge.body_output) {
+                    errors.push(format!(
+                        "{path}.effects.{domain} body produces '{}', but the final body token is \
+                         {:?}",
+                        merge.body_output,
+                        body_effects.get(domain)
+                    ));
+                }
+                if !effect_tokens.insert(merge.produces.clone()) {
+                    errors.push(format!(
+                        "{path}.effects.{domain}.produces '{}' is already produced",
+                        merge.produces
+                    ));
+                }
+                effects.insert(domain.clone(), merge.produces.clone());
+            }
         }
         WorkflowNode::Branch {
             predicate,
@@ -1966,6 +1142,9 @@ fn validate_workflow_node(
             effects: merges,
         } => {
             require_workflow_value(predicate, values, &format!("{path}.predicate"), errors);
+            if let Some(contract) = value_contracts.get(predicate) {
+                validate_predicate_contract(contract, &format!("{path}.predicate"), errors);
+            }
             if cases.is_empty() {
                 errors.push(format!("{path}.cases must not be empty"));
             }
@@ -2308,8 +1487,46 @@ fn validate_integer_scalar_contract(
                 errors.push(format!("{path} rank-zero contract must have shape []"));
             }
         }
-        1 => {}
+        1 => {
+            if !matches!(
+                contract.shape.as_deref(),
+                Some([crate::schema::TensorDimension::Fixed(1)])
+            ) {
+                errors.push(format!(
+                    "{path} rank-one control contract must have static shape [1]"
+                ));
+            }
+        }
         _ => errors.push(format!("{path} must be a scalar or rank-one tensor")),
+    }
+}
+
+fn validate_predicate_contract(
+    contract: &crate::schema::TensorContract,
+    path: &str,
+    errors: &mut Vec<String>,
+) {
+    if contract.dtype != "bool"
+        && !matches!(
+            contract.dtype.as_str(),
+            "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16" | "uint32" | "uint64"
+        )
+    {
+        errors.push(format!("{path} must have a bool or integer dtype"));
+    }
+    if !matches!(contract.rank, 0 | 1) {
+        errors.push(format!(
+            "{path} must be a scalar or rank-one broadcast tensor"
+        ));
+    } else if contract.rank == 1
+        && !matches!(
+            contract.shape.as_deref(),
+            Some([crate::schema::TensorDimension::Fixed(1)])
+        )
+    {
+        errors.push(format!(
+            "{path} rank-one predicate contract must have static shape [1]"
+        ));
     }
 }
 

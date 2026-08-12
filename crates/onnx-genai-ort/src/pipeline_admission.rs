@@ -103,13 +103,106 @@ fn validate_workflow_signatures(
                     }
                 }
             }
-            for port in actual.keys() {
-                if !declared.contains_key(port) {
-                    return Err(OrtError::InvalidArgument(format!(
-                        "workflow component '{component}' ONNX graph exposes undeclared \
-                         {direction} port '{port}'"
-                    )));
+        }
+    }
+    validate_workflow_invocations(&workflow.steps, workflow, signatures)?;
+    Ok(())
+}
+
+fn validate_workflow_invocations(
+    steps: &[onnx_genai_metadata::WorkflowStep],
+    workflow: &onnx_genai_metadata::WorkflowSpec,
+    signatures: &BTreeMap<String, ComponentSignature>,
+) -> Result<()> {
+    for step in steps {
+        match step {
+            onnx_genai_metadata::WorkflowStep::Sequence { steps } => {
+                validate_workflow_invocations(steps, workflow, signatures)?;
+            }
+            onnx_genai_metadata::WorkflowStep::Invoke {
+                component,
+                inputs,
+                outputs,
+            } => {
+                let declaration = workflow.components.get(component).ok_or_else(|| {
+                    OrtError::InvalidArgument(format!(
+                        "workflow invokes unknown component '{component}'"
+                    ))
+                })?;
+                if matches!(
+                    declaration.implementation,
+                    onnx_genai_metadata::ComponentImplementation::Onnx { .. }
+                ) {
+                    let signature = signatures.get(component).ok_or_else(|| {
+                        OrtError::InvalidArgument(format!(
+                            "workflow ONNX component '{component}' has no inspected model"
+                        ))
+                    })?;
+                    validate_invocation_ports(
+                        component,
+                        "input",
+                        inputs,
+                        &signature.inputs,
+                        Some(&signature.defaulted_inputs),
+                        true,
+                    )?;
+                    validate_invocation_ports(
+                        component,
+                        "output",
+                        outputs,
+                        &signature.outputs,
+                        None,
+                        false,
+                    )?;
                 }
+            }
+            onnx_genai_metadata::WorkflowStep::Loop { setup, steps, .. } => {
+                validate_workflow_invocations(setup, workflow, signatures)?;
+                validate_workflow_invocations(steps, workflow, signatures)?;
+            }
+            onnx_genai_metadata::WorkflowStep::Branch { cases, default, .. } => {
+                for case in cases.values() {
+                    validate_workflow_invocations(
+                        std::slice::from_ref(case),
+                        workflow,
+                        signatures,
+                    )?;
+                }
+                if let Some(default) = default {
+                    validate_workflow_invocations(
+                        std::slice::from_ref(default.as_ref()),
+                        workflow,
+                        signatures,
+                    )?;
+                }
+            }
+            onnx_genai_metadata::WorkflowStep::Emit { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_invocation_ports(
+    component: &str,
+    direction: &str,
+    bindings: &BTreeMap<String, String>,
+    actual: &BTreeMap<String, PortSignature>,
+    optional: Option<&BTreeSet<String>>,
+    require_all: bool,
+) -> Result<()> {
+    for port in bindings.keys() {
+        if !actual.contains_key(port) {
+            return Err(OrtError::InvalidArgument(format!(
+                "workflow invocation of '{component}' binds unknown {direction} port '{port}'"
+            )));
+        }
+    }
+    if require_all {
+        for port in actual.keys() {
+            if !bindings.contains_key(port) && !optional.is_some_and(|ports| ports.contains(port)) {
+                return Err(OrtError::InvalidArgument(format!(
+                    "workflow invocation of '{component}' is missing {direction} port '{port}'"
+                )));
             }
         }
     }

@@ -31,6 +31,7 @@ pub mod capabilities {
 }
 
 pub mod component;
+mod lowering;
 pub mod parser;
 pub mod schema;
 pub mod validation;
@@ -38,6 +39,7 @@ pub mod validation;
 pub use component::{
     ComponentDataType, ComponentError, ComponentIo, ComponentSession, ComponentTensor,
 };
+pub use lowering::{CompiledWorkflow, compile_workflow};
 pub use parser::{
     MtpProposerSpec, SharedKvProposerSpec, SpeculatorConfigSource, SpeculatorDescriptor,
     SpeculatorProposerKind, SpeculatorProposerStatus, detect_speculator, load_metadata,
