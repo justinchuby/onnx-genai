@@ -20,8 +20,6 @@ pub(crate) mod kv_sizing;
 pub mod logits;
 mod memory_authority;
 #[cfg(feature = "native-backend")]
-pub mod native_component;
-#[cfg(feature = "native-backend")]
 pub mod native_decode;
 pub mod native_decode_device;
 #[cfg(feature = "native-backend")]
@@ -64,8 +62,6 @@ pub use logits::{
 pub use memory_authority::{
     DeviceCompatibilityDomain, DeviceMemoryAuthority, MemoryAuthorityProvider,
 };
-#[cfg(feature = "native-backend")]
-pub use native_component::NativeComponentSession;
 #[cfg(feature = "native-backend")]
 pub use native_decode::{
     CudaGraphDebugStats, CudaKvDebugStats, NATIVE_DECODER_CAPTURED_STEP_INPUT_DECODES,
@@ -167,9 +163,7 @@ pub struct VmmArenaStats {
 #[cfg(feature = "native-backend")]
 pub use onnx_runtime_session::DecodePrecision;
 pub use pipeline::{
-    ImageOutput, ImageRequest, ImageStep, ImageStepCallback, ImageStream, IterativeOverrides,
-    PipelineEngine, PipelineGenerateRequest, PipelineSynthesis, PipelineTensors, Scheduler,
-    SchedulerFactory, SchedulerRegistry, validate_pipeline_backend_request,
+    PipelineEngine, PipelineGenerateRequest, PipelineTensors, validate_pipeline_backend_request,
 };
 pub use sampling::{CategoricalSampler, GreedySampler, Sampler};
 pub use speculative::{

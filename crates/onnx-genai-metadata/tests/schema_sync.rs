@@ -40,6 +40,20 @@ fn generated_schema_preserves_all_root_constraints() {
         constraint["not"]["required"] == serde_json::json!(["pipeline", "model"])
             && constraint["not"]["properties"]["model"]["required"] == serde_json::json!(["io"])
     }));
+
+    let serialized = serde_json::to_string(&schema).expect("schema serializes");
+    for removed in [
+        "PipelineStrategy",
+        "PipelineStrategyKind",
+        "PhaseConfig",
+        "PhaseRunOn",
+        "SchedulerSpec",
+    ] {
+        assert!(
+            !serialized.contains(removed),
+            "generated schema still exposes removed legacy definition {removed}"
+        );
+    }
 }
 
 fn schema_path() -> PathBuf {

@@ -2006,20 +2006,12 @@ name = "onnx-genai"
 version = "0.1.0-dev.5"
 dependencies = [
  "anyhow",
- "clap",
- "image",
- "onnx-genai-comfyui-config",
  "onnx-genai-engine",
  "onnx-genai-kv",
  "onnx-genai-metadata",
  "onnx-genai-ort",
  "onnx-genai-preprocess",
  "onnx-genai-scheduler",
- "rand 0.9.5",
- "rand_distr",
- "serde_json",
- "tokenizers",
- "tracing",
 ]
 
 [[package]]
@@ -2076,16 +2068,6 @@ dependencies = [
  "tokio",
  "tracing-subscriber",
  "unicode-width 0.2.2",
-]
-
-[[package]]
-name = "onnx-genai-comfyui-config"
-version = "0.1.0-dev.5"
-dependencies = [
- "onnx-genai-metadata",
- "serde",
- "serde_json",
- "thiserror 2.0.19",
 ]
 
 [[package]]

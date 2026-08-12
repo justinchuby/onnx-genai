@@ -1247,6 +1247,8 @@ pipeline:
     inputs:
       initial: { contract: { dtype: int64, rank: 0, shape: [] }, role: { kind: opaque },
                  source: { kind: application, name: initial }, required: true }
+      run_branch: { contract: { dtype: bool, rank: 0, shape: [] }, role: { kind: opaque },
+                    source: { kind: application, name: run_branch }, required: true }
       increment: { contract: { dtype: int64, rank: 0, shape: [] }, role: { kind: opaque },
                    source: { kind: application, name: increment }, required: true }
       limit: { contract: { dtype: int64, rank: 0, shape: [] }, role: { kind: opaque },
@@ -1304,73 +1306,122 @@ pipeline:
     graph:
       kind: sequence
       nodes:
-        - kind: loop
-          setup:
-            kind: invoke
-            component: binding
-            inputs: { value: initial }
-            outputs: { value: world.current }
-            effects: {}
-          body:
-            kind: sequence
-            nodes:
-              - kind: invoke
-                component: update
-                inputs: { current: world.body, update: increment }
-                outputs: { next: world.body_next }
-                effects: { update: { consumes: update.0, produces: update.1 } }
-              - kind: invoke
-                component: predicate
-                inputs: { value: world.body_next, limit: limit }
-                outputs: { continue: loop.continue }
-                effects: { predicate: { consumes: predicate.0, produces: predicate.1 } }
-              - kind: emit
-                value: world.body_next
-                output: events
-                mode: event
-                effect_name: stream
-                effect: { consumes: stream.0, produces: stream.1 }
-          condition: loop.continue
-          max_iterations: iterations
-          carried:
-            - cell: world
-              current: world.current
-              body_input: world.body
-              body_output: world.body_next
-              next: world.final
-              read_effect: { consumes: state.0, produces: state.1 }
-              write_effect: { consumes: state.1, produces: state.2 }
         - kind: branch
-          predicate: world.final
+          predicate: run_branch
+          cases:
+            "true":
+              kind: loop
+              setup:
+                kind: invoke
+                component: binding
+                inputs: { value: initial }
+                outputs: { value: world.current }
+                effects: {}
+              body:
+                kind: sequence
+                nodes:
+                  - kind: invoke
+                    component: update
+                    inputs: { current: world.body, update: increment }
+                    outputs: { next: world.body_next }
+                    effects: { update: { consumes: update.0, produces: update.1 } }
+                  - kind: invoke
+                    component: predicate
+                    inputs: { value: world.body_next, limit: limit }
+                    outputs: { continue: loop.continue }
+                    effects: { predicate: { consumes: predicate.0, produces: predicate.1 } }
+                  - kind: emit
+                    value: world.body_next
+                    output: events
+                    mode: event
+                    effect_name: stream
+                    effect: { consumes: stream.0, produces: stream.1 }
+              condition: loop.continue
+              max_iterations: iterations
+              carried:
+                - cell: world
+                  current: world.current
+                  body_input: world.body
+                  body_output: world.body_next
+                  next: world.final
+                  read_effect: { consumes: state.0, produces: state.1 }
+                  write_effect: { consumes: state.1, produces: state.2 }
+          outputs:
+            world.selected:
+              cases: { "true": world.final }
+          effects:
+            update:
+              incoming: update.0
+              cases: { "true": update.1 }
+              produces: update.joined
+            predicate:
+              incoming: predicate.0
+              cases: { "true": predicate.1 }
+              produces: predicate.joined
+            stream:
+              incoming: stream.0
+              cases: { "true": stream.1 }
+              produces: stream.joined
+            "state:world":
+              incoming: state.0
+              cases: { "true": state.2 }
+              produces: state.joined
+        - kind: branch
+          predicate: world.selected
           cases:
             "3":
               kind: emit
-              value: world.current
+              value: world.selected
               output: state
               mode: replace
               effect_name: stream
-              effect: { consumes: stream.1, produces: stream.2 }
+              effect: { consumes: stream.joined, produces: stream.2 }
             "5":
               kind: emit
-              value: world.current
+              value: world.selected
               output: state
               mode: replace
               effect_name: stream
-              effect: { consumes: stream.1, produces: stream.2 }
+              effect: { consumes: stream.joined, produces: stream.2 }
           default:
             kind: emit
-            value: world.current
+            value: world.selected
             output: state
             mode: replace
             effect_name: stream
-            effect: { consumes: stream.1, produces: stream.2 }
+            effect: { consumes: stream.joined, produces: stream.2 }
           effects:
             stream:
-              incoming: stream.1
+              incoming: stream.joined
               cases: { "3": stream.2, "5": stream.2 }
               default: stream.2
               produces: stream.after_branch
 "#;
+    let invalid = metadata.replace(
+        r#"          outputs:
+            world.selected:
+              cases: { "true": world.final }
+"#,
+        "          outputs: {}\n",
+    );
+    let invalid_root = package(
+        "world-missing-state-phi",
+        &invalid,
+        &[
+            ("update.onnx.textproto", ADD_STATE),
+            ("less.onnx.textproto", LESS),
+        ],
+    )?;
+    let error = Engine::from_pipeline_dir(&invalid_root, EngineConfig::default())
+        .err()
+        .expect("branch-local session state must escape through a phi output");
+    assert!(
+        error
+            .to_string()
+            .contains("updates session state 'world' to 'world.final'"),
+        "{error}"
+    );
+
     let root = package(
         "world",
         metadata,
@@ -1387,22 +1438,46 @@ pipeline:
         options: first_options,
     })
     .with_session_id("world-a")
+    .with_input(
+        "run_branch",
+        Value::from_raw_bytes(vec![1], &[], onnx_genai_ort::DataType::Bool)?,
+    )
     .with_input("initial", Value::from_slice_i64(&[0], &[])?)
     .with_input("increment", Value::from_slice_i64(&[1], &[])?)
     .with_input("limit", Value::from_slice_i64(&[3], &[])?);
     assert_eq!(engine.run_pipeline(first)?["state"].to_vec_i64()?, [3]);
 
     let mut second_options = onnx_genai_engine::GenerateOptions::default();
-    second_options.max_new_tokens = 4;
+    second_options.max_new_tokens = 1;
     let second = PipelineGenerateRequest::new(GenerateRequest {
         prompt: GeneratePrompt::TokenIds(vec![]),
         options: second_options,
     })
     .with_session_id("world-a")
+    .with_input(
+        "run_branch",
+        Value::from_raw_bytes(vec![1], &[], onnx_genai_ort::DataType::Bool)?,
+    )
     .with_input("initial", Value::from_slice_i64(&[0], &[])?)
     .with_input("increment", Value::from_slice_i64(&[1], &[])?)
     .with_input("limit", Value::from_slice_i64(&[5], &[])?);
-    assert_eq!(engine.run_pipeline(second)?["state"].to_vec_i64()?, [5]);
+    assert_eq!(engine.run_pipeline(second)?["state"].to_vec_i64()?, [4]);
+
+    let mut third_options = onnx_genai_engine::GenerateOptions::default();
+    third_options.max_new_tokens = 1;
+    let third = PipelineGenerateRequest::new(GenerateRequest {
+        prompt: GeneratePrompt::TokenIds(vec![]),
+        options: third_options,
+    })
+    .with_session_id("world-a")
+    .with_input(
+        "run_branch",
+        Value::from_raw_bytes(vec![1], &[], onnx_genai_ort::DataType::Bool)?,
+    )
+    .with_input("initial", Value::from_slice_i64(&[0], &[])?)
+    .with_input("increment", Value::from_slice_i64(&[1], &[])?)
+    .with_input("limit", Value::from_slice_i64(&[5], &[])?);
+    assert_eq!(engine.run_pipeline(third)?["state"].to_vec_i64()?, [5]);
     Ok(())
 }
 

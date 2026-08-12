@@ -155,11 +155,10 @@ impl EngineResourceGovernor {
         allow_runtime_override: bool,
         kv_config: ModelKvConfig,
         model_weights_bytes: u64,
-        cuda_device_index: Option<u32>,
         provider: Option<&SharedMemoryAuthorityProvider>,
         domain: Option<&DeviceCompatibilityDomain>,
     ) -> Result<Self, ResourceError> {
-        let capacities = capacity_providers_for_device(&limits, cuda_device_index);
+        let capacities = fallback_capacity_providers(&limits);
         Self::new_with_capacities_and_authority(
             limits,
             allow_runtime_override,
@@ -172,24 +171,16 @@ impl EngineResourceGovernor {
     }
 
     #[cfg(feature = "native-backend")]
-    // Eight parameters (one over the lint's threshold) because this is
-    // `new_with_authority` plus an explicit reservation: #840 added
-    // `cuda_device_index` to fix a VRAM-capacity portability bug and pushed it
-    // over. Grouping them into a struct would buy nothing here — this is a
-    // crate-private constructor with exactly one caller (`engine::load`), and
-    // every argument is already a distinct type carrying its own meaning.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_authority_and_reservation(
         limits: ResourceLimits,
         allow_runtime_override: bool,
         kv_config: ModelKvConfig,
         model_weights_bytes: u64,
         reservation_bytes: u64,
-        cuda_device_index: Option<u32>,
         provider: Option<&SharedMemoryAuthorityProvider>,
         domain: Option<&DeviceCompatibilityDomain>,
     ) -> Result<Self, ResourceError> {
-        let capacities = capacity_providers_for_device(&limits, cuda_device_index);
+        let capacities = fallback_capacity_providers(&limits);
         Self::new_with_capacities_and_authority(
             limits,
             allow_runtime_override,
@@ -198,27 +189,6 @@ impl EngineResourceGovernor {
             (model_weights_bytes, reservation_bytes),
             provider,
             domain,
-        )
-    }
-
-    pub(crate) fn new_for_shared_pipeline_kv(
-        limits: ResourceLimits,
-        allow_runtime_override: bool,
-        kv_config: ModelKvConfig,
-        existing_device_usage_bytes: u64,
-        cuda_device_index: Option<u32>,
-        provider: Option<&SharedMemoryAuthorityProvider>,
-        domain: &DeviceCompatibilityDomain,
-    ) -> Result<Self, ResourceError> {
-        let capacities = capacity_providers_for_device(&limits, cuda_device_index);
-        Self::new_with_capacities_and_authority(
-            limits,
-            allow_runtime_override,
-            capacities,
-            kv_config,
-            (existing_device_usage_bytes, 0),
-            provider,
-            Some(domain),
         )
     }
 
@@ -596,66 +566,8 @@ pub(crate) fn fallback_capacity_providers(limits: &ResourceLimits) -> CapacityPr
     }
 }
 
-/// Query the real total/free VRAM of a CUDA device via `cudaMemGetInfo`.
-///
-/// Returns `(total_bytes, free_bytes)` on success. Returns `None` when the
-/// query is unavailable (no driver, query failure, or a nonsense zero total)
-/// so the caller falls back to the provisional capacity constant.
-#[cfg(feature = "cuda")]
-pub(crate) fn real_cuda_vram_capacity(device_index: u32) -> Option<(u64, u64)> {
-    let device_id = i32::try_from(device_index).ok()?;
-    match onnx_genai_ort::cuda_rt::device_memory_info(device_id) {
-        Ok(info) if info.total_bytes > 0 => Some((info.total_bytes as u64, info.free_bytes as u64)),
-        Ok(_) => {
-            tracing::warn!(
-                device_index,
-                "cudaMemGetInfo reported zero total VRAM; falling back to provisional capacity"
-            );
-            None
-        }
-        Err(err) => {
-            tracing::warn!(
-                device_index,
-                error = %err,
-                "could not query real CUDA device memory; falling back to provisional VRAM capacity"
-            );
-            None
-        }
-    }
-}
-
-/// Capacity providers with the VRAM tier resolved against the *real* device
-/// total when the decode targets a CUDA device.
-///
-/// The provisional `PROVISIONAL_VRAM_CAPACITY_BYTES` (8 GiB) is a portability
-/// hazard: a `Fraction(0.90)` limit resolved against it caps device leases at
-/// ~7.2 GiB on *every* machine, so any model larger than that fails to load
-/// resident even on a 143 GiB H200. When the native device is CUDA we query
-/// the driver for the true capacity so the default fraction "just works"; the
-/// 8 GiB constant survives only as a last-resort fallback for CPU-only builds
-/// or a failed query.
-pub(crate) fn capacity_providers_for_device(
-    limits: &ResourceLimits,
-    cuda_device_index: Option<u32>,
-) -> CapacityProviders {
-    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
-    let mut providers = fallback_capacity_providers(limits);
-    #[cfg(feature = "cuda")]
-    if let Some(index) = cuda_device_index
-        && let Some((total, free)) = real_cuda_vram_capacity(index)
-    {
-        providers.vram = Arc::new(FixedCapacity::new(total, free));
-    }
-    #[cfg(not(feature = "cuda"))]
-    let _ = cuda_device_index;
-    providers
-}
-
-pub(crate) fn resolve_vram_limit_bytes(
-    limits: &ResourceLimits,
-    cuda_device_index: Option<u32>,
-) -> anyhow::Result<u64> {
-    let capacities = capacity_providers_for_device(limits, cuda_device_index);
+pub(crate) fn resolve_vram_limit_bytes(limits: &ResourceLimits) -> anyhow::Result<u64> {
+    let capacities = fallback_capacity_providers(limits);
     onnx_genai_scheduler::resolve_limit(limits.vram_limit, capacities.vram.as_ref(), "vram")
         .map_err(anyhow::Error::new)
 }
@@ -769,7 +681,6 @@ pub(crate) fn component_governor(
     config: &EngineConfig,
     kv_model: Option<&KvModelInfo>,
     model_weights_bytes: u64,
-    cuda_device_index: Option<u32>,
     provider: Option<&crate::memory_authority::SharedMemoryAuthorityProvider>,
     domain: &crate::memory_authority::DeviceCompatibilityDomain,
 ) -> anyhow::Result<EngineResourceGovernor> {
@@ -782,7 +693,6 @@ pub(crate) fn component_governor(
         config.allow_runtime_override,
         kv_config,
         model_weights_bytes,
-        cuda_device_index,
         provider,
         Some(domain),
     )
@@ -792,72 +702,6 @@ pub(crate) fn component_governor(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn fallback_vram_fraction_resolves_against_provisional_capacity() {
-        // CPU-only / no-CUDA path: `cuda_device_index = None` must resolve a
-        // `Fraction` against the provisional 8 GiB tier (documented last-resort
-        // fallback), never a zero or a panic.
-        let limits = ResourceLimits {
-            vram_limit: ResourceLimit::Fraction(0.90),
-            host_ram_limit: ResourceLimit::Fraction(0.90),
-            disk_spill_limit: None,
-        };
-        let resolved = resolve_vram_limit_bytes(&limits, None).unwrap();
-        let expected = (PROVISIONAL_VRAM_CAPACITY_BYTES as f64 * 0.90) as u64;
-        // The resolver applies the fraction in f32, so allow a few ULP of slack.
-        assert!(
-            resolved.abs_diff(expected) <= 4096,
-            "resolved {resolved} should be ~0.9 * 8 GiB ({expected})"
-        );
-    }
-
-    #[test]
-    fn no_cuda_device_uses_provisional_vram_provider() {
-        let limits = ResourceLimits::default();
-        let providers = capacity_providers_for_device(&limits, None);
-        assert_eq!(
-            providers.vram.total_bytes(),
-            PROVISIONAL_VRAM_CAPACITY_BYTES
-        );
-    }
-
-    // The real-capacity path is what fixes the portability bug: on a CUDA build
-    // with a visible device, a `Fraction(0.90)` must resolve against the true
-    // device total, not the 8 GiB provisional cap — otherwise any model larger
-    // than ~7.2 GiB fails to load resident even on a 143 GiB H200.
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn real_cuda_capacity_lifts_fraction_above_provisional_cap() {
-        let Some((total, _free)) = real_cuda_vram_capacity(0) else {
-            eprintln!("no CUDA device 0 visible; skipping real-capacity assertion");
-            return;
-        };
-        // Only meaningful when the device is larger than the provisional tier
-        // (true for every modern datacenter GPU, e.g. H200 = 143 GiB).
-        if total <= PROVISIONAL_VRAM_CAPACITY_BYTES {
-            eprintln!("device 0 total {total} <= provisional cap; skipping");
-            return;
-        }
-        let limits = ResourceLimits {
-            vram_limit: ResourceLimit::Fraction(0.90),
-            host_ram_limit: ResourceLimit::Fraction(0.90),
-            disk_spill_limit: None,
-        };
-        let resolved = resolve_vram_limit_bytes(&limits, Some(0)).unwrap();
-        let provisional_cap = (PROVISIONAL_VRAM_CAPACITY_BYTES as f64 * 0.90) as u64;
-        assert!(
-            resolved > provisional_cap,
-            "resolved {resolved} must exceed provisional cap {provisional_cap}"
-        );
-        // And it should track the real device total, not some other constant.
-        let expected = (total as f64 * 0.90) as u64;
-        let tolerance = expected / 100; // 1%
-        assert!(
-            resolved.abs_diff(expected) <= tolerance,
-            "resolved {resolved} should be ~0.9 * device total {total} (= {expected})"
-        );
-    }
 
     #[test]
     fn missing_kv_geometry_is_unknown_not_a_token_count_byte_size() {

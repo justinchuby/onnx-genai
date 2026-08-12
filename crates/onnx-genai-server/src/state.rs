@@ -487,7 +487,6 @@ impl AppState {
             id: model_id,
             // Test-only constructor: the model was handed in already loaded, so
             // there is no package directory to resolve files against.
-            model_dir: std::path::PathBuf::new(),
             engine: engine_driver,
             tokenizer: Arc::new(tokenizer),
             chat_template: chat_template.map(Arc::new),
@@ -496,8 +495,6 @@ impl AppState {
             fim_config,
             pipeline: false,
             multimodal: None,
-            text_to_image: false,
-            text_to_audio: false,
         });
         let registry = ModelRegistry::from_handle(Arc::new(handle), config.clone());
         Self {
@@ -602,26 +599,18 @@ pub(crate) fn enforce_requested_max_batch(
 /// loading (`ModelRegistry::load`).  It is a **blocking** function (it calls
 /// `Engine::from_dir`, which takes seconds) and must therefore be invoked from a
 /// blocking context (e.g. at startup or via `tokio::task::spawn_blocking`).
-#[cfg(test)]
-pub(crate) fn build_handle(spec: &ModelSpec, config: &ServerConfig) -> anyhow::Result<ModelHandle> {
-    let authorities = Arc::new(ServerMemoryAuthorities::new(
-        config.engine_config.limits.vram_limit,
-    ));
-    build_handle_with_authorities(spec, config, authorities)
-}
-
 pub(crate) fn build_handle_with_authorities(
     spec: &ModelSpec,
     config: &ServerConfig,
     authorities: Arc<ServerMemoryAuthorities>,
 ) -> anyhow::Result<ModelHandle> {
-    onnx_genai_engine::validate_pipeline_backend_request(config.engine_config.decode_backend)?;
     let model_dir = spec.path.as_path();
     let model_id = spec.id.clone();
     let chat_template = load_chat_template(model_dir)?;
     if let Some(directory) = PipelineModelDirectory::load_if_declared(model_dir)
         .map_err(|e| anyhow::anyhow!("Failed to discover pipeline directory: {e}"))?
     {
+        onnx_genai_engine::validate_pipeline_backend_request(config.engine_config.decode_backend)?;
         let model_max_context = load_model_max_context(directory.metadata_path.as_deref())?;
         return build_pipeline_handle(
             model_dir,
@@ -657,7 +646,6 @@ pub(crate) fn build_handle_with_authorities(
     let engine_driver = EngineDriver::start(engine, requested_max_batch, config.max_queue_depth);
     Ok(ModelHandle::new(ModelHandleParts {
         id: model_id,
-        model_dir: model_dir.to_path_buf(),
         engine: engine_driver,
         tokenizer: Arc::new(tokenizer),
         chat_template: chat_template.map(Arc::new),
@@ -666,8 +654,6 @@ pub(crate) fn build_handle_with_authorities(
         fim_config,
         pipeline: false,
         multimodal: None,
-        text_to_image: false,
-        text_to_audio: false,
     }))
 }
 
@@ -684,10 +670,6 @@ fn build_pipeline_handle(
     let tokenizer = Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("Failed to load pipeline tokenizer: {e}"))?;
 
-    // A package that declares a denoise loop can serve image generation; one
-    // whose pipeline ends in a waveform stage can serve speech.
-    let text_to_image = directory.spec.strategy.denoiser.is_some();
-    let text_to_audio = onnx_genai::text_to_audio::is_text_to_audio(&directory.spec);
     let engine = Engine::from_pipeline_dir_with_memory_authority_provider(
         model_dir,
         config.engine_config.clone(),
@@ -696,7 +678,6 @@ fn build_pipeline_handle(
     let multimodal = crate::multimodal::build(&directory, engine.models())?;
     Ok(ModelHandle::new(ModelHandleParts {
         id: model_id,
-        model_dir: model_dir.to_path_buf(),
         engine: EngineDriver::start_pipeline(engine, config.max_queue_depth),
         tokenizer: Arc::new(tokenizer),
         chat_template: chat_template.map(Arc::new),
@@ -708,42 +689,12 @@ fn build_pipeline_handle(
         fim_config: None,
         pipeline: true,
         multimodal: Some(multimodal),
-        text_to_image,
-        text_to_audio,
     }))
 }
 
 #[cfg(test)]
 mod authority_tests {
-    #[cfg(not(feature = "native-backend"))]
-    use std::path::PathBuf;
-
     use super::*;
-
-    #[cfg(not(feature = "native-backend"))]
-    #[test]
-    fn shared_server_load_validates_native_backend_before_model_io() {
-        let spec = ModelSpec {
-            id: "missing-native".to_string(),
-            path: PathBuf::from("this-model-directory-does-not-exist"),
-            eager: true,
-            warmup: false,
-        };
-        let config = ServerConfig {
-            engine_config: EngineConfig {
-                decode_backend: onnx_genai_engine::EngineDecodeBackend::Native,
-                ..EngineConfig::default()
-            },
-            ..ServerConfig::default()
-        };
-
-        let error = build_handle(&spec, &config)
-            .err()
-            .expect("native backend validation must fail")
-            .to_string();
-        assert!(error.contains("compiled without the 'native-backend' feature"));
-        assert!(!error.contains("does not exist"), "{error}");
-    }
 
     #[test]
     fn concurrent_requests_create_one_authority() {

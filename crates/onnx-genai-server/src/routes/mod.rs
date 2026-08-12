@@ -11,9 +11,6 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response, Sse, sse::Event},
 };
-use base64::Engine as _;
-use onnx_genai::text_to_audio::TextToAudioRequest;
-use onnx_genai::text_to_image::TextToImageRequest;
 use onnx_genai::{
     FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult, SessionId,
     StopSequence,
@@ -47,10 +44,8 @@ use crate::{
         ChatLogprobs, ChatMessage, ChatMessageContent, ChatMessageToolCall,
         ChatMessageToolCallFunction, ChatTokenLogprob, ChatTool, ChatTopLogprob, CompletionChoice,
         CompletionLogprobs, CompletionRequest, CompletionResponse, EmbeddingData, EmbeddingInput,
-        EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, EmbeddingVector, ImageData,
-        ImageGenerationRequest, ImageGenerationResponse, ImageResponseFormat, InputAudio,
-        ResponseFormat, SpeechRequest, SpeechResponseFormat, StopInput, ToolChoice, ToolChoiceMode,
-        Usage,
+        EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, EmbeddingVector, InputAudio,
+        ResponseFormat, StopInput, ToolChoice, ToolChoiceMode, Usage,
     },
 };
 
@@ -66,6 +61,8 @@ pub(crate) use admin::{
     admin_warmup_model, debug_config, debug_kv, debug_profile, debug_sessions, debug_trace,
     debug_trace_perfetto, health, models, resources, status,
 };
+#[cfg(test)]
+pub(crate) use completions::prepare_completion;
 pub use completions::{
     ParsedAssistantOutput, build_generate_request, build_prompt, parse_assistant_output,
     parse_tool_calls,
@@ -73,9 +70,7 @@ pub use completions::{
 pub(crate) use completions::{
     chat_completions, collect_generation_result, completions, embeddings,
 };
-#[cfg(test)]
-pub(crate) use completions::{image_placeholder_text, prepare_completion};
-pub(crate) use multimodal::{audio_speech, audio_transcriptions, image_generations};
+pub(crate) use multimodal::audio_transcriptions;
 pub(crate) use sessions::{create_session, delete_session};
 
 const SESSION_ID_HEADER: &str = "x-session-id";

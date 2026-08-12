@@ -204,7 +204,7 @@ const NON_DETERMINISTIC_OPERATORS: &[&str] = &[
 ///
 /// A component's declared phase says only *when* it runs, never that it is
 /// deterministic, so purity is read off the graph instead of assumed from
-/// `run_on: prompt_only`.
+/// an invocation outside the decode loop.
 ///
 /// Everything the runtime will execute is walked, not just the main graph: a
 /// random operator is no less random for sitting inside a `Loop` body or a

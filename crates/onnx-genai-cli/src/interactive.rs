@@ -626,33 +626,19 @@ impl Backend {
 
     /// Run one turn, streaming tokens through `callback`.
     /// Clear the pipeline reuse counters so a profile covers only the next turn.
-    pub(super) fn reset_reuse_stats(&self) {
-        if let Self::Pipeline(pipeline) = self {
-            pipeline.engine.reset_cache_stats();
-        }
-    }
+    pub(super) fn reset_reuse_stats(&self) {}
 
     /// What a multimodal pipeline avoided recomputing, or `None` for a single
     /// decoder graph, which has no encoder or attachments to reuse.
     pub(super) fn multimodal_reuse(&self) -> Option<profile::MultimodalReuse> {
-        let Self::Pipeline(pipeline) = self else {
-            return None;
-        };
-        let stats = pipeline.engine.cache_stats();
-        Some(profile::MultimodalReuse {
-            encoder_hits: stats.encoder_hits,
-            encoder_misses: stats.encoder_misses,
-            encoder_bytes: stats.encoder_bytes,
-            prefix_reused_tokens: stats.prefix_reused_tokens,
-            prefill_tokens: stats.prefill_tokens,
-        })
+        None
     }
 
     /// What the KV page pool holds right now, when the backend pages its KV.
     pub(super) fn page_usage(&self) -> Option<onnx_genai::kv::PageUsage> {
         match self {
             Self::Text(engine) => Some(engine.page_usage()),
-            Self::Pipeline(pipeline) => pipeline.engine.page_usage(),
+            Self::Pipeline(_) => None,
         }
     }
 

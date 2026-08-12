@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use schemars::JsonSchema;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
 fn deserialize_non_empty_string<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
@@ -16,34 +16,17 @@ where
     Ok(value)
 }
 
-fn deserialize_optional_non_empty_string<'de, D>(
-    deserializer: D,
-) -> Result<Option<String>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    Option::<String>::deserialize(deserializer)?.map_or(Ok(None), |value| {
-        if value.is_empty() {
-            Err(serde::de::Error::custom("presence keys must not be empty"))
-        } else {
-            Ok(Some(value))
-        }
-    })
-}
-
 mod generation;
 mod hardware;
 mod ir;
 mod model_io;
 mod pipeline;
-mod scheduler;
 
 pub use generation::*;
 pub use hardware::*;
 pub use ir::*;
 pub use model_io::*;
 pub use pipeline::*;
-pub use scheduler::*;
 
 /// ONNX inference metadata consumed by runtimes and emitted by model builders.
 ///
@@ -259,34 +242,6 @@ mod schema_vocabulary {
     );
 
     extensible_string!(
-        /// Pipeline component-role vocabulary.
-        PipelineRole,
-        pipeline_role,
-        PIPELINE_ROLE,
-        [
-            "encoder",
-            "vision_encoder",
-            "audio_encoder",
-            "decoder",
-            "draft",
-            "denoiser",
-            "scheduler",
-            "vocoder",
-            "speech_synthesis"
-        ]
-    );
-
-    extensible_string!(
-        /// Execution-device preference vocabulary.
-        DevicePreference,
-        device_preference,
-        DEVICE_PREFERENCE,
-        [
-            "auto", "cpu", "cuda", "rocm", "directml", "coreml", "webgpu", "npu"
-        ]
-    );
-
-    extensible_string!(
         /// Generic inference-strategy vocabulary.
         StrategyKind,
         strategy_kind,
@@ -374,43 +329,11 @@ mod schema_vocabulary {
     );
 
     extensible_string!(
-        /// Image token-count source vocabulary.
-        ImageTokenCountSource,
-        image_token_count_source,
-        IMAGE_TOKEN_COUNT_SOURCE,
-        ["per_tile", "per_patch", "from_grid"]
-    );
-
-    extensible_string!(
-        /// Prompt-placeholder to image correspondence vocabulary.
-        ImageCorrespondence,
-        image_correspondence,
-        IMAGE_CORRESPONDENCE,
-        ["prompt_order", "explicit_indices"]
-    );
-
-    extensible_string!(
         /// Optional-thumbnail ordering vocabulary.
         ThumbnailOrder,
         thumbnail_order,
         THUMBNAIL_ORDER,
         ["none", "prepend", "append"]
-    );
-
-    extensible_string!(
-        /// Position-value generation vocabulary.
-        PositionGeneration,
-        position_generation,
-        POSITION_GENERATION,
-        ["linear", "processor_coordinates"]
-    );
-
-    extensible_string!(
-        /// Prefill→decode position-continuation vocabulary.
-        PositionContinuation,
-        position_continuation,
-        POSITION_CONTINUATION,
-        ["linear_increment", "carry_max", "from_grid"]
     );
 
     extensible_string!(
@@ -570,36 +493,6 @@ mod schema_helpers {
         );
     }
 
-    pub(super) fn phase_run_on(schema: &mut Schema) {
-        extensible_string_enum(
-            schema,
-            &[
-                "prompt_only",
-                "every_step",
-                "always",
-                "final_only",
-                "on_demand",
-            ],
-        );
-    }
-
-    pub(super) fn pipeline_strategy_kind(schema: &mut Schema) {
-        extensible_string_enum(
-            schema,
-            &[
-                "autoregressive",
-                "iterative",
-                "diffusion_steps",
-                "diffusion-steps",
-                "single_pass",
-                "single-pass",
-                "composite",
-                "nested_autoregressive",
-                "nested-autoregressive",
-            ],
-        );
-    }
-
     pub(super) fn attention_type(schema: &mut Schema) {
         extensible_string_enum(schema, super::schema_vocabulary::ATTENTION_TYPE);
     }
@@ -622,14 +515,6 @@ mod schema_helpers {
 
     pub(super) fn precision(schema: &mut Schema) {
         extensible_string_enum(schema, super::schema_vocabulary::PRECISION);
-    }
-
-    pub(super) fn pipeline_role(schema: &mut Schema) {
-        extensible_string_enum(schema, super::schema_vocabulary::PIPELINE_ROLE);
-    }
-
-    pub(super) fn device_preference(schema: &mut Schema) {
-        extensible_string_enum(schema, super::schema_vocabulary::DEVICE_PREFERENCE);
     }
 
     pub(super) fn strategy_kind(schema: &mut Schema) {
@@ -664,24 +549,8 @@ mod schema_helpers {
         extensible_string_enum(schema, super::schema_vocabulary::IMAGE_OUTPUT_CONTENT);
     }
 
-    pub(super) fn image_token_count_source(schema: &mut Schema) {
-        extensible_string_enum(schema, super::schema_vocabulary::IMAGE_TOKEN_COUNT_SOURCE);
-    }
-
-    pub(super) fn image_correspondence(schema: &mut Schema) {
-        extensible_string_enum(schema, super::schema_vocabulary::IMAGE_CORRESPONDENCE);
-    }
-
     pub(super) fn thumbnail_order(schema: &mut Schema) {
         extensible_string_enum(schema, super::schema_vocabulary::THUMBNAIL_ORDER);
-    }
-
-    pub(super) fn position_continuation(schema: &mut Schema) {
-        extensible_string_enum(schema, super::schema_vocabulary::POSITION_CONTINUATION);
-    }
-
-    pub(super) fn position_generation(schema: &mut Schema) {
-        extensible_string_enum(schema, super::schema_vocabulary::POSITION_GENERATION);
     }
 
     pub(super) fn kv_update_kind(schema: &mut Schema) {
@@ -798,7 +667,6 @@ mod tests {
     #[derive(Debug, Deserialize, Serialize)]
     struct OptionalModalityDocument {
         io: ModelIoSpec,
-        phase: PhaseConfig,
     }
 
     #[test]
@@ -806,13 +674,10 @@ mod tests {
         let old_yaml = r#"
 io:
   sequence_source: token_ids
-phase:
-  run_on: prompt_only
 "#;
         let old: OptionalModalityDocument =
             serde_yaml::from_str(old_yaml).expect("old metadata deserializes");
         assert!(old.io.optional_inputs.is_empty());
-        assert!(old.phase.when_present.is_none());
         assert_eq!(
             serde_yaml::to_value(&old).expect("old metadata serializes"),
             serde_yaml::from_str::<serde_yaml::Value>(old_yaml).expect("old YAML parses")
@@ -826,9 +691,6 @@ io:
       absent:
         kind: zeros
         shape: [0, sequence_len]
-phase:
-  run_on: prompt_only
-  when_present: audio
 "#;
         let new: OptionalModalityDocument =
             serde_yaml::from_str(new_yaml).expect("optional-modality metadata deserializes");
@@ -846,7 +708,6 @@ phase:
                 TensorDimension::Symbol("sequence_len".into())
             ]
         );
-        assert_eq!(new.phase.when_present.as_deref(), Some("audio"));
         assert_eq!(
             serde_yaml::to_value(&new).expect("optional-modality metadata serializes"),
             serde_yaml::from_str::<serde_yaml::Value>(new_yaml).expect("new YAML parses")

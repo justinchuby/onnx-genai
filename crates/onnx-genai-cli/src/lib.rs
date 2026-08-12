@@ -53,8 +53,6 @@ use interactive::{
 };
 use model_inspection::{list, show, version};
 use onnx_genai::engine::EngineDecodeBackend;
-use onnx_genai::text_to_audio::TextToAudioRequest;
-use onnx_genai::text_to_image::{TextToImageRequest, VaeDecoder};
 use onnx_genai::{EngineConfig, GenerateOptions, SamplingOverrides, StopSequence};
 use onnx_genai_server::{ServeArgs, run_serve};
 use output::write_merged_trace;
@@ -422,112 +420,6 @@ struct AttachmentArgs {
     audio: Vec<PathBuf>,
 }
 
-/// Text-to-image flags for `generate --output-image`.
-#[derive(Debug, Args)]
-struct ImageOutputArgs {
-    /// Render the prompt to this PNG file instead of generating text. Requires a
-    /// diffusion package whose metadata declares `strategy.kind: iterative`.
-    /// With `--batch-size > 1` the images are written as `<stem>_0.png`, ...
-    #[arg(long, value_name = "PATH")]
-    output_image: Option<PathBuf>,
-
-    /// Negative prompt, used as the classifier-free-guidance unconditional embedding.
-    #[arg(long, default_value = "")]
-    negative_prompt: String,
-
-    /// Number of denoise steps. Defaults to the package's declared `num_steps`.
-    #[arg(long)]
-    steps: Option<usize>,
-
-    /// Classifier-free-guidance scale; 1.0 disables guidance. Defaults to the
-    /// package's declared `guidance_scale`.
-    #[arg(long)]
-    guidance_scale: Option<f32>,
-
-    /// Seed for the initial latent.
-    #[arg(long, default_value_t = 0)]
-    seed: u64,
-
-    /// Output image height in pixels (must be a multiple of 8).
-    #[arg(long, default_value_t = 512)]
-    height: usize,
-
-    /// Output image width in pixels (must be a multiple of 8).
-    #[arg(long, default_value_t = 512)]
-    width: usize,
-
-    /// Number of images to render in one batch.
-    #[arg(long, default_value_t = 1)]
-    batch_size: usize,
-
-    /// CLIP tokenizer.json (defaults to `<model>/tokenizer.json`).
-    #[arg(long)]
-    tokenizer: Option<PathBuf>,
-
-    /// Prompt encoder ONNX file (defaults to the component declared in metadata).
-    #[arg(long)]
-    text_encoder: Option<PathBuf>,
-
-    /// Standalone latent→image ONNX decoder, for packages whose pipeline stops
-    /// at the latent instead of declaring a final image phase.
-    #[arg(long)]
-    vae_decoder: Option<PathBuf>,
-
-    /// Latent scaling factor applied before `--vae-decoder` (Stable Diffusion 1.x uses 0.18215).
-    #[arg(long, default_value_t = 0.18215)]
-    vae_scaling_factor: f32,
-}
-
-impl ImageOutputArgs {
-    fn to_request(&self, prompt: String) -> TextToImageRequest {
-        TextToImageRequest {
-            prompt,
-            negative_prompt: self.negative_prompt.clone(),
-            steps: self.steps,
-            guidance_scale: self.guidance_scale,
-            start_step: None,
-            seed: self.seed,
-            height: self.height,
-            width: self.width,
-            batch_size: self.batch_size,
-            tokenizer_path: self.tokenizer.clone(),
-            text_encoder_path: self.text_encoder.clone(),
-            vae_decoder: self.vae_decoder.clone().map(|model_path| VaeDecoder {
-                model_path,
-                scaling_factor: self.vae_scaling_factor,
-            }),
-            source_image: None,
-            vae_encoder: None,
-        }
-    }
-}
-
-/// Text-to-speech flags for `generate --output-audio`.
-#[derive(Debug, Args)]
-struct AudioOutputArgs {
-    /// Synthesize the prompt to this WAV file instead of generating text.
-    /// Requires a package whose pipeline ends in a waveform stage.
-    #[arg(long, value_name = "PATH")]
-    output_audio: Option<PathBuf>,
-
-    /// Override the package's declared output sample rate, in hertz. Only
-    /// needed for a package whose metadata omits `pipeline.audio.sample_rate`.
-    #[arg(long)]
-    sample_rate: Option<u32>,
-}
-
-impl AudioOutputArgs {
-    fn to_request(&self, text: String, sampling: &SamplingArgs) -> TextToAudioRequest {
-        TextToAudioRequest {
-            text,
-            max_new_tokens: sampling.max_new_tokens,
-            temperature: sampling.temperature,
-            sample_rate: self.sample_rate,
-            seed: None,
-        }
-    }
-}
-
 #[derive(Debug, Args)]
 struct GenerateArgs {
     /// Model directory, or a config file inside it (e.g. inference_metadata.yaml).
@@ -544,12 +436,6 @@ struct GenerateArgs {
 
     #[command(flatten)]
     cpu: CpuArgs,
-
-    #[command(flatten)]
-    image_output: ImageOutputArgs,
-
-    #[command(flatten)]
-    audio_output: AudioOutputArgs,
 
     /// Print generated tokens as they arrive.
     #[arg(long)]
@@ -1252,81 +1138,6 @@ mod tests {
                     vec![PathBuf::from("a.png"), PathBuf::from("b.png")]
                 );
                 assert_eq!(args.attachments.audio, vec![PathBuf::from("c.wav")]);
-                assert!(args.image_output.output_image.is_none());
-            }
-            _ => panic!("expected generate command"),
-        }
-    }
-
-    #[test]
-    fn generate_accepts_text_to_image_flags() {
-        let parsed = Cli::try_parse_from([
-            "onnx-genai",
-            "generate",
-            "./m",
-            "--prompt",
-            "an astronaut riding a horse",
-            "--output-image",
-            "out.png",
-            "--negative-prompt",
-            "blurry",
-            "--steps",
-            "20",
-            "--guidance-scale",
-            "7.5",
-            "--seed",
-            "42",
-            "--width",
-            "768",
-            "--height",
-            "512",
-        ])
-        .unwrap();
-
-        match parsed.command {
-            Commands::Generate(args) => {
-                let request = args.image_output.to_request(args.prompt.clone());
-                assert_eq!(
-                    args.image_output.output_image,
-                    Some(PathBuf::from("out.png"))
-                );
-                assert_eq!(request.negative_prompt, "blurry");
-                assert_eq!(request.steps, Some(20));
-                assert_eq!(request.guidance_scale, Some(7.5));
-                assert_eq!(request.seed, 42);
-                assert_eq!((request.width, request.height), (768, 512));
-                assert!(request.vae_decoder.is_none());
-            }
-            _ => panic!("expected generate command"),
-        }
-    }
-
-    #[test]
-    fn image_output_args_carry_the_standalone_vae_decoder() {
-        let parsed = Cli::try_parse_from([
-            "onnx-genai",
-            "generate",
-            "./m",
-            "--prompt",
-            "a cat",
-            "--output-image",
-            "out.png",
-            "--vae-decoder",
-            "vae_decoder/model.onnx",
-            "--vae-scaling-factor",
-            "0.13025",
-        ])
-        .unwrap();
-
-        match parsed.command {
-            Commands::Generate(args) => {
-                let decoder = args
-                    .image_output
-                    .to_request(args.prompt.clone())
-                    .vae_decoder
-                    .expect("--vae-decoder must be carried through");
-                assert_eq!(decoder.model_path, PathBuf::from("vae_decoder/model.onnx"));
-                assert!((decoder.scaling_factor - 0.13025).abs() < 1e-6);
             }
             _ => panic!("expected generate command"),
         }

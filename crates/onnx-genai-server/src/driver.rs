@@ -1,14 +1,11 @@
 use std::{
     collections::{HashMap, VecDeque},
-    path::PathBuf,
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
 
 use anyhow::Context;
-use onnx_genai::text_to_audio::{SynthesizedAudio, TextToAudioRequest};
-use onnx_genai::text_to_image::{RenderedImage, TextToImageRequest};
 use onnx_genai::{
     Engine, GenerateOptions, GenerateRequest, GenerateResult, GenerateToken, SessionId, TokenId,
 };
@@ -18,7 +15,6 @@ use onnx_genai_engine::{
     FimConfig, GovernorSnapshot, KvNotApplicable, KvTelemetry, MemoryStrategyPlan, PipelineEngine,
     PipelineGenerateRequest, ResourceLimit, SchedulerAdmissionError,
 };
-use onnx_genai_ort::Tokenizer;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 use crate::metrics::GenerationMetrics;
@@ -137,16 +133,6 @@ pub(crate) enum DriverCommand {
         input_ids: Vec<TokenId>,
         options: EmbeddingOptions,
         reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<f32>>>,
-    },
-    RenderImages {
-        pipeline_dir: PathBuf,
-        request: Box<TextToImageRequest>,
-        reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<RenderedImage>>>,
-    },
-    SynthesizeSpeech {
-        tokenizer: Arc<Tokenizer>,
-        request: Box<TextToAudioRequest>,
-        reply: tokio::sync::oneshot::Sender<anyhow::Result<SynthesizedAudio>>,
     },
     #[cfg(test)]
     ResourceSnapshot(tokio::sync::oneshot::Sender<anyhow::Result<GovernorSnapshot>>),
@@ -523,66 +509,6 @@ impl EngineDriver {
         })
     }
 
-    /// Render images on the engine thread that owns the pipeline.
-    ///
-    /// Diffusion is a single long synchronous call rather than a token stream,
-    /// so this is a plain request/response command instead of an event channel.
-    pub(crate) async fn render_images(
-        &self,
-        pipeline_dir: PathBuf,
-        request: TextToImageRequest,
-    ) -> Result<anyhow::Result<Vec<RenderedImage>>, GenerateSubmitError> {
-        let _permit = self
-            .generation_capacity
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| GenerateSubmitError::Overloaded)?;
-        let (reply, rx) = tokio::sync::oneshot::channel();
-        if self
-            .commands
-            .send(DriverCommand::RenderImages {
-                pipeline_dir,
-                request: Box::new(request),
-                reply,
-            })
-            .await
-            .is_err()
-        {
-            return Err(GenerateSubmitError::DriverStopped);
-        }
-        rx.await.map_err(|_| GenerateSubmitError::DriverStopped)
-    }
-
-    /// Synthesize speech on the engine thread that owns the pipeline.
-    ///
-    /// Like image rendering, this is one long synchronous call rather than a
-    /// token stream, so it is a plain request/response command.
-    pub(crate) async fn synthesize_speech(
-        &self,
-        tokenizer: Arc<Tokenizer>,
-        request: TextToAudioRequest,
-    ) -> Result<anyhow::Result<SynthesizedAudio>, GenerateSubmitError> {
-        let _permit = self
-            .generation_capacity
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| GenerateSubmitError::Overloaded)?;
-        let (reply, rx) = tokio::sync::oneshot::channel();
-        if self
-            .commands
-            .send(DriverCommand::SynthesizeSpeech {
-                tokenizer,
-                request: Box::new(request),
-                reply,
-            })
-            .await
-            .is_err()
-        {
-            return Err(GenerateSubmitError::DriverStopped);
-        }
-        rx.await.map_err(|_| GenerateSubmitError::DriverStopped)
-    }
-
     pub(crate) async fn generate_fim(
         &self,
         prefix: String,
@@ -729,26 +655,6 @@ fn run_pipeline_driver(
                 events,
                 permit,
             } => run_pipeline_generation(engine, *request, input, admission, events, permit),
-            DriverCommand::RenderImages {
-                pipeline_dir,
-                request,
-                reply,
-            } => {
-                let _ = reply.send(onnx_genai::text_to_image::render(
-                    &pipeline_dir,
-                    engine,
-                    &request,
-                ));
-            }
-            DriverCommand::SynthesizeSpeech {
-                tokenizer,
-                request,
-                reply,
-            } => {
-                let _ = reply.send(onnx_genai::text_to_audio::synthesize(
-                    engine, &tokenizer, &request,
-                ));
-            }
             DriverCommand::CreateSession(response) => {
                 let _ = response.send(Err(anyhow::anyhow!(
                     "sessions are not supported by pipeline models"
@@ -1195,8 +1101,6 @@ fn deferred_permit_holder_count(deferred: &VecDeque<DriverCommand>) -> usize {
                 DriverCommand::Generate { .. }
                     | DriverCommand::GeneratePipeline { .. }
                     | DriverCommand::GenerateFim { .. }
-                    | DriverCommand::RenderImages { .. }
-                    | DriverCommand::SynthesizeSpeech { .. }
             )
         })
         .count()
@@ -1401,20 +1305,6 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
             reply,
         } => {
             let _ = reply.send(engine.embed_with_options(&input_ids, options));
-        }
-        DriverCommand::RenderImages { reply, .. } => {
-            let _ = reply.send(Err(anyhow::anyhow!(
-                "What: image generation was routed to a single-model engine. \
-                 Why: only a declared diffusion pipeline can run a denoise loop. \
-                 How: request a model whose package declares `strategy.denoiser`."
-            )));
-        }
-        DriverCommand::SynthesizeSpeech { reply, .. } => {
-            let _ = reply.send(Err(anyhow::anyhow!(
-                "What: speech synthesis was routed to a single-model engine. \
-                 Why: only a declared pipeline can run a post-decode vocoder stage. \
-                 How: request a model whose package declares a `run_on: final_only` waveform stage."
-            )));
         }
         #[cfg(test)]
         DriverCommand::ResourceSnapshot(reply) => {
@@ -1824,66 +1714,6 @@ mod admission_tests {
             admission_step(1, 1, 0, false, false),
             AdmissionStep::WaitToSettle,
             "a non-empty deferred queue is not a solo request"
-        );
-    }
-
-    /// Every command that takes a `generation_capacity` permit must be counted.
-    ///
-    /// `in_flight` is derived from that semaphore, and this count is subtracted
-    /// from it to estimate arrivals. Missing a permit-holding variant here
-    /// understates the deferred total, inflates the estimate, and forces a lone
-    /// request onto the slow path -- which is exactly what happened when only
-    /// the three text-generation commands were counted.
-    #[test]
-    fn image_commands_are_counted_as_permit_holders() {
-        let (image_reply, _image_rx) = tokio::sync::oneshot::channel();
-        let mut deferred: VecDeque<DriverCommand> = VecDeque::new();
-        deferred.push_back(DriverCommand::RenderImages {
-            pipeline_dir: PathBuf::new(),
-            request: Box::new(TextToImageRequest::default()),
-            reply: image_reply,
-        });
-
-        assert_eq!(
-            deferred_permit_holder_count(&deferred),
-            1,
-            "RenderImages holds a generation_capacity permit and must be \
-             subtracted from the in-flight estimate"
-        );
-    }
-
-    /// A deferred permit holder must not be mistaken for an incoming sibling.
-    ///
-    /// This is the end-to-end shape of the bug: one image request queued behind
-    /// a lone generation used to make `expected_this_batch` exceed `collected`,
-    /// which held the generation to the hard deadline and then ran it through
-    /// the continuous-batch path by itself.
-    #[test]
-    fn a_deferred_image_request_does_not_force_a_lone_generation_onto_the_slow_path() {
-        let (image_reply, _image_rx) = tokio::sync::oneshot::channel();
-        let mut deferred: VecDeque<DriverCommand> = VecDeque::new();
-        deferred.push_back(DriverCommand::RenderImages {
-            pipeline_dir: PathBuf::new(),
-            request: Box::new(TextToImageRequest::default()),
-            reply: image_reply,
-        });
-
-        // Two permits are held: our lone generation, and the queued image.
-        let in_flight = 2usize;
-        let max_batch = 4usize;
-        let expected_this_batch = in_flight
-            .saturating_sub(deferred_permit_holder_count(&deferred))
-            .min(max_batch);
-
-        assert_eq!(
-            expected_this_batch, 1,
-            "the queued image is accounted for, not counted as an arrival"
-        );
-        assert_ne!(
-            admission_step(1, expected_this_batch, 0, deferred.is_empty(), false),
-            AdmissionStep::WaitForSibling,
-            "a lone generation must not wait for a sibling that is really a \
-             queued image request"
         );
     }
 }

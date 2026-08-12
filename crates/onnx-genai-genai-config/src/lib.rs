@@ -33,12 +33,10 @@ mod json_builders;
 mod loading;
 mod wire_types;
 
+pub(crate) use compatibility::incomplete;
 pub use compatibility::{DerivedDecoderIo, DerivedStatePair};
-pub(crate) use compatibility::{
-    ModelShape, incomplete, required_str, transducer_unsupported, unrepresentable_preprocessing,
-};
 pub(crate) use graph_io::*;
-pub use graph_io::{EncoderDecoderGraphInfo, GraphTensorInfo, ModelGraphInfo, PipelineGraphInfo};
+pub use graph_io::{GraphTensorInfo, ModelGraphInfo};
 pub(crate) use json_builders::*;
 pub use loading::*;
 pub use wire_types::*;

@@ -35,7 +35,9 @@ mod values;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use logits::{extract_logits_sequence_with_io, extract_next_token_logits_from_outputs};
+pub(crate) use logits::extract_logits_sequence_with_io;
+#[cfg(test)]
+pub(crate) use logits::extract_next_token_logits_from_outputs;
 #[cfg(feature = "native-backend")]
 pub(crate) use metadata::{KeySequenceLengthsPolicy, key_sequence_lengths_policy};
 pub(crate) use metadata::{
@@ -45,7 +47,7 @@ pub(crate) use metadata::{
 pub(crate) use state::DecodeState;
 #[cfg(feature = "native-backend")]
 pub(crate) use step::position_ids_from_starts;
-pub(crate) use step::{run_decode_session_logits, run_decode_step, run_decode_step_with_extra};
+pub(crate) use step::{run_decode_session_logits, run_decode_step};
 pub(crate) use token_sampling::{
     DraftProposalRequest, apply_paged_sliding_window, next_session_token_argmax,
     next_session_token_logits, next_session_token_logits_and_hidden,

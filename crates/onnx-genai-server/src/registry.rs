@@ -1,7 +1,6 @@
 use std::{
     collections::HashMap,
     fmt,
-    path::PathBuf,
     sync::{
         Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -41,7 +40,6 @@ pub(crate) struct ModelHandle {
     pub(crate) id: String,
     /// Directory the model was loaded from, needed by routes that resolve
     /// package-relative files (the diffusion tokenizer and prompt encoder).
-    pub(crate) model_dir: PathBuf,
     pub(crate) engine: EngineDriver,
     pub(crate) tokenizer: Arc<Tokenizer>,
     pub(crate) chat_template: Option<Arc<ChatTemplate>>,
@@ -58,12 +56,6 @@ pub(crate) struct ModelHandle {
     /// Declared image/audio input contracts, or `None` for a single decoder
     /// graph. Shared with the CLI so both front ends admit the same inputs.
     pub(crate) multimodal: Option<MultimodalSpecs>,
-    /// Whether the package declares a denoise loop, i.e. whether it can serve
-    /// `POST /v1/images/generations`.
-    pub(crate) text_to_image: bool,
-    /// Whether the package's pipeline ends in a waveform stage, i.e. whether it
-    /// can serve `POST /v1/audio/speech`.
-    pub(crate) text_to_audio: bool,
     /// Epoch-millisecond timestamp of the last call to `ModelRegistry::resolve`.
     /// Initialised to construction time; updated on every resolve for LRU eviction.
     pub(crate) last_request_at: AtomicU64,
@@ -78,7 +70,6 @@ pub(crate) struct ModelHandle {
 /// optional and same-typed, so positional construction was easy to get wrong.
 pub(crate) struct ModelHandleParts {
     pub(crate) id: String,
-    pub(crate) model_dir: PathBuf,
     pub(crate) engine: EngineDriver,
     pub(crate) tokenizer: Arc<Tokenizer>,
     pub(crate) chat_template: Option<Arc<ChatTemplate>>,
@@ -87,15 +78,12 @@ pub(crate) struct ModelHandleParts {
     pub(crate) fim_config: Option<FimConfig>,
     pub(crate) pipeline: bool,
     pub(crate) multimodal: Option<MultimodalSpecs>,
-    pub(crate) text_to_image: bool,
-    pub(crate) text_to_audio: bool,
 }
 
 impl ModelHandle {
     pub(crate) fn new(parts: ModelHandleParts) -> Self {
         let ModelHandleParts {
             id,
-            model_dir,
             engine,
             tokenizer,
             chat_template,
@@ -104,12 +92,9 @@ impl ModelHandle {
             fim_config,
             pipeline,
             multimodal,
-            text_to_image,
-            text_to_audio,
         } = parts;
         Self {
             id,
-            model_dir,
             engine,
             tokenizer,
             chat_template,
@@ -118,8 +103,6 @@ impl ModelHandle {
             fim_config,
             pipeline,
             multimodal,
-            text_to_image,
-            text_to_audio,
             last_request_at: AtomicU64::new(now_millis()),
             warmed: AtomicBool::new(false),
             warmup_lock: std::sync::Mutex::new(()),
@@ -760,7 +743,7 @@ impl ModelRegistry {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{path::PathBuf, sync::Arc};
 
     use tokio::sync::{Semaphore, mpsc};
 
@@ -782,7 +765,6 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         Arc::new(ModelHandle {
             id: id.to_string(),
-            model_dir: PathBuf::new(),
             engine: EngineDriver {
                 commands: tx,
                 generation_capacity: Arc::new(Semaphore::new(0)),
@@ -810,8 +792,6 @@ mod tests {
             fim_config: None,
             pipeline: false,
             multimodal: None,
-            text_to_image: false,
-            text_to_audio: false,
             last_request_at: AtomicU64::new(last_request_at),
             warmed: AtomicBool::new(false),
             warmup_lock: std::sync::Mutex::new(()),
@@ -907,56 +887,6 @@ mod tests {
             metrics_snapshot.vram.headroom,
             first_authority.headroom_bytes()
         );
-    }
-
-    #[tokio::test]
-    async fn production_pipeline_loads_reserve_all_components_on_shared_ledger() {
-        let model_dir =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-txt2img");
-        let specs = vec![
-            ModelSpec {
-                id: "pipeline-a".to_string(),
-                path: model_dir.clone(),
-                eager: true,
-                warmup: false,
-            },
-            ModelSpec {
-                id: "pipeline-b".to_string(),
-                path: model_dir,
-                eager: true,
-                warmup: false,
-            },
-        ];
-        let registry = ModelRegistry::from_specs(&specs, ServerConfig::default()).unwrap();
-        let first = registry.resolve("pipeline-a").unwrap().unwrap();
-        let second = registry.resolve("pipeline-b").unwrap().unwrap();
-        assert!(first.pipeline);
-        let first_authority = first.engine.device_authority.as_ref().unwrap().clone();
-        let second_authority = second.engine.device_authority.as_ref().unwrap().clone();
-        assert_eq!(
-            first_authority.authority_id(),
-            second_authority.authority_id()
-        );
-        assert!(first_authority.used_bytes() > 0);
-        assert_eq!(
-            first.engine.resource_snapshot().await.unwrap().vram.used,
-            first_authority.used_bytes()
-        );
-        assert_eq!(
-            second.engine.resource_snapshot().await.unwrap().vram.used,
-            first_authority.used_bytes()
-        );
-        let aggregate_used = first_authority.used_bytes();
-        drop(first);
-        registry.unload("pipeline-a").unwrap();
-        for _ in 0..500 {
-            if first_authority.used_bytes() < aggregate_used {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(first_authority.used_bytes() < aggregate_used);
-        assert!(first_authority.used_bytes() > 0);
     }
 
     #[tokio::test]
