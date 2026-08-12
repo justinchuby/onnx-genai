@@ -1,22 +1,25 @@
-# Sebastian — History (compacted 2026-07-29)
+# Sebastian — History (compacted 2026-08-12T06:00:00Z)
 
 **Role:** Owns DESIGN §26 batched serving, runtime/server performance, and cross-runtime benchmark analysis for `onnx-genai`. Preserve `submit`/`step`/`poll` batching semantics, force single-thread ORT for exact-equality real-model tests, and use canonical benchmark/observability harnesses for runtime comparisons.
 
 ## Durable lessons
-- §26 Stage A/B delivered `Engine::generate_batched_static` and `ContinuousBatchManager`; later governor notes require byte-denominated VRAM/RAM limits and transactional lowering.
-- Benchmark/observability contracts include `onnx-genai-bench`, `scripts/run_benchmarks.sh`, atomic metrics, `/metrics`, `/v1/status`, spans, trace IDs, token/TTFT/latency/cache-hit/429 counters.
+- §26 Stage A/B: `Engine::generate_batched_static` and `ContinuousBatchManager`; byte-denominated VRAM/RAM limits and transactional lowering.
 - CPU decode profiling showed ORT `session.run` dominates (~98.9%); fp32 `lm_head` quantization and op fusion are major levers.
-- Foundry Local isolation proved decode parity with FL's exact CPU model; QKV fusion was decode-neutral/low priority and no missing FL session option was found.
-- PR #203 lockout repair changed the split-K numeric test to `n=1152` so it exercised `matmul_nbits_gemv_f16_scales_f16_splitk`.
-- Native CPU EP can stand alone on Apple Silicon; the moat is AMX/Accelerate prefill, not fp16 decode. MLAS hgemm can erode decode-only advantage, while KleidiAI/MLAS vendoring is lower value than graph fusion and Accelerate.
-- `half_gemm.rs` is portable for non-Mac ARM but 15–25× slower than BNNS/AMX on Mac prefill; `try_matmul_half` catching M=1 fp16 can bypass optimized GEMV.
-- CLI is a development/maintainer harness, not a consumer product; use `docs/research/cli/00-backlog.md` as source of truth and keep remote-client mode out of scope.
-- BNNS `BNNSMatMul` f16→f32 measured 2000–2450 GFLOPS; M=1 should use GEMV and M≥2 on macOS should use BNNS/sgemm/Accelerate. BNNS is deprecated in macOS 15 but still works.
-- Retract batch-decode 15× claims unless same-load ORT confirms them; current cautious estimate was ~4–5× pending remeasurement.
-- Convert pointwise/Conv per-layer speedups through Amdahl/model-level measurement before making campaign claims.
+- `filter_map` is wrong wherever position or rank is load-bearing; use `map → Vec<Option<usize>>`.
+- A reviewer's "SAFE" is not proof; verify the load-bearing claim independently.
+- `cargo test --workspace` silently truncates on failure — always use `--no-fail-fast`.
+- Never commit `.squad/` files to external repos.
 
-## Recent work (current wave, ~2026-07-28/29)
-- 2026-07-28: Pointwise Conv microbench diagnosis was useful, but the initial 5.7–9.8× BNNS headline overstated real impact.
-- 2026-07-28T17:40:00+0000: PR #362 merged (`5a079029`): If/Loop/Scan inference landed; #355 container typing remains deferred.
+## Recent work (current wave, 2026-08-12)
+
+### 2026-08-12 — PR #31973 v2: architecture-specific dispatch threshold fix
+Renamed `kAvx2DispatchThreshold` → `kKernelDispatchThreshold`. Fixed `CatastrophicCancellationPasses` to exercise accuracy branch. Renamed `AdversarialPrecisionReport` → `DISABLED_`. Removed N=7 benchmark. Head `72e02cd92c`.
+
+### 2026-08-12 — PR #762 S1/S2/S3 resolution (commit a5448fa36)
+S1: `production_scratch_alloc(numel, dtype)` helper + 2 new canary tests (`scratch_buffer_wider_write_absorbed_by_padding`, `scratch_buffer_detects_oversized_write`).
+S2: `TensorMut::validate_write_dtype()` — exact match for present, byte-size gate for absent. `mark_absent()` invariant documented.
+S3: `NodeOutputSink::Absent` variant — `build_subgraph_routing` no longer allocates phantom slots.
+Nits: removed 4 no-op identity transmutes.
+280 passed / 0 failed. Clippy clean. fmt clean. Miri: 4/4 canary tests clean.
 
 Full pre-compaction history in `history-archive.md`.

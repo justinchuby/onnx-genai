@@ -306,12 +306,6 @@ impl Fence {
     }
 }
 
-/// Marker for an EP exported as an ORT-compatible C ABI plugin (Phase 2).
-#[derive(Debug, Default)]
-pub struct OrtPluginExport {
-    pub register_symbol: String,
-}
-
 /// Resolved-shape facts needed by an EP's structural capture-region policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CaptureRegionShapeStatus {
@@ -938,11 +932,6 @@ pub trait ExecutionProvider: Send + Sync {
 
     /// Block until all pending work on this EP completes.
     fn sync(&self) -> Result<()>;
-
-    /// Export this EP as an ORT C ABI plugin, if supported (Phase 2).
-    fn as_ort_plugin(&self) -> Option<OrtPluginExport> {
-        None
-    }
 
     /// EP-specific optimization passes, run after the generic optimizer.
     fn custom_passes(&self) -> Vec<Box<dyn onnx_runtime_optimizer::OptimizationPass>> {

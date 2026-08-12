@@ -23,6 +23,16 @@ Every `ONNX_GENAI_*` or `NXRT_*` name appearing in `docs/` must either
 
 Adding a variable to the allowlist is deliberate and reviewable. Forgetting to
 wire one up is not silent.
+
+# Filename-reference exclusion
+
+A match immediately followed by a documentation file extension (`.md`, `.rst`,
+`.toml`) is a **filename**, not an environment variable — e.g. `NXRT_ABI.md` is
+a cross-reference to `docs/NXRT_ABI.md`, not an undeclared knob. A genuine env
+var is never written with a file extension suffix, so this exclusion cannot mask
+a real gap. Without this rule, any doc named with the `NXRT_*` or
+`ONNX_GENAI_*` prefix would trip the gate the moment another doc links to it —
+a false-positive class, not a one-off.
 """
 
 from __future__ import annotations
@@ -50,7 +60,8 @@ KNOWN_UNIMPLEMENTED: dict[str, str] = {
 
 # Uppercase only: the lowercase `onnx_genai_*` names in the docs are Prometheus
 # metric identifiers, which are a different surface with a different contract.
-ENV_PATTERN = re.compile(r"\b(?:ONNX_GENAI|NXRT)_[A-Z0-9_]+\b")
+# The negative lookahead excludes filename references (see docstring above).
+ENV_PATTERN = re.compile(r"\b(?:ONNX_GENAI|NXRT)_[A-Z0-9_]+\b(?!\.(?:md|rst|toml)\b)")
 
 
 def collect(root: Path, pattern: str) -> dict[str, set[str]]:

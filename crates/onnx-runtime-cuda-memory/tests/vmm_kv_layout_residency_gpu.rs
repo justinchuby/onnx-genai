@@ -35,6 +35,11 @@ use std::sync::Arc;
 
 use cudarc::driver::CudaContext;
 use cudarc::driver::sys as cu;
+// `test_support` is gated on `feature = "gpu-tests"` in the library (cfg(test)
+// does not propagate to integration test crates). The import is conditional so
+// this binary still compiles in the base (cuda-only) configuration where the
+// test functions are #[ignore]d and their bodies are cfg'd out.
+#[cfg(feature = "gpu-tests")]
 use onnx_runtime_cuda_memory::test_support::TestStream;
 
 const SENTINEL: u8 = 0x5a;
@@ -139,6 +144,7 @@ fn read_host(address: cu::CUdeviceptr, len: usize) -> Vec<u8> {
 /// match count and the first mismatching offset/value. Distinguishes "the write
 /// never became visible" (all bytes are the pre-write value) from "a partial or
 /// torn write" (a prefix matches, then diverges) so a failure names its cause.
+#[cfg(feature = "gpu-tests")]
 fn mismatch_report(seen: &[u8], want: u8) -> String {
     let matched = seen.iter().filter(|&&b| b == want).count();
     let first = seen.iter().position(|&b| b != want);
@@ -258,12 +264,14 @@ fn commit_and_measure(
 
 /// A captured graph that memsets `len` bytes at `address` — the decode hot path
 /// in miniature.
+#[cfg(feature = "gpu-tests")]
 struct CapturedMemset {
     graph: cu::CUgraph,
     exec: cu::CUgraphExec,
     len: usize,
 }
 
+#[cfg(feature = "gpu-tests")]
 impl CapturedMemset {
     fn capture(stream: cu::CUstream, address: cu::CUdeviceptr, value: u8, len: usize) -> Self {
         let mut graph = std::ptr::null_mut();
@@ -304,6 +312,7 @@ impl CapturedMemset {
     }
 }
 
+#[cfg(feature = "gpu-tests")]
 impl Drop for CapturedMemset {
     fn drop(&mut self) {
         if !self.exec.is_null() {
@@ -426,88 +435,93 @@ fn layout_decides_committed_bytes_at_the_near_empty_floor() {
 )]
 #[test]
 fn seq_major_fixed_stride_grows_under_captured_replay_without_recapture() {
-    let context = require_cuda();
-    context.bind_to_thread().expect("bind CUDA context");
-    let device = 0;
-    let granule = granularity(device);
-    let geo = QWEN14B;
+    // Body uses TestStream which is only available with gpu-tests. When the
+    // feature is absent the test is #[ignore]d so this empty body is fine.
+    #[cfg(feature = "gpu-tests")]
+    {
+        let context = require_cuda();
+        context.bind_to_thread().expect("bind CUDA context");
+        let device = 0;
+        let granule = granularity(device);
+        let geo = QWEN14B;
 
-    // Reserve a modest full-context VA (8 granules) for one seq-major binding
-    // and commit the dense prefix for a short live length.
-    const RESERVED_GRANULES: usize = 8;
-    let reserved = granule * RESERVED_GRANULES;
-    let base = reserve(reserved);
-    // Single-stream discipline (#797): every device operation below — the
-    // baseline zero-fill, the captured memset, its replays, the readbacks, and
-    // the tail write — flows through this one non-blocking stream, so a single
-    // `sync` is a total order. Mixing in a default-stream copy here would
-    // reintroduce the cold-context race this test was flaky on.
-    let test_stream = TestStream::with_context(context.clone());
-    let stream = test_stream.raw();
+        // Reserve a modest full-context VA (8 granules) for one seq-major binding
+        // and commit the dense prefix for a short live length.
+        const RESERVED_GRANULES: usize = 8;
+        let reserved = granule * RESERVED_GRANULES;
+        let base = reserve(reserved);
+        // Single-stream discipline (#797): every device operation below — the
+        // baseline zero-fill, the captured memset, its replays, the readbacks, and
+        // the tail write — flows through this one non-blocking stream, so a single
+        // `sync` is a total order. Mixing in a default-stream copy here would
+        // reintroduce the cold-context race this test was flaky on.
+        let test_stream = TestStream::with_context(context.clone());
+        let stream = test_stream.raw();
 
-    // valid_len chosen so the dense prefix is under one granule (near-empty).
-    let short_valid = 100usize;
-    let short_bytes = short_valid * geo.bytes_per_token(); // 100 * 2048 = 200 KiB
+        // valid_len chosen so the dense prefix is under one granule (near-empty).
+        let short_valid = 100usize;
+        let short_bytes = short_valid * geo.bytes_per_token(); // 100 * 2048 = 200 KiB
 
-    let mut handles = Vec::new();
-    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        // Commit the first granule (holds the short dense prefix) and capture a
-        // graph that writes the live prefix — the decode step in miniature.
-        handles.push(commit_granule(device, base, granule));
-        test_stream.fill(base, 0, short_bytes);
-        let captured = CapturedMemset::capture(stream, base, SENTINEL, short_bytes);
-        captured.replay(stream);
-        let seen = test_stream.read(base, short_bytes);
-        assert!(
-            seen.iter().all(|&b| b == SENTINEL),
-            "captured replay must fill the committed dense prefix: {}",
-            mismatch_report(&seen, SENTINEL)
-        );
+        let mut handles = Vec::new();
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            // Commit the first granule (holds the short dense prefix) and capture a
+            // graph that writes the live prefix — the decode step in miniature.
+            handles.push(commit_granule(device, base, granule));
+            test_stream.fill(base, 0, short_bytes);
+            let captured = CapturedMemset::capture(stream, base, SENTINEL, short_bytes);
+            captured.replay(stream);
+            let seen = test_stream.read(base, short_bytes);
+            assert!(
+                seen.iter().all(|&b| b == SENTINEL),
+                "captured replay must fill the committed dense prefix: {}",
+                mismatch_report(&seen, SENTINEL)
+            );
 
-        // Grow the live length past the first granule by committing tail
-        // granules at the SAME VA and stride — no re-stride, no data move.
-        let long_valid = 4000usize; // 4000 * 2048 = ~7.8 MiB → spans 4 granules
-        let long_bytes = long_valid * geo.bytes_per_token();
-        let last_granule = (long_bytes - 1) / granule;
-        for g in 1..=last_granule {
-            handles.push(commit_granule(device, base + (g * granule) as u64, granule));
+            // Grow the live length past the first granule by committing tail
+            // granules at the SAME VA and stride — no re-stride, no data move.
+            let long_valid = 4000usize; // 4000 * 2048 = ~7.8 MiB → spans 4 granules
+            let long_bytes = long_valid * geo.bytes_per_token();
+            let last_granule = (long_bytes - 1) / granule;
+            for g in 1..=last_granule {
+                handles.push(commit_granule(device, base + (g * granule) as u64, granule));
+            }
+
+            // The ORIGINAL captured graph still replays correctly after growth: a
+            // stable stride did not invalidate it. This is the property bucket
+            // growth cannot offer.
+            captured.replay(stream);
+            let seen_after = test_stream.read(base, short_bytes);
+            assert!(
+                seen_after.iter().all(|&b| b == SENTINEL),
+                "the pre-growth captured graph must replay unchanged after tail growth: {}",
+                mismatch_report(&seen_after, SENTINEL)
+            );
+
+            // And the newly committed tail is usable by a fresh write, proving the
+            // growth actually extended residency at the same VA.
+            test_stream.fill(base + granule as u64, SENTINEL, 64);
+            let tail = test_stream.read(base + granule as u64, 64);
+            assert!(
+                tail.iter().all(|&b| b == SENTINEL),
+                "grown tail granule must be resident at the stable VA"
+            );
+
+            last_granule
+        }));
+
+        for (i, handle) in handles.into_iter().enumerate() {
+            let _ = unsafe { cu::cuMemUnmap(base + (i * granule) as u64, granule) };
+            release_handle(handle);
         }
-
-        // The ORIGINAL captured graph still replays correctly after growth: a
-        // stable stride did not invalidate it. This is the property bucket
-        // growth cannot offer.
-        captured.replay(stream);
-        let seen_after = test_stream.read(base, short_bytes);
-        assert!(
-            seen_after.iter().all(|&b| b == SENTINEL),
-            "the pre-growth captured graph must replay unchanged after tail growth: {}",
-            mismatch_report(&seen_after, SENTINEL)
+        free_reservation(base, reserved);
+        drop(test_stream);
+        let last_granule = match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        };
+        eprintln!(
+            "seq-major fixed-stride growth: committed granule 0 then grew to granule {last_granule} \
+             at a stable VA; the pre-growth captured graph replayed unchanged (0 re-captures)."
         );
-
-        // And the newly committed tail is usable by a fresh write, proving the
-        // growth actually extended residency at the same VA.
-        test_stream.fill(base + granule as u64, SENTINEL, 64);
-        let tail = test_stream.read(base + granule as u64, 64);
-        assert!(
-            tail.iter().all(|&b| b == SENTINEL),
-            "grown tail granule must be resident at the stable VA"
-        );
-
-        last_granule
-    }));
-
-    for (i, handle) in handles.into_iter().enumerate() {
-        let _ = unsafe { cu::cuMemUnmap(base + (i * granule) as u64, granule) };
-        release_handle(handle);
     }
-    free_reservation(base, reserved);
-    drop(test_stream);
-    let last_granule = match result {
-        Ok(value) => value,
-        Err(payload) => std::panic::resume_unwind(payload),
-    };
-    eprintln!(
-        "seq-major fixed-stride growth: committed granule 0 then grew to granule {last_granule} \
-         at a stable VA; the pre-growth captured graph replayed unchanged (0 re-captures)."
-    );
 }

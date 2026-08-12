@@ -1,19 +1,41 @@
 # Luba — History
 
-## Project Context (joined day)
-- **Project:** onnx-genai — Rust inference runtime for generative AI on ONNX Runtime.
-- **State when joined:** Native CUDA EP beats/parity ORT on several Foundry models; correctness suite green (int8/block32 f64-adjudicated in #190). Team reorganized into pods; CPU & Edge pod formed to broaden hardware coverage beyond CUDA/Metal.
-- **Role:** ARM CPU / QNN EP Engineer — ARM64 CPU (NEON/SVE) perf + Qualcomm QNN NPU execution provider, edge/Windows-on-ARM.
-- **Requested by:** Justin Chu
-- **Joined:** 2026-07-26
+## Role
+ARM CPU / QNN EP Engineer — ARM64 CPU (NEON/SVE) perf + Qualcomm QNN NPU execution provider, edge/Windows-on-ARM. CPU & Edge pod. Joined 2026-07-26.
 
-## 2026-07-26 — Joined the team
-Cast into the CPU & Edge pod. Standing directive: optimizations must be portable (consumer/edge hardware, not just H200); every perf claim backed by a benchmark; SIMD/NPU paths must match the scalar/f64 reference within a justified tolerance and be locked with regression tests.
-## 2026-07-27T04:35:00-07:00 — Scribe update: Mac CPU EP PR #227
+## Historical context
 
-- Native Mac CPU EP now has Apple-Silicon-general NEON paths for multi-thread GEMV, SDPA, SiLU, and direct-from-mmap FP16 GEMV; runtime feature detection/dispatch is expected for SIMD paths instead of machine-specific tuning.
-- FP16 works because Apple Silicon NEON can widen f16 loads directly while ORT CPU widens before GEMM; keep this architectural distinction in mind for CPU EP work on other platforms.
-- The campaign learned that untested SIMD paths are as risky as placeholders; new AVX/NEON/SVE/QNN paths need guard-break tests and paired scalar/reference checks.
+Joined during CUDA parity wave. Fixed PR #294 aarch64 build by cfg-gating the x86-only perf probe. Worked through the Mac CPU EP PR #227 wave (Apple-Silicon-general NEON paths). Triage: ARM/Apple CI failures for upstream PRs #31973 and #31974 were all confirmed infra flakes (CDN timeouts, job timeouts) — no code bugs. Helped fix B3 NxrtStatus inline buffer for PR #762.
 
-## 2026-07-27T19:35:00Z — Roadmap wave update
-- Fixed PR #294 aarch64 build by cfg-gating the x86-only perf probe after Drake lockout.
+Pre-2026-08-11 entries archived in `history-archive.md`.
+
+## 2026-08-11 — Apple MLAS FP16 cast kernel audit and implementation (PR #31993)
+
+Audited: Apple ARM64 genuinely excluded from NEON f16↔f32 cast kernel. Gap is real; "baseline instructions" claim was wrong (vcvt_f32_f16 needs `-march=armv8.2-a+fp16`). All Apple Silicon has FEAT_FP16, so this is a build-system issue, not hardware. Introduced `MLAS_CAST_F16_NEON_SUPPORTED`, gated on `__APPLE__ && MLAS_TARGET_ARM64`. Draft PR #31993 opened. No performance claims.
+
+## 2026-08-11 — PR #31993 Holden review and Freysa revision
+
+Holden reviewed `nxrt/mlas-apple-f16-cast` @ `df162d9`. All gating confirmed correct. Two substantive findings: S1 (vacuous dispatch test — 1.0 converts identically on scalar path), S2 (missing sNaN/denormal coverage). Freysa revised under lockout (Luba barred). Both issues fixed. Head: `54f2fc8`. PR remains draft pending Apple CI.
+
+## Archive pointer
+
+Older entries in `history-archive.md`.
+
+## 2026-08-11T23:55Z — PR A: Apple Accelerate infrastructure option
+
+- **PR:** https://github.com/microsoft/onnxruntime/pull/32001 (draft)
+- **Branch:** `nxrt/mlas-apple-framework-option`
+- **Option:** `onnxruntime_USE_APPLE_ACCELERATE` (default OFF, FATAL_ERROR on non-Apple)
+- **Linkage:** `find_library(Accelerate)` → system framework (macOS/iOS/universal2)
+- **Verified:** Default-OFF configure on Linux x86-64 is behaviour-identical to upstream/main
+- **Cannot verify here:** Apple SDK resolution, actual linking on Apple targets
+- **Next:** PR B (Accelerate cblas SGEMM/SDPA), separate branch, needs Apple hardware
+
+## 2026-08-12 — PR #32001 review fixes (Isidore under lockout)
+
+- Luv reviewed PR #32001 and found three substantive issues: S1 (FATAL_ERROR wrong idiom), S2 (no `build.py` argument), S3 (dangling compile definition).
+- **Luba and Luv both locked out** of the revision. Isidore revised all three.
+- S1: `message(WARNING ...) + set(onnxruntime_USE_APPLE_ACCELERATE OFF)` matching SVE/KleidiAI idiom.
+- S2: `--use_apple_accelerate` plumbed through `build_args.py` + `build.py`.
+- S3: `target_compile_definitions` line removed — no consumer exists yet.
+- Head: `d16a108252`. PR remains draft. @justinchuby directed PR A stay separate from kernel PRs.

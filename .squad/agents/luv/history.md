@@ -1,4 +1,4 @@
-# Luv — History (compacted 2026-07-29)
+# Luv — History (compacted 2026-08-12)
 
 **Role:** Code reviewer for correctness/safety gates across decode, sampling, KV, concurrency, CPU/CUDA EP coverage, and API contracts. Validate with real exit codes and mutation/guard-break evidence; rejection triggers strict reviewer lockout.
 
@@ -15,26 +15,25 @@
 - Run a new test in isolation before believing it; a full parallel-suite green can be a fluke.
 - A near-deterministic token stream cannot witness sampling through its tokens; PR #411 token-stream assertion was ~95% false-fail, and stderr timestamps did not prove stdout diversity.
 - For sampling-policy regressions, instrument the generation boundary: `--stats`/`--profile` must reflect the policy actually resolved for the turn, not a separate or stale `/session` view.
+- A reviewer's "SAFE" is not proof; verify the load-bearing claim independently.
+- A reviewer's blocker can be a false positive; verify reviewer claims the same way we verify author claims.
 
-## Recent work (current wave, ~2026-07-28/29)
+## Historical context (pre-2026-08-12)
 
-### 2026-07-28T09-10-28+00-00 — CUDA coverage batch 7 merged
-- PR #338 (`c59383db`) added CUDA `Pad` and `Range`, moving CUDA coverage 134→136 and standard CPU parity 105→107/141. Freysa approved after 174/174 H200 GPU 2 parity cases, coverage validation, content-corrupting mutation proof, and clean default-target Clippy. #67 remains open; ScatterND, quantization, and cuDNN work are deferred.
+Wave 2026-07-28/29: CUDA coverage batch 7 merged (PR #338); PR #411 tiny-reasoning fixture rounds 2 and 3; reviewer lockout held throughout. Full detail in `history-archive.md`.
 
-### 2026-07-29T12:30:00Z — tiny-reasoning-fixture rounds 2 and 3 (PR #411)
+Wave 2026-08-11: Reviews of PR #31974 (BFloat16 LayerNorm/RMSNorm CPU EP, conditional approve → approve after S1 fix), B4+B6 test rework, PR #762 third review (no blockers, S1 optional-slot vacuity confirmed), PR #31985 (ort-docfix, NITS only), PR #32001 (Apple Accelerate CMake, three substantive, no blockers). Full detail in `history-archive.md`.
 
-#### Round 2 REJECT
-Ran Batty's statistical token-stream test alone in isolation: 15/15 failures with the fix intact. One green in full parallel suite was a fluke. Supporting evidence ("8/8 distinct outputs") was a stderr-timestamp artifact; test compared stdout only. Issued REJECT; Batty locked out. Also diagnosed: at `temperature 0.6, top_k 20` decode is near-greedy — 80/80 no-flag runs byte-identical to the greedy stream. The token-stream assertion is ~95% false-fail, not false-pass; raising the run count or picking a seed does not rescue it.
+## Archive pointer
 
-#### Round 3 APPROVE (commit `f8ed4fb4`)
-Verified by building, running, and mutating — not by reading the report. Isolation: 10/10 PASS both new policy tests. Full suite: 44/44. Mutation (per-turn resolution disabled): both tests FAIL 3/3 deterministically; `/session`-keyed tests stayed GREEN. Mutated stats line: `greedy=true temperature=1 top_k=0` — the #385/#392 regression. Running the mutated binary: `--stats` reported `greedy=true` while `/session` reported `greedy=false temperature=0.6 top_k=20` — visible divergence proves stats reads the generation path. Issued APPROVE.
+Older entries in `history-archive.md`.
 
-#### Delta APPROVE (commit `88fa86b5`)
-Capture moved inside `run_generation_turn`. Mutation still bites 3/3. `turn` bound immutably; moved into `backend.generate(turn, …)` with no reassignment between capture and move. Divergence now impossible by construction. Full suite: 44/44. Issued APPROVE.
+## 2026-08-12 — Review #31973 v3 (AVX2 LayerNorm blocker fix)
 
-Durable rules recorded:
-- "Run a new test in isolation before believing it."
-- "A near-deterministic fixture cannot witness sampling through its tokens."
-Full review detail in `.squad/decisions.md` ("Luv round-3 review" section, 2026-07-29). Inbox drops `luv-round3-verdict.md` and `luv-round3-delta-verdict.md` survived (written to both TEAM ROOT and worktree) and merged into decisions.
-
-Full pre-compaction history in `history-archive.md`.
+Fresh adversarial review of `nxrt/mlas-avx2-layernorm` @ `72e02cd92c` after the architecture-specific dispatch threshold fix. Key findings:
+- **Threshold fix is genuine**, not cosmetic — old test would not have caught the original RVV bug because both production and test shared the same wrong universal-8 assumption. New architecture-specific constant correctly encodes the real contract.
+- **Three stale Welford comments** (test_layernorm.cpp:275,646,1055) describe the wrong algorithm after the Welford→centered-two-pass rewrite. Substantive — fix before leaving draft.
+- **CatastrophicCancellation honestly fixed** — two new scenarios with condition < 1e7 make the accuracy branch actually execute.
+- All five non-blocking fixes landed honestly. No leaks, no performance overclaims.
+- **Not ready for draft exit** until stale Welford comments fixed.
+- Head reviewed: `72e02cd92c`. Wrote `.squad/decisions/inbox/luv-review-31973-v3.md`.
