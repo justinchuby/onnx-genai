@@ -131,3 +131,4 @@ PR*.md
 
 # seq-major microbenchmark scratch crate
 /bench-seqmajor/target/
+bench-bins/

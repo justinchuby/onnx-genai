@@ -29,7 +29,8 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_ir::DataType;
 use onnx_runtime_memory_governor::{DeviceAllocator, Tier};
 
-use crate::runtime::{CudaRuntime, PinnedStaging, raw_ptr};
+use crate::pinned_pool::PinnedStagingPool;
+use crate::runtime::{CopyCompleted, CudaRuntime, PinnedStaging, raw_ptr};
 
 /// Alignment for stable-VA weight slots (issue #716). The VMM arena rounds
 /// commits to the 2 MiB device granule (#776) regardless, so this only governs
@@ -134,6 +135,12 @@ pub struct GlobalOffloadStats {
     pub content_resident_bytes: u64,
     pub physical_owned_bytes: u64,
     pub mapped_physical_bytes: u64,
+    /// Real `cuMemHostAlloc` calls issued by the pinned staging pool (issue
+    /// #837). A page-in that reuses a pooled buffer does not increment this, so
+    /// on the not-fit streaming path this stays far below `page_ins`.
+    pub pinned_alloc_calls: u64,
+    /// Page-ins whose pinned staging buffer was served from the pool free-list.
+    pub pinned_reuses: u64,
 }
 
 /// Read the process-global weight-offload counters.
@@ -158,6 +165,8 @@ pub fn global_offload_stats() -> GlobalOffloadStats {
         content_resident_bytes: GLOBAL_CONTENT_RESIDENT_BYTES.load(Ordering::Relaxed),
         physical_owned_bytes: crate::virtual_memory::total_physical_pool_owned_bytes(),
         mapped_physical_bytes: GLOBAL_WEIGHT_MAPPED_BYTES.load(Ordering::Relaxed),
+        pinned_alloc_calls: crate::pinned_pool::global_pinned_alloc_calls(),
+        pinned_reuses: crate::pinned_pool::global_pinned_reuses(),
     }
 }
 
@@ -183,6 +192,7 @@ pub fn reset_global_offload_stats() {
     GLOBAL_HTOD_BYTES.store(0, Ordering::Relaxed);
     GLOBAL_VRAM_ALLOC_NS.store(0, Ordering::Relaxed);
     GLOBAL_VRAM_FREE_NS.store(0, Ordering::Relaxed);
+    crate::pinned_pool::reset_pinned_pool_counters();
 }
 
 /// Environment switch that enables the CUDA device residency cache. Reuses the
@@ -569,7 +579,7 @@ impl CudaWeightPage {
         shape: Vec<usize>,
         len: usize,
         staging: PinnedStaging,
-    ) -> Result<(Self, u64, PinnedStaging), WeightHandleError> {
+    ) -> Result<(Self, u64, PinnedStaging, CopyCompleted), WeightHandleError> {
         if len == 0 {
             return Err(WeightHandleError::MissingRegions);
         }
@@ -594,12 +604,13 @@ impl CudaWeightPage {
             shape,
         };
         let staged = &staging.as_slice()[..len];
-        let copy_ms = unsafe { runtime.htod_async_elapsed_ms(staged, ptr) }.map_err(|error| {
-            WeightHandleError::DeviceBinding(format!("measured H2D copy: {error}"))
-        })?;
+        let (copy_ms, completed) =
+            unsafe { runtime.htod_async_elapsed_ms(staged, ptr) }.map_err(|error| {
+                WeightHandleError::DeviceBinding(format!("measured H2D copy: {error}"))
+            })?;
         GLOBAL_HTOD_NS.fetch_add((copy_ms * 1_000_000.0) as u64, Ordering::Relaxed);
         GLOBAL_HTOD_BYTES.fetch_add(len as u64, Ordering::Relaxed);
-        Ok((page, 0, staging))
+        Ok((page, 0, staging, completed))
     }
 
     /// Opaque device pointer to the paged bytes, for a kernel `TensorView`.
@@ -786,6 +797,11 @@ pub struct CudaWeightResidency {
     runtime: Arc<CudaRuntime>,
     scan_resistant_dense: bool,
     physical: OnceLock<PhysicalAdmission>,
+    /// Reused pinned host staging buffers for weight page-ins. Shared so every
+    /// page-in draws from the same bounded free-list instead of page-locking a
+    /// fresh buffer per miss (issue #837). See [`crate::pinned_pool`] for the
+    /// fence-safety argument.
+    staging_pool: Arc<PinnedStagingPool>,
     inner: Mutex<ResidencyInner>,
 }
 
@@ -1009,9 +1025,10 @@ impl CudaWeightResidency {
     pub fn new(runtime: Arc<CudaRuntime>, budget_bytes: u64) -> Self {
         replace_global_budget(0, budget_bytes);
         Self {
-            runtime,
+            runtime: Arc::clone(&runtime),
             scan_resistant_dense: false,
             physical: OnceLock::new(),
+            staging_pool: PinnedStagingPool::new(Arc::clone(&runtime)),
             inner: Mutex::new(ResidencyInner {
                 policy: WeightResidencyPolicy::new(budget_bytes),
                 lease: None,
@@ -1058,9 +1075,10 @@ impl CudaWeightResidency {
         )?;
         replace_global_budget(0, lease.bytes());
         Ok(Self {
-            runtime,
+            runtime: Arc::clone(&runtime),
             scan_resistant_dense: false,
             physical: OnceLock::new(),
+            staging_pool: PinnedStagingPool::new(Arc::clone(&runtime)),
             inner: Mutex::new(ResidencyInner {
                 policy: WeightResidencyPolicy::new(lease.bytes()),
                 lease: Some(lease),
@@ -1292,12 +1310,16 @@ impl CudaWeightResidency {
             return Ok(hit);
         }
         let len = weight.region_bytes_len();
+        // Draw a reusable pinned staging buffer from the bounded pool instead of
+        // page-locking a fresh `cuMemHostAlloc` per page-in (issue #837). The
+        // buffer returns to the pool only after the (host-blocking) H2D copy
+        // below completes — see `pinned_pool` for the fence-safety argument.
         let mut staging = self
-            .runtime
-            .alloc_pinned(len)
+            .staging_pool
+            .acquire(len)
             .map_err(|error| WeightHandleError::DeviceBinding(format!("pinned alloc: {error}")))?;
         let materialize_start = std::time::Instant::now();
-        fill_staging_from_regions(weight, source, &mut staging)?;
+        fill_staging_from_regions(weight, source, staging.staging_mut())?;
         add_duration(&GLOBAL_MATERIALIZE_NS, materialize_start.elapsed());
         if self.physical.get().is_some() {
             return self.resident_vmm_with(
@@ -1306,25 +1328,36 @@ impl CudaWeightResidency {
                 weight.shape.clone(),
                 len,
                 self.eviction_for(weight.boundary),
+                // `staging` (a `PooledStaging`) is moved into the fill closure.
+                // `htod_async_elapsed_ms` host-synchronizes the copy before it
+                // returns and yields a `CopyCompleted` witness; `retire` consumes
+                // that witness to return the buffer to the pool, so reuse is
+                // structurally gated on the copy having completed.
                 move |runtime, ptr| {
                     let staged = &staging.as_slice()[..len];
-                    let copy_ms =
+                    let (copy_ms, completed) =
                         unsafe { runtime.htod_async_elapsed_ms(staged, ptr) }.map_err(|error| {
                             WeightHandleError::DeviceBinding(format!("measured H2D copy: {error}"))
                         })?;
                     GLOBAL_HTOD_NS.fetch_add((copy_ms * 1_000_000.0) as u64, Ordering::Relaxed);
                     GLOBAL_HTOD_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+                    staging.retire(completed);
                     Ok(())
                 },
             );
         }
-        let (page, _, _staging) = CudaWeightPage::upload_staged_async(
+        // Non-VMM branch: `upload_staged_async` consumes the buffer, performs a
+        // host-blocking copy, and hands it back with a `CopyCompleted` witness.
+        // Return it to the pool with that witness (copy complete), then admit.
+        let raw_staging = staging.into_inner();
+        let (page, _, raw_staging, completed) = CudaWeightPage::upload_staged_async(
             &self.runtime,
             weight.dtype,
             weight.shape.clone(),
             len,
-            staging,
+            raw_staging,
         )?;
+        self.staging_pool.release(raw_staging, completed);
         self.admit(key, Arc::new(page), self.eviction_for(weight.boundary))
     }
 

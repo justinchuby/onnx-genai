@@ -461,6 +461,16 @@ fn print_weight_offload_observability(emitted_tokens: u64) {
         stats.physical_owned_bytes,
         stats.htod_bytes
     );
+    let htod_gbps = if stats.htod_ns > 0 {
+        stats.htod_bytes as f64 / (stats.htod_ns as f64 / 1_000_000_000.0) / 1e9
+    } else {
+        0.0
+    };
+    println!(
+        "weight_offload_staging: pinned_alloc_calls={} pinned_reuses={} \
+         effective_htod_gbps={:.3}",
+        stats.pinned_alloc_calls, stats.pinned_reuses, htod_gbps
+    );
 }
 
 fn print_vmm_observability(engine: &Engine) {
