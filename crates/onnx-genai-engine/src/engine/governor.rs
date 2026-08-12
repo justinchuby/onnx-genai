@@ -631,6 +631,7 @@ pub(crate) fn capacity_providers_for_device(
     limits: &ResourceLimits,
     cuda_device_index: Option<u32>,
 ) -> CapacityProviders {
+    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
     let mut providers = fallback_capacity_providers(limits);
     #[cfg(feature = "cuda")]
     if let Some(index) = cuda_device_index
@@ -808,7 +809,10 @@ mod tests {
     fn no_cuda_device_uses_provisional_vram_provider() {
         let limits = ResourceLimits::default();
         let providers = capacity_providers_for_device(&limits, None);
-        assert_eq!(providers.vram.total_bytes(), PROVISIONAL_VRAM_CAPACITY_BYTES);
+        assert_eq!(
+            providers.vram.total_bytes(),
+            PROVISIONAL_VRAM_CAPACITY_BYTES
+        );
     }
 
     // The real-capacity path is what fixes the portability bug: on a CUDA build
