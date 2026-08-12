@@ -9,9 +9,10 @@ use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, Ten
 use onnx_runtime_ir::{DataType, Node};
 use std::collections::BTreeMap;
 
+use super::check_arity;
 use super::gelu::tanh_gelu;
 use super::matmul::gemm;
-use super::{check_arity, to_dense_f32, write_dense_f32};
+use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Activation {
@@ -142,16 +143,28 @@ impl Kernel for MoEKernel {
             }
         }
         for (index, input) in inputs.iter().enumerate().filter(|(_, v)| !v.is_absent()) {
-            if input.dtype != DataType::Float32 {
+            if !matches!(
+                input.dtype,
+                DataType::Float32 | DataType::Float16 | DataType::BFloat16
+            ) {
                 return Err(error(format!(
-                    "input {index} requires Float32 in Phase 1, got {:?}",
+                    "input {index} requires Float32, Float16, or BFloat16, got {:?}",
                     input.dtype
                 )));
             }
+            if input.dtype != inputs[0].dtype {
+                return Err(error(format!(
+                    "input {index} dtype {:?} must match input 0 dtype {:?}",
+                    input.dtype, inputs[0].dtype
+                )));
+            }
         }
-        if outputs[0].dtype != DataType::Float32 {
+        if !matches!(
+            outputs[0].dtype,
+            DataType::Float32 | DataType::Float16 | DataType::BFloat16
+        ) {
             return Err(error(format!(
-                "output requires Float32 in Phase 1, got {:?}",
+                "output requires Float32, Float16, or BFloat16, got {:?}",
                 outputs[0].dtype
             )));
         }
@@ -227,7 +240,10 @@ impl Kernel for MoEKernel {
                 .ok_or_else(|| error("unfused swiglu requires input 6 fc3_experts_weights"))?;
             require_exact_shape("fc3_experts_weights", view.shape, &[experts, inter, hidden])?;
             validate_bias("fc3_experts_bias", inputs, 7, experts, inter)?;
-            (Some(to_dense_f32(view)?), optional_dense(inputs, 7)?)
+            (
+                Some(to_dense_f32_widen("MoE", view)?.into_owned()),
+                optional_dense(inputs, 7)?,
+            )
         } else {
             if has_fc3 {
                 return Err(error(
@@ -242,10 +258,10 @@ impl Kernel for MoEKernel {
             (None, None)
         };
 
-        let x = to_dense_f32(&inputs[0])?;
-        let router = to_dense_f32(&inputs[1])?;
-        let fc1 = to_dense_f32(&inputs[2])?;
-        let fc2 = to_dense_f32(&inputs[4])?;
+        let x = to_dense_f32_widen("MoE", &inputs[0])?.into_owned();
+        let router = to_dense_f32_widen("MoE", &inputs[1])?.into_owned();
+        let fc1 = to_dense_f32_widen("MoE", &inputs[2])?.into_owned();
+        let fc2 = to_dense_f32_widen("MoE", &inputs[4])?.into_owned();
         let mut output = vec![0.0f32; rows * hidden];
 
         let mut tasks = BTreeMap::<usize, Vec<(usize, f32)>>::new();
@@ -293,7 +309,7 @@ impl Kernel for MoEKernel {
                 }
             }
         }
-        write_dense_f32(&mut outputs[0], &output)
+        write_dense_f32_narrow("MoE", &mut outputs[0], &output)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -628,7 +644,7 @@ fn optional_dense(inputs: &[TensorView], index: usize) -> Result<Option<Vec<f32>
     inputs
         .get(index)
         .filter(|v| !v.is_absent())
-        .map(to_dense_f32)
+        .map(|v| to_dense_f32_widen("MoE", v).map(|c| c.into_owned()))
         .transpose()
 }
 
@@ -1003,6 +1019,42 @@ mod tests {
             )
             .unwrap();
         assert_close(&y.to_f32(), &[0.5, 0.0]);
+    }
+
+    #[test]
+    fn moe_top1_relu_runs_natively_in_bf16_matching_f32() {
+        // Same node as the top1/relu default test, but Q/router/weights and the
+        // output are bf16. MoE computes in f32 (widen on read, narrow on write),
+        // so the bf16 result must match the f32 reference within bf16 tolerance.
+        let shapes = [
+            Some(&[1, 2][..]),
+            Some(&[1, 2]),
+            Some(&[2, 2, 2]),
+            None,
+            Some(&[2, 2, 2]),
+        ];
+        let (graph, node) = model_node(&shapes, &[1, 2], &[]);
+        let x = Owned::bf16(&[1, 2], &[1.0, -2.0]);
+        let router = Owned::bf16(&[1, 2], &[0.0, 0.0]);
+        let fc1 = Owned::bf16(&[2, 2, 2], &[1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0]);
+        let fc2 = Owned::bf16(&[2, 2, 2], &[1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0]);
+        let mut y = Owned::zeros(DataType::BFloat16, &[1, 2]);
+        kernel(&graph, node)
+            .execute(
+                &[
+                    x.view(),
+                    router.view(),
+                    fc1.view(),
+                    TensorView::absent(DataType::Undefined),
+                    fc2.view(),
+                ],
+                &mut [y.view_mut()],
+            )
+            .unwrap();
+        let got = y.to_bf16_as_f32();
+        for (i, (&g, &w)) in got.iter().zip(&[0.5, 0.0]).enumerate() {
+            assert!((g - w).abs() <= 0.05, "index {i}: got {g}, want {w}");
+        }
     }
 
     #[test]
