@@ -13,8 +13,8 @@ type WorkflowAdapterExecutor = fn(
     &std::collections::BTreeMap<String, String>,
     &onnx_genai_metadata::WorkflowComponent,
     &mut PipelineTensors,
+    &HashMap<String, i64>,
     &mut HashMap<String, i64>,
-    &std::collections::HashSet<String>,
 ) -> anyhow::Result<()>;
 
 fn workflow_adapter_registry()
@@ -786,6 +786,13 @@ impl PipelineEngine {
                         let session = self.models.session(component).with_context(|| {
                             format!("workflow ONNX component '{component}' was not loaded")
                         })?;
+                        // Component dimensions are invocation-local. A decoder, for example, may
+                        // bind `sequence` to the prompt length in setup and to one in the loop.
+                        // Values crossing the package boundary were already checked there; the
+                        // component contract unifies its own ports without conflating equal
+                        // spelling in separate contract scopes.
+                        let mut component_symbols = HashMap::new();
+                        let component_dynamic_symbols = std::collections::HashSet::new();
                         let resolved = inputs
                             .iter()
                             .map(|(port, value)| {
@@ -811,8 +818,8 @@ impl PipelineEngine {
                                             value,
                                             tensor,
                                             contract,
-                                            symbols,
-                                            dynamic_symbols,
+                                            &mut component_symbols,
+                                            &component_dynamic_symbols,
                                         )?;
                                         Ok((port.as_str(), tensor))
                                     })
@@ -836,8 +843,8 @@ impl PipelineEngine {
                                 value,
                                 &tensor,
                                 contract,
-                                symbols,
-                                dynamic_symbols,
+                                &mut component_symbols,
+                                &component_dynamic_symbols,
                             )?;
                             values.insert(value.clone(), tensor);
                         }
@@ -860,6 +867,7 @@ impl PipelineEngine {
                         if let Some(execute) =
                             workflow_adapter_registry().get(&(abi.as_str(), version.as_str()))
                         {
+                            let mut component_symbols = HashMap::new();
                             execute(
                                 self,
                                 component,
@@ -868,7 +876,7 @@ impl PipelineEngine {
                                 declaration,
                                 values,
                                 symbols,
-                                dynamic_symbols,
+                                &mut component_symbols,
                             )?;
                         } else {
                             anyhow::bail!(
@@ -1107,8 +1115,8 @@ impl PipelineEngine {
         outputs: &std::collections::BTreeMap<String, String>,
         declaration: &onnx_genai_metadata::WorkflowComponent,
         values: &mut PipelineTensors,
-        symbols: &mut HashMap<String, i64>,
-        dynamic_symbols: &std::collections::HashSet<String>,
+        package_symbols: &HashMap<String, i64>,
+        component_symbols: &mut HashMap<String, i64>,
     ) -> anyhow::Result<()> {
         let program = self
             .preprocessing
@@ -1126,6 +1134,20 @@ impl PipelineEngine {
         let encoded = values
             .get(encoded_ref)
             .with_context(|| format!("workflow value '{encoded_ref}' is unavailable"))?;
+        let encoded_contract = declaration.ports.inputs.get("encoded").with_context(|| {
+            format!(
+                "workflow image preprocessing adapter '{component}' has no declared input \
+                 port 'encoded'"
+            )
+        })?;
+        let component_dynamic_symbols = std::collections::HashSet::new();
+        validate_workflow_value(
+            encoded_ref,
+            encoded,
+            encoded_contract,
+            component_symbols,
+            &component_dynamic_symbols,
+        )?;
         if encoded.dtype() != DataType::Uint8 || encoded.shape().len() != 1 {
             anyhow::bail!(
                 "workflow image preprocessing adapter '{component}' input 'encoded' must be \
@@ -1143,7 +1165,7 @@ impl PipelineEngine {
                 pixels.name
             )
         })?;
-        let target_shape = resolve_workflow_shape(pixel_contract, symbols)?;
+        let target_shape = resolve_workflow_shape(pixel_contract, package_symbols)?;
         let processor = onnx_genai_preprocess::image::ImagePreprocessor::from_input_and_program(
             &target_shape,
             program,
@@ -1169,7 +1191,13 @@ impl PipelineEngine {
                 )
             })?;
             let value = image_tensor_to_value(tensor)?;
-            validate_workflow_value(value_ref, &value, contract, symbols, dynamic_symbols)?;
+            validate_workflow_value(
+                value_ref,
+                &value,
+                contract,
+                component_symbols,
+                &component_dynamic_symbols,
+            )?;
             values.insert(value_ref.clone(), value);
         }
         if !tensors.is_empty() {
@@ -1537,10 +1565,9 @@ fn literal_shape(contract: &TensorContract) -> anyhow::Result<Vec<i64>> {
         .iter()
         .map(|dimension| match dimension {
             TensorDimension::Fixed(value) => Ok(*value),
-            TensorDimension::Symbol(symbol) if symbol == "batch" => Ok(1),
-            TensorDimension::Symbol(symbol) => {
-                anyhow::bail!("literal workflow input has unresolved dimension '{symbol}'")
-            }
+            // A scalar literal initializes an otherwise-unbound symbolic axis as a singleton.
+            // Concrete request/component values can subsequently unify shared symbols.
+            TensorDimension::Symbol(_) => Ok(1),
         })
         .collect()
 }

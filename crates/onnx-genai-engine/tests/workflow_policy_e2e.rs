@@ -227,6 +227,39 @@ graph {
 opset_import { domain: "" version: 13 }
 "#;
 
+const INT64_MATRIX_IDENTITY: &str = r#"
+ir_version: 8
+graph {
+  node { input: "input" output: "output" op_type: "Identity" }
+  name: "int64_matrix_identity"
+  input { name: "input" type { tensor_type { elem_type: 7 shape {
+    dim { dim_param: "batch" } dim { dim_param: "sequence" }
+  }}}}
+  output { name: "output" type { tensor_type { elem_type: 7 shape {
+    dim { dim_param: "batch" } dim { dim_param: "sequence" }
+  }}}}
+}
+opset_import { domain: "" version: 13 }
+"#;
+
+const INT64_MATRIX_ADD: &str = r#"
+ir_version: 8
+graph {
+  node { input: "left" input: "right" output: "output" op_type: "Add" }
+  name: "int64_matrix_add"
+  input { name: "left" type { tensor_type { elem_type: 7 shape {
+    dim { dim_param: "batch" } dim { dim_param: "sequence" }
+  }}}}
+  input { name: "right" type { tensor_type { elem_type: 7 shape {
+    dim { dim_param: "batch" } dim { dim_param: "sequence" }
+  }}}}
+  output { name: "output" type { tensor_type { elem_type: 7 shape {
+    dim { dim_param: "batch" } dim { dim_param: "sequence" }
+  }}}}
+}
+opset_import { domain: "" version: 13 }
+"#;
+
 const VISION_IDENTITY: &str = r#"
 ir_version: 8
 graph {
@@ -276,7 +309,7 @@ preprocessing:
         name: image.pixel_values
         content: pixels
         dtype: float32
-        contract: { dtype: float32, rank: 4, shape: [1, 3, 2, 2] }
+        contract: { dtype: float32, rank: 4, shape: [batch, 3, 2, 2] }
       - source: grid
         name: image.grid
         content: original_size
@@ -291,6 +324,11 @@ pipeline:
       custom_op_versions: {}
       capabilities: [workflow_ssa, linear_effects, typed_emit]
     inputs:
+      request.batch_anchor:
+        contract: { dtype: int64, rank: 2, shape: [batch, sequence] }
+        role: { kind: opaque }
+        source: { kind: application, name: batch_anchor }
+        required: true
       request.image:
         contract: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
         role: { kind: opaque }
@@ -298,7 +336,7 @@ pipeline:
         required: true
     outputs:
       result:
-        contract: { dtype: float32, rank: 4, shape: [1, 3, 2, 2] }
+        contract: { dtype: float32, rank: 4, shape: [batch, 3, 2, 2] }
         role: image
         stage: post_adapter
     components:
@@ -308,33 +346,33 @@ pipeline:
           inputs:
             encoded: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
           outputs:
-            pixel_values: { dtype: float32, rank: 4, shape: [1, 3, 2, 2] }
+            pixel_values: { dtype: float32, rank: 4, shape: [batch, 3, 2, 2] }
             grid: { dtype: int64, rank: 2, shape: [1, 2] }
         effects: []
       vision:
         implementation: { kind: onnx, artifact: vision.onnx.textproto }
         ports:
           inputs:
-            pixel_values: { dtype: float32, rank: 4, shape: [1, 3, 2, 2] }
+            pixel_values: { dtype: float32, rank: 4, shape: [batch, 3, 2, 2] }
             grid: { dtype: int64, rank: 2, shape: [1, 2] }
           outputs:
-            image_features: { dtype: float32, rank: 4, shape: [1, 3, 2, 2] }
+            image_features: { dtype: float32, rank: 4, shape: [batch, 3, 2, 2] }
         effects: []
       embedding:
         implementation: { kind: onnx, artifact: embedding.onnx.textproto }
         ports:
           inputs:
-            input: { dtype: float32, rank: 4, shape: [1, 3, 2, 2] }
+            input: { dtype: float32, rank: 4, shape: [batch, 3, 2, 2] }
           outputs:
-            output: { dtype: float32, rank: 4, shape: [1, 3, 2, 2] }
+            output: { dtype: float32, rank: 4, shape: [batch, 3, 2, 2] }
         effects: []
       decoder:
         implementation: { kind: onnx, artifact: decoder.onnx.textproto }
         ports:
           inputs:
-            input: { dtype: float32, rank: 4, shape: [1, 3, 2, 2] }
+            input: { dtype: float32, rank: 4, shape: [batch, 3, 2, 2] }
           outputs:
-            output: { dtype: float32, rank: 4, shape: [1, 3, 2, 2] }
+            output: { dtype: float32, rank: 4, shape: [batch, 3, 2, 2] }
         effects: []
     initial_effects: { stream: stream.0 }
     graph:
@@ -385,6 +423,7 @@ pipeline:
     let png_len = i64::try_from(png.len())?;
     let request =
         PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
+            .with_input("batch_anchor", Value::from_slice_i64(&[0, 0], &[1, 2])?)
             .with_input(
                 "image",
                 Value::from_raw_bytes(png, &[png_len], DataType::Uint8)?,
@@ -458,6 +497,210 @@ pipeline:
             );
     let output = engine.run_pipeline(request)?;
     assert_eq!(output["token"].to_vec_i64()?, [1, 2]);
+    Ok(())
+}
+
+#[test]
+fn workflow_scalar_literal_materializes_unbound_symbol_as_singleton() -> anyhow::Result<()> {
+    let metadata = r#"
+pipeline:
+  workflow:
+    manifest:
+      ir_version: "1.0"
+      onnx_opsets: { ai.onnx: 13 }
+      adapter_abis: {}
+      custom_op_versions: {}
+      capabilities: [workflow_ssa, linear_effects, typed_emit]
+    inputs:
+      eos:
+        contract: { dtype: int64, rank: 1, shape: [num_eos] }
+        role: { kind: opaque }
+        source: { kind: literal }
+        required: true
+        default: 99
+    outputs:
+      result:
+        contract: { dtype: int64, rank: 1, shape: [num_eos] }
+        role: tokens
+        stage: pre_adapter
+    components: {}
+    initial_effects: { stream: stream.0 }
+    graph:
+      kind: emit
+      value: eos
+      output: result
+      mode: replace
+      effect_name: stream
+      effect: { consumes: stream.0, produces: stream.1 }
+"#;
+    let root = package("symbolic-literal", metadata, &[])?;
+    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+    let output = engine.run_pipeline(PipelineGenerateRequest::new(GenerateRequest::new(
+        GeneratePrompt::TokenIds(vec![]),
+    )))?;
+    assert_eq!(output["result"].shape(), [1]);
+    assert_eq!(output["result"].to_vec_i64()?, [99]);
+    Ok(())
+}
+
+#[test]
+fn workflow_component_symbols_are_scoped_per_invocation() -> anyhow::Result<()> {
+    let metadata = r#"
+pipeline:
+  workflow:
+    manifest:
+      ir_version: "1.0"
+      onnx_opsets: { ai.onnx: 13 }
+      adapter_abis: {}
+      custom_op_versions: {}
+      capabilities: [workflow_ssa, linear_effects, typed_emit]
+    inputs:
+      prompt:
+        contract: { dtype: int64, rank: 2, shape: [batch, prompt_sequence] }
+        role: { kind: opaque }
+        source: { kind: application, name: prompt }
+        required: true
+      token:
+        contract: { dtype: int64, rank: 2, shape: [batch, 1] }
+        role: { kind: opaque }
+        source: { kind: application, name: token }
+        required: true
+    outputs:
+      result:
+        contract: { dtype: int64, rank: 2, shape: [batch, 1] }
+        role: tokens
+        stage: pre_adapter
+    components:
+      identity:
+        implementation: { kind: onnx, artifact: identity.onnx.textproto }
+        ports:
+          inputs:
+            input: { dtype: int64, rank: 2, shape: [batch, sequence] }
+          outputs:
+            output: { dtype: int64, rank: 2, shape: [batch, sequence] }
+        effects: []
+    initial_effects: { stream: stream.0 }
+    graph:
+      kind: sequence
+      nodes:
+        - kind: invoke
+          component: identity
+          inputs: { input: prompt }
+          outputs: { output: prompt.output }
+          effects: {}
+        - kind: invoke
+          component: identity
+          inputs: { input: token }
+          outputs: { output: token.output }
+          effects: {}
+        - kind: emit
+          value: token.output
+          output: result
+          mode: replace
+          effect_name: stream
+          effect: { consumes: stream.0, produces: stream.1 }
+"#;
+    let root = package(
+        "component-symbol-scope",
+        metadata,
+        &[("identity.onnx.textproto", INT64_MATRIX_IDENTITY)],
+    )?;
+    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+    let request =
+        PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
+            .with_input("prompt", Value::from_slice_i64(&[1, 2], &[1, 2])?)
+            .with_input("token", Value::from_slice_i64(&[3], &[1, 1])?);
+    let output = engine.run_pipeline(request)?;
+    assert_eq!(output["result"].to_vec_i64()?, [3]);
+    Ok(())
+}
+
+#[test]
+fn workflow_component_symbols_ignore_package_dynamic_symbol_names() -> anyhow::Result<()> {
+    let metadata = r#"
+pipeline:
+  workflow:
+    manifest:
+      ir_version: "1.0"
+      onnx_opsets: { ai.onnx: 13 }
+      adapter_abis: {}
+      custom_op_versions: {}
+      capabilities: [workflow_ssa, linear_effects, typed_emit, bounded_state_growth]
+    inputs:
+      prompt:
+        contract: { dtype: int64, rank: 2, shape: [batch, prompt_sequence] }
+        role: { kind: opaque }
+        source: { kind: application, name: prompt }
+        required: true
+      token:
+        contract: { dtype: int64, rank: 2, shape: [batch, 1] }
+        role: { kind: opaque }
+        source: { kind: application, name: token }
+        required: true
+      one:
+        contract: { dtype: int64, rank: 1, shape: [batch] }
+        role: { kind: opaque }
+        source: { kind: literal }
+        required: false
+        default: 1
+      maximum:
+        contract: { dtype: int64, rank: 1, shape: [batch] }
+        role: { kind: opaque }
+        source: { kind: literal }
+        required: false
+        default: 8
+    outputs:
+      result:
+        contract: { dtype: int64, rank: 2, shape: [batch, prompt_sequence] }
+        role: tokens
+        stage: pre_adapter
+    components:
+      pair:
+        implementation: { kind: onnx, artifact: pair.onnx.textproto }
+        ports:
+          inputs:
+            left: { dtype: int64, rank: 2, shape: [batch, sequence] }
+            right: { dtype: int64, rank: 2, shape: [batch, sequence] }
+          outputs:
+            output: { dtype: int64, rank: 2, shape: [batch, sequence] }
+        effects: []
+    state:
+      dummy:
+        contract: { dtype: int64, rank: 2, shape: [batch, sequence] }
+        scope: invocation
+        initializer: prompt
+        recurrence: { kind: growing, axis: 1, increment: one, max: maximum }
+    initial_effects: { stream: stream.0, "state:dummy": state.0 }
+    graph:
+      kind: sequence
+      nodes:
+        - kind: invoke
+          component: pair
+          inputs: { left: prompt, right: token }
+          outputs: { output: combined }
+          effects: {}
+        - kind: emit
+          value: combined
+          output: result
+          mode: replace
+          effect_name: stream
+          effect: { consumes: stream.0, produces: stream.1 }
+"#;
+    let root = package(
+        "component-dynamic-symbol-scope",
+        metadata,
+        &[("pair.onnx.textproto", INT64_MATRIX_ADD)],
+    )?;
+    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+    let request =
+        PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
+            .with_input("prompt", Value::from_slice_i64(&[1, 2], &[1, 2])?)
+            .with_input("token", Value::from_slice_i64(&[3], &[1, 1])?);
+    let error = match engine.run_pipeline(request) {
+        Ok(_) => anyhow::bail!("mismatched component symbols unexpectedly executed"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("binds symbol 'sequence'"), "{error}");
     Ok(())
 }
 
