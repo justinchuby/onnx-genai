@@ -74,3 +74,19 @@ Could not compile locally (no nvcc). iPhone failure is a dep-download flake, lef
 ## 2026-08-12 — PR #32003 draft (strict-aliasing split from #31988)
 
 Split strict-aliasing/`-Werror` `memcpy` fixes from #31988 into standalone draft PR #32003. Fixed `vec_permuted` overload and bf16 overload. Coordinator found 4 missed identical sites in `vec_a` (`__CUDA_ARCH__ < 530` fallback, lines 117–120). Isidore completed those under lockout. Lesson: grep for the full pattern when fixing aliasing, not just the first overload.
+
+## 2026-08-12 — PR #31973 wording fix (x86-64 → x86)
+
+Fixed inaccurate "x86-64" in comments to "x86 (32-bit and 64-bit)" / "x86" across
+`mlas.h`, `layernorm_kernel_avx2.cpp`, and `test_layernorm.cpp`. The compile gate
+is `MLAS_TARGET_AMD64 || MLAS_TARGET_IX86` so the narrower term understated scope.
+Build: 41 passed, 2 disabled. Pushed as `4a16925a88`.
+
+## 2026-08-12 — PR #31973 x86 wording correction (lockout from Challenger nit)
+
+Challenger's delta review flagged `mlas.h:1699` saying "x86-64" while the `#if` covers
+`MLAS_TARGET_AMD64 || MLAS_TARGET_IX86` (both widths). Changed to "x86 (32-bit and 64-bit)"
+in `mlas.h` doxygen comment; "x86" in shorter inline comments and six `GTEST_SKIP` messages
+in `test_layernorm.cpp` and `layernorm_kernel_avx2.cpp`. Comment-only; build verified 41/2.
+Commit `4a16925a88`. Irony: a prior readability fix ("AMD64/IX86" → "x86-64") made the
+comment less accurate.

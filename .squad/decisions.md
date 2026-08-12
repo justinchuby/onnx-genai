@@ -353,3 +353,35 @@ Last consolidated: 2026-08-12T09:45:00Z (Scribe #32001 ready wave; 3 inbox drops
 - `sapper-31974-ab.md` — PrePack A/B testing decision
 
 Last consolidated: 2026-08-12T10:15:00Z (Scribe final-review-wave; 2 inbox drops merged: iran-31993-nan-runtime.md, sapper-31974-ab.md)
+
+## 2026-08-12 — PR #31973 N1: arch-specific test guard + benchmarks (Batty, Challenger, Deckard)
+
+**By:** Batty (N1 fix + benchmarks), Challenger (delta review), Deckard (wording fix), Coordinator (verification)
+**PR:** microsoft/onnxruntime#31973 — MLAS AVX2 LayerNorm kernel
+**Head:** `4a16925a88`
+
+### What happened
+
+Three separate instances of the same cross-arch test bug appeared on this PR family:
+1. A production `NormSize < 8` gate suppressed the RVV kernel on RISC-V.
+2. A test restated the x86 dispatch threshold as a literal.
+3. Six precision suites asserted centered-two-pass properties but on RISC-V ran against the RVV uncentered kernel.
+
+Batty closed N1 (instance 3) by adding `HasCenteredTwoPassKernel()` — a compile-time predicate guarded by the same `#if defined(MLAS_TARGET_AMD64) || defined(MLAS_TARGET_IX86)` as the production gate. Six precision suites now `GTEST_SKIP` when this returns false; on x86 they run and assert as before. Batty also produced benchmark numbers on AMD EPYC 9V74 (AVX2/FMA, no AVX-512): LayerNorm 6.8–11.9× over scalar Welford fp32 at N=128–4096, RMSNorm 2.3–3.6×, 1000 iterations, p50 median.
+
+Challenger (delta review) confirmed no blockers: guard correctly scoped, benchmark baseline (Welford fp32) fair, 41/2 → 43/43 build verified. One nit: `mlas.h` said "x86-64" while the `#if` also covers 32-bit `MLAS_TARGET_IX86`. Deckard fixed this to "x86 (32-bit and 64-bit)" across `mlas.h`, `layernorm_kernel_avx2.cpp`, and six `GTEST_SKIP` messages (`4a16925a88`). Both PRs marked ready for review.
+
+### Durable lessons
+
+- **Arch-specific assumptions leaked into tests three separate times on one PR.** When a kernel is architecture-specific, its assertions are too — gate them with a predicate mirroring the production `#if`, never a restated literal. Use `HasCenteredTwoPassKernel()` as the pattern.
+- **Publish benchmarks only with the baseline named and the scope bounded.** The numbers here are defensible because the baseline provably mirrors `layer_norm_impl.cc` (Welford fp32 for LayerNorm, single-pass sum-of-squares for RMSNorm), and the PR body states it is a per-row in-process microbenchmark with no end-to-end claim.
+- **Making a comment more readable can make it less accurate.** "AMD64/IX86" → "x86-64" read better but excluded 32-bit x86, which the `#if` covers. "x86 (32-bit and 64-bit)" achieves both.
+- **This host can measure x86 honestly** (AVX2/FMA, no AVX-512) — x86 performance claims should be measured rather than omitted on this host.
+
+### Merged inbox drops
+
+- `batty-31973-n1.md` — `HasCenteredTwoPassKernel()` guard decision
+- `challenger-31973-delta.md` — delta review verdict
+- `deckard-31973-wording.md` — "x86" wording fix
+
+Last consolidated: 2026-08-12T11:30:00Z (Scribe #31973/#31974 ready wave; 3 inbox drops merged)

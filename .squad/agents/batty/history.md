@@ -39,3 +39,19 @@ Full pre-compaction history in `history-archive.md`.
 - clang-format passes; leak check clean.
 - Coordinator independently reproduced PTX result: byte-identical confirms
   codegen-neutral status. PR marked ready for review.
+
+## 2026-08-12 — PR #31973 N1: HasCenteredTwoPassKernel()
+
+Closed the final blocker on #31973. Added `HasCenteredTwoPassKernel()` predicate
+(x86-64 compile-time guard) so the six precision suites skip on RISC-V/ARM where
+the centered two-pass algorithm isn't used. Fixed `mlas.h` wording (AMD64/IX86 →
+x86-64). Fresh build: 41 passed / 2 disabled, 43/43 with disabled. Produced
+benchmark numbers on AMD EPYC 9V74 (AVX2/FMA): LayerNorm 6.8–11.9× vs scalar
+at N≥128, RMSNorm 2.3–3.5× at same sizes, 1000 iters, p50 median.
+
+## 2026-08-12 — PR #31973 N1 wording fix (lockout, Deckard)
+
+Deckard corrected "x86-64" → "x86 (32-bit and 64-bit)" in `mlas.h`, `layernorm_kernel_avx2.cpp`,
+and six `GTEST_SKIP` messages after Challenger's delta review flagged the inaccuracy. Batty's
+implementation was correct; only the comment wording was stale. Head `4a16925a88`. PR #31973
+marked ready for review.

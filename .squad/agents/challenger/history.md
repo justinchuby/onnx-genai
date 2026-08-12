@@ -24,3 +24,21 @@ Reviewed commits af45043fd + b906ab2bb. **0 blockers. 3 substantive. Ready to le
 86 passed / 0 failed. Clippy clean.
 
 Full pre-compaction history in `history-archive.md`.
+
+## 2026-08-12 — PR #31973 delta review (N1 fix)
+
+Reviewed commit a49b702a36: `HasCenteredTwoPassKernel()` arch guard for six precision suites.
+- **No blockers.** Guard is correctly scoped, mirrors production `#if` exactly.
+- Suites still run on x86 (verified 41/2, 43/43 fresh build).
+- Benchmark baseline (Welford fp32) is fair; 11× plausible.
+- One nit: `mlas.h` comment says "x86-64" but `#if` covers 32-bit too.
+- No leaks. Ready to leave draft.
+
+## 2026-08-12 — PR #31973 wording nit resolved (Deckard follow-up)
+
+Challenger's delta review of `a49b702a36` found one nit: `mlas.h` said "x86-64" while the
+`#if` gate covers both AMD64 and IX86. Deckard fixed this to "x86 (32-bit and 64-bit)" across
+three files as `4a16925a88`. PR #31973 and #31974 both marked ready for review.
+
+**Board state:** #762 ready · #31985 merged · #31973 ready · #31974 ready · #32001 ready
+· #32003 ready · #31993 draft · #31988 draft (parked)
