@@ -429,3 +429,212 @@ divergence past the shared region. Those are the increments below.
 Nothing in the landed primitive touches the attention kernel or the flat
 per-sequence VA — the whole point is that the kernel is unchanged and learns
 nothing.
+
+---
+
+## Generalising shareability: the arithmetic predicate (#777, this round)
+
+The framing above (and my earlier writing) said prefix sharing "requires
+seq-major" and is "impractical under head-major". That is a **granule-relative**
+claim stated absolutely, and it is wrong. The owner's correction is right:
+
+> 前缀共享应该是一个通用 所有情况都能用的功能 ... ort backend我也想做前缀共享呀
+
+Whether a shared prefix can be physically shared is **arithmetic**, not a
+property of a named layout. Sharing maps whole granules, so a granule that holds
+both shared prefix and private continuation cannot be shared:
+
+```
+fragment_bytes                  = prefix_len × (contiguous bytes per fragment in that layout)
+shareable                       = fragment_bytes ≥ granule
+shareable_granules_per_fragment = floor(fragment_bytes / granule)
+multi_map_ops                   = fragments × shareable_granules_per_fragment
+wasted_boundary_bytes/sequence  = fragments × (fragment_bytes mod granule)   [the straddling
+                                  granule is private per sequence]
+```
+
+Layout sets `fragment_bytes` and the **cost** (fragments and multi-map ops), not
+the **possibility**. The genuine requirements are (a) the KV buffer is
+**VMM-backed** and (b) `fragment_bytes ≥ granule` for the layout on the platform.
+Neither says "seq-major".
+
+This is now a real, tested function rather than a prose rule:
+`onnx_runtime_memory_governor::shareability::evaluate_prefix_shareability`
+(`crates/onnx-runtime-memory-governor/src/shareability.rs`), over a
+`ModelKvGeometry` and a `KvFragmentation` descriptor (`head_major_bnsh`,
+`seq_major_bsnh`, `token_major`, or an arbitrary stride arrangement per #783).
+Its `PrefixShareability` result carries `shareable`, `fragments`,
+`fragment_bytes`, `shareable_granules_per_fragment`, `multi_map_ops`,
+`wasted_boundary_bytes_per_sequence`, and a `refusal_reason()` a KV path uses to
+**refuse with a reason** instead of silently making N private copies. It is the
+authority that replaces any "is this seq-major" check;
+`gqa_shared_prefix_parity_gpu.rs` now consults it to admit the share before
+mapping.
+
+### A correction to the issue's worked table
+
+The 2 MiB column of the qwen14b table in the issue thread reads **"seq-major: 2
+granules each — shareable"**. That is `ceil` (granules the prefix *touches* /
+residency), not `floor` (whole granules that fall entirely inside the shared
+prefix). The shareable count is `floor(4_096_000 / 2_097_152) = 1`, giving
+`96 × 1 = 96` multi-map ops — which is exactly the "96 multi-maps per sequence"
+the design section states for seq-major. So the correct cell is **1 granule per
+fragment, 96 ops**, and the rest of the table's *possibility* verdicts are
+unchanged. This is a slip in one cell (ceil vs floor), not a missing term in the
+model; the predicate uses `floor`, which is the one that counts shareable
+granules. Every other verified cell (head-major not shareable at 2 MiB / ~7 at
+64 KiB; token-major ~187 at 2 MiB) matches.
+
+### Shareability across layout × granule × prefix length
+
+`share, N ops` means shareable with `N` total multi-map operations per sequence;
+`no` means `fragment_bytes < granule` (not shareable at that granule). Verified by
+`evaluate_prefix_shareability` and the module tests.
+
+#### qwen14b (48 layers, 8 kv_heads, head_dim 128, fp16)
+
+| Layout | Granule | 512 tok | 2,048 tok | 8,192 tok |
+|---|---|---|---|---|
+| head-major BNSH | 2 MiB | no | no | share, 768 ops |
+| head-major BNSH | 64 KiB | share, 1,536 ops | share, 6,144 ops | share, 24,576 ops |
+| head-major BNSH | 4 KiB | share, 24,576 ops | share, 98,304 ops | share, 393,216 ops |
+| seq-major BSNH | 2 MiB | no | share, 192 ops | share, 768 ops |
+| seq-major BSNH | 64 KiB | share, 1,536 ops | share, 6,144 ops | share, 24,576 ops |
+| seq-major BSNH | 4 KiB | share, 24,576 ops | share, 98,304 ops | share, 393,216 ops |
+| token-major | 2 MiB | share, 48 ops | share, 192 ops | share, 768 ops |
+| token-major | 64 KiB | share, 1,536 ops | share, 6,144 ops | share, 24,576 ops |
+| token-major | 4 KiB | share, 24,576 ops | share, 98,304 ops | share, 393,216 ops |
+
+The **head-major @ 2 MiB @ 8,192 tokens** cell is the headline: head-major *does*
+become shareable when the arithmetic says so. The threshold is exactly
+`granule / (head_dim × dtype) = 2_097_152 / 256 = 8,192` tokens — realistic for
+RAG and long system prompts, not hypothetical.
+
+#### qwen2.5-0.5b (24 layers, 2 kv_heads, head_dim 64, fp16)
+
+| Layout | Granule | 512 tok | 2,048 tok | 8,192 tok |
+|---|---|---|---|---|
+| head-major BNSH | 2 MiB | no | no | no |
+| head-major BNSH | 64 KiB | share, 96 ops | share, 384 ops | share, 1,536 ops |
+| head-major BNSH | 4 KiB | share, 1,536 ops | share, 6,144 ops | share, 24,576 ops |
+| seq-major BSNH | 2 MiB | no | no | share, 48 ops |
+| seq-major BSNH | 64 KiB | share, 96 ops | share, 384 ops | share, 1,536 ops |
+| seq-major BSNH | 4 KiB | share, 1,536 ops | share, 6,144 ops | share, 24,576 ops |
+| token-major | 2 MiB | share, 3 ops | share, 12 ops | share, 48 ops |
+| token-major | 64 KiB | share, 96 ops | share, 384 ops | share, 1,536 ops |
+| token-major | 4 KiB | share, 1,536 ops | share, 6,144 ops | share, 24,576 ops |
+
+On the small model the per-fragment bytes are `kv_heads`/`head_dim` smaller, so at
+2 MiB only token-major shares below 8,192 tokens — again the arithmetic, not a
+layout preference, saying so. At 64 KiB and 4 KiB every layout shares.
+
+### Cross-checking whether a term is missing
+
+Asked to verify the arithmetic independently: the invariant
+`fragments × contiguous_bytes_per_token = layers × 2 × kv_heads × head_dim ×
+dtype` (the whole-model per-token byte count) holds for all three layouts, so the
+fragment descriptors partition the same bytes — a term-conservation check the
+module test `total_bytes_per_token_is_layout_invariant` encodes. The only
+divergence from the issue's numbers is the ceil-vs-floor slip noted above. One
+honest caveat the predicate makes explicit but does not resolve: it counts
+*whole* shareable granules and treats the straddling boundary granule as private;
+it does **not** model sharing at a sub-granule unit (which VMM cannot do) nor the
+CPU/`mmap` case where sharing at page rather than granule granularity could share
+the boundary page too. Those are platform capabilities the caller supplies as
+`granule`, not terms missing from the formula.
+
+## The ORT backend — definitive answer (deliverable #2)
+
+The question is **not** "can ORT share prefixes" — the `commit_shared_prefix`
+primitive (#803) and the `DeviceAllocator` seam (#809) are layout-agnostic and
+apply to any VMM-backed buffer. The question is **"does ORT's KV allocation route
+through an allocator we can back with the VMM arena?"** Answer, with citations
+into `crates/onnx-genai-ort/`:
+
+### Where ORT KV comes from today — two paths, both bypass a VMM arena
+
+1. **Dynamic decode (`DecodeKvMode::ZeroCopyRebind`,
+   `src/decode/mod.rs:66`).** ORT allocates the `present.*` outputs itself and we
+   rebind them as next step's `past_key_values.*` — "No Rust-side KV copy is
+   performed" (`src/decode/mod.rs:67`). These outputs are allocated by the EP's
+   own output allocator (its BFC arena); no allocator parameter of ours is
+   involved at all. **This path cannot be routed through a provided allocator.**
+
+2. **Shared-buffer decode (`DecodeKvMode::SharedBuffer`,
+   `src/decode/shared_batch.rs`, `src/decode/dynamic.rs:413`).** Here we *do*
+   pre-allocate one max-length KV `OrtValue` per tensor and bind it as both past
+   input and present output. But it is created with
+   `Value::empty_in(&shape, dtype, device_allocator)`
+   (`src/decode/shared_batch.rs:360`), which calls `CreateTensorAsOrtValue`
+   (`src/value.rs:141`) with an allocator obtained from
+   `Session::device_kv_allocator()` (`src/session/mod.rs:607`). That allocator is
+   built by `Allocator::for_session_device` → **`CreateAllocator`**
+   (`src/allocator.rs:239`), which the doc comment states plainly **"wraps the
+   session's internal EP allocator"** (`src/allocator.rs:232`). So `CreateAllocator`
+   lets us pick the *device* the tensor lands on, **not the allocation
+   implementation** — the bytes still come from ORT's internal CUDA allocator, not
+   a VMM arena we control.
+
+The one seam that lets us supply the *implementation* is **`RegisterAllocator`**
+(`src/governed_allocator.rs:738`, `register_governed_allocator`), which installs
+our `OrtAllocator` vtable on the environment for sessions created with
+`session.use_env_allocators` (`src/session/options.rs:63`). But this confirms the
+`allocator.rs:65` hint rather than defeating it: ORT **reserves the arena kind
+for its own internal arenas** — a registered allocator must describe itself as a
+non-arena `OrtDeviceAllocator` (`src/governed_allocator.rs:746`), and ORT then
+fronts it with its **own BFC arena**, calling our `Alloc` only for coarse chunks
+and sub-allocating each KV tensor *inside* a chunk. So even under
+`RegisterAllocator`, an individual `past_key_values`/`present` tensor is a
+byte-range inside an arena chunk at an arena-chosen offset — **not a
+granule-aligned VMM reservation whose base and granules we own**. `commit_shared_prefix`
+needs the latter (it maps physical handles into a specific reservation at a
+granule-aligned `byte_offset`, `PROT_READ`, without disturbing neighbours), so it
+cannot apply to an ORT-arena sub-allocation.
+
+**Definitive negative for the automatic paths:** as wired today, neither the
+dynamic nor the shared-buffer KV path yields a KV buffer we can back with the VMM
+arena. `CreateAllocator` selects device, not implementation; `RegisterAllocator`
+gives us coarse chunks that ORT re-carves. `commit_shared_prefix` has nothing to
+attach to.
+
+### The one affirmative route, and its exact scope
+
+There **is** a concrete path, and it is worth stating precisely so it is not
+mistaken for "ORT just works". ORT exposes `CreateTensorWithDataAsOrtValue`
+(`src/value.rs:1103`, wrapped by `create_tensor_with_data_in`), whose doc says it
+exists "so a caller can hand ORT memory it allocated itself" (`src/value.rs:1099`)
+with an explicit device `MemoryInfo`. So a KV buffer allocated on **our VMM
+arena** can be presented to ORT as an `OrtValue` over external device memory and
+bound through the existing `IoBinding` (`src/decode/binding.rs`). This only works
+in the **shared-buffer / `past_present_share_buffer`** mode, because that mode
+already uses one fixed max-length buffer bound as both past and present
+(`src/decode/mod.rs:70`) — a stable reservation whose prefix region can be pinned
+read-only for the sharers' lifetime. The dynamic mode cannot, because ORT owns
+the `present.*` allocation.
+
+Two consequences to record before anyone builds it:
+
+- **ORT's KV is head-major BNSH.** Per `schema/inference_metadata.schema.json`
+  and the ORT GQA contract, past/present is `[batch, kv_heads, seq, head_dim]` on
+  every ORT dispatch path (Flash, cuDNN SDPA, memory-efficient, XQA). By the
+  predicate above, head-major at a 2 MiB CUDA granule is shareable only for
+  prefixes **≥ 8,192 tokens** (or on a finer-granule EP). So an ORT prefix-share
+  is real but bounded: it pays for long pinned system prompts / RAG documents, and
+  the seam correctly **refuses** (with reason) for shorter prefixes rather than
+  mis-mapping.
+- **It requires bypassing ORT's arena for the KV OrtValue**, i.e. constructing
+  the shared-buffer KV via `CreateTensorWithDataAsOrtValue` over VMM memory
+  instead of `Value::empty_in`/`CreateTensorAsOrtValue`, and keeping that VMM
+  reservation alive for the OrtValue's whole life (ORT will not free external
+  memory). This is a real change to `shared_batch.rs`'s allocation call, scoped
+  but not trivial, and explicitly **out of scope for this PR**.
+
+**Bottom line:** ORT prefix sharing is not "free via the existing allocator". The
+`CreateAllocator` KV path selects device, not implementation, and the dynamic path
+bypasses our allocators entirely; `commit_shared_prefix` cannot attach to an
+ORT-arena sub-allocation. The viable route is to allocate the shared-buffer KV on
+the VMM arena and bind it as external device memory via
+`CreateTensorWithDataAsOrtValue` + `IoBinding`, at which point the same
+`create_shared_prefix`/`commit_shared_prefix`/`DeviceAllocator` machinery applies
+unchanged — bounded by the head-major arithmetic (≥ 8,192-token prefixes at
+2 MiB). That is the scoped follow-up, not this PR.
