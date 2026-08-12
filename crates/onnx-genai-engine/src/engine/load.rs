@@ -204,7 +204,7 @@ impl Engine {
             metadata,
             metadata_max_context,
             decode_path,
-        } = resolve_metadata_and_decode_path(&session, metadata)?;
+        } = resolve_metadata_and_decode_path(&session, &model_directory.model_path, metadata)?;
 
         let tokenizer = {
             let _span = onnx_genai_ort::prof_span!("engine.tokenizer_load");
@@ -935,6 +935,7 @@ fn load_inference_metadata(model_directory: &ModelDirectory) -> anyhow::Result<I
 
 fn resolve_metadata_and_decode_path(
     session: &Session,
+    model_path: &Path,
     metadata: InferenceMetadata,
 ) -> anyhow::Result<MetadataResolution> {
     // Validate capabilities
@@ -965,6 +966,14 @@ fn resolve_metadata_and_decode_path(
         .map(|max_len| cap_kv_len(max_len, kv_shared_buffer_cap));
     let sliding_window = crate::decode::sliding_window_from_metadata(&metadata)?;
     let sink_tokens = crate::decode::sink_tokens_from_metadata(&metadata);
+    // Graph-truth check for the declared sliding window: only a window the
+    // exported decoder graph actually enforces (GQA `local_window_size`) is
+    // treated as active. A metadata-only/vestigial window (e.g. Muse-Glimmer)
+    // is reclassified as global attention so decode reaches the capture-stable
+    // shared-buffer KV path. Best-effort: if the graph cannot be read, the
+    // declared window is kept (no regression for real SWA models).
+    let decoder_graph =
+        sliding_window.and_then(|_| onnx_runtime_loader::load_model(model_path).ok());
     let decode_path = {
         let _span = onnx_genai_ort::prof_span!("engine.detect_decode_path");
         detect_model_decode_path(
@@ -973,6 +982,7 @@ fn resolve_metadata_and_decode_path(
             metadata_max_context,
             shared_kv_max_len,
             sliding_window,
+            decoder_graph.as_ref(),
             sink_tokens,
         )?
     };
@@ -1145,7 +1155,15 @@ fn load_draft_model(
             // path were introduced without explicitly loading draft metadata.
             // If a draft model needs its own SWA + sinks, load its
             // inference_metadata.yaml and pass the values from there.
-            detect_model_decode_path(&draft_session, None, metadata_max_context, None, None, 0)?;
+            detect_model_decode_path(
+                &draft_session,
+                None,
+                metadata_max_context,
+                None,
+                None,
+                None,
+                0,
+            )?;
         let draft_kv_model = infer_kv_model_info(
             &draft_session,
             draft_io.as_ref(),

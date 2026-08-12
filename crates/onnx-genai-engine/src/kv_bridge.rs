@@ -1816,7 +1816,7 @@ mod tests {
         let _guard = model_test_lock();
         let (_environment, session) = load_session("tiny-llm")?;
         let io = fixture_io("tiny-llm")?;
-        let path = detect_model_decode_path(&session, Some(&io), None, None, Some(2), 0)?;
+        let path = detect_model_decode_path(&session, Some(&io), None, None, Some(2), None, 0)?;
         assert!(matches!(
             path,
             ModelDecodePath::PastPresent {
@@ -1840,7 +1840,7 @@ mod tests {
         // paged sliding-window path (shared_buffer: false), since the append-only
         // single shared buffer cannot express windowed eviction.
         assert!(matches!(
-            detect_model_decode_path(&session, Some(&io), Some(16), Some(16), Some(2), 0)?,
+            detect_model_decode_path(&session, Some(&io), Some(16), Some(16), Some(2), None, 0)?,
             ModelDecodePath::PastPresent {
                 shared_buffer: false,
                 max_len: None,
@@ -1848,6 +1848,83 @@ mod tests {
                 sink_tokens: None,
             }
         ));
+        Ok(())
+    }
+
+    /// Build a single-node GroupQueryAttention decoder graph. `Some(w)` carries a
+    /// real, graph-enforced `local_window_size`; `None` is global attention.
+    fn gqa_graph(local_window_size: Option<i64>) -> onnx_runtime_ir::Graph {
+        use onnx_runtime_ir::{Attribute, Graph, Node};
+        let mut graph = Graph::default();
+        graph.nodes.insert_with(|id| {
+            let mut node = Node::new(id, "GroupQueryAttention", vec![], vec![]);
+            node.domain = "com.microsoft".to_string();
+            if let Some(window) = local_window_size {
+                node.attributes
+                    .insert("local_window_size".to_string(), Attribute::Int(window));
+            }
+            node
+        });
+        graph
+    }
+
+    #[test]
+    fn vestigial_metadata_window_routes_to_shared_buffer() -> anyhow::Result<()> {
+        let _guard = model_test_lock();
+        let (_environment, session) = load_session("tiny-llm")?;
+        let io = fixture_io("tiny-llm")?;
+
+        // A window declared in metadata (Some(2)) but NOT enforced by the graph
+        // (GQA carries no local_window_size => global attention, like
+        // Muse-Glimmer) must be reclassified as global and reach the
+        // capture-stable shared-buffer / fixed-capacity KV path.
+        let global_graph = gqa_graph(None);
+        let path = detect_model_decode_path(
+            &session,
+            Some(&io),
+            Some(16),
+            Some(16),
+            Some(2),
+            Some(&global_graph),
+            0,
+        )?;
+        assert!(
+            matches!(
+                path,
+                ModelDecodePath::PastPresent {
+                    shared_buffer: true,
+                    max_len: Some(16),
+                    sliding_window: None,
+                    sink_tokens: None,
+                }
+            ),
+            "vestigial window must route to shared-buffer, got {path:?}"
+        );
+
+        // A window the graph actually enforces (GQA local_window_size > 0, real
+        // SWA) stays on the bounded paged windowed path — no regression.
+        let windowed_graph = gqa_graph(Some(2));
+        let windowed = detect_model_decode_path(
+            &session,
+            Some(&io),
+            Some(16),
+            Some(16),
+            Some(2),
+            Some(&windowed_graph),
+            0,
+        )?;
+        assert!(
+            matches!(
+                windowed,
+                ModelDecodePath::PastPresent {
+                    shared_buffer: false,
+                    max_len: None,
+                    sliding_window: Some(2),
+                    sink_tokens: None,
+                }
+            ),
+            "real graph-enforced window must stay on the paged windowed path, got {windowed:?}"
+        );
         Ok(())
     }
 
