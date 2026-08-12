@@ -71,10 +71,15 @@
 //! a budget. Live state is never taken to make room.
 
 pub mod allocator;
+pub mod shareability;
 
 pub use allocator::{
     AllocationCommitRange, DeviceAllocator, DeviceKey, HostAllocator, MappedAllocation,
     SharedDevicePrefix, SharedPrefixCommitInfo,
+};
+pub use shareability::{
+    KvFragmentation, ModelKvGeometry, PrefixShareability, evaluate_geometry_shareability,
+    evaluate_prefix_shareability,
 };
 
 use std::collections::{BTreeMap, VecDeque};

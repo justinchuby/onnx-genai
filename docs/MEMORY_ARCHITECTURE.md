@@ -799,12 +799,44 @@ The durable design conclusion is narrower:
 
 The floor is a constant that amortizes with context length. Shared-prefix
 savings scale with concurrent requests, the axis multi-request serving in #750
-cares about:
+cares about.
 
-- Head-major: a prefix is `layers × 2 × kv_heads` scattered fragments.
-- Seq-major: it is `layers × 2` contiguous layer-side ranges.
-- Token-major: it is **one contiguous range covering every layer**, shareable
-  with one physical-handle multi-map.
+**Shareability is arithmetic, not a layout (#777).** Sharing maps whole
+granules, so a prefix is shareable exactly when each contiguous fragment is at
+least one granule:
+
+```
+fragment_bytes = prefix_len × (contiguous bytes per fragment in that layout)
+shareable      = fragment_bytes ≥ granule
+multi_map_ops  = fragments × floor(fragment_bytes / granule)
+```
+
+Layout sets `fragment_bytes` (and the cost) but **not** the possibility. The two
+genuine requirements are a **VMM-backed** KV buffer and `fragment_bytes ≥
+granule` on the platform. This is a tested predicate,
+`onnx_runtime_memory_governor::shareability::evaluate_prefix_shareability`, that
+replaces any "is this seq-major" check; a KV path refuses with a reason when the
+arithmetic says a configuration is not shareable rather than making N private
+copies. Layout only sets fragment size and cost:
+
+- Head-major: a prefix is `layers × 2 × kv_heads` scattered fragments, each
+  `head_dim × dtype` per token. On qwen14b that is *not* shareable at a 2 MiB
+  granule below an **8,192-token** prefix (`granule / (head_dim × dtype)`), but
+  *is* shareable at or above it, and shareable at any realistic prefix on a
+  finer-granule EP (~64 KiB Level Zero/Vulkan, 4 KiB CPU `mmap`).
+- Seq-major: `layers × 2` contiguous layer-side ranges (`kv_heads × head_dim`
+  per token) — shareable at 2 MiB from a ~2,048-token prefix on qwen14b, at
+  `floor` = 1 granule per fragment, i.e. 96 multi-map ops.
+- Token-major: **one contiguous range covering every layer** — shareable at the
+  smallest prefix, one physical-handle multi-map per sequence (cheapest cost).
+
+The full shareability grid across layout × granule × prefix-length for both
+qwen14b and qwen2.5-0.5b, and the derivation, live in
+[`PREFIX_SHARE_INVESTIGATION.md`](./PREFIX_SHARE_INVESTIGATION.md). At this
+device's measured 2 MiB granule (#776), token-major remains the cheapest and
+seq-major the practical middle, but "head-major cannot share" is only true
+*below the 8,192-token threshold at 2 MiB* — corrected from the earlier absolute
+phrasing.
 
 For a 2,000-token shared prompt and eight concurrent qwen14b requests, avoiding
 the seven duplicate copies saves about **2.56 GiB** (#777/#787). This uses the
