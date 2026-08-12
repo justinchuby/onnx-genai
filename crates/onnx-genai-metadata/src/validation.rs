@@ -191,18 +191,28 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
         }
     }
 
+    let mut strategy_owned = BTreeSet::new();
+    collect_strategy_models(&spec.strategy, &mut strategy_owned);
+
     for phase_component in spec.phases.keys() {
         if !spec.models.contains_key(phase_component) {
             errors.push(format!(
                 "phase references unknown component: {phase_component}"
             ));
+        } else if strategy_owned.contains(phase_component.as_str()) {
+            errors.push(format!(
+                "pipeline.phases must not contain strategy-owned component {phase_component}; \
+                 its lifecycle is defined by pipeline.strategy"
+            ));
         }
     }
     for model_component in spec.models.keys() {
-        if !spec.phases.contains_key(model_component) {
+        if !strategy_owned.contains(model_component.as_str())
+            && !spec.phases.contains_key(model_component)
+        {
             errors.push(format!(
-                "pipeline model {model_component} must have a pipeline.phases entry declaring \
-                 run_on and optional when_present"
+                "auxiliary pipeline model {model_component} must have a pipeline.phases entry \
+                 declaring run_on and optional when_present"
             ));
         }
     }
@@ -214,6 +224,24 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
         Ok(())
     } else {
         Err(PipelineValidationError { errors })
+    }
+}
+
+fn collect_strategy_models<'a>(strategy: &'a PipelineStrategy, out: &mut BTreeSet<&'a str>) {
+    for model in [
+        strategy.decoder.as_deref(),
+        strategy.model.as_deref(),
+        strategy.denoiser.as_deref(),
+        strategy.outer.as_deref(),
+        strategy.inner.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        out.insert(model);
+    }
+    for stage in &strategy.stages {
+        collect_strategy_models(&stage.strategy, out);
     }
 }
 

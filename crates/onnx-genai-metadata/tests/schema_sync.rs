@@ -26,6 +26,22 @@ fn committed_inference_metadata_schema_is_current() {
     );
 }
 
+#[test]
+fn generated_schema_preserves_all_root_constraints() {
+    let schema: serde_json::Value =
+        serde_json::from_str(&inference_metadata_schema_json().expect("schema serializes"))
+            .expect("generated schema is JSON");
+    let constraints = schema["allOf"].as_array().expect("root allOf array");
+
+    assert!(constraints.iter().any(|constraint| {
+        constraint["not"]["required"] == serde_json::json!(["speculative", "speculator_config"])
+    }));
+    assert!(constraints.iter().any(|constraint| {
+        constraint["not"]["required"] == serde_json::json!(["pipeline", "model"])
+            && constraint["not"]["properties"]["model"]["required"] == serde_json::json!(["io"])
+    }));
+}
+
 fn schema_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")

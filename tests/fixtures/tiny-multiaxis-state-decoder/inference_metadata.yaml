@@ -39,8 +39,6 @@ pipeline:
   phases:
     embedding:
       run_on: every_step
-    decoder:
-      run_on: every_step
   positions:
     input: position_ids
     rank: 3

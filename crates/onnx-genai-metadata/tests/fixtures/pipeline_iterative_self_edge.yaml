@@ -19,7 +19,5 @@ pipeline:
     denoiser: denoiser
     num_steps: 20
   phases:
-    denoiser:
-      run_on: every_step
     vae:
       run_on: final_only

@@ -917,8 +917,8 @@ pipeline:
     vae: { type: vae_decoder, filename: vae_decoder.onnx }
 
   strategy:
-    kind: diffusion
-    scheduler: euler_discrete
+    kind: iterative
+    denoiser: unet
     num_steps: 20
     guidance_scale: 7.5
 
@@ -931,8 +931,6 @@ pipeline:
   phases:
     text_encoder:
       run_on: prompt_only
-    unet:
-      run_on: denoise_loop    # new phase type for diffusion
     vae:
       run_on: final_only
 ```
@@ -1113,8 +1111,8 @@ pipeline:
     kind: autoregressive | iterative | single_pass | composite
     # ... kind-specific parameters below
 
-  # WHEN every model runs and under what optional presence condition.
-  # Every model above must have exactly one entry here.
+  # WHEN auxiliary models run and under what optional presence condition.
+  # Models named by strategy control-flow fields do not appear here.
   phases:
     model_name:
       run_on: prompt_only | every_step | final_only | on_demand
@@ -1189,8 +1187,11 @@ strategy:
       strategy: { kind: autoregressive, decoder: decoder }
 ```
 
-Stages describe only nested execution structure and order. Component lifecycle
-scheduling is declared once in `pipeline.phases`; stages never carry `run_on`.
+Stages describe nested execution structure and order, which implies the
+lifecycle of every model they own. `pipeline.phases` schedules only auxiliary
+models that are not named by a strategy `decoder`, `model`, `denoiser`,
+`outer`, or `inner` field. Stages never carry `run_on`, and strategy-owned
+models must not have phase entries.
 
 ### 20.3 Concrete Pipeline Examples
 
@@ -1230,15 +1231,10 @@ pipeline:
             - eos_token: true
       - name: synthesize_audio
         strategy: { kind: single_pass, model: vocoder }
-
-  phases:
-    text_encoder: { run_on: prompt_only }
-    acoustic: { run_on: every_step }
-    vocoder: { run_on: final_only }
 ```
 
 **Post-decode stages & the generated-codes tensor contract.** The vocoder above
-is a `final_only` single_pass stage that runs **once, after** the AR decode loop
+is a single-pass stage after the AR stage and runs **once, after** the decode loop
 completes — the one composite structure that is neither a prompt-phase encoder
 nor a per-step decoder. The engine wires it up as follows:
 
@@ -1249,7 +1245,7 @@ nor a per-step decoder. The engine wires it up as follows:
 - A post-decode stage consumes those codes via a normal `dataflow` edge, e.g.
   `decoder.output_ids -> vocoder.codes`, and writes its waveform back into the
   pool (e.g. `vocoder.audio`).
-- `final_only` components are collected (in dataflow order) into
+- Strategy stages after the autoregressive stage are collected (in declared order) into
   `AutoregressivePlan::post_decode_components` and run once over the shared pool
   after the loop, exactly like a prompt-phase stage but *downstream* of decode.
 
@@ -1268,7 +1264,7 @@ metadata** (`pipeline.audio`), never inferred:
 | field | meaning |
 |---|---|
 | `sample_rate` | Playback rate in hertz. A runtime cannot recover this from the samples; guessing changes pitch and duration, so a package that omits it is rejected rather than played back wrong. |
-| `output` | Endpoint carrying the waveform, e.g. `vocoder.audio`. Optional: when absent the sole output of the `run_on: final_only` component is used, which is unambiguous for the common single-vocoder shape. |
+| `output` | Endpoint carrying the waveform, e.g. `vocoder.audio`. Optional: when absent the sole output of the final strategy stage is used, which is unambiguous for the common single-vocoder shape. |
 | `channels` | Interleaved channel count. Defaults to 1 (mono). |
 
 `onnx_genai::text_to_audio` implements that contract once — resolving the
@@ -1318,11 +1314,6 @@ strategy:
         inner: code_predictor    # AR inner decoder (num_code_groups steps per frame)
         num_code_groups: 4       # inner-loop depth (RVQ residual codebooks)
     - {name: vocode, strategy: {kind: single_pass, model: vocoder}}
-phases:
-  embedding: {run_on: prompt_only}
-  talker: {run_on: every_step}
-  code_predictor: {run_on: on_demand}
-  vocoder: {run_on: final_only}
 dataflow:
   # inner step-0 seed: talker frame hidden state → inner decoder input embeds
   - {from: talker.last_hidden_state, to: code_predictor.inputs_embeds}
@@ -1625,12 +1616,9 @@ pipeline:
     kind: composite
     stages:
       - { name: encode_vision,   strategy: { kind: single_pass,    model: vision_encoder } }
-      - { name: fuse_embeddings, strategy: { kind: single_pass,    model: embedding } }
       - { name: decode,          strategy: { kind: autoregressive, decoder: decoder } }
   phases:
-    vision_encoder: { run_on: prompt_only }
     embedding: { run_on: every_step }
-    decoder: { run_on: every_step }
 ```
 
 The engine handles two seams unique to `inputs_embeds` fusion (see

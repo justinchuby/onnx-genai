@@ -171,6 +171,12 @@ For a composite document, each graph declares its contract only at
 `pipeline` is present. `speculative.io` remains the standalone proposer
 contract. All three locations use the same explicit, model-agnostic fields:
 
+Pipeline lifecycle metadata is similarly non-overlapping. Models referenced by
+strategy control-flow fields (`decoder`, `model`, `denoiser`, `outer`, or
+`inner`, including nested stages) derive their lifecycle from that structure
+and must not appear in `pipeline.phases`. Every other auxiliary model requires
+a phase entry declaring `run_on` and optional `when_present`.
+
 - `sequence_source`: `token_ids` or `inputs_embeds`.
 - `token_input` / `inputs_embeds_input`: exact graph port selected by
   `sequence_source`.

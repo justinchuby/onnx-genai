@@ -540,7 +540,6 @@ fn build_pipeline_metadata(
         "to": format!("denoiser.{DENOISER_SAMPLE_INPUT}"),
     })];
     let mut phases = Map::new();
-    phases.insert("denoiser".into(), json!({ "run_on": "every_step" }));
 
     if has_text_encoder {
         models.insert(

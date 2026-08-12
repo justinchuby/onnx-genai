@@ -225,9 +225,6 @@ pipeline:
   strategy:
     kind: single_pass
     model: component
-  phases:
-    component:
-      run_on: prompt_only
 "#,
     )?;
 
@@ -343,21 +340,13 @@ pipeline:
         strategy:
           kind: single_pass
           model: source
-      - name: embedding
-        strategy:
-          kind: single_pass
-          model: embedding
       - name: decode
         strategy:
           kind: autoregressive
           decoder: decoder
   phases:
-    source:
-      run_on: prompt_only
     embedding:
       run_on: {embedding_phase}
-    decoder:
-      run_on: every_step
 "#,
         per_layer_edge.unwrap_or("")
     )
@@ -420,9 +409,6 @@ pipeline:
   strategy:
     kind: single_pass
     model: consumer
-  phases:
-    consumer:
-      run_on: prompt_only
 "#,
     )?;
 
@@ -461,9 +447,6 @@ pipeline:
   strategy:
     kind: single_pass
     model: consumer
-  phases:
-    consumer:
-      run_on: prompt_only
 "#,
     )?;
 
@@ -513,9 +496,6 @@ pipeline:
   strategy:
     kind: single_pass
     model: consumer
-  phases:
-    consumer:
-      run_on: prompt_only
 "#
             ),
         )?;
@@ -575,22 +555,12 @@ pipeline:
       to: consumer.features
       dtype: fp32
   strategy:
-    kind: composite
-    stages:
-      - name: producer
-        strategy:
-          kind: single_pass
-          model: producer
-      - name: consumer
-        strategy:
-          kind: single_pass
-          model: consumer
+    kind: single_pass
+    model: consumer
   phases:
     producer:
       run_on: prompt_only
       when_present: audio
-    consumer:
-      run_on: prompt_only
 "#,
             optional_input.unwrap_or("")
         ),
@@ -711,13 +681,6 @@ pipeline:
         strategy:
           kind: autoregressive
           decoder: decoder
-  phases:
-    conditioning:
-      run_on: prompt_only
-    embedding:
-      run_on: every_step
-    decoder:
-      run_on: every_step
   positions:
     input: position
     rank: 1
@@ -784,11 +747,6 @@ pipeline:
         strategy:
           kind: single_pass
           model: consumer
-  phases:
-    producer:
-      run_on: prompt_only
-    consumer:
-      run_on: prompt_only
 "#,
     )?;
 
@@ -830,9 +788,6 @@ pipeline:
   strategy:
     kind: autoregressive
     decoder: decoder
-  phases:
-    decoder:
-      run_on: every_step
 "#,
     )?;
 
@@ -862,9 +817,6 @@ pipeline:
   strategy:
     kind: autoregressive
     decoder: decoder
-  phases:
-    decoder:
-      run_on: every_step
 "#,
     )?;
 
@@ -946,9 +898,6 @@ pipeline:
   strategy:
     kind: single_pass
     model: vision_encoder
-  phases:
-    vision_encoder:
-      run_on: prompt_only
   vision:
     image_placeholder_token_id: 7
     tokens_per_tile: 4

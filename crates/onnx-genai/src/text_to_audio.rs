@@ -26,7 +26,7 @@ use anyhow::{Context, Result, bail};
 use onnx_genai_engine::{
     GenerateOptions, GeneratePrompt, GenerateRequest, PipelineEngine, PipelineGenerateRequest,
 };
-use onnx_genai_metadata::{PhaseRunOn, PipelineSpec};
+use onnx_genai_metadata::{PhaseRunOn, PipelineSpec, PipelineStrategy, PipelineStrategyKind};
 use onnx_genai_ort::Tokenizer;
 use onnx_genai_preprocess::audio::encode_wav_pcm16;
 
@@ -127,35 +127,59 @@ fn resolve_audio_output(spec: &PipelineSpec) -> AudioOutput {
     let declared = spec.audio.as_ref();
     AudioOutput {
         endpoint: declared.and_then(|audio| audio.output.clone()),
-        final_component: spec
-            .phases
-            .iter()
-            .find(|(_, phase)| phase.run_on == PhaseRunOn::FinalOnly)
-            .map(|(name, _)| name.clone()),
+        final_component: final_strategy_component(&spec.strategy).or_else(|| {
+            spec.phases
+                .iter()
+                .find(|(_, phase)| phase.run_on == PhaseRunOn::FinalOnly)
+                .map(|(name, _)| name.clone())
+        }),
         sample_rate: declared.and_then(|audio| audio.sample_rate),
         channels: declared.and_then(|audio| audio.channels).unwrap_or(1),
     }
 }
 
+fn final_strategy_component(strategy: &PipelineStrategy) -> Option<String> {
+    let loop_index = strategy
+        .stages
+        .iter()
+        .position(|stage| strategy_contains_decode_loop(&stage.strategy))?;
+    strategy.stages[loop_index + 1..]
+        .last()
+        .and_then(|stage| terminal_strategy_component(&stage.strategy))
+}
+
+fn strategy_contains_decode_loop(strategy: &PipelineStrategy) -> bool {
+    matches!(
+        strategy.kind,
+        PipelineStrategyKind::Autoregressive | PipelineStrategyKind::NestedAutoregressive
+    ) || strategy
+        .stages
+        .iter()
+        .any(|stage| strategy_contains_decode_loop(&stage.strategy))
+}
+
+fn terminal_strategy_component(strategy: &PipelineStrategy) -> Option<String> {
+    strategy
+        .stages
+        .last()
+        .and_then(|stage| terminal_strategy_component(&stage.strategy))
+        .or_else(|| strategy.model.clone())
+}
+
 /// Returns true when `spec` describes a pipeline that emits audio.
 ///
 /// A package qualifies when it declares `pipeline.audio`, or when it has a
-/// final-only stage fed by an autoregressive decoder — the TTS shape.
+/// final strategy stage fed by an autoregressive decoder — the TTS shape.
 pub fn is_text_to_audio(spec: &PipelineSpec) -> bool {
     if spec.audio.is_some() {
         return true;
     }
-    let has_final_stage = spec
-        .phases
-        .values()
-        .any(|phase| phase.run_on == PhaseRunOn::FinalOnly);
-    let has_decoder = spec.strategy.decoder.is_some()
-        || spec.strategy.outer.is_some()
+    let has_final_stage = final_strategy_component(&spec.strategy).is_some()
         || spec
-            .strategy
-            .stages
-            .iter()
-            .any(|stage| stage.strategy.decoder.is_some() || stage.strategy.outer.is_some());
+            .phases
+            .values()
+            .any(|phase| phase.run_on == PhaseRunOn::FinalOnly);
+    let has_decoder = strategy_contains_decode_loop(&spec.strategy);
     has_final_stage && has_decoder
 }
 
@@ -237,7 +261,7 @@ pub fn synthesize(
         None => {
             let component = output.final_component.as_ref().context(
                 "What: the waveform could not be located. \
-                 Why: the package declares neither `pipeline.audio.output` nor a `run_on: final_only` component. \
+                 Why: the package declares neither `pipeline.audio.output` nor a final strategy stage. \
                  How: declare `pipeline.audio.output` naming the endpoint that carries the waveform.",
             )?;
             let prefix = format!("{component}.");
@@ -316,8 +340,7 @@ pub fn synthesize(
 mod tests {
     use super::*;
     use onnx_genai_metadata::{
-        PhaseConfig, PipelineAudioConfig, PipelineComponentSpec, PipelineStrategy,
-        PipelineStrategyStage,
+        PipelineAudioConfig, PipelineComponentSpec, PipelineStrategy, PipelineStrategyStage,
     };
 
     fn component(filename: &str, role: &str) -> PipelineComponentSpec {
@@ -333,14 +356,24 @@ mod tests {
     fn tts_spec() -> PipelineSpec {
         let mut spec = PipelineSpec {
             strategy: PipelineStrategy {
-                stages: vec![PipelineStrategyStage {
-                    name: "decode_codes".to_string(),
-                    strategy: Box::new(PipelineStrategy {
-                        decoder: Some("decoder".to_string()),
-                        max_tokens: Some(4),
-                        ..Default::default()
-                    }),
-                }],
+                stages: vec![
+                    PipelineStrategyStage {
+                        name: "decode_codes".to_string(),
+                        strategy: Box::new(PipelineStrategy {
+                            decoder: Some("decoder".to_string()),
+                            max_tokens: Some(4),
+                            ..Default::default()
+                        }),
+                    },
+                    PipelineStrategyStage {
+                        name: "synthesize_audio".to_string(),
+                        strategy: Box::new(PipelineStrategy {
+                            kind: PipelineStrategyKind::SinglePass,
+                            model: Some("vocoder".to_string()),
+                            ..Default::default()
+                        }),
+                    },
+                ],
                 ..Default::default()
             },
             ..Default::default()
@@ -349,13 +382,6 @@ mod tests {
             .insert("decoder".to_string(), component("decoder.onnx", "decoder"));
         spec.models
             .insert("vocoder".to_string(), component("vocoder.onnx", "vocoder"));
-        spec.phases.insert(
-            "vocoder".to_string(),
-            PhaseConfig {
-                run_on: PhaseRunOn::FinalOnly,
-                when_present: None,
-            },
-        );
         spec
     }
 
@@ -367,7 +393,7 @@ mod tests {
     #[test]
     fn a_package_without_a_final_stage_is_not_text_to_audio() {
         let mut spec = tts_spec();
-        spec.phases.clear();
+        spec.strategy.stages.pop();
 
         assert!(!is_text_to_audio(&spec));
     }

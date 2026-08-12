@@ -189,7 +189,6 @@ def main() -> int:
             "    scheduler_config:\n      kind: ddim\n      num_train_timesteps: 1000\n"
             "      beta_start: 0.00085\n      beta_end: 0.012\n      beta_schedule: scaled_linear\n"
             "      prediction_type: epsilon\n"
-            "  phases:\n    denoiser:\n      run_on: every_step\n"
         )
         latent0.numpy().astype("<f4").tofile(pdir / "sample.f32")
         cond.detach().numpy().astype("<f4").tofile(pdir / "cond.f32")

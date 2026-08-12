@@ -2126,9 +2126,11 @@ impl PipelinePlan {
         if !spec.models.contains_key(&decoder) {
             anyhow::bail!("pipeline decoder '{decoder}' is not declared in models");
         }
-        let prompt_components = prompt_phase_components(spec, &decoder)?;
+        let (mut prompt_components, mut post_decode_components) =
+            strategy_components_around(spec, &decoder);
+        prompt_components.extend(prompt_phase_components(spec, &decoder)?);
         let step_components = step_phase_components(spec, &decoder)?;
-        let post_decode_components = post_decode_components(spec, &decoder)?;
+        post_decode_components.extend(post_decode_components_for_phases(spec, &decoder)?);
         Ok(Self::Autoregressive(AutoregressivePlan {
             decoder,
             prompt_components,
@@ -2329,10 +2331,11 @@ impl PipelinePlan {
 
         // Prompt-phase (`prompt_only`) and post-decode (`final_only`) components,
         // treating both loop decoders as loop components (neither pre nor post).
-        let mut prompt_components = Vec::new();
-        let mut post_decode_components = Vec::new();
+        let (mut prompt_components, mut post_decode_components) =
+            strategy_components_around(spec, &outer);
+        let strategy_owned = strategy_owned_components(&spec.strategy);
         for component in topological_components(spec)? {
-            if component == outer || component == inner {
+            if strategy_owned.contains(&component) {
                 continue;
             }
             // The pre-embedder is driven per-frame inside the outer loop, not as a
@@ -2340,7 +2343,7 @@ impl PipelinePlan {
             if pre_embedder_component.as_deref() == Some(component.as_str()) {
                 continue;
             }
-            match component_phase(spec, &component) {
+            match component_phase(spec, &component)? {
                 PhaseRunOn::PromptOnly => prompt_components.push(component),
                 PhaseRunOn::FinalOnly => post_decode_components.push(component),
                 PhaseRunOn::OnDemand => {}
@@ -2391,7 +2394,7 @@ impl PipelinePlan {
             if component == model {
                 continue;
             }
-            match component_phase(spec, &component) {
+            match component_phase(spec, &component)? {
                 PhaseRunOn::PromptOnly => prompt_components.push(component),
                 PhaseRunOn::OnDemand => {}
                 PhaseRunOn::EveryStep | PhaseRunOn::FinalOnly => anyhow::bail!(
@@ -2548,7 +2551,7 @@ impl PipelinePlan {
             if component == denoiser {
                 continue;
             }
-            match component_phase(spec, &component) {
+            match component_phase(spec, &component)? {
                 PhaseRunOn::PromptOnly => prompt_components.push(component),
                 PhaseRunOn::FinalOnly => final_components.push(component),
                 PhaseRunOn::OnDemand => {}
@@ -2640,15 +2643,15 @@ fn presence_conditions(spec: &PipelineSpec) -> HashMap<String, String> {
         .collect()
 }
 
-/// Collect the `prompt_only`-phase components (everything except `primary`
-/// defaults to prompt-phase), rejecting unsupported phase strings.
+/// Collect auxiliary `prompt_only` components, rejecting unsupported phases.
 fn prompt_phase_components(spec: &PipelineSpec, primary: &str) -> anyhow::Result<Vec<String>> {
     let mut prompt_components = Vec::new();
+    let strategy_owned = strategy_owned_components(&spec.strategy);
     for component in topological_components(spec)? {
-        if component == primary {
+        if component == primary || strategy_owned.contains(&component) {
             continue;
         }
-        match component_phase(spec, &component) {
+        match component_phase(spec, &component)? {
             PhaseRunOn::PromptOnly => prompt_components.push(component),
             PhaseRunOn::EveryStep | PhaseRunOn::OnDemand | PhaseRunOn::FinalOnly => {}
             PhaseRunOn::Other(value) => {
@@ -2672,11 +2675,12 @@ fn prompt_phase_components(spec: &PipelineSpec, primary: &str) -> anyhow::Result
 /// component consume an earlier one's freshly produced output within the step.
 fn step_phase_components(spec: &PipelineSpec, decoder: &str) -> anyhow::Result<Vec<String>> {
     let mut step = Vec::new();
+    let strategy_owned = strategy_owned_components(&spec.strategy);
     for component in topological_components(spec)? {
-        if component == decoder {
+        if component == decoder || strategy_owned.contains(&component) {
             continue;
         }
-        if let PhaseRunOn::EveryStep = component_phase(spec, &component) {
+        if let PhaseRunOn::EveryStep = component_phase(spec, &component)? {
             step.push(component);
         }
     }
@@ -2688,17 +2692,130 @@ fn step_phase_components(spec: &PipelineSpec, decoder: &str) -> anyhow::Result<V
 /// shape from DESIGN.md §20). Kept separate from [`prompt_phase_components`] so
 /// the decode loop's generated code tokens (exposed as `{decoder}.output_ids`)
 /// can be routed into them before they run.
-fn post_decode_components(spec: &PipelineSpec, decoder: &str) -> anyhow::Result<Vec<String>> {
+fn post_decode_components_for_phases(
+    spec: &PipelineSpec,
+    decoder: &str,
+) -> anyhow::Result<Vec<String>> {
     let mut post = Vec::new();
+    let strategy_owned = strategy_owned_components(&spec.strategy);
     for component in topological_components(spec)? {
-        if component == decoder {
+        if component == decoder || strategy_owned.contains(&component) {
             continue;
         }
-        if let PhaseRunOn::FinalOnly = component_phase(spec, &component) {
+
+        if let PhaseRunOn::FinalOnly = component_phase(spec, &component)? {
             post.push(component);
         }
     }
     Ok(post)
+}
+
+fn strategy_owned_components(strategy: &PipelineStrategy) -> BTreeSet<String> {
+    let mut owned = BTreeSet::new();
+    collect_strategy_components(strategy, &mut owned);
+    owned
+}
+
+fn collect_strategy_components(strategy: &PipelineStrategy, owned: &mut BTreeSet<String>) {
+    for component in [
+        strategy.decoder.as_ref(),
+        strategy.model.as_ref(),
+        strategy.denoiser.as_ref(),
+        strategy.outer.as_ref(),
+        strategy.inner.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        owned.insert(component.clone());
+    }
+    for stage in &strategy.stages {
+        collect_strategy_components(&stage.strategy, owned);
+    }
+}
+
+/// For a loop nested in a composite strategy, single-pass stages before the
+/// loop run once before it and stages after the loop run once after it.
+fn strategy_components_around(
+    spec: &PipelineSpec,
+    loop_component: &str,
+) -> (Vec<String>, Vec<String>) {
+    fn recurse(
+        strategy: &PipelineStrategy,
+        loop_component: &str,
+    ) -> Option<(Vec<String>, Vec<String>)> {
+        let stage_index = strategy
+            .stages
+            .iter()
+            .position(|stage| strategy_references(&stage.strategy, loop_component))?;
+        let mut before = Vec::new();
+        let mut after = Vec::new();
+        for stage in &strategy.stages[..stage_index] {
+            collect_strategy_components_in_order(&stage.strategy, &mut before);
+        }
+        if let Some((nested_before, nested_after)) =
+            recurse(&strategy.stages[stage_index].strategy, loop_component)
+        {
+            before.extend(nested_before);
+            after.extend(nested_after);
+        }
+        for stage in &strategy.stages[stage_index + 1..] {
+            collect_strategy_components_in_order(&stage.strategy, &mut after);
+        }
+        Some((before, after))
+    }
+
+    let (before, after) = recurse(&spec.strategy, loop_component).unwrap_or_default();
+    (
+        before
+            .into_iter()
+            .filter(|component| spec.models.contains_key(component))
+            .collect(),
+        after
+            .into_iter()
+            .filter(|component| spec.models.contains_key(component))
+            .collect(),
+    )
+}
+
+fn strategy_references(strategy: &PipelineStrategy, component: &str) -> bool {
+    [
+        strategy.decoder.as_deref(),
+        strategy.model.as_deref(),
+        strategy.denoiser.as_deref(),
+        strategy.outer.as_deref(),
+        strategy.inner.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|model| model == component)
+        || strategy
+            .stages
+            .iter()
+            .any(|stage| strategy_references(&stage.strategy, component))
+}
+
+fn collect_strategy_components_in_order(strategy: &PipelineStrategy, out: &mut Vec<String>) {
+    if strategy.stages.is_empty() {
+        for component in [
+            strategy.model.as_ref(),
+            strategy.decoder.as_ref(),
+            strategy.denoiser.as_ref(),
+            strategy.outer.as_ref(),
+            strategy.inner.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !out.contains(component) {
+                out.push(component.clone());
+            }
+        }
+    } else {
+        for stage in &strategy.stages {
+            collect_strategy_components_in_order(&stage.strategy, out);
+        }
+    }
 }
 
 /// Build a DDIM scheduler from the declared config, or `None` when no scheduler
@@ -2769,14 +2886,16 @@ fn require_component_logits_output(spec: &PipelineSpec, component: &str) -> anyh
     Ok(logits_output)
 }
 
-fn component_phase(spec: &PipelineSpec, component: &str) -> PhaseRunOn {
+fn component_phase(spec: &PipelineSpec, component: &str) -> anyhow::Result<PhaseRunOn> {
     spec.phases
         .get(component)
-        .unwrap_or_else(|| {
-            panic!("validated pipeline model '{component}' must have a pipeline.phases entry")
+        .map(|phase| phase.run_on.clone())
+        .with_context(|| {
+            format!(
+                "auxiliary pipeline component '{component}' is missing lifecycle scheduling; \
+                 declare 'pipeline.phases.{component}.run_on'"
+            )
         })
-        .run_on
-        .clone()
 }
 
 /// The pipeline component that produces an embeds-driven `decoder`'s
@@ -2850,7 +2969,7 @@ fn endpoint_component(endpoint: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use onnx_genai_metadata::{PhaseConfig, PipelineComponentSpec, PipelineStrategyStage};
+    use onnx_genai_metadata::{PipelineComponentSpec, PipelineStrategyStage};
     use std::collections::BTreeMap;
 
     fn component(role: &str) -> PipelineComponentSpec {
@@ -2953,6 +3072,20 @@ mod tests {
             other => panic!("expected a nested_autoregressive plan, got {other:?}"),
         }
         Ok(())
+    }
+
+    #[test]
+    fn missing_auxiliary_phase_returns_actionable_error() {
+        let mut spec = nested_autoregressive_spec(Some("code_embeds".to_string()));
+        spec.phases.remove("embedding");
+
+        let error = component_phase(&spec, "embedding").expect_err("missing phase must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("pipeline.phases.embedding.run_on"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -3100,9 +3233,6 @@ pipeline:
   strategy:
     kind: autoregressive
     decoder: decoder
-  phases:
-    decoder:
-      run_on: every_step
 "#,
         )?;
 
@@ -3222,22 +3352,7 @@ pipeline:
                     },
                 ],
             },
-            phases: BTreeMap::from([
-                (
-                    "vision_encoder".to_string(),
-                    PhaseConfig {
-                        run_on: PhaseRunOn::PromptOnly,
-                        when_present: None,
-                    },
-                ),
-                (
-                    "decoder".to_string(),
-                    PhaseConfig {
-                        run_on: PhaseRunOn::EveryStep,
-                        when_present: None,
-                    },
-                ),
-            ]),
+            phases: BTreeMap::new(),
             vision: None,
             positions: None,
         };

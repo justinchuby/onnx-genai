@@ -366,11 +366,6 @@ def write_metadata(path: Path) -> None:
           kind: autoregressive
           decoder: decoder
           max_tokens: 4
-  phases:
-    encoder:
-      run_on: prompt_only
-    decoder:
-      run_on: every_step
 """
     )
 

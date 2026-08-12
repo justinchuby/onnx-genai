@@ -196,7 +196,6 @@ def write_metadata(directory: Path, block_length: int | None, cfg_scale: float =
     ]
     if block_length is not None:
         lines.append(f"      block_length: {block_length}")
-    lines += ["  phases:", "    denoiser:", "      run_on: every_step"]
     (directory / "inference_metadata.yaml").write_text("\n".join(lines) + "\n")
 
 

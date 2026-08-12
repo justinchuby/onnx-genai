@@ -435,12 +435,8 @@ pipeline:
         sequence_source: inputs_embeds
         inputs_embeds_input: inputs_embeds
         logits_output: logits
-        kv_inputs:
-          - past_key_values.0.key
-          - past_key_values.0.value
-        kv_outputs:
-          - present.0.key
-          - present.0.value
+        kv_inputs: [past_key_values.0.key, past_key_values.0.value]
+        kv_outputs: [present.0.key, present.0.value]
   dataflow:
     - from: vision_encoder.image_features
       to: embedding.image_features
@@ -457,21 +453,13 @@ pipeline:
         strategy:
           kind: single_pass
           model: vision_encoder
-      - name: fuse_embeddings
-        strategy:
-          kind: single_pass
-          model: embedding
       - name: decode
         strategy:
           kind: autoregressive
           decoder: decoder
           max_tokens: 4
   phases:
-    vision_encoder:
-      run_on: prompt_only
     embedding:
-      run_on: every_step
-    decoder:
       run_on: every_step
   vision:
     image_placeholder_token_id: 7
@@ -521,12 +509,8 @@ pipeline:
         sequence_source: inputs_embeds
         inputs_embeds_input: inputs_embeds
         logits_output: logits
-        kv_inputs:
-          - past_key_values.0.key
-          - past_key_values.0.value
-        kv_outputs:
-          - present.0.key
-          - present.0.value
+        kv_inputs: [past_key_values.0.key, past_key_values.0.value]
+        kv_outputs: [present.0.key, present.0.value]
   dataflow:
     - from: vision_encoder.image_features
       to: embedding.image_features
@@ -543,21 +527,13 @@ pipeline:
         strategy:
           kind: single_pass
           model: vision_encoder
-      - name: fuse_embeddings
-        strategy:
-          kind: single_pass
-          model: embedding
       - name: decode
         strategy:
           kind: autoregressive
           decoder: decoder
           max_tokens: 4
   phases:
-    vision_encoder:
-      run_on: prompt_only
     embedding:
-      run_on: every_step
-    decoder:
       run_on: every_step
   vision:
     image_placeholder_token_id: 7

@@ -75,7 +75,5 @@ pipeline:
   phases:
     text_encoder:
       run_on: prompt_only # Encode prompt text once before the denoise loop.
-    denoiser:
-      run_on: every_step # Invoke the UNet for every iterative scheduler step.
     vae_decoder:
       run_on: final_only # Decode pixels only after the last latent update.
