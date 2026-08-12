@@ -1,6 +1,6 @@
 use super::*;
 
-use super::kv_commit::KvCommitLayout;
+use super::kv_commit::{self, KvBindingGeometry, KvCommitLayout};
 
 /// Resolve the physical KV-cache layout for the native CUDA binding layer.
 ///
@@ -1568,12 +1568,49 @@ impl DecodeCudaState {
             .collect()
     }
 
+    /// Per-binding [`KvBindingGeometry`] for a rank-4 BNSH KV binding
+    /// `[batch, kv_heads, capacity, head_dim]`, so the shared
+    /// [`kv_commit`] geometry (not a duplicated inline formula) decides the
+    /// committed byte ranges. Returns the geometry and the full-context
+    /// `capacity` (grow-axis stride) the layout is committed against.
+    fn kv_binding_geometry(
+        &self,
+        binding: &DeviceIoBinding,
+    ) -> anyhow::Result<(KvBindingGeometry, usize)> {
+        let shape = binding.physical_shape();
+        if shape.len() != 4 {
+            bail!(
+                "VMM-backed CUDA KV binding '{}' must be rank 4, got {:?}",
+                binding.input_name(),
+                shape
+            );
+        }
+        let elem_bytes = binding.dtype.checked_storage_bytes(1).with_context(|| {
+            format!(
+                "VMM-backed CUDA KV '{}' has unsized dtype {:?}",
+                binding.input_name(),
+                binding.dtype
+            )
+        })?;
+        let geometry = KvBindingGeometry {
+            kv_heads: shape[1],
+            head_dim: shape[3],
+            elem_bytes,
+        };
+        Ok((geometry, shape[2]))
+    }
+
     /// KV-only commit requests for the seq-major fixed path: commit the dense
-    /// token prefix `[0, committed_len)` for each KV binding. The mask is fully
-    /// committed at construction and never grows here, so — unlike
-    /// [`Self::vmm_growth_requests`] — no mask range is appended. Re-committing
-    /// the already-mapped prefix is idempotent; the governor only bills the newly
-    /// mapped granules.
+    /// live-prefix ranges [`kv_commit::live_prefix_ranges`] computes for
+    /// [`KvCommitLayout::SeqMajor`] — a single contiguous run
+    /// `0..(committed_len × kv_heads × head_dim × elem)` per KV binding, because
+    /// seq-major bytes are token-contiguous. This is the *same* geometry unit
+    /// the driver-level residency measurement (`vmm_kv_layout_residency_gpu`) and
+    /// the `kv_commit.rs` unit tests exercise, so the live commit path and the
+    /// measured floor cannot drift apart. The mask is fully committed at
+    /// construction and never grows here, so — unlike [`Self::vmm_growth_requests`]
+    /// — no mask range is appended. Re-committing the already-mapped prefix is
+    /// idempotent; the governor only bills the newly mapped granules.
     fn seq_major_kv_commit_requests(
         &self,
         committed_len: usize,
@@ -1581,26 +1618,23 @@ impl DecodeCudaState {
         let mut requested = Vec::<(usize, usize, usize)>::new();
         for index in self.kv_binding_range.clone() {
             let binding = &self.bindings[index];
-            let mut shape = binding.physical_shape().to_vec();
-            if shape.len() != 4 {
-                bail!(
-                    "seq-major VMM-backed CUDA KV binding '{}' must be rank 4, got {:?}",
-                    binding.input_name(),
-                    shape
-                );
-            }
-            // Seq-major bytes are token-contiguous, so the committed dense prefix
-            // of `committed_len` tokens is exactly the byte extent of a
-            // `[.., committed_len, ..]` shaped tensor.
-            shape[2] = committed_len;
-            let bytes = checked_shape_bytes(&shape, binding.dtype).with_context(|| {
+            let (geometry, capacity) = self.kv_binding_geometry(binding)?;
+            let ranges = kv_commit::live_prefix_ranges(
+                KvCommitLayout::SeqMajor,
+                geometry,
+                capacity,
+                committed_len,
+            )
+            .with_context(|| {
                 format!(
-                    "seq-major VMM-backed CUDA KV '{}' commit size overflows for shape {:?}",
-                    binding.input_name(),
-                    shape
+                    "seq-major VMM-backed CUDA KV '{}' dense-prefix commit ranges overflow \
+                     (capacity {capacity}, committed_len {committed_len})",
+                    binding.input_name()
                 )
             })?;
-            requested.push((index, 0, bytes));
+            for range in ranges {
+                requested.push((index, range.start, range.end - range.start));
+            }
         }
         Ok(requested)
     }
@@ -1904,6 +1938,26 @@ impl DecodeCudaState {
             .context("size native CUDA KV mapped-growth transaction")
     }
 
+    /// Growth commit requests for the **head-major** (and non-fixed-stride)
+    /// VMM path: a single flat range `0..(new_capacity × kv_heads × head_dim ×
+    /// elem)` per KV binding, plus the mask island.
+    ///
+    /// This is deliberately left as the flat **bucket** range rather than routed
+    /// through [`kv_commit::live_prefix_ranges`], and it is byte-identical to the
+    /// dense head-major geometry here: head-major grows a *packed* bucket whose
+    /// per-head stride is `new_capacity` (the bucket, not a fixed full context),
+    /// so each head's stripe is contiguous with the next and the `kv_heads`
+    /// live-prefix fragments `live_prefix_ranges` would return tile the same
+    /// `[0, bucket_bytes)` run — they touch exactly the same physical granules.
+    /// The `kv_heads×` scatter that separates head-major from seq-major only
+    /// appears on a *fixed full-context* stride (where a head stripe is
+    /// `max_len × head_dim × elem` apart, crossing a granule once
+    /// `capacity × head_dim × elem ≥ granule`, i.e. ≈8192 tokens at head_dim
+    /// 128/fp16, #776); the growing bucket keeps head-major dense, so its dense
+    /// ranges equal its bucket ranges and it stays byte-identical (see
+    /// `docs/MEMORY_ARCHITECTURE.md`, "KV layout and residency"). Seq-major
+    /// instead reports a fixed full-context stride and commits its dense prefix
+    /// through [`Self::seq_major_kv_commit_requests`].
     fn vmm_growth_requests(
         &self,
         new_capacity: usize,

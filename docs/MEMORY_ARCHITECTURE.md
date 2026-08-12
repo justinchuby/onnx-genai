@@ -626,13 +626,36 @@ measured 2 MiB CUDA granule:
 > either way) is reachable only via the #755 opt-out. One residency caveat
 > remains orthogonal to this shape/stride change:
 >
-> * **Committed physical bytes are still equal head vs seq** (100,663,296 both
->   under the default VMM arena; 786,432 both under legacy realloc), because the
->   engine still commits flat bucket/granule ranges rather than the dense
->   live-prefix ranges `kv_commit.rs::live_prefix_ranges` computes. The
->   `kv_heads×` residency win is therefore still driver-level only
->   (`vmm_kv_layout_residency_gpu`); wiring the dense-prefix commit into the live
->   path is the documented next step (shared with token-major and #777).
+> * **The dense-prefix commit is now wired into the live seq-major path
+>   (dense-prefix-commit).** `DecodeCudaState::seq_major_kv_commit_requests`
+>   consumes `kv_commit.rs::live_prefix_ranges` directly instead of duplicating
+>   the byte arithmetic, so the engine's committed seq-major geometry and the
+>   driver-level residency measurement (`vmm_kv_layout_residency_gpu`) are
+>   single-sourced and cannot drift. Head-major stays byte-identical on its flat
+>   bucket commit (`vmm_growth_requests`): on a *growing packed bucket* its
+>   per-head stride is the bucket, so the `kv_heads` live-prefix fragments tile
+>   the same contiguous `[0, bucket_bytes)` run — head-major's dense ranges
+>   **equal** its bucket ranges, and it is left alone.
+> * **Committed physical bytes remain equal head vs seq on this harness**
+>   (measured `dense-prefix-commit`, process-isolated, all four vmm-inplace
+>   configurations: 100,663,296 both; 786,432 both under legacy realloc), and
+>   this is now understood to be the **granule floor, not an un-wired commit**.
+>   On qwen2.5-0.5b (`kv_heads = 2`, `head_dim = 64`, fp16, hard-max context
+>   512) a *single binding's entire reservation* is `512 × 2 × 64 × 2 =
+>   131,072 B = 128 KiB`, far below the 2 MiB granule, so **both** layouts pin
+>   at exactly one granule per binding — `48 bindings × 2 MiB = 100,663,296 B`,
+>   which **is** the `layers × 2 = 48`-granule floor. Seq-major already sits on
+>   that floor; head-major coincides because its 64-token bucket is also
+>   sub-granule. The `kv_heads×` separation only materializes once a single
+>   head's live stripe crosses a granule — `capacity × head_dim × elem ≥ 2 MiB`,
+>   i.e. ≈8,192 tokens at head_dim 128/fp16 (the measured head-major crossover,
+>   #776) — which a 512-max, 48-token run never approaches. So the dense-prefix
+>   commit is correct and floor-faithful, but the driver-measured `kv_heads×`
+>   residency win (`vmm_kv_layout_residency_gpu`, qwen14b at 32,768-token stride)
+>   is **not** reproducible end-to-end on the qwen2.5-0.5b harness: its geometry
+>   never leaves a single granule. Demonstrating it end-to-end needs a model/
+>   context whose per-head stripe exceeds a granule (large `head_dim`/context),
+>   not a change to this commit path.
 > * **A fourth place the layout lives — the engine-side non-kernel KV
 >   consumers — is now gated (`seqmajor-physical-shape`).** Beyond kernel
 >   indexing, commit geometry, and growth byte geometry, the device
@@ -650,9 +673,12 @@ measured 2 MiB CUDA granule:
 >   path where our own GQA kernel is the sole consumer of the device KV; the
 >   moment a `present_*`-reading consumer (host mirror / paged prefix reuse) is
 >   engaged, the runtime refuses. Prefix sharing (#777/#809) therefore does not
->   yet "fall out" for free under seq-major: its device seed is a head-major
+>   > yet "fall out" for free under seq-major: its device seed is a head-major
 >   consumer, so realizing it under seq-major requires teaching that seed the
->   BSNH byte geometry — tracked with the dense-prefix commit above.
+>   BSNH byte geometry. The dense-prefix commit above does **not** address this
+>   (it changes only the commit range geometry, not the seed/host-mirror stride
+>   arithmetic), so the seq-major refusal on `present_*`-reading consumers still
+>   stands and the BSNH seed remains a separate follow-on.
 >
 > Wall-clock is intentionally not reported: deterministic counters answer the
 > invalidation question, while this shared box has shown large timing variance.
