@@ -134,17 +134,14 @@ pipeline:
         strategy:
           kind: single_pass # Invoke one component once when its phase gate allows.
           model: vision_encoder # Component name from `pipeline.models`.
-        run_on: prompt_only # Vision features are computed only during prompt prefill.
       - name: embed_tokens # Stage that turns token IDs into hidden vectors.
         strategy:
           kind: single_pass # One embedding graph invocation per pipeline step.
           model: token_embedding # Component name from `pipeline.models`.
-        run_on: every_step # Runs for prompt tokens and each generated token.
       - name: decode # Stage that produces logits and advances KV state.
         strategy:
           kind: autoregressive # Runtime-managed token-by-token generation loop.
           decoder: decoder # Decoder component named above.
-        run_on: every_step # Runs during prompt processing and token decoding.
 
   # Per-component phase gates repeat the execution contract at component level.
   phases:

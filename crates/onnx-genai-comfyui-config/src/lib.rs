@@ -540,6 +540,7 @@ fn build_pipeline_metadata(
         "to": format!("denoiser.{DENOISER_SAMPLE_INPUT}"),
     })];
     let mut phases = Map::new();
+    phases.insert("denoiser".into(), json!({ "run_on": "every_step" }));
 
     if has_text_encoder {
         models.insert(
@@ -593,9 +594,7 @@ fn build_pipeline_metadata(
     pipeline.insert("models".into(), Value::Object(models));
     pipeline.insert("dataflow".into(), Value::Array(dataflow));
     pipeline.insert("strategy".into(), Value::Object(strategy));
-    if !phases.is_empty() {
-        pipeline.insert("phases".into(), Value::Object(phases));
-    }
+    pipeline.insert("phases".into(), Value::Object(phases));
 
     let root = json!({ "pipeline": Value::Object(pipeline) });
     Ok(root)

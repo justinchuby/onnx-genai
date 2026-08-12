@@ -23,22 +23,63 @@ impl Default for RuntimeCapabilities {
     }
 }
 
-/// Validate that all required capabilities are supported.
+/// Validate the metadata document and required runtime capabilities.
 pub fn validate(
     metadata: &InferenceMetadata,
     runtime: &RuntimeCapabilities,
 ) -> Result<(), Vec<String>> {
-    let unsupported: Vec<String> = metadata
-        .required_capabilities
-        .iter()
-        .filter(|cap| !runtime.supported.contains(cap))
-        .cloned()
-        .collect();
+    let mut errors = validate_metadata(metadata).err().unwrap_or_default();
+    errors.extend(
+        metadata
+            .required_capabilities
+            .iter()
+            .filter(|cap| !runtime.supported.contains(cap))
+            .cloned(),
+    );
 
-    if unsupported.is_empty() {
+    if errors.is_empty() {
         Ok(())
     } else {
-        Err(unsupported)
+        Err(errors)
+    }
+}
+
+/// Validate document-level invariants independent of runtime capabilities.
+pub fn validate_metadata(metadata: &InferenceMetadata) -> Result<(), Vec<String>> {
+    let mut errors = Vec::new();
+
+    if let Err(error) = validate_composite_io(metadata) {
+        errors.push(error);
+    }
+
+    if let Some(pipeline) = &metadata.pipeline
+        && let Err(error) = validate_pipeline_spec(pipeline)
+    {
+        errors.extend(error.errors);
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+pub(crate) fn validate_composite_io(metadata: &InferenceMetadata) -> Result<(), String> {
+    if metadata.pipeline.is_some()
+        && metadata
+            .model
+            .as_ref()
+            .and_then(|model| model.io.as_ref())
+            .is_some()
+    {
+        Err(
+            "model.io is only valid for bare single-model metadata; when pipeline is present, \
+             declare decoder I/O at pipeline.models.<component>.io"
+                .to_string(),
+        )
+    } else {
+        Ok(())
     }
 }
 
@@ -154,6 +195,14 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
         if !spec.models.contains_key(phase_component) {
             errors.push(format!(
                 "phase references unknown component: {phase_component}"
+            ));
+        }
+    }
+    for model_component in spec.models.keys() {
+        if !spec.phases.contains_key(model_component) {
+            errors.push(format!(
+                "pipeline model {model_component} must have a pipeline.phases entry declaring \
+                 run_on and optional when_present"
             ));
         }
     }

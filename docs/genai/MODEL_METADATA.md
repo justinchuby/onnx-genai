@@ -165,8 +165,11 @@ keeps strict canonical validation.
 
 ## Native decoder and proposer execution contracts
 
-`model.io` (target decoder) and `speculative.io` (standalone proposer) use the
-same explicit, model-agnostic contract:
+For a bare decoder-only document, `model.io` is the target decoder contract.
+For a composite document, each graph declares its contract only at
+`pipeline.models.<component>.io`; top-level `model.io` is invalid when
+`pipeline` is present. `speculative.io` remains the standalone proposer
+contract. All three locations use the same explicit, model-agnostic fields:
 
 - `sequence_source`: `token_ids` or `inputs_embeds`.
 - `token_input` / `inputs_embeds_input`: exact graph port selected by

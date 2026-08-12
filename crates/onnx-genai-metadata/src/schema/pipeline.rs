@@ -14,8 +14,9 @@ pub struct PipelineSpec {
     /// Loop and execution strategy for the pipeline.
     pub strategy: PipelineStrategy,
 
-    /// Optional per-component phase gating, keyed by component name.
-    #[serde(default)]
+    /// Required per-component lifecycle scheduling, keyed by component name.
+    ///
+    /// Every entry in `models` must have exactly one corresponding phase entry.
     pub phases: BTreeMap<String, PhaseConfig>,
 
     /// Vision-language model token-expansion contract.
@@ -807,6 +808,8 @@ pub struct PrefillEmbedderSpec {
 
 /// Named child stage of a composite pipeline strategy.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(deny_unknown_fields)]
 pub struct PipelineStrategyStage {
     /// Non-empty stage name unique within its containing composite.
     #[schemars(length(min = 1))]
@@ -814,7 +817,4 @@ pub struct PipelineStrategyStage {
 
     /// Execution strategy for this stage.
     pub strategy: Box<PipelineStrategy>,
-
-    /// Optional phase gate for the stage.
-    pub run_on: Option<PhaseRunOn>,
 }

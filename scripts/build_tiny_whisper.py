@@ -361,13 +361,11 @@ def write_metadata(path: Path) -> None:
         strategy:
           kind: single_pass
           model: encoder
-        run_on: prompt_only
       - name: decode_transcript
         strategy:
           kind: autoregressive
           decoder: decoder
           max_tokens: 4
-        run_on: every_step
   phases:
     encoder:
       run_on: prompt_only

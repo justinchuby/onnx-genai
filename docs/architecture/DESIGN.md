@@ -1097,6 +1097,7 @@ pipeline:
     model_name:
       filename: "model.onnx"
       type: encoder | decoder | denoiser | vocoder | classifier | embedder
+      io: {}  # This component's graph I/O contract
       # Optional: execution constraints
       device_preference: gpu | npu | cpu
 
@@ -1107,16 +1108,22 @@ pipeline:
       dtype: fp16 | fp32 | int64 | string
       device_transfer: true | false  # needs D2H or H2D copy?
 
-  # Execution strategy
+  # HOW the pipeline executes: control structure, nesting, order, and loop kind.
   strategy:
     kind: autoregressive | iterative | single_pass | composite
     # ... kind-specific parameters below
 
-  # Per-model phase gating (when does each model run?)
+  # WHEN every model runs and under what optional presence condition.
+  # Every model above must have exactly one entry here.
   phases:
     model_name:
       run_on: prompt_only | every_step | final_only | on_demand
+      when_present: optional_input_key
 ```
+
+Composite metadata declares graph I/O only at
+`pipeline.models.<component>.io`. Top-level `model.io` is reserved for bare
+single-decoder documents and is invalid when `pipeline` is present.
 
 ### 20.2 Strategy Definitions
 
@@ -1178,11 +1185,12 @@ strategy:
   stages:
     - name: encode
       strategy: { kind: single_pass, model: encoder }
-      run_on: prompt_only
     - name: decode
       strategy: { kind: autoregressive, decoder: decoder }
-      run_on: every_step
 ```
+
+Stages describe only nested execution structure and order. Component lifecycle
+scheduling is declared once in `pipeline.phases`; stages never carry `run_on`.
 
 ### 20.3 Concrete Pipeline Examples
 
@@ -1302,15 +1310,19 @@ that frame.
 strategy:
   kind: composite
   stages:
-    - {name: fuse, strategy: {kind: single_pass, model: embedding}, run_on: prompt_only}
+    - {name: fuse, strategy: {kind: single_pass, model: embedding}}
     - name: generate_codes
       strategy:
         kind: nested_autoregressive
         outer: talker            # AR outer decoder (one step per audio frame)
         inner: code_predictor    # AR inner decoder (num_code_groups steps per frame)
         num_code_groups: 4       # inner-loop depth (RVQ residual codebooks)
-      run_on: every_step
-    - {name: vocode, strategy: {kind: single_pass, model: vocoder}, run_on: final_only}
+    - {name: vocode, strategy: {kind: single_pass, model: vocoder}}
+phases:
+  embedding: {run_on: prompt_only}
+  talker: {run_on: every_step}
+  code_predictor: {run_on: on_demand}
+  vocoder: {run_on: final_only}
 dataflow:
   # inner step-0 seed: talker frame hidden state → inner decoder input embeds
   - {from: talker.last_hidden_state, to: code_predictor.inputs_embeds}
@@ -1612,9 +1624,13 @@ pipeline:
   strategy:
     kind: composite
     stages:
-      - { name: encode_vision,   strategy: { kind: single_pass,    model: vision_encoder }, run_on: prompt_only }
-      - { name: fuse_embeddings, strategy: { kind: single_pass,    model: embedding },      run_on: prompt_only }
-      - { name: decode,          strategy: { kind: autoregressive, decoder: decoder },      run_on: every_step }
+      - { name: encode_vision,   strategy: { kind: single_pass,    model: vision_encoder } }
+      - { name: fuse_embeddings, strategy: { kind: single_pass,    model: embedding } }
+      - { name: decode,          strategy: { kind: autoregressive, decoder: decoder } }
+  phases:
+    vision_encoder: { run_on: prompt_only }
+    embedding: { run_on: every_step }
+    decoder: { run_on: every_step }
 ```
 
 The engine handles two seams unique to `inputs_embeds` fusion (see

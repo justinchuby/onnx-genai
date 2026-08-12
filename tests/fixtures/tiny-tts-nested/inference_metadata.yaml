@@ -58,12 +58,10 @@ pipeline:
           inner_embedding_output: code_embeds
           num_code_groups: 4
           max_tokens: 3
-        run_on: every_step
       - name: vocode
         strategy:
           kind: single_pass
           model: vocoder
-        run_on: final_only
   phases:
     talker:
       run_on: every_step

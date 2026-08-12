@@ -86,28 +86,23 @@ pipeline:
         strategy:
           kind: single_pass # One frontend invocation per scheduled audio chunk.
           model: audio_features # Component name from `pipeline.models`.
-        run_on: every_step # Eligible at every streaming pipeline step.
       - name: voice_activity_detection # Optional speech-detection stage.
         strategy:
           kind: single_pass # Invoke the VAD graph once per explicit request.
           model: vad # Component name from `pipeline.models`.
-        run_on: on_demand # Application must explicitly request this stage.
       - name: encode_audio_chunk # Acoustic encoding stage.
         strategy:
           kind: single_pass # One encoder invocation for each scheduled chunk.
           model: audio_encoder # Component name from `pipeline.models`.
-        run_on: every_step # Eligible for every streaming chunk.
       - name: predict_transcript_symbol # RNN-T prediction-network stage.
         strategy:
           kind: autoregressive # Runtime-managed token/symbol loop declaration.
           decoder: prediction_network # Decoder component named above.
           max_tokens: 10 # Maximum generated symbols for this stage; count, not milliseconds.
-        run_on: every_step # Eligible at every streaming pipeline step.
       - name: join_audio_and_symbol # Combine acoustic and prediction features.
         strategy:
           kind: single_pass # One joiner invocation when the stage is reached.
           model: joiner # Component name from `pipeline.models`.
-        run_on: every_step # Eligible at every streaming pipeline step.
 
   # Component-level phase and request-presence gates.
   phases:

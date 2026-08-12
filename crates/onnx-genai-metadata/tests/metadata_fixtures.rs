@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use onnx_genai_metadata::{
     InferenceMetadata, MetadataError, PipelineStrategyKind, RuntimeCapabilities,
-    SequenceLengthScalarBroadcast, load_metadata, load_pipeline_spec, validate,
+    SequenceLengthScalarBroadcast, load_metadata, load_pipeline_spec, validate, validate_metadata,
     validate_pipeline_spec,
 };
 
@@ -97,6 +97,128 @@ fn parses_valid_json_fixture() {
             .expect("kv_cache config")
             .dtype,
         ["fp16", "fp8_e5m2"]
+    );
+}
+
+#[test]
+fn composite_metadata_rejects_top_level_model_io() {
+    let yaml = r#"
+model:
+  io:
+    token_input: input_ids
+pipeline:
+  models:
+    decoder:
+      filename: decoder.onnx
+      type: decoder
+      io:
+        token_input: input_ids
+  strategy:
+    kind: autoregressive
+    decoder: decoder
+  phases:
+    decoder:
+      run_on: every_step
+"#;
+    let metadata: InferenceMetadata = serde_yaml::from_str(yaml).expect("metadata parses");
+    let errors = validate_metadata(&metadata).expect_err("duplicate composite I/O is rejected");
+    assert!(
+        errors.iter().any(|error| {
+            error.contains("model.io is only valid for bare single-model metadata")
+                && error.contains("pipeline.models.<component>.io")
+        }),
+        "unexpected errors: {errors:?}"
+    );
+
+    let instance: serde_json::Value = serde_yaml::from_str(yaml).expect("YAML converts to JSON");
+    assert!(
+        schema_validator().validate(&instance).is_err(),
+        "JSON schema must reject model.io together with pipeline"
+    );
+}
+
+#[test]
+fn metadata_loader_rejects_top_level_io_for_pipeline() {
+    let error = load_metadata(&crate_fixture("composite_top_level_io_invalid.yaml"))
+        .expect_err("loader rejects duplicate composite I/O");
+    let message = error.to_string();
+    assert!(
+        message.contains("model.io is only valid for bare single-model metadata")
+            && message.contains("pipeline.models.<component>.io"),
+        "{message}"
+    );
+}
+
+#[test]
+fn bare_decoder_metadata_accepts_top_level_model_io() {
+    let metadata: InferenceMetadata = serde_yaml::from_str(
+        r#"
+model:
+  io:
+    token_input: input_ids
+    logits_output: logits
+"#,
+    )
+    .expect("bare decoder metadata parses");
+    validate_metadata(&metadata).expect("bare decoder model.io remains valid");
+}
+
+#[test]
+fn pipeline_validation_requires_phase_for_every_model() {
+    let metadata: InferenceMetadata = serde_yaml::from_str(
+        r#"
+pipeline:
+  models:
+    encoder:
+      filename: encoder.onnx
+      type: encoder
+    decoder:
+      filename: decoder.onnx
+      type: decoder
+  strategy:
+    kind: autoregressive
+    decoder: decoder
+  phases:
+    decoder:
+      run_on: every_step
+"#,
+    )
+    .expect("metadata parses");
+    let error = validate_pipeline_spec(metadata.pipeline.as_ref().expect("pipeline"))
+        .expect_err("missing component phase is rejected");
+    assert!(
+        error.errors.iter().any(|error| {
+            error.contains("pipeline model encoder must have a pipeline.phases entry")
+        }),
+        "unexpected errors: {:?}",
+        error.errors
+    );
+}
+
+#[test]
+fn pipeline_strategy_stage_rejects_run_on() {
+    let error = serde_yaml::from_str::<InferenceMetadata>(
+        r#"
+pipeline:
+  models:
+    encoder:
+      filename: encoder.onnx
+      type: encoder
+  strategy:
+    kind: composite
+    stages:
+      - name: encode
+        strategy: { kind: single_pass, model: encoder }
+        run_on: prompt_only
+  phases:
+    encoder:
+      run_on: prompt_only
+"#,
+    )
+    .expect_err("stage-level run_on is no longer supported");
+    assert!(
+        error.to_string().contains("unknown field `run_on`"),
+        "{error}"
     );
 }
 
@@ -506,6 +628,11 @@ pipeline:
   strategy:
     kind: autoregressive
     decoder: decoder
+  phases:
+    encoder:
+      run_on: prompt_only
+    decoder:
+      run_on: every_step
 ";
     let metadata: onnx_genai_metadata::InferenceMetadata =
         serde_yaml::from_str(yaml).expect("parses");
@@ -541,6 +668,13 @@ pipeline:
   strategy:
     kind: autoregressive
     decoder: decoder
+  phases:
+    encoder_a:
+      run_on: prompt_only
+    encoder_b:
+      run_on: prompt_only
+    decoder:
+      run_on: every_step
 ";
     let metadata: onnx_genai_metadata::InferenceMetadata =
         serde_yaml::from_str(yaml).expect("parses");
@@ -605,6 +739,9 @@ pipeline:
   strategy:
     kind: autoregressive
     decoder: decoder
+  phases:
+    decoder:
+      run_on: every_step
   vision:
     image_placeholder_token_id: 32000
     tokens_per_tile: 256
@@ -640,6 +777,9 @@ pipeline:
     num_steps: 3
     timestep_input: t
     timesteps: [0.1, 0.2]
+  phases:
+    denoiser:
+      run_on: every_step
 ";
     let metadata: onnx_genai_metadata::InferenceMetadata =
         serde_yaml::from_str(yaml).expect("parses");
@@ -866,6 +1006,9 @@ pipeline:
   strategy:
     kind: autoregressive
     decoder: decoder
+  phases:
+    decoder:
+      run_on: every_step
   positions:
     input: position_ids
     rank: 1

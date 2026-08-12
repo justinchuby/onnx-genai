@@ -52,7 +52,7 @@ pub use scheduler::*;
     title = "ONNX Inference Metadata",
     description = "Portable, runtime-agnostic inference metadata for ONNX generative models. All top-level sections are optional, and unknown fields are permitted for forward-compatible schema evolution.",
     extend("$id" = "https://github.com/onnx/onnx/issues/8184"),
-    transform = schema_helpers::inference_metadata_aliases
+    transform = schema_helpers::inference_metadata_constraints
 )]
 pub struct InferenceMetadata {
     /// Schema version of this inference-metadata document, e.g. `"v1"`.
@@ -472,7 +472,7 @@ mod schema_helpers {
     use schemars::Schema;
     use serde_json::{Value, json};
 
-    pub(super) fn inference_metadata_aliases(schema: &mut Schema) {
+    pub(super) fn inference_metadata_constraints(schema: &mut Schema) {
         add_alias(
             schema,
             "speculative",
@@ -480,6 +480,19 @@ mod schema_helpers {
             "Deprecated alias for `speculative`.",
         );
         forbid_both(schema, "speculative", "speculator_config");
+        schema.ensure_object().insert(
+            "allOf".into(),
+            json!([{
+                "not": {
+                    "required": ["pipeline", "model"],
+                    "properties": {
+                        "model": {
+                            "required": ["io"]
+                        }
+                    }
+                }
+            }]),
+        );
     }
 
     pub(super) fn speculator_config_aliases(schema: &mut Schema) {

@@ -13,3 +13,6 @@ pipeline:
     scheduler_config:
       kind: masked_diffusion
       mask_token_id: 1
+  phases:
+    denoiser:
+      run_on: every_step

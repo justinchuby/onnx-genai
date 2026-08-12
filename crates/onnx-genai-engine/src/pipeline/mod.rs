@@ -2560,7 +2560,7 @@ impl PipelinePlan {
             if pre_embedder_component.as_deref() == Some(component.as_str()) {
                 continue;
             }
-            match component_phase(spec, &component, &outer) {
+            match component_phase(spec, &component) {
                 PhaseRunOn::PromptOnly => prompt_components.push(component),
                 PhaseRunOn::FinalOnly => post_decode_components.push(component),
                 PhaseRunOn::OnDemand => {}
@@ -2611,7 +2611,7 @@ impl PipelinePlan {
             if component == model {
                 continue;
             }
-            match component_phase(spec, &component, &model) {
+            match component_phase(spec, &component) {
                 PhaseRunOn::PromptOnly => prompt_components.push(component),
                 PhaseRunOn::OnDemand => {}
                 PhaseRunOn::EveryStep | PhaseRunOn::FinalOnly => anyhow::bail!(
@@ -2768,7 +2768,7 @@ impl PipelinePlan {
             if component == denoiser {
                 continue;
             }
-            match component_phase(spec, &component, &denoiser) {
+            match component_phase(spec, &component) {
                 PhaseRunOn::PromptOnly => prompt_components.push(component),
                 PhaseRunOn::FinalOnly => final_components.push(component),
                 PhaseRunOn::OnDemand => {}
@@ -2868,7 +2868,7 @@ fn prompt_phase_components(spec: &PipelineSpec, primary: &str) -> anyhow::Result
         if component == primary {
             continue;
         }
-        match component_phase(spec, &component, primary) {
+        match component_phase(spec, &component) {
             PhaseRunOn::PromptOnly => prompt_components.push(component),
             PhaseRunOn::EveryStep | PhaseRunOn::OnDemand | PhaseRunOn::FinalOnly => {}
             PhaseRunOn::Other(value) => {
@@ -2896,7 +2896,7 @@ fn step_phase_components(spec: &PipelineSpec, decoder: &str) -> anyhow::Result<V
         if component == decoder {
             continue;
         }
-        if let PhaseRunOn::EveryStep = component_phase(spec, &component, decoder) {
+        if let PhaseRunOn::EveryStep = component_phase(spec, &component) {
             step.push(component);
         }
     }
@@ -2914,7 +2914,7 @@ fn post_decode_components(spec: &PipelineSpec, decoder: &str) -> anyhow::Result<
         if component == decoder {
             continue;
         }
-        if let PhaseRunOn::FinalOnly = component_phase(spec, &component, decoder) {
+        if let PhaseRunOn::FinalOnly = component_phase(spec, &component) {
             post.push(component);
         }
     }
@@ -2989,31 +2989,14 @@ fn require_component_logits_output(spec: &PipelineSpec, component: &str) -> anyh
     Ok(logits_output)
 }
 
-fn component_phase(spec: &PipelineSpec, component: &str, decoder: &str) -> PhaseRunOn {
-    // An embeds-driven decoder (`sequence_source: inputs_embeds`) must be fed a
-    // fresh embedding for the single running token on every decode step, so the
-    // upstream component that produces its `inputs_embeds` runs `every_step`
-    // even when the model package labels it `prompt_only`. A prompt-only
-    // embedding would run once over the prompt and leave the decoder consuming
-    // stale prefill embeddings for every generated token (a shape mismatch at
-    // best, silently wrong output at worst). This mirrors the `muse_decode`
-    // harness, which re-embeds the running token each step. The reclassification
-    // is scoped to the single dataflow producer of the decoder's `inputs_embeds`
-    // port, so cached conditioning producers (e.g. a vision encoder feeding the
-    // embedder's image features) keep their declared `prompt_only` phase.
-    if decoder_embeds_producer(spec, decoder).as_deref() == Some(component) {
-        return PhaseRunOn::EveryStep;
-    }
+fn component_phase(spec: &PipelineSpec, component: &str) -> PhaseRunOn {
     spec.phases
         .get(component)
-        .map(|phase| phase.run_on.clone())
         .unwrap_or_else(|| {
-            if component == decoder {
-                PhaseRunOn::EveryStep
-            } else {
-                PhaseRunOn::PromptOnly
-            }
+            panic!("validated pipeline model '{component}' must have a pipeline.phases entry")
         })
+        .run_on
+        .clone()
 }
 
 /// The pipeline component that produces an embeds-driven `decoder`'s
@@ -3337,6 +3320,9 @@ pipeline:
   strategy:
     kind: autoregressive
     decoder: decoder
+  phases:
+    decoder:
+      run_on: every_step
 "#,
         )?;
 
@@ -3423,7 +3409,6 @@ pipeline:
                             prefill_embedder: None,
                             stages: vec![],
                         }),
-                        run_on: Some(PhaseRunOn::PromptOnly),
                     },
                     PipelineStrategyStage {
                         name: "decode".to_string(),
@@ -3454,7 +3439,6 @@ pipeline:
                             prefill_embedder: None,
                             stages: vec![],
                         }),
-                        run_on: Some(PhaseRunOn::EveryStep),
                     },
                 ],
             },
@@ -3529,7 +3513,6 @@ pipeline:
                 model: Some(model.to_string()),
                 ..bare_strategy(PipelineStrategyKind::SinglePass)
             }),
-            run_on: None,
         }
     }
 
@@ -3597,7 +3580,6 @@ pipeline:
                         denoiser: Some("encoder".to_string()),
                         ..bare_strategy(PipelineStrategyKind::Iterative)
                     }),
-                    run_on: None,
                 }],
                 ..bare_strategy(PipelineStrategyKind::Composite)
             },

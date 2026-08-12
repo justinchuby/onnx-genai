@@ -2284,8 +2284,7 @@
           "additionalProperties": {
             "$ref": "#/$defs/PhaseConfig"
           },
-          "default": {},
-          "description": "Optional per-component phase gating, keyed by component name.",
+          "description": "Required per-component lifecycle scheduling, keyed by component name.\n\nEvery entry in `models` must have exactly one corresponding phase entry.",
           "type": "object"
         },
         "positions": {
@@ -2317,7 +2316,8 @@
       },
       "required": [
         "models",
-        "strategy"
+        "strategy",
+        "phases"
       ],
       "type": "object"
     },
@@ -2558,23 +2558,13 @@
       "type": "string"
     },
     "PipelineStrategyStage": {
+      "additionalProperties": false,
       "description": "Named child stage of a composite pipeline strategy.",
       "properties": {
         "name": {
           "description": "Non-empty stage name unique within its containing composite.",
           "minLength": 1,
           "type": "string"
-        },
-        "run_on": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/PhaseRunOn"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Optional phase gate for the stage."
         },
         "strategy": {
           "$ref": "#/$defs/PipelineStrategy",
@@ -4111,9 +4101,16 @@
   "allOf": [
     {
       "not": {
+        "properties": {
+          "model": {
+            "required": [
+              "io"
+            ]
+          }
+        },
         "required": [
-          "speculative",
-          "speculator_config"
+          "pipeline",
+          "model"
         ]
       }
     }

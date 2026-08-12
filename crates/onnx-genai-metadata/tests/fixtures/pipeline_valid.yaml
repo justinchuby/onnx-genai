@@ -22,13 +22,11 @@ pipeline:
         strategy:
           kind: single_pass
           model: vision_encoder
-        run_on: prompt_only
       - name: decode_text
         strategy:
           kind: autoregressive
           decoder: decoder
           max_tokens: 128
-        run_on: every_step
   phases:
     vision_encoder:
       run_on: prompt_only
