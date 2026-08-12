@@ -411,11 +411,13 @@ pub(crate) fn node_passes_dtype_filter(
         let Some(value) = ir_graph.values.get(vid) else {
             continue;
         };
+        // Absent optional outputs are exempt from the dtype filter — the
+        // kernel doesn't actually produce them, so their dtype doesn't need
+        // to be in supported_dtypes.
+        if absent_outputs.contains(&vid) {
+            continue;
+        }
         if value.dtype == DataType::Undefined {
-            // Absent optional output — known absence tracked out-of-band.
-            if absent_outputs.contains(&vid) {
-                continue;
-            }
             return false;
         }
         if !entry.supported_dtypes.contains(&value.dtype) {
@@ -535,11 +537,50 @@ fn ep_compile_inner(
                     // Read per-output declared dtype from the ORT graph's
                     // value info — never inferred from inputs. This is the
                     // authoritative dtype for Cast, Where, Shape, etc.
-                    let output_dtypes: Vec<DataType> = view
-                        .node_outputs(node_idx)
+                    // Absent optional outputs now carry their actual ORT-declared
+                    // dtype (not Undefined) so scratch buffers are sized correctly.
+                    let absent = reader.absent_outputs();
+                    let node_output_vals = view.node_outputs(node_idx);
+                    let mut output_dtypes: Vec<DataType> = node_output_vals
                         .iter()
                         .map(|&val_idx| view.value(val_idx).dtype)
                         .collect();
+                    let absent_output_slots: std::collections::HashSet<usize> = node_output_vals
+                        .iter()
+                        .enumerate()
+                        .filter(|&(_, &val_idx)| {
+                            let vid = view.value_id(val_idx);
+                            absent.contains(&vid)
+                        })
+                        .map(|(slot, _)| slot)
+                        .collect();
+
+                    // Resolve Undefined dtypes for absent output slots: if ORT
+                    // didn't provide type info, propagate from the first present
+                    // output of the same node (ONNX type constraints share types
+                    // across outputs). This is NOT input-based inference — it uses
+                    // present outputs of the same node.
+                    if absent_output_slots
+                        .iter()
+                        .any(|&s| output_dtypes.get(s).copied() == Some(DataType::Undefined))
+                    {
+                        let present_dtype = output_dtypes
+                            .iter()
+                            .enumerate()
+                            .find(|(i, dt)| {
+                                !absent_output_slots.contains(i) && **dt != DataType::Undefined
+                            })
+                            .map(|(_, dt)| *dt);
+                        if let Some(dt) = present_dtype {
+                            for &slot in &absent_output_slots {
+                                if output_dtypes[slot] == DataType::Undefined {
+                                    output_dtypes[slot] = dt;
+                                }
+                            }
+                        }
+                        // If no present output has a known dtype, the fail-closed
+                        // path in compute.rs will reject the scratch allocation.
+                    }
 
                     // Determine shape inference strategy using full node
                     // attributes (wired to Deckard's 22 rules).
@@ -568,6 +609,7 @@ fn ep_compile_inner(
                         num_inputs,
                         num_outputs,
                         output_dtypes,
+                        absent_output_slots,
                         shape_inference,
                         input_slots,
                     });

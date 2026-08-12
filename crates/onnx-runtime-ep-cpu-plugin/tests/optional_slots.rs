@@ -609,3 +609,517 @@ fn simplified_layer_norm_two_outputs_position() {
         eprintln!("\n✅ simplified_layer_norm_two_outputs_position: PASSED");
     }
 }
+
+// ─── f16/bf16 helpers ────────────────────────────────────────────────────────
+
+/// Truncate an f32 to IEEE 754 binary16 (round-to-nearest-even).
+fn f32_to_f16(val: f32) -> u16 {
+    let bits = val.to_bits();
+    let sign = (bits >> 16) & 0x8000;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let mant = bits & 0x7FFFFF;
+    if exp == 0xFF {
+        // Inf / NaN
+        return (sign | 0x7C00 | if mant != 0 { 0x0200 } else { 0 }) as u16;
+    }
+    let new_exp = exp - 127 + 15;
+    if new_exp >= 31 {
+        return (sign | 0x7C00) as u16; // overflow → ±inf
+    }
+    if new_exp <= 0 {
+        return sign as u16; // underflow → ±0 (good enough for test data)
+    }
+    (sign | ((new_exp as u32) << 10) | (mant >> 13)) as u16
+}
+
+/// Truncate an f32 to bfloat16 (top 16 bits of the f32 representation).
+fn f32_to_bf16(val: f32) -> u16 {
+    (val.to_bits() >> 16) as u16
+}
+
+unsafe fn make_float16_tensor(
+    api: *const ort::OrtApi,
+    data: &mut [u16],
+    shape: &[i64],
+) -> *mut ort::OrtValue {
+    unsafe {
+        let mut mem_info: *mut ort::OrtMemoryInfo = ptr::null_mut();
+        let status = ((*api).CreateCpuMemoryInfo.unwrap())(
+            ort::OrtDeviceAllocator,
+            ort::OrtMemTypeDefault,
+            &mut mem_info,
+        );
+        check_status(api, status, "CreateCpuMemoryInfo(f16)");
+
+        let mut val: *mut ort::OrtValue = ptr::null_mut();
+        let status = ((*api).CreateTensorWithDataAsOrtValue.unwrap())(
+            mem_info,
+            data.as_mut_ptr().cast(),
+            std::mem::size_of_val(data),
+            shape.as_ptr(),
+            shape.len(),
+            ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16,
+            &mut val,
+        );
+        check_status(api, status, "CreateTensorFloat16");
+        ((*api).ReleaseMemoryInfo.unwrap())(mem_info);
+        val
+    }
+}
+
+unsafe fn make_bfloat16_tensor(
+    api: *const ort::OrtApi,
+    data: &mut [u16],
+    shape: &[i64],
+) -> *mut ort::OrtValue {
+    unsafe {
+        let mut mem_info: *mut ort::OrtMemoryInfo = ptr::null_mut();
+        let status = ((*api).CreateCpuMemoryInfo.unwrap())(
+            ort::OrtDeviceAllocator,
+            ort::OrtMemTypeDefault,
+            &mut mem_info,
+        );
+        check_status(api, status, "CreateCpuMemoryInfo(bf16)");
+
+        let mut val: *mut ort::OrtValue = ptr::null_mut();
+        let status = ((*api).CreateTensorWithDataAsOrtValue.unwrap())(
+            mem_info,
+            data.as_mut_ptr().cast(),
+            std::mem::size_of_val(data),
+            shape.as_ptr(),
+            shape.len(),
+            ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16,
+            &mut val,
+        );
+        check_status(api, status, "CreateTensorBFloat16");
+        ((*api).ReleaseMemoryInfo.unwrap())(mem_info);
+        val
+    }
+}
+
+// ─── B1: f16 SkipLayerNormalization with absent optional outputs ─────────────
+
+/// B1 regression: SkipLayerNormalization (float16) with outputs (output,"","",sum).
+///
+/// Pre-fix: scratch buffer allocated at 2 bytes/elem (f16) but kernel given
+/// a Float32 TensorMut (4 bytes/elem) → 2x heap buffer overflow on every
+/// absent slot write. If the allocator happened to over-allocate, the overflow
+/// was silent; this test detects it because incorrect dtype/size causes either
+/// a crash or wrong data in the present outputs.
+#[test]
+fn skip_layer_norm_f16_absent_output_no_overflow() {
+    let _lock = lock_ort_ep();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let model_path = PathBuf::from(manifest_dir)
+        .join("tests/fixtures/skip_layer_norm_f16_absent_output/model.onnx");
+
+    let Some((_lib, api, env, opts, session)) = (unsafe { setup("cpu_ep_slnf16", &model_path) })
+    else {
+        eprintln!("*** SKIPPED: skip_layer_norm_f16_absent_output_no_overflow ***");
+        return;
+    };
+
+    unsafe {
+        // X = [[1, 2, 3, 4], [5, 6, 7, 8]] in f16
+        let mut x_data: [u16; 8] = [
+            f32_to_f16(1.0),
+            f32_to_f16(2.0),
+            f32_to_f16(3.0),
+            f32_to_f16(4.0),
+            f32_to_f16(5.0),
+            f32_to_f16(6.0),
+            f32_to_f16(7.0),
+            f32_to_f16(8.0),
+        ];
+        // skip = [[0.5, -1, 1, 0], [-2, -3, -4, -1]] in f16
+        let mut skip_data: [u16; 8] = [
+            f32_to_f16(0.5),
+            f32_to_f16(-1.0),
+            f32_to_f16(1.0),
+            f32_to_f16(0.0),
+            f32_to_f16(-2.0),
+            f32_to_f16(-3.0),
+            f32_to_f16(-4.0),
+            f32_to_f16(-1.0),
+        ];
+        // gamma = [1, 1, 1, 1] in f16
+        let mut gamma_data: [u16; 4] = [f32_to_f16(1.0); 4];
+
+        let shape: [i64; 2] = [2, 4];
+        let gamma_shape: [i64; 1] = [4];
+
+        let x_val = make_float16_tensor(api, &mut x_data, &shape);
+        let skip_val = make_float16_tensor(api, &mut skip_data, &shape);
+        let gamma_val = make_float16_tensor(api, &mut gamma_data, &gamma_shape);
+
+        let input_names = [c"X".as_ptr(), c"skip".as_ptr(), c"gamma".as_ptr()];
+        let output_names = [c"output".as_ptr(), c"sum".as_ptr()];
+        let inputs: [*const ort::OrtValue; 3] = [x_val, skip_val, gamma_val];
+        let mut outputs: [*mut ort::OrtValue; 2] = [ptr::null_mut(); 2];
+
+        let status = ((*api).Run.unwrap())(
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs.as_ptr(),
+            3,
+            output_names.as_ptr(),
+            2,
+            outputs.as_mut_ptr(),
+        );
+        check_status(api, status, "Run(skip_layer_norm_f16)");
+
+        // sum = X + skip: [1.5, 1.0, 4.0, 4.0, 3.0, 3.0, 3.0, 7.0] (f16)
+        let sum_out = outputs[1];
+        assert!(!sum_out.is_null(), "sum output is null");
+        let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
+        let status = ((*api).GetTensorMutableData.unwrap())(sum_out, &mut data_ptr);
+        check_status(api, status, "GetTensorMutableData(sum_f16)");
+        let result = std::slice::from_raw_parts(data_ptr as *const u16, 8);
+
+        let expected_sum_f32: [f32; 8] = [1.5, 1.0, 4.0, 4.0, 3.0, 3.0, 3.0, 7.0];
+        eprintln!("  f16 sum (raw u16): {result:?}");
+        for (i, (&got_u16, &want_f32)) in result.iter().zip(expected_sum_f32.iter()).enumerate() {
+            let expected_u16 = f32_to_f16(want_f32);
+            assert_eq!(
+                got_u16, expected_u16,
+                "sum[{i}]: got 0x{got_u16:04X}, want 0x{expected_u16:04X} (f32={want_f32}) — \
+                 if the values are corrupted, the scratch buffer overflow is present"
+            );
+        }
+
+        for o in &outputs {
+            if !o.is_null() {
+                ((*api).ReleaseValue.unwrap())(*o);
+            }
+        }
+        ((*api).ReleaseValue.unwrap())(x_val);
+        ((*api).ReleaseValue.unwrap())(skip_val);
+        ((*api).ReleaseValue.unwrap())(gamma_val);
+        teardown(api, env, opts, session, "cpu_ep_slnf16");
+        eprintln!("\n✅ skip_layer_norm_f16_absent_output_no_overflow: PASSED");
+    }
+}
+
+// ─── B1: bf16 SkipLayerNormalization with absent optional outputs ────────────
+
+/// Same as the f16 test but with bfloat16.
+#[test]
+fn skip_layer_norm_bf16_absent_output_no_overflow() {
+    let _lock = lock_ort_ep();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let model_path = PathBuf::from(manifest_dir)
+        .join("tests/fixtures/skip_layer_norm_bf16_absent_output/model.onnx");
+
+    let Some((_lib, api, env, opts, session)) = (unsafe { setup("cpu_ep_slnbf16", &model_path) })
+    else {
+        eprintln!("*** SKIPPED: skip_layer_norm_bf16_absent_output_no_overflow ***");
+        return;
+    };
+
+    unsafe {
+        let mut x_data: [u16; 8] = [
+            f32_to_bf16(1.0),
+            f32_to_bf16(2.0),
+            f32_to_bf16(3.0),
+            f32_to_bf16(4.0),
+            f32_to_bf16(5.0),
+            f32_to_bf16(6.0),
+            f32_to_bf16(7.0),
+            f32_to_bf16(8.0),
+        ];
+        let mut skip_data: [u16; 8] = [
+            f32_to_bf16(0.5),
+            f32_to_bf16(-1.0),
+            f32_to_bf16(1.0),
+            f32_to_bf16(0.0),
+            f32_to_bf16(-2.0),
+            f32_to_bf16(-3.0),
+            f32_to_bf16(-4.0),
+            f32_to_bf16(-1.0),
+        ];
+        let mut gamma_data: [u16; 4] = [f32_to_bf16(1.0); 4];
+
+        let shape: [i64; 2] = [2, 4];
+        let gamma_shape: [i64; 1] = [4];
+
+        let x_val = make_bfloat16_tensor(api, &mut x_data, &shape);
+        let skip_val = make_bfloat16_tensor(api, &mut skip_data, &shape);
+        let gamma_val = make_bfloat16_tensor(api, &mut gamma_data, &gamma_shape);
+
+        let input_names = [c"X".as_ptr(), c"skip".as_ptr(), c"gamma".as_ptr()];
+        let output_names = [c"output".as_ptr(), c"sum".as_ptr()];
+        let inputs: [*const ort::OrtValue; 3] = [x_val, skip_val, gamma_val];
+        let mut outputs: [*mut ort::OrtValue; 2] = [ptr::null_mut(); 2];
+
+        let status = ((*api).Run.unwrap())(
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs.as_ptr(),
+            3,
+            output_names.as_ptr(),
+            2,
+            outputs.as_mut_ptr(),
+        );
+        check_status(api, status, "Run(skip_layer_norm_bf16)");
+
+        let sum_out = outputs[1];
+        assert!(!sum_out.is_null(), "sum output is null");
+        let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
+        let status = ((*api).GetTensorMutableData.unwrap())(sum_out, &mut data_ptr);
+        check_status(api, status, "GetTensorMutableData(sum_bf16)");
+        let result = std::slice::from_raw_parts(data_ptr as *const u16, 8);
+
+        let expected_sum_f32: [f32; 8] = [1.5, 1.0, 4.0, 4.0, 3.0, 3.0, 3.0, 7.0];
+        eprintln!("  bf16 sum (raw u16): {result:?}");
+        for (i, (&got_u16, &want_f32)) in result.iter().zip(expected_sum_f32.iter()).enumerate() {
+            let expected_u16 = f32_to_bf16(want_f32);
+            assert_eq!(
+                got_u16, expected_u16,
+                "sum[{i}]: got 0x{got_u16:04X}, want 0x{expected_u16:04X} (f32={want_f32})"
+            );
+        }
+
+        for o in &outputs {
+            if !o.is_null() {
+                ((*api).ReleaseValue.unwrap())(*o);
+            }
+        }
+        ((*api).ReleaseValue.unwrap())(x_val);
+        ((*api).ReleaseValue.unwrap())(skip_val);
+        ((*api).ReleaseValue.unwrap())(gamma_val);
+        teardown(api, env, opts, session, "cpu_ep_slnbf16");
+        eprintln!("\n✅ skip_layer_norm_bf16_absent_output_no_overflow: PASSED");
+    }
+}
+
+// ─── B1: f16 LayerNormalization with absent Mean/InvStdDev ───────────────────
+
+/// B1 regression: LayerNormalization (float16) with outputs (Y, "", "").
+/// Mean and InvStdDev are absent — their scratch buffers must be sized for
+/// f16 (2 bytes/elem), not hardcoded Float32 (4 bytes/elem).
+#[test]
+fn layer_norm_f16_absent_output_no_overflow() {
+    let _lock = lock_ort_ep();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let model_path =
+        PathBuf::from(manifest_dir).join("tests/fixtures/layer_norm_f16_absent_output/model.onnx");
+
+    let Some((_lib, api, env, opts, session)) = (unsafe { setup("cpu_ep_lnf16", &model_path) })
+    else {
+        eprintln!("*** SKIPPED: layer_norm_f16_absent_output_no_overflow ***");
+        return;
+    };
+
+    unsafe {
+        let mut x_data: [u16; 8] = [
+            f32_to_f16(1.0),
+            f32_to_f16(2.0),
+            f32_to_f16(3.0),
+            f32_to_f16(4.0),
+            f32_to_f16(5.0),
+            f32_to_f16(6.0),
+            f32_to_f16(7.0),
+            f32_to_f16(8.0),
+        ];
+        let mut scale_data: [u16; 4] = [f32_to_f16(1.0); 4];
+
+        let shape: [i64; 2] = [2, 4];
+        let scale_shape: [i64; 1] = [4];
+
+        let x_val = make_float16_tensor(api, &mut x_data, &shape);
+        let scale_val = make_float16_tensor(api, &mut scale_data, &scale_shape);
+
+        let input_names = [c"X".as_ptr(), c"Scale".as_ptr()];
+        let output_names = [c"Y".as_ptr()];
+        let inputs: [*const ort::OrtValue; 2] = [x_val, scale_val];
+        let mut output: *mut ort::OrtValue = ptr::null_mut();
+
+        let status = ((*api).Run.unwrap())(
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs.as_ptr(),
+            2,
+            output_names.as_ptr(),
+            1,
+            &mut output,
+        );
+        check_status(api, status, "Run(layer_norm_f16)");
+        assert!(!output.is_null());
+
+        // Just verify the run succeeded without crash — the key assertion is
+        // that the scratch buffers for absent Mean/InvStdDev didn't overflow.
+        eprintln!("  layer_norm_f16: run completed without crash");
+
+        ((*api).ReleaseValue.unwrap())(output);
+        ((*api).ReleaseValue.unwrap())(x_val);
+        ((*api).ReleaseValue.unwrap())(scale_val);
+        teardown(api, env, opts, session, "cpu_ep_lnf16");
+        eprintln!("\n✅ layer_norm_f16_absent_output_no_overflow: PASSED");
+    }
+}
+
+// ─── B1: bf16 LayerNormalization with absent Mean/InvStdDev ──────────────────
+
+/// Same as the f16 test but with bfloat16.
+#[test]
+fn layer_norm_bf16_absent_output_no_overflow() {
+    let _lock = lock_ort_ep();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let model_path =
+        PathBuf::from(manifest_dir).join("tests/fixtures/layer_norm_bf16_absent_output/model.onnx");
+
+    let Some((_lib, api, env, opts, session)) = (unsafe { setup("cpu_ep_lnbf16", &model_path) })
+    else {
+        eprintln!("*** SKIPPED: layer_norm_bf16_absent_output_no_overflow ***");
+        return;
+    };
+
+    unsafe {
+        let mut x_data: [u16; 8] = [
+            f32_to_bf16(1.0),
+            f32_to_bf16(2.0),
+            f32_to_bf16(3.0),
+            f32_to_bf16(4.0),
+            f32_to_bf16(5.0),
+            f32_to_bf16(6.0),
+            f32_to_bf16(7.0),
+            f32_to_bf16(8.0),
+        ];
+        let mut scale_data: [u16; 4] = [f32_to_bf16(1.0); 4];
+
+        let shape: [i64; 2] = [2, 4];
+        let scale_shape: [i64; 1] = [4];
+
+        let x_val = make_bfloat16_tensor(api, &mut x_data, &shape);
+        let scale_val = make_bfloat16_tensor(api, &mut scale_data, &scale_shape);
+
+        let input_names = [c"X".as_ptr(), c"Scale".as_ptr()];
+        let output_names = [c"Y".as_ptr()];
+        let inputs: [*const ort::OrtValue; 2] = [x_val, scale_val];
+        let mut output: *mut ort::OrtValue = ptr::null_mut();
+
+        let status = ((*api).Run.unwrap())(
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs.as_ptr(),
+            2,
+            output_names.as_ptr(),
+            1,
+            &mut output,
+        );
+        check_status(api, status, "Run(layer_norm_bf16)");
+        assert!(!output.is_null());
+
+        eprintln!("  layer_norm_bf16: run completed without crash");
+
+        ((*api).ReleaseValue.unwrap())(output);
+        ((*api).ReleaseValue.unwrap())(x_val);
+        ((*api).ReleaseValue.unwrap())(scale_val);
+        teardown(api, env, opts, session, "cpu_ep_lnbf16");
+        eprintln!("\n✅ layer_norm_bf16_absent_output_no_overflow: PASSED");
+    }
+}
+
+// ─── B2: Add → SkipLayerNorm(out,"","",sum) → Mul ────────────────────────────
+
+/// B2 regression: Multi-node fused subgraph with an absent optional output in
+/// the middle node. Tests that the routed path allocates scratch for absent
+/// slots and keeps positions aligned.
+///
+/// Fixture: Add(A,B)->T; SkipLayerNorm(T,skip,gamma)->(out,"","",sum); Mul(sum,C)->result
+///
+/// Guards:
+/// - `session.disable_cpu_ep_fallback=1` — ORT errors if our EP declines
+/// - EP graph assignment assertion — verifies our EP owns the nodes
+#[test]
+fn add_skip_layer_norm_mul_routed() {
+    let _lock = lock_ort_ep();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let model_path =
+        PathBuf::from(manifest_dir).join("tests/fixtures/add_skip_layer_norm_mul/model.onnx");
+
+    let Some((_lib, api, env, opts, session)) = (unsafe { setup("cpu_ep_aslnm", &model_path) })
+    else {
+        eprintln!("*** SKIPPED: add_skip_layer_norm_mul_routed ***");
+        return;
+    };
+
+    unsafe {
+        // A = [[1,2,3,4],[5,6,7,8]]
+        let mut a_data: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        // B = [[0,0,0,0],[0,0,0,0]]
+        let mut b_data: [f32; 8] = [0.0; 8];
+        // skip = [[0.5, -1, 1, 0], [-2, -3, -4, -1]]
+        let mut skip_data: [f32; 8] = [0.5, -1.0, 1.0, 0.0, -2.0, -3.0, -4.0, -1.0];
+        // gamma = [1, 1, 1, 1]
+        let mut gamma_data: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+        // C = [[2, 2, 2, 2], [2, 2, 2, 2]]
+        let mut c_data: [f32; 8] = [2.0; 8];
+
+        let shape: [i64; 2] = [2, 4];
+        let gamma_shape: [i64; 1] = [4];
+
+        let a_val = make_float_tensor(api, &mut a_data, &shape);
+        let b_val = make_float_tensor(api, &mut b_data, &shape);
+        let skip_val = make_float_tensor(api, &mut skip_data, &shape);
+        let gamma_val = make_float_tensor(api, &mut gamma_data, &gamma_shape);
+        let c_val = make_float_tensor(api, &mut c_data, &shape);
+
+        let input_names = [
+            c"A".as_ptr(),
+            c"B".as_ptr(),
+            c"skip".as_ptr(),
+            c"gamma".as_ptr(),
+            c"C".as_ptr(),
+        ];
+        let output_names = [c"result".as_ptr()];
+        let inputs: [*const ort::OrtValue; 5] = [a_val, b_val, skip_val, gamma_val, c_val];
+        let mut output: *mut ort::OrtValue = ptr::null_mut();
+
+        let status = ((*api).Run.unwrap())(
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs.as_ptr(),
+            5,
+            output_names.as_ptr(),
+            1,
+            &mut output,
+        );
+        check_status(api, status, "Run(add_skip_ln_mul)");
+        assert!(!output.is_null());
+
+        // T = A + B = A (since B=0)
+        // sum = T + skip = [[1.5, 1, 4, 4], [3, 3, 3, 7]]
+        // result = sum * C = [[3, 2, 8, 8], [6, 6, 6, 14]]
+        let expected: [f32; 8] = [3.0, 2.0, 8.0, 8.0, 6.0, 6.0, 6.0, 14.0];
+        let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
+        let status = ((*api).GetTensorMutableData.unwrap())(output, &mut data_ptr);
+        check_status(api, status, "GetTensorMutableData(result)");
+        let result = std::slice::from_raw_parts(data_ptr as *const f32, 8);
+
+        eprintln!("  result got:      {result:?}");
+        eprintln!("  result expected: {expected:?}");
+
+        for (i, (got, want)) in result.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-4,
+                "result[{i}] = {got}, want {want} — \
+                 if positions are misrouted, the absent slot compaction bug is present"
+            );
+        }
+
+        ((*api).ReleaseValue.unwrap())(output);
+        ((*api).ReleaseValue.unwrap())(a_val);
+        ((*api).ReleaseValue.unwrap())(b_val);
+        ((*api).ReleaseValue.unwrap())(skip_val);
+        ((*api).ReleaseValue.unwrap())(gamma_val);
+        ((*api).ReleaseValue.unwrap())(c_val);
+        teardown(api, env, opts, session, "cpu_ep_aslnm");
+        eprintln!("\n✅ add_skip_layer_norm_mul_routed: PASSED");
+    }
+}

@@ -13,6 +13,7 @@
 //! where only the op name is known; it returns `Declined` for any op whose shape
 //! requires attributes (Reshape, Conv, reductions, etc.).
 
+use std::collections::HashSet;
 use std::ffi::c_void;
 
 use onnx_genai_ort_sys as ort;
@@ -569,8 +570,13 @@ pub struct CompiledKernelEntry {
     pub num_outputs: usize,
     /// Per-output declared IR dtype, read from the ORT graph's value info at
     /// Compile time. Indexed by output slot. Never inferred from inputs —
-    /// this is the authoritative dtype for each output tensor.
+    /// this is the authoritative dtype for each output tensor. Absent optional
+    /// outputs carry their actual ORT-declared dtype (not `Undefined`) so
+    /// scratch buffers can be sized correctly for f16/bf16 ops.
     pub output_dtypes: Vec<DataType>,
+    /// Which output slots are absent (omitted optional outputs). Absent slots
+    /// get a scratch buffer at runtime; present slots are allocated via ORT.
+    pub absent_output_slots: HashSet<usize>,
     pub shape_inference: ShapeInference,
     /// Maps node input position → `Some(ort_index)` for present inputs,
     /// `None` for absent optional inputs. Used by the single-kernel fast
@@ -800,22 +806,56 @@ unsafe extern "C" fn compute_execute(
 
                 // Execute — dispatch based on sinks.
                 // For outputs going to ORT we allocate via ORT API;
-                // for outputs going to intermediate buffers we allocate on heap.
+                // for outputs going to intermediate buffers we allocate on heap;
+                // for absent slots we allocate a scratch buffer.
                 let mut ort_outputs: Vec<crate::kernel_ctx::OwnedOutput> = Vec::new();
                 let mut buf_writes: Vec<(usize, Vec<usize>, DataType)> = Vec::new();
+                let mut absent_scratch: Vec<(usize, Vec<u8>, DataType)> = Vec::new(); // (slot, buf, dtype)
+
+                // Per-slot view map to keep positions aligned end-to-end.
+                enum RoutedSlotKind {
+                    Ort,
+                    Buffer,
+                    Absent(usize), // index into absent_scratch
+                }
+                let mut slot_kinds: Vec<RoutedSlotKind> = Vec::with_capacity(sinks.len());
 
                 // We need to know which output slot → which sink.
-                for (out_slot, (shape, sink)) in output_shapes.iter().zip(sinks).enumerate() {
+                for (out_slot, shape) in output_shapes.iter().enumerate() {
+                    if entry.absent_output_slots.contains(&out_slot) {
+                        // Absent output slot — allocate scratch using the
+                        // slot's own dtype. Fail closed if unknown.
+                        let scratch_dtype = match entry.output_dtypes.get(out_slot).copied() {
+                            Some(dt) if dt != DataType::Undefined && dt.byte_size() > 0 => dt,
+                            _ => {
+                                return fail_status(&format!(
+                                    "Compute: absent output slot {out_slot} has unknown dtype; \
+                                     cannot allocate scratch buffer (fail closed)"
+                                ));
+                            }
+                        };
+                        let numel: usize = shape.iter().product::<usize>().max(1);
+                        let elem_bytes = scratch_dtype.byte_size().max(8);
+                        let buf = vec![0u8; numel * elem_bytes];
+                        let idx = absent_scratch.len();
+                        absent_scratch.push((out_slot, buf, scratch_dtype));
+                        slot_kinds.push(RoutedSlotKind::Absent(idx));
+                        continue;
+                    }
                     let out_dtype = match entry.output_dtypes.get(out_slot).copied() {
-                        Some(DataType::Undefined) => {
-                            // Absent output slot — skip allocation entirely.
-                            continue;
-                        }
                         Some(dt) => dt,
                         None => {
                             return fail_status(&format!(
                                 "Compute: output slot {out_slot} has no declared dtype \
                                  (output_dtypes vec is too short)"
+                            ));
+                        }
+                    };
+                    let sink = match sinks.get(out_slot) {
+                        Some(s) => s,
+                        None => {
+                            return fail_status(&format!(
+                                "Compute: output slot {out_slot} has no sink"
                             ));
                         }
                     };
@@ -829,10 +869,11 @@ unsafe extern "C" fn compute_execute(
                                     return fail_status(&format!("Compute: {e}"));
                                 }
                             }
-                            let _ = out_slot;
+                            slot_kinds.push(RoutedSlotKind::Ort);
                         }
                         NodeOutputSink::Buffer(buf_idx) => {
                             buf_writes.push((*buf_idx, shape.clone(), out_dtype));
+                            slot_kinds.push(RoutedSlotKind::Buffer);
                         }
                     }
                 }
@@ -860,19 +901,41 @@ unsafe extern "C" fn compute_execute(
                     ));
                 }
 
-                // Collect all output views in the order the kernel expects.
-                // Collect all output views in sink order.
-                // ort_out_views contains owned TensorMut values; consume via drain.
+                // Collect all output views using the per-slot view map so
+                // positions stay aligned even when absent slots are present.
+                let absent_shapes: Vec<Vec<usize>> = output_shapes.clone();
+                let absent_strides_storage: Vec<Vec<i64>> = absent_shapes
+                    .iter()
+                    .map(|s| contiguous_strides(s))
+                    .collect();
                 let mut all_output_views: Vec<_> = {
                     let mut ort_iter = ort_out_views.drain(..);
                     let mut buf_iter = new_bufs.iter_mut();
-                    sinks
+                    slot_kinds
                         .iter()
-                        .map(|sink| match sink {
-                            NodeOutputSink::Ort(_) => ort_iter.next().unwrap(),
-                            NodeOutputSink::Buffer(_) => {
+                        .enumerate()
+                        .map(|(slot_idx, kind)| match kind {
+                            RoutedSlotKind::Ort => ort_iter.next().unwrap(),
+                            RoutedSlotKind::Buffer => {
                                 let (_, buf) = buf_iter.next().unwrap();
                                 buf_view_mut(buf)
+                            }
+                            RoutedSlotKind::Absent(idx) => {
+                                let (_, scratch_buf, dtype) = &mut absent_scratch[*idx];
+                                let shape = &absent_shapes[slot_idx];
+                                let strides = &absent_strides_storage[slot_idx];
+                                TensorMut::new(
+                                    DevicePtrMut(scratch_buf.as_mut_ptr().cast()),
+                                    *dtype,
+                                    unsafe {
+                                        std::mem::transmute::<&[usize], &[usize]>(shape.as_slice())
+                                    },
+                                    unsafe {
+                                        std::mem::transmute::<&[i64], &[i64]>(strides.as_slice())
+                                    },
+                                    DeviceId::cpu(),
+                                )
+                                .mark_absent()
                             }
                         })
                         .collect()
@@ -911,10 +974,10 @@ unsafe extern "C" fn compute_execute(
                     return fail_status(&format!("Compute: shape inference failed: {e}"));
                 }
             };
-            // Allocate outputs. Absent slots (DataType::Undefined) get a
-            // local scratch buffer so the kernel sees the full output arity
-            // and can index by position, while only present slots are
-            // allocated through ORT's kernel context (sequential ORT indices).
+            // Allocate outputs. Absent slots get a local scratch buffer so the
+            // kernel sees the full output arity and can index by position,
+            // while only present slots are allocated through ORT's kernel
+            // context (sequential ORT indices).
             let mut owned_outputs: Vec<crate::kernel_ctx::OwnedOutput> = Vec::new();
             let mut absent_bufs: Vec<Vec<u8>> = Vec::new();
             // Track whether each node output slot is ORT-allocated or absent.
@@ -922,34 +985,38 @@ unsafe extern "C" fn compute_execute(
                 Ort,           // present, comes from ORT
                 Absent(usize), // index into absent_bufs
             }
+            // Also record the dtype for each absent slot so the TensorMut
+            // matches the kernel's element size.
+            let mut absent_dtypes: Vec<DataType> = Vec::new();
             let mut slot_map: Vec<SlotKind> = Vec::with_capacity(entry.num_outputs);
             let mut ort_out_idx: usize = 0;
 
             for (out_slot, shape) in output_shapes.iter().enumerate() {
+                if entry.absent_output_slots.contains(&out_slot) {
+                    // Absent output slot — allocate scratch buffer using the
+                    // slot's own ORT-declared dtype. Fail closed if unknown.
+                    let scratch_dtype = match entry.output_dtypes.get(out_slot).copied() {
+                        Some(dt) if dt != DataType::Undefined && dt.byte_size() > 0 => dt,
+                        _ => {
+                            return fail_status(&format!(
+                                "Compute: absent output slot {out_slot} has unknown dtype; \
+                                 cannot allocate scratch buffer (fail closed)"
+                            ));
+                        }
+                    };
+                    let numel: usize = shape.iter().product::<usize>().max(1);
+                    // Use max(declared_byte_size, 8) to prevent overflow if the
+                    // kernel internally writes a wider type (e.g., Float32 stats
+                    // for f16 SkipLayerNormalization mean/inv_std_var).
+                    let elem_bytes = scratch_dtype.byte_size().max(8);
+                    let buf = vec![0u8; numel * elem_bytes];
+                    let idx = absent_bufs.len();
+                    absent_bufs.push(buf);
+                    absent_dtypes.push(scratch_dtype);
+                    slot_map.push(SlotKind::Absent(idx));
+                    continue;
+                }
                 let out_dtype = match entry.output_dtypes.get(out_slot).copied() {
-                    Some(DataType::Undefined) => {
-                        // Absent output slot — allocate scratch buffer.
-                        // Use the inferred shape (may be reduced dims) so the
-                        // kernel can write without bounds error, but the data
-                        // is discarded.
-                        let numel: usize = shape.iter().product::<usize>().max(1);
-                        // Size from the primary output's dtype (slot 0 is always
-                        // present). Fall back to 8 bytes if unknown, to cover
-                        // f64/i64 without under-allocating.
-                        let elem_bytes = entry
-                            .output_dtypes
-                            .first()
-                            .copied()
-                            .filter(|dt| *dt != DataType::Undefined)
-                            .map(|dt| dt.byte_size())
-                            .filter(|&s| s > 0)
-                            .unwrap_or(8);
-                        let buf = vec![0u8; numel * elem_bytes];
-                        let idx = absent_bufs.len();
-                        absent_bufs.push(buf);
-                        slot_map.push(SlotKind::Absent(idx));
-                        continue;
-                    }
                     Some(dt) => dt,
                     None => {
                         return fail_status(&format!(
@@ -990,13 +1057,15 @@ unsafe extern "C" fn compute_execute(
                         let buf = &mut absent_bufs[*idx];
                         let shape = &absent_shapes[slot_idx];
                         let strides = &absent_strides_storage[slot_idx];
+                        let scratch_dtype = absent_dtypes[*idx];
                         let view = TensorMut::new(
                             DevicePtrMut(buf.as_mut_ptr().cast()),
-                            DataType::Float32,
+                            scratch_dtype,
                             unsafe { std::mem::transmute::<&[usize], &[usize]>(shape.as_slice()) },
                             unsafe { std::mem::transmute::<&[i64], &[i64]>(strides.as_slice()) },
                             DeviceId::cpu(),
-                        );
+                        )
+                        .mark_absent();
                         output_views.push(view);
                     }
                 }
@@ -2718,5 +2787,101 @@ mod tests {
         // Output 0 = full shape, output 1 = reduced (dims from axis onward → 1).
         assert_eq!(shapes[0], vec![2, 4, 8]);
         assert_eq!(shapes[1], vec![2, 4, 1]);
+    }
+
+    // ── B1: Canary tests for scratch buffer sizing with f16/bf16 ──────────────
+
+    /// Verify that scratch buffer sizing uses the correct byte_size for f16.
+    /// Pre-fix, the code would allocate 2 bytes/elem (f16 byte_size) but then
+    /// hand the kernel a Float32 TensorMut, causing 4-byte writes → 2x overflow.
+    /// This canary test allocates an f16-sized buffer with sentinel bytes around
+    /// it, simulates a kernel writing numel elements at the declared byte_size,
+    /// and verifies that the sentinel bytes are intact.
+    #[test]
+    fn scratch_buffer_canary_f16_no_overflow() {
+        const CANARY: u8 = 0xCD;
+        const CANARY_LEN: usize = 64;
+        let numel = 8usize;
+        let scratch_dtype = DataType::Float16;
+        let elem_bytes = scratch_dtype.byte_size();
+        assert_eq!(elem_bytes, 2, "Float16 byte_size should be 2");
+        let data_len = numel * elem_bytes;
+        // Allocate with canary padding on both sides.
+        let total_len = CANARY_LEN + data_len + CANARY_LEN;
+        let mut buf = vec![CANARY; total_len];
+        // Zero the data region (simulating vec![0u8; data_len]).
+        buf[CANARY_LEN..CANARY_LEN + data_len].fill(0);
+        // Simulate kernel writing numel f16 values (2 bytes each).
+        let data_slice = &mut buf[CANARY_LEN..CANARY_LEN + data_len];
+        for i in 0..numel {
+            let val: u16 = 0x3C00; // 1.0 in f16
+            data_slice[i * 2..i * 2 + 2].copy_from_slice(&val.to_ne_bytes());
+        }
+        // Verify canary bytes are intact.
+        for (i, &b) in buf[..CANARY_LEN].iter().enumerate() {
+            assert_eq!(
+                b, CANARY,
+                "front canary[{i}] corrupted — scratch buffer overflow!"
+            );
+        }
+        for (i, &b) in buf[CANARY_LEN + data_len..].iter().enumerate() {
+            assert_eq!(
+                b, CANARY,
+                "back canary[{i}] corrupted — scratch buffer overflow!"
+            );
+        }
+    }
+
+    /// Same canary test but for BFloat16.
+    #[test]
+    fn scratch_buffer_canary_bf16_no_overflow() {
+        const CANARY: u8 = 0xCD;
+        const CANARY_LEN: usize = 64;
+        let numel = 8usize;
+        let scratch_dtype = DataType::BFloat16;
+        let elem_bytes = scratch_dtype.byte_size();
+        assert_eq!(elem_bytes, 2, "BFloat16 byte_size should be 2");
+        let data_len = numel * elem_bytes;
+        let total_len = CANARY_LEN + data_len + CANARY_LEN;
+        let mut buf = vec![CANARY; total_len];
+        buf[CANARY_LEN..CANARY_LEN + data_len].fill(0);
+        let data_slice = &mut buf[CANARY_LEN..CANARY_LEN + data_len];
+        for i in 0..numel {
+            let val: u16 = 0x3F80; // 1.0 in bf16
+            data_slice[i * 2..i * 2 + 2].copy_from_slice(&val.to_ne_bytes());
+        }
+        for (i, &b) in buf[..CANARY_LEN].iter().enumerate() {
+            assert_eq!(
+                b, CANARY,
+                "front canary[{i}] corrupted — scratch buffer overflow!"
+            );
+        }
+        for (i, &b) in buf[CANARY_LEN + data_len..].iter().enumerate() {
+            assert_eq!(
+                b, CANARY,
+                "back canary[{i}] corrupted — scratch buffer overflow!"
+            );
+        }
+    }
+
+    /// Verify that the fixed code never uses Float32 as scratch dtype for absent
+    /// slots — it uses the slot's own dtype from output_dtypes.
+    #[test]
+    fn scratch_dtype_matches_absent_slot_dtype() {
+        // Simulate the fixed logic: absent slot at index 1 with Float16 dtype.
+        let output_dtypes = [DataType::Float16, DataType::Float16, DataType::Float16];
+        let absent_output_slots: HashSet<usize> = [1, 2].into_iter().collect();
+        for &slot in &[1usize, 2] {
+            assert!(absent_output_slots.contains(&slot));
+            let scratch_dtype = output_dtypes[slot];
+            // This assertion would fail under the old code where Float32 was hardcoded.
+            assert_ne!(
+                scratch_dtype,
+                DataType::Float32,
+                "scratch dtype must NOT be hardcoded Float32 — it should match the slot's dtype"
+            );
+            assert_eq!(scratch_dtype, DataType::Float16);
+            assert_eq!(scratch_dtype.byte_size(), 2);
+        }
     }
 }

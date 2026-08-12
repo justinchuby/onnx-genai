@@ -370,6 +370,7 @@ fn compute_add_end_to_end() {
         num_inputs: 2,
         num_outputs: 1,
         output_dtypes: vec![DataType::Float32],
+        absent_output_slots: std::collections::HashSet::new(),
         shape_inference: ShapeInference::ElementwiseBroadcast,
         input_slots: vec![Some(0), Some(1)],
     };
@@ -435,6 +436,7 @@ fn compute_add_broadcast() {
         num_inputs: 2,
         num_outputs: 1,
         output_dtypes: vec![DataType::Float32],
+        absent_output_slots: std::collections::HashSet::new(),
         shape_inference: ShapeInference::ElementwiseBroadcast,
         input_slots: vec![Some(0), Some(1)],
     };

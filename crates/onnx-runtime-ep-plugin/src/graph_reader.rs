@@ -92,7 +92,7 @@ impl OutboundGraphReader {
         }
 
         // First pass: create output values for all nodes.
-        let mut node_output_names: Vec<Vec<String>> = Vec::with_capacity(num_nodes);
+        let mut node_output_names: Vec<Vec<(String, DataType)>> = Vec::with_capacity(num_nodes);
         let mut node_input_names: Vec<Vec<String>> = Vec::with_capacity(num_nodes);
 
         for ort_node in &ort_nodes {
@@ -114,7 +114,7 @@ impl OutboundGraphReader {
             let mut out_names = Vec::with_capacity(n_out);
             for info in &out_infos {
                 if info.is_null() {
-                    out_names.push(String::new());
+                    out_names.push((String::new(), DataType::Undefined));
                     continue;
                 }
                 let (name, dtype, shape) = unsafe { Self::read_value_info(api, *info)? };
@@ -122,7 +122,7 @@ impl OutboundGraphReader {
                     let vid = ir_graph.create_named_value(&name, dtype, shape);
                     value_map.insert(name.clone(), vid);
                 }
-                out_names.push(name);
+                out_names.push((name, dtype));
             }
             node_output_names.push(out_names);
 
@@ -181,20 +181,24 @@ impl OutboundGraphReader {
 
             // Preserve positional output slots: ONNX addresses outputs by
             // position, so omitted optional outputs (empty name) must remain
-            // as placeholder ValueIds with DataType::Undefined rather than
-            // being compacted away, which would shift downstream positions.
+            // as placeholder ValueIds rather than being compacted away, which
+            // would shift downstream positions. Absent slots now carry the
+            // ORT-declared dtype (not Undefined) so downstream scratch buffers
+            // can be sized correctly for f16/bf16 ops.
             let outputs: Vec<ValueId> = node_output_names[i]
                 .iter()
                 .enumerate()
-                .map(|(slot, n)| {
+                .map(|(slot, (n, slot_dtype))| {
                     if n.is_empty() {
                         // Absent output slot — create a placeholder value so the
                         // position is preserved. The ValueId is recorded in
                         // `absent_outputs` (out-of-band) rather than using a
                         // magic name prefix that could be forged from model content.
+                        // Carry the actual ORT-declared dtype so scratch buffers
+                        // match the kernel's element size.
                         let vid = ir_graph.create_named_value(
                             format!("_absent_{i}_{slot}"),
-                            DataType::Undefined,
+                            *slot_dtype,
                             vec![],
                         );
                         absent_outputs.insert(vid);

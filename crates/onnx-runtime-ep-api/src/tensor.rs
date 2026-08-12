@@ -247,6 +247,10 @@ pub struct TensorMut<'a> {
     /// Offset in **bytes** of the element origin from `data` (DLPack semantics).
     pub byte_offset: usize,
     pub device: DeviceId,
+    /// Whether this output slot is absent (scratch buffer for an omitted
+    /// optional output). Kernels should skip dtype validation and treat
+    /// writes as discarded.
+    pub absent: bool,
     _marker: PhantomData<&'a mut ()>,
 }
 
@@ -267,6 +271,7 @@ impl<'a> TensorMut<'a> {
             strides,
             byte_offset: 0,
             device,
+            absent: false,
             _marker: PhantomData,
         }
     }
@@ -275,6 +280,19 @@ impl<'a> TensorMut<'a> {
     pub fn with_byte_offset(mut self, byte_offset: usize) -> Self {
         self.byte_offset = byte_offset;
         self
+    }
+
+    /// Mark this TensorMut as absent (scratch buffer for an omitted optional
+    /// output). Kernels should skip dtype validation for absent outputs.
+    pub fn mark_absent(mut self) -> Self {
+        self.absent = true;
+        self
+    }
+
+    /// Whether this output is an absent optional (scratch buffer whose data
+    /// is discarded). Kernels should skip dtype validation for absent outputs.
+    pub fn is_absent(&self) -> bool {
+        self.absent
     }
 
     /// Check the view's invariants (rank, dtype, offset alignment).

@@ -330,6 +330,125 @@ def gen_simplified_layer_norm_f32():
     save(model, "simplified_layer_norm_f32")
 
 
+# ── skip_layer_norm_f16_absent_output ────────────────────────────────────────
+# SkipLayerNormalization(f16) with outputs (output, '', '', sum).
+# Absent optional outputs at slots 1,2. Tests B1 scratch buffer overflow.
+def gen_skip_layer_norm_f16_absent_output():
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT16, [2, 4])
+    skip = helper.make_tensor_value_info("skip", TensorProto.FLOAT16, [2, 4])
+    gamma = helper.make_tensor_value_info("gamma", TensorProto.FLOAT16, [4])
+    output = helper.make_tensor_value_info("output", TensorProto.FLOAT16, [2, 4])
+    sum_out = helper.make_tensor_value_info("sum", TensorProto.FLOAT16, [2, 4])
+    node = helper.make_node(
+        "SkipLayerNormalization",
+        inputs=["X", "skip", "gamma"],
+        outputs=["output", "", "", "sum"],
+        domain="com.microsoft",
+        epsilon=1e-5,
+    )
+    graph = helper.make_graph([node], "skip_ln_f16_absent", [X, skip, gamma], [output, sum_out])
+    model = helper.make_model(graph, opset_imports=[
+        helper.make_opsetid("", 17),
+        helper.make_opsetid("com.microsoft", 1),
+    ])
+    model.ir_version = 8
+    save(model, "skip_layer_norm_f16_absent_output")
+
+
+# ── skip_layer_norm_bf16_absent_output ───────────────────────────────────────
+# Same as f16 but bfloat16.
+def gen_skip_layer_norm_bf16_absent_output():
+    X = helper.make_tensor_value_info("X", TensorProto.BFLOAT16, [2, 4])
+    skip = helper.make_tensor_value_info("skip", TensorProto.BFLOAT16, [2, 4])
+    gamma = helper.make_tensor_value_info("gamma", TensorProto.BFLOAT16, [4])
+    output = helper.make_tensor_value_info("output", TensorProto.BFLOAT16, [2, 4])
+    sum_out = helper.make_tensor_value_info("sum", TensorProto.BFLOAT16, [2, 4])
+    node = helper.make_node(
+        "SkipLayerNormalization",
+        inputs=["X", "skip", "gamma"],
+        outputs=["output", "", "", "sum"],
+        domain="com.microsoft",
+        epsilon=1e-5,
+    )
+    graph = helper.make_graph([node], "skip_ln_bf16_absent", [X, skip, gamma], [output, sum_out])
+    model = helper.make_model(graph, opset_imports=[
+        helper.make_opsetid("", 17),
+        helper.make_opsetid("com.microsoft", 1),
+    ])
+    model.ir_version = 8
+    save(model, "skip_layer_norm_bf16_absent_output")
+
+
+# ── layer_norm_f16_absent_output ─────────────────────────────────────────────
+# LayerNormalization(f16) with outputs (Y, '', '').
+# Mean and InvStdDev are absent.
+def gen_layer_norm_f16_absent_output():
+    X = helper.make_tensor_value_info("X", TensorProto.FLOAT16, [2, 4])
+    scale = helper.make_tensor_value_info("Scale", TensorProto.FLOAT16, [4])
+    Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT16, [2, 4])
+    node = helper.make_node(
+        "LayerNormalization",
+        inputs=["X", "Scale"],
+        outputs=["Y", "", ""],
+        axis=-1,
+    )
+    graph = helper.make_graph([node], "layer_norm_f16_absent", [X, scale], [Y])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    save(model, "layer_norm_f16_absent_output")
+
+
+# ── layer_norm_bf16_absent_output ────────────────────────────────────────────
+# Same as f16 but bfloat16.
+def gen_layer_norm_bf16_absent_output():
+    X = helper.make_tensor_value_info("X", TensorProto.BFLOAT16, [2, 4])
+    scale = helper.make_tensor_value_info("Scale", TensorProto.BFLOAT16, [4])
+    Y = helper.make_tensor_value_info("Y", TensorProto.BFLOAT16, [2, 4])
+    node = helper.make_node(
+        "LayerNormalization",
+        inputs=["X", "Scale"],
+        outputs=["Y", "", ""],
+        axis=-1,
+    )
+    graph = helper.make_graph([node], "layer_norm_bf16_absent", [X, scale], [Y])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    model.ir_version = 8
+    save(model, "layer_norm_bf16_absent_output")
+
+
+# ── add_skip_layer_norm_mul ──────────────────────────────────────────────────
+# Add -> SkipLayerNormalization(out,'','',sum) -> Mul (f32).
+# Multi-node fused subgraph for B2 routed-path test.
+def gen_add_skip_layer_norm_mul():
+    A = helper.make_tensor_value_info("A", TensorProto.FLOAT, [2, 4])
+    B = helper.make_tensor_value_info("B", TensorProto.FLOAT, [2, 4])
+    skip = helper.make_tensor_value_info("skip", TensorProto.FLOAT, [2, 4])
+    gamma = helper.make_tensor_value_info("gamma", TensorProto.FLOAT, [4])
+    C = helper.make_tensor_value_info("C", TensorProto.FLOAT, [2, 4])
+    result = helper.make_tensor_value_info("result", TensorProto.FLOAT, [2, 4])
+    add_node = helper.make_node("Add", inputs=["A", "B"], outputs=["T"])
+    sln_node = helper.make_node(
+        "SkipLayerNormalization",
+        inputs=["T", "skip", "gamma"],
+        outputs=["sln_output", "", "", "sum"],
+        domain="com.microsoft",
+        epsilon=1e-5,
+    )
+    mul_node = helper.make_node("Mul", inputs=["sum", "C"], outputs=["result"])
+    graph = helper.make_graph(
+        [add_node, sln_node, mul_node],
+        "add_skip_ln_mul",
+        [A, B, skip, gamma, C],
+        [result],
+    )
+    model = helper.make_model(graph, opset_imports=[
+        helper.make_opsetid("", 17),
+        helper.make_opsetid("com.microsoft", 1),
+    ])
+    model.ir_version = 8
+    save(model, "add_skip_layer_norm_mul")
+
+
 if __name__ == "__main__":
     print("Generating ONNX conformance fixtures …")
     gen_add_broadcast()
@@ -349,4 +468,9 @@ if __name__ == "__main__":
     gen_layer_norm_f32()
     gen_layer_norm_neg_axis_f32()
     gen_simplified_layer_norm_f32()
+    gen_skip_layer_norm_f16_absent_output()
+    gen_skip_layer_norm_bf16_absent_output()
+    gen_layer_norm_f16_absent_output()
+    gen_layer_norm_bf16_absent_output()
+    gen_add_skip_layer_norm_mul()
     print("Done.")
