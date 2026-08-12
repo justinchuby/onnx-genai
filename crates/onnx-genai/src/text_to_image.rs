@@ -1216,6 +1216,7 @@ mod tests {
             device_preference: None,
             tokenizer: None,
             io: None,
+            ports: Default::default(),
         }
     }
 

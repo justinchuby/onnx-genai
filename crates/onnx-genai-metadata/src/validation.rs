@@ -2,7 +2,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::schema::{InferenceMetadata, PipelineSpec, PipelineStrategy, PipelineStrategyKind};
+use crate::schema::{
+    ControlFlow, InferenceMetadata, PipelineSpec, PipelineStrategy, PipelineStrategyKind,
+    ProgramOperation, StateScope, Termination,
+};
 
 /// Capabilities this runtime supports.
 pub struct RuntimeCapabilities {
@@ -18,6 +21,7 @@ impl Default for RuntimeCapabilities {
                 "multi_head_attention".to_string(),
                 "prefix_cache".to_string(),
                 "continuous_batching".to_string(),
+                "control_flow_loop".to_string(),
             ],
         }
     }
@@ -29,18 +33,96 @@ pub fn validate(
     runtime: &RuntimeCapabilities,
 ) -> Result<(), Vec<String>> {
     let mut errors = validate_metadata(metadata).err().unwrap_or_default();
-    errors.extend(
-        metadata
-            .required_capabilities
-            .iter()
-            .filter(|cap| !runtime.supported.contains(cap))
-            .cloned(),
-    );
+    let required = metadata
+        .required_capabilities
+        .iter()
+        .cloned()
+        .chain(derived_capabilities(metadata));
+    errors.extend(required.filter(|capability| !runtime.supported.contains(capability)));
 
     if errors.is_empty() {
         Ok(())
     } else {
         Err(errors)
+    }
+}
+
+/// Capabilities implied by concrete metadata features.
+pub fn derived_capabilities(metadata: &InferenceMetadata) -> BTreeSet<String> {
+    let mut capabilities = BTreeSet::new();
+    let Some(pipeline) = &metadata.pipeline else {
+        return capabilities;
+    };
+    if let Some(control) = &pipeline.control {
+        collect_control_capabilities(control, &mut capabilities);
+    }
+    if pipeline.reducers.values().any(|reducer| {
+        !matches!(
+            reducer.kind,
+            crate::schema::ReducerKind::First | crate::schema::ReducerKind::Last
+        )
+    }) {
+        capabilities.insert("tensor_reducers".to_string());
+    }
+    if pipeline
+        .states
+        .values()
+        .any(|state| state.scope == StateScope::Session)
+    {
+        capabilities.insert("persistent_session_state".to_string());
+    }
+    for program in pipeline.programs.values() {
+        for operation in &program.operations {
+            match operation {
+                ProgramOperation::Sample { .. } => {
+                    capabilities.insert("sampling_program".to_string());
+                }
+                ProgramOperation::SolverStep { .. } => {
+                    capabilities.insert("solver_program".to_string());
+                }
+                ProgramOperation::Copy { .. } | ProgramOperation::Cast { .. } => {}
+            }
+        }
+    }
+    if pipeline
+        .batching
+        .as_ref()
+        .is_some_and(|batching| batching.continuous)
+    {
+        capabilities.insert("continuous_batching".to_string());
+    }
+    if pipeline.postprocessing.is_some() {
+        capabilities.insert("postprocessing_program".to_string());
+    }
+    capabilities
+}
+
+fn collect_control_capabilities(control: &ControlFlow, capabilities: &mut BTreeSet<String>) {
+    match control {
+        ControlFlow::Sequence { steps } => {
+            for step in steps {
+                collect_control_capabilities(step, capabilities);
+            }
+        }
+        ControlFlow::Invoke { .. } => {}
+        ControlFlow::Loop {
+            body, termination, ..
+        } => {
+            capabilities.insert("control_flow_loop".to_string());
+            if matches!(termination, Termination::Predicate { .. }) {
+                capabilities.insert("predicate_termination".to_string());
+            }
+            collect_control_capabilities(body, capabilities);
+        }
+        ControlFlow::Branch { cases, default, .. } => {
+            capabilities.insert("control_flow_branch".to_string());
+            for case in cases.values() {
+                collect_control_capabilities(case, capabilities);
+            }
+            if let Some(default) = default {
+                collect_control_capabilities(default, capabilities);
+            }
+        }
     }
 }
 
@@ -102,6 +184,7 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
         if name.trim().is_empty() {
             errors.push("pipeline model names must not be empty".to_string());
         }
+
         if name.contains('.') {
             errors.push(format!("pipeline model name must not contain '.': {name}"));
         }
@@ -112,10 +195,49 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
             errors.push(format!("pipeline model {name} must declare a type"));
         }
     }
+    validate_typed_contracts(spec, &mut errors);
+    if let Some(control) = &spec.control {
+        if !spec.phases.is_empty() || !legacy_strategy_is_empty(&spec.strategy) {
+            errors.push(
+                "pipeline.control cannot be combined with legacy pipeline.strategy or \
+                 pipeline.phases; express all control flow with pipeline.control"
+                    .to_string(),
+            );
+        }
+        validate_control_flow(control, spec, "pipeline.control", &mut errors);
+    }
 
     let mut adjacency: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     for name in spec.models.keys() {
         adjacency.entry(name.as_str()).or_default();
+    }
+
+    fn legacy_strategy_is_empty(strategy: &PipelineStrategy) -> bool {
+        strategy.kind == PipelineStrategyKind::Autoregressive
+            && strategy.decoder.is_none()
+            && strategy.max_tokens.is_none()
+            && strategy.stop_conditions.is_none()
+            && strategy.kv_cache.is_none()
+            && strategy.speculative.is_none()
+            && strategy.model.is_none()
+            && strategy.batching.is_none()
+            && strategy.denoiser.is_none()
+            && strategy.scheduler.is_none()
+            && strategy.num_steps.is_none()
+            && strategy.timestep_input.is_none()
+            && strategy.timesteps.is_none()
+            && strategy.start_step.is_none()
+            && strategy.scheduler_config.is_none()
+            && strategy.cfg_conditioning_input.is_none()
+            && strategy.guidance_scale.is_none()
+            && strategy.state.is_none()
+            && strategy.outer.is_none()
+            && strategy.inner.is_none()
+            && strategy.num_code_groups.is_none()
+            && strategy.pre_embedder.is_none()
+            && strategy.inner_embedding_output.is_none()
+            && strategy.prefill_embedder.is_none()
+            && strategy.stages.is_empty()
     }
 
     // A same-component self-edge (`A.x -> A.y`) is a legal loop-carried temporal
@@ -123,6 +245,9 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
     // is treated as a cycle. Collect the components allowed to have self-edges.
     let mut iterative_denoisers: BTreeSet<&str> = BTreeSet::new();
     collect_iterative_denoisers(&spec.strategy, &mut iterative_denoisers);
+    if let Some(control) = &spec.control {
+        collect_loop_components(control, &mut iterative_denoisers);
+    }
 
     // Each destination port may be fed by at most one edge; multiple producers
     // into one input are ambiguous (order-dependent) and rejected.
@@ -144,8 +269,9 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
                     ));
                 }
             }
+            None if spec.inputs.contains_key(&edge.from) => {}
             None => errors.push(format!(
-                "dataflow edge source must be component.port: {}",
+                "dataflow edge source must be a declared package input or component.port: {}",
                 edge.from
             )),
         }
@@ -165,13 +291,14 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
                     ));
                 }
             }
+            None if spec.outputs.contains_key(&edge.to) => {}
             None => errors.push(format!(
-                "dataflow edge destination must be component.port: {}",
+                "dataflow edge destination must be component.port or a declared package output: {}",
                 edge.to
             )),
         }
 
-        if !seen_destinations.insert(edge.to.as_str()) {
+        if !seen_destinations.insert(edge.to.as_str()) && !spec.reducers.contains_key(&edge.to) {
             errors.push(format!(
                 "dataflow has multiple edges into the same destination port: {}",
                 edge.to
@@ -191,39 +318,160 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
         }
     }
 
-    let mut strategy_owned = BTreeSet::new();
-    collect_strategy_models(&spec.strategy, &mut strategy_owned);
-
-    for phase_component in spec.phases.keys() {
-        if !spec.models.contains_key(phase_component) {
+    for destination in spec.reducers.keys() {
+        let count = spec
+            .dataflow
+            .iter()
+            .filter(|edge| &edge.to == destination)
+            .count();
+        if count < 2 {
             errors.push(format!(
-                "phase references unknown component: {phase_component}"
-            ));
-        } else if strategy_owned.contains(phase_component.as_str()) {
-            errors.push(format!(
-                "pipeline.phases must not contain strategy-owned component {phase_component}; \
-                 its lifecycle is defined by pipeline.strategy"
-            ));
-        }
-    }
-    for model_component in spec.models.keys() {
-        if !strategy_owned.contains(model_component.as_str())
-            && !spec.phases.contains_key(model_component)
-        {
-            errors.push(format!(
-                "auxiliary pipeline model {model_component} must have a pipeline.phases entry \
-                 declaring run_on and optional when_present"
+                "pipeline.reducers.{destination} requires at least two incoming dataflow edges"
             ));
         }
     }
 
-    validate_strategy(&spec.strategy, &spec.models, "strategy", &mut errors);
+    if spec.control.is_none() {
+        let mut strategy_owned = BTreeSet::new();
+        collect_strategy_models(&spec.strategy, &mut strategy_owned);
+
+        for phase_component in spec.phases.keys() {
+            if !spec.models.contains_key(phase_component) {
+                errors.push(format!(
+                    "phase references unknown component: {phase_component}"
+                ));
+            } else if strategy_owned.contains(phase_component.as_str()) {
+                errors.push(format!(
+                    "pipeline.phases must not contain strategy-owned component {phase_component}; \
+                     its lifecycle is defined by pipeline.strategy"
+                ));
+            }
+        }
+        for model_component in spec.models.keys() {
+            if !strategy_owned.contains(model_component.as_str())
+                && !spec.phases.contains_key(model_component)
+            {
+                errors.push(format!(
+                    "auxiliary pipeline model {model_component} must have a pipeline.phases entry \
+                     declaring run_on and optional when_present"
+                ));
+            }
+        }
+        validate_strategy(&spec.strategy, &spec.models, "strategy", &mut errors);
+    }
+
     validate_acyclic(&adjacency, &mut errors);
 
     if errors.is_empty() {
         Ok(())
     } else {
         Err(PipelineValidationError { errors })
+    }
+}
+
+fn validate_typed_contracts(spec: &PipelineSpec, errors: &mut Vec<String>) {
+    for (component, model) in &spec.models {
+        let ports = &model.ports;
+        for (direction, contracts) in [("inputs", &ports.inputs), ("outputs", &ports.outputs)] {
+            for (port, contract) in contracts {
+                if contract
+                    .shape
+                    .as_ref()
+                    .is_some_and(|shape| shape.len() != contract.rank)
+                {
+                    errors.push(format!(
+                        "pipeline.models.{component}.ports.{direction}.{port} declares rank {} but shape has {} dimensions",
+                        contract.rank,
+                        contract.shape.as_ref().map_or(0, Vec::len)
+                    ));
+                }
+            }
+        }
+    }
+    for (state, declaration) in &spec.states {
+        if declaration
+            .contract
+            .shape
+            .as_ref()
+            .is_some_and(|shape| shape.len() != declaration.contract.rank)
+        {
+            errors.push(format!(
+                "pipeline.states.{state}.type rank does not match its shape"
+            ));
+        }
+    }
+}
+
+fn validate_control_flow(
+    control: &ControlFlow,
+    spec: &PipelineSpec,
+    path: &str,
+    errors: &mut Vec<String>,
+) {
+    match control {
+        ControlFlow::Sequence { steps } => {
+            if steps.is_empty() {
+                errors.push(format!("{path}.steps must not be empty"));
+            }
+            for (index, step) in steps.iter().enumerate() {
+                validate_control_flow(step, spec, &format!("{path}.steps[{index}]"), errors);
+            }
+        }
+        ControlFlow::Invoke { component, .. } => {
+            if !spec.models.contains_key(component) {
+                errors.push(format!("{path} invokes unknown component '{component}'"));
+            }
+        }
+        ControlFlow::Loop {
+            body,
+            carried,
+            termination,
+            step_program,
+        } => {
+            if let Termination::Iterations { count, start } = termination
+                && (*count == 0 || start > count)
+            {
+                errors.push(format!(
+                    "{path}.termination requires count > 0 and start <= count"
+                ));
+            }
+            for carry in carried {
+                if !spec.states.contains_key(&carry.state) {
+                    errors.push(format!(
+                        "{path}.carried references unknown state '{}'",
+                        carry.state
+                    ));
+                }
+                for (field, endpoint) in [("from", &carry.from), ("to", &carry.to)] {
+                    match parse_endpoint(endpoint) {
+                        Some((component, _)) if spec.models.contains_key(component) => {}
+                        _ => errors.push(format!(
+                            "{path}.carried.{field} must reference a declared component port, \
+                             got '{endpoint}'"
+                        )),
+                    }
+                }
+            }
+            if let Some(program) = step_program
+                && !spec.programs.contains_key(program)
+            {
+                errors.push(format!(
+                    "{path}.step_program references unknown program '{program}'"
+                ));
+            }
+            validate_control_flow(body, spec, &format!("{path}.body"), errors);
+        }
+        ControlFlow::Branch { cases, default, .. } => {
+            if cases.is_empty() && default.is_none() {
+                errors.push(format!("{path} must declare a case or default"));
+            }
+            for (name, case) in cases {
+                validate_control_flow(case, spec, &format!("{path}.cases.{name}"), errors);
+            }
+            if let Some(default) = default {
+                validate_control_flow(default, spec, &format!("{path}.default"), errors);
+            }
+        }
     }
 }
 
@@ -268,6 +516,48 @@ fn collect_iterative_denoisers<'a>(strategy: &'a PipelineStrategy, out: &mut BTr
             }
         }
         _ => {}
+    }
+}
+
+fn collect_loop_components<'a>(control: &'a ControlFlow, out: &mut BTreeSet<&'a str>) {
+    match control {
+        ControlFlow::Sequence { steps } => {
+            for step in steps {
+                collect_loop_components(step, out);
+            }
+        }
+        ControlFlow::Invoke { .. } => {}
+        ControlFlow::Loop { body, .. } => collect_invoked_components(body, out),
+        ControlFlow::Branch { cases, default, .. } => {
+            for case in cases.values() {
+                collect_loop_components(case, out);
+            }
+            if let Some(default) = default {
+                collect_loop_components(default, out);
+            }
+        }
+    }
+}
+
+fn collect_invoked_components<'a>(control: &'a ControlFlow, out: &mut BTreeSet<&'a str>) {
+    match control {
+        ControlFlow::Invoke { component, .. } => {
+            out.insert(component);
+        }
+        ControlFlow::Sequence { steps } => {
+            for step in steps {
+                collect_invoked_components(step, out);
+            }
+        }
+        ControlFlow::Loop { body, .. } => collect_invoked_components(body, out),
+        ControlFlow::Branch { cases, default, .. } => {
+            for case in cases.values() {
+                collect_invoked_components(case, out);
+            }
+            if let Some(default) = default {
+                collect_invoked_components(default, out);
+            }
+        }
     }
 }
 
