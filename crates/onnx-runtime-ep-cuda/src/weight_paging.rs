@@ -195,9 +195,15 @@ pub const WEIGHT_OFFLOAD_ENV: &str = onnx_runtime_ep_cpu::WEIGHT_OFFLOAD_ENV;
 pub const WEIGHT_OFFLOAD_DEVICE_BYTES_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_DEVICE_BYTES";
 
 /// Sub-knob (default ON / opt-OUT) selecting the asynchronous, fence-ordered
-/// residency page-in over the synchronous `cuMemcpyHtoD`. Set to a truthy value
-/// (`1`/`true`/`yes`/`on`, case/whitespace-insensitive) to force async page-in;
-/// set to a falsy value (`0`/`false`/`no`/`off`) to force synchronous page-in.
+/// residency page-in over the synchronous `cuMemcpyHtoD`. **Unset** uses async.
+/// When set, only `1`/`true`/`yes`/`on` (case/whitespace-insensitive) keep async
+/// enabled; **every other value — including an empty string, `2`, or `enabled` —
+/// selects the synchronous path.** That is deliberate and pinned by
+/// `async_pagein_env_parsing`, but it is strictly stronger than "a falsy value
+/// disables it", so a typo here silently selects the slow path rather than
+/// erroring. Note the asymmetry with [`WEIGHT_OFFLOAD_SCAN_RESISTANT_ENV`],
+/// which disables only on an explicitly falsy value and ignores anything else.
+///
 /// Unset uses async because the not-fit WDDM regime needs a prefetchable,
 /// fence-ordered H2D path; keeping the old synchronous default made every
 /// lookahead request decline before it could overlap the known layer order. This
@@ -216,8 +222,12 @@ pub const WEIGHT_OFFLOAD_ASYNC_PAGEIN_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_ASY
 pub const WEIGHT_OFFLOAD_SCAN_RESISTANT_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_SCAN_RESISTANT";
 
 /// Parse [`WEIGHT_OFFLOAD_ASYNC_PAGEIN_ENV`]. Async page-in is **default-on**:
-/// unset (`None`) enables it, an explicit falsy value disables it, and truthy
-/// values keep it enabled.
+/// unset (`None`) enables it. When a value *is* present, this is opt-**in**, not
+/// opt-out — only `1`/`true`/`yes`/`on` keep async enabled, and every other
+/// value (including `""` and `"maybe"`, both pinned by
+/// `async_pagein_env_parsing`) selects the synchronous path. Deliberate, but
+/// note it differs from [`scan_resistant_from_env_value`], which disables only
+/// on an explicitly falsy value.
 pub(crate) fn async_pagein_from_env_value(value: Option<&str>) -> bool {
     match value {
         Some(value) => matches!(
@@ -285,8 +295,10 @@ impl DeviceOffloadPolicy {
         let device_budget_bytes = std::env::var(WEIGHT_OFFLOAD_DEVICE_BYTES_ENV)
             .ok()
             .and_then(|value| parse_budget_bytes(&value));
-        // Async page-in defaults ON; an explicit falsy value restores the old
-        // synchronous demand-copy path for A/B.
+        // Async page-in defaults ON when the variable is unset. When it IS set,
+        // parsing is opt-in: anything other than 1/true/yes/on restores the old
+        // synchronous demand-copy path, so a typo here costs performance
+        // silently rather than erroring.
         let async_pagein = async_pagein_from_env_value(
             std::env::var(WEIGHT_OFFLOAD_ASYNC_PAGEIN_ENV)
                 .ok()
