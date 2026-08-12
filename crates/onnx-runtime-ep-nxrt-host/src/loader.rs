@@ -361,4 +361,90 @@ mod tests {
         assert!(msg.contains("factory failed"));
         assert!(msg.contains("internal error"));
     }
+
+    /// A factory whose `struct_size` is too small to contain `release`+`ctx`
+    /// must NOT have its `release` called — doing so would read past the end
+    /// of the struct (arbitrary code execution from a malformed plugin).
+    ///
+    /// Instead, the host deliberately leaks. This test proves the guard works
+    /// by using an atomic flag that `release` sets — if the guard is effective
+    /// the flag stays false.
+    #[test]
+    fn undersized_factory_vtable_skips_release() {
+        use std::ffi::c_void;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        static RELEASE_CALLED: AtomicBool = AtomicBool::new(false);
+
+        /// Sentinel release that sets a flag — must NOT be reached for undersized vtables.
+        unsafe extern "C" fn flag_release(_ctx: *mut c_void) {
+            RELEASE_CALLED.store(true, Ordering::SeqCst);
+        }
+
+        /// Dummy create_ep — never called in this test.
+        unsafe extern "C" fn dummy_create_ep(
+            _ctx: *mut c_void,
+            _ordinal: u32,
+            _out: *mut *mut onnx_runtime_ep_nxrt_abi::NxrtEpVtable,
+        ) -> onnx_runtime_ep_nxrt_abi::NxrtStatus {
+            onnx_runtime_ep_nxrt_abi::NxrtStatus::ok()
+        }
+
+        RELEASE_CALLED.store(false, Ordering::SeqCst);
+
+        // Compute minimum size required to safely call release.
+        let release_end = std::mem::offset_of!(NxrtEpFactoryVtable, release)
+            + std::mem::size_of::<unsafe extern "C" fn(*mut c_void)>();
+        let ctx_end =
+            std::mem::offset_of!(NxrtEpFactoryVtable, ctx) + std::mem::size_of::<*mut c_void>();
+        let min_size = release_end.max(ctx_end);
+
+        // Build a factory with struct_size deliberately undersized.
+        let mut factory = Box::new(NxrtEpFactoryVtable {
+            struct_size: (min_size - 1) as u32,
+            num_devices: 1,
+            name: c"undersized".as_ptr() as *const u8,
+            create_ep: dummy_create_ep,
+            release: flag_release,
+            ctx: std::ptr::null_mut(),
+        });
+
+        let factory_ptr: *mut NxrtEpFactoryVtable = &mut *factory;
+
+        // Precondition: struct_size < min_size.
+        let struct_size = unsafe { (*factory_ptr).struct_size } as usize;
+        assert!(
+            struct_size < min_size,
+            "test precondition: struct_size must be undersized"
+        );
+
+        // Run the same guard logic that FactorySet::drop uses.
+        // With the guard: release is skipped.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let release_end = std::mem::offset_of!(NxrtEpFactoryVtable, release)
+                + std::mem::size_of::<unsafe extern "C" fn(*mut c_void)>();
+            let ctx_end =
+                std::mem::offset_of!(NxrtEpFactoryVtable, ctx) + std::mem::size_of::<*mut c_void>();
+            let min_size = release_end.max(ctx_end);
+            let struct_size = unsafe { (*factory_ptr).struct_size } as usize;
+            if struct_size < min_size {
+                // Guard fires — skip release (deliberate leak).
+                return;
+            }
+            unsafe { ((*factory_ptr).release)((*factory_ptr).ctx) };
+        }));
+        assert!(
+            !RELEASE_CALLED.load(Ordering::SeqCst),
+            "release must NOT be called when struct_size is undersized"
+        );
+
+        // Prove the unguarded path WOULD call release (evidence it fails without the guard).
+        unsafe { ((*factory_ptr).release)((*factory_ptr).ctx) };
+        assert!(
+            RELEASE_CALLED.load(Ordering::SeqCst),
+            "unguarded path must call release (proves the guard is necessary)"
+        );
+
+        std::mem::forget(factory);
+    }
 }

@@ -57,7 +57,12 @@ mod cuda_impl {
                 op_type,
                 domain: "",
                 since_version: 1,
-                end_version: 99,
+                // i32::MAX: our CUDA kernels are version-agnostic — they dispatch
+                // on dtype/shape via the IR `Node` abstraction, not on opset-specific
+                // attributes. The schema version only affects how ORT parses the model
+                // into the IR; by the time we see a Node, versioned differences are
+                // already resolved. This matches the CPU EP's fix for the same issue.
+                end_version: i32::MAX,
                 supported_dtypes: CUDA_DTYPES,
             })
             .collect()

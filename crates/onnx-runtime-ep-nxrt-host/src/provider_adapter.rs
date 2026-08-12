@@ -77,7 +77,15 @@ impl NxrtExecutionProvider {
         // Validate struct_size covers the create_ep field before dereferencing.
         let factory_struct_size = unsafe { (*factory_ptr).struct_size } as usize;
         let create_ep_end =
-            memoffset_of_create_ep() + std::mem::size_of::<unsafe extern "C" fn()>();
+            std::mem::offset_of!(onnx_runtime_ep_nxrt_abi::NxrtEpFactoryVtable, create_ep)
+                + std::mem::size_of::<
+                    unsafe extern "C" fn(
+                        *mut std::ffi::c_void,
+                        u32,
+                        *mut *mut onnx_runtime_ep_nxrt_abi::NxrtEpVtable,
+                    )
+                        -> onnx_runtime_ep_nxrt_abi::NxrtStatus,
+                >();
         if factory_struct_size < create_ep_end {
             return Err(NxrtHostError::FactoryFailed {
                 path: plugin.path.clone().to_path_buf(),
@@ -146,21 +154,30 @@ impl NxrtExecutionProvider {
     }
 }
 
-/// Byte offset past the `create_ep` field in `NxrtEpFactoryVtable`.
-/// Used for struct_size validation before dereferencing that vtable slot.
-fn memoffset_of_create_ep() -> usize {
-    // Layout: struct_size(u32) + num_devices(u32) + name(*const u8) + create_ep(fn ptr)
-    // On 64-bit: 4 + 4 + 8 + 8 = 24 (offset of create_ep is 16, end is 24)
-    // We compute it precisely using a dummy to avoid hardcoding.
-    let base = std::mem::size_of::<u32>() * 2 + std::mem::size_of::<*const u8>();
-    base + std::mem::size_of::<unsafe extern "C" fn()>()
-}
-
 impl Drop for NxrtExecutionProvider {
     fn drop(&mut self) {
         if !self.ep_vtable.is_null() {
             let vtable = self.ep_vtable;
             let _ = catch_unwind(AssertUnwindSafe(|| {
+                // Validate struct_size covers release+ctx before calling.
+                // If the vtable is too small, we deliberately leak rather than
+                // jump through a bogus pointer — UB/arbitrary code execution is
+                // far worse than a resource leak.
+                let release_end = std::mem::offset_of!(NxrtEpVtable, release)
+                    + std::mem::size_of::<unsafe extern "C" fn(*mut std::ffi::c_void)>();
+                let ctx_end = std::mem::offset_of!(NxrtEpVtable, ctx)
+                    + std::mem::size_of::<*mut std::ffi::c_void>();
+                let min_size = release_end.max(ctx_end);
+                let struct_size = unsafe { (*vtable).struct_size } as usize;
+                if struct_size < min_size {
+                    // Leak deliberately: jumping through a bogus pointer is
+                    // arbitrary code execution; leaking is merely wasteful.
+                    eprintln!(
+                        "WARNING: EP vtable struct_size ({struct_size}) too small to contain \
+                         release/ctx ({min_size}), skipping release (leaking)"
+                    );
+                    return;
+                }
                 // SAFETY: We own the EP vtable per the ABI contract.
                 unsafe { ((*vtable).release)((*vtable).ctx) };
             }));
