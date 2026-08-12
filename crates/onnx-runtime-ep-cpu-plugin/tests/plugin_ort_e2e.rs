@@ -64,34 +64,67 @@ fn lock_ort_ep() -> MutexGuard<'static, ()> {
 
 /// Resolve the directory containing `libonnxruntime.so`.
 fn find_ort_lib_dir() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("NXRT_ORT_LIB_DIR") {
-        let p = PathBuf::from(dir);
-        if p.join("libonnxruntime.so").exists() {
-            return Some(p);
+    ort_discovery::find_ort_lib_dir()
+}
+
+/// Shared ORT discovery logic — delegates to the canonical implementation.
+mod ort_discovery {
+    use std::path::{Path, PathBuf};
+
+    pub fn ort_lib_name() -> &'static str {
+        if cfg!(target_os = "windows") {
+            "onnxruntime.dll"
+        } else if cfg!(target_os = "macos") {
+            "libonnxruntime.dylib"
+        } else {
+            "libonnxruntime.so"
         }
     }
 
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let workspace_root = std::path::Path::new(manifest_dir)
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap();
-    let build_dir = workspace_root.join("target/debug/build");
-    if build_dir.exists()
-        && let Ok(entries) = std::fs::read_dir(&build_dir)
-    {
+    fn workspace_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf()
+    }
+
+    fn scan_build_dir(build_dir: &Path) -> Option<PathBuf> {
+        let entries = std::fs::read_dir(build_dir).ok()?;
         for entry in entries.flatten() {
             let name = entry.file_name();
             if name.to_string_lossy().starts_with("onnx-genai-ort-sys-") {
                 let lib_dir = entry.path().join("out/ort-prebuilt/lib");
-                if lib_dir.join("libonnxruntime.so").exists() {
+                if lib_dir.join(ort_lib_name()).exists() {
                     return Some(lib_dir);
                 }
             }
         }
+        None
     }
-    None
+
+    pub fn find_ort_lib_dir() -> Option<PathBuf> {
+        // 1. Explicit override
+        if let Ok(dir) = std::env::var("NXRT_ORT_LIB_DIR") {
+            let p = PathBuf::from(dir);
+            if p.join(ort_lib_name()).exists() {
+                return Some(p);
+            }
+        }
+
+        // 2. CARGO_TARGET_DIR
+        if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
+            let build_dir = Path::new(&target_dir).join("debug/build");
+            if let Some(d) = scan_build_dir(&build_dir) {
+                return d.into();
+            }
+        }
+
+        // 3. Workspace default
+        let build_dir = workspace_root().join("target/debug/build");
+        scan_build_dir(&build_dir)
+    }
 }
 
 /// Find the EP cdylib produced by this crate.
@@ -696,6 +729,12 @@ unsafe fn conformance_setup(
     };
 
     if !model_path.exists() {
+        if std::env::var("NXRT_REQUIRE_ORT_TESTS").as_deref() == Ok("1") {
+            panic!(
+                "NXRT_REQUIRE_ORT_TESTS=1 but fixture missing at {}",
+                model_path.display()
+            );
+        }
         eprintln!(
             "*** SKIPPED: fixture missing at {} ***",
             model_path.display()
@@ -703,8 +742,23 @@ unsafe fn conformance_setup(
         return None;
     }
 
-    let ort_lib_path = ort_lib_dir.join("libonnxruntime.so");
-    let lib = unsafe { libloading::Library::new(&ort_lib_path) }.ok()?;
+    let ort_lib_path = ort_lib_dir.join(ort_discovery::ort_lib_name());
+    let lib = match unsafe { libloading::Library::new(&ort_lib_path) } {
+        Ok(l) => l,
+        Err(e) => {
+            if std::env::var("NXRT_REQUIRE_ORT_TESTS").as_deref() == Ok("1") {
+                panic!(
+                    "NXRT_REQUIRE_ORT_TESTS=1 but dlopen failed for {}: {e}",
+                    ort_lib_path.display()
+                );
+            }
+            eprintln!(
+                "*** SKIPPED: dlopen failed for {}: {e} ***",
+                ort_lib_path.display()
+            );
+            return None;
+        }
+    };
     let api = unsafe { get_ort_api(&lib) };
 
     // Env
