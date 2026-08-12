@@ -260,9 +260,10 @@ pub fn load_nxrt_plugin(path: impl AsRef<Path>) -> Result<NxrtPlugin, NxrtHostEr
         let factory = &*factory_ptrs[0];
         let name_end =
             std::mem::offset_of!(NxrtEpFactoryVtable, name) + std::mem::size_of::<*const u8>();
-        if (factory.struct_size as usize) < name_end {
-            String::from("unknown")
-        } else if factory.name.is_null() {
+        // Short-circuit order matters: the struct_size check must come first
+        // because reading factory.name is only sound once we know the struct
+        // is large enough to contain that field.
+        if (factory.struct_size as usize) < name_end || factory.name.is_null() {
             String::from("unknown")
         } else {
             CStr::from_ptr(factory.name as *const std::os::raw::c_char)
