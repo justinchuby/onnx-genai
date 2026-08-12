@@ -27,12 +27,12 @@
 //!    returned an unconditional fail status whenever `shared_ep` was set,
 //!    meaning no ORT session could ever execute a compiled subgraph on a
 //!    shared-EP factory (e.g. CUDA) — even with real hardware present.
-//! 2. **Single shared runtime/context instance.** The `Arc<dyn
-//!    ExecutionProvider>` handed to `CreateEp` is *the exact same
-//!    allocation* used to construct the allocator, sync stream, and data
-//!    transfer (verified via `Arc::ptr_eq`), and calls dispatched through
-//!    each of those surfaces land in one shared call log tagged with one
-//!    `instance_id`.
+//! 2. **Single shared runtime/context instance.** The
+//!    `Arc<Mutex<Box<dyn ExecutionProvider + Send>>>` handed to `CreateEp`
+//!    (as `EpHandle::Shared`) is *the exact same allocation* used to construct
+//!    the allocator, sync stream, and data transfer (verified via
+//!    `Arc::ptr_eq`), and calls dispatched through each of those surfaces land
+//!    in one shared call log tagged with one `instance_id`.
 //! 3. **Non-null, correctly-owned stream handles**: the opaque handle set at
 //!    factory-construction time round-trips unchanged through
 //!    `CreateSyncStreamForDevice` → `GetHandle`, and is never freed by the
@@ -47,6 +47,13 @@
 //! 6. **`shutdown()` is correctly skipped** while the factory (and other
 //!    surfaces) still hold `Arc` clones — releasing one `OrtEp` must never
 //!    tear down a runtime other surfaces depend on.
+//!
+//! # Relationship to #832
+//!
+//! PR #832 fixed `CreateEp` for shared EPs and validated it on a physical H200.
+//! These tests are the CPU-runnable falsifier for that fix: they fail on any
+//! host if the shared-instance invariant or the release ordering regresses,
+//! without needing a GPU.
 
 /// Canonical ORT discovery lives in the `onnx-runtime-ort-testkit` crate —
 /// aliased here so existing `ort_discovery::` call sites keep working.
@@ -64,7 +71,7 @@ use onnx_runtime_ep_api::{
     Result as EpResult,
 };
 use onnx_runtime_ep_plugin::device::DeviceSupport;
-use onnx_runtime_ep_plugin::ep::ExportedEp;
+use onnx_runtime_ep_plugin::ep::{EpHandle, ExportedEp};
 use onnx_runtime_ep_plugin::factory::{create_ep_factories_for_shared_ep, release_ep_factory};
 use onnx_runtime_ir::{DataType, DeviceId, DeviceType, Node, Shape, TensorLayout};
 
@@ -409,12 +416,12 @@ fn create_ep_succeeds_for_shared_ep_and_shares_the_runtime_instance() {
     assert!(!api_base.is_null());
 
     let (mock, _log, dropped) = MockCudaLikeEp::new();
-    let mut ep_dyn: Box<dyn ExecutionProvider> = Box::new(mock);
+    let mut ep_dyn: Box<dyn ExecutionProvider + Send> = Box::new(mock);
     ep_dyn.initialize(&EpConfig::default()).expect("initialize");
-    let shared: Arc<dyn ExecutionProvider> = Arc::from(ep_dyn);
+    let shared = Arc::new(Mutex::new(ep_dyn));
     // Keep a clone to compare identity against what `CreateEp` produces, and
     // to prove `Arc::ptr_eq` — not name matching — is the identity channel.
-    let shared_for_check: Arc<dyn ExecutionProvider> = Arc::clone(&shared);
+    let shared_for_check = Arc::clone(&shared);
 
     let name = "mock_cuda_like_ep";
     let mut out_factories: [*mut ort::OrtEpFactory; 1] = [ptr::null_mut()];
@@ -466,18 +473,24 @@ fn create_ep_succeeds_for_shared_ep_and_shares_the_runtime_instance() {
     let got_name = unsafe { std::ffi::CStr::from_ptr(name_ptr) }.to_string_lossy();
     assert_eq!(got_name, "mock_cuda_like_ep");
 
-    // Identity proof: the `Arc<dyn ExecutionProvider>` inside the returned
-    // `ExportedEp` is the *exact same allocation* as `shared_for_check` — not
-    // merely an EP with a matching name. This is possible because `ep.rs`
+    // Identity proof: the `Arc` inside the returned `ExportedEp`'s
+    // `EpHandle::Shared` is the *exact same allocation* as `shared_for_check` —
+    // not merely an EP with a matching name. This is possible because `ep.rs`
     // publicly exposes `ExportedEp` and its `ep` field precisely so
     // white-box tests like this one can verify the ownership invariant.
     let exported_ep = unsafe { &*(out_ep.cast::<ExportedEp>()) };
-    assert!(
-        Arc::ptr_eq(&exported_ep.ep, &shared_for_check),
-        "CreateEp's Arc<dyn ExecutionProvider> is a DIFFERENT instance than the one shared \
-         with the allocator/stream/transfer surfaces — single-runtime invariant violated"
-    );
-    eprintln!("✓ CreateEp shares the exact same Arc<dyn ExecutionProvider> instance");
+    match &exported_ep.ep {
+        EpHandle::Shared(arc) => assert!(
+            Arc::ptr_eq(arc, &shared_for_check),
+            "CreateEp's shared EP is a DIFFERENT instance than the one shared with the \
+             allocator/stream/transfer surfaces — single-runtime invariant violated"
+        ),
+        EpHandle::Owned(_) => panic!(
+            "CreateEp built an Owned EP for a shared factory — it would run on a different \
+             runtime/context than the memory ORT allocated through the factory"
+        ),
+    }
+    eprintln!("✓ CreateEp shares the exact same shared-EP instance (EpHandle::Shared)");
 
     // ReleaseEp must not call shutdown() while the factory (and our local
     // `shared_for_check` clone) still hold other strong references — dropping
@@ -527,10 +540,10 @@ fn shared_ep_surfaces_all_dispatch_to_one_runtime_instance() {
 
     let (mock, log, dropped) = MockCudaLikeEp::new();
     let instance_id = mock.instance_id;
-    let mut ep_dyn: Box<dyn ExecutionProvider> = Box::new(mock);
+    let mut ep_dyn: Box<dyn ExecutionProvider + Send> = Box::new(mock);
     ep_dyn.initialize(&EpConfig::default()).expect("initialize");
-    let shared: Arc<dyn ExecutionProvider> = Arc::from(ep_dyn);
-    let shared_for_check: Arc<dyn ExecutionProvider> = Arc::clone(&shared);
+    let shared = Arc::new(Mutex::new(ep_dyn));
+    let shared_for_check = Arc::clone(&shared);
 
     // A stream handle we own for the test's duration (stands in for a real
     // `cudaStream_t`). The adapter must pass it through unmodified and never
@@ -832,10 +845,15 @@ fn shared_ep_surfaces_all_dispatch_to_one_runtime_instance() {
     assert!(!out_ep.is_null());
 
     let exported_ep = unsafe { &*(out_ep.cast::<ExportedEp>()) };
-    assert!(
-        Arc::ptr_eq(&exported_ep.ep, &shared_for_check),
-        "CreateEp's EP is not the same instance shared with allocator/stream/transfer"
-    );
+    match &exported_ep.ep {
+        EpHandle::Shared(arc) => assert!(
+            Arc::ptr_eq(arc, &shared_for_check),
+            "CreateEp's EP is not the same instance shared with allocator/stream/transfer"
+        ),
+        EpHandle::Owned(_) => {
+            panic!("CreateEp built an Owned EP for a shared factory")
+        }
+    }
     eprintln!("✓ CreateEp shares the same runtime instance as allocator/stream/transfer");
 
     let release_ep = unsafe { (*factory_ptr).ReleaseEp }.expect("ReleaseEp missing");

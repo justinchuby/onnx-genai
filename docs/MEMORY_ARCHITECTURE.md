@@ -671,6 +671,68 @@ measured 2 MiB CUDA granule:
 >   never leaves a single granule. Demonstrating it end-to-end needs a model/
 >   context whose per-head stripe exceeds a granule (large `head_dim`/context),
 >   not a change to this commit path.
+> * **The qwen14b end-to-end measurement is now in (`qwen14b-floor`), and it
+>   is a precise negative result** — the model #827 identified as the *only* one
+>   whose per-head stripe reaches the granule (`8192 × 128 × 2 = 2 MiB` exactly,
+>   at full context). Test
+>   `crates/onnx-genai-engine/tests/qwen14b_kv_floor_sweep_native_cuda.rs` sweeps
+>   the reserved KV capacity across the 2 MiB-per-stripe threshold
+>   (`ONNX_GENAI_KV_MIN_BUCKET ∈ {1024, 2048, 4096, 8192}`), in-place VMM,
+>   head-major vs a `kv_layout=1` copy, process-isolated, same session. Measured
+>   committed **physical** KV bytes:
+>
+>   | Reserved capacity | Head-major committed | Seq-major committed | Ratio | Tokens |
+>   |---:|---:|---:|---:|:--|
+>   | 1024 | 402,653,184 B (192 gr) | 402,653,184 B (192 gr) | 1.00× | byte-identical |
+>   | 2048 | 603,979,776 B (288 gr) | 603,979,776 B (288 gr) | 1.00× | byte-identical |
+>   | 4096 | 1,006,632,960 B (480 gr) | 1,006,632,960 B (480 gr) | 1.00× | byte-identical |
+>   | 8192 | 1,811,939,328 B (864 gr) | 1,811,939,328 B (864 gr) | 1.00× | byte-identical |
+>
+>   The `kv_heads×` floor **does not separate at equal committed length**: both
+>   layouts commit byte-identically, ramping together.
+>
+>   **The mechanism is a property of this harness, not of the engine — and the
+>   original write-up of this table got that wrong.** The sweep sets
+>   `ONNX_GENAI_KV_MIN_BUCKET = capacity` at every point, and
+>   `onnx_genai_kv::kv_capacity_bucket(len, hard_max)` is
+>   `len.next_power_of_two().max(min_bucket).min(hard_max)`. Pinning
+>   `min_bucket == capacity` *forces* `initial_bucket_len == capacity`, hence
+>   `committed_len == capacity`. Concluding from that same number that "the engine
+>   commits the full KV bucket eagerly" is circular: the knob produced the
+>   observation. Re-running the identical child at the engine's **default**
+>   `ONNX_GENAI_KV_MIN_BUCKET=256` yields, for seq-major, `committed_len = 256`
+>   with `max_len = 8192` — a live-prefix commit far short of the bucket. **The
+>   engine does commit on demand.**
+>
+>   Seq-major's fixed full-context stride is confirmed active (`max_len == 8192` at
+>   every capacity vs head-major's `max_len == capacity`) and the token streams
+>   match, so the seq-major kernel and layout resolution are correct; a fixed
+>   stride makes *growth* free (#797's 0 bytes moved) and keeps the captured graph
+>   (#811/#812). The head-major committed count is close to the predicted
+>   `layers × 2 × kv_heads = 768` granules at full context (measured 864, the extra
+>   ~96 being non-granule-aligned reservation bases spanning one extra granule per
+>   binding); seq-major sits on the *same* number only because this harness pinned
+>   it to the same committed length.
+>
+>   **Separation requires two conditions at once, and every measurement so far has
+>   violated one of them:**
+>   1. head-major capacity large enough that its per-head stripe reaches a granule
+>      (`capacity × head_dim × 2 ≥ 2 MiB`, i.e. capacity ≈ 8192), **and**
+>   2. the seq-major committed dense prefix left free to stay small — i.e.
+>      `ONNX_GENAI_KV_MIN_BUCKET` *not* pinned to the capacity.
+>
+>   The sweep above violates (2) by construction. At the default bucket 256 both
+>   layouts commit 192 granules because (1) is violated instead — a 256-token head
+>   stripe is 64 KiB, sub-granule. The regime where the 8× can appear is small
+>   bucket *and* long live prefix, and is measured separately. The test asserts
+>   the equality as a #812-style guard, with its `committed_len` assertions
+>   documented as *harness preconditions* rather than engine findings: if seq-major
+>   ever commits less, the guard fires and this table must be updated — that would
+>   be the win.
+>
+>   **Lesson (the third time this document has had to be corrected):** before
+>   attributing a measured number to the system, check that no knob you set is
+>   itself producing that number. See the "instrument itself" failure mode below.
 > * **A fourth place the layout lives — the engine-side non-kernel KV
 >   consumers — is now gated (#812, `seqmajor-physical-shape`).** Beyond kernel
 >   indexing, commit geometry, and growth byte geometry, the device

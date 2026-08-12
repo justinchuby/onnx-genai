@@ -9,14 +9,8 @@
 //! The following defects have been addressed:
 //!
 //! 1. **Shared CUDA runtime/context.** A single `CudaExecutionProvider` is
-//!    constructed once and shared across allocator, stream, data transfer,
-//!    AND `CreateEp` (graph compilation / kernel dispatch) via a lock-free
-//!    `Arc<dyn ExecutionProvider>`. Each component holds a strong `Arc` clone
-//!    (B1 fix). Previously, `CreateEp` unconditionally failed for shared EPs,
-//!    which meant no ORT session could ever actually execute a compiled
-//!    subgraph on this EP even with a GPU present — only the pre-session
-//!    allocator/stream/transfer surfaces worked. `CreateEp` now clones the
-//!    same `Arc`, so compute uses the identical runtime/context instance.
+//!    constructed once and shared across allocator, stream, and data transfer
+//!    via `Arc<Mutex<..>>`. Each component holds a strong `Arc` clone (B1 fix).
 //!
 //! 2. **`CreateDataTransfer` returns a real adapter.** `DeviceDataTransferFull`
 //!    now classifies copy direction using `Value_GetMemoryDevice` +
@@ -41,7 +35,6 @@
 
 #[cfg(feature = "cuda")]
 mod cuda_impl {
-    use onnx_runtime_ep_api::provider::ExecutionProvider as _;
     use onnx_runtime_ep_cuda::CudaExecutionProvider;
     use onnx_runtime_ep_plugin::device::DeviceSupport;
     use onnx_runtime_ep_plugin::ep::KernelRegistryEntry;
@@ -83,26 +76,16 @@ mod cuda_impl {
     /// Construct the CUDA EP and extract the native stream handle.
     ///
     /// Returns `(ep, stream_handle)` or an error if no GPU is available.
-    ///
-    /// The EP is initialized (`ExecutionProvider::initialize`) here, while it
-    /// is still an exclusively-owned `Box` — this is the only point at which
-    /// `&mut self` access is available, since the caller immediately wraps
-    /// the returned EP in an `Arc<dyn ExecutionProvider>` to share it across
-    /// the allocator, sync stream, data transfer, and every `OrtEp` returned
-    /// by `CreateEp`.
     pub(crate) fn construct_ep_with_stream() -> Result<
         (
-            Box<dyn onnx_runtime_ep_api::provider::ExecutionProvider>,
+            Box<dyn onnx_runtime_ep_api::provider::ExecutionProvider + Send>,
             *mut std::os::raw::c_void,
         ),
         String,
     > {
-        let mut ep = CudaExecutionProvider::new_default().map_err(|e| {
+        let ep = CudaExecutionProvider::new_default().map_err(|e| {
             format!("CUDA EP construction failed (no GPU or driver unavailable): {e}")
         })?;
-        let config = onnx_runtime_ep_api::provider::EpConfig::default();
-        ep.initialize(&config)
-            .map_err(|e| format!("CUDA EP initialization failed: {e}"))?;
         let stream_handle = ep.runtime().stream_ptr() as *mut std::os::raw::c_void;
         Ok((Box::new(ep), stream_handle))
     }
@@ -184,17 +167,11 @@ pub unsafe extern "C" fn CreateEpFactories(
             let ep_name = ep.name().to_string();
             let entries = cuda_impl::build_kernel_registry_entries();
             let support = cuda_impl::device_support();
-            // CreateEp fix: shared as a lock-free Arc<dyn ExecutionProvider>.
-            // `ep` was already initialized (`ExecutionProvider::initialize`)
-            // inside `construct_ep_with_stream` while it was still an
-            // exclusively-owned `Box` — the only point at which `&mut self`
-            // access is available before sharing.
-            let shared_ep: std::sync::Arc<dyn onnx_runtime_ep_api::provider::ExecutionProvider> =
-                std::sync::Arc::from(ep);
+            let shared_ep = std::sync::Arc::new(std::sync::Mutex::new(ep));
 
             // S4 fix: use create_ep_factories_for_shared_ep which takes the
             // EP name directly, avoiding the constructor call that would panic.
-            unsafe {
+            let status = unsafe {
                 onnx_runtime_ep_plugin::factory::create_ep_factories_for_shared_ep(
                     api_base,
                     out_factories,
@@ -206,7 +183,8 @@ pub unsafe extern "C" fn CreateEpFactories(
                     support,
                     stream_handle,
                 )
-            }
+            };
+            status
         }
 
         #[cfg(not(feature = "cuda"))]

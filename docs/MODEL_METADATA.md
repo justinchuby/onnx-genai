@@ -259,6 +259,40 @@ and `model.io.kv_update: shared_buffer` declares fixed-capacity KV behavior
 without requiring a particular attention operator name. Omitting the scalar
 permission keeps the canonical vector requirement.
 
+### Generating `inference_metadata.yaml` from a `genai_config.json` (#384)
+
+A stock onnxruntime-genai export ships `genai_config.json` but **not**
+`inference_metadata.yaml`, so it is not native-loadable until the metadata file
+exists — the #384 gap. When the export is a plain single-decoder LLM (the
+`model.io` block is fully derivable from the genai config's declared ports),
+`scripts/gen_inference_metadata.py` emits the file deterministically:
+
+```bash
+python scripts/gen_inference_metadata.py MODEL_DIR            # writes MODEL_DIR/inference_metadata.yaml
+python scripts/gen_inference_metadata.py MODEL_DIR --stdout   # print without writing
+python scripts/gen_inference_metadata.py MODEL_DIR --force    # overwrite an existing file
+```
+
+It reads only `genai_config.json` and maps `model.context_length →
+model.max_sequence_length`; `model.decoder.inputs.input_ids / attention_mask →
+io.token_input / io.attention_mask_input`; `model.decoder.outputs.logits →
+io.logits_output`; and expands the `past_key_names` / `past_value_names` /
+`present_key_names` / `present_value_names` `%d` templates over
+`num_hidden_layers` into positionally paired `io.kv_inputs` / `io.kv_outputs`
+(key-then-value per layer). This turns a one-off hand-written fix into a
+repeatable step; it was used to make the qwen14b export native-loadable for the
+KV-floor measurement
+(`crates/onnx-genai-engine/tests/qwen14b_kv_floor_sweep_native_cuda.rs`), and it
+reproduces that hand-written file exactly apart from a two-line provenance
+comment header that the generator prepends (verified: the emitted YAML is
+identical to the hand-written qwen14b-zp `inference_metadata.yaml` once the
+header is dropped and line endings are normalized). It intentionally covers
+**only**
+the derivable single-decoder case: hybrid linear-attention decoders with
+recurrent state ports still rely on the graph-derived `model.io` fallback above,
+and any package that already declares `model.io` should keep its authoritative
+declaration.
+
 ## Colocation Groups
 
 Nodes with the same `onnx_runtime.group` value are treated as a colocation set.

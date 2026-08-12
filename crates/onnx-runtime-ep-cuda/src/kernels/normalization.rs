@@ -38,11 +38,13 @@ use std::sync::{Arc, Mutex};
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    DevicePtr, DevicePtrMut, EpError, Kernel, KernelFactory, Result, TensorMut, TensorView,
+};
 use onnx_runtime_ir::{DataType, Node};
 
 use crate::error::{driver_err, not_implemented};
-use crate::runtime::{CudaRuntime, cuptr};
+use crate::runtime::{CudaRuntime, cuptr, raw_ptr};
 
 use super::softmax::resolve_axis;
 
@@ -1603,6 +1605,94 @@ impl Drop for SkipBroadcastMetadataCache {
 }
 
 impl SkipSimplifiedLayerNormKernel {
+    /// BFloat16 activations: the fused Skip-RMS kernels are implemented for
+    /// Float16 and Float32 only, so the BFloat16 case is staged through Float32.
+    /// Every BFloat16 operand is losslessly widened into a scratch f32 buffer,
+    /// the f32 kernel path runs, and each result is narrowed back to its original
+    /// dtype. SkipSimplifiedLayerNormalization appears once per token (the final
+    /// norm), so the extra pointwise casts are negligible. The per-call scratch
+    /// makes this path incompatible with graph-capture replay.
+    fn run_bf16_via_f32(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        let mut scratch: Vec<CUdeviceptr> = Vec::new();
+        let staged = (|| -> Result<()> {
+            // Widen every BFloat16 input into f32 scratch; forward the rest.
+            let mut f32_inputs: Vec<TensorView> = Vec::with_capacity(inputs.len());
+            for input in inputs {
+                if input.dtype == DataType::BFloat16 && !input.is_absent() {
+                    let n = input.numel();
+                    let ptr = self.runtime.alloc_raw(n.max(1) * 4)?;
+                    scratch.push(ptr);
+                    super::cast::launch_cast_raw(
+                        &self.runtime,
+                        cuptr(input.data_ptr::<u8>() as *const c_void),
+                        DataType::BFloat16,
+                        ptr,
+                        DataType::Float32,
+                        n,
+                    )?;
+                    f32_inputs.push(TensorView::new(
+                        DevicePtr(raw_ptr(ptr) as *const c_void),
+                        DataType::Float32,
+                        input.shape,
+                        input.strides,
+                        input.device,
+                    ));
+                } else {
+                    f32_inputs.push(*input);
+                }
+            }
+
+            // Allocate an f32 scratch result for every output slot so the f32
+            // kernel writes into it; present outputs are narrowed back afterward.
+            let mut out_scratch: Vec<CUdeviceptr> = Vec::with_capacity(outputs.len());
+            let mut f32_outputs: Vec<TensorMut> = Vec::with_capacity(outputs.len());
+            for output in outputs.iter() {
+                let n = output.numel();
+                let ptr = self.runtime.alloc_raw(n.max(1) * 4)?;
+                scratch.push(ptr);
+                out_scratch.push(ptr);
+                f32_outputs.push(TensorMut::new(
+                    DevicePtrMut(raw_ptr(ptr)),
+                    DataType::Float32,
+                    output.shape,
+                    output.strides,
+                    output.device,
+                ));
+            }
+
+            self.run(&f32_inputs, &mut f32_outputs)?;
+
+            // Narrow each present output back to its original dtype.
+            for (output, src_ptr) in outputs.iter_mut().zip(out_scratch.iter()) {
+                if output.is_absent() || output.numel() == 0 {
+                    continue;
+                }
+                let n = output.numel();
+                super::cast::launch_cast_raw(
+                    &self.runtime,
+                    *src_ptr,
+                    DataType::Float32,
+                    cuptr(output.data_ptr_mut::<u8>() as *const c_void),
+                    output.dtype,
+                    n,
+                )?;
+            }
+            Ok(())
+        })();
+
+        // `cuMemFree` waits for preceding stream work, so freeing after the
+        // casts + f32 kernel is safe. Free every scratch buffer exactly once.
+        for ptr in scratch {
+            // SAFETY: each `ptr` came from `alloc_raw` above and is freed once.
+            let free = unsafe { self.runtime.free_raw(ptr) };
+            if staged.is_ok() {
+                free?;
+            }
+        }
+        self.last_call_capture_safe.store(false, Ordering::Relaxed);
+        staged
+    }
+
     fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         self.last_call_capture_safe.store(false, Ordering::Relaxed);
         let op = "SkipSimplifiedLayerNormalization";
@@ -1617,6 +1707,9 @@ impl SkipSimplifiedLayerNormKernel {
         let skip = &inputs[1];
         let gamma = &inputs[2];
         let bias = inputs.get(3).filter(|bias| !bias.is_absent());
+        if input.dtype == DataType::BFloat16 {
+            return self.run_bf16_via_f32(inputs, outputs);
+        }
         require_f16_or_f32(op, "input", input.dtype)?;
         let is_half = input.dtype == DataType::Float16;
         if skip.dtype != input.dtype {

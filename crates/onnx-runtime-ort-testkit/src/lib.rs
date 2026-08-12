@@ -21,7 +21,13 @@
 //! | `NXRT_ORT_LIB_DIR` | Explicit directory containing the ORT shared library. |
 //! | `NXRT_REQUIRE_ORT_TESTS=1` | Turn "skip because ORT is missing" into a hard failure. Used in CI to prove the real-ORT tests actually ran. |
 //! | `NXRT_<PLUGIN>_PLUGIN_PATH` | Explicit path to a plugin cdylib (see [`find_plugin_cdylib`]). |
-//! | `PROFILE` | `debug` (default) or `release`; selects the cargo target subdirectory. |
+//! | `NXRT_SKIP_PLUGIN_REBUILD=1` | Never shell out to `cargo build`; use whatever artifact already exists. |
+//!
+//! The cargo profile, target directory, and `--target` triple are **derived
+//! from the running test binary** ([`build_layout`]), never guessed from
+//! `PROFILE` (which cargo only sets for build scripts, so a `--release` test
+//! run would have silently resolved `target/debug/...` and loaded a stale
+//! cdylib).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -67,8 +73,12 @@ fn scan_build_dir(build_dir: &Path) -> Option<PathBuf> {
 ///
 /// Resolution order:
 /// 1. `NXRT_ORT_LIB_DIR` (explicit override)
-/// 2. `$CARGO_TARGET_DIR/debug/build/onnx-genai-ort-sys-*/out/ort-prebuilt/lib`
-/// 3. `<workspace>/target/debug/build/onnx-genai-ort-sys-*/out/ort-prebuilt/lib`
+/// 2. `<derived target dir>/<derived profile>/build/onnx-genai-ort-sys-*/out/ort-prebuilt/lib`
+/// 3. `$CARGO_TARGET_DIR/{debug,release}/build/...`
+/// 4. `<workspace>/target/{debug,release}/build/...`
+///
+/// Build-script output lives under `<target-dir>/<profile>/build/` even when
+/// `--target` is used, so the triple is deliberately not part of the path.
 pub fn find_ort_lib_dir() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("NXRT_ORT_LIB_DIR") {
         let p = PathBuf::from(dir);
@@ -77,15 +87,24 @@ pub fn find_ort_lib_dir() -> Option<PathBuf> {
         }
     }
 
-    if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
-        let build_dir = Path::new(&target_dir).join("debug/build");
-        if let Some(d) = scan_build_dir(&build_dir) {
-            return Some(d);
-        }
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let derived = build_layout();
+    if let Some(layout) = &derived {
+        roots.push(layout.target_dir.join(&layout.profile_dir_name));
     }
+    let mut push_profiles = |root: PathBuf| {
+        for profile in ["debug", "release"] {
+            roots.push(root.join(profile));
+        }
+    };
+    if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
+        push_profiles(PathBuf::from(target_dir));
+    }
+    push_profiles(workspace_root().join("target"));
 
-    let build_dir = workspace_root().join("target/debug/build");
-    scan_build_dir(&build_dir)
+    roots
+        .into_iter()
+        .find_map(|root| scan_build_dir(&root.join("build")))
 }
 
 /// Full path to the ORT shared library, if one can be found.
@@ -157,10 +176,107 @@ fn plugin_path_env_var(package: &str) -> String {
     format!("NXRT_{short}_PATH")
 }
 
+/// Where the running test binary was built, derived from `current_exe()`.
+///
+/// Cargo lays test binaries out as
+/// `<target-dir>/[<triple>/]<profile-dir>/deps/<name>-<hash>`, and puts a
+/// package's `cdylib` next to `deps` in the same `<profile-dir>`. Deriving the
+/// layout from the actual executable is the only way to be right for
+/// `--release`, a custom `--profile`, `--target`, and `CARGO_TARGET_DIR` at
+/// once. `PROFILE` is **not** usable here: cargo sets it for build scripts
+/// only, so it is absent during `cargo test` and defaulting it to `debug`
+/// makes a release run load a stale debug cdylib.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BuildLayout {
+    /// Directory holding this profile's artifacts (the parent of `deps/`).
+    pub profile_dir: PathBuf,
+    /// Cargo target root (`CARGO_TARGET_DIR` or `<workspace>/target`).
+    pub target_dir: PathBuf,
+    /// Profile *directory* name (`debug`, `release`, or a custom profile's dir).
+    pub profile_dir_name: String,
+    /// `--target` triple, when the test binary was cross-compiled.
+    pub target_triple: Option<String>,
+}
+
+impl BuildLayout {
+    /// Cargo arguments that reproduce this layout in a nested build.
+    fn cargo_args(&self) -> Vec<String> {
+        let mut args = vec![
+            "--target-dir".to_string(),
+            self.target_dir.display().to_string(),
+        ];
+        // `debug` is the `dev` profile's directory name; every other directory
+        // name equals its profile name.
+        match self.profile_dir_name.as_str() {
+            "debug" => {}
+            other => {
+                args.push("--profile".to_string());
+                args.push(other.to_string());
+            }
+        }
+        if let Some(triple) = &self.target_triple {
+            args.push("--target".to_string());
+            args.push(triple.clone());
+        }
+        args
+    }
+}
+
+/// A path component is a target triple if it looks like `arch-vendor-os[-env]`.
+///
+/// Cargo only inserts such a directory when `--target` was passed, and no
+/// profile directory name contains a `-` followed by another segment in this
+/// shape, so the check is unambiguous in practice.
+fn looks_like_triple(component: &str) -> bool {
+    component.split('-').count() >= 3 && !component.contains(' ')
+}
+
+/// Derive [`BuildLayout`] from the running test binary.
+///
+/// Returns `None` when `current_exe()` is unavailable or does not have the
+/// expected `.../<profile>/deps/<bin>` shape (e.g. a binary copied elsewhere).
+pub fn build_layout() -> Option<BuildLayout> {
+    let exe = std::env::current_exe().ok()?;
+    let deps_dir = exe.parent()?;
+    // Integration tests live in `deps/`; a plain `--bin` lives directly in the
+    // profile dir. Accept both.
+    let profile_dir = if deps_dir.file_name().map(|n| n == "deps").unwrap_or(false) {
+        deps_dir.parent()?
+    } else {
+        deps_dir
+    };
+    let profile_dir_name = profile_dir.file_name()?.to_str()?.to_string();
+    let parent = profile_dir.parent()?;
+    let parent_name = parent.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let (target_dir, target_triple) = if looks_like_triple(parent_name) {
+        (
+            parent.parent()?.to_path_buf(),
+            Some(parent_name.to_string()),
+        )
+    } else {
+        (parent.to_path_buf(), None)
+    };
+    Some(BuildLayout {
+        profile_dir: profile_dir.to_path_buf(),
+        target_dir,
+        profile_dir_name,
+        target_triple,
+    })
+}
+
 fn cdylib_candidates(package: &str) -> Vec<PathBuf> {
-    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
     let libname = cdylib_filename(package);
     let mut out = Vec::new();
+    // The build the current test binary came from is always the best match.
+    if let Some(layout) = build_layout() {
+        out.push(layout.profile_dir.join(&libname));
+    }
+    // Fallbacks for an unusual layout: keep looking under both plausible
+    // target roots, but only for the profile we actually derived (defaulting
+    // to `debug` only when nothing could be derived at all).
+    let profile = build_layout()
+        .map(|l| l.profile_dir_name)
+        .unwrap_or_else(|| "debug".to_string());
     if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
         out.push(PathBuf::from(target_dir).join(&profile).join(&libname));
     }
@@ -170,6 +286,7 @@ fn cdylib_candidates(package: &str) -> Vec<PathBuf> {
             .join(&profile)
             .join(&libname),
     );
+    out.dedup();
     out
 }
 
@@ -224,12 +341,16 @@ fn resolve_plugin_cdylib(package: &str) -> Option<PathBuf> {
     }
 
     if std::env::var("NXRT_SKIP_PLUGIN_REBUILD").as_deref() != Ok("1") {
-        let status = std::process::Command::new(
+        let mut cmd = std::process::Command::new(
             std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()),
-        )
-        .args(["build", "-p", package])
-        .status();
-        match status {
+        );
+        cmd.args(["build", "-p", package]);
+        // Build into the same target dir / profile / triple this test binary
+        // came from, or the "rebuild" would refresh a cdylib we never load.
+        if let Some(layout) = build_layout() {
+            cmd.args(layout.cargo_args());
+        }
+        match cmd.status() {
             Ok(s) if s.success() => {}
             // Fall through: a previously built artifact is better than nothing,
             // but only if one already exists.
@@ -345,5 +466,103 @@ mod tests {
     fn ort_lib_name_is_platform_correct() {
         let name = ort_lib_name();
         assert!(name.contains("onnxruntime"), "unexpected name {name}");
+    }
+
+    /// The derived layout must describe the build this very test binary came
+    /// from — otherwise a `--release` run resolves a stale `debug` cdylib.
+    #[test]
+    fn build_layout_matches_the_running_test_binary() {
+        let layout = build_layout().expect("build_layout must resolve for a cargo test binary");
+        let exe = std::env::current_exe().expect("current_exe");
+        assert!(
+            exe.starts_with(&layout.profile_dir),
+            "profile dir {:?} is not an ancestor of the test binary {:?}",
+            layout.profile_dir,
+            exe
+        );
+        assert!(
+            exe.starts_with(&layout.target_dir),
+            "target dir {:?} is not an ancestor of the test binary {:?}",
+            layout.target_dir,
+            exe
+        );
+        assert!(
+            !layout.profile_dir_name.is_empty(),
+            "profile dir name must not be empty"
+        );
+        // `cfg!(debug_assertions)` is the only profile fact a test can check
+        // without trusting the same derivation it is validating.
+        if cfg!(debug_assertions) {
+            assert_ne!(
+                layout.profile_dir_name, "release",
+                "a debug-assertions build cannot have come from target/release"
+            );
+        }
+    }
+
+    /// The nested `cargo build` must target the same directory/profile/triple,
+    /// or the "always rebuild" guarantee refreshes an artifact nobody loads.
+    #[test]
+    fn nested_cargo_args_reproduce_the_running_layout() {
+        let layout = build_layout().expect("build_layout");
+        let args = layout.cargo_args();
+        let joined = args.join(" ");
+        assert!(
+            joined.contains("--target-dir"),
+            "nested build must pin the target dir: {joined}"
+        );
+        assert!(
+            args.contains(&layout.target_dir.display().to_string()),
+            "nested build must use the derived target dir: {joined}"
+        );
+        match layout.profile_dir_name.as_str() {
+            "debug" => assert!(
+                !joined.contains("--profile"),
+                "the dev profile is cargo's default and needs no flag: {joined}"
+            ),
+            other => assert!(
+                args.windows(2)
+                    .any(|w| w[0] == "--profile" && w[1] == other),
+                "nested build must pass --profile {other}: {joined}"
+            ),
+        }
+        match &layout.target_triple {
+            Some(triple) => assert!(
+                args.windows(2)
+                    .any(|w| w[0] == "--target" && w[1] == *triple),
+                "nested build must pass --target {triple}: {joined}"
+            ),
+            None => assert!(
+                !joined.contains("--target "),
+                "no --target may be passed for a host build: {joined}"
+            ),
+        }
+    }
+
+    #[test]
+    fn triple_detection_accepts_triples_and_rejects_profile_names() {
+        assert!(looks_like_triple("x86_64-unknown-linux-gnu"));
+        assert!(looks_like_triple("aarch64-apple-darwin"));
+        assert!(looks_like_triple("x86_64-pc-windows-msvc"));
+        assert!(!looks_like_triple("debug"));
+        assert!(!looks_like_triple("release"));
+        assert!(!looks_like_triple("bench-fast"));
+    }
+
+    /// The first cdylib candidate must sit next to this test binary's `deps`
+    /// directory — the artifact a nested build actually refreshes.
+    #[test]
+    fn cdylib_candidates_lead_with_the_running_profile_dir() {
+        let layout = build_layout().expect("build_layout");
+        let candidates = cdylib_candidates("onnx-runtime-ep-cpu-plugin");
+        assert_eq!(
+            candidates.first(),
+            Some(
+                &layout
+                    .profile_dir
+                    .join(cdylib_filename("onnx-runtime-ep-cpu-plugin"))
+            ),
+            "candidates: {candidates:?}"
+        );
     }
 }

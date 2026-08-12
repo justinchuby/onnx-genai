@@ -76,38 +76,41 @@ pub fn ep_supports_hardware_type(
 /// How a component references the EP. Shared holds an `Arc` clone (B1 fix);
 /// Owned holds a raw pointer that will be freed on drop.
 pub(crate) enum EpRef {
-    /// Shared EP backed by a lock-free `Arc<dyn ExecutionProvider>` clone.
-    /// The strong reference keeps the EP (and its runtime/context) alive for
-    /// the component's lifetime. No mutex is needed: every
-    /// `ExecutionProvider` method used post-construction (`allocate`,
-    /// `deallocate`, `copy`, `copy_async`, `sync`, `get_kernel`,
-    /// `supports_op`, ...) takes `&self`, so concurrent callers (allocator,
-    /// stream, data transfer, and the compiled `OrtEp`) can all hold and use
-    /// the same `Arc` simultaneously without contending on a lock.
-    Shared(Arc<dyn ExecutionProvider>),
+    /// Shared EP backed by an `Arc<Mutex<..>>`. Each use locks the mutex.
+    /// The strong reference keeps the EP alive for the component's lifetime.
+    Shared(Arc<Mutex<Box<dyn ExecutionProvider + Send>>>),
     /// Owned raw pointer — the component will reconstruct and drop the `Box`
     /// on release. Used only for the non-shared (fresh constructor) path.
     Owned(*const dyn ExecutionProvider),
 }
 
-// SAFETY: Both variants are Send+Sync — Arc<dyn ExecutionProvider> is
-// Send+Sync because ExecutionProvider: Send + Sync, and the raw pointer
-// behind Owned is Send+Sync per the same trait bounds.
+// SAFETY: Both variants are Send+Sync — Arc is inherently so, and the raw
+// pointer behind Owned is Send+Sync per the ExecutionProvider trait bounds.
 unsafe impl Send for EpRef {}
 unsafe impl Sync for EpRef {}
 
 impl EpRef {
-    /// Execute `f` with a reference to the EP.
+    /// Execute `f` with a reference to the EP. For `Shared`, locks the mutex.
     ///
-    /// Always succeeds for `Shared` (no lock to poison). Returns `Err` only
-    /// for `Owned` with a null pointer (should not happen in practice, but
-    /// checked defensively since this crosses the ORT FFI boundary).
+    /// A poisoned mutex is **recovered** rather than propagated (matching
+    /// `EpHandle::with` in `ep.rs`): every `ExecutionProvider` method reached
+    /// through here takes `&self`, so a panic elsewhere cannot have left the EP
+    /// half-mutated, while refusing to run would turn `Free` into a permanent
+    /// no-op and leak every subsequent device allocation.
+    ///
+    /// Returns `Err` only for `Owned` with a null pointer (S2 fix: no
+    /// `.unwrap()` across FFI).
     pub(crate) fn with_ep<R>(
         &self,
         f: impl FnOnce(&dyn ExecutionProvider) -> R,
     ) -> Result<R, &'static str> {
         match self {
-            EpRef::Shared(arc) => Ok(f(&**arc)),
+            EpRef::Shared(arc) => {
+                let guard = arc
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                Ok(f(&**guard))
+            }
             EpRef::Owned(ptr) => {
                 if ptr.is_null() {
                     return Err("EP pointer is null");
@@ -177,7 +180,7 @@ impl DeviceAllocator {
     ///
     /// `memory_info` must be a valid ORT-owned pointer.
     pub unsafe fn new_shared(
-        shared: Arc<dyn ExecutionProvider>,
+        shared: Arc<Mutex<Box<dyn ExecutionProvider + Send>>>,
         memory_info: *const ort::OrtMemoryInfo,
     ) -> Box<Self> {
         Box::new(Self {
@@ -258,11 +261,19 @@ unsafe extern "C" fn device_alloc(
                     // from "failure". Fail the allocation instead.
                     return ptr::null_mut();
                 }
-                if let Ok(mut sizes) = alloc.alloc_sizes.lock() {
-                    // Record what we actually asked the EP for, so `Free`
-                    // returns the identical size.
-                    sizes.insert(p as usize, request);
-                }
+                // Recover from a poisoned lock rather than dropping the record:
+                // an unrecorded allocation is one `device_free` can never
+                // reclaim, so poisoning would silently turn into a device-memory
+                // leak. The guarded data is a plain `HashMap` whose only
+                // mutations here are `insert`/`remove`, so it cannot be left
+                // logically inconsistent by a panic elsewhere.
+                let mut sizes = alloc
+                    .alloc_sizes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // Record what we actually asked the EP for, so `Free`
+                // returns the identical size.
+                sizes.insert(p as usize, request);
                 p
             }
             _ => ptr::null_mut(),
@@ -280,11 +291,13 @@ unsafe extern "C" fn device_free(this: *mut ort::OrtAllocator, p: *mut std::os::
         // Look up the true allocation size from our tracking table.
         // S1 fix: if the pointer is unknown, skip the free rather than
         // passing a fabricated size=0 to deallocate.
+        // Poison recovery (see `device_alloc`): a poisoned lock must not turn
+        // every subsequent free into a no-op.
         let size = alloc
             .alloc_sizes
             .lock()
-            .ok()
-            .and_then(|mut sizes| sizes.remove(&(p as usize)));
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&(p as usize));
         let size = match size {
             Some(s) => s,
             None => return, // unknown pointer — no-op (S1)
@@ -352,7 +365,7 @@ impl DeviceSyncStream {
 
     /// Create a sync stream backed by a shared EP (`Arc` clone).
     pub fn new_shared(
-        shared: Arc<dyn ExecutionProvider>,
+        shared: Arc<Mutex<Box<dyn ExecutionProvider + Send>>>,
         stream_handle: *mut std::os::raw::c_void,
     ) -> Box<Self> {
         Box::new(Self {
@@ -548,8 +561,6 @@ pub fn validate_stream_request(support: &DeviceSupport) -> *mut ort::OrtStatus {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     use super::*;
     use onnx_runtime_ep_api::{EpError, Kernel, KernelMatch, Result as EpResult};
     use onnx_runtime_ir::{DataType, DeviceId, DeviceType, Node, Shape, TensorLayout};
@@ -961,8 +972,8 @@ mod tests {
 
     #[test]
     fn device_sync_stream_flush_succeeds() {
-        let ep: Box<dyn ExecutionProvider> = Box::new(MockGpuEp);
-        let shared: Arc<dyn ExecutionProvider> = Arc::from(ep);
+        let ep: Box<dyn ExecutionProvider + Send> = Box::new(MockGpuEp);
+        let shared = Arc::new(Mutex::new(ep));
         let stream = DeviceSyncStream::new_shared(shared, ptr::null_mut());
         let stream_ptr = Box::into_raw(stream);
 
@@ -980,8 +991,8 @@ mod tests {
 
     #[test]
     fn device_sync_stream_get_handle_returns_null_for_mock() {
-        let ep: Box<dyn ExecutionProvider> = Box::new(MockGpuEp);
-        let shared: Arc<dyn ExecutionProvider> = Arc::from(ep);
+        let ep: Box<dyn ExecutionProvider + Send> = Box::new(MockGpuEp);
+        let shared = Arc::new(Mutex::new(ep));
         let stream = DeviceSyncStream::new_shared(shared, ptr::null_mut());
         let stream_ptr = Box::into_raw(stream);
 
@@ -993,8 +1004,8 @@ mod tests {
 
     #[test]
     fn device_sync_stream_release_does_not_panic() {
-        let ep: Box<dyn ExecutionProvider> = Box::new(MockGpuEp);
-        let shared: Arc<dyn ExecutionProvider> = Arc::from(ep);
+        let ep: Box<dyn ExecutionProvider + Send> = Box::new(MockGpuEp);
+        let shared = Arc::new(Mutex::new(ep));
         let stream = DeviceSyncStream::new_shared(shared, ptr::null_mut());
         let stream_ptr = Box::into_raw(stream);
         unsafe { stream_release(stream_ptr.cast()) };
@@ -1008,6 +1019,8 @@ mod tests {
 
     #[test]
     fn stream_release_reclaims_owned_ep_no_leak() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
         static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
 
         /// An EP whose Drop increments a counter, proving the EP is reclaimed.
@@ -1209,9 +1222,7 @@ mod tests {
     /// hardened CUDA allocator that refuses `cudaMalloc(0)`. If the adapter
     /// ever stops normalising, `Alloc(0)` starts returning null and every
     /// empty-tensor model breaks.
-    struct ZeroHostileEp {
-        zero_requests: AtomicUsize,
-    }
+    struct ZeroHostileEp;
 
     impl ExecutionProvider for ZeroHostileEp {
         fn name(&self) -> &str {
@@ -1240,9 +1251,7 @@ mod tests {
             _input_dtypes: &[DataType],
             _layouts: &[TensorLayout],
         ) -> KernelMatch {
-            KernelMatch::Unsupported {
-                reason: "mock".into(),
-            }
+            KernelMatch::unsupported("mock")
         }
         fn get_kernel(
             &self,
@@ -1258,14 +1267,12 @@ mod tests {
             size: usize,
             _alignment: usize,
         ) -> EpResult<onnx_runtime_ep_api::provider::DeviceBuffer> {
-            if size == 0 {
-                self.zero_requests.fetch_add(1, Ordering::SeqCst);
-                return Err(EpError::OutOfMemory {
-                    requested: 0,
-                    available: 0,
-                });
-            }
+            assert_ne!(
+                size, 0,
+                "the adapter must normalise size 0 before reaching the EP allocator"
+            );
             let layout = std::alloc::Layout::from_size_align(size, 16).unwrap();
+            // SAFETY: `layout` has non-zero size (asserted above).
             let ptr = unsafe { std::alloc::alloc(layout) };
             if ptr.is_null() {
                 return Err(EpError::OutOfMemory {
@@ -1273,6 +1280,7 @@ mod tests {
                     available: 0,
                 });
             }
+            // SAFETY: `ptr` is live for `size` bytes with alignment 16.
             Ok(unsafe {
                 onnx_runtime_ep_api::provider::DeviceBuffer::from_raw_parts(
                     ptr.cast(),
@@ -1292,6 +1300,7 @@ mod tests {
             );
             if !ptr.is_null() {
                 let layout = std::alloc::Layout::from_size_align(size, 16).unwrap();
+                // SAFETY: same layout the matching `allocate` used.
                 unsafe { std::alloc::dealloc(ptr as *mut u8, layout) };
             }
             Ok(())
@@ -1318,6 +1327,12 @@ mod tests {
         }
     }
 
+    fn zero_hostile_allocator() -> *mut DeviceAllocator {
+        let ep_ptr = Box::into_raw(Box::new(ZeroHostileEp) as Box<dyn ExecutionProvider>);
+        // SAFETY: `ep_ptr` comes from `Box::into_raw`; the allocator takes it.
+        Box::into_raw(unsafe { DeviceAllocator::new_owned(ep_ptr, ptr::null()) })
+    }
+
     #[test]
     fn normalize_alloc_size_only_rewrites_zero() {
         assert_eq!(normalize_alloc_size(0), ZERO_SIZE_ALLOC_BYTES);
@@ -1336,13 +1351,9 @@ mod tests {
     /// allocator, owns this normalisation.
     #[test]
     fn zero_size_alloc_is_normalised_at_the_adapter_boundary() {
-        let ep = ZeroHostileEp {
-            zero_requests: AtomicUsize::new(0),
-        };
-        let ep_ptr = Box::into_raw(Box::new(ep) as Box<dyn ExecutionProvider>);
-        let alloc = unsafe { DeviceAllocator::new_owned(ep_ptr, ptr::null()) };
-        let alloc_ptr = Box::into_raw(alloc);
+        let alloc_ptr = zero_hostile_allocator();
 
+        // SAFETY: `alloc_ptr` is a live `DeviceAllocator`.
         let a = unsafe { device_alloc(alloc_ptr.cast(), 0) };
         let b = unsafe { device_alloc(alloc_ptr.cast(), 0) };
         assert!(
@@ -1354,30 +1365,91 @@ mod tests {
 
         // `deallocate` asserts the size is non-zero, so this also proves Free
         // returns the normalised size rather than the caller's 0.
+        // SAFETY: both pointers came from `device_alloc` on this allocator.
         unsafe { device_free(alloc_ptr.cast(), a) };
         unsafe { device_free(alloc_ptr.cast(), b) };
 
+        // SAFETY: reclaim the allocator created by `zero_hostile_allocator`.
         unsafe { drop(Box::from_raw(alloc_ptr)) };
     }
 
     /// A non-zero request must be passed through untouched.
     #[test]
     fn non_zero_alloc_size_is_passed_through_unchanged() {
-        let ep = ZeroHostileEp {
-            zero_requests: AtomicUsize::new(0),
-        };
-        let ep_ptr = Box::into_raw(Box::new(ep) as Box<dyn ExecutionProvider>);
-        let alloc = unsafe { DeviceAllocator::new_owned(ep_ptr, ptr::null()) };
-        let alloc_ptr = Box::into_raw(alloc);
+        let alloc_ptr = zero_hostile_allocator();
 
+        // SAFETY: `alloc_ptr` is a live `DeviceAllocator`.
         let p = unsafe { device_alloc(alloc_ptr.cast(), 256) };
         assert!(!p.is_null());
         let recorded = {
-            let a = unsafe { &*(alloc_ptr.cast::<DeviceAllocator>()) };
+            // SAFETY: `alloc_ptr` is a live `DeviceAllocator`.
+            let a = unsafe { &*alloc_ptr };
             *a.alloc_sizes.lock().unwrap().get(&(p as usize)).unwrap()
         };
         assert_eq!(recorded, 256);
+        // SAFETY: `p` came from `device_alloc` on this allocator.
         unsafe { device_free(alloc_ptr.cast(), p) };
+        // SAFETY: reclaim the allocator created by `zero_hostile_allocator`.
+        unsafe { drop(Box::from_raw(alloc_ptr)) };
+    }
+
+    /// A poisoned `alloc_sizes` lock must not silently turn every later `Free`
+    /// into a no-op: that is a device-memory leak, not a safe degradation.
+    #[test]
+    fn poisoned_alloc_sizes_lock_still_frees() {
+        let alloc_ptr = zero_hostile_allocator();
+
+        // Poison the tracking lock exactly the way a panic-in-callback would.
+        {
+            // SAFETY: `alloc_ptr` is a live `DeviceAllocator`.
+            let a = unsafe { &*alloc_ptr };
+            let poisoner = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = a.alloc_sizes.lock().unwrap();
+                panic!("poison the alloc_sizes mutex");
+            }));
+            assert!(poisoner.is_err(), "the poisoning panic must be observed");
+            assert!(a.alloc_sizes.is_poisoned(), "lock must now be poisoned");
+        }
+
+        // SAFETY: `alloc_ptr` is a live `DeviceAllocator`.
+        let p = unsafe { device_alloc(alloc_ptr.cast(), 128) };
+        assert!(
+            !p.is_null(),
+            "allocation must still succeed with a poisoned tracking lock"
+        );
+        let recorded = {
+            // SAFETY: `alloc_ptr` is a live `DeviceAllocator`.
+            let a = unsafe { &*alloc_ptr };
+            a.alloc_sizes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&(p as usize))
+                .copied()
+        };
+        assert_eq!(
+            recorded,
+            Some(128),
+            "the size must be recorded even through a poisoned lock, or Free can never reclaim it"
+        );
+
+        // ZeroHostileEp::deallocate would panic on a fabricated size; reaching
+        // it at all proves the free path ran.
+        // SAFETY: `p` came from `device_alloc` on this allocator.
+        unsafe { device_free(alloc_ptr.cast(), p) };
+        let still_tracked = {
+            // SAFETY: `alloc_ptr` is a live `DeviceAllocator`.
+            let a = unsafe { &*alloc_ptr };
+            a.alloc_sizes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&(p as usize))
+        };
+        assert!(
+            !still_tracked,
+            "Free must remove the tracking entry, proving it actually ran"
+        );
+
+        // SAFETY: reclaim the allocator created by `zero_hostile_allocator`.
         unsafe { drop(Box::from_raw(alloc_ptr)) };
     }
 }

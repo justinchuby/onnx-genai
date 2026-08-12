@@ -58,6 +58,9 @@ The opt-in profiling binaries measure different layers:
 The `--steady` path is directly comparable head-to-head: both backends use the
 same engine callbacks, warmups, token IDs, and `--decode-skip` timing window.
 The non-steady path retains native-only tracing and logit-dump diagnostics.
+Native steady runs also print the resolved memory strategy, CUDA graph
+capture/replay counters, weight-residency activity, and committed VMM physical
+bytes so an over-budget run cannot be mistaken for a full-resident one.
 
 ```bash
 cargo run --release -p onnx-genai-bench \

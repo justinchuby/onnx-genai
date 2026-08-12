@@ -3579,6 +3579,7 @@ impl KernelFactory for MatMulNBitsFactory {
                 .and_then(onnx_runtime_ir::Attribute::as_float)
                 .unwrap_or(1e-5),
             last_call_capture_safe: AtomicBool::new(false),
+            bf16_scratch: Mutex::new(Bf16Scratch::new(self.runtime.clone())),
         }))
     }
 }
@@ -3618,6 +3619,58 @@ impl Drop for Accuracy4Workspace {
     }
 }
 
+/// Reusable device scratch for the BFloat16 activation path.
+///
+/// BFloat16 operands are staged through Float16 (see
+/// [`MatMulNBitsKernel::run_bf16`]). A per-node allocation + free for each
+/// staging buffer would synchronize the device on every one of the hundreds of
+/// MatMulNBits nodes per decode step (`cuMemAlloc`/`cuMemFree` are synchronous),
+/// collapsing throughput. This grow-only arena is carved into per-call regions
+/// and reused across decode steps, so after the first step the BFloat16 path
+/// issues only asynchronous casts and the tuned fp16 matmul — no device sync.
+/// Each kernel instance owns its own arena, and consecutive uses are ordered on
+/// the EP stream, so region reuse never races.
+#[derive(Debug)]
+struct Bf16Scratch {
+    runtime: Arc<CudaRuntime>,
+    ptr: CUdeviceptr,
+    cap: usize,
+}
+
+impl Bf16Scratch {
+    fn new(runtime: Arc<CudaRuntime>) -> Self {
+        Self {
+            runtime,
+            ptr: 0,
+            cap: 0,
+        }
+    }
+
+    /// Ensure the arena holds at least `bytes`, returning its base pointer.
+    fn ensure(&mut self, bytes: usize) -> Result<CUdeviceptr> {
+        if bytes > self.cap {
+            if self.ptr != 0 {
+                // SAFETY: exclusively owned; freed once before replacement.
+                unsafe { self.runtime.free_raw(self.ptr)? };
+                self.ptr = 0;
+            }
+            self.ptr = self.runtime.alloc_raw(bytes.max(1))?;
+            self.cap = bytes;
+        }
+        Ok(self.ptr)
+    }
+}
+
+impl Drop for Bf16Scratch {
+    fn drop(&mut self) {
+        if self.ptr != 0 {
+            // SAFETY: this persistent buffer is exclusively owned by the kernel.
+            let _ = unsafe { self.runtime.free_raw(self.ptr) };
+            self.ptr = 0;
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct MatMulNBitsKernel {
     runtime: Arc<CudaRuntime>,
@@ -3648,6 +3701,8 @@ pub struct MatMulNBitsKernel {
     /// the fused prologue reproduces its `1/sqrt(mean_sq + epsilon)`.
     rmsnorm_epsilon: f32,
     last_call_capture_safe: AtomicBool,
+    /// Reusable Float16 staging arena for the BFloat16 activation path.
+    bf16_scratch: Mutex<Bf16Scratch>,
 }
 
 impl MatMulNBitsKernel {
@@ -3671,6 +3726,9 @@ impl MatMulNBitsKernel {
                 return self.run_f16_gate_up_swiglu(inputs, outputs);
             }
             return self.run_f16(inputs, outputs);
+        }
+        if inputs[0].dtype == DataType::BFloat16 {
+            return self.run_bf16(inputs, outputs, workspace);
         }
         require_dtype("A", inputs[0].dtype, DataType::Float32)?;
         require_dtype("B", inputs[1].dtype, DataType::Uint8)?;
@@ -4086,6 +4144,111 @@ impl MatMulNBitsKernel {
         };
         let bytes = blas::gemm_workspace_bytes(self.runtime.blas(), &params)?;
         Ok(blas::governed_workspace_requirement(bytes))
+    }
+
+    /// BFloat16-activation path. The tuned int4/int8 GEMV/GEMM kernels are
+    /// implemented for Float16 and Float32 activations only, so BFloat16 inputs
+    /// are staged through Float16: every BFloat16 operand (activation, scales,
+    /// and any fused residual/gamma) is converted into a scratch Float16 buffer,
+    /// the reused fp16 path runs the actual matmul against the still-quantized
+    /// int4/int8 weights, and the Float16 result is converted back to BFloat16.
+    ///
+    /// Only the small activation/scale/output buffers are converted; the packed
+    /// weights (the memory-bound term in decode) keep their int4/int8 layout, so
+    /// the extra work is a handful of pointwise casts per node. Float16 losslessly
+    /// represents the post-normalization magnitudes MatMulNBits consumes here.
+    /// The per-call scratch means this path is not graph-capture safe.
+    fn run_bf16(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        require_dtype("A", inputs[0].dtype, DataType::BFloat16)?;
+        require_dtype("Y", outputs[0].dtype, DataType::BFloat16)?;
+
+        // Lay out per-call Float16 regions inside the reusable arena: one region
+        // per BFloat16 input, plus one for the Float16 result. Regions are padded
+        // so each begins aligned for the tuned fp16 kernels' vectorized loads.
+        const ALIGN: usize = 256;
+        let f16 = std::mem::size_of::<half::f16>();
+        let round = |bytes: usize| bytes.div_ceil(ALIGN) * ALIGN;
+
+        let mut offsets: Vec<Option<usize>> = Vec::with_capacity(inputs.len());
+        let mut total = 0usize;
+        for input in inputs {
+            if input.dtype == DataType::BFloat16 {
+                offsets.push(Some(total));
+                total += round(input.numel() * f16);
+            } else {
+                offsets.push(None);
+            }
+        }
+        let out_off = total;
+        let out_n = outputs[0].numel();
+        total += round(out_n * f16);
+
+        // Hold the arena for the whole call: the staging casts, the reused fp16
+        // matmul, and the narrowing cast all run stream-ordered against it. The
+        // fp16 path never touches `bf16_scratch`, so this cannot deadlock.
+        let mut arena = self
+            .bf16_scratch
+            .lock()
+            .map_err(|_| error("MatMulNBits bf16 scratch mutex poisoned"))?;
+        let base = arena.ensure(total)?;
+
+        let mut f16_inputs: Vec<TensorView> = Vec::with_capacity(inputs.len());
+        for (input, offset) in inputs.iter().zip(offsets.iter()) {
+            match offset {
+                Some(off) => {
+                    let ptr = base + *off as CUdeviceptr;
+                    super::cast::launch_cast_raw(
+                        &self.runtime,
+                        cuptr(input.data_ptr::<u8>() as *const c_void),
+                        DataType::BFloat16,
+                        ptr,
+                        DataType::Float16,
+                        input.numel(),
+                    )?;
+                    f16_inputs.push(TensorView::new(
+                        DevicePtr(raw_ptr(ptr) as *const c_void),
+                        DataType::Float16,
+                        input.shape,
+                        input.strides,
+                        input.device,
+                    ));
+                }
+                None => f16_inputs.push(*input),
+            }
+        }
+
+        let out_ptr = base + out_off as CUdeviceptr;
+        let out_shape = outputs[0].shape;
+        let out_strides = outputs[0].strides;
+        let out_device = outputs[0].device;
+        let mut y_f16 = TensorMut::new(
+            DevicePtrMut(raw_ptr(out_ptr)),
+            DataType::Float16,
+            out_shape,
+            out_strides,
+            out_device,
+        );
+        self.run(&f16_inputs, std::slice::from_mut(&mut y_f16), workspace)?;
+        super::cast::launch_cast_raw(
+            &self.runtime,
+            out_ptr,
+            DataType::Float16,
+            cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void),
+            DataType::BFloat16,
+            out_n,
+        )?;
+        // Capture-safety is inherited from the staged fp16 run: the M==1 decode
+        // GEMV is capture-safe, and the staging casts add only allocation-free,
+        // sync-free stream launches against the persistent arena (which is grown
+        // once, before capture). Prefill (M>1) leaves the flag cleared. So the
+        // flag `run` set during recursion is exactly right — do not override it.
+        drop(arena);
+        Ok(())
     }
 
     /// Direct fp16-activation x int4/int8-weight path. Scales may be fp16 or
@@ -6759,6 +6922,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
+            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
         };
         kernel.run(&inputs, &mut outputs, None).unwrap();
         runtime.synchronize().unwrap();
@@ -7038,6 +7202,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
+            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
         };
         kernel.run(&inputs, &mut outputs, None).unwrap();
         runtime.synchronize().unwrap();
@@ -7189,6 +7354,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 rmsnorm_prologue: false,
                 rmsnorm_epsilon: 1e-5,
                 last_call_capture_safe: AtomicBool::new(false),
+                bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
             };
             let staged_source = format!("{GEMV_F16_SRC}\n{STAGED_DOWN_REFERENCE_SRC}");
             let staged_function = runtime
@@ -7933,6 +8099,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
+            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
         };
         kernel.run(&inputs, &mut outputs, None).unwrap();
         runtime.synchronize().unwrap();
@@ -8191,6 +8358,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
+            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
         };
 
         match bits {
@@ -8460,6 +8628,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
+            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
         };
         let kernel_fold = MatMulNBitsKernel {
             runtime: runtime.clone(),
@@ -8475,6 +8644,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
+            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
         };
         kernel_nobias
             .launch_f16_gemv_variant(
@@ -8733,6 +8903,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 rmsnorm_prologue: false,
                 rmsnorm_epsilon: 1e-5,
                 last_call_capture_safe: AtomicBool::new(false),
+                bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
             };
             // Reference: two standalone MatMulNBits projections.
             if m == 1 {
@@ -9151,6 +9322,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 rmsnorm_prologue: false,
                 rmsnorm_epsilon: epsilon,
                 last_call_capture_safe: AtomicBool::new(false),
+                bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
             };
             let fused_swiglu = MatMulNBitsKernel {
                 runtime: runtime.clone(),
@@ -9166,6 +9338,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 rmsnorm_prologue: true,
                 rmsnorm_epsilon: epsilon,
                 last_call_capture_safe: AtomicBool::new(false),
+                bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
             };
 
             // Reference: normalize the activation (production prefill norm
@@ -9616,6 +9789,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 rmsnorm_prologue: rmsnorm,
                 rmsnorm_epsilon: epsilon,
                 last_call_capture_safe: AtomicBool::new(false),
+                bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
             };
 
             // ── Reference: preceding GEMV → skip_rmsnorm → following GEMV ──

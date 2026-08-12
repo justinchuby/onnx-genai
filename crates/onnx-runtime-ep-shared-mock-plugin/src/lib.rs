@@ -3,9 +3,10 @@
 //!
 //! # Why this crate exists
 //!
-//! The shared-EP ownership model (one `Arc<dyn ExecutionProvider>` handed to
-//! the allocator, sync stream, data transfer, *and* every `OrtEp` a factory
-//! produces) is the path a real CUDA plugin takes. Until now it was only
+//! The shared-EP ownership model (one `Arc<Mutex<Box<dyn ExecutionProvider +
+//! Send>>>` handed to the allocator, sync stream, data transfer, *and* every
+//! `OrtEp` a factory produces via `EpHandle::Shared`) is the path a real CUDA
+//! plugin takes. Until now it was only
 //! covered by tests that call our own `extern "C"` vtable entries directly.
 //! That proves the function pointers work; it does **not** prove that a real
 //! `OrtSession` can be created against a shared-EP factory, that ORT will
@@ -17,9 +18,9 @@
 //! only matches hardware devices that ORT actually enumerates, so on a
 //! GPU-less host a GPU-typed mock would never be selected and no session could
 //! ever be created. A CPU-typed shared EP exercises every shared-ownership
-//! code path that matters (single instance across sessions, workspace and
-//! intermediate allocation through the EP allocator, factory-level teardown)
-//! on ordinary CI hardware.
+//! code path that matters (single instance across sessions, governed kernel
+//! workspaces, fused-subgraph intermediates, factory-level teardown) on
+//! ordinary CI hardware.
 //!
 //! **This proves shared-EP ownership, workspace plumbing, and teardown
 //! ordering. It proves nothing about CUDA correctness or device memory.**
@@ -37,12 +38,18 @@
 //! [`PlainMulKernel`] (op `Mul`) declares [`WorkspaceRequirement::NONE`] and
 //! implements only `execute`, so the "no workspace needed" path stays covered.
 //!
+//! Setting [`nxrt_mock_shared_ep_set_persistent_workspace`] flips the `Add`
+//! kernel's declared lifetime to [`WorkspaceLifetime::SessionPersistent`],
+//! which the executor cannot honour. The falsifier for "never silently
+//! downgrade" is that `Run()` then **fails** and
+//! `nxrt_mock_shared_ep_persistent_dispatched` stays `0`.
+//!
 //! All observable state is exported through `#[no_mangle]` C accessors so the
 //! integration test — which reaches this library through ORT's `dlopen` — can
 //! read the same statics ORT's copy mutates.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use onnx_runtime_ep_api::{
     Cost, DeviceBuffer, EpConfig, EpError, ExecutionProvider, Fence, Kernel, KernelMatch,
@@ -76,6 +83,10 @@ static KERNEL_WORKSPACE_OK: AtomicUsize = AtomicUsize::new(0);
 static KERNEL_WORKSPACE_MISSING: AtomicUsize = AtomicUsize::new(0);
 static KERNEL_EXECUTE_WITHOUT_WORKSPACE: AtomicUsize = AtomicUsize::new(0);
 static KERNEL_MUL_EXECUTED: AtomicUsize = AtomicUsize::new(0);
+static KERNEL_PERSISTENT_DISPATCHED: AtomicUsize = AtomicUsize::new(0);
+
+/// When set, `WorkspaceAddKernel` declares a `SessionPersistent` workspace.
+static PERSISTENT_WORKSPACE: AtomicBool = AtomicBool::new(false);
 
 macro_rules! counter_export {
     ($fn_name:ident, $static_name:ident, $doc:literal) => {
@@ -106,8 +117,11 @@ counter_export!(
 counter_export!(
     nxrt_mock_shared_ep_alloc_calls,
     EP_ALLOC_CALLS,
-    "Cumulative `ExecutionProvider::allocate` calls (workspaces + subgraph \
-     intermediates + absent-output scratch)."
+    "Cumulative `ExecutionProvider::allocate` calls. Workspaces and subgraph \
+     intermediates come from ORT scratch (`KernelContext_GetScratchBuffer`), \
+     **not** from here, so this must stay `0` during `Run()` — a non-zero value \
+     means per-dispatch EP allocate/free came back, which synchronises the \
+     device and is illegal during CUDA-graph capture."
 );
 counter_export!(
     nxrt_mock_shared_ep_dealloc_calls,
@@ -117,8 +131,8 @@ counter_export!(
 counter_export!(
     nxrt_mock_shared_ep_alloc_live,
     EP_ALLOC_LIVE,
-    "Allocations made through the EP that have not been freed. Must return to \
-     `0` after a `Run()` completes — a non-zero value is a per-call leak."
+    "Allocations made through the EP that have not been freed. Must be `0` \
+     after a `Run()` completes — a non-zero value is a per-call leak."
 );
 counter_export!(
     nxrt_mock_shared_ep_workspace_ok,
@@ -142,6 +156,26 @@ counter_export!(
     KERNEL_MUL_EXECUTED,
     "Dispatches of the zero-workspace `Mul` kernel."
 );
+counter_export!(
+    nxrt_mock_shared_ep_persistent_dispatched,
+    KERNEL_PERSISTENT_DISPATCHED,
+    "Dispatches that reached the kernel while it declared a `SessionPersistent` \
+     workspace. Must stay `0`: the executor has no persistent device arena, so \
+     serving such a request from step-scoped scratch would be a silent \
+     downgrade."
+);
+
+/// Select the workspace lifetime the mock `Add` kernel declares.
+///
+/// `0` = `StepScoped` (the honourable request), anything else =
+/// `SessionPersistent` (the request the executor must reject rather than
+/// silently downgrade). Call before `CreateSession`, since
+/// `workspace_requirement` is consulted per dispatch but the kernel is built
+/// at compile time.
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_mock_shared_ep_set_persistent_workspace(on: usize) {
+    PERSISTENT_WORKSPACE.store(on != 0, Ordering::SeqCst);
+}
 
 /// Reset every counter. Tests call this before each scenario.
 #[unsafe(no_mangle)]
@@ -153,9 +187,11 @@ pub extern "C" fn nxrt_mock_shared_ep_reset_counters() {
         &KERNEL_WORKSPACE_MISSING,
         &KERNEL_EXECUTE_WITHOUT_WORKSPACE,
         &KERNEL_MUL_EXECUTED,
+        &KERNEL_PERSISTENT_DISPATCHED,
     ] {
         c.store(0, Ordering::SeqCst);
     }
+    PERSISTENT_WORKSPACE.store(false, Ordering::SeqCst);
     // `EP_INSTANCES_CREATED`, `EP_INSTANCES_LIVE`, `EP_SHUTDOWN_CALLS` and
     // `EP_ALLOC_LIVE` are lifetime invariants, not per-scenario counters, and
     // are deliberately NOT reset.
@@ -376,11 +412,18 @@ impl Kernel for WorkspaceAddKernel {
             .first()
             .map(|m| m.shape.iter().product())
             .unwrap_or(0usize);
+        let persistent = PERSISTENT_WORKSPACE.load(Ordering::SeqCst);
         Ok(WorkspaceRequirement {
             bytes: (numel * std::mem::size_of::<f32>()) as u64,
             alignment: MOCK_WORKSPACE_ALIGNMENT,
-            lifetime: WorkspaceLifetime::StepScoped,
-            role: MemoryRole::Workspace { step_scoped: true },
+            lifetime: if persistent {
+                WorkspaceLifetime::SessionPersistent
+            } else {
+                WorkspaceLifetime::StepScoped
+            },
+            role: MemoryRole::Workspace {
+                step_scoped: !persistent,
+            },
         })
     }
 
@@ -390,6 +433,15 @@ impl Kernel for WorkspaceAddKernel {
         outputs: &mut [TensorMut],
         workspace: Option<WorkspaceView>,
     ) -> EpResult<()> {
+        if PERSISTENT_WORKSPACE.load(Ordering::SeqCst) {
+            KERNEL_PERSISTENT_DISPATCHED.fetch_add(1, Ordering::SeqCst);
+            return Err(EpError::KernelFailed(
+                "WorkspaceAddKernel: dispatched while declaring a SessionPersistent workspace. \
+                 The executor silently downgraded a persistent request to step-scoped scratch \
+                 instead of failing closed."
+                    .to_string(),
+            ));
+        }
         let (a, b, numel) = f32_operands(inputs, "Add")?;
         let need = numel * std::mem::size_of::<f32>();
 
@@ -507,7 +559,8 @@ pub unsafe extern "C" fn CreateEpFactories(
     let out_factories_raw = out_factories;
     let out_num_raw = out_num;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let shared: Arc<dyn ExecutionProvider> = Arc::new(SharedMockEp::new());
+        let ep: Box<dyn ExecutionProvider + Send> = Box::new(SharedMockEp::new());
+        let shared = Arc::new(Mutex::new(ep));
         unsafe {
             create_ep_factories_for_shared_ep(
                 api_base,

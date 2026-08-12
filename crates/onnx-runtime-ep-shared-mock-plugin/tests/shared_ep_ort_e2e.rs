@@ -146,6 +146,18 @@ impl Fixture {
         unsafe { f() }
     }
 
+    /// Flip the mock `Add` kernel's declared workspace lifetime.
+    fn set_persistent_workspace(&self, on: bool) {
+        type SetFn = unsafe extern "C" fn(usize);
+        // SAFETY: exported by the plugin as `extern "C" fn(usize)`.
+        let f: libloading::Symbol<'_, SetFn> = unsafe {
+            self.plugin_lib
+                .get(b"nxrt_mock_shared_ep_set_persistent_workspace\0")
+        }
+        .expect("nxrt_mock_shared_ep_set_persistent_workspace missing from plugin");
+        unsafe { f(usize::from(on)) }
+    }
+
     fn reset_counters(&self) {
         type ResetFn = unsafe extern "C" fn();
         // SAFETY: exported by the plugin as `extern "C" fn()`.
@@ -356,6 +368,101 @@ unsafe fn run_1x4(
     result
 }
 
+/// Run a `[1,4]` f32 model and return the failure message instead of panicking.
+///
+/// Used by the fail-closed falsifiers, where a *successful* `Run()` is the bug.
+///
+/// # Safety
+/// `api`/`session` must be valid.
+unsafe fn try_run_1x4(
+    api: *const ort::OrtApi,
+    session: *mut ort::OrtSession,
+    input_names: &[&CStr],
+    input_data: &[[f32; 4]],
+    output_name: &CStr,
+) -> Result<[f32; 4], String> {
+    let mut mem_info: *mut ort::OrtMemoryInfo = ptr::null_mut();
+    let status = unsafe {
+        ((*api).CreateCpuMemoryInfo.unwrap())(
+            ort::OrtDeviceAllocator,
+            ort::OrtMemTypeDefault,
+            &mut mem_info,
+        )
+    };
+    unsafe { check_status(api, status, "CreateCpuMemoryInfo") };
+
+    let shape: [i64; 2] = [1, 4];
+    let mut owned: Vec<[f32; 4]> = input_data.to_vec();
+    let mut values: Vec<*mut ort::OrtValue> = Vec::with_capacity(owned.len());
+    for buf in owned.iter_mut() {
+        let mut v: *mut ort::OrtValue = ptr::null_mut();
+        let status = unsafe {
+            ((*api).CreateTensorWithDataAsOrtValue.unwrap())(
+                mem_info,
+                buf.as_mut_ptr().cast(),
+                4 * std::mem::size_of::<f32>(),
+                shape.as_ptr(),
+                2,
+                ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+                &mut v,
+            )
+        };
+        unsafe { check_status(api, status, "CreateTensorWithDataAsOrtValue") };
+        values.push(v);
+    }
+
+    let name_ptrs: Vec<*const std::os::raw::c_char> =
+        input_names.iter().map(|n| n.as_ptr()).collect();
+    let const_values: Vec<*const ort::OrtValue> = values.iter().map(|v| *v as *const _).collect();
+    let out_names = [output_name.as_ptr()];
+    let mut output: *mut ort::OrtValue = ptr::null_mut();
+
+    let status = unsafe {
+        ((*api).Run.unwrap())(
+            session,
+            ptr::null(),
+            name_ptrs.as_ptr(),
+            const_values.as_ptr(),
+            const_values.len(),
+            out_names.as_ptr(),
+            1,
+            &mut output,
+        )
+    };
+
+    let result = if status.is_null() {
+        assert!(!output.is_null(), "Run produced a null output value");
+        let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
+        let s2 = unsafe { ((*api).GetTensorMutableData.unwrap())(output, &mut data_ptr) };
+        unsafe { check_status(api, s2, "GetTensorMutableData") };
+        let slice = unsafe { std::slice::from_raw_parts(data_ptr as *const f32, 4) };
+        Ok([slice[0], slice[1], slice[2], slice[3]])
+    } else {
+        let get_msg = unsafe { (*api).GetErrorMessage }.expect("GetErrorMessage");
+        let msg_ptr = unsafe { get_msg(status) };
+        let msg = if msg_ptr.is_null() {
+            "(no message)".to_owned()
+        } else {
+            unsafe { std::ffi::CStr::from_ptr(msg_ptr) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        if let Some(release) = unsafe { (*api).ReleaseStatus } {
+            unsafe { release(status) };
+        }
+        Err(msg)
+    };
+
+    if !output.is_null() {
+        unsafe { ((*api).ReleaseValue.unwrap())(output) };
+    }
+    for v in values {
+        unsafe { ((*api).ReleaseValue.unwrap())(v) };
+    }
+    unsafe { ((*api).ReleaseMemoryInfo.unwrap())(mem_info) };
+    result
+}
+
 fn assert_close(got: [f32; 4], want: [f32; 4], label: &str) {
     for i in 0..4 {
         assert!(
@@ -414,9 +521,12 @@ fn shared_ep_session_runs_and_workspace_is_plumbed() {
             fx.counter("nxrt_mock_shared_ep_workspace_ok") >= 1,
             "no dispatch received a valid workspace"
         );
-        assert!(
-            fx.counter("nxrt_mock_shared_ep_alloc_calls") >= 1,
-            "workspace was not allocated through the EP allocator"
+        assert_eq!(
+            fx.counter("nxrt_mock_shared_ep_alloc_calls"),
+            0,
+            "workspace must come from ORT scratch (KernelContext_GetScratchBuffer), not from a \
+             per-dispatch ExecutionProvider::allocate/deallocate pair — that pair synchronises \
+             the device and is illegal during CUDA-graph capture"
         );
         assert_eq!(
             fx.counter("nxrt_mock_shared_ep_alloc_live"),
@@ -433,16 +543,17 @@ fn shared_ep_session_runs_and_workspace_is_plumbed() {
 }
 
 /// A fused, routed multi-node subgraph must produce correct values, which
-/// requires correctly allocated *and correctly device-tagged* intermediates.
+/// requires correctly allocated intermediates threaded between nodes.
 ///
 /// `chain_add_mul` is `T = (A + B) * C + D`; both `Add` nodes go through the
 /// workspace-requiring kernel and the `Mul` node through the zero-workspace
 /// one, so a single Run covers both halves of the contract plus two
 /// intermediates.
 #[test]
-fn shared_ep_routed_subgraph_intermediates_are_ep_allocated() {
+fn shared_ep_routed_subgraph_intermediates_come_from_ort_scratch() {
     let _lock = lock_ort_ep();
-    let Some(fx) = Fixture::acquire("shared_ep_routed_subgraph_intermediates_are_ep_allocated")
+    let Some(fx) =
+        Fixture::acquire("shared_ep_routed_subgraph_intermediates_come_from_ort_scratch")
     else {
         return;
     };
@@ -489,11 +600,12 @@ fn shared_ep_routed_subgraph_intermediates_are_ep_allocated() {
             fx.counter("nxrt_mock_shared_ep_mul_executed") >= 1,
             "the zero-workspace Mul kernel never ran — the subgraph was not fused onto our EP"
         );
-        // Two workspaces + two routed intermediates at minimum.
-        assert!(
-            fx.counter("nxrt_mock_shared_ep_alloc_calls") >= 4,
-            "expected >=4 EP allocations (2 workspaces + 2 intermediates), saw {}",
-            fx.counter("nxrt_mock_shared_ep_alloc_calls")
+        // Both workspaces and both routed intermediates come from ORT scratch.
+        assert_eq!(
+            fx.counter("nxrt_mock_shared_ep_alloc_calls"),
+            0,
+            "routed workspaces/intermediates must come from ORT scratch, not from per-dispatch \
+             ExecutionProvider::allocate/deallocate"
         );
         assert_eq!(
             fx.counter("nxrt_mock_shared_ep_alloc_calls"),
@@ -662,4 +774,71 @@ fn shared_ep_shutdown_runs_once_at_library_unregister() {
             "shutdown() ran more than once"
         );
     }
+}
+
+/// `WorkspaceLifetime::SessionPersistent` must fail closed, never be silently
+/// downgraded to the step-scoped ORT scratch this executor can actually serve.
+///
+/// ORT reclaims `KernelContext_GetScratchBuffer` memory when `Compute` returns,
+/// so handing it to a kernel that asked for session-persistent scratch would
+/// give it memory recycled behind its back — a silent correctness bug on the
+/// second decode step. The falsifier: the same model that succeeds with a
+/// step-scoped request must **fail** with a persistent one, and the kernel must
+/// never be dispatched.
+#[test]
+fn session_persistent_workspace_fails_closed_instead_of_downgrading() {
+    let _lock = lock_ort_ep();
+    let Some(fx) = Fixture::acquire("session_persistent_workspace_fails_closed") else {
+        return;
+    };
+    fx.reset_counters();
+    fx.set_persistent_workspace(true);
+    let api = fx.api;
+    let model = fixture_model("add_1x4");
+    let reg_name = CString::new("shared_mock_persistent").unwrap();
+
+    unsafe {
+        let env = create_env_with_plugin(api, "nxrt_shared_persistent", &reg_name, &fx.plugin_path);
+        let device = find_our_ep_device(api, env);
+        let (session, options) = create_session_on_our_ep(api, env, device, &model);
+
+        let outcome = try_run_1x4(
+            api,
+            session,
+            &[c"X", c"Y"],
+            &[[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]],
+            c"Z",
+        );
+
+        let err = match outcome {
+            Ok(values) => panic!(
+                "Run() succeeded ({values:?}) for a SessionPersistent workspace request — the \
+                 executor silently downgraded it to step-scoped ORT scratch, which ORT recycles \
+                 when Compute returns"
+            ),
+            Err(msg) => msg,
+        };
+        assert!(
+            err.contains("SessionPersistent"),
+            "the failure must name the unsupported lifetime so a kernel author can act on it; \
+             got: {err}"
+        );
+        assert_eq!(
+            fx.counter("nxrt_mock_shared_ep_persistent_dispatched"),
+            0,
+            "the kernel was dispatched despite an unservable workspace request"
+        );
+        assert_eq!(
+            fx.counter("nxrt_mock_shared_ep_workspace_ok"),
+            0,
+            "no dispatch may have been served while the persistent request was in force"
+        );
+
+        ((*api).ReleaseSession.unwrap())(session);
+        ((*api).ReleaseSessionOptions.unwrap())(options);
+        let status = ((*api).UnregisterExecutionProviderLibrary.unwrap())(env, reg_name.as_ptr());
+        check_status(api, status, "UnregisterExecutionProviderLibrary");
+        ((*api).ReleaseEnv.unwrap())(env);
+    }
+    fx.set_persistent_workspace(false);
 }
