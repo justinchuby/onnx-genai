@@ -40,3 +40,58 @@ pipeline:
     let message = error.to_string();
     assert!(message.contains("unknown field") || message.contains("missing field `workflow`"));
 }
+
+#[test]
+fn emit_valid_length_requires_integer_scalar_or_vector() {
+    fn errors(dtype: &str, rank: usize, shape: &str) -> Vec<String> {
+        let metadata: InferenceMetadata = serde_yaml::from_str(&format!(
+            r#"
+pipeline:
+  workflow:
+    manifest:
+      ir_version: "1.0"
+      onnx_opsets: {{ ai.onnx: 24 }}
+      capabilities: [workflow_ssa, linear_effects, typed_emit, emit_valid_length]
+    inputs:
+      value:
+        contract: {{ dtype: int64, rank: 1, shape: [sequence] }}
+        role: {{ kind: opaque }}
+        source: {{ kind: application, name: value }}
+        required: true
+      length:
+        contract: {{ dtype: {dtype}, rank: {rank}, shape: {shape} }}
+        role: {{ kind: opaque }}
+        source: {{ kind: application, name: length }}
+        required: true
+    outputs:
+      result:
+        contract: {{ dtype: int64, rank: 1, shape: [valid] }}
+        role: tokens
+        stage: pre_adapter
+    components: {{}}
+    initial_effects: {{ stream: stream.0 }}
+    graph:
+      kind: emit
+      value: value
+      valid_length: length
+      output: result
+      mode: replace
+      effect_name: stream
+      effect: {{ consumes: stream.0, produces: stream.1 }}
+"#
+        ))
+        .expect("workflow metadata parses");
+        validate_metadata(&metadata).expect_err("invalid valid_length must fail")
+    }
+
+    assert!(
+        errors("float32", 0, "[]")
+            .iter()
+            .any(|error| error.contains("must have an integer dtype"))
+    );
+    assert!(
+        errors("int64", 2, "[batch, one]")
+            .iter()
+            .any(|error| error.contains("must be a scalar or rank-one tensor"))
+    );
+}

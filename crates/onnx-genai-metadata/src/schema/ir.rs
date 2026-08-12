@@ -528,6 +528,10 @@ pub enum WorkflowNode {
     },
     Emit {
         value: String,
+        /// Optional scalar or rank-one integer SSA value limiting the emitted prefix
+        /// on the value's final axis. It must contain exactly one element at runtime.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        valid_length: Option<String>,
         output: String,
         mode: WorkflowEmitMode,
         effect_name: String,
@@ -612,6 +616,11 @@ pub enum ShapeRecurrence {
     Growing {
         axis: usize,
         increment: String,
+        max: String,
+    },
+    /// The selected axis may grow or shrink between iterations, but never exceed `max`.
+    Bounded {
+        axis: usize,
         max: String,
     },
 }

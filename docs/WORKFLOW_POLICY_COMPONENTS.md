@@ -241,6 +241,30 @@ effects: { verify: { consumes: verify.0, produces: verify.1 } }
 Acceptance and correction-token math belongs entirely to the artifact.
 `accepted_len` may also drive the generic serving service's row/KV bookkeeping.
 
+### Runtime-length emission
+
+An `emit` may name `valid_length`, an integer scalar or rank-one SSA value. At
+execution it must contain exactly one non-negative element. The runtime emits
+`value[..., 0:valid_length]`: slicing is always on the final axis and happens
+before package-output contract validation. The length must not exceed that axis.
+This applies uniformly to `replace`, `append`, and `event`.
+
+The source and package-output contracts must have the same dtype and rank and
+compatible non-final dimensions; the output's final dimension may use a distinct
+symbol. Packages using this operand declare the `emit_valid_length` capability.
+Per-row lengths for a batch are not a dense tensor prefix and must instead use a
+declared ragged/offset contract or separate row events.
+
+```yaml
+kind: emit
+value: accepted.tokens       # int64[B,K]
+valid_length: accepted.len   # int64 scalar or [B], containing one element at runtime
+output: tokens               # int64[B,A], A = accepted.len
+mode: append
+effect_name: stream
+effect: { consumes: stream.0, produces: stream.1 }
+```
+
 ## Generic state update
 
 `role: state_update`
@@ -264,6 +288,54 @@ effects: { state: { consumes: state.0, produces: state.1 } }
 Append, scatter, accumulation, paging policy, and other tensor mutation math are
 not workflow operators. The ONNX component computes `next`; loop carry or session
 state wiring publishes it as the next cell version.
+
+### Rollback and selected-prefix state
+
+Rollback is ordinary policy math, not a KV-specific host operation. An ONNX
+component consumes tentative state plus a typed selection/length and returns the
+selected state. A branch phi chooses that result or a correction result, and the
+joined SSA value is the loop carry's `body_output`:
+
+```yaml
+state:
+  history:
+    contract: { dtype: float32, rank: 3, shape: [batch, sequence, width] }
+    scope: invocation
+    initializer: history.current
+    recurrence: { kind: bounded, axis: 1, max: max_context }
+
+# In the loop body:
+- kind: invoke
+  component: accepted_prefix
+  inputs: { state: history.body, valid_length: accepted.len }
+  outputs: { selected: history.accepted }
+  effects: {}
+- kind: branch
+  predicate: accept
+  cases:
+    "true":
+      kind: invoke
+      component: binding
+      inputs: { value: history.accepted }
+      outputs: { value: branch.accepted }
+      effects: {}
+    "false":
+      kind: invoke
+      component: correction
+      inputs: { state: history.body }
+      outputs: { selected: branch.corrected }
+      effects: {}
+  outputs:
+    history.selected:
+      cases: { "true": branch.accepted, "false": branch.corrected }
+  effects: {}
+```
+
+`bounded` recurrence is generic shape policy: the declared axis may grow or
+shrink between iterations, both the current and next extent must be at most the
+non-negative integer `max` SSA value, and dtype, rank, and every other axis remain
+invariant. Packages using it declare `bounded_state_recurrence`. The invoked
+component performs all truncation, gathering, or compaction.
 
 ## Conditional joins
 
