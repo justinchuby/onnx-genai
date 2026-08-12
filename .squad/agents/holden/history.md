@@ -54,3 +54,17 @@ Focused delta re-review of three new BF16 tests and comment hygiene. All three t
 - **Hygiene:** Clean sweep — no internal vocabulary in branch diff or commit messages.
 - **Test counts:** 20/20 BF16, 106/106 LayerNorm suite, 7/7 SkipLayerNormPrePack.
 - **Nit (non-blocking):** `GenericBroadcast` test reference comment slightly imprecise — scale's dim-0 is broadcast-expanded, not "outer dim broadcast."
+
+### 2026-08-12 — Focused review of PR #32001 blocker fix (ec73d63a0e)
+- **Scope:** Validation that `--use_apple_accelerate` rejects all non-macOS-arm64 targets.
+- **Verdict:** No blockers. Rejection set is complete. Tests are non-vacuous (each guard independently necessary). Body matches code. Lint clean. No persona leaks.
+- **Substantive (non-blocking):** S1: duplicate validation in `build.py` and `build_args.py` — `build.py` copy is dead code. S2: accept-path tests don't verify cmake arg emission.
+- **Decision:** Ready to leave draft. macOS CI lane deferral is reasonable.
+- **Output:** `.squad/decisions/inbox/holden-32001-focused.md`
+
+### 2026-08-12 — Focused review of PR #32001 after Zhora deduplication (3a0bd75aa3)
+
+- Confirmed S1 resolved: single validation site now in `build_args.py`; `build.py` dead-code copy removed.
+- Error messages now name the actual cause (non-macOS wording distinguishes wrong OS from wrong arch).
+- 13/13 tests pass; ruff clean; no persona leaks; body matches code.
+- PR #32001 confirmed **ready for review**.

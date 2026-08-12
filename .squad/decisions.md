@@ -288,3 +288,53 @@ Compiled minimal TU (base and head copies of `matmul_4bits_common.cuh` with `GPU
 
 Last consolidated: 2026-08-12T08:30:00Z (Scribe #32003 PTX-evidence wave; 1 inbox drop merged: batty-32003-ptx.md)
 
+
+## 2026-08-12 — PR #32001: Comprehensive --use_apple_accelerate validation (Resch + Holden + Zhora)
+
+**By:** Resch (initial fix), Holden (focused review), Zhora (deduplication)
+**PR:** microsoft/onnxruntime#32001 — `onnxruntime_USE_APPLE_ACCELERATE` CMake option
+**Head:** `3a0bd75aa3`
+
+### What happened
+
+`build.py` only checked `is_macOS()` for `--use_apple_accelerate`, so Intel Macs,
+x86_64 cross-compiles, iOS, tvOS, visionOS, and Mac Catalyst all passed Python
+validation and then silently downgraded in CMake — contrary to the PR body's "fails
+loudly" promise.
+
+Resch added rejections in `build_args.py` (`parser.error()`) and `build.py` (`BuildError`).
+Holden's review found S1: the `build.py` copy was dead code (unreachable). Zhora
+consolidated to a single site, keeping only `build_args.py` as the canonical validation
+home. 13/13 tests pass; ruff clean; PR ready.
+
+### Rejection set
+
+| Target | Flag(s) | Guard |
+|--------|---------|-------|
+| Non-macOS (Linux, Windows) | `is_macOS()` returns False | `parser.error()` |
+| Intel Mac / x86_64 cross | `getattr(args, "osx_arch", None)` not in `("arm64", "arm64e")` | `parser.error()` |
+| iOS | `getattr(args, "ios", False)` | `parser.error()` |
+| tvOS | `getattr(args, "tvos", False)` | `parser.error()` |
+| visionOS | `getattr(args, "visionos", False)` | `parser.error()` |
+| Mac Catalyst | `getattr(args, "macos", None) == "Catalyst"` | `parser.error()` |
+| universal2 | not a valid `--osx_arch` choice | argparse-level rejection |
+
+### Durable lessons
+
+- **Duplicated validation is the fourth instance of the copy-drift failure family.** Two `find_ort_lib_dir` copies diverged silently; a scratch-sizing formula duplicated between production and tests left a heap overflow canary ineffective; an MLAS dispatch threshold restated as a literal in a test disagreed with production on RISC-V. The rule is now explicit: **never maintain two copies of a rule — extract, or have one delegate to the other.**
+
+- **Verify the copy that actually executes.** The `build.py` validation block was reviewed line-by-line and was dead code; `build_args.py` exits first. Trace control flow before trusting a review of a duplicated site.
+
+- **Argument validation belongs at parse time.** `parser.error()` in `build_args.py` fails cleanly before any build work starts; raising later in `build.py` is both later and, here, unreachable.
+
+- **Error messages should name their actual cause.** "Only supported on macOS arm64" is misleading on an Intel Mac, where the host *is* macOS and only the architecture is wrong.
+
+- **Body-versus-code agreement deserves explicit checking every round.** #32001 had three separate rounds where the PR body promised behaviour the code did not implement — a `FATAL_ERROR` that had become warn-and-disable, claims of x86_64/universal2/iOS support, and a loud-failure promise that only checked `is_macOS()`.
+
+### Merged inbox drops
+
+- `resch-32001-validation.md` — initial comprehensive validation + 9 new tests
+- `holden-32001-focused.md` — focused review; S1 dead-code finding; no blockers
+- `zhora-32001-dedupe.md` — deduplication to single validation site
+
+Last consolidated: 2026-08-12T09:45:00Z (Scribe #32001 ready wave; 3 inbox drops merged: resch-32001-validation.md, holden-32001-focused.md, zhora-32001-dedupe.md)
