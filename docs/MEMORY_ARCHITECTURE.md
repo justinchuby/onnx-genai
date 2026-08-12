@@ -565,6 +565,26 @@ measured 2 MiB CUDA granule:
 >   `kv_heads×` residency win is therefore still driver-level only
 >   (`vmm_kv_layout_residency_gpu`); wiring the dense-prefix commit into the live
 >   path is the documented next step (shared with token-major and #777).
+> * **A fourth place the layout lives — the engine-side non-kernel KV
+>   consumers — is now gated (`seqmajor-physical-shape`).** Beyond kernel
+>   indexing, commit geometry, and growth byte geometry, the device
+>   present-KV host mirror (`DecodeCudaState::read_present_kv`) and the paged
+>   prefix-reuse seed (`DecodeCudaState::seed_prefix`) stride the padded buffer
+>   with hard-coded head-major (BNSH) arithmetic
+>   (`capacity_head_stride = physical_shape[2] × head_dim × elem`, per-head
+>   fragments). Under a seq-major (BSNH) physical buffer those offsets address
+>   the wrong bytes — heads are interleaved per token, not laid out as capacity
+>   stripes — so a host mirror or a shared-prefix seed would silently return or
+>   write mis-indexed KV. Both now **error under seq-major** rather than
+>   mis-mapping, matching the kernel-level "unsupported readers/writers fail
+>   rather than silently mis-index" gate. This makes the working seq-major
+>   surface a precise **condition**: seq-major is supported on the pure decode
+>   path where our own GQA kernel is the sole consumer of the device KV; the
+>   moment a `present_*`-reading consumer (host mirror / paged prefix reuse) is
+>   engaged, the runtime refuses. Prefix sharing (#777/#809) therefore does not
+>   yet "fall out" for free under seq-major: its device seed is a head-major
+>   consumer, so realizing it under seq-major requires teaching that seed the
+>   BSNH byte geometry — tracked with the dense-prefix commit above.
 >
 > Wall-clock is intentionally not reported: deterministic counters answer the
 > invalidation question, while this shared box has shown large timing variance.
