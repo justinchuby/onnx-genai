@@ -84,6 +84,7 @@ pub(crate) fn cuda_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
     vec![
         Box::new(CudaSiluFusion),
         Box::new(CudaFoldConstantTranspose),
+        Box::new(CudaFoldConstantCast),
         // Runs before the fusions so they see the fp16-native normalization
         // form (no `Cast` wrappers) that the rest of the pipeline expects.
         Box::new(CudaDropNormalizationCasts),
@@ -632,8 +633,198 @@ fn permute_bytes(src: &[u8], dims: &[usize], perm: &[usize], elem: usize) -> Vec
     dst
 }
 
-/// Fold a standalone `Add(MatMulNBits(x), bias)` into the `MatMulNBits` bias
-/// input, removing the separate elementwise launch.
+/// Fold a `Cast` whose input is a producer-less constant initializer into a
+/// pre-converted constant, removing the per-decode-step cast launch.
+///
+/// WHY: bf16 decoders that compute their RMS/layer norms in fp32 export, around
+/// every norm, a `Cast(bf16→f32)` of the *constant* norm weight (`gamma`). That
+/// cast recomputes the identical fp32 weight on every single token — pure launch
+/// overhead in the decode step, which at M=1 is dominated by per-op dispatch
+/// (kernel launch), not GPU math. Muse-Glimmer-30B has 208 such constant-weight
+/// casts per step (four norms × 52 layers); hoisting them out of the step
+/// removes 208 launches per token. The generic [`ConstantFolding`] pass caps at
+/// 1024 elements (shape math only) and has no `Cast` evaluator, so weight-sized
+/// casts reach it unfolded; this CUDA-scoped pass materializes them exactly.
+///
+/// Correctness: the fold is byte-identical to the runtime `Cast` kernel.
+/// Widening (e.g. bf16→f32) is exact; narrowing to f16/bf16 uses `half`'s
+/// round-to-nearest-even, matching the kernel's `__float2half_rn` /
+/// `__float2bfloat16`. Only producer-less, statically-shaped, whole-byte float
+/// initializers among {f16, bf16, f32, f64} are folded; every other case is
+/// skipped (a safe no-op), never risking a wrong constant. The original
+/// initializer is left intact for any other consumers.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CudaFoldConstantCast;
+
+/// Environment opt-out for [`CudaFoldConstantCast`], mirroring the other
+/// CUDA-pass switches. Any value other than unset/empty/`0` restores the
+/// exported per-step constant `Cast` launches (for A/B measurement or rollback).
+const CONST_CAST_FOLD_DISABLE_ENV: &str = "ONNX_GENAI_CUDA_DISABLE_CONST_CAST_FOLD";
+
+fn const_cast_fold_disabled() -> bool {
+    std::env::var_os(CONST_CAST_FOLD_DISABLE_ENV)
+        .is_some_and(|value| value != "0" && !value.is_empty())
+}
+
+struct CastFoldPlan {
+    node: NodeId,
+    output: ValueId,
+    dtype: DataType,
+    dims: Vec<usize>,
+    bytes: Vec<u8>,
+}
+
+impl OptimizationPass for CudaFoldConstantCast {
+    fn name(&self) -> &str {
+        "CudaFoldConstantCast"
+    }
+
+    fn run(&self, graph: &mut Graph, ctx: &PassContext) -> OptimizerResult<()> {
+        if const_cast_fold_disabled() {
+            return Ok(());
+        }
+        let candidates: Vec<NodeId> = graph
+            .nodes
+            .iter()
+            .filter_map(|(id, node)| {
+                (node.op_type == "Cast"
+                    && matches!(node.domain.as_str(), "" | "ai.onnx")
+                    && node.inputs.len() == 1
+                    && node.outputs.len() == 1)
+                    .then_some(id)
+            })
+            .collect();
+
+        let mut plans: Vec<CastFoldPlan> = Vec::new();
+        for node_id in candidates {
+            if let Some(plan) = self.plan_fold(graph, ctx, node_id) {
+                plans.push(plan);
+            }
+        }
+
+        let changed = !plans.is_empty();
+        for plan in plans {
+            // Delete the Cast; its output value survives because a consumer (or
+            // graph-output slot) still references it, mirroring the transpose
+            // fold. Then retype the surviving value and back it with the
+            // materialized constant.
+            graph.remove_node(plan.node);
+            if graph.try_value(plan.output).is_none() {
+                continue;
+            }
+            let value = graph.value_mut(plan.output);
+            value.dtype = plan.dtype;
+            value.shape = static_shape(plan.dims.clone());
+            let tensor = TensorData::from_raw(plan.dtype, plan.dims, plan.bytes);
+            graph.set_initializer(plan.output, WeightRef::Inline(tensor));
+        }
+
+        if changed {
+            graph.validate().map_err(OptimizerError::from)?;
+        }
+        Ok(())
+    }
+}
+
+impl CudaFoldConstantCast {
+    fn plan_fold(&self, graph: &Graph, ctx: &PassContext, node_id: NodeId) -> Option<CastFoldPlan> {
+        let node = graph.try_node(node_id)?;
+        let input = node.inputs[0]?;
+        let output = node.outputs[0];
+
+        // The input must be an immutable, producer-less constant initializer.
+        if graph.try_value(input)?.producer.is_some() {
+            return None;
+        }
+        let weight = graph.initializers.get(&input)?;
+        let src_dtype = weight.dtype();
+        let dst_dtype = DataType::from_onnx(node.attr("to").and_then(Attribute::as_int)? as i32)?;
+
+        // Only whole-byte float element types are converted here; sub-byte and
+        // non-float casts are left untouched rather than risk a wrong constant.
+        if src_dtype.byte_size() == 0 || src_dtype.is_sub_byte() {
+            return None;
+        }
+        let dims = weight.dims().to_vec();
+        let src = ctx.initializer_bytes(weight)?;
+        let expected = dims
+            .iter()
+            .product::<usize>()
+            .checked_mul(src_dtype.byte_size())?;
+        if src.len() != expected {
+            return None;
+        }
+        // No-op cast (same dtype): let dead-node elimination handle it.
+        if src_dtype == dst_dtype {
+            return None;
+        }
+        let bytes = convert_float_bytes(src, src_dtype, dst_dtype)?;
+
+        Some(CastFoldPlan {
+            node: node_id,
+            output,
+            dtype: dst_dtype,
+            dims,
+            bytes,
+        })
+    }
+}
+
+/// Convert raw tensor bytes between float element types, matching the runtime
+/// `Cast` kernel's rounding (round-to-nearest-even for narrowing, exact for
+/// widening). Returns `None` for any element type outside {f16, bf16, f32, f64},
+/// so an unsupported cast is skipped rather than mis-folded.
+fn convert_float_bytes(src: &[u8], from: DataType, to: DataType) -> Option<Vec<u8>> {
+    // Decode source into an f32 working value per element. f64 is decoded via
+    // f32 to keep the kernel's `double` intermediate exactness for the float
+    // set we support (f16/bf16/f32 all fit exactly in f32 and f64).
+    let values: Vec<f64> = match from {
+        DataType::Float32 => src
+            .chunks_exact(4)
+            .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]) as f64)
+            .collect(),
+        DataType::Float64 => src
+            .chunks_exact(8)
+            .map(|c| f64::from_ne_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+            .collect(),
+        DataType::Float16 => src
+            .chunks_exact(2)
+            .map(|c| half::f16::from_bits(u16::from_ne_bytes([c[0], c[1]])).to_f32() as f64)
+            .collect(),
+        DataType::BFloat16 => src
+            .chunks_exact(2)
+            .map(|c| half::bf16::from_bits(u16::from_ne_bytes([c[0], c[1]])).to_f32() as f64)
+            .collect(),
+        _ => return None,
+    };
+
+    let mut out = Vec::with_capacity(values.len() * to.byte_size().max(1));
+    match to {
+        DataType::Float32 => {
+            for v in values {
+                out.extend_from_slice(&(v as f32).to_ne_bytes());
+            }
+        }
+        DataType::Float64 => {
+            for v in values {
+                out.extend_from_slice(&v.to_ne_bytes());
+            }
+        }
+        DataType::Float16 => {
+            for v in values {
+                out.extend_from_slice(&half::f16::from_f32(v as f32).to_bits().to_ne_bytes());
+            }
+        }
+        DataType::BFloat16 => {
+            for v in values {
+                out.extend_from_slice(&half::bf16::from_f32(v as f32).to_bits().to_ne_bytes());
+            }
+        }
+        _ => return None,
+    }
+    Some(out)
+}
+
 ///
 /// Only the exact QKV-style decode pattern is fused: a `MatMulNBits` with no
 /// zero-points / group-index / existing bias, whose sole consumer is a plain
@@ -2137,6 +2328,201 @@ mod tests {
             .unwrap();
         assert!(graph.nodes.values().all(|node| node.op_type != "Transpose"));
         assert_eq!(static_shape_of(&graph, transposed), vec![5, 2]);
+    }
+
+    // === Constant Cast fold ===
+
+    /// Build a graph `Cast(const [n], to=dst) -> Identity consumer`, with the
+    /// constant provided as an inline initializer of `src_dtype` holding the
+    /// bytes `src_bytes`.
+    fn const_cast_graph(
+        n: usize,
+        src_dtype: DataType,
+        src_bytes: Vec<u8>,
+        dst_dtype: DataType,
+    ) -> (Graph, ValueId) {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+
+        let weight = graph.create_named_value("weight", src_dtype, vec![Dim::Static(n)]);
+        graph.set_initializer(
+            weight,
+            WeightRef::Inline(TensorData::from_raw(src_dtype, vec![n], src_bytes)),
+        );
+
+        let cast_out = graph.create_named_value("cast_out", dst_dtype, vec![Dim::Static(n)]);
+        let mut node = Node::new(NodeId(0), "Cast", vec![Some(weight)], vec![cast_out]);
+        node.attributes
+            .insert("to".into(), Attribute::Int(dst_dtype.to_onnx() as i64));
+        graph.insert_node(node);
+
+        let out = graph.create_named_value("out", dst_dtype, vec![Dim::Static(n)]);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Identity",
+            vec![Some(cast_out)],
+            vec![out],
+        ));
+        graph.add_output(out);
+        (graph, cast_out)
+    }
+
+    #[test]
+    fn folds_constant_cast_bf16_to_f32_byte_identical() {
+        // bf16 → f32 widening is exact. Element i holds bf16(i * 1.5).
+        let n = 6usize;
+        let mut bytes = Vec::with_capacity(n * 2);
+        let mut expected = Vec::with_capacity(n);
+        for i in 0..n {
+            let v = half::bf16::from_f32(i as f32 * 1.5);
+            bytes.extend_from_slice(&v.to_le_bytes());
+            expected.push(v.to_f32());
+        }
+        let (mut graph, cast_out) =
+            const_cast_graph(n, DataType::BFloat16, bytes, DataType::Float32);
+        assert!(graph.value(cast_out).producer.is_some());
+
+        CudaFoldConstantCast
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        // Cast node gone; the value is now a producer-less f32 initializer.
+        assert!(graph.nodes.values().all(|node| node.op_type != "Cast"));
+        assert!(graph.value(cast_out).producer.is_none());
+        assert_eq!(graph.value(cast_out).dtype, DataType::Float32);
+        let WeightRef::Inline(tensor) = graph.initializers.get(&cast_out).unwrap() else {
+            panic!("expected inline initializer");
+        };
+        assert_eq!(tensor.dims, vec![n]);
+        for (i, want) in expected.iter().enumerate() {
+            let got = f32::from_le_bytes([
+                tensor.data[i * 4],
+                tensor.data[i * 4 + 1],
+                tensor.data[i * 4 + 2],
+                tensor.data[i * 4 + 3],
+            ]);
+            assert_eq!(got, *want, "element {i}");
+        }
+        assert!(graph.validate().is_ok());
+    }
+
+    #[test]
+    fn folds_constant_cast_f32_to_bf16_round_to_nearest_even() {
+        // f32 → bf16 narrowing must match the kernel's round-to-nearest-even
+        // (`half::bf16::from_f32`).
+        let values = [0.0f32, 1.0, 1.5, -2.75, 3.141_592_7, 65_504.0];
+        let mut bytes = Vec::new();
+        for v in values {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let (mut graph, cast_out) =
+            const_cast_graph(values.len(), DataType::Float32, bytes, DataType::BFloat16);
+
+        CudaFoldConstantCast
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        let WeightRef::Inline(tensor) = graph.initializers.get(&cast_out).unwrap() else {
+            panic!("expected inline initializer");
+        };
+        for (i, v) in values.iter().enumerate() {
+            let got = half::bf16::from_le_bytes([tensor.data[i * 2], tensor.data[i * 2 + 1]]);
+            assert_eq!(got, half::bf16::from_f32(*v), "element {i}");
+        }
+        assert!(graph.validate().is_ok());
+    }
+
+    #[test]
+    fn leaves_cast_of_non_constant() {
+        // A Cast whose input is a graph input (not an initializer) is left alone.
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let x = graph.create_named_value("x", DataType::BFloat16, vec![Dim::Static(4)]);
+        graph.add_input(x);
+        let cast_out =
+            graph.create_named_value("cast_out", DataType::Float32, vec![Dim::Static(4)]);
+        let mut node = Node::new(NodeId(0), "Cast", vec![Some(x)], vec![cast_out]);
+        node.attributes.insert(
+            "to".into(),
+            Attribute::Int(DataType::Float32.to_onnx() as i64),
+        );
+        graph.insert_node(node);
+        graph.add_output(cast_out);
+
+        CudaFoldConstantCast
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        assert_eq!(
+            graph
+                .nodes
+                .values()
+                .filter(|node| node.op_type == "Cast")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn leaves_sub_byte_constant_cast() {
+        // An int4-packed constant must not be folded by the byte-wise path.
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let weight = graph.create_named_value("weight", DataType::Int4, vec![Dim::Static(4)]);
+        graph.set_initializer(
+            weight,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Int4,
+                vec![4],
+                vec![0x21, 0x43],
+            )),
+        );
+        let cast_out =
+            graph.create_named_value("cast_out", DataType::Float32, vec![Dim::Static(4)]);
+        let mut node = Node::new(NodeId(0), "Cast", vec![Some(weight)], vec![cast_out]);
+        node.attributes.insert(
+            "to".into(),
+            Attribute::Int(DataType::Float32.to_onnx() as i64),
+        );
+        graph.insert_node(node);
+        graph.add_output(cast_out);
+
+        CudaFoldConstantCast
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        assert_eq!(
+            graph
+                .nodes
+                .values()
+                .filter(|node| node.op_type == "Cast")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn const_cast_fold_respects_disable_env() {
+        // SAFETY: single-threaded test; env is restored before returning.
+        let n = 4usize;
+        let mut bytes = Vec::new();
+        for i in 0..n {
+            bytes.extend_from_slice(&half::bf16::from_f32(i as f32).to_le_bytes());
+        }
+        let (mut graph, _cast_out) =
+            const_cast_graph(n, DataType::BFloat16, bytes, DataType::Float32);
+        unsafe { std::env::set_var(CONST_CAST_FOLD_DISABLE_ENV, "1") };
+        let result = CudaFoldConstantCast.run(&mut graph, &PassContext::new());
+        unsafe { std::env::remove_var(CONST_CAST_FOLD_DISABLE_ENV) };
+        result.unwrap();
+        assert_eq!(
+            graph
+                .nodes
+                .values()
+                .filter(|node| node.op_type == "Cast")
+                .count(),
+            1
+        );
     }
 
     #[test]
