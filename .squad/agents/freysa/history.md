@@ -41,3 +41,10 @@ Older entries in `history-archive.md`.
 - Added "Keep in sync" cross-references at both threshold literal sites.
 - Changed benchmark comment "AVX2 kernel" → "SIMD kernel" for architecture neutrality.
 - Fresh build: 41 passed + 2 disabled; clang-format clean; no leaks. Head `697189f2ae`.
+
+## 2026-08-12 — PR #762 final items (ort_discovery + validate_write_dtype)
+
+- Consolidated `find_ort_lib_dir` into `tests/common/ort_discovery.rs`; all three integration tests use `#[path]` include.
+- Documented `validate_write_dtype` as test-only contract helper; named `scratch_alloc_bytes` as actual guard.
+- 283 passed, 0 failed; clippy clean; fmt clean.
+- Commit `5258e0281`.
