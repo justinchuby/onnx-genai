@@ -56,11 +56,14 @@ use std::sync::{Arc, Mutex};
 
 use onnx_runtime_memory_governor::{
     AllocationCommitRange, DeviceAllocator, DeviceKey, HolderId, MappedPhysicalCapacityToken,
-    MemoryError, MemoryGovernor, MemoryLease, MemoryRole, Tier,
+    MemoryAuthorityId, MemoryError, MemoryGovernor, MemoryLease, MemoryRole, SharedDevicePrefix,
+    SharedPrefixCommitInfo, Tier,
 };
 use onnx_runtime_virtual_memory::{PhysicalMemoryAccounting, VirtualBacking};
 
-use crate::virtual_memory::{CudaVirtualBacking, PhysicalHandlePool, PhysicalHandlePoolStats};
+use crate::virtual_memory::{
+    CudaVirtualBacking, PhysicalHandlePool, PhysicalHandlePoolStats, SharedPrefixReservation,
+};
 use cudarc::driver::CudaContext;
 
 /// Environment switch selecting the VMM arena over `cuMemAlloc`.
@@ -441,6 +444,134 @@ pub struct SpanCommit {
     pub newly_mapped_bytes: u64,
 }
 
+/// A pinned, read-only shared prefix: physical granules created **once**
+/// through the #740 pool and mappable into many sequences' reservations at zero
+/// incremental owned bytes (#777).
+///
+/// This is the explicit pinned-prefix primitive the #793 probe named as the
+/// smallest next increment: a pinned system prompt / tool schema / RAG document
+/// whose KV is written once and then read, unchanged, by every concurrent
+/// request that shares it. Detection (hashing) and copy-on-write at divergence
+/// are deliberately **not** here — this is the allocator primitive only.
+///
+/// Fill the prefix's KV once through [`device_ptr`](Self::device_ptr), then map
+/// it into each sequence with [`CudaVmmAllocator::commit_shared_prefix`]. The
+/// physical granules live for the **union** of this owner and every sharer: the
+/// pool's shared refcount retains them until the last mapping — this owner's on
+/// `Drop`, or any sharer's on deallocation — is gone.
+pub struct SharedPrefix {
+    reservation: SharedPrefixReservation,
+    device: DeviceKey,
+    authority: Option<MemoryAuthorityId>,
+    requested_bytes: usize,
+}
+
+// SAFETY: the inner reservation is `Send + Sync` (its physical handles are
+// plain integers and every driver call binds the context first); the other
+// fields are trivially so.
+unsafe impl Send for SharedPrefix {}
+unsafe impl Sync for SharedPrefix {}
+
+impl std::fmt::Debug for SharedPrefix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedPrefix")
+            .field("device", &self.device)
+            .field("granules", &self.reservation.granule_count())
+            .field("committed_physical_bytes", &self.committed_physical_bytes())
+            .field("requested_bytes", &self.requested_bytes)
+            .finish()
+    }
+}
+
+impl SharedPrefix {
+    /// Device address of the writable owner window. Fill the prefix's KV here
+    /// once, before or after sharing; sharers see it read-only.
+    pub fn device_ptr(&self) -> u64 {
+        self.reservation.base() as u64
+    }
+
+    /// The granule-rounded byte length the prefix actually spans.
+    pub fn mapped_bytes(&self) -> usize {
+        self.reservation.granule_count() * self.reservation.granularity()
+    }
+
+    /// Bytes requested at construction, before granule rounding.
+    pub fn requested_bytes(&self) -> usize {
+        self.requested_bytes
+    }
+
+    /// Physical device bytes this prefix owns — charged **once**, on the owned
+    /// axis, no matter how many sequences share it. This is the reported
+    /// *physical* cost, never nominal content bytes.
+    pub fn committed_physical_bytes(&self) -> u64 {
+        self.reservation.owned_bytes()
+    }
+
+    fn granule_count(&self) -> usize {
+        self.reservation.granule_count()
+    }
+
+    fn granularity(&self) -> usize {
+        self.reservation.granularity()
+    }
+}
+
+impl SharedDevicePrefix for SharedPrefix {
+    fn device_ptr(&self) -> u64 {
+        SharedPrefix::device_ptr(self)
+    }
+
+    fn committed_physical_bytes(&self) -> u64 {
+        SharedPrefix::committed_physical_bytes(self)
+    }
+
+    fn mapped_bytes(&self) -> usize {
+        SharedPrefix::mapped_bytes(self)
+    }
+
+    fn requested_bytes(&self) -> usize {
+        SharedPrefix::requested_bytes(self)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// The accounting outcome of mapping a shared prefix into one sequence.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SharedPrefixCommit {
+    /// Physical bytes newly owned by mapping the prefix here.
+    ///
+    /// Always **zero**: the prefix's granules were charged once when it was
+    /// created, so admitting the Nth sharer costs only its *private* bytes —
+    /// the admission arithmetic the multi-request serving path (#745) needs.
+    pub additional_owned_bytes: u64,
+    /// Physical bytes newly mapped into this sequence's reservation. One
+    /// mapping of already-owned physical memory, reported on the mapped axis.
+    pub newly_mapped_bytes: u64,
+    /// Granules mapped read-only into the sequence.
+    pub granules: usize,
+}
+
+/// Held open while a CUDA graph capture or replay may touch this allocator's
+/// reservations. While any guard is alive, [`CudaVmmAllocator::commit_shared_prefix`]
+/// refuses to map — `cuMemMap` inside a capture is not proven replayable.
+#[must_use = "the capture is only guarded while this guard is held"]
+pub struct SharedPrefixCaptureGuard<'a> {
+    allocator: &'a CudaVmmAllocator,
+}
+
+impl Drop for SharedPrefixCaptureGuard<'_> {
+    fn drop(&mut self) {
+        // No assertion here: this is a Drop path, and a panic here aborts the
+        // process (STATUS_STACK_BUFFER_OVERRUN on this platform). The decrement
+        // is balanced one-for-one with the increment in `enter_graph_capture`,
+        // so a plain `fetch_sub` cannot underflow.
+        self.allocator.capture_depth.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Device memory carved out of one reserved address range, with physical
 /// granules mapped on demand and charged to a [`MemoryGovernor`].
 pub struct CudaVmmAllocator {
@@ -449,6 +580,16 @@ pub struct CudaVmmAllocator {
     holder: HolderId,
     role: MemoryRole,
     device: DeviceKey,
+    /// Non-zero while a CUDA graph capture (or a replay that may be in flight)
+    /// is declared open on this allocator.
+    ///
+    /// Mapping a shared prefix into a reservation issues `cuMemMap`, which
+    /// returns `CUDA_SUCCESS` inside a capture but is **not proven replayable**
+    /// (#777/#727). Rather than leave that as a comment, this gate makes the
+    /// rule enforceable: [`commit_shared_prefix`] refuses while it is non-zero.
+    ///
+    /// [`commit_shared_prefix`]: CudaVmmAllocator::commit_shared_prefix
+    capture_depth: AtomicU64,
 }
 
 struct VmmConstruction {
@@ -748,6 +889,7 @@ impl CudaVmmAllocator {
             holder,
             role,
             device,
+            capture_depth: AtomicU64::new(0),
         })
     }
 
@@ -1052,6 +1194,274 @@ impl CudaVmmAllocator {
         let unmapped = self.release_granules_report(&mut arena, &live.committed);
         arena.spans.give_back(offset, live.len);
         unmapped
+    }
+
+    /// Declare a CUDA graph capture (or replay window) open on this allocator.
+    ///
+    /// While the returned guard is alive, [`commit_shared_prefix`] refuses to
+    /// map a shared prefix, because `cuMemMap` inside a capture returns
+    /// `CUDA_SUCCESS` but is not proven replayable (#727/#777). This turns the
+    /// "never map inside a captured region" rule into an enforced error rather
+    /// than a comment. Nest freely: the gate lifts when the last guard drops.
+    ///
+    /// [`commit_shared_prefix`]: Self::commit_shared_prefix
+    pub fn enter_graph_capture(&self) -> SharedPrefixCaptureGuard<'_> {
+        self.capture_depth.fetch_add(1, Ordering::AcqRel);
+        SharedPrefixCaptureGuard { allocator: self }
+    }
+
+    /// Create a pinned, read-only shared prefix of `bytes`, rounded up to whole
+    /// granules and charged **once** on the owned axis.
+    ///
+    /// The prefix's physical granules are created through the same #740 pool as
+    /// every other allocation here — there is no second allocator and no
+    /// per-sequence physical reservation. Fill the prefix's KV once through
+    /// [`SharedPrefix::device_ptr`], then map it into each sequence with
+    /// [`commit_shared_prefix`](Self::commit_shared_prefix).
+    ///
+    /// Errors, rather than mis-mapping, when this allocator was built without
+    /// the production physical-handle pool: a shared prefix is defined by
+    /// physical-handle identity across reservations, which only the pool
+    /// provides.
+    pub fn create_shared_prefix(&self, bytes: usize) -> Result<SharedPrefix, MemoryError> {
+        if bytes == 0 {
+            return Err(invalid(
+                bytes,
+                String::from("a shared prefix must cover at least one byte"),
+            ));
+        }
+        let granularity = self.lock().spans.granularity;
+        let granule_count = bytes.div_ceil(granularity);
+        let reservation = self
+            .backing
+            .reserve_and_map_shared_prefix(granule_count)
+            .map_err(|error| invalid(bytes, format!("shared prefix reservation: {error}")))?;
+        Ok(SharedPrefix {
+            reservation,
+            device: self.device,
+            authority: self.physical_pool_authority(),
+            requested_bytes: bytes,
+        })
+    }
+
+    /// Estimate the incremental **owned** physical bytes to admit one more
+    /// sharer of `prefix` — always zero, because the prefix's granules are
+    /// already owned.
+    ///
+    /// This is the admission-facing statement (#745): the shared bytes are
+    /// charged once, so the Nth request costs only its private continuation.
+    /// It is an observation; [`commit_shared_prefix`](Self::commit_shared_prefix)
+    /// is the operation.
+    pub fn incremental_owned_bytes_for_shared_prefix(&self, prefix: &SharedPrefix) -> u64 {
+        let _ = prefix;
+        0
+    }
+
+    /// Map `prefix` into the live allocation `ptr` at `byte_offset`,
+    /// **read-only**, taking one granule-reference per shared granule.
+    ///
+    /// The prefix's physical handles are already owned, so this maps existing
+    /// memory: it charges **zero** incremental owned bytes and keeps the shared
+    /// granules alive until the last sharer (or the prefix owner) leaves. Every
+    /// mapped granule is `PROT_READ`, so a mis-targeted store faults loudly
+    /// (Q3) instead of corrupting another request's KV.
+    ///
+    /// Errors — never mis-maps — when:
+    ///
+    /// * a graph capture is declared open (see [`enter_graph_capture`]);
+    /// * `prefix` belongs to a different device or pool authority;
+    /// * `byte_offset` is not granule-aligned, or the prefix would not fit
+    ///   inside the allocation there;
+    /// * `ptr` is not a live allocation of exactly `allocation_bytes`;
+    /// * any target granule is already committed (this never overlays live KV).
+    ///
+    /// [`enter_graph_capture`]: Self::enter_graph_capture
+    pub fn commit_shared_prefix(
+        &self,
+        prefix: &SharedPrefix,
+        ptr: NonNull<u8>,
+        allocation_bytes: usize,
+        byte_offset: usize,
+    ) -> Result<SharedPrefixCommit, MemoryError> {
+        if self.capture_depth.load(Ordering::Acquire) > 0 {
+            return Err(invalid(
+                allocation_bytes,
+                String::from(
+                    "cannot map a shared prefix while a graph capture is open: cuMemMap inside a \
+                     capture is not proven replayable (#727/#777)",
+                ),
+            ));
+        }
+        if prefix.device != self.device {
+            return Err(invalid(
+                allocation_bytes,
+                format!(
+                    "shared prefix belongs to device {:?} but this allocator serves {:?}",
+                    prefix.device, self.device
+                ),
+            ));
+        }
+        match (prefix.authority, self.physical_pool_authority()) {
+            (Some(prefix_authority), Some(self_authority))
+                if prefix_authority == self_authority => {}
+            (None, _) | (_, None) => {
+                return Err(invalid(
+                    allocation_bytes,
+                    String::from(
+                        "shared prefix requires the production physical-handle pool on both the \
+                         prefix and the committing allocator",
+                    ),
+                ));
+            }
+            _ => {
+                return Err(invalid(
+                    allocation_bytes,
+                    String::from(
+                        "shared prefix was created under a different pool authority than this \
+                         allocator",
+                    ),
+                ));
+            }
+        }
+
+        let mut arena = self.lock();
+        let granularity = arena.spans.granularity;
+        if !byte_offset.is_multiple_of(granularity) {
+            return Err(invalid(
+                allocation_bytes,
+                format!(
+                    "shared prefix offset {byte_offset} is not granule-aligned ({granularity}); a \
+                     shared prefix maps whole physical granules"
+                ),
+            ));
+        }
+        let prefix_bytes = prefix.granule_count() * prefix.granularity();
+        if prefix.granularity() != granularity {
+            return Err(invalid(
+                allocation_bytes,
+                format!(
+                    "shared prefix granularity {} does not match this arena's {granularity}",
+                    prefix.granularity()
+                ),
+            ));
+        }
+        let end = byte_offset.checked_add(prefix_bytes).ok_or_else(|| {
+            invalid(
+                allocation_bytes,
+                format!("shared prefix at offset {byte_offset} overflows the address space"),
+            )
+        })?;
+        if end > allocation_bytes {
+            return Err(invalid(
+                allocation_bytes,
+                format!(
+                    "shared prefix {byte_offset}..{end} exceeds the allocation of \
+                     {allocation_bytes} bytes"
+                ),
+            ));
+        }
+
+        let base = <CudaVirtualBacking as VirtualBacking>::base(&arena.reservation);
+        let address = ptr.as_ptr() as usize;
+        let Some(offset) = address.checked_sub(base) else {
+            return Err(invalid(
+                allocation_bytes,
+                String::from("shared prefix pointer is below the VMM arena reservation"),
+            ));
+        };
+        let Some(live) = arena.spans.live.get(&offset) else {
+            return Err(invalid(
+                allocation_bytes,
+                String::from("shared prefix pointer is not a live VMM allocation"),
+            ));
+        };
+        if live.len != allocation_bytes {
+            return Err(invalid(
+                allocation_bytes,
+                format!(
+                    "shared prefix allocation size {allocation_bytes} does not match live VMM \
+                     allocation size {}",
+                    live.len
+                ),
+            ));
+        }
+
+        if !(offset + byte_offset).is_multiple_of(granularity) {
+            return Err(invalid(
+                allocation_bytes,
+                format!(
+                    "shared prefix target address (allocation offset {offset} + {byte_offset}) is \
+                     not granule-aligned ({granularity}); allocate the sequence at granule \
+                     alignment so its prefix maps whole physical granules"
+                ),
+            ));
+        }
+
+        let first_granule = (offset + byte_offset) / granularity;
+        let granule_count = prefix.granule_count();
+        for i in 0..granule_count {
+            let granule = first_granule + i;
+            if arena.spans.granule_refs[granule] != 0 {
+                return Err(invalid(
+                    allocation_bytes,
+                    format!(
+                        "shared prefix would overlay granule {granule}, which is already \
+                         committed; a shared prefix maps only into an uncommitted region"
+                    ),
+                ));
+            }
+        }
+
+        // Map every granule read-only, unwinding cleanly on any failure so a
+        // partial map never lingers.
+        let mut mapped: Vec<usize> = Vec::with_capacity(granule_count);
+        for i in 0..granule_count {
+            let granule = first_granule + i;
+            let handle = prefix.reservation.handle(i).ok_or_else(|| {
+                invalid(
+                    allocation_bytes,
+                    format!("shared prefix has no handle for granule {i}"),
+                )
+            })?;
+            match self.backing.map_shared_prefix_readonly(
+                &mut arena.reservation,
+                granule * granularity,
+                handle,
+            ) {
+                Ok(()) => mapped.push(granule),
+                Err(error) => {
+                    for &done in &mapped {
+                        // Unmap what this call mapped; the handle returns to the
+                        // pool's shared refcount, not to `available`, so other
+                        // sharers are unaffected.
+                        let _ = self.backing.release(
+                            &mut arena.reservation,
+                            done * granularity,
+                            granularity,
+                        );
+                    }
+                    return Err(invalid(
+                        allocation_bytes,
+                        format!("shared prefix mapping: {error}"),
+                    ));
+                }
+            }
+        }
+
+        for &granule in &mapped {
+            arena.spans.granule_refs[granule] = 1;
+            arena.spans.committed += granularity;
+            note_commit(granularity);
+        }
+        if let Some(live) = arena.spans.live.get_mut(&offset) {
+            live.committed.extend(mapped.iter().copied());
+        }
+
+        Ok(SharedPrefixCommit {
+            additional_owned_bytes: 0,
+            newly_mapped_bytes: (granule_count * granularity) as u64,
+            granules: granule_count,
+        })
     }
 
     fn uncommitted_granules(
@@ -1537,6 +1947,57 @@ impl DeviceAllocator for CudaVmmAllocator {
 
     fn device(&self) -> DeviceKey {
         self.device
+    }
+
+    fn create_shared_prefix(
+        &self,
+        bytes: usize,
+    ) -> Result<Box<dyn SharedDevicePrefix>, MemoryError> {
+        let prefix = CudaVmmAllocator::create_shared_prefix(self, bytes)?;
+        Ok(Box::new(prefix))
+    }
+
+    fn incremental_owned_bytes_for_shared_prefix(&self, prefix: &dyn SharedDevicePrefix) -> u64 {
+        // A prefix from another allocator kind cannot be mapped here, so its
+        // incremental owned cost is not this allocator's to estimate; treat the
+        // unmappable case as "not free" so a caller never admits against a
+        // prefix `commit_shared_prefix` will refuse.
+        match prefix.as_any().downcast_ref::<SharedPrefix>() {
+            Some(prefix) => {
+                CudaVmmAllocator::incremental_owned_bytes_for_shared_prefix(self, prefix)
+            }
+            None => prefix.committed_physical_bytes(),
+        }
+    }
+
+    fn commit_shared_prefix(
+        &self,
+        prefix: &dyn SharedDevicePrefix,
+        ptr: NonNull<u8>,
+        allocation_bytes: usize,
+        byte_offset: usize,
+    ) -> Result<SharedPrefixCommitInfo, MemoryError> {
+        let prefix = prefix.as_any().downcast_ref::<SharedPrefix>().ok_or_else(|| {
+            invalid(
+                allocation_bytes,
+                String::from(
+                    "shared prefix was not created by a CUDA VMM allocator; it cannot be mapped \
+                     here",
+                ),
+            )
+        })?;
+        let commit = CudaVmmAllocator::commit_shared_prefix(
+            self,
+            prefix,
+            ptr,
+            allocation_bytes,
+            byte_offset,
+        )?;
+        Ok(SharedPrefixCommitInfo {
+            additional_owned_bytes: commit.additional_owned_bytes,
+            newly_mapped_bytes: commit.newly_mapped_bytes,
+            granules: commit.granules,
+        })
     }
 }
 

@@ -1,10 +1,13 @@
 # VMM page-level prefix sharing: viability probe & design (#777)
 
-Status: **isolating GPU probe + written design. No KV integration, no engine or
-production-kernel change this round** (per scope). The primitive is proven sound
-at the CUDA driver level and against the real #740 allocator/ledger; this
-document records the measured answers, the design decisions that do **not** get
-implemented yet, and the smallest next increment.
+Status: **isolating GPU probe + written design + the allocator primitive landed.
+No KV integration, no engine or production-kernel change this round** (per
+scope). The primitive is proven sound at the CUDA driver level and against the
+real #740 allocator/ledger, and the cross-reservation multi-map entry point
+(`commit_shared_prefix`) is now **implemented and tested** on that allocator.
+This document records the measured answers, the design decisions that do **not**
+get implemented yet, what the landed entry point does, and the smallest next
+increment.
 
 References **#777** (this issue), **#727** (one handle at two VAs, captured-graph
 safe), **#740/#745** (authority-scoped physical-handle pool, `carve()`
@@ -52,12 +55,14 @@ questions cleared with no kill finding:
    this WDDM box — roughly **22% / 39%** of an assumed 25 ms decode step, paid
    **once** when a sequence first writes past the shared prefix.
 
-**Smallest next increment:** not a kernel change and not COW. It is an
-**explicit pinned-prefix API on the token-major reservation model** (§ Design)
-— a `commit_shared_prefix(handle, range)` entry point on the arena that maps an
-existing physical handle into a new sequence's reservation at offset 0 and takes
-a granule-ref on it, charged on the owned axis. Everything downstream (the
-attention kernel, the flat VA) is unchanged. Detection by hashing and COW come
+**Smallest next increment (now landed):** not a kernel change and not COW. It
+was an **explicit pinned-prefix API on the token-major reservation model**
+(§ Design) — a `commit_shared_prefix(handle, range)` entry point on the arena
+that maps an existing physical handle into a new sequence's reservation at
+offset 0 and takes a granule-ref on it, charged on the owned axis. This entry
+point is now **implemented and GPU-tested** (§ Landed). Everything downstream
+(the attention kernel, the flat VA) is unchanged. Detection by hashing and COW
+come
 later; the explicit case is unambiguous and covers the highest-value scenario
 (a pinned system prompt / RAG document).
 
@@ -70,6 +75,7 @@ context or a process-global counter cannot contaminate another:
 | `vmm_prefix_share_ledger_gpu.rs` | Q2 (real allocator/ledger charge-once) |
 | `vmm_prefix_share_write_protect_gpu.rs` | Q3 (write-protect soundness + stickiness) |
 | `vmm_prefix_share_compose_gpu.rs` | Q4 (compose with #759 dummy page) |
+| `vmm_commit_shared_prefix_gpu.rs` | The landed entry point (cross-reservation multi-map on the real allocator) |
 
 ---
 
@@ -309,18 +315,117 @@ reservation model.
 
 ---
 
+## Landed this round — the `commit_shared_prefix` entry point (#777)
+
+The cross-reservation multi-map that Q1/Q2 said "remains" is now implemented on
+the real allocator, as an allocator primitive only (no KV path, no engine, no
+detection, no COW):
+
+1. **`CudaVmmAllocator::create_shared_prefix(bytes)`** reserves a private window
+   and acquires `granule_count` physical handles from the existing #740
+   authority-scoped pool, maps them read/write for the owner to fill, and charges
+   them **once** on the owned axis (`governor.used(Tier::Device)`). It returns a
+   `SharedPrefix` handle whose lifetime holds one owner-reference — the
+   registry-entry model from § Lifetime, so the prefix survives momentarily-zero
+   sharers.
+2. **`CudaVmmAllocator::commit_shared_prefix(&prefix, ptr, allocation_bytes,
+   byte_offset)`** maps those already-owned physical handles into a *different*
+   sequence's reservation at `byte_offset`, **`PROT_READ`** (Q3's non-sticky
+   write-protection posture), and takes a pool-level shared-map ref. It goes
+   through the existing #740 pool and `carve()` suballocation on the existing
+   global granule-ref **0->1 / 1->0** attribution — **no second allocator, no
+   per-sequence physical reservation** (which is what made #733 net-negative).
+   Two refcounts compose: the arena's per-granule allocation refcount and the
+   pool's cross-reservation `shared[handle]` count; the physical handle returns
+   to the pool only when the **last** mapping (owner or sharer) unmaps — lifetime
+   is the **union** of sharers, structurally (§ Lifetime).
+3. **`incremental_owned_bytes_for_shared_prefix(&prefix)` returns 0** — the Nth
+   sharer bills only its private bytes, Q2's admission arithmetic made explicit
+   on the entry point (#745).
+4. Failure modes error rather than mis-map: a non-granule-aligned target VA, a
+   granularity mismatch, a prefix that overflows or exceeds the target
+   allocation, a pointer outside the arena or not a live allocation, a target
+   granule that is **already committed** (never overlay live KV), and — crucially
+   — **any attempt to map while a graph capture is open** (`enter_graph_capture`
+   raises a depth counter that `commit_shared_prefix` refuses under; this makes
+   "never `cuMemMap` inside a captured region" an *enforced* rule, not a comment).
+   Every failure path rolls back cleanly (unmap + pool return), leaving the
+   region uncommitted.
+5. Reported bytes are **physical** (`committed_physical_bytes`, `mapped_bytes`),
+   never nominal content bytes; no `assert!` runs inside any `Drop`.
+
+`vmm_commit_shared_prefix_gpu.rs` proves this against the **real**
+`CudaVmmAllocator` + `LedgerGovernor` (no mock), one concern per test:
+
+- **N sequences share one pinned prefix, charged once, alive until the last** —
+  8 sequences map one 2 MiB prefix; owned bytes are 18 MiB (1 prefix + 8 private
+  tails), not 32 MiB; freeing 7 sharers keeps the survivor reading the shared
+  page; teardown returns `total_owned_bytes`, `governor.used`, and
+  `creates - releases` all to zero.
+- **Admitting a sharer costs only private bytes** — asserted against the real
+  ledger: mapping the shared prefix moves the governor by 0; only committing the
+  sequence's own private granule charges it.
+- **A write into the shared prefix faults and the context survives** — reusing
+  the Q3 pattern; both a synchronous and an asynchronous write fault, the context
+  is healthy afterwards (non-sticky), and the owner's copy is uncorrupted.
+- **Unsupported requests error rather than mis-map** — misaligned offset,
+  over-long prefix, mapping over a committed granule, and mapping under an open
+  capture all return `Err` and leave the region clean.
+
+All device operations in the new suite route through synchronous copies or a
+single created stream (the #797 harness hazard — a legacy-default-stream readback
+racing a non-blocking-stream memset with no CUDA error — is avoided), and each
+test constructs its own allocator so no alphabetically-earlier sibling warms the
+context.
+
+**What is now possible vs. what still needs KV integration.** The allocator can
+now physically share a pinned prefix across independent sequence reservations,
+charged once, read-only, with the correct union lifetime and admission
+arithmetic — the capacity mechanism (roughly doubled admissible concurrency for a
+large shared system prompt) exists at the allocator layer. What it does **not**
+yet do: nothing constructs a sequence's KV as `shared prefix + private tail` in
+the engine, nothing detects that two requests share a prefix, and nothing handles
+divergence past the shared region. Those are the increments below.
+
 ## Smallest next increment
 
-1. Add an explicit `commit_shared_prefix(handle, offset, len)` entry point to the
-   token-major arena that maps an existing pooled physical handle into a new
-   sequence's reservation at offset 0 and takes a granule-ref on it (charged on
-   the owned axis, so the Nth sharer bills 0 — Q2's arithmetic). No detection, no
-   COW, no eviction: a **pinned** prefix, read-only for its lifetime.
-2. Validate it end-to-end on the existing output-level parity oracle: two
-   concurrent sequences sharing a pinned prefix must produce identical logits to
-   two independent sequences, at the measured physical saving.
-3. Only after that: hash-based automatic detection (layer 2) and boundary COW
-   for divergence past a shared prefix (layer 3, Q5 cost already characterized).
+1. **KV-path integration (first production consumer — landed for seq-major,
+   #777).** The landed primitive previously had no live caller. It is now
+   reachable from production through an allocator-agnostic seam on the
+   `DeviceAllocator` trait (`create_shared_prefix` /
+   `incremental_owned_bytes_for_shared_prefix` / `commit_shared_prefix`, yielding
+   an opaque `dyn SharedDevicePrefix`); non-VMM allocators keep default impls that
+   refuse rather than mis-map. The first consumer is the **seq-major** fused fp16
+   GQA decode kernel: a caller pins a token prefix once and a second sequence maps
+   it, then the real kernel reads it. Validated on the output-level parity oracle
+   in `crates/onnx-runtime-ep-cuda/tests/gqa_shared_prefix_parity_gpu.rs`: two
+   sequences sharing one pinned seq-major prefix (`layers × 2` contiguous ranges)
+   produce **byte-identical** output to two independent sequences. Measured
+   (KV_HEADS=8, HEAD_DIM=128, f16, 1024-token prefix + 1024-token private tail):
+   independent = 8 granules (16,777,216 B), shared = 6 granules (12,582,912 B);
+   prefix charged **once** (`incremental_owned_bytes_for_shared_prefix` = 0),
+   second sharer's admission = **private bytes only** (4,194,304 B), saving
+   `(C−1)×(K_prefix+V_prefix)` = 2 granules. This is deliberately restricted to
+   the **explicit** case (a caller declares the shared prefix) and to prefixes
+   **provably read-only for the sharers' lifetime** — divergence/COW is out of
+   scope here (layer 3 below).
 
-Nothing here touches the attention kernel or the flat per-sequence VA — the whole
-point of the primitive is that the kernel is unchanged and learns nothing.
+   Seq-major accepts `layers × 2` multi-maps per sequence rather than the single
+   multi-map that only token-major (#783/#787) achieves; token-major is measured
+   but not built. **Structural blocker for auto engine use:** the engine
+   generation loop cannot call this seam yet because
+   `persistent_state_shapes` in `native_decode/cuda.rs` builds a hard-coded BNSH
+   physical KV shape and no model declares a seq-major end-to-end fixed-stride
+   physical shape (#794 showed seq-major changed only kernel indexing, not commit
+   geometry). A BNSH/seq-major fixed-stride physical-shape build is the
+   prerequisite for wiring the primitive into the automatic decode path.
+2. Then: hash-based automatic detection (layer 2) — a rolling-hash prefix
+   registry keyed to the same handle, once the explicit path is proven
+   end-to-end.
+3. Then: boundary copy-on-write for divergence past a shared prefix (layer 3, Q5
+   cost already characterized at ~5.5 ms pooled / ~9.8 ms cold, once at
+   divergence).
+
+Nothing in the landed primitive touches the attention kernel or the flat
+per-sequence VA — the whole point is that the kernel is unchanged and learns
+nothing.

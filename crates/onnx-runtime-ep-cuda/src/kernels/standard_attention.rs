@@ -81,8 +81,12 @@ use std::sync::{Arc, Mutex};
 
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
+    WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
+};
 use onnx_runtime_ir::{DataType, Node};
+use onnx_runtime_memory_governor::MemoryRole;
 
 use crate::error::driver_err;
 use crate::runtime::{CudaRuntime, cuptr};
@@ -563,6 +567,102 @@ const WS_STAGE_KEY: usize = 4;
 const WS_STAGE_VALUE: usize = 5;
 const WS_COUNT: usize = 6;
 
+/// Alignment of the governed default-domain `Attention` score buffer (#736),
+/// matching the executor's 256-byte device-allocation granularity.
+const STD_SCORES_ALIGN: usize = 256;
+
+/// Byte size of the governed default-domain `Attention` f32 score matrix for one
+/// concrete geometry: `batch·q_heads·q_seq·total_seq` fp32 scores. Prepare-only
+/// planning (`Kernel::workspace_requirement`) and execution (`run`) size the
+/// reservation through this identical helper so the reserved and consumed byte
+/// counts cannot drift; a degenerate geometry still reserves one element,
+/// matching the kernel's historical `qk_expected * 4` under `bytes.max(1)`.
+fn std_attention_scores_bytes(
+    batch: usize,
+    q_heads: usize,
+    q_seq: usize,
+    total_seq: usize,
+) -> Result<usize> {
+    let rows = batch
+        .checked_mul(q_heads)
+        .and_then(|value| value.checked_mul(q_seq))
+        .ok_or_else(|| EpError::KernelFailed("Attention: attention row count overflow".into()))?;
+    let elements = rows
+        .checked_mul(total_seq)
+        .ok_or_else(|| EpError::KernelFailed("Attention: score scratch size overflow".into()))?;
+    elements
+        .max(1)
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| EpError::KernelFailed("Attention: score scratch byte count overflow".into()))
+}
+
+/// Report the exact fp32 score-matrix scratch a default-domain `Attention`
+/// dispatch will materialize (#736), for prepare-only planning. The kernel has
+/// **no** shared-memory/flash route: `attention_row` always stages the
+/// `batch·q_heads·q_seq·total_seq` scores in device memory (fp32 accumulate,
+/// regardless of the f32/f16/bf16 operand dtype), so — unlike GQA/Phase-2a —
+/// every valid route reserves and none reports NONE. Only unresolvable or
+/// non-float input metadata returns NONE, letting `run` raise the precise error.
+///
+/// The score matrix's lifetime is route-dependent, so this models both classes
+/// truthfully: a single-token decode (`batch==1 && q_seq==1`) is the only shape
+/// that can take the capture-eligible pooled route whose buffer is retained
+/// across steps, charged `SessionPersistent`; every multi-token prefill (the
+/// 512-MiB-class quadratic worst case) and batched dispatch takes the per-call
+/// route whose scratch is freed on each exit, charged `StepScoped`. This is a
+/// free function so it is exercised by CPU-only unit tests without a GPU.
+fn std_attention_scores_requirement(
+    inputs: &[TensorMetadata<'_>],
+    q_num_heads: Option<usize>,
+    kv_num_heads: Option<usize>,
+) -> Result<WorkspaceRequirement> {
+    let (Some(q), Some(k)) = (inputs.first(), inputs.get(1)) else {
+        return Ok(WorkspaceRequirement::NONE);
+    };
+    if !matches!(
+        q.dtype,
+        DataType::Float32 | DataType::Float16 | DataType::BFloat16
+    ) {
+        return Ok(WorkspaceRequirement::NONE);
+    }
+    let Some((batch, q_heads, q_seq, _)) = bhsd_from_meta(q.shape, q_num_heads) else {
+        return Ok(WorkspaceRequirement::NONE);
+    };
+    let Some((_, _, k_seq, _)) = bhsd_from_meta(k.shape, kv_num_heads) else {
+        return Ok(WorkspaceRequirement::NONE);
+    };
+    // Total attended length = past-cache length + current key length. The past
+    // key (input 4) is optional; when a frozen fixed-capacity cache binds it at
+    // physical capacity this over-estimates the valid length by the padding
+    // rows, which is safe (reserve ≥ consume) — execution re-derives the exact
+    // size through the same helper and refuses on any shortfall, so it never
+    // silently under-allocates.
+    let past_seq = inputs
+        .get(4)
+        .filter(|past| past.present)
+        .and_then(|past| bhsd_from_meta(past.shape, kv_num_heads))
+        .map(|(_, _, seq, _)| seq)
+        .unwrap_or(0);
+    let total_seq = past_seq
+        .checked_add(k_seq)
+        .ok_or_else(|| EpError::KernelFailed("Attention: total attended length overflow".into()))?;
+    let bytes = std_attention_scores_bytes(batch, q_heads, q_seq, total_seq)?;
+    let step_scoped = !(batch == 1 && q_seq == 1);
+    let lifetime = if step_scoped {
+        WorkspaceLifetime::StepScoped
+    } else {
+        WorkspaceLifetime::SessionPersistent
+    };
+    Ok(WorkspaceRequirement {
+        bytes: u64::try_from(bytes).map_err(|_| {
+            EpError::KernelFailed("Attention: score workspace does not fit u64".into())
+        })?,
+        alignment: STD_SCORES_ALIGN,
+        lifetime,
+        role: MemoryRole::Workspace { step_scoped },
+    })
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct StdWorkspaceSlot {
     ptr: CUdeviceptr,
@@ -767,6 +867,28 @@ fn resolve_bhsd(view: &TensorView, name: &str, num_heads: Option<usize>) -> Resu
     }
 }
 
+/// Resolve a Q/K/V input's `[batch, heads, seq, dim]` dims from static shape
+/// metadata (no device access), mirroring [`resolve_bhsd`] for prepare-only
+/// workspace planning. Returns `None` when the shape is not a resolvable
+/// rank-3/4 attention operand, in which case the caller charges no workspace and
+/// lets execution raise the precise error.
+fn bhsd_from_meta(
+    shape: &[usize],
+    num_heads: Option<usize>,
+) -> Option<(usize, usize, usize, usize)> {
+    match shape.len() {
+        4 => Some((shape[0], shape[1], shape[2], shape[3])),
+        3 => {
+            let heads = num_heads?;
+            if heads == 0 || shape[2] == 0 || !shape[2].is_multiple_of(heads) {
+                return None;
+            }
+            Some((shape[0], heads, shape[1], shape[2] / heads))
+        }
+        _ => None,
+    }
+}
+
 fn dense_i64(runtime: &CudaRuntime, view: &TensorView) -> Result<Vec<i64>> {
     if view.dtype != DataType::Int64 {
         return Err(EpError::KernelFailed(
@@ -929,8 +1051,13 @@ impl StandardAttentionKernel {
     }
 }
 
-impl Kernel for StandardAttentionKernel {
-    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+impl StandardAttentionKernel {
+    fn run(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        prepared: Option<WorkspaceView>,
+    ) -> Result<()> {
         check_arity("Attention", inputs, outputs, 3, 7, 1)?;
         // Inputs may have been uploaded asynchronously on the EP stream. During
         // CUDA-graph capture the uploads are recorded into the graph, so no host
@@ -1349,9 +1476,32 @@ impl Kernel for StandardAttentionKernel {
             } else {
                 None
             };
-            let scores_ptr = match ws.as_mut() {
-                Some(ws) => ws.reserve(WS_SCORES, qk_expected * 4)?,
-                None => alloc(&self.runtime, &mut owned, qk_expected * 4)?,
+            let scores_bytes = std_attention_scores_bytes(batch, q_heads, q_seq, total_seq)?;
+            let scores_ptr = match prepared {
+                Some(view) => {
+                    // Governed slice (#736): the executor reserved this score
+                    // buffer against the device authority during prepare-only
+                    // planning, sized through the same `std_attention_scores_bytes`
+                    // helper. Refuse deterministically on a shortfall rather than
+                    // silently under-allocating or reintroducing a raw allocation
+                    // that bypasses the authority.
+                    if view.bytes() < scores_bytes {
+                        return Err(EpError::KernelFailed(format!(
+                            "Attention: prepared score workspace {} bytes is smaller than the \
+                             {scores_bytes} bytes this dispatch requires",
+                            view.bytes()
+                        )));
+                    }
+                    cuptr(view.ptr().0.cast_const())
+                }
+                // Compatibility/opt-out path (direct `execute`, e.g. unit tests):
+                // no executor-prepared workspace, so the score scratch stays
+                // self-owned — pooled on the capture-eligible route, per-call
+                // otherwise.
+                None => match ws.as_mut() {
+                    Some(ws) => ws.reserve(WS_SCORES, scores_bytes)?,
+                    None => alloc(&self.runtime, &mut owned, scores_bytes)?,
+                },
             };
             let key_kv_ptr = if stage_key {
                 match ws.as_mut() {
@@ -1608,6 +1758,38 @@ impl Kernel for StandardAttentionKernel {
             }
         }
         result.and(free_result)
+    }
+
+    /// Report the exact fp32 score-matrix scratch this dispatch will materialize
+    /// (#736), for prepare-only planning. Delegates to the free
+    /// [`std_attention_scores_requirement`] so the route/lifetime classifier is
+    /// covered by CPU-only unit tests without a GPU.
+    fn reference_scores_requirement(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+    ) -> Result<WorkspaceRequirement> {
+        std_attention_scores_requirement(inputs, self.q_num_heads, self.kv_num_heads)
+    }
+}
+
+impl Kernel for StandardAttentionKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        // Compatibility/opt-out path: no executor-prepared workspace, so the
+        // score scratch stays self-owned (pooled or per-call inside `run`).
+        self.run(inputs, outputs, None)
+    }
+
+    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+        self.reference_scores_requirement(inputs)
+    }
+
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.run(inputs, outputs, workspace)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -2144,6 +2326,131 @@ mod alias_tests {
                 onnx_runtime_ep_api::CaptureSupport::Supported
             ),
             "capture must be Supported once a device-valid-length single-token decode step is warmed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod workspace_governance_tests {
+    //! CPU-only unit tests (no GPU needed) for the governed default-domain
+    //! `Attention` score matrix (#736): the shared byte helper and the
+    //! prepare-only route/lifetime classifier.
+    use super::*;
+    use onnx_runtime_ep_api::TensorMetadata;
+
+    fn meta(dtype: DataType, shape: &[usize]) -> TensorMetadata<'_> {
+        TensorMetadata::new(dtype, shape, true)
+    }
+
+    #[test]
+    fn scores_bytes_matches_score_count_formula() {
+        // Planning and execution size the governed score buffer through this
+        // exact helper (#736), so pin its formula: `batch·heads·q_seq·total_seq`
+        // fp32 scores. A degenerate geometry still reserves one element.
+        let (batch, heads, q_seq, total) = (2usize, 4usize, 8usize, 130usize);
+        assert_eq!(
+            std_attention_scores_bytes(batch, heads, q_seq, total).unwrap(),
+            batch * heads * q_seq * total * std::mem::size_of::<f32>()
+        );
+        assert_eq!(
+            std_attention_scores_bytes(0, heads, q_seq, total).unwrap(),
+            std::mem::size_of::<f32>()
+        );
+    }
+
+    #[test]
+    fn prefill_scores_are_step_scoped_and_quadratic() {
+        // Multi-token prefill (the 512-MiB-class worst case) is the per-call
+        // route: StepScoped, sized to `batch·heads·q_seq·(past+key)` fp32.
+        let hidden = 32 * 128;
+        let q = [1usize, 2048, hidden];
+        let kv = [1usize, 2048, hidden];
+        let inputs = [meta(DataType::Float32, &q), meta(DataType::Float32, &kv)];
+        let req = std_attention_scores_requirement(&inputs, Some(32), Some(32)).unwrap();
+        assert_eq!(req.bytes, 1u64 * 32 * 2048 * 2048 * 4);
+        assert_eq!(req.lifetime, WorkspaceLifetime::StepScoped);
+        assert!(matches!(
+            req.role,
+            MemoryRole::Workspace { step_scoped: true }
+        ));
+        assert_eq!(req.alignment, STD_SCORES_ALIGN);
+    }
+
+    #[test]
+    fn single_token_decode_scores_are_session_persistent() {
+        // Single-token decode is the only capture-eligible (pooled/retained)
+        // route: SessionPersistent, and linear in the past-cache capacity.
+        let hidden_q = 32 * 128;
+        let hidden_kv = 8 * 128;
+        let q = [1usize, 1, hidden_q];
+        let kv = [1usize, 1, hidden_kv];
+        let past = [1usize, 8, 2048, 128];
+        let inputs = [
+            meta(DataType::Float32, &q),
+            meta(DataType::Float32, &kv),
+            meta(DataType::Float32, &kv),
+            meta(DataType::Float32, &[1, 1, 1, 1]),
+            meta(DataType::Float32, &past),
+        ];
+        let req = std_attention_scores_requirement(&inputs, Some(32), Some(8)).unwrap();
+        // total_seq = past(2048) + current key(1) -> over-estimates by one row.
+        assert_eq!(req.bytes, 1u64 * 32 * 1 * (2048 + 1) * 4);
+        assert_eq!(req.lifetime, WorkspaceLifetime::SessionPersistent);
+        assert!(matches!(
+            req.role,
+            MemoryRole::Workspace { step_scoped: false }
+        ));
+    }
+
+    #[test]
+    fn non_float_or_unresolvable_metadata_reserves_nothing() {
+        // Non-float operand: rejected by `run`, so charge nothing.
+        let q_i = [1usize, 8, 256];
+        let int_inputs = [meta(DataType::Int32, &q_i), meta(DataType::Int32, &q_i)];
+        assert_eq!(
+            std_attention_scores_requirement(&int_inputs, Some(4), Some(4)).unwrap(),
+            WorkspaceRequirement::NONE
+        );
+        // Rank-2 shape is not a resolvable attention operand.
+        let bad = [8usize, 256];
+        let bad_inputs = [meta(DataType::Float32, &bad), meta(DataType::Float32, &bad)];
+        assert_eq!(
+            std_attention_scores_requirement(&bad_inputs, Some(4), Some(4)).unwrap(),
+            WorkspaceRequirement::NONE
+        );
+    }
+}
+
+/// Regression guard for issue #736: the governed default-domain `Attention`
+/// score matrix (`WS_SCORES`) is routed through `Kernel::workspace_requirement`
+/// + an executor-prepared workspace, consumed via `execute_with_workspace`. This
+/// CPU-only test fails if the score buffer reintroduces an unconditional raw
+/// (self-owned) allocation on the governed dispatch, bypassing the device
+/// authority. It runs on CI without a GPU, matching the #751/#795 bar (a source
+/// scan compiled into the test binary, not an external `Select-String`).
+#[cfg(test)]
+mod raw_allocation_guard {
+    #[test]
+    fn std_attention_scores_slot_is_governed_not_raw_allocated() {
+        const SOURCE: &str = include_str!("standard_attention.rs");
+        assert!(
+            SOURCE.contains("fn execute_with_workspace"),
+            "default-domain Attention must stay wired into governed workspace preparation (#736)."
+        );
+        assert!(
+            SOURCE.contains("std_attention_scores_bytes"),
+            "the score buffer must be sized through the shared helper (#736)."
+        );
+        // The pre-#736 seam sized the score slot as `qk_expected * 4` directly
+        // in both the pooled and per-call branches. The needles are assembled at
+        // runtime so these literals do not themselves match under `include_str!`.
+        let pooled = ["ws.reserve(WS_SCORES, qk_expected", " * 4)"].concat();
+        let owned = ["owned, qk_expected", " * 4)"].concat();
+        assert!(
+            !SOURCE.contains(pooled.as_str()) && !SOURCE.contains(owned.as_str()),
+            "default-domain Attention must not reintroduce an unconditional raw allocation of the \
+             governed score slot (#736); size it through `std_attention_scores_bytes` and consume \
+             the executor-prepared workspace."
         );
     }
 }

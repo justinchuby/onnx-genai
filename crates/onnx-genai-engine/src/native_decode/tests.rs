@@ -1,3 +1,4 @@
+use super::kv_commit::KvCommitLayout;
 use super::*;
 #[cfg(feature = "cuda")]
 use onnx_genai_metadata::LoopStatePair;
@@ -87,6 +88,56 @@ fn graph_capture_auto_enables_for_owned_cuda_kv() {
     assert!(resolve_graph_capture_enabled(
         None, false, false, structural, false, false
     ));
+}
+
+#[test]
+fn every_decode_level_capture_decline_names_its_predicate() {
+    let owned_cuda = GraphCaptureStructuralSafety {
+        device_is_cuda: true,
+        kv_ownership: KvOwnership::Owned,
+    };
+    let cases = [
+        resolve_graph_capture_decision(None, false, false, owned_cuda, true, false),
+        resolve_graph_capture_decision(Some(false), false, false, owned_cuda, false, false),
+        resolve_graph_capture_decision(None, true, false, owned_cuda, false, false),
+        resolve_graph_capture_decision(
+            None,
+            false,
+            false,
+            GraphCaptureStructuralSafety {
+                device_is_cuda: false,
+                kv_ownership: KvOwnership::Owned,
+            },
+            false,
+            false,
+        ),
+        resolve_graph_capture_decision(
+            None,
+            false,
+            false,
+            GraphCaptureStructuralSafety {
+                device_is_cuda: true,
+                kv_ownership: KvOwnership::Shared,
+            },
+            false,
+            false,
+        ),
+    ];
+
+    for decision in cases {
+        assert!(!decision.is_enabled());
+        let reason = decision
+            .decline_reason()
+            .expect("a disabled capture decision must always carry a reason");
+        assert!(
+            reason.starts_with("predicate `"),
+            "decline must name its predicate: {reason}"
+        );
+    }
+
+    let enabled = resolve_graph_capture_decision(None, false, false, owned_cuda, false, false);
+    assert!(enabled.is_enabled());
+    assert!(enabled.decline_reason().is_none());
 }
 
 #[test]
@@ -1956,6 +2007,82 @@ fn cuda_persistent_state_shapes_preserve_growing_kv_and_fixed_recurrent_geometry
 }
 
 #[test]
+fn kv_growth_byte_layout_keeps_head_major_bnsh_and_permutes_seq_major_to_bsnh() {
+    // BNSH declared shape [batch, kv_heads, capacity, head_dim].
+    let bnsh = [1usize, 8, 512, 128];
+
+    // Head-major must be byte-identical to the historical behavior: the byte
+    // layout equals the declared shape and the grow axis is 2.
+    let (head_bytes, head_axis) =
+        kv_growth_byte_layout(&bnsh, KvCommitLayout::HeadMajor).expect("head-major layout");
+    assert_eq!(head_bytes, bnsh.to_vec());
+    assert_eq!(head_axis, 2);
+
+    // Seq-major stores bytes as BSNH [batch, capacity, kv_heads, head_dim] and
+    // grows on axis 1.
+    let (seq_bytes, seq_axis) =
+        kv_growth_byte_layout(&bnsh, KvCommitLayout::SeqMajor).expect("seq-major layout");
+    assert_eq!(seq_bytes, vec![1, 512, 8, 128]);
+    assert_eq!(seq_axis, 1);
+
+    // Rank must be four.
+    assert!(kv_growth_byte_layout(&[1, 8, 512], KvCommitLayout::SeqMajor).is_err());
+}
+
+// The defining property of the seq-major buffer: the per-token stride is
+// `kv_heads * head_dim` and is independent of the sequence capacity, so growing
+// the capacity does not move any live byte. Head-major's per-head stripe stride
+// scales with capacity, so growth re-strides every head but head 0.
+#[test]
+fn seq_major_growth_is_fixed_stride_and_moves_no_bytes() {
+    // Mirror the block/stride arithmetic of `copy_kv_prefix_device_to_device*`:
+    // for a byte-layout shape and grow axis, block `b` starts at
+    // `b * capacity * inner` elements, where `inner` is the product of the axes
+    // below the grow axis.
+    fn block_bases(bnsh: &[usize], layout: KvCommitLayout) -> (Vec<usize>, usize) {
+        let (bytes, axis) = kv_growth_byte_layout(bnsh, layout).expect("byte layout");
+        let capacity = bytes[axis];
+        let blocks: usize = bytes[..axis].iter().product();
+        let inner: usize = bytes[axis + 1..].iter().product();
+        let bases = (0..blocks).map(|b| b * capacity * inner).collect();
+        (bases, inner)
+    }
+
+    let old = [1usize, 8, 256, 128];
+    let new = [1usize, 8, 512, 128];
+
+    // Seq-major: one block (batch), fixed inner stride kv_heads*head_dim, and the
+    // single block base is 0 for both capacities, so the live prefix keeps its
+    // byte offsets — the in-place copy is a no-op.
+    let (seq_old_bases, seq_inner) = block_bases(&old, KvCommitLayout::SeqMajor);
+    let (seq_new_bases, seq_inner_new) = block_bases(&new, KvCommitLayout::SeqMajor);
+    assert_eq!(seq_inner, 8 * 128);
+    assert_eq!(
+        seq_inner_new,
+        8 * 128,
+        "per-token stride is capacity-independent"
+    );
+    assert_eq!(
+        seq_old_bases, seq_new_bases,
+        "no seq-major block base moves on growth"
+    );
+    assert_eq!(seq_old_bases, vec![0]);
+
+    // Head-major: one block per head, and every head but head 0 moves to a wider
+    // stride when the capacity grows.
+    let (head_old_bases, head_inner) = block_bases(&old, KvCommitLayout::HeadMajor);
+    let (head_new_bases, _) = block_bases(&new, KvCommitLayout::HeadMajor);
+    assert_eq!(head_inner, 128);
+    assert_ne!(
+        head_old_bases, head_new_bases,
+        "head-major re-strides on growth"
+    );
+    for head in 1..8 {
+        assert!(head_new_bases[head] > head_old_bases[head]);
+    }
+}
+
+#[test]
 fn cuda_fixed_state_shapes_reject_unbounded_non_batch_dimensions() {
     let error = DecodeCudaState::persistent_state_shapes(
         "state",
@@ -2257,6 +2384,15 @@ fn native_cuda_symbolic_total_seq_aux_declines_capture_but_decodes_eagerly() -> 
     assert_eq!(stats.graph.captures, 0);
     assert_eq!(stats.graph.replays, 0);
     assert_eq!(stats.graph.fallbacks, 0);
+    let reason = stats
+        .graph
+        .decline_reason
+        .as_deref()
+        .expect("a binding-time capture decline must be observable");
+    assert!(
+        reason.contains("predicate `auxiliary_outputs_have_fixed_persistent_shapes`"),
+        "{reason}"
+    );
 
     // Decode is bit-exact with a plain eager (graph_capture=false) run — the
     // unresolved aux output changes nothing about the decode result.

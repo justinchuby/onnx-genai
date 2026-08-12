@@ -74,6 +74,7 @@ pub mod allocator;
 
 pub use allocator::{
     AllocationCommitRange, DeviceAllocator, DeviceKey, HostAllocator, MappedAllocation,
+    SharedDevicePrefix, SharedPrefixCommitInfo,
 };
 
 use std::collections::{BTreeMap, VecDeque};
