@@ -1,5 +1,32 @@
 use super::*;
 
+use super::kv_commit::KvCommitLayout;
+
+/// Resolve the physical KV-cache layout for the native CUDA binding layer.
+///
+/// The authoritative source is the model's [`ModelIoSpec::kv_layout`] descriptor
+/// (a seq-major descriptor selects [`KvCommitLayout::SeqMajor`]). Absent metadata
+/// means head-major, preserving the historical behavior exactly. The
+/// `ONNX_GENAI_CUDA_KV_LAYOUT` environment variable (`seq_major` / `bsnh` vs
+/// `head_major` / `bnsh`) overrides the descriptor for residency diagnostics; it
+/// never changes which kernels run, only how the binding layer accounts for and
+/// commits residency.
+pub(crate) fn resolve_cuda_kv_layout(
+    metadata: Option<&onnx_genai_metadata::KvCacheLayout>,
+) -> KvCommitLayout {
+    if let Ok(value) = std::env::var("ONNX_GENAI_CUDA_KV_LAYOUT") {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "seq_major" | "seq-major" | "bsnh" => return KvCommitLayout::SeqMajor,
+            "head_major" | "head-major" | "bnsh" => return KvCommitLayout::HeadMajor,
+            _ => {}
+        }
+    }
+    match metadata.and_then(|layout| layout.gqa_attribute_value()) {
+        Some(1) => KvCommitLayout::SeqMajor,
+        _ => KvCommitLayout::HeadMajor,
+    }
+}
+
 /// Purely structural signals that gate whether whole-step CUDA graph capture is
 /// *auto-attempted* on the native decode path. Never derived from a model or
 /// architecture name (RULES.md §2/§2.1) — only from device placement and the
@@ -18,8 +45,52 @@ pub(crate) struct GraphCaptureStructuralSafety {
 
 impl GraphCaptureStructuralSafety {
     /// True when structural conditions make whole-step capture safe to attempt.
+    #[cfg(test)]
     pub(crate) fn is_capture_safe(self) -> bool {
         self.device_is_cuda && self.kv_ownership == KvOwnership::Owned
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GraphCaptureDecision {
+    enabled: bool,
+    decline_reason: Option<String>,
+}
+
+impl GraphCaptureDecision {
+    fn enabled() -> Self {
+        Self {
+            enabled: true,
+            decline_reason: None,
+        }
+    }
+
+    fn declined(predicate: &str, detail: impl std::fmt::Display) -> Self {
+        Self {
+            enabled: false,
+            decline_reason: Some(format!(
+                "predicate `{predicate}` declined capture: {detail}"
+            )),
+        }
+    }
+
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    #[cfg(test)]
+    pub(crate) fn decline_reason(&self) -> Option<&str> {
+        self.decline_reason.as_deref()
+    }
+
+    fn decline_if_enabled(&mut self, predicate: &str, detail: impl std::fmt::Display) {
+        if self.enabled {
+            *self = Self::declined(predicate, detail);
+        }
+    }
+
+    fn into_decline_reason(self) -> Option<String> {
+        self.decline_reason
     }
 }
 
@@ -28,54 +99,278 @@ impl GraphCaptureStructuralSafety {
 /// auto-decision.
 ///
 /// Precedence:
-/// 0. Live weight offload (`ONNX_GENAI_WEIGHT_OFFLOAD=1`) always wins and forces
-///    capture OFF. The pager's alloc/copy/free ops are capture-illegal, so the
-///    two features are mutually exclusive; offload wins and capture is skipped
-///    with a one-time notice.
+/// 0. Live weight offload (`ONNX_GENAI_WEIGHT_OFFLOAD=1`) forces capture OFF
+///    **only when its paging path is not stable-VA**. The legacy pager's
+///    alloc/copy/free ops return a different device pointer per page-in, and a
+///    captured graph bakes pointers into its recorded nodes, so the two are
+///    mutually exclusive on that path (the decision records the named predicate).
+///    When offload runs on the stable virtual-address VMM path (issue #716),
+///    every retained weight keeps a reserved-once device VA whose physical
+///    granules are remapped underneath, which is capture-safe, so this no longer
+///    forces capture OFF and the normal precedence below applies.
 /// 1. Programmatic `NativeDecodeCudaOptions::graph_capture` (`Some`) wins next.
 /// 2. An explicitly-set `ONNX_GENAI_CUDA_GRAPH` env var (`=0` forces OFF, `=1`
 ///    forces ON) is honored next.
 /// 3. When neither is set, auto-decide from `structural` safety: attempt capture
 ///    only when the decode topology is structurally graph-safe.
+pub(crate) fn resolve_graph_capture_decision(
+    programmatic: Option<bool>,
+    env_explicit: bool,
+    env_value: bool,
+    structural: GraphCaptureStructuralSafety,
+    weight_offload_enabled: bool,
+    weight_offload_stable_va: bool,
+) -> GraphCaptureDecision {
+    if weight_offload_enabled && !weight_offload_stable_va {
+        return GraphCaptureDecision::declined(
+            "weight_offload_enabled && !weight_offload_stable_va",
+            "weight offload is using the pointer-unstable paging path",
+        );
+    }
+    if let Some(explicit) = programmatic {
+        return if explicit {
+            GraphCaptureDecision::enabled()
+        } else {
+            GraphCaptureDecision::declined(
+                "NativeDecodeCudaOptions::graph_capture",
+                "the programmatic override is Some(false)",
+            )
+        };
+    }
+    if env_explicit {
+        return if env_value {
+            GraphCaptureDecision::enabled()
+        } else {
+            GraphCaptureDecision::declined(
+                "ONNX_GENAI_CUDA_GRAPH",
+                "the process-wide runtime configuration captured an explicit value of 0 on first use",
+            )
+        };
+    }
+    if !structural.device_is_cuda {
+        return GraphCaptureDecision::declined(
+            "GraphCaptureStructuralSafety::device_is_cuda",
+            "the decode device is not CUDA",
+        );
+    }
+    if structural.kv_ownership != KvOwnership::Owned {
+        return GraphCaptureDecision::declined(
+            "GraphCaptureStructuralSafety::kv_ownership",
+            format_args!(
+                "KV ownership is {:?}, but capture requires Owned",
+                structural.kv_ownership
+            ),
+        );
+    }
+    GraphCaptureDecision::enabled()
+}
+
+#[cfg(test)]
 pub(crate) fn resolve_graph_capture_enabled(
     programmatic: Option<bool>,
     env_explicit: bool,
     env_value: bool,
     structural: GraphCaptureStructuralSafety,
     weight_offload_enabled: bool,
+    weight_offload_stable_va: bool,
 ) -> bool {
-    if weight_offload_enabled {
-        log_weight_offload_capture_exclusion();
-        return false;
-    }
-    if let Some(explicit) = programmatic {
-        return explicit;
-    }
-    if env_explicit {
-        return env_value;
-    }
-    structural.is_capture_safe()
+    resolve_graph_capture_decision(
+        programmatic,
+        env_explicit,
+        env_value,
+        structural,
+        weight_offload_enabled,
+        weight_offload_stable_va,
+    )
+    .is_enabled()
 }
 
-/// Emit the offload/capture mutual-exclusion notice at most once per process, so
-/// operators who enable both learn capture was declined without log spam.
-fn log_weight_offload_capture_exclusion() {
-    static NOTICE: std::sync::Once = std::sync::Once::new();
-    NOTICE.call_once(|| {
-        tracing::warn!("weight offload is incompatible with CUDA graph capture; capture disabled");
-    });
+fn cuda_step_profile_enabled() -> bool {
+    std::env::var_os("ONNX_GENAI_PROFILE_CUDA_DECODE_STEPS").is_some_and(|value| {
+        let value = value.to_string_lossy();
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct StepOffloadSnapshot {
+    materialize_ns: u64,
+    htod_ns: u64,
+    admit_sync_ns: u64,
+    page_ins: u64,
+    staging_fill_bytes: u64,
+    staging_fill_regions: u64,
+    staging_fill_calls: u64,
+    materialize_fallback_calls: u64,
+    htod_bytes: u64,
+    vram_alloc_ns: u64,
+    vram_free_ns: u64,
+}
+
+impl StepOffloadSnapshot {
+    fn read() -> Self {
+        #[cfg(feature = "cuda")]
+        {
+            let stats = onnx_runtime_ep_cuda::global_offload_stats();
+            Self {
+                materialize_ns: stats.materialize_ns,
+                htod_ns: stats.htod_ns,
+                admit_sync_ns: stats.admit_sync_ns,
+                page_ins: stats.page_ins,
+                staging_fill_bytes: stats.staging_fill_bytes,
+                staging_fill_regions: stats.staging_fill_regions,
+                staging_fill_calls: stats.staging_fill_calls,
+                materialize_fallback_calls: stats.materialize_fallback_calls,
+                htod_bytes: stats.htod_bytes,
+                vram_alloc_ns: stats.vram_alloc_ns,
+                vram_free_ns: stats.vram_free_ns,
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            Self::default()
+        }
+    }
+
+    fn delta(self, before: Self) -> Self {
+        Self {
+            materialize_ns: self.materialize_ns.saturating_sub(before.materialize_ns),
+            htod_ns: self.htod_ns.saturating_sub(before.htod_ns),
+            admit_sync_ns: self.admit_sync_ns.saturating_sub(before.admit_sync_ns),
+            page_ins: self.page_ins.saturating_sub(before.page_ins),
+            staging_fill_bytes: self
+                .staging_fill_bytes
+                .saturating_sub(before.staging_fill_bytes),
+            staging_fill_regions: self
+                .staging_fill_regions
+                .saturating_sub(before.staging_fill_regions),
+            staging_fill_calls: self
+                .staging_fill_calls
+                .saturating_sub(before.staging_fill_calls),
+            materialize_fallback_calls: self
+                .materialize_fallback_calls
+                .saturating_sub(before.materialize_fallback_calls),
+            htod_bytes: self.htod_bytes.saturating_sub(before.htod_bytes),
+            vram_alloc_ns: self.vram_alloc_ns.saturating_sub(before.vram_alloc_ns),
+            vram_free_ns: self.vram_free_ns.saturating_sub(before.vram_free_ns),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CudaStepWallBreakdown {
+    run_ms: f64,
+    logits_read_ms: f64,
+    capture_check_ms: f64,
+    finite_check_ms: f64,
+}
+
+struct CudaStepProfile {
+    past_len: usize,
+    total_len: usize,
+    before: StepOffloadSnapshot,
+    start: std::time::Instant,
+}
+
+impl CudaStepProfile {
+    fn begin(past_len: usize, total_len: usize) -> Option<Self> {
+        if !cuda_step_profile_enabled() {
+            return None;
+        }
+        onnx_runtime_session::enable_exec_phase_profile_for_process();
+        onnx_runtime_session::reset_exec_phase_profile();
+        Some(Self {
+            past_len,
+            total_len,
+            before: StepOffloadSnapshot::read(),
+            start: std::time::Instant::now(),
+        })
+    }
+
+    fn finish(self, path: &'static str, wall: CudaStepWallBreakdown) {
+        let total_ms = self.start.elapsed().as_secs_f64() * 1_000.0;
+        let delta = StepOffloadSnapshot::read().delta(self.before);
+        let staging_ms = ns_to_ms(delta.materialize_ns);
+        let h2d_ms = ns_to_ms(delta.htod_ns);
+        let admit_sync_ms = ns_to_ms(delta.admit_sync_ns);
+        let vram_alloc_ms = ns_to_ms(delta.vram_alloc_ns);
+        let vram_free_ms = ns_to_ms(delta.vram_free_ns);
+        let phase_stats = onnx_runtime_session::exec_phase_stats();
+        let phase_ms = |phase: &str| -> f64 {
+            phase_stats
+                .iter()
+                .find_map(|(name, total_ns, _)| (*name == phase).then_some(*total_ns))
+                .map(|ns| ns as f64 / 1_000_000.0)
+                .unwrap_or(0.0)
+        };
+        let kernel_host_ms = phase_ms("exec_kernel.compute");
+        let build_inputs_ms = phase_ms("exec_kernel.build_inputs");
+        let build_inputs_attributed_ms =
+            staging_ms + h2d_ms + admit_sync_ms + vram_alloc_ms + vram_free_ms;
+        let build_inputs_unattributed_ms = (build_inputs_ms - build_inputs_attributed_ms).max(0.0);
+        let executor_other_ms = wall.run_ms - build_inputs_ms - kernel_host_ms;
+        let run_unattributed_ms = build_inputs_unattributed_ms + executor_other_ms;
+        let residual_ms = total_ms
+            - staging_ms
+            - h2d_ms
+            - admit_sync_ms
+            - vram_alloc_ms
+            - vram_free_ms
+            - kernel_host_ms
+            - build_inputs_unattributed_ms
+            - executor_other_ms
+            - wall.logits_read_ms
+            - wall.capture_check_ms
+            - wall.finite_check_ms;
+        static HEADER: std::sync::Once = std::sync::Once::new();
+        HEADER.call_once(|| {
+            eprintln!(
+                "[onnx-genai-cuda-step] path,past_len,total_len,total_ms,staging_fill_ms,h2d_copy_ms,kernel_host_dispatch_ms,admit_sync_ms,vram_alloc_ms,vram_free_ms,build_inputs_unattributed_ms,executor_other_ms,run_unattributed_ms,logits_read_sync_ms,capture_check_ms,finite_check_ms,residual_ms,page_ins,staging_fill_bytes,staging_fill_regions,staging_fill_calls,materialize_fallback_calls,h2d_bytes"
+            );
+        });
+        eprintln!(
+            "[onnx-genai-cuda-step] {path},{},{},{total_ms:.3},{staging_ms:.3},{h2d_ms:.3},{kernel_host_ms:.3},{admit_sync_ms:.3},{vram_alloc_ms:.3},{vram_free_ms:.3},{build_inputs_unattributed_ms:.3},{executor_other_ms:.3},{run_unattributed_ms:.3},{:.3},{:.3},{:.3},{residual_ms:.3},{},{},{},{},{},{}",
+            self.past_len,
+            self.total_len,
+            wall.logits_read_ms,
+            wall.capture_check_ms,
+            wall.finite_check_ms,
+            delta.page_ins,
+            delta.staging_fill_bytes,
+            delta.staging_fill_regions,
+            delta.staging_fill_calls,
+            delta.materialize_fallback_calls,
+            delta.htod_bytes
+        );
+    }
+}
+
+fn ns_to_ms(ns: u64) -> f64 {
+    ns as f64 / 1_000_000.0
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CudaKvDebugStats {
     pub logical_len: usize,
     pub max_len: usize,
+    pub kv_committed_len: usize,
     pub hard_max_len: usize,
     pub max_len_source: String,
     pub device_ptrs: Vec<usize>,
     pub kv_committed_bytes: usize,
     pub kv_physical_bytes_by_binding: Vec<usize>,
     pub kv_transfers: DeviceBindingTransferStats,
+    pub kv_growth_events: u64,
+    pub kv_growth_d2d_copy_bytes: u64,
+    /// `true` when the KV bindings are stored seq-major (BSNH) and the binding
+    /// layer accounts residency by the dense live-prefix rule; `false` for the
+    /// default head-major (BNSH) flat-bucket accounting. Surfaced so the
+    /// committed-bytes measurement can attribute a residency number to the
+    /// layout that produced it.
+    pub kv_layout_seq_major: bool,
     pub graph: CudaGraphDebugStats,
 }
 
@@ -100,7 +395,24 @@ pub struct CudaGraphDebugStats {
     pub captures: u64,
     pub replays: u64,
     pub fallbacks: u64,
+    pub invalidations: u64,
+    /// Number of KV-cache growth events that **kept** the captured graph instead
+    /// of invalidating it, because the growth provably changed none of the
+    /// captured graph's baked dependencies (seq-major fixed full-context stride:
+    /// stable device pointers, unchanged physical shapes, capacity-independent
+    /// addressing). Head-major and the legacy realloc path never keep — they are
+    /// counted under `invalidations`. Surfaced so an operator can attribute why a
+    /// graph survived a growth (#804-style named reporting).
+    pub growth_keeps: u64,
     pub allocation_counts: DeviceAllocationCounts,
+    /// Named decode-level predicate that declined capture, whether before the
+    /// first attempt or during the runtime capture audit.
+    pub decline_reason: Option<String>,
+    /// The most recent KV-growth capture decision (kept vs invalidated) with the
+    /// named predicate that produced it, so an operator can see *why* a graph was
+    /// kept or invalidated across a growth — a silent "kept" is as dangerous as a
+    /// silent capture decline.
+    pub growth_decision: Option<String>,
     /// Structured reasons from the most recent capture fallback.
     pub fallback_report: Option<CaptureDeclineReport>,
 }
@@ -174,10 +486,32 @@ pub(crate) struct DecodeCudaState {
     graph_captures: u64,
     graph_replays: u64,
     graph_fallbacks: u64,
+    graph_invalidations: u64,
+    kv_growth_events: u64,
+    kv_growth_d2d_copy_bytes: u64,
+    /// Count of KV-growth events that kept the captured graph (seq-major
+    /// fixed-stride commit-on-demand path). Mutually exclusive with the
+    /// growth-attributable slice of `graph_invalidations`.
+    graph_growth_keeps: u64,
+    /// Highest committed KV sequence length, in tokens. For the seq-major
+    /// fixed-stride path this is the commit high-water mark that advances on
+    /// growth **without** changing the reported physical shape; for head-major
+    /// and legacy realloc it tracks the reported physical capacity.
+    kv_committed_len: usize,
+    /// Named rationale for the most recent KV-growth capture decision.
+    graph_growth_decision: Option<String>,
     capacity: CudaKvCapacity,
     /// The KV bindings reserve their full context address range while the CUDA
     /// VMM allocator maps only the token stripes reached so far.
     kv_commits_on_demand: bool,
+    /// The physical KV-cache layout this session's bindings are stored in,
+    /// resolved from [`ModelIoSpec::kv_layout`] (absent = head-major, exactly
+    /// the historical behavior). Consumed by the residency accounting and the
+    /// commit-geometry decision so the binding layer is no longer layout-blind:
+    /// seq-major's live prefix is one dense contiguous run, so its committed
+    /// windows follow `ceil(live_bytes / granule)` rather than a flat bucket.
+    kv_layout: KvCommitLayout,
+    pub(crate) graph_decline_reason: Option<String>,
     pub(crate) graph_fallback_reason: Option<String>,
     pub(crate) graph_fallback_report: Option<CaptureDeclineReport>,
     /// Structural reasons, recorded at binding time, why one or more auxiliary
@@ -305,6 +639,99 @@ pub(crate) fn trace_capture_declines(trace: &TraceContext, report: &CaptureDecli
 }
 
 impl NativeDecodeSession {
+    pub(crate) fn prepare_cuda_prefill_workspace(
+        &mut self,
+        token_ids: &[TokenId],
+    ) -> anyhow::Result<onnx_runtime_session::WorkspaceRequirement> {
+        self.prepare_cuda_prefill_workspace_with_step_inputs(token_ids, 0, &[])
+    }
+
+    pub(crate) fn prepare_cuda_prefill_workspace_with_step_inputs(
+        &mut self,
+        token_ids: &[TokenId],
+        past_len: usize,
+        step_inputs: &[(String, Tensor)],
+    ) -> anyhow::Result<onnx_runtime_session::WorkspaceRequirement> {
+        if self.has_eager_step_inputs() {
+            let workspace_nodes = self.session.workspace_node_locations();
+            if workspace_nodes.is_empty() {
+                return Ok(onnx_runtime_session::WorkspaceRequirement::NONE);
+            }
+        }
+        let position_input = self
+            .step_input_name(NativeStepInputSource::PositionIds)
+            .map(str::to_owned);
+        let input_len = token_ids.len();
+        let total_len = past_len
+            .checked_add(input_len)
+            .context("native CUDA workspace preparation length overflow")?;
+        let supplied = step_inputs
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+            .collect::<HashMap<_, _>>();
+        let mut owned =
+            if let Some(name) = self.step_input_name(NativeStepInputSource::InputsEmbeds) {
+                if let Some(tensor) = supplied.get(name) {
+                    vec![(name.to_owned(), (*tensor).try_clone()?)]
+                } else {
+                    let meta = self
+                        .session
+                        .inputs()
+                        .iter()
+                        .find(|meta| meta.name == name)
+                        .with_context(|| {
+                            format!("missing native CUDA inputs_embeds metadata for '{name}'")
+                        })?;
+                    let hidden = match meta.shape.last() {
+                        Some(Dim::Static(hidden)) => *hidden,
+                        _ => bail!(
+                            "prepare-only QMoE workspace planning cannot conservatively bind \
+                             inputs_embeds '{name}': expected a static hidden width, got {:?}",
+                            meta.shape
+                        ),
+                    };
+                    vec![(
+                        name.to_owned(),
+                        Tensor::zeros(meta.dtype, vec![1, input_len, hidden])?,
+                    )]
+                }
+            } else {
+                let token_input = self
+                    .step_input_name(NativeStepInputSource::TokenIds)
+                    .context("native CUDA decoder has no token or inputs_embeds input binding")?
+                    .to_owned();
+                let ids = token_ids
+                    .iter()
+                    .map(|&id| i64::from(id))
+                    .collect::<Vec<_>>();
+                vec![(token_input, Tensor::from_i64(&[1, input_len], &ids)?)]
+            };
+        for (name, tensor) in step_inputs {
+            if !owned.iter().any(|(bound, _)| bound == name) {
+                owned.push((name.clone(), tensor.try_clone()?));
+            }
+        }
+        if let Some(position_input) = position_input {
+            owned.push((
+                position_input,
+                self.build_step_positions(past_len, total_len)?,
+            ));
+        }
+        let state = self
+            .cuda
+            .as_mut()
+            .context("CUDA decode state is not initialized")?;
+        state.ensure_capacity(&mut self.session, total_len)?;
+        state.extend_mask(past_len, total_len, total_len)?;
+        let inputs = owned
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+            .collect::<Vec<_>>();
+        self.session
+            .prepare_with_device_bindings(&inputs, &mut state.bindings[..state.base_binding_count])
+            .context("prepare native CUDA prefill workspace")
+    }
+
     /// Run one eager (uncaptured) `[1, K]` device forward pass and return host
     /// `[K, vocab]` logits.
     ///
@@ -375,7 +802,9 @@ impl NativeDecodeSession {
             Ok(outputs) => outputs,
             Err(error) => {
                 let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
-                bail!("native CUDA {error_context} forward pass failed{diagnosis}: {error}");
+                return Err(anyhow::Error::new(error).context(format!(
+                    "native CUDA {error_context} forward pass failed{diagnosis}"
+                )));
             }
         };
         let names = self
@@ -499,11 +928,19 @@ impl NativeDecodeSession {
                 // exec's capture machine stays dormant on decode, so the shared
                 // EP's single graph slot + capture-error latch are owned solely by
                 // the sibling.
+                let step_profile = CudaStepProfile::begin(past_len, total_len);
+                let mut step_wall = CudaStepWallBreakdown::default();
+                let run_start = std::time::Instant::now();
                 if let Err(error) = state.run_one_token_inline(&mut self.session, &self.trace) {
                     let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
-                    bail!("native CUDA decode-inline forward pass failed{diagnosis}: {error}");
+                    return Err(error.context(format!(
+                        "native CUDA decode-inline forward pass failed{diagnosis}"
+                    )));
                 }
+                step_wall.run_ms = run_start.elapsed().as_secs_f64() * 1_000.0;
+                let logits_start = std::time::Instant::now();
                 let logits = state.read_logits()?;
+                step_wall.logits_read_ms = logits_start.elapsed().as_secs_f64() * 1_000.0;
                 // Detection-before-consumption (Harry #588 PR-3 rec #1): the
                 // logits read above is the single per-step device→host sync.
                 // Piggyback on it to poll the shared capture-error word — a
@@ -511,39 +948,61 @@ impl NativeDecodeSession {
                 // latches the flag; fail hard before consuming the produced token.
                 // The latch lives on the shared EP, so this reads the sibling's
                 // replay result even though the poll is the main-exec-facing call.
+                let capture_check_start = std::time::Instant::now();
                 let capture_error = self.session.check_device_capture_error()?;
+                step_wall.capture_check_ms = capture_check_start.elapsed().as_secs_f64() * 1_000.0;
                 if capture_error != 0 {
                     let _ = state.invalidate_graph(&mut self.session);
                     bail!(
                         "native CUDA decode-inline aborted: device capture validation violation (flags=0x{capture_error:x}) detected during captured graph replay; the produced token was rejected before consumption and the decode-inline graph was invalidated"
                     );
                 }
+                let finite_check_start = std::time::Instant::now();
                 if logits.iter().flatten().any(|value| !value.is_finite()) {
                     bail!("native decoder produced non-finite logits");
+                }
+                step_wall.finite_check_ms = finite_check_start.elapsed().as_secs_f64() * 1_000.0;
+                if let Some(profile) = step_profile {
+                    profile.finish("decode_inline", step_wall);
                 }
                 state.set_logical_len(total_len)?;
                 self.current_len = total_len;
                 return Ok(logits);
             }
+            let step_profile = CudaStepProfile::begin(past_len, total_len);
+            let mut step_wall = CudaStepWallBreakdown::default();
+            let run_start = std::time::Instant::now();
             if let Err(error) = state.run_one_token(&mut self.session, &self.trace) {
                 let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
-                bail!("native CUDA decoder forward pass failed{diagnosis}: {error}");
+                return Err(error.context(format!(
+                    "native CUDA decoder forward pass failed{diagnosis}"
+                )));
             }
+            step_wall.run_ms = run_start.elapsed().as_secs_f64() * 1_000.0;
+            let logits_start = std::time::Instant::now();
             let logits = state.read_logits()?;
+            step_wall.logits_read_ms = logits_start.elapsed().as_secs_f64() * 1_000.0;
             // Detection-before-consumption: the logits read above is the single
             // per-step device→host sync. Piggyback on it to poll the shared
             // capture-error word (no extra synchronize). If a captured replay
             // violates a device-side bound, kernels latch the flag and avoid the
             // unsafe access, so fail hard before consuming the produced token.
+            let capture_check_start = std::time::Instant::now();
             let capture_error = self.session.check_device_capture_error()?;
+            step_wall.capture_check_ms = capture_check_start.elapsed().as_secs_f64() * 1_000.0;
             if capture_error != 0 {
                 let _ = state.invalidate_graph(&mut self.session);
                 bail!(
                     "native CUDA decoder aborted: device capture validation violation (flags=0x{capture_error:x}) detected during captured graph replay; the produced token was rejected before consumption and the decode graph was invalidated"
                 );
             }
+            let finite_check_start = std::time::Instant::now();
             if logits.iter().flatten().any(|value| !value.is_finite()) {
                 bail!("native decoder produced non-finite logits");
+            }
+            step_wall.finite_check_ms = finite_check_start.elapsed().as_secs_f64() * 1_000.0;
+            if let Some(profile) = step_profile {
+                profile.finish("decode", step_wall);
             }
             state.set_logical_len(total_len)?;
             self.current_len = total_len;
@@ -612,14 +1071,24 @@ impl NativeDecodeSession {
         state.extend_mask(if grew { 0 } else { past_len }, total_len, mask_expose)?;
         state.write_captured_step_inputs(supplied, position)?;
 
+        let step_profile = CudaStepProfile::begin(past_len, total_len);
+        let mut step_wall = CudaStepWallBreakdown::default();
+        let run_start = std::time::Instant::now();
         if let Err(error) = state.run_one_token(&mut self.session, &self.trace) {
             let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
-            bail!("native CUDA decoder forward pass failed{diagnosis}: {error}");
+            return Err(error.context(format!(
+                "native CUDA decoder forward pass failed{diagnosis}"
+            )));
         }
+        step_wall.run_ms = run_start.elapsed().as_secs_f64() * 1_000.0;
+        let logits_start = std::time::Instant::now();
         let logits = state.read_logits()?;
+        step_wall.logits_read_ms = logits_start.elapsed().as_secs_f64() * 1_000.0;
         // Detection-before-consumption: piggyback on the single logits sync to
         // poll the shared capture-error word (mirrors the token captured path).
+        let capture_check_start = std::time::Instant::now();
         let capture_error = self.session.check_device_capture_error()?;
+        step_wall.capture_check_ms = capture_check_start.elapsed().as_secs_f64() * 1_000.0;
         if capture_error != 0 {
             let _ = self
                 .cuda
@@ -630,8 +1099,13 @@ impl NativeDecodeSession {
                 "native CUDA decoder aborted: device capture validation violation (flags=0x{capture_error:x}) detected during captured graph replay of a per-step-input decode; the produced token was rejected before consumption and the decode graph was invalidated"
             );
         }
+        let finite_check_start = std::time::Instant::now();
         if logits.iter().flatten().any(|value| !value.is_finite()) {
             bail!("native decoder produced non-finite logits");
+        }
+        step_wall.finite_check_ms = finite_check_start.elapsed().as_secs_f64() * 1_000.0;
+        if let Some(profile) = step_profile {
+            profile.finish("captured_step_inputs", step_wall);
         }
         let state = self
             .cuda
@@ -862,7 +1336,9 @@ impl NativeDecodeSession {
             // never round-trip to the host.
             if let Err(error) = state.run_one_token_inline(&mut self.session, &self.trace) {
                 let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
-                bail!("native CUDA decode-inline forward pass failed{diagnosis}: {error}");
+                return Err(error.context(format!(
+                    "native CUDA decode-inline forward pass failed{diagnosis}"
+                )));
             }
             // Detection-before-consumption (Harry #588 PR-3 rec #1): the greedy
             // device-argmax read already returns the shared capture-error word;
@@ -881,7 +1357,9 @@ impl NativeDecodeSession {
         }
         if let Err(error) = state.run_one_token(&mut self.session, &self.trace) {
             let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
-            bail!("native CUDA decoder forward pass failed{diagnosis}: {error}");
+            return Err(error.context(format!(
+                "native CUDA decoder forward pass failed{diagnosis}"
+            )));
         }
         let (token_id, capture_error) = state.read_greedy_result()?;
         if capture_error != 0 {
@@ -960,6 +1438,21 @@ impl DecodeCudaState {
         Ok(bytes)
     }
 
+    /// Build the padded physical and initial logical shapes for a persistent KV
+    /// (`fixed == false`) or recurrent-state (`fixed == true`) binding.
+    ///
+    /// The KV shape is always **BNSH** `[1, kv_heads, max_len, head_dim]`,
+    /// growing on axis 2, for *both* the head-major and seq-major layouts. This
+    /// is deliberate and is the KV binding contract: the CUDA GQA node validates
+    /// `past_key`/`past_value` as `[batch, kv_heads, seq, head_dim]` and reads
+    /// `present_capacity` from axis 2 **regardless** of the `kv_layout`
+    /// attribute (which only re-specializes the kernel's stride arithmetic). A
+    /// seq-major binding therefore keeps this BNSH metadata shape; its BSNH
+    /// physical byte layout — and the capacity-independent fixed per-token stride
+    /// that lets it grow without moving data — is expressed by the growth/commit
+    /// geometry (`kv_growth_byte_layout`, `apply_vmm_growth`,
+    /// `build_grown_buffers`), not by permuting this shape. See
+    /// `docs/MEMORY_ARCHITECTURE.md`, "KV layout and residency".
     pub(crate) fn persistent_state_shapes(
         name: &str,
         dtype: DataType,
@@ -1047,11 +1540,241 @@ impl DecodeCudaState {
         )
     }
 
+    /// True when this session uses the seq-major fixed full-context stride path:
+    /// VMM commit-on-demand backing *and* a seq-major (BSNH) KV layout. On this
+    /// path the KV bindings report a physical shape pinned at the hard-max
+    /// context length while only the reached token stripes are committed, so
+    /// bucket growth changes no captured-graph dependency and the decode graph is
+    /// kept across growth. Head-major and the legacy realloc path return false.
+    fn seq_major_fixed_stride(&self) -> bool {
+        self.kv_commits_on_demand && self.kv_layout.is_seq_major()
+    }
+
+    /// A conservative signature of every binding's captured-graph dependencies
+    /// that KV growth could plausibly disturb: the device pointer (baked into
+    /// recorded graph nodes) and the reported physical shape (baked into kernel
+    /// argument extents / strides). If any entry differs across a growth commit,
+    /// the captured graph's assumptions changed and we must invalidate — this is
+    /// the defense-in-depth check behind the "provably unchanged -> keep" rule.
+    fn binding_growth_signature(&self) -> Vec<(usize, Vec<usize>)> {
+        self.bindings
+            .iter()
+            .map(|binding| {
+                (
+                    binding.device_ptr() as usize,
+                    binding.physical_shape().to_vec(),
+                )
+            })
+            .collect()
+    }
+
+    /// KV-only commit requests for the seq-major fixed path: commit the dense
+    /// token prefix `[0, committed_len)` for each KV binding. The mask is fully
+    /// committed at construction and never grows here, so — unlike
+    /// [`Self::vmm_growth_requests`] — no mask range is appended. Re-committing
+    /// the already-mapped prefix is idempotent; the governor only bills the newly
+    /// mapped granules.
+    fn seq_major_kv_commit_requests(
+        &self,
+        committed_len: usize,
+    ) -> anyhow::Result<Vec<(usize, usize, usize)>> {
+        let mut requested = Vec::<(usize, usize, usize)>::new();
+        for index in self.kv_binding_range.clone() {
+            let binding = &self.bindings[index];
+            let mut shape = binding.physical_shape().to_vec();
+            if shape.len() != 4 {
+                bail!(
+                    "seq-major VMM-backed CUDA KV binding '{}' must be rank 4, got {:?}",
+                    binding.input_name(),
+                    shape
+                );
+            }
+            // Seq-major bytes are token-contiguous, so the committed dense prefix
+            // of `committed_len` tokens is exactly the byte extent of a
+            // `[.., committed_len, ..]` shaped tensor.
+            shape[2] = committed_len;
+            let bytes = checked_shape_bytes(&shape, binding.dtype).with_context(|| {
+                format!(
+                    "seq-major VMM-backed CUDA KV '{}' commit size overflows for shape {:?}",
+                    binding.input_name(),
+                    shape
+                )
+            })?;
+            requested.push((index, 0, bytes));
+        }
+        Ok(requested)
+    }
+
+    fn seq_major_commit_mapped_bytes(&self, committed_len: usize) -> anyhow::Result<u64> {
+        let requested = self.seq_major_kv_commit_requests(committed_len)?;
+        let ranges = requested
+            .iter()
+            .map(|&(index, offset, bytes)| (&self.bindings[index], offset, bytes))
+            .collect::<Vec<_>>();
+        self.bindings[0]
+            .mapped_bytes_for_binding_ranges(&ranges)
+            .context("size seq-major native CUDA KV commit transaction")
+    }
+
+    fn commit_seq_major_kv(
+        &mut self,
+        committed_len: usize,
+        grant: Option<&mut onnx_runtime_memory_governor::MappedGrowthGrant>,
+    ) -> anyhow::Result<u64> {
+        let requested = self.seq_major_kv_commit_requests(committed_len)?;
+        let ranges = requested
+            .iter()
+            .map(|&(index, offset, bytes)| (&self.bindings[index], offset, bytes))
+            .collect::<Vec<_>>();
+        match grant {
+            Some(grant) => {
+                self.bindings[0].commit_binding_ranges_with_mapped_growth(&ranges, grant)
+            }
+            None => {
+                self.bindings[0].commit_binding_ranges(&ranges)?;
+                Ok(0)
+            }
+        }
+        .context("commit seq-major native CUDA KV binding ranges atomically")
+    }
+
+    /// Zero the newly committed dense token stripe `[old_committed, new_committed)`
+    /// on every KV binding. Not strictly required for correctness (the kernel
+    /// reads only `[0, total_lengths)`), but it keeps the padding suffix zeroed
+    /// exactly as the growing-bucket path does, guarding against any future
+    /// over-read touching uninitialized physical pages.
+    fn zero_seq_major_committed_tail(
+        &self,
+        old_committed: usize,
+        new_committed: usize,
+    ) -> anyhow::Result<()> {
+        for index in self.kv_binding_range.clone() {
+            let binding = &self.bindings[index];
+            let mut shape = binding.physical_shape().to_vec();
+            shape[2] = old_committed;
+            let old_bytes = checked_shape_bytes(&shape, binding.dtype)
+                .context("seq-major committed-tail old size overflow")?;
+            shape[2] = new_committed;
+            let new_bytes = checked_shape_bytes(&shape, binding.dtype)
+                .context("seq-major committed-tail new size overflow")?;
+            let ptr = binding.device_ptr() as usize;
+            native_cuda_memset_zero(ptr + old_bytes, new_bytes - old_bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Record and surface a KV-growth capture decision (kept vs invalidated) with
+    /// the named rationale, so an operator can attribute why a captured graph
+    /// survived or was discarded across a growth. A silent "kept" is as dangerous
+    /// as a silent capture decline, so every keep is both counted and logged.
+    fn record_growth_decision(&mut self, kept: bool, reason: &str) {
+        if kept {
+            self.graph_growth_keeps = self.graph_growth_keeps.saturating_add(1);
+        }
+        let verb = if kept { "kept" } else { "invalidated" };
+        tracing::info!(
+            kept,
+            reason,
+            growth_keeps = self.graph_growth_keeps,
+            invalidations = self.graph_invalidations,
+            "native CUDA decode graph {verb} across KV growth"
+        );
+        self.graph_growth_decision = Some(format!("{verb}: {reason}"));
+    }
+
+    /// Grow the seq-major fixed full-context stride KV cache by committing more
+    /// token stripes on demand, keeping the captured decode graph alive.
+    ///
+    /// The reported physical shape stays pinned at the hard maximum and every
+    /// device pointer stays fixed, so none of the captured graph's baked
+    /// dependencies change; we verify that invariant (device pointers + physical
+    /// shapes) before deciding to keep, and invalidate if anything moved. This is
+    /// the "provably unchanged -> keep" branch: seq-major addressing at batch
+    /// index 0 is capacity-independent (proven byte-identical with 0 bytes moved
+    /// by #805), so the graph replays correctly into the newly committed pages.
+    fn ensure_capacity_seq_major_fixed(
+        &mut self,
+        session: &mut InferenceSession,
+        required: usize,
+    ) -> anyhow::Result<bool> {
+        if required > self.capacity.max_len {
+            bail!("{}", self.capacity_exceeded_error(required));
+        }
+        if required <= self.kv_committed_len {
+            return Ok(false);
+        }
+        let old_committed = self.kv_committed_len;
+        let new_committed = onnx_genai_kv::kv_capacity_bucket(required, self.capacity.max_len);
+
+        // Defense in depth: snapshot the dependency signature before mutating any
+        // mapping so we can prove nothing the captured graph baked in moved.
+        let before = self.binding_growth_signature();
+
+        let mapped_growth_bytes = self.seq_major_commit_mapped_bytes(new_committed)?;
+        let mut grant = session
+            .prepare_mapped_growth(
+                mapped_growth_bytes,
+                onnx_runtime_memory_governor::MemoryRole::KvCache,
+            )
+            .context("prepare transactional seq-major native CUDA KV commit")?;
+        tracing::info!(
+            mapped_growth_bytes,
+            grant_prepared = grant.is_some(),
+            "prepared seq-major native CUDA KV commit transaction"
+        );
+        let actual_mapped_bytes = self
+            .commit_seq_major_kv(new_committed, grant.as_mut())
+            .map_err(|error| {
+                let memory = cuda_device_memory_snapshot(session.device_id().index as i32)
+                    .map_err(|error| error.to_string());
+                self.growth_failed_error(old_committed, new_committed, error, memory)
+            })?;
+        if let Some(grant) = grant {
+            grant
+                .commit_bytes(actual_mapped_bytes)
+                .context("commit seq-major native CUDA KV mapped-growth attribution")?;
+        }
+        native_cuda_device_barrier(session)?;
+        self.zero_seq_major_committed_tail(old_committed, new_committed)?;
+
+        // The reported physical shape and device pointers are unchanged by an
+        // on-demand commit; verify that before we keep the graph. If anything did
+        // move, default to invalidating — a wrong keep would corrupt output.
+        let after = self.binding_growth_signature();
+        if before == after {
+            self.record_growth_decision(
+                true,
+                "seq-major fixed full-context stride: device pointers and physical shapes unchanged, \
+                 batch-0 addressing capacity-independent, mask fully committed",
+            );
+        } else {
+            self.invalidate_graph(session)?;
+            self.record_growth_decision(
+                false,
+                "seq-major commit unexpectedly changed a binding device pointer or physical shape",
+            );
+        }
+
+        self.kv_committed_len = new_committed;
+        self.kv_growth_events += 1;
+        // Seq-major growth moves no KV bytes — the valid prefix keeps its offsets.
+        tracing::info!(
+            old_committed_len = old_committed,
+            new_committed_len = new_committed,
+            hard_max_len = self.capacity.max_len,
+            "committed seq-major native CUDA KV stripe on demand (fixed stride)"
+        );
+        Ok(true)
+    }
+
     pub(super) fn ensure_capacity(
         &mut self,
         session: &mut InferenceSession,
         required: usize,
     ) -> anyhow::Result<bool> {
+        if self.seq_major_fixed_stride() {
+            return self.ensure_capacity_seq_major_fixed(session, required);
+        }
         if self.kv_commits_on_demand {
             if required > self.capacity.max_len {
                 bail!("{}", self.capacity_exceeded_error(required));
@@ -1062,15 +1785,46 @@ impl DecodeCudaState {
             let old_capacity = self.max_len;
             let new_capacity = onnx_genai_kv::kv_capacity_bucket(required, self.capacity.max_len);
             let valid_len = self.logical_len;
-            self.commit_vmm_growth(new_capacity).map_err(|error| {
-                let memory = cuda_device_memory_snapshot(session.device_id().index as i32)
-                    .map_err(|error| error.to_string());
-                self.growth_failed_error(old_capacity, new_capacity, error, memory)
-            })?;
+            let mapped_growth_bytes = self.vmm_growth_mapped_bytes(new_capacity)?;
+            let mut grant = session
+                .prepare_mapped_growth(
+                    mapped_growth_bytes,
+                    onnx_runtime_memory_governor::MemoryRole::KvCache,
+                )
+                .context("prepare transactional native CUDA KV growth")?;
+            tracing::info!(
+                mapped_growth_bytes,
+                grant_prepared = grant.is_some(),
+                "prepared native CUDA KV mapped-growth transaction"
+            );
+            let actual_mapped_bytes = self
+                .commit_vmm_growth(new_capacity, grant.as_mut())
+                .map_err(|error| {
+                    let memory = cuda_device_memory_snapshot(session.device_id().index as i32)
+                        .map_err(|error| error.to_string());
+                    self.growth_failed_error(old_capacity, new_capacity, error, memory)
+                })?;
+            if let Some(grant) = grant {
+                grant
+                    .commit_bytes(actual_mapped_bytes)
+                    .context("commit native CUDA KV mapped-growth attribution")?;
+            }
             native_cuda_device_barrier(session)?;
             self.apply_vmm_growth(new_capacity, valid_len)?;
             self.invalidate_graph(session)?;
             self.max_len = new_capacity;
+            self.kv_growth_events += 1;
+            // Seq-major grows in place on a fixed per-token stride, so the valid
+            // prefix keeps its byte offsets and no KV data is copied; head-major
+            // re-strides every head stripe, moving `valid_len × bytes_per_token`.
+            let moved_bytes_per_token = if self.kv_layout.is_seq_major() {
+                0
+            } else {
+                self.capacity.bytes_per_token as u64
+            };
+            self.kv_growth_d2d_copy_bytes = self
+                .kv_growth_d2d_copy_bytes
+                .saturating_add((valid_len as u64).saturating_mul(moved_bytes_per_token));
             tracing::info!(
                 old_len = old_capacity,
                 new_len = new_capacity,
@@ -1091,6 +1845,12 @@ impl DecodeCudaState {
                 new_capacity,
                 valid_len,
             } => {
+                backend.state.kv_growth_events += 1;
+                backend.state.kv_growth_d2d_copy_bytes =
+                    backend.state.kv_growth_d2d_copy_bytes.saturating_add(
+                        (valid_len as u64)
+                            .saturating_mul(backend.state.capacity.bytes_per_token as u64),
+                    );
                 tracing::info!(
                     old_len = old_capacity,
                     new_len = new_capacity,
@@ -1111,11 +1871,46 @@ impl DecodeCudaState {
     /// the old shapes and hold the old layout. Extra committed granules are
     /// only installed after their lease succeeds, so the governor remains the
     /// single source of memory truth.
-    fn commit_vmm_growth(&mut self, new_capacity: usize) -> anyhow::Result<()> {
-        let mut committed: Vec<(usize, usize, usize)> = Vec::new();
-        let kv_indices = self.kv_binding_range.clone().collect::<Vec<_>>();
-        for index in kv_indices {
-            let binding = &mut self.bindings[index];
+    fn commit_vmm_growth(
+        &mut self,
+        new_capacity: usize,
+        grant: Option<&mut onnx_runtime_memory_governor::MappedGrowthGrant>,
+    ) -> anyhow::Result<u64> {
+        let requested = self.vmm_growth_requests(new_capacity)?;
+        let ranges = requested
+            .iter()
+            .map(|&(index, offset, bytes)| (&self.bindings[index], offset, bytes))
+            .collect::<Vec<_>>();
+        match grant {
+            Some(grant) => {
+                self.bindings[0].commit_binding_ranges_with_mapped_growth(&ranges, grant)
+            }
+            None => {
+                self.bindings[0].commit_binding_ranges(&ranges)?;
+                Ok(0)
+            }
+        }
+        .context("commit native CUDA KV binding ranges atomically")
+    }
+
+    fn vmm_growth_mapped_bytes(&self, new_capacity: usize) -> anyhow::Result<u64> {
+        let requested = self.vmm_growth_requests(new_capacity)?;
+        let ranges = requested
+            .iter()
+            .map(|&(index, offset, bytes)| (&self.bindings[index], offset, bytes))
+            .collect::<Vec<_>>();
+        self.bindings[0]
+            .mapped_bytes_for_binding_ranges(&ranges)
+            .context("size native CUDA KV mapped-growth transaction")
+    }
+
+    fn vmm_growth_requests(
+        &self,
+        new_capacity: usize,
+    ) -> anyhow::Result<Vec<(usize, usize, usize)>> {
+        let mut requested = Vec::<(usize, usize, usize)>::new();
+        for index in self.kv_binding_range.clone() {
+            let binding = &self.bindings[index];
             let mut new_shape = binding.physical_shape().to_vec();
             if new_shape.len() != 4 {
                 bail!(
@@ -1132,40 +1927,15 @@ impl DecodeCudaState {
                     new_shape
                 )
             })?;
-            let old_bytes = checked_shape_bytes(binding.physical_shape(), binding.dtype)
-                .with_context(|| {
-                    format!(
-                        "VMM-backed CUDA KV '{}' current size overflows for shape {:?}",
-                        binding.input_name(),
-                        binding.physical_shape()
-                    )
-                })?;
-            if let Err(error) = binding.commit_range(0, bytes) {
-                rollback_vmm_growth_commits(&mut self.bindings, &committed);
-                return Err(error.into());
-            }
-            committed.push((index, old_bytes, bytes.saturating_sub(old_bytes)));
+            requested.push((index, 0, bytes));
         }
         let mask_bytes = new_capacity
             .checked_mul(std::mem::size_of::<i64>())
             .with_context(|| {
                 format!("VMM-backed CUDA mask growth overflows for capacity {new_capacity}")
             })?;
-        let old_mask_bytes =
-            checked_shape_bytes(self.bindings[0].physical_shape(), DataType::Int64).with_context(
-                || {
-                    format!(
-                        "VMM-backed CUDA mask current size overflows for shape {:?}",
-                        self.bindings[0].physical_shape()
-                    )
-                },
-            )?;
-        if let Err(error) = self.bindings[0].commit_range(0, mask_bytes) {
-            rollback_vmm_growth_commits(&mut self.bindings, &committed);
-            return Err(error.into());
-        }
-        committed.push((0, old_mask_bytes, mask_bytes.saturating_sub(old_mask_bytes)));
-        Ok(())
+        requested.push((0, 0, mask_bytes));
+        Ok(requested)
     }
 
     /// Grow VMM-backed KV in place, keeping the reserved address range stable.
@@ -1182,6 +1952,7 @@ impl DecodeCudaState {
         // tight-card failure path is transactional. A later CUDA copy/memset
         // failure can still leave mixed old/new strides; #699 tracks adding a
         // poison/reset path rather than hiding that rarer device failure here.
+        let layout = self.kv_layout;
         for binding in &mut self.bindings[self.kv_binding_range.clone()] {
             let old_shape = binding.physical_shape().to_vec();
             if old_shape.len() != 4 {
@@ -1201,10 +1972,16 @@ impl DecodeCudaState {
                 )
             })?;
             let ptr = binding.device_ptr() as usize;
+            // Move/zero over the *physical* byte layout. Head-major re-strides
+            // each head stripe on axis 2 (unchanged); seq-major grows on axis 1
+            // with a capacity-independent per-token stride, so the in-place copy
+            // is a no-op and only the newly grown tail is zeroed — no KV moves.
+            let (old_bytes, grow_axis) = kv_growth_byte_layout(&old_shape, layout)?;
+            let (new_bytes, _) = kv_growth_byte_layout(&new_shape, layout)?;
             copy_kv_prefix_device_to_device_in_place(
-                ptr, &old_shape, &new_shape, 2, valid_len, elem,
+                ptr, &old_bytes, &new_bytes, grow_axis, valid_len, elem,
             )?;
-            zero_kv_suffix_device(ptr, &new_shape, 2, valid_len, elem)?;
+            zero_kv_suffix_device(ptr, &new_bytes, grow_axis, valid_len, elem)?;
             let mut logical_shape = new_shape.clone();
             logical_shape[2] = valid_len;
             binding.set_physical_and_logical_shapes(new_shape, logical_shape)?;
@@ -1318,17 +2095,39 @@ impl DecodeCudaState {
         Ok(shape)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         session: &mut InferenceSession,
         io: DecodeCudaIo<'_>,
         present_to_past: &HashMap<String, String>,
         fixed_state_inputs: &HashSet<String>,
         capacity: CudaKvCapacity,
-        graph_enabled: bool,
+        mut graph_capture: GraphCaptureDecision,
         position_rank: usize,
+        kv_layout: KvCommitLayout,
     ) -> anyhow::Result<Self> {
         let kv_commits_on_demand = session.commits_on_demand();
-        let max_len = onnx_genai_kv::kv_capacity_bucket(0, capacity.max_len);
+        // Seq-major KV addressing is capacity-independent at batch index 0 (the
+        // only index native decode uses): token `t` always lands at
+        // `t * kv_heads * head_dim`, and the baked `cache_capacity` scalar only
+        // scales the batch term (= 0 here). So a seq-major VMM binding can report
+        // a *fixed* full-context physical stride while committing token stripes
+        // on demand — growth then changes neither device pointer nor physical
+        // shape nor addressing, and the captured decode graph survives it. Head-
+        // major uses `cache_capacity` as the per-head stride, so its addressing
+        // shifts on growth and it must keep the growing-bucket (re-capture) model.
+        // The legacy realloc path (no VMM) also keeps the growing-bucket model.
+        let seq_major_fixed = kv_commits_on_demand && kv_layout.is_seq_major();
+        let initial_bucket_len = onnx_genai_kv::kv_capacity_bucket(0, capacity.max_len);
+        // The capacity reported to the bindings (physical axis-2 / mask island).
+        // Seq-major fixed stride pins this at the hard maximum from the start;
+        // everything else starts at the initial bucket and grows it.
+        let reported_len = if seq_major_fixed {
+            capacity.max_len
+        } else {
+            initial_bucket_len
+        };
+        let max_len = reported_len;
         let mask_bytes = max_len
             .checked_mul(std::mem::size_of::<i64>())
             .context("initial CUDA mask size overflow")?;
@@ -1336,8 +2135,16 @@ impl DecodeCudaState {
             .max_len
             .checked_mul(std::mem::size_of::<i64>())
             .context("full CUDA mask reservation size overflow")?;
+        // Seq-major fixed stride commits the whole (tiny) mask at construction so
+        // the mask island is shape-static at the hard max and never grows; every
+        // other path commits only the initial mask bucket and grows it in place.
+        let mask_committed_bytes = if seq_major_fixed {
+            full_mask_bytes
+        } else {
+            mask_bytes
+        };
         let mask = if kv_commits_on_demand {
-            let committed = std::iter::once(0..mask_bytes).collect::<Vec<_>>();
+            let committed = std::iter::once(0..mask_committed_bytes).collect::<Vec<_>>();
             session.allocate_device_binding_committed(
                 io.attention_mask,
                 None::<String>,
@@ -1356,7 +2163,7 @@ impl DecodeCudaState {
                 vec![1, max_len],
             )?
         };
-        native_cuda_memset_zero(mask.device_ptr() as usize, mask_bytes)?;
+        native_cuda_memset_zero(mask.device_ptr() as usize, mask_committed_bytes)?;
 
         let mut pairs = present_to_past
             .iter()
@@ -1387,11 +2194,20 @@ impl DecodeCudaState {
                 .with_context(|| {
                     format!("sizing full VMM-backed CUDA KV reservation for '{past}'")
                 })?;
-                let initial_range =
-                    Self::initial_vmm_kv_committed_range(&physical_shape, meta.dtype)
-                        .with_context(|| {
-                            format!("sizing initial VMM-backed CUDA KV bucket for '{past}'")
-                        })?;
+                let initial_range = if seq_major_fixed {
+                    // Physical shape is pinned at the hard max, but only the
+                    // initial dense token prefix is mapped; growth commits more
+                    // stripes without ever changing the reported shape.
+                    let mut initial_shape = physical_shape.clone();
+                    initial_shape[2] = initial_bucket_len;
+                    Self::initial_vmm_kv_committed_range(&initial_shape, meta.dtype).with_context(
+                        || format!("sizing initial VMM-backed CUDA KV bucket for '{past}'"),
+                    )?
+                } else {
+                    Self::initial_vmm_kv_committed_range(&physical_shape, meta.dtype).with_context(
+                        || format!("sizing initial VMM-backed CUDA KV bucket for '{past}'"),
+                    )?
+                };
                 session.allocate_device_binding_committed(
                     past.clone(),
                     Some(present.clone()),
@@ -1415,12 +2231,20 @@ impl DecodeCudaState {
         let kv_end = bindings.len();
         if kv_commits_on_demand {
             for binding in &mut bindings[kv_start..kv_end] {
-                let bytes = checked_shape_bytes(binding.physical_shape(), binding.dtype)
-                    .with_context(|| {
+                // Zero only the committed region. For seq-major fixed stride the
+                // physical shape is the hard max but only `initial_bucket_len`
+                // tokens are mapped, so zeroing the full shape would touch
+                // uncommitted pages and fault.
+                let mut committed_shape = binding.physical_shape().to_vec();
+                if seq_major_fixed {
+                    committed_shape[2] = initial_bucket_len;
+                }
+                let bytes =
+                    checked_shape_bytes(&committed_shape, binding.dtype).with_context(|| {
                         format!(
                             "initial VMM-backed CUDA KV '{}' bucket size overflows for shape {:?}",
                             binding.input_name(),
-                            binding.physical_shape()
+                            committed_shape
                         )
                     })?;
                 native_cuda_memset_zero(binding.device_ptr() as usize, bytes)?;
@@ -1581,11 +2405,14 @@ impl DecodeCudaState {
         // host mid-capture). Decline capture up front, with a clear structural
         // reason, and fall back to the eager device path — which still decodes
         // correctly by dynamically allocating the unbindable output each step.
-        let graph_enabled = if !declined_auxiliary.is_empty() {
-            if graph_enabled {
-                tracing::warn!(
-                    "native CUDA decode graph capture disabled: auxiliary output(s) {} carry unresolved symbolic dimensions that cannot be collapsed to a fixed persistent device binding; decode continues eagerly with dynamic allocation for those outputs",
-                    declined_auxiliary.join(", ")
+        if !declined_auxiliary.is_empty() {
+            if graph_capture.is_enabled() {
+                graph_capture.decline_if_enabled(
+                    "auxiliary_outputs_have_fixed_persistent_shapes",
+                    format_args!(
+                        "auxiliary output(s) {} carry unresolved symbolic dimensions",
+                        declined_auxiliary.join(", ")
+                    ),
                 );
             } else {
                 tracing::debug!(
@@ -1593,10 +2420,7 @@ impl DecodeCudaState {
                     declined_auxiliary.join(", ")
                 );
             }
-            false
-        } else {
-            graph_enabled
-        };
+        }
 
         let input_ids_binding = bindings.len();
         if let Some(embeds) = &io.inputs_embeds {
@@ -1693,9 +2517,9 @@ impl DecodeCudaState {
 
         // A graph records launch geometry, so replay is unsafe when a persistent
         // binding exposes a growing logical prefix instead of fixed capacity.
-        // Surfacing *which* bindings force the eager fallback (previously a
-        // silent `graph_enabled = false`) is essential for capture bring-up of
-        // new architectures — enable with `RUST_LOG=onnx_genai_engine=debug`.
+        // Surfacing *which* bindings force the eager fallback is essential for
+        // capture bring-up of new architectures, so the decision below retains
+        // their names for the session warning and debug/profile statistics.
         let dynamic_logical: Vec<String> = bindings
             .iter()
             .filter(|binding| binding.has_dynamic_logical_input_shape())
@@ -1708,10 +2532,13 @@ impl DecodeCudaState {
                 )
             })
             .collect();
-        if graph_enabled && !dynamic_logical.is_empty() {
-            tracing::debug!(
-                "native CUDA decode graph capture disabled: input binding(s) {} expose a growing logical prefix instead of fixed capacity (their consumers are not capacity-aware kernels); decode continues eagerly",
-                dynamic_logical.join(", ")
+        if graph_capture.is_enabled() && !dynamic_logical.is_empty() {
+            graph_capture.decline_if_enabled(
+                "persistent_inputs_have_fixed_logical_shapes",
+                format_args!(
+                    "input binding(s) {} expose a growing logical prefix instead of fixed capacity",
+                    dynamic_logical.join(", ")
+                ),
             );
         }
         // The attention-mask binding (bindings[0]) is allocated with the
@@ -1728,13 +2555,22 @@ impl DecodeCudaState {
         let mask_exposes_logical = bindings
             .first()
             .is_some_and(DeviceIoBinding::exposes_logical_input_shape);
-        if graph_enabled && mask_exposes_logical {
-            tracing::debug!(
-                "native CUDA decode graph capture disabled: attention-mask binding '{}' exposes its logical valid length to a non-capacity-aware consumer (e.g. an indexer arithmetic branch); single-token decode uses the growing logical mask width and continues eagerly",
-                bindings[0].input_name()
+        if graph_capture.is_enabled() && mask_exposes_logical {
+            graph_capture.decline_if_enabled(
+                "attention_mask_consumers_are_capacity_aware",
+                format_args!(
+                    "attention-mask binding '{}' exposes its logical valid length to a non-capacity-aware consumer",
+                    bindings[0].input_name()
+                ),
             );
         }
-        let graph_enabled = graph_enabled && dynamic_logical.is_empty() && !mask_exposes_logical;
+        let graph_enabled = graph_capture.is_enabled();
+        let graph_decline_reason = graph_capture.into_decline_reason();
+        if let Some(reason) = &graph_decline_reason {
+            tracing::warn!(
+                "native CUDA decode graph capture disabled: {reason}; decode continues eagerly"
+            );
+        }
 
         // Inc3c: enable the captured per-step-input path when (a) graph capture
         // is structurally available (`graph_enabled`), (b) the decoder actually
@@ -1773,8 +2609,23 @@ impl DecodeCudaState {
             graph_captures: 0,
             graph_replays: 0,
             graph_fallbacks: 0,
+            graph_invalidations: 0,
+            kv_growth_events: 0,
+            kv_growth_d2d_copy_bytes: 0,
+            graph_growth_keeps: 0,
+            // Seq-major fixed stride starts with only the initial dense token
+            // prefix mapped; every other path reports its physical capacity as
+            // fully committed (head-major grows the bucket, legacy reallocates).
+            kv_committed_len: if seq_major_fixed {
+                initial_bucket_len
+            } else {
+                reported_len
+            },
+            graph_growth_decision: None,
             capacity,
             kv_commits_on_demand,
+            kv_layout,
+            graph_decline_reason,
             graph_fallback_reason: None,
             graph_fallback_report: None,
             auxiliary_bind_declines: declined_auxiliary,
@@ -1888,6 +2739,27 @@ impl DecodeCudaState {
         else {
             return Ok(None);
         };
+        // The device present-KV read-out below strides the padded buffer with
+        // hard-coded head-major (BNSH) arithmetic: `capacity_head_stride =
+        // physical_shape[2] * head_dim * elem` with a per-head compaction. Under
+        // a seq-major (BSNH) physical buffer the same offsets index the wrong
+        // bytes (heads are interleaved per token, not laid out as capacity
+        // stripes), so this host mirror would silently return mis-indexed KV.
+        // Only our own GQA kernel understands the seq-major byte geometry; a
+        // host mirror / paged-prefix consumer of `present_*` is a fourth place
+        // the layout lives that the seq-major byte geometry does not yet honor.
+        // Refuse rather than mis-map (the runtime's hard "error, never
+        // mis-index" gate for the converted path).
+        if self.kv_layout.is_seq_major() {
+            bail!(
+                "device present-KV read-out for '{past_name}' is unavailable under the seq-major \
+                 (BSNH) KV layout: the host mirror strides the padded buffer with head-major \
+                 (BNSH) arithmetic and would mis-index the interleaved seq-major bytes. Seq-major \
+                 is supported only on the pure decode path where our GQA kernel is the sole \
+                 consumer of the device KV; host-mirror / paged-prefix reuse must run under \
+                 head-major KV."
+            );
+        }
         let binding = &mut self.bindings[index];
         let dtype = binding.dtype;
         let mut physical_shape = binding.physical_shape().to_vec();
@@ -1944,6 +2816,22 @@ impl DecodeCudaState {
     ) -> anyhow::Result<()> {
         if seq_len == 0 {
             bail!("device paged prefix reuse requires a non-empty prefix");
+        }
+        // The device seed below writes each head into its own capacity-offset
+        // slot (`head * capacity_head_stride`), i.e. head-major (BNSH) byte
+        // arithmetic. Under a seq-major (BSNH) physical buffer that offset
+        // addresses the wrong bytes, so a shared-prefix seed would corrupt the
+        // KV. Prefix sharing therefore does not "fall out" under seq-major with
+        // the current device seed: refuse rather than mis-map (the runtime's
+        // hard "error, never mis-index" gate for the converted path).
+        if self.kv_layout.is_seq_major() {
+            bail!(
+                "device paged prefix reuse is unavailable under the seq-major (BSNH) KV layout: \
+                 the device seed writes each head at a head-major (BNSH) capacity offset and would \
+                 mis-index the interleaved seq-major bytes. Seq-major is supported only on the \
+                 pure decode path where our GQA kernel is the sole consumer of the device KV; \
+                 prefix reuse must run under head-major KV."
+            );
         }
         self.ensure_capacity(session, seq_len)?;
         for (name, data, shape) in entries {
@@ -2124,6 +3012,7 @@ impl DecodeCudaState {
                         self.graph_phase = DecodeCudaGraphPhase::Unsupported;
                         trace_capture_declines(trace, &report);
                         let reason = report.to_string();
+                        self.graph_decline_reason = Some(reason.clone());
                         self.graph_fallback_reason = Some(reason.clone());
                         self.graph_fallback_report = Some(report);
                         tracing::warn!(
@@ -2207,6 +3096,7 @@ impl DecodeCudaState {
                         self.inline_graph_phase = DecodeCudaGraphPhase::Unsupported;
                         trace_capture_declines(trace, &report);
                         let reason = report.to_string();
+                        self.graph_decline_reason = Some(reason.clone());
                         self.graph_fallback_reason = Some(reason.clone());
                         self.graph_fallback_report = Some(report);
                         tracing::warn!(
@@ -2276,6 +3166,7 @@ impl DecodeCudaState {
         session.reset_decode_inline_device_graph()?;
         self.graph_phase = DecodeCudaGraphPhase::NeedsWarmup;
         self.inline_graph_phase = DecodeCudaGraphPhase::NeedsWarmup;
+        self.graph_invalidations += 1;
         Ok(())
     }
 
@@ -2327,18 +3218,26 @@ impl DecodeCudaState {
         CudaKvDebugStats {
             logical_len: self.logical_len,
             max_len: self.max_len,
+            kv_committed_len: self.kv_committed_len,
             hard_max_len: self.capacity.max_len,
             max_len_source: self.capacity.source.clone(),
             device_ptrs,
             kv_committed_bytes,
             kv_physical_bytes_by_binding,
             kv_transfers: transfers,
+            kv_growth_events: self.kv_growth_events,
+            kv_growth_d2d_copy_bytes: self.kv_growth_d2d_copy_bytes,
+            kv_layout_seq_major: self.kv_layout.is_seq_major(),
             graph: CudaGraphDebugStats {
                 enabled: self.graph_enabled,
                 captures: self.graph_captures,
                 replays: self.graph_replays,
                 fallbacks: self.graph_fallbacks,
+                invalidations: self.graph_invalidations,
+                growth_keeps: self.graph_growth_keeps,
                 allocation_counts: session.device_allocation_counts().unwrap_or_default(),
+                decline_reason: self.graph_decline_reason.clone(),
+                growth_decision: self.graph_growth_decision.clone(),
                 fallback_report: self.graph_fallback_report.clone(),
             },
         }
@@ -2381,6 +3280,7 @@ impl onnx_genai_kv::KvCapacityGrowthBackend for NativeCudaCapacityBackend<'_> {
         valid_len: usize,
     ) -> anyhow::Result<Self::GrownBuffers> {
         let old_capacity = self.state.max_len;
+        let layout = self.state.kv_layout;
         (|| {
             native_cuda_device_barrier(self.session)?;
             let mut replacements = Vec::with_capacity(self.state.kv_binding_range.len());
@@ -2408,19 +3308,19 @@ impl onnx_genai_kv::KvCapacityGrowthBackend for NativeCudaCapacityBackend<'_> {
                         )
                     })?;
                 native_cuda_memset_zero(dst, total_bytes)?;
+                // Copy the live prefix following the physical byte layout: one
+                // contiguous run for seq-major (grow axis 1), one fragment per
+                // head stripe for head-major (grow axis 2, unchanged).
+                let elem = old.dtype.checked_storage_bytes(1).with_context(|| {
+                    format!(
+                        "CUDA KV grow copy element size overflow for '{}'",
+                        old.input_name()
+                    )
+                })?;
+                let (old_bytes, grow_axis) = kv_growth_byte_layout(old.physical_shape(), layout)?;
+                let (new_bytes, _) = kv_growth_byte_layout(&physical_shape, layout)?;
                 copy_kv_prefix_device_to_device(
-                    dst,
-                    src,
-                    old.physical_shape(),
-                    &physical_shape,
-                    2,
-                    valid_len,
-                    old.dtype.checked_storage_bytes(1).with_context(|| {
-                        format!(
-                            "CUDA KV grow copy element size overflow for '{}'",
-                            old.input_name()
-                        )
-                    })?,
+                    dst, src, &old_bytes, &new_bytes, grow_axis, valid_len, elem,
                 )?;
                 replacements.push((index, new_binding));
             }
@@ -2529,6 +3429,44 @@ fn native_cuda_memset_zero(dst: usize, bytes: usize) -> anyhow::Result<()> {
 #[cfg(not(feature = "cuda"))]
 fn native_cuda_memset_zero(_dst: usize, _bytes: usize) -> anyhow::Result<()> {
     bail!("native CUDA KV growth requires the onnx-genai-engine `cuda` feature")
+}
+
+/// Map a BNSH-declared KV binding shape `[batch, kv_heads, capacity, head_dim]`
+/// to the physical byte-layout shape and grow-axis index the resolved
+/// [`KvCommitLayout`] actually stores it in.
+///
+/// The binding *metadata* shape reported to the CUDA EP is always BNSH — the
+/// GQA node validates `past_key`/`past_value` as `[batch, kv_heads, seq,
+/// head_dim]` and reads `present_capacity` from axis 2 *regardless of the
+/// `kv_layout` attribute* (only the kernel's stride arithmetic changes). So this
+/// permutation never leaves the growth machinery; it drives the copy/zero
+/// geometry over raw device bytes so that growth is faithful to how the bytes
+/// are really laid out:
+///
+/// * **Head-major BNSH**: the byte layout equals the declared shape and the grow
+///   axis is 2. Each head owns its own `capacity × head_dim` stripe, so growth
+///   re-strides every head — byte-identical to the historical behavior.
+/// * **Seq-major BSNH**: the bytes are `[batch, capacity, kv_heads, head_dim]`
+///   and the grow axis is 1. A token's whole KV (all heads) is contiguous with a
+///   fixed `kv_heads × head_dim` stride that is **independent of capacity**, so
+///   the live prefix keeps its byte offsets across growth and no KV data moves.
+///   This is the fixed-stride property #797 measured at the driver level, here
+///   realized on the engine growth path.
+pub(super) fn kv_growth_byte_layout(
+    bnsh_shape: &[usize],
+    layout: KvCommitLayout,
+) -> anyhow::Result<(Vec<usize>, usize)> {
+    if bnsh_shape.len() != 4 {
+        bail!("CUDA KV binding must be rank-4 BNSH, got shape {bnsh_shape:?}");
+    }
+    Ok(match layout {
+        KvCommitLayout::HeadMajor => (bnsh_shape.to_vec(), 2),
+        KvCommitLayout::SeqMajor => {
+            let (batch, kv_heads, capacity, head_dim) =
+                (bnsh_shape[0], bnsh_shape[1], bnsh_shape[2], bnsh_shape[3]);
+            (vec![batch, capacity, kv_heads, head_dim], 1)
+        }
+    })
 }
 
 #[cfg(feature = "cuda")]
@@ -2679,18 +3617,6 @@ pub(super) fn in_place_copy_route(
         InPlaceCopyRoute::Scratch
     } else {
         InPlaceCopyRoute::DeviceToDevice
-    }
-}
-
-fn rollback_vmm_growth_commits(
-    bindings: &mut [DeviceIoBinding],
-    committed: &[(usize, usize, usize)],
-) {
-    for &(index, old_bytes, extra_bytes) in committed.iter().rev() {
-        if extra_bytes == 0 {
-            continue;
-        }
-        let _ = bindings[index].decommit_range(old_bytes, extra_bytes);
     }
 }
 

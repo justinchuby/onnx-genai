@@ -44,3 +44,23 @@ Scribe note: the CLI dev-tool charter and prioritized backlog from the merged CL
 
 ## 2026-07-28T17:40:00+0000
 PR #362 merged (5a079029): If/Loop/Scan inference landed; #355 container typing remains deferred.
+
+## ARCHIVED 2026-08-12T06:00:00Z (Scribe #762 memory-safety wave compaction)
+
+### 2026-08-11T03:47 — AVX2 LayerNorm/RMSNorm benchmark
+Measured against true scalar fp32 baseline. LayerNorm 15–22× (algorithmic + SIMD), RMSNorm 3–4× (pure SIMD). Pris's original fp64-reference numbers were conservative. Updated `test_layernorm.cpp`.
+
+### 2026-08-11T13:30 — BL1/BL3 fixes for PR #762
+BL1: `ShapeInference::LayerNorm` stores `raw_axis: i64`, resolved at runtime. BL3: `build_subgraph_routing` emits `NodeInputSource::Absent`. Registry `end_version` validation added. 216 passed / 0 failed.
+
+### 2026-08-11 — PR #762 third corrective wave BL1
+`raw_axis` preserved, resolved per-invocation against actual input rank. `NodeInputSource::Absent` for None inputs. Commit `168e40c3e`.
+
+### 2026-08-11 — Adversarial review of onnxruntime #31988 (CUDA MatMulNBits SM-adaptive cols)
+Bit-identicality confirmed. Wide-n invariance confirmed. Flagged 3× template instantiation cost as BLOCKING for PR description. Claimed `n % 8 != 0` path "SAFE" — this was wrong (n=12 with SelectColsPerBlock=4 would be newly accepted, changing shape routing).
+
+### 2026-08-12 — PR #31988 review self-correction
+Declared `n % 8 != 0` SAFE — incorrect. Chew revised and confirmed routing concern was real. Lesson: a reviewer's "SAFE" is not proof; verify independently.
+
+### 2026-08-12 — PR #31973: Fix architecture-specific dispatch threshold in LayerNorm tests
+Renamed `kAvx2DispatchThreshold` → `kKernelDispatchThreshold`. Added conditions with `#if MLAS_TARGET_AMD64 || MLAS_TARGET_IX86`, else 1. Fixed `CatastrophicCancellationPasses` (condition 1e4/1e5 reachable). Renamed `AdversarialPrecisionReport` → `DISABLED_`. Removed N=7 benchmark. Head `72e02cd92c`.

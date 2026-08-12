@@ -13,6 +13,7 @@ use onnx_runtime_ep_api::{EpError, Result};
 use onnx_runtime_ir::DataType;
 
 use crate::error::{driver_err, not_implemented};
+use crate::kernels::kv_stride::{KvCachePath, KvCacheStrides};
 use crate::runtime::CudaRuntime;
 
 const QUERY_TILE: usize = 8;
@@ -82,8 +83,7 @@ __device__ __forceinline__ void flash_attention_body(
 
     const unsigned long long q_base =
         ((unsigned long long)(b * q_heads + h) * sq + qi) * dim;
-    const unsigned long long kv_base =
-        (unsigned long long)(b * kv_heads + kvh) * kv_capacity * dim;
+    const unsigned long long kv_base = FLASH_KV_BASE(b, kvh);
 
     for (int key0 = 0; key0 < sk; key0 += FLASH_K_TILE) {
         const int tile_keys = min(FLASH_K_TILE, sk - key0);
@@ -95,7 +95,8 @@ __device__ __forceinline__ void flash_attention_body(
             float kval = 0.0f;
             float vval = 0.0f;
             if (j < sk) {
-                const unsigned long long offset = kv_base + (unsigned long long)j * dim + p;
+                const unsigned long long offset =
+                    kv_base + (unsigned long long)j * FLASH_KV_STRIDE + p;
                 kval = flash_load<T>(key[offset]);
                 vval = flash_load<T>(value[offset]);
             }
@@ -314,8 +315,7 @@ extern "C" __global__ void flash_attention_f16_tc(
     const int logical_sk = total_lengths ? total_lengths[b] : sk;
     const unsigned long long q_plane =
         (unsigned long long)(b * q_heads + h) * sq * dim;
-    const unsigned long long kv_plane =
-        (unsigned long long)(b * kv_heads + kvh) * kv_capacity * dim;
+    const unsigned long long kv_plane = FLASH_KV_BASE(b, kvh);
 
     for (int index = tid; index < FLASH_TC_Q * FLASH_TC_D; index += blockDim.x) {
         const int row = index / FLASH_TC_D;
@@ -337,7 +337,8 @@ extern "C" __global__ void flash_attention_f16_tc(
             const int p = index - row * FLASH_TC_D;
             const int kj = key0 + row;
             if (kj < sk && p < dim) {
-                const unsigned long long offset = kv_plane + (unsigned long long)kj * dim + p;
+                const unsigned long long offset =
+                    kv_plane + (unsigned long long)kj * FLASH_KV_STRIDE + p;
                 k_tile[index] = key[offset];
                 v_tile[index] = value[offset];
             } else {
@@ -516,6 +517,7 @@ pub(super) fn run(
     past_lengths: CUdeviceptr,
     local_window: i32,
     softcap: f32,
+    kv_strides: &KvCacheStrides,
 ) -> Result<()> {
     if !supported(sq, head_dim) {
         return Err(not_implemented(format!(
@@ -526,27 +528,28 @@ pub(super) fn run(
     let tensor_core_f16 = dtype == DataType::Float16
         && head_dim.is_multiple_of(16)
         && runtime.capabilities().compute_capability().0 >= 7;
-    let (module, source, entry, query_tile) = match dtype {
+    kv_strides.require_converted_path_support(KvCachePath::FlashPrefillRead)?;
+    let (module, source_body, entry, query_tile) = match dtype {
         DataType::Float32 => (
-            "flash_attention_f32_v1",
+            kv_strides.flash_f32_module_key()?,
             FLASH_F32_SOURCE.as_str(),
             "flash_attention_f32",
             QUERY_TILE,
         ),
         DataType::Float16 if tensor_core_f16 => (
-            "flash_attention_half_v2",
+            kv_strides.flash_half_module_key()?,
             FLASH_HALF_SOURCE.as_str(),
             "flash_attention_f16_tc",
             16,
         ),
         DataType::Float16 => (
-            "flash_attention_half_v2",
+            kv_strides.flash_half_module_key()?,
             FLASH_HALF_SOURCE.as_str(),
             "flash_attention_f16",
             QUERY_TILE,
         ),
         DataType::BFloat16 => (
-            "flash_attention_half_v2",
+            kv_strides.flash_half_module_key()?,
             FLASH_HALF_SOURCE.as_str(),
             "flash_attention_bf16",
             QUERY_TILE,
@@ -562,9 +565,10 @@ pub(super) fn run(
     // crt/mma.h from a separately packaged wheel. Say so here rather than let
     // NVRTC report a missing file whose name identifies neither the kernel nor
     // the package that carries it.
-    if source == FLASH_HALF_SOURCE.as_str() {
+    if source_body == FLASH_HALF_SOURCE.as_str() {
         runtime.require_nvrtc_tensor_core_headers("fused Attention")?;
     }
+    let source = format!("{}{}", kv_strides.flash_prelude(), source_body);
 
     let as_i32 = |name: &str, value: usize| {
         i32::try_from(value).map_err(|_| {
@@ -593,10 +597,14 @@ pub(super) fn run(
         ))
     })?;
     if grid_x == 0 || sk == 0 {
-        return runtime.synchronize();
+        return if runtime.is_capturing()? {
+            Ok(())
+        } else {
+            runtime.synchronize()
+        };
     }
 
-    let function = runtime.nvrtc_function(module, source, entry)?;
+    let function = runtime.nvrtc_function(module, &source, entry)?;
     let mut builder = runtime.stream().launch_builder(&function);
     builder
         .arg(&q)
@@ -629,6 +637,9 @@ pub(super) fn run(
         })
     }
     .map_err(|error| driver_err(&format!("launch {entry}"), error))?;
+    if runtime.is_capturing()? {
+        return Ok(());
+    }
     runtime.synchronize()
 }
 
@@ -862,6 +873,7 @@ mod tests {
                     0,
                     0,
                     0.0,
+                    &KvCacheStrides::head_major_bnsh(),
                 )
                 .unwrap();
 

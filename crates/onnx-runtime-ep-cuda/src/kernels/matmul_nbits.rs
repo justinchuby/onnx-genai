@@ -7,11 +7,12 @@ use std::sync::{Arc, Mutex};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg, sys::CUdeviceptr};
 use onnx_runtime_ep_api::{
-    DevicePtr, DevicePtrMut, EpError, Kernel, KernelFactory, Result, TensorMut, TensorView,
+    DevicePtr, DevicePtrMut, EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut,
+    TensorView, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ir::{DataType, Node};
 
-use crate::blas::{self, GemmDtype, GemmEpilogue, GemmEpilogueKind, GemmParams, WORKSPACE_BYTES};
+use crate::blas::{self, GemmDtype, GemmEpilogue, GemmEpilogueKind, GemmParams};
 use crate::error::driver_err;
 use crate::runtime::{CudaRuntime, cuptr, raw_ptr};
 
@@ -3650,7 +3651,12 @@ pub struct MatMulNBitsKernel {
 }
 
 impl MatMulNBitsKernel {
-    fn run(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+    fn run(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
         self.last_call_capture_safe.store(false, Ordering::Relaxed);
         let max_inputs = if self.gate_up_swiglu { 8 } else { 7 };
         if !(3..=max_inputs).contains(&inputs.len()) || outputs.len() != 1 {
@@ -3978,15 +3984,6 @@ impl MatMulNBitsKernel {
         );
 
         let weight = self.runtime.alloc_raw(self.k * self.n * 4)?;
-        let workspace = match self.runtime.alloc_raw(WORKSPACE_BYTES) {
-            Ok(workspace) => workspace,
-            Err(err) => {
-                // SAFETY: `weight` was allocated above and has not been freed.
-                let _ = unsafe { self.runtime.free_raw(weight) };
-                return Err(err);
-            }
-        };
-
         let result = self
             .launch_dequant(
                 &inputs[1],
@@ -4019,22 +4016,76 @@ impl MatMulNBitsKernel {
                 // allocation cover the complete GEMM; workspace and stream live
                 // through the call and Y aliases neither input.
                 unsafe {
-                    blas::gemm(
+                    blas::governed_gemm(
                         self.runtime.blas(),
                         self.runtime.stream_ptr(),
                         &params,
                         workspace,
-                        WORKSPACE_BYTES,
+                        "MatMulNBits",
                     )
                 }
             })
             .and_then(|()| self.runtime.synchronize());
 
-        // SAFETY: both pointers came from `alloc_raw` and are released once,
-        // after all submitted work has synchronized (or the submission failed).
-        let free_workspace = unsafe { self.runtime.free_raw(workspace) };
+        // SAFETY: `weight` came from `alloc_raw` and is released once, after all
+        // submitted work has synchronized (or the submission failed).
         let free_weight = unsafe { self.runtime.free_raw(weight) };
-        result.and(free_workspace).and(free_weight)
+        result.and(free_weight)
+    }
+
+    fn uses_dequant_cublas_workspace(
+        &self,
+        dtype: DataType,
+        a_shape: &[usize],
+        group_indices_present: bool,
+    ) -> bool {
+        if dtype != DataType::Float32 || a_shape.is_empty() || a_shape[a_shape.len() - 1] != self.k
+        {
+            return false;
+        }
+        let m = a_shape[..a_shape.len() - 1].iter().product::<usize>();
+        if m == 1 && !group_indices_present {
+            return false;
+        }
+        !(self.bits == 4
+            && self.accuracy_level == 4
+            && self.block_size == 32
+            && !group_indices_present)
+    }
+
+    fn workspace_requirement_for(
+        &self,
+        inputs: &[TensorMetadata<'_>],
+    ) -> Result<WorkspaceRequirement> {
+        let Some(a) = inputs.first() else {
+            return Ok(WorkspaceRequirement::NONE);
+        };
+        let group_indices_present = inputs.get(4).is_some_and(|input| input.present);
+        if !self.uses_dequant_cublas_workspace(a.dtype, a.shape, group_indices_present) {
+            return Ok(WorkspaceRequirement::NONE);
+        }
+        let m = a.shape[..a.shape.len() - 1].iter().product::<usize>();
+        let params = GemmParams {
+            dtype: GemmDtype::F32,
+            a: 1,
+            b: 1,
+            c: 1,
+            m,
+            k: self.k,
+            n: self.n,
+            batch: 1,
+            a_batch_stride: m * self.k,
+            b_batch_stride: 0,
+            epilogue: inputs
+                .get(5)
+                .filter(|bias| bias.present)
+                .map(|_| GemmEpilogue {
+                    kind: GemmEpilogueKind::Bias,
+                    bias: 0,
+                }),
+        };
+        let bytes = blas::gemm_workspace_bytes(self.runtime.blas(), &params)?;
+        Ok(blas::governed_workspace_requirement(bytes))
     }
 
     /// Direct fp16-activation x int4/int8-weight path. Scales may be fp16 or
@@ -6170,7 +6221,20 @@ impl MatMulNBitsKernel {
 
 impl Kernel for MatMulNBitsKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        self.run(inputs, outputs)
+        self.run(inputs, outputs, None)
+    }
+
+    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+        self.workspace_requirement_for(inputs)
+    }
+
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        self.run(inputs, outputs, workspace)
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -6516,8 +6580,8 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         let mut zp_codes = vec![8i32; n * k_blocks];
         let mut zp_packed = vec![0u8; n * zp_row_bytes];
         if explicit_zp {
-            for i in 0..n * k_blocks {
-                zp_codes[i] = ((next() * 0.5 + 0.5) * 15.0).round().clamp(0.0, 15.0) as i32;
+            for code in zp_codes.iter_mut().take(n * k_blocks) {
+                *code = ((next() * 0.5 + 0.5) * 15.0).round().clamp(0.0, 15.0) as i32;
             }
             for col in 0..n {
                 for block in 0..k_blocks {
@@ -6612,8 +6676,6 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         let b_strides = [(k_blocks * blob_size) as i64, blob_size as i64, 1];
         let scales_shape = [n, k_blocks];
         let scales_strides = [k_blocks as i64, 1];
-        let zp_shape = [n, zp_row_bytes];
-        let zp_strides = [zp_row_bytes as i64, 1];
         let bias_shape = [n];
         let bias_strides = [1i64];
         let y_shape = [1usize, n];
@@ -6698,7 +6760,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
         };
-        kernel.run(&inputs, &mut outputs).unwrap();
+        kernel.run(&inputs, &mut outputs, None).unwrap();
         runtime.synchronize().unwrap();
 
         assert!(
@@ -6977,7 +7039,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
         };
-        kernel.run(&inputs, &mut outputs).unwrap();
+        kernel.run(&inputs, &mut outputs, None).unwrap();
         runtime.synchronize().unwrap();
 
         assert!(
@@ -7872,7 +7934,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
         };
-        kernel.run(&inputs, &mut outputs).unwrap();
+        kernel.run(&inputs, &mut outputs, None).unwrap();
         runtime.synchronize().unwrap();
 
         assert!(
@@ -9577,6 +9639,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                             inputs
                         },
                         std::slice::from_mut(&mut matmul_out),
+                        None,
                     )
                     .unwrap();
             }
@@ -9650,7 +9713,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                     inputs.push(bias_post_view);
                 }
                 following_ref
-                    .run(&inputs, std::slice::from_mut(&mut y_ref))
+                    .run(&inputs, std::slice::from_mut(&mut y_ref), None)
                     .unwrap();
             }
 
@@ -9675,6 +9738,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                             residual_view,
                         ],
                         std::slice::from_mut(&mut pre_fused),
+                        None,
                     )
                     .unwrap();
             }
@@ -9702,7 +9766,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 }
                 inputs.push(gamma_view);
                 following_fused
-                    .run(&inputs, std::slice::from_mut(&mut y_fused))
+                    .run(&inputs, std::slice::from_mut(&mut y_fused), None)
                     .unwrap();
             }
 

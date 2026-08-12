@@ -3,9 +3,10 @@
 use std::borrow::Cow;
 
 use onnx_runtime_ir::TensorLayout;
+use onnx_runtime_memory_governor::MemoryRole;
 
 use crate::error::Result;
-use crate::tensor::{TensorMut, TensorView};
+use crate::tensor::{DevicePtrMut, TensorMut, TensorView};
 use crate::weight::WeightHandle;
 
 /// A cost estimate for running a kernel, consumed by the placement cost model
@@ -81,6 +82,7 @@ impl Cost {
 /// A decline reason travels with the decision that produced it. EPs must not
 /// maintain a separate reason table: colocating the reason with `Unsupported`
 /// keeps diagnostics from drifting away from the actual claim predicate.
+#[derive(Debug)]
 pub enum KernelMatch {
     Supported {
         cost: Cost,
@@ -446,6 +448,70 @@ impl<'a> KernelInput<'a> {
     }
 }
 
+/// Concrete tensor facts available during prepare-only graph traversal.
+#[derive(Clone, Copy, Debug)]
+pub struct TensorMetadata<'a> {
+    pub dtype: onnx_runtime_ir::DataType,
+    pub shape: &'a [usize],
+    pub present: bool,
+}
+
+impl<'a> TensorMetadata<'a> {
+    pub const fn new(dtype: onnx_runtime_ir::DataType, shape: &'a [usize], present: bool) -> Self {
+        Self {
+            dtype,
+            shape,
+            present,
+        }
+    }
+}
+
+/// How long prepared kernel workspace remains live.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspaceLifetime {
+    StepScoped,
+    SessionPersistent,
+}
+
+/// A kernel's exact owned-scratch request for one concrete input geometry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorkspaceRequirement {
+    pub bytes: u64,
+    pub alignment: usize,
+    pub lifetime: WorkspaceLifetime,
+    pub role: MemoryRole,
+}
+
+impl WorkspaceRequirement {
+    pub const NONE: Self = Self {
+        bytes: 0,
+        alignment: 1,
+        lifetime: WorkspaceLifetime::StepScoped,
+        role: MemoryRole::Workspace { step_scoped: true },
+    };
+}
+
+/// Executor-owned prepared workspace handed to a kernel for one dispatch.
+#[derive(Clone, Copy, Debug)]
+pub struct WorkspaceView {
+    ptr: DevicePtrMut,
+    bytes: usize,
+}
+
+impl WorkspaceView {
+    pub const fn new(ptr: DevicePtrMut, bytes: usize) -> Self {
+        Self { ptr, bytes }
+    }
+
+    pub const fn ptr(self) -> DevicePtrMut {
+        self.ptr
+    }
+
+    pub const fn bytes(self) -> usize {
+        self.bytes
+    }
+}
+
 /// A kernel ready to execute a specific op with specific shapes (§4.2).
 pub trait Kernel: Send {
     /// Tell the kernel which positional inputs are immutable graph constants.
@@ -457,8 +523,42 @@ pub trait Kernel: Send {
         let _ = constant_inputs;
     }
 
+    /// Tell the kernel whether all of this node's outputs have fully-static
+    /// (sequence-independent) symbolic shapes, as derived from the graph's IR
+    /// metadata — **not** from runtime shape values.
+    ///
+    /// The session calls this exactly once, immediately after construction. A
+    /// kernel that gates CUDA-graph capture on sequence-independence (the
+    /// pointwise/elementwise/bitwise/prelu family) uses this to admit a
+    /// fully-static head-major decode shape (e.g. `[1,1,heads,dim]`) that the
+    /// runtime-extent heuristic cannot recognize, while a shape carrying a
+    /// symbolic (growing sequence) dimension stays eager. Deriving eligibility
+    /// from metadata is essential: `[heads=32, feat=128]` (capturable) is
+    /// indistinguishable from `[tokens=32, feat=128]` (unsafe) by extent alone.
+    /// Default: no-op.
+    fn set_capture_seq_independent(&mut self, seq_independent: bool) {
+        let _ = seq_independent;
+    }
+
     /// Execute over device-resident inputs/outputs.
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()>;
+
+    /// Report exact owned scratch needed for these concrete inputs.
+    fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
+        let _ = inputs;
+        Ok(WorkspaceRequirement::NONE)
+    }
+
+    /// Execute using workspace prepared before request admission.
+    fn execute_with_workspace(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        let _ = workspace;
+        self.execute(inputs, outputs)
+    }
 
     /// Execute through the general weight-delivery seam.
     ///

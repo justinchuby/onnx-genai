@@ -1,4 +1,4 @@
-# Chew — History (compacted 2026-07-29)
+# Chew — History (compacted 2026-08-12)
 
 **Role:** Numerics/precision reviewer. Require reference-backed coherent outputs rather than mere execution success, and guard dtype/layout symmetry, silent coercions, opset semantics, broadcast behavior, stable reductions/softmax, and realistic parity tests.
 
@@ -18,50 +18,44 @@
 - PR #334 formatting failures are review-blocking even when numerics are sound; Iran was the revision agent after rejection.
 - BNNS grouped/depthwise convolution via deprecated API is genuinely broken for groups > 1; guard is justified, but im2col is only a correct intermediate step and direct NEON depthwise should target 2–3× ORT.
 - Documentation rationales are correctness artifacts: wrong L1-cache premises and derived-looking fitted constants must be corrected before merge.
+- A reviewer's "SAFE" is not proof; verify the load-bearing claim. Sebastian cleared n%8≠0 as safe on #31988; the coordinator's reading found n=12 would have been newly accepted, changing routing.
+- An occupancy change must not become a routing change. Exhaustive pinning test (`SelectColsPerBlock_OnlyMod8Accepted`, n∈[1..256] × 5 SM counts) prevents accepted-shape-set drift.
+- Never validate with `--compile_no_warning_as_error`; it masks the exact class of failure that blocks upstream CI.
+- Leak scans must cover committed C++ source comments, not just `.squad/` paths — two agent names sat in public upstream PR #31973 comments, forcing a third history rewrite.
 
-## Recent work (current wave, ~2026-07-28/29)
-## 2026-07-27T01:30:00-07:00 — PR #227 CPU EP NEON numerics review
+_Pre-2026-08-11 dated entries archived to `history-archive.md`. 2026-08-11 detailed entries also archived there._
 
-- **APPROVE with concerns** for Iran's 4-commit CPU EP optimization branch (`squad/mac-cpu-ep-roofline`): NEON SiLU, SDPA, GEMV, Accelerate sgemm, dtype fast path.
-- SiLU polynomial: measured ~28 ULP in practical range (claimed ~1 ULP — docstring incorrect). Acceptable for inference.
-- Swish→SiLU canonicalization: exact f32 equality correct, no silent misroute.
-- SDPA NEON: numerics sound (softmax max-subtraction stability inherited), but zero test coverage for the NEON dispatch path — all tests call scalar reference directly.
-- GEMV: transpose correct, tail handling correct, f32 accumulation throughout. Guard-break test passed.
-- dtype.rs f32 memcpy: contiguity guard is sound.
-- matmul_nbits.rs: visibility change only, safe.
-- All NEON intrinsics are ARMv8 baseline. No hardcoded cache/thread counts.
-- 7 dead code items from removed Accelerate sgemv path.
-- Filed to `.squad/decisions/inbox/chew-pr227-numerics-review.md`.
+## 2026-08-11 — PR #31988 routing guard + template cost docs
 
-## 2026-07-27T02:00:00-07:00 — PR #227 FP16 Path Review (Second Pass)
+- **Finding:** SelectColsPerBlock would expand accepted shapes (n%4, n%2) beyond upstream's n%8 requirement. Shape routing DOES change without a guard.
+- **Fix:** Added `n % kColsPerThreadBlock != 0 → return false` before M=1 path. Option (a) — no routing change.
+- **Template cost:** Documented 24→72 instantiations, ~38 KB binary, all reachable.
+- **Tests:** Added `SelectColsPerBlock_OnlyMod8Accepted` and `SelectColsPerBlock_RoutingInvariance_NMod8Required`.
+- **Commit:** a4aa076657, pushed to `nxrt/cuda-matmulnbits-sm-cols`. PR stays draft.
+- **No perf numbers, no leaks confirmed.**
 
-**Scope:** Commits `75311827` (FP16 storage GEMV + NEON bulk f16↔f32) and `3a88ba8c` (SPMD pool for FP32 GEMV + cleanup).
+## 2026-08-12 — PR #31988 routing guard (lockout revision)
 
-**Verdict: APPROVE** — numerics are sound.
+- **Finding:** Sebastian cleared `n % 8 != 0` as SAFE — incorrect. `SelectColsPerBlock` returning 4 for n=12 (12%4==0) would have been newly accepted, changing shape routing beyond occupancy.
+- **Fix:** Added `n % kColsPerThreadBlock != 0 → return false` before M=1 GEMV call. Accepted-shape set now identical to upstream.
+- **Tests:** `SelectColsPerBlock_OnlyMod8Accepted` (exhaustive n∈[1..256] × 5 SM counts) and `SelectColsPerBlock_RoutingInvariance_NMod8Required`.
+- **Template cost documented:** 24 → 72 instantiations, ~38 KB, all reachable.
+- **Commit:** a4aa076657. Chew barred Sebastian from revising his own rejected finding.
 
-### Key findings
-- **Inline asm `fcvtl`:** Constraints, clobbers, and options are correct. Bit-exact against scalar `half::f16::to_f32()` across all edge cases (denorm, inf, NaN, ±0). Using asm to avoid nightly `f16` type is justified today. Recommend TODO for intrinsic replacement.
-- **FP32 accumulation verified:** Measured max relative error 2.38e-7 vs f64 reference across model-scale shapes (gate/down/q/kv projections). FP16 vs F32 GEMV same-weight discrepancy: 1.73e-6 — confirms accumulation is genuinely f32.
-- **Bulk conversion:** `fcvtn` narrow matches `half::f16::from_f32()` bit-for-bit. Round-to-nearest-even confirmed. Overflow → inf. Denormal/NaN preserved. Asm annotations correct (`nostack` only for write path, `readonly,pure` for read path).
-- **Tail handling:** K=67, N=9 correct. K=1/N=1 correct.
-- **Transpose cache:** `OnceLock` provides thread-safe lazy init. Rayon `par_chunks_mut` writes to disjoint slices.
-- **SPMD pool:** `perf_cores.saturating_sub(1).max(1).min(available)` guarantees ≥1 worker. `None` fallback on Intel/VM is correct.
-- **Tests:** 922 passing (906 lib + extras). 3 new FP16 GEMV tests + 1 updated cache test.
-- **Non-blocking concerns:** C1 = add TODO for intrinsic migration; C2 = tighten test error thresholds (2% → 1e-4).
-- Filed to `.squad/decisions/inbox/chew-pr227-fp16-review.md`.
+### 2026-08-12 — PR #31974 coverage strengthening
 
-## 2026-07-28T00:40:00-07:00 — PR #334 Grouped/Depthwise Conv Review
+- **Task:** Add PrePack and generic-broadcast BF16 test coverage; remove internal labels; fix comments.
+- **Tests added:** `LayerNorm17_PrePack_ScaleBiasInitializers`, `SkipLayerNorm_PrePack_GammaBetaInitializers`, `LayerNorm17_GenericBroadcast`.
+- **Coverage:** 17 → 20 BF16 tests, 103 → 106 total LayerNorm suite. All pass.
+- **Internal labels removed:** 2× "B5" in test comments.
+- **SrcDispatcher comment fixed:** now accurately describes `if constexpr` preventing `ComputeImpl<NarrowType, NarrowType>` instantiation.
+- **Tolerance comments fixed:** aligned with actual checker semantics (`tolerance = absolute + relative * |expected|`, numpy.isclose style).
+- **Commit:** `a12c7ddde3` on `nxrt/mlas-bf16-layernorm`. PR stays draft.
 
-- **REJECT** (formatting) for Deckard's depthwise conv im2col+GEMM PR.
-- `cargo fmt --all -- --check` fails with 3 violations — same class as #324.
-- **Numerics: SOUND.** Grouped im2col indexing is correct across all 8 parity tests (true depthwise, grouped-not-depthwise, channel multiplier, non-SIMD-width channels, stride>1, dilation, asymmetric padding). Guard-break test detects off-by-one immediately.
-- **BNNS claim independently verified:** Probed `BNNSFilterCreateLayerConvolution` directly via FFI. With `groups > 1`, BNNS either returns NULL (oc_per_group in descriptor) or accepts but only writes group 0's output (full oc mode). The deprecated API is genuinely broken for groups > 1. Guard is justified.
-- **Fall-through:** No #275 pattern. Both paths produce fully-populated output vectors.
-- **Non-grouped path untouched** (byte-identical except defensive n==0 guard).
-- **Reachability:** Counter `CONV_IM2COL_GEMM_TEST_HITS` covers both branches, manifest claim present, test genuinely forces grouped path.
-- **12× gap judgement:** im2col is structurally wrong for depthwise (memory-bound, K=9, M=1). Direct NEON kernel would be 4–8× faster (eliminates im2col buffer entirely). This PR is a correct intermediate step. Schedule NEON depthwise follow-up targeting 2–3× ORT.
-- **Revision agent:** Iran.
-- Filed to `.squad/decisions/inbox/chew-pr334-review.md`.
-- 2026-07-28: Reviews of PR #347 and #349 approved after verifying numerical bounds and real decode firing. Documentation rationales are reviewable correctness artifacts: wrong L1-cache premises and derived-looking fitted constants must be corrected before merge.
+## 2026-08-12 — PR #31974 Opus v2 coverage wave
 
-Full pre-compaction history in `history-archive.md`.
+- **Task:** Add PrePack and generic-broadcast BF16 test coverage; remove internal labels; fix comments.
+- **Tests added:** `LayerNorm17_PrePack_ScaleBiasInitializers` (`is_initializer=true`, lines 717-718), `SkipLayerNorm_PrePack_GammaBetaInitializers` (`is_initializer=true`, lines 752-753), `LayerNorm17_GenericBroadcast` (X={2,2,2}, scale={2,2} → `use_generic_broadcast=true`).
+- **Coverage:** 17 → 20 BF16 tests, 103 → 106 total LayerNorm suite. All pass.
+- **Hygiene:** Removed 2× "B5" internal labels; fixed SrcDispatcher comment; aligned tolerance comments with checker reality (`absolute + relative × |expected|`, numpy.isclose).
+- **Commit:** `a12c7ddde3`. Delta review by Holden: no blockers. PR remains draft (vcpkg bootstrap TLS infra flake in CI).

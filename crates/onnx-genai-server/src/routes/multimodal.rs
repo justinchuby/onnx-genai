@@ -94,15 +94,14 @@ pub(crate) async fn audio_transcriptions(
             ..GenerateOptions::default()
         },
     };
-    let result = collect_generation_result(
-        handle
-            .engine
-            .generate_pipeline(request, Some(input))
-            .await
-            .map_err(map_generate_submit_error)?,
-    )
-    .await
-    .map_err(|err| ApiError::internal(format!("transcription failed: {err}")))?;
+    let generation = handle
+        .engine
+        .generate_pipeline(request, Some(input))
+        .await
+        .map_err(map_generate_submit_error)?;
+    let result = collect_generation_result(generation.events)
+        .await
+        .map_err(generation_failure)?;
     crate::metrics::add_prompt_tokens(prompt_tokens);
 
     match response_format.as_str() {
@@ -311,4 +310,29 @@ fn encode_png_base64(image: &onnx_genai::text_to_image::RenderedImage) -> anyhow
     let mut png = Vec::new();
     onnx_genai::text_to_image::write_png(image, &mut png)?;
     Ok(base64::engine::general_purpose::STANDARD.encode(png))
+}
+
+#[cfg(test)]
+mod transcription_failure_tests {
+    use super::*;
+
+    #[test]
+    fn kv_admission_refusal_maps_to_overload() {
+        let error = generation_failure(DriverFailure {
+            message: "internal scheduler details".to_string(),
+            kind: DriverFailureKind::MemoryOverload,
+        });
+
+        assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error.kind, "resource_limit_error");
+        assert_eq!(error.message, MEMORY_OVERLOAD_MESSAGE);
+    }
+
+    #[test]
+    fn unrelated_transcription_failure_remains_internal() {
+        let error = generation_failure(DriverFailure::internal("decoder failure"));
+
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error.kind, "server_error");
+    }
 }

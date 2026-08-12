@@ -4,6 +4,9 @@ pub(crate) struct NativeDecodeLoadOptions<'a> {
     pub(crate) host_cache: onnx_runtime_ep_cpu::WeightOffloadHostCache,
     #[cfg(feature = "cuda")]
     pub(crate) cuda_offload_policy: Option<onnx_runtime_ep_cuda::DeviceOffloadPolicy>,
+    #[cfg(feature = "cuda")]
+    pub(crate) cuda_memory_governor:
+        Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
     pub(crate) io: Option<&'a ModelIoSpec>,
     pub(crate) metadata_max_len: Option<usize>,
     pub(crate) key_sequence_lengths_policy: crate::decode::KeySequenceLengthsPolicy,
@@ -79,7 +82,14 @@ impl NativeDecodeSession {
             .as_ref()
             .and_then(|metadata| metadata.model.as_ref())
             .and_then(|model| model.io.as_ref());
-        Self::load_with_cuda_options_and_io(path, device, NativeDecodeCudaOptions::default(), io)
+        Self::load_with_cuda_options_and_io(
+            path,
+            device,
+            NativeDecodeCudaOptions::default(),
+            io,
+            None,
+            None,
+        )
     }
 
     pub(crate) fn load_with_weight_offload_host_cache(
@@ -106,18 +116,16 @@ impl NativeDecodeSession {
         }
         #[cfg(feature = "cuda")]
         if let NativeDecodeDevice::Cuda { index } = device {
-            let ep = match options.cuda_offload_policy {
-                Some(policy) => {
-                    onnx_runtime_ep_cuda::CudaExecutionProvider::initialized_with_offload_policy(
-                        index.unwrap_or(0),
-                        policy,
-                    )
-                }
-                None => {
-                    onnx_runtime_ep_cuda::CudaExecutionProvider::initialized(index.unwrap_or(0))
-                }
-            }
-            .context("initialize native CUDA execution provider")?;
+            let policy = options
+                .cuda_offload_policy
+                .unwrap_or_else(onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env);
+            let ep = onnx_runtime_ep_cuda::CudaExecutionProvider::
+                initialized_with_offload_policy_and_governor(
+                    index.unwrap_or(0),
+                    policy,
+                    options.cuda_memory_governor,
+                )
+                .context("initialize native CUDA execution provider")?;
             builder = builder.execution_provider(Arc::new(ep));
         }
         if let NativeDecodeDevice::Plugin {
@@ -150,6 +158,18 @@ impl NativeDecodeSession {
                     #[cfg(feature = "cuda")]
                     {
                         options.cuda_offload_policy.map(|policy| policy.enabled)
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    {
+                        None
+                    }
+                },
+                weight_offload_stable_va: {
+                    #[cfg(feature = "cuda")]
+                    {
+                        options
+                            .cuda_offload_policy
+                            .map(|policy| policy.enabled && policy.managed_no_spill)
                     }
                     #[cfg(not(feature = "cuda"))]
                     {
@@ -212,6 +232,7 @@ impl NativeDecodeSession {
                 metadata_max_len,
                 graph_capture: None,
                 weight_offload_enabled: None,
+                weight_offload_stable_va: None,
             },
         )
     }
@@ -228,7 +249,7 @@ impl NativeDecodeSession {
         device: NativeDecodeDevice,
         options: NativeDecodeCudaOptions,
     ) -> anyhow::Result<Self> {
-        Self::load_with_cuda_options_and_io(path, device, options, None)
+        Self::load_with_cuda_options_and_io(path, device, options, None, None, None)
     }
 
     /// Load a decoder-with-past model, threading the pipeline-declared
@@ -236,12 +257,38 @@ impl NativeDecodeSession {
     /// and routed step inputs are bound from metadata rather than guessed from
     /// tensor shapes. The pipeline's native device-KV decoder (inc2b) uses this so
     /// an `inputs_embeds` decoder with no token input loads correctly.
+    #[cfg(not(feature = "cuda"))]
     pub(crate) fn load_with_io(
         path: impl AsRef<Path>,
         device: NativeDecodeDevice,
         io: Option<&ModelIoSpec>,
     ) -> anyhow::Result<Self> {
-        Self::load_with_cuda_options_and_io(path, device, NativeDecodeCudaOptions::default(), io)
+        Self::load_with_cuda_options_and_io(
+            path,
+            device,
+            NativeDecodeCudaOptions::default(),
+            io,
+            None,
+            None,
+        )
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(crate) fn load_with_io_and_cuda_governor(
+        path: impl AsRef<Path>,
+        device: NativeDecodeDevice,
+        io: Option<&ModelIoSpec>,
+        offload_policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy,
+        governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
+    ) -> anyhow::Result<Self> {
+        Self::load_with_cuda_options_and_io(
+            path,
+            device,
+            NativeDecodeCudaOptions::default(),
+            io,
+            Some(governor),
+            Some(offload_policy),
+        )
     }
 
     fn load_with_cuda_options_and_io(
@@ -249,9 +296,26 @@ impl NativeDecodeSession {
         device: NativeDecodeDevice,
         mut options: NativeDecodeCudaOptions,
         io: Option<&ModelIoSpec>,
+        #[cfg(feature = "cuda")] cuda_governor: Option<
+            Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
+        >,
+        #[cfg(not(feature = "cuda"))] _cuda_governor: Option<()>,
+        #[cfg(feature = "cuda")] cuda_offload_policy: Option<
+            onnx_runtime_ep_cuda::DeviceOffloadPolicy,
+        >,
+        #[cfg(not(feature = "cuda"))] _cuda_offload_policy: Option<()>,
     ) -> anyhow::Result<Self> {
         if options.metadata_max_len.is_none() {
             options.metadata_max_len = native_metadata_max_len_from_model_path(path.as_ref());
+        }
+        // Issue #716: the managed no-spill authority path installs the VMM arena
+        // and physical granule pool, so weight page-ins run on reserved-once
+        // stable virtual addresses. Record that here — where the effective
+        // offload policy is known — so the decode session can keep whole-step
+        // CUDA graph capture ON while offload is active.
+        #[cfg(feature = "cuda")]
+        if let Some(policy) = cuda_offload_policy {
+            options.weight_offload_stable_va = Some(policy.enabled && policy.managed_no_spill);
         }
         let preference = match device {
             NativeDecodeDevice::Cpu => DevicePreference::Cpu,
@@ -259,6 +323,18 @@ impl NativeDecodeSession {
             NativeDecodeDevice::Plugin { .. } => DevicePreference::Cpu,
         };
         let mut builder = InferenceSession::builder().model(path).device(preference);
+        #[cfg(feature = "cuda")]
+        if let (NativeDecodeDevice::Cuda { index }, Some(governor)) = (&device, cuda_governor) {
+            let ep = onnx_runtime_ep_cuda::CudaExecutionProvider::
+                initialized_with_offload_policy_and_governor(
+                    index.unwrap_or(0),
+                    cuda_offload_policy
+                        .unwrap_or_else(onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env),
+                    governor,
+                )
+                .context("initialize governed native CUDA execution provider")?;
+            builder = builder.execution_provider(Arc::new(ep));
+        }
         if let NativeDecodeDevice::Plugin {
             library,
             registration_name,
@@ -296,6 +372,7 @@ impl NativeDecodeSession {
                 metadata_max_len: None,
                 graph_capture: None,
                 weight_offload_enabled: None,
+                weight_offload_stable_va: None,
             },
             io,
         )
@@ -337,54 +414,7 @@ impl NativeDecodeSession {
             inputs: session.inputs().iter().map(to_graph_tensor).collect(),
             outputs: session.outputs().iter().map(to_graph_tensor).collect(),
         };
-        let derived = onnx_genai_genai_config::GenAiConfig::derive_decoder_io_from_graph(&graph)?;
-        // Safety gate: only the recurrent-hybrid case the shape-inference path
-        // cannot handle. Pure-dense decoders (no state pairs) keep `io = None`.
-        if derived.state_pairs.is_empty() {
-            return None;
-        }
-        let input_names: HashSet<&str> = session
-            .inputs()
-            .iter()
-            .map(|meta| meta.name.as_str())
-            .collect();
-        let output_names: HashSet<&str> = session
-            .outputs()
-            .iter()
-            .map(|meta| meta.name.as_str())
-            .collect();
-        let present_input = |name: &str| input_names.contains(name).then(|| name.to_owned());
-        let present_output = |name: &str| output_names.contains(name).then(|| name.to_owned());
-        let state_pairs = derived
-            .state_pairs
-            .into_iter()
-            .map(|pair| LoopStatePair {
-                input: pair.input,
-                output: pair.output,
-                init: Some("zeros".to_owned()),
-                update: Some("replace".to_owned()),
-            })
-            .collect::<Vec<_>>();
-        Some(ModelIoSpec {
-            sequence_source: None,
-            kv_ownership: None,
-            token_input: present_input("input_ids"),
-            inputs_embeds_input: None,
-            attention_mask_input: present_input("attention_mask"),
-            position_ids_input: present_input("position_ids"),
-            logits_output: present_output("logits"),
-            hidden_output: None,
-            kv_inputs: (!derived.kv_inputs.is_empty()).then_some(derived.kv_inputs),
-            kv_outputs: (!derived.kv_outputs.is_empty()).then_some(derived.kv_outputs),
-            encoder_hidden_states_input: None,
-            audio_features_input: None,
-            cross_kv_inputs: None,
-            cross_kv_outputs: None,
-            kv_update: None,
-            state_pairs: Some(state_pairs),
-            optional_inputs: BTreeMap::new(),
-            static_cache: None,
-        })
+        onnx_genai_genai_config::GenAiConfig::derive_model_io_spec_from_graph(&graph)
     }
 
     fn from_session_with_cuda_options_and_io(
@@ -729,7 +759,12 @@ impl NativeDecodeSession {
                 .unwrap_or_else(|| onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env().enabled);
             #[cfg(not(feature = "cuda"))]
             let weight_offload_enabled = false;
-            let graph_enabled = resolve_graph_capture_enabled(
+            // Issue #716: offload no longer forces capture OFF when it runs on
+            // the stable-VA VMM paging path. Default to the conservative (unsafe)
+            // assumption so any path that has not proven pointer stability keeps
+            // the old mutual exclusion.
+            let weight_offload_stable_va = cuda_options.weight_offload_stable_va.unwrap_or(false);
+            let graph_capture = resolve_graph_capture_decision(
                 cuda_options.graph_capture,
                 runtime_config.cuda_graph_explicit,
                 runtime_config.cuda_graph,
@@ -738,11 +773,15 @@ impl NativeDecodeSession {
                     kv_ownership,
                 },
                 weight_offload_enabled,
+                weight_offload_stable_va,
             );
             let mut span = onnx_genai_ort::prof_span!("native.cuda_kv_alloc");
             span.set_arg("max_len", capacity.max_len as u64);
             span.set_arg("kv_pairs", present_to_past.len() as u64);
-            span.set_arg("graph_capture", graph_enabled);
+            span.set_arg("graph_capture", graph_capture.is_enabled());
+            let kv_layout = crate::native_decode::cuda::resolve_cuda_kv_layout(
+                io.and_then(|io| io.kv_layout.as_ref()),
+            );
             Some(DecodeCudaState::new(
                 &mut session,
                 DecodeCudaIo {
@@ -756,8 +795,9 @@ impl NativeDecodeSession {
                 &present_to_past,
                 &fixed_state_inputs,
                 capacity,
-                graph_enabled,
+                graph_capture,
                 position_rank,
+                kv_layout,
             )?)
         } else {
             None

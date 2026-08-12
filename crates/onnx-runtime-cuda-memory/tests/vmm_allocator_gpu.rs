@@ -111,6 +111,183 @@ fn an_allocation_commits_a_granule_and_the_ledger_sees_it() {
     );
 }
 
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn grant_capacity_commits_with_exact_headroom_and_no_pool() {
+    let granule = 2_u64 << 20;
+    let (allocator, governor) = allocator(64 << 20, granule);
+    let requester = governor
+        .reserve_mapped_allowance(
+            Tier::Device,
+            granule,
+            MemoryRole::Workspace { step_scoped: false },
+            HolderId::new(22),
+        )
+        .expect("requester allowance");
+    let mut grant = governor
+        .prepare_mapped_growth(&requester, granule)
+        .expect("reserve exact physical headroom");
+    assert!(
+        governor
+            .reserve(Tier::Device, 1, MemoryRole::Activation, HolderId::new(23))
+            .is_err(),
+        "ordinary claims remain blocked by the live grant"
+    );
+    let full = 0..4096;
+    let allocation = allocator
+        .allocate_committed_with_capacity(
+            4096,
+            256,
+            std::slice::from_ref(&full),
+            grant.physical_capacity(),
+        )
+        .expect("allocator consumes grant-bound capacity");
+    let pointer = allocation.allocation;
+    assert_eq!(allocation.newly_mapped_bytes, granule);
+    assert_eq!(grant.physical_capacity().remaining_bytes(), 0);
+    grant.commit_bytes(granule).expect("mapped attribution");
+    assert_eq!(governor.used(Tier::Device), granule);
+    let unmapped = allocator.deallocate_span(pointer);
+    assert_eq!(unmapped, granule, "a nonshared allocation unmaps itself");
+    assert_eq!(requester.unmap(unmapped), unmapped);
+    assert_eq!(requester.mapped_bytes(), 0);
+    assert_eq!(governor.used(Tier::Device), 0);
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn mapped_allocation_rejects_a_different_arena_zone() {
+    let granule = 2_u64 << 20;
+    let (allocator, governor) = allocator(64 << 20, granule * 2);
+    let arena_zone = governor
+        .reserve_mapped_allowance(
+            Tier::Device,
+            granule,
+            MemoryRole::Workspace { step_scoped: false },
+            HolderId::new(26),
+        )
+        .expect("arena-zone allowance");
+    let mut first_grant = governor
+        .prepare_mapped_growth(&arena_zone, granule)
+        .expect("arena-zone grant");
+    let full = 0..4096;
+    let first = allocator
+        .allocate_committed_with_capacity(
+            4096,
+            256,
+            std::slice::from_ref(&full),
+            first_grant.physical_capacity(),
+        )
+        .expect("bind arena mapped owner");
+    first_grant
+        .commit_bytes(first.newly_mapped_bytes)
+        .expect("commit arena-zone mapping");
+
+    let wrong_zone = governor
+        .reserve_mapped_allowance(
+            Tier::Device,
+            granule,
+            MemoryRole::Workspace { step_scoped: false },
+            HolderId::new(27),
+        )
+        .expect("different-zone allowance");
+    let mut grant = governor
+        .prepare_mapped_growth(&wrong_zone, granule)
+        .expect("different-zone grant");
+    let error = allocator
+        .allocate_committed_with_capacity(
+            4096,
+            256,
+            std::slice::from_ref(&full),
+            grant.physical_capacity(),
+        )
+        .expect_err("one arena cannot accept a different mapped owner");
+    assert!(error.to_string().contains("different allowance"), "{error}");
+    assert_eq!(allocator.committed_and_reserved().0, granule as usize);
+    let unmapped = allocator.deallocate_span(first.allocation);
+    arena_zone.unmap(unmapped);
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn adjacent_shared_granule_consumes_mapped_growth_once() {
+    fn run(reverse: bool) {
+        let granule = 2_u64 << 20;
+        let (allocator, governor) = allocator(64 << 20, granule * 2);
+        let requester = governor
+            .reserve_mapped_allowance(
+                Tier::Device,
+                granule * 2,
+                MemoryRole::Workspace { step_scoped: false },
+                HolderId::new(if reverse { 25 } else { 24 }),
+            )
+            .expect("requester allowance");
+        let full = 0..4096;
+        let mut first_grant = governor
+            .prepare_mapped_growth(&requester, granule)
+            .expect("first granule grant");
+        let first = allocator
+            .allocate_committed_with_capacity(
+                4096,
+                256,
+                std::slice::from_ref(&full),
+                first_grant.physical_capacity(),
+            )
+            .expect("first workspace allocation");
+        assert_eq!(first.newly_mapped_bytes, granule);
+        first_grant
+            .commit_bytes(first.newly_mapped_bytes)
+            .expect("attribute first granule");
+
+        let mut second_grant = governor
+            .prepare_mapped_growth(&requester, granule)
+            .expect("workspace reserves its rounded upper bound");
+        let second = allocator
+            .allocate_committed_with_capacity(
+                4096,
+                256,
+                std::slice::from_ref(&full),
+                second_grant.physical_capacity(),
+            )
+            .expect("adjacent packed workspace allocation");
+        assert_eq!(second.newly_mapped_bytes, 0);
+        second_grant
+            .commit_bytes(second.newly_mapped_bytes)
+            .expect("attribute no additional bytes");
+        assert_eq!(requester.mapped_bytes(), granule);
+
+        let (early, last) = if reverse {
+            (second.allocation, first.allocation)
+        } else {
+            (first.allocation, second.allocation)
+        };
+        let early_unmapped = allocator.deallocate_span(early);
+        assert_eq!(early_unmapped, 0, "the surviving workspace retains mapping");
+        requester.unmap(early_unmapped);
+        assert_eq!(requester.mapped_bytes(), granule);
+        assert_eq!(allocator.committed_and_reserved().0, granule as usize);
+
+        let last_unmapped = allocator.deallocate_span(last);
+        assert_eq!(last_unmapped, granule, "last reference owns the unmap");
+        requester.unmap(last_unmapped);
+        assert_eq!(requester.mapped_bytes(), 0);
+        assert_eq!(allocator.committed_and_reserved().0, 0);
+        assert_eq!(governor.used(Tier::Device), 0);
+    }
+
+    run(false);
+    run(true);
+}
+
 /// A partial commit is a real allocation claim, not just a map operation.
 ///
 /// KV reserves a large span and commits pieces later. If those late commits do
@@ -232,9 +409,12 @@ fn decommit_range_rolls_back_late_commits_without_releasing_prefix() {
         .expect("late growth commit");
     assert_eq!(allocator.committed_and_reserved().0, granularity * 2);
 
-    allocator
-        .decommit_allocation_range(pointer, len, 256, granularity, granularity)
-        .expect("rollback late growth commit");
+    assert_eq!(
+        allocator
+            .decommit_allocation_range(pointer, len, 256, granularity, granularity)
+            .expect("rollback late growth commit"),
+        granularity as u64
+    );
     assert_eq!(
         allocator.committed_and_reserved().0,
         granularity,
@@ -275,9 +455,12 @@ fn decommit_misaligned_growth_tail_releases_new_granules_only() {
         .expect("growth claims a second granule");
     assert_eq!(allocator.committed_and_reserved().0, granularity * 2);
 
-    allocator
-        .decommit_allocation_range(pointer, len, 256, old_bytes, granularity)
-        .expect("rollback starts at a non-granule-aligned old bucket");
+    assert_eq!(
+        allocator
+            .decommit_allocation_range(pointer, len, 256, old_bytes, granularity)
+            .expect("rollback starts at a non-granule-aligned old bucket"),
+        granularity as u64
+    );
     assert_eq!(
         allocator.committed_and_reserved().0,
         granularity,

@@ -375,30 +375,10 @@ pub(super) fn build_lazy_weight_handles(
     }
 
     let mut handles = HashMap::new();
-    for (&value, weight) in &graph.initializers {
-        let graph_value = graph.value(value);
-        let consumers = graph.consumers(value);
-        // A weight is offload-eligible only if it feeds exclusively into offload
-        // boundary ops (BlockQuantizedMoE, QMoE, or MatMulNBits) and nothing
-        // else. Capture the boundary from the first consumer so the lazy handle
-        // carries the right binding site.
-        let mut boundary = None;
-        let lazy_only = graph_value.producer.is_none()
-            && !graph.outputs.contains(&value)
-            && !consumers.is_empty()
-            && consumers.into_iter().all(|consumer| {
-                let node = graph.node(consumer);
-                match LazyWeightBoundary::for_op(&node.domain, &node.op_type) {
-                    Some(found) => {
-                        boundary.get_or_insert(found);
-                        true
-                    }
-                    None => false,
-                }
-            });
-        let Some(boundary) = boundary.filter(|_| lazy_only) else {
-            continue;
-        };
+    for candidate in lazy_weight_candidates(graph) {
+        let value = candidate.value;
+        let boundary = candidate.boundary;
+        let weight = &graph.initializers[&value];
         let Some((mapping_id, offset, len)) = weights.external_mmap_provenance(weight) else {
             continue;
         };
@@ -495,6 +475,7 @@ impl Executor {
         let (input_index, required_inputs, name_index) = Self::build_name_indexes(&graph);
 
         let plan_len = plan.len();
+        let capture_growing_symbols = compute_capture_disqualifying_symbols(&graph);
         let mut exec = Self {
             graph,
             weights,
@@ -524,6 +505,7 @@ impl Executor {
             capture_warm_shapes: HashMap::new(),
             capture_warm_seeded: HashMap::new(),
             capture_quarantine_ops: HashSet::new(),
+            capture_growing_symbols,
             last_capture_failed_node: None,
             views: HashMap::new(),
             pinned: HashSet::new(),
@@ -555,6 +537,10 @@ impl Executor {
             scan_inline_single_trip_enabled: scan_inline_single_trip_env_enabled(),
             scan_inline_single_trip_count: 0,
             kernel_bindings: vec![None; plan_len],
+            persistent_workspace: None,
+            step_workspace: None,
+            inherited_workspace: None,
+            workspace_preparation_required: false,
         };
 
         // 5) Fully-static graphs are materialized eagerly (buffers + the whole
@@ -1697,6 +1683,8 @@ impl Executor {
                 .collect();
             let node = self.graph.node(node_id);
             let opset = effective_opset(&self.graph, node);
+            let seq_independent =
+                node_capture_seq_independent(&self.graph, node, &self.capture_growing_symbols);
             let (_, key) = self.cache.get_or_create(
                 node_id,
                 node,
@@ -1704,6 +1692,7 @@ impl Executor {
                 &input_dtypes,
                 &constant_inputs,
                 opset,
+                seq_independent,
                 self.ep.as_ref(),
             )?;
             // Pre-populate the kernel binding so the first decode step already

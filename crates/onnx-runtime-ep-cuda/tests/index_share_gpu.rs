@@ -1,3 +1,17 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation,
+    clippy::uninlined_format_args,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::type_complexity,
+    clippy::drop_non_drop,
+    clippy::manual_repeat_n,
+    clippy::manual_is_multiple_of,
+    clippy::err_expect,
+    clippy::clone_on_copy
+)]
 //! GPU parity tests for `pkg.nxrt::IndexShare` v1.
 //!
 //! Each case builds a tiny single-node model with the `onnx-runtime-ir` graph
@@ -22,7 +36,8 @@
 
 use half::{bf16, f16};
 use onnx_runtime_ep_api::{
-    DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView,
+    DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, TensorMetadata, TensorMut,
+    TensorView, WorkspaceView,
 };
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
@@ -323,6 +338,40 @@ fn run_cpu(
     Ok(out_bufs)
 }
 
+fn workspace_view_for<'a>(
+    kernel: &dyn onnx_runtime_ep_api::Kernel,
+    input_views: &[TensorView],
+    buffer: &'a mut Option<DeviceBuffer>,
+    ep: &CudaExecutionProvider,
+) -> onnx_runtime_ep_api::Result<Option<WorkspaceView>> {
+    let metadata = input_views
+        .iter()
+        .map(|view| TensorMetadata::new(view.dtype, view.shape, !view.is_absent()))
+        .collect::<Vec<_>>();
+    let requirement = kernel.workspace_requirement(&metadata)?;
+    if requirement.bytes == 0 {
+        return Ok(None);
+    }
+    let bytes = usize::try_from(requirement.bytes).map_err(|_| {
+        onnx_runtime_ep_api::EpError::KernelFailed(format!(
+            "test workspace requirement {} does not fit usize",
+            requirement.bytes
+        ))
+    })?;
+    if buffer
+        .as_ref()
+        .is_none_or(|buffer| buffer.len() < bytes || buffer.alignment() < requirement.alignment)
+    {
+        if let Some(old) = buffer.take() {
+            ep.deallocate(old)?;
+        }
+        *buffer = Some(ep.allocate(bytes.max(1), requirement.alignment)?);
+    }
+    Ok(buffer
+        .as_mut()
+        .map(|buffer| WorkspaceView::new(DevicePtrMut(buffer.as_mut_ptr()), bytes)))
+}
+
 fn run_gpu(
     ep: &CudaExecutionProvider,
     graph: &Graph,
@@ -393,7 +442,9 @@ fn run_gpu(
             )
         })
         .collect();
-    let result = kernel.execute(&input_views, &mut out_views);
+    let mut workspace_buffer = None;
+    let workspace = workspace_view_for(kernel.as_ref(), &input_views, &mut workspace_buffer, ep)?;
+    let result = kernel.execute_with_workspace(&input_views, &mut out_views, workspace);
     drop(out_views);
     drop(input_views);
 
@@ -412,6 +463,9 @@ fn run_gpu(
         ep.deallocate(buffer)?;
     }
     for buffer in out_buffers.drain(..) {
+        ep.deallocate(buffer)?;
+    }
+    if let Some(buffer) = workspace_buffer {
         ep.deallocate(buffer)?;
     }
     result.map(|()| outputs)
@@ -977,6 +1031,8 @@ fn run_gpu_capture_replay(
         .iter()
         .map(|len| ep.allocate((*len).max(1), 256))
         .collect::<onnx_runtime_ep_api::Result<_>>()?;
+    let mut workspace_buffer = None;
+    let workspace = workspace_view_for(kernel.as_ref(), &input_views, &mut workspace_buffer, ep)?;
 
     let make_out_views = |out_buffers: &mut [DeviceBuffer]| -> Vec<TensorMut> {
         out_buffers
@@ -1002,7 +1058,7 @@ fn run_gpu_capture_replay(
     // capture eligibility.
     {
         let mut out_views = make_out_views(&mut out_buffers);
-        kernel.execute(&input_views, &mut out_views)?;
+        kernel.execute_with_workspace(&input_views, &mut out_views, workspace)?;
     }
     runtime.synchronize()?;
     assert!(
@@ -1039,7 +1095,7 @@ fn run_gpu_capture_replay(
             })?;
         }
         let mut out_views = make_out_views(&mut out_buffers);
-        let record = kernel.execute(&input_views, &mut out_views);
+        let record = kernel.execute_with_workspace(&input_views, &mut out_views, workspace);
         drop(out_views);
         // Always end capture to leave the stream clean, even on error.
         // SAFETY: `stream` is capturing; `graph_handle` is a valid out-pointer.
@@ -1091,6 +1147,9 @@ fn run_gpu_capture_replay(
         ep.deallocate(buffer)?;
     }
     for buffer in out_buffers.drain(..) {
+        ep.deallocate(buffer)?;
+    }
+    if let Some(buffer) = workspace_buffer {
         ep.deallocate(buffer)?;
     }
     captured.map(|()| outputs)
@@ -1346,6 +1405,9 @@ fn captured_replay_latches_capture_error_on_invalid_index() {
     let out_len = specs[0].shape.iter().product::<usize>() * specs[0].dtype.byte_size();
     let out_stride = compute_contiguous_strides(&specs[0].shape);
     let mut out_buffer = ep.allocate(out_len.max(1), 256).expect("alloc out");
+    let mut workspace_buffer = None;
+    let workspace = workspace_view_for(kernel.as_ref(), &input_views, &mut workspace_buffer, &ep)
+        .expect("workspace");
     let make_out = |buffer: &mut DeviceBuffer| -> Vec<TensorMut> {
         vec![TensorMut::new(
             DevicePtrMut(buffer.as_mut_ptr()),
@@ -1363,7 +1425,7 @@ fn captured_replay_latches_capture_error_on_invalid_index() {
     {
         let mut out = make_out(&mut out_buffer);
         kernel
-            .execute(&input_views, &mut out)
+            .execute_with_workspace(&input_views, &mut out, workspace)
             .expect("warmup execute");
     }
     runtime.synchronize().expect("sync");
@@ -1400,7 +1462,7 @@ fn captured_replay_latches_capture_error_on_invalid_index() {
             })?;
         }
         let mut out = make_out(&mut out_buffer);
-        let record = kernel.execute(&input_views, &mut out);
+        let record = kernel.execute_with_workspace(&input_views, &mut out, workspace);
         drop(out);
         // SAFETY: `stream` is capturing; `graph_handle` is a valid out-pointer.
         let end = unsafe { cuStreamEndCapture(stream, &mut graph_handle) }
@@ -1444,6 +1506,9 @@ fn captured_replay_latches_capture_error_on_invalid_index() {
     runtime.reset_capture_error().expect("reset latch");
 
     ep.deallocate(out_buffer).expect("free out");
+    if let Some(buffer) = workspace_buffer {
+        ep.deallocate(buffer).expect("free workspace");
+    }
     for buffer in buffers.into_iter().flatten() {
         ep.deallocate(buffer).expect("free input");
     }

@@ -52,9 +52,9 @@ use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{EpError, Result};
 
 use crate::error::driver_err;
+use crate::kernels::kv_stride::{KvCachePath, KvCacheStrides};
 use crate::runtime::CudaRuntime;
 
-const MODULE_KEY: &str = "gqa_decode_attention_f16_v6";
 const ENTRY: &str = "gqa_decode_attention_f16";
 const MERGE_ENTRY: &str = "gqa_decode_attention_f16_merge";
 
@@ -177,8 +177,15 @@ extern "C" __global__ void gqa_decode_attention_f16(
     const long q_base =
         ((long)(batch_index * query_heads + query_head) * query_seq + query_pos)
             * (long)head_size;
-    const long kv_plane =
-        (long)(batch_index * kv_heads + kv_head) * (long)cache_capacity * (long)head_size;
+    // KV cache base offset and per-token stride for this (batch, kv_head),
+    // generated from the KV stride descriptor at NVRTC module-build time via the
+    // `GQA_KV_BASE`/`GQA_KV_STRIDE` prelude (no runtime layout branch):
+    //   head-major BNSH  [b, kv_heads, cap, head]: base=(b*kv_heads+h)*cap*head,
+    //                    stride=head (tokens contiguous within a head plane);
+    //   seq-major  BSNH  [b, cap, kv_heads, head]: base=(b*cap*kv_heads+h)*head,
+    //                    stride=kv_heads*head (tokens strided by all heads).
+    const long kv_base = GQA_KV_BASE(batch_index, kv_head);
+    const long kv_stride = GQA_KV_STRIDE;
 
     const int h2 = head_size >> 1;   // number of half2 elements per row
     const half2* q2 = reinterpret_cast<const half2*>(query + q_base);
@@ -200,7 +207,7 @@ extern "C" __global__ void gqa_decode_attention_f16(
     // CTA's contiguous sequence slice.
     for (int key_pos = split_start + warp_in_block; key_pos < split_end;
          key_pos += warps_per_block) {
-        const long kv_off = kv_plane + (long)key_pos * (long)head_size;
+        const long kv_off = kv_base + (long)key_pos * kv_stride;
         const half2* k2 = reinterpret_cast<const half2*>(key + kv_off);
         float partial = 0.0f;
 #pragma unroll
@@ -372,11 +379,14 @@ extern "C" __global__ void gqa_decode_attention_f16_merge(
 
 /// Launch the capture-safe fp16 flash-decode kernel.
 ///
-/// Present K/V live in `[batch, kv_heads, cache_capacity, head_dim]` fp16 with
-/// RoPE already applied to stored keys at their absolute positions;
-/// `query`/`output` are BNSH fp16 with `query_seq == 1`. The valid length per
-/// batch is read on the device from `total_lengths` (never from
-/// `cache_capacity`), so the launch geometry is fixed for capture/replay.
+/// Present K/V live in `[batch, kv_heads, cache_capacity, head_dim]` (head-major
+/// BNSH) or `[batch, cache_capacity, kv_heads, head_dim]` (seq-major BSNH) fp16
+/// with RoPE already applied to stored keys at their absolute positions;
+/// `query`/`output` are BNSH fp16 with `query_seq == 1`. The KV base/stride
+/// arithmetic is specialized per `kv_strides` descriptor into the NVRTC module
+/// (no runtime layout branch). The valid length per batch is read on the device
+/// from `total_lengths` (never from `cache_capacity`), so the launch geometry is
+/// fixed for capture/replay.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run(
     runtime: &CudaRuntime,
@@ -395,8 +405,12 @@ pub(super) fn run(
     total_lengths: CUdeviceptr,
     local_window: i32,
     softcap: f32,
+    kv_strides: &KvCacheStrides,
 ) -> Result<()> {
     runtime.require_nvrtc_half_headers("gqa_decode_attention_f16")?;
+    kv_strides.require_converted_path_support(KvCachePath::Fp16DecodeRead)?;
+    let module_key = kv_strides.decode_module_key()?;
+    let decode_src = format!("{}{}", kv_strides.decode_prelude(), DECODE_SRC);
 
     let as_i32 = |name: &str, value: usize| {
         i32::try_from(value).map_err(|_| {
@@ -461,7 +475,7 @@ pub(super) fn run(
             EpError::KernelFailed("cuda_ep GQA fp16 decode: shared-mem bytes exceed u32".into())
         })?;
 
-    let function = runtime.nvrtc_function(MODULE_KEY, DECODE_SRC, ENTRY)?;
+    let function = runtime.nvrtc_function(module_key, &decode_src, ENTRY)?;
     let single_split_direct = super::gqa_decode::single_split_direct_flag();
     let mut builder = runtime.stream().launch_builder(&function);
     builder
@@ -496,7 +510,7 @@ pub(super) fn run(
     }
     .map_err(|error| driver_err("launch GQA fp16 flash-decode attention", error))?;
 
-    let merge_function = runtime.nvrtc_function(MODULE_KEY, DECODE_SRC, MERGE_ENTRY)?;
+    let merge_function = runtime.nvrtc_function(module_key, &decode_src, MERGE_ENTRY)?;
     let mut merge_builder = runtime.stream().launch_builder(&merge_function);
     merge_builder
         .arg(&output)
@@ -561,6 +575,7 @@ mod tests {
     /// **fp16-rounded** inputs so the only residual error the parity test sees is
     /// the kernel's fp16 output rounding plus its fp32 (vs f64) accumulation —
     /// not the input quantization, which both sides share.
+    #[allow(clippy::too_many_arguments)]
     fn cpu_reference(
         query: &[f32],
         key: &[f32],
@@ -707,6 +722,7 @@ mod tests {
                 totals_dev,
                 0,
                 0.0,
+                &KvCacheStrides::head_major_bnsh(),
             )
             .unwrap();
 
@@ -734,6 +750,7 @@ mod tests {
                 totals_dev,
                 0,
                 0.0,
+                &KvCacheStrides::head_major_bnsh(),
             )
             .unwrap();
             let mut repeated_f16 = vec![f16::ZERO; num_heads * head_dim];
@@ -795,6 +812,7 @@ mod tests {
             totals_dev,
             0,
             0.0,
+            &KvCacheStrides::head_major_bnsh(),
         )
         .unwrap();
         runtime.end_graph_capture().unwrap();
@@ -936,6 +954,7 @@ mod tests {
                     totals_dev,
                     0,
                     0.0,
+                    &KvCacheStrides::head_major_bnsh(),
                 )
                 .unwrap();
                 let mut got = vec![f16::ZERO; num_heads * head_dim];

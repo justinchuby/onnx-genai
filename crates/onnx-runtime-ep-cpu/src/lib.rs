@@ -44,6 +44,7 @@ pub mod weight_offload;
 
 pub use backend::CpuBackend;
 pub use kernels::qmoe::WeightOffloadHostCache;
+pub use kernels::{CpuOpDescriptor, build_cpu_registry_with_descriptors, supported_dtypes_for_op};
 pub use optimizer::{
     ConvBatchNormActivationFusion, MatMulNBitsBiasFusion, ProjectionFusion, SiblingProjectionMerge,
     cpu_optimization_passes,

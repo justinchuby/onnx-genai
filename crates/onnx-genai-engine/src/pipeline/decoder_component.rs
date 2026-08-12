@@ -33,6 +33,17 @@ use onnx_genai_kv::{PagedKvCache, SequenceId};
 /// and (when paging) [`mirror_last_present_kv`](Self::mirror_last_present_kv)
 /// without ever handling a concrete tensor type.
 pub(crate) trait PipelineDecoderComponent {
+    /// Prepare any governed decoder workspace using the exact routed values for
+    /// this step. Backends without a workspace contract remain a no-op.
+    fn prepare_step(
+        &mut self,
+        _input_tokens: &[TokenId],
+        _past_len: usize,
+        _extras: &[(String, Value)],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Run one decoder step over `input_tokens` at absolute `past_len`, binding
     /// the routed `extras` (every_step outputs, `inputs_embeds`, routed
     /// positions, static cross-attention KV), advancing the internal KV. The
@@ -211,6 +222,19 @@ pub(crate) struct NativePipelineDecoder {
 
 #[cfg(feature = "native-backend")]
 impl NativePipelineDecoder {
+    fn native_step_inputs(
+        extras: &[(String, Value)],
+    ) -> anyhow::Result<Vec<(String, onnx_runtime_session::Tensor)>> {
+        let mut step_inputs = Vec::with_capacity(extras.len());
+        for (port, value) in extras {
+            let component = value_to_component_tensor(value)?;
+            let tensor =
+                crate::native_component::component_tensor_to_native_tensor(port, &component)?;
+            step_inputs.push((port.clone(), tensor));
+        }
+        Ok(step_inputs)
+    }
+
     /// Load the decoder ONNX model as a native decode session on the given
     /// device, keeping its KV cache resident across the generation. The
     /// pipeline-declared `io` spec is threaded so an `inputs_embeds` decoder
@@ -219,7 +243,26 @@ impl NativePipelineDecoder {
         path: &std::path::Path,
         device: crate::native_decode::NativeDecodeDevice,
         io: Option<&onnx_genai_metadata::ModelIoSpec>,
+        #[cfg(feature = "cuda")] offload_policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy,
+        #[cfg(feature = "cuda")] governor: std::sync::Arc<
+            dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync,
+        >,
     ) -> anyhow::Result<Self> {
+        #[cfg(feature = "cuda")]
+        let session = crate::native_decode::NativeDecodeSession::load_with_io_and_cuda_governor(
+            path,
+            device,
+            io,
+            offload_policy,
+            governor,
+        )
+        .with_context(|| {
+            format!(
+                "failed to load native pipeline decoder '{}'",
+                path.display()
+            )
+        })?;
+        #[cfg(not(feature = "cuda"))]
         let session = crate::native_decode::NativeDecodeSession::load_with_io(path, device, io)
             .with_context(|| {
                 format!(
@@ -236,6 +279,21 @@ impl NativePipelineDecoder {
 
 #[cfg(feature = "native-backend")]
 impl PipelineDecoderComponent for NativePipelineDecoder {
+    fn prepare_step(
+        &mut self,
+        input_tokens: &[TokenId],
+        past_len: usize,
+        extras: &[(String, Value)],
+    ) -> anyhow::Result<()> {
+        let step_inputs = Self::native_step_inputs(extras)?;
+        self.session.prepare_generation_workspace_with_step_inputs(
+            input_tokens,
+            past_len,
+            &step_inputs,
+        )?;
+        Ok(())
+    }
+
     fn step(
         &mut self,
         input_tokens: &[TokenId],
@@ -247,13 +305,7 @@ impl PipelineDecoderComponent for NativePipelineDecoder {
         // value -> ComponentTensor -> native Tensor reuses the Inc1 value-type
         // seam; this is one token's embedding per decode step (small upload),
         // while the KV cache stays resident inside the native session.
-        let mut step_inputs = Vec::with_capacity(extras.len());
-        for (port, value) in extras {
-            let component = value_to_component_tensor(value)?;
-            let tensor =
-                crate::native_component::component_tensor_to_native_tensor(port, &component)?;
-            step_inputs.push((port.clone(), tensor));
-        }
+        let step_inputs = Self::native_step_inputs(extras)?;
         let rows = self
             .session
             .decode_with_step_inputs(input_tokens, past_len, &step_inputs)?;

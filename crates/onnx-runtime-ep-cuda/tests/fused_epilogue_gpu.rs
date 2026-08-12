@@ -1,7 +1,22 @@
+#![allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::unusual_byte_groupings,
+    clippy::doc_lazy_continuation,
+    clippy::uninlined_format_args,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::type_complexity,
+    clippy::drop_non_drop,
+    clippy::manual_repeat_n,
+    clippy::manual_is_multiple_of,
+    clippy::err_expect,
+    clippy::clone_on_copy
+)]
 //! GPU numeric parity tests for cuBLASLt bias/activation GEMM epilogues.
 
 use onnx_runtime_ep_api::{
-    DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch, TensorMut, TensorView,
+    DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch, TensorMetadata, TensorMut, TensorView,
+    WorkspaceView,
 };
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::runtime::cuptr;
@@ -137,9 +152,21 @@ fn run_model(
         &out_strides,
         device,
     );
-    ep.get_kernel(node, &shapes, 1)
-        .unwrap()
-        .execute(&inputs, &mut [output])
+    let kernel = ep.get_kernel(node, &shapes, 1).unwrap();
+    let metadata = inputs
+        .iter()
+        .map(|input| TensorMetadata::new(input.dtype, input.shape, true))
+        .collect::<Vec<_>>();
+    let requirement = kernel.workspace_requirement(&metadata).unwrap();
+    let mut workspace = (requirement.bytes != 0).then(|| {
+        ep.allocate(requirement.bytes as usize, requirement.alignment)
+            .unwrap()
+    });
+    let workspace_view = workspace
+        .as_mut()
+        .map(|buffer| WorkspaceView::new(DevicePtrMut(buffer.as_mut_ptr()), buffer.len()));
+    kernel
+        .execute_with_workspace(&inputs, &mut [output], workspace_view)
         .unwrap();
     let mut bytes = vec![0; out_shape.iter().product::<usize>() * 4];
     // SAFETY: the destination exactly matches the output allocation.
@@ -150,6 +177,9 @@ fn run_model(
     }
     for buffer in buffers {
         ep.deallocate(buffer).unwrap();
+    }
+    if let Some(workspace) = workspace {
+        ep.deallocate(workspace).unwrap();
     }
     ep.deallocate(out_buffer).unwrap();
     bytes

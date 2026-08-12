@@ -167,3 +167,32 @@ WP-B landed: Chew's rejection of loader-IR shape authority directly informed the
 - **Revision agent:** Iran.
 - Filed to `.squad/decisions/inbox/chew-pr334-review.md`.
 - 2026-07-28: Reviews of PR #347 and #349 approved after verifying numerical bounds and real decode firing. Documentation rationales are reviewable correctness artifacts: wrong L1-cache premises and derived-looking fitted constants must be corrected before merge.
+
+## Archived from live history (Scribe compaction 2026-08-12T00:15:00Z)
+
+### 2026-07-27T01:30:00-07:00 — PR #227 CPU EP NEON numerics review
+APPROVE with concerns. SiLU polynomial ~28 ULP (not ~1 ULP as claimed). SDPA zero dispatch coverage. GEMV transpose/tail/f32-accumulation correct. Filed chew-pr227-numerics-review.md.
+
+### 2026-07-27T02:00:00-07:00 — PR #227 FP16 Path Review (Second Pass)
+APPROVE. fcvtl asm bit-exact, FP32 accumulation max-rel-error 2.38e-7, bulk conversion bit-for-bit, tail handling correct, SPMD pool guaranteed ≥1 worker.
+
+### 2026-07-28T00:40:00-07:00 — PR #334 Grouped/Depthwise Conv Review
+REJECT (formatting). 3 cargo fmt violations. Numerics sound. BNNS genuinely broken for groups>1 verified by FFI probe. im2col correct intermediate step; NEON depthwise follow-up targeting 2-3× ORT.
+
+### 2026-08-11 — AVX2 LayerNorm/RMSNorm precision audit + test updates (PRs #31973, #31974)
+Two-pass E[x²]-mean² suffers catastrophic cancellation at high base. Welford SIMD recommended. BF16 widen-accumulate-narrow ≤1 ULP above floor. Leak scrub (2 agent names) under lockout.
+
+### 2026-08-11 — PR #31973 clarity pass
+Added explanatory comment: two-pass safe in fp64; kept as oracle for independence. Removed dead (void)0; 40/40 tests pass.
+
+### 2026-08-11 — #762 Test Repair (Corrective Wave, B1-B4)
+All four blockers resolved. 154+20+32+10+6 tests passed. Clippy/fmt clean.
+
+### 2026-08-11 — PR #762: LayerNorm test hardening
+Removed #[ignore], added shape assertions, neg-axis test, RMSNorm test. 23 passed.
+
+### 2026-08-11 — PR #31974 CI fix: unused functions
+Removed BF16Ulp and ReportErrors dead functions. 45/45 BF16 tests pass.
+
+### 2026-08-11 — Leak scrubs on PR #31973 (×2)
+Both interactive-rebase rewrites; force-pushed. 42/42 tests green.

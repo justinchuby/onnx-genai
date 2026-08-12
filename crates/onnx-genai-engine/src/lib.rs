@@ -16,7 +16,9 @@ pub mod embedding;
 pub mod engine;
 pub mod fim;
 pub(crate) mod kv_bridge;
+pub(crate) mod kv_sizing;
 pub mod logits;
+mod memory_authority;
 #[cfg(feature = "native-backend")]
 pub mod native_component;
 #[cfg(feature = "native-backend")]
@@ -33,25 +35,34 @@ pub mod sampling;
 pub(crate) mod session;
 pub mod speculative;
 
-pub use batched::{ContinuousBatchEvent, ContinuousBatchHandle, ContinuousBatchManager};
+pub use onnx_genai_scheduler::SchedulerAdmissionError;
+
+pub use batched::{
+    BatchingCapability, ContinuousBatchAdmission, ContinuousBatchEvent, ContinuousBatchHandle,
+    ContinuousBatchManager,
+};
 pub use connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 pub use embedding::{EmbeddingOptions, EmbeddingPooling};
 pub use engine::{
-    DevicePolicy, DevicePolicyParseError, DryConfig, Eagle3Config, Engine, EngineConfig,
-    EngineConfigError, EngineDecodeBackend, EngineGovernorError, EngineResourceGovernor,
-    FinishReason, GenerateConstraint, GenerateOptions, GeneratePrompt, GenerateRequest,
-    GenerateResult, GenerateToken, GenerateTokenCallback, GenerationBudgetCap, KvConnectorBackend,
-    KvConnectorConfig, LimitParseError, MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig,
-    MtpHiddenLayout, MtpWeightSource, PrioritizedGenerateRequest, PrioritizedGenerateResult,
-    RewindTokenCount, SamplingOverrides, ScheduledGenerateArrival, SessionCheckpoint,
-    SessionForkCapability, SessionId, SessionPosition, SharedKvBinding, SharedKvProposerConfig,
-    SpeculativeMode, TokenLogprob, WeightPlacementReport, XtcConfig, parse_device_policy,
-    parse_resource_limit,
+    DecisionSource, DevicePolicy, DevicePolicyParseError, DryConfig, Eagle3Config, Engine,
+    EngineConfig, EngineConfigError, EngineDecodeBackend, EngineGovernorError,
+    EngineResourceGovernor, FinishReason, GenerateConstraint, GenerateOptions, GeneratePrompt,
+    GenerateRequest, GenerateResult, GenerateToken, GenerateTokenCallback, GenerationBudgetCap,
+    KvConnectorBackend, KvConnectorConfig, LayerWeightBytes, LimitParseError,
+    MemoryPolicyApplication, MemoryStrategy, MemoryStrategyDecision, MemoryStrategyPlan,
+    MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource,
+    PrioritizedGenerateRequest, PrioritizedGenerateResult, RewindTokenCount, SamplingOverrides,
+    ScheduledGenerateArrival, SessionCheckpoint, SessionForkCapability, SessionId, SessionPosition,
+    SharedKvBinding, SharedKvProposerConfig, SpeculativeMode, TokenLogprob, WeightAccessPattern,
+    WeightPlacementReport, XtcConfig, parse_device_policy, parse_resource_limit,
 };
 pub use fim::{FimConfig, FimFormat};
 pub use logits::{
     Constraint, ConstraintProcessor, JsonConstraint, LogitProcessor, ProcessorChain,
     ProcessorChainBuilder, ProcessorContext, ProcessorSignal, StopSequence, TokenId,
+};
+pub use memory_authority::{
+    DeviceCompatibilityDomain, DeviceMemoryAuthority, MemoryAuthorityProvider,
 };
 #[cfg(feature = "native-backend")]
 pub use native_component::NativeComponentSession;
@@ -67,10 +78,12 @@ pub use onnx_genai_kv::{
 };
 pub use onnx_genai_metadata::GenerationDefaults;
 pub use onnx_genai_scheduler::{
-    GovernorReconfigureOutcome, GovernorSnapshot, ResourceLimit, ResourceLimits,
+    FixedCapacity, GovernorReconfigureOutcome, GovernorSnapshot, ResourceLimit, ResourceLimits,
+    resolve_limit,
 };
 #[cfg(feature = "native-backend")]
 pub use onnx_runtime_ep_cpu::set_decode_thread_budget as set_cpu_decode_thread_budget;
+pub use onnx_runtime_memory_governor::MappedGrowthMetrics;
 
 /// Executor phase costs from the native runtime, as `(phase, total_ns, calls)`.
 ///
@@ -156,7 +169,7 @@ pub use onnx_runtime_session::DecodePrecision;
 pub use pipeline::{
     ImageOutput, ImageRequest, ImageStep, ImageStepCallback, ImageStream, IterativeOverrides,
     PipelineEngine, PipelineGenerateRequest, PipelineSynthesis, PipelineTensors, Scheduler,
-    SchedulerFactory, SchedulerRegistry,
+    SchedulerFactory, SchedulerRegistry, validate_pipeline_backend_request,
 };
 pub use sampling::{CategoricalSampler, GreedySampler, Sampler};
 pub use speculative::{

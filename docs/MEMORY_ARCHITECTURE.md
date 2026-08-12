@@ -31,15 +31,920 @@ when in fact it is 1955 lines.
 | L4 ClusterCoordinator | §6 | **design only** | no type exists |
 | Lease contract | §1.1 | **implemented** | `crates/onnx-runtime-memory-governor` |
 | Allocator contract | §1.2, §1.3, §1.5 | **implemented on all three backends** | `onnx-runtime-memory-governor/src/allocator.rs`; CPU EP, ONNX Runtime and CUDA EP each implement it |
-| Virtual contiguity | §1.6 | **implemented; the CUDA allocator uses it; still opt-in** | `crates/onnx-runtime-virtual-memory`; `CudaVmmAllocator` in `onnx-runtime-cuda-memory` reserves one range and maps 2 MiB granules on demand, leasing each before it maps it. Opt-in via `ONNX_GENAI_CUDA_VMM`. **It has not earned the default**, and on Windows it is currently *worse*: `cuMemCreate` cannot exceed dedicated VRAM while `cudaMalloc` silently spills into WDDM shared memory, so enabling the arena can turn a working load into an OOM (#704). The KV cache still has no virtually contiguous layout (#656) |
-| Composability of the memory paths | — | **broken: 2 of 4 configurations fail to load** | The VMM arena, weight offload and the baseline do not compose. Measured on qwen2.5-14b int4: neither → 6.01 tok/s; arena only → OOM; offload only → double-counted budget (fixed by #707); both → 0.22 tok/s. Every A/B that toggled one of these compared a working configuration against a broken one (#704) |
-| Weight offload vs the OS | — | **27x slower than doing nothing** | WDDM demand-paging reaches 6.01 tok/s on a model that does not fit; our managed offload reaches 0.22. The largest known cause is stated only in a warning: *"weight offload is incompatible with CUDA graph capture; capture disabled"*. On a Windows consumer GPU a user is currently better off leaving offload off (#705) |
-| `--vram-limit` | — | **does not limit VRAM** | Bounds only the KV budget derivation. A 2 GB ceiling on a model needing ~15.5 GB still generates successfully, warning and proceeding. #712 proposes making it the single knob that also drives offload automatically |
+| Virtual contiguity | §1.6 | **implemented; managed no-spill VMM is the default for native CUDA (#755)** | `crates/onnx-runtime-virtual-memory`; `CudaVmmAllocator` in `onnx-runtime-cuda-memory` reserves one range and maps 2 MiB granules on demand, leasing each before it maps it. On native CUDA the authority-governed VMM/pool path is now selected **by default, without a flag** (#755): memory-strategy inference runs unconditionally (#752) and drives policy, so a plain `serve` gets managed **no-spill** mode and does not rely on WDDM shared-memory fallback. An explicit `serve --vram-limit <bytes>` now **overrides the inferred device budget** rather than being the trigger. When the resolved budget cannot hold the package weights the runtime **automatically enables weight streaming/offload** instead of failing, so being larger than the budget is a supported configuration; a model that fits stays `FullResident` and does **not** page. Failure to construct the required VMM arena/pool is fatal before model allocation and names both the requested limit and provider failure; it never silently falls back to ungoverned `cuMemAlloc`. The legacy allocator remains reachable for one release via `ONNX_GENAI_LEGACY_ALLOCATOR=1` (back-compat: `ONNX_GENAI_DYNAMIC_KV_WEIGHT_LENDING=0`), which restores the compatibility fallback. The resolved budget, chosen strategy and offload state are printed at startup and exposed in `/v1/resources` (`memory_strategy`). |
+| Composability of the memory paths | — | **authority-governed native path implemented** | The historical independent VMM and weight-offload toggles did not compose (#704). On native CUDA — by default under #755, or under an explicit byte limit — native CUDA constructs one authority before the allocator, charges the physical-handle pool once, registers reloadable weight residency explicitly, and admits KV/workspace growth transactionally. The compatibility path remains available through the legacy-allocator opt-out; performance parity with WDDM remains separate work. |
+| Weight offload vs the OS | — | **27x slower than doing nothing; cause identified 2026-08-06** | WDDM demand-paging reaches 6.01 tok/s on a model that does not fit; our managed offload path is far behind. The gap now has a named mechanism rather than a mystery: the residency cache never served a single weight without copying it (see the row below), so every decode step re-staged 7.33 GiB and paid 6,936 `cuMemAlloc`/`cuMemFree` pairs. Measured with CUDA events, that places **~39% of step time downstream of one eviction-policy defect** — `h2d_copy` 18.8%, `staging_fill` 9.0%, `vram_free` 9.0%, `vram_alloc` 2.3%. The remainder is not yet accounted for, and graph capture — worth **2.6x** in isolation, ranges non-overlapping — is disabled on **every** offload runffload reaches 0.22. The largest known cause is stated only in a warning: *"weight offload is incompatible with CUDA graph capture; capture disabled"*. On a Windows consumer GPU a user is currently better off leaving offload off (#705) |
+| `--vram-limit` | — | **override, not trigger; managed no-spill is the default (#755)** | Under #755 memory-strategy inference runs on every native CUDA load and selects managed no-spill by default; `--vram-limit` now **overrides** the inferred device budget rather than being what turns the managed path on. If package weights exceed the resolved budget, weight offload is enabled automatically and its allowance is derived as `budget − governed device state`; the same authority owns physical VMM handles, mapped weights, KV, and workspace. A 6 GiB qwen2.5-14b int4 live run loaded, generated the expected `Paris`, stayed at 5,534,384,128 owned bytes, rejected an 8K request pre-header with 429, and completed four queued short requests without overlap-only rejection. Crossing the first physical KV-growth boundary transferred 201,326,592 bytes through one grant and reported 201,326,592 mapped KV bytes; later governed capacity exhaustion returned 429 rather than 500/OOM. Managed initialization failure is an early arithmetic/provider error, while `ONNX_GENAI_LEGACY_ALLOCATOR=1` (back-compat `ONNX_GENAI_DYNAMIC_KV_WEIGHT_LENDING=0`) restores the prior non-VMM/WDDM-capable compatibility fallback. Limitation: the native server's FIFO per-request engine queue verified ordering and absence of overlap-only rejection, but did not demonstrate simultaneous live KV accumulation. Caveat carried, not closed: `activations_bytes=unknown` and `runtime_overhead_bytes=unknown` are not subtracted (#514). PRs #717, #736. |
+| Managed no-spill VMM default (#755) | — | **implemented; measured on native CUDA** | Memory-strategy inference selects the managed no-spill VMM path by default (no flag) on native CUDA, and auto-enables weight streaming when the resolved budget cannot hold the weights. Locked by the ignored live test `qwen2_5_0_5b_managed_vmm_default_e2e` (Qwen2.5-0.5B int4 mobius, same process): **(A)** default no flag → `strategy=FullResident`, `weight_offload_enabled=false`, `managed_no_spill=true`, resolved budget 7,730,940,928 bytes, committed 381,681,664 device bytes, **0 page-ins** (a fitting model does not start paging); **(B)** synthetic over-budget via an explicit 268,435,456-byte `--vram-limit` → `strategy=DynamicWeightResidency`, `weight_offload_enabled=true`, `managed_no_spill=true`, streaming engaged with **434 page-ins / 432 evictions**, committed bounded to 90,177,536 device bytes (« the cap — no WDDM spill), and at that extreme synthetic cap the residency arithmetic **refused cleanly** ("no page is evictable") rather than spilling; **(C)** `ONNX_GENAI_LEGACY_ALLOCATOR=1` → `managed_no_spill=false` (legacy allocator observable); **(D)** an explicit `--vram-limit` overrides the resolved device budget. Deterministic counters only; wall-clock omitted (this box ranged 3.9–28 tok/s across identical runs, and other agents build concurrently). A native large-model run that genuinely exceeds VRAM was not measured: `qwen14b-zp` lacks `inference_metadata.yaml` (#384), so the over-budget condition was synthesized with a small explicit budget, as noted. CUDA-graph segment count is not a public counter; capture-ON-under-offload on the stable-VA path is pinned by the #796 unit tests, not re-measured here. |
+| Weight residency cache (CUDA) | — | **had a 0% hit rate for its entire life; fixed 2026-08-06** | `evict_to_fit` was a plain LRU evicting from the least-recently-used end, while the decode weight walk is a **cyclic sequential scan** over the layers — the pessimal pairing, which returns the hit rate to zero at *every* capacity. Measured: **6,936 page-ins, 0 hits, at both 3 GB and 6 GB budgets**, with staged bytes identical (7,870,916,608 per step) because miss traffic under this pathology is invariant to capacity. Rivals eliminated on hardware: the budget knob works (peak resident 3.0 vs 6.0 GB) and staged bytes reconcile with `page_ins × page size`. A stable-resident-subset policy measures **74.18%** against a `B/W ≈ 76%` ceiling, page-ins 6,936 → 1,791, evictions 6,286 → **0**. #720, PR #723 |
+| KV page storage | — | **contract opened 2026-08-06; still host-only** | `onnx-genai-kv` implements paging, ref-counting/CoW, prefix sharing and quantization layout, and **never touched device memory**: storage was host `Vec`, `Device::Gpu(0)` a label on a struct field, and a tier migration one enum assignment moving zero bytes. Documented as a placeholder in `tiered.rs` from the start — the seam was designed in and the GPU backend behind it was never built. `PageTable` now holds `Box<dyn KvPageStore>` so a third party can supply a store without patching the crate; host stores expose slices, device stores expose an opaque span, and a host view of a device page requires explicit materialization. Stages 2–5 in #721. PR #726. Device KV paging is **not** owned by `onnx-genai-kv`: under the VMM design it is owned by the CUDA VMM layer (`CudaVmmAllocator`, the #740 physical-handle pool), with committed-granule admission (#745) and growth grants (#748). `native_decode/cuda.rs` still has no `PageTable`/`PagedKvCache` consumer, and `paged_gqa.rs` is a batch-1 CPU primitive. |
+| Captured graphs across a VMM remap | — | **verified on hardware 2026-08-06** | A CUDA graph instantiated before `cuMemUnmap`/`cuMemCreate`/`cuMemMap` at the same virtual address replays correctly afterwards and writes into the **new** physical pages — sentinel-proven, closing the page-recycling confound. The growth-shaped case passes, and one physical handle mapped at two virtual addresses is readable by captured work through either. Untested and treated as unsafe: unmapping while a replay is in flight. `cuMemMap` during capture returns `CUDA_SUCCESS` but is **not** proven replayable, so growth is issued outside the captured segment. This is the premise under #721 stage 4 and under re-scoping #716, and its stated falsifier did not fire. PR #727 |
 | Activation planning | — | **wired for measurement; not yet allocating** | `crates/onnx-runtime-memory` now has a consumer: the session executor builds a `ViewMap`, runs the planner, and reports peak vs naive. Measured 2.4x-2.7x on qwen2.5-0.5b, though see #671 for a review finding that may inflate that. Sharing slots for real is #670 |
 | Native KV page size | — | **wrong unit** | `governor_kv_config` puts a token count in `page_size_bytes` when the geometry is unknown, so the native `bytes_per_token` is 1 (#628) |
 | Governor integration, server path | — | **fixed 2026-08-06** | `/metrics` reported `vram_used_bytes = 0` while a 14B was loaded and generating, because the server read the scheduler's `ByteBudget` rather than the engine's lease ledger. Admission therefore saw a permanently empty card and never applied back-pressure: 16 concurrent requests cost **12.8x** the wall clock of 8, with zero rejections. Fixed in #711 (16-concurrent 472.8 s → 126.4 s median); the tail is still bad (#706) |
 | Prefix reuse | — | **implemented and measured** | The one part of this document with an unambiguous end-to-end win. On qwen2.5-0.5b with a 5,122-token shared prefix, a warm request prefilled **9 tokens instead of 5,131** and TTFT fell from 137,850 ms to **2,758 ms** — a 44x reduction. Served by native-session KV rewind; the recurrent-state snapshots of #650/#672 are a separate path that native CUDA does not currently hit (`lookups=0`). Confirmed on the HTTP server too: hit rate **0.9886** across a concurrency sweep |
 | Paged attention (vLLM-style) | — | **not built, and not the plan** | Verified against the tree: `block_table` does not appear in any CUDA attention kernel. `GroupQueryAttention` takes `past_key`/`past_value` as ordinary contiguous tensors and `CompressedSparseAttention` reads a flat pointer with a computed stride, so there is no input through which a page index could be passed. Making every kernel walk a block table cannot be made uniform across backends — we do not own ORT's kernels — so vAttention-style commit-on-demand under a contiguous virtual range is the chosen route instead (#656) |
+
+### CUDA raw allocation audit (#736, 2026-08-10)
+
+Updated through #736 (default-domain `Attention` staged K/V) on 2026-08-12.
+
+Scope: production code in `crates/onnx-runtime-ep-cuda`,
+`crates/onnx-runtime-session`, and CUDA kernel launch support. Test-only
+`alloc_raw` calls under `#[cfg(test)]` are excluded. The only direct `cuMemAlloc`
+entry point in this scope remains `CudaRuntime::alloc_raw`
+(`crates/onnx-runtime-ep-cuda/src/runtime.rs:898`); the replaceable
+`CudaDeviceAllocator`/VMM allocator path is the EP allocation authority seam, not
+a kernel scratch bypass. `crates/onnx-runtime-session` has no CUDA raw allocation
+call; it owns the governed workspace preparation path
+(`executor/bindings.rs:16`, `executor/dispatch.rs:1538`).
+
+| file/line | owner | byte formula | size source | lifetime class | status |
+|---|---|---|---|---|---|
+| `kernels/attention.rs:830-831` | legacy `Attention` Phase-2a scores + cuBLASLt workspace | `align256(batch * num_heads * sq * sk * elem_size) + WORKSPACE_BYTES` | prompt/cache dependent score matrix + static cuBLASLt ceiling | step-scoped | **governed by #753** inside one composite workspace; direct-execute compatibility/opt-out fallback remains raw |
+| `kernels/csa_checkpoint.rs:126` | CSA checkpoint main carry snapshot | `main_carry_bytes.max(1)` | config/state shape | session-persistent | raw bypass |
+| `kernels/csa_checkpoint.rs:127` | CSA checkpoint index carry snapshot | `index_carry_bytes.max(1)` | config/state shape | session-persistent | raw bypass |
+| `kernels/csa_device_state.rs:160` | CSA device-state allocation/growth | `size` | config/state shape | session-persistent | raw bypass |
+| `kernels/csa_device_state.rs:169` | CSA device-state replacement | `size.max(1)` | config/state shape | session-persistent | raw bypass |
+| `kernels/elementwise.rs:699` | elementwise scalar/shape metadata upload | `metadata_bytes.len()` | op arity/rank | step-scoped | raw bypass |
+| `kernels/fused_gemm.rs` | fused GEMM cuBLASLt workspace | selected heuristic `workspaceSize` (ceiling `WORKSPACE_BYTES`) | shape/dtype/algorithm dependent | session-persistent shared peak | **governed by #799** via the shared exact plan/execute helper + prepared workspace |
+| `kernels/gemm.rs` | GEMM cuBLASLt workspace | selected heuristic `workspaceSize` (ceiling `WORKSPACE_BYTES`) | shape/dtype/algorithm dependent | session-persistent shared peak | **governed by #799** via the shared exact plan/execute helper + prepared workspace |
+| `kernels/group_query_attention.rs` `workspace_requirement`, scores region carved at `:2774` (`WS_SCORES` region) | `GroupQueryAttention` f32 reference score buffer | `batch * num_heads * sq * present_capacity * sizeof(f32)` | prompt/cache dependent (`sq * present_capacity`) | session-persistent | **governed by #795** via `workspace_requirement` + prepared workspace, reserved only on the f32 reference path (now the score region of the #736 composite) |
+| `kernels/group_query_attention.rs` `workspace_requirement` (packed Q/K/V staging region) | `GroupQueryAttention` packed QKV-projection staging | `align256(B·sq·num_heads·head_dim·elem) + 2·align256(B·sq·kv_num_heads·head_dim·elem)`, only when a packed QKV tensor is split | prompt-dependent (`sq`), elem = `dtype.byte_size()` (f32=4, f16/bf16=2) | session-persistent | **governed by #736** via `workspace_requirement` + prepared composite workspace, sized through the shared `gqa_workspace_layout`/`gqa_packed_staging_bytes` helpers; reserved only on the packed-input split route, `NONE` when Q/K/V arrive separately |
+| `kernels/group_query_attention.rs` `gqa_transpose_scratch` + `gqa_workspace_layout` (`WS_Q_BNSH` / `WS_OUT_BNSH`) | `GroupQueryAttention` Q/output BNSH transpose scratch | Q: `align256(B·sq·num_heads·head_dim·elem)` when `sq>1`, packed input, or RoPE; output: the same aligned bytes only when `sq>1` | prompt/dtype/route dependent | session-persistent | **governed by #736** in the existing GQA composite; unpacked non-RoPE `sq==1` uses Q/output directly and charges `NONE` absent another region; packed `sq==1` overlays Q extraction with packed-Q staging |
+| `kernels/group_query_attention.rs` `GqaWorkspace::reserve` | `GroupQueryAttention` remaining pooled slots (present K/V / metadata) | slot-specific `bytes.max(1)` | cache/batch dependent, then reused | session-persistent growable state | raw bypass; scores, packed Q/K/V staging, and BNSH transpose slots are excluded — carved from the prepared composite on governed execution |
+| `kernels/index_share.rs:708` | `pkg.nxrt::IndexShare` selected-token attention workspace | aligned sum of reachable present staging, `B * q_heads * q_seq * selected_width * 4`, and optional `2 * B * sizeof(i64)` | prompt/cache dependent | session-persistent | **governed by #751** via `workspace_requirement` + prepared workspace |
+| `kernels/index_transform.rs:150` | index-transform metadata | `bytes.len()` | op/rank/config | step-scoped | raw bypass |
+| `kernels/indexing.rs:410` | indexing metadata | `bytes.len().max(1)` | op/rank/config | step-scoped | raw bypass |
+| `kernels/matmul.rs:222` | f32 `M=1` MatMul cached-plan workspace | selected heuristic `workspaceSize` | shape/algorithm dependent | session-persistent cached plan scratch | raw bypass; separate from #799's shared non-GEMV path |
+| `kernels/matmul.rs` | MatMul cuBLASLt workspace (non-GEMV routes only) | selected heuristic `workspaceSize` (ceiling `WORKSPACE_BYTES`) | shape/dtype/algorithm dependent | session-persistent shared peak | **governed by #799**; f32/fp16 `M=1` GEMV routes report `NONE` |
+| `kernels/matmul_nbits.rs:3599` | `MatMulNBits` accuracy-4 decode activation quantization | `padded_k + (padded_k / block_size) * sizeof(f32)` | model config (`K`, `block_size`) | model-lifetime fixed scratch | raw bypass |
+| `kernels/matmul_nbits.rs:3980` | `MatMulNBits` f32 dequantized weight fallback | `K * N * 4` | model config (`K`, `N`) | step-scoped/prefill fallback | raw bypass |
+| `kernels/matmul_nbits.rs` | `MatMulNBits` f32 cuBLASLt workspace | selected heuristic `workspaceSize` (ceiling `WORKSPACE_BYTES`) | shape/dtype/algorithm dependent | session-persistent shared peak | **governed by #799**; direct GEMV/tiled routes report `NONE` |
+| `kernels/matmul_nbits.rs:4425` | `MatMulNBits` RMSNorm prefill activation scratch | `M * K * sizeof(f16)` | prompt-dependent (`M`) and model config (`K`) | request/prefill-dependent | raw bypass |
+| `kernels/matmul_nbits.rs:4942` | `MatMulNBits` decomposed SiLU scratch | `output.byte_size()` | output shape/prompt dependent | step-scoped | raw bypass |
+| `kernels/matmul_nbits.rs:5200` | `MatMulNBits` gate/up RMSNorm prefill scratch | `M * K * sizeof(f16)` | prompt-dependent (`M`) and model config (`K`) | request/prefill-dependent | raw bypass |
+| `kernels/mod_op.rs:222` | Mod metadata | `metadata_bytes.len().max(1)` | op/rank/config | step-scoped | raw bypass |
+| `kernels/movement.rs:239` | movement op metadata | `bytes.len()` | op/rank/config | step-scoped | raw bypass |
+| `kernels/nary.rs:264` | N-ary fp32 scratch | `n * sizeof(f32)` | output element count | step-scoped | raw bypass |
+| `kernels/nary.rs:271` | N-ary metadata | `metadata_bytes.len().max(1)` | op arity/rank | step-scoped | raw bypass |
+| `kernels/nonzero.rs:99` | NonZero strides metadata | `bytes.len()` | input rank | step-scoped | raw bypass |
+| `kernels/normalization.rs:1563` | normalization metadata | `metadata_bytes.len()` | op/rank/config | step-scoped | raw bypass |
+| `kernels/packed_varlen_attention.rs:581` | packed-varlen metadata | `bytes.max(1)` | batch/sequence metadata | step-scoped | raw bypass |
+| `kernels/pad.rs:292` | Pad metadata | `metadata.len()` | rank/pads config | step-scoped | raw bypass |
+| `kernels/pooling.rs:538` | pooling metadata | `bytes.len()` | rank/kernel config | step-scoped | raw bypass |
+| `kernels/qlinear_matmul.rs:299` | QLinearMatMul metadata | `bytes.len()` | rank/quantization params | step-scoped | raw bypass |
+| `kernels/qmoe.rs:1956` | legacy QMoE pooled scratch | slot-specific `bytes` | prompt/expert dependent | session-persistent growable scratch | raw bypass; separate from governed `BlockQuantizedMoE` path |
+| `kernels/reduce.rs:711` | reduce base shape metadata | `base_bytes.len().max(1)` | rank/config | step-scoped | raw bypass |
+| `kernels/reduce.rs:712` | reduce delta shape metadata | `delta_bytes.len().max(1)` | rank/config | step-scoped | raw bypass |
+| `kernels/reduce.rs:720` | reduce axes metadata | `axes_bytes.len().max(1)` | rank/axes config | step-scoped | raw bypass |
+| `kernels/resize.rs:259` | Resize metadata | `bytes.len()` | rank/scales/sizes config | step-scoped | raw bypass |
+| `kernels/standard_attention.rs:633,777` (`std_attention_workspace_layout` / `workspace_requirement`), selected at `:1690-1766` | default-domain `Attention` f32 scores + staged dense K/V composite | scores `batch * q_heads * q_seq * total_seq * sizeof(f32)` on every route; staged key/value, when reachable, each `batch * kv_heads * present_seq * head_dim * element_bytes`, with 256-byte region alignment | prompt/cache/route dependent | step-scoped on per-call prefill/batched dense growth; session-persistent on capture-eligible single-token dense growth | **governed by #736** through one shared plan/execute layout; fixed-capacity append, no-past, and missing present-output routes add **zero** staged-K/V bytes (the always-live scores remain); direct-`execute` compatibility keeps self-owned scratch |
+| `kernels/standard_attention.rs:1780,1799-1803` | default-domain `Attention` capture/eager control metadata | device valid length `sizeof(i32)`; offsets + pad limits `2 * batch.max(1) * sizeof(i64)` | batch dependent, negligible | step-scoped on eager calls; retained for capture-eligible decode | raw bypass; staged K/V and scores are excluded and governed by #736 |
+| `kernels/varlen_attention.rs:531` | varlen attention metadata buffer | `bytes.max(1)` | batch/sequence metadata | step-scoped | raw bypass |
+| `kernels/where_op.rs:123` | Where metadata | `metadata_bytes.len()` | broadcast rank/config | step-scoped | raw bypass |
+| `runtime.rs:391` | capture-error latch | `sizeof(u32)` | static | session-persistent | raw bypass |
+| `weight_paging.rs:377` | lazy weight page upload | `bytes.len()` | weight tensor storage | already-governed tensor/output allocation? no; weight paging has separate residency accounting | session-persistent until page eviction |
+| `weight_paging.rs:424` | async lazy weight page upload | `bytes.len()` | weight tensor storage | weight residency/page lifetime | governed by weight residency budget, not workspace contract |
+| `weight_paging.rs:479` | staged async lazy weight page upload | `len` | weight tensor storage | weight residency/page lifetime | governed by weight residency budget, not workspace contract |
+| `weight_paging.rs:643` | multi-region lazy QMoE weight binding | `weight.region_bytes_len()` | weight tensor storage | weight binding/page lifetime | governed by weight residency budget, not workspace contract |
+
+#751 governs the `IndexShare` slice — routing it through
+`Kernel::workspace_requirement`, prepare-only planning, `reserve_workspace`, and
+`MappedGrowthGrant` rather than a kernel-owned raw scratch pool. `IndexShare` is
+a real but **low-byte** governed slice, not the largest live bypass in this
+table. Before #751, its two `present_key`/`present_value` staging segments (the
+largest part of the reservation) were reserved but unused on the common
+three-output decode path, where present K/V is written directly to output
+tensors. #751 now threads the static output arity through the shared layout
+helper: the three-output path reserves only scores (and optional frontier
+metadata), while the one-output path retains staging because execution uses it
+(`kernels/index_share.rs:603-631`, `:867-910`). In decode `q_seq == 1` with a
+sparse `selected_width`, so the live bytes are small. `IndexShare` is also a
+`pkg.nxrt` custom op used only by GLM/DSA sparse-attention families, so it is not
+on the hot path for dense models (#751).
+
+The **`GroupQueryAttention` `WS_SCORES` slot** is governed by #795: the f32
+reference-attention score buffer — `batch * num_heads * sq *
+present_capacity * sizeof(f32)`, quadratic in `sq * present_capacity` and the
+largest remaining live GQA scratch — now routes through
+`Kernel::workspace_requirement` (reporting the exact bytes), prepare-only
+planning, and a prepared workspace consumed by `execute_with_workspace`. Planning
+and execution size the reservation through the **same** `gqa_reference_scores_bytes`
+helper, so they cannot drift; a shortfall errors deterministically rather than
+under-allocating. Because `sq * present_capacity` is prompt-dependent, the
+executor grows the session-persistent slot transactionally through a
+`MappedGrowthGrant` against the device authority, and capacity refusal surfaces
+as the pre-header **429** typed path (`TierExhausted` / `CapacityUnavailable`,
+#743) rather than a late 500/OOM. The compatibility/opt-out path (no
+executor-prepared workspace) keeps its self-owned pooled scratch.
+
+**Lifetime, and why it differs from Attention Phase-2a (#753).** GQA's slot
+allocator grows each slot to the largest geometry seen and **retains** it across
+decode/prefill steps — a standing claim held for the whole session — so
+`WS_SCORES` is charged as `WorkspaceLifetime::SessionPersistent`, not the
+`StepScoped` lifetime Phase-2a's per-call scratch used. A graph mixing QMoE,
+IndexShare, Attention Phase-2a (step-scoped) and GQA (session-persistent) now
+exercises both per-lifetime-class peaks; the two classes are reserved into
+separate executor slots so neither peak stands in for the other.
+
+**Over-reservation finding (the #751 defect class).** `WS_SCORES` is materialized
+on **exactly one** GQA route: the f32 *reference* path, reached only when
+`!use_fused && query dtype == f32 && !gqa_decode::supported(q_seq, head_dim)`
+(i.e. f32 prefill `Sq > 1`, or f32 `head_dim > 128`). The fused-flash path, the
+capture-safe f32/fp16 split-K decode kernels, and the phase-2a path **never
+allocate a device score matrix** — they stream softmax through registers/shared
+memory, and phase-2a owns its own scratch. Reserving `WS_SCORES`
+unconditionally would therefore charge the device authority for bytes the common
+fp16 decode path never touches — the same defect #751 found in IndexShare's
+present K/V staging. The governed reservation threads that static signal (query
+dtype + `gqa_decode::supported`) through the shared helper and reports
+`WorkspaceRequirement::NONE` on every fp16/bf16 path and every f32 *decode* path,
+so those charge **zero**. The only residual conservative reservation is f32
+prefill that dynamically fuses on a short (`valid_seq ≤ 128`) sequence: the fused
+win is a runtime measurement, so planning reserves to never under-allocate, and
+that path (a fallback of a fallback) idles the buffer rather than corrupting.
+Derived bytes: `B=1, H=32, Sq=1024, present_capacity=1024, f32` ≈ **128 MiB** on
+the reference path; **0 bytes** on fp16 decode/prefill and f32 decode.
+
+#799 governs the cuBLASLt GEMM follow-up. The initial hypothesis — one fixed
+32 MiB session-persistent allocation — was conservative but still
+over-reserved: `WORKSPACE_BYTES` is only
+`CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES`, while the selected algorithm exposes
+its actual `workspaceSize`. On the RTX 4060 Laptop GPU regression shapes,
+standard `MatMul`, `Gemm`, `MatMulNBits`, `FusedMatMulBias`, and most
+`FusedGemm` cases selected **0 bytes**; the largest observed selection was
+**96 bytes** (`FusedGemm`, transposed operands). Planning and execution now use
+the same cuBLASLt plan helper and reserve the exact selected size, with a
+deterministic error if execution ever selects more than the prepared slot.
+
+The four newly governed kernel families share one **session-persistent peak**,
+not four node reservations: on the measured shapes that is 96 bytes instead of
+`4 * 32 MiB` (saving **134,217,632 bytes**, ≈128 MiB). Including the already
+governed Attention Phase-2a workspace, the five-site naive accounting would be
+160 MiB; measured planned cuBLASLt scratch is `32 MiB + 96 bytes`, the same
+**134,217,632-byte logical-reservation saving**. Under the managed VMM's 2 MiB
+physical granule, the 96-byte peak commits one granule, so the five-site physical
+total is 34 MiB rather than 160 MiB — **132,120,576 bytes (126 MiB) saved**.
+Attention is intentionally not folded into the persistent slot: its 32 MiB
+region is live concurrently with its score matrix inside one step-scoped
+composite buffer, while direct `execute` must retain the compatibility/opt-out
+raw fallback. The executor therefore shares exactly where the lifetimes and
+interface permit, rather than falsifying attribution to reach a nominal
+one-buffer result.
+
+#### Governed by #736: default-domain `Attention` f32 scores
+
+The largest evidenced non-QMoE score bypass after #795/#799 is now governed:
+`standard_attention.rs` (`workspace_requirement` at `:614`, consumed at `:1480`).
+Every default-domain `Attention` dispatch materializes
+`batch * q_heads * q_seq * total_seq * sizeof(f32)` scores in device memory
+(`attention_row` stages the row scores in global memory for softcap/mask/softmax/
+`probs·V`, in fp32 regardless of the f32/f16/bf16 operand dtype). At
+`B=1, H=32, q_seq=total_seq=2048` that is **512 MiB** — larger than the
+already-governed Phase-2a range (#753). It now routes through
+`Kernel::workspace_requirement`, prepare-only planning, and a prepared workspace
+consumed by `execute_with_workspace`; planning and execution size the reservation
+through the **same** `std_attention_scores_bytes` helper, so they cannot drift,
+and a shortfall errors deterministically rather than under-allocating. Capacity
+refusal surfaces as the pre-header **429** typed path (`TierExhausted` /
+`CapacityUnavailable`, #743) via `MappedGrowthGrant` (#748) against the device
+authority. The compatibility/opt-out path (direct `execute`, no
+executor-prepared workspace) keeps its self-owned scratch — pooled on the
+capture-eligible route, per-call otherwise.
+
+**Negative result — no route reports `NONE` (genuine use, unlike #751/#795).**
+`attention_row` has **no** shared-memory/flash route: it always stages the score
+matrix in global memory, so — unlike GQA's f32-reference-only `WS_SCORES` (#795)
+or the fused Attention prefill path (#753) — *every* valid dispatch materializes
+and reserves the fp32 scores; only unresolvable or non-float input metadata
+reports `NONE` (execution then raises the precise error). This is recorded so the
+next reader does not re-investigate expecting a route that charges zero.
+
+**Both lifetime classes, modelled truthfully.** The score matrix is
+route-dependent: a single-token decode (`batch == 1 && q_seq == 1`) is the only
+shape that can take the capture-eligible pooled route whose buffer is retained
+across steps, charged `WorkspaceLifetime::SessionPersistent` (small: linear in
+`total_seq`, ~256 KiB at the example shape); every multi-token prefill (the
+512-MiB-class quadratic worst case) and batched dispatch takes the per-call route
+whose scratch is freed on each exit, charged `WorkspaceLifetime::StepScoped`.
+Prepare-only planning reserves each class into its own executor slot (#753), so a
+graph mixing them governs both. The classifier keys the split on static input
+metadata (`batch`, `q_seq`), a conservative proxy for capture eligibility; the
+frozen fixed-capacity decode path over-estimates `total_seq` by the padding rows,
+which is safe (reserve ≥ consume) since execution re-derives the exact size
+through the same helper and refuses on any shortfall.
+
+**Over-reservation found: none.** The only sibling bypass — the staged-K/V and
+capture-metadata slots (`:702,1396`) — is a genuinely different lifetime/geometry
+from the scores and did not fall out of this change, so it is left raw and
+tracked as the next candidate below.
+
+#### Governed by #736: `GroupQueryAttention` QKV-projection staging
+
+With the three quadratic score matrices governed (Phase-2a #753, GQA `WS_SCORES`
+#795, default-domain `Attention` #736), the largest remaining evidenced non-QMoE
+workspace bypass — the **`GroupQueryAttention` packed QKV-projection staging** —
+is now governed. When Q/K/V arrive **packed** (both key/value inputs absent), the
+unfused prep path splits the interleaved `[B, S, (H + 2·Hkv)·D]` query tensor
+into three device staging buffers before the BSH→BNSH transpose and cache append.
+Those buffers cost
+`align256(B·sq·num_heads·head_dim·elem) + 2·align256(B·sq·kv_num_heads·head_dim·elem)`,
+with `elem = dtype.byte_size()` (f32=4, f16/bf16=2). They now share the GQA
+session-persistent composite workspace with the #795 `WS_SCORES` region: the
+executor reserves one slot per lifetime class and hands the kernel one view, and
+the f32 *reference prefill* route needs both the staging and the score matrix
+live at once, so they occupy disjoint regions of the same reservation. The
+staging regions come first (offsets depend only on shape metadata, so planning
+and execution agree exactly); the capacity-dependent score matrix is last and
+unpadded, so its exact geometry extends into the reserved peak without perturbing
+the staging offsets, and the composite total equals exactly the score bytes when
+no staging is present (preserving the #795 accounting). Planning
+(`workspace_requirement`) and execution (`execute_with_workspace` → the split
+branch of `run`) size every region through the **same**
+`gqa_workspace_layout`/`gqa_packed_staging_bytes`/`gqa_reference_scores_bytes`
+helpers, and `gqa_carve` refuses a short view deterministically rather than
+under-allocating. Growth, 429 refusal (`TierExhausted`/`CapacityUnavailable`,
+#743 via `MappedGrowthGrant` #748) and the self-owned compatibility/opt-out
+pooled fallback behave exactly as for `WS_SCORES`.
+
+**Lifetime — session-persistent, verified against code, not the table.** The
+staging buffers are reserved from the same `GqaWorkspace` slot allocator that
+grows each slot to the largest geometry seen and **retains** it across
+decode/prefill steps (`group_query_attention.rs:1191`), so — like `WS_SCORES` —
+the composite is charged `WorkspaceLifetime::SessionPersistent`, a single class
+(the audit table's "session-persistent growable scratch" is correct here; unlike
+the default-domain `Attention` scores — whose lifetime is route-dependent and
+needed both classes modelled — this lifetime is **not** route-dependent, so one
+class models the truth).
+
+**Over-reservation found (the #751 defect class).** Staging is materialized on
+**exactly one** family of routes — a *packed* QKV tensor split on the unfused
+prep path (`packed_qkv && !fuse_prep`). Two evidenced routes charge **zero** for
+it:
+
+- **Unpacked inputs** (Q/K/V arrive as three separate tensors) never split, so
+  `want_staging` is false and the staging regions are zero-length. This is the
+  primary "size from use" finding: the pre-#736 pooled allocator would grow
+  `WS_PACKED_Q/K/V` on any path that reached `reserve`, but the separate-input
+  route writes Q/K/V straight through and touches none of them.
+- **fp16/bf16 fused decode** (`q_seq == 1` with an aliased device KV cache) fuses
+  the prep into the decode kernel and never splits. Because that fusion is a
+  runtime pointer comparison (`fuse_prep` aliases the present cache), it is
+  **not** visible at planning time, so planning conservatively reserves staging
+  for every packed dispatch; on fused decode the reserved region is tiny
+  (`q_seq == 1`) and left untouched rather than corrupting. Every packed
+  *prefill* genuinely splits, so this is a fallback-of-a-fallback idle, not the
+  common case.
+
+The requirement therefore reports `WorkspaceRequirement::NONE` when neither
+staging nor the f32 reference scores are needed (e.g. an unpacked-input fp16/bf16
+dispatch), charging the device authority nothing.
+
+**Derived bytes.** At `B=1, num_heads=32, head_dim=128` (so `q_hidden=4096`),
+`kv_num_heads=8` (`k_hidden=1024`), `sq=1024`: f32 packed prefill stages
+16 MiB (Q) + 2·4 MiB (K,V) = **24 MiB**, plus the ~128 MiB f32 reference score
+region when that route is taken; fp16/bf16 packed prefill halves the staging to
+**12 MiB** and charges **0** scores; unpacked-input and fused-decode routes charge
+**0** for staging.
+
+#### Governed by #736: `GroupQueryAttention` BNSH transpose scratch
+
+The `WS_Q_BNSH` and `WS_OUT_BNSH` roles now join the existing GQA prepared
+composite. Planning and execution both call `gqa_transpose_scratch` and
+`gqa_workspace_layout`; `gqa_carve` rejects a short prepared view instead of
+falling back to an invisible allocation. Direct `Kernel::execute` remains the
+compatibility/opt-out path and retains self-owned pooled slots.
+
+**Route result — partial over-reservation, not a blanket decode `NONE`.**
+`Sq==1` makes the BSH↔BNSH index transform an identity, and output already
+writes directly to BSH, so `WS_OUT_BNSH` is genuinely needed only for
+multi-token routes. Query has two additional roles beyond transpose:
+
+- unpacked, non-RoPE `Sq==1` reads the input Q directly and now charges zero for
+  both transpose regions (and reports `WorkspaceRequirement::NONE` when staging
+  and scores are also absent);
+- unpacked RoPE decode needs one writable Q copy, so its query bytes are
+  genuine even though the transpose itself is an identity;
+- packed decode must extract Q. Fused prep writes that extraction into the Q
+  region; unfused prep consumes/rotates packed-Q staging in place. The layout
+  overlays those mutually-exclusive `Sq==1` roles instead of summing them;
+- every `Sq>1` route needs both Q BSH→BNSH and output BNSH→BSH buffers.
+
+Seq-major BSNH changes only KV-cache physical strides; all attention consumers
+still take Q/output in BNSH internally, so it removes neither transpose.
+
+**Lifetime — session-persistent, verified from `GqaWorkspace`.** The old
+`WS_Q_BNSH`/`WS_OUT_BNSH` slots grew to the largest geometry and were retained
+by the kernel across calls. The governed replacement therefore stays in the
+same `WorkspaceLifetime::SessionPersistent` class as the other GQA composite
+regions; capture, success, error, and cancellation release remain owned by the
+executor's prepared-workspace grant.
+
+**Derived bytes (not measured).** For `B=1, H=32, head_dim=128, sq=1024`,
+Q and output each cost 16 MiB f32 or 8 MiB fp16/bf16, so transpose scratch is
+**32 MiB f32** or **16 MiB fp16/bf16**. At `sq=1`, unpacked non-RoPE costs
+**0**; unpacked RoPE costs 16 KiB f32 or 8 KiB fp16/bf16 for Q only. These are
+derived from `dtype.byte_size()` and the code formula, not allocator telemetry.
+
+#### Default-domain `Attention` staged K/V result
+
+`standard_attention.rs` `WS_STAGE_KEY` / `WS_STAGE_VALUE` are now regions of the
+existing governed default-domain `Attention` composite. Dense aliased growth is
+genuine use: `build_kv` changes the per-head stride from `past_seq` to
+`total_seq`, so it must rebuild into disjoint key/value buffers before copying
+back. Planning and execution size those regions through
+`std_attention_workspace_layout`; a prepared-slot shortfall errors
+deterministically rather than falling back to `alloc_raw`.
+
+**Route result — genuine on dense alias, zero on fixed append.** The prior
+allocator did not allocate these slots unnecessarily; `stage_key` /
+`stage_value` were already runtime-conditional. The governance risk was
+introducing a new unconditional reservation. The static classifier preserves
+the split: mask-driven non-causal routes whose mask width equals the physical
+past-cache capacity, no-past, and absent present-output routes add **zero**
+staging bytes; dense in-op-cache routes reserve only present outputs that exist.
+The composite itself is not `NONE`
+because this kernel always materializes fp32 scores — “zero” here is the staged
+K/V component, not the independently genuine score region.
+
+**Lifetime — both classes, verified from use.** Dense `B=1, Sq=1` growth is
+capture-eligible and previously retained `WS_STAGE_KEY` / `WS_STAGE_VALUE` in
+`StdAttnWorkspace`, so its governed composite is
+`SessionPersistent`. Multi-token or batched dense growth allocated owned
+per-call buffers and freed them on success or error, so it is `StepScoped`.
+Executor-owned prepared slots now preserve those same release boundaries,
+including cancellation. Direct `execute` remains the compatibility/opt-out path
+with self-owned scratch.
+
+**Derived bytes (not measured).** Each staged region is
+`B · Hkv · present_seq · head_dim · element_bytes`; both K and V are live
+simultaneously. At `B=1, Hkv=8, present_seq=2048, head_dim=128`, staging is
+**16 MiB f32** or **8 MiB fp16/bf16** total for K+V, plus at most 255 bytes of
+alignment before each region. Fixed-capacity append is **0 staged bytes**.
+
+#### Next slice (chosen from this table): `MatMulNBits` f32 dequantized weights
+
+The next evidenced non-QMoE bypass is the general/grouped
+`MatMulNBits` fallback at `matmul_nbits.rs:3986`: it allocates
+`K · N · sizeof(f32)` bytes, dequantizes the packed weight, uses it for one
+cuBLAS GEMM, synchronizes, and frees it. This is a model-dimension-sized
+step-scoped allocation already adjacent to the #799 governed cuBLAS workspace
+contract, and it is route-dependent: direct GEMV and tuned accuracy-4 tiled
+routes return before the allocation. Derived examples are **64 MiB** at
+`K=N=4096` and **172 MiB** at `K=4096, N=11008`.
+
+### KV layout and residency
+
+This is the single authoritative home for KV layout, VMM geometry, residency,
+and the measurements behind the design. Investigation notes link here rather
+than copying conclusions, following the anti-staleness rule established in
+#781.
+
+**Status, as of 2026-08-11:**
+
+- **Implemented:** head-major BNSH remains the default. PR #782 landed the
+  seq-major BSNH fused fp16 single-token decode append/read pair, and #792
+  replaced its layout enum with a symbolic stride descriptor and static
+  per-layout NVRTC specialization. Flash prefill now uses the same descriptor
+  for cache preparation and reads, enabling full seq-major prefill + fp16
+  decode generations when the fused-flash shape gate applies. Unsupported
+  readers and writers still fail rather than silently mis-index. The engine KV
+  *growth byte geometry* is now layout-faithful (bsnh-fixed-stride): under
+  in-place VMM growth a seq-major buffer grows on its capacity-independent
+  `kv_heads × head_dim` stride and moves **0** KV bytes, measured end to end on a
+  real model (see "KV layout and residency" below). The BNSH binding *metadata*
+  shape is retained deliberately for both layouts — the GQA node and
+  `DeviceIoBinding` require it — so seq-major lives in the byte geometry, not a
+  permuted shape. Process-isolated end-to-end capture measurement also shows
+  that fixed stride alone does **not** yet remove growth re-capture: the current
+  engine explicitly invalidates the graph on every KV bucket growth for both
+  layouts.
+- **Measured, not implemented:** token-major across all layers. Its residency
+  floor and 192 KiB-stride read cost were measured in #787, but no production
+  kernel or binding layout uses it.
+- **Proposed, in progress:** make layout selection a per-EP, per-platform
+  capability (#783). Binding views, layout negotiation, prefix multi-map,
+  staggering, and commit-ahead policy described below remain design intent,
+  not present-tense capabilities.
+
+#### Governing rule: layout controls residency
+
+`cuMemMap` maps a whole granule-aligned **window** of virtual address space onto
+a whole physical granule. Partial mapping does not exist:
+
+```
+VA: |<------ granule ------>|<------ granule ------>|<------ granule ------>|
+       window 0                 window 1                 window 2
+       mapped or not            mapped or not            mapped or not
+
+committed bytes = granule × (number of windows containing at least one live byte)
+```
+
+The allocator cannot compact live bytes that the tensor layout scattered across
+VA windows. This is the same unsurprising behavior as a sparse file: writing one
+byte at offsets 0, 1 MiB, and 2 MiB can consume three filesystem blocks for
+three live bytes. Nothing is malfunctioning; the placement selected three
+allocation units.
+
+In the diagrams below, `X` is live KV, `.` is reserved but not live, and each
+bracketed span is one physical-mapping window.
+
+**Head-major BNSH scatters one live prefix per head stripe:**
+
+```
+one layer-side buffer, four heads shown:
+
+ head 0              head 1              head 2              head 3
+|X.................|X.................|X.................|X.................|
+[==== window 0 ====][==== window 1 ====][==== window 2 ====][==== window 3 ====]
+      COMMIT               COMMIT               COMMIT               COMMIT
+
+Four tiny live fragments open four complete physical windows.
+```
+
+Each head owns its full `max_seq × head_dim` stripe. Across the model, the
+near-empty floor is therefore `layers × 2 × kv_heads` windows.
+
+**Seq-major BSNH is dense within each buffer, but K and V remain separate for
+every layer:**
+
+```
+one layer-side buffer:
+
+|XXXXXXXX........................................................|
+[==== window 0 ====][==== window 1 ====][==== window 2 ====]
+      COMMIT              unmapped              unmapped
+
+all layer-side buffers:
+
+layer 0 K: [X...][ ][ ]  COMMIT
+layer 0 V: [X...][ ][ ]  COMMIT
+layer 1 K: [X...][ ][ ]  COMMIT
+...
+layer 47 V:[X...][ ][ ]  COMMIT        (96 independent buffers on qwen14b)
+```
+
+The live prefix is dense, but every independent reservation has its own window
+zero. The floor is `layers × 2` windows.
+
+**Token-major across all layers makes the complete sequence one dense run:**
+
+```
+one reservation, with every layer's K and V interleaved by token:
+
+| token 0: all layers | token 1: all layers | token 2 ...               |
+|XXXXXXXXXXXXXXXXXXXXXX..................................................|
+[========== window 0 ==========][========== window 1 ==========]
+             COMMIT                           unmapped
+```
+
+The per-layer bindings become views into that reservation. The floor is one
+window per sequence. This was measured, but that binding model is not built
+(#787).
+
+**A paged-attention block is fully allocated regardless of its internal
+layout:**
+
+```
+pre-committed block pool:
+ [ blk 0 ][ blk 1 ][ blk 2 ][ blk 3 ] ...
+     ^        ^                 ^
+   seq A    seq B             seq A       (selected through a block table)
+
+inside any allocated block, the same bytes are occupied:
+ BNHS [head][dim][token]   BNSH [head][token][dim]   BSNH [token][head][dim]
+```
+
+Paging therefore decouples physical residency from internal layout: layout is a
+compute-side choice because the allocation unit is already fully used. Flat VA
+plus VMM couples them: a window is only as full as the layout makes it (#783).
+
+#### Measured floor progression
+
+For qwen14b (`48` layers, K+V, `8` KV heads, head dimension `128`, fp16) on the
+measured 2 MiB CUDA granule:
+
+| Layout | Floor unit | Near-empty floor | Evidence/status |
+|---|---:|---:|---|
+| BNSH head-major | `layers × 2 × kv_heads = 768` | ~1.5 GiB | Default; geometry measured in #772/#776/#787 |
+| BSNH seq-major | `layers × 2 = 96` | ~192 MiB | **Driver-level residency measured** (`vmm_kv_layout_residency_gpu`); see below |
+| token-major across all layers | `1` per sequence | ~2 MiB | **768× measured reduction**, #787; not implemented |
+
+> **These floors are properties of the layout geometry, not of what the runtime
+> currently commits on the end-to-end engine path.** Measured in #794 on both
+> qwen2.5-0.5b and qwen14b, head-major and seq-major commit **identical**
+> physical bytes (100,663,296 B and 402,653,184 B respectively), because the
+> native CUDA bindings allocated bucket-sized packed shapes and committed flat
+> bucket ranges without consuming the KV layout metadata — so seq-major changed
+> **kernel indexing only**, not reservation or commit geometry. #787 reached the
+> same conclusion from the other direction: the read path is free, and the cost
+> sits on the binding layer.
+>
+> **Update (kv-binding-views).** The layout-aware commit *geometry* is now built
+> and measured directly at the driver level. A `KvCommitLayout`-driven commit
+> path (`crates/onnx-genai-engine/src/native_decode/kv_commit.rs`, unit-tested)
+> computes, per binding, the live-prefix commit ranges the layout implies on a
+> **fixed full-context stride**: seq-major is one dense run
+> `0..ceil(live_bytes/granule)`; head-major stays one live fragment per head
+> stripe. The GPU test `vmm_kv_layout_residency_gpu` (in `onnx-runtime-cuda-memory`)
+> maps those ranges on the real 2 MiB granule and confirms, deterministically:
+>
+> | Model | Per-binding head-major | Per-binding seq-major | Ratio | Model-wide head-major | Model-wide seq-major |
+> |---|---:|---:|---:|---:|---:|
+> | qwen2.5-0.5b | 4 MiB (2 granules) | 2 MiB (1 granule) | **2× = kv_heads** | 192 MiB (96 granules) | 96 MiB (48 granules) |
+> | qwen14b | 16 MiB (8 granules) | 2 MiB (1 granule) | **8× = kv_heads** | 1536 MiB (768 granules) | 192 MiB (96 granules) |
+>
+> The same test also grows a seq-major fixed-stride binding **under a captured
+> replay** (granule 0 → 3 at a stable VA) and observes **0 re-captures** — the
+> stable-stride win #782 could not demonstrate end to end, shown here on hardware.
+>
+> **Update (bsnh-fixed-stride).** The engine growth *byte geometry* is now
+> layout-faithful, and a real seq-major generation runs end to end. Two findings
+> refine the earlier "structural gap" note precisely:
+>
+> 1. **The KV binding metadata shape must stay BNSH for both layouts.** The CUDA
+>    GQA node validates `past_key`/`past_value` as `[batch, kv_heads, seq,
+>    head_dim]` and reads `present_capacity` from axis 2 *regardless of the
+>    `kv_layout` attribute* (only the kernel's stride arithmetic re-specializes),
+>    and `DeviceIoBinding` requires the logical and physical shapes to share axis
+>    order. So `persistent_state_shapes` is *correctly* BNSH for seq-major too —
+>    a permuted binding shape cannot express seq-major. Seq-major is realized in
+>    the **growth/commit byte geometry** (`kv_growth_byte_layout`,
+>    `apply_vmm_growth`, `build_grown_buffers`), which now maps the BNSH shape to
+>    its BSNH byte layout `[batch, capacity, kv_heads, head_dim]` (grow axis 1)
+>    and drives the copy/zero primitives over that. Head-major is byte-identical
+>    to before (grow axis 2, one stripe per head).
+>
+> 2. **The "0 bytes moved on growth" fixed-stride property holds only on the
+>    in-place VMM growth path**, not on the default bucket-*reallocation* path. A
+>    reallocation fills a fresh buffer, so it copies the live prefix either way;
+>    seq-major's win there is one contiguous copy instead of `kv_heads` stripes,
+>    not a smaller byte count. Under `ONNX_GENAI_CUDA_VMM=1` (`commits_on_demand`,
+>    growth maps granules onto the same base VA) the capacity-independent
+>    `kv_heads × head_dim` per-token stride keeps the prefix in place.
+>
+> **Measured end to end** on `qwen2.5-0.5b-q4_0-mobius` (stock BNSH export vs a
+> copy whose 24 GQA nodes carry `kv_layout=1`), forcing growth with
+> `ONNX_GENAI_KV_MIN_BUCKET=8` and generating 48 greedy tokens (3 growth events,
+> 8→16→32→64), test
+> `crates/onnx-genai-engine/tests/mobius_seqmajor_growth_parity_native_cuda.rs`:
+>
+> | Growth path | Capture | Tokens | Physical committed bytes (head = seq) | d2d KV copy bytes head | d2d KV copy bytes seq |
+> |---|---|---|---:|---:|---:|
+> | in-place VMM (default since #798) | OFF | byte-identical | 100,663,296 | 688,576 | **0** |
+> | in-place VMM (default since #798) | ON | byte-identical | 100,663,296 | 688,576 | **0** |
+> | legacy realloc (`ONNX_GENAI_LEGACY_ALLOCATOR=1`) | OFF | byte-identical | 786,432 | 688,576 | 688,576 |
+>
+> The capture-ON default-VMM row was measured with **every layout/configuration
+> in its own process**, interleaving head-major then seq-major in the same
+> session:
+>
+> | Layout | Growth events | Captures | Replays | Invalidations |
+> |---|---:|---:|---:|---:|
+> | head-major | 3 | 4 | 39 | 4 |
+> | seq-major | 3 | 4 | 39 | 4 |
+>
+> A same-generation, no-growth control (`min_bucket=64`) measured `1 capture,
+> 45 replays, 1 invalidation` for each layout. Therefore the three bucket
+> growths account for exactly three additional invalidations and three
+> additional captures in both rows. This is attributable in code as well as by
+> counter delta: `DecodeCudaState::ensure_capacity` calls `invalidate_graph`
+> unconditionally after `apply_vmm_growth`, before branching on layout for the
+> moved-byte accounting. The seq-major fixed stride really does keep KV offsets
+> stable (`0` bytes moved), but the engine does not yet use that fact to retain
+> the captured graph. Thus #797's driver-level `0 re-captures` result is **not
+> demonstrated end to end** by the current bucket-growth path; the remaining
+> invalidator is the engine's explicit growth policy, not an unknown model gate.
+>
+> The 48-token stream is byte-identical head-major vs seq-major in every row —
+> the first real seq-major generation that exercises *growth*. (#794's 32-token
+> run never crossed the 256-token bucket, so it validated kernel indexing only.)
+> Since #798 made managed no-spill VMM the default, the **default** growth path is
+> in-place VMM, so seq-major now grows moving **0 KV bytes by default**; the
+> legacy reallocation allocator (which copies the live prefix to a fresh buffer
+> either way) is reachable only via the #755 opt-out. One residency caveat
+> remains orthogonal to this shape/stride change:
+>
+> * **Committed physical bytes are still equal head vs seq** (100,663,296 both
+>   under the default VMM arena; 786,432 both under legacy realloc), because the
+>   engine still commits flat bucket/granule ranges rather than the dense
+>   live-prefix ranges `kv_commit.rs::live_prefix_ranges` computes. The
+>   `kv_heads×` residency win is therefore still driver-level only
+>   (`vmm_kv_layout_residency_gpu`); wiring the dense-prefix commit into the live
+>   path is the documented next step (shared with token-major and #777).
+> * **A fourth place the layout lives — the engine-side non-kernel KV
+>   consumers — is now gated (`seqmajor-physical-shape`).** Beyond kernel
+>   indexing, commit geometry, and growth byte geometry, the device
+>   present-KV host mirror (`DecodeCudaState::read_present_kv`) and the paged
+>   prefix-reuse seed (`DecodeCudaState::seed_prefix`) stride the padded buffer
+>   with hard-coded head-major (BNSH) arithmetic
+>   (`capacity_head_stride = physical_shape[2] × head_dim × elem`, per-head
+>   fragments). Under a seq-major (BSNH) physical buffer those offsets address
+>   the wrong bytes — heads are interleaved per token, not laid out as capacity
+>   stripes — so a host mirror or a shared-prefix seed would silently return or
+>   write mis-indexed KV. Both now **error under seq-major** rather than
+>   mis-mapping, matching the kernel-level "unsupported readers/writers fail
+>   rather than silently mis-index" gate. This makes the working seq-major
+>   surface a precise **condition**: seq-major is supported on the pure decode
+>   path where our own GQA kernel is the sole consumer of the device KV; the
+>   moment a `present_*`-reading consumer (host mirror / paged prefix reuse) is
+>   engaged, the runtime refuses. Prefix sharing (#777/#809) therefore does not
+>   yet "fall out" for free under seq-major: its device seed is a head-major
+>   consumer, so realizing it under seq-major requires teaching that seed the
+>   BSNH byte geometry — tracked with the dense-prefix commit above.
+>
+> Wall-clock is intentionally not reported: deterministic counters answer the
+> invalidation question, while this shared box has shown large timing variance.
+
+The small-model measurement makes the waste concrete: qwen2.5-0.5b committed
+**96 head stripes × 2 MiB = 192 MiB to hold about 12 KiB** of live KV (#772).
+The token-major probe repeated the comparison on qwen14b: the identical
+196,608-byte one-token payload committed **1,536 MiB head-major versus 2 MiB
+token-major**, the measured 768× reduction (#787).
+
+This also preserves an important historical correction. The earlier
+"tokens per granule" model was **wrong for head-major** and was publicly
+retracted in #776: independently strided heads cannot pool their sub-granule
+live bytes. The same model is **exactly right for token-major**, where all KV for
+a token is contiguous in one reservation (#787). The granule, model, and VMM
+are unchanged; only layout changes. That is the clearest demonstration that
+layout is the governing variable.
+
+#### Crossover against bucket growth
+
+The crossover is the context length below which a fixed full-context stride
+commits more physical memory than growing a packed bucket. For head-major:
+
+```
+crossover_head_major = granule / (head_dim × sizeof(dtype))
+```
+
+`layers` and `kv_heads` cancel, so this crossover is **model-size independent**.
+Hardware probes spanning a 480× model-size range measured about **8,192 tokens**
+at head dimension 128/fp16 and **16,384 tokens** at head dimension 64/fp16
+(#776).
+
+Seq-major changes the unit:
+
+```
+crossover_seq_major = granule / (kv_heads × head_dim × sizeof(dtype))
+```
+
+It is no longer model-independent: it scales with `kv_heads`. With the measured
+2 MiB granule it is **1,024 tokens on qwen14b** and **8,192 on
+qwen2.5-0.5b** (#778). Token-major has **no crossover**: packed growth and the
+fixed flat view occupy the same dense byte stream, rounded once per sequence
+(#787).
+
+A live-length-bounded read leaves the reserved tail physically uncommitted,
+including under captured graph replay; reading one byte into an uncommitted
+tail faults. Thus reservation alone does not force commitment (#772). Layout
+decides which windows the bounded live prefix touches, while an over-broad read
+can additionally force the tail.
+
+#### Granularity is the coupling, and it is platform-specific
+
+On the development GPU,
+`CU_MEM_ALLOC_GRANULARITY_MINIMUM == CU_MEM_ALLOC_GRANULARITY_RECOMMENDED ==
+2 MiB`; no finer device granule is available (#776). If the granule were one
+byte, layout would be irrelevant to residency. On this CUDA device, the floor
+must therefore be fixed by layout rather than by tuning the allocator.
+
+Reported minimum mapping units span roughly 500× across relevant APIs (#783):
+
+| Platform/API | Typical minimum unit | Consequence |
+|---|---:|---|
+| CUDA VMM | ~2 MiB, measured here | Layout severity described above |
+| HIP VMM | commonly ~2 MiB; must be queried | Re-derive for #731; do not inherit CUDA's answer |
+| Level Zero / Intel device-local | ~64 KiB | Much smaller layout penalty |
+| Vulkan sparse buffers | ~64 KiB | Much smaller layout penalty |
+| CPU `mmap` | 4 KiB | Usually negligible |
+| Metal / Apple Silicon | no direct equivalent; unified-memory regime | Re-derive residency semantics (#608) |
+
+At 64 KiB, the head-major head-dimension-128/fp16 crossover is about **256
+tokens**, so realistic contexts generally exceed it (#783). Intel's reported
+BNHS preference is therefore coherent with Level Zero's much finer pages: a
+layout that is severe on this CUDA device can be reasonable on Intel.
+
+**Design intent:** granularity must be queried as a device property and feed
+memory-strategy inference (#735), not be hardcoded. Layout follows from
+`(platform granularity, EP capability, model geometry)`. HIP support (#731)
+must measure and re-derive rather than copy the CUDA choice.
+
+#### Read and remap costs
+
+**Measured read cost is not the obstacle.** Seq-major/head-major decode-read
+ratios were **0.80-1.02 (within 2%)** for sequence lengths 512 through 32K
+(#778). The token-major probe then held bytes and occupancy constant while
+raising the token stride to 192 KiB: at a 6 GiB working set the bandwidth ratio
+was **1.000**, about **207 GB/s (~80% of peak)** (#787). On this device the reads
+are DRAM-bandwidth-bound independently of stride; 2 MiB-backed device memory
+keeps the 192 KiB stride within TLB reach.
+
+**Measured remap cost is a burst, not a per-token tax.** A granule supplies
+about 8,192 tokens of headroom per head-major stripe or 1,024 per seq-major
+buffer on qwen14b. Amortizing remaps across those tokens yields about 0.1% of a
+step, but hides the user-visible event: all aligned buffers cross together on
+one token. The measured qwen14b boundary burst was **49.5 ms head-major versus
+4.5 ms seq-major** (#778).
+
+Lockstep is an alignment artifact, not an inherent VMM requirement.
+**Proposed, not built:** stagger buffer phases or commit ahead of the write
+frontier. Commit-ahead is graph-safe because VMM preserves the virtual address;
+bucket growth changes the address/stride and forces graph re-capture (#778).
+
+#### Paged attention is the alternative architecture
+
+Paged attention avoids layout-dependent residency by making every kernel follow
+a block table. Its per-sequence allocation quantum is not merely one small
+per-layer block: a vLLM-style 16-token growth step needs a block in every layer.
+For qwen14b:
+
+```
+196,608 bytes/token × 16 tokens = 3 MiB per sequence
+```
+
+The equivalent VMM calculation is:
+
+| Model | `granule / KV bytes per token` | 16-token paged quantum | Token-major VMM quantum |
+|---|---:|---:|---:|
+| qwen14b | 10.67 tokens | ~3 MiB | 2 MiB |
+| qwen2.5-0.5b | 170.67 tokens | ~0.19 MiB | 2 MiB |
+
+These arithmetic comparisons were verified in #787. Token-major plus VMM
+matches or slightly beats the paged quantum for qwen14b without adding a block
+table to every kernel, but is honestly coarser on the small model. It also keeps
+physical memory returnable. The compared vLLM policy pre-commits a pool (about
+90% of VRAM by default) for the process lifetime rather than returning unused
+capacity to the system (#783).
+
+#### Quantization is a split result
+
+Because VMM's quantum is byte-denominated, token-major density automatically
+scales with quantization on qwen14b: **10.7, 21.3, and 42.7 tokens per granule**
+for fp16, fp8, and int4, with no tuning (#787). However, the per-sequence
+**byte** floor stays 2 MiB at every dtype, while the waste in a token-denominated
+16-token paged design shrinks with bytes per token. Under aggressive
+quantization, paging can therefore have the smaller partial-allocation waste.
+
+The durable design conclusion is narrower:
+
+- Head-major makes KV quantization and residency **antagonistic**: halving bytes
+  per token doubles the crossover in tokens (#776/#787).
+- Token-major makes them **independent**: there is no crossover; the one-window
+  floor remains one window at any dtype (#787).
+
+#### Prefix sharing is the concurrency-scaled prize
+
+The floor is a constant that amortizes with context length. Shared-prefix
+savings scale with concurrent requests, the axis multi-request serving in #750
+cares about.
+
+**Shareability is arithmetic, not a layout (#777).** Sharing maps whole
+granules, so a prefix is shareable exactly when each contiguous fragment is at
+least one granule:
+
+```
+fragment_bytes = prefix_len × (contiguous bytes per fragment in that layout)
+shareable      = fragment_bytes ≥ granule
+multi_map_ops  = fragments × floor(fragment_bytes / granule)
+```
+
+Layout sets `fragment_bytes` (and the cost) but **not** the possibility. The two
+genuine requirements are a **VMM-backed** KV buffer and `fragment_bytes ≥
+granule` on the platform. This is a tested predicate,
+`onnx_runtime_memory_governor::shareability::evaluate_prefix_shareability`, that
+replaces any "is this seq-major" check; a KV path refuses with a reason when the
+arithmetic says a configuration is not shareable rather than making N private
+copies. Layout only sets fragment size and cost:
+
+- Head-major: a prefix is `layers × 2 × kv_heads` scattered fragments, each
+  `head_dim × dtype` per token. On qwen14b that is *not* shareable at a 2 MiB
+  granule below an **8,192-token** prefix (`granule / (head_dim × dtype)`), but
+  *is* shareable at or above it, and shareable at any realistic prefix on a
+  finer-granule EP (~64 KiB Level Zero/Vulkan, 4 KiB CPU `mmap`).
+- Seq-major: `layers × 2` contiguous layer-side ranges (`kv_heads × head_dim`
+  per token) — shareable at 2 MiB from a ~2,048-token prefix on qwen14b, at
+  `floor` = 1 granule per fragment, i.e. 96 multi-map ops.
+- Token-major: **one contiguous range covering every layer** — shareable at the
+  smallest prefix, one physical-handle multi-map per sequence (cheapest cost).
+
+The full shareability grid across layout × granule × prefix-length for both
+qwen14b and qwen2.5-0.5b, and the derivation, live in
+[`PREFIX_SHARE_INVESTIGATION.md`](./PREFIX_SHARE_INVESTIGATION.md). At this
+device's measured 2 MiB granule (#776), token-major remains the cheapest and
+seq-major the practical middle, but "head-major cannot share" is only true
+*below the 8,192-token threshold at 2 MiB* — corrected from the earlier absolute
+phrasing.
+
+For a 2,000-token shared prompt and eight concurrent qwen14b requests, avoiding
+the seven duplicate copies saves about **2.56 GiB** (#777/#787). This uses the
+multi-map primitive proven in #727, but detection, lifetime, read-only/COW
+enforcement, and 1:N handle bookkeeping are **not yet implemented**.
+
+The #777 isolating GPU probe has now cleared all five primitive questions with
+no kill finding — N-way multi-map under captured-graph replay, charge-once in the
+real #740 ledger, non-sticky/non-corrupting write protection, coexistence with
+the #759 dummy page, and a one-time ~5.5 ms pooled copy-on-write at the boundary.
+Measured answers, the concurrency/saving and capacity tables, and the design for
+an explicit pinned-prefix API (the smallest next increment) are in
+[`PREFIX_SHARE_INVESTIGATION.md`](./PREFIX_SHARE_INVESTIGATION.md).
+
+**First production consumer landed (#777).** The prefix-sharing primitive
+(`create_shared_prefix`/`commit_shared_prefix`, #803) previously had no live
+caller — only its definition and GPU tests. It is now reachable from production
+code through an allocator-agnostic seam on the `DeviceAllocator` trait
+(`create_shared_prefix` / `incremental_owned_bytes_for_shared_prefix` /
+`commit_shared_prefix`, returning an opaque `dyn SharedDevicePrefix`), so a
+caller holding only `dyn DeviceAllocator` can pin a token prefix once and have
+subsequent sequences map it. Non-VMM allocators keep the default impls, which
+refuse (`InvalidRequest`) rather than mis-map. The **seq-major** fused fp16 GQA
+decode kernel is the first consumer: a GPU parity test
+(`crates/onnx-runtime-ep-cuda/tests/gqa_shared_prefix_parity_gpu.rs`) drives the
+real kernel over shared-prefix VMM KV and proves two sequences sharing one pinned
+seq-major prefix (`layers × 2` contiguous ranges) produce **byte-identical**
+output to two independent sequences. Measured at KV_HEADS=8, HEAD_DIM=128, f16,
+1024-token prefix + 1024-token private tail per sequence: independent = 8
+granules (16,777,216 B), shared = 6 granules (12,582,912 B); the prefix is
+charged **once** (`incremental_owned_bytes_for_shared_prefix` = 0) and the second
+sharer's admission is **only its private bytes** (4,194,304 B = its two private
+tails), so sharing removes `(C−1)×(K_prefix+V_prefix)` = 2 granules.
+
+**What remains structural.** The *engine generation loop* cannot yet call this
+seam automatically: `persistent_state_shapes` in
+`native_decode/cuda.rs` builds a hard-coded BNSH physical KV shape and no model
+declares a seq-major end-to-end fixed-stride physical shape (#794 showed
+seq-major changed only kernel indexing, not commit geometry). A BNSH/seq-major
+fixed-stride physical-shape build is therefore the prerequisite for auto engine
+use. Hash-based automatic detection, token-major (one multi-map per sequence),
+and copy-on-write at divergence remain the later increments named below. The
+delivered consumer is explicit (a caller declares the shared prefix) and is
+restricted to prefixes that are read-only for the sharers' lifetime.
+
+#### Layout belongs to the KV owner
+
+Layout is a per-EP, per-platform capability, not a global constant (#783).
+ONNX Runtime GQA is BNSH-only on every dispatch path:
+`group_query_attention_helper.h` hardcodes
+`past_kv_format = Q_K_V_BNSH`. The native backend may use seq-major while ORT
+remains BNSH because each backend owns its KV buffers and neither reads the
+other's bytes (#522, #726).
+
+A per-step transpose bridge is disqualified: decode reads the complete live KV
+every step, so a bridge adds a second full KV pass on the hot path (#783). For
+heterogeneous multi-EP placement (#603), the design rule is therefore:
+**the owner of the KV buffer chooses the layout; another EP must accept that
+layout or not participate in that KV.** The proposed stride descriptor and
+capability negotiation are tracked in #783. The fixed-stride/dummy-tail work in
+#759 remains complementary fault-safety machinery; it cannot repair residency
+that a layout has already scattered.
+
+**Weight offload and CUDA graph capture no longer force each other off on the
+managed no-spill path (#716).** The legacy pager's alloc/copy/free operations are
+capture-illegal because each page-in returns a different device pointer and a
+captured graph bakes pointers into its recorded nodes, so on that path enabling
+offload still disables capture (see the module docs in
+`crates/onnx-genai-engine/src/native_decode/cuda.rs`). **#716** removes the
+mutual exclusion for the managed no-spill authority path: each retained weight
+`key` is served from a **reserved-once device virtual address** whose physical
+granules are committed on page-in and decommitted on eviction under the same VA
+(mechanism proven survivable by #727; isolated end-to-end for a captured read
+that tracks repaged granules in
+`crates/onnx-runtime-cuda-memory/tests/vmm_stable_va_weight_slot_gpu.rs`, and at
+the residency level in `weight_paging.rs`'s
+`vmm_retained_weight_key_keeps_a_stable_virtual_address_across_repage`). Physical
+granules still come from the #740 authority-scoped pool through `carve()`
+suballocation and are charged once on the global `0→1 / 1→0` granule-ref
+attribution — no second allocator, no per-weight reservation (the mistake that
+made #733 net-negative). The addressing change is strictly underneath #723's
+`StableResident` policy, which is unchanged. Gating: capture is kept ON under
+offload only when `weight_offload_enabled && managed_no_spill` (the explicit
+byte `--vram-limit` authority that installs the VMM arena + physical pool); the
+pointer-unstable `alloc_raw`/`free_raw` compatibility path keeps the old
+capture-off exclusion. This unblocks the capture-fragmentation wins that #708 and
+#728 landed — those took 35B-A3B decode from **154 to 34** graph segments — for
+large models that need offload, and was the hard prerequisite for #755 (managed
+no-spill VMM as the default with automatic weight streaming), which has since
+landed: managed no-spill is now the native CUDA default and over-budget loads
+auto-enable streaming. Ordering rule the
+safety relies on, enforced in code rather than by comment: page-ins (and thus the
+eviction-driven `decommit` of any stable slot) run entirely under the residency
+mutex, whole-step capture is capture-once/replay-many with no page-ins during
+replay, and the engine additionally declines capture when a step reports a
+bypass/eviction — so no `decommit` of a baked VA can occur while a replay is in
+flight (the case #727 explicitly did not prove safe).
+
+**Sequential weight prefetch does not work and was deleted (#715, #718).** It was
+implemented, measured to produce no usable compute/transfer overlap on the dev
+box, and removed in PR #715. AirLLM's own analysis (#718) reaches the same
+conclusion independently — the bottleneck is disk/transfer bandwidth, not a lack
+of overlap — and rates prefetch at ~10% by their own account. On a model that
+does not fit there is not enough independent compute to hide the transfer behind,
+so any doc presenting prefetch/compute overlap as the plan, the lever, or an
+existing capability is stale. The withdrawn `h2d_enqueue_copy_ms` = 1.7% figure
+that once retired this line of work is corrected to **18.8%** by CUDA-event
+measurement (see the instrument-failure narrative below).
 
 ### The platform is part of the memory system
 
@@ -137,8 +1042,145 @@ Two corollaries worth stating because both cost time here:
   preserves the source mtime, so restoring a file from a `.bak` can leave cargo
   reusing a stale artifact.
 
+### A third failure mode: the instrument itself
+
+The two above are about code that never runs and numbers that mean something
+else. There is a third, and it cost the most: **an instrument that runs, reports
+a plausible number, and measures the wrong thing.**
+
+`h2d_enqueue_copy_ms` reported host-to-device transfer at **1.7%** of decode step
+time. That figure retired an entire line of work — prefetch depth, pinned versus
+pageable staging, transfer overlap — and was published on #705 and #718.
+
+It was wrong by an order of magnitude. The arithmetic gives it away: the same
+step stages **7.33 GiB**, and 7.33 GiB in 30 ms would be ~250 GB/s, roughly ten
+times this machine's PCIe link. The counter bracketed an *asynchronous enqueue
+returning*, not a transfer completing.
+
+The first repair renamed it `copy_wait_ms` and pointed it at
+`compute_wait_fence`, whose own doc comment reads *"a stream-ordered, **non
+host-blocking** cross-stream wait."* The same non-measurement survived under a
+name that invited the wrong reading more strongly than before. Measured properly
+with CUDA events — start event on the copy stream before `cuMemcpyHtoDAsync`, end
+event after, host-block to read `cuEventElapsedTime` — transfer is **18.8%**.
+
+Two habits, both cheap:
+
+**Divide the bytes by the time and ask whether the answer is a real bandwidth.**
+A number near link speed, near memcpy speed, or ten times either is telling you
+what the counter actually bracketed. This is what caught it, and it takes
+seconds.
+
+**State, in a comment on every timing counter, exactly what lies between start
+and stop and whether anything there blocks the host.** A host-side `Instant` span
+around a stream-ordered call must never carry a name suggesting it waited for
+device work. Enforced in `weight_paging.rs` since #715.
+
+The corollary is about naming, not timing: a counter whose name overstates what
+it brackets is worse than no counter, because it is believed. The same is true of
+a counter that is emitted with nothing writing it — a row reading `0.00` cannot
+be distinguished from a row that was never measured, which is why #715 removed
+the dead ones and added a test that every emitted counter has a live writer.
+
+### The pattern underneath all three
+
+Telemetry that never reaches the operator, three times in one subsystem:
+documented environment variables that nothing reads (#688); counters computed,
+used to gate a profile section, and then never printed (#719); counters printed
+with nothing writing them (#715).
+
+The #719 case is the sharpest. A residency cache paging at a **0% hit rate**
+printed a weight-offload section in which **every visible row read `0.00`** — and
+the first reading of that output was that the cache was inert. The opposite was
+true, and provably so: the section printing at all required one of the three
+*hidden* counters to be non-zero. The instrument reported the exact inverse of
+what it measured.
+
+After the third instance the response should be a guard, not more vigilance.
+
 The `Challenger` role (`.squad/agents/challenger/charter.md`) exists to apply
 this systematically to any result that would change technical direction.
+
+### A fourth failure mode: order-dependent test state
+
+The three above are about telemetry that never reaches the operator. There is a
+fourth that reaches the operator loud and clear, and is worse for it: **a test
+result that depends on the order the tests ran in, reported as a real finding.**
+Because the memory and capture work is measurement-driven, a wrong number does
+not merely fail — it redirects the design. Two of these landed in one week.
+
+**#804 (carried into #794 / #801): process-frozen configuration.**
+`RuntimeConfig` is a process-wide snapshot frozen on first read (an `OnceLock` in
+`onnx-genai-runtime-config`). A capture-OFF phase set `ONNX_GENAI_CUDA_GRAPH=0`
+*after* that snapshot was already frozen, so the mutation had no effect and every
+later phase in the same process inherited the frozen policy. The forced-growth
+harness then reported `captures=0` and it was attributed — in a merged PR body —
+to the model *structurally declining* CUDA graph capture. It does not: with each
+policy phase isolated in its own process, the model captures (`captures=4`). Two
+PRs (#794, #801) failed to reproduce an end-to-end measurement on this exact
+mistake before #804 found it.
+
+**#797: a context warmed by an earlier sibling subtest.** A residency GPU test
+failed ~50% of the time on a *cold* CUDA context and passed otherwise. It looked
+exactly like a correctness bug in growth-under-capture. The cause was a
+test-harness ordering defect: the baseline fill and the readback ran on the
+legacy **default stream** while the captured memset ran on a created
+**non-blocking stream**, and those two are *mutually exempt from implicit
+synchronization* — so the readback raced the memset and returned partial fills
+**with no CUDA error**. `cuCtxSynchronize` did **not** fix it (synchronizing the
+context imposes no order between two mutually-exempt streams), which is what
+refuted the obvious race theory. It had only ever "passed" because an
+alphabetically-earlier sibling subtest warmed the context first.
+
+Both are the same family: **state that is frozen or warmed once per process,
+making a result depend on test order.** The two remedies are as specific as the
+two mechanisms:
+
+- **Process isolation for anything that reads process-frozen config.** A test
+  phase that needs a different `RuntimeConfig` value must run in its own process
+  — set the environment, then spawn a child that reads it fresh — never mutate
+  the environment after the snapshot may have frozen. `mobius_seqmajor_growth_
+  parity_native_cuda.rs` does this (child-process-per-mode); it is the pattern,
+  not the exception.
+- **Single-stream discipline for device tests.** Route *every* device operation
+  a test performs — baseline fills, captured-graph launches, memsets, readbacks,
+  tail writes — through one stream, so a single `cuStreamSynchronize` is a total
+  order. `onnx-runtime-cuda-memory::test_support::TestStream` makes this the easy
+  path and documents the default-vs-non-blocking exemption at the call site.
+
+After the second instance in a week the response is, again, a guard rather than
+more vigilance. `runtime_config()` records the environment it froze from and, in
+debug/test builds only (`debug_assertions`, so the release path is untouched and
+cost-free), **panics loudly** if any variable that fed the frozen snapshot is
+later observed to differ — a test can no longer silently believe it set a knob
+that was already frozen (`onnx-genai-runtime-config`, this PR). The single-stream
+helper is the guard for the second mechanism: a test written against `TestStream`
+cannot reintroduce the default-stream/non-blocking split.
+
+The discipline that catches both before they mislead is one line: **run any test
+you touch in isolation as well as in the full suite, and confirm both pass.** An
+order-dependent result is exactly the one that passes in a suite and fails alone
+(or the reverse), so this is the property that names the defect.
+
+### Keeping the documentation from going stale
+
+The same discipline applies to the prose, not just the code and the counters.
+Most of the staleness this subsystem accumulates is a *performance claim written
+in the present tense that a later measurement overturned* — prefetch overlap
+(#715), the 1.7% h2d figure (#718), the 0% residency cache (#723), the
+"tokens per granule" KV framing (#776). Three rules keep it from recurring:
+
+- **A performance claim in docs must cite the measurement that produced it.** A
+  number with no PR/issue behind it is a guess, and a guess ages into a false
+  fact. If you cannot name where it was measured, mark it as an estimate.
+- **When measurement overturns a claim, correct it in place and say what
+  superseded it** — do not silently delete the old claim. A reader who remembers
+  the old number must be able to see it was tested and retired, with the PR/issue
+  that did it. That traceability is what makes the docs trustworthy.
+- **Distinguish measured fact from design intent from not-yet-built.** Aspirational
+  design written in the present tense is the most common failure mode: a design
+  document may describe an intended design, but must not claim it is implemented
+  or measured when it is not.
 
 The last five rows are newer than the layers above them and move fastest, so
 each says where it actually is. "Decided" and "in `main`" are different states
@@ -230,6 +1272,32 @@ commits physically on demand and leases each granule, it knows about the
 weights — so that half of the reservation is released at adoption, and only the
 half nothing else accounts for is kept. Holding both charged the same memory
 twice and made the ledger refuse the arena.
+
+**Workspace lifetime is not physical mapping ownership.** Step-scoped and
+session-persistent workspace remain distinct content/lease categories, but
+allocations packed into one VMM arena use one `WorkspaceZone` mapped allowance.
+The zone charges global granule transitions `0→1` and refunds `1→0`, so the
+last surviving allocation may perform the refund regardless of which lifetime
+first mapped the granule. An arena rejects a grant from another mapped zone
+before physical allocation. The current native provider also suballocates KV
+from that arena, so KV and workspace content metrics remain distinct while
+their physical mapped attribution uses the same arena-zone allowance. Weight
+paging has separate storage and mapped attribution.
+
+Transactional mapped growth assigns authority capacity that belongs to no
+mapped zone before asking a registered holder to shrink or reclaim. A failed or
+overestimated grant returns that newly assigned allowance, while committed
+growth keeps it with the mapped zone until that zone is dropped (or, for a zone
+registered as reclaimable, a later request transfers it).
+
+Mapped-zone refund is an allocator/provider responsibility, not a workspace
+caller responsibility. Every VMM deallocation observes the arena's actual
+global granule transition `1→0` and refunds the canonical arena allowance
+itself. This includes ordinary executor buffers that happen to be the final
+reference to a granule first mapped by governed workspace; specialized
+workspace cleanup must not issue a second refund. Retained physical-pool
+handles remain authority-owned—the refund concerns virtual mapped-zone
+attribution only.
 
 ### 1.1 The lease contract, and who may replace it
 
@@ -483,6 +1551,105 @@ pub trait ExecutionProvider: Send + Sync {
 
 Every higher layer ultimately calls through these primitives. The EP knows nothing
 about weight tiers, budgets, or other sessions.
+
+### 2.1 Kernel scratch/workspace governance audit (#736)
+
+There are two ways a CUDA kernel can obtain device scratch:
+
+- **Governed** — the kernel reports a size through
+  `Kernel::workspace_requirement` and the session executor reserves it via
+  `ExecutionProvider::{reserve_workspace, prepare_mapped_growth, allocate}`
+  *before execution*. This counts against the device authority, so a
+  capacity shortfall surfaces as a pre-header **HTTP 429** (`MemoryOverload`)
+  through `DriverFailure::from_engine_error`, never as a late 500/OOM.
+  Prepare-only planning (#747) sizes the workspace from resolved shapes at
+  admission; `MappedGrowthGrant` (#748) grows it transactionally against the
+  same authority. Planning and execution size through the *same* helper.
+- **Ungoverned** — the kernel calls `CudaRuntime::alloc_raw` (a thin
+  `cuMemAlloc`/pool wrapper) directly. These bytes are invisible to the
+  authority: under the managed no-spill path (default on native CUDA under #755,
+  or an explicit `--vram-limit`) they are the residual
+  `activations_bytes=unknown` (#514) and can drive a late device OOM instead
+  of a clean 429.
+
+**Measured finding: size from use, not allocation.** Five of six slices found
+over-reservation rather than only an ungoverned allocation: IndexShare reserved
+unreachable present-K/V staging (#751), GQA reserved `WS_SCORES` outside its f32
+reference route (#795), cuBLASLt treated a 32 MiB ceiling as demand although
+measured algorithms used 0–96 bytes (#799), GQA packed QKV staging is populated
+only when a packed tensor is split (#736), and GQA's query BNSH slot was
+unnecessary for unpacked non-RoPE `Sq==1` while its output slot is never needed
+for `Sq==1` (#736). The default-domain `Attention` scores were the genuine-use
+exception: every route stages fp32 scores, so none reports `NONE` (#736). The
+detailed byte accounting remains in the
+[site-by-site audit](#cuda-raw-allocation-audit-736-2026-08-10) above.
+
+**Audit guidance (design intent, derived from #751, #795, and #799):**
+
+1. Enumerate dispatch routes and buffer reads/writes before classifying the
+   allocation; `alloc_raw` identifies the source, not whether that route uses it.
+2. Treat constant-sized reservations as suspect: they commonly encode an API
+   ceiling, a worst-case shape, or a layout artifact rather than measured use.
+3. Find the static route signal — output arity, dtype/shape dispatch, or
+   single-call scope in these slices — and thread it through the shared sizing
+   helper so planning and execution cannot drift.
+4. Do not govern a bypass before making its reservation path-sensitive. The
+   naive governed form can convert invisible waste into charged waste; #799
+   would have charged five 32 MiB ceilings for algorithms using under 100 bytes.
+5. Record a genuine-use result too, so the next audit does not repeat it (#736).
+
+This is admission control, not tidiness: every byte charged against the device
+authority tightens committed-granule admission (#745), reducing admissible
+concurrency on the multi-request-serving axis measured by #750 and #777.
+
+**Implemented today.** The executor has one central
+`is_planned_workspace_node` predicate
+(`crates/onnx-runtime-session/src/executor/bindings.rs`) covering QMoE,
+IndexShare, Attention Phase-2a, GQA (`WS_SCORES`, packed QKV-projection staging,
+and BNSH-transpose scratch folded into one composite
+reservation), the
+default-domain `Attention` score + route-required staged-K/V composite, and the
+standard/fused GEMM family
+(#747, #751, #753, #795, #799, #736), rather than parallel per-feature checks.
+Prepare-only planning tracks and reserves one peak per lifetime class
+(`SessionPersistent` and `StepScoped`), so a graph mixing the two governs both
+without summing sequential users of the same slot (#753).
+
+**Governed today**
+
+| kernel / node | file · site | byte formula | size class | lifetime | mechanism |
+|---|---|---|---|---|---|
+| `BlockQuantizedMoE` (QMoE) | `block_quantized_moe.rs` `workspace_requirement` | routing + dequant + GEMM staging over `tokens × experts × hidden` | config-derived (static per model) | session-persistent | #747 prepare-only + #748 grant |
+| `pkg.nxrt::IndexShare` | `index_share.rs` `workspace_requirement` | selected-token scores plus only the staging actually reachable for the path | prompt/cache dependent | session-persistent | #751 + prepared workspace |
+| `com.microsoft::Attention` Phase-2a | `attention.rs` `run_attention_phase2a` (governed branch) | `align256(batch·num_heads·sq·sk·elem) + 32 MiB` cuBLASLt workspace | prompt-dependent; score matrix is ~256–512 MiB at B=1/H=32/S=2048 | step-scoped | #753 + prepared workspace |
+| `com.microsoft::GroupQueryAttention` f32 reference scores | `group_query_attention.rs` `workspace_requirement` | `batch·heads·sq·present_capacity·sizeof(f32)` only on the path that materializes scores | prompt/cache dependent | session-persistent | #795 + prepared workspace |
+| `com.microsoft::GroupQueryAttention` packed QKV staging | `group_query_attention.rs` `workspace_requirement` | `align256(B·sq·num_heads·head_dim·elem) + 2·align256(B·sq·kv_num_heads·head_dim·elem)` only when a packed QKV tensor is split | prompt-dependent; ~24 MiB (f32) / 12 MiB (fp16) at B=1/H=32/hd=128/Hkv=8/sq=1024; `NONE` on unpacked/fused-decode routes | session-persistent | #736 + prepared composite workspace (shares the `WS_SCORES` slot) |
+| `com.microsoft::GroupQueryAttention` BNSH transpose scratch | `group_query_attention.rs` `gqa_transpose_scratch` / `gqa_workspace_layout` | Q: `align256(B·sq·num_heads·head_dim·elem)` for `sq>1`, packed Q, or RoPE; output: same only for `sq>1`; packed `sq==1` Q overlays packed-Q staging | prompt/route dependent; derived 32 MiB f32 / 16 MiB fp16 at B=1/H=32/hd=128/sq=1024; unpacked non-RoPE decode charges 0, RoPE decode Q-only | session-persistent | #736 + existing prepared GQA composite |
+| `Attention` (default domain) scores + staged dense K/V | `standard_attention.rs` `std_attention_workspace_layout` / `workspace_requirement` | scores `B·Hq·Sq·Sk·sizeof(f32)` always; staged K/V each `B·Hkv·present_seq·head_dim·elem` only for reachable dense aliased growth | prompt/cache/route dependent; derived scores ~512 MiB at B=1/Hq=32/S=2048; derived K+V staging 16 MiB f32 / 8 MiB fp16 at B=1/Hkv=8/S=2048/D=128; fixed-capacity append staging 0 | step-scoped (per-call prefill/batched) **and** session-persistent (capture-eligible single-token decode) | #736 + one prepared composite; route-sized through the shared helper |
+| `MatMul`, `Gemm`, `MatMulNBits`, `FusedMatMulBias`, `FusedGemm` cuBLASLt scratch | `blas.rs` shared planner; `fused_gemm.rs`, `gemm.rs`, `matmul.rs`, `matmul_nbits.rs` | selected heuristic `workspaceSize`, bounded by the 32 MiB preference ceiling | measured 0–96 bytes on #799 shapes; algorithm dependent | session-persistent shared peak | #799 exact plan/execute helper + prepared workspace |
+
+The Attention **fused** (flash) prefill path uses shared memory only and
+allocates no device scratch, so `workspace_requirement` returns `NONE` for it —
+the executor reserves nothing (#753). By contrast, the default-domain
+`Attention` kernel (`standard_attention.rs`) has **no** flash/shared-memory
+route: `attention_row` always stages the fp32 score matrix in global memory, so
+every valid dispatch reserves it and none reports `NONE` (#736) — a genuine-use
+result, not a missed optimization. Its staged K/V component is separate and
+route-conditional: fixed-capacity append/no-past/no-present-output routes add
+zero, while dense aliased growth adds disjoint key/value regions in the same
+prepared composite. `attention.rs` remains outside #799's
+shared cuBLASLt slot because its workspace is concurrent with the score matrix
+inside the StepScoped Phase-2a composite; direct `execute` keeps the documented
+self-owned compatibility/opt-out fallback (#753, #799).
+
+KV layout and residency are a separate contract; use
+[KV layout and residency](#kv-layout-and-residency) rather than restating them
+in this workspace table (#791).
+
+The authoritative site-by-site raw-allocation table, measured GEMM workspace
+result, byte savings, and evidence-selected next slice live in
+[CUDA raw allocation audit](#cuda-raw-allocation-audit-736-2026-08-10) above.
+They are not repeated here so status and byte formulas have one source of truth.
 
 ---
 

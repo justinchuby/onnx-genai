@@ -851,6 +851,13 @@ impl GenAiConfig {
             processor_program_json(&processor, vision, vision_pixel_info, vision_grid_info)?;
 
         let mut decoder_io = Map::new();
+        // The split-VLM decoder is driven by `inputs_embeds` produced by the
+        // embedding component (the vision encoder raises image features into the
+        // same embedding stream); it declares no token-id input. Declare the
+        // sequence source explicitly so decode resolves the embeds input rather
+        // than defaulting to a (non-existent) token input. This mirrors the
+        // text-only fallback (`to_strict_text_only_pipeline_metadata`).
+        decoder_io.insert("sequence_source".into(), json!("inputs_embeds"));
         if let Some(token) = self.model.decoder.inputs.input_ids.as_deref() {
             require_graph_input(&graphs.decoder, token, "decoder")?;
             decoder_io.insert("token_input".into(), json!(token));
@@ -1716,6 +1723,70 @@ impl GenAiConfig {
             kv_outputs: metadata.kv_outputs,
             state_pairs,
             kv_dtype: metadata.kv_dtype,
+        })
+    }
+
+    /// Best-effort auto-derived [`ModelIoSpec`] for a stock decoder export whose
+    /// sidecar declares no `io` block, built purely from an ONNX graph's port
+    /// inventory.
+    ///
+    /// This is the single canonical glue shared by both auto-derive callers (the
+    /// native decode driver's live-session `derive_fallback_io` and the engine
+    /// loader's disk-graph `maybe_fill_hybrid_io_from_graph`): it reuses the
+    /// guarded [`derive_decoder_io_from_graph`](Self::derive_decoder_io_from_graph)
+    /// classifier, applies the recurrent-hybrid safety gate (non-empty
+    /// `state_pairs`), binds the conventional non-KV ports by name-presence in the
+    /// graph interface, and assembles the `ModelIoSpec`.
+    ///
+    /// Returns `None` (leaving the caller's `io = None` shape-inference path
+    /// untouched) unless the derivation yields at least one recurrent state pair —
+    /// the exact case the shape-inference path cannot resolve. Pure-dense decoders
+    /// (no state pairs) always return `None`.
+    pub fn derive_model_io_spec_from_graph(
+        graph: &ModelGraphInfo,
+    ) -> Option<onnx_genai_metadata::ModelIoSpec> {
+        use onnx_genai_metadata::{LoopStatePair, ModelIoSpec};
+
+        let derived = Self::derive_decoder_io_from_graph(graph)?;
+        // Safety gate: only the recurrent-hybrid case the shape-inference path
+        // cannot handle. Pure-dense decoders (no state pairs) keep `io = None`.
+        if derived.state_pairs.is_empty() {
+            return None;
+        }
+        let input_names: BTreeSet<&str> = graph.inputs.iter().map(|t| t.name.as_str()).collect();
+        let output_names: BTreeSet<&str> = graph.outputs.iter().map(|t| t.name.as_str()).collect();
+        let present_input = |name: &str| input_names.contains(name).then(|| name.to_owned());
+        let present_output = |name: &str| output_names.contains(name).then(|| name.to_owned());
+        let state_pairs = derived
+            .state_pairs
+            .into_iter()
+            .map(|pair| LoopStatePair {
+                input: pair.input,
+                output: pair.output,
+                init: Some("zeros".to_owned()),
+                update: Some("replace".to_owned()),
+            })
+            .collect::<Vec<_>>();
+        Some(ModelIoSpec {
+            sequence_source: None,
+            kv_ownership: None,
+            kv_layout: None,
+            token_input: present_input("input_ids"),
+            inputs_embeds_input: None,
+            attention_mask_input: present_input("attention_mask"),
+            position_ids_input: present_input("position_ids"),
+            logits_output: present_output("logits"),
+            hidden_output: None,
+            kv_inputs: (!derived.kv_inputs.is_empty()).then_some(derived.kv_inputs),
+            kv_outputs: (!derived.kv_outputs.is_empty()).then_some(derived.kv_outputs),
+            encoder_hidden_states_input: None,
+            audio_features_input: None,
+            cross_kv_inputs: None,
+            cross_kv_outputs: None,
+            kv_update: None,
+            state_pairs: Some(state_pairs),
+            optional_inputs: std::collections::BTreeMap::new(),
+            static_cache: None,
         })
     }
 

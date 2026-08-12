@@ -202,7 +202,7 @@ impl Holder {
 /// holder.
 #[derive(Debug)]
 pub(crate) struct ModelMemoryPlan {
-    governor: onnx_runtime_memory_governor::LedgerGovernor,
+    governor: crate::memory_authority::EngineMemoryGovernor,
     entries: Vec<PlanEntry>,
     /// Device KV pool grants taken through [`ModelMemoryPlan::kv_pool`].
     ///
@@ -222,7 +222,7 @@ struct PlanEntry {
 
 impl ModelMemoryPlan {
     /// A plan that leases from `governor`.
-    pub(crate) fn new(governor: onnx_runtime_memory_governor::LedgerGovernor) -> Self {
+    pub(crate) fn new(governor: crate::memory_authority::EngineMemoryGovernor) -> Self {
         Self {
             governor,
             entries: Vec::new(),
@@ -347,6 +347,10 @@ impl ModelMemoryPlan {
             tier: Some(tier),
             lease,
         });
+        if holder == Holder::NativeKvCache && tier == Tier::Device {
+            self.kv_pool_bytes
+                .fetch_add(granted, std::sync::atomic::Ordering::Relaxed);
+        }
         Ok(granted)
     }
 
@@ -426,15 +430,13 @@ impl ModelMemoryPlan {
         self.governor.available(tier)
     }
 
-    /// A live handle on the device KV pool bytes leased through this plan.
+    /// A live handle on device KV bytes reserved for admitted sequences.
     ///
     /// Admission needs it to turn "bytes free on the device" into "bytes
     /// available for KV": a device-tier pool's grant is already spent from the
     /// ledger's view, but it is exactly the memory admitted sequences run in,
     /// so it is not competition for them.
     ///
-    /// Reads zero today -- every KV pool holder is `Tier::Host`. See the
-    /// tier tests below.
     pub(crate) fn kv_pool_bytes_handle(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
         std::sync::Arc::clone(&self.kv_pool_bytes)
     }
@@ -457,20 +459,23 @@ impl ModelMemoryPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use onnx_runtime_memory_governor::{LeaseLedger, LedgerGovernor};
 
-    fn governor(device_bytes: u64) -> LedgerGovernor {
-        LedgerGovernor::new(LeaseLedger::new(device_bytes, 0, 0))
+    fn governor(device_bytes: u64) -> crate::memory_authority::EngineMemoryGovernor {
+        crate::memory_authority::EngineMemoryGovernor::new(
+            crate::DeviceMemoryAuthority::new(
+                crate::DeviceCompatibilityDomain::Cuda(0),
+                device_bytes,
+            ),
+            0,
+            0,
+        )
     }
 
     /// The admission ceiling adds device-tier KV pool grants back to
     /// `available(Device)`, because a pool's own grant is the memory admitted
     /// sequences run in rather than competition for them.
     ///
-    /// Every KV pool holder is host-tier today, so that add-back is zero. This
-    /// pins it: if a pool moves to the device tier, the add-back starts
-    /// mattering, and whoever moves it should see that here rather than in a
-    /// halved admission rate under load.
+    /// Paged KV pool holders are host-tier today, so their add-back is zero.
     #[test]
     fn a_host_tier_pool_is_not_added_back() {
         for holder in [Holder::KvPool, Holder::PipelineKvPool, Holder::DraftKvPool] {
@@ -514,6 +519,21 @@ mod tests {
             )),
             "a KV pool is on the device tier, so the add-back is live: \
              {device_holders:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "native-backend")]
+    fn native_device_kv_reservation_is_available_to_admission() {
+        let mut plan = ModelMemoryPlan::new(governor(1024));
+        plan.reserve_on(Holder::NativeKvCache, Tier::Device, 768)
+            .unwrap();
+
+        assert_eq!(plan.available_on(Tier::Device), 256);
+        assert_eq!(
+            plan.kv_pool_bytes_handle()
+                .load(std::sync::atomic::Ordering::Relaxed),
+            768
         );
     }
 

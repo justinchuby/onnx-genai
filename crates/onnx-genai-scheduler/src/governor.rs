@@ -127,16 +127,50 @@ impl VramBreakdown {
 /// Model-specific mapping between KV bytes, pages, and tokens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelKvConfig {
-    pub page_size_bytes: u64,
+    pub page_size_bytes: Option<u64>,
     pub tokens_per_page: u64,
+    pub page_geometry_required: bool,
 }
 
 impl ModelKvConfig {
-    pub fn pages_for_bytes(&self, bytes: u64) -> u64 {
-        if self.page_size_bytes == 0 {
-            return 0;
+    pub fn known(page_size_bytes: u64, tokens_per_page: u64) -> Self {
+        Self {
+            page_size_bytes: Some(page_size_bytes),
+            tokens_per_page,
+            page_geometry_required: true,
         }
-        bytes / self.page_size_bytes
+    }
+
+    pub fn unknown(tokens_per_page: u64) -> Self {
+        Self {
+            page_size_bytes: None,
+            tokens_per_page,
+            page_geometry_required: true,
+        }
+    }
+
+    pub fn no_paged_cache(tokens_per_page: u64) -> Self {
+        Self {
+            page_size_bytes: None,
+            tokens_per_page,
+            page_geometry_required: false,
+        }
+    }
+
+    pub fn bytes_per_token(&self) -> Option<u64> {
+        if self.tokens_per_page == 0 {
+            return None;
+        }
+        self.page_size_bytes
+            .map(|page_size_bytes| page_size_bytes.div_ceil(self.tokens_per_page))
+    }
+
+    pub fn pages_for_bytes(&self, bytes: u64) -> Option<u64> {
+        let page_size_bytes = self.page_size_bytes?;
+        if page_size_bytes == 0 {
+            return Some(0);
+        }
+        Some(bytes / page_size_bytes)
     }
 
     pub fn tokens_for_pages(&self, pages: u64) -> Option<u64> {
@@ -260,6 +294,13 @@ pub enum ResourceError {
     MissingDiskCapacityProvider,
 
     #[error(
+        "cannot derive the KV memory budget because per-layer KV page geometry is unknown \
+         ({tokens_per_page} token(s) per page but no byte size); fix by declaring model.io.kv_inputs \
+         and model.io.kv_outputs so the runtime can inspect the model's real KV head geometry"
+    )]
+    UnknownKvGeometry { tokens_per_page: u64 },
+
+    #[error(
         "cannot derive a valid resource budget because {operation} overflowed u64; {reason}; \
          reduce the configured ceiling, fixed reservations, KV page size, or tokens per page"
     )]
@@ -364,45 +405,77 @@ pub fn derive_kv_budget(
                 operation: "summing model weights, activations, and runtime overhead",
                 reason: "the fixed VRAM reservations exceed the representable byte range".into(),
             })?;
-    let minimum_bytes = reserved_bytes
-        .checked_add(kv_config.page_size_bytes)
-        .ok_or_else(|| ResourceError::BudgetArithmeticOverflow {
+    let Some(page_size_bytes) = kv_config.page_size_bytes else {
+        if kv_config.page_geometry_required {
+            return Err(ResourceError::UnknownKvGeometry {
+                tokens_per_page: kv_config.tokens_per_page,
+            });
+        }
+        let (reserved_bytes, reservation_applied) =
+            if resolved_vram_bytes < reserved_bytes && reserved_bytes > 0 {
+                tracing::warn!(
+                    reserved_bytes,
+                    resolved_vram_bytes,
+                    "fixed memory reservation does not fit under the resolved ceiling; \
+                     deriving the non-paged KV budget without it. Raise the VRAM limit \
+                     (--vram-limit / serving.memory.limits.vram_limit) so the runtime \
+                     is sized against real capacity."
+                );
+                (0, false)
+            } else {
+                (reserved_bytes, reserved_bytes > 0)
+            };
+        let kv_bytes = resolved_vram_bytes
+            .checked_sub(reserved_bytes)
+            .ok_or_else(|| ResourceError::BudgetArithmeticOverflow {
+                operation: "subtracting fixed VRAM reservations from the ceiling",
+                reason: "the resolved ceiling is smaller than the fixed reservations".into(),
+            })?;
+        return Ok(DerivedBudget {
+            kv_bytes,
+            total_pages: 0,
+            max_total_tokens: 0,
+            reserved_bytes,
+            reservation_applied,
+        });
+    };
+    let minimum_bytes = reserved_bytes.checked_add(page_size_bytes).ok_or_else(|| {
+        ResourceError::BudgetArithmeticOverflow {
             operation: "adding one KV page to the fixed VRAM reservations",
             reason: "even the one-page minimum exceeds the representable byte range".into(),
-        })?;
+        }
+    })?;
     // The reservation is an estimate (measured weights) carved out of a ceiling
     // that may itself be provisional. When the two cannot both hold, drop the
     // reservation rather than refuse to start: the previous behaviour reserved
     // nothing at all, so failing here would be a pure regression.
-    let (reserved_bytes, reservation_applied) = if kv_config.page_size_bytes > 0
-        && resolved_vram_bytes < minimum_bytes
-        && reserved_bytes > 0
-    {
-        tracing::warn!(
-            reserved_bytes,
-            resolved_vram_bytes,
-            page_size_bytes = kv_config.page_size_bytes,
-            "fixed memory reservation does not fit under the resolved ceiling; \
+    let (reserved_bytes, reservation_applied) =
+        if page_size_bytes > 0 && resolved_vram_bytes < minimum_bytes && reserved_bytes > 0 {
+            tracing::warn!(
+                reserved_bytes,
+                resolved_vram_bytes,
+                page_size_bytes,
+                "fixed memory reservation does not fit under the resolved ceiling; \
                  deriving the KV budget without it. Raise the VRAM limit \
                  (--vram-limit / serving.memory.limits.vram_limit) so the KV cache \
                  is sized against real capacity."
-        );
-        (0, false)
-    } else {
-        (reserved_bytes, reserved_bytes > 0)
-    };
-    let minimum_bytes = reserved_bytes
-        .checked_add(kv_config.page_size_bytes)
-        .ok_or_else(|| ResourceError::BudgetArithmeticOverflow {
+            );
+            (0, false)
+        } else {
+            (reserved_bytes, reserved_bytes > 0)
+        };
+    let minimum_bytes = reserved_bytes.checked_add(page_size_bytes).ok_or_else(|| {
+        ResourceError::BudgetArithmeticOverflow {
             operation: "adding one KV page to the fixed VRAM reservations",
             reason: "even the one-page minimum exceeds the representable byte range".into(),
-        })?;
-    if kv_config.page_size_bytes == 0 || resolved_vram_bytes < minimum_bytes {
+        }
+    })?;
+    if page_size_bytes == 0 || resolved_vram_bytes < minimum_bytes {
         let reason = if resolved_vram_bytes < reserved_bytes {
             format!(
                 "fixed model weights, activations, and runtime overhead reserve {reserved_bytes} B"
             )
-        } else if kv_config.page_size_bytes == 0 {
+        } else if page_size_bytes == 0 {
             "the model reports a zero-byte KV page, so no valid page budget can be derived".into()
         } else {
             let remaining_bytes =
@@ -413,10 +486,7 @@ pub fn derive_kv_budget(
                         reason: "the resolved ceiling is smaller than the fixed reservations"
                             .into(),
                     })?;
-            format!(
-                "the remaining {} B cannot hold one {} B KV page",
-                remaining_bytes, kv_config.page_size_bytes
-            )
+            format!("the remaining {remaining_bytes} B cannot hold one {page_size_bytes} B KV page")
         };
         return Err(ResourceError::CannotSatisfyLoweredLimit {
             requested_bytes: resolved_vram_bytes,
@@ -431,14 +501,18 @@ pub fn derive_kv_budget(
             operation: "subtracting fixed VRAM reservations from the ceiling",
             reason: "the resolved ceiling is smaller than the fixed reservations".into(),
         })?;
-    let total_pages = kv_config.pages_for_bytes(kv_bytes);
+    let total_pages =
+        kv_config
+            .pages_for_bytes(kv_bytes)
+            .ok_or(ResourceError::UnknownKvGeometry {
+                tokens_per_page: kv_config.tokens_per_page,
+            })?;
     if total_pages == 0 {
         return Err(ResourceError::CannotSatisfyLoweredLimit {
             requested_bytes: resolved_vram_bytes,
             minimum_bytes,
             reason: format!(
-                "the derived KV budget of {kv_bytes} B cannot hold one {} B KV page",
-                kv_config.page_size_bytes
+                "the derived KV budget of {kv_bytes} B cannot hold one {page_size_bytes} B KV page"
             ),
         });
     }
@@ -655,10 +729,7 @@ mod tests {
     }
 
     fn kv_config() -> ModelKvConfig {
-        ModelKvConfig {
-            page_size_bytes: 10,
-            tokens_per_page: 16,
-        }
+        ModelKvConfig::known(10, 16)
     }
 
     fn governor(vram_bytes: u64) -> ResourceGovernor {
@@ -737,6 +808,26 @@ mod tests {
                 reservation_applied: true,
             }
         );
+    }
+
+    #[test]
+    fn unknown_kv_geometry_does_not_synthesize_one_byte_tokens() {
+        let kv_config = ModelKvConfig::unknown(16);
+        assert_eq!(kv_config.page_size_bytes, None);
+        assert_eq!(kv_config.bytes_per_token(), None);
+        assert_eq!(kv_config.pages_for_bytes(256), None);
+
+        let error = derive_kv_budget(1_000, &breakdown(), &kv_config).unwrap_err();
+        assert!(matches!(
+            error,
+            ResourceError::UnknownKvGeometry {
+                tokens_per_page: 16
+            }
+        ));
+        let message = error.to_string();
+        assert!(message.contains("per-layer KV page geometry is unknown"));
+        assert!(message.contains("model.io.kv_inputs"));
+        assert!(message.contains("model.io.kv_outputs"));
     }
 
     #[test]

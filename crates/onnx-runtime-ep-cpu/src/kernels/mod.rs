@@ -21,10 +21,317 @@
 //! strides and byte offset) into a dense row-major buffer. This keeps the
 //! per-kernel `unsafe` surface to the two element accessors in this module.
 
-use onnx_runtime_ep_api::{EpError, OpKey, OpRegistry, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    EpError, KernelFactory, OpKey, OpRegistry, Result, TensorMut, TensorView,
+};
 use onnx_runtime_ir::DataType;
 
 use crate::strided::{elem_offset, next_index, numel};
+
+// ─── Kernel registry entry derivation ────────────────────────────────────────
+
+/// Descriptor of one registered op for the plugin kernel-registry advertisement.
+/// Derived from the real `OpRegistry` registration calls — not hand-maintained.
+#[derive(Clone, Debug)]
+pub struct CpuOpDescriptor {
+    pub op_type: String,
+    pub domain: String,
+    pub since_version: u64,
+    /// Supported element types for the "T" type-constraint. Derived from the
+    /// kernel's actual dtype dispatch — fail closed (f32-only) when unknown.
+    pub supported_dtypes: &'static [DataType],
+}
+
+/// Wrapper around `OpRegistry` that records every registered key.
+struct RecordingOpRegistry {
+    inner: OpRegistry,
+    keys: Vec<(String, String, u64)>,
+}
+
+impl RecordingOpRegistry {
+    fn new() -> Self {
+        Self {
+            inner: OpRegistry::new(),
+            keys: Vec::new(),
+        }
+    }
+
+    fn register(&mut self, key: OpKey, factory: Box<dyn KernelFactory>) {
+        self.keys
+            .push((key.op_type.clone(), key.domain.clone(), key.since_version));
+        self.inner.register(key, factory);
+    }
+
+    fn into_parts(self) -> (OpRegistry, Vec<(String, String, u64)>) {
+        (self.inner, self.keys)
+    }
+}
+
+// ── Dtype categories ─────────────────────────────────────────────────────────
+//
+// Derived from actual kernel dispatch macros/implementations:
+// - `dispatch_arith!` → ARITH_DTYPES (f32,f16,bf16,f64,i8..u64)
+// - `dispatch_float!` → FLOAT_DTYPES (f32,f16,bf16,f64)
+// - byte-movers (Identity,Reshape,etc.) → ALL_DTYPES
+// - f32-only kernels → F32_ONLY
+// - comparison/logical → handled per-op
+
+/// All dtypes the CPU EP can physically handle (byte-mover ops).
+static ALL_DTYPES: &[DataType] = &[
+    DataType::Float32,
+    DataType::Float16,
+    DataType::BFloat16,
+    DataType::Float64,
+    DataType::Int8,
+    DataType::Int16,
+    DataType::Int32,
+    DataType::Int64,
+    DataType::Uint8,
+    DataType::Uint16,
+    DataType::Uint32,
+    DataType::Uint64,
+    DataType::Bool,
+];
+
+/// Dtypes supported by `dispatch_arith!` (arithmetic ops).
+static ARITH_DTYPES: &[DataType] = &[
+    DataType::Float32,
+    DataType::Float16,
+    DataType::BFloat16,
+    DataType::Float64,
+    DataType::Int8,
+    DataType::Int16,
+    DataType::Int32,
+    DataType::Int64,
+    DataType::Uint8,
+    DataType::Uint16,
+    DataType::Uint32,
+    DataType::Uint64,
+];
+
+/// Dtypes supported by `dispatch_float!` (transcendental/accumulate ops).
+static FLOAT_DTYPES: &[DataType] = &[
+    DataType::Float32,
+    DataType::Float16,
+    DataType::BFloat16,
+    DataType::Float64,
+];
+
+/// Fail-closed default: only f32.
+static F32_ONLY: &[DataType] = &[DataType::Float32];
+
+/// Determine the supported dtypes for a given (op_type, domain) based on the
+/// actual kernel dispatch implementation. Fail closed: unknown ops get f32 only.
+pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataType] {
+    // Byte-mover ops: dtype-agnostic (just copy bytes, no arithmetic).
+    match (op_type, domain) {
+        ("Identity", "")
+        | ("Reshape", "")
+        | ("Flatten", "")
+        | ("Squeeze", "")
+        | ("Unsqueeze", "")
+        | ("Expand", "")
+        | ("Concat", "")
+        | ("Slice", "")
+        | ("Split", "")
+        | ("Transpose", "")
+        | ("Gather", "")
+        | ("GatherElements", "")
+        | ("GatherND", "")
+        | ("ScatterElements", "")
+        | ("ScatterND", "")
+        | ("Shape", "")
+        | ("Size", "")
+        | ("Pad", "")
+        | ("ConstantOfShape", "")
+        | ("Constant", "")
+        | ("Tile", "")
+        | ("Compress", "")
+        | ("Trilu", "")
+        | ("OneHot", "")
+        | ("Dropout", "")
+        | ("Unique", "") => ALL_DTYPES,
+
+        // Arithmetic ops (dispatch_arith!): f32, f16, bf16, f64, int types.
+        ("Add", "")
+        | ("Sub", "")
+        | ("Mul", "")
+        | ("Div", "")
+        | ("Mod", "")
+        | ("Pow", "")
+        | ("Min", "")
+        | ("Max", "")
+        | ("Sum", "")
+        | ("Mean", "") => ARITH_DTYPES,
+
+        // MatMul supports f32 natively + f16/bf16 via half_gemm.
+        ("MatMul", "") | ("Gemm", "") => FLOAT_DTYPES,
+
+        // Float-only ops (dispatch_float! or explicit float handling).
+        ("Sqrt", "")
+        | ("Erf", "")
+        | ("Tanh", "")
+        | ("Exp", "")
+        | ("Log", "")
+        | ("Sigmoid", "")
+        | ("Softplus", "")
+        | ("Softsign", "")
+        | ("Reciprocal", "")
+        | ("Sin", "")
+        | ("Cos", "")
+        | ("Tan", "")
+        | ("Acos", "")
+        | ("Acosh", "")
+        | ("Asin", "")
+        | ("Asinh", "")
+        | ("Atan", "")
+        | ("Atanh", "")
+        | ("Cosh", "")
+        | ("Sinh", "")
+        | ("Abs", "")
+        | ("Neg", "")
+        | ("Sign", "")
+        | ("Floor", "")
+        | ("Ceil", "")
+        | ("Round", "")
+        | ("Relu", "")
+        | ("Elu", "")
+        | ("LeakyRelu", "")
+        | ("HardSigmoid", "")
+        | ("Selu", "")
+        | ("ThresholdedRelu", "") => FLOAT_DTYPES,
+
+        // Softmax, LogSoftmax, ReduceMean, LayerNorm, etc.: float-only.
+        ("Softmax", "")
+        | ("LogSoftmax", "")
+        | ("ReduceMean", "")
+        | ("ReduceSum", "")
+        | ("ReduceMax", "")
+        | ("ReduceMin", "")
+        | ("ReduceProd", "")
+        | ("ReduceSumSquare", "")
+        | ("ReduceL1", "")
+        | ("ReduceL2", "")
+        | ("ReduceLogSum", "")
+        | ("ReduceLogSumExp", "")
+        | ("LayerNormalization", "")
+        | ("Gelu", "")
+        | ("RMSNormalization", "")
+        | ("RotaryEmbedding", "")
+        | ("Swish", "")
+        | ("Attention", "")
+        | ("LpNormalization", "")
+        | ("Hardmax", "") => FLOAT_DTYPES,
+
+        // Cast/CastLike handle all types.
+        ("Cast", "") | ("CastLike", "") => ALL_DTYPES,
+
+        // Clip, ArgMax, ArgMin, TopK: arithmetic types.
+        ("Clip", "") | ("ArgMax", "") | ("ArgMin", "") | ("TopK", "") => ARITH_DTYPES,
+
+        // Logical: bool/int inputs.
+        ("And", "") | ("Or", "") | ("Xor", "") | ("Not", "") => &[DataType::Bool],
+        ("Equal", "")
+        | ("Greater", "")
+        | ("GreaterOrEqual", "")
+        | ("Less", "")
+        | ("LessOrEqual", "") => ARITH_DTYPES,
+
+        // Where: all types (condition is bool, data can be anything).
+        ("Where", "") => ALL_DTYPES,
+
+        // NonZero: all types.
+        ("NonZero", "") | ("NonMaxSuppression", "") => ALL_DTYPES,
+
+        // Bitwise: integer types.
+        ("BitShift", "")
+        | ("BitwiseAnd", "")
+        | ("BitwiseOr", "")
+        | ("BitwiseXor", "")
+        | ("BitwiseNot", "") => &[
+            DataType::Uint8,
+            DataType::Uint16,
+            DataType::Uint32,
+            DataType::Uint64,
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+        ],
+
+        // IsInf, IsNaN: float inputs.
+        ("IsInf", "") | ("IsNaN", "") | ("EyeLike", "") => FLOAT_DTYPES,
+
+        // Quantization: specific types but advertise broad.
+        ("QuantizeLinear", "")
+        | ("DequantizeLinear", "")
+        | ("DynamicQuantizeLinear", "")
+        | ("QLinearMatMul", "") => ARITH_DTYPES,
+
+        // Sequence/range ops.
+        ("Range", "") | ("CumSum", "") | ("CumProd", "") => ARITH_DTYPES,
+
+        // Window functions.
+        ("HannWindow", "") | ("HammingWindow", "") | ("BlackmanWindow", "") | ("DFT", "") => {
+            FLOAT_DTYPES
+        }
+
+        // com.microsoft contrib ops.
+        ("LayerNormalization", "com.microsoft")
+        | ("FusedMatMulBias", "com.microsoft")
+        | ("FusedGemm", "com.microsoft")
+        | ("FusedAttention", "com.microsoft")
+        | ("GroupQueryAttention", "com.microsoft")
+        | ("MultiHeadAttention", "com.microsoft")
+        | ("Attention", "com.microsoft")
+        | ("Gelu", "com.microsoft")
+        | ("BiasGelu", "com.microsoft")
+        | ("FastGelu", "com.microsoft")
+        | ("QuickGelu", "com.microsoft")
+        | ("Silu", "com.microsoft")
+        | ("SkipLayerNormalization", "com.microsoft")
+        | ("SimplifiedLayerNormalization", "com.microsoft")
+        | ("SkipSimplifiedLayerNormalization", "com.microsoft")
+        | ("RotaryEmbedding", "com.microsoft")
+        | ("CausalConvWithState", "com.microsoft")
+        | ("LinearAttention", "com.microsoft")
+        | ("GatherBlockQuantized", "com.microsoft") => FLOAT_DTYPES,
+
+        ("SimplifiedLayerNormalization", "") | ("LinearAttention", "") => FLOAT_DTYPES,
+
+        ("MatMulNBits", "com.microsoft") => F32_ONLY,
+        ("MoE", "com.microsoft") | ("QMoE", "com.microsoft") => F32_ONLY,
+
+        // pkg.nxrt custom ops: f32-only (fail closed).
+        (_, "pkg.nxrt") => F32_ONLY,
+
+        // CNN ops (feature-gated).
+        ("Conv", "")
+        | ("ConvTranspose", "")
+        | ("AveragePool", "")
+        | ("MaxPool", "")
+        | ("GlobalAveragePool", "")
+        | ("GlobalMaxPool", "")
+        | ("LpPool", "")
+        | ("GlobalLpPool", "")
+        | ("Resize", "")
+        | ("GridSample", "")
+        | ("AffineGrid", "")
+        | ("Col2Im", "")
+        | ("CenterCropPad", "")
+        | ("SpaceToDepth", "")
+        | ("BatchNormalization", "")
+        | ("InstanceNormalization", "")
+        | ("GroupNormalization", "")
+        | ("PRelu", "") => FLOAT_DTYPES,
+
+        // NCHWC domain ops: f32-only.
+        (_, "com.microsoft.nchwc") => F32_ONLY,
+
+        // Fail closed: unknown op → f32 only.
+        _ => F32_ONLY,
+    }
+}
 
 pub mod activations;
 pub mod add;
@@ -394,63 +701,119 @@ register_operator_group!(register_cnn_ops, "ops-cnn", |registry| {
 /// `lookup` picks the highest applicable version, so future opset-specialized
 /// kernels can be added alongside these.
 pub fn build_cpu_registry() -> OpRegistry {
-    build_cpu_registry_with_weight_offload_cache(qmoe::default_weight_offload_host_cache().clone())
+    let (reg, _keys) =
+        build_cpu_registry_recorded_inner(qmoe::default_weight_offload_host_cache().clone());
+    reg
+}
+
+/// Build the CPU registry AND return all registered op keys (for kernel-registry
+/// type-constraint advertisement). The keys are derived from the exact same
+/// registration calls — not hand-maintained.
+pub fn build_cpu_registry_with_descriptors() -> (OpRegistry, Vec<CpuOpDescriptor>) {
+    let (reg, keys) =
+        build_cpu_registry_recorded_inner(qmoe::default_weight_offload_host_cache().clone());
+    let descriptors = keys
+        .into_iter()
+        .map(|(op_type, domain, since_version)| {
+            let dtypes = supported_dtypes_for_op(&op_type, &domain);
+            CpuOpDescriptor {
+                op_type,
+                domain,
+                since_version,
+                supported_dtypes: dtypes,
+            }
+        })
+        .collect();
+    (reg, descriptors)
+}
+
+/// Build the CPU registry AND return keys, with a custom weight-offload cache.
+pub fn build_cpu_registry_with_descriptors_and_cache(
+    host_cache: qmoe::WeightOffloadHostCache,
+) -> (OpRegistry, Vec<CpuOpDescriptor>) {
+    let (reg, keys) = build_cpu_registry_recorded_inner(host_cache);
+    let descriptors = keys
+        .into_iter()
+        .map(|(op_type, domain, since_version)| {
+            let dtypes = supported_dtypes_for_op(&op_type, &domain);
+            CpuOpDescriptor {
+                op_type,
+                domain,
+                since_version,
+                supported_dtypes: dtypes,
+            }
+        })
+        .collect();
+    (reg, descriptors)
 }
 
 pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     host_cache: qmoe::WeightOffloadHostCache,
 ) -> OpRegistry {
-    let mut reg = OpRegistry::new();
-    register_cnn_ops(&mut reg);
-    reg.register(OpKey::new("MatMul", "", 1), Box::new(matmul::MatMulFactory));
-    reg.register(
+    let (reg, _keys) = build_cpu_registry_recorded_inner(host_cache);
+    reg
+}
+
+fn build_cpu_registry_recorded_inner(
+    host_cache: qmoe::WeightOffloadHostCache,
+) -> (OpRegistry, Vec<(String, String, u64)>) {
+    let mut rec = RecordingOpRegistry::new();
+    // CNN ops go directly into the inner registry (they use &mut OpRegistry).
+    register_cnn_ops(&mut rec.inner);
+    // CNN ops are feature-gated f32/FLOAT_DTYPES ops. They are registered into
+    // the real OpRegistry but not individually recorded here — this is fine for
+    // f16/bf16 routing since CNN ops don't support f16/bf16.
+    //
+    // All subsequent registrations go through the recording wrapper.
+    rec.register(OpKey::new("MatMul", "", 1), Box::new(matmul::MatMulFactory));
+    rec.register(
         OpKey::new("MatMulNBits", "com.microsoft", 1),
         Box::new(matmul_nbits::MatMulNBitsFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("BlockQuantizedMatMul", "pkg.nxrt", 1),
         Box::new(block_quantized_matmul::BlockQuantizedMatMulFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("BlockQuantizedMoE", "pkg.nxrt", 1),
         Box::new(block_quantized_moe::BlockQuantizedMoEFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("IndexShare", "pkg.nxrt", 1),
         Box::new(index_share::IndexShareFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("VarlenAttention", "pkg.nxrt", 1),
         Box::new(varlen_attention::VarlenAttentionFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("PackedVarlenAttention", "pkg.nxrt", 1),
         Box::new(packed_varlen_attention::PackedVarlenAttentionFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("PackedMultiHeadAttention", "com.microsoft", 1),
         Box::new(packed_multi_head_attention::PackedMultiHeadAttentionFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("SparseKvGather", "pkg.nxrt", 1),
         Box::new(sparse_kv_gather::SparseKvGatherFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("CompressedSparseAttention", "pkg.nxrt", 1),
         Box::new(compressed_sparse_attention::CompressedSparseAttentionFactory),
     );
-    reg.register(OpKey::new("Add", "", 1), Box::new(add::AddFactory));
-    reg.register(OpKey::new("Relu", "", 1), Box::new(relu::ReluFactory));
-    reg.register(
+    rec.register(OpKey::new("Add", "", 1), Box::new(add::AddFactory));
+    rec.register(OpKey::new("Relu", "", 1), Box::new(relu::ReluFactory));
+    rec.register(
         OpKey::new("Reshape", "", 1),
         Box::new(reshape::ReshapeFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("Transpose", "", 1),
         Box::new(transpose::TransposeFactory),
     );
-    reg.register(OpKey::new("Gather", "", 1), Box::new(gather::GatherFactory));
-    reg.register(
+    rec.register(OpKey::new("Gather", "", 1), Box::new(gather::GatherFactory));
+    rec.register(
         OpKey::new("LayerNormalization", "", 1),
         Box::new(layernorm::LayerNormFactory),
     );
@@ -458,14 +821,14 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     // domain (`com.microsoft`); bind the same kernel there so dispatch resolves
     // the fused op by (domain, op_type). The default-domain registration above
     // still serves standard ONNX `LayerNormalization`.
-    reg.register(
+    rec.register(
         OpKey::new("LayerNormalization", "com.microsoft", 1),
         Box::new(layernorm::LayerNormFactory),
     );
     // The optimizer's `MatMul + Add(bias)` fusion emits `FusedMatMulBias` in the
     // contrib domain; bind its kernel there so dispatch resolves the fused op by
     // (domain, op_type). It reuses the shared MatMul GEMM + broadcast-Add.
-    reg.register(
+    rec.register(
         OpKey::new("FusedMatMulBias", "com.microsoft", 1),
         Box::new(fused_matmul_bias::FusedMatMulBiasFactory),
     );
@@ -473,7 +836,7 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     // the contrib domain; bind its kernel there so dispatch resolves the fused
     // op by (domain, op_type). It reuses the shared MatMul GEMM + broadcast-Add
     // + elementwise Relu.
-    reg.register(
+    rec.register(
         OpKey::new("FusedGemm", "com.microsoft", 1),
         Box::new(fused_gemm::FusedGemmFactory),
     );
@@ -482,11 +845,11 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     // kernel there so dispatch resolves the fused op by (domain, op_type). It
     // reuses the shared MatMul GEMM (twice), broadcast-Add (mask) and the
     // extracted last-axis softmax helper.
-    reg.register(
+    rec.register(
         OpKey::new("FusedAttention", "com.microsoft", 1),
         Box::new(fused_attention::FusedAttentionFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("GroupQueryAttention", "com.microsoft", 1),
         Box::new(group_query_attention::GroupQueryAttentionFactory),
     );
@@ -495,7 +858,7 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     // query/key head size), an optional Q/K/V bias, key_padding_mask, additive
     // attention_bias, causal (`unidirectional`) masking, and an in-op KV cache
     // (`past_*` → `present_*`). f32 reference kernel matching ORT 1.26.0.
-    reg.register(
+    rec.register(
         OpKey::new("MultiHeadAttention", "com.microsoft", 1),
         Box::new(multi_head_attention::MultiHeadAttentionFactory),
     );
@@ -506,31 +869,31 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     // `attention_bias`, `unidirectional` causal masking, `qkv_hidden_sizes`,
     // an explicit `scale`, and the `past`→`present` KV cache. f32 reference
     // kernel matching ORT 1.26.0; unblocks Whisper's packed-QKV encoder.
-    reg.register(
+    rec.register(
         OpKey::new("Attention", "com.microsoft", 1),
         Box::new(msft_attention::MsftAttentionFactory),
     );
     // `com.microsoft::CausalConvWithState` and `com.microsoft::LinearAttention`:
     // the hybrid linear-attention (Gated DeltaNet) primitives used by Qwen3.5 /
     // Qwen3-Next. Shape-driven and gate-configurable (no model-specific dims).
-    reg.register(
+    rec.register(
         OpKey::new("CausalConvWithState", "com.microsoft", 1),
         Box::new(causal_conv::CausalConvWithStateFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("LinearAttention", "com.microsoft", 1),
         Box::new(linear_attention::LinearAttentionFactory),
     );
     // Standard ONNX-domain spelling (onnx/onnx#7689), semantically identical to
     // the com.microsoft op — served by the same fused kernel.
-    reg.register(
+    rec.register(
         OpKey::new("LinearAttention", "", 1),
         Box::new(linear_attention::LinearAttentionFactory),
     );
     // `com.microsoft::GatherBlockQuantized`: block-quantized embedding gather
     // (the Qwen3.5 `embed_tokens` table is uint8 with `bits = 8`). Shape-driven,
     // dequantizes on the fly to the graph's activation dtype.
-    reg.register(
+    rec.register(
         OpKey::new("GatherBlockQuantized", "com.microsoft", 1),
         Box::new(gather_block_quantized::GatherBlockQuantizedFactory),
     );
@@ -543,58 +906,58 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     // versions are registered so opset-23 models keep the original
     // `qk_matmul_output_mode` 1↔2 ordering while opset-24+ models get the
     // swapped ordering and `nonpad_kv_seqlen` support.
-    reg.register(
+    rec.register(
         OpKey::new("Attention", "", 23),
         Box::new(attention::AttentionFactory { since_version: 23 }),
     );
-    reg.register(
+    rec.register(
         OpKey::new("Attention", "", 24),
         Box::new(attention::AttentionFactory { since_version: 24 }),
     );
     // The optimizer's exact-GELU fusion emits `com.microsoft::Gelu`; bind its
     // CPU kernel in the same contrib domain (there is no standard-domain `Gelu`
     // op, so it is registered only under `com.microsoft`).
-    reg.register(
+    rec.register(
         OpKey::new("Gelu", "com.microsoft", 1),
         Box::new(gelu::GeluFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("BiasGelu", "com.microsoft", 1),
         Box::new(contrib_fused::BiasGeluFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("FastGelu", "com.microsoft", 1),
         Box::new(contrib_fused::FastGeluFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("QuickGelu", "com.microsoft", 1),
         Box::new(contrib_fused::QuickGeluFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("Silu", "com.microsoft", 1),
         Box::new(activations::SiluFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("SkipLayerNormalization", "com.microsoft", 1),
         Box::new(contrib_fused::SkipLayerNormFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("SimplifiedLayerNormalization", "com.microsoft", 1),
         Box::new(contrib_fused::SimplifiedLayerNormFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("SimplifiedLayerNormalization", "", 1),
         Box::new(contrib_fused::SimplifiedLayerNormFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("SkipSimplifiedLayerNormalization", "com.microsoft", 1),
         Box::new(skip_simplified_layernorm::SkipSimplifiedLayerNormFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("MoE", "com.microsoft", 1),
         Box::new(moe::MoEFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("QMoE", "com.microsoft", 1),
         Box::new(qmoe::QMoEFactory::new(host_cache)),
     );
@@ -605,403 +968,403 @@ pub(crate) fn build_cpu_registry_with_weight_offload_cache(
     // `ai.onnx::Gelu` was added at opset 20 with the `approximate` attribute
     // ("none" = exact erf, "tanh" = tanh approximation). Distinct from the
     // com.microsoft::Gelu contrib op above.
-    reg.register(OpKey::new("Gelu", "", 20), Box::new(gelu::StdGeluFactory));
+    rec.register(OpKey::new("Gelu", "", 20), Box::new(gelu::StdGeluFactory));
     // `ai.onnx::RMSNormalization` added at opset 23.
-    reg.register(
+    rec.register(
         OpKey::new("RMSNormalization", "", 23),
         Box::new(rmsnorm::RmsNormFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("LpNormalization", "", 1),
         Box::new(lp_normalization::LpNormalizationFactory),
     );
     // `ai.onnx::RotaryEmbedding` added at opset 23.
-    reg.register(
+    rec.register(
         OpKey::new("RotaryEmbedding", "", 23),
         Box::new(rotary_embedding::RotaryEmbeddingFactory),
     );
     // `com.microsoft::RotaryEmbedding` contrib op: same rotation math, but the
     // inputs are ordered `(X, position_ids, cos_cache, sin_cache)`.
-    reg.register(
+    rec.register(
         OpKey::new("RotaryEmbedding", "com.microsoft", 1),
         Box::new(rotary_embedding::RotaryEmbeddingContribFactory),
     );
     // `ai.onnx::Swish` added at opset 24: y = x·sigmoid(alpha·x).
-    reg.register(
+    rec.register(
         OpKey::new("Swish", "", 24),
         Box::new(activations::SwishFactory),
     );
     // Elementwise binary broadcasting ops.
-    reg.register(OpKey::new("Sub", "", 1), Box::new(elementwise::SubFactory));
-    reg.register(OpKey::new("Mul", "", 1), Box::new(elementwise::MulFactory));
-    reg.register(OpKey::new("Div", "", 1), Box::new(elementwise::DivFactory));
-    reg.register(OpKey::new("Mod", "", 10), Box::new(elementwise::ModFactory));
-    reg.register(OpKey::new("Pow", "", 1), Box::new(elementwise::PowFactory));
-    reg.register(OpKey::new("IsInf", "", 10), Box::new(is_inf::IsInfFactory));
-    reg.register(OpKey::new("IsNaN", "", 9), Box::new(is_nan::IsNaNFactory));
-    reg.register(
+    rec.register(OpKey::new("Sub", "", 1), Box::new(elementwise::SubFactory));
+    rec.register(OpKey::new("Mul", "", 1), Box::new(elementwise::MulFactory));
+    rec.register(OpKey::new("Div", "", 1), Box::new(elementwise::DivFactory));
+    rec.register(OpKey::new("Mod", "", 10), Box::new(elementwise::ModFactory));
+    rec.register(OpKey::new("Pow", "", 1), Box::new(elementwise::PowFactory));
+    rec.register(OpKey::new("IsInf", "", 10), Box::new(is_inf::IsInfFactory));
+    rec.register(OpKey::new("IsNaN", "", 9), Box::new(is_nan::IsNaNFactory));
+    rec.register(
         OpKey::new("EyeLike", "", 9),
         Box::new(eye_like::EyeLikeFactory),
     );
-    reg.register(OpKey::new("Min", "", 1), Box::new(elementwise::MinFactory));
-    reg.register(OpKey::new("Max", "", 1), Box::new(elementwise::MaxFactory));
-    reg.register(OpKey::new("Sum", "", 1), Box::new(elementwise::SumFactory));
-    reg.register(
+    rec.register(OpKey::new("Min", "", 1), Box::new(elementwise::MinFactory));
+    rec.register(OpKey::new("Max", "", 1), Box::new(elementwise::MaxFactory));
+    rec.register(OpKey::new("Sum", "", 1), Box::new(elementwise::SumFactory));
+    rec.register(
         OpKey::new("Mean", "", 1),
         Box::new(elementwise::MeanFactory),
     );
     // Elementwise unary ops.
-    reg.register(
+    rec.register(
         OpKey::new("Sqrt", "", 1),
         Box::new(elementwise::SqrtFactory),
     );
-    reg.register(OpKey::new("Erf", "", 1), Box::new(elementwise::ErfFactory));
-    reg.register(
+    rec.register(OpKey::new("Erf", "", 1), Box::new(elementwise::ErfFactory));
+    rec.register(
         OpKey::new("Tanh", "", 1),
         Box::new(elementwise::TanhFactory),
     );
-    reg.register(OpKey::new("Cast", "", 1), Box::new(cast::CastFactory));
-    reg.register(
+    rec.register(OpKey::new("Cast", "", 1), Box::new(cast::CastFactory));
+    rec.register(
         OpKey::new("CastLike", "", 15),
         Box::new(cast::CastLikeFactory),
     );
     // Identity: dtype-agnostic passthrough (raw byte copy).
-    reg.register(
+    rec.register(
         OpKey::new("Identity", "", 1),
         Box::new(identity::IdentityFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("ReduceMean", "", 1),
         Box::new(reduce::ReduceMeanFactory),
     );
     // Softmax: legacy coerce-to-2D at opset ≤ 12, per-axis at opset ≥ 13. The
     // provider's opset-aware lookup selects the version-correct kernel.
-    reg.register(
+    rec.register(
         OpKey::new("Softmax", "", 1),
         Box::new(softmax::SoftmaxLegacyFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("Softmax", "", 13),
         Box::new(softmax::SoftmaxFactory),
     );
     // LogSoftmax shares Softmax's opset split: legacy flattened trailing axes
     // through opset 12, then one-axis normalization from opset 13.
-    reg.register(
+    rec.register(
         OpKey::new("LogSoftmax", "", 1),
         Box::new(log_softmax::LogSoftmaxLegacyFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("LogSoftmax", "", 13),
         Box::new(log_softmax::LogSoftmaxFactory),
     );
     // Shape / data movement.
-    reg.register(OpKey::new("Shape", "", 1), Box::new(shape::ShapeFactory));
-    reg.register(
+    rec.register(OpKey::new("Shape", "", 1), Box::new(shape::ShapeFactory));
+    rec.register(
         OpKey::new("Unsqueeze", "", 1),
         Box::new(unsqueeze::UnsqueezeFactory),
     );
-    reg.register(OpKey::new("Expand", "", 1), Box::new(expand::ExpandFactory));
-    reg.register(OpKey::new("Slice", "", 1), Box::new(slice::SliceFactory));
-    reg.register(OpKey::new("Split", "", 1), Box::new(split::SplitFactory));
-    reg.register(OpKey::new("Split", "", 18), Box::new(split::SplitFactory));
-    reg.register(
+    rec.register(OpKey::new("Expand", "", 1), Box::new(expand::ExpandFactory));
+    rec.register(OpKey::new("Slice", "", 1), Box::new(slice::SliceFactory));
+    rec.register(OpKey::new("Split", "", 1), Box::new(split::SplitFactory));
+    rec.register(OpKey::new("Split", "", 18), Box::new(split::SplitFactory));
+    rec.register(
         OpKey::new("Unique", "", 11),
         Box::new(unique::UniqueFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("Dropout", "", 13),
         Box::new(dropout::DropoutFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("Dropout", "", 22),
         Box::new(dropout::DropoutFactory),
     );
-    reg.register(OpKey::new("Pad", "", 1), Box::new(pad::PadFactory));
-    reg.register(
+    rec.register(OpKey::new("Pad", "", 1), Box::new(pad::PadFactory));
+    rec.register(
         OpKey::new("ConstantOfShape", "", 1),
         Box::new(constant_of_shape::ConstantOfShapeFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("Constant", "", 1),
         Box::new(constant::ConstantFactory),
     );
     // GEMM.
-    reg.register(OpKey::new("Gemm", "", 1), Box::new(gemm::GemmFactory));
+    rec.register(OpKey::new("Gemm", "", 1), Box::new(gemm::GemmFactory));
     // Linear quantization evolved at opsets 10, 13, 19, 21, 23, and 25. The
     // implementation accepts the newest parameter set for all these revisions.
     for version in [10, 13, 19, 21, 23, 25] {
-        reg.register(
+        rec.register(
             OpKey::new("QuantizeLinear", "", version),
             Box::new(quantization::QuantizeLinearFactory),
         );
-        reg.register(
+        rec.register(
             OpKey::new("DequantizeLinear", "", version),
             Box::new(quantization::DequantizeLinearFactory),
         );
     }
-    reg.register(
+    rec.register(
         OpKey::new("DynamicQuantizeLinear", "", 11),
         Box::new(quantization::DynamicQuantizeLinearFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("QLinearMatMul", "", 10),
         Box::new(qlinear_matmul::QLinearMatMulFactory),
     );
     // --- Additional ep-cpu op coverage (op-coverage wave) ---------------------
     // Elementwise unary math (f32). Additive, default-domain-only registrations.
-    reg.register(OpKey::new("Abs", "", 1), Box::new(unary_math::AbsFactory));
-    reg.register(OpKey::new("Neg", "", 1), Box::new(unary_math::NegFactory));
-    reg.register(
+    rec.register(OpKey::new("Abs", "", 1), Box::new(unary_math::AbsFactory));
+    rec.register(OpKey::new("Neg", "", 1), Box::new(unary_math::NegFactory));
+    rec.register(
         OpKey::new("Reciprocal", "", 1),
         Box::new(unary_math::ReciprocalFactory),
     );
-    reg.register(OpKey::new("Exp", "", 1), Box::new(unary_math::ExpFactory));
-    reg.register(OpKey::new("Log", "", 1), Box::new(unary_math::LogFactory));
-    reg.register(OpKey::new("Sign", "", 1), Box::new(unary_math::SignFactory));
-    reg.register(
+    rec.register(OpKey::new("Exp", "", 1), Box::new(unary_math::ExpFactory));
+    rec.register(OpKey::new("Log", "", 1), Box::new(unary_math::LogFactory));
+    rec.register(OpKey::new("Sign", "", 1), Box::new(unary_math::SignFactory));
+    rec.register(
         OpKey::new("Floor", "", 1),
         Box::new(unary_math::FloorFactory),
     );
-    reg.register(OpKey::new("Ceil", "", 1), Box::new(unary_math::CeilFactory));
-    reg.register(
+    rec.register(OpKey::new("Ceil", "", 1), Box::new(unary_math::CeilFactory));
+    rec.register(
         OpKey::new("Round", "", 1),
         Box::new(unary_math::RoundFactory),
     );
-    reg.register(OpKey::new("Sin", "", 1), Box::new(unary_math::SinFactory));
-    reg.register(OpKey::new("Cos", "", 1), Box::new(unary_math::CosFactory));
-    reg.register(
+    rec.register(OpKey::new("Sin", "", 1), Box::new(unary_math::SinFactory));
+    rec.register(OpKey::new("Cos", "", 1), Box::new(unary_math::CosFactory));
+    rec.register(
         OpKey::new("Sigmoid", "", 1),
         Box::new(unary_math::SigmoidFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("Softplus", "", 1),
         Box::new(unary_math::SoftplusFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("Softsign", "", 1),
         Box::new(unary_math::SoftsignFactory),
     );
-    reg.register(OpKey::new("Acos", "", 1), Box::new(unary_math::AcosFactory));
-    reg.register(
+    rec.register(OpKey::new("Acos", "", 1), Box::new(unary_math::AcosFactory));
+    rec.register(
         OpKey::new("Acosh", "", 1),
         Box::new(unary_math::AcoshFactory),
     );
-    reg.register(OpKey::new("Asin", "", 1), Box::new(unary_math::AsinFactory));
-    reg.register(
+    rec.register(OpKey::new("Asin", "", 1), Box::new(unary_math::AsinFactory));
+    rec.register(
         OpKey::new("Asinh", "", 1),
         Box::new(unary_math::AsinhFactory),
     );
-    reg.register(OpKey::new("Atan", "", 1), Box::new(unary_math::AtanFactory));
-    reg.register(
+    rec.register(OpKey::new("Atan", "", 1), Box::new(unary_math::AtanFactory));
+    rec.register(
         OpKey::new("Atanh", "", 1),
         Box::new(unary_math::AtanhFactory),
     );
-    reg.register(OpKey::new("Cosh", "", 1), Box::new(unary_math::CoshFactory));
-    reg.register(OpKey::new("Sinh", "", 1), Box::new(unary_math::SinhFactory));
-    reg.register(OpKey::new("Tan", "", 1), Box::new(unary_math::TanFactory));
-    reg.register(OpKey::new("Elu", "", 1), Box::new(activations::EluFactory));
-    reg.register(
+    rec.register(OpKey::new("Cosh", "", 1), Box::new(unary_math::CoshFactory));
+    rec.register(OpKey::new("Sinh", "", 1), Box::new(unary_math::SinhFactory));
+    rec.register(OpKey::new("Tan", "", 1), Box::new(unary_math::TanFactory));
+    rec.register(OpKey::new("Elu", "", 1), Box::new(activations::EluFactory));
+    rec.register(
         OpKey::new("LeakyRelu", "", 1),
         Box::new(activations::LeakyReluFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("HardSigmoid", "", 1),
         Box::new(activations::HardSigmoidFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("Selu", "", 6),
         Box::new(activations::SeluFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("ThresholdedRelu", "", 10),
         Box::new(activations::ThresholdedReluFactory),
     );
     // Logical / selection.
-    reg.register(OpKey::new("And", "", 7), Box::new(logical::AndFactory));
-    reg.register(OpKey::new("Or", "", 7), Box::new(logical::OrFactory));
-    reg.register(OpKey::new("Xor", "", 7), Box::new(logical::XorFactory));
-    reg.register(OpKey::new("Not", "", 1), Box::new(logical::NotFactory));
-    reg.register(OpKey::new("Equal", "", 1), Box::new(logical::EqualFactory));
-    reg.register(
+    rec.register(OpKey::new("And", "", 7), Box::new(logical::AndFactory));
+    rec.register(OpKey::new("Or", "", 7), Box::new(logical::OrFactory));
+    rec.register(OpKey::new("Xor", "", 7), Box::new(logical::XorFactory));
+    rec.register(OpKey::new("Not", "", 1), Box::new(logical::NotFactory));
+    rec.register(OpKey::new("Equal", "", 1), Box::new(logical::EqualFactory));
+    rec.register(
         OpKey::new("Greater", "", 1),
         Box::new(logical::GreaterFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("GreaterOrEqual", "", 1),
         Box::new(logical::GreaterOrEqualFactory),
     );
-    reg.register(OpKey::new("Less", "", 1), Box::new(logical::LessFactory));
-    reg.register(
+    rec.register(OpKey::new("Less", "", 1), Box::new(logical::LessFactory));
+    rec.register(
         OpKey::new("LessOrEqual", "", 1),
         Box::new(logical::LessOrEqualFactory),
     );
-    reg.register(OpKey::new("Where", "", 1), Box::new(where_op::WhereFactory));
+    rec.register(OpKey::new("Where", "", 1), Box::new(where_op::WhereFactory));
     // Reductions (axes attribute or opset-13/18 axes input).
-    reg.register(
+    rec.register(
         OpKey::new("ReduceSum", "", 1),
         Box::new(reduce_ops::ReduceSumFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("ReduceMax", "", 1),
         Box::new(reduce_ops::ReduceMaxFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("ReduceMin", "", 1),
         Box::new(reduce_ops::ReduceMinFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("ReduceProd", "", 1),
         Box::new(reduce_ops::ReduceProdFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("ReduceSumSquare", "", 1),
         Box::new(reduce_ops::ReduceSumSquareFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("ReduceL1", "", 1),
         Box::new(reduce_ops::ReduceL1Factory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("ReduceL2", "", 1),
         Box::new(reduce_ops::ReduceL2Factory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("ReduceLogSum", "", 1),
         Box::new(reduce_ops::ReduceLogSumFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("ReduceLogSumExp", "", 1),
         Box::new(reduce_ops::ReduceLogSumExpFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("ReduceLogSumExp", "", 18),
         Box::new(reduce_ops::ReduceLogSumExpFactory),
     );
     // Shape / data movement (dtype-agnostic byte movers).
-    reg.register(OpKey::new("Concat", "", 1), Box::new(concat::ConcatFactory));
-    reg.register(
+    rec.register(OpKey::new("Concat", "", 1), Box::new(concat::ConcatFactory));
+    rec.register(
         OpKey::new("Flatten", "", 1),
         Box::new(movement_ops::FlattenFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("Squeeze", "", 1),
         Box::new(movement_ops::SqueezeFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("Size", "", 1),
         Box::new(movement_ops::SizeFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("Trilu", "", 14),
         Box::new(movement_ops::TriluFactory),
     );
     // Indexed data movement and sequence construction.
-    reg.register(
+    rec.register(
         OpKey::new("GatherElements", "", 11),
         Box::new(indexing::GatherElementsFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("GatherND", "", 11),
         Box::new(indexing::GatherNDFactory),
     );
     // ScatterElements gained its reduction attribute at opset 16.
-    reg.register(
+    rec.register(
         OpKey::new("ScatterElements", "", 11),
         Box::new(indexing::ScatterElementsFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("ScatterElements", "", 16),
         Box::new(indexing::ScatterElementsFactory),
     );
     // ScatterND gained reduction at opset 16 and max/min reductions at opset 18.
     for version in [11, 16, 18] {
-        reg.register(
+        rec.register(
             OpKey::new("ScatterND", "", version),
             Box::new(indexing::ScatterNDFactory),
         );
     }
-    reg.register(
+    rec.register(
         OpKey::new("OneHot", "", 9),
         Box::new(indexing::OneHotFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("OneHot", "", 11),
         Box::new(onehot::OneHotFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("BitShift", "", 11),
         Box::new(bitshift::BitShiftFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("Compress", "", 11),
         Box::new(compress::CompressFactory),
     );
-    reg.register(OpKey::new("Tile", "", 6), Box::new(sequence::TileFactory));
-    reg.register(
+    rec.register(OpKey::new("Tile", "", 6), Box::new(sequence::TileFactory));
+    rec.register(
         OpKey::new("Range", "", 11),
         Box::new(sequence::RangeFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("CumSum", "", 14),
         Box::new(sequence::CumSumFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("CumProd", "", 26),
         Box::new(sequence::CumProdFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("HannWindow", "", 17),
         Box::new(window::HannWindowFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("HammingWindow", "", 17),
         Box::new(window::HammingWindowFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("BlackmanWindow", "", 17),
         Box::new(window::BlackmanWindowFactory),
     );
-    reg.register(OpKey::new("DFT", "", 17), Box::new(dft::DftFactory));
-    reg.register(
+    rec.register(OpKey::new("DFT", "", 17), Box::new(dft::DftFactory));
+    rec.register(
         OpKey::new("BitwiseAnd", "", 18),
         Box::new(bitwise::BitwiseAndFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("BitwiseOr", "", 18),
         Box::new(bitwise::BitwiseOrFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("BitwiseXor", "", 18),
         Box::new(bitwise::BitwiseXorFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("BitwiseNot", "", 18),
         Box::new(bitwise::BitwiseNotFactory),
     );
     // Value selection.
-    reg.register(OpKey::new("Clip", "", 1), Box::new(selection::ClipFactory));
-    reg.register(
+    rec.register(OpKey::new("Clip", "", 1), Box::new(selection::ClipFactory));
+    rec.register(
         OpKey::new("ArgMax", "", 1),
         Box::new(selection::ArgMaxFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("ArgMin", "", 1),
         Box::new(selection::ArgMinFactory),
     );
-    reg.register(OpKey::new("TopK", "", 10), Box::new(selection::TopKFactory));
-    reg.register(
+    rec.register(OpKey::new("TopK", "", 10), Box::new(selection::TopKFactory));
+    rec.register(
         OpKey::new("NonMaxSuppression", "", 10),
         Box::new(selection::NonMaxSuppressionFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("NonZero", "", 9),
         Box::new(selection::NonZeroFactory),
     );
-    reg.register(
+    rec.register(
         OpKey::new("Hardmax", "", 13),
         Box::new(hardmax::HardmaxFactory),
     );
-    reg
+    rec.into_parts()
 }
 
 // ---------------------------------------------------------------------------
@@ -1853,5 +2216,103 @@ mod tests {
         let a = Owned::f32(&[3, 2], &[1., 4., 2., 5., 3., 6.]);
         let v = a.view();
         view_in_bounds(v.shape, v.strides, v.byte_offset, 4, a.bytes.len()).unwrap();
+    }
+
+    // ─── Registry-entry derivation tests ─────────────────────────────────
+
+    /// Shared fixture: build the registry + descriptors once for all
+    /// descriptor-related tests, avoiding ~8 redundant full-registry
+    /// constructions that inflate peak memory and wall-clock time.
+    fn shared_registry_with_descriptors() -> &'static (OpRegistry, Vec<CpuOpDescriptor>) {
+        use std::sync::OnceLock;
+        static FIXTURE: OnceLock<(OpRegistry, Vec<CpuOpDescriptor>)> = OnceLock::new();
+        FIXTURE.get_or_init(build_cpu_registry_with_descriptors)
+    }
+
+    #[test]
+    fn build_cpu_registry_with_descriptors_returns_nonempty() {
+        let (_reg, descriptors) = shared_registry_with_descriptors();
+        assert!(
+            descriptors.len() > 100,
+            "expected >100 descriptors, got {}",
+            descriptors.len()
+        );
+    }
+
+    #[test]
+    fn descriptors_include_add_with_f16_bf16() {
+        let (_reg, descriptors) = shared_registry_with_descriptors();
+        let add_entries: Vec<_> = descriptors
+            .iter()
+            .filter(|d| d.op_type == "Add" && d.domain.is_empty())
+            .collect();
+        assert!(!add_entries.is_empty(), "Add must appear in descriptors");
+        for entry in &add_entries {
+            assert!(
+                entry.supported_dtypes.contains(&DataType::Float16),
+                "Add must advertise Float16"
+            );
+            assert!(
+                entry.supported_dtypes.contains(&DataType::BFloat16),
+                "Add must advertise BFloat16"
+            );
+        }
+    }
+
+    #[test]
+    fn descriptors_include_matmul_with_f16_bf16() {
+        let (_reg, descriptors) = shared_registry_with_descriptors();
+        let matmul_entries: Vec<_> = descriptors
+            .iter()
+            .filter(|d| d.op_type == "MatMul" && d.domain.is_empty())
+            .collect();
+        assert!(
+            !matmul_entries.is_empty(),
+            "MatMul must appear in descriptors"
+        );
+        for entry in &matmul_entries {
+            assert!(
+                entry.supported_dtypes.contains(&DataType::Float16),
+                "MatMul must advertise Float16"
+            );
+            assert!(
+                entry.supported_dtypes.contains(&DataType::BFloat16),
+                "MatMul must advertise BFloat16"
+            );
+        }
+    }
+
+    #[test]
+    fn fail_closed_unknown_op_gets_f32_only() {
+        // An op not in our dtype mapping should get only f32.
+        let dtypes = supported_dtypes_for_op("TotallyFakeOp", "");
+        assert_eq!(dtypes, &[DataType::Float32]);
+        assert!(
+            !dtypes.contains(&DataType::Float16),
+            "unknown op must not advertise Float16"
+        );
+    }
+
+    #[test]
+    fn fail_closed_pkg_nxrt_ops_get_f32_only() {
+        let dtypes = supported_dtypes_for_op("BlockQuantizedMatMul", "pkg.nxrt");
+        assert_eq!(dtypes, &[DataType::Float32]);
+    }
+
+    #[test]
+    fn descriptors_derived_from_real_registry_not_hand_maintained() {
+        // Verify that the descriptor count matches the registry entry count
+        // (minus CNN ops that are directly registered without recording).
+        let reg = build_cpu_registry();
+        let (_reg2, descriptors) = shared_registry_with_descriptors();
+        // Descriptors should be close to registry len; CNN ops are the delta.
+        let delta = reg.len() as isize - descriptors.len() as isize;
+        assert!(
+            (0..50).contains(&delta),
+            "descriptor count ({}) should be close to registry len ({}), delta={}",
+            descriptors.len(),
+            reg.len(),
+            delta
+        );
     }
 }

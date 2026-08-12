@@ -135,3 +135,24 @@ Scribe note: the CLI dev-tool charter and prioritized backlog from the merged CL
 
 ## 2026-07-28T17:40:00+0000
 #364 merged after the implementation was corrected to use prefetch only in eviction-neutral cache regimes.
+
+---
+## ARCHIVED 2026-08-12T09:45:00Z (Scribe compaction — wave Jul-27 and Aug-11)
+
+### 2026-07-27T13:10:00-07:00 — CLI backlog now on main
+Source of truth: `docs/research/cli/00-backlog.md`.
+
+### 2026-07-27T14:55:00-07:00 — REPL Phase 1 rejection revision
+Took over PR #289 after Gaff's rejection. Made REPL command parsing mode-aware (Plain/Tty). Fixed post-generation newline.
+
+### 2026-07-27T18:46:09-07:00 — generate default stats stdout/stderr contract
+Compact stats on only when stdin+stdout are terminals; stderr-only; suppressed by `--profile`; piped stdout byte-stable.
+
+### 2026-07-28T17:40:00+0000
+#364 merged after correction to use prefetch only in eviction-neutral cache regimes.
+
+### 2026-08-11T19:30:00Z — PR #762 documentation accuracy pass (wave note)
+Rewrote PR body; updated 8 stale SHA refs in docs. `CUDA_EP_STATUS.md` accurate, no change.
+
+## 2026-08-11 — PR #762 documentation accuracy pass (commit bb280c0ea)
+PR body completely rewritten: 3 late-breaking blockers documented, 269 EP tests, explicit "What Is NOT Proven" section. 8 stale SHAs → `c1d2556b5`. Gaff confirmed; PR marked ready.

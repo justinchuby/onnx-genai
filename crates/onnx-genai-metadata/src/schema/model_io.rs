@@ -1,7 +1,7 @@
 use super::*;
 
 /// Model properties that are baked into the graph or advertised as configurable.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct ModelCapabilities {
     /// Attention architecture and dimensions.
     pub attention: Option<AttentionConfig>,
@@ -62,6 +62,16 @@ pub struct ModelIoSpec {
     /// Absent preserves the historical `owned` behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_ownership: Option<KvOwnership>,
+
+    /// Physical layout of this backend's KV cache tensors, as a stride
+    /// descriptor. Accepts a readable named layout (`head_major_bnsh` or
+    /// `seq_major_bsnh`) or a fully explicit [`KvStrideDescriptor`]. This is a
+    /// per-backend capability — each backend owns its KV buffers and never reads
+    /// the other's KV bytes — so the ORT backend stays head-major while the
+    /// native backend may declare seq-major. Absent preserves the historical
+    /// head-major (BNSH) behavior. See [`KvCacheLayout`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_layout: Option<KvCacheLayout>,
 
     /// Token-id input (e.g. `input_ids`).
     ///
@@ -311,6 +321,233 @@ pub enum KvOwnership {
     Shared,
 }
 
+/// A runtime KV-cache dimension that an axis stride can be a multiple of.
+///
+/// Absolute element strides are a serving-time property — they depend on the
+/// `cache_capacity` a runtime picks — so metadata cannot store them as numbers.
+/// A stride is therefore stored **symbolically**, as the (unordered) set of
+/// runtime dimensions it multiplies. The concrete element stride of an axis is
+/// the product of the sizes of the dimensions in its factor list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum KvStrideDim {
+    /// Number of KV heads (`kv_heads` / `N`).
+    KvHeads,
+    /// Sequence capacity of the growing axis (`cache_capacity` / `S`).
+    SeqCapacity,
+    /// Per-token head width (`head_dim` / `H`).
+    HeadDim,
+}
+
+/// Symbolic element stride of each of the four logical KV axes.
+///
+/// The stride of an axis is the product of the runtime dimensions in its factor
+/// list; an **empty** list means unit stride (the innermost, contiguous axis).
+/// The innermost axis of every layout the converted kernels honor is
+/// `head_dim`, whose stride is `1` (empty), because the fp16 read vectorizes
+/// `head_dim` as `half2` and the fused write addresses it as `dst + d`.
+///
+/// The two historical layouts map onto this as:
+///
+/// | axis     | head-major BNSH        | seq-major BSNH        |
+/// |----------|------------------------|-----------------------|
+/// | batch    | `kv_heads·seq·head_dim`| `seq·kv_heads·head_dim`|
+/// | head     | `seq·head_dim`         | `head_dim`            |
+/// | seq      | `head_dim`             | `kv_heads·head_dim`   |
+/// | head_dim | `1`                    | `1`                   |
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+pub struct KvAxisStrides {
+    /// Factors of the batch-axis stride.
+    #[serde(default)]
+    pub batch: Vec<KvStrideDim>,
+    /// Factors of the KV-head-axis stride.
+    #[serde(default)]
+    pub head: Vec<KvStrideDim>,
+    /// Factors of the sequence-axis (per-token) stride.
+    #[serde(default)]
+    pub seq: Vec<KvStrideDim>,
+    /// Factors of the head-dim-axis stride. Unit (empty) for every honored
+    /// layout.
+    #[serde(default)]
+    pub head_dim: Vec<KvStrideDim>,
+}
+
+fn u64_is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+/// A fully explicit KV-cache stride descriptor.
+///
+/// This is the general form the two named layouts expand into, and the shape a
+/// future layout (e.g. token-major) is expressed in without adding an enum
+/// variant. The `reservation_*` fields describe a binding that is a **view into
+/// a larger reservation** rather than the owner of its whole buffer:
+/// token-major stores every layer's tokens in one reservation and hands each
+/// `(layer, side)` a sub-view, so its per-token (seq) stride is taken over the
+/// reservation's total token count and its data starts at a non-zero offset.
+/// Both historical layouts are whole-buffer bindings: `offset == 0` and no
+/// reservation override.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+pub struct KvStrideDescriptor {
+    /// Symbolic stride of each logical axis.
+    pub strides: KvAxisStrides,
+    /// Element offset of this binding's first element within the reservation it
+    /// views. `0` for a binding that owns its whole buffer — the only case the
+    /// converted kernels honor today.
+    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    pub reservation_offset_elements: u64,
+    /// Sequence-axis extent, in token slots, of the reservation this binding
+    /// views when the reservation is larger than the binding's own
+    /// `cache_capacity`. Absent means the binding spans its own capacity (a
+    /// whole-buffer binding). Present expresses a token-major view whose seq
+    /// stride collapses the per-`(layer, side)` buffer boundary; not honored by
+    /// the converted path yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reservation_seq_slots: Option<u64>,
+}
+
+impl KvStrideDescriptor {
+    /// Head-major BNSH `[batch, kv_heads, seq, head_dim]` explicit strides.
+    pub fn head_major_bnsh() -> Self {
+        use KvStrideDim::{HeadDim, KvHeads, SeqCapacity};
+        KvStrideDescriptor {
+            strides: KvAxisStrides {
+                batch: vec![KvHeads, SeqCapacity, HeadDim],
+                head: vec![SeqCapacity, HeadDim],
+                seq: vec![HeadDim],
+                head_dim: vec![],
+            },
+            reservation_offset_elements: 0,
+            reservation_seq_slots: None,
+        }
+    }
+
+    /// Seq-major BSNH `[batch, seq, kv_heads, head_dim]` explicit strides.
+    pub fn seq_major_bsnh() -> Self {
+        use KvStrideDim::{HeadDim, KvHeads, SeqCapacity};
+        KvStrideDescriptor {
+            strides: KvAxisStrides {
+                batch: vec![SeqCapacity, KvHeads, HeadDim],
+                head: vec![HeadDim],
+                seq: vec![KvHeads, HeadDim],
+                head_dim: vec![],
+            },
+            reservation_offset_elements: 0,
+            reservation_seq_slots: None,
+        }
+    }
+}
+
+/// Physical memory layout of a backend's KV cache tensors, as a stride
+/// descriptor.
+///
+/// This is a **per-backend capability**, not a cross-backend constant: the two
+/// backends own their KV buffers independently and never read each other's KV
+/// bytes, so they may store the cache differently. The ONNX Runtime backend
+/// requires head-major BNSH (`[batch, kv_heads, seq, head_dim]`) because ORT's
+/// GroupQueryAttention past/present is BNSH on every dispatch path (Flash,
+/// cuDNN SDPA, memory-efficient, XQA). The native backend additionally supports
+/// seq-major BSNH (`[batch, seq, kv_heads, head_dim]`), which makes each token's
+/// live prefix contiguous across heads — shrinking the VMM granule floor by the
+/// `kv_heads` factor, removing growth-triggered graph re-capture (the append
+/// stride is sequence-length independent), and making page-level prefix sharing
+/// (#777) practical. Absent preserves the historical head-major behavior.
+///
+/// Layout preference is per-EP and per-platform rather than a global constant,
+/// and a JIT backend compiles a specialized kernel per descriptor, so this is a
+/// descriptor rather than a closed enum: a raw stride tuple is unreadable, so
+/// the common cases are still nameable (`head_major_bnsh`, `seq_major_bsnh`)
+/// while an explicit [`KvStrideDescriptor`] expresses anything the named forms
+/// cannot (e.g. a token-major view).
+///
+/// On-device, the native backend selects the layout by stamping the `kv_layout`
+/// attribute (`0` = BNSH, `1` = BSNH) on its GroupQueryAttention nodes; the
+/// CUDA EP honors it on the fused fp16 single-token decode pair. Seq-major is
+/// only enabled end-to-end once the prefill (flash) read is also converted, so
+/// the two never disagree about how a shared cache is physically laid out.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(untagged)]
+pub enum KvCacheLayout {
+    /// A readable shorthand for a standard layout. Deserializes from the strings
+    /// `"head_major_bnsh"` and `"seq_major_bsnh"`; expands to explicit strides
+    /// via [`KvCacheLayout::resolve_strides`].
+    Named(KvNamedLayout),
+    /// A fully explicit stride descriptor for layouts the named forms cannot
+    /// express.
+    Explicit(KvStrideDescriptor),
+}
+
+/// The named, human-readable KV cache layouts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum KvNamedLayout {
+    /// Head-major BNSH `[batch, kv_heads, seq, head_dim]`. ORT-compatible; the
+    /// default for both backends.
+    HeadMajorBnsh,
+    /// Seq-major BSNH `[batch, seq, kv_heads, head_dim]`. Native backend only.
+    SeqMajorBsnh,
+}
+
+impl KvNamedLayout {
+    /// The explicit stride descriptor this named layout expands into.
+    pub fn strides(self) -> KvStrideDescriptor {
+        match self {
+            KvNamedLayout::HeadMajorBnsh => KvStrideDescriptor::head_major_bnsh(),
+            KvNamedLayout::SeqMajorBsnh => KvStrideDescriptor::seq_major_bsnh(),
+        }
+    }
+
+    /// The `kv_layout` GroupQueryAttention attribute value the native backend
+    /// stamps for this layout (`0` = BNSH, `1` = BSNH).
+    pub fn gqa_attribute_value(self) -> i64 {
+        match self {
+            KvNamedLayout::HeadMajorBnsh => 0,
+            KvNamedLayout::SeqMajorBsnh => 1,
+        }
+    }
+}
+
+impl KvCacheLayout {
+    /// Named head-major BNSH layout (the default).
+    pub fn head_major_bnsh() -> Self {
+        KvCacheLayout::Named(KvNamedLayout::HeadMajorBnsh)
+    }
+
+    /// Named seq-major BSNH layout (native backend only).
+    pub fn seq_major_bsnh() -> Self {
+        KvCacheLayout::Named(KvNamedLayout::SeqMajorBsnh)
+    }
+
+    /// Expand this layout to its explicit stride descriptor. Named layouts
+    /// expand to their canonical strides; an explicit descriptor is returned
+    /// unchanged.
+    pub fn resolve_strides(&self) -> KvStrideDescriptor {
+        match self {
+            KvCacheLayout::Named(named) => named.strides(),
+            KvCacheLayout::Explicit(descriptor) => descriptor.clone(),
+        }
+    }
+
+    /// The `kv_layout` GroupQueryAttention attribute value (`0` = BNSH,
+    /// `1` = BSNH) this layout stamps, or `None` when the descriptor is not one
+    /// of the two attribute-expressible named layouts (e.g. a token-major view
+    /// the wire format cannot yet carry).
+    pub fn gqa_attribute_value(&self) -> Option<i64> {
+        match self {
+            KvCacheLayout::Named(named) => Some(named.gqa_attribute_value()),
+            KvCacheLayout::Explicit(descriptor) => {
+                if *descriptor == KvStrideDescriptor::head_major_bnsh() {
+                    Some(0)
+                } else if *descriptor == KvStrideDescriptor::seq_major_bsnh() {
+                    Some(1)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
 /// One fixed-shape loop-carried recurrent-state port pair.
 ///
 /// Generic and architecture-neutral: the runtime zero/other-initializes `input`
@@ -542,4 +779,70 @@ pub struct QuantizationOverride {
     /// Required precision or quantization recipe.
     #[schemars(with = "schema_vocabulary::Precision")]
     pub precision: String,
+}
+
+#[cfg(test)]
+mod kv_layout_tests {
+    use super::*;
+
+    // The named layouts must expand to exactly the strides the retired
+    // `KvLayout::{HeadMajorBnsh, SeqMajorBsnh}` enum variants implied, so the
+    // descriptor migration cannot silently change a layout.
+    #[test]
+    fn head_major_bnsh_strides_match_legacy_enum() {
+        use KvStrideDim::{HeadDim, KvHeads, SeqCapacity};
+        let strides = KvCacheLayout::head_major_bnsh().resolve_strides().strides;
+        assert_eq!(strides.batch, vec![KvHeads, SeqCapacity, HeadDim]);
+        assert_eq!(strides.head, vec![SeqCapacity, HeadDim]);
+        assert_eq!(strides.seq, vec![HeadDim]);
+        assert_eq!(strides.head_dim, Vec::<KvStrideDim>::new());
+    }
+
+    #[test]
+    fn seq_major_bsnh_strides_match_legacy_enum() {
+        use KvStrideDim::{HeadDim, KvHeads, SeqCapacity};
+        let strides = KvCacheLayout::seq_major_bsnh().resolve_strides().strides;
+        assert_eq!(strides.batch, vec![SeqCapacity, KvHeads, HeadDim]);
+        assert_eq!(strides.head, vec![HeadDim]);
+        assert_eq!(strides.seq, vec![KvHeads, HeadDim]);
+        assert_eq!(strides.head_dim, Vec::<KvStrideDim>::new());
+    }
+
+    // Existing metadata that names a layout as a bare string keeps working.
+    #[test]
+    fn named_layout_deserializes_from_string_alias() {
+        let bnsh: KvCacheLayout = serde_json::from_str("\"head_major_bnsh\"").unwrap();
+        assert_eq!(bnsh, KvCacheLayout::head_major_bnsh());
+        assert_eq!(
+            bnsh.resolve_strides(),
+            KvStrideDescriptor::head_major_bnsh()
+        );
+        assert_eq!(bnsh.gqa_attribute_value(), Some(0));
+
+        let bsnh: KvCacheLayout = serde_json::from_str("\"seq_major_bsnh\"").unwrap();
+        assert_eq!(bsnh, KvCacheLayout::seq_major_bsnh());
+        assert_eq!(bsnh.gqa_attribute_value(), Some(1));
+    }
+
+    // The general form round-trips and an explicit descriptor equal to a named
+    // layout still maps back onto its wire attribute value.
+    #[test]
+    fn explicit_descriptor_round_trips() {
+        let explicit = KvCacheLayout::Explicit(KvStrideDescriptor::seq_major_bsnh());
+        let json = serde_json::to_string(&explicit).unwrap();
+        let parsed: KvCacheLayout = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, explicit);
+        assert_eq!(parsed.gqa_attribute_value(), Some(1));
+    }
+
+    // A token-major-style view (non-zero offset, reservation override) is
+    // expressible but is not one of the two attribute-expressible named layouts.
+    #[test]
+    fn reservation_view_has_no_wire_attribute() {
+        let mut descriptor = KvStrideDescriptor::seq_major_bsnh();
+        descriptor.reservation_offset_elements = 4096;
+        descriptor.reservation_seq_slots = Some(1 << 20);
+        let view = KvCacheLayout::Explicit(descriptor);
+        assert_eq!(view.gqa_attribute_value(), None);
+    }
 }

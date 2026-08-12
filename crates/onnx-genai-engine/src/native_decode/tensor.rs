@@ -305,33 +305,61 @@ pub(crate) fn recurrent_state_bytes_per_sequence(
         if !declared.contains(meta.name.as_str()) || !is_recurrent_state_shape(&meta.shape) {
             continue;
         }
-        let mut elements: u64 = 1;
-        for (axis, dim) in meta.shape.iter().copied().enumerate() {
-            let extent = match dim {
-                Dim::Static(value) => u64::try_from(value).unwrap_or(0),
-                // Axis 0 is batch, and this figure is per sequence.
-                Dim::Symbolic(_) if axis == 0 => 1,
-                Dim::Symbolic(_) => bail!(
-                    "cannot size recurrent state '{}': dimension {axis} of {:?} is symbolic and \
-                     is not the batch axis, so the export did not pin a geometry to reserve for",
-                    meta.name,
-                    meta.shape
-                ),
-            };
-            elements = elements.saturating_mul(extent);
-        }
-        let bytes = meta
-            .dtype
-            .checked_storage_bytes(usize::try_from(elements).unwrap_or(usize::MAX))
-            .with_context(|| {
-                format!(
-                    "unsupported recurrent-state dtype {:?} for '{}'",
-                    meta.dtype, meta.name
-                )
-            })?;
-        total = total.saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+        total = total.saturating_add(recurrent_state_tensor_bytes(
+            &meta.name,
+            meta.dtype,
+            &meta.shape,
+        )?);
     }
     Ok(total)
+}
+
+#[cfg(feature = "cuda")]
+pub(crate) fn recurrent_state_bytes_from_graph(
+    graph: &onnx_runtime_ir::Graph,
+    io: Option<&onnx_genai_metadata::ModelIoSpec>,
+) -> anyhow::Result<u64> {
+    let declared: std::collections::HashSet<&str> = io
+        .and_then(|io| io.state_pairs.as_deref())
+        .unwrap_or_default()
+        .iter()
+        .map(|pair| pair.input.as_str())
+        .collect();
+    let mut total = 0_u64;
+    for &input in &graph.inputs {
+        let value = graph.value(input);
+        let Some(name) = value.name.as_deref() else {
+            continue;
+        };
+        if !declared.contains(name) || !is_recurrent_state_shape(&value.shape) {
+            continue;
+        }
+        total = total.saturating_add(recurrent_state_tensor_bytes(
+            name,
+            value.dtype,
+            &value.shape,
+        )?);
+    }
+    Ok(total)
+}
+
+fn recurrent_state_tensor_bytes(name: &str, dtype: DataType, shape: &[Dim]) -> anyhow::Result<u64> {
+    let mut elements: u64 = 1;
+    for (axis, dim) in shape.iter().copied().enumerate() {
+        let extent = match dim {
+            Dim::Static(value) => u64::try_from(value).unwrap_or(0),
+            Dim::Symbolic(_) if axis == 0 => 1,
+            Dim::Symbolic(_) => bail!(
+                "cannot size recurrent state '{name}': dimension {axis} of {shape:?} is symbolic \
+                 and is not the batch axis, so the export did not pin a geometry to reserve for"
+            ),
+        };
+        elements = elements.saturating_mul(extent);
+    }
+    let bytes = dtype
+        .checked_storage_bytes(usize::try_from(elements).unwrap_or(usize::MAX))
+        .with_context(|| format!("unsupported recurrent-state dtype {dtype:?} for '{name}'"))?;
+    Ok(u64::try_from(bytes).unwrap_or(u64::MAX))
 }
 
 /// Bytes of KV cache one sequence holds at full context, from the declared
@@ -368,8 +396,7 @@ pub(crate) fn kv_cache_bytes_per_sequence(
 ) -> anyhow::Result<u64> {
     let declared: std::collections::HashSet<&str> =
         present_to_past.values().map(String::as_str).collect();
-    let context = u64::try_from(max_context).unwrap_or(0);
-    let mut total: u64 = 0;
+    let mut tensors = Vec::new();
     for meta in session.inputs() {
         // Recurrent state is loop-carried too, and is charged separately at its
         // own fixed size. Sizing it by context would be wrong by orders of
@@ -377,37 +404,32 @@ pub(crate) fn kv_cache_bytes_per_sequence(
         if !declared.contains(meta.name.as_str()) || is_recurrent_state_shape(&meta.shape) {
             continue;
         }
-        let mut elements: u64 = 1;
-        let mut sequence_axes = 0;
-        for (axis, dim) in meta.shape.iter().copied().enumerate() {
-            let extent = match dim {
-                Dim::Static(value) => u64::try_from(value).unwrap_or(0),
-                // Axis 0 is batch, and this figure is per sequence.
-                Dim::Symbolic(_) if axis == 0 => 1,
-                Dim::Symbolic(_) => {
-                    sequence_axes += 1;
-                    context
-                }
-            };
-            elements = elements.saturating_mul(extent);
-        }
-        if sequence_axes > 1 {
-            bail!(
-                "cannot size KV input '{}': {:?} has {sequence_axes} symbolic non-batch axes, so \
-                 which one grows with context is ambiguous and a reservation would be a guess",
-                meta.name,
-                meta.shape
-            );
-        }
-        let bytes = meta
-            .dtype
-            .checked_storage_bytes(usize::try_from(elements).unwrap_or(usize::MAX))
-            .with_context(|| {
-                format!("unsupported KV dtype {:?} for '{}'", meta.dtype, meta.name)
-            })?;
-        total = total.saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+        tensors.push(crate::kv_sizing::KvTensorSpec {
+            name: meta.name.clone(),
+            dtype: match meta.dtype {
+                DataType::Float32 => crate::kv_sizing::KvStorageType::Float32,
+                DataType::Float16 => crate::kv_sizing::KvStorageType::Float16,
+                DataType::BFloat16 => crate::kv_sizing::KvStorageType::BFloat16,
+                dtype => bail!("unsupported KV dtype {dtype:?} for '{}'", meta.name),
+            },
+            shape: meta
+                .shape
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(axis, dim)| match dim {
+                    Dim::Static(value) => {
+                        crate::kv_sizing::KvDimension::Fixed(u64::try_from(value).unwrap_or(0))
+                    }
+                    Dim::Symbolic(_) if axis == 0 => {
+                        crate::kv_sizing::KvDimension::PerSequenceBatch
+                    }
+                    Dim::Symbolic(_) => crate::kv_sizing::KvDimension::Context,
+                })
+                .collect(),
+        });
     }
-    Ok(total)
+    crate::kv_sizing::kv_cache_bytes_for_tensors(&tensors, u64::try_from(max_context).unwrap_or(0))
 }
 
 pub(crate) fn make_empty_input_tensor(

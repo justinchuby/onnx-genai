@@ -608,6 +608,81 @@ async fn streaming_chat_and_completion_chunks_include_logprobs() {
 }
 
 #[tokio::test]
+async fn accepted_streams_preserve_first_chunk_and_chat_protocol_order() {
+    let chat = app(tiny_state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-llm",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "max_tokens": 2,
+                        "temperature": 0.0,
+                        "stream": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(chat.status(), StatusCode::OK);
+    let chat_events = sse_json_events(&to_bytes(chat.into_body(), usize::MAX).await.unwrap());
+    assert_eq!(
+        chat_events[0]["choices"][0]["delta"]["role"], "assistant",
+        "the role chunk must remain first after admission"
+    );
+    assert_eq!(
+        chat_events
+            .iter()
+            .filter(|event| event["choices"][0]["delta"]["content"].is_string())
+            .count(),
+        2,
+        "the admission handshake must not consume the first content token"
+    );
+
+    let completion = app(tiny_state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-llm",
+                        "prompt": "hello",
+                        "max_tokens": 2,
+                        "temperature": 0.0,
+                        "stream": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(completion.status(), StatusCode::OK);
+    let completion_events =
+        sse_json_events(&to_bytes(completion.into_body(), usize::MAX).await.unwrap());
+    assert_eq!(
+        completion_events
+            .iter()
+            .filter(|event| {
+                !event["choices"][0]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .is_empty()
+            })
+            .count(),
+        2,
+        "the admission handshake must not consume the first completion token"
+    );
+}
+
+#[tokio::test]
 async fn logprobs_validation_enforces_openai_limits() {
     for body in [
         json!({
@@ -1697,6 +1772,26 @@ async fn resources_get_and_admin_vram_override_report_governor_state() {
         );
     }
 
+    // #755: the resolved memory strategy (strategy, offload state, managed
+    // no-spill VMM state, resolved budget) must be observable over /v1/resources.
+    let memory_strategy = body
+        .get("memory_strategy")
+        .expect("resources must report the resolved memory strategy");
+    for key in [
+        "strategy",
+        "weight_offload_enabled",
+        "managed_no_spill",
+        "auto_enabled",
+    ] {
+        assert!(
+            memory_strategy.get(key).is_some(),
+            "missing memory_strategy key {key}"
+        );
+    }
+    assert!(
+        memory_strategy["strategy"].is_string(),
+        "memory strategy must be named: {body}"
+    );
     let impossible = router
         .clone()
         .oneshot(
@@ -1731,6 +1826,88 @@ async fn resources_get_and_admin_vram_override_report_governor_state() {
         .unwrap();
     assert_eq!(valid.status(), StatusCode::OK);
     assert!(json_body(valid).await["vram"]["limit"].is_number());
+}
+
+#[tokio::test]
+async fn explicit_max_batch_above_one_is_refused_on_non_batching_backend() {
+    // tiny-llm is a plain past/present model with no shared KV buffer on the CPU
+    // EP, so it cannot batch. An explicit `--max-batch 4` must be refused at
+    // startup (issue #750), not silently accepted and served one-at-a-time.
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+    let error = match AppState::load_with_config(
+        &model_dir,
+        Some("tiny-llm".to_string()),
+        ServerConfig {
+            max_batch: Some(4),
+            ..ServerConfig::default()
+        },
+    ) {
+        Ok(_) => panic!("explicit --max-batch 4 must be refused on a non-batching backend"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(
+        error.contains("--max-batch 4") && error.contains("cannot be honored"),
+        "refusal must name the flag and the reason: {error}"
+    );
+}
+
+#[tokio::test]
+async fn default_max_batch_is_silently_clamped_on_non_batching_backend() {
+    // With no explicit `--max-batch`, the same non-batching model must still load
+    // (the default width is clamped, not refused), and `/v1/resources` must
+    // report the honest capability so an operator is not left guessing.
+    let router = app(tiny_state());
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/v1/resources")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(
+        body["batching"]["supported"], false,
+        "tiny-llm cannot batch on the CPU EP"
+    );
+    assert_eq!(
+        body["batching"]["effective_max_batch"], 1,
+        "non-batching backend must clamp the effective width to 1"
+    );
+    assert!(
+        body["batching"]["reason"]
+            .as_str()
+            .is_some_and(|r| !r.is_empty()),
+        "batching report must carry a non-empty reason"
+    );
+}
+
+#[tokio::test]
+async fn resources_reports_batching_supported_on_static_cache_backend() {
+    // The static-cache fixture decodes a shared batch, so the report must say so:
+    // this is the positive control proving the capability is read from the decode
+    // path and not hard-coded to false.
+    let model_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter");
+    let state =
+        AppState::load(&model_dir, Some("tiny-llm-scatter".to_string())).expect("load scatter");
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/resources")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(
+        body["batching"]["supported"], true,
+        "static-cache decode supports continuous batching"
+    );
 }
 
 #[tokio::test]
@@ -1906,6 +2083,99 @@ fn stop_boundary_buffer_suppresses_matched_stop_sequence() {
 }
 
 #[tokio::test]
+async fn fim_stream_returns_headers_before_generation_finishes() {
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+    let state = AppState::load(&model_dir, Some("tiny-llm".to_string()))
+        .expect("load fixture")
+        .with_default_fim_config(Some(onnx_genai_engine::FimConfig {
+            prefix_token: "<PRE>".to_string(),
+            middle_token: "<MID>".to_string(),
+            suffix_token: "<SUF>".to_string(),
+            format: onnx_genai_engine::FimFormat::PSM,
+        }));
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/completions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({
+                "model": "tiny-llm",
+                "prompt": "prefix",
+                "suffix": "suffix",
+                "max_tokens": 1,
+                "temperature": 0.0,
+                "stream": true
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let response = timeout(Duration::from_millis(100), app(state).oneshot(request))
+        .await
+        .expect("SSE headers must follow admission, not completed FIM generation")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = timeout(
+        Duration::from_secs(10),
+        to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("FIM stream did not terminate")
+    .unwrap();
+    assert!(
+        std::str::from_utf8(&body)
+            .unwrap()
+            .ends_with("data: [DONE]\n\n")
+    );
+}
+
+#[tokio::test]
+async fn accepted_zero_visible_output_stream_returns_headers_and_terminates() {
+    let response = app(tiny_state())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-llm",
+                        "prompt": "hello",
+                        "max_tokens": 1,
+                        "temperature": 0.0,
+                        "stop": "tok22",
+                        "logprobs": 1,
+                        "stream": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let events = sse_json_events(&body);
+    assert!(
+        events.iter().all(|event| event["choices"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty()),
+        "the stop sequence must suppress all visible token text: {}",
+        std::str::from_utf8(&body).unwrap()
+    );
+    assert_eq!(
+        events.last().unwrap()["choices"][0]["finish_reason"],
+        "stop"
+    );
+    assert!(
+        std::str::from_utf8(&body)
+            .unwrap()
+            .ends_with("data: [DONE]\n\n")
+    );
+}
+
+#[tokio::test]
 async fn loaded_server_model_reports_nonzero_device_ledger_usage() {
     let state = tiny_state();
     let handle = state.registry.resolve("").unwrap().unwrap();
@@ -1994,6 +2264,7 @@ async fn stalled_output_route_does_not_block_another_completion() {
     }))
     .unwrap();
     let (slow_tx, _slow_rx) = mpsc::channel(1);
+    let (slow_admission, _slow_admission_rx) = tokio::sync::oneshot::channel();
     let slow_permit = driver
         .generation_capacity
         .clone()
@@ -2004,6 +2275,7 @@ async fn stalled_output_route_does_not_block_another_completion() {
         .send(DriverCommand::Generate {
             session_id: None,
             request: Box::new(build_generate_request(&slow_request)),
+            admission: slow_admission,
             events: slow_tx,
             permit: slow_permit,
         })
@@ -2014,10 +2286,13 @@ async fn stalled_output_route_does_not_block_another_completion() {
         .await
         .unwrap();
 
-    let fast_result = timeout(Duration::from_secs(5), collect_generation_result(fast_rx))
-        .await
-        .expect("fast request timed out behind stalled consumer")
-        .expect("fast request failed");
+    let fast_result = timeout(
+        Duration::from_secs(5),
+        collect_generation_result(fast_rx.events),
+    )
+    .await
+    .expect("fast request timed out behind stalled consumer")
+    .expect("fast request failed");
     assert_eq!(fast_result.token_ids.len(), 2);
 }
 
@@ -2042,11 +2317,14 @@ async fn native_driver_sessions_generate_through_server_path() {
     request.options.max_new_tokens = 2;
     request.options.temperature = 0.0;
     request.options.stop_on_eos = false;
-    let rx = driver.generate(Some(session_id), request).await.unwrap();
-    let result = timeout(Duration::from_secs(5), collect_generation_result(rx))
-        .await
-        .expect("native session generation timed out")
-        .expect("native session generation failed");
+    let generation = driver.generate(Some(session_id), request).await.unwrap();
+    let result = timeout(
+        Duration::from_secs(5),
+        collect_generation_result(generation.events),
+    )
+    .await
+    .expect("native session generation timed out")
+    .expect("native session generation failed");
 
     assert_eq!(result.token_ids, vec![1, 1]);
     assert_eq!(driver.session_token_count(session_id).await.unwrap(), 3);
@@ -2433,6 +2711,65 @@ fn lazy_state(config: ServerConfig) -> AppState {
         },
     ];
     AppState::load_from_specs(specs, config).expect("load lazy two-model state")
+}
+
+#[cfg(feature = "metrics")]
+#[tokio::test]
+async fn metrics_keep_shared_vram_after_default_model_unload() {
+    let state = lazy_state(ServerConfig::default());
+    state.registry.load("model-b").await.unwrap();
+    state.registry.unload("model-a").unwrap();
+
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    let used = prometheus_sample(&body, "onnx_genai_vram_used_bytes");
+    let limit = prometheus_sample(&body, "onnx_genai_vram_limit_bytes");
+    let headroom = prometheus_sample(&body, "onnx_genai_vram_headroom_bytes");
+    assert!(used > 0);
+    assert!(limit > used);
+    assert_eq!(headroom, limit - used);
+}
+
+#[tokio::test]
+async fn admin_vram_update_with_no_loaded_models_sets_future_policy() {
+    let state = lazy_state(ServerConfig {
+        enable_admin_endpoints: true,
+        engine_config: EngineConfig {
+            allow_runtime_override: true,
+            ..EngineConfig::default()
+        },
+        ..ServerConfig::default()
+    });
+    state.registry.unload("model-a").unwrap();
+
+    let response = app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/admin/resources/vram-limit")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"limit": "7GiB"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let loaded = state.registry.load("model-b").await.unwrap();
+    assert_eq!(
+        loaded.engine.resource_snapshot().await.unwrap().vram.limit,
+        7 << 30
+    );
 }
 
 fn chat_request(model: &str) -> Request<Body> {
@@ -3621,6 +3958,25 @@ async fn debug_profile_reports_stage_totals() {
             .as_str()
             .is_some_and(|note| note.contains("ONNX_GENAI_PROFILE")),
         "an empty profile must say how to fill it: {body}"
+    );
+    let plans = body["memory_strategy_plans"]
+        .as_array()
+        .expect("profile must expose model memory strategy plans");
+    assert_eq!(plans.len(), 1, "body: {body}");
+    assert_eq!(plans[0]["model_id"], "tiny-llm");
+    assert!(
+        plans[0]["plan"]["strategy"].is_string(),
+        "the effective strategy must be present: {body}"
+    );
+    assert!(
+        plans[0]["plan"]["decisions"]
+            .as_array()
+            .is_some_and(|decisions| decisions.iter().all(|decision| {
+                decision["source"].is_string()
+                    && decision["reason"].is_string()
+                    && decision["evidence"].is_string()
+            })),
+        "every strategy decision must include provenance: {body}"
     );
 }
 

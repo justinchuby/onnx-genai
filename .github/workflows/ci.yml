@@ -541,6 +541,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       CARGO_TERM_COLOR: always
+      NXRT_REQUIRE_ORT_TESTS: "1"
 
     steps:
       - uses: actions/checkout@v5
@@ -637,6 +638,9 @@ jobs:
       # required-features = ["cuda", "native-backend"] and are not selected here.
       - name: Test onnx-genai-engine native backend
         run: cargo test --locked -p onnx-genai-engine --features native-backend
+      - name: Test onnx-runtime-ep-cpu-plugin (ORT gate)
+        if: runner.os == 'Linux'
+        run: cargo test --locked --no-fail-fast -p onnx-runtime-ep-cpu-plugin
       - name: Upload CLI ORT coverage to Codecov
         if: always()
         uses: codecov/codecov-action@v4
@@ -704,6 +708,13 @@ jobs:
 
       - name: Verify CUDA test inventory and skip honesty
         run: python .github/scripts/verify_cuda_test_honesty.py
+
+      # The capture-sync source audit is a static check (it reads kernel sources,
+      # touches no device) that the honesty checker deliberately does not police
+      # as a GPU test. Run it explicitly here so a capture-unsafe synchronize()
+      # still fails the CPU lane at PR time.
+      - name: Audit CUDA kernel capture-sync contract
+        run: cargo test --locked -p onnx-runtime-ep-cuda --features cuda --test capture_sync_contract
 
       - name: Clippy CUDA execution provider
         run: cargo clippy -p onnx-runtime-ep-cuda --features cuda -- -D warnings

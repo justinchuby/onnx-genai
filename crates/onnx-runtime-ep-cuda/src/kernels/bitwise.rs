@@ -29,7 +29,7 @@ use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, Ten
 use onnx_runtime_ir::{Attribute, DataType, Node};
 
 use super::elementwise::{
-    BroadcastMetadataCache, BroadcastMetadataKey, is_fixed_decode_shape,
+    BroadcastMetadataCache, BroadcastMetadataKey, capture_shape_eligible,
     require_matching_capture_signature,
 };
 use crate::error::{driver_err, not_implemented};
@@ -248,6 +248,7 @@ impl KernelFactory for BitwiseBinaryFactory {
             runtime: self.runtime.clone(),
             metadata: Mutex::new(BroadcastMetadataCache::new(self.runtime.clone())),
             last_capture_safe_signature: Mutex::new(None),
+            capture_seq_independent: false,
         }))
     }
 }
@@ -278,6 +279,7 @@ impl KernelFactory for BitShiftFactory {
             runtime: self.runtime.clone(),
             metadata: Mutex::new(BroadcastMetadataCache::new(self.runtime.clone())),
             last_capture_safe_signature: Mutex::new(None),
+            capture_seq_independent: false,
         }))
     }
 }
@@ -303,6 +305,10 @@ pub struct BinaryIntKernel {
     /// The dtype/shape signature recorded by the most recent successful
     /// fixed-decode call. `Some` iff the op is currently capture-safe.
     last_capture_safe_signature: Mutex<Option<BinaryCaptureSignature>>,
+    /// Metadata-derived seq-independence: `true` iff all IR output dims are
+    /// statically known (no growing seq axis), making the op capture-eligible
+    /// regardless of the runtime row count.
+    capture_seq_independent: bool,
 }
 
 impl BinaryIntKernel {
@@ -360,8 +366,7 @@ impl BinaryIntKernel {
         let b_ptr = cuptr(b.data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
 
-        let capture_eligible =
-            out_shape.iter().product::<usize>() == 1 || is_fixed_decode_shape(&out_shape);
+        let capture_eligible = capture_shape_eligible(self.capture_seq_independent, &out_shape);
         let current_signature = capture_eligible.then(|| BinaryCaptureSignature {
             dtype: a.dtype,
             shapes: BroadcastMetadataKey {
@@ -432,6 +437,10 @@ impl Kernel for BinaryIntKernel {
                 self.kind.op_name()
             )),
         }
+    }
+
+    fn set_capture_seq_independent(&mut self, seq_independent: bool) {
+        self.capture_seq_independent = seq_independent;
     }
 }
 

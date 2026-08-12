@@ -247,6 +247,7 @@ fn resolve_shared_kv(model_dir: &Path, config: &SpeculatorConfig) -> SpeculatorP
         .unwrap_or_else(|| crate::schema::ModelIoSpec {
             sequence_source: Some(crate::schema::SequenceInputKind::InputsEmbeds),
             kv_ownership: Some(crate::schema::KvOwnership::Shared),
+            kv_layout: None,
             token_input: None,
             inputs_embeds_input: Some("inputs_embeds".into()),
             attention_mask_input: Some("attention_mask".into()),

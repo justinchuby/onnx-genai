@@ -622,6 +622,9 @@ impl Kernel for LinearAttentionKernel {
             })
         }
         .map_err(|error| driver_err("launch LinearAttention", error))?;
+        if self.runtime.is_capturing()? {
+            return Ok(());
+        }
         self.runtime.synchronize()
     }
 

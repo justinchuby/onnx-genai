@@ -1,7 +1,8 @@
 //! Batched static-cache generation path.
 
 use crate::config::{
-    FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult,
+    EngineDecodeBackend, FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest,
+    GenerateResult,
 };
 use crate::decode::ModelDecodePath;
 use crate::decode_loop::{
@@ -36,6 +37,17 @@ pub enum ContinuousBatchEvent {
     Finished {
         handle: ContinuousBatchHandle,
         result: GenerateResult,
+    },
+}
+
+#[derive(Debug)]
+pub enum ContinuousBatchAdmission {
+    Assigned {
+        handle: ContinuousBatchHandle,
+    },
+    Rejected {
+        handle: ContinuousBatchHandle,
+        error: anyhow::Error,
     },
 }
 
@@ -92,6 +104,67 @@ impl ContinuousBatchRow {
     }
 }
 
+/// Operator-facing description of how many sequences the engine's decode path
+/// can advance in a single shared forward pass.
+///
+/// This is sourced from the decode path itself — the resolved
+/// [`EngineDecodeBackend`](crate::EngineDecodeBackend) plus the model-I/O
+/// [`ModelDecodePath`] selection — **not** from whether an ORT decoder session
+/// happens to be present. Before this type existed, the only signal an operator
+/// had was [`Engine::continuous_batch_manager`] returning `Err`, which the
+/// server swallowed into a debug/info-level "using per-request engine path" log
+/// line. On the native backend that `Err` is structural and permanent (batch and
+/// query-seq are pinned to 1 in `native_decode/cuda.rs`), so reporting it as a
+/// first-class capability lets `--max-batch` and `/v1/resources` tell the truth
+/// instead of accepting a batch width that silently has no effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchingCapability {
+    /// Maximum number of sequences that can be decoded concurrently in one
+    /// shared forward pass. `None` means "not structurally capped": batching is
+    /// supported and bounded only by memory and the operator's `--max-batch`.
+    /// `Some(1)` means the decode path can only ever advance one sequence, so
+    /// continuous batching is unavailable regardless of the requested width.
+    max_concurrent_sequences: Option<usize>,
+    /// Operator-facing explanation naming the backend / decode path and the
+    /// reason for the limit. Safe to log and to surface over `/v1/resources`.
+    reason: String,
+}
+
+impl BatchingCapability {
+    /// Whether more than one sequence can share a decode step.
+    pub fn supports_batching(&self) -> bool {
+        !matches!(self.max_concurrent_sequences, Some(cap) if cap <= 1)
+    }
+
+    /// The structural cap on concurrently-decoded sequences, if any. `None`
+    /// means "bounded only by memory / configuration".
+    pub fn max_concurrent_sequences(&self) -> Option<usize> {
+        self.max_concurrent_sequences
+    }
+
+    /// Operator-facing reason string describing the backend / decode path.
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    /// Whether a requested batch width can be honored by this decode path.
+    pub fn allows(&self, requested: usize) -> bool {
+        match self.max_concurrent_sequences {
+            None => true,
+            Some(cap) => requested <= cap,
+        }
+    }
+
+    /// The batch width that will actually take effect for `requested`: the
+    /// request clamped to `[1, cap]` (or just floored at 1 when uncapped).
+    pub fn effective_max_batch(&self, requested: usize) -> usize {
+        match self.max_concurrent_sequences {
+            None => requested.max(1),
+            Some(cap) => requested.clamp(1, cap),
+        }
+    }
+}
+
 /// Synchronous continuous-batch manager for STATIC-CACHE models.
 ///
 /// Requests are submitted into a FIFO queue and admitted into a fixed number of
@@ -105,6 +178,7 @@ pub struct ContinuousBatchManager<'a> {
     static_max_len: usize,
     queue: VecDeque<PendingContinuousRequest>,
     rows: Vec<Option<ContinuousBatchRow>>,
+    admissions: VecDeque<ContinuousBatchAdmission>,
     events: VecDeque<ContinuousBatchEvent>,
     next_handle: usize,
 }
@@ -132,6 +206,7 @@ impl<'a> ContinuousBatchManager<'a> {
             static_max_len,
             queue: VecDeque::new(),
             rows: (0..max_batch).map(|_| None).collect(),
+            admissions: VecDeque::new(),
             events: VecDeque::new(),
             next_handle: 0,
         })
@@ -161,6 +236,8 @@ impl<'a> ContinuousBatchManager<'a> {
         let max_context = self.max_context_for_request(&options);
         let chain = build_processor_chain(&options, Some(self.tokenizer))?;
         if reached_context_limit(prompt_tokens.len(), max_context) {
+            self.admissions
+                .push_back(ContinuousBatchAdmission::Assigned { handle });
             ensure_constrained_finish(&options, "", FinishReason::Length)?;
             self.events.push_back(ContinuousBatchEvent::Finished {
                 handle,
@@ -180,7 +257,7 @@ impl<'a> ContinuousBatchManager<'a> {
 
     /// Advance all rows with pending logits by one generated token.
     pub fn step(&mut self) -> anyhow::Result<()> {
-        self.admit_available_rows()?;
+        self.admit_available_rows();
         let ready_rows = self
             .rows
             .iter()
@@ -205,13 +282,33 @@ impl<'a> ContinuousBatchManager<'a> {
             }
         }
 
-        self.admit_available_rows()?;
         self.decode_next_pending_rows()
+    }
+
+    /// Assign queued requests to currently available decode rows.
+    pub fn admit_pending(&mut self) {
+        self.admit_available_rows();
     }
 
     /// Drain token/result events emitted by previous `submit` or `step` calls.
     pub fn poll(&mut self) -> Vec<ContinuousBatchEvent> {
         self.events.drain(..).collect()
+    }
+
+    pub fn poll_admissions(&mut self) -> Vec<ContinuousBatchAdmission> {
+        self.admissions.drain(..).collect()
+    }
+
+    pub fn cancel_pending(&mut self, handle: ContinuousBatchHandle) -> bool {
+        let Some(index) = self
+            .queue
+            .iter()
+            .position(|pending| pending.handle == handle)
+        else {
+            return false;
+        };
+        self.queue.remove(index);
+        true
     }
 
     pub fn max_batch(&self) -> usize {
@@ -239,15 +336,22 @@ impl<'a> ContinuousBatchManager<'a> {
         Some(configured.map_or(self.static_max_len, |limit| limit.min(self.static_max_len)))
     }
 
-    fn admit_available_rows(&mut self) -> anyhow::Result<()> {
+    fn admit_available_rows(&mut self) {
         while !self.queue.is_empty() {
             let Some(row_index) = self.rows.iter().position(|row| row.is_none()) else {
                 break;
             };
             let pending = self.queue.pop_front().expect("queue checked non-empty");
-            self.admit_pending_into_row(pending, row_index)?;
+            let handle = pending.handle;
+            match self.admit_pending_into_row(pending, row_index) {
+                Ok(()) => self
+                    .admissions
+                    .push_back(ContinuousBatchAdmission::Assigned { handle }),
+                Err(error) => self
+                    .admissions
+                    .push_back(ContinuousBatchAdmission::Rejected { handle, error }),
+            }
         }
-        Ok(())
     }
 
     fn admit_pending_into_row(
@@ -601,6 +705,68 @@ impl Engine {
         }
 
         collect_batch_results(results)
+    }
+
+    /// Report how many sequences this engine's decode path can advance in a
+    /// single shared forward pass, and why.
+    ///
+    /// The answer is derived from the resolved decode backend and the model-I/O
+    /// [`ModelDecodePath`], **not** from whether an ORT decoder session happens
+    /// to be present. That distinction is the whole point: on the native backend
+    /// [`Self::continuous_batch_manager`] always fails because there is no ORT
+    /// decoder session, but the honest reason is that native decode pins batch
+    /// and query-seq to 1 as a structural invariant (`native_decode/cuda.rs`),
+    /// not that a session is momentarily missing.
+    pub fn batching_capability(&self) -> BatchingCapability {
+        // The native decode path advances exactly one sequence per step
+        // regardless of the model's KV I/O shape, so it is answered first and
+        // unconditionally. `native_decode/cuda.rs` pins both the batch dimension
+        // and the query-sequence dimension to 1 as a structural decode
+        // invariant, which is not a tunable.
+        if self.decode_backend == EngineDecodeBackend::Native {
+            return BatchingCapability {
+                max_concurrent_sequences: Some(1),
+                reason: "the native decode backend advances exactly one sequence \
+                         per step: batch and query-seq are pinned to 1 as a \
+                         structural decode invariant (native_decode/cuda.rs), so \
+                         continuous batching is unavailable"
+                    .to_string(),
+            };
+        }
+        match self.decode_path {
+            ModelDecodePath::StaticCache { .. } => BatchingCapability {
+                max_concurrent_sequences: None,
+                reason: "ONNX Runtime static-cache decode advances a shared batch \
+                         of sequences per step; concurrency is bounded only by \
+                         memory and the configured maximum batch size"
+                    .to_string(),
+            },
+            ModelDecodePath::PastPresent {
+                shared_buffer: true,
+                ..
+            } => BatchingCapability {
+                max_concurrent_sequences: None,
+                reason: "shared-KV-buffer past/present decode advances a shared \
+                         batch of sequences per step; concurrency is bounded only \
+                         by memory and the configured maximum batch size"
+                    .to_string(),
+            },
+            ModelDecodePath::PastPresent { .. } => BatchingCapability {
+                max_concurrent_sequences: Some(1),
+                reason: "this past/present model is not using a shared KV buffer: \
+                         the execution provider did not report fixed-capacity \
+                         present binding, or it was not opted into at launch, so \
+                         only one sequence can be decoded at a time"
+                    .to_string(),
+            },
+            ModelDecodePath::Legacy => BatchingCapability {
+                max_concurrent_sequences: Some(1),
+                reason: "this legacy past/present model has no shared KV buffer \
+                         and cannot batch: continuous batching requires a \
+                         static-cache or shared-buffer past/present model"
+                    .to_string(),
+            },
+        }
     }
 
     /// Create a lower-level continuous-batch manager for incremental serving.
@@ -1003,6 +1169,107 @@ fn collect_batch_results(
 mod tests {
     use super::*;
     use crate::sampling::sample_categorical;
+    use onnx_genai_ort::decode::BatchedDecodeSession;
+    use onnx_genai_ort::{OrtError, Value};
+    use std::path::Path;
+
+    struct RejectAssignDecode;
+
+    impl<'a> BatchedDecodeSession<'a> for RejectAssignDecode {
+        fn batch_size(&self) -> usize {
+            1
+        }
+
+        fn max_len(&self) -> usize {
+            32
+        }
+
+        fn row_len(&self, _row: usize) -> onnx_genai_ort::Result<usize> {
+            Ok(0)
+        }
+
+        fn active_rows(&self) -> Vec<usize> {
+            Vec::new()
+        }
+
+        fn deactivate_row(&mut self, _row: usize) -> onnx_genai_ort::Result<()> {
+            Ok(())
+        }
+
+        fn assign_row(&mut self, _row: usize) -> onnx_genai_ort::Result<()> {
+            Err(OrtError::InvalidArgument(
+                "deliberate row assignment failure".to_string(),
+            ))
+        }
+
+        fn step_select(
+            &mut self,
+            _next_token_ids: &[i64],
+            _position_ids: &[i64],
+            _advance_rows: &[bool],
+        ) -> onnx_genai_ort::Result<Value> {
+            unreachable!("a rejected row must never decode")
+        }
+
+        fn step_active(
+            &mut self,
+            _next_token_ids: &[i64],
+            _position_ids: &[i64],
+        ) -> onnx_genai_ort::Result<Value> {
+            unreachable!("a rejected row must never decode")
+        }
+    }
+
+    struct AcceptAssignDecode;
+
+    impl<'a> BatchedDecodeSession<'a> for AcceptAssignDecode {
+        fn batch_size(&self) -> usize {
+            1
+        }
+
+        fn max_len(&self) -> usize {
+            32
+        }
+
+        fn row_len(&self, _row: usize) -> onnx_genai_ort::Result<usize> {
+            Ok(0)
+        }
+
+        fn active_rows(&self) -> Vec<usize> {
+            Vec::new()
+        }
+
+        fn deactivate_row(&mut self, _row: usize) -> onnx_genai_ort::Result<()> {
+            Ok(())
+        }
+
+        fn assign_row(&mut self, _row: usize) -> onnx_genai_ort::Result<()> {
+            Ok(())
+        }
+
+        fn step_select(
+            &mut self,
+            _next_token_ids: &[i64],
+            _position_ids: &[i64],
+            _advance_rows: &[bool],
+        ) -> onnx_genai_ort::Result<Value> {
+            unreachable!("admission must not require backend generation")
+        }
+
+        fn step_active(
+            &mut self,
+            _next_token_ids: &[i64],
+            _position_ids: &[i64],
+        ) -> onnx_genai_ort::Result<Value> {
+            unreachable!("admission must not require backend generation")
+        }
+    }
+
+    fn test_tokenizer() -> Tokenizer {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm/tokenizer.json");
+        Tokenizer::from_file(path).expect("load tiny tokenizer")
+    }
 
     #[test]
     fn per_row_sampling_is_seedable_and_independent() {
@@ -1020,5 +1287,66 @@ mod tests {
         assert_eq!(sequence(0), sequence(0));
         assert_eq!(sequence(1), sequence(1));
         assert_ne!(sequence(0), sequence(1));
+    }
+
+    #[test]
+    fn row_assignment_failure_is_reported_for_the_submitted_handle() {
+        let tokenizer = test_tokenizer();
+        let mut manager =
+            ContinuousBatchManager::new(Box::new(RejectAssignDecode), &tokenizer, None, 1).unwrap();
+        let handle = manager
+            .submit(GenerateRequest::new(GeneratePrompt::TokenIds(vec![1])))
+            .unwrap();
+
+        assert!(manager.poll_admissions().is_empty());
+        manager.step().unwrap();
+        let admissions = manager.poll_admissions();
+        assert_eq!(admissions.len(), 1);
+        match &admissions[0] {
+            ContinuousBatchAdmission::Rejected {
+                handle: rejected,
+                error,
+            } => {
+                assert_eq!(*rejected, handle);
+                assert!(
+                    error
+                        .to_string()
+                        .contains("deliberate row assignment failure")
+                );
+            }
+            ContinuousBatchAdmission::Assigned { .. } => panic!("failed row was acknowledged"),
+        }
+        assert!(!manager.has_pending_work());
+    }
+
+    #[test]
+    fn successful_row_admission_is_observable_before_backend_generation() {
+        let tokenizer = test_tokenizer();
+        let mut manager =
+            ContinuousBatchManager::new(Box::new(AcceptAssignDecode), &tokenizer, None, 1).unwrap();
+        let handle = manager
+            .submit(GenerateRequest::new(GeneratePrompt::TokenIds(vec![1])))
+            .unwrap();
+
+        manager.admit_pending();
+        let admissions = manager.poll_admissions();
+        assert!(matches!(
+            admissions.as_slice(),
+            [ContinuousBatchAdmission::Assigned { handle: assigned }] if *assigned == handle
+        ));
+    }
+
+    #[test]
+    fn pending_request_can_be_cancelled_without_an_admission_event() {
+        let tokenizer = test_tokenizer();
+        let mut manager =
+            ContinuousBatchManager::new(Box::new(RejectAssignDecode), &tokenizer, None, 1).unwrap();
+        let handle = manager
+            .submit(GenerateRequest::new(GeneratePrompt::TokenIds(vec![1])))
+            .unwrap();
+
+        assert!(manager.cancel_pending(handle));
+        assert!(!manager.has_pending_work());
+        assert!(manager.poll_admissions().is_empty());
     }
 }

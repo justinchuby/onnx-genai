@@ -425,6 +425,7 @@ impl KernelFactory for UnaryFactory {
                     .and_then(Attribute::as_int)
                     == Some(1),
             last_capture_safe_signature: Mutex::new(None),
+            capture_seq_independent: false,
         }))
     }
 }
@@ -454,6 +455,7 @@ impl KernelFactory for StandardGeluFactory {
             runtime: self.runtime.clone(),
             decomposed_silu: false,
             last_capture_safe_signature: Mutex::new(None),
+            capture_seq_independent: false,
         }))
     }
 }
@@ -465,6 +467,7 @@ pub struct UnaryKernel {
     runtime: Arc<CudaRuntime>,
     decomposed_silu: bool,
     last_capture_safe_signature: Mutex<Option<UnaryCaptureSignature>>,
+    capture_seq_independent: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -533,10 +536,13 @@ impl UnaryKernel {
                 "CUDA SwiGLU fusion was not selected because this Silu does not feed one eligible equal-shape Mul exclusively"
             );
         }
-        let current_signature = is_fixed_decode_shape(x.shape).then(|| UnaryCaptureSignature {
-            dtype,
-            shape: x.shape.to_vec(),
-        });
+        let current_signature =
+            capture_shape_eligible(self.capture_seq_independent, x.shape).then(|| {
+                UnaryCaptureSignature {
+                    dtype,
+                    shape: x.shape.to_vec(),
+                }
+            });
         require_matching_capture_signature(
             &self.runtime,
             op,
@@ -597,6 +603,10 @@ impl Kernel for UnaryKernel {
             )),
         }
     }
+
+    fn set_capture_seq_independent(&mut self, seq_independent: bool) {
+        self.capture_seq_independent = seq_independent;
+    }
 }
 
 /// Factory for [`BinaryKernel`]; carries the op identity and shared runtime.
@@ -617,6 +627,7 @@ impl KernelFactory for BinaryFactory {
                     .and_then(Attribute::as_int)
                     == Some(1),
                 last_capture_safe_signature: Mutex::new(None),
+                capture_seq_independent: false,
             }));
         }
         Ok(Box::new(BinaryKernel {
@@ -624,6 +635,7 @@ impl KernelFactory for BinaryFactory {
             runtime: self.runtime.clone(),
             metadata: Mutex::new(BroadcastMetadataCache::new(self.runtime.clone())),
             last_capture_safe_signature: Mutex::new(None),
+            capture_seq_independent: false,
         }))
     }
 }
@@ -635,6 +647,7 @@ pub struct BinaryKernel {
     runtime: Arc<CudaRuntime>,
     metadata: Mutex<BroadcastMetadataCache>,
     last_capture_safe_signature: Mutex<Option<BinaryCaptureSignature>>,
+    capture_seq_independent: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -796,14 +809,15 @@ impl BinaryKernel {
                 "CUDA SwiGLU fusion was not selected because this Mul is not an eligible equal-shape, single-consumer Mul(Silu(gate), up) pattern"
             );
         }
-        let current_signature = is_fixed_decode_shape(&out_shape).then(|| BinaryCaptureSignature {
-            dtype: a.dtype,
-            shapes: BroadcastMetadataKey {
-                a_shape: a.shape.to_vec(),
-                b_shape: b.shape.to_vec(),
-                out_shape: out_shape.clone(),
-            },
-        });
+        let current_signature = capture_shape_eligible(self.capture_seq_independent, &out_shape)
+            .then(|| BinaryCaptureSignature {
+                dtype: a.dtype,
+                shapes: BroadcastMetadataKey {
+                    a_shape: a.shape.to_vec(),
+                    b_shape: b.shape.to_vec(),
+                    out_shape: out_shape.clone(),
+                },
+            });
         require_matching_capture_signature(
             &self.runtime,
             op,
@@ -874,6 +888,10 @@ impl Kernel for BinaryKernel {
             )),
         }
     }
+
+    fn set_capture_seq_independent(&mut self, seq_independent: bool) {
+        self.capture_seq_independent = seq_independent;
+    }
 }
 
 /// Fused equal-shape `silu(gate) * up` pointwise kernel.
@@ -882,6 +900,7 @@ struct SiluMulKernel {
     runtime: Arc<CudaRuntime>,
     decomposed: bool,
     last_capture_safe_signature: Mutex<Option<UnaryCaptureSignature>>,
+    capture_seq_independent: bool,
 }
 
 impl SiluMulKernel {
@@ -925,10 +944,11 @@ impl SiluMulKernel {
         let n = gate.numel();
         let n_u64 = u64::try_from(n)
             .map_err(|_| EpError::KernelFailed(format!("cuda_ep {OP}: {n} elements exceed u64")))?;
-        let current_signature = is_fixed_decode_shape(gate.shape).then(|| UnaryCaptureSignature {
-            dtype,
-            shape: gate.shape.to_vec(),
-        });
+        let current_signature = capture_shape_eligible(self.capture_seq_independent, gate.shape)
+            .then(|| UnaryCaptureSignature {
+                dtype,
+                shape: gate.shape.to_vec(),
+            });
         require_matching_capture_signature(
             &self.runtime,
             OP,
@@ -995,6 +1015,10 @@ impl Kernel for SiluMulKernel {
             ),
         }
     }
+
+    fn set_capture_seq_independent(&mut self, seq_independent: bool) {
+        self.capture_seq_independent = seq_independent;
+    }
 }
 
 pub(crate) fn require_matching_capture_signature<T: PartialEq>(
@@ -1011,8 +1035,31 @@ pub(crate) fn require_matching_capture_signature<T: PartialEq>(
     Ok(())
 }
 
-pub(crate) fn is_fixed_decode_shape(shape: &[usize]) -> bool {
-    !shape.is_empty() && shape[..shape.len() - 1].iter().product::<usize>() == 1
+/// Whether a pointwise op may be admitted to CUDA-graph capture for this call.
+///
+/// The build-time growing-symbol classifier
+/// (`compute_capture_disqualifying_symbols` →
+/// `node_capture_seq_independent` → `set_capture_seq_independent`) is the sole,
+/// authoritative authority here: `seq_independent == true` means every symbol on
+/// this node's output shape is *provably* pinned (fail-safe classifier) / not
+/// proven growing (denylist classifier), so the captured launch geometry stays
+/// valid across every decode replay. `seq_independent == false` is a definitive
+/// "not provably safe" in BOTH classifiers, so capture MUST be vetoed regardless
+/// of the runtime shape.
+///
+/// This deliberately does NOT fall back to a runtime-extent heuristic. A prior
+/// version OR-ed in `product == 1` / `is_fixed_decode_shape` (any rank-1 `[N]`
+/// row), which could re-admit a node the classifier had correctly disqualified —
+/// e.g. a `Reshape([seq_kv*8]) → Sigmoid` whose growing extent `[320]` must be
+/// `[328]` next step — baking stale geometry into the graph and silently
+/// corrupting decode. Those OR terms can only ever *wrongly override* a real
+/// disqualification (the classifier already treats a genuinely pinned
+/// single-token decode axis — query `seq_len == 1`, static feature dims — as
+/// `seq_independent = true` natively), so they are pure hazard and are dropped.
+/// The `shape` argument is retained for a stable call signature and potential
+/// logging; eligibility is decided entirely by the classifier's verdict.
+pub(crate) fn capture_shape_eligible(seq_independent: bool, _shape: &[usize]) -> bool {
+    seq_independent
 }
 
 pub(crate) fn broadcast_metadata(a: &[usize], b: &[usize], out: &[usize]) -> Vec<u64> {
@@ -1151,6 +1198,70 @@ mod tests {
     }
 
     #[test]
+    fn classifier_disqualified_node_is_never_capture_eligible_regardless_of_shape() {
+        // `seq_independent == false` is the growing-symbol classifier's hard veto:
+        // no runtime shape may re-admit the node to CUDA-graph capture. On HEAD
+        // 0fd87df3 `capture_shape_eligible(false, &[320])` returned `true` (any
+        // rank-1 `[N]` satisfied `is_fixed_decode_shape`), silently baking a
+        // growing KV extent into the captured graph -> decode corruption. The
+        // authoritative veto must return `false` here.
+        assert!(!capture_shape_eligible(false, &[320]));
+        assert!(!capture_shape_eligible(false, &[328]));
+        // Scalar / product==1 shapes were also OR-admitted before; still vetoed.
+        assert!(!capture_shape_eligible(false, &[1]));
+        assert!(!capture_shape_eligible(false, &[1, 1, 1]));
+        assert!(!capture_shape_eligible(false, &[]));
+        // Higher-rank growing rows were always eager and remain so.
+        assert!(!capture_shape_eligible(false, &[320, 8]));
+    }
+
+    #[test]
+    fn classifier_pinned_node_stays_capture_eligible() {
+        // A truly pinned single-token decode shape the classifier proves safe
+        // (`seq_independent == true`, e.g. `[1,1,heads,dim]`) stays eligible.
+        assert!(capture_shape_eligible(true, &[1, 1, 32, 128]));
+        assert!(capture_shape_eligible(true, &[1]));
+        assert!(capture_shape_eligible(true, &[]));
+        // The verdict is shape-independent: even a large static feature row the
+        // classifier proved pinned stays capturable.
+        assert!(capture_shape_eligible(true, &[320]));
+    }
+
+    #[test]
+    fn disqualified_growing_reshape_consumer_yields_no_capture_signature() {
+        // Capture-LEVEL check mirroring `UnaryKernel::run`'s gating
+        // (`capture_shape_eligible(self.capture_seq_independent, shape).then(..)`)
+        // for a `Reshape([seq_kv,8],[-1]) -> seq_kv*8 -> Sigmoid` consumer that
+        // the classifier disqualified (`capture_seq_independent = false`) with a
+        // growing runtime extent `[320]`. A disqualified node must never produce a
+        // capture-safe signature, so `capture_support()` reports Unsupported. On
+        // HEAD 0fd87df3 this signature was `Some` (the silent-corruption hole).
+        let seq_independent = false;
+        let growing_shape = [320usize];
+        let signature = capture_shape_eligible(seq_independent, &growing_shape)
+            .then_some(growing_shape.to_vec());
+        assert!(
+            signature.is_none(),
+            "a classifier-disqualified node must never produce a capture-safe signature"
+        );
+    }
+
+    #[test]
+    fn pinned_single_token_consumer_yields_capture_signature() {
+        // Positive companion: a classifier-proven-pinned single-token decode
+        // consumer still produces a capture-safe signature, so capture coverage
+        // for genuinely fixed decode shapes is preserved.
+        let seq_independent = true;
+        let pinned_shape = [1usize, 1, 32, 128];
+        let signature =
+            capture_shape_eligible(seq_independent, &pinned_shape).then_some(pinned_shape.to_vec());
+        assert!(
+            signature.is_some(),
+            "a classifier-proven-pinned node must remain capture-eligible"
+        );
+    }
+
+    #[test]
     fn silu_mul_f16_matches_reference_with_half2_tail() {
         let previous_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
@@ -1212,6 +1323,7 @@ mod tests {
             runtime: runtime.clone(),
             decomposed: false,
             last_capture_safe_signature: Mutex::new(None),
+            capture_seq_independent: false,
         }
         .execute(&inputs, &mut outputs)
         .unwrap();
@@ -1297,6 +1409,7 @@ mod tests {
             runtime: runtime.clone(),
             decomposed_silu: true,
             last_capture_safe_signature: Mutex::new(None),
+            capture_seq_independent: false,
         }
         .execute(&standalone_input, &mut standalone_output)
         .unwrap();

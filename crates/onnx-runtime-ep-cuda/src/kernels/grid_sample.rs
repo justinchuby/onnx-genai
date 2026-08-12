@@ -298,6 +298,9 @@ impl Kernel for GridSampleKernel {
             })
         }
         .map_err(|error| driver_err("launch GridSample", error))?;
+        if self.runtime.is_capturing()? {
+            return Ok(());
+        }
         self.runtime.synchronize()
     }
 }

@@ -1,3 +1,4 @@
+use super::kv_commit::KvCommitLayout;
 use super::*;
 #[cfg(feature = "cuda")]
 use onnx_genai_metadata::LoopStatePair;
@@ -85,8 +86,58 @@ fn graph_capture_auto_enables_for_owned_cuda_kv() {
     // Env unset, no programmatic override, offload disabled -> auto-enable from
     // structure.
     assert!(resolve_graph_capture_enabled(
-        None, false, false, structural, false
+        None, false, false, structural, false, false
     ));
+}
+
+#[test]
+fn every_decode_level_capture_decline_names_its_predicate() {
+    let owned_cuda = GraphCaptureStructuralSafety {
+        device_is_cuda: true,
+        kv_ownership: KvOwnership::Owned,
+    };
+    let cases = [
+        resolve_graph_capture_decision(None, false, false, owned_cuda, true, false),
+        resolve_graph_capture_decision(Some(false), false, false, owned_cuda, false, false),
+        resolve_graph_capture_decision(None, true, false, owned_cuda, false, false),
+        resolve_graph_capture_decision(
+            None,
+            false,
+            false,
+            GraphCaptureStructuralSafety {
+                device_is_cuda: false,
+                kv_ownership: KvOwnership::Owned,
+            },
+            false,
+            false,
+        ),
+        resolve_graph_capture_decision(
+            None,
+            false,
+            false,
+            GraphCaptureStructuralSafety {
+                device_is_cuda: true,
+                kv_ownership: KvOwnership::Shared,
+            },
+            false,
+            false,
+        ),
+    ];
+
+    for decision in cases {
+        assert!(!decision.is_enabled());
+        let reason = decision
+            .decline_reason()
+            .expect("a disabled capture decision must always carry a reason");
+        assert!(
+            reason.starts_with("predicate `"),
+            "decline must name its predicate: {reason}"
+        );
+    }
+
+    let enabled = resolve_graph_capture_decision(None, false, false, owned_cuda, false, false);
+    assert!(enabled.is_enabled());
+    assert!(enabled.decline_reason().is_none());
 }
 
 #[test]
@@ -95,23 +146,77 @@ fn weight_offload_forces_graph_capture_off() {
         device_is_cuda: true,
         kv_ownership: KvOwnership::Owned,
     };
-    // Offload wins over every other signal: auto-safe structure, an explicit
-    // env=1, and an explicit programmatic request all still resolve to OFF.
+    // On the pointer-unstable (non stable-VA) paging path, offload wins over
+    // every other signal: auto-safe structure, an explicit env=1, and an
+    // explicit programmatic request all still resolve to OFF.
     assert!(!resolve_graph_capture_enabled(
-        None, false, false, safe, true
+        None, false, false, safe, true, false
     ));
-    assert!(!resolve_graph_capture_enabled(None, true, true, safe, true));
+    assert!(!resolve_graph_capture_enabled(
+        None, true, true, safe, true, false
+    ));
     assert!(!resolve_graph_capture_enabled(
         Some(true),
         true,
         true,
         safe,
-        true
+        true,
+        false
     ));
     // Sanity: with offload disabled the same safe structure enables capture, so
     // the exclusion above is genuinely caused by offload.
     assert!(resolve_graph_capture_enabled(
-        None, false, false, safe, false
+        None, false, false, safe, false, false
+    ));
+}
+
+#[test]
+fn weight_offload_on_stable_va_path_keeps_graph_capture() {
+    // Issue #716: when offload runs on the stable virtual-address VMM paging
+    // path, weight page-ins reuse a reserved-once device VA, which is
+    // capture-safe. Offload no longer forces capture OFF; the normal precedence
+    // (programmatic > env > structural) applies exactly as with offload off.
+    let safe = GraphCaptureStructuralSafety {
+        device_is_cuda: true,
+        kv_ownership: KvOwnership::Owned,
+    };
+    // Auto-decision from a safe structure now enables capture with offload on.
+    assert!(resolve_graph_capture_enabled(
+        None, false, false, safe, true, true
+    ));
+    // An explicit env=1 is honored.
+    assert!(resolve_graph_capture_enabled(
+        None, true, true, safe, true, true
+    ));
+    // A programmatic request is honored in both directions.
+    assert!(resolve_graph_capture_enabled(
+        Some(true),
+        false,
+        false,
+        safe,
+        true,
+        true
+    ));
+    assert!(!resolve_graph_capture_enabled(
+        Some(false),
+        false,
+        false,
+        safe,
+        true,
+        true
+    ));
+    // An unsafe structure still declines, exactly as it would with offload off.
+    let unsafe_structure = GraphCaptureStructuralSafety {
+        device_is_cuda: true,
+        kv_ownership: KvOwnership::Shared,
+    };
+    assert!(!resolve_graph_capture_enabled(
+        None,
+        false,
+        false,
+        unsafe_structure,
+        true,
+        true
     ));
 }
 
@@ -241,7 +346,7 @@ fn graph_capture_auto_declines_for_non_owned_or_non_cuda() {
     };
     assert!(!shared.is_capture_safe());
     assert!(!resolve_graph_capture_enabled(
-        None, false, false, shared, false
+        None, false, false, shared, false, false
     ));
 
     let cpu_owned = GraphCaptureStructuralSafety {
@@ -250,7 +355,7 @@ fn graph_capture_auto_declines_for_non_owned_or_non_cuda() {
     };
     assert!(!cpu_owned.is_capture_safe());
     assert!(!resolve_graph_capture_enabled(
-        None, false, false, cpu_owned, false
+        None, false, false, cpu_owned, false, false
     ));
 }
 
@@ -266,7 +371,7 @@ fn graph_capture_env_explicit_overrides_auto_decision() {
     };
     // ONNX_GENAI_CUDA_GRAPH=0 forces OFF even when structurally safe.
     assert!(!resolve_graph_capture_enabled(
-        None, true, false, safe, false
+        None, true, false, safe, false, false
     ));
     // ONNX_GENAI_CUDA_GRAPH=1 forces ON even when structure would decline
     // (the runtime decline machinery is still the final safety net).
@@ -275,6 +380,7 @@ fn graph_capture_env_explicit_overrides_auto_decision() {
         true,
         true,
         unsafe_structural,
+        false,
         false
     ));
 }
@@ -291,6 +397,7 @@ fn graph_capture_programmatic_override_wins_over_env_and_structure() {
         true,
         true,
         safe,
+        false,
         false
     ));
     // Programmatic Some(true) beats explicit env=0.
@@ -299,6 +406,7 @@ fn graph_capture_programmatic_override_wins_over_env_and_structure() {
         true,
         false,
         safe,
+        false,
         false
     ));
 }
@@ -749,6 +857,7 @@ fn target_io(sequence_source: SequenceInputKind) -> ModelIoSpec {
     ModelIoSpec {
         sequence_source: Some(sequence_source),
         kv_ownership: Some(KvOwnership::Owned),
+        kv_layout: None,
         token_input: (sequence_source == SequenceInputKind::TokenIds).then(|| "input_ids".into()),
         inputs_embeds_input: (sequence_source == SequenceInputKind::InputsEmbeds)
             .then(|| "embedded_sequence".into()),
@@ -773,6 +882,7 @@ fn tiny_decoder_io() -> ModelIoSpec {
     ModelIoSpec {
         sequence_source: Some(SequenceInputKind::TokenIds),
         kv_ownership: Some(KvOwnership::Owned),
+        kv_layout: None,
         token_input: Some("input_ids".into()),
         inputs_embeds_input: None,
         attention_mask_input: Some("attention_mask".into()),
@@ -918,6 +1028,7 @@ fn proposer_io(sequence_source: SequenceInputKind, kv_ownership: KvOwnership) ->
     ModelIoSpec {
         sequence_source: Some(sequence_source),
         kv_ownership: Some(kv_ownership),
+        kv_layout: None,
         token_input: (sequence_source == SequenceInputKind::TokenIds).then(|| "input_ids".into()),
         inputs_embeds_input: (sequence_source == SequenceInputKind::InputsEmbeds)
             .then(|| "embeddings".into()),
@@ -1272,6 +1383,7 @@ fn build_cuda_decoder_with_fixed_state(
                 metadata_max_len: None,
                 graph_capture: Some(graph_capture),
                 weight_offload_enabled: None,
+                weight_offload_stable_va: None,
             },
         )
     }
@@ -1895,6 +2007,82 @@ fn cuda_persistent_state_shapes_preserve_growing_kv_and_fixed_recurrent_geometry
 }
 
 #[test]
+fn kv_growth_byte_layout_keeps_head_major_bnsh_and_permutes_seq_major_to_bsnh() {
+    // BNSH declared shape [batch, kv_heads, capacity, head_dim].
+    let bnsh = [1usize, 8, 512, 128];
+
+    // Head-major must be byte-identical to the historical behavior: the byte
+    // layout equals the declared shape and the grow axis is 2.
+    let (head_bytes, head_axis) =
+        kv_growth_byte_layout(&bnsh, KvCommitLayout::HeadMajor).expect("head-major layout");
+    assert_eq!(head_bytes, bnsh.to_vec());
+    assert_eq!(head_axis, 2);
+
+    // Seq-major stores bytes as BSNH [batch, capacity, kv_heads, head_dim] and
+    // grows on axis 1.
+    let (seq_bytes, seq_axis) =
+        kv_growth_byte_layout(&bnsh, KvCommitLayout::SeqMajor).expect("seq-major layout");
+    assert_eq!(seq_bytes, vec![1, 512, 8, 128]);
+    assert_eq!(seq_axis, 1);
+
+    // Rank must be four.
+    assert!(kv_growth_byte_layout(&[1, 8, 512], KvCommitLayout::SeqMajor).is_err());
+}
+
+// The defining property of the seq-major buffer: the per-token stride is
+// `kv_heads * head_dim` and is independent of the sequence capacity, so growing
+// the capacity does not move any live byte. Head-major's per-head stripe stride
+// scales with capacity, so growth re-strides every head but head 0.
+#[test]
+fn seq_major_growth_is_fixed_stride_and_moves_no_bytes() {
+    // Mirror the block/stride arithmetic of `copy_kv_prefix_device_to_device*`:
+    // for a byte-layout shape and grow axis, block `b` starts at
+    // `b * capacity * inner` elements, where `inner` is the product of the axes
+    // below the grow axis.
+    fn block_bases(bnsh: &[usize], layout: KvCommitLayout) -> (Vec<usize>, usize) {
+        let (bytes, axis) = kv_growth_byte_layout(bnsh, layout).expect("byte layout");
+        let capacity = bytes[axis];
+        let blocks: usize = bytes[..axis].iter().product();
+        let inner: usize = bytes[axis + 1..].iter().product();
+        let bases = (0..blocks).map(|b| b * capacity * inner).collect();
+        (bases, inner)
+    }
+
+    let old = [1usize, 8, 256, 128];
+    let new = [1usize, 8, 512, 128];
+
+    // Seq-major: one block (batch), fixed inner stride kv_heads*head_dim, and the
+    // single block base is 0 for both capacities, so the live prefix keeps its
+    // byte offsets — the in-place copy is a no-op.
+    let (seq_old_bases, seq_inner) = block_bases(&old, KvCommitLayout::SeqMajor);
+    let (seq_new_bases, seq_inner_new) = block_bases(&new, KvCommitLayout::SeqMajor);
+    assert_eq!(seq_inner, 8 * 128);
+    assert_eq!(
+        seq_inner_new,
+        8 * 128,
+        "per-token stride is capacity-independent"
+    );
+    assert_eq!(
+        seq_old_bases, seq_new_bases,
+        "no seq-major block base moves on growth"
+    );
+    assert_eq!(seq_old_bases, vec![0]);
+
+    // Head-major: one block per head, and every head but head 0 moves to a wider
+    // stride when the capacity grows.
+    let (head_old_bases, head_inner) = block_bases(&old, KvCommitLayout::HeadMajor);
+    let (head_new_bases, _) = block_bases(&new, KvCommitLayout::HeadMajor);
+    assert_eq!(head_inner, 128);
+    assert_ne!(
+        head_old_bases, head_new_bases,
+        "head-major re-strides on growth"
+    );
+    for head in 1..8 {
+        assert!(head_new_bases[head] > head_old_bases[head]);
+    }
+}
+
+#[test]
 fn cuda_fixed_state_shapes_reject_unbounded_non_batch_dimensions() {
     let error = DecodeCudaState::persistent_state_shapes(
         "state",
@@ -2196,6 +2384,15 @@ fn native_cuda_symbolic_total_seq_aux_declines_capture_but_decodes_eagerly() -> 
     assert_eq!(stats.graph.captures, 0);
     assert_eq!(stats.graph.replays, 0);
     assert_eq!(stats.graph.fallbacks, 0);
+    let reason = stats
+        .graph
+        .decline_reason
+        .as_deref()
+        .expect("a binding-time capture decline must be observable");
+    assert!(
+        reason.contains("predicate `auxiliary_outputs_have_fixed_persistent_shapes`"),
+        "{reason}"
+    );
 
     // Decode is bit-exact with a plain eager (graph_capture=false) run — the
     // unresolved aux output changes nothing about the decode result.
@@ -2285,6 +2482,7 @@ fn native_cuda_qwen_decode_matches_cpu_tokens() -> anyhow::Result<()> {
             metadata_max_len: None,
             graph_capture: Some(false),
             weight_offload_enabled: None,
+            weight_offload_stable_va: None,
         },
     )?;
     let eager_before = eager
@@ -2305,6 +2503,7 @@ fn native_cuda_qwen_decode_matches_cpu_tokens() -> anyhow::Result<()> {
             metadata_max_len: None,
             graph_capture: Some(true),
             weight_offload_enabled: None,
+            weight_offload_stable_va: None,
         },
     )?;
     let captured_before = captured.cuda_kv_debug_stats().unwrap();
@@ -2492,6 +2691,7 @@ fn native_cuda_verify_rewind_no_kv_corruption() -> anyhow::Result<()> {
                 metadata_max_len: None,
                 graph_capture: Some(graph),
                 weight_offload_enabled: None,
+                weight_offload_stable_va: None,
             },
         )
     };
@@ -2872,6 +3072,65 @@ fn decode_inline_never_routes_when_disabled_or_unbuilt() {
         1,
         false
     ));
+}
+
+/// The native CUDA KV-cache layout is resolved from the model's declared
+/// `kv_layout` descriptor, with an environment override for residency
+/// diagnostics. Absent metadata means head-major — exactly the historical
+/// behavior — so no currently-loadable model changes its committed geometry.
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_kv_layout_resolves_from_metadata_with_env_override() {
+    use super::cuda::resolve_cuda_kv_layout;
+    use super::kv_commit::KvCommitLayout;
+    use onnx_genai_metadata::KvCacheLayout;
+
+    let _guard = env_lock().lock().unwrap();
+
+    // Absent metadata → head-major (the historical default, byte-identical).
+    {
+        let _env = EnvVarGuard::set("ONNX_GENAI_CUDA_KV_LAYOUT", "");
+        // A truly-empty value is not one of the recognized tokens, so it is
+        // ignored and the metadata (here `None`) decides.
+        unsafe {
+            std::env::remove_var("ONNX_GENAI_CUDA_KV_LAYOUT");
+        }
+        assert_eq!(resolve_cuda_kv_layout(None), KvCommitLayout::HeadMajor);
+        assert_eq!(
+            resolve_cuda_kv_layout(Some(&KvCacheLayout::head_major_bnsh())),
+            KvCommitLayout::HeadMajor
+        );
+        // A declared seq-major descriptor selects seq-major.
+        assert_eq!(
+            resolve_cuda_kv_layout(Some(&KvCacheLayout::seq_major_bsnh())),
+            KvCommitLayout::SeqMajor
+        );
+    }
+
+    // The env override wins over the descriptor, in both directions, so a
+    // residency measurement can pin the layout regardless of the model.
+    {
+        let _env = EnvVarGuard::set("ONNX_GENAI_CUDA_KV_LAYOUT", "seq_major");
+        assert_eq!(
+            resolve_cuda_kv_layout(Some(&KvCacheLayout::head_major_bnsh())),
+            KvCommitLayout::SeqMajor
+        );
+    }
+    {
+        let _env = EnvVarGuard::set("ONNX_GENAI_CUDA_KV_LAYOUT", "head_major");
+        assert_eq!(
+            resolve_cuda_kv_layout(Some(&KvCacheLayout::seq_major_bsnh())),
+            KvCommitLayout::HeadMajor
+        );
+    }
+    // An unrecognized override token is ignored (falls back to the descriptor).
+    {
+        let _env = EnvVarGuard::set("ONNX_GENAI_CUDA_KV_LAYOUT", "nonsense");
+        assert_eq!(
+            resolve_cuda_kv_layout(Some(&KvCacheLayout::seq_major_bsnh())),
+            KvCommitLayout::SeqMajor
+        );
+    }
 }
 
 /// Fixed recurrent state is sized from the graph, per sequence.
