@@ -25,3 +25,13 @@ Upstream landed `a29da16687` (Validate SkipLayerNorm prepacked lengths) which co
 ## 2026-08-11 (upstream CI correction wave) — Session append
 
 Both upstream PRs converted back to draft per user instruction. Rebase outcomes confirmed stable: no code changes needed. Lessons: "not caused by us" ≠ "safe to mark ready"; draft until CI board is green.
+
+## 2026-08-12 — PR #31974 PrePack A/B
+
+Converted `LayerNorm17_PrePack_ScaleBiasInitializers` and `SkipLayerNorm_PrePack_GammaBetaInitializers` from single-config (`is_initializer=true`) to A/B loop (`{false, true}`). Both configs assert against the same reference output, proving PrePack does not change results. 20 BF16 / 106 LayerNorm tests green. Head: `e053afd77e`.
+
+## 2026-08-12 — PR #31974 PrePack A/B + PR body correction
+
+**PrePack A/B:** Converted `LayerNorm17_PrePack_ScaleBiasInitializers` and `SkipLayerNorm_PrePack_GammaBetaInitializers` to A/B loop (`is_initializer ∈ {false, true}`). Both configs assert against the same `LayerNormRef` reference. 20 BF16 / 106 LayerNorm-suite tests green. Head: `e053afd77e`.
+
+**PR body correction (Coordinator):** PR #31974 also changes pre-existing MLFloat16 behavior: (1) `REGISTER_CONTRIB_KERNELS(MLFloat16)` → `REGISTER_CONTRIB_KERNELS(MLFloat16, float)`, (2) MLFloat16 `ComputeJob` overload uses `WriteStat<U=float>` instead of `MLFloat16(mean)`. PR body rewritten to disclose both explicitly; stale "45 MLAS tests / 10 operator tests" table removed. Awaiting CI.

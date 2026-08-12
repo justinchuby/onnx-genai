@@ -338,3 +338,18 @@ home. 13/13 tests pass; ruff clean; PR ready.
 - `zhora-32001-dedupe.md` — deduplication to single validation site
 
 Last consolidated: 2026-08-12T09:45:00Z (Scribe #32001 ready wave; 3 inbox drops merged: resch-32001-validation.md, holden-32001-focused.md, zhora-32001-dedupe.md)
+
+## Durable lessons — #31993 NaN semantics + AArch64 runtime evidence (2026-08-12)
+
+- **QEMU + a cross-compiler turns "unverifiable on this host" into real runtime evidence.** `g++-aarch64-linux-gnu` plus `qemu-aarch64-static` executed the actual NEON kernel and settled a NaN-semantics question no amount of code reading could. Reach for this before declaring an architecture untestable — but label it emulation, not hardware.
+- **Hardware and software NaN handling differ in more than the quiet bit.** `FCVTN` preserves the payload; the scalar reference canonicalizes to `0x7E00`. Assert NaN-ness (exponent all ones, mantissa non-zero) and sign only; keep raw-bit equality for non-NaN values.
+- **"Compiles and links" is not "runs".** #31993's CI lane only built macOS arm64; `onnxruntime_mlas_test` was never executed, while the PR body implied otherwise. Check whether a lane actually runs the tests before citing it as validation.
+- **A PR can change behaviour for types it does not mention.** #31974 is a BF16 PR that also alters pre-existing **MLFloat16** stat precision and registration. Diff every touched overload, not just the new one, and disclose it.
+- **Verify an agent's "no behaviour change" claim against the diff.** Sapper's was wrong on both counts and would have shipped an undisclosed change to existing fp16 output.
+
+### Merged inbox drops (2026-08-12 final review wave)
+
+- `iran-31993-nan-runtime.md` — NaN assertion fix, QEMU runtime evidence, FEAT_FP16 correction
+- `sapper-31974-ab.md` — PrePack A/B testing decision
+
+Last consolidated: 2026-08-12T10:15:00Z (Scribe final-review-wave; 2 inbox drops merged: iran-31993-nan-runtime.md, sapper-31974-ab.md)
