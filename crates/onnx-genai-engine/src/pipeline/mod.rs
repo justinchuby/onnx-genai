@@ -30,7 +30,8 @@ use onnx_genai_kv::{PagedKvCache, PrefixCache, SequenceId};
 use onnx_genai_metadata::{
     AbsentInputKind, ComponentImplementation, ControlFlow, DataflowEdge, DeviceKind, ModelIoSpec,
     PhaseRunOn, PipelineSpec, PipelineStrategy, PipelineStrategyKind, PipelineVisionConfig,
-    Predicate, SchedulerSpec, SequenceInputKind, TensorDimension, Termination, WorkflowNode,
+    Predicate, RuntimeInputRole, ScalarValue, SchedulerSpec, SequenceInputKind, TensorContract,
+    TensorDimension, Termination, WorkflowEmitMode, WorkflowInputSource, WorkflowNode,
     WorkflowSpec,
 };
 use onnx_genai_ort::{
@@ -175,6 +176,8 @@ pub struct PipelineGenerateRequest {
     pub num_image_tiles: Option<usize>,
     /// Live overrides for an iterative pipeline's loop parameters.
     pub iterative_overrides: IterativeOverrides,
+    /// Session identity used by session-scoped workflow state cells.
+    pub session_id: Option<String>,
 }
 
 impl PipelineGenerateRequest {
@@ -185,6 +188,7 @@ impl PipelineGenerateRequest {
             present: BTreeSet::new(),
             num_image_tiles: None,
             iterative_overrides: IterativeOverrides::default(),
+            session_id: None,
         }
     }
 
@@ -212,6 +216,11 @@ impl PipelineGenerateRequest {
     /// (steps / guidance scale / start step).
     pub fn with_iterative_overrides(mut self, overrides: IterativeOverrides) -> Self {
         self.iterative_overrides = overrides;
+        self
+    }
+
+    pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
         self
     }
 }
@@ -244,6 +253,7 @@ pub struct PipelineEngine {
     /// not re-run its encoder. Behind a `RefCell` because the prompt phase runs
     /// from `&self` paths (single-pass, iterative) as well as `&mut self` ones.
     component_cache: RefCell<ComponentOutputCache>,
+    workflow_session_state: RefCell<HashMap<(String, String), Value>>,
     /// Components whose graphs contain only deterministic operators, and whose
     /// outputs may therefore be memoized. Computed once at load.
     memoizable_components: BTreeSet<String>,
@@ -1178,6 +1188,7 @@ impl PipelineEngine {
             component_cache: RefCell::new(ComponentOutputCache::new(
                 usize::try_from(config.pipeline_cache_bytes).unwrap_or(usize::MAX),
             )),
+            workflow_session_state: RefCell::new(HashMap::new()),
             memoizable_components,
             retained: None,
             paged,

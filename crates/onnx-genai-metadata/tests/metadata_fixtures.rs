@@ -385,6 +385,57 @@ fn sound_workflow_manifest_ssa_and_effects_validate() {
 }
 
 #[test]
+fn workflow_rejects_unimplemented_session_lease_options() {
+    let yaml = SOUND_POLICY_WORKFLOW.replace(
+        "    graph:",
+        r#"    state:
+      cache:
+        contract: { dtype: float32, rank: 2, shape: [batch, vocab] }
+        scope: session
+        initializer: logits
+        recurrence: { kind: invariant }
+        session:
+          policy: copy_on_write
+          ttl_seconds: 60
+          optimistic_metadata_version: true
+    graph:"#,
+    );
+    let metadata: InferenceMetadata = serde_yaml::from_str(&yaml).expect("workflow parses");
+
+    let error = validate_pipeline_spec(metadata.pipeline.as_ref().expect("pipeline"))
+        .expect_err("unsupported session lease options fail at load");
+    for expected in [
+        "copy-on-write session mutation",
+        "declares session TTL",
+        "optimistic metadata versioning",
+    ] {
+        assert!(
+            error
+                .errors
+                .iter()
+                .any(|message| message.contains(expected)),
+            "missing '{expected}' in {:?}",
+            error.errors
+        );
+    }
+}
+
+#[test]
+fn workflow_rejects_dtype_not_supported_by_runtime() {
+    let yaml = SOUND_POLICY_WORKFLOW.replace("float32", "float64");
+    let metadata: InferenceMetadata = serde_yaml::from_str(&yaml).expect("workflow parses");
+
+    let error = validate_pipeline_spec(metadata.pipeline.as_ref().expect("pipeline"))
+        .expect_err("unsupported runtime dtype fails at load");
+    assert!(
+        error
+            .errors
+            .iter()
+            .any(|message| message.contains("workflow runtime does not support"))
+    );
+}
+
+#[test]
 fn workflow_policy_requires_onnx_rank_contracts_and_outputs() {
     let mut metadata: InferenceMetadata =
         serde_yaml::from_str(SOUND_POLICY_WORKFLOW).expect("sound workflow parses");

@@ -747,7 +747,7 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
         ) {
             if !matches!(
                 contract.dtype.as_str(),
-                "float16" | "float32" | "float64" | "bfloat16"
+                "float16" | "fp16" | "float32" | "fp32" | "float64" | "bfloat16" | "bf16"
             ) {
                 errors.push(format!(
                     "workflow policy component '{component}' port '{port}' must be floating point"
@@ -883,6 +883,46 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
             }
         }
 
+        fn validate_runtime_dtype(
+            path: &str,
+            contract: &crate::schema::TensorContract,
+            errors: &mut Vec<String>,
+        ) {
+            if !matches!(
+                contract.dtype.as_str(),
+                "float16"
+                    | "fp16"
+                    | "float32"
+                    | "fp32"
+                    | "bfloat16"
+                    | "bf16"
+                    | "int8"
+                    | "int16"
+                    | "int32"
+                    | "int64"
+                    | "uint8"
+                    | "uint16"
+                    | "uint32"
+                    | "uint64"
+                    | "bool"
+            ) {
+                errors.push(format!(
+                    "{path} uses dtype '{}', which the workflow runtime does not support",
+                    contract.dtype
+                ));
+            }
+        }
+
+        for (name, input) in &workflow.inputs {
+            validate_runtime_dtype(&format!("workflow input '{name}'"), &input.contract, errors);
+        }
+        for (name, output) in &workflow.outputs {
+            validate_runtime_dtype(
+                &format!("workflow output '{name}'"),
+                &output.contract,
+                errors,
+            );
+        }
         for (name, component) in &workflow.components {
             if name.trim().is_empty() || name.contains('.') {
                 errors.push(format!("workflow component name is invalid: '{name}'"));
@@ -919,6 +959,20 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
                 }
                 crate::schema::ComponentImplementation::Binding => {}
             }
+            for (port, contract) in &component.ports.inputs {
+                validate_runtime_dtype(
+                    &format!("workflow component '{name}' input '{port}'"),
+                    contract,
+                    errors,
+                );
+            }
+            for (port, contract) in &component.ports.outputs {
+                validate_runtime_dtype(
+                    &format!("workflow component '{name}' output '{port}'"),
+                    contract,
+                    errors,
+                );
+            }
             if component.policy.is_some()
                 && !matches!(
                     component.implementation,
@@ -932,12 +986,33 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
             validate_policy_component(name, component, errors);
         }
         for (name, state) in &workflow.state {
+            validate_runtime_dtype(&format!("workflow state '{name}'"), &state.contract, errors);
             if state.scope == crate::schema::WorkflowStateScope::Invocation
                 && state.session.is_some()
             {
                 errors.push(format!(
                     "workflow state '{name}' has session lease settings but invocation scope"
                 ));
+            }
+            if let Some(session) = &state.session {
+                if session.policy != crate::schema::SessionMutationPolicy::Exclusive {
+                    errors.push(format!(
+                        "workflow state '{name}' requests copy-on-write session mutation, \
+                         which this runtime does not support"
+                    ));
+                }
+                if session.ttl_seconds.is_some() {
+                    errors.push(format!(
+                        "workflow state '{name}' declares session TTL, which this runtime \
+                         does not yet enforce"
+                    ));
+                }
+                if session.optimistic_metadata_version {
+                    errors.push(format!(
+                        "workflow state '{name}' requests optimistic metadata versioning, \
+                         which this runtime does not support"
+                    ));
+                }
             }
 
             if let crate::schema::ShapeRecurrence::Growing { axis, .. } = &state.recurrence
@@ -951,12 +1026,18 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
         }
 
         let mut values = workflow.inputs.keys().cloned().collect::<BTreeSet<_>>();
+        let mut value_contracts = workflow
+            .inputs
+            .iter()
+            .map(|(name, input)| (name.clone(), input.contract.clone()))
+            .collect::<BTreeMap<_, _>>();
         let mut effects = workflow.initial_effects.clone();
         let mut effect_tokens = effects.values().cloned().collect::<BTreeSet<_>>();
         validate_workflow_node(
             &workflow.graph,
             workflow,
             &mut values,
+            &mut value_contracts,
             &mut effects,
             &mut effect_tokens,
             "pipeline.workflow.graph",
@@ -986,6 +1067,7 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
         node: &WorkflowNode,
         workflow: &WorkflowSpec,
         values: &mut BTreeSet<String>,
+        value_contracts: &mut BTreeMap<String, crate::schema::TensorContract>,
         effects: &mut BTreeMap<String, String>,
         effect_tokens: &mut BTreeSet<String>,
         path: &str,
@@ -1001,6 +1083,7 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
                         node,
                         workflow,
                         values,
+                        value_contracts,
                         effects,
                         effect_tokens,
                         &format!("{path}.nodes[{index}]"),
@@ -1023,6 +1106,17 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
                         errors.push(format!("{path}.inputs has unknown port '{port}'"));
                     }
                     require_workflow_value(value, values, &format!("{path}.inputs.{port}"), errors);
+                    if let (Some(source), Some(target)) = (
+                        value_contracts.get(value),
+                        declaration.ports.inputs.get(port),
+                    ) {
+                        require_compatible_contracts(
+                            source,
+                            target,
+                            &format!("{path}.inputs.{port}"),
+                            errors,
+                        );
+                    }
                 }
                 for port in declaration.ports.inputs.keys() {
                     if !inputs.contains_key(port) {
@@ -1034,6 +1128,9 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
                         errors.push(format!("{path}.outputs has unknown port '{port}'"));
                     }
                     define_workflow_value(value, values, &format!("{path}.outputs.{port}"), errors);
+                    if let Some(contract) = declaration.ports.outputs.get(port) {
+                        value_contracts.insert(value.clone(), contract.clone());
+                    }
                 }
                 if let Some(policy) = &declaration.policy {
                     use crate::schema::PolicyComponentContract as Policy;
@@ -1115,6 +1212,7 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
                     setup,
                     workflow,
                     values,
+                    value_contracts,
                     effects,
                     effect_tokens,
                     &format!("{path}.setup"),
@@ -1127,21 +1225,34 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
                     errors,
                 );
                 let mut body_values = values.clone();
+                let mut body_contracts = value_contracts.clone();
                 let mut body_effects = effects.clone();
                 for carry in carried {
-                    if !workflow.state.contains_key(&carry.cell) {
+                    let Some(state) = workflow.state.get(&carry.cell) else {
                         errors.push(format!(
                             "{path}.carried references unknown cell '{}'",
                             carry.cell
                         ));
-                    }
+                        continue;
+                    };
                     require_workflow_value(
                         &carry.current,
                         values,
                         &format!("{path}.carried.current"),
                         errors,
                     );
+                    if let Some(current_contract) = value_contracts.get(&carry.current) {
+                        require_state_contract(
+                            current_contract,
+                            &state.contract,
+                            &state.recurrence,
+                            false,
+                            &format!("{path}.carried.current"),
+                            errors,
+                        );
+                    }
                     body_values.insert(carry.body_input.clone());
+                    body_contracts.insert(carry.body_input.clone(), state.contract.clone());
                     apply_effect_transition(
                         &format!("state:{}", carry.cell),
                         &carry.read_effect,
@@ -1155,6 +1266,7 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
                     body,
                     workflow,
                     &mut body_values,
+                    &mut body_contracts,
                     &mut body_effects,
                     effect_tokens,
                     &format!("{path}.body"),
@@ -1173,6 +1285,19 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
                         &format!("{path}.carried.body_output"),
                         errors,
                     );
+                    if let (Some(next_contract), Some(state)) = (
+                        body_contracts.get(&carry.body_output),
+                        workflow.state.get(&carry.cell),
+                    ) {
+                        require_state_contract(
+                            next_contract,
+                            &state.contract,
+                            &state.recurrence,
+                            true,
+                            &format!("{path}.carried.body_output"),
+                            errors,
+                        );
+                    }
                     apply_effect_transition(
                         &format!("state:{}", carry.cell),
                         &carry.write_effect,
@@ -1187,6 +1312,9 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
                         &format!("{path}.carried.next"),
                         errors,
                     );
+                    if let Some(contract) = body_contracts.get(&carry.body_output) {
+                        value_contracts.insert(carry.next.clone(), contract.clone());
+                    }
                 }
                 *effects = body_effects;
             }
@@ -1202,13 +1330,16 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
                 let mut resulting_effects = Vec::new();
                 for (case, node) in cases {
                     let mut case_values = values.clone();
+                    let mut case_contracts = value_contracts.clone();
                     let mut case_effects = effects.clone();
+                    let mut case_tokens = effect_tokens.clone();
                     validate_workflow_node(
                         node,
                         workflow,
                         &mut case_values,
+                        &mut case_contracts,
                         &mut case_effects,
-                        effect_tokens,
+                        &mut case_tokens,
                         &format!("{path}.cases.{case}"),
                         errors,
                     );
@@ -1216,13 +1347,16 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
                 }
                 if let Some(default) = default {
                     let mut default_values = values.clone();
+                    let mut default_contracts = value_contracts.clone();
                     let mut default_effects = effects.clone();
+                    let mut default_tokens = effect_tokens.clone();
                     validate_workflow_node(
                         default,
                         workflow,
                         &mut default_values,
+                        &mut default_contracts,
                         &mut default_effects,
-                        effect_tokens,
+                        &mut default_tokens,
                         &format!("{path}.default"),
                         errors,
                     );
@@ -1248,6 +1382,16 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
                 require_workflow_value(value, values, &format!("{path}.value"), errors);
                 if !workflow.outputs.contains_key(output) {
                     errors.push(format!("{path} emits undeclared output '{output}'"));
+                } else if let (Some(value_contract), Some(output_contract)) = (
+                    value_contracts.get(value),
+                    workflow.outputs.get(output).map(|output| &output.contract),
+                ) {
+                    require_compatible_contracts(
+                        value_contract,
+                        output_contract,
+                        &format!("{path}.output"),
+                        errors,
+                    );
                 }
                 apply_effect_transition(
                     effect_name,
@@ -1261,6 +1405,9 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
             WorkflowNode::Transfer { input, output, .. } => {
                 require_workflow_value(input, values, &format!("{path}.input"), errors);
                 define_workflow_value(output, values, &format!("{path}.output"), errors);
+                if let Some(contract) = value_contracts.get(input).cloned() {
+                    value_contracts.insert(output.clone(), contract);
+                }
             }
         }
     }
@@ -1286,6 +1433,97 @@ pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidat
     ) {
         if !values.insert(value.to_string()) {
             errors.push(format!("{path} redefines SSA value '{value}'"));
+        }
+    }
+
+    fn require_compatible_contracts(
+        source: &crate::schema::TensorContract,
+        target: &crate::schema::TensorContract,
+        path: &str,
+        errors: &mut Vec<String>,
+    ) {
+        fn normalize_dtype(dtype: &str) -> &str {
+            match dtype {
+                "fp32" => "float32",
+                "fp16" => "float16",
+                "bf16" => "bfloat16",
+                other => other,
+            }
+        }
+        if normalize_dtype(&source.dtype) != normalize_dtype(&target.dtype)
+            || source.rank != target.rank
+        {
+            errors.push(format!(
+                "{path} has incompatible tensor contracts: {} rank {} -> {} rank {}",
+                source.dtype, source.rank, target.dtype, target.rank
+            ));
+            return;
+        }
+        if let (Some(source_shape), Some(target_shape)) = (&source.shape, &target.shape) {
+            for (axis, (source, target)) in source_shape.iter().zip(target_shape).enumerate() {
+                if matches!(
+                    (source, target),
+                    (
+                        crate::schema::TensorDimension::Fixed(_),
+                        crate::schema::TensorDimension::Fixed(_)
+                    )
+                ) && source != target
+                {
+                    errors.push(format!(
+                        "{path} has incompatible fixed dimension at axis {axis}"
+                    ));
+                }
+            }
+        }
+    }
+
+    fn require_state_contract(
+        actual: &crate::schema::TensorContract,
+        declared: &crate::schema::TensorContract,
+        recurrence: &crate::schema::ShapeRecurrence,
+        next: bool,
+        path: &str,
+        errors: &mut Vec<String>,
+    ) {
+        fn normalize_dtype(dtype: &str) -> &str {
+            match dtype {
+                "fp32" => "float32",
+                "fp16" => "float16",
+                "bf16" => "bfloat16",
+                other => other,
+            }
+        }
+        if normalize_dtype(&actual.dtype) != normalize_dtype(&declared.dtype)
+            || actual.rank != declared.rank
+        {
+            errors.push(format!(
+                "{path} is incompatible with state contract {} rank {}",
+                declared.dtype, declared.rank
+            ));
+            return;
+        }
+        let (Some(actual_shape), Some(declared_shape)) = (&actual.shape, &declared.shape) else {
+            return;
+        };
+        let growing_axis = match recurrence {
+            crate::schema::ShapeRecurrence::Growing { axis, .. } if next => Some(*axis),
+            _ => None,
+        };
+        for (axis, (actual, declared)) in actual_shape.iter().zip(declared_shape).enumerate() {
+            if Some(axis) != growing_axis
+                && matches!(
+                    (actual, declared),
+                    (
+                        crate::schema::TensorDimension::Fixed(_),
+                        crate::schema::TensorDimension::Fixed(_)
+                    )
+                )
+                && actual != declared
+            {
+                errors.push(format!(
+                    "{path} has incompatible state dimension at axis {axis}"
+                ));
+            }
         }
     }
 
