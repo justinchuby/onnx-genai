@@ -159,3 +159,19 @@ hardware (blocked on #768).
 ## 2026-08-12 — PR #31988 build fix (sm_count parameter mismatch)
 
 Build Linux CUDA x64 and TensorRT x64 both failed: `TryMatMulNBits` gained `sm_count` parameter (our diff) but `fpA_intB_gemm_kernel_test.cc` not updated (13 args vs 14). Fixed by passing `device_prop_.multiProcessorCount`. Commit `55e438ca6f`. Verdict: OURS.
+
+## 2026-08-12 — #762 Corrective Wave Completion
+
+Completed the #762 corrective wave as revision author under reviewer lockout.
+
+**Changes:**
+1. **EP graph assignment assertion** — Added `assert_ops_assigned_to_our_ep` to `optional_slots.rs` + `record_ep_graph_assignment_info=1` in setup. The `add_skip_layer_norm_mul_routed` test now proves Add, SkipLayerNormalization, and Mul are assigned to `cpu_ep`. Nabil's stated reason ("not exposed in Rust bindings") was false — the API was already used at `layernorm_dynamic_axis.rs:155`.
+2. **`end_version` ranges** — Was incomplete: `end_version: since` in cpu-plugin meant ops matched only their introduction opset. Fixed to `i32::MAX`.
+3. **Factory `struct_size` validation** — Added bounds checks in `loader.rs` before reading `name` and calling `release`/`ctx`, mirroring `provider_adapter.rs`.
+4. **`NXRT_REQUIRE_ORT_TESTS=1` gate** — Tests panic instead of skip when ORT absent and env var set. Wired into `conformance_setup`, `skip_if_missing!`, `optional_slots::setup()`, `layernorm_dynamic_axis.rs`.
+5. **Initializer-backed MatMul fixture** — `matmul_initializer_weights` test covers prepacking path.
+6. **`.gitignore` negations** — Added missing entries for 5 tracked fixtures.
+
+**Preserved:** All B1/B2 fixes, canary tests, absent_outputs HashSet, RoutedSlotKind, panic containment, c_char portability.
+
+**Test counts:** 278 passed, 0 failed (was 277; +1 new test).

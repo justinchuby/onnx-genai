@@ -119,6 +119,20 @@ impl Drop for FactorySet {
             if !factory.is_null() {
                 // Catch panics at the plugin boundary.
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    // Validate struct_size covers release+ctx before calling.
+                    let release_end = std::mem::offset_of!(NxrtEpFactoryVtable, release)
+                        + std::mem::size_of::<unsafe extern "C" fn(*mut std::ffi::c_void)>();
+                    let ctx_end = std::mem::offset_of!(NxrtEpFactoryVtable, ctx)
+                        + std::mem::size_of::<*mut std::ffi::c_void>();
+                    let min_size = release_end.max(ctx_end);
+                    let struct_size = unsafe { (*factory).struct_size } as usize;
+                    if struct_size < min_size {
+                        eprintln!(
+                            "WARNING: factory[{i}] struct_size ({struct_size}) too small \
+                             to contain release/ctx ({min_size}), skipping release"
+                        );
+                        return;
+                    }
                     // SAFETY: We own these factories per the ABI contract.
                     unsafe { ((*factory).release)((*factory).ctx) };
                 }));
@@ -220,7 +234,14 @@ pub fn load_nxrt_plugin(path: impl AsRef<Path>) -> Result<NxrtPlugin, NxrtHostEr
                 if !item.is_null() {
                     let fptr = *item;
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        unsafe { ((*fptr).release)((*fptr).ctx) };
+                        let release_end = std::mem::offset_of!(NxrtEpFactoryVtable, release)
+                            + std::mem::size_of::<unsafe extern "C" fn(*mut std::ffi::c_void)>();
+                        let ctx_end = std::mem::offset_of!(NxrtEpFactoryVtable, ctx)
+                            + std::mem::size_of::<*mut std::ffi::c_void>();
+                        let min_size = release_end.max(ctx_end);
+                        if (unsafe { (*fptr).struct_size } as usize) >= min_size {
+                            unsafe { ((*fptr).release)((*fptr).ctx) };
+                        }
                     }));
                 }
             }
@@ -232,9 +253,16 @@ pub fn load_nxrt_plugin(path: impl AsRef<Path>) -> Result<NxrtPlugin, NxrtHostEr
     }
 
     // Read name from first factory (borrowed for factory lifetime — copy it).
+    // Validate struct_size covers the `name` field before dereferencing it.
+    // A newer host talking to an older plugin must not read past the end of
+    // a smaller struct (mirrors provider_adapter.rs struct_size guards).
     let name = unsafe {
         let factory = &*factory_ptrs[0];
-        if factory.name.is_null() {
+        let name_end =
+            std::mem::offset_of!(NxrtEpFactoryVtable, name) + std::mem::size_of::<*const u8>();
+        if (factory.struct_size as usize) < name_end {
+            String::from("unknown")
+        } else if factory.name.is_null() {
             String::from("unknown")
         } else {
             CStr::from_ptr(factory.name as *const std::os::raw::c_char)

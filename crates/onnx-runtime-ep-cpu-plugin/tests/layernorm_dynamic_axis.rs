@@ -220,10 +220,16 @@ fn layernorm_dynamic_axis_mean_invstddev_shape() {
         PathBuf::from(manifest_dir).join("tests/fixtures/layer_norm_dynamic_axis/model.onnx");
 
     let Some(ort_lib_dir) = find_ort_lib_dir() else {
+        if std::env::var("NXRT_REQUIRE_ORT_TESTS").as_deref() == Ok("1") {
+            panic!("NXRT_REQUIRE_ORT_TESTS=1 but ORT not found");
+        }
         eprintln!("*** SKIPPED: layernorm_dynamic_axis — ORT not found ***");
         return;
     };
     let Some(ep_lib_path) = find_ep_cdylib() else {
+        if std::env::var("NXRT_REQUIRE_ORT_TESTS").as_deref() == Ok("1") {
+            panic!("NXRT_REQUIRE_ORT_TESTS=1 but EP cdylib not found");
+        }
         eprintln!("*** SKIPPED: layernorm_dynamic_axis — EP cdylib not found ***");
         return;
     };

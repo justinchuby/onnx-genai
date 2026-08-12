@@ -27,7 +27,10 @@ fn build_kernel_registry_entries() -> Vec<KernelRegistryEntry> {
                 op_type: leak_str(&d.op_type),
                 domain: leak_str(&d.domain),
                 since_version: since,
-                end_version: since,
+                // Cover all future opset versions so ORT matches our kernel
+                // regardless of the model's declared opset (e.g. Add@7 must
+                // still match a model at opset 21).
+                end_version: i32::MAX,
                 supported_dtypes: d.supported_dtypes,
             }
         })

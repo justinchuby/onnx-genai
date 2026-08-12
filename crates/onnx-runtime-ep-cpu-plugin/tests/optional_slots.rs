@@ -103,8 +103,24 @@ unsafe fn setup(
     *mut ort::OrtSessionOptions,
     *mut ort::OrtSession,
 )> {
-    let ort_lib_dir = find_ort_lib_dir()?;
-    let ep_lib_path = find_ep_cdylib()?;
+    let ort_lib_dir = match find_ort_lib_dir() {
+        Some(d) => d,
+        None => {
+            if std::env::var("NXRT_REQUIRE_ORT_TESTS").as_deref() == Ok("1") {
+                panic!("NXRT_REQUIRE_ORT_TESTS=1 but ORT lib dir not found");
+            }
+            return None;
+        }
+    };
+    let ep_lib_path = match find_ep_cdylib() {
+        Some(p) => p,
+        None => {
+            if std::env::var("NXRT_REQUIRE_ORT_TESTS").as_deref() == Ok("1") {
+                panic!("NXRT_REQUIRE_ORT_TESTS=1 but EP cdylib not found");
+            }
+            return None;
+        }
+    };
     if !model_path.exists() {
         eprintln!(
             "*** SKIPPED: fixture missing at {} ***",
@@ -170,6 +186,21 @@ unsafe fn setup(
             "AddSessionConfigEntry(disable_cpu_ep_fallback)",
         )
     };
+
+    // Enable EP graph assignment recording so we can query per-node provider
+    // attribution via Session_GetEpGraphAssignmentInfo (ORT ≥1.24).
+    {
+        let key = std::ffi::CString::new("session.record_ep_graph_assignment_info").unwrap();
+        let val = std::ffi::CString::new("1").unwrap();
+        let status = unsafe { add_config(session_options, key.as_ptr(), val.as_ptr()) };
+        unsafe {
+            check_status(
+                api,
+                status,
+                "AddSessionConfigEntry(record_ep_graph_assignment_info)",
+            )
+        };
+    }
 
     let devices_arr: [*const ort::OrtEpDevice; 1] = [our_device];
     let status = unsafe {
@@ -243,6 +274,90 @@ unsafe fn make_float_tensor(
 
 unsafe fn make_scalar_float_tensor(api: *const ort::OrtApi, value: &mut f32) -> *mut ort::OrtValue {
     unsafe { make_float_tensor(api, std::slice::from_mut(value), &[]) }
+}
+
+// ─── Helper: require-ORT gate ─────────────────────────────────────────────────
+
+/// When `NXRT_REQUIRE_ORT_TESTS=1`, tests must fail instead of silently skipping
+/// if ORT or the EP cdylib is unavailable. Silent skips let the suite look green
+/// while proving nothing.
+fn require_ort_or_skip(test_name: &str) -> bool {
+    if std::env::var("NXRT_REQUIRE_ORT_TESTS").as_deref() == Ok("1") {
+        panic!(
+            "NXRT_REQUIRE_ORT_TESTS=1 but ORT or EP cdylib is unavailable — \
+             {test_name} cannot run. Install ORT or unset the variable."
+        );
+    }
+    false
+}
+
+// ─── Helper: EP graph assignment assertion ────────────────────────────────────
+
+/// Assert that every op in `expected_ops` is assigned to "cpu_ep" (our plugin EP),
+/// not ORT's built-in CPUExecutionProvider, via `Session_GetEpGraphAssignmentInfo`.
+///
+/// Requires `session.record_ep_graph_assignment_info=1` (enabled by `setup()`).
+unsafe fn assert_ops_assigned_to_our_ep(
+    api: *const ort::OrtApi,
+    session: *mut ort::OrtSession,
+    expected_ops: &[&str],
+    label: &str,
+) {
+    let get_info = unsafe { (*api).Session_GetEpGraphAssignmentInfo }
+        .expect("Session_GetEpGraphAssignmentInfo not in OrtApi — requires ORT ≥1.24");
+    let get_ep_name =
+        unsafe { (*api).EpAssignedSubgraph_GetEpName }.expect("EpAssignedSubgraph_GetEpName");
+    let get_nodes =
+        unsafe { (*api).EpAssignedSubgraph_GetNodes }.expect("EpAssignedSubgraph_GetNodes");
+    let get_op_type =
+        unsafe { (*api).EpAssignedNode_GetOperatorType }.expect("EpAssignedNode_GetOperatorType");
+
+    let mut ep_subgraphs: *const *const ort::OrtEpAssignedSubgraph = ptr::null();
+    let mut num_subgraphs: usize = 0;
+    let status = unsafe { get_info(session, &mut ep_subgraphs, &mut num_subgraphs) };
+    unsafe { check_status(api, status, "Session_GetEpGraphAssignmentInfo") };
+
+    let mut assignments: Vec<(String, String)> = Vec::new();
+    for i in 0..num_subgraphs {
+        let subgraph = unsafe { *ep_subgraphs.add(i) };
+        let mut ep_name_ptr: *const std::os::raw::c_char = ptr::null();
+        let status = unsafe { get_ep_name(subgraph, &mut ep_name_ptr) };
+        unsafe { check_status(api, status, "EpAssignedSubgraph_GetEpName") };
+        let ep_name = unsafe { CStr::from_ptr(ep_name_ptr) }
+            .to_string_lossy()
+            .into_owned();
+
+        let mut ep_nodes: *const *const ort::OrtEpAssignedNode = ptr::null();
+        let mut num_nodes: usize = 0;
+        let status = unsafe { get_nodes(subgraph, &mut ep_nodes, &mut num_nodes) };
+        unsafe { check_status(api, status, "EpAssignedSubgraph_GetNodes") };
+
+        for j in 0..num_nodes {
+            let node = unsafe { *ep_nodes.add(j) };
+            let mut op_type_ptr: *const std::os::raw::c_char = ptr::null();
+            let status = unsafe { get_op_type(node, &mut op_type_ptr) };
+            unsafe { check_status(api, status, "EpAssignedNode_GetOperatorType") };
+            let op_type = unsafe { CStr::from_ptr(op_type_ptr) }
+                .to_string_lossy()
+                .into_owned();
+            assignments.push((ep_name.clone(), op_type));
+        }
+    }
+
+    let ours: Vec<&str> = assignments
+        .iter()
+        .filter(|(ep, _)| ep == "cpu_ep")
+        .map(|(_, op)| op.as_str())
+        .collect();
+
+    for &expected in expected_ops {
+        assert!(
+            ours.contains(&expected),
+            "[{label}] Expected op '{expected}' to be assigned to 'cpu_ep', \
+             but it was not. Assignments: {assignments:?}"
+        );
+    }
+    eprintln!("  ✓ [{label}] ops assigned to cpu_ep: {ours:?}");
 }
 
 // ─── BL2: SkipLayerNormalization output=(output, "", "", sum) ────────────────
@@ -1045,7 +1160,20 @@ fn add_skip_layer_norm_mul_routed() {
     let Some((_lib, api, env, opts, session)) = (unsafe { setup("cpu_ep_aslnm", &model_path) })
     else {
         eprintln!("*** SKIPPED: add_skip_layer_norm_mul_routed ***");
-        return;
+        if !require_ort_or_skip("add_skip_layer_norm_mul_routed") {
+            return;
+        }
+        unreachable!();
+    };
+
+    // Prove all three fused nodes are assigned to our cpu_ep, not ORT's built-in.
+    unsafe {
+        assert_ops_assigned_to_our_ep(
+            api,
+            session,
+            &["Add", "SkipLayerNormalization", "Mul"],
+            "add_skip_layer_norm_mul",
+        );
     };
 
     unsafe {

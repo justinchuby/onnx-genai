@@ -99,12 +99,22 @@ fn find_ep_cdylib() -> Option<PathBuf> {
     cdylib_resolve::find_cpu_plugin_cdylib_optional()
 }
 
+/// When `NXRT_REQUIRE_ORT_TESTS=1`, tests must fail instead of silently skipping
+/// if ORT or the EP cdylib is unavailable.
+///
 /// Skip a test loudly when a required resource is missing.
+/// When `NXRT_REQUIRE_ORT_TESTS=1`, panics instead of skipping.
 macro_rules! skip_if_missing {
     ($resource:expr, $msg:literal) => {
         match $resource {
             Some(v) => v,
             None => {
+                if std::env::var("NXRT_REQUIRE_ORT_TESTS").as_deref() == Ok("1") {
+                    panic!(
+                        "NXRT_REQUIRE_ORT_TESTS=1 but required resource unavailable — {} cannot run",
+                        $msg
+                    );
+                }
                 eprintln!("\n*** SKIPPED: {} ***\n", $msg);
                 return;
             }
@@ -660,8 +670,30 @@ unsafe fn conformance_setup(
     *mut ort::OrtSessionOptions,
     *mut ort::OrtSession,
 )> {
-    let ort_lib_dir = find_ort_lib_dir()?;
-    let ep_lib_path = find_ep_cdylib()?;
+    let ort_lib_dir = match find_ort_lib_dir() {
+        Some(d) => d,
+        None => {
+            if std::env::var("NXRT_REQUIRE_ORT_TESTS").as_deref() == Ok("1") {
+                panic!(
+                    "NXRT_REQUIRE_ORT_TESTS=1 but ORT lib dir not found — \
+                     conformance test '{reg_name}' cannot run"
+                );
+            }
+            return None;
+        }
+    };
+    let ep_lib_path = match find_ep_cdylib() {
+        Some(p) => p,
+        None => {
+            if std::env::var("NXRT_REQUIRE_ORT_TESTS").as_deref() == Ok("1") {
+                panic!(
+                    "NXRT_REQUIRE_ORT_TESTS=1 but EP cdylib not found — \
+                     conformance test '{reg_name}' cannot run"
+                );
+            }
+            return None;
+        }
+    };
 
     if !model_path.exists() {
         eprintln!(
@@ -2911,5 +2943,80 @@ fn conformance_rms_norm() {
         assert_ops_assigned_to_our_ep(api, session, &["RMSNormalization"], "rms_norm");
         conformance_teardown(api, env, opts, session, "cpu_ep_rms");
         eprintln!("\n✅ conformance_rms_norm: PASSED — Y shape [2,4], rms(Y row)≈1.0");
+    }
+}
+
+// ─── Initializer-backed MatMul ───────────────────────────────────────────────
+
+/// MatMul with constant-initializer weights (not graph inputs).
+///
+/// Real models supply weights as initializers, routing through prepacking rather
+/// than graph inputs. This test verifies our EP handles initializer-backed inputs
+/// correctly — a gap the upstream sibling PR identified.
+///
+/// Fixture: X[2,4] @ W[4,3](initializer) = Y[2,3]
+#[test]
+fn conformance_matmul_initializer_weights() {
+    let _lock = lock_ort_ep();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let model_path =
+        PathBuf::from(manifest_dir).join("tests/fixtures/matmul_initializer_weights/model.onnx");
+
+    let Some((_lib, api, env, opts, session)) =
+        (unsafe { conformance_setup("cpu_ep_matmul_init", &model_path, true) })
+    else {
+        eprintln!(
+            "*** SKIPPED: conformance_matmul_initializer_weights — ORT or EP cdylib not found ***"
+        );
+        return;
+    };
+
+    unsafe {
+        assert_ops_assigned_to_our_ep(api, session, &["MatMul"], "matmul_initializer_weights");
+    };
+
+    unsafe {
+        // X = [[1,0,0,0],[0,1,0,0]]
+        // W (initializer) = [[1,0,0],[0,1,0],[0,0,1],[1,1,1]]
+        // Y = X @ W = [[1,0,0],[0,1,0]]
+        let mut x_data: [f32; 8] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+        let x_shape: [i64; 2] = [2, 4];
+        let x_val = make_float_tensor(api, &mut x_data, &x_shape);
+
+        let input_names = [c"X".as_ptr()];
+        let output_names = [c"Y".as_ptr()];
+        let inputs: [*const ort::OrtValue; 1] = [x_val];
+        let mut output: *mut ort::OrtValue = ptr::null_mut();
+
+        let status = ((*api).Run.unwrap())(
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs.as_ptr(),
+            1,
+            output_names.as_ptr(),
+            1,
+            &mut output,
+        );
+        check_status(api, status, "Run(matmul_initializer_weights)");
+        assert!(!output.is_null());
+
+        // Verify output shape [2,3]
+        assert_output_shape(api, output, &[2, 3], "matmul_init_Y");
+
+        // Verify values: [[1,0,0],[0,1,0]]
+        let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
+        let status = ((*api).GetTensorMutableData.unwrap())(output, &mut data_ptr);
+        check_status(api, status, "GetTensorMutableData(matmul_init_Y)");
+        let result = std::slice::from_raw_parts(data_ptr as *const f32, 6);
+        let expected: [f32; 6] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
+        for (i, (got, want)) in result.iter().zip(expected.iter()).enumerate() {
+            assert!((got - want).abs() < 1e-4, "Y[{i}] = {got}, want {want}");
+        }
+
+        ((*api).ReleaseValue.unwrap())(output);
+        ((*api).ReleaseValue.unwrap())(x_val);
+        conformance_teardown(api, env, opts, session, "cpu_ep_matmul_init");
+        eprintln!("\n✅ conformance_matmul_initializer_weights: PASSED");
     }
 }
