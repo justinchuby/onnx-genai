@@ -26,9 +26,16 @@ pub(crate) struct MemoryStrategyPlanInput<'a> {
     pub(crate) required_device_non_weight_bytes: u64,
     pub(crate) minimum_useful_weight_budget_bytes: u64,
     pub(crate) default_dynamic_device_budget_bytes: Option<u64>,
-    /// The current runtime activation gate. This remains explicit-byte-only
-    /// until #755 flips the managed VMM default after #716.
+    /// The runtime activation gate. Since #755 this is set by the caller to
+    /// `managed_vmm || <explicit --vram-limit>`, so inference drives policy on
+    /// the no-flag path whenever the managed VMM default is active.
     pub(crate) inferred_policy_enabled: bool,
+    /// True when the managed no-spill VMM path is the selected allocator for
+    /// this load. Since #755 this is the default on the native CUDA path and is
+    /// only cleared by the explicit legacy opt-out. It governs `managed_no_spill`
+    /// (physical-handle pool + committed-granule admission, no WDDM spill) and
+    /// the resolved-budget cap reported as `managed_limit_bytes`.
+    pub(crate) managed_vmm: bool,
     pub(crate) overrides: MemoryStrategyOverrides,
     pub(crate) advisory_only: bool,
 }
@@ -96,6 +103,12 @@ pub(crate) fn build_memory_strategy_plan(input: MemoryStrategyPlanInput<'_>) -> 
     let available_weight_budget_bytes = input
         .resolved_vram_bytes
         .saturating_sub(input.required_device_non_weight_bytes);
+    // Since #755 the managed no-spill VMM path is the default: it owns the
+    // authority-scoped physical-handle pool and caps at the resolved budget
+    // instead of relying on WDDM shared-memory spill. Reported in the plan so
+    // the new default is observable rather than implicit.
+    let managed_no_spill = input.managed_vmm;
+    let managed_limit_bytes = managed_no_spill.then_some(input.resolved_vram_bytes);
     let inferred_strategy = if kv_unknown {
         MemoryStrategy::Unknown
     } else {
@@ -135,7 +148,8 @@ pub(crate) fn build_memory_strategy_plan(input: MemoryStrategyPlanInput<'_>) -> 
         (
             MemoryStrategy::Compatibility,
             DecisionSource::CompatibilityDefault,
-            "inference runs without a flag, but automatic activation remains gated on #716/#755",
+            "inference runs, but the managed VMM default is disabled (legacy allocator opt-out) \
+             and no explicit --vram-limit is set, so paging stays off",
         )
     } else {
         (
@@ -170,11 +184,8 @@ pub(crate) fn build_memory_strategy_plan(input: MemoryStrategyPlanInput<'_>) -> 
                 weight_offload_enabled: false,
                 device_budget_bytes: None,
                 scan_resistant_dense: input.overrides.scan_resistant_dense.unwrap_or(true),
-                managed_no_spill: matches!(input.config.limits.vram_limit, ResourceLimit::Bytes(_)),
-                managed_limit_bytes: match input.config.limits.vram_limit {
-                    ResourceLimit::Bytes(_) => Some(input.resolved_vram_bytes),
-                    _ => None,
-                },
+                managed_no_spill,
+                managed_limit_bytes,
                 device_budget_is_override: false,
                 auto_enabled_from_vram_limit: false,
             },
@@ -184,6 +195,7 @@ pub(crate) fn build_memory_strategy_plan(input: MemoryStrategyPlanInput<'_>) -> 
                     device_budget_bytes: input.overrides.device_budget_bytes.or({
                         if forced_offload
                             && !matches!(input.config.limits.vram_limit, ResourceLimit::Bytes(_))
+                            && !input.managed_vmm
                         {
                             input.default_dynamic_device_budget_bytes
                         } else {
@@ -191,17 +203,12 @@ pub(crate) fn build_memory_strategy_plan(input: MemoryStrategyPlanInput<'_>) -> 
                         }
                     }),
                     scan_resistant_dense: input.overrides.scan_resistant_dense.unwrap_or(true),
-                    managed_no_spill: matches!(
-                        input.config.limits.vram_limit,
-                        ResourceLimit::Bytes(_)
-                    ),
-                    managed_limit_bytes: match input.config.limits.vram_limit {
-                        ResourceLimit::Bytes(_) => Some(input.resolved_vram_bytes),
-                        _ => None,
-                    },
+                    managed_no_spill,
+                    managed_limit_bytes,
                     device_budget_is_override: input.overrides.device_budget_bytes.is_some(),
                     auto_enabled_from_vram_limit: !forced_offload
-                        && matches!(input.config.limits.vram_limit, ResourceLimit::Bytes(_)),
+                        && (input.managed_vmm
+                            || matches!(input.config.limits.vram_limit, ResourceLimit::Bytes(_))),
                 }
             }
             MemoryStrategy::Compatibility | MemoryStrategy::Unknown => compatibility_application,
@@ -403,6 +410,10 @@ fn compatibility_application(
 ) -> MemoryPolicyApplication {
     let explicit_bytes = matches!(input.config.limits.vram_limit, ResourceLimit::Bytes(_));
     let forced = input.overrides.weight_offload == Some(true);
+    // The compatibility/Unknown application cannot page safely (no known weight
+    // access boundary), so automatic offload stays keyed on an explicit byte
+    // limit even under the managed default. The managed no-spill cap is still
+    // reported so the physical-handle pool bounds the load instead of spilling.
     let auto_enabled = explicit_bytes && !fits && !forced;
     let enabled = forced || auto_enabled;
     MemoryPolicyApplication {
@@ -423,8 +434,8 @@ fn compatibility_application(
             None
         },
         scan_resistant_dense: input.overrides.scan_resistant_dense.unwrap_or(true),
-        managed_no_spill: explicit_bytes,
-        managed_limit_bytes: explicit_bytes.then_some(input.resolved_vram_bytes),
+        managed_no_spill: input.managed_vmm,
+        managed_limit_bytes: input.managed_vmm.then_some(input.resolved_vram_bytes),
         device_budget_is_override: input.overrides.device_budget_bytes.is_some(),
         auto_enabled_from_vram_limit: auto_enabled,
     }
@@ -633,6 +644,31 @@ mod tests {
         weights: u64,
         overrides: MemoryStrategyOverrides,
     ) -> MemoryStrategyPlan {
+        plan_with_managed(config, graph, limit, weights, overrides, false)
+    }
+
+    /// Build a plan as the native CUDA loader does under the #755 managed VMM
+    /// default: inference drives policy and the managed no-spill path is on.
+    fn input_managed(
+        config: &EngineConfig,
+        graph: GraphMemoryEvidence,
+        limit: u64,
+        weights: u64,
+        overrides: MemoryStrategyOverrides,
+    ) -> MemoryStrategyPlan {
+        plan_with_managed(config, graph, limit, weights, overrides, true)
+    }
+
+    fn plan_with_managed(
+        config: &EngineConfig,
+        graph: GraphMemoryEvidence,
+        limit: u64,
+        weights: u64,
+        overrides: MemoryStrategyOverrides,
+        managed_default: bool,
+    ) -> MemoryStrategyPlan {
+        let explicit_bytes = matches!(config.limits.vram_limit, ResourceLimit::Bytes(_));
+        let managed_vmm = managed_default || explicit_bytes;
         build_memory_strategy_plan(MemoryStrategyPlanInput {
             config,
             resolved_vram_bytes: limit,
@@ -642,7 +678,8 @@ mod tests {
             required_device_non_weight_bytes: 0,
             minimum_useful_weight_budget_bytes: 0,
             default_dynamic_device_budget_bytes: None,
-            inferred_policy_enabled: matches!(config.limits.vram_limit, ResourceLimit::Bytes(_)),
+            inferred_policy_enabled: managed_vmm || explicit_bytes,
+            managed_vmm,
             overrides,
             advisory_only: false,
         })
@@ -659,7 +696,10 @@ mod tests {
     }
 
     #[test]
-    fn no_flag_inference_runs_but_activation_remains_compatibility_gated() {
+    fn legacy_opt_out_no_flag_keeps_compatibility_gate() {
+        // With the managed VMM default disabled (legacy allocator opt-out) and no
+        // explicit --vram-limit, inference still runs but paging stays off. `input`
+        // models managed_vmm=false because the default config carries no byte limit.
         let config = EngineConfig::default();
         let plan = input(
             &config,
@@ -674,6 +714,64 @@ mod tests {
         );
         assert_eq!(plan.strategy, MemoryStrategy::Compatibility);
         assert!(!plan.application.weight_offload_enabled);
+        assert!(!plan.application.managed_no_spill);
+    }
+
+    #[test]
+    fn managed_default_no_flag_fitting_model_is_full_resident_without_paging() {
+        // #755: a model that fits the resolved default budget must stay fully
+        // resident with offload OFF even though managed VMM is now the default.
+        let config = EngineConfig::default();
+        let plan = input_managed(
+            &config,
+            graph_with_boundary("", "MatMul"),
+            256,
+            128,
+            MemoryStrategyOverrides::default(),
+        );
+        assert_eq!(plan.inferred_strategy, MemoryStrategy::FullResident);
+        assert_eq!(plan.strategy, MemoryStrategy::FullResident);
+        assert!(!plan.application.weight_offload_enabled);
+        assert!(
+            plan.application.managed_no_spill,
+            "managed VMM must be the default allocator without a flag"
+        );
+        assert_eq!(plan.application.managed_limit_bytes, Some(256));
+    }
+
+    #[test]
+    fn managed_default_no_flag_over_budget_model_auto_streams() {
+        // #755: over-budget under the managed default automatically enables weight
+        // streaming instead of failing, with no explicit --vram-limit set.
+        let config = EngineConfig::default();
+        let plan = input_managed(
+            &config,
+            graph_with_boundary("", "MatMul"),
+            64,
+            128,
+            MemoryStrategyOverrides::default(),
+        );
+        assert_eq!(plan.strategy, MemoryStrategy::DynamicWeightResidency);
+        assert!(plan.application.weight_offload_enabled);
+        assert!(plan.application.managed_no_spill);
+        assert!(plan.application.auto_enabled_from_vram_limit);
+        assert_eq!(plan.application.device_budget_bytes, Some(64));
+        assert_eq!(plan.application.managed_limit_bytes, Some(64));
+    }
+
+    #[test]
+    fn managed_default_over_budget_moe_auto_streams() {
+        let config = EngineConfig::default();
+        let plan = input_managed(
+            &config,
+            graph_with_boundary("com.microsoft", "QMoE"),
+            64,
+            128,
+            MemoryStrategyOverrides::default(),
+        );
+        assert_eq!(plan.strategy, MemoryStrategy::MoeRoutingAware);
+        assert!(plan.application.weight_offload_enabled);
+        assert!(plan.application.managed_no_spill);
     }
 
     #[test]
