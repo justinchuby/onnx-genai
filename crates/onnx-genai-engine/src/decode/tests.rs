@@ -3,9 +3,9 @@
 //! Pure code motion from `decode.rs`.
 
 use super::metadata::{
-    KeySequenceLengthsPolicy, decode_kv_mode_from_shared_buffer_len, is_group_query_attention,
-    is_share_buffer_kv_dtype, key_sequence_lengths_policy, shared_kv_buffer_len_from_metadata,
-    sliding_window_from_metadata,
+    KeySequenceLengthsPolicy, decode_kv_mode_from_shared_buffer_len, effective_sliding_window,
+    graph_enforces_sliding_window, is_group_query_attention, is_share_buffer_kv_dtype,
+    key_sequence_lengths_policy, shared_kv_buffer_len_from_metadata, sliding_window_from_metadata,
 };
 use super::step::{build_position_step, decode_step_layout};
 use super::values::{slice_value_axis, zero_state_value};
@@ -419,6 +419,94 @@ fn sliding_window_metadata_is_consumed_and_validated() {
     assert!(sliding_window_from_metadata(&invalid).is_err());
     assert_eq!(
         sliding_window_from_metadata(&empty_metadata()).unwrap(),
+        None
+    );
+}
+
+/// Build a single-node decoder graph with one `GroupQueryAttention` op. When
+/// `local_window_size` is `Some(w)`, the op carries that attribute (a real,
+/// graph-enforced sliding window); when `None`, the op has no window attribute
+/// (global attention), mirroring a vestigial metadata-only window.
+fn gqa_graph(local_window_size: Option<i64>) -> onnx_runtime_ir::Graph {
+    use onnx_runtime_ir::{Attribute, Graph, Node};
+    let mut graph = Graph::default();
+    graph.nodes.insert_with(|id| {
+        let mut node = Node::new(id, "GroupQueryAttention", vec![], vec![]);
+        node.domain = "com.microsoft".to_string();
+        node.attributes
+            .insert("num_heads".to_string(), Attribute::Int(32));
+        node.attributes
+            .insert("kv_num_heads".to_string(), Attribute::Int(2));
+        node.attributes
+            .insert("do_rotary".to_string(), Attribute::Int(1));
+        if let Some(window) = local_window_size {
+            node.attributes
+                .insert("local_window_size".to_string(), Attribute::Int(window));
+        }
+        node
+    });
+    graph
+}
+
+#[test]
+fn graph_enforces_sliding_window_detects_gqa_local_window() {
+    // Real SWA export (Gemma/Mistral-style): GQA op carries local_window_size > 0.
+    assert!(graph_enforces_sliding_window(&gqa_graph(Some(4096))));
+}
+
+#[test]
+fn graph_without_local_window_is_global_attention() {
+    // Muse-Glimmer-style: GQA ops carry NO local_window_size => global attention.
+    assert!(!graph_enforces_sliding_window(&gqa_graph(None)));
+    // ORT's disabled sentinel (-1) and 0 both mean "no window".
+    assert!(!graph_enforces_sliding_window(&gqa_graph(Some(-1))));
+    assert!(!graph_enforces_sliding_window(&gqa_graph(Some(0))));
+}
+
+#[test]
+fn graph_enforces_sliding_window_recurses_into_subgraphs() {
+    use onnx_runtime_ir::{Attribute, Graph, Node};
+    let mut outer = Graph::default();
+    outer.nodes.insert_with(|id| {
+        let mut node = Node::new(id, "If", vec![], vec![]);
+        node.attributes.insert(
+            "then_branch".to_string(),
+            Attribute::Graph(Box::new(gqa_graph(Some(2048)))),
+        );
+        node
+    });
+    assert!(graph_enforces_sliding_window(&outer));
+}
+
+#[test]
+fn effective_sliding_window_drops_vestigial_metadata_window() {
+    // A window declared in inference_metadata.yaml but NOT enforced by the graph
+    // (Muse-Glimmer): treated as global attention so it routes to shared-buffer.
+    let global_graph = gqa_graph(None);
+    assert_eq!(
+        effective_sliding_window(Some(2048), Some(&global_graph)),
+        None
+    );
+}
+
+#[test]
+fn effective_sliding_window_preserves_real_swa_window() {
+    // A window the graph actually enforces (real SWA) stays active => windowed path.
+    let windowed_graph = gqa_graph(Some(4096));
+    assert_eq!(
+        effective_sliding_window(Some(4096), Some(&windowed_graph)),
+        Some(4096)
+    );
+}
+
+#[test]
+fn effective_sliding_window_is_conservative_without_graph() {
+    // If the graph cannot be inspected, keep the declared window so real SWA
+    // models are never regressed onto a global-attention path.
+    assert_eq!(effective_sliding_window(Some(4096), None), Some(4096));
+    // No declared window is always None regardless of graph.
+    assert_eq!(
+        effective_sliding_window(None, Some(&gqa_graph(Some(4096)))),
         None
     );
 }
