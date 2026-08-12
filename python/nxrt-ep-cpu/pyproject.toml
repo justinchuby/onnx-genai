@@ -54,6 +54,10 @@ nxrt_ep_cpu = ["*.so", "*.dll", "*.dylib"]
 [tool.cibuildwheel]
 # One build per platform is enough: the wheel is tagged py3-none-<platform>
 # (the bundled cdylib has no CPython ABI dependency), so cp310 covers all.
+# EXCEPTION: Windows ARM64 (win_arm64) has no CPython 3.10 build, so the CI
+# workflow overrides CIBW_BUILD to cp311-* for that row only (see
+# .github/workflows/publish-ep-plugins.yml). Any single CPython drives the
+# ABI-less build.
 build = "cp310-*"
 skip = "*-musllinux_*"
 test-command = 'python -c "import nxrt_ep_cpu, os; p=nxrt_ep_cpu.get_library_path(); assert os.path.exists(p), p; print(\"OK\", p)"'
