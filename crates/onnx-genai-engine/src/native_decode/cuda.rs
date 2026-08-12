@@ -1328,6 +1328,21 @@ impl DecodeCudaState {
         Ok(bytes)
     }
 
+    /// Build the padded physical and initial logical shapes for a persistent KV
+    /// (`fixed == false`) or recurrent-state (`fixed == true`) binding.
+    ///
+    /// The KV shape is always **BNSH** `[1, kv_heads, max_len, head_dim]`,
+    /// growing on axis 2, for *both* the head-major and seq-major layouts. This
+    /// is deliberate and is the KV binding contract: the CUDA GQA node validates
+    /// `past_key`/`past_value` as `[batch, kv_heads, seq, head_dim]` and reads
+    /// `present_capacity` from axis 2 **regardless** of the `kv_layout`
+    /// attribute (which only re-specializes the kernel's stride arithmetic). A
+    /// seq-major binding therefore keeps this BNSH metadata shape; its BSNH
+    /// physical byte layout — and the capacity-independent fixed per-token stride
+    /// that lets it grow without moving data — is expressed by the growth/commit
+    /// geometry (`kv_growth_byte_layout`, `apply_vmm_growth`,
+    /// `build_grown_buffers`), not by permuting this shape. See
+    /// `docs/MEMORY_ARCHITECTURE.md`, "KV layout and residency".
     pub(crate) fn persistent_state_shapes(
         name: &str,
         dtype: DataType,
@@ -1459,9 +1474,17 @@ impl DecodeCudaState {
             self.invalidate_graph(session)?;
             self.max_len = new_capacity;
             self.kv_growth_events += 1;
-            self.kv_growth_d2d_copy_bytes = self.kv_growth_d2d_copy_bytes.saturating_add(
-                (valid_len as u64).saturating_mul(self.capacity.bytes_per_token as u64),
-            );
+            // Seq-major grows in place on a fixed per-token stride, so the valid
+            // prefix keeps its byte offsets and no KV data is copied; head-major
+            // re-strides every head stripe, moving `valid_len × bytes_per_token`.
+            let moved_bytes_per_token = if self.kv_layout.is_seq_major() {
+                0
+            } else {
+                self.capacity.bytes_per_token as u64
+            };
+            self.kv_growth_d2d_copy_bytes = self
+                .kv_growth_d2d_copy_bytes
+                .saturating_add((valid_len as u64).saturating_mul(moved_bytes_per_token));
             tracing::info!(
                 old_len = old_capacity,
                 new_len = new_capacity,
@@ -1589,6 +1612,7 @@ impl DecodeCudaState {
         // tight-card failure path is transactional. A later CUDA copy/memset
         // failure can still leave mixed old/new strides; #699 tracks adding a
         // poison/reset path rather than hiding that rarer device failure here.
+        let layout = self.kv_layout;
         for binding in &mut self.bindings[self.kv_binding_range.clone()] {
             let old_shape = binding.physical_shape().to_vec();
             if old_shape.len() != 4 {
@@ -1608,10 +1632,16 @@ impl DecodeCudaState {
                 )
             })?;
             let ptr = binding.device_ptr() as usize;
+            // Move/zero over the *physical* byte layout. Head-major re-strides
+            // each head stripe on axis 2 (unchanged); seq-major grows on axis 1
+            // with a capacity-independent per-token stride, so the in-place copy
+            // is a no-op and only the newly grown tail is zeroed — no KV moves.
+            let (old_bytes, grow_axis) = kv_growth_byte_layout(&old_shape, layout)?;
+            let (new_bytes, _) = kv_growth_byte_layout(&new_shape, layout)?;
             copy_kv_prefix_device_to_device_in_place(
-                ptr, &old_shape, &new_shape, 2, valid_len, elem,
+                ptr, &old_bytes, &new_bytes, grow_axis, valid_len, elem,
             )?;
-            zero_kv_suffix_device(ptr, &new_shape, 2, valid_len, elem)?;
+            zero_kv_suffix_device(ptr, &new_bytes, grow_axis, valid_len, elem)?;
             let mut logical_shape = new_shape.clone();
             logical_shape[2] = valid_len;
             binding.set_physical_and_logical_shapes(new_shape, logical_shape)?;
@@ -2800,6 +2830,7 @@ impl onnx_genai_kv::KvCapacityGrowthBackend for NativeCudaCapacityBackend<'_> {
         valid_len: usize,
     ) -> anyhow::Result<Self::GrownBuffers> {
         let old_capacity = self.state.max_len;
+        let layout = self.state.kv_layout;
         (|| {
             native_cuda_device_barrier(self.session)?;
             let mut replacements = Vec::with_capacity(self.state.kv_binding_range.len());
@@ -2827,19 +2858,19 @@ impl onnx_genai_kv::KvCapacityGrowthBackend for NativeCudaCapacityBackend<'_> {
                         )
                     })?;
                 native_cuda_memset_zero(dst, total_bytes)?;
+                // Copy the live prefix following the physical byte layout: one
+                // contiguous run for seq-major (grow axis 1), one fragment per
+                // head stripe for head-major (grow axis 2, unchanged).
+                let elem = old.dtype.checked_storage_bytes(1).with_context(|| {
+                    format!(
+                        "CUDA KV grow copy element size overflow for '{}'",
+                        old.input_name()
+                    )
+                })?;
+                let (old_bytes, grow_axis) = kv_growth_byte_layout(old.physical_shape(), layout)?;
+                let (new_bytes, _) = kv_growth_byte_layout(&physical_shape, layout)?;
                 copy_kv_prefix_device_to_device(
-                    dst,
-                    src,
-                    old.physical_shape(),
-                    &physical_shape,
-                    2,
-                    valid_len,
-                    old.dtype.checked_storage_bytes(1).with_context(|| {
-                        format!(
-                            "CUDA KV grow copy element size overflow for '{}'",
-                            old.input_name()
-                        )
-                    })?,
+                    dst, src, &old_bytes, &new_bytes, grow_axis, valid_len, elem,
                 )?;
                 replacements.push((index, new_binding));
             }
@@ -2948,6 +2979,44 @@ fn native_cuda_memset_zero(dst: usize, bytes: usize) -> anyhow::Result<()> {
 #[cfg(not(feature = "cuda"))]
 fn native_cuda_memset_zero(_dst: usize, _bytes: usize) -> anyhow::Result<()> {
     bail!("native CUDA KV growth requires the onnx-genai-engine `cuda` feature")
+}
+
+/// Map a BNSH-declared KV binding shape `[batch, kv_heads, capacity, head_dim]`
+/// to the physical byte-layout shape and grow-axis index the resolved
+/// [`KvCommitLayout`] actually stores it in.
+///
+/// The binding *metadata* shape reported to the CUDA EP is always BNSH — the
+/// GQA node validates `past_key`/`past_value` as `[batch, kv_heads, seq,
+/// head_dim]` and reads `present_capacity` from axis 2 *regardless of the
+/// `kv_layout` attribute* (only the kernel's stride arithmetic changes). So this
+/// permutation never leaves the growth machinery; it drives the copy/zero
+/// geometry over raw device bytes so that growth is faithful to how the bytes
+/// are really laid out:
+///
+/// * **Head-major BNSH**: the byte layout equals the declared shape and the grow
+///   axis is 2. Each head owns its own `capacity × head_dim` stripe, so growth
+///   re-strides every head — byte-identical to the historical behavior.
+/// * **Seq-major BSNH**: the bytes are `[batch, capacity, kv_heads, head_dim]`
+///   and the grow axis is 1. A token's whole KV (all heads) is contiguous with a
+///   fixed `kv_heads × head_dim` stride that is **independent of capacity**, so
+///   the live prefix keeps its byte offsets across growth and no KV data moves.
+///   This is the fixed-stride property #797 measured at the driver level, here
+///   realized on the engine growth path.
+pub(super) fn kv_growth_byte_layout(
+    bnsh_shape: &[usize],
+    layout: KvCommitLayout,
+) -> anyhow::Result<(Vec<usize>, usize)> {
+    if bnsh_shape.len() != 4 {
+        bail!("CUDA KV binding must be rank-4 BNSH, got shape {bnsh_shape:?}");
+    }
+    Ok(match layout {
+        KvCommitLayout::HeadMajor => (bnsh_shape.to_vec(), 2),
+        KvCommitLayout::SeqMajor => {
+            let (batch, kv_heads, capacity, head_dim) =
+                (bnsh_shape[0], bnsh_shape[1], bnsh_shape[2], bnsh_shape[3]);
+            (vec![batch, capacity, kv_heads, head_dim], 1)
+        }
+    })
 }
 
 #[cfg(feature = "cuda")]
