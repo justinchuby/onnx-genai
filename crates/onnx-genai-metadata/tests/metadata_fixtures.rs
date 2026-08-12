@@ -612,7 +612,82 @@ pipeline:
         error
             .errors
             .iter()
-            .any(|message| message.contains("unordered side effects"))
+            .any(|message| message.contains("without an explicit branch merge"))
+    );
+}
+
+const BRANCH_PHI_WORKFLOW: &str = r#"
+pipeline:
+  workflow:
+    manifest:
+      ir_version: "1.0"
+      onnx_opsets: { ai.onnx: 24 }
+      adapter_abis: {}
+      custom_op_versions: {}
+      capabilities: [workflow_ssa, linear_effects, nested_control_flow, explicit_transfer]
+    inputs:
+      selector:
+        contract: { dtype: int64, rank: 0, shape: [] }
+        role: { kind: opaque }
+        source: { kind: application, name: selector }
+        required: true
+      selected:
+        contract: { dtype: int64, rank: 1, shape: [batch] }
+        role: { kind: opaque }
+        source: { kind: application, name: selected }
+        required: true
+      fallback:
+        contract: { dtype: int64, rank: 1, shape: [batch] }
+        role: { kind: opaque }
+        source: { kind: application, name: fallback }
+        required: true
+    outputs: {}
+    components: {}
+    initial_effects: {}
+    graph:
+      kind: branch
+      predicate: selector
+      cases:
+        "1": { kind: transfer, input: selected, output: case.selected, device: cpu }
+      default: { kind: transfer, input: fallback, output: case.default, device: cpu }
+      outputs:
+        joined:
+          cases: { "1": case.selected }
+          default: case.default
+"#;
+
+#[test]
+fn workflow_branch_phi_requires_complete_compatible_mappings() {
+    let metadata: InferenceMetadata =
+        serde_yaml::from_str(BRANCH_PHI_WORKFLOW).expect("branch workflow parses");
+    validate_pipeline_spec(metadata.pipeline.as_ref().expect("pipeline"))
+        .expect("complete branch phi validates");
+
+    let missing_default = BRANCH_PHI_WORKFLOW.replace("          default: case.default\n", "");
+    let metadata: InferenceMetadata =
+        serde_yaml::from_str(&missing_default).expect("branch workflow parses");
+    let error = validate_pipeline_spec(metadata.pipeline.as_ref().expect("pipeline"))
+        .expect_err("default phi mapping is required");
+    assert!(
+        error
+            .errors
+            .iter()
+            .any(|message| message.contains("must map the default branch exactly"))
+    );
+
+    let incompatible = BRANCH_PHI_WORKFLOW.replace(
+        "contract: { dtype: int64, rank: 1, shape: [batch] }\n        role: { kind: opaque }\n        source: { kind: application, name: fallback }",
+        "contract: { dtype: float32, rank: 1, shape: [batch] }\n        role: { kind: opaque }\n        source: { kind: application, name: fallback }",
+    );
+    let metadata: InferenceMetadata =
+        serde_yaml::from_str(&incompatible).expect("branch workflow parses");
+    let error = validate_pipeline_spec(metadata.pipeline.as_ref().expect("pipeline"))
+        .expect_err("incompatible phi contracts fail");
+    assert!(
+        error
+            .errors
+            .iter()
+            .any(|message| message.contains("incompatible tensor contracts"))
     );
 }
 

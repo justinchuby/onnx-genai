@@ -192,3 +192,42 @@ effects: { state: { consumes: state.0, produces: state.1 } }
 Append, scatter, accumulation, paging policy, and other tensor mutation math are
 not workflow operators. The ONNX component computes `next`; loop carry or session
 state wiring publishes it as the next cell version.
+
+## Conditional joins
+
+`branch` keeps case-local SSA and effect tokens isolated. Values escape only through
+typed `outputs` phi mappings, with one source for every case and the default when
+present. Each output's source contracts must unify.
+
+Linear effects use explicit `effects` merges. Every case starts from the same
+`incoming` token and may produce a distinct local successor; the branch publishes one
+new `produces` token for subsequent nodes:
+
+```yaml
+kind: branch
+predicate: proposal.accepted
+cases:
+  "true":
+    kind: invoke
+    component: accept_state
+    inputs: { value: proposal.tokens }
+    outputs: { value: accepted.tokens }
+    effects: { state: { consumes: state.0, produces: state.accepted } }
+  "false":
+    kind: invoke
+    component: correction_state
+    inputs: { value: verifier.tokens }
+    outputs: { value: corrected.tokens }
+    effects: { state: { consumes: state.0, produces: state.corrected } }
+outputs:
+  next.tokens:
+    cases: { "true": accepted.tokens, "false": corrected.tokens }
+effects:
+  state:
+    incoming: state.0
+    cases: { "true": state.accepted, "false": state.corrected }
+    produces: state.joined
+```
+
+Case-local names such as `accepted.tokens` and `corrected.tokens` are unavailable
+after the branch; only `next.tokens` and `state.joined` escape.
