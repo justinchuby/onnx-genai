@@ -55,10 +55,15 @@ impl GraphCaptureStructuralSafety {
 /// auto-decision.
 ///
 /// Precedence:
-/// 0. Live weight offload (`ONNX_GENAI_WEIGHT_OFFLOAD=1`) always wins and forces
-///    capture OFF. The pager's alloc/copy/free ops are capture-illegal, so the
-///    two features are mutually exclusive; offload wins and capture is skipped
-///    with a one-time notice.
+/// 0. Live weight offload (`ONNX_GENAI_WEIGHT_OFFLOAD=1`) forces capture OFF
+///    **only when its paging path is not stable-VA**. The legacy pager's
+///    alloc/copy/free ops return a different device pointer per page-in, and a
+///    captured graph bakes pointers into its recorded nodes, so the two are
+///    mutually exclusive on that path (a one-time notice explains the decline).
+///    When offload runs on the stable virtual-address VMM path (issue #716),
+///    every retained weight keeps a reserved-once device VA whose physical
+///    granules are remapped underneath, which is capture-safe, so this no longer
+///    forces capture OFF and the normal precedence below applies.
 /// 1. Programmatic `NativeDecodeCudaOptions::graph_capture` (`Some`) wins next.
 /// 2. An explicitly-set `ONNX_GENAI_CUDA_GRAPH` env var (`=0` forces OFF, `=1`
 ///    forces ON) is honored next.
@@ -70,8 +75,9 @@ pub(crate) fn resolve_graph_capture_enabled(
     env_value: bool,
     structural: GraphCaptureStructuralSafety,
     weight_offload_enabled: bool,
+    weight_offload_stable_va: bool,
 ) -> bool {
-    if weight_offload_enabled {
+    if weight_offload_enabled && !weight_offload_stable_va {
         log_weight_offload_capture_exclusion();
         return false;
     }
@@ -85,11 +91,15 @@ pub(crate) fn resolve_graph_capture_enabled(
 }
 
 /// Emit the offload/capture mutual-exclusion notice at most once per process, so
-/// operators who enable both learn capture was declined without log spam.
+/// operators who enable both on the pointer-unstable (non stable-VA) paging path
+/// learn capture was declined without log spam.
 fn log_weight_offload_capture_exclusion() {
     static NOTICE: std::sync::Once = std::sync::Once::new();
     NOTICE.call_once(|| {
-        tracing::warn!("weight offload is incompatible with CUDA graph capture; capture disabled");
+        tracing::warn!(
+            "weight offload on the non stable-VA paging path is incompatible with CUDA graph \
+             capture; capture disabled (issue #716: managed no-spill offload keeps capture on)"
+        );
     });
 }
 
