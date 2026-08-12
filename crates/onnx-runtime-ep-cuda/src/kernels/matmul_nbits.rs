@@ -6922,6 +6922,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
+            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
         };
         kernel.run(&inputs, &mut outputs, None).unwrap();
         runtime.synchronize().unwrap();
@@ -7201,6 +7202,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
+            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
         };
         kernel.run(&inputs, &mut outputs, None).unwrap();
         runtime.synchronize().unwrap();
@@ -7352,6 +7354,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 rmsnorm_prologue: false,
                 rmsnorm_epsilon: 1e-5,
                 last_call_capture_safe: AtomicBool::new(false),
+                bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
             };
             let staged_source = format!("{GEMV_F16_SRC}\n{STAGED_DOWN_REFERENCE_SRC}");
             let staged_function = runtime
@@ -8096,6 +8099,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
+            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
         };
         kernel.run(&inputs, &mut outputs, None).unwrap();
         runtime.synchronize().unwrap();
@@ -8354,6 +8358,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
+            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
         };
 
         match bits {
@@ -8623,6 +8628,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
+            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
         };
         let kernel_fold = MatMulNBitsKernel {
             runtime: runtime.clone(),
@@ -8638,6 +8644,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_prologue: false,
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
+            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
         };
         kernel_nobias
             .launch_f16_gemv_variant(
@@ -8896,6 +8903,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 rmsnorm_prologue: false,
                 rmsnorm_epsilon: 1e-5,
                 last_call_capture_safe: AtomicBool::new(false),
+                bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
             };
             // Reference: two standalone MatMulNBits projections.
             if m == 1 {
@@ -9314,6 +9322,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 rmsnorm_prologue: false,
                 rmsnorm_epsilon: epsilon,
                 last_call_capture_safe: AtomicBool::new(false),
+                bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
             };
             let fused_swiglu = MatMulNBitsKernel {
                 runtime: runtime.clone(),
@@ -9329,6 +9338,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 rmsnorm_prologue: true,
                 rmsnorm_epsilon: epsilon,
                 last_call_capture_safe: AtomicBool::new(false),
+                bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
             };
 
             // Reference: normalize the activation (production prefill norm
@@ -9779,6 +9789,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 rmsnorm_prologue: rmsnorm,
                 rmsnorm_epsilon: epsilon,
                 last_call_capture_safe: AtomicBool::new(false),
+                bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
             };
 
             // ── Reference: preceding GEMV → skip_rmsnorm → following GEMV ──
