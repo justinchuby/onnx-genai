@@ -403,7 +403,37 @@ fn weight_offload_hit_rate(stats: &onnx_runtime_ep_cuda::GlobalOffloadStats) -> 
     (lookups > 0).then(|| stats.hits as f64 / lookups as f64 * 100.0)
 }
 
-fn print_weight_offload_observability() {
+/// Ratio of an accumulated counter to the number of emitted tokens.
+///
+/// This is the batch-invariant quantity the #750 measurement protocol requires
+/// leading every batch-1 vs batch-N comparison: on a streaming-bound model the
+/// weight bytes streamed per decode step are (near-)constant in batch size `B`,
+/// so `htod_bytes / emitted_tokens` and `page_ins / emitted_tokens` should fall
+/// ~1/B while wall-clock throughput stays noisy. Returns `None` when no tokens
+/// were emitted so the caller reports `n/a` rather than dividing by zero.
+fn per_emitted_token(total: u64, emitted_tokens: u64) -> Option<f64> {
+    (emitted_tokens > 0).then(|| total as f64 / emitted_tokens as f64)
+}
+
+fn print_weight_offload_amortization(
+    stats: &onnx_runtime_ep_cuda::GlobalOffloadStats,
+    emitted_tokens: u64,
+) {
+    let fmt = |value: Option<f64>| {
+        value
+            .map(|ratio| format!("{ratio:.1}"))
+            .unwrap_or_else(|| "n/a".to_string())
+    };
+    println!(
+        "weight_offload_amortization: emitted_tokens={} htod_bytes_per_token={} \
+         page_ins_per_token={}",
+        emitted_tokens,
+        fmt(per_emitted_token(stats.htod_bytes, emitted_tokens)),
+        fmt(per_emitted_token(stats.page_ins, emitted_tokens))
+    );
+}
+
+fn print_weight_offload_observability(emitted_tokens: u64) {
     let stats = onnx_runtime_ep_cuda::global_offload_stats();
     let hit_rate = weight_offload_hit_rate(&stats)
         .map(|rate| format!("{rate:.2}%"))
@@ -413,6 +443,7 @@ fn print_weight_offload_observability() {
          bypassed_page_ins={}",
         stats.page_ins, stats.hits, hit_rate, stats.evictions, stats.bypassed_page_ins
     );
+    print_weight_offload_amortization(&stats, emitted_tokens);
     println!(
         "weight_offload_timing: materialize_ms={:.3} htod_ms={:.3} \
          admit_sync_ms={:.3} vram_alloc_ms={:.3} vram_free_ms={:.3}",
@@ -613,7 +644,7 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
         println!("generated_token_ids: {tokens:?}");
     }
     print_cuda_observability(&engine, cuda_before.as_ref());
-    print_weight_offload_observability();
+    print_weight_offload_observability(generated as u64);
     print_vmm_observability(&engine);
     if profile::enabled() {
         println!("{}", profile::report(generated as u64));
@@ -1032,6 +1063,7 @@ fn main() -> Result<()> {
         "weight_offload_cache: page_ins={} hits={} evictions={}",
         offload.page_ins, offload.hits, offload.evictions
     );
+    print_weight_offload_amortization(&offload, generated as u64);
     if profile::enabled() {
         println!("{}", profile::report(generated as u64));
     }
@@ -1071,6 +1103,18 @@ mod tests {
             weight_offload_hit_rate(&onnx_runtime_ep_cuda::GlobalOffloadStats::default()),
             None
         );
+    }
+
+    #[test]
+    fn per_emitted_token_divides_counter_by_tokens() {
+        // 65,772,419,072 htod bytes over 16 emitted tokens is the #837 baseline;
+        // the ratio (~4.11 GB/token) is the batch-invariant quantity a batch-N
+        // run must drive down, and is far more stable than wall-clock tok/s.
+        assert_eq!(per_emitted_token(65_772_419_072, 16), Some(4_110_776_192.0));
+        assert_eq!(per_emitted_token(5_535, 16), Some(345.9375));
+        // No emitted tokens must report `n/a`, never divide by zero.
+        assert_eq!(per_emitted_token(1_000, 0), None);
+        assert_eq!(per_emitted_token(0, 8), Some(0.0));
     }
 
     #[test]
