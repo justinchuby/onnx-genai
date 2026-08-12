@@ -1,5 +1,6 @@
 //! Universal metadata-declared workflow runtime.
 
+use crate::decode::clone_value;
 use crate::engine::{
     Engine, EngineConfig, EngineResourceGovernor, MemoryStrategyPlanInput, analyze_model_memory,
     build_memory_strategy_plan, combine_graph_memory, component_governor, log_memory_strategy_plan,
@@ -25,6 +26,12 @@ use std::sync::Arc;
 mod workflow;
 
 pub type PipelineTensors = HashMap<String, Value>;
+
+/// Replayable snapshot of semantic session-scoped workflow state.
+pub struct WorkflowSessionCheckpoint {
+    semantic_state: HashMap<String, Value>,
+    contracts: HashMap<String, TensorContract>,
+}
 
 /// A request for the universal workflow interpreter.
 pub struct PipelineGenerateRequest {
@@ -268,6 +275,69 @@ impl PipelineEngine {
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineTensors> {
         self.run_workflow(request)
+    }
+
+    pub fn checkpoint_session(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<WorkflowSessionCheckpoint> {
+        let session_state = self.workflow_session_state.borrow();
+        let mut semantic_state = HashMap::new();
+        let mut contracts = HashMap::new();
+        for (cell, declaration) in &self.workflow.state {
+            if declaration.scope != onnx_genai_metadata::WorkflowStateScope::Session
+                || declaration.class != onnx_genai_metadata::WorkflowStateClass::Semantic
+            {
+                continue;
+            }
+            if let Some(value) = session_state.get(&(session_id.to_string(), cell.clone())) {
+                semantic_state.insert(cell.clone(), clone_value(value)?);
+                contracts.insert(cell.clone(), declaration.contract.clone());
+            }
+        }
+        Ok(WorkflowSessionCheckpoint {
+            semantic_state,
+            contracts,
+        })
+    }
+
+    pub fn restore_session_checkpoint(
+        &mut self,
+        session_id: &str,
+        checkpoint: &WorkflowSessionCheckpoint,
+    ) -> anyhow::Result<()> {
+        for cell in checkpoint.semantic_state.keys() {
+            let Some(declaration) = self.workflow.state.get(cell) else {
+                anyhow::bail!("workflow checkpoint references unknown state cell '{cell}'");
+            };
+            if declaration.scope != onnx_genai_metadata::WorkflowStateScope::Session
+                || declaration.class != onnx_genai_metadata::WorkflowStateClass::Semantic
+            {
+                anyhow::bail!("workflow checkpoint state '{cell}' is not semantic session state");
+            }
+            if checkpoint.contracts.get(cell) != Some(&declaration.contract) {
+                anyhow::bail!(
+                    "workflow checkpoint state '{cell}' has an incompatible tensor contract"
+                );
+            }
+        }
+        let staged = checkpoint
+            .semantic_state
+            .iter()
+            .map(|(cell, value)| Ok((cell.clone(), clone_value(value)?)))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let mut session_state = self.workflow_session_state.borrow_mut();
+        for (cell, declaration) in &self.workflow.state {
+            if declaration.scope == onnx_genai_metadata::WorkflowStateScope::Session
+                && declaration.class == onnx_genai_metadata::WorkflowStateClass::Semantic
+            {
+                session_state.remove(&(session_id.to_string(), cell.clone()));
+            }
+        }
+        for (cell, value) in staged {
+            session_state.insert((session_id.to_string(), cell), value);
+        }
+        Ok(())
     }
 
     /// Convenience text API lowered through the generic tokens package output.
