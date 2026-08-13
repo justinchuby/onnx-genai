@@ -105,7 +105,8 @@ pub struct WorkflowInput {
     pub contract: TensorContract,
     pub role: SemanticInputRole,
     pub source: WorkflowInputSource,
-    #[serde(default)]
+    #[serde(default = "default_true")]
+    #[schemars(default = "default_true")]
     pub required: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<ScalarValue>,
@@ -141,7 +142,7 @@ pub enum RuntimeInputRole {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkflowInputSource {
-    Request { field: RuntimeInputRole },
+    Request,
     Application { name: String },
     Literal,
     Artifact { path: String },
@@ -187,8 +188,6 @@ pub struct WorkflowComponent {
     pub application_overridable: bool,
     #[serde(default)]
     pub effects: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resources: Option<WorkflowResourceContract>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
@@ -245,7 +244,7 @@ pub enum WorkflowStep {
         #[serde(default)]
         setup: Vec<WorkflowStep>,
         steps: Vec<WorkflowStep>,
-        condition: String,
+        continue_when: String,
         max_iterations: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         iteration: Option<WorkflowLoopIteration>,
@@ -262,6 +261,8 @@ pub enum WorkflowStep {
     },
     Emit {
         value: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        when: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         valid_length: Option<String>,
         output: String,
@@ -292,9 +293,9 @@ pub enum WorkflowNode {
     Loop {
         setup: Box<WorkflowNode>,
         body: Box<WorkflowNode>,
-        condition: String,
+        continue_when: String,
         max_iterations: String,
-        /// Optional zero-based induction value, scoped to this loop's body and condition.
+        /// Optional zero-based induction value, scoped to this loop's body and continue_when.
         iteration: Option<WorkflowLoopIteration>,
         carried: Vec<WorkflowLoopCarry>,
         effects: BTreeMap<String, WorkflowLoopEffect>,
@@ -308,8 +309,10 @@ pub enum WorkflowNode {
     },
     Emit {
         value: String,
+        /// Optional scalar or rank-one boolean guard. False rows are suppressed.
+        when: Option<String>,
         /// Optional scalar or rank-one integer SSA value limiting the emitted prefix
-        /// on the value's final axis. It must contain exactly one element at runtime.
+        /// on the value's final axis, globally or per batch row.
         valid_length: Option<String>,
         output: String,
         mode: WorkflowEmitMode,
@@ -325,6 +328,10 @@ pub enum WorkflowNode {
     ExecutionIsland {
         id: usize,
     },
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
@@ -388,6 +395,8 @@ pub struct WorkflowStateCell {
     pub scope: WorkflowStateScope,
     pub initializer: String,
     pub recurrence: ShapeRecurrence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_group: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<SessionLeaseContract>,
 }
@@ -460,6 +469,35 @@ pub struct KvServiceContract {
     pub allocation: SlotAllocationMode,
     #[serde(default)]
     pub compaction: bool,
+    #[serde(default)]
+    pub groups: BTreeMap<String, KvServiceGroupContract>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct KvServiceGroupContract {
+    pub sequence_axis: usize,
+    pub layout: String,
+    #[serde(default)]
+    pub storage: KvStorageMode,
+    #[serde(default)]
+    pub ports: BTreeMap<String, BTreeMap<String, KvPortAlias>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum KvStorageMode {
+    #[default]
+    Separate,
+    SharedBuffer,
+    Paged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct KvPortAlias {
+    pub input: String,
+    pub output: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
@@ -474,34 +512,4 @@ pub enum KvPagingMode {
 pub enum SlotAllocationMode {
     Static,
     Runtime,
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct WorkflowResourceContract {
-    #[serde(default)]
-    pub allowed_devices: Vec<DeviceKind>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preferred_device: Option<DeviceKind>,
-    pub memory_class: WorkflowMemoryClass,
-    pub batching: WorkflowBatchingContract,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub concurrency: Option<usize>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkflowMemoryClass {
-    Default,
-    Device,
-    Host,
-    Pinned,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum WorkflowBatchingContract {
-    None,
-    Stack { axis: usize },
-    Ragged { offsets: String },
 }

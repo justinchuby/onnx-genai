@@ -632,12 +632,12 @@ fn collect_value_uses(node: &WorkflowNode, uses: &mut HashMap<String, usize>) {
         WorkflowNode::Loop {
             setup,
             body,
-            condition,
+            continue_when,
             max_iterations,
             carried,
             ..
         } => {
-            use_value(condition);
+            use_value(continue_when);
             use_value(max_iterations);
             for carry in carried {
                 use_value(&carry.current);
@@ -671,10 +671,14 @@ fn collect_value_uses(node: &WorkflowNode, uses: &mut HashMap<String, usize>) {
         }
         WorkflowNode::Emit {
             value,
+            when,
             valid_length,
             ..
         } => {
             use_value(value);
+            if let Some(when) = when {
+                use_value(when);
+            }
             if let Some(valid_length) = valid_length {
                 use_value(valid_length);
             }
@@ -1117,7 +1121,6 @@ mod tests {
             contract: None,
             application_overridable: false,
             effects: Vec::new(),
-            resources: None,
         }
     }
 

@@ -558,7 +558,7 @@ impl PipelineEngine {
             WorkflowNode::Loop {
                 setup,
                 body,
-                condition,
+                continue_when,
                 max_iterations,
                 iteration,
                 carried,
@@ -579,14 +579,14 @@ impl PipelineEngine {
                     let state = workflow.state.get(&carry.cell).with_context(|| {
                         format!("workflow loop carries undeclared state '{}'", carry.cell)
                     })?;
-                    let initializer = values.get(&state.initializer).with_context(|| {
+                    let initializer = values.get(&carry.current).with_context(|| {
                         format!(
-                            "workflow state '{}' initializer '{}' is unavailable after loop setup",
-                            carry.cell, state.initializer
+                            "workflow state '{}' loop initializer '{}' is unavailable after setup",
+                            carry.cell, carry.current
                         )
                     })?;
                     validate_workflow_value(
-                        &state.initializer,
+                        &carry.current,
                         initializer,
                         &state.contract,
                         symbols,
@@ -606,6 +606,10 @@ impl PipelineEngine {
                     );
                 }
                 for index in 0..limit {
+                    let active_rows = workflow_bool_rows(values, continue_when)?;
+                    if !active_rows.iter().any(|active| *active) {
+                        break;
+                    }
                     telemetry.loop_iterations += 1;
                     if let Some(iteration) = iteration {
                         values.insert(
@@ -614,8 +618,11 @@ impl PipelineEngine {
                         );
                     }
                     for carry in carried {
-                        let current = values.get(&carry.current).with_context(|| {
-                            format!("workflow loop value '{}' is unavailable", carry.current)
+                        if carry.body_input == carry.next {
+                            continue;
+                        }
+                        let current = values.get(&carry.next).with_context(|| {
+                            format!("workflow loop value '{}' is unavailable", carry.next)
                         })?;
                         values.insert(carry.body_input.clone(), clone_value(current)?);
                     }
@@ -631,8 +638,8 @@ impl PipelineEngine {
                         telemetry,
                     )?;
                     for carry in carried {
-                        let current = values.get(&carry.current).with_context(|| {
-                            format!("workflow loop value '{}' is unavailable", carry.current)
+                        let current = values.get(&carry.next).with_context(|| {
+                            format!("workflow loop value '{}' is unavailable", carry.next)
                         })?;
                         let next = values.get(&carry.body_output).with_context(|| {
                             format!("workflow loop body did not produce '{}'", carry.body_output)
@@ -641,13 +648,20 @@ impl PipelineEngine {
                             format!("workflow loop carries undeclared state '{}'", carry.cell)
                         })?;
                         validate_state_recurrence(&carry.cell, current, next, state, values)?;
-                        let next_value = clone_value(next)?;
-                        values.insert(carry.current.clone(), clone_value(&next_value)?);
+                        let next_value = merge_inactive_rows(
+                            current,
+                            next,
+                            &active_rows,
+                            state.service_group.is_some(),
+                        )
+                        .with_context(|| {
+                            format!(
+                                "workflow loop carry '{}' cannot preserve inactive rows",
+                                carry.cell
+                            )
+                        })?;
                         values.insert(carry.next.clone(), next_value);
                         final_state_refs.insert(carry.cell.clone(), carry.next.clone());
-                    }
-                    if !workflow_scalar_bool(values, condition)? {
-                        break;
                     }
                 }
                 if let Some(iteration) = iteration {
@@ -728,25 +742,61 @@ impl PipelineEngine {
             }
             WorkflowNode::Emit {
                 value,
+                when,
                 valid_length,
                 output,
                 mode,
                 ..
             } => {
-                let tensor = values
-                    .get(value)
-                    .with_context(|| format!("workflow emit value '{value}' is unavailable"))?;
+                let tensor =
+                    clone_value(values.get(value).with_context(|| {
+                        format!("workflow emit value '{value}' is unavailable")
+                    })?)?;
                 let output_contract = workflow.outputs.get(output).with_context(|| {
                     format!("workflow emit references undeclared output '{output}'")
                 })?;
+                let guards = when
+                    .as_deref()
+                    .map(|guard| workflow_bool_rows(values, guard))
+                    .transpose()?;
+                let lengths = valid_length
+                    .as_deref()
+                    .map(|length| workflow_usize_rows(values, length))
+                    .transpose()?;
+                let row_count = guards
+                    .as_ref()
+                    .map_or(1, Vec::len)
+                    .max(lengths.as_ref().map_or(1, Vec::len));
+                if row_count > 1 {
+                    emit_workflow_rows(
+                        values,
+                        &tensor,
+                        output,
+                        mode,
+                        guards.as_deref(),
+                        lengths.as_deref(),
+                        emit_counts,
+                        telemetry,
+                    )?;
+                    return Ok(());
+                }
+                if guards
+                    .as_ref()
+                    .is_some_and(|guards| !guards.first().copied().unwrap_or(false))
+                {
+                    return Ok(());
+                }
                 let emitted = if let Some(valid_length) = valid_length {
-                    let length =
-                        workflow_scalar_usize(values, valid_length).with_context(|| {
+                    let length = lengths
+                        .as_ref()
+                        .and_then(|lengths| lengths.first())
+                        .copied()
+                        .with_context(|| {
                             format!("workflow emit valid_length '{valid_length}' is invalid")
                         })?;
-                    slice_workflow_prefix(tensor, length)?
+                    slice_workflow_prefix(&tensor, length)?
                 } else {
-                    clone_value(tensor)?
+                    tensor
                 };
                 if telemetry.first_emit_ns.is_none() {
                     telemetry.first_emit_ns = telemetry
@@ -1174,9 +1224,16 @@ impl PipelineEngine {
                 Some(value)
             } else {
                 match &input.source {
-                    WorkflowInputSource::Request { field } => {
-                        workflow_request_value(field, request, &input.contract)?
-                    }
+                    WorkflowInputSource::Request => match &input.role {
+                        onnx_genai_metadata::SemanticInputRole::Runtime { role, .. } => {
+                            workflow_request_value(role, request, &input.contract)?
+                        }
+                        onnx_genai_metadata::SemanticInputRole::Opaque => {
+                            anyhow::bail!(
+                                "workflow request input '{name}' must declare a versioned runtime role"
+                            )
+                        }
+                    },
                     WorkflowInputSource::Literal => input
                         .default
                         .as_ref()
@@ -1647,30 +1704,53 @@ fn validate_state_recurrence(
                     );
                 }
             }
-            let growth = i64::try_from(workflow_scalar_usize(values, increment)?)
-                .context("workflow state growth increment exceeds i64")?;
-            let limit = i64::try_from(workflow_scalar_usize(values, max)?)
-                .context("workflow state growth limit exceeds i64")?;
+            let growth = workflow_usize_rows(values, increment)?;
+            let limits = workflow_usize_rows(values, max)?;
             let before = *current.shape().get(*axis).with_context(|| {
                 format!("workflow state '{cell}' grows outside its tensor rank")
             })?;
             let after = *next.shape().get(*axis).with_context(|| {
                 format!("workflow state '{cell}' grows outside its tensor rank")
             })?;
-            let expected = before
-                .checked_add(growth)
-                .with_context(|| format!("workflow state '{cell}' shape growth overflowed"))?;
-            if after != expected {
-                anyhow::bail!(
-                    "workflow state '{cell}' growing axis {axis} changed from {before} to {after}, \
-                     expected {expected}"
+            if growth.len() > 1 || limits.len() > 1 {
+                anyhow::ensure!(
+                    state.service_group.is_some(),
+                    "workflow state '{cell}' uses per-row growth without a KV service group"
                 );
-            }
-            if after > limit {
-                anyhow::bail!(
-                    "workflow state '{cell}' growing axis {axis} reached {after}, above maximum \
-                     {limit}"
+                let rows = growth.len().max(limits.len());
+                for row in 0..rows {
+                    let growth = growth[if growth.len() == 1 { 0 } else { row }];
+                    let limit = limits[if limits.len() == 1 { 0 } else { row }];
+                    anyhow::ensure!(
+                        growth <= limit,
+                        "workflow state '{cell}' row {row} growth {growth} exceeds maximum {limit}"
+                    );
+                }
+                let storage_limit = limits.iter().copied().max().unwrap_or_default();
+                anyhow::ensure!(
+                    usize::try_from(after).is_ok_and(|after| after <= storage_limit),
+                    "workflow state '{cell}' dense storage extent {after} exceeds maximum \
+                     {storage_limit}"
                 );
+            } else {
+                let growth =
+                    i64::try_from(growth[0]).context("workflow state growth exceeds i64")?;
+                let limit = i64::try_from(limits[0]).context("workflow state limit exceeds i64")?;
+                let expected = before
+                    .checked_add(growth)
+                    .with_context(|| format!("workflow state '{cell}' shape growth overflowed"))?;
+                if after != expected {
+                    anyhow::bail!(
+                        "workflow state '{cell}' growing axis {axis} changed from {before} to \
+                         {after}, expected {expected}"
+                    );
+                }
+                if after > limit {
+                    anyhow::bail!(
+                        "workflow state '{cell}' growing axis {axis} reached {after}, above maximum \
+                         {limit}"
+                    );
+                }
             }
         }
         onnx_genai_metadata::ShapeRecurrence::Bounded { axis, max } => {
@@ -1833,6 +1913,187 @@ fn slice_workflow_prefix(value: &Value, valid_length: usize) -> anyhow::Result<V
     Value::from_raw_bytes(data, &shape, dtype).map_err(Into::into)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn emit_workflow_rows(
+    values: &mut PipelineTensors,
+    tensor: &Value,
+    output: &str,
+    mode: &WorkflowEmitMode,
+    guards: Option<&[bool]>,
+    lengths: Option<&[usize]>,
+    emit_counts: &mut HashMap<String, usize>,
+    telemetry: &mut WorkflowRunTelemetry,
+) -> anyhow::Result<()> {
+    let rows = tensor
+        .shape()
+        .first()
+        .copied()
+        .context("per-row workflow emit requires rank >= 1")?;
+    let rows = usize::try_from(rows).context("workflow emit has a negative batch dimension")?;
+    for cardinality in [guards.map(<[bool]>::len), lengths.map(<[usize]>::len)]
+        .into_iter()
+        .flatten()
+    {
+        anyhow::ensure!(
+            cardinality == 1 || cardinality == rows,
+            "workflow emit row control has {cardinality} values for batch {rows}"
+        );
+    }
+    for row in 0..rows {
+        let active = guards.map_or(true, |values| {
+            values[if values.len() == 1 { 0 } else { row }]
+        });
+        if !active {
+            continue;
+        }
+        let length = lengths.map(|values| values[if values.len() == 1 { 0 } else { row }]);
+        let emitted = slice_workflow_row(tensor, row, length)?;
+        if telemetry.first_emit_ns.is_none() {
+            telemetry.first_emit_ns = telemetry
+                .started
+                .map(|started| started.elapsed().as_nanos());
+        }
+        telemetry.emit_events += 1;
+        telemetry.emitted_elements += emitted.numel() as u64;
+        let row_output = format!("{output}.row.{row}");
+        match mode {
+            WorkflowEmitMode::Replace => {
+                values.insert(row_output, emitted);
+            }
+            WorkflowEmitMode::Append => {
+                let appended = if let Some(previous) = values.get(&row_output) {
+                    append_workflow_value(previous, &emitted)?
+                } else {
+                    emitted
+                };
+                values.insert(row_output, appended);
+            }
+            WorkflowEmitMode::Event => {
+                let index = emit_counts.entry(row_output.clone()).or_default();
+                values.insert(format!("{row_output}.{index}"), clone_value(&emitted)?);
+                *index += 1;
+                values.insert(row_output, emitted);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn slice_workflow_row(
+    value: &Value,
+    row: usize,
+    valid_length: Option<usize>,
+) -> anyhow::Result<Value> {
+    let mut shape = value.shape().to_vec();
+    let rows = usize::try_from(
+        *shape
+            .first()
+            .context("per-row workflow emit requires rank >= 1")?,
+    )
+    .context("workflow emit has a negative batch dimension")?;
+    anyhow::ensure!(row < rows, "workflow emit row {row} exceeds batch {rows}");
+    let row_elements = value.numel() / rows;
+    let element_size = value.dtype().size_of();
+    let source = value.to_raw_bytes()?;
+    let start = row * row_elements * element_size;
+    let row_value = Value::from_raw_bytes(
+        source[start..start + row_elements * element_size].to_vec(),
+        &{
+            shape[0] = 1;
+            shape
+        },
+        value.dtype(),
+    )?;
+    match valid_length {
+        Some(length) => slice_workflow_prefix(&row_value, length),
+        None => Ok(row_value),
+    }
+}
+
+fn merge_inactive_rows(
+    current: &Value,
+    next: &Value,
+    active: &[bool],
+    service_managed: bool,
+) -> anyhow::Result<Value> {
+    if active.len() == 1 || active.iter().all(|active| *active) {
+        return clone_value(next);
+    }
+    if service_managed && current.shape() != next.shape() {
+        // Per-row logical lengths and inactive-row storage are owned by the bound service.
+        return clone_value(next);
+    }
+    anyhow::ensure!(current.dtype() == next.dtype());
+    anyhow::ensure!(
+        current.shape() == next.shape() || service_managed,
+        "mixed active rows require equal current/next dense shapes; use per-row lengths and a \
+         KV service group for growing state"
+    );
+    let rows = usize::try_from(
+        *current
+            .shape()
+            .first()
+            .context("mixed active row carry requires rank >= 1")?,
+    )?;
+    anyhow::ensure!(
+        active.len() == rows,
+        "loop active mask has {} rows for state batch {rows}",
+        active.len()
+    );
+    let row_bytes = current.to_raw_bytes()?.len() / rows;
+    let current_bytes = current.to_raw_bytes()?;
+    let next_bytes = next.to_raw_bytes()?;
+    let mut merged = Vec::with_capacity(next_bytes.len());
+    for (row, active) in active.iter().enumerate() {
+        let source = if *active { &next_bytes } else { &current_bytes };
+        merged.extend_from_slice(&source[row * row_bytes..(row + 1) * row_bytes]);
+    }
+    Value::from_raw_bytes(merged, next.shape(), next.dtype()).map_err(Into::into)
+}
+
+fn workflow_bool_rows(values: &PipelineTensors, name: &str) -> anyhow::Result<Vec<bool>> {
+    let value = values
+        .get(name)
+        .with_context(|| format!("workflow predicate value '{name}' is unavailable"))?;
+    anyhow::ensure!(
+        value.dtype() == DataType::Bool,
+        "workflow predicate '{name}' must have bool dtype"
+    );
+    let data = value.to_raw_bytes()?;
+    anyhow::ensure!(
+        !data.is_empty() && value.shape().len() <= 1,
+        "workflow predicate '{name}' must be a scalar or rank-one row tensor"
+    );
+    Ok(data.into_iter().map(|value| value != 0).collect())
+}
+
+fn workflow_usize_rows(values: &PipelineTensors, name: &str) -> anyhow::Result<Vec<usize>> {
+    let value = values
+        .get(name)
+        .with_context(|| format!("workflow integer control '{name}' is unavailable"))?;
+    anyhow::ensure!(
+        value.shape().len() <= 1,
+        "workflow integer control '{name}' must be scalar or rank one"
+    );
+    let bytes = value.to_raw_bytes()?;
+    let width = value.dtype().size_of();
+    anyhow::ensure!(
+        width > 0 && !bytes.is_empty() && bytes.len() % width == 0,
+        "workflow integer control '{name}' must contain at least one value"
+    );
+    (0..bytes.len() / width)
+        .map(|index| {
+            let start = index * width;
+            let mut one = PipelineTensors::new();
+            one.insert(
+                name.to_string(),
+                Value::from_raw_bytes(bytes[start..start + width].to_vec(), &[], value.dtype())?,
+            );
+            workflow_scalar_usize(&one, name)
+        })
+        .collect()
+}
+
 fn workflow_scalar_usize(values: &PipelineTensors, name: &str) -> anyhow::Result<usize> {
     let value = values
         .get(name)
@@ -1909,15 +2170,17 @@ mod workflow_scalar_tests {
     use super::*;
 
     #[test]
-    fn batched_predicate_is_not_silently_reduced() {
+    fn batched_loop_predicate_preserves_rows() {
         let mut values = PipelineTensors::new();
         values.insert(
             "done".to_string(),
             Value::from_raw_bytes(vec![0, 1], &[2], DataType::Bool).expect("bool tensor"),
         );
 
-        let error = workflow_scalar_bool(&values, "done").expect_err("batched predicate fails");
-        assert!(error.to_string().contains("exactly one value"));
+        assert_eq!(
+            workflow_bool_rows(&values, "done").expect("batched predicate"),
+            [false, true]
+        );
     }
 
     #[test]
@@ -1930,6 +2193,43 @@ mod workflow_scalar_tests {
 
         let error = workflow_scalar_key(&values, "case").expect_err("batched branch key fails");
         assert!(error.to_string().contains("exactly one value"));
+    }
+
+    #[test]
+    fn inactive_rows_keep_their_previous_carry() {
+        let current = Value::from_slice_i64(&[1, 2, 3, 4], &[2, 2]).expect("current");
+        let next = Value::from_slice_i64(&[10, 20, 30, 40], &[2, 2]).expect("next");
+        let merged =
+            merge_inactive_rows(&current, &next, &[true, false], false).expect("merge active rows");
+        assert_eq!(merged.to_vec_i64().expect("merged values"), [10, 20, 3, 4]);
+    }
+
+    #[test]
+    fn row_emit_slices_each_runtime_prefix_and_suppresses_guarded_rows() {
+        let tensor = Value::from_slice_i64(&[10, 11, 12, 20, 21, 22], &[2, 3]).expect("row tensor");
+        let mut values = PipelineTensors::new();
+        let mut counts = HashMap::new();
+        let mut telemetry = WorkflowRunTelemetry::default();
+        emit_workflow_rows(
+            &mut values,
+            &tensor,
+            "tokens",
+            &WorkflowEmitMode::Replace,
+            Some(&[true, false]),
+            Some(&[2, 1]),
+            &mut counts,
+            &mut telemetry,
+        )
+        .expect("row emit");
+
+        assert_eq!(
+            values["tokens.row.0"]
+                .to_vec_i64()
+                .expect("first row values"),
+            [10, 11]
+        );
+        assert!(!values.contains_key("tokens.row.1"));
+        assert_eq!(telemetry.emit_events, 1);
     }
 
     #[test]
@@ -1977,6 +2277,33 @@ recurrence: { kind: growing, axis: 1, increment: accepted, max: max_context }
         let error = validate_state_recurrence("tokens", &current, &invalid, &state, &values)
             .expect_err("wrong increment fails");
         assert!(error.to_string().contains("expected 3"));
+    }
+
+    #[test]
+    fn kv_service_accepts_per_row_growth_controls() {
+        let state: onnx_genai_metadata::WorkflowStateCell = serde_yaml::from_str(
+            r#"
+contract: { dtype: int64, rank: 2, shape: [batch, sequence] }
+scope: invocation
+initializer: initial
+recurrence: { kind: growing, axis: 1, increment: accepted, max: max_context }
+service_group: decoder_cache
+"#,
+        )
+        .expect("state");
+        let current = Value::from_slice_i64(&[1, 2, 3, 4], &[2, 2]).expect("current");
+        let next = Value::from_slice_i64(&[1, 2, 9, 3, 4, 0], &[2, 3]).expect("next");
+        let mut values = PipelineTensors::new();
+        values.insert(
+            "accepted".to_string(),
+            Value::from_slice_i64(&[1, 0], &[2]).expect("per-row growth"),
+        );
+        values.insert(
+            "max_context".to_string(),
+            Value::from_slice_i64(&[4], &[]).expect("limit"),
+        );
+        validate_state_recurrence("cache", &current, &next, &state, &values)
+            .expect("KV service owns per-row logical lengths");
     }
 
     #[test]

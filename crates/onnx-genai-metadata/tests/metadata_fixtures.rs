@@ -11,7 +11,7 @@ pipeline:
       ir_version: "1.0"
       onnx_opsets:
         ai.onnx: 24
-      capabilities: [workflow_ssa, linear_effects]
+      capabilities: [workflow_ssa]
     components:
       noop:
         implementation:
@@ -76,7 +76,7 @@ pipeline:
     manifest:
       ir_version: "1.0"
       onnx_opsets: {{ ai.onnx: 24 }}
-      capabilities: [workflow_ssa, linear_effects, typed_emit, emit_valid_length]
+      capabilities: [workflow_ssa, typed_emit, emit_valid_length]
     inputs:
       value:
         contract: {{ dtype: int64, rank: 1, shape: [sequence] }}
@@ -119,7 +119,7 @@ pipeline:
 }
 
 #[test]
-fn advisory_state_cannot_be_session_persistent() {
+fn advisory_state_may_be_session_scoped_but_is_not_semantic() {
     let metadata: InferenceMetadata = serde_yaml::from_str(
         r#"
 pipeline:
@@ -127,7 +127,7 @@ pipeline:
     manifest:
       ir_version: "1.0"
       onnx_opsets: { ai.onnx: 24 }
-      capabilities: [workflow_ssa, linear_effects, advisory_state]
+      capabilities: [workflow_ssa, advisory_state, session_state_lease]
     inputs:
       estimate:
         contract: { dtype: float32, rank: 1, shape: [batch] }
@@ -152,13 +152,70 @@ pipeline:
 "#,
     )
     .expect("workflow metadata parses");
-    let errors = validate_metadata(&metadata).expect_err("advisory session state must fail");
-    assert!(
-        errors
-            .iter()
-            .any(|error| error.contains("must use invocation scope")),
-        "{errors:?}"
-    );
+    validate_metadata(&metadata).expect("advisory session state is resettable and non-semantic");
+}
+
+#[test]
+fn kv_state_binds_named_runtime_service_group() {
+    let metadata: InferenceMetadata = serde_yaml::from_str(
+        r#"
+pipeline:
+  workflow:
+    manifest:
+      ir_version: "1.0"
+      onnx_opsets: { ai.onnx: 24 }
+      capabilities: [workflow_ssa, serving_service_contract]
+    inputs:
+      active:
+        contract: { dtype: bool, rank: 1, shape: [batch] }
+        role: { kind: opaque }
+        source: { kind: application, name: active }
+      done:
+        contract: { dtype: bool, rank: 1, shape: [batch] }
+        role: { kind: opaque }
+        source: { kind: application, name: done }
+      slot_ids:
+        contract: { dtype: int64, rank: 1, shape: [batch] }
+        role: { kind: opaque }
+        source: { kind: application, name: slot_ids }
+      empty_cache:
+        contract: { dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim] }
+        role: { kind: opaque }
+        source: { kind: application, name: empty_cache }
+    components:
+      decoder:
+        implementation: { kind: onnx, artifact: decoder.onnx }
+        ports: {}
+    state:
+      cache:
+        contract: { dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim] }
+        class: semantic
+        scope: invocation
+        initializer: empty_cache
+        recurrence: { kind: invariant }
+        service_group: decoder_cache
+    serving:
+      active: active
+      done: done
+      slot_ids: slot_ids
+      kv_service:
+        paging: paged
+        allocation: runtime
+        groups:
+          decoder_cache:
+            sequence_axis: 2
+            layout: bnsh
+            storage: shared_buffer
+            ports:
+              decoder:
+                cache: { input: past_key_values, output: present_key_values }
+    steps:
+      - kind: invoke
+        component: decoder
+"#,
+    )
+    .expect("KV service metadata parses");
+    validate_metadata(&metadata).expect("KV service group is executable and bound");
 }
 
 #[test]

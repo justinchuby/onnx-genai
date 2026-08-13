@@ -627,7 +627,7 @@ pipeline:
       onnx_opsets: { ai.onnx: 13 }
       adapter_abis: { onnx-genai.image-preprocess: "1" }
       custom_op_versions: {}
-      capabilities: [workflow_ssa, linear_effects, typed_emit]
+      capabilities: [workflow_ssa, typed_emit]
     inputs:
       request.batch_anchor:
         contract: { dtype: int64, rank: 2, shape: [batch, sequence] }
@@ -737,7 +737,7 @@ pipeline:
       onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
       custom_op_versions: {}
-      capabilities: [workflow_ssa, linear_effects, typed_emit]
+      capabilities: [workflow_ssa, typed_emit]
     inputs:
       logits:
         contract: { dtype: float32, rank: 2, shape: [batch, vocabulary] }
@@ -747,17 +747,17 @@ pipeline:
       temperature:
         contract: { dtype: float32, rank: 1, shape: [1] }
         role: { kind: runtime, version: "1", role: sampling_temperature }
-        source: { kind: request, field: sampling_temperature }
+        source: { kind: request }
         required: true
       top_k:
         contract: { dtype: int64, rank: 1, shape: [1] }
         role: { kind: runtime, version: "1", role: sampling_top_k }
-        source: { kind: request, field: sampling_top_k }
+        source: { kind: request }
         required: true
       top_p:
         contract: { dtype: float32, rank: 1, shape: [1] }
         role: { kind: runtime, version: "1", role: sampling_top_p }
-        source: { kind: request, field: sampling_top_p }
+        source: { kind: request }
         required: true
       grammar_mask:
         contract: { dtype: bool, rank: 2, shape: [batch, vocabulary] }
@@ -909,7 +909,7 @@ pipeline:
       onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
       custom_op_versions: {}
-      capabilities: [workflow_ssa, linear_effects, typed_emit, nested_control_flow]
+      capabilities: [workflow_ssa, typed_emit, nested_control_flow]
     inputs:
       initial_cache:
         contract: { dtype: float32, rank: 2, shape: [batch, cache] }
@@ -963,7 +963,7 @@ pipeline:
             component: decoder
             inputs: { past_key_values: cache, token_state: token_state }
             outputs: { present_key_values: cache.next }
-        condition: continue
+        continue_when: continue
         max_iterations: iterations
         carried: [{ cell: cache, initial: initial_cache, next: cache.next }]
       - kind: emit
@@ -990,6 +990,19 @@ pipeline:
             .with_input("max_context", Value::from_slice_i64(&[3], &[1])?),
     )?;
     assert_eq!(output["final_cache"].to_vec_f32()?, [1.0, 2.0, 2.0]);
+    let zero_trip = engine.run_pipeline(
+        PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
+            .with_input("initial_cache", Value::from_slice_f32(&[1.0], &[1, 1])?)
+            .with_input("token_state", Value::from_slice_f32(&[2.0], &[1, 1])?)
+            .with_input("iterations", Value::from_slice_i64(&[2], &[1])?)
+            .with_input(
+                "continue",
+                Value::from_raw_bytes(vec![0], &[], DataType::Bool)?,
+            )
+            .with_input("one", Value::from_slice_i64(&[1], &[1])?)
+            .with_input("max_context", Value::from_slice_i64(&[3], &[1])?),
+    )?;
+    assert_eq!(zero_trip["final_cache"].to_vec_f32()?, [1.0]);
     Ok(())
 }
 
@@ -1003,7 +1016,7 @@ pipeline:
       onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
       custom_op_versions: {}
-      capabilities: [workflow_ssa, linear_effects, typed_emit]
+      capabilities: [workflow_ssa, typed_emit]
     inputs:
       logits:
         contract: { dtype: float32, rank: 2, shape: [batch, vocabulary] }
@@ -1013,7 +1026,7 @@ pipeline:
       min_p:
         contract: { dtype: float32, rank: 1, shape: [1] }
         role: { kind: runtime, version: "1", role: sampling_min_p }
-        source: { kind: request, field: sampling_min_p }
+        source: { kind: request }
         required: true
       eos:
         contract: { dtype: int64, rank: 1, shape: [1] }
@@ -1141,7 +1154,7 @@ pipeline:
       onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
       custom_op_versions: {}
-      capabilities: [workflow_ssa, linear_effects, typed_emit]
+      capabilities: [workflow_ssa, typed_emit]
     inputs:
       logits:
         contract: { dtype: float32, rank: 2, shape: [batch, 4] }
@@ -1214,7 +1227,7 @@ pipeline:
       onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
       custom_op_versions: {}
-      capabilities: [workflow_ssa, linear_effects, typed_emit]
+      capabilities: [workflow_ssa, typed_emit]
     inputs:
       logits.raw:
         contract: { dtype: float32, rank: 2, shape: [batch, 4] }
@@ -1285,7 +1298,7 @@ pipeline:
       onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
       custom_op_versions: {}
-      capabilities: [workflow_ssa, linear_effects, typed_emit]
+      capabilities: [workflow_ssa, typed_emit]
     inputs:
       eos:
         contract: { dtype: int64, rank: 1, shape: [num_eos] }
@@ -1325,7 +1338,7 @@ pipeline:
       onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
       custom_op_versions: {}
-      capabilities: [workflow_ssa, linear_effects, typed_emit]
+      capabilities: [workflow_ssa, typed_emit]
     inputs:
       prompt:
         contract: { dtype: int64, rank: 2, shape: [batch, prompt_sequence] }
@@ -1389,7 +1402,7 @@ pipeline:
       onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
       custom_op_versions: {}
-      capabilities: [workflow_ssa, linear_effects, typed_emit, bounded_state_growth]
+      capabilities: [workflow_ssa, typed_emit, bounded_state_growth]
     inputs:
       prompt:
         contract: { dtype: int64, rank: 2, shape: [batch, prompt_sequence] }
@@ -1471,14 +1484,14 @@ pipeline:
       onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
       custom_op_versions: {}
-      capabilities: [workflow_ssa, linear_effects, typed_emit, nested_control_flow]
+      capabilities: [workflow_ssa, typed_emit, nested_control_flow]
     inputs:
       logits: { contract: { dtype: float32, rank: 2, shape: [batch, vocabulary] },
                 role: { kind: opaque }, source: { kind: application, name: logits }, required: true }
       seed:
         contract: { dtype: int64, rank: 1, shape: [batch] }
         role: { kind: runtime, version: v1, role: seed }
-        source: { kind: request, field: seed }
+        source: { kind: request }
         required: true
       offset: { contract: { dtype: int64, rank: 1, shape: [batch] },
                 role: { kind: opaque }, source: { kind: application, name: offset }, required: true }
@@ -1491,8 +1504,11 @@ pipeline:
       iterations:
         contract: { dtype: int64, rank: 0, shape: [] }
         role: { kind: runtime, version: v1, role: max_output_tokens }
-        source: { kind: request, field: max_output_tokens }
+        source: { kind: request }
         required: true
+      initial_continue: { contract: { dtype: bool, rank: 1, shape: [1] },
+                          role: { kind: opaque },
+                          source: { kind: application, name: initial_continue }, required: true }
     outputs:
       tokens: { contract: { dtype: int64, rank: 1, shape: [generated] },
                 role: tokens, stage: pre_adapter }
@@ -1550,6 +1566,11 @@ pipeline:
         scope: invocation
         initializer: offset
         recurrence: { kind: invariant }
+      active:
+        contract: { dtype: bool, rank: 1, shape: [1] }
+        scope: invocation
+        initializer: initial_continue
+        recurrence: { kind: invariant }
     steps:
       - kind: loop
         setup:
@@ -1575,12 +1596,14 @@ pipeline:
               value: sampled
               output: tokens
               mode: append
-        condition: loop.continue
+        continue_when: active
         max_iterations: iterations
         carried:
           - cell: rng
             initial: rng.current
             next: rng.body_next
+          - cell: active
+            next: loop.continue
 "#;
     let root = package(
         "autoregressive",
@@ -1602,6 +1625,10 @@ pipeline:
     .with_input("logits", Value::from_slice_f32(&[0.1, 0.9, 0.0], &[1, 3])?)
     .with_input("offset", Value::from_slice_i64(&[0], &[1])?)
     .with_input("eos", Value::from_slice_i64(&[2], &[1])?)
+    .with_input(
+        "initial_continue",
+        Value::from_raw_bytes(vec![1], &[1], DataType::Bool)?,
+    )
     .with_input("iteration", Value::from_slice_i64(&[0], &[1])?)
     .with_input("max_iterations", Value::from_slice_i64(&[10], &[1])?);
     let output = engine.run_pipeline(request)?;
@@ -1619,7 +1646,7 @@ pipeline:
       onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
       custom_op_versions: {}
-      capabilities: [workflow_ssa, linear_effects, typed_emit, nested_control_flow,
+      capabilities: [workflow_ssa, typed_emit, nested_control_flow,
                      loop_induction_values]
     inputs:
       sample: { contract: { dtype: float32, rank: 2, shape: [batch, width] },
@@ -1687,7 +1714,7 @@ pipeline:
                 value: diffusion.step
                 output: steps
                 mode: append
-          condition: continue
+          continue_when: continue
           max_iterations: iterations
           iteration:
             value: diffusion.step
@@ -1742,7 +1769,7 @@ pipeline:
       onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
       custom_op_versions: {}
-      capabilities: [workflow_ssa, linear_effects, typed_emit, nested_control_flow,
+      capabilities: [workflow_ssa, typed_emit, nested_control_flow,
                      loop_induction_values]
     inputs:
       outer_count: { contract: { dtype: int64, rank: 0, shape: [] },
@@ -1773,13 +1800,13 @@ pipeline:
                 value: inner.index
                 output: inner_steps
                 mode: append
-              condition: continue
+              continue_when: continue
               max_iterations: inner_count
               iteration:
                 value: inner.index
                 contract: { dtype: int64, rank: 1, shape: [1] }
               carried: []
-        condition: continue
+        continue_when: continue
         max_iterations: outer_count
         iteration:
           value: outer.index
@@ -1812,7 +1839,7 @@ pipeline:
       onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
       custom_op_versions: {}
-      capabilities: [workflow_ssa, linear_effects, typed_emit]
+      capabilities: [workflow_ssa, typed_emit]
     inputs:
       current: { contract: { dtype: int64, rank: 2, shape: [batch, sequence] }, role: { kind: opaque },
                  source: { kind: application, name: current }, required: true }
@@ -1884,7 +1911,7 @@ pipeline:
       onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
       custom_op_versions: {}
-      capabilities: [workflow_ssa, linear_effects, typed_emit, emit_valid_length]
+      capabilities: [workflow_ssa, typed_emit, emit_valid_length]
     inputs:
       target: { contract: { dtype: float32, rank: 3, shape: [batch, draft, vocabulary] }, role: { kind: opaque },
                 source: { kind: application, name: target }, required: true }
@@ -1979,7 +2006,7 @@ pipeline:
       adapter_abis: {}
       custom_op_versions: {}
       capabilities:
-        [workflow_ssa, linear_effects, typed_emit, nested_control_flow,
+        [workflow_ssa, typed_emit, nested_control_flow,
          bounded_state_recurrence]
     inputs:
       tentative: { contract: { dtype: int64, rank: 2, shape: [batch, state] },
@@ -2054,7 +2081,7 @@ pipeline:
                 outputs:
                   selected:
                     cases: { "true": branch.accepted, "false": branch.corrected }
-          condition: continue
+          continue_when: continue
           max_iterations: iterations
           carried:
             - cell: rollback
@@ -2113,7 +2140,7 @@ pipeline:
       adapter_abis: { onnx-genai.grammar-guidance: "1" }
       custom_op_versions: {}
       capabilities:
-        [workflow_ssa, linear_effects, typed_emit, emit_valid_length,
+        [workflow_ssa, typed_emit, emit_valid_length,
          nested_control_flow, grammar_guidance_adapter, adaptive_proposal_budget,
          advisory_state]
     inputs:
@@ -2408,7 +2435,7 @@ pipeline:
                 value: grammar.token
                 output: tokens
                 mode: append
-          condition: continue
+          continue_when: continue
           max_iterations: iterations
           carried:
             - cell: grammar
@@ -2522,7 +2549,7 @@ pipeline:
       onnx_opsets: { ai.onnx: 13 }
       adapter_abis: { onnx-genai.telemetry: "1" }
       custom_op_versions: {}
-      capabilities: [workflow_ssa, linear_effects, typed_emit, telemetry_adapter]
+      capabilities: [workflow_ssa, typed_emit, telemetry_adapter]
     inputs: {}
     outputs:
       elapsed_ms: { contract: { dtype: float32, rank: 0, shape: [] },
@@ -2589,7 +2616,7 @@ pipeline:
       adapter_abis: {}
       custom_op_versions: {}
       capabilities:
-        [workflow_ssa, linear_effects, typed_emit, streaming_emit,
+        [workflow_ssa, typed_emit, streaming_emit,
          nested_control_flow, session_state_lease]
     inputs:
       initial: { contract: { dtype: int64, rank: 0, shape: [] }, role: { kind: opaque },
@@ -2603,8 +2630,11 @@ pipeline:
       iterations:
         contract: { dtype: int64, rank: 0, shape: [] }
         role: { kind: runtime, version: v1, role: max_iterations }
-        source: { kind: request, field: max_iterations }
+        source: { kind: request }
         required: true
+      initial_continue: { contract: { dtype: bool, rank: 0, shape: [] },
+                          role: { kind: opaque },
+                          source: { kind: application, name: initial_continue }, required: true }
     outputs:
       state: { contract: { dtype: int64, rank: 0, shape: [] }, role: tensor, stage: pre_adapter }
       events: { contract: { dtype: int64, rank: 0, shape: [] }, role: event, stage: pre_adapter }
@@ -2644,6 +2674,11 @@ pipeline:
         initializer: initial
         recurrence: { kind: invariant }
         session: { policy: exclusive }
+      active:
+        contract: { dtype: bool, rank: 0, shape: [] }
+        scope: invocation
+        initializer: initial_continue
+        recurrence: { kind: invariant }
     steps:
         - kind: branch
           predicate: run_branch
@@ -2668,12 +2703,14 @@ pipeline:
                     value: world.body_next
                     output: events
                     mode: event
-              condition: loop.continue
+              continue_when: active
               max_iterations: iterations
               carried:
                 - cell: world
                   initial: world.current
                   next: world.body_next
+                - cell: active
+                  next: loop.continue
           outputs:
             world.selected:
               cases: { "true": world }
@@ -2741,6 +2778,10 @@ pipeline:
         "run_branch",
         Value::from_raw_bytes(vec![1], &[], onnx_genai_ort::DataType::Bool)?,
     )
+    .with_input(
+        "initial_continue",
+        Value::from_raw_bytes(vec![1], &[], DataType::Bool)?,
+    )
     .with_input("initial", Value::from_slice_i64(&[0], &[])?)
     .with_input("increment", Value::from_slice_i64(&[1], &[])?)
     .with_input("limit", Value::from_slice_i64(&[3], &[])?);
@@ -2757,6 +2798,10 @@ pipeline:
         "run_branch",
         Value::from_raw_bytes(vec![1], &[], onnx_genai_ort::DataType::Bool)?,
     )
+    .with_input(
+        "initial_continue",
+        Value::from_raw_bytes(vec![1], &[], DataType::Bool)?,
+    )
     .with_input("initial", Value::from_slice_i64(&[0], &[])?)
     .with_input("increment", Value::from_slice_i64(&[1], &[])?)
     .with_input("limit", Value::from_slice_i64(&[5], &[])?);
@@ -2772,6 +2817,10 @@ pipeline:
     .with_input(
         "run_branch",
         Value::from_raw_bytes(vec![1], &[], onnx_genai_ort::DataType::Bool)?,
+    )
+    .with_input(
+        "initial_continue",
+        Value::from_raw_bytes(vec![1], &[], DataType::Bool)?,
     )
     .with_input("initial", Value::from_slice_i64(&[0], &[])?)
     .with_input("increment", Value::from_slice_i64(&[1], &[])?)
@@ -2791,7 +2840,7 @@ pipeline:
       adapter_abis: {}
       custom_op_versions: {}
       capabilities:
-        [workflow_ssa, linear_effects, typed_emit, streaming_emit,
+        [workflow_ssa, typed_emit, streaming_emit,
          nested_control_flow, session_state_lease]
     inputs:
       initial: { contract: { dtype: int64, rank: 0, shape: [] },
@@ -2815,7 +2864,7 @@ pipeline:
       iterations:
         contract: { dtype: int64, rank: 0, shape: [] }
         role: { kind: runtime, version: v1, role: max_iterations }
-        source: { kind: request, field: max_iterations }
+        source: { kind: request }
         required: true
     outputs:
       latent: { contract: { dtype: int64, rank: 0, shape: [] },
@@ -2905,7 +2954,7 @@ pipeline:
                 outputs:
                   latent.next:
                     cases: { "true": environment.low, "false": environment.high }
-          condition: continue
+          continue_when: continue
           max_iterations: iterations
           carried:
             - cell: latent
@@ -2982,7 +3031,7 @@ pipeline:
       onnx_opsets: { ai.onnx: 24 }
       adapter_abis: {}
       custom_op_versions: {}
-      capabilities: [workflow_ssa, linear_effects, typed_emit, streaming_emit, nested_control_flow]
+      capabilities: [workflow_ssa, typed_emit, streaming_emit, nested_control_flow]
     inputs:
       accept:
         contract: { dtype: bool, rank: 0, shape: [] }

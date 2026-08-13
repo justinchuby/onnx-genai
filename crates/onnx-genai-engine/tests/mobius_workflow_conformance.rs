@@ -6,7 +6,7 @@
 //! ```bash
 //! MOBIUS_WORKFLOW_CONFORMANCE_DIR=/path/to/generated \
 //!   cargo test -p onnx-genai-engine --test mobius_workflow_conformance \
-//!   -- --ignored --nocapture
+//!   -- --nocapture
 //! ```
 
 use onnx_genai_engine::{
@@ -21,7 +21,6 @@ fn root(name: &str) -> Option<PathBuf> {
 }
 
 #[test]
-#[ignore = "requires Mobius-generated workflow packages via MOBIUS_WORKFLOW_CONFORMANCE_DIR"]
 fn mobius_decoder_workflow_executes() -> anyhow::Result<()> {
     let Some(root) = root("decoder") else {
         eprintln!("skipping: set MOBIUS_WORKFLOW_CONFORMANCE_DIR");
@@ -39,7 +38,6 @@ fn mobius_decoder_workflow_executes() -> anyhow::Result<()> {
 }
 
 #[test]
-#[ignore = "requires Mobius-generated workflow packages via MOBIUS_WORKFLOW_CONFORMANCE_DIR"]
 fn mobius_masked_diffusion_workflow_executes() -> anyhow::Result<()> {
     let Some(root) = root("masked") else {
         eprintln!("skipping: set MOBIUS_WORKFLOW_CONFORMANCE_DIR");
@@ -64,7 +62,6 @@ fn mobius_masked_diffusion_workflow_executes() -> anyhow::Result<()> {
 }
 
 #[test]
-#[ignore = "requires Mobius-generated workflow packages via MOBIUS_WORKFLOW_CONFORMANCE_DIR"]
 fn mobius_codec_workflow_executes() -> anyhow::Result<()> {
     let Some(root) = root("codec") else {
         eprintln!("skipping: set MOBIUS_WORKFLOW_CONFORMANCE_DIR");
