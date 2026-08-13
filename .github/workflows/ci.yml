@@ -636,8 +636,12 @@ jobs:
       # `native-backend` is CPU-runnable: it selects the native CPU EP/session
       # crates, while CUDA-only engine integration tests are behind
       # required-features = ["cuda", "native-backend"] and are not selected here.
+      # Serialize these tests because native session selection uses process-wide
+      # environment overrides; parallel execution can interfere across tests.
       - name: Test onnx-genai-engine native backend
-        run: cargo test --locked -p onnx-genai-engine --features native-backend
+        run: >-
+          cargo test --locked -p onnx-genai-engine --features native-backend
+          -- --test-threads=1
       - name: Test onnx-runtime-ep-cpu-plugin (ORT gate)
         if: runner.os == 'Linux'
         run: cargo test --locked --no-fail-fast -p onnx-runtime-ep-cpu-plugin
