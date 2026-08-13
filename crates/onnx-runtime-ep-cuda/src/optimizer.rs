@@ -1,5 +1,5 @@
 use onnx_runtime_ir::{
-    Attribute, DataType, Graph, NodeId, TensorData, ValueId, WeightRef, static_shape,
+    Attribute, DataType, Dim, Graph, Node, NodeId, TensorData, ValueId, WeightRef, static_shape,
 };
 use onnx_runtime_optimizer::{
     OptimizationPass, OptimizerError, PassContext, Result as OptimizerResult,
@@ -85,6 +85,11 @@ pub(crate) fn cuda_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
         Box::new(CudaSiluFusion),
         Box::new(CudaFoldConstantTranspose),
         Box::new(CudaFoldConstantCast),
+        // Fuse the per-layer Q/K/V projections into one wider MatMulNBits while
+        // the projections are still pristine three/four-input GEMVs (before the
+        // norm-into-matmul fusion could add a gamma slot). Reuses the existing
+        // MatMulNBits + Split kernels; no new kernel required.
+        Box::new(CudaQkvProjectionFusion),
         // Runs before the fusions so they see the fp16-native normalization
         // form (no `Cast` wrappers) that the rest of the pipeline expects.
         Box::new(CudaDropNormalizationCasts),
@@ -1866,6 +1871,437 @@ struct Projection {
     zero_points: Option<ValueId>,
     n: usize,
     k: usize,
+}
+
+/// Environment opt-in: set to `1` to enable [`CudaQkvProjectionFusion`].
+///
+/// The pass is **disabled by default**. An end-to-end A/B on Muse-Glimmer-30B
+/// int4 (#872 follow-up) showed the fusion is byte-exact and cuts the captured
+/// `MatMulNBits` launch count 417 → 313 (−104 GEMV launches/token), yet decode
+/// throughput is flat-to-marginally-worse (47.33 → 47.26 tok/s median). Decode
+/// is weight-bandwidth/compute-floor bound, not expensive-dispatch bound, so
+/// enabling the fusion by default would ship a (small) regression for no gain.
+/// The correct, tested implementation is retained behind this flag for future
+/// architectures where the projections are dispatch-bound (e.g. fp16 activations
+/// or shapes with a higher launch-latency-to-bandwidth ratio).
+const QKV_FUSION_ENABLE_ENV: &str = "ONNX_GENAI_CUDA_ENABLE_QKV_FUSION";
+
+fn qkv_fusion_enabled() -> bool {
+    std::env::var_os(QKV_FUSION_ENABLE_ENV).is_some_and(|value| value != "0" && !value.is_empty())
+}
+
+/// Fuse the three per-decoder-layer attention projections (`q_proj`, `k_proj`,
+/// `v_proj`) — separate `MatMulNBits` GEMVs that all read the *same*
+/// input-normalization activation — into a single wider `MatMulNBits` whose
+/// output is demultiplexed by one `Split` back to the original Q/K/V consumers.
+///
+/// ## Why (the lever this tests)
+///
+/// Under CUDA-graph capture, decode is dominated by serially issued grid
+/// launches. Prior work (#870, #872) showed reducing *cheap* elementwise node
+/// count does not help. This pass tests the remaining hypothesis by cutting the
+/// count of *expensive* GEMV launches: 3 projection launches/layer become 1
+/// (+ one `Split` copy), i.e. −2 `MatMulNBits` launches × 52 layers = −104
+/// GEMV launches/token. If tok/s improves, decode is dispatch-bound on the
+/// expensive path; if flat/worse, it is weight-bandwidth/compute-floor bound
+/// (the three projections read disjoint weights, so fusing cannot reduce bytes).
+///
+/// ## Result (measured, Muse-Glimmer-30B int4, #872 follow-up)
+///
+/// The fusion is byte-exact and cuts the captured `MatMulNBits` launch count
+/// 417 → 313 (−104 GEMV launches/token, capture stays 1 segment / 0 seams), yet
+/// decode throughput is **flat-to-marginally-worse** (47.33 → 47.26 tok/s median
+/// over 3 interleaved trials). The three projections read disjoint weights, so
+/// fusing cannot cut bytes moved — this is the definitive evidence that decode
+/// is weight-bandwidth/compute-floor bound, not expensive-dispatch bound. The
+/// pass is therefore **disabled by default** (opt-in via
+/// [`QKV_FUSION_ENABLE_ENV`]) and retained for future dispatch-bound shapes.
+///
+/// ## Byte-exactness
+///
+/// `MatMulNBits` computes each output column independently from its own weight
+/// row / scale / zero-point block, reducing over the shared contraction `K`.
+/// Column-concatenating the Q, K, V weight/scale/zero-point initializers along
+/// their output (`N`) axis therefore leaves every column's dequant + reduction
+/// bit-for-bit identical; the trailing `Split` is a pure copy. Greedy tokens
+/// stay byte-identical (verified end-to-end).
+///
+/// ## Gate (structural + capability, never a specific model's dimensions)
+///
+/// Fires on a `GroupQueryAttention` whose query/key/value trace back to three
+/// distinct `MatMulNBits` GEMVs that (a) share one activation input, (b) share
+/// `K`, `block_size` (32) and `bits` (4), (c) hold persistent initializer
+/// weights/scales (and either all or none carry an asymmetric zero point), and
+/// (d) each feed exactly one consumer and no graph output. Any mismatch leaves
+/// the three separate GEMVs untouched.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CudaQkvProjectionFusion;
+
+struct QkvProj {
+    matmul: NodeId,
+    out: ValueId,
+    weight: ValueId,
+    scales: ValueId,
+    zero_points: Option<ValueId>,
+    activation: ValueId,
+    n: usize,
+    k: usize,
+    block_size: i64,
+    bits: i64,
+}
+
+struct QkvFusionPlan {
+    activation: ValueId,
+    q: QkvProj,
+    k: QkvProj,
+    v: QkvProj,
+}
+
+impl OptimizationPass for CudaQkvProjectionFusion {
+    fn name(&self) -> &str {
+        "CudaQkvProjectionFusion"
+    }
+
+    fn run(&self, graph: &mut Graph, ctx: &PassContext) -> OptimizerResult<()> {
+        if !qkv_fusion_enabled() {
+            return Ok(());
+        }
+        self.fuse_all(graph, ctx)
+    }
+}
+
+impl CudaQkvProjectionFusion {
+    /// Perform the fusion regardless of the [`QKV_FUSION_ENABLE_ENV`] gate.
+    /// `run` applies the opt-in gate and then delegates here; tests exercise the
+    /// fusion logic directly without mutating process-global environment state.
+    fn fuse_all(&self, graph: &mut Graph, ctx: &PassContext) -> OptimizerResult<()> {
+        let gqa_nodes: Vec<NodeId> = graph
+            .nodes
+            .iter()
+            .filter_map(|(id, node)| {
+                (node.op_type == "GroupQueryAttention" && node.domain == MICROSOFT_DOMAIN)
+                    .then_some(id)
+            })
+            .collect();
+
+        let mut plans: Vec<QkvFusionPlan> = Vec::new();
+        for gqa_id in gqa_nodes {
+            if let Some(plan) = self.plan_fuse(graph, gqa_id) {
+                plans.push(plan);
+            }
+        }
+
+        let changed = !plans.is_empty();
+        for plan in plans {
+            self.apply_fuse(graph, ctx, plan)?;
+        }
+
+        if changed {
+            graph.validate().map_err(OptimizerError::from)?;
+        }
+        Ok(())
+    }
+
+    fn plan_fuse(&self, graph: &Graph, gqa_id: NodeId) -> Option<QkvFusionPlan> {
+        let gqa = graph.try_node(gqa_id)?;
+        if gqa.inputs.len() < 3 {
+            return None;
+        }
+        let q_mm = self.trace_back_to_matmul(graph, gqa.inputs[0]?)?;
+        let k_mm = self.trace_back_to_matmul(graph, gqa.inputs[1]?)?;
+        let v_mm = self.trace_back_to_matmul(graph, gqa.inputs[2]?)?;
+        if q_mm == k_mm || q_mm == v_mm || k_mm == v_mm {
+            return None;
+        }
+
+        let q = self.eligible_projection(graph, q_mm)?;
+        let k = self.eligible_projection(graph, k_mm)?;
+        let v = self.eligible_projection(graph, v_mm)?;
+
+        // All three projections must read the same activation and be mutually
+        // compatible (shared contraction depth, quantization geometry, and
+        // zero-point presence) so their weights concatenate byte-exactly.
+        if q.activation != k.activation || q.activation != v.activation {
+            return None;
+        }
+        if q.k != k.k || q.k != v.k {
+            return None;
+        }
+        if q.block_size != k.block_size || q.block_size != v.block_size {
+            return None;
+        }
+        if q.bits != k.bits || q.bits != v.bits {
+            return None;
+        }
+        if q.zero_points.is_some() != k.zero_points.is_some()
+            || q.zero_points.is_some() != v.zero_points.is_some()
+        {
+            return None;
+        }
+        // Weight/scale (and zero-point) element types must match across the
+        // three so the concatenated initializer stays homogeneous.
+        if graph.value(q.out).dtype != graph.value(k.out).dtype
+            || graph.value(q.out).dtype != graph.value(v.out).dtype
+        {
+            return None;
+        }
+        if graph.initializers.get(&q.scales)?.dtype() != graph.initializers.get(&k.scales)?.dtype()
+            || graph.initializers.get(&q.scales)?.dtype()
+                != graph.initializers.get(&v.scales)?.dtype()
+        {
+            return None;
+        }
+
+        Some(QkvFusionPlan {
+            activation: q.activation,
+            q,
+            k,
+            v,
+        })
+    }
+
+    /// Walk back from `value` along the primary (`input[0]`) data edge until a
+    /// `MatMulNBits` producer is found, skipping the Q/K post-projection
+    /// norm/scale/reshape glue. Returns `None` on a dead end or if no
+    /// `MatMulNBits` is reached within a small depth bound.
+    fn trace_back_to_matmul(&self, graph: &Graph, mut value: ValueId) -> Option<NodeId> {
+        for _ in 0..12 {
+            let producer = graph.try_value(value)?.producer?;
+            let node = graph.try_node(producer)?;
+            if node.op_type == "MatMulNBits" && node.domain == MICROSOFT_DOMAIN {
+                return Some(producer);
+            }
+            value = node.inputs.first().copied().flatten()?;
+        }
+        None
+    }
+
+    /// Validate one projection `MatMulNBits` against the capability contract and
+    /// return its value ids + geometry, or `None` if it cannot be fused.
+    fn eligible_projection(&self, graph: &Graph, matmul_id: NodeId) -> Option<QkvProj> {
+        let node = graph.try_node(matmul_id)?;
+        // `[activation, weight, scales]` plus an optional asymmetric zero point
+        // (slot 3). Reject a group index (slot 4) or bias (slot 5).
+        let present: Vec<ValueId> = node.input_values().collect();
+        if !(present.len() == 3 || present.len() == 4)
+            || node.inputs.iter().skip(4).any(Option::is_some)
+        {
+            return None;
+        }
+        let zero_points = node.inputs.get(3).copied().flatten();
+
+        let n = node.attr("N").and_then(Attribute::as_int)? as usize;
+        let k = node.attr("K").and_then(Attribute::as_int)? as usize;
+        let block_size = node.attr("block_size").and_then(Attribute::as_int)?;
+        let bits = node.attr("bits").and_then(Attribute::as_int).unwrap_or(4);
+        // Match the block-32 / 4-bit form the concatenation reasons about; the
+        // byte layout of any other geometry is not assumed here.
+        if block_size != GATE_UP_SWIGLU_SUPPORTED_BLOCK_SIZE as i64
+            || bits != GATE_UP_SWIGLU_SUPPORTED_BITS
+        {
+            return None;
+        }
+
+        let activation = node.inputs[0]?;
+        let weight = node.inputs[1]?;
+        let scales = node.inputs[2]?;
+        if !graph.initializers.contains_key(&weight) || !graph.initializers.contains_key(&scales) {
+            return None;
+        }
+        if let Some(zp) = zero_points
+            && !graph.initializers.contains_key(&zp)
+        {
+            return None;
+        }
+
+        // The projection output must feed exactly one consumer and not escape as
+        // a graph output, so reusing it as a `Split` output is safe.
+        let out = node.outputs[0];
+        if graph.consumers(out).len() != 1 || graph.value(out).is_graph_output {
+            return None;
+        }
+
+        Some(QkvProj {
+            matmul: matmul_id,
+            out,
+            weight,
+            scales,
+            zero_points,
+            activation,
+            n,
+            k,
+            block_size,
+            bits,
+        })
+    }
+
+    fn apply_fuse(
+        &self,
+        graph: &mut Graph,
+        ctx: &PassContext,
+        plan: QkvFusionPlan,
+    ) -> OptimizerResult<()> {
+        let QkvFusionPlan {
+            activation,
+            q,
+            k,
+            v,
+        } = plan;
+        let n_total = q.n + k.n + v.n;
+
+        // Concatenate the int4 weight / scale / (zero-point) initializers along
+        // their output (`N`) axis. Axis 0 is the outermost, row-major dimension,
+        // so an N-axis concatenation is a byte concatenation; each sub-tensor is
+        // byte-aligned (`N * n_blocks` even for the zero points), keeping it exact.
+        let weight_bytes = self.concat_initializers(graph, ctx, &[q.weight, k.weight, v.weight])?;
+        let scale_bytes = self.concat_initializers(graph, ctx, &[q.scales, k.scales, v.scales])?;
+        let zero_bytes = match (q.zero_points, k.zero_points, v.zero_points) {
+            (Some(qz), Some(kz), Some(vz)) => {
+                Some(self.concat_initializers(graph, ctx, &[qz, kz, vz])?)
+            }
+            _ => None,
+        };
+
+        // Fused weight dims: [N_total, n_blocks, blob] cloned from Q (the three
+        // share n_blocks/blob because they share K, block_size and bits).
+        let q_weight = graph.initializers.get(&q.weight).ok_or_else(|| {
+            OptimizerError::Fusion("qkv fusion: missing q weight initializer".into())
+        })?;
+        let mut weight_dims = q_weight.dims().to_vec();
+        let weight_dtype = q_weight.dtype();
+        if weight_dims.is_empty() {
+            return Err(OptimizerError::Fusion(
+                "qkv fusion: scalar weight initializer".into(),
+            ));
+        }
+        weight_dims[0] = n_total;
+
+        let scale_dtype = graph
+            .initializers
+            .get(&q.scales)
+            .ok_or_else(|| OptimizerError::Fusion("qkv fusion: missing q scales".into()))?
+            .dtype();
+
+        let fused_weight = graph.create_value(weight_dtype, static_shape(weight_dims.clone()));
+        graph.set_initializer(
+            fused_weight,
+            WeightRef::Inline(TensorData::from_raw(
+                weight_dtype,
+                weight_dims,
+                weight_bytes,
+            )),
+        );
+
+        let scale_len = scale_bytes.len() / scale_dtype.byte_size().max(1);
+        let fused_scales = graph.create_value(scale_dtype, static_shape(vec![scale_len]));
+        graph.set_initializer(
+            fused_scales,
+            WeightRef::Inline(TensorData::from_raw(
+                scale_dtype,
+                vec![scale_len],
+                scale_bytes,
+            )),
+        );
+
+        let fused_zero = zero_bytes.map(|bytes| {
+            let value = graph.create_value(DataType::Uint8, static_shape(vec![bytes.len()]));
+            graph.set_initializer(
+                value,
+                WeightRef::Inline(TensorData::from_raw(
+                    DataType::Uint8,
+                    vec![bytes.len()],
+                    bytes,
+                )),
+            );
+            value
+        });
+
+        // Fused MatMulNBits output: Q's output shape with the trailing (`N`) axis
+        // widened to N_total.
+        let out_dtype = graph.value(q.out).dtype;
+        let mut fused_shape = graph.value(q.out).shape.clone();
+        match fused_shape.last_mut() {
+            Some(dim) => *dim = Dim::Static(n_total),
+            None => {
+                return Err(OptimizerError::Fusion(
+                    "qkv fusion: scalar projection output".into(),
+                ));
+            }
+        }
+        let fused_out = graph.create_value(out_dtype, fused_shape);
+
+        // Clone Q's attributes (preserving block_size/bits/accuracy_level/etc.)
+        // and widen N.
+        let mut attributes = graph.node(q.matmul).attributes.clone();
+        attributes.insert("N".into(), Attribute::Int(n_total as i64));
+        let version = graph.node(q.matmul).version;
+
+        let mut fused_inputs = vec![Some(activation), Some(fused_weight), Some(fused_scales)];
+        if let Some(zero) = fused_zero {
+            fused_inputs.push(Some(zero));
+        }
+        let mut fused_matmul = Node::new(NodeId(0), "MatMulNBits", fused_inputs, vec![fused_out]);
+        fused_matmul.domain = MICROSOFT_DOMAIN.into();
+        fused_matmul.version = version;
+        fused_matmul.attributes = attributes;
+        graph.insert_node(fused_matmul);
+
+        // Drop the three now-redundant projection GEMVs. Their outputs survive
+        // (each still has its downstream consumer) with a cleared producer, so
+        // they can be re-attached as the Split outputs below.
+        let axis = graph.value(q.out).shape.len() as i64 - 1;
+        for proj in [&q, &k, &v] {
+            graph.remove_node(proj.matmul);
+        }
+        // Retire the original per-projection weight/scale/zero-point initializers
+        // so they are neither uploaded nor left dangling.
+        for proj in [&q, &k, &v] {
+            for value in [Some(proj.weight), Some(proj.scales), proj.zero_points]
+                .into_iter()
+                .flatten()
+            {
+                graph.initializers.remove(&value);
+                graph.gc_value_if_orphan(value);
+            }
+        }
+
+        // One Split demuxes [Q|K|V] back to the original consumer edges.
+        let mut split = Node::new(
+            NodeId(0),
+            "Split",
+            vec![Some(fused_out)],
+            vec![q.out, k.out, v.out],
+        );
+        split.attributes.insert("axis".into(), Attribute::Int(axis));
+        split.attributes.insert(
+            "split".into(),
+            Attribute::Ints(vec![q.n as i64, k.n as i64, v.n as i64]),
+        );
+        graph.insert_node(split);
+
+        Ok(())
+    }
+
+    /// Read and byte-concatenate the raw little-endian bytes of several
+    /// initializers in order.
+    fn concat_initializers(
+        &self,
+        graph: &Graph,
+        ctx: &PassContext,
+        values: &[ValueId],
+    ) -> OptimizerResult<Vec<u8>> {
+        let mut out = Vec::new();
+        for &value in values {
+            let weight = graph.initializers.get(&value).ok_or_else(|| {
+                OptimizerError::Fusion("qkv fusion: missing initializer for concat".into())
+            })?;
+            let bytes = ctx.initializer_bytes(weight).ok_or_else(|| {
+                OptimizerError::Fusion("qkv fusion: could not resolve initializer bytes".into())
+            })?;
+            out.extend_from_slice(bytes);
+        }
+        Ok(out)
+    }
 }
 
 /// Lower a capture-unsafe `If` whose branches are pure, side-effect-free
@@ -4762,5 +5198,282 @@ mod tests {
             .unwrap();
         assert!(graph.nodes.values().any(|n| n.op_type == "If"));
         assert!(where_nodes(&graph).is_empty());
+    }
+
+    // === QKV projection fusion ===
+
+    struct QkvGraph {
+        graph: Graph,
+        q_weight: ValueId,
+        k_weight: ValueId,
+        v_weight: ValueId,
+        q_out: ValueId,
+        k_out: ValueId,
+        v_out: ValueId,
+    }
+
+    /// Build one `q_proj`/`k_proj`/`v_proj` → (Reshape, Reshape, direct) → GQA
+    /// block over a shared activation, with block-32 4-bit weights. Each
+    /// projection's weight/scale/zero-point bytes are filled with a distinct
+    /// constant so concatenation order is checkable.
+    fn qkv_graph(k: usize, nq: usize, nk: usize, nv: usize, with_zp: bool) -> QkvGraph {
+        assert!(k.is_multiple_of(32));
+        let n_blocks = k / 32;
+        let blob = 16; // 32 * 4 / 8
+        let dt = DataType::BFloat16;
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        graph.opset_imports.insert(MICROSOFT_DOMAIN.into(), 1);
+
+        let x = graph.create_named_value("x", dt, vec![Dim::Static(1), Dim::Static(k)]);
+        graph.add_input(x);
+
+        let make_proj = |graph: &mut Graph, tag: &str, n: usize, fill: u8| -> (ValueId, ValueId) {
+            let w = graph.create_named_value(
+                format!("{tag}.weight"),
+                DataType::Uint8,
+                vec![Dim::Static(n), Dim::Static(n_blocks), Dim::Static(blob)],
+            );
+            graph.set_initializer(
+                w,
+                WeightRef::Inline(TensorData::from_raw(
+                    DataType::Uint8,
+                    vec![n, n_blocks, blob],
+                    vec![fill; n * n_blocks * blob],
+                )),
+            );
+            let s = graph.create_named_value(
+                format!("{tag}.scales"),
+                dt,
+                vec![Dim::Static(n * n_blocks)],
+            );
+            graph.set_initializer(
+                s,
+                WeightRef::Inline(TensorData::from_raw(
+                    dt,
+                    vec![n * n_blocks],
+                    vec![fill.wrapping_add(1); n * n_blocks * 2],
+                )),
+            );
+            let mut inputs = vec![Some(x), Some(w), Some(s)];
+            if with_zp {
+                let zp_bytes = n * n_blocks / 2;
+                let z = graph.create_named_value(
+                    format!("{tag}.zp"),
+                    DataType::Uint8,
+                    vec![Dim::Static(zp_bytes)],
+                );
+                graph.set_initializer(
+                    z,
+                    WeightRef::Inline(TensorData::from_raw(
+                        DataType::Uint8,
+                        vec![zp_bytes],
+                        vec![fill.wrapping_add(2); zp_bytes],
+                    )),
+                );
+                inputs.push(Some(z));
+            }
+            let out = graph.create_named_value(
+                format!("{tag}.out"),
+                dt,
+                vec![Dim::Static(1), Dim::Static(n)],
+            );
+            let mut mm = Node::new(NodeId(0), "MatMulNBits", inputs, vec![out]);
+            mm.domain = MICROSOFT_DOMAIN.into();
+            mm.attributes.insert("K".into(), Attribute::Int(k as i64));
+            mm.attributes.insert("N".into(), Attribute::Int(n as i64));
+            mm.attributes
+                .insert("block_size".into(), Attribute::Int(32));
+            mm.attributes.insert("bits".into(), Attribute::Int(4));
+            graph.insert_node(mm);
+            (w, out)
+        };
+
+        let (q_weight, q_out) = make_proj(&mut graph, "q", nq, 0x11);
+        let (k_weight, k_out) = make_proj(&mut graph, "k", nk, 0x22);
+        let (v_weight, v_out) = make_proj(&mut graph, "v", nv, 0x33);
+
+        // Q and K flow through a Reshape before attention; V feeds it directly.
+        let q_res = graph.create_named_value("q_res", dt, vec![Dim::Static(1), Dim::Static(nq)]);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Reshape",
+            vec![Some(q_out)],
+            vec![q_res],
+        ));
+        let k_res = graph.create_named_value("k_res", dt, vec![Dim::Static(1), Dim::Static(nk)]);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Reshape",
+            vec![Some(k_out)],
+            vec![k_res],
+        ));
+
+        let attn = graph.create_named_value("attn", dt, vec![Dim::Static(1), Dim::Static(nq)]);
+        graph.add_output(attn);
+        let mut gqa = Node::new(
+            NodeId(0),
+            "GroupQueryAttention",
+            vec![Some(q_res), Some(k_res), Some(v_out)],
+            vec![attn],
+        );
+        gqa.domain = MICROSOFT_DOMAIN.into();
+        graph.insert_node(gqa);
+
+        QkvGraph {
+            graph,
+            q_weight,
+            k_weight,
+            v_weight,
+            q_out,
+            k_out,
+            v_out,
+        }
+    }
+
+    fn inline_bytes(graph: &Graph, value: ValueId) -> &[u8] {
+        match graph.initializers.get(&value).unwrap() {
+            WeightRef::Inline(t) => &t.data,
+            WeightRef::External { .. } => panic!("expected inline"),
+        }
+    }
+
+    #[test]
+    fn fuses_qkv_projections_into_one_matmul_and_split() {
+        let mut g = qkv_graph(64, 8, 4, 4, true);
+        let (q_out, k_out, v_out) = (g.q_out, g.k_out, g.v_out);
+        CudaQkvProjectionFusion
+            .fuse_all(&mut g.graph, &PassContext::new())
+            .unwrap();
+
+        let matmuls: Vec<_> = g
+            .graph
+            .nodes
+            .values()
+            .filter(|n| n.op_type == "MatMulNBits")
+            .collect();
+        assert_eq!(matmuls.len(), 1, "three projections collapse to one GEMV");
+        let fused = matmuls[0];
+        assert_eq!(fused.attr("N").and_then(Attribute::as_int), Some(16));
+        assert_eq!(fused.attr("K").and_then(Attribute::as_int), Some(64));
+        assert_eq!(
+            fused.input_values().count(),
+            4,
+            "activation+weight+scales+zp"
+        );
+
+        let splits: Vec<_> = g
+            .graph
+            .nodes
+            .values()
+            .filter(|n| n.op_type == "Split")
+            .collect();
+        assert_eq!(splits.len(), 1);
+        let split = splits[0];
+        assert_eq!(
+            split.attr("split").and_then(Attribute::as_ints),
+            Some([8i64, 4, 4].as_slice())
+        );
+        assert_eq!(split.attr("axis").and_then(Attribute::as_int), Some(1));
+        // Split re-attaches the original consumer edges.
+        assert_eq!(split.outputs, vec![q_out, k_out, v_out]);
+
+        // Fused weight bytes are the byte concatenation of Q||K||V weights.
+        let fused_weight = fused.inputs[1].unwrap();
+        let bytes = inline_bytes(&g.graph, fused_weight);
+        let n_blocks = 2usize;
+        let blob = 16usize;
+        assert_eq!(bytes.len(), 16 * n_blocks * blob);
+        assert!(bytes[..8 * n_blocks * blob].iter().all(|&b| b == 0x11));
+        assert!(
+            bytes[8 * n_blocks * blob..12 * n_blocks * blob]
+                .iter()
+                .all(|&b| b == 0x22)
+        );
+        assert!(bytes[12 * n_blocks * blob..].iter().all(|&b| b == 0x33));
+
+        // The original per-projection weight initializers are retired.
+        for old in [g.q_weight, g.k_weight, g.v_weight] {
+            assert!(!g.graph.initializers.contains_key(&old));
+        }
+
+        g.graph.validate().unwrap();
+    }
+
+    #[test]
+    fn fuses_symmetric_qkv_without_zero_points() {
+        let mut g = qkv_graph(32, 6, 2, 2, false);
+        CudaQkvProjectionFusion
+            .fuse_all(&mut g.graph, &PassContext::new())
+            .unwrap();
+        let fused = g
+            .graph
+            .nodes
+            .values()
+            .find(|n| n.op_type == "MatMulNBits")
+            .unwrap();
+        assert_eq!(fused.attr("N").and_then(Attribute::as_int), Some(10));
+        assert_eq!(fused.input_values().count(), 3, "no zero-point slot");
+        g.graph.validate().unwrap();
+    }
+
+    #[test]
+    fn does_not_fuse_when_activations_differ() {
+        let mut g = qkv_graph(64, 8, 4, 4, true);
+        // Repoint K's projection at a different activation.
+        let other = g.graph.create_named_value(
+            "other",
+            DataType::BFloat16,
+            vec![Dim::Static(1), Dim::Static(64)],
+        );
+        g.graph.add_input(other);
+        let k_mm = g.graph.value(g.k_out).producer.unwrap();
+        g.graph.replace_input(k_mm, 0, Some(other));
+
+        CudaQkvProjectionFusion
+            .fuse_all(&mut g.graph, &PassContext::new())
+            .unwrap();
+        let matmuls = g
+            .graph
+            .nodes
+            .values()
+            .filter(|n| n.op_type == "MatMulNBits")
+            .count();
+        assert_eq!(matmuls, 3, "mismatched activation leaves projections split");
+    }
+
+    #[test]
+    fn qkv_fusion_is_opt_in_and_disabled_by_default() {
+        // The pass must not fire unless the opt-in env flag is set, so the
+        // default release binary keeps the three separate GEMVs (no regression).
+        // SAFETY: single-threaded test; env is restored before returning.
+        let mut g = qkv_graph(64, 8, 4, 4, true);
+        unsafe { std::env::remove_var(QKV_FUSION_ENABLE_ENV) };
+        CudaQkvProjectionFusion
+            .run(&mut g.graph, &PassContext::new())
+            .unwrap();
+        let unfused = g
+            .graph
+            .nodes
+            .values()
+            .filter(|n| n.op_type == "MatMulNBits")
+            .count();
+        assert_eq!(
+            unfused, 3,
+            "default (flag unset) leaves projections unfused"
+        );
+
+        // With the flag set, `run` performs the fusion.
+        unsafe { std::env::set_var(QKV_FUSION_ENABLE_ENV, "1") };
+        let result = CudaQkvProjectionFusion.run(&mut g.graph, &PassContext::new());
+        unsafe { std::env::remove_var(QKV_FUSION_ENABLE_ENV) };
+        result.unwrap();
+        let fused = g
+            .graph
+            .nodes
+            .values()
+            .filter(|n| n.op_type == "MatMulNBits")
+            .count();
+        assert_eq!(fused, 1, "opt-in flag enables the fusion");
     }
 }
