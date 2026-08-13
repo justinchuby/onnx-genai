@@ -112,7 +112,7 @@ pub(crate) fn detect_model_decode_path(
         });
     }
 
-    Ok(ModelDecodePath::Legacy)
+    Ok(ModelDecodePath::Generic)
 }
 
 /// Sliding-window size declared by the model, if present and valid.

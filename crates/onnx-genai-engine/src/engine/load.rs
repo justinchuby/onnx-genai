@@ -794,7 +794,7 @@ impl Engine {
             prefix_cache: PrefixCache::new(),
             token_prefix_cache: Vec::new(),
             kv_model,
-            decode_path: ModelDecodePath::Legacy,
+            decode_path: ModelDecodePath::Generic,
             scheduler,
             governor,
             sessions: HashMap::new(),
@@ -961,7 +961,7 @@ fn build_governor_and_scheduler(
     authority_domain: &DeviceCompatibilityDomain,
 ) -> anyhow::Result<(EngineResourceGovernor, Scheduler)> {
     let governor_kv_config = match (kv_model, decode_path) {
-        (None, ModelDecodePath::StaticCache { .. } | ModelDecodePath::Legacy) => {
+        (None, ModelDecodePath::StaticCache { .. } | ModelDecodePath::Generic) => {
             governor_no_paged_kv_config(config)?
         }
         _ => governor_kv_config(kv_model, config)?,
