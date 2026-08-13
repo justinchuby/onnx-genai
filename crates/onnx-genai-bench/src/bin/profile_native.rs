@@ -185,9 +185,8 @@ struct Args {
     #[arg(long, default_value_t = 40)]
     logprobs_k: usize,
     /// Override the text prompt with an explicit JSON array of token ids (e.g.
-    /// "[9707, 12824, 13]"). Enables exact teacher-forced logit comparison
-    /// against ORT without tokenizer round-trip drift. Only honored with
-    /// --dump-logprobs.
+    /// "[9707, 12824, 13]"). Applies to native, pipeline, and log-probability
+    /// runs so paired benchmarks avoid tokenizer round-trip drift.
     #[arg(long)]
     prompt_ids: Option<PathBuf>,
     /// HF-style repetition penalty applied host-side to the output logits before
@@ -3239,7 +3238,14 @@ fn main() -> Result<()> {
     };
     let tokenizer = Tokenizer::from_file(&tokenizer_path)
         .context("load tokenizer.json beside native decoder")?;
-    let prompt_tokens = tokenizer.encode(&args.prompt).context("tokenize prompt")?;
+    let prompt_tokens = if let Some(ids_path) = args.prompt_ids.as_ref() {
+        let raw = std::fs::read_to_string(ids_path)
+            .with_context(|| format!("read prompt ids from {}", ids_path.display()))?;
+        serde_json::from_str::<Vec<u32>>(raw.trim())
+            .with_context(|| format!("parse prompt ids JSON from {}", ids_path.display()))?
+    } else {
+        tokenizer.encode(&args.prompt).context("tokenize prompt")?
+    };
     if prompt_tokens.is_empty() {
         bail!("prompt tokenized to an empty sequence");
     }
@@ -3350,19 +3356,10 @@ fn main() -> Result<()> {
         );
     }
     if let Some(dump_path) = args.dump_logprobs.as_ref() {
-        let dump_prompt_tokens = if let Some(ids_path) = args.prompt_ids.as_ref() {
-            let raw = std::fs::read_to_string(ids_path)
-                .with_context(|| format!("read prompt ids from {}", ids_path.display()))?;
-            let ids: Vec<u32> = serde_json::from_str(raw.trim())
-                .with_context(|| format!("parse prompt ids JSON from {}", ids_path.display()))?;
-            if ids.is_empty() {
-                bail!("--prompt-ids must contain at least one token id");
-            }
-            println!("dump_prompt_ids: {ids:?}");
-            ids
-        } else {
-            prompt_tokens.clone()
-        };
+        let dump_prompt_tokens = prompt_tokens.clone();
+        if args.prompt_ids.is_some() {
+            println!("dump_prompt_ids: {dump_prompt_tokens:?}");
+        }
         let options = GenerateOptions {
             max_new_tokens: 1,
             temperature: 0.0,
