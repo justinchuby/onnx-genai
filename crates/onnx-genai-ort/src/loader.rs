@@ -392,6 +392,16 @@ impl PipelineModels {
         Self::load_with_ort_session_filter(root, options, |_| true)
     }
 
+    /// Load component sessions with `component_options` while retaining
+    /// `generated_options` for execution-island sessions built from those components.
+    pub fn load_with_component_options(
+        root: impl AsRef<Path>,
+        component_options: SessionOptions,
+        generated_options: SessionOptions,
+    ) -> Result<Self> {
+        Self::load_with_options_and_filter(root, component_options, generated_options, |_| true)
+    }
+
     /// Resolve and load pipeline assets, building an ORT [`Session`] only for the
     /// components for which `build_ort_session(name)` returns `true`.
     ///
@@ -407,6 +417,15 @@ impl PipelineModels {
         options: SessionOptions,
         build_ort_session: impl Fn(&str) -> bool,
     ) -> Result<Self> {
+        Self::load_with_options_and_filter(root, options.clone(), options, build_ort_session)
+    }
+
+    fn load_with_options_and_filter(
+        root: impl AsRef<Path>,
+        component_options: SessionOptions,
+        generated_options: SessionOptions,
+        build_ort_session: impl Fn(&str) -> bool,
+    ) -> Result<Self> {
         let directory = PipelineModelDirectory::load(root)?;
         let environment = Environment::new("onnx-genai-pipeline")?;
 
@@ -416,7 +435,7 @@ impl PipelineModels {
             if build_ort_session(name) {
                 sessions.insert(
                     name.clone(),
-                    Session::new(&environment, path, options.clone())?,
+                    Session::new(&environment, path, component_options.clone())?,
                 );
             } else {
                 graph_io_metadata.insert(name.clone(), graph_io_from_model_path(path)?);
@@ -442,7 +461,7 @@ impl PipelineModels {
             tokenizers,
             shared_tokenizer,
             directory,
-            session_options: options,
+            session_options: generated_options,
             _environment: environment,
         })
     }

@@ -16,6 +16,7 @@ pub struct WorkflowPerformanceDiagnostic {
     pub total_elapsed_ns: u128,
     pub last_elapsed_ns: u128,
     pub last_ttft_ns: Option<u128>,
+    pub last_emit_timestamps_ns: Vec<u128>,
     pub last_loop_iterations: u64,
     pub last_component_invocations: u64,
     pub last_emit_events: u64,
@@ -31,6 +32,7 @@ pub(crate) struct WorkflowPerformanceCounters {
     total_elapsed_ns: u128,
     last_elapsed_ns: u128,
     last_ttft_ns: Option<u128>,
+    last_emit_timestamps_ns: Vec<u128>,
     last_loop_iterations: u64,
     last_component_invocations: u64,
     last_emit_events: u64,
@@ -58,6 +60,7 @@ pub struct WorkflowExecutionPlan<'a> {
 struct WorkflowRunTelemetry {
     started: Option<std::time::Instant>,
     first_emit_ns: Option<u128>,
+    emit_timestamps_ns: Vec<u128>,
     max_iterations_only: bool,
     loop_iterations: u64,
     component_invocations: u64,
@@ -347,6 +350,7 @@ impl PipelineEngine {
             total_elapsed_ns: counters.total_elapsed_ns,
             last_elapsed_ns: counters.last_elapsed_ns,
             last_ttft_ns: counters.last_ttft_ns,
+            last_emit_timestamps_ns: counters.last_emit_timestamps_ns.clone(),
             last_loop_iterations: counters.last_loop_iterations,
             last_component_invocations: counters.last_component_invocations,
             last_emit_events: counters.last_emit_events,
@@ -567,6 +571,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
         counters.total_elapsed_ns += elapsed_ns;
         counters.last_elapsed_ns = elapsed_ns;
         counters.last_ttft_ns = telemetry.first_emit_ns;
+        counters.last_emit_timestamps_ns = telemetry.emit_timestamps_ns;
         counters.last_loop_iterations = telemetry.loop_iterations;
         counters.last_component_invocations = telemetry.component_invocations;
         counters.last_emit_events = telemetry.emit_events;
@@ -1066,10 +1071,10 @@ impl PipelineEngine {
                 } else {
                     tensor
                 };
-                if telemetry.first_emit_ns.is_none() {
-                    telemetry.first_emit_ns = telemetry
-                        .started
-                        .map(|started| started.elapsed().as_nanos());
+                if let Some(started) = telemetry.started {
+                    let emitted_at = started.elapsed().as_nanos();
+                    telemetry.first_emit_ns.get_or_insert(emitted_at);
+                    telemetry.emit_timestamps_ns.push(emitted_at);
                 }
                 telemetry.emit_events += 1;
                 telemetry.emitted_elements += emitted.numel() as u64;

@@ -951,23 +951,43 @@ fn build_execution_island(
             }
         }
     }
-    let options = models.session_options();
+    let mut options = models.session_options();
     let capture_requested = options.graph_capture;
     let structurally_capture_eligible =
         device.starts_with("cuda:") && capture_requested && linked.capture_declines.is_empty();
-    let session = Session::from_model_bytes_with_external_files(
+    let session_name = format!("workflow-island-{id}");
+    let (session, capture_session_failure) = match Session::from_model_bytes_with_external_files(
         models.environment(),
-        format!("workflow-island-{id}"),
+        &session_name,
         &linked.bytes,
         &linked.external_files,
-        options,
-    )?;
+        options.clone(),
+    ) {
+        Ok(session) => (session, None),
+        Err(error) if capture_requested => {
+            options.graph_capture = false;
+            let reason = format!(
+                "ORT rejected CUDA graph capture for this island; using stable binding: {error}"
+            );
+            let session = Session::from_model_bytes_with_external_files(
+                models.environment(),
+                session_name,
+                &linked.bytes,
+                &linked.external_files,
+                options,
+            )?;
+            (session, Some(reason))
+        }
+        Err(error) => return Err(error.into()),
+    };
     let device_allocator = if device.starts_with("cuda:") {
         session.device_allocator()?
     } else {
         None
     };
-    let capture_eligible = structurally_capture_eligible && device_allocator.is_some();
+    let capture_eligible = structurally_capture_eligible
+        && capture_session_failure.is_none()
+        && device_allocator.is_some();
     let external_initializer_bytes = linked
         .external_files
         .iter()
@@ -1026,7 +1046,9 @@ fn build_execution_island(
         device_memory_baseline_free_bytes: Cell::new(None),
         device_memory_min_free_bytes: Cell::new(None),
         total_run_ns: Cell::new(0),
-        fallback_reason: RefCell::new(if !device.starts_with("cuda:") {
+        fallback_reason: RefCell::new(if let Some(reason) = capture_session_failure {
+            Some(reason)
+        } else if !device.starts_with("cuda:") {
             Some("island is not placed on CUDA".to_string())
         } else if !linked.capture_declines.is_empty() {
             Some(linked.capture_declines.join("; "))

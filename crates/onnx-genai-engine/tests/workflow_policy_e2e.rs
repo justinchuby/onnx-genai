@@ -1270,6 +1270,12 @@ pipeline:
     assert_eq!(performance.last_emit_events, 2);
     assert_eq!(performance.last_emitted_elements, 2);
     assert!(performance.last_ttft_ns.is_some());
+    assert_eq!(performance.last_emit_timestamps_ns.len(), 2);
+    assert_eq!(
+        performance.last_ttft_ns,
+        performance.last_emit_timestamps_ns.first().copied()
+    );
+    assert!(performance.last_emit_timestamps_ns[0] <= performance.last_emit_timestamps_ns[1]);
     assert!(performance.last_elements_per_second > 0.0);
 
     let mut generate = GenerateRequest::new(GeneratePrompt::TokenIds(vec![]));

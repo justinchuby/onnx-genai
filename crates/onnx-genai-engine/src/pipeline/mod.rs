@@ -250,8 +250,17 @@ impl PipelineEngine {
             authority_provider.as_ref(),
             &authority_domain,
         )?;
-        let models = PipelineModels::load_with_options(pipeline_dir, session_options)
-            .map_err(|error| anyhow::anyhow!("Failed to load workflow components: {error}"))?;
+        // CUDA Graph capture applies to stable linked execution islands. Enabling
+        // it on every source component rejects valid setup/control-flow graphs
+        // before the workflow planner can determine capture eligibility.
+        let mut component_session_options = session_options.clone();
+        component_session_options.graph_capture = false;
+        let models = PipelineModels::load_with_component_options(
+            pipeline_dir,
+            component_session_options,
+            session_options,
+        )
+        .map_err(|error| anyhow::anyhow!("Failed to load workflow components: {error}"))?;
 
         let workflow = directory.spec.workflow;
         let mut compiled_workflow = onnx_genai_metadata::compile_workflow(&workflow)
