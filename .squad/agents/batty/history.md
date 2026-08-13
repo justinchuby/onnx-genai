@@ -62,3 +62,12 @@ path so Muse-Glimmer loads resident on the engine native decode path — precond
 for CUDA-graph capture engaging. Part of Sebastian's 3-blocker escalation (LOAD +
 CLASSIFY [Deckard] + CAPTURE [Sebastian]). Shared team goal: **beat ORT 40 tok/s via
 CUDA-graph capture**. In progress.
+
+## 2026-08-12 — CUDA capture arc COMPLETE (shared: 11.4 → 23.13 tok/s)
+Blocker 1 (LOAD) landed as **#850** (`29bd8a35`): `PipelineEngine` now runs
+Muse-Glimmer's embedding component on the native CUDA EP (embeds-producer promoted
+to every_step, ORT-skips on native backend, bf16 gates relaxed, empty image-features
+seed, KV context ceiling threaded). End-to-end load + byte-exact parity. Prerequisite
+#2 of the 5-blocker chain (#848 → #850 → #852 → #855 → #854). Team result: native
+decode **11.4 → 23.13 tok/s**, capture fully engaged (1 segment / 0 seams). Next lever
+= Cast round-trip elimination (overlaps my decode-graph domain).
