@@ -371,6 +371,11 @@ pub enum SharedEpTeardown {
     /// teardown: `Arc::get_mut` refuses when `strong_count > 1` **or** when any
     /// `Weak` exists, and reporting only `strong_count` produced the nonsense
     /// diagnostic "0 other reference(s) are still alive" in the weak-only case.
+    ///
+    /// `strong_count == 1 && weak_count == 0` is reachable only when references
+    /// are being manipulated concurrently with `ReleaseEpFactory`: exclusive
+    /// access is retried once before this is reported, and the diagnostic then
+    /// names the race rather than a blocker that the counts do not support.
     StillReferenced {
         strong_count: usize,
         weak_count: usize,
@@ -440,25 +445,36 @@ pub unsafe fn release_ep_factory_with_teardown(
 
     let outcome = match exported.shared_ep.take() {
         None => SharedEpTeardown::NotShared,
-        Some(mut shared) => match Arc::get_mut(&mut shared) {
-            Some(mutex) => {
-                let ep = mutex
-                    .get_mut()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                match ep.shutdown() {
-                    Ok(()) => SharedEpTeardown::ShutdownCalled,
-                    Err(e) => {
-                        eprintln!(
-                            "nxrt ep plugin: shared EP shutdown() failed during \
-                             ReleaseEpFactory: {e}"
-                        );
-                        SharedEpTeardown::ShutdownFailed
-                    }
+        Some(mut shared) => {
+            // `Arc::get_mut` and the count reads below are three separate
+            // atomic operations, so a concurrent owner can release *between*
+            // them. Retry once when the counts read back as exclusive rather
+            // than printing "1 strong, 0 weak blocked exclusive access", which
+            // is self-contradictory, and would also give up a shutdown() that
+            // is now legal.
+            let mut retried = false;
+            loop {
+                if let Some(mutex) = Arc::get_mut(&mut shared) {
+                    let ep = mutex
+                        .get_mut()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    break match ep.shutdown() {
+                        Ok(()) => SharedEpTeardown::ShutdownCalled,
+                        Err(e) => {
+                            eprintln!(
+                                "nxrt ep plugin: shared EP shutdown() failed during \
+                                 ReleaseEpFactory: {e}"
+                            );
+                            SharedEpTeardown::ShutdownFailed
+                        }
+                    };
                 }
-            }
-            None => {
                 let strong_count = Arc::strong_count(&shared);
                 let weak_count = Arc::weak_count(&shared);
+                if strong_count == 1 && weak_count == 0 && !retried {
+                    retried = true;
+                    continue;
+                }
                 // `Arc::get_mut` returns `None` for either reason, and the two
                 // call for different follow-up, so name the one that applies.
                 let blocker = if strong_count > 1 {
@@ -467,12 +483,20 @@ pub unsafe fn release_ep_factory_with_teardown(
                          (allocator / sync stream / data transfer / OrtEp)",
                         strong_count - 1
                     )
-                } else {
+                } else if weak_count > 0 {
                     format!(
                         "the factory holds the only strong reference, but {weak_count} Weak \
                          handle(s) to the shared EP are outstanding, which is also enough to \
                          block exclusive access"
                     )
+                } else {
+                    // Exclusive by the counts, yet still not exclusive when
+                    // asked. Another thread is manipulating references
+                    // concurrently; say that, and do not invent a blocker.
+                    "exclusive access was refused twice even though the counts now read \
+                     strong=1 weak=0, so references are being created or released \
+                     concurrently with ReleaseEpFactory"
+                        .to_string()
                 };
                 eprintln!(
                     "nxrt ep plugin: ReleaseEpFactory called while {blocker}. ORT should release \
@@ -480,12 +504,12 @@ pub unsafe fn release_ep_factory_with_teardown(
                      back to the Drop-only invariant: the EP is released when the last strong \
                      reference goes away. (strong_count={strong_count}, weak_count={weak_count})"
                 );
-                SharedEpTeardown::StillReferenced {
+                break SharedEpTeardown::StillReferenced {
                     strong_count,
                     weak_count,
-                }
+                };
             }
-        },
+        }
     };
 
     drop(exported);
