@@ -10,9 +10,9 @@ use onnx_genai_engine::logits::{
     MinPProcessor, RepetitionPenaltyProcessor, TemperatureProcessor, TopKProcessor, TopPProcessor,
 };
 use onnx_genai_engine::{
-    DecodePrecision, Engine, EngineConfig, EngineDecodeBackend, GenerateOptions, GenerateRequest,
-    NativeDecodeDevice, NativeDecodeSession, PipelineEngine, PipelineGenerateRequest,
-    ProcessorChain, SpeculativeMode, SpeculativeStats, parse_resource_limit,
+    DecodePrecision, Engine, EngineConfig, EngineDecodeBackend, GenerateOptions, GeneratePrompt,
+    GenerateRequest, NativeDecodeDevice, NativeDecodeSession, PipelineEngine,
+    PipelineGenerateRequest, ProcessorChain, parse_resource_limit,
 };
 use onnx_genai_ort::{Tokenizer, available_execution_providers, profile};
 use onnx_runtime_session::InferenceSession;
@@ -454,33 +454,10 @@ fn request_with_prompt(args: &Args, tokens: usize, prompt: &str) -> GenerateRequ
     request
 }
 
-/// Wire the prompt-lookup speculative mode into the request options. A no-op for
-/// `--speculative none`, so the default greedy fast path is untouched.
-fn apply_speculative_options(options: &mut GenerateOptions, args: &Args) {
-    match args.speculative {
-        SpeculativeArg::None => {}
-        SpeculativeArg::PromptLookup => {
-            options.speculative_mode = Some(SpeculativeMode::PromptLookup {
-                ngram: args.spec_ngram,
-                max_tokens: args.spec_tokens,
-            });
-            options.num_speculative_tokens = Some(args.spec_tokens);
-        }
-    }
-}
-
-fn describe_speculative(args: &Args) -> String {
-    match args.speculative {
-        SpeculativeArg::None => "speculative: OFF (plain M=1 greedy)".to_string(),
-        SpeculativeArg::PromptLookup => format!(
-            "speculative: prompt-lookup ngram={} K={}",
-            args.spec_ngram, args.spec_tokens
-        ),
-    }
-}
-
-fn pipeline_request(args: &Args, tokens: usize, prompt: &str) -> PipelineGenerateRequest {
-    PipelineGenerateRequest::new(request_with_prompt(args, tokens, prompt))
+fn pipeline_request(args: &Args, tokens: usize, prompt_tokens: &[u32]) -> PipelineGenerateRequest {
+    let mut request = request(args, tokens);
+    request.prompt = GeneratePrompt::TokenIds(prompt_tokens.to_vec());
+    PipelineGenerateRequest::new(request)
 }
 
 fn describe_sampling(args: &Args) -> String {
@@ -3020,38 +2997,18 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
     apply_vram_limit_env(&mut config)?;
     let mut engine = PipelineEngine::from_dir_with_config(model_dir, config)
         .with_context(|| format!("load pipeline engine {}", model_dir.display()))?;
-
-    // Resolve the prompt against the engine's own tokenizer, then report the
-    // length. Prefill numbers are meaningless without the token count they were
-    // measured over, and a harness-side tokenizer is not guaranteed to be the
-    // one this pipeline routes prompts through.
-    let prompt = match args.prompt_tokens {
-        None => args.prompt.clone(),
-        Some(want) => {
-            let ids = engine.tokenize(&args.prompt).context("tokenize prompt")?;
-            if ids.len() < want {
-                bail!(
-                    "--prompt-tokens {want} exceeds the {} tokens available in the prompt; \
-                     supply a longer --prompt-file (testdata/long-prompt.txt has ~21.7k)",
-                    ids.len()
-                );
-            }
-            engine
-                .detokenize(&ids[..want])
-                .context("detokenize truncated prompt")?
-        }
-    };
-    let prompt_tokens = engine.tokenize(&prompt).context("tokenize prompt")?.len();
-    println!("profile_native: prompt_tokens={prompt_tokens}");
-
-    if let Some(lengths) = args.prefill_sweep.clone() {
-        return run_prefill_sweep(args, &mut engine, &lengths);
+    let tokenizer =
+        Tokenizer::from_file(tokenizer_file(model_dir)).context("load pipeline tokenizer.json")?;
+    let prompt_tokens = tokenizer
+        .encode(&args.prompt)
+        .context("tokenize pipeline prompt")?;
+    if prompt_tokens.is_empty() {
+        bail!("pipeline prompt tokenized to an empty sequence");
     }
-
     for _ in 0..args.warmups {
         std::hint::black_box(
             engine
-                .generate_with_pipeline_request(pipeline_request(args, args.tokens, &prompt))
+                .generate_with_pipeline_request(pipeline_request(args, args.tokens, &prompt_tokens))
                 .context("pipeline warmup generation")?,
         );
     }
@@ -3074,7 +3031,7 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
             };
             let result = engine
                 .generate_with_callback(
-                    pipeline_request(args, args.tokens, &prompt),
+                    pipeline_request(args, args.tokens, &prompt_tokens),
                     Some(&mut callback),
                 )
                 .context("steady pipeline measured generation")?;
@@ -3160,7 +3117,7 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
     for _ in 0..args.runs {
         let start = Instant::now();
         let result = engine
-            .generate_with_pipeline_request(pipeline_request(args, args.tokens, &prompt))
+            .generate_with_pipeline_request(pipeline_request(args, args.tokens, &prompt_tokens))
             .context("pipeline measured generation")?;
         elapsed += start.elapsed();
         generated += result.token_ids.len();
