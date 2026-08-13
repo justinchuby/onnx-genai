@@ -11,9 +11,9 @@ macOS-arm64 + win_amd64) and **`nxrt-ep-cuda`** (CUDA 13, manylinux_2_28_x86_64)
 CI = fmt/build/test + **blocking clippy** + Miri unsafe-crate soundness + scheduled
 `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-08-12T16:20:00Z_
+_Last updated: 2026-08-13T03:08:00Z_
 
-**Current `origin/main` implementation HEAD:** `431ccf15`.
+**Current `origin/main` implementation HEAD:** `b871c869`.
 
 ---
 
@@ -24,6 +24,11 @@ _Last updated: 2026-08-12T16:20:00Z_
   bit-exact or native-more-accurate vs an fp32 oracle, zero fallbacks. The ORT 1.28
   three-config fairness benchmark measured native **1.23–2.74×** faster than
   ORT-GenAI-direct (Qwen2.5-0.5B 557 vs 203 tok/s = 2.74×; DeepSeek-R1-1.5B 1.23×).
+- **Muse-Glimmer-30B (dense int4, bf16 decoder, heavy GQA) decodes at ORT parity on
+  native CUDA** — **11.4 → 40.21 tok/s** (matches ORT's ~40) after a 4-gate CUDA-graph
+  capture chain (#848/#850/#852/#855/#854 → 1 segment / 0 seams) plus a bf16 RMSNorm
+  cast-fold + parallel f32 tree reduction (#860). Capture collapses ~1600 launches/token
+  into one replay; first-16 greedy ids match reference.
 - **Large / hybrid models run native-only** where ORT cannot load them: GLM-4-9B
   (partial-RoPE GQA, ORT rejects the schema), DeepSeek-V2-Lite (MLA + QMoE), and
   Qwen3.5/3.6-**27B** hybrid Gated-DeltaNet — all load and decode on native CUDA via a
@@ -73,7 +78,44 @@ _Last updated: 2026-08-12T16:20:00Z_
 
 ---
 
-## Recent milestones (2026-07-28 → 2026-08-12) — newest first
+## Recent milestones (2026-07-28 → 2026-08-13) — newest first
+
+### 2026-08-13 — Muse-Glimmer-30B native CUDA decode reaches ORT parity (40 tok/s)
+
+- **11.4 → 40.21 tok/s (native now matches ORT's ~40) on Muse-Glimmer-30B** (dense int4,
+  52 layers, **bf16** decoder, hidden 6656, heavy GQA num_kv_heads=2, vocab 202048). The
+  decode was dispatch/launch-overhead bound (~1600 kernel launches/token, GPU ~99% idle);
+  the fix was a 4-gate CUDA-graph-capture chain followed by a kernel/graph lever:
+  - **Gate 1 — classify onto shared-buffer KV (#848):** vestigial `sliding_window`
+    detected via graph truth (`local_window_size`) so Muse-Glimmer lands on the
+    capture-stable fixed-capacity KV path, not the growing/paged path.
+  - **Gate 2 — native pipeline embed load (#850):** `PipelineEngine` runs the embedding
+    component on the native CUDA EP, so the model loads + greedy-decodes end-to-end on
+    `--pipeline --backend native --ep cuda`.
+  - **Gate 3 — GQA KV seq-symbol pin (#852):** pins the 52 GQA nodes' fixed-capacity KV
+    seq symbols, dropping the classifier's disqualifying-symbol set 53 → 0.
+  - **Gate 4 — bf16 capture-safe GQA decode kernel (#855/#854):** new `gqa_decode_bf16`
+    device-length split-K decode (fp32 accumulation) admits bf16 q_seq==1 aliased device
+    KV as capture-safe, plus a skip-norm capture-safety flag fix → **54 → 1 segment / 0
+    seams**, lifting decode to ~23 tok/s.
+- **Cast / RMSNorm elimination lever (#860):** generalized the ep-cuda
+  `CudaDropNormalizationCasts` pass to fold **bf16** casts around **`RMSNormalization`**
+  (Muse-Glimmer wraps all 312 RMSNorm nodes in `Cast(bf16→f32)→RMSNorm→Cast(f32→bf16)`,
+  624 of 834 decoder casts). The fold **op-swaps `RMSNormalization` →
+  `SimplifiedLayerNormalization`** so the session's post-optimization shape re-inference
+  stays bf16 (ONNX RMSNormalization output Y follows the *scale* dtype `V`, not activation
+  `T`; both ops map to the same fused `RmsNormKernel`). Honest attribution: the cast-fold
+  alone is ~free under capture (**23.16 → 23.43 tok/s** — casts are cheap once launches are
+  captured); the real lever is `rmsnorm_bf16`'s **parallel f32 tree reduction** replacing
+  the serial single-thread mean-square (~40% of captured decode at M=1) → **23.16 → 40.21
+  tok/s** (median of 40.13/40.29/40.21).
+- **Correctness / capture:** capture stays **1 segment / 0 seams**, first-16 greedy ids
+  match the reference exactly. The parallel tree reduction is full f32 precision and, per
+  Chew's numerics review 🟢, **~807× more accurate than the old serial order** (within 1
+  bf16 ulp of an f64 oracle at hidden 6656). Greedy decode is byte-exact for the first ~37
+  tokens then shows expected sub-ulp greedy sensitivity (accuracy-level-4 int4 quant);
+  `ONNX_GENAI_CUDA_DISABLE_NORM_CAST_FOLD=1` restores the strict CPU-order byte-exact
+  serial path (at ~23 tok/s).
 
 ### 2026-08-12 — EP plugins run inside ONNX Runtime and ship on PyPI
 
