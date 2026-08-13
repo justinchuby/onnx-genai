@@ -21,3 +21,11 @@ Older detailed work archived in `history-archive.md`.
 Commit `59b84aca7a` (Leon) introduced a regression: flipped `is_packed` default from `false` to `true` in `LayerNormImpl::PrePack`. `ConvertMLFloat16ToFloatIfNeeded` only sets `is_packed` inside narrow-float branches; for float inputs it is a no-op, so float dispatch incorrectly believed Scale/Bias were prepacked and failed with "Missing Input: Scale". Nine float `LayerNormTest` cases broke. Coco root-caused and fixed in `e036e53d31` (one-line restore of `false` default). Full-suite results: BF16 21/21, LayerNorm 107/107, SkipLayerNorm 26/26. The `narrow_float_utils.h` centralisation was sound and kept.
 
 **Lesson reinforced:** A flag set only on some code paths must default to the conservative value. Set it explicitly where the work happens.
+
+## 2026-08-12 — CUDA-graph capture arc: PR #852 pin GQA fixed-capacity KV seq symbol (MERGED)
+
+Link 3 (**PIN**) of the 5-blocker capture chain. Pinned the GQA fixed-capacity KV seq symbol so
+the capture classifier admits **52 GQA nodes** (53 → 0 disqualifying symbols), keeping the
+two-gate-AND capture safety and growth-invalidation intact. Merged after #848 → #850, before
+#855 → #854. Shared arc result: native CUDA decode **11.4 → 23.13 tok/s**, capture fully engaged
+(1 segment, 0 seams).

@@ -55,3 +55,11 @@ Deckard corrected "x86-64" → "x86 (32-bit and 64-bit)" in `mlas.h`, `layernorm
 and six `GTEST_SKIP` messages after Challenger's delta review flagged the inaccuracy. Batty's
 implementation was correct; only the comment wording was stale. Head `4a16925a88`. PR #31973
 marked ready for review.
+
+## 2026-08-12 — CUDA-graph capture arc: PR #850 native pipeline embedding on CUDA EP (MERGED)
+
+Link 2 (**LOAD**) of the 5-blocker capture chain. `PipelineEngine` now runs the Muse-Glimmer
+embedding component on the native CUDA EP; the model loads + decodes end-to-end on
+`--pipeline --backend native --ep cuda`, parity identical. Precondition for capture to engage.
+Shared arc result: native CUDA decode **11.4 → 23.13 tok/s**, capture fully engaged (1 segment,
+0 seams).

@@ -90,3 +90,11 @@ in `mlas.h` doxygen comment; "x86" in shorter inline comments and six `GTEST_SKI
 in `test_layernorm.cpp` and `layernorm_kernel_avx2.cpp`. Comment-only; build verified 41/2.
 Commit `4a16925a88`. Irony: a prior readability fix ("AMD64/IX86" → "x86-64") made the
 comment less accurate.
+
+## 2026-08-12 — CUDA-graph capture arc: PR #848 graph-truth SWA detection (MERGED)
+
+Link 1 (**CLASSIFY**) of the 5-blocker capture chain for Muse-Glimmer-30B native decode.
+Replaced the vestigial `sliding_window` (SWA) signal with graph-truth SWA detection, routing
+Muse-Glimmer to shared-buffer / fixed-capacity KV (capture-stable). 463 tests. Merged first in
+dependency order (#848 → #850 → #852 → #855 → #854). Shared arc result: native CUDA decode
+**11.4 → 23.13 tok/s**, CUDA-graph capture fully engaged (1 captured segment, 0 eager seams).

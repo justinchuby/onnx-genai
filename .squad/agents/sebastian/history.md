@@ -23,3 +23,14 @@ Nits: removed 4 no-op identity transmutes.
 280 passed / 0 failed. Clippy clean. fmt clean. Miri: 4/4 canary tests clean.
 
 Full pre-compaction history in `history-archive.md`.
+
+## 2026-08-12 — CUDA-graph capture arc: escalation diagnosis + PRs #855, #854 (MERGED)
+
+Produced the measured escalation diagnosis that framed the whole 5-blocker chain
+(classify → load → pin → bf16-kernel → skip-norm), then authored links 4 and 5:
+- **#855** — bf16 capture-safe `gqa_decode` kernel; 54 → 2 segments; 22.52 tok/s; f64-oracle
+  max_abs 1.953e-3 (Chew 🟢 APPROVE on H200, fp32 accumulation airtight).
+- **#854** — bf16 skip-norm capture-flag fix; 2 → 1 segment, **0 seams**; 23.13 tok/s
+  (+33% capture ON); rebased onto main after #855 squash-merged.
+Shared arc result: native CUDA decode **11.4 → 23.13 tok/s**, capture fully engaged. Next lever
+(dispatched separately): Cast round-trip elimination (Cast 40.1% / 626 casts/token).

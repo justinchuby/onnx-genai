@@ -59,3 +59,13 @@ _Pre-2026-08-11 dated entries archived to `history-archive.md`. 2026-08-11 detai
 - **Coverage:** 17 → 20 BF16 tests, 103 → 106 total LayerNorm suite. All pass.
 - **Hygiene:** Removed 2× "B5" internal labels; fixed SrcDispatcher comment; aligned tolerance comments with checker reality (`absolute + relative × |expected|`, numpy.isclose).
 - **Commit:** `a12c7ddde3`. Delta review by Holden: no blockers. PR remains draft (vcpkg bootstrap TLS infra flake in CI).
+
+## 2026-08-12 — CUDA-graph capture arc: numerics review of PR #855 bf16 GQA kernel (🟢 APPROVE)
+
+Reviewed Sebastian's bf16 capture-safe `gqa_decode` kernel (link 4 of the 5-blocker capture
+chain) on real **H200**, not by inspection alone. Confirmed fp32 accumulation throughout (no
+bf16 arithmetic intrinsics in any reduction path), the f64 oracle is genuine and reproduced
+`max_abs=1.953e-3 max_rel=3.888e-3` to the digit, 16-way split-K is exercised and deterministic
+under capture replay, single-split fast path bit-exact to decode+merge, and no capture-only
+precision shortcut (distinct NVRTC module key avoids fp16 module-cache collision). Cleared #855
+for merge. Shared arc result: native CUDA decode **11.4 → 23.13 tok/s**, capture fully engaged.
