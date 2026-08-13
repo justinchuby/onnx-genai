@@ -56,6 +56,7 @@ KNOWN_UNIMPLEMENTED: dict[str, str] = {
     "NXRT_SQNBIT_PREFILL_MIN": "referenced in prose about a proposed tuning knob",
     "ONNX_GENAI_BASE_URL": "client-side variable read by external tooling, not by this workspace",
     "ONNX_GENAI_SD_PACKAGE": "referenced in prose about a proposed packaging layout",
+    "ONNX_GENAI_WEIGHT_FOLD": "documented as a reverted, non-shipping research probe",
 }
 
 # Uppercase only: the lowercase `onnx_genai_*` names in the docs are Prometheus
