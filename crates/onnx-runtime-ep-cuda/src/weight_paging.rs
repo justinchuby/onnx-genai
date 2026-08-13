@@ -52,6 +52,15 @@ static GLOBAL_EVICTIONS: AtomicU64 = AtomicU64::new(0);
 // a non-zero value since capture arm means the resident set is NOT stable, so
 // whole-step CUDA graph capture must stay declined for correctness).
 static GLOBAL_BYPASSED_PAGE_INS: AtomicU64 = AtomicU64::new(0);
+// Weight **bytes** streamed H2D by bypassed page-ins (issue #837 item 3). Every
+// bypass still runs the full host->device copy — so these bytes are already
+// inside `GLOBAL_HTOD_BYTES` — but the page is handed back transiently and never
+// joins the resident set, so the identical bytes are re-streamed on the next
+// decode step. This is the byte-weighted attribution of the bypass count: it
+// answers "how much of `htod_bytes` is bypass traffic that residency policy
+// left on the table" directly, rather than inferring it from the ~11.9 MB
+// average page-in size.
+static GLOBAL_BYPASSED_PAGE_IN_BYTES: AtomicU64 = AtomicU64::new(0);
 // Time spent filling the host staging buffer from mmap regions. This is a
 // host-blocking CPU memcpy span and contains no CUDA synchronization.
 static GLOBAL_MATERIALIZE_NS: AtomicU64 = AtomicU64::new(0);
@@ -128,6 +137,11 @@ pub struct GlobalOffloadStats {
     pub hit_bytes: u64,
     pub evictions: u64,
     pub bypassed_page_ins: u64,
+    /// Weight bytes streamed H2D by bypassed page-ins. A subset of
+    /// [`Self::htod_bytes`]: these bytes were copied device-ward but the page was
+    /// not retained, so they are re-streamed every decode step. See
+    /// [`Self::bypassed_byte_share`].
+    pub bypassed_page_in_bytes: u64,
     pub materialize_ns: u64,
     pub htod_ns: u64,
     pub admit_sync_ns: u64,
@@ -167,6 +181,20 @@ impl GlobalOffloadStats {
         let requested = self.hit_bytes.checked_add(self.htod_bytes)?;
         (requested > 0).then(|| self.hit_bytes as f64 / requested as f64)
     }
+
+    /// Fraction of streamed weight **bytes** (`htod_bytes`) attributable to
+    /// bypassed page-ins — page-ins copied device-ward but never retained, so
+    /// they are re-streamed every decode step. This is the byte-weighted
+    /// attribution of the bypass count (#837 item 3): a large share means the
+    /// residency policy is spending H2D bandwidth on traffic it keeps no benefit
+    /// from, and is the first thing to rule in or out when explaining the gap
+    /// between `htod_bytes_per_token` and the streaming floor `W - B`.
+    ///
+    /// `None` when no bytes were streamed in the window.
+    #[must_use]
+    pub fn bypassed_byte_share(&self) -> Option<f64> {
+        (self.htod_bytes > 0).then(|| self.bypassed_page_in_bytes as f64 / self.htod_bytes as f64)
+    }
 }
 
 /// Read the process-global weight-offload counters.
@@ -177,6 +205,7 @@ pub fn global_offload_stats() -> GlobalOffloadStats {
         hit_bytes: GLOBAL_HIT_BYTES.load(Ordering::Relaxed),
         evictions: GLOBAL_EVICTIONS.load(Ordering::Relaxed),
         bypassed_page_ins: GLOBAL_BYPASSED_PAGE_INS.load(Ordering::Relaxed),
+        bypassed_page_in_bytes: GLOBAL_BYPASSED_PAGE_IN_BYTES.load(Ordering::Relaxed),
         materialize_ns: GLOBAL_MATERIALIZE_NS.load(Ordering::Relaxed),
         htod_ns: GLOBAL_HTOD_NS.load(Ordering::Relaxed),
         admit_sync_ns: GLOBAL_ADMIT_SYNC_NS.load(Ordering::Relaxed),
@@ -210,6 +239,7 @@ pub fn reset_global_offload_stats() {
     GLOBAL_HIT_BYTES.store(0, Ordering::Relaxed);
     GLOBAL_EVICTIONS.store(0, Ordering::Relaxed);
     GLOBAL_BYPASSED_PAGE_INS.store(0, Ordering::Relaxed);
+    GLOBAL_BYPASSED_PAGE_IN_BYTES.store(0, Ordering::Relaxed);
     GLOBAL_MATERIALIZE_NS.store(0, Ordering::Relaxed);
     GLOBAL_HTOD_NS.store(0, Ordering::Relaxed);
     GLOBAL_ADMIT_SYNC_NS.store(0, Ordering::Relaxed);
@@ -259,6 +289,59 @@ pub const WEIGHT_OFFLOAD_ASYNC_PAGEIN_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_ASY
 /// reduced evictions from 6,286 to 0 in the same harness.
 pub const WEIGHT_OFFLOAD_SCAN_RESISTANT_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_SCAN_RESISTANT";
 
+/// Sub-knob (default OFF / opt-IN) selecting **byte-aware** residency on top of
+/// scan-resistant dense residency. Set to `1`/`true`/`yes`/`on` to enable.
+///
+/// Scan-resistant `StableResident` makes a size-blind admission decision: once
+/// the budget is full, every subsequent distinct tensor is streamed transiently
+/// (a "bypass") regardless of its size, and the resident set stays whatever
+/// first-fit tensors happened to land in the remaining headroom — which biases
+/// toward *small* tensors, because a small tensor fits the leftover budget while
+/// a large one does not. Measured on qwen14b-zp (#837 item 3), that leaves
+/// bypasses at 11% of page-in *events* but **44.6% of streamed bytes** (avg
+/// bypass 49.9 MB vs 7.8 MB for retained page-ins): the policy streams the large
+/// projections transiently and re-streams them every decode step.
+///
+/// Byte-aware residency instead admits an incoming tensor into the resident set
+/// (evicting the *smallest* evictable resident to make room) whenever it is
+/// strictly larger than that smallest resident, and evicts smallest-first. This
+/// converges the resident set to the top-`B`-bytes tensors, driving the
+/// byte-weighted hit rate toward the `B/W` ceiling. Default OFF.
+///
+/// **EXPERIMENTAL — KNOWN UNSAFE, DO NOT ENABLE (#837 item 3).** A/B measurement
+/// on qwen14b-zp (managed streaming, `ONNX_GENAI_MANAGED_WEIGHT_STREAMING=1`)
+/// shows that whenever this policy *actually engages* (offload active, i.e. the
+/// only regime where it could help), it **violates the token-identity hard
+/// constraint**: greedy decode collapses to 3 tokens instead of 16, both with
+/// (`ONNX_GENAI_CUDA_GRAPH=1`) and without CUDA-graph capture.
+///
+/// The failure is **silent numeric corruption, not an admission error** — proven
+/// by the profiler's error-propagation structure: `generate_with_callback` is
+/// `?`-propagated with `.context("steady measured generation")` *before* the
+/// `bail!("generation emitted N tokens")` check, so the observed `bail!` means
+/// generation returned `Ok` with only 3 tokens (an early EOS), not that a
+/// `WeightHandleError` surfaced. A residency policy decides *what is resident*,
+/// not *what is computed*: both the resident-hit and bypass paths fill the
+/// correct bytes at a stable per-tensor VA, and every eviction here only targets
+/// `strong_count == 1` pages after draining **both** the compute and copy
+/// streams. Under those guards a change of eviction *target* (smallest-by-bytes
+/// instead of `next_evictable_index`'s front-of-order oldest page) should be
+/// value-neutral. That it is not implicates state that depends on eviction
+/// *order* — most plausibly the physical granule / retained-handle pool
+/// accounting — rather than the policy decision itself. Reproduction with CUDA
+/// graph OFF rules out captured-VA baking as the sole cause. Whether this is a
+/// bug in the byte-aware admission loop or a **latent defect in the existing
+/// offload path** (exposed, not caused, by reordering evictions) was not
+/// isolated here and is worth a separate investigation.
+///
+/// The count-vs-byte residency gap therefore cannot be closed by an eviction-
+/// order change alone; it needs the structural lever deferred by #837 (a
+/// dedicated transient staging zone so a large tensor can be handed to the
+/// kernel *without* evicting a resident page). Kept default-OFF and wired only
+/// so the rejected approach and its evidence are reviewable; the default
+/// (size-blind) path is unaffected.
+pub const WEIGHT_OFFLOAD_BYTE_AWARE_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_BYTE_AWARE";
+
 /// Parse [`WEIGHT_OFFLOAD_ASYNC_PAGEIN_ENV`]. Async page-in is **default-on**:
 /// unset (`None`) enables it. When a value *is* present, this is opt-**in**, not
 /// opt-out — only `1`/`true`/`yes`/`on` keep async enabled, and every other
@@ -288,6 +371,27 @@ pub(crate) fn scan_resistant_from_env_value(value: Option<&str>) -> bool {
     }
 }
 
+/// Parse [`WEIGHT_OFFLOAD_BYTE_AWARE_ENV`]. Byte-aware residency defaults **OFF**
+/// (opt-in): only `1`/`true`/`yes`/`on` (case/whitespace-insensitive) enable it,
+/// every other value — including unset — keeps the size-blind admission path.
+pub(crate) fn byte_aware_from_env_value(value: Option<&str>) -> bool {
+    match value {
+        Some(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        None => false,
+    }
+}
+
+/// Read [`WEIGHT_OFFLOAD_BYTE_AWARE_ENV`] from the process environment. Exposed
+/// so the engine's memory-strategy policy can opt this experimental A/B knob in
+/// without threading a new field through the whole runtime-application config.
+#[must_use]
+pub fn byte_aware_residency_from_env() -> bool {
+    byte_aware_from_env_value(std::env::var(WEIGHT_OFFLOAD_BYTE_AWARE_ENV).ok().as_deref())
+}
+
 /// Whether/how the CUDA EP should page offloaded weights into a bounded VRAM
 /// residency cache. Disabled by default so the resident fast path is untouched
 /// and byte-identical.
@@ -311,6 +415,13 @@ pub struct DeviceOffloadPolicy {
     /// MoE boundaries stay on LRU even when this is enabled to avoid regressing
     /// skewed expert selection.
     pub scan_resistant_dense: bool,
+    /// Use byte-aware admission on top of scan-resistant residency: keep the
+    /// largest tensors resident instead of whatever first-fit smalls landed in
+    /// the leftover budget. Default-off / opt-in via
+    /// `ONNX_GENAI_WEIGHT_OFFLOAD_BYTE_AWARE=1` (#837 item 3). Has no effect
+    /// unless `scan_resistant_dense` is also on, since it only refines the
+    /// `StableResident` bypass decision.
+    pub byte_aware_residency: bool,
 }
 
 impl Default for DeviceOffloadPolicy {
@@ -322,6 +433,7 @@ impl Default for DeviceOffloadPolicy {
             device_budget_bytes: None,
             async_pagein: false,
             scan_resistant_dense: true,
+            byte_aware_residency: false,
         }
     }
 }
@@ -347,6 +459,8 @@ impl DeviceOffloadPolicy {
                 .ok()
                 .as_deref(),
         );
+        let byte_aware_residency =
+            byte_aware_from_env_value(std::env::var(WEIGHT_OFFLOAD_BYTE_AWARE_ENV).ok().as_deref());
         Self {
             enabled,
             managed_no_spill: false,
@@ -354,6 +468,7 @@ impl DeviceOffloadPolicy {
             device_budget_bytes,
             async_pagein,
             scan_resistant_dense,
+            byte_aware_residency,
         }
     }
 }
@@ -824,6 +939,12 @@ impl<S: MmapRegionSource + ?Sized> LazyDeviceWeightBinder for CudaWeightPager<'_
 pub struct CudaWeightResidency {
     runtime: Arc<CudaRuntime>,
     scan_resistant_dense: bool,
+    /// Byte-aware admission (#837 item 3): keep the largest tensors resident by
+    /// evicting the smallest evictable resident to admit a strictly-larger
+    /// incoming tensor, instead of streaming it transiently. Default false so
+    /// the shipped path is byte-identical; opt in via
+    /// `ONNX_GENAI_WEIGHT_OFFLOAD_BYTE_AWARE=1`.
+    byte_aware: bool,
     physical: OnceLock<PhysicalAdmission>,
     /// Reused pinned host staging buffers for weight page-ins. Shared so every
     /// page-in draws from the same bounded free-list instead of page-locking a
@@ -948,6 +1069,65 @@ impl WeightResidencyPolicy {
         }
     }
 
+    /// Pure CPU model of the byte-aware `StableResident` admission decision the
+    /// GPU VMM path implements in `admit_committed_span` (#837 item 3): a page
+    /// that does not fit is *retained* only when room can be made by evicting
+    /// **strictly smaller** residents (smallest first); otherwise it bypasses.
+    /// Refusing to evict an equal-or-larger peer is what keeps the largest
+    /// tensors a *stable* resident set instead of thrashing them against each
+    /// other. Lets the convergence-to-largest property be regression-tested
+    /// without a GPU. The GPU path's physical-eviction loop differs in mechanism
+    /// but shares this decision, which is what governs the byte-weighted hit
+    /// rate.
+    #[cfg(test)]
+    fn access_byte_aware(&mut self, key: u64, bytes: u64) -> WeightPolicyAccess {
+        if self.bytes_by_key.contains_key(&key) {
+            self.record_hit(key);
+            return WeightPolicyAccess {
+                hit: true,
+                admitted: false,
+                evicted: Vec::new(),
+            };
+        }
+        if !self.can_fit(bytes) {
+            // Room can only be made from residents strictly smaller than the
+            // incoming page; equal/larger peers are never displaced.
+            let reclaimable: u64 = self
+                .bytes_by_key
+                .values()
+                .filter(|&&resident| resident < bytes)
+                .sum();
+            let free = self.budget.saturating_sub(self.resident_bytes);
+            if free.saturating_add(reclaimable) < bytes {
+                self.record_page_in();
+                return WeightPolicyAccess {
+                    hit: false,
+                    admitted: false,
+                    evicted: Vec::new(),
+                };
+            }
+        }
+        let mut evicted = Vec::new();
+        while !self.can_fit(bytes) {
+            let Some((&smallest_key, _)) = self
+                .bytes_by_key
+                .iter()
+                .filter(|&(_, &resident)| resident < bytes)
+                .min_by_key(|&(_, &resident)| resident)
+            else {
+                break;
+            };
+            self.remove_page(smallest_key);
+            evicted.push(smallest_key);
+        }
+        self.insert_page(key, bytes);
+        WeightPolicyAccess {
+            hit: false,
+            admitted: true,
+            evicted,
+        }
+    }
+
     fn can_fit(&self, incoming: u64) -> bool {
         self.resident_bytes.saturating_add(incoming) <= self.budget
     }
@@ -1055,6 +1235,7 @@ impl CudaWeightResidency {
         Self {
             runtime: Arc::clone(&runtime),
             scan_resistant_dense: false,
+            byte_aware: false,
             physical: OnceLock::new(),
             staging_pool: PinnedStagingPool::new(Arc::clone(&runtime)),
             inner: Mutex::new(ResidencyInner {
@@ -1105,6 +1286,7 @@ impl CudaWeightResidency {
         Ok(Self {
             runtime: Arc::clone(&runtime),
             scan_resistant_dense: false,
+            byte_aware: false,
             physical: OnceLock::new(),
             staging_pool: PinnedStagingPool::new(Arc::clone(&runtime)),
             inner: Mutex::new(ResidencyInner {
@@ -1224,6 +1406,14 @@ impl CudaWeightResidency {
     /// Select whether dense per-layer weights use scan-resistant residency.
     pub fn with_scan_resistant_dense(mut self, scan_resistant_dense: bool) -> Self {
         self.scan_resistant_dense = scan_resistant_dense;
+        self
+    }
+
+    /// Select byte-aware admission (#837 item 3). Only refines the
+    /// `StableResident` bypass decision, so it has no effect unless
+    /// scan-resistant dense residency is also on.
+    pub fn with_byte_aware_residency(mut self, byte_aware: bool) -> Self {
+        self.byte_aware = byte_aware;
         self
     }
 
@@ -1533,7 +1723,7 @@ impl CudaWeightResidency {
             shape,
         });
         if bypass {
-            inner.record_bypassed_page_in();
+            inner.record_bypassed_page_in(len as u64);
         } else {
             inner.insert_page(key, Arc::clone(&page), len as u64);
         }
@@ -1630,7 +1820,27 @@ impl CudaWeightResidency {
                     }
                 }
             } else if eviction == WeightEvictionPolicy::StableResident {
-                bypass = true;
+                // Size-blind `StableResident` always bypasses here: once the
+                // budget is full every distinct tensor streams transiently,
+                // which biases residency toward small first-fit tensors and
+                // streams the large projections every step (#837 item 3).
+                //
+                // Byte-aware admission instead retains the incoming page (falls
+                // through to evict the *smallest* resident below) whenever it is
+                // strictly larger than the smallest evictable resident, so the
+                // resident set converges to the top-`B`-bytes tensors. A page no
+                // larger than the smallest resident still bypasses, so a small
+                // tensor never displaces a large one to become resident.
+                //
+                // NOTE (#837 item 3): `self.byte_aware` is EXPERIMENTAL and
+                // measured UNSAFE — when this branch actually engages it
+                // corrupts decode output (token-identity failure). It is
+                // default-OFF and never set on the shipped path; see
+                // `WEIGHT_OFFLOAD_BYTE_AWARE_ENV` for the measured evidence.
+                bypass = !(self.byte_aware
+                    && inner
+                        .smallest_evictable()
+                        .is_some_and(|(_, smallest)| (len as u64) > smallest));
             }
 
             if evictions >= max_evictions {
@@ -1647,7 +1857,16 @@ impl CudaWeightResidency {
                 .map_or(0, |stats| stats.snapshot().total_owned_bytes);
             let before_required_owned = required_owned;
             let before_required_mapped = required_mapped;
-            let Some(evicted_key) = inner.next_evictable_key(eviction) else {
+            // Byte-aware admission evicts the smallest evictable resident so a
+            // large incoming tensor displaces cheap smalls rather than another
+            // large tensor; size-blind residency evicts in LRU order (#837
+            // item 3).
+            let evicted_key = if self.byte_aware {
+                inner.smallest_evictable().map(|(key, _)| key)
+            } else {
+                inner.next_evictable_key(eviction)
+            };
+            let Some(evicted_key) = evicted_key else {
                 return Err(WeightHandleError::DeviceBinding(format!(
                     "weight residency requires {required_mapped} incremental mapped bytes with \
                      {zone_available} bytes of weight-zone headroom and {required_owned} \
@@ -1770,7 +1989,7 @@ impl CudaWeightResidency {
             return Ok(existing);
         }
         if eviction == WeightEvictionPolicy::StableResident && !inner.policy.can_fit(bytes) {
-            inner.record_bypassed_page_in();
+            inner.record_bypassed_page_in(bytes);
             return Ok(page);
         }
         inner.evict_to_fit(bytes, eviction);
@@ -1980,10 +2199,11 @@ impl ResidencyInner {
 
     /// Count a miss whose freshly paged-in allocation is returned directly to
     /// the caller instead of becoming part of the resident set.
-    fn record_bypassed_page_in(&mut self) {
+    fn record_bypassed_page_in(&mut self, bytes: u64) {
         self.policy.record_page_in();
         GLOBAL_PAGE_INS.fetch_add(1, Ordering::Relaxed);
         GLOBAL_BYPASSED_PAGE_INS.fetch_add(1, Ordering::Relaxed);
+        GLOBAL_BYPASSED_PAGE_IN_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
     fn next_evictable_key(&self, eviction: WeightEvictionPolicy) -> Option<u64> {
@@ -1994,6 +2214,28 @@ impl ResidencyInner {
                     .is_some_and(|page| Arc::strong_count(page) == 1)
             })
             .map(|index| self.policy.order[index])
+    }
+
+    /// Smallest evictable resident page as `(key, bytes)`, or `None` when no
+    /// page is evictable.
+    ///
+    /// "Evictable" is the same predicate [`Self::next_evictable_key`] uses: the
+    /// cache must be the page's sole owner (`Arc::strong_count == 1`), so a page
+    /// still read by an in-flight kernel is never a candidate. Byte-aware
+    /// admission uses this to displace only the cheapest resident, protecting
+    /// the large tensors that dominate streaming cost (#837 item 3).
+    fn smallest_evictable(&self) -> Option<(u64, u64)> {
+        let mut best: Option<(u64, u64)> = None;
+        for (&key, &bytes) in &self.policy.bytes_by_key {
+            let evictable = self
+                .pages
+                .get(&key)
+                .is_some_and(|page| Arc::strong_count(page) == 1);
+            if evictable && best.is_none_or(|(_, best_bytes)| bytes < best_bytes) {
+                best = Some((key, bytes));
+            }
+        }
+        best
     }
 
     fn remove_page(&mut self, key: u64) {
@@ -2115,6 +2357,23 @@ mod tests {
     }
 
     #[test]
+    fn bypassed_byte_share_attributes_streamed_bytes() {
+        // No bytes streamed -> no attribution, never a divide-by-zero.
+        assert_eq!(GlobalOffloadStats::default().bypassed_byte_share(), None);
+        // Bypass bytes are a subset of htod_bytes: 3 MiB of a 12 MiB stream.
+        let stats = GlobalOffloadStats {
+            htod_bytes: 12 * 1024 * 1024,
+            bypassed_page_in_bytes: 3 * 1024 * 1024,
+            ..GlobalOffloadStats::default()
+        };
+        let share = stats.bypassed_byte_share().expect("bytes were streamed");
+        assert!(
+            (share - 0.25).abs() < 1e-9,
+            "one quarter of stream: {share}"
+        );
+    }
+
+    #[test]
     fn scan_resistant_env_defaults_on_with_lru_opt_out() {
         assert!(scan_resistant_from_env_value(None));
         assert!(scan_resistant_from_env_value(Some("1")));
@@ -2127,6 +2386,22 @@ mod tests {
         assert!(!scan_resistant_from_env_value(Some("  off ")));
         assert!(scan_resistant_from_env_value(Some("")));
         assert!(scan_resistant_from_env_value(Some("maybe")));
+    }
+
+    #[test]
+    fn byte_aware_env_defaults_off_and_opts_in() {
+        // Opt-in: unset and every non-truthy value stay OFF, so the shipped path
+        // is byte-identical unless the operator explicitly enables the A/B knob.
+        assert!(!byte_aware_from_env_value(None));
+        assert!(!byte_aware_from_env_value(Some("0")));
+        assert!(!byte_aware_from_env_value(Some("false")));
+        assert!(!byte_aware_from_env_value(Some("")));
+        assert!(!byte_aware_from_env_value(Some("maybe")));
+        // Only the canonical truthy spellings enable it.
+        assert!(byte_aware_from_env_value(Some("1")));
+        assert!(byte_aware_from_env_value(Some("true")));
+        assert!(byte_aware_from_env_value(Some("YES")));
+        assert!(byte_aware_from_env_value(Some("  On ")));
     }
 
     #[test]
@@ -2617,6 +2892,125 @@ mod tests {
                 "stable-subset residency should recover B/W for B={capacity}/{WORKING_SET}"
             );
         }
+    }
+
+    /// The core #837 item-3 claim, modelled on CPU: when small tensors are
+    /// touched *before* the large ones each cycle, size-blind `StableResident`
+    /// lets the smalls win the first-fit race and crowds the large projections
+    /// out of the budget, streaming them every step. Byte-aware admission
+    /// evicts those smalls to seat the large tensors, so its **byte-weighted**
+    /// hit rate is materially higher and it streams strictly fewer bytes.
+    ///
+    /// This exercises the admission *decision function* in isolation — an
+    /// abstract residency model with no CUDA-graph capture, no physical granule
+    /// churn, and no in-flight-read lifecycle. It confirms the size-greedy rule
+    /// does what it claims *on paper*. It does **not** validate the real GPU
+    /// path: the on-device A/B (see `WEIGHT_OFFLOAD_BYTE_AWARE_ENV`) shows the
+    /// same rule corrupts decode output when it actually engages, which is why
+    /// the knob is default-OFF and unshipped. Keep both facts together.
+    #[test]
+    fn byte_aware_beats_stable_subset_when_smalls_crowd_out_larges() {
+        // Six 1-byte "norms/biases" touched first, then two 10-byte
+        // "projections". W = 26 bytes; budget seats both projections (20) plus
+        // two norms with room to spare, but only if the norms do not squat it.
+        let order: [(u64, u64); 8] = [
+            (0, 1),
+            (1, 1),
+            (2, 1),
+            (3, 1),
+            (4, 1),
+            (5, 1),
+            (6, 10),
+            (7, 10),
+        ];
+        const BUDGET: u64 = 22;
+        const WARMUP: u64 = 4;
+        const MEASURED: u64 = 6;
+
+        let byte_hits = |byte_aware: bool| -> (u64, u64) {
+            let mut policy = WeightResidencyPolicy::new(BUDGET);
+            let mut hit_bytes = 0u64;
+            let mut streamed_bytes = 0u64;
+            for cycle in 0..(WARMUP + MEASURED) {
+                let measuring = cycle >= WARMUP;
+                for (key, bytes) in order {
+                    let access = if byte_aware {
+                        policy.access_byte_aware(key, bytes)
+                    } else {
+                        policy.access(key, bytes, WeightEvictionPolicy::StableResident)
+                    };
+                    if measuring {
+                        if access.hit {
+                            hit_bytes += bytes;
+                        } else {
+                            streamed_bytes += bytes;
+                        }
+                    }
+                }
+            }
+            (hit_bytes, streamed_bytes)
+        };
+
+        let (blind_hit, blind_stream) = byte_hits(false);
+        let (aware_hit, aware_stream) = byte_hits(true);
+        let blind_rate = blind_hit as f64 / (blind_hit + blind_stream) as f64;
+        let aware_rate = aware_hit as f64 / (aware_hit + aware_stream) as f64;
+
+        assert!(
+            aware_rate > blind_rate + 0.15,
+            "byte-aware residency must materially raise the byte-weighted hit rate when \
+             smalls crowd out larges: blind={blind_rate:.3} aware={aware_rate:.3}"
+        );
+        // The point is a smaller `htod_bytes`, not just a nicer count-based report.
+        assert!(
+            aware_stream < blind_stream,
+            "byte-aware residency must stream fewer bytes: \
+             blind={blind_stream} aware={aware_stream}"
+        );
+    }
+
+    /// The honest limit of the policy, also locked in: when the *large* tensors
+    /// alone exceed the budget, no admission order can hold them all, so
+    /// byte-aware must not thrash the large set against itself (strictly-smaller
+    /// eviction) and must not regress below size-blind `StableResident`. This is
+    /// the case that a naive "evict the smallest to admit any larger page" rule
+    /// gets wrong, and the reason the policy refuses to displace equal/larger
+    /// peers (#837 item 3).
+    #[test]
+    fn byte_aware_does_not_thrash_when_larges_exceed_budget() {
+        // Five 10-byte projections (50 bytes) against a 22-byte budget: at most
+        // two can ever be resident, and a clean cyclic scan of five is pessimal
+        // for any evict-to-admit rule.
+        let order: [(u64, u64); 5] = [(0, 10), (1, 10), (2, 10), (3, 10), (4, 10)];
+        const BUDGET: u64 = 22;
+        const WARMUP: u64 = 4;
+        const MEASURED: u64 = 6;
+
+        let steady_stream = |byte_aware: bool| -> u64 {
+            let mut policy = WeightResidencyPolicy::new(BUDGET);
+            let mut streamed = 0u64;
+            for cycle in 0..(WARMUP + MEASURED) {
+                for (key, bytes) in order {
+                    let access = if byte_aware {
+                        policy.access_byte_aware(key, bytes)
+                    } else {
+                        policy.access(key, bytes, WeightEvictionPolicy::StableResident)
+                    };
+                    if cycle >= WARMUP && !access.hit {
+                        streamed += bytes;
+                    }
+                }
+            }
+            streamed
+        };
+
+        assert!(
+            steady_stream(true) <= steady_stream(false),
+            "byte-aware must not stream more than size-blind when larges exceed budget: \
+             aware={} blind={}",
+            steady_stream(true),
+            steady_stream(false)
+        );
     }
 
     #[test]
