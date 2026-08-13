@@ -97,3 +97,17 @@ bound fraction ≈ **3–4%**; int2-everywhere (−45% bytes) projects ≈+1.6%.
 on the ~2568-node serial chain (~8.2 µs/node)**, not bandwidth-bound. Ceiling VALUE (~47) and
 "marginal fusion isn't a lever" still stand; only the WHY changes. **Megakernel / drastic per-layer
 node-collapse REOPENED as the true next lever.** Brief: `docs/research/lowbit-quant-feasibility.md`.
+
+## 2026-08-13 — Dense-decode megakernel: multi-CTA GEMV megakernel MEASURED 🟥 NO-GO (#898)
+Built the persistent multi-CTA cooperative one-layer megakernel (MLP triple-GEMV, 1056 co-resident
+CTAs = 8/SM × 132 SMs, grid.sync seams, L2-resident scratch, production int4 GEMV math) and measured
+vs identical-math per-op baseline (H200, median 200 iters × 3). **Per-op 0.656 → megakernel
+0.676–0.680 ms/layer-MLP = −3.2% recovered (~3% SLOWER), byte-exact 0-ulp; grid.sync = 2.23
+µs/barrier.** Projected whole-model gain ≈ 0% (stays ~47 tok/s). **This CLOSES the megakernel lever
+the #885 correction reopened** — mechanism: (1) CUDA-graph replay already banks the per-launch
+overhead, (2) multi-CTA must PAY a grid.sync tax that cancels savings, (3) GEMVs are genuine
+full-device weight reads already fanned across 132 SMs. **Redirect: the only remaining
+recoverable-overhead lever is graph-side glue node-collapse (Batty, `optimizer.rs`);** my role is
+the already-landed fused epilogues (#867, #854) that enable node deletion. Merged PR #898
+(main @ 0790849c). Staged arc (superseded): Phase A/B feasibility GO → P1.5 (single-CTA 926× slower,
+grid.sync capturable) → P2 multi-CTA NO-GO. Doc: `docs/research/dense-decode-megakernel-feasibility.md` §7.
