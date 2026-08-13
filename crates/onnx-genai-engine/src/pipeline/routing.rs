@@ -616,9 +616,9 @@ impl PipelineEngine {
         Ok(())
     }
 
-    /// Bind an empty tensor for any `every_step` component input that has no
-    /// value available in the shared pool but whose declared shape has a dynamic
-    /// axis (so an empty tensor is shape-valid).
+    /// Bind an empty tensor for any `every_step` component input whose declared
+    /// producer did not run, when its declared shape has a dynamic axis (so an
+    /// empty tensor is shape-valid).
     ///
     /// This is the multimodal image-features contract when no image is present:
     /// an embeds-driven decoder's embedder consumes both `input_ids` (seeded per
@@ -626,8 +626,17 @@ impl PipelineEngine {
     /// never runs, so its `image_features` output is absent. The embedder still
     /// requires the graph input to be bound, so an empty `[0, hidden]` tensor is
     /// seeded once — exactly the empty image feed the `muse_decode` harness sends
-    /// every step. Inputs that are routed from an active producer, already
-    /// present, or have a fully-static shape are left untouched.
+    /// every step.
+    ///
+    /// Seeding is deliberately limited to inputs the pipeline **declares a
+    /// producer for** via a `dataflow` edge. An input with no declared producer
+    /// is a plain required graph input: substituting an empty tensor for it
+    /// would silently run the model on nothing instead of reporting the missing
+    /// binding, which is exactly what
+    /// `undeclared_required_audio_input_never_receives_a_fallback` forbids. Such
+    /// inputs are left untouched so `missing_input_error` names them at run.
+    /// Inputs that are routed from an active producer, already present, or have
+    /// a fully-static shape are also left untouched.
     pub(crate) fn seed_absent_step_component_inputs(
         &self,
         step_components: &[String],
@@ -660,6 +669,17 @@ impl PipelineEngine {
                 }
                 let endpoint = format!("{component}.{name}");
                 if tensors.contains_key(&endpoint) {
+                    continue;
+                }
+                // Only an input the pipeline declares a producer for may be
+                // emptied when that producer is absent. Without this the empty
+                // seed becomes a silent fallback for every dynamically-shaped
+                // required input.
+                let has_declared_producer =
+                    self.plan.dataflow().iter().any(|edge| {
+                        edge.to == endpoint && endpoint_component(&edge.from).is_some()
+                    });
+                if !has_declared_producer {
                     continue;
                 }
                 let routed = self.plan.dataflow().iter().any(|edge| {
