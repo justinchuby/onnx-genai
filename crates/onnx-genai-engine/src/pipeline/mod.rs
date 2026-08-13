@@ -27,6 +27,7 @@ mod islands;
 mod workflow;
 
 pub use islands::ExecutionIslandDiagnostic;
+pub use workflow::WorkflowPerformanceDiagnostic;
 
 pub type PipelineTensors = HashMap<String, Value>;
 
@@ -93,6 +94,7 @@ pub struct PipelineEngine {
     workflow: WorkflowSpec,
     compiled_workflow: CompiledWorkflow,
     execution_islands: Vec<islands::ExecutionIsland>,
+    workflow_performance: RefCell<workflow::WorkflowPerformanceCounters>,
     workflow_session_state: RefCell<HashMap<(String, String), Value>>,
     preprocessing: Option<PreprocessingSpec>,
 }
@@ -265,6 +267,7 @@ impl PipelineEngine {
             workflow,
             compiled_workflow,
             execution_islands,
+            workflow_performance: RefCell::new(workflow::WorkflowPerformanceCounters::default()),
             workflow_session_state: RefCell::new(HashMap::new()),
             preprocessing: directory.preprocessing,
         })

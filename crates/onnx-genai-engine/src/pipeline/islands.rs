@@ -1,6 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
+use std::time::Instant;
 
 use anyhow::{Context, bail};
 use onnx_genai_metadata::{ComponentImplementation, WorkflowComponent, WorkflowNode, WorkflowSpec};
@@ -19,9 +20,30 @@ pub struct ExecutionIslandDiagnostic {
     pub components: Vec<String>,
     pub device: String,
     pub capture_eligible: bool,
+    pub linked_node_count: usize,
+    pub component_boundaries_elided: usize,
     pub runs: u64,
+    pub session_runs: u64,
+    pub eager_runs: u64,
+    pub stable_binding_runs: u64,
     pub captures: u64,
     pub replays: u64,
+    pub device_synchronizations: u64,
+    pub host_to_host_copies: u64,
+    pub host_to_device_copies: u64,
+    pub device_to_host_copies: u64,
+    pub device_to_device_copies: u64,
+    pub host_to_host_bytes: u64,
+    pub host_to_device_bytes: u64,
+    pub device_to_host_bytes: u64,
+    pub device_to_device_bytes: u64,
+    pub stable_binding_bytes: u64,
+    pub external_initializer_bytes: u64,
+    pub device_memory_total_bytes: Option<u64>,
+    pub device_memory_baseline_free_bytes: Option<u64>,
+    pub device_memory_min_free_bytes: Option<u64>,
+    pub observed_device_memory_high_watermark_bytes: Option<u64>,
+    pub total_run_ns: u128,
     pub fallback_reason: Option<String>,
 }
 
@@ -43,10 +65,29 @@ pub(crate) struct ExecutionIsland {
     device: String,
     bindings: RefCell<HashMap<Vec<(String, Vec<i64>)>, StableIslandBinding>>,
     device_allocator: Option<Allocator>,
+    linked_node_count: usize,
+    external_initializer_bytes: u64,
     next_graph_id: Cell<i32>,
     runs: Cell<u64>,
+    session_runs: Cell<u64>,
+    eager_runs: Cell<u64>,
+    stable_binding_runs: Cell<u64>,
     captures: Cell<u64>,
     replays: Cell<u64>,
+    device_synchronizations: Cell<u64>,
+    host_to_host_copies: Cell<u64>,
+    host_to_device_copies: Cell<u64>,
+    device_to_host_copies: Cell<u64>,
+    device_to_device_copies: Cell<u64>,
+    host_to_host_bytes: Cell<u64>,
+    host_to_device_bytes: Cell<u64>,
+    device_to_host_bytes: Cell<u64>,
+    device_to_device_bytes: Cell<u64>,
+    stable_binding_bytes: Cell<u64>,
+    device_memory_total_bytes: Cell<Option<u64>>,
+    device_memory_baseline_free_bytes: Cell<Option<u64>>,
+    device_memory_min_free_bytes: Cell<Option<u64>>,
+    total_run_ns: Cell<u128>,
     fallback_reason: RefCell<Option<String>>,
 }
 
@@ -59,15 +100,44 @@ struct StableIslandBinding {
 }
 
 impl ExecutionIsland {
+    pub(crate) fn component_count(&self) -> usize {
+        self.components.len()
+    }
+
     fn diagnostic(&self) -> ExecutionIslandDiagnostic {
         ExecutionIslandDiagnostic {
             id: self.id,
             components: self.components.clone(),
             device: self.device.clone(),
             capture_eligible: self.capture_eligible,
+            linked_node_count: self.linked_node_count,
+            component_boundaries_elided: self.components.len().saturating_sub(1),
             runs: self.runs.get(),
+            session_runs: self.session_runs.get(),
+            eager_runs: self.eager_runs.get(),
+            stable_binding_runs: self.stable_binding_runs.get(),
             captures: self.captures.get(),
             replays: self.replays.get(),
+            device_synchronizations: self.device_synchronizations.get(),
+            host_to_host_copies: self.host_to_host_copies.get(),
+            host_to_device_copies: self.host_to_device_copies.get(),
+            device_to_host_copies: self.device_to_host_copies.get(),
+            device_to_device_copies: self.device_to_device_copies.get(),
+            host_to_host_bytes: self.host_to_host_bytes.get(),
+            host_to_device_bytes: self.host_to_device_bytes.get(),
+            device_to_host_bytes: self.device_to_host_bytes.get(),
+            device_to_device_bytes: self.device_to_device_bytes.get(),
+            stable_binding_bytes: self.stable_binding_bytes.get(),
+            external_initializer_bytes: self.external_initializer_bytes,
+            device_memory_total_bytes: self.device_memory_total_bytes.get(),
+            device_memory_baseline_free_bytes: self.device_memory_baseline_free_bytes.get(),
+            device_memory_min_free_bytes: self.device_memory_min_free_bytes.get(),
+            observed_device_memory_high_watermark_bytes: self
+                .device_memory_baseline_free_bytes
+                .get()
+                .zip(self.device_memory_min_free_bytes.get())
+                .map(|(baseline, minimum)| baseline.saturating_sub(minimum)),
+            total_run_ns: self.total_run_ns.get(),
             fallback_reason: self.fallback_reason.borrow().clone(),
         }
     }
@@ -77,6 +147,8 @@ impl ExecutionIsland {
         values: &mut PipelineTensors,
         component_overrides: &HashMap<String, String>,
     ) -> anyhow::Result<()> {
+        let started = Instant::now();
+        self.record_device_memory();
         if self
             .components
             .iter()
@@ -112,7 +184,10 @@ impl ExecutionIsland {
 
         let mut bindings = self.bindings.borrow_mut();
         if let Some(stable) = bindings.get_mut(&signature) {
+            self.stable_binding_runs
+                .set(self.stable_binding_runs.get() + 1);
             for ((_, source), (_, destination)) in resolved.iter().zip(&stable.inputs) {
+                self.record_copy(source, destination)?;
                 if let Some(device_id) = self.session.cuda_device_id() {
                     destination.copy_from_cuda(source, device_id)?;
                 } else {
@@ -124,10 +199,13 @@ impl ExecutionIsland {
                 && self.session.graph_capture()
                 && !self.capture_disabled.get();
             let result = if capture_enabled {
+                self.record_device_synchronization();
                 self.session.synchronize_device()?;
+                self.session_runs.set(self.session_runs.get() + 1);
                 self.session
                     .run_with_binding_graph(&stable.binding, stable.graph_id)
             } else {
+                self.session_runs.set(self.session_runs.get() + 1);
                 self.session.run_with_binding(&stable.binding)
             };
             if let Err(error) = result {
@@ -135,8 +213,11 @@ impl ExecutionIsland {
                     "stable island binding/capture failed; executing eagerly: {error}"
                 ));
                 self.capture_disabled.set(true);
+                self.eager_runs.set(self.eager_runs.get() + 1);
+                self.session_runs.set(self.session_runs.get() + 1);
                 let produced = self.session.run(&resolved)?;
                 self.store_outputs(values, produced)?;
+                self.record_elapsed(started);
                 return Ok(());
             }
             if capture_enabled {
@@ -150,12 +231,17 @@ impl ExecutionIsland {
             for (port, output) in &stable.outputs {
                 let value_ref = &self.outputs[port];
                 let output = if let Some(device_id) = self.session.cuda_device_id() {
-                    output.to_host_from_cuda(device_id)?
+                    let host = Value::empty(output.shape(), output.dtype())?;
+                    self.record_copy(output, &host)?;
+                    host.copy_from_cuda(output, device_id)?;
+                    host
                 } else {
+                    self.record_host_copy(output);
                     clone_value(output)?
                 };
                 values.insert(value_ref.clone(), output);
             }
+            self.record_elapsed(started);
             return Ok(());
         }
 
@@ -178,6 +264,7 @@ impl ExecutionIsland {
             let mut stable_inputs = Vec::new();
             for (name, source) in &resolved {
                 let stable = Value::empty_in(source.shape(), source.dtype(), allocator)?;
+                self.record_copy(source, &stable)?;
                 stable.copy_from_cuda(source, device_id)?;
                 binding.bind_input(name, &stable)?;
                 stable_inputs.push(((*name).to_string(), stable));
@@ -193,7 +280,10 @@ impl ExecutionIsland {
                     );
                 }
             }
+            self.record_device_synchronization();
             self.session.synchronize_device()?;
+            self.eager_runs.set(self.eager_runs.get() + 1);
+            self.session_runs.set(self.session_runs.get() + 1);
             self.session.run_with_binding(&binding)?;
             let produced = binding.output_values()?;
             binding.clear()?;
@@ -209,8 +299,12 @@ impl ExecutionIsland {
             self.next_graph_id.set(graph_id + 1);
             for (port, output) in &stable_outputs {
                 let value_ref = &self.outputs[port];
-                values.insert(value_ref.clone(), output.to_host_from_cuda(device_id)?);
+                let host = Value::empty(output.shape(), output.dtype())?;
+                self.record_copy(output, &host)?;
+                host.copy_from_cuda(output, device_id)?;
+                values.insert(value_ref.clone(), host);
             }
+            self.record_stable_binding_bytes(&stable_inputs, &stable_outputs);
             bindings.insert(
                 signature,
                 StableIslandBinding {
@@ -221,26 +315,32 @@ impl ExecutionIsland {
                     graph_id,
                 },
             );
+            self.record_elapsed(started);
             return Ok(());
         }
 
+        self.eager_runs.set(self.eager_runs.get() + 1);
+        self.session_runs.set(self.session_runs.get() + 1);
         let produced = self.session.run(&resolved)?;
         let mut binding = IoBinding::new(&self.session)?;
         let mut stable_inputs = Vec::new();
         for (name, source) in &resolved {
             let stable =
                 Value::from_raw_bytes(source.to_raw_bytes()?, source.shape(), source.dtype())?;
+            self.record_host_copy(source);
             binding.bind_input(name, &stable)?;
             stable_inputs.push(((*name).to_string(), stable));
         }
         let mut stable_outputs = Vec::new();
         for (name, output) in self.session.output_names().iter().zip(&produced) {
             let stable = Value::empty(output.shape(), output.dtype())?;
+            self.record_host_copy(output);
             binding.bind_output(name, &stable)?;
             stable_outputs.push((name.clone(), stable));
         }
         let graph_id = self.next_graph_id.get();
         self.next_graph_id.set(graph_id + 1);
+        self.record_stable_binding_bytes(&stable_inputs, &stable_outputs);
         bindings.insert(
             signature,
             StableIslandBinding {
@@ -251,7 +351,94 @@ impl ExecutionIsland {
                 graph_id,
             },
         );
-        self.store_outputs(values, produced)
+        self.store_outputs(values, produced)?;
+        self.record_elapsed(started);
+        Ok(())
+    }
+
+    fn record_elapsed(&self, started: Instant) {
+        self.record_device_memory();
+        self.total_run_ns
+            .set(self.total_run_ns.get() + started.elapsed().as_nanos());
+    }
+
+    fn record_device_memory(&self) {
+        #[cfg(not(any(feature = "cuda", feature = "ort-cuda")))]
+        return;
+
+        #[cfg(any(feature = "cuda", feature = "ort-cuda"))]
+        {
+            let Some(device_id) = self.session.cuda_device_id() else {
+                return;
+            };
+            let Ok(memory) = onnx_genai_ort::cuda_rt::device_memory_info(device_id) else {
+                return;
+            };
+            let free = memory.free_bytes as u64;
+            self.device_memory_total_bytes
+                .set(Some(memory.total_bytes as u64));
+            if self.device_memory_baseline_free_bytes.get().is_none() {
+                self.device_memory_baseline_free_bytes.set(Some(free));
+            }
+            self.device_memory_min_free_bytes.set(Some(
+                self.device_memory_min_free_bytes
+                    .get()
+                    .map_or(free, |minimum| minimum.min(free)),
+            ));
+        }
+    }
+
+    fn record_device_synchronization(&self) {
+        self.device_synchronizations
+            .set(self.device_synchronizations.get() + 1);
+    }
+
+    fn record_host_copy(&self, value: &Value) {
+        self.host_to_host_copies
+            .set(self.host_to_host_copies.get() + 1);
+        self.host_to_host_bytes
+            .set(self.host_to_host_bytes.get() + (value.numel() * value.dtype().size_of()) as u64);
+    }
+
+    fn record_copy(&self, source: &Value, destination: &Value) -> anyhow::Result<()> {
+        let bytes = (source.numel() * source.dtype().size_of()) as u64;
+        match (source.is_host_resident()?, destination.is_host_resident()?) {
+            (true, true) => {
+                self.host_to_host_copies
+                    .set(self.host_to_host_copies.get() + 1);
+                self.host_to_host_bytes
+                    .set(self.host_to_host_bytes.get() + bytes);
+            }
+            (true, false) => {
+                self.host_to_device_copies
+                    .set(self.host_to_device_copies.get() + 1);
+                self.host_to_device_bytes
+                    .set(self.host_to_device_bytes.get() + bytes);
+            }
+            (false, true) => {
+                self.device_to_host_copies
+                    .set(self.device_to_host_copies.get() + 1);
+                self.device_to_host_bytes
+                    .set(self.device_to_host_bytes.get() + bytes);
+            }
+            (false, false) => {
+                self.device_to_device_copies
+                    .set(self.device_to_device_copies.get() + 1);
+                self.device_to_device_bytes
+                    .set(self.device_to_device_bytes.get() + bytes);
+            }
+        }
+        Ok(())
+    }
+
+    fn record_stable_binding_bytes(&self, inputs: &[(String, Value)], outputs: &[(String, Value)]) {
+        let bytes = inputs
+            .iter()
+            .chain(outputs)
+            .map(|(_, value)| value.numel() * value.dtype().size_of())
+            .sum::<usize>() as u64;
+        self.stable_binding_bytes
+            .set(self.stable_binding_bytes.get() + bytes);
     }
 
     fn store_outputs(
@@ -525,10 +712,10 @@ fn build_execution_island(
         .cloned()
         .collect::<HashSet<_>>();
     let linked = link_models(id, &invocations, models, &boundary_outputs)?;
-    let mut options = models.session_options();
+    let options = models.session_options();
+    let capture_requested = options.graph_capture;
     let structurally_capture_eligible =
-        device.starts_with("cuda:") && linked.capture_declines.is_empty();
-    options.graph_capture = structurally_capture_eligible;
+        device.starts_with("cuda:") && capture_requested && linked.capture_declines.is_empty();
     let session = Session::from_model_bytes_with_external_files(
         models.environment(),
         format!("workflow-island-{id}"),
@@ -542,6 +729,11 @@ fn build_execution_island(
         None
     };
     let capture_eligible = structurally_capture_eligible && device_allocator.is_some();
+    let external_initializer_bytes = linked
+        .external_files
+        .iter()
+        .map(|(_, bytes)| bytes.len() as u64)
+        .sum();
     let components = invocations
         .iter()
         .map(|invoke| invoke.component.clone())
@@ -558,14 +750,35 @@ fn build_execution_island(
         device: device.to_string(),
         bindings: RefCell::new(HashMap::new()),
         device_allocator,
+        linked_node_count: linked.node_count,
+        external_initializer_bytes,
         next_graph_id: Cell::new((id as i32).saturating_mul(1000)),
         runs: Cell::new(0),
+        session_runs: Cell::new(0),
+        eager_runs: Cell::new(0),
+        stable_binding_runs: Cell::new(0),
         captures: Cell::new(0),
         replays: Cell::new(0),
+        device_synchronizations: Cell::new(0),
+        host_to_host_copies: Cell::new(0),
+        host_to_device_copies: Cell::new(0),
+        device_to_host_copies: Cell::new(0),
+        device_to_device_copies: Cell::new(0),
+        host_to_host_bytes: Cell::new(0),
+        host_to_device_bytes: Cell::new(0),
+        device_to_host_bytes: Cell::new(0),
+        device_to_device_bytes: Cell::new(0),
+        stable_binding_bytes: Cell::new(0),
+        device_memory_total_bytes: Cell::new(None),
+        device_memory_baseline_free_bytes: Cell::new(None),
+        device_memory_min_free_bytes: Cell::new(None),
+        total_run_ns: Cell::new(0),
         fallback_reason: RefCell::new(if !device.starts_with("cuda:") {
             Some("island is not placed on CUDA".to_string())
         } else if !linked.capture_declines.is_empty() {
             Some(linked.capture_declines.join("; "))
+        } else if !capture_requested {
+            Some("CUDA graph capture is disabled by session options".to_string())
         } else if !capture_eligible {
             Some("CUDA execution-island device allocator is unavailable".to_string())
         } else {
@@ -580,6 +793,7 @@ struct LinkedModel {
     outputs: BTreeMap<String, String>,
     capture_declines: Vec<String>,
     external_files: Vec<(String, Vec<u8>)>,
+    node_count: usize,
 }
 
 fn link_models(
@@ -624,8 +838,22 @@ fn link_models(
         }
         model.ir_version = model.ir_version.max(source.ir_version);
         for import in source.opset_import.drain(..) {
-            let version = opsets.entry(import.domain).or_default();
-            *version = (*version).max(import.version);
+            // A node serialized against an older schema is not automatically valid under a newer
+            // import (for example ReduceSum moved `axes` from an attribute to an input at opset
+            // 13). Linking therefore requires conversion, not merely taking the maximum version.
+            if let Some(version) = opsets.get(&import.domain)
+                && *version != import.version
+            {
+                bail!(
+                    "component '{}' imports opset domain '{}' at version {}, but the island \
+                     already uses version {}; convert artifacts to one opset before fusion",
+                    invocation.component,
+                    import.domain,
+                    import.version,
+                    version
+                );
+            }
+            opsets.insert(import.domain, import.version);
         }
         let mut source_graph = source
             .graph
@@ -757,7 +985,6 @@ fn link_models(
                 }
             }
         }
-        let mut boundary_nodes = Vec::new();
         for (port, value_ref) in &invocation.outputs {
             let internal = names.get(port).with_context(|| {
                 format!(
@@ -778,24 +1005,14 @@ fn link_models(
                             invocation.component
                         )
                     })?;
-                let boundary_name =
-                    format!("out__{}_{}", fused_outputs.len(), safe_name(value_ref));
-                // An Identity preserves the internal optimizer-visible value while
-                // giving the island boundary a stable, collision-free ABI name.
-                boundary_nodes.push(onnx_runtime_loader::proto::onnx::NodeProto {
-                    input: vec![internal.clone()],
-                    output: vec![boundary_name.clone()],
-                    name: format!("{prefix}boundary_{port}"),
-                    op_type: "Identity".to_string(),
-                    ..Default::default()
-                });
-                info.name = boundary_name.clone();
+                // Component-local values are already uniquely prefixed. Export the producer
+                // value directly so a logical component boundary adds no executable ONNX node.
+                info.name = internal.clone();
                 graph.output.push(info);
-                fused_outputs.insert(boundary_name, value_ref.clone());
+                fused_outputs.insert(internal.clone(), value_ref.clone());
             }
         }
         graph.node.extend(source_graph.node);
-        graph.node.extend(boundary_nodes);
         graph.initializer.extend(source_graph.initializer);
         graph.value_info.extend(source_graph.value_info);
     }
@@ -812,12 +1029,14 @@ fn link_models(
     if fused_outputs.is_empty() {
         bail!("execution island has no externally used outputs");
     }
+    let node_count = graph.node.len();
     Ok(LinkedModel {
         bytes: model.encode_to_vec(),
         inputs: fused_inputs,
         outputs: fused_outputs,
         capture_declines,
         external_files: external_files.into_iter().collect(),
+        node_count,
     })
 }
 

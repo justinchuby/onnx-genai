@@ -76,7 +76,10 @@ The first run resolves artifact-inferred dynamic extents and establishes stable 
 subsequent equal-shape run captures, then later runs replay. Unsupported graph features, allocator
 failure, shape changes, or provider capture errors fall back to ordinary island execution rather
 than changing workflow semantics. `PipelineEngine::execution_island_diagnostics()` reports each
-island's components, device, eligibility, run/capture/replay counts, and fallback reason.
+island's components, device, session/capture/replay counts, transfers, synchronizations, stable
+memory, observed CUDA memory high-watermark delta, and fallback reason. The benchmark methodology
+and acceptance bar are defined in
+[`WORKFLOW_PERFORMANCE_CONFORMANCE.md`](WORKFLOW_PERFORMANCE_CONFORMANCE.md).
 
 ## Versioned component contracts
 

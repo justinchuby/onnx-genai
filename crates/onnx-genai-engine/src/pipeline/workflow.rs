@@ -3,6 +3,43 @@
 use super::*;
 use crate::decode::clone_value;
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct WorkflowPerformanceDiagnostic {
+    pub runs: u64,
+    pub total_elapsed_ns: u128,
+    pub last_elapsed_ns: u128,
+    pub last_ttft_ns: Option<u128>,
+    pub last_loop_iterations: u64,
+    pub last_component_invocations: u64,
+    pub last_emit_events: u64,
+    pub last_emitted_elements: u64,
+    pub last_steps_per_second: f64,
+    pub last_elements_per_second: f64,
+    pub islands: Vec<ExecutionIslandDiagnostic>,
+}
+
+#[derive(Default)]
+pub(crate) struct WorkflowPerformanceCounters {
+    runs: u64,
+    total_elapsed_ns: u128,
+    last_elapsed_ns: u128,
+    last_ttft_ns: Option<u128>,
+    last_loop_iterations: u64,
+    last_component_invocations: u64,
+    last_emit_events: u64,
+    last_emitted_elements: u64,
+}
+
+#[derive(Default)]
+struct WorkflowRunTelemetry {
+    started: Option<std::time::Instant>,
+    first_emit_ns: Option<u128>,
+    loop_iterations: u64,
+    component_invocations: u64,
+    emit_events: u64,
+    emitted_elements: u64,
+}
+
 type WorkflowAdapterExecutor = fn(
     &PipelineEngine,
     &str,
@@ -222,10 +259,41 @@ fn resolve_component_invocation<'a>(
 }
 
 impl PipelineEngine {
+    pub fn workflow_performance_diagnostic(&self) -> WorkflowPerformanceDiagnostic {
+        let counters = self.workflow_performance.borrow();
+        let elapsed_seconds = counters.last_elapsed_ns as f64 / 1_000_000_000.0;
+        WorkflowPerformanceDiagnostic {
+            runs: counters.runs,
+            total_elapsed_ns: counters.total_elapsed_ns,
+            last_elapsed_ns: counters.last_elapsed_ns,
+            last_ttft_ns: counters.last_ttft_ns,
+            last_loop_iterations: counters.last_loop_iterations,
+            last_component_invocations: counters.last_component_invocations,
+            last_emit_events: counters.last_emit_events,
+            last_emitted_elements: counters.last_emitted_elements,
+            last_steps_per_second: if elapsed_seconds > 0.0 {
+                counters.last_loop_iterations as f64 / elapsed_seconds
+            } else {
+                0.0
+            },
+            last_elements_per_second: if elapsed_seconds > 0.0 {
+                counters.last_emitted_elements as f64 / elapsed_seconds
+            } else {
+                0.0
+            },
+            islands: self.execution_island_diagnostics(),
+        }
+    }
+
     pub(crate) fn run_workflow(
         &self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineTensors> {
+        let started = std::time::Instant::now();
+        let mut telemetry = WorkflowRunTelemetry {
+            started: Some(started),
+            ..WorkflowRunTelemetry::default()
+        };
         let PipelineGenerateRequest {
             request,
             inputs,
@@ -290,6 +358,7 @@ impl PipelineEngine {
             &mut emit_counts,
             &mut final_state_refs,
             &component_overrides,
+            &mut telemetry,
         )?;
         for output in workflow_emitted_outputs(&self.compiled_workflow.graph) {
             let Some(value) = values.get(&output) else {
@@ -324,6 +393,16 @@ impl PipelineEngine {
                 session_state.insert(key, value);
             }
         }
+        let elapsed_ns = started.elapsed().as_nanos();
+        let mut counters = self.workflow_performance.borrow_mut();
+        counters.runs += 1;
+        counters.total_elapsed_ns += elapsed_ns;
+        counters.last_elapsed_ns = elapsed_ns;
+        counters.last_ttft_ns = telemetry.first_emit_ns;
+        counters.last_loop_iterations = telemetry.loop_iterations;
+        counters.last_component_invocations = telemetry.component_invocations;
+        counters.last_emit_events = telemetry.emit_events;
+        counters.last_emitted_elements = telemetry.emitted_elements;
         Ok(values)
     }
     fn run_workflow_node(
@@ -336,6 +415,7 @@ impl PipelineEngine {
         emit_counts: &mut HashMap<String, usize>,
         final_state_refs: &mut HashMap<String, String>,
         component_overrides: &HashMap<String, String>,
+        telemetry: &mut WorkflowRunTelemetry,
     ) -> anyhow::Result<()> {
         match node {
             WorkflowNode::Sequence { nodes } => {
@@ -349,6 +429,7 @@ impl PipelineEngine {
                         emit_counts,
                         final_state_refs,
                         component_overrides,
+                        telemetry,
                     )?;
                 }
             }
@@ -358,6 +439,7 @@ impl PipelineEngine {
                 outputs,
                 ..
             } => {
+                telemetry.component_invocations += 1;
                 let declaration = workflow
                     .components
                     .get(component)
@@ -491,6 +573,7 @@ impl PipelineEngine {
                     emit_counts,
                     final_state_refs,
                     component_overrides,
+                    telemetry,
                 )?;
                 for carry in carried {
                     let state = workflow.state.get(&carry.cell).with_context(|| {
@@ -523,6 +606,7 @@ impl PipelineEngine {
                     );
                 }
                 for index in 0..limit {
+                    telemetry.loop_iterations += 1;
                     if let Some(iteration) = iteration {
                         values.insert(
                             iteration.value.clone(),
@@ -544,6 +628,7 @@ impl PipelineEngine {
                         emit_counts,
                         final_state_refs,
                         component_overrides,
+                        telemetry,
                     )?;
                     for carry in carried {
                         let current = values.get(&carry.current).with_context(|| {
@@ -596,6 +681,7 @@ impl PipelineEngine {
                     emit_counts,
                     &mut branch_state_refs,
                     component_overrides,
+                    telemetry,
                 )?;
 
                 // Emits are explicit side effects at the package boundary, so selected-branch
@@ -662,6 +748,13 @@ impl PipelineEngine {
                 } else {
                     clone_value(tensor)?
                 };
+                if telemetry.first_emit_ns.is_none() {
+                    telemetry.first_emit_ns = telemetry
+                        .started
+                        .map(|started| started.elapsed().as_nanos());
+                }
+                telemetry.emit_events += 1;
+                telemetry.emitted_elements += emitted.numel() as u64;
                 let validation_contract =
                     if valid_length.is_some() || matches!(mode, WorkflowEmitMode::Append) {
                         emit_chunk_contract(&output_contract.contract, &emitted)?
@@ -714,6 +807,7 @@ impl PipelineEngine {
                 let island = self.execution_islands.get(*id).with_context(|| {
                     format!("workflow references unknown execution island {id}")
                 })?;
+                telemetry.component_invocations += island.component_count() as u64;
                 island.run(values, component_overrides)?;
             }
         }
