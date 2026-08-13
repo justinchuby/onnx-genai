@@ -773,13 +773,9 @@ impl Backend {
         }
     }
 
-    /// The model author's declared generation defaults, when the loaded package
-    /// ships them.
+    /// Legacy hook retained while callers migrate to request-provided policy inputs.
     pub(super) fn generation_defaults(&self) -> Option<&GenerationDefaults> {
-        match self {
-            Self::Text(engine) => engine.metadata().generation.as_ref(),
-            Self::Pipeline(pipeline) => pipeline.engine.generation_defaults(),
-        }
+        None
     }
 
     pub(super) fn generate(

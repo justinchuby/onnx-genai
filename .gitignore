@@ -21,9 +21,6 @@ models/
 !tests/fixtures/tiny-diffusion/denoiser_step.onnx
 !tests/fixtures/tiny-dit-diffusion/denoiser.onnx
 !tests/fixtures/tiny-masked-diffusion/lm.onnx
-# `speculator-eagle3/model.onnx` is an 8-byte placeholder (never loaded as a
-# model), kept as-is for model-directory resolution tests.
-!crates/onnx-genai-ort/tests/fixtures/speculator-eagle3/model.onnx
 # `qmoe_weight_offload/model.onnx` intentionally stays binary: its test exercises
 # external-data (`weights.bin`) mmap weight-offload, which requires External
 # weight refs that an inlined textproto cannot represent.
