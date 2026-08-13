@@ -2,8 +2,8 @@
 
 **Authors:** Roy (Lead), Sapper (GPU/Systems), Nabil (FFI/Systems — B1/B3/S4),
 Sebastian (Performance — H200 validation in #832, PR #830 revision 3),
-Batty (Engine — PR #830 revision 4)
-**Updated:** 2026-08-13 (PR #830 revision 4, rebased on `main` @ `8ed44e1cc`)
+Batty (Engine — PR #830 revision 4), Gaff (Review — evidence harness, revision 4.3)
+**Updated:** 2026-08-13 (PR #830 revision 4.3, rebased on `main` @ `8ed44e1cc`)
 **Branch:** `squad/cuda-plugin-runtime` (draft PR #830, follows merged #762, #832)
 
 > **Read this first.** The situation changed on 2026-08-12: PR
@@ -347,12 +347,20 @@ Both declare `SessionPersistent` for all shapes, and both `execute()` and
 
 | Kernel | Site |
 |---|---|
-| default-domain `Attention` Phase-2a scratch | `attention.rs:973` |
-| `StandardAttention` prefill / batched decode | `standard_attention.rs:864` |
+| `com.microsoft` `Attention` Phase-2a scratch | `attention.rs:973`, registered at `kernels/mod.rs:946` |
+| default-domain `Attention` (opset 23/24) = `StandardAttention`, prefill / batched | `standard_attention.rs:864`, registered at `kernels/mod.rs:952` |
 
 These are the only paths where this change does something observable on
 hardware, and they are what H200 validation must exercise. **GQA decode is not
 one of them** — it declines, so measuring it would validate nothing.
+
+> Earlier revisions of this document and of #830 called `attention.rs:973` the
+> **default-domain** `Attention` kernel. It is not: `AttentionFactory` is
+> registered only under `("Attention", "com.microsoft", 1)`, and default-domain
+> `Attention` at opsets 23 and 24 resolves to `StandardAttentionFactory`. Both
+> are `StepScoped` at prefill geometry, so the validation plan is unchanged, but
+> a model built with a default-domain `Attention` node exercises the second row,
+> not the first.
 
 Everything in (b) with `bytes > 0`, and everything in (c), **already fails this
 way on the plugin path on `main` today**. This executor neither fixes nor
@@ -554,7 +562,18 @@ Everything in this list is about the PR #830 delta or was never in #832's scope:
   satisfies real cuBLASLt / FlashAttention alignment and size requirements on
   device, and whether ORT's CUDA-side scratch is arena-backed (if it is not,
   each request is a real `cuMemAlloc` and the capture-safety argument narrows to
-  "no free", not "no allocation");
+  "no free", not "no allocation").
+
+  > What is now known, on **CPU** with ORT 1.28 and the shared-mock plugin (run
+  > `python scripts/validate_ep_workspace_h200.py --self-test`): across 29
+  > serves ORT returned 29 **distinct** blocks inside a ~239 KiB window — a
+  > reused arena region with a moving offset, not one reused block — and the
+  > blocks were **64-byte aligned against a 256-byte request**, with the
+  > executor's align-up moving the pointer by up to 192 bytes. On this
+  > allocator the over-allocate-and-align-up in `prepare_workspace` is
+  > load-bearing, not defensive. Whether the H200 CUDA allocator behaves the
+  > same is exactly what the harness measures on device, and is **not**
+  > answered by the CPU result;
 - whether declining `SessionPersistent` leaves `GroupQueryAttention` and
   `StandardAttention`'s single-token decode geometry on a correct self-owned
   path under the plugin executor specifically (#832 validated the *native* path
@@ -579,27 +598,62 @@ Everything in this list is about the PR #830 delta or was never in #832's scope:
   across real devices (compile-verified only);
 - `prefetch_lazy_weight` remains a stub (§8).
 
-**To validate the remaining workspace path on an H200**, use the same path #832
-used:
+**To validate the remaining workspace path on an H200**, run the harness that
+covers all of it in one command:
 
 ```sh
 cargo build --release -p onnx-runtime-ep-cuda-plugin --features cuda
-python scripts/validate_plugin_ep_ort.py \
-    target/release/libonnx_runtime_ep_cuda_plugin.so
+python scripts/validate_ep_workspace_h200.py \
+    --lib target/release/libonnx_runtime_ep_cuda_plugin.so \
+    --nsys --cuda-profiler-range
 ```
 
-then run a model that exercises a **true `StepScoped` consumer** — per §4.1(d),
-either default-domain `Attention` Phase-2a, or `StandardAttention` on a
-**prefill / batched** geometry (`batch > 1` or `q_seq > 1`). Assert numerics
-against the native CUDA EP, and capture
+It exits `0` VALIDATED, `1` FAILED, `2` UNVALIDATED (preconditions absent —
+never a pass), and covers, in order: a served `StepScoped` consumer at prefill
+geometry; the compiled-node and workspace-placement counters read out of the
+very cdylib ORT loaded; numerics against a float64 NumPy reference *and* ORT's
+own CPU execution with the tolerance printed; a steady-state loop asserting the
+workspace is served on every step; an `nsys` capture compared at `n` and `4n`
+steps; and two-session teardown with re-registration and a device-memory leak
+check. `NXRT_EP_WORKSPACE_TRACE=1` (set by the harness) makes every served
+workspace print the block address, its measured alignment and the skew, which is
+the direct evidence for whether `KernelContext_GetScratchBuffer` is arena-backed
+and reused on the device.
+
+The default model is a default-domain `Attention` (opset 23), i.e. per §4.1(d)
+the `StandardAttention` row, at `batch=2 q_seq=8` — a **prefill / batched**
+geometry (`batch > 1` or `q_seq > 1`), which is what makes it `StepScoped`.
+`--batch 1 --q-seq 1` is refused as UNVALIDATED rather than measured. To
+exercise the `com.microsoft` `Attention` Phase-2a row instead, point `--lib` at
+the same plugin and supply a model with a `com.microsoft` `Attention` node.
+
+The harness self-tests on a host with no GPU, against the CPU shared-mock
+plugin, so it can be checked before it is trusted on hardware:
 
 ```sh
-nsys profile --trace=cuda,nvtx -o ws_check python scripts/your_runner.py
-nsys stats --report cuda_api_sum ws_check.nsys-rep | grep -E 'cuMemAlloc|cuMemFree'
+cargo build -p onnx-runtime-ep-shared-mock-plugin
+python scripts/validate_ep_workspace_h200.py --self-test
+```
+
+Each of its checks has a demonstrated falsifier:
+`NXRT_HARNESS_FORCE_PERSISTENT=1` turns the serve checks red, `--atol 0
+--rtol 0` turns numerics red, decode geometry is refused, and
+`NXRT_HARNESS_RETAIN_SESSION=1` forces the teardown diagnostic to fire (the
+clean run uses this as a control, since "no diagnostic" is only evidence when a
+diagnostic could have appeared). The `nsys` path fails on an unreadable or
+empty report and requires kernel launches to scale with step count, so a capture
+that measured nothing cannot read as a clean allocation count.
+
+The raw `nsys` question, for reference, is:
+
+```sh
+nsys stats --report cuda_api_sum ws_check_n64.nsys-rep | grep -E 'cuMemAlloc|cuMemFree'
 ```
 
 expecting **no** per-node `cuMemAlloc`/`cuMemFree` inside the steady-state
-decode region.
+decode region. Note that real reports name these `cuMemAlloc_v2` /
+`cuMemFree_v2`; a matcher that does not strip the `_vN` suffix will find
+nothing and call it clean.
 
 > **Do not use GQA decode as the workspace evidence.** `GroupQueryAttention`
 > *declines* (§4.1(a)), so it exercises the self-owned fallback and would prove
@@ -607,9 +661,17 @@ decode region.
 > `batch == 1 && q_seq == 1` declines; only its prefill/batched geometry is
 > served.
 
-That was **not run for this revision** — the development environment has no
-NVIDIA device (`nvidia-smi` absent, no `/dev/nvidia*`, `cuInit` →
-`CUDA_ERROR_NO_DEVICE`). PR #830 stays **Draft** until it is.
+That was **not run for this revision** — no NVIDIA device is reachable from this
+environment. The evidence, not the assertion: the VM is a `Standard_D32as_v5`
+(CPU-only SKU, per Azure IMDS), `nvidia-smi` is absent, there is no
+`/dev/nvidia*` and no loaded nvidia kernel module, `cuInit(0)` returns `100`
+(`CUDA_ERROR_NO_DEVICE`) against the userspace `libcuda.so.580.173.02` that is
+installed, the repository has **zero** self-hosted Actions runners and no GPU
+larger-runner entitlement, no workflow in `.github/workflows/` targets a GPU
+runner, and the H200 (`StandardNDISRH200V5Family`) quota is **0** in every
+region of both subscriptions this environment's managed identity can see. The
+H200 that validated #832 is a separately operated host that this environment has
+no credential for. PR #830 stays **Draft** until the harness above is run there.
 
 ---
 
