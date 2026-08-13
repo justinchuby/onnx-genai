@@ -931,6 +931,9 @@ impl PipelineEngine {
             managed_vmm: pipeline_managed_vmm,
             overrides: memory_strategy_overrides,
             advisory_only: !native_cuda_plan,
+            // #864: WDDM shared-memory fallback is a Windows platform property.
+            shared_memory_weight_fallback: cfg!(windows),
+            force_managed_weight_streaming: crate::engine::force_managed_weight_streaming_enabled(),
         });
         log_memory_strategy_plan(&memory_strategy_plan, "pipeline");
         #[cfg(all(feature = "cuda", feature = "native-backend"))]
