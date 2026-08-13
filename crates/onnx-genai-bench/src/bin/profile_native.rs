@@ -14,7 +14,7 @@ use onnx_genai_engine::{
     GenerateRequest, NativeDecodeDevice, NativeDecodeSession, PipelineEngine,
     PipelineGenerateRequest, ProcessorChain, parse_resource_limit,
 };
-use onnx_genai_ort::{Tokenizer, available_execution_providers, profile};
+use onnx_genai_ort::{DataType, Tokenizer, Value, available_execution_providers, profile};
 use onnx_runtime_session::InferenceSession;
 
 /// Honor `ONNX_GENAI_VRAM_LIMIT` in the profiler, mirroring the server CLI.
@@ -141,6 +141,9 @@ struct Args {
     /// runs so paired benchmarks avoid tokenizer round-trip drift.
     #[arg(long)]
     prompt_ids: Option<PathBuf>,
+    /// Encoded image supplied as the optional `request.image` workflow input.
+    #[arg(long)]
+    image: Option<PathBuf>,
     /// HF-style repetition penalty applied host-side to the output logits before
     /// token selection (divides positive / multiplies negative logits of tokens
     /// already in the prompt+generated stream). Default 1.0 is OFF and keeps the
@@ -289,10 +292,24 @@ fn request(args: &Args, tokens: usize) -> GenerateRequest {
     request
 }
 
-fn pipeline_request(args: &Args, tokens: usize, prompt_tokens: &[u32]) -> PipelineGenerateRequest {
+fn pipeline_request(
+    args: &Args,
+    tokens: usize,
+    prompt_tokens: &[u32],
+) -> Result<PipelineGenerateRequest> {
     let mut request = request(args, tokens);
     request.prompt = GeneratePrompt::TokenIds(prompt_tokens.to_vec());
-    PipelineGenerateRequest::new(request)
+    let mut pipeline_request = PipelineGenerateRequest::new(request);
+    if let Some(image_path) = args.image.as_ref() {
+        let image = std::fs::read(image_path)
+            .with_context(|| format!("read workflow image {}", image_path.display()))?;
+        let encoded_bytes = i64::try_from(image.len()).context("workflow image is too large")?;
+        pipeline_request = pipeline_request.with_input(
+            "request.image",
+            Value::from_raw_bytes(image, &[encoded_bytes], DataType::Uint8)?,
+        );
+    }
+    Ok(pipeline_request)
 }
 
 fn describe_sampling(args: &Args) -> String {
@@ -924,7 +941,11 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
     for _ in 0..args.warmups {
         std::hint::black_box(
             engine
-                .generate_with_pipeline_request(pipeline_request(args, args.tokens, &prompt_tokens))
+                .generate_with_pipeline_request(pipeline_request(
+                    args,
+                    args.tokens,
+                    &prompt_tokens,
+                )?)
                 .context("pipeline warmup generation")?,
         );
     }
@@ -944,7 +965,7 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
             };
             let result = engine
                 .generate_with_callback(
-                    pipeline_request(args, args.tokens, &prompt_tokens),
+                    pipeline_request(args, args.tokens, &prompt_tokens)?,
                     Some(&mut callback),
                 )
                 .context("steady pipeline measured generation")?;
@@ -1042,7 +1063,7 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
     for _ in 0..args.runs {
         let start = Instant::now();
         let result = engine
-            .generate_with_pipeline_request(pipeline_request(args, args.tokens, &prompt_tokens))
+            .generate_with_pipeline_request(pipeline_request(args, args.tokens, &prompt_tokens)?)
             .context("pipeline measured generation")?;
         elapsed += start.elapsed();
         generated += result.token_ids.len();
