@@ -500,6 +500,7 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
         }
     }
 
+    let mut initial_value_names = workflow.inputs.keys().cloned().collect::<BTreeSet<_>>();
     for (name, input) in &workflow.inputs {
         validate_runtime_dtype(&format!("workflow input '{name}'"), &input.contract, errors);
         if matches!(input.source, crate::schema::WorkflowInputSource::Request)
@@ -509,11 +510,72 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
                 "workflow request input '{name}' must declare one versioned runtime role"
             ));
         }
-        if !input.required && input.default.is_none() {
+        if !input.required && input.default.is_none() && input.present_as.is_none() {
             errors.push(format!(
-                "workflow input '{name}' cannot be optional without a literal default; model \
-                 presence explicitly with a required value and predicate"
+                "workflow input '{name}' cannot be optional without a literal default or \
+                 present_as predicate"
             ));
+        }
+        if let Some(present_as) = &input.present_as {
+            if input.required {
+                errors.push(format!(
+                    "workflow input '{name}' uses present_as but is required; presence predicates \
+                     are only valid for optional inputs"
+                ));
+            }
+            if input.default.is_some() {
+                errors.push(format!(
+                    "workflow input '{name}' cannot combine present_as with a literal default"
+                ));
+            }
+            if !matches!(
+                input.source,
+                crate::schema::WorkflowInputSource::Request
+                    | crate::schema::WorkflowInputSource::Application { .. }
+            ) {
+                errors.push(format!(
+                    "workflow input '{name}' can use present_as only with request or application \
+                     sources"
+                ));
+            }
+            if matches!(input.source, crate::schema::WorkflowInputSource::Request)
+                && !matches!(
+                    input.role,
+                    crate::schema::SemanticInputRole::Runtime {
+                        role: crate::schema::RuntimeInputRole::Media
+                            | crate::schema::RuntimeInputRole::Constraint
+                            | crate::schema::RuntimeInputRole::SessionId,
+                        ..
+                    }
+                )
+            {
+                errors.push(format!(
+                    "workflow request input '{name}' can use present_as only with media, \
+                     constraint, or session_id roles whose absence is observable"
+                ));
+            }
+            if present_as.trim().is_empty() {
+                errors.push(format!(
+                    "workflow input '{name}' has an empty present_as value"
+                ));
+            } else if !initial_value_names.insert(present_as.clone()) {
+                errors.push(format!(
+                    "workflow input '{name}' present_as value '{present_as}' collides with another \
+                     initial SSA value"
+                ));
+            }
+        }
+    }
+    for (name, input) in &workflow.inputs {
+        if let Some(present_as) = &input.present_as {
+            validate_optional_input_guards(
+                &compiled.graph,
+                name,
+                present_as,
+                false,
+                "pipeline.workflow.steps",
+                errors,
+            );
         }
     }
     for (name, output) in &workflow.outputs {
@@ -835,6 +897,20 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
         .iter()
         .map(|(name, input)| (name.clone(), input.contract.clone()))
         .collect::<BTreeMap<_, _>>();
+    for input in workflow.inputs.values() {
+        if let Some(present_as) = &input.present_as {
+            values.insert(present_as.clone());
+            value_contracts.insert(
+                present_as.clone(),
+                crate::schema::TensorContract {
+                    dtype: "bool".to_string(),
+                    rank: 0,
+                    shape: Some(Vec::new()),
+                    optional: false,
+                },
+            );
+        }
+    }
     let mut effects = compiled.initial_effects.clone();
     let mut effect_tokens = effects.values().cloned().collect::<BTreeSet<_>>();
     validate_workflow_node(
@@ -920,6 +996,13 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
         .any(|state| state.class == crate::schema::WorkflowStateClass::Advisory)
     {
         used.insert("advisory_state".to_string());
+    }
+    if workflow
+        .inputs
+        .values()
+        .any(|input| input.present_as.is_some())
+    {
+        used.insert("input_presence".to_string());
     }
     collect_workflow_capabilities(&compiled.graph, &mut used);
     for capability in used.difference(&workflow.manifest.capabilities) {
@@ -1752,6 +1835,150 @@ fn validate_predicate_contract(
         errors.push(format!(
             "{path} rank-one predicate contract must have static shape [1]"
         ));
+    }
+}
+
+fn validate_optional_input_guards(
+    node: &WorkflowNode,
+    input: &str,
+    present_as: &str,
+    guaranteed_present: bool,
+    path: &str,
+    errors: &mut Vec<String>,
+) {
+    let check = |value: &str, value_path: &str, errors: &mut Vec<String>| {
+        if value == input && !guaranteed_present {
+            errors.push(format!(
+                "{value_path} reads optional input '{input}' outside the true case of its \
+                     present_as predicate '{present_as}'"
+            ));
+        }
+    };
+    match node {
+        WorkflowNode::Sequence { nodes } => {
+            for (index, node) in nodes.iter().enumerate() {
+                validate_optional_input_guards(
+                    node,
+                    input,
+                    present_as,
+                    guaranteed_present,
+                    &format!("{path}.nodes[{index}]"),
+                    errors,
+                );
+            }
+        }
+        WorkflowNode::Invoke {
+            inputs: invoke_inputs,
+            ..
+        } => {
+            for (port, value) in invoke_inputs {
+                check(value, &format!("{path}.inputs.{port}"), errors);
+            }
+        }
+        WorkflowNode::Loop {
+            setup,
+            body,
+            continue_when,
+            max_iterations,
+            carried,
+            ..
+        } => {
+            check(continue_when, &format!("{path}.continue_when"), errors);
+            check(max_iterations, &format!("{path}.max_iterations"), errors);
+            for (index, carry) in carried.iter().enumerate() {
+                check(
+                    &carry.current,
+                    &format!("{path}.carried[{index}].current"),
+                    errors,
+                );
+                check(
+                    &carry.body_output,
+                    &format!("{path}.carried[{index}].body_output"),
+                    errors,
+                );
+            }
+            validate_optional_input_guards(
+                setup,
+                input,
+                present_as,
+                guaranteed_present,
+                &format!("{path}.setup"),
+                errors,
+            );
+            validate_optional_input_guards(
+                body,
+                input,
+                present_as,
+                guaranteed_present,
+                &format!("{path}.body"),
+                errors,
+            );
+        }
+        WorkflowNode::Branch {
+            predicate,
+            cases,
+            default,
+            outputs,
+            ..
+        } => {
+            check(predicate, &format!("{path}.predicate"), errors);
+            for (case, node) in cases {
+                let case_present =
+                    guaranteed_present || (predicate == present_as && case == "true");
+                validate_optional_input_guards(
+                    node,
+                    input,
+                    present_as,
+                    case_present,
+                    &format!("{path}.cases.{case}"),
+                    errors,
+                );
+            }
+            if let Some(default) = default {
+                validate_optional_input_guards(
+                    default,
+                    input,
+                    present_as,
+                    guaranteed_present,
+                    &format!("{path}.default"),
+                    errors,
+                );
+            }
+            for (output, phi) in outputs {
+                for (case, value) in &phi.cases {
+                    let case_present =
+                        guaranteed_present || (predicate == present_as && case == "true");
+                    if value == input && !case_present {
+                        errors.push(format!(
+                            "{path}.outputs.{output}.cases.{case} reads optional input '{input}' \
+                                 outside its presence branch"
+                        ));
+                    }
+                }
+                if let Some(value) = &phi.default {
+                    check(value, &format!("{path}.outputs.{output}.default"), errors);
+                }
+            }
+        }
+        WorkflowNode::Emit {
+            value,
+            when,
+            valid_length,
+            ..
+        } => {
+            check(value, &format!("{path}.value"), errors);
+            if let Some(when) = when {
+                check(when, &format!("{path}.when"), errors);
+            }
+            if let Some(valid_length) = valid_length {
+                check(valid_length, &format!("{path}.valid_length"), errors);
+            }
+        }
+        WorkflowNode::Transfer {
+            input: transfer_input,
+            ..
+        } => check(transfer_input, &format!("{path}.input"), errors),
+        WorkflowNode::ExecutionIsland { .. } => {}
     }
 }
 

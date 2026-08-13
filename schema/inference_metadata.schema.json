@@ -2364,6 +2364,13 @@
             }
           ]
         },
+        "present_as": {
+          "description": "Initial scalar bool SSA value indicating whether the caller supplied this input.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "required": {
           "default": true,
           "type": "boolean"

@@ -1504,6 +1504,13 @@ impl PipelineEngine {
                     }
                 }
             };
+            let is_present = value.is_some();
+            if let Some(present_as) = &input.present_as {
+                values.insert(
+                    present_as.clone(),
+                    Value::from_raw_bytes(vec![u8::from(is_present)], &[], DataType::Bool)?,
+                );
+            }
             match value {
                 Some(value) => {
                     values.insert(name.clone(), value);
