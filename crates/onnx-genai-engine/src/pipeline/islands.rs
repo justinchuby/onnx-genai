@@ -7,7 +7,8 @@ use anyhow::{Context, bail};
 use onnx_genai_metadata::{ComponentImplementation, WorkflowComponent, WorkflowNode, WorkflowSpec};
 use onnx_genai_ort::{Allocator, IoBinding, Session, Value};
 use onnx_runtime_loader::proto::onnx::{
-    GraphProto, ModelProto, TensorProto, ValueInfoProto, tensor_proto,
+    GraphProto, ModelProto, TensorProto, TensorShapeProto, TypeProto, ValueInfoProto, tensor_proto,
+    tensor_shape_proto, type_proto,
 };
 use prost::Message;
 
@@ -923,6 +924,7 @@ fn link_models(
             );
         }
         let prefix = format!("island{id}_c{index}_");
+        alpha_rename_graph_dim_params(&mut source_graph, &prefix);
         collect_external_initializers(
             &mut source_graph.initializer,
             path,
@@ -1091,6 +1093,79 @@ fn link_models(
     })
 }
 
+/// Namespace artifact-local symbolic dimensions before models share one graph.
+///
+/// ONNX `dim_param` equality is graph-scoped. Component artifacts commonly use
+/// generic names such as `batch` and `sequence`, but those names are independent
+/// until the linker combines their `ValueInfoProto`s. Prefixing each artifact's
+/// symbols preserves equality within that artifact without asserting equality
+/// between unrelated component axes.
+fn alpha_rename_graph_dim_params(graph: &mut GraphProto, prefix: &str) {
+    let mut symbols = BTreeMap::<String, String>::new();
+    for value_info in graph
+        .input
+        .iter_mut()
+        .chain(&mut graph.output)
+        .chain(&mut graph.value_info)
+    {
+        if let Some(value_type) = &mut value_info.r#type {
+            alpha_rename_type_dim_params(value_type, prefix, &mut symbols);
+        }
+    }
+}
+
+fn alpha_rename_type_dim_params(
+    value_type: &mut TypeProto,
+    prefix: &str,
+    symbols: &mut BTreeMap<String, String>,
+) {
+    match value_type.value.as_mut() {
+        Some(type_proto::Value::TensorType(tensor)) => {
+            if let Some(shape) = &mut tensor.shape {
+                alpha_rename_shape_dim_params(shape, prefix, symbols);
+            }
+        }
+        Some(type_proto::Value::SparseTensorType(tensor)) => {
+            if let Some(shape) = &mut tensor.shape {
+                alpha_rename_shape_dim_params(shape, prefix, symbols);
+            }
+        }
+        Some(type_proto::Value::SequenceType(sequence)) => {
+            if let Some(element_type) = &mut sequence.elem_type {
+                alpha_rename_type_dim_params(element_type, prefix, symbols);
+            }
+        }
+        Some(type_proto::Value::MapType(map)) => {
+            if let Some(mapped_type) = &mut map.value_type {
+                alpha_rename_type_dim_params(mapped_type, prefix, symbols);
+            }
+        }
+        Some(type_proto::Value::OptionalType(optional)) => {
+            if let Some(element_type) = &mut optional.elem_type {
+                alpha_rename_type_dim_params(element_type, prefix, symbols);
+            }
+        }
+        Some(type_proto::Value::OpaqueType(_)) | None => {}
+    }
+}
+
+fn alpha_rename_shape_dim_params(
+    shape: &mut TensorShapeProto,
+    prefix: &str,
+    symbols: &mut BTreeMap<String, String>,
+) {
+    for dimension in &mut shape.dim {
+        let Some(tensor_shape_proto::dimension::Value::DimParam(symbol)) = dimension.value.as_mut()
+        else {
+            continue;
+        };
+        let renamed = symbols
+            .entry(symbol.clone())
+            .or_insert_with(|| format!("{prefix}dim__{symbol}"));
+        symbol.clone_from(renamed);
+    }
+}
+
 fn collect_external_initializers(
     initializers: &mut [TensorProto],
     model_path: &Path,
@@ -1161,6 +1236,51 @@ mod tests {
     use super::*;
     use onnx_genai_metadata::ComponentPorts;
 
+    fn symbolic_tensor(name: &str, symbol: &str) -> ValueInfoProto {
+        ValueInfoProto {
+            name: name.to_string(),
+            r#type: Some(TypeProto {
+                value: Some(type_proto::Value::TensorType(type_proto::Tensor {
+                    elem_type: 1,
+                    shape: Some(TensorShapeProto {
+                        dim: vec![
+                            tensor_shape_proto::Dimension {
+                                value: Some(tensor_shape_proto::dimension::Value::DimValue(1)),
+                                ..Default::default()
+                            },
+                            tensor_shape_proto::Dimension {
+                                value: Some(tensor_shape_proto::dimension::Value::DimParam(
+                                    symbol.to_string(),
+                                )),
+                                ..Default::default()
+                            },
+                        ],
+                    }),
+                })),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn symbol(value_info: &ValueInfoProto) -> &str {
+        let Some(TypeProto {
+            value: Some(type_proto::Value::TensorType(tensor)),
+            ..
+        }) = &value_info.r#type
+        else {
+            panic!("expected tensor type");
+        };
+        let Some(tensor_shape_proto::Dimension {
+            value: Some(tensor_shape_proto::dimension::Value::DimParam(symbol)),
+            ..
+        }) = tensor.shape.as_ref().and_then(|shape| shape.dim.get(1))
+        else {
+            panic!("expected symbolic second dimension");
+        };
+        symbol
+    }
+
     fn component(implementation: ComponentImplementation) -> WorkflowComponent {
         WorkflowComponent {
             implementation,
@@ -1191,5 +1311,40 @@ mod tests {
             custom_ops: BTreeMap::new(),
         });
         assert!(!is_fusible_component(&adapter));
+    }
+
+    #[test]
+    fn linker_alpha_renames_artifact_local_symbols_with_different_runtime_extents() {
+        // Both source artifacts call their independent dynamic axis `sequence`.
+        // The first invocation binds it to 2 while the second binds it to 5.
+        // Once linked, preserving the original spelling would falsely make
+        // those axes equal in the combined ONNX graph.
+        let mut first = GraphProto {
+            input: vec![symbolic_tensor("first_input", "sequence")],
+            output: vec![symbolic_tensor("first_output", "sequence")],
+            value_info: vec![symbolic_tensor("first_internal", "sequence")],
+            ..Default::default()
+        };
+        let mut second = GraphProto {
+            input: vec![symbolic_tensor("second_input", "sequence")],
+            output: vec![symbolic_tensor("second_output", "sequence")],
+            value_info: vec![symbolic_tensor("second_internal", "sequence")],
+            ..Default::default()
+        };
+
+        alpha_rename_graph_dim_params(&mut first, "island0_c0_");
+        alpha_rename_graph_dim_params(&mut second, "island0_c1_");
+
+        assert_eq!(symbol(&first.input[0]), symbol(&first.output[0]));
+        assert_eq!(symbol(&first.input[0]), symbol(&first.value_info[0]));
+        assert_eq!(symbol(&second.input[0]), symbol(&second.output[0]));
+        assert_eq!(symbol(&second.input[0]), symbol(&second.value_info[0]));
+        assert_ne!(symbol(&first.input[0]), symbol(&second.input[0]));
+
+        let runtime_extents = BTreeMap::from([
+            (symbol(&first.input[0]).to_string(), 2_i64),
+            (symbol(&second.input[0]).to_string(), 5_i64),
+        ]);
+        assert_eq!(runtime_extents.len(), 2);
     }
 }
