@@ -603,6 +603,41 @@ graph {
 opset_import { domain: "" version: 13 }
 "#;
 
+const DYNAMIC_FEATURE_IDENTITY: &str = r#"
+ir_version: 8
+graph {
+  node { input: "input" output: "output" op_type: "Identity" }
+  name: "dynamic_feature_identity"
+  input { name: "input" type { tensor_type { elem_type: 1 shape {
+    dim { dim_param: "num_features" } dim { dim_value: 4 }
+  }}}}
+  output { name: "output" type { tensor_type { elem_type: 1 shape {
+    dim { dim_param: "num_features" } dim { dim_value: 4 }
+  }}}}
+}
+opset_import { domain: "" version: 13 }
+"#;
+
+const EMPTY_FEATURES: &str = r#"
+ir_version: 8
+graph {
+  node {
+    output: "output"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t { dims: 0 dims: 4 data_type: 1 }
+      type: TENSOR
+    }
+  }
+  name: "empty_features"
+  output { name: "output" type { tensor_type { elem_type: 1 shape {
+    dim { dim_value: 0 } dim { dim_value: 4 }
+  }}}}
+}
+opset_import { domain: "" version: 13 }
+"#;
+
 #[test]
 fn workflow_materializes_image_adapter_outputs_as_ssa_values() -> anyhow::Result<()> {
     let metadata = r#"
@@ -729,6 +764,87 @@ pipeline:
     let output = engine.run_pipeline(request)?;
     assert_eq!(output["result"].shape(), [1, 3, 2, 2]);
     assert_eq!(output["result"].to_vec_f32()?.len(), 12);
+    Ok(())
+}
+
+#[test]
+fn optional_media_presence_selects_real_or_empty_features() -> anyhow::Result<()> {
+    let metadata = r#"
+pipeline:
+  workflow:
+    manifest:
+      ir_version: "1.0"
+      onnx_opsets: { ai.onnx: 13 }
+      capabilities: [workflow_ssa, nested_control_flow, typed_emit, input_presence]
+    inputs:
+      request.image_features:
+        contract: { dtype: float32, rank: 2, shape: [num_features, 4] }
+        role: { kind: runtime, version: "1.0", role: media }
+        source: { kind: request }
+        required: false
+        present_as: request.image_present
+    outputs:
+      result:
+        contract: { dtype: float32, rank: 2, shape: [num_features, 4] }
+        role: tensor
+        stage: pre_adapter
+    components:
+      supplied:
+        implementation: { kind: onnx, artifact: supplied.onnx.textproto }
+        ports:
+          inputs:
+            input: { dtype: float32, rank: 2, shape: [num_features, 4] }
+          outputs:
+            output: { dtype: float32, rank: 2, shape: [num_features, 4] }
+      empty:
+        implementation: { kind: onnx, artifact: empty.onnx.textproto }
+        ports:
+          outputs:
+            output: { dtype: float32, rank: 2, shape: [0, 4] }
+    steps:
+      - kind: branch
+        predicate: request.image_present
+        cases:
+          "true":
+            kind: invoke
+            component: supplied
+            inputs: { input: request.image_features }
+            outputs: { output: image.supplied }
+        default:
+          kind: invoke
+          component: empty
+          outputs: { output: image.empty }
+        outputs:
+          image.features:
+            cases: { "true": image.supplied }
+            default: image.empty
+      - kind: emit
+        value: image.features
+        output: result
+        mode: replace
+"#;
+    let root = package(
+        "optional-media-presence",
+        metadata,
+        &[
+            ("supplied.onnx.textproto", DYNAMIC_FEATURE_IDENTITY),
+            ("empty.onnx.textproto", EMPTY_FEATURES),
+        ],
+    )?;
+    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+
+    let absent = engine.run_pipeline(PipelineGenerateRequest::new(GenerateRequest::new(
+        GeneratePrompt::TokenIds(vec![]),
+    )))?;
+    assert_eq!(absent["result"].shape(), [0, 4]);
+
+    let supplied = Value::from_slice_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 4])?;
+    let present = engine.run_pipeline(
+        PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
+            .with_input("request.image_features", supplied),
+    )?;
+    assert_eq!(present["result"].shape(), [1, 4]);
+    assert_eq!(present["result"].to_vec_f32()?, [1.0, 2.0, 3.0, 4.0]);
     Ok(())
 }
 

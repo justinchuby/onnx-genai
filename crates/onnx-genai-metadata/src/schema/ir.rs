@@ -110,6 +110,9 @@ pub struct WorkflowInput {
     pub required: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<ScalarValue>,
+    /// Initial scalar bool SSA value indicating whether the caller supplied this input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub present_as: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]

@@ -54,6 +54,34 @@ Inactive rows retain their previous carried values while active rows advance. `m
 an integer safety bound. Branch predicates remain invocation-level scalars; row-wise tensor choice
 is ordinary ONNX policy math rather than host control flow.
 
+Optional request/application tensors use `present_as` to define an initial scalar bool SSA value.
+The runtime sets it from actual caller presence without inventing a fake tensor. Consumers must
+branch before reading the optional input and merge a real alternative value:
+
+```yaml
+inputs:
+  request.image:
+    contract: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+    role: { kind: runtime, version: "1.0", role: media }
+    source: { kind: request }
+    required: false
+    present_as: request.image_present
+steps:
+  - kind: branch
+    predicate: request.image_present
+    cases:
+      "true": # preprocess and encode request.image
+        ...
+    default: # produce an empty [0, hidden_size] feature tensor
+      ...
+```
+
+`present_as` requires the `input_presence` capability and cannot be combined with `required: true`
+or a literal default. Request-sourced presence is available for media, constraint, and session ID
+roles, whose absence is observable; application-sourced tensors may use it generally. For text-only
+VLM requests, the absent branch should produce the embedding graph's supported zero-image feature
+tensor; clients do not pass sentinel or fake image bytes.
+
 `emit.when` optionally suppresses an event. `emit.valid_length` accepts `int[B]` and emits a ragged
 event per active row, slicing each row to its runtime prefix. This defines EOS behavior explicitly:
 a workflow may emit the EOS token, suppress it with `when`, or emit a zero-length row.

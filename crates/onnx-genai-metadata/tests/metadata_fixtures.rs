@@ -27,6 +27,140 @@ pipeline:
 }
 
 #[test]
+fn optional_input_presence_is_an_explicit_branch_predicate() {
+    let metadata: InferenceMetadata = serde_yaml::from_str(
+        r#"
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      ir_version: "1.0"
+      onnx_opsets: { ai.onnx: 24 }
+      capabilities: [workflow_ssa, nested_control_flow, input_presence]
+    inputs:
+      request.image:
+        contract: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+        role: { kind: runtime, version: "1.0", role: media }
+        source: { kind: request }
+        required: false
+        present_as: request.image_present
+    components:
+      noop:
+        implementation: { kind: binding }
+        ports: {}
+    steps:
+      - kind: branch
+        predicate: request.image_present
+        cases:
+          "true": { kind: invoke, component: noop }
+        default: { kind: invoke, component: noop }
+"#,
+    )
+    .expect("workflow metadata parses");
+    validate_metadata(&metadata).expect("explicit input presence validates");
+}
+
+#[test]
+fn optional_tensor_without_default_or_presence_is_rejected() {
+    let metadata: InferenceMetadata = serde_yaml::from_str(
+        r#"
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      ir_version: "1.0"
+      onnx_opsets: { ai.onnx: 24 }
+      capabilities: [workflow_ssa]
+    inputs:
+      request.image:
+        contract: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+        role: { kind: runtime, version: "1.0", role: media }
+        source: { kind: request }
+        required: false
+    components: {}
+    steps: []
+"#,
+    )
+    .expect("workflow metadata parses");
+    let errors = validate_metadata(&metadata).expect_err("implicit absence must fail");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("literal default or present_as predicate"))
+    );
+}
+
+#[test]
+fn optional_tensor_must_only_be_read_in_its_presence_branch() {
+    let metadata: InferenceMetadata = serde_yaml::from_str(
+        r#"
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      ir_version: "1.0"
+      onnx_opsets: { ai.onnx: 24 }
+      capabilities: [workflow_ssa, input_presence]
+    inputs:
+      request.image:
+        contract: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+        role: { kind: runtime, version: "1.0", role: media }
+        source: { kind: request }
+        required: false
+        present_as: request.image_present
+    components:
+      consume:
+        implementation: { kind: binding }
+        ports:
+          inputs:
+            image: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+    steps:
+      - kind: invoke
+        component: consume
+        inputs: { image: request.image }
+"#,
+    )
+    .expect("workflow metadata parses");
+    let errors = validate_metadata(&metadata).expect_err("unguarded optional input must fail");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("outside the true case"))
+    );
+}
+
+#[test]
+fn request_presence_rejects_roles_with_implicit_defaults() {
+    let metadata: InferenceMetadata = serde_yaml::from_str(
+        r#"
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      ir_version: "1.0"
+      onnx_opsets: { ai.onnx: 24 }
+      capabilities: [workflow_ssa, input_presence]
+    inputs:
+      request.temperature:
+        contract: { dtype: float32, rank: 1, shape: [1] }
+        role: { kind: runtime, version: "1.0", role: sampling_temperature }
+        source: { kind: request }
+        required: false
+        present_as: request.temperature_present
+    components: {}
+    steps: []
+"#,
+    )
+    .expect("workflow metadata parses");
+    let errors = validate_metadata(&metadata).expect_err("implicit request default must fail");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("whose absence is observable"))
+    );
+}
+
+#[test]
 fn legacy_pipeline_control_fields_are_rejected() {
     let error = serde_yaml::from_str::<InferenceMetadata>(
         r#"
