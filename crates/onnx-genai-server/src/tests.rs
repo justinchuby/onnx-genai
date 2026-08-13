@@ -1792,6 +1792,29 @@ async fn resources_get_and_admin_vram_override_report_governor_state() {
         memory_strategy["strategy"].is_string(),
         "memory strategy must be named: {body}"
     );
+    // #874: the reported strategy must be the one the platform default actually
+    // selects, not merely a well-formed string. The keys above were already
+    // asserted before #874 changed the *value* on Windows, so a silent revert of
+    // that decision would not have failed any test — exactly the shape of gap
+    // that let `device_policy` go unnoticed for months (#678).
+    //
+    // This model fits, so both platforms must infer `FullResident` with offload
+    // off. The platform split only appears for an over-budget model: Windows/WDDM
+    // prefers the OS shared-memory path (`Compatibility`), while Linux keeps
+    // managed streaming because there is no fallback there and the alternative is
+    // "does not run" (#783 — do not inherit a WDDM-specific conclusion).
+    assert_eq!(
+        memory_strategy["strategy"], "FullResident",
+        "a fitting model must stay fully resident on every platform: {body}"
+    );
+    assert_eq!(
+        memory_strategy["weight_offload_enabled"], false,
+        "a fitting model must not enable weight offload: {body}"
+    );
+    assert_eq!(
+        memory_strategy["auto_enabled"], false,
+        "nothing should be auto-enabled from a vram limit for a fitting model: {body}"
+    );
     let impossible = router
         .clone()
         .oneshot(
