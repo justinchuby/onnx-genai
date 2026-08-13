@@ -35,6 +35,7 @@ pub(crate) enum KvCachePath {
     FlashPrefillPrep,
     FlashPrefillRead,
     Fp16DecodeRead,
+    Bf16DecodeRead,
     UnfusedDecodePrep,
     F32DecodeRead,
     ReferenceRead,
@@ -48,6 +49,7 @@ impl KvCachePath {
             Self::FlashPrefillPrep => "flash prefill prep",
             Self::FlashPrefillRead => "flash prefill read",
             Self::Fp16DecodeRead => "fp16 split-K decode read",
+            Self::Bf16DecodeRead => "bf16 split-K decode read",
             Self::UnfusedDecodePrep => "unfused decode prep",
             Self::F32DecodeRead => "f32 split-K decode read",
             Self::ReferenceRead => "reference attention read",
@@ -61,6 +63,7 @@ const CONVERTED_PATHS: &[KvCachePath] = &[
     KvCachePath::FlashPrefillPrep,
     KvCachePath::FlashPrefillRead,
     KvCachePath::Fp16DecodeRead,
+    KvCachePath::Bf16DecodeRead,
 ];
 
 /// Symbolic per-axis strides of a KV-cache binding, general over layout.
@@ -179,6 +182,19 @@ impl KvCacheStrides {
         match self.named {
             "bnsh" => Ok("gqa_decode_attention_f16_v8_bnsh"),
             "bsnh" => Ok("gqa_decode_attention_f16_v8_bsnh"),
+            _ => Err(self.no_cached_module_err()),
+        }
+    }
+
+    /// The `'static` module-cache key for the bf16 split-K decode read kernel.
+    ///
+    /// bf16 shares the fp16 kernel's structure and KV-stride prelude but emits a
+    /// distinct NVRTC source (different element type and intrinsics), so it must
+    /// use its own module-cache key to avoid colliding with the fp16 module.
+    pub(crate) fn decode_module_key_bf16(&self) -> Result<&'static str> {
+        match self.named {
+            "bnsh" => Ok("gqa_decode_attention_bf16_v1_bnsh"),
+            "bsnh" => Ok("gqa_decode_attention_bf16_v1_bsnh"),
             _ => Err(self.no_cached_module_err()),
         }
     }
