@@ -11,9 +11,9 @@ macOS-arm64 + win_amd64) and **`nxrt-ep-cuda`** (CUDA 13, manylinux_2_28_x86_64)
 CI = fmt/build/test + **blocking clippy** + Miri unsafe-crate soundness + scheduled
 `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-08-13T06:34:00Z_
+_Last updated: 2026-08-13T14:45:00Z_
 
-**Current `origin/main` implementation HEAD:** `887e3742`.
+**Current `origin/main` implementation HEAD:** `26bd410f`.
 
 ---
 
@@ -31,9 +31,11 @@ _Last updated: 2026-08-13T06:34:00Z_
   constant-scale cache (#867 → 47.25). Capture collapses ~1600 launches/token into one
   replay; first-16 greedy ids match reference. **Three independent A/B experiments
   (#870/#872/#873) then proved this is the architectural ceiling:** native CUDA int4
-  decode of this model is **weight-bandwidth/compute-floor bound at ~47.25 tok/s on H200**,
-  NOT launch-dispatch bound — so `GroupQueryAttention` (~41% of eager decode) is *not* a
-  lever, and node/launch fusion cannot help.
+  decode of this model is **latency-bound on the serial ~2568-node dependency chain
+  (~8.2 µs/node); measured NOT weight-bandwidth-bound — a 4× weight-byte cut yields only
+  +2.8%, HBM util ~15% (#885)** — so `GroupQueryAttention` (~41% of eager decode) is *not* a
+  lever, and marginal node/launch fusion cannot help. Lower-bit quant/sparsity is a measured
+  no-go (#885); drastic per-layer node-collapse (decode megakernel) is the reopened lever.
 - **Large / hybrid models run native-only** where ORT cannot load them: GLM-4-9B
   (partial-RoPE GQA, ORT rejects the schema), DeepSeek-V2-Lite (MLA + QMoE), and
   Qwen3.5/3.6-**27B** hybrid Gated-DeltaNet — all load and decode on native CUDA via a
@@ -212,12 +214,12 @@ configurations have ranged 3.9–28 tok/s, much of it WDDM paging our own memory
   cast). `GroupQueryAttention` is now the largest eager share (~41%) — tested next as the
   candidate lever.
 
-### 2026-08-13 — Native CUDA decode ceiling: bandwidth-bound at ~47 tok/s (#870/#872/#873)
+### 2026-08-13 — Native CUDA decode ceiling: latency-bound at ~47 tok/s (#870/#872/#873, mechanism corrected by #885)
 
 - **Three independent A/B experiments conclusively prove native CUDA int4 decode of
-  Muse-Glimmer-30B is weight-bandwidth/compute-floor bound at ~47.25 tok/s on H200, NOT
+  Muse-Glimmer-30B hits an architectural ceiling at ~47.25 tok/s on H200, NOT
   launch-dispatch bound** — so the `GroupQueryAttention` (~41% eager) "next open lever" is
-  disproven and node/launch fusion is a dead end on this model:
+  disproven and marginal node/launch fusion is a dead end on this model:
   - **#870 (GQA cheapening): flat.** Cheapening the GQA kernel's inner loop under capture
     did not move tok/s — decode is not GQA-compute bound.
   - **#872 (−208 cheap Add nodes): −2.8% regression.** A byte-exact constant-Add fold that
@@ -227,17 +229,23 @@ configurations have ranged 3.9–28 tok/s, much of it WDDM paging our own memory
     projections into one wider `MatMulNBits` (417 → 313 MatMulNBits/token, +52 Split,
     capture stays 1 segment / 0 seams) is byte-exact (all 64 greedy ids identical) but
     throughput is flat (47.33 → 47.26 median over 3 interleaved trials).
-- **Why:** at M=1 decode reads each disjoint int4 weight blob exactly once from DRAM (the
-  roofline is bytes-moved, not launches), so neither cheap-node nor expensive-launch
-  fusion can cut bytes moved — a wider fused GEMV moves the same total bytes as the
-  separate ones. 47.25 tok/s (already +18% vs ORT's ~40) is the architectural ceiling; we
-  bank the win.
+- **Why (mechanism corrected 2026-08-13 by probe #885):** decode is **latency-bound on the
+  serial ~2568-node dependency chain (~8.2 µs/node × 2568 ≈ 21 ms/token)**, NOT
+  weight-bandwidth-bound. A controlled weight-DRAM byte-fold probe measured that cutting weight
+  bytes read to 25% raises tok/s only 47.29 → 48.62 (**+2.8%**, HBM util ~15%); int2-everywhere
+  projects to ≈+1.6%. That is why neither cheap-node (#872) nor expensive-launch (#873) fusion
+  moves throughput — the critical path is serial node latency, not bytes moved. 47.25 tok/s
+  (already +18% vs ORT's ~40) is the architectural ceiling; we bank the win.
 - **Disposition:** the correct, byte-exact `CudaQkvProjectionFusion` pass (#873) is
   retained **opt-in / disabled-by-default** (`ONNX_GENAI_CUDA_ENABLE_QKV_FUSION=1`) for
   future dispatch-bound architectures (e.g. fp16 activations, higher launch-latency-to-
   bandwidth shapes); the default binary keeps the three separate GEMVs.
-- **Real levers to beat 47 are not node fusion:** reduce weight **bytes/token** (lower-bit
-  quant, sparsity) or switch kernel family (a decode megakernel). Future work.
+- **Real levers to beat 47 are not marginal node fusion, and NOT lower-bit quant:** lower-bit
+  quant/sparsity (int3/int2/mixed/2:4/NF4) is a **measured 🟥 no-go** (#885 — byte-fold flat,
+  ~15% HBM util, and every sub-4-bit path needs a re-quant from the fp16 source + immature
+  ORT tooling). The only direction consistent with all three measurements is **drastic
+  per-layer node-collapse — a decode megakernel (activations resident, few launches/layer),
+  REOPENED as the true next lever.** Future work.
 
 ### 2026-08-12 — EP plugins run inside ONNX Runtime and ship on PyPI
 

@@ -85,3 +85,15 @@ bf16 fold went non-deterministic (f16-staging); safe version needs a bf16-native
 of Muse-Glimmer-30B is weight-bandwidth/compute-floor bound at ~47.25 tok/s (H200), NOT
 dispatch-bound. 47.25 is the architectural ceiling; beat it via fewer weight bytes/token or a
 megakernel, NOT node fusion.**
+
+## 2026-08-13 — Lower-bit quant NO-GO + mechanism correction (#885, docs-only)
+Researched whether lower-bit quant could beat ~47 tok/s. Byte budget: decoder reads **15.325
+GB weights/token** = 724 GB/s at 47 tok/s = only **~15% of H200 HBM roofline**. Ran a controlled
+weight-DRAM byte-fold probe (`ONNX_GENAI_WEIGHT_FOLD=D`, throwaway/reverted, node-count
+byte-identical): full **47.29** → half **47.98** (+1.5%) → quarter **48.62** (+2.8%). Weight-DRAM-
+bound fraction ≈ **3–4%**; int2-everywhere (−45% bytes) projects ≈+1.6%. **VERDICT: lower-bit quant
+(int3/int2/mixed/2:4/NF4) is a MEASURED 🟥 NO-GO.** **KEY CORRECTION:** this REFUTES the earlier
+"weight-bandwidth/compute-floor bound" attribution (#870/#872/#873) — decode is **LATENCY-bound
+on the ~2568-node serial chain (~8.2 µs/node)**, not bandwidth-bound. Ceiling VALUE (~47) and
+"marginal fusion isn't a lever" still stand; only the WHY changes. **Megakernel / drastic per-layer
+node-collapse REOPENED as the true next lever.** Brief: `docs/research/lowbit-quant-feasibility.md`.

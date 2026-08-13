@@ -1,5 +1,7 @@
 # Decisions — live standing directives
 
+Last consolidated: 2026-08-13T14:45:00Z (Scribe lowbit-nogo-probe batch @ main 26bd410f; merged 2 inbox drops — sebastian-lowbit-feasibility + fact-checker-lowbit-accuracy — into new "Lower-bit quant — MEASURED no-go; ceiling is latency-bound not bandwidth-bound" section [PR #885]. KEY: byte-fold probe (−75% weight DRAM → +2.8%, HBM util ~15%) REFUTES the earlier "weight-bandwidth-bound" attribution; decode is LATENCY-bound on the ~2568-node serial chain (~8.2 µs/node). Appended a Correction note to the #870/#872/#873 fusion-arc entry (ceiling VALUE + "marginal fusion not a lever" stand; mechanism + lower-bit future-lever were wrong). Also corrected the mechanism wording in docs/PROGRESS.md (#875 lines) + bumped HEAD → 26bd410f. Megakernel/node-collapse REOPENED as true lever. Size gate: after merge decisions.md hit 53,745 B (>50 KB) → archived the detailed #870/#871/#872/#873 fusion-arc sub-entries to decisions-archive/2026-08.md (milestone conclusion + correction kept live) → 49,381 B, under the 50 KB gate. Histories: appended probe+NO-GO to sebastian/fact-checker history.md; checked chronicle + 15,360 B gates.)
+
 Last consolidated: 2026-08-13T05:15:00Z (Scribe fusion-arc batch @ main 887e3742; merged 4 inbox drops — chew-pr871-numerics, batty-fusion-contract, batty-qkv-contract, sebastian-bf16-swiglu-fusion-contract, sebastian-gqa-not-a-capture-lever — into the "Fusion arc — 47.25 tok/s is the architectural ceiling" milestone section [PRs #870/#871/#872/#873]. KEY CONCLUSION: three byte-exact A/B experiments prove native int4 decode of Muse-Glimmer-30B is weight-bandwidth/compute-floor bound at ~47.25 tok/s, NOT dispatch-bound — node/launch fusion (cheap OR expensive) does not help; #873 QKV fusion retained opt-in behind ONNX_GENAI_CUDA_ENABLE_QKV_FUSION=1. Size gate: after merge decisions.md exceeded 50 KB → archived the detailed #867 MatMulNBits narrative to decisions-archive/2026-08.md, kept milestone + standing numerics rule live. Histories: appended #871/#872/#873 + ceiling to sebastian/chew/batty history.md; all < 15,360 B chronicle gate, none summarized.)
 Last consolidated: 2026-08-13T04:10:00Z (Scribe CUDA-47tok/s-beats-ORT batch @ main 1002e360; merged sebastian-cuda-matmulnbits-gemv (PR #867, MatMulNBits bf16 constant-scale cache, native decode 40.21 → 47.25 tok/s — native now clearly beats ORT ~40, +18%). Size gate: 49,418 B + drop would exceed 50 KB → archived the detailed 23→40 (#860) narrative to decisions-archive/2026-08.md, kept its standing numerics rule live → decisions.md now 48,855 B, under charter 50 KB gate. Histories: appended PR #867 milestone to sebastian/history.md; checked all histories against the chronicle + 15,360 B gates — none summarized.)
 Last consolidated: 2026-08-13T03:03:13Z (Scribe CUDA-40tok/s milestone batch; merged sebastian-cuda-cast-elimination (PR #860) + recorded Chew's PR #860 numerics sign-off — Chew's inbox drop file was absent, decision reconstructed from spawn manifest. NO archive: decisions.md 44,755 B, below charter 50 KB gate. NOTE: the spawn prompt's "archive entries older than 30 days at ≥20,480 B" is an age-based gate the charter forbids — it no-ops since all live entries are 2026-07/08, and 20 KB is below the standing-directive floor. Histories: sebastian 3,948 B / chew 6,951 B, both below the chronicle + 15,360 B gates, none summarized.)
@@ -56,67 +58,75 @@ sparsity) or move to a **different kernel family (megakernel)** — NOT node fus
 decisively beats ORT (**47.25 vs ~40, +18%**). **The perf arc is concluded at the ceiling;
 no code perf change shipped, one opt-in pass retained.**
 
-### 2026-08-13: bf16 decomposed SiLU/SiLU-Mul kernels — fixes a portability CRASH (#871 MERGED, Chew 🟢)
-**By:** Sebastian; gated by Chew.
-**What:** Added `decomposed_silu_mul_bf16` + `decomposed_silu_bf16` NVRTC kernels and admitted
-`BFloat16` in the decomposed path of `SiluMulKernel`/`UnaryKernel` (`kernels/elementwise.rs`).
-Previously bf16 hit a hard `"decomposed SiLU fusion requires float16"` error — a **real
-portability defect (hard crash)**. Sigmoid and the silu product each round to bf16 via the same
-`__float2bfloat16_rn` as the standalone ops; all intermediate math fp32. Also enables the graph
-`CudaSiluFusion`/SwiGLU-Mul fold (Sigmoid+Mul → `silu_mul`) once its bf16 gate in `optimizer.rs`
-is opened.
-**Chew gate → 🟢 APPROVE:** fp32 accumulation airtight; **byte-exact, 0 ulp bit-identical vs f64
-oracle** (unfused two-op graph); 5/5 silu tests pass on H200. Decision drop:
-chew-pr871-numerics.md.
-**Perf:** its own graph SwiGLU-Mul fold is FLAT (−104 *cheapest* nodes/token → tok/s flat within
-noise) — consistent with the dispatch-independence finding below. The full gate_up bf16 fold
-(−312 nodes) went **non-deterministic** through the f16-staging fused dual-scale path; making it
-safe needs a bf16-native fused `gate_up_swiglu` kernel (fp32 accumulate, no f16 round-trip) +
-Chew gate — a scoped follow-up, NOT pursued given the ceiling.
+> **Correction (2026-08-13, per probe #885):** the mechanism named above ("weight-bandwidth /
+> compute-floor bound") is **wrong**. A controlled weight-DRAM byte-fold probe (#885) measured
+> that cutting weight bytes read to 25% raises tok/s only 47.29 → 48.62 (**+2.8%**, HBM util
+> ~15%) — decode is **latency-bound on the ~2568-node serial dependency chain (~8.2 µs/node)**,
+> NOT weight-bandwidth-bound. The ceiling VALUE (~47.25) and the "marginal node/launch fusion is
+> not a lever" conclusion still stand; only the WHY changes. Consequently the "cut weight
+> BYTES/token (lower-bit quant, sparsity)" future-lever above is a **MEASURED no-go** (see the
+> Lower-bit quant section below), and **drastic per-layer node-collapse (decode megakernel,
+> activations resident) is REOPENED as the true next lever.**
 
-### 2026-08-13: GQA / inner-loop cheapening is NOT a decode lever (#870, doc-only)
-**By:** Sebastian. Under CUDA-graph capture, decode is 2568 nodes/token × ~8.17 µs/node = the
-~21 ms/token floor. Cheapening ANY single kernel's inner loop — GQA seq-loop (cap to 1 key:
-47.52), general f16 GEMV depth-loops (47.13), MLP int4 GEMV loops (47.17), split_fill 2→8
-(47.27) — leaves tok/s flat; forcing split_fill=1 (−52 nodes, serializes the loop-carried
-flash-softmax dep) is WORSE (46.31). GQA seq-length work is <2% of decode. No GQA PR (a no-op
-that risks parity). `gqa_decode_bf16` is already bf16-native I/O, fp32 accumulate, vectorized.
-
-### 2026-08-13: Cheap-node fusion (−208 constant `Add` nodes/token) REGRESSES −2.8% (#872 MERGED, doc-only)
-**By:** Batty. Folded the per-token constant `Add(Cast(weight_bf16→f32), 1.0)` RMS-norm "weight+1"
-scale into a resident f32 initializer (`CudaFoldConstantAdd`), removing **208 Add nodes/token**
-(byte-exact, full 128-token sequence identical, capture 1seg/0seams). A/B on ONE binary
-(`ONNX_GENAI_CUDA_DISABLE_CONST_ADD_FOLD=1`): captured **47.17 (off) → 45.85 (on) = −2.8%,
-reproducibly WORSE**; eager 36.72 → 36.14 (also worse). **Not shipped** (a default-on regression
-/ default-off dead code is churn for zero gain; PR is doc-only). The 8.17 µs/node figure is an
-*average* over a skewed distribution dominated by the expensive serial GEMV/GQA critical path,
-NOT a savable per-node cost for cheap off-critical-path glue. Suspected mechanism (unconfirmed):
-cold-read/scheduling perturbation — the folded gamma is now a cold resident initializer instead
-of a warm-in-L2 `Add` output; footprint ~unchanged. Decision drop: batty-fusion-contract.md.
-
-### 2026-08-13: QKV projection fusion (−104 EXPENSIVE GEMV launches/token) is FLAT → retained OPT-IN (#873 MERGED)
-**By:** Batty. `CudaQkvProjectionFusion` (`optimizer.rs`) column-concatenates the 3 per-layer
-`q_proj`(N=4096)/`k_proj`(N=256)/`v_proj`(N=256) int4 weight/scale/zero-point initializers into
-one wider `[N=4608]` `MatMulNBits` + a `Split(axis=-1,[4096,256,256])` — **no new kernel** (reuses
-the existing MatMulNBits + capture-safe Split). MatMulNBits **417 → 313** (−104 GEMV launches/token,
-2/layer×52), +52 Split, GQA 52 unchanged, capture 1seg/0seams. **BYTE-EXACT** (each output column's
-dequant + K-reduction untouched; all 64 generated ids identical; first-16 match reference
-`[24,372,1045,10016,328,2885,262,5091,8811,511,917,4921,768,328,2885,262]`) — no Chew flag.
-**Throughput FLAT / marginally worse:** baseline 47.33 → fused 47.26 (−0.07, within noise).
-**This is the decisive dispatch-vs-bandwidth test:** removing 104 *expensive* launches yields ZERO
-gain → decode is bandwidth/compute-floor bound; the 3 projections read disjoint int4 weights so
-fusing cannot cut bytes moved. **Disposition:** correct + tested (4 unit tests) + byte-exact, so
-**retained but DISABLED-BY-DEFAULT**, opt-in via `ONNX_GENAI_CUDA_ENABLE_QKV_FUSION=1`; default
-binary keeps the 3 separate GEMVs (47.33). Preserved for future dispatch-bound architectures
-(fp16 activations, higher launch-latency-to-bandwidth shapes). A fused-launch QKV epilogue kernel
-(Q/K/V to 3 destinations, dropping the 52 Splits) is **NOT worth building** — still bandwidth-bound.
-Decision drops: batty-qkv-contract.md, sebastian-bf16-swiglu-fusion-contract.md,
-sebastian-gqa-not-a-capture-lever.md.
+### Detailed #870/#871/#872/#873 sub-entries → archived
+The four detailed per-PR narratives (bf16 SiLU #871, GQA-not-a-lever #870, cheap-Add regression #872, QKV-fusion-flat #873) are in `.squad/decisions-archive/2026-08.md` ("Archived by Scribe 2026-08-13T14:45Z"). The milestone conclusion + latency-bound correction above are the live record; #873's `CudaQkvProjectionFusion` stays opt-in via `ONNX_GENAI_CUDA_ENABLE_QKV_FUSION=1`.
 
 **Profiling note (all four investigations):** hardware profilers remain blocked in-sandbox (ncu
 absent; nsys "Creating threads in this process is forbidden by design"; RmProfilingAdminOnly=1).
 All numbers from the built-in op timer + `ONNX_GENAI_PROFILE_OPS`/`cuGraphGetNodes` node counts +
 capture-safe env-gated A/B on a single release binary.
+
+## Lower-bit quant — MEASURED no-go; ceiling is latency-bound not bandwidth-bound (2026-08-13, PR #885)
+
+**KEY CONCLUSION (record prominently):** Research asked whether lower-bit quant (int3/int2/mixed/
+2:4/NF4) could beat ~47 tok/s on Muse-Glimmer-30B native CUDA decode. **NET RESULT: a MEASURED
+🟥 NO-GO** — and the probe that settled it also **corrected the earlier bandwidth-bound
+mis-attribution.** Decode is **latency-bound on the serial ~2568-node dependency chain
+(~8.2 µs/node × 2568 ≈ 21 ms/token)**, NOT weight-bandwidth-bound. Reconciles both prior
+negatives: not bandwidth (byte-fold flat) AND not marginal-node-sensitive (#872/#873 flat/worse).
+**Megakernel / drastic per-layer node-collapse (activations resident) is the reopened true lever.**
+
+### 2026-08-13: Bandwidth probe (#885 MERGED, docs-only) — the mechanism is latency, not bytes
+**By:** Sebastian (Perf). Full brief: `docs/research/lowbit-quant-feasibility.md`.
+**Byte budget** (measured from the real ONNX, 417 MatMulNBits, bits=4/bs=32/asymmetric/bf16-scales):
+packed weights 13 254 MB + bf16 scales 1 657 MB + int4 zero-points 414 MB = **15 325 MB/token**
+= at 47 tok/s only **724 GB/s = ~15% of the H200's 4.8 TB/s HBM roofline** (if bandwidth-bound
+we'd be ~313 tok/s). The bf16 scale floor does NOT shrink with fewer bits, so int2-everywhere is
+only 0.554× bytes, not 0.5×.
+**Controlled probe** (throwaway/reverted, `ONNX_GENAI_WEIGHT_FOLD=D` folds the int4 GEMV weight-read
+column so DRAM footprint → 1/D with loop-trip/instruction/launch/node-count byte-identical; H200,
+CUDA_GRAPH=1, --pipeline, 3×128-tok median):
+| weight DRAM | tok/s | Δ |
+|---|---|---|
+| full (D=1) | **47.29** | — |
+| half (D=2) | 47.98 | +1.5% |
+| quarter (D=4) | 48.62 | +2.8% |
+
+−75% weight DRAM → **+2.8%** ⇒ weight-DRAM-bound fraction ≈ **3–4%**. int2-everywhere (−45% bytes)
+projects to **≈+1.6% (~48 tok/s)**, not the naive +14%/+80%. **Lower-bit quant (all variants) =
+MEASURED 🟥 NO-GO** as the next lever.
+
+### 2026-08-13: Accuracy reality-check (Fact Checker) — every sub-4-bit path also needs a re-quant
+**By:** Fact Checker (independent, accuracy lens only; read-only, no kernels touched). Full brief:
+merged from `fact-checker-lowbit-accuracy.md`.
+- **int3 weight-only (imatrix/AWQ-class, ~3.5 bpw / SpQR mixed):** 🟢 credible — small real quality
+  tax, least-risky sub-4-bit lever.
+- **int2 scalar / Q2_K:** 🔴 accuracy-prohibitive (cliff) — do not ship for quality-sensitive output.
+- **int2 via codebook/trellis (QuIP#/AQLM/QTIP):** 🟡 SOTA-for-2-bit but still a visible FP16 gap at
+  30B, AND replaces scalar dequant with LUT/trellis decode that **spends the bandwidth win back** —
+  accuracy win and bandwidth win are coupled, not independent.
+- **Mixed-precision (SpQR/LLM-MQ, ~2.5–3.5 avg bit):** 🟢 accuracy / 🟡 kernel+tooling (irregular
+  layout + outlier FP16 sidecar).
+- **2:4 structured sparsity:** 🟡 needs a fine-tune for quality; no M=1 tensor-core benefit anyway.
+- **Load-bearing blockers:** (1) we only HAVE int4 — EVERY sub-4-bit method must re-quantize/calibrate
+  from the **fp16/bf16 SOURCE** checkpoint (re-squeezing the existing int4 compounds error → collapse);
+  (2) ORT-stack tooling for sub-4-bit >7B is immature (GGUF/imatrix ships it but off-stack; Olive not
+  demonstrated). Chew is the numerics gate if any sub-4-bit path is ever funded.
+
+**Disposition:** no code/quant change made or planned. Lower-bit quant replaced on the roadmap by a
+one-layer decode-megakernel prototype (the only direction consistent with all three measurements:
+byte-fold flat, marginal fusion flat/worse, ~15% HBM util). Decision drops merged & deleted:
+`sebastian-lowbit-feasibility.md`, `fact-checker-lowbit-accuracy.md`.
 
 ## nxrt EP plugins on PyPI + CUDA 13 target (2026-08-12)
 
