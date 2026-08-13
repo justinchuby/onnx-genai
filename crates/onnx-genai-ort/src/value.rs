@@ -332,7 +332,13 @@ impl Value {
         // is undefined behaviour. This is the one constructor whose buffer we do
         // not allocate, so it is the only place the invariant can be violated —
         // report it here, where the caller can still fix the allocation.
-        if !(data as usize).is_multiple_of(dtype.align_of()) {
+        //
+        // A zero-element tensor is exempt, and deliberately so: no reader ever
+        // dereferences its data pointer, so there is nothing to misalign. The
+        // exemption is also load-bearing, because the natural way to produce an
+        // empty buffer is an empty `Vec<u8>`, whose dangling pointer is `0x1` —
+        // non-null, and never aligned for a multi-byte dtype.
+        if bytes > 0 && !(data as usize).is_multiple_of(dtype.align_of()) {
             return Err(OrtError::InvalidArgument(format!(
                 "external buffer at {data:p} is not aligned to {} bytes as {dtype:?} elements \
                  require; allocate it with at least element alignment",
@@ -2319,6 +2325,31 @@ mod element_alignment_tests {
             message.contains("not aligned") && message.contains('4'),
             "the error must name the alignment f32 requires: {message}"
         );
+    }
+
+    /// A zero-element external buffer is accepted whatever its pointer, because
+    /// no reader ever dereferences it — and the obvious way to spell "empty" in
+    /// Rust, `Vec::<u8>::new()`, yields the misaligned dangling `0x1`.
+    ///
+    /// This is not hypothetical: `governed_allocator_session`'s real-session
+    /// test feeds exactly this when a model input has zero elements.
+    #[test]
+    fn a_zero_length_external_buffer_is_accepted_despite_a_dangling_pointer() {
+        let mut empty: Vec<u8> = Vec::new();
+        assert_eq!(empty.as_mut_ptr() as usize, 1, "Vec's dangling sentinel");
+        let info = MemoryInfo::cpu().expect("cpu memory info");
+        let value = unsafe {
+            Value::from_external_memory(
+                empty.as_mut_ptr().cast(),
+                0,
+                &[0, 8],
+                DataType::Float32,
+                &info,
+            )
+        }
+        .expect("a zero-element tensor has nothing to misalign");
+        assert_eq!(value.numel(), 0);
+        assert!(value.to_vec_f32().expect("read back").is_empty());
     }
 
     /// The rejection must be about alignment, not about external buffers: a
