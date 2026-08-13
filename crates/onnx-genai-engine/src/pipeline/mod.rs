@@ -264,6 +264,13 @@ pub struct PipelineEngine {
     /// pipelines whose prompt components never activate (e.g. a text-only prompt
     /// through a multimodal package never builds the vision encoder). Behind a
     /// `RefCell` because the prologue runs from `&self` paths.
+    #[cfg_attr(
+        not(feature = "native-backend"),
+        allow(
+            dead_code,
+            reason = "native prompt sessions are built only by the native backend"
+        )
+    )]
     native_prompt_sessions:
         RefCell<BTreeMap<String, Box<dyn onnx_genai_metadata::ComponentSession>>>,
     #[cfg(feature = "cuda")]
@@ -533,6 +540,13 @@ fn build_step_component_session<'a>(
 /// sidecar's `model.max_sequence_length` first, then the compatibility
 /// `genai_config.json` context length. `None` preserves the prior unbounded
 /// behavior for packages that declare neither.
+#[cfg_attr(
+    not(feature = "native-backend"),
+    allow(
+        dead_code,
+        reason = "the declared context length is read only by the native decoder"
+    )
+)]
 fn pipeline_metadata_max_len(directory: &onnx_genai_ort::PipelineModelDirectory) -> Option<usize> {
     if let Some(path) = directory.metadata_path.as_ref()
         && let Ok(metadata) = onnx_genai_metadata::load_metadata(path)
