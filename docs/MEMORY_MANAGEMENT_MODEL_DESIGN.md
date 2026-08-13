@@ -54,13 +54,25 @@ These contracts must preserve the following invariants:
 ## Proposed design
 
 ```text
-Local Runtime / OrtEnv
-ResourceRegistry + TopologyProvider (C1, C7, C8)
+Application / local API clients
                         |
                         v
-Engine / Scheduler: plan complete model + StateBundle work (C4, C9, I10)
-                        |
-                        v
++--------------------------------------------------------------------+
+| GenAI Server (or embedded GenAI Runtime)                            |
+| ModelRegistry: load / switch / unload | RequestRouter: queue/priority|
+| Resource API: limits / policy / snapshots / metrics                |
++-------------------------------+------------------------------------+
+                                | owns process services; creates engines
+                                v
+Local Runtime / OrtEnv: ResourceRegistry + TopologyProvider (C1,C7,C8)
+                                |
+                  +-------------+----------------+
+                  | authority/topology handles   |
+                  v                              v
+ Engine / Scheduler [per model/pipeline] --bind/run--> ORT Session / EPs
+ plan Model + StateBundle (C4,C9,I10)
+                  |
+                  v
 +--------------------------------------------------------------------+
 | Memory control plane                                               |
 | Host/UnifiedAuthority       | DeviceAuthority[distinct local pool] |
@@ -84,11 +96,12 @@ hot / warm / cold      prefix + request state  cached / reclaimable
 +-----------------------------+--------------------------------------+
                               |
                               v
-            ORT session / EP kernels / captured graph
+                   EP kernels / captured graph
 ```
 
 | Design component | Contract and invariant coverage |
 | --- | --- |
+| GenAI server/runtime and model registry | C1, C2, C4, C5, C7-C9; I3, I5-I8, I10 |
 | Resource registry and topology provider | C1, C7, C8; I1, I8 |
 | Device and host authorities | C1, C2, C5, C8; I1, I2, I3, I6, I7 |
 | Scheduler and admission | C4, C7-C9; I4, I5, I8, I10 |
@@ -97,6 +110,14 @@ hot / warm / cold      prefix + request state  cached / reclaimable
 | Contiguous-VA VMM backend | C2-C4, C6, C7, C9; I1-I5, I8-I10 |
 | ORT allocator and I/O-binding adapters | C2, C3, C6, C8, C9; I2, I3, I10 |
 | Persistent state manager | C2, C4, C6, C9; I4-I6, I10 |
+
+**Server/runtime interaction.** The server owns the process-local resource
+registry and authorities. The model registry requests model-level leases before
+constructing an engine/ORT session and returns them on unload or demotion. The
+request router supplies priority and latency policy; each engine scheduler
+performs byte admission and C4 transactions. The resource API configures C8
+limits and reads the same authority snapshots used for admission. An embedded
+caller uses the identical runtime services without the HTTP layer.
 
 **Control plane.** `DeviceMemoryAuthority` owns the ledger and stable
 `MemoryAuthorityId` for one distinct device-local pool. Devices sharing physical
