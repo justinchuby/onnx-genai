@@ -2866,7 +2866,7 @@ pipeline:
       custom_op_versions: {}
       capabilities:
         [workflow_ssa, typed_emit, streaming_emit,
-         nested_control_flow, session_state_lease]
+         nested_control_flow, session_state_lease, advisory_state]
     inputs:
       initial: { contract: { dtype: int64, rank: 0, shape: [] },
                  role: { kind: opaque }, source: { kind: application, name: initial },
@@ -2894,6 +2894,8 @@ pipeline:
     outputs:
       latent: { contract: { dtype: int64, rank: 0, shape: [] },
                 role: tensor, stage: pre_adapter }
+      advisory_count: { contract: { dtype: int64, rank: 0, shape: [] },
+                        role: tensor, stage: pre_adapter }
       actions: { contract: { dtype: bool, rank: 0, shape: [] },
                  role: event, stage: pre_adapter }
     components:
@@ -2935,6 +2937,14 @@ pipeline:
             update: { dtype: int64, rank: 0, shape: [] }
           outputs:
             next: { dtype: int64, rank: 0, shape: [] }
+      advisory_counter:
+        implementation: { kind: onnx, artifact: advisory-counter.onnx.textproto }
+        ports:
+          inputs:
+            current: { dtype: int64, rank: 0, shape: [] }
+            update: { dtype: int64, rank: 0, shape: [] }
+          outputs:
+            next: { dtype: int64, rank: 0, shape: [] }
     state:
       latent:
         contract: { dtype: int64, rank: 0, shape: [] }
@@ -2943,13 +2953,26 @@ pipeline:
         initializer: initial
         recurrence: { kind: invariant }
         session: { policy: exclusive }
+      advisory_steps:
+        contract: { dtype: int64, rank: 0, shape: [] }
+        class: advisory
+        scope: session
+        initializer: initial
+        recurrence: { kind: invariant }
+        session: { policy: exclusive }
     steps:
         - kind: loop
           setup:
-            - kind: invoke
-              component: bind_state
-              inputs: { value: initial }
-              outputs: { value: latent.current }
+            - kind: sequence
+              steps:
+                - kind: invoke
+                  component: bind_state
+                  inputs: { value: initial }
+                  outputs: { value: latent.current }
+                - kind: invoke
+                  component: bind_state
+                  inputs: { value: initial }
+                  outputs: { value: advisory.current }
           steps:
               - kind: invoke
                 component: observation_encoder
@@ -2979,15 +3002,26 @@ pipeline:
                 outputs:
                   latent.next:
                     cases: { "true": environment.low, "false": environment.high }
+              - kind: invoke
+                component: advisory_counter
+                inputs: { current: advisory_steps, update: low_delta }
+                outputs: { next: advisory.next }
           continue_when: continue
           max_iterations: iterations
           carried:
             - cell: latent
               initial: latent.current
               next: latent.next
+            - cell: advisory_steps
+              initial: advisory.current
+              next: advisory.next
         - kind: emit
           value: latent
           output: latent
+          mode: replace
+        - kind: emit
+          value: advisory_steps
+          output: advisory_count
           mode: replace
 "#;
     let root = package(
@@ -2998,6 +3032,7 @@ pipeline:
             ("action.onnx.textproto", LESS),
             ("environment-low.onnx.textproto", ADD_STATE),
             ("environment-high.onnx.textproto", ADD_STATE),
+            ("advisory-counter.onnx.textproto", ADD_STATE),
         ],
     )?;
     let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
@@ -3029,16 +3064,23 @@ pipeline:
 
     let first = engine.run_pipeline(request(2, 1))?;
     assert_eq!(first["latent"].to_vec_i64()?, [5]);
+    assert_eq!(first["advisory_count"].to_vec_i64()?, [2]);
     assert_eq!(first["actions"].as_raw_bytes()?, [0]);
     let checkpoint = engine.checkpoint_session("world-checkpoint")?;
 
     let advanced = engine.run_pipeline(request(1, 2))?;
     assert_eq!(advanced["latent"].to_vec_i64()?, [9]);
+    assert_eq!(advanced["advisory_count"].to_vec_i64()?, [3]);
     assert_eq!(advanced["actions"].as_raw_bytes()?, [0]);
 
     engine.restore_session_checkpoint("world-checkpoint", &checkpoint)?;
     let replayed = engine.run_pipeline(request(1, 2))?;
     assert_eq!(replayed["latent"].to_vec_i64()?, [9]);
+    assert_eq!(
+        replayed["advisory_count"].to_vec_i64()?,
+        [4],
+        "advisory session state is intentionally excluded from semantic checkpoints"
+    );
     assert_eq!(
         replayed["actions"].as_raw_bytes()?,
         advanced["actions"].as_raw_bytes()?
