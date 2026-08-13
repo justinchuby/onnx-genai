@@ -183,7 +183,6 @@ jobs:
       - name: Build Linux offline crates
         run: >-
           cargo build --locked
-          -p onnx-genai-comfyui-config
           -p onnx-genai-metadata
           -p onnx-genai-genai-config
           -p onnx-genai-kv
@@ -217,7 +216,6 @@ jobs:
       - name: Clippy Linux offline crates
         run: >-
           cargo clippy --locked --all-targets
-          -p onnx-genai-comfyui-config
           -p onnx-genai-metadata
           -p onnx-genai-genai-config
           -p onnx-genai-kv
@@ -349,7 +347,6 @@ jobs:
       - name: Run clippy on all offline crates
         run: >-
           cargo clippy --locked --all-targets
-          -p onnx-genai-comfyui-config
           -p onnx-genai-metadata
           -p onnx-genai-genai-config
           -p onnx-genai-kv
@@ -633,7 +630,6 @@ jobs:
         run: >-
           cargo clippy --locked --all-targets
           --target aarch64-pc-windows-msvc
-          -p onnx-genai-comfyui-config
           -p onnx-genai-metadata
           -p onnx-genai-genai-config
           -p onnx-genai-kv
