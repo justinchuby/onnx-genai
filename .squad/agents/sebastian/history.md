@@ -58,3 +58,17 @@ summation order changes). Native CUDA decode **23.16 → 40.21 tok/s** (H200, 3-
 capture; the parallel reduction is the real lever (serial `fadd` chain ≈40% of captured
 decode; serial floor ≈33 tok/s). Chew-gated 🟢. Escape hatch
 `ONNX_GENAI_CUDA_DISABLE_NORM_CAST_FOLD=1`. **Multi-session CUDA goal MET: matches ORT ~40 tok/s.**
+
+## 2026-08-13 — PR #867 MERGED: 40→47 tok/s, native CUDA now BEATS ORT
+Cached the Float16-staged constant int4 scales. `MatMulNBitsKernel::run_bf16` was re-casting
+the immutable int4 scale slots bf16→f16 into an ephemeral arena **every** decode step
+(~3.3 GB/token, ~25% of int4 weight traffic, 417 redundant cast launches). Added a persistent
+per-kernel `Bf16ConstCache` that stages the constant scale slots once (general path input 2;
+SwiGLU-fusion inputs 2 and 4) and reuses them; dynamic slots (activation input 0, bias
+residual) stay on the ephemeral arena. Capture-safe (alloc+cast on pre-capture warmup; replays
+hit lookups only). Native decode **40.21 → 47.25 tok/s** (H200, 3-run median), MatMulNBits eager
+share ~44%→~31%, 1 segment / 0 seams, full 128-token sequence byte-identical. **Byte-exact by
+construction — no Chew gate**; test `bf16_scale_cache_is_bit_exact_to_inline_staging`.
+**MILESTONE: native CUDA EP now clearly beats ORT — 47.25 vs ~40 tok/s, +18%.** Next lever
+(deferred): GQA is now the largest eager share (~41%); full bf16-native GEMV / accuracy_level=4
+DP4A int8 remain open, both numerics-gated.
