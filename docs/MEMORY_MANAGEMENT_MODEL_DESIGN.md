@@ -2,7 +2,7 @@
 
 **Status:** Design proposal  
 **Date:** 2026-08-13  
-**Scope:** Process-local device and host memory for inference and generation
+**Scope:** Process-local device, host, and optional disk-backed memory for inference and generation
 
 ## Summary
 
@@ -22,18 +22,23 @@ strategies.
 The design introduces one shared memory control plane while retaining
 specialized allocation and caching data planes.
 
+**Decision:** place a GenAI-independent `ProcessMemoryManager` in the ORT
+foundation; let ORT GenAI own generation/state policy and Foundry Local own
+product policy. Sessions, model residency, state holders, and arenas all lease
+from the same authorities through the contracts below.
+
 ## Contracts
 
 | ID | Contract | Responsibility |
 | --- | --- | --- |
-| **C1** | Resource authority | Within one `ProcessMemoryManager`, one authority owns each distinct physical memory pool. Devices with private memory use a device authority; devices sharing physical memory alias the same host/unified authority. |
-| **C2** | Lease and allowance | A holder acquires an RAII lease before retaining physical memory. Additional mappings or OS residency budgets use authority-scoped allowances, not a second physical charge. |
+| **C1** | Resource authority | Within one `ProcessMemoryManager`, each distinct physical pool has one canonical authority identity. A governor may expose several tiers, but devices sharing physical memory alias the same authority and mismatched identities fail before use. |
+| **C2** | Lease and allowance | Before retaining physical memory, a holder acquires an RAII lease identifying authority, tier, bytes, role, and holder. Mappings or OS residency budgets use authority-scoped allowances, not a second physical charge. |
 | **C3** | Allocator and backing | `DeviceAllocator` obtains memory; `VirtualBacking` reserves, maps, and unmaps address space. Neither decides admission or eviction policy. |
-| **C4** | Capacity transaction | Any capacity-changing operation follows `plan -> reserve -> expose provisional view -> execute -> commit`, with rollback before commit. |
-| **C5** | Reclaimable holder | Under pressure, the authority requests bytes from a registered holder. The holder selects safe victims and reports what it actually released. |
+| **C4** | Capacity transaction | An operation that changes committed model/request state, transfers capacity between holders/tiers, or changes a model-visible mapping follows `plan -> reserve -> expose provisional view -> execute -> commit`. Suballocation within an existing lease does not. |
+| **C5** | Reclaimable holder | Pressure is a non-blocking, cancellable ticket carrying target bytes, priority, deadline, and configuration generation. The holder selects safe victims and may legitimately release zero. |
 | **C6** | Model memory view | A backend exposes contiguous, blocks-plus-table, indexed, or opaque state views. The view remains valid for the execution that consumes it. |
 | **C7** | Topology and capability | The platform reports capacity, tier aliasing, mapping granularity, transfer paths, and supported model views. Selection is capability-driven. |
-| **C8** | Reconfiguration and observability | Authorities expose used, available, oversubscribed, and role-attributed bytes; limits may be lowered only through the reclaim protocol. |
+| **C8** | Reconfiguration and observability | Authorities expose used, available, oversubscribed, and role-attributed bytes. Lowering a limit uses prepare/reclaim/commit; if the target cannot be met, the old limit remains and completed actions are reported. |
 | **C9** | Persistent state bundle | Every model declares all loop-carried state and its lifetime, growth/update pattern, model view, and checkpoint/fork/migrate capabilities. The engine transacts the complete bundle, not only attention KV. |
 
 These contracts must preserve the following invariants:
@@ -42,11 +47,11 @@ These contracts must preserve the following invariants:
 | --- | --- |
 | **I1 — Single accounting authority** | Every managed physical byte is charged to exactly one authority. Shared mappings and prefix aliases may consume allowances but do not create a second physical charge. |
 | **I2 — Charge before commit** | Physical allocation or mapping is preceded by a lease or transactional grant/allowance. Already-committed bytes are recorded even when that reveals oversubscription. |
-| **I3 — Fail closed** | A denied lease, authority mismatch, or required managed-memory initialization failure never falls back to ungoverned allocation. |
-| **I4 — Exclusive ownership state** | Physical capacity and allowances are exactly one of free, transaction-reserved, or committed to a holder. |
+| **I3 — Fail closed** | Managed mode never silently escapes the authority after denial, mismatch, or initialization failure. An explicit compatibility mode may delegate to the OS, but must report that hard limits no longer apply. |
+| **I4 — Exclusive ownership state** | At the authority level, physical capacity and allowances are exactly one of free, transaction-reserved, or committed to a holder; an arena may suballocate inside its committed lease. |
 | **I5 — Transaction consistency** | A pre-commit failure restores the prior request, complete state bundle, and capture state. If components can diverge after commit begins, the engine becomes unhealthy rather than continuing. |
 | **I6 — Live-state safety** | The authority never takes memory directly. The holder may release it, but cannot select pinned or in-flight data for reclaim. |
-| **I7 — Non-blocking governance** | No thread waits while holding an authority lock, and allocator callbacks do not wait for reclaim. A waiter is woken only after capacity or allowance is reserved. |
+| **I7 — Non-blocking governance** | No thread waits while holding an authority lock. Allocator callbacks treat pending pressure as `WouldBlock`/denial; wait-capable callers wake only after reservation, and cancellation/timeout releases any grant exactly once. |
 | **I8 — Bytes are authoritative** | Tokens, blocks, and pages are derived from exact model geometry and queried platform granularity; admission includes rounding and transient migration peaks. |
 | **I9 — Remap synchronization** | A virtual mapping is not changed while a kernel, transfer, or captured graph may access it. |
 | **I10 — State-complete commit** | KV, recurrent state, convolution state, sampler/search state, and request progress commit or roll back at the same logical step. |
@@ -67,7 +72,7 @@ flowchart TD
         ModelRuntime["Model loader / engine factory"]
         RequestRuntime["Request scheduler / tokenizer / sampler"]
         Engine["Generation Engine(s)"]
-        Weights["Model residency: weights + captures"]
+        Weights["Model residency: weights + capture-safe stable slots"]
         State["StateBundle + KvPageStore policy<br/>KV + recurrent + conv + prefixes"]
         GenApi --> ModelRuntime
         GenApi --> RequestRuntime
@@ -81,9 +86,10 @@ flowchart TD
         Memory["ProcessMemoryManager<br/>owns budgets, pressure, and telemetry"]
         Topology["TopologyProvider<br/>physical pools, aliasing, granularity, links"]
         Registry["MemoryAuthorityRegistry<br/>one authority per physical pool"]
-        Host["HostGovernor<br/>host RAM/disk tickets + pressure"]
+        Host["HostGovernor<br/>host RAM + disk authorities; ticketed pressure"]
         Device["DeviceMemoryAuthority(s)<br/>device ledger + mapped growth"]
         LeaseAPI["MemoryGovernor contract<br/>leases, allowances, holder registration"]
+        Txn["CapacityTransactionCoordinator<br/>reserve/commit across authorities"]
         Adapters["Governed allocator adapters<br/>bulk leases + local suballocation"]
         Env["OrtEnv<br/>logging, threads, allocator registration"]
         Session["InferenceSession(s)<br/>graph plan, bind, Run"]
@@ -96,9 +102,11 @@ flowchart TD
         Registry --> Device
         Host -->|"implements"| LeaseAPI
         Device -->|"implements"| LeaseAPI
+        Memory --> Txn
+        Txn --> LeaseAPI
         LeaseAPI --> Adapters
         Adapters --> Env
-        Env --> Session
+        Env -->|"shared allocator context"| Session
         Adapters --> Arenas
         Session --> Arenas
         Arenas --> Allocators
@@ -110,7 +118,8 @@ flowchart TD
     Foundry -->|"resource limits / policy"| Memory
     Standalone --> Env
     Standalone -->|"create or use default manager"| Memory
-    Engine -->|"plan / prepare C4 transaction"| LeaseAPI
+    Standalone -->|"create / Run"| Session
+    Engine -->|"plan / prepare C4 transaction"| Txn
     Weights -->|"reserve + register reclaim holder"| LeaseAPI
     State -->|"reserve + register reclaim holder"| LeaseAPI
     Weights -->|"allocate/map after grant"| Allocators
@@ -133,14 +142,21 @@ sequenceDiagram
     participant S as InferenceSession / EP
 
     H->>G: reserve or prepare mapped growth
-    G-->>H: MemoryLease / MappedGrowthGrant
-    H->>A: allocate or map using the grant
-    A-->>H: stable allocation / model view
-    H->>S: bind or publish C6 view
-    Note over H,S: Holder keeps the lease while bytes and view remain live
-    G->>H: pressure notification outside allocator locks
-    H->>A: fence work and release a safe victim
-    H-->>G: report bytes actually released
+    alt granted
+        G-->>H: MemoryLease / MappedGrowthGrant
+        H->>A: allocate or map using the grant
+        A-->>H: stable allocation / model view
+        H->>S: bind or publish C6 view
+        Note over H,S: Holder keeps the lease while bytes and view remain live
+    else pending or denied
+        G-->>H: WouldBlock / Denied
+        Note over H,G: Allocator fails fast; scheduler may await a pressure ticket
+    end
+    opt later pressure against a live holder
+        G->>H: notification outside allocator locks
+        H->>A: fence work and release a safe victim
+        H-->>G: shrink/drop lease and report released bytes
+    end
 ```
 
 | Diagram node | Responsibility | Contract / invariant coverage |
@@ -150,15 +166,16 @@ sequenceDiagram
 | `ProcessMemoryManager` | Owns the process-wide resource service and configuration/telemetry entry point. | C1, C7, C8; I1, I8 |
 | `TopologyProvider` | Reports distinct/aliased pools, capacities, mapping granularity, and transfer paths. | C7; I8 |
 | `MemoryAuthorityRegistry` | Resolves each physical pool to exactly one stable authority. | C1; I1 |
-| `HostGovernor` | Accounts host RAM/disk and arbitrates ticketed, non-blocking pressure across sessions/devices. | C1, C2, C5, C8; I1-I3, I6, I7 |
+| `HostGovernor` | Owns distinct host-RAM/disk authority identities and arbitrates ticketed pressure across sessions/devices. | C1, C2, C5, C8; I1-I3, I6, I7 |
 | `DeviceMemoryAuthority` | Accounts one device-local pool and coordinates leases, mapped allowances, and growth. | C1, C2, C5, C8; I1-I3, I6-I9 |
-| `MemoryGovernor` | Common lease/allowance/reclaim interface implemented by host and device authorities. | C2, C5, C8; I2, I3, I6, I7 |
+| `MemoryGovernor` | Common lease/allowance/reclaim interface; every grant names the exact underlying authority even when one governor exposes several tiers. | C2, C5, C8; I2, I3, I6, I7 |
+| `CapacityTransactionCoordinator` | Reserves all participating authorities before publishing a cross-tier/device state change. | C4; I4, I5, I7, I8, I10 |
 | Governed allocator adapters | Convert bulk grants into fast ORT/EP-local suballocation. | C2, C3; I2, I3, I7 |
 | `OrtEnv` | Provides ORT process context and registers shared allocator adapters; owns no resource policy. | C3, C8; I3, I7 |
 | `InferenceSession` | Plans and executes one graph, binds C6 views, and reports persistent/transient needs. | C4, C6, C8; I5, I8-I10 |
 | Model residency | Chooses hot/warm/cold weights and capture-safe stable slots; releases only safe victims. | C2, C4-C6; I2, I5, I6, I9 |
 | `StateBundle` / `KvPageStore` | Owns KV, recurrent/conv, prefix, fork, checkpoint, and migration semantics. | C2, C4-C6, C9; I2, I4-I6, I9, I10 |
-| ORT/EP arenas | Pool activations/workspace under bulk leases and return reclaimable regions. | C2-C5; I2-I7 |
+| ORT/EP arenas | Pool activations/workspace under bulk leases and return reclaimable regions. | C2, C3, C5, C8; I2-I4, I6, I7 |
 | `DeviceAllocator` / `VirtualBacking` | Performs allocation and VA reserve/map/unmap without making policy. | C3; I2, I3, I9 |
 | EP kernels / capture | Consume declared model views; captured work pins compatible addresses/shapes. | C6, C9; I5, I9, I10 |
 
@@ -209,10 +226,10 @@ One process-local `HostGovernor` covers host resources shared by all sessions
 and devices; cross-process enforcement is out of scope.
 
 **Fast path.** Governance is not a callback on every tensor or kernel.
-Allocators bulk-lease arena regions; persistent weights/state lease on growth;
-suballocation stays inside the local arena. Admission and reclaim run at model,
-request-step, arena-growth, and limit-change boundaries. The ordinary ORT
-allocation hot path therefore remains a local allocator operation.
+Device/ORT arenas bulk-lease regions and suballocate locally; direct host
+allocation may use a cheap header-contained lease or a precharged envelope.
+Persistent weights/state lease on growth. Admission and reclaim run at model,
+request-step, arena-growth, and limit-change boundaries, never per kernel.
 
 **Data plane.** `DeviceAllocator` answers *where bytes come from*;
 `MemoryGovernor` answers *whether they may be retained*. `VirtualBacking`
@@ -274,8 +291,10 @@ with a stable pool/table buffer and bucketed table shapes.
 
 ### Capacity transaction
 
-Every C9 state bundle—including paged or VMM-backed KV—uses the same step
-protocol:
+`ProcessMemoryManager`'s transaction coordinator first reserves every source,
+destination, and transient peak across the participating authorities. It then
+hands scoped grants to the holders. Every C9 state bundle—including paged or
+VMM-backed KV—uses the same step protocol:
 
 ```text
 plan -> reserve bytes and pages -> expose provisional model view -> execute
@@ -293,7 +312,7 @@ rather than continue with divergent state.
 ### Extensibility and backend selection
 
 Implementations extend the contracts, not the engine: custom
-`MemoryGovernor`/`LeaseAccounting` policy, server-owned
+`MemoryGovernor`/`LeaseAccounting` policy, host-supplied
 `MemoryAuthorityProvider`, platform `DeviceAllocator`/`VirtualBacking`,
 device-specific `KvPageStoreFactory`, and holder-specific reclaim policy all
 remain replaceable.
@@ -387,6 +406,8 @@ under explicit cross-component contracts.
 | --- | --- |
 | Independent fixed budgets for ORT, weights, and KV | Simple and predictable, but strands capacity and requires the user to guess the right split before load. One model can fail while another pool retains unused bytes. |
 | One global allocator | Conflates policy with mechanism. Activations, KV, weights, shared prefixes, and virtual mappings have different lifetimes and ownership rules; some ORT and EP allocations also occur behind specialized arenas. |
+| GenAI-owned authority | Coordinates generation state, but excludes standalone ORT and couples physical accounting to generation semantics. Foundry/GenAI should configure and consume the authority, not define it. |
+| `OrtEnv`-owned policy | Gives sessions a shared lifetime but mixes machine policy with logging/thread/EP environment responsibilities. `OrtEnv` should register adapters backed by the independent manager. |
 | Paged attention only | Efficient for high concurrency, but requires exported block-table inputs and a compatible attention operator. It cannot transparently serve existing ORT graphs that declare flat past/present tensors. |
 | Contiguous-VA VMM only | Preserves existing tensor contracts, but coarse device granularity can waste memory for many short sequences, and not every platform exposes equivalent remapping. |
 | Rely on OS or driver oversubscription | Can make an oversized model run, especially under WDDM, but placement, eviction, and latency are opaque and the runtime cannot reserve headroom for other applications. |
@@ -403,9 +424,12 @@ and hardware measurements summarized in `MEMORY_ARCHITECTURE.md`.
 | Risk | Confidence | Evidence and remaining work |
 | --- | --- | --- |
 | **Incomplete accounting** | **Medium** | Governed ORT allocation and CUDA weight/KV/workspace leases share one ledger; activation/overhead and ORT VMM KV remain incomplete. Reconcile telemetry and reserve unattributed headroom. |
+| **Governance overhead** | **Medium** | Header-based host governance measured about 15 ns in the repository and VMM charges at granule growth, not per tensor. Multi-session contention and ORT device-arena adapter overhead still need measurement; keep suballocation local and policy off kernel paths. |
 | **VMM granularity waste** | **Medium-high** | Tests measure a 2 MiB CUDA granule and layout crossovers; token-major cut one floor by 768x. Automatic cross-device selection remains. |
 | **Unsafe remap/commit** | **Medium end to end** | Same-VA graph replay, stable weight slots, prefix multi-map/refcounts, and mapped-growth transactions pass GPU tests. In-flight unmap and multi-model/multi-stream stress remain unsupported. |
 | **Offload thrash/corruption** | **Low-medium** | Cyclic LRU measured 0% hits versus 74.18% for a stable set; WDDM cold reads beat managed churn. Dynamic stable-slot re-admission has unresolved corruption. Ship static hybrid first; gate dynamic policy on token identity, bytes/token, and tail latency. |
+| **Pressure deadlock/starvation** | **Medium-high for host protocol; medium end to end** | Ticketed `HostGovernor` has TLA/refinement, priority aging, cancellation, and conformance tests. Cross-tier device/host reclaim with real holders still needs stress and fault campaigns. |
+| **Incomplete state bundle** | **Medium** | Native recurrent-prefix parity and KV transaction tests exist, while ORT hybrid reuse deliberately recomputes because full C9 restore is absent. Require state-schema identity and complete-bundle commit before enabling a cache hit. |
 | **Host pressure** | **Medium-low** | Ticketed `HostGovernor` has TLA/refinement and conformance tests; RSS, pinned, disk, and WDDM non-local pressure are not yet one physical authority. |
 | **Topology errors** | **Low-medium** | CUDA/WDDM are measured; Intel NPU and true UMA graphs need capability/admission conformance. |
 | **External consumers** | **Low** | A process-local authority cannot reclaim opaque or other-process allocations; telemetry and reserve provide backpressure, not a hard guarantee. |
