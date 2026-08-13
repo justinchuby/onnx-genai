@@ -438,10 +438,23 @@ fn print_weight_offload_observability(emitted_tokens: u64) {
     let hit_rate = weight_offload_hit_rate(&stats)
         .map(|rate| format!("{rate:.2}%"))
         .unwrap_or_else(|| "n/a".to_string());
+    // The byte-weighted rate is the one residency policy must be judged on: the
+    // count-based rate weights a 10 KiB norm like an 11 MiB projection, so it can
+    // improve while streamed bytes get worse (#857, #837 item 3).
+    let byte_hit_rate = stats
+        .byte_hit_rate()
+        .map(|rate| format!("{:.2}%", rate * 100.0))
+        .unwrap_or_else(|| "n/a".to_string());
     println!(
-        "weight_offload_cache: page_ins={} hits={} hit_rate={} evictions={} \
-         bypassed_page_ins={}",
-        stats.page_ins, stats.hits, hit_rate, stats.evictions, stats.bypassed_page_ins
+        "weight_offload_cache: page_ins={} hits={} hit_rate={} byte_hit_rate={} \
+         hit_bytes={} evictions={} bypassed_page_ins={}",
+        stats.page_ins,
+        stats.hits,
+        hit_rate,
+        byte_hit_rate,
+        stats.hit_bytes,
+        stats.evictions,
+        stats.bypassed_page_ins
     );
     print_weight_offload_amortization(&stats, emitted_tokens);
     println!(

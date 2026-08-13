@@ -42,6 +42,10 @@ const WEIGHT_SLOT_ALIGN: usize = 256;
 /// benchmark measurement windows while caches remain alive.
 static GLOBAL_PAGE_INS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_HITS: AtomicU64 = AtomicU64::new(0);
+/// Bytes served from residency without an H2D copy. Pairs with
+/// [`GLOBAL_HTOD_BYTES`] to give a byte-weighted hit rate; see
+/// [`ResidencyInner::record_hit`] for why the count-based rate misleads.
+static GLOBAL_HIT_BYTES: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_EVICTIONS: AtomicU64 = AtomicU64::new(0);
 // Page-ins under scan-resistant admission that could not be admitted to the
 // resident set and were handed back to the caller transiently (issue #716:
@@ -118,6 +122,10 @@ fn eviction_made_committed_progress(
 pub struct GlobalOffloadStats {
     pub page_ins: u64,
     pub hits: u64,
+    /// Bytes served from residency (no H2D copy). With [`Self::htod_bytes`] this
+    /// gives the **byte-weighted** hit rate, which is what streaming cost
+    /// actually tracks — see [`Self::byte_hit_rate`].
+    pub hit_bytes: u64,
     pub evictions: u64,
     pub bypassed_page_ins: u64,
     pub materialize_ns: u64,
@@ -143,11 +151,30 @@ pub struct GlobalOffloadStats {
     pub pinned_reuses: u64,
 }
 
+impl GlobalOffloadStats {
+    /// Fraction of requested weight **bytes** served from residency.
+    ///
+    /// Prefer this over `hits / (hits + page_ins)` when judging residency policy:
+    /// the count-based rate weights a 10 KiB norm the same as an 11 MiB
+    /// projection, so it can improve while the bytes actually streamed get
+    /// worse. Measured on qwen14b-zp, raising the weight budget moved the count
+    /// rate 57.09% -> 81.31% while the byte gap to the streaming floor widened
+    /// from 1.78x to 2.30x (#857, #837 item 3).
+    ///
+    /// `None` when no weight bytes were requested in the window.
+    #[must_use]
+    pub fn byte_hit_rate(&self) -> Option<f64> {
+        let requested = self.hit_bytes.checked_add(self.htod_bytes)?;
+        (requested > 0).then(|| self.hit_bytes as f64 / requested as f64)
+    }
+}
+
 /// Read the process-global weight-offload counters.
 pub fn global_offload_stats() -> GlobalOffloadStats {
     GlobalOffloadStats {
         page_ins: GLOBAL_PAGE_INS.load(Ordering::Relaxed),
         hits: GLOBAL_HITS.load(Ordering::Relaxed),
+        hit_bytes: GLOBAL_HIT_BYTES.load(Ordering::Relaxed),
         evictions: GLOBAL_EVICTIONS.load(Ordering::Relaxed),
         bypassed_page_ins: GLOBAL_BYPASSED_PAGE_INS.load(Ordering::Relaxed),
         materialize_ns: GLOBAL_MATERIALIZE_NS.load(Ordering::Relaxed),
@@ -180,6 +207,7 @@ pub fn global_offload_stats() -> GlobalOffloadStats {
 pub fn reset_global_offload_stats() {
     GLOBAL_PAGE_INS.store(0, Ordering::Relaxed);
     GLOBAL_HITS.store(0, Ordering::Relaxed);
+    GLOBAL_HIT_BYTES.store(0, Ordering::Relaxed);
     GLOBAL_EVICTIONS.store(0, Ordering::Relaxed);
     GLOBAL_BYPASSED_PAGE_INS.store(0, Ordering::Relaxed);
     GLOBAL_MATERIALIZE_NS.store(0, Ordering::Relaxed);
@@ -1921,9 +1949,21 @@ impl Drop for CudaWeightResidency {
 impl ResidencyInner {
     /// Record a cache hit for `key`: mark it most-recently-used and bump the
     /// per-instance and process-global hit counters.
+    ///
+    /// Also accumulates the **bytes** served from residency. The count-based hit
+    /// rate is a poor proxy for streaming cost, because the resident set skews
+    /// toward many small tensors (norms, biases) while misses skew toward few
+    /// large ones. Measured on qwen14b-zp: raising the weight budget moved the
+    /// count hit rate 57.09% -> 81.31% while the byte gap to the streaming floor
+    /// *widened* from 1.78x to 2.30x (#857). `htod_bytes` drives cost, so the
+    /// byte-weighted rate `hit_bytes / (hit_bytes + htod_bytes)` is the metric
+    /// residency-policy work must be judged on (#837 item 3).
     fn record_hit(&mut self, key: u64) {
         self.policy.record_hit(key);
         GLOBAL_HITS.fetch_add(1, Ordering::Relaxed);
+        if let Some(page) = self.pages.get(&key) {
+            GLOBAL_HIT_BYTES.fetch_add(page.len as u64, Ordering::Relaxed);
+        }
     }
 
     /// Insert a freshly paged-in `page` of `bytes` under `key`, updating the
@@ -2041,6 +2081,37 @@ mod tests {
         assert!(!async_pagein_from_env_value(Some("false")));
         assert!(!async_pagein_from_env_value(Some("")));
         assert!(!async_pagein_from_env_value(Some("maybe")));
+    }
+
+    #[test]
+    fn byte_hit_rate_diverges_from_the_count_based_rate() {
+        // The failure mode this metric exists to catch, from the #857
+        // measurement: raising the weight budget moved the count-based hit rate
+        // 57.09% -> 81.31% while the bytes actually streamed stayed dominant,
+        // because hits skew small (norms, biases) and misses skew large
+        // (projections, ~11.9 MB average page-in on qwen14b).
+        let stats = GlobalOffloadStats {
+            hits: 9,
+            page_ins: 1,
+            hit_bytes: 9 * 10 * 1024,     // nine 10 KiB tensors
+            htod_bytes: 12 * 1024 * 1024, // one 12 MiB tensor
+            ..GlobalOffloadStats::default()
+        };
+        let count_rate = stats.hits as f64 / (stats.hits + stats.page_ins) as f64;
+        let byte_rate = stats.byte_hit_rate().expect("bytes were requested");
+        assert!(
+            (count_rate - 0.90).abs() < 1e-9,
+            "count-based rate looks excellent: {count_rate}"
+        );
+        assert!(
+            byte_rate < 0.01,
+            "byte-weighted rate tells the truth about streaming cost: {byte_rate}"
+        );
+    }
+
+    #[test]
+    fn byte_hit_rate_is_none_when_no_bytes_were_requested() {
+        assert_eq!(GlobalOffloadStats::default().byte_hit_rate(), None);
     }
 
     #[test]
