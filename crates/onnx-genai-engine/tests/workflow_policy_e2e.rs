@@ -1647,9 +1647,11 @@ pipeline:
         ],
     )?;
     let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
-    let mut options = onnx_genai_engine::GenerateOptions::default();
-    options.max_new_tokens = 3;
-    options.seed = Some(7);
+    let options = onnx_genai_engine::GenerateOptions {
+        max_new_tokens: 3,
+        seed: Some(7),
+        ..Default::default()
+    };
     let request = PipelineGenerateRequest::new(GenerateRequest {
         prompt: GeneratePrompt::TokenIds(vec![]),
         options,
@@ -2813,8 +2815,10 @@ pipeline:
         ],
     )?;
     let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
-    let mut first_options = onnx_genai_engine::GenerateOptions::default();
-    first_options.max_new_tokens = 4;
+    let first_options = onnx_genai_engine::GenerateOptions {
+        max_new_tokens: 4,
+        ..Default::default()
+    };
     let first = PipelineGenerateRequest::new(GenerateRequest {
         prompt: GeneratePrompt::TokenIds(vec![]),
         options: first_options,
@@ -2833,8 +2837,10 @@ pipeline:
     .with_input("limit", Value::from_slice_i64(&[3], &[])?);
     assert_eq!(engine.run_pipeline(first)?["state"].to_vec_i64()?, [3]);
 
-    let mut second_options = onnx_genai_engine::GenerateOptions::default();
-    second_options.max_new_tokens = 1;
+    let second_options = onnx_genai_engine::GenerateOptions {
+        max_new_tokens: 1,
+        ..Default::default()
+    };
     let second = PipelineGenerateRequest::new(GenerateRequest {
         prompt: GeneratePrompt::TokenIds(vec![]),
         options: second_options,
@@ -2853,8 +2859,10 @@ pipeline:
     .with_input("limit", Value::from_slice_i64(&[5], &[])?);
     assert_eq!(engine.run_pipeline(second)?["state"].to_vec_i64()?, [4]);
 
-    let mut third_options = onnx_genai_engine::GenerateOptions::default();
-    third_options.max_new_tokens = 1;
+    let third_options = onnx_genai_engine::GenerateOptions {
+        max_new_tokens: 1,
+        ..Default::default()
+    };
     let third = PipelineGenerateRequest::new(GenerateRequest {
         prompt: GeneratePrompt::TokenIds(vec![]),
         options: third_options,
@@ -3059,8 +3067,10 @@ pipeline:
     let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
 
     let request = |iterations, observation| {
-        let mut options = onnx_genai_engine::GenerateOptions::default();
-        options.max_new_tokens = iterations;
+        let options = onnx_genai_engine::GenerateOptions {
+            max_new_tokens: iterations,
+            ..Default::default()
+        };
         PipelineGenerateRequest::new(GenerateRequest {
             prompt: GeneratePrompt::TokenIds(vec![]),
             options,

@@ -270,6 +270,7 @@ pub(crate) fn f32_slice_to_dtype_bytes(dtype: DataType, values: &[f32]) -> anyho
 /// Only `f32` (Inc-D) and `f16` (Inc-D.1) rank-4 CUDA GQA caches reach here;
 /// `bf16` and other dtypes stay gated to the non-paged fallback
 /// ([`DecodeCudaState::kv_bindings_paged_rank4`]) and are rejected defensively.
+#[allow(dead_code)]
 pub(crate) fn kv_dtype_to_f32(tensor: &Tensor) -> anyhow::Result<Vec<f32>> {
     match tensor.dtype {
         DataType::Float32 => Ok(tensor.to_vec_f32()),

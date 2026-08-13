@@ -258,6 +258,7 @@ impl NativeDecodeSession {
     /// tensor shapes. The pipeline's native device-KV decoder (inc2b) uses this so
     /// an `inputs_embeds` decoder with no token input loads correctly.
     #[cfg(not(feature = "cuda"))]
+    #[allow(dead_code)]
     pub(crate) fn load_with_io(
         path: impl AsRef<Path>,
         device: NativeDecodeDevice,
