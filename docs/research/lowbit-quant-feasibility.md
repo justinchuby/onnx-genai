@@ -4,7 +4,7 @@
 **Model:** Muse-Glimmer-30B, `cuda/int4` Olive package · **HW:** H200 SXM (HBM3e ≈ 4.8 TB/s) · **Regime:** M=1 captured decode, `ONNX_GENAI_CUDA_GRAPH=1`
 **Baseline:** 47.25 tok/s median (native CUDA, capture 1 seg / 0 seams), the current ceiling after the #855/#854/#860/#867/#870 arc.
 
-> **Headline (read this first).** At 47.25 tok/s the decoder reads **15.3 GB of weights/token at only 724 GB/s — 15% of the H200's 4.8 TB/s roofline.** Decode is **dispatch-bound (2568 captured nodes/token, ~8.2 µs/node), NOT aggregate-weight-bandwidth-bound.** Therefore the naive "halve the bytes → double tok/s" projection is **wrong by ~2×**: an Amdahl analysis puts even *int2-everywhere* at ~**54 tok/s (+14%)**, not 94, and that is gated behind a 🔴 accuracy cliff and an **L-sized tooling+kernel dependency we do not currently have** (only int4 weights exist; our GEMV supports only bits∈{4,8}). **Recommendation: lower-bit quant is a NO-GO as the next lever.** The evidence-backed next move is (a) a ~1-day *bandwidth probe* micro-experiment to empirically confirm the payoff ceiling before any quant tooling is funded, and (b) if a sub-4-bit path is still wanted, **int3 (never int2-everywhere) via GPTQ/AWQ from the bf16 source**, scoped as a large multi-team effort.
+> **Headline (read this first).** At 47.25 tok/s the decoder reads **15.3 GB of weights/token at only 724 GB/s — 15% of the H200's 4.8 TB/s roofline.** Decode is **NOT weight-bandwidth-bound** — and this is now **confirmed by direct measurement** (§Bandwidth Probe): a kernel-level A/B that cuts the packed-weight DRAM footprint to **¼** raises decode only **47.29 → 48.62 tok/s (+2.8%)**. The binding constraint is the **serial ~2568-node dependency chain (~8.2 µs/node)**. Therefore the naive "halve the bytes → double tok/s" projection is **empirically false**, and even *int2-everywhere* would gain **≈+2%, not +80%**. Combined with a 🔴 accuracy cliff and an **L-sized tooling+kernel dependency we do not have** (only int4 weights exist; our GEMV supports only bits∈{4,8}; sub-4-bit needs re-quant from the fp16 source), **lower-bit quant is a measured NO-GO as the next lever.** The evidence-backed next move is **drastic node-count collapse (decode megakernel)** — the only axis the probe leaves open.
 
 ---
 
@@ -73,7 +73,7 @@ We are **6.6× slower than the memory roofline.** If decode were weight-bandwidt
 
 Note int2 lands at **0.554×**, not 0.5×, because of the bf16-scale floor — so even the *naive* int2 ceiling is 47.25/0.554 = **85 tok/s**, not the 94 in the ask. (Shrinking scales to fp8/int8 could recover part of the floor but adds its own accuracy risk and a second kernel change.)
 
-**Projected decode tok/s — naive (assume bandwidth-bound) vs realistic (Amdahl, `W≈0.28`):**
+**Projected decode tok/s — naive (assume bandwidth-bound) vs pre-probe Amdahl (`W≈0.28` from the 15% roofline).** ⚠️ **Both columns are now superseded by the *measured* §5 result** (`W ≈ 0.035`), which drops even the "realistic" int2 figure from ~54 to ~48 tok/s. They are retained to show the modeling before measurement:
 `realistic speedup = 1 / ((1−W) + x·W)`, `x = ×base`.
 
 | format | ×base bytes | naive tok/s (W=1) | **realistic tok/s (W≈0.28)** | accuracy risk | tooling dep |
@@ -84,7 +84,7 @@ Note int2 lands at **0.554×**, not 0.5×, because of the bf16-scale floor — s
 | 2:4 sparse int4 | 0.594 | 79.5 | **~53.4** | 🟡 (needs sparse-aware fine-tune) | sparse GEMV from scratch |
 | NF4/AF4 | 1.000 | 47.25 | **47.25** | 🟢 (accuracy *enabler*, not byte saver) | LUT-dequant kernel |
 
-**The gap between the naive and realistic columns is the whole story:** because we sit at 15% of the memory roofline, the biggest theoretically-available byte cut (int2, −45%) buys only **+14% tok/s** in practice, and only if the accuracy cliff and tooling are solved. NF4/AF4 saves **zero** bytes (still 4-bit) — its only value is improving accuracy-per-bit so that int3/int2 becomes *tolerable*; it is an enabler for the rows above, not a lever by itself.
+**The gap between the naive and realistic columns is the whole story:** because we sit at 15% of the memory roofline, the biggest theoretically-available byte cut (int2, −45%) buys only **+14% tok/s** even in this Amdahl model — and the **measured probe (§5) collapses that further to ~+1.6%.** NF4/AF4 saves **zero** bytes (still 4-bit) — its only value is improving accuracy-per-bit so that int3/int2 becomes *tolerable*; it is an enabler for the rows above, not a lever by itself.
 
 > All tok/s figures are **projections** from the measured byte budget + an estimated `W`; none are measured on a real sub-4-bit build (we have no such build — §4). No accuracy numbers are quoted because we have not run perplexity; risk flags cite the **method class**, not measured deltas.
 
@@ -127,32 +127,44 @@ To get any sub-4-bit weights we must **re-quantize from the bf16 source** with a
 
 ---
 
-## 5. Recommendation & smallest de-risking experiment
+## 5. Bandwidth Probe — measured result (the arbiter)
 
-**Ranking** by (expected tok/s gain × accuracy safety × impl+tooling cost):
+**Motivation.** Two facts were in tension: the fusion arc (#870/#872/#873) found node-count reduction flat/regressive (⇒ *not* naively launch-dispatch-bound), while §1's roofline shows only 15% HBM utilization (⇒ *not* aggregate-bandwidth-bound). Both negatives can't leave the system unexplained. So I ran the probe directly.
 
-| rank | option | realistic gain | accuracy | cost | verdict |
-|---|---|---|---|---|---|
-| — | **(not lower-bit) more node-count fusion** | attacks the *actual* bound (2568 nodes) | 🟢 (structural) | already in-flight (Batty) | **the real lever** |
-| 1 | **int3 via GPTQ/AWQ from bf16 source** | ~50 (+6%) | 🟡 | **L** (source+recipe+kernel) | 🟥 **NO-GO now**, revisit only if fusion tapped out |
-| 2 | mixed int4-attn / int3-MLP | ~51 (+8%) | 🟡 | **L** | 🟥 NO-GO now |
-| 3 | int2-everywhere | ~54 (+14%) | 🔴 | **L** | 🟥 NO-GO (accuracy cliff) |
-| 4 | 2:4 sparse int4 | ~53 | 🟡 | **L** (no M=1 HW benefit) | 🟥 NO-GO for decode |
-| 5 | NF4/AF4 | 0% bytes | 🟢 | S | ➖ only as an *enabler* for #1–#3 |
+**Method (throwaway, reverted — never shipped).** Added a private env flag `ONNX_GENAI_WEIGHT_FOLD=D` that folds the *weight-read column* of the dominant decode GEMV (`matmul_nbits_gemv_f16_scales_f16_zp_splitk`, which handles **all** int4 decode projections + lm_head on this model — the fused gate/up path does not fire here) so every output column aliases into the first `N/D` weight rows. This shrinks the packed-weight + scale + zero-point **DRAM footprint to 1/D while keeping the loop-trip count, instruction stream, launch grid, and captured node count byte-identical.** Crucially this isolates the *memory-throughput* axis — exactly what lower-bit quant reduces (lower-bit keeps the same K-block count, only fewer bytes/weight; so a K-loop-shortening probe would be *unfaithful*, but address-folding is faithful). Output is numerically garbage; only timing is trusted.
 
-**Go/no-go:** **NO-GO on lower-bit quantization as the next perf lever.** It is the wrong tool for a dispatch-bound workload: the maximum realistic prize is ~+14% (int2), it sits behind a 🔴 accuracy cliff and an L-sized source-weights + recipe + new-kernel dependency we don't have, while the measured bottleneck (2568 nodes/token) is untouched by it. Byte-reduction only becomes the right lever **after** node-count fusion has pushed `W` (the weight-bound fraction) back up toward 1 — i.e. once decode is actually bandwidth-bound again.
+**Measured (H200, `ONNX_GENAI_CUDA_GRAPH=1`, `--pipeline`, staged Muse-Glimmer, capture 1 seg/0 seams, median of 3×128-tok runs):**
 
-### The single smallest experiment that de-risks the biggest uncertainty
+| probe | weight DRAM footprint | decode tok/s | Δ vs full |
+|---|---:|---:|---:|
+| **full (D=1, real)** | 100% | **47.29** | — |
+| **half (D=2)** | 50% | **47.98** | **+1.5%** |
+| **quarter (D=4)** | 25% | **48.62** | **+2.8%** |
 
-Two cheap, **kernel-only, no-tooling** micro-experiments — do the first before funding *anything*:
+**Interpretation — the "flat" branch fired.** Removing **75% of weight DRAM traffic buys only +2.8% tok/s.** Extrapolating, a hypothetical *zero-cost* weight read (bytes→0) would land ≈48.5–49 tok/s — an Amdahl ceiling implying the **weight-DRAM-bound fraction is only ~3–4%**, far below even §1's 15% roofline estimate (the roofline counts bytes moved; the probe additionally shows those bytes are *latency-hidden*, not throughput-limiting, because folding keeps the same per-load Long-Scoreboard stalls). **Decode is empirically NOT weight-bandwidth-bound.** Mapping onto §2: int2-everywhere (−45% bytes) would gain ≈ 0.45 × 3.5% ≈ **+1.6% (~48 tok/s), not +14% and certainly not +80%.** This is the measured kill-shot for lower-bit quant.
 
-1. **Bandwidth probe (≈1 day, decisive).** In a throwaway build, modify the int4 GEMV to **read only half the packed-weight bytes** (e.g. skip alternate `uint4` loads and double-count, or memset-alias the upper nibbles) — deliberately wrong numerically, but it makes the kernel move ~0.5× weight bytes. Run the standard `profile_native --pipeline --tokens 128` steady loop and read tok/s. **This empirically measures `W` and the true tok/s ceiling of *any* byte reduction — for free, with no re-quantization, no new format, no accuracy work.** If tok/s barely moves (predicted: 47→~52–54), that is the quantitative kill-shot for the whole lower-bit direction; if it jumps toward the naive ~85, the roofline model is wrong and lower-bit becomes worth funding. **Either way we learn the answer in a day instead of weeks.**
-
-2. **Accuracy probe (only if #1 is favorable).** Before writing production kernels, quantize **just the MLP `down_proj` of a few layers to int3 and int2** from the bf16 source (GPTQ, offline, Python/numpy — no CUDA kernel needed) and measure **perplexity delta** on a small eval set. This isolates the accuracy cliff (the true 🔴) at near-zero engineering cost and tells us whether int3 (🟡) or nothing (int2 🔴) is the viable floor.
-
-**Bottom line for the coordinator:** don't fund lower-bit quant yet. Run the 1-day bandwidth probe (#5.1). Expect it to confirm decode is dispatch-bound and cap the lower-bit prize at ~+14%, redirecting effort back to node-count fusion — the lever that actually matches the bottleneck.
+**What the system *is* bound by.** The two negatives now reconcile: it is **neither** bandwidth-bound (byte-fold flat) **nor** sensitive to *marginal* node changes (#872/#873: ±4–8% nodes → flat/regressive). It is bound by the **serial critical-path latency of the ~2568-node dependency chain — ~8.2 µs/node fixed floor × 2568 ≈ 21 ms/token.** Under graph replay the per-node CPU launch cost is ~0, so this floor is GPU-side per-kernel latency (grid launch + block scheduling + minimum memory-latency tail), which neither cheaper bytes nor merging a handful of nodes removes. **Only a *drastic* collapse of the node count — a decode megakernel that keeps activations in registers/shared and does many ops per launch — attacks this floor.**
 
 ---
+
+## 6. Recommendation & the reopened lever
+
+**Ranking** by (measured tok/s gain × accuracy safety × impl+tooling cost) — gains now use the **measured** ~3.5% weight-bound fraction, not the pre-probe Amdahl estimate:
+
+| rank | option | measured-grounded gain | accuracy | cost | verdict |
+|---|---|---|---|---|---|
+| — | **decode megakernel / drastic node-count collapse** | the only axis the probe leaves open (attacks the ~8.2 µs × 2568-node floor) | 🟢 (structural) | **L** (new effort) | **REOPENED — the real lever** |
+| 1 | int3 via GPTQ/AWQ from bf16 source | **~+1–2% (~48 tok/s)** | 🟡 | **L** (source+recipe+kernel) | 🟥 **NO-GO** (measured) |
+| 2 | mixed int4-attn / int2-MLP | ~+1–2% | 🟡/🔴 | **L** | 🟥 NO-GO |
+| 3 | int2-everywhere | **~+1.6% (~48 tok/s)** | 🔴 | **L** | 🟥 NO-GO (measured; accuracy cliff too) |
+| 4 | 2:4 sparse int4 | ~+1–2% | 🟡 | **L** (no M=1 HW benefit) | 🟥 NO-GO for decode |
+| 5 | NF4/AF4 | 0% bytes | 🟢 | S | ➖ enabler only, irrelevant given the probe |
+
+**Go/no-go — MEASURED:** 🟥 **NO-GO on lower-bit quantization (all variants) as the next perf lever.** The bandwidth probe empirically caps the entire byte-reduction direction at **~+3% best case (bytes→0)**; the largest safe byte cut (int2, −45%) buys **~+1.6%**, behind a 🔴 accuracy cliff and an L-sized source-weights + recipe + new-kernel dependency we don't have. Byte reduction would only matter *after* the node-count floor is broken (i.e. once decode is actually bandwidth-bound again — which it currently is not, by measurement).
+
+**Reopened lever — decode megakernel.** The probe leaves exactly one axis open: the serial ~2568-node latency chain. The fusion arc (#872/#873) only disproved *marginal* fusion (removing 4–8% of nodes → flat/regressive); it did **not** test *drastic* collapse. A persistent/megakernel that fuses a whole decoder layer's elementwise+norm+GEMV epilogue chain into few launches — keeping activations resident and paying per-kernel latency a handful of times per layer instead of ~49 — is the only direction consistent with all three measurements (byte-fold flat, marginal-fusion flat, 15% HBM util). It is a large effort and itself needs a prototype/probe (fuse one layer, measure the per-layer node count and tok/s), but it is the **true next lever** and should replace lower-bit quant on the roadmap.
+
+**PROGRESS.md correction call (explicit).** The 2026-08-13 entry *"Native CUDA decode ceiling: bandwidth-bound at ~47 tok/s (#870/#872/#873)"* wording — **"weight-bandwidth/compute-floor bound at ~47.25 tok/s … the roofline is bytes-moved, not launches"** — is **WRONG / misleading and should be corrected.** It inferred "bandwidth-bound" from a *negative* (fusion flat) without ever measuring the bandwidth axis; the direct byte-fold probe now refutes it (−75% weight bytes → +2.8%). Suggested replacement wording: *"latency-bound on the serial ~2568-node dependency chain (~8.2 µs/node); **neither** weight-bandwidth-bound (a 4× weight-byte cut yields only +2.8%, HBM util ~15%) **nor** removable by marginal node fusion — only drastic node-count collapse (a decode megakernel) can move it."* The entry's *conclusions* (small fusion is a dead end; 47.25 is the ceiling for the current kernel/graph structure) stand; only the **mechanism attribution** ("bandwidth") is wrong. The "Real levers to beat 47" bullet should drop *"reduce weight bytes/token (lower-bit quant, sparsity)"* and keep only *"decode megakernel."* (Left to the coordinator/Scribe to edit that dated entry, per source-of-truth ownership.)
 
 ### Appendix — reproducibility
 
@@ -160,6 +172,7 @@ Two cheap, **kernel-only, no-tooling** micro-experiments — do the first before
 - Roofline: 15.325 GB × 47.25 tok/s = 724 GB/s; H200 HBM3e peak ≈ 4.8 TB/s (per task spec / NVIDIA H200 SXM datasheet class).
 - Baseline 47.25 tok/s: prior merged measurement (#867), `CUDA_VISIBLE_DEVICES=0 ONNX_GENAI_CUDA_GRAPH=1 profile_native --pipeline --ep cuda --backend native --steady --warmups 1 --runs 3 --tokens 128`, capture 1 seg/0 seams.
 - Node count 2568/token, ~8.2 µs/node: prior finding #870 (dispatch-bound).
+- **Bandwidth probe (this task):** throwaway `ONNX_GENAI_WEIGHT_FOLD=D` flag folds the weight-read column of `matmul_nbits_gemv_f16_scales_f16_zp_splitk` (the sole int4 decode GEMV entry that fires for Muse-Glimmer, incl. lm_head; verified via one-shot NVRTC entry logging) so the packed-weight/scale/zp DRAM footprint shrinks to 1/D with loop-trip/instruction/launch/node-count held byte-identical. Measured median (3×128-tok, `ONNX_GENAI_CUDA_GRAPH=1`, `--pipeline`): D=1 → 47.29, D=2 → 47.98, D=4 → 48.62 tok/s. **Probe code was reverted and is NOT shipped.**
 - Kernel bits support: `crates/onnx-runtime-ep-cuda/src/kernels/matmul_nbits.rs` dispatches only `bits∈{4,8}`; `uint4` (128-bit) weight loads; `accuracy_level=4` dp4a int8-activation path present.
 - Tooling: `meta-models-Muse-Glimmer-30B/cuda/int4/config.json` (`OnnxKQuantQuantization bits=4 block_size=32`); only `cuda/int4` exists under the model root; source `meta-models/Muse-Glimmer-30B` (bf16, HF).
 - **All tok/s beyond 47.25 are projections; no accuracy/perplexity numbers were measured — risk flags cite method class only.**

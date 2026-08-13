@@ -22,3 +22,19 @@
 **Smallest experiment to de-risk before funding anything (≈1 day, kernel-only, NO tooling):** a **bandwidth probe** — hack the int4 GEMV to read only half the packed bytes (numerically wrong on purpose) and measure tok/s on the standard steady profile. This empirically measures W and the true ceiling of ANY byte reduction for free. Predicted 47→~52–54 (kill-shot for lower-bit); if it jumps toward ~85 the roofline model is wrong and lower-bit becomes worth funding. Only if favorable: an offline GPTQ int3/int2 perplexity probe on a few MLP down_proj layers (Python, no kernel) to test the accuracy cliff.
 
 **Go/no-go per format:** int3 🟥 (defer), int2 🟥 (accuracy cliff), mixed 🟥 (defer), 2:4 sparse 🟥 (no M=1 tensor-core benefit), NF4/AF4 ➖ (enabler only). All tok/s are projections; no accuracy numbers measured — risk flags cite method class. Chew is the numerics gate if any sub-4-bit path is later funded.
+
+---
+
+### 2026-08-13 (UPDATE): Bandwidth probe RESOLVES the tension — latency-chain bound, NOT bandwidth-bound. Lower-bit is a MEASURED no-go; megakernel REOPENED.
+
+I ran the arbiter probe (env `ONNX_GENAI_WEIGHT_FOLD=D`, throwaway/reverted/never shipped): fold the weight-read column of the sole int4 decode GEMV that fires for Muse-Glimmer (`matmul_nbits_gemv_f16_scales_f16_zp_splitk`, incl. lm_head) so all output columns alias into the first N/D weight rows → packed+scale+zp **DRAM footprint → 1/D** with loop-trip/instruction/launch/node-count byte-identical. This faithfully isolates memory-throughput (lower-bit keeps the same K-block count, only fewer bytes/weight — a K-shortening probe would be unfaithful).
+
+**Measured (H200, CUDA_GRAPH=1, --pipeline, 3×128-tok median, 1seg/0seams):** full(D=1) **47.29** → half(D=2) **47.98** (+1.5%) → quarter(D=4) **48.62** (+2.8%).
+
+**Verdict — "flat" branch fired.** −75% weight DRAM → +2.8% ⇒ weight-DRAM-bound fraction ≈ **3–4%**. Decode is **empirically NOT weight-bandwidth-bound**. int2-everywhere (−45% bytes) → **≈+1.6% (~48 tok/s)**, not +14%/+80%. **Lower-bit quant (all variants) = MEASURED 🟥 NO-GO** as next lever (on top of 🔴 accuracy cliff + the "only-int4-exists, sub-4-bit needs re-quant from fp16 source + new kernels" L-blocker).
+
+**Bound by:** serial critical-path latency of the ~2568-node chain (~8.2 µs/node × 2568 ≈ 21 ms/token). Reconciles both negatives: not bandwidth (byte-fold flat) AND not marginal-node-sensitive (#872/#873 flat/regressive).
+
+**Megakernel REOPENED as the true lever** — #872/#873 only disproved *marginal* fusion, never *drastic* collapse. A layer-level persistent/megakernel (activations resident, few launches/layer) is the only direction consistent with all three measurements. Large effort; needs a one-layer prototype. Should replace lower-bit on the roadmap.
+
+**PROGRESS.md correction call (EXPLICIT):** the 2026-08-13 "bandwidth-bound at ~47 tok/s (#870/#872/#873)" entry wording "weight-bandwidth/compute-floor bound … roofline is bytes-moved, not launches" is **WRONG/misleading — correct it.** Suggested: "latency-bound on the serial ~2568-node dependency chain (~8.2 µs/node); neither weight-bandwidth-bound (4× byte cut → +2.8%, HBM util ~15%) nor removable by marginal node fusion — only drastic node-count collapse (decode megakernel) can move it." Entry's *conclusions* (marginal fusion dead, 47.25 current-structure ceiling, QKV-fusion opt-in) stand; only the **mechanism attribution** ("bandwidth") + the "reduce weight bytes/token (lower-bit, sparsity)" future-lever bullet are wrong. Left to coordinator/Scribe to edit that dated entry.
