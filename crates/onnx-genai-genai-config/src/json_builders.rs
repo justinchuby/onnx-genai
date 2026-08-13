@@ -49,28 +49,3 @@ pub(crate) fn insert_usize(map: &mut Map<String, Value>, key: &str, value: Optio
         map.insert(key.into(), json!(value));
     }
 }
-
-pub(crate) fn insert_i64(map: &mut Map<String, Value>, key: &str, value: Option<i64>) {
-    if let Some(value) = value {
-        map.insert(key.into(), json!(value));
-    }
-}
-
-pub(crate) fn insert_f32(map: &mut Map<String, Value>, key: &str, value: Option<f32>) {
-    if let Some(value) = value {
-        map.insert(key.into(), json!(value));
-    }
-}
-
-pub(crate) fn insert_bool(map: &mut Map<String, Value>, key: &str, value: Option<bool>) {
-    if let Some(value) = value {
-        map.insert(key.into(), json!(value));
-    }
-}
-
-pub(crate) fn is_share_buffer_kv_dtype(dtype: &str) -> bool {
-    matches!(
-        dtype.to_ascii_lowercase().as_str(),
-        "float16" | "fp16" | "half" | "bfloat16" | "bf16" | "float32" | "fp32" | "float"
-    )
-}

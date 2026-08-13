@@ -141,9 +141,7 @@ impl Engine {
             None => governor_kv_config(None, &config)?,
         };
         let model_weight_bytes = device_weight_package_bytes(&model_directory.model_path);
-        // ORT backend manages its own device memory (advisory-only governor),
-        // so it has no native CUDA ordinal to resolve the VRAM fraction against.
-        let resolved_vram_bytes = resolve_vram_limit_bytes(&config.limits, None)?;
+        let resolved_vram_bytes = resolve_vram_limit_bytes(&config.limits)?;
         let graph_memory = analyze_model_memory(&model_directory.model_path);
         let minimum_useful_weight_budget_bytes = graph_memory
             .per_layer_weight_bytes
@@ -206,9 +204,8 @@ impl Engine {
         // Stage: metadata and decode-path resolution.
         let MetadataResolution {
             metadata,
-            metadata_max_context,
             decode_path,
-        } = resolve_metadata_and_decode_path(&session, &model_directory.model_path, metadata)?;
+        } = resolve_metadata_and_decode_path(metadata)?;
 
         let tokenizer = {
             let _span = onnx_genai_ort::prof_span!("engine.tokenizer_load");
@@ -227,13 +224,7 @@ impl Engine {
         )?;
         // Stage: draft-model loading. Kept before KV-cache allocation to preserve
         // the original constructor's fallible-step ordering.
-        let draft = load_draft_model(
-            &config,
-            &environment,
-            &session_options,
-            metadata_max_context,
-            &governor,
-        )?;
+        let draft = load_draft_model(&config, &environment, &session_options, &governor)?;
 
         // Stage: runtime KV-cache allocation, granted by the governor built above.
         let kv_cache = allocate_kv_cache(&config, kv_model.as_ref(), &governor)?;
@@ -400,8 +391,7 @@ impl Engine {
             .map(|layer| layer.bytes)
             .max()
             .unwrap_or(0);
-        let resolved_vram_bytes =
-            resolve_vram_limit_bytes(&config.limits, native_device.cuda_index())?;
+        let resolved_vram_bytes = resolve_vram_limit_bytes(&config.limits)?;
         #[cfg(feature = "cuda")]
         let required_device_non_weight_bytes = if matches!(
             native_device,
@@ -521,7 +511,6 @@ impl Engine {
                 governor_kv_config,
                 model_weight_bytes,
                 weight_reservation_bytes,
-                native_device.cuda_index(),
                 authority_provider,
                 Some(authority_domain),
             )
@@ -916,7 +905,6 @@ fn package_selection_from_session_options(
 /// Produced by [`resolve_metadata_and_decode_path`] as the first construction stage.
 struct MetadataResolution {
     metadata: InferenceMetadata,
-    metadata_max_context: Option<usize>,
     decode_path: ModelDecodePath,
 }
 
@@ -940,8 +928,6 @@ fn load_inference_metadata(model_directory: &ModelDirectory) -> anyhow::Result<I
 }
 
 fn resolve_metadata_and_decode_path(
-    session: &Session,
-    model_path: &Path,
     metadata: InferenceMetadata,
 ) -> anyhow::Result<MetadataResolution> {
     // Validate capabilities
@@ -950,51 +936,18 @@ fn resolve_metadata_and_decode_path(
         anyhow::bail!("Invalid inference metadata: {errors:?}");
     }
 
-    // Optional explicit cap on runtime-owned KV growth. Foundry /
-    // onnxruntime-genai `genai_config.json` models advertise the model's full
-    // `context_length` (e.g. 32k-131k) as their max sequence length. The
-    // shared-buffer decode path pre-allocates at an initial power-of-two bucket
-    // (256 tokens by default, overridden by `ONNX_GENAI_KV_MIN_BUCKET`) and grows
-    // on demand up to the model's declared `max_length`; it does not pre-allocate
-    // the full context. `ONNX_GENAI_KV_MAX_LEN` caps growth below the model
-    // maximum, mirroring the native path's `ONNX_GENAI_CUDA_KV_MAX_LEN`.
-    // Unset = model metadata is the factual ceiling.
-    let kv_shared_buffer_cap = shared_buffer_cap_from_env();
-    let metadata_max_context = metadata
-        .model
-        .as_ref()
-        .and_then(|model| model.max_sequence_length)
-        .map(|max_len| cap_kv_len(max_len, kv_shared_buffer_cap));
-    // Our own inference metadata (inference_metadata.yaml), not
-    // onnxruntime-genai's genai_config.json, drives the runtime-owned
-    // share-buffer KV path for GQA models.
-    let shared_kv_max_len = crate::decode::shared_kv_buffer_len_from_metadata(&metadata)
-        .map(|max_len| cap_kv_len(max_len, kv_shared_buffer_cap));
     let sliding_window = crate::decode::sliding_window_from_metadata(&metadata)?;
     let sink_tokens = crate::decode::sink_tokens_from_metadata(&metadata);
-    // Graph-truth check for the declared sliding window: only a window the
-    // exported decoder graph actually enforces (GQA `local_window_size`) is
-    // treated as active. A metadata-only/vestigial window (e.g. Muse-Glimmer)
-    // is reclassified as global attention so decode reaches the capture-stable
-    // shared-buffer KV path. Best-effort: if the graph cannot be read, the
-    // declared window is kept (no regression for real SWA models).
-    let decoder_graph =
-        sliding_window.and_then(|_| onnx_runtime_loader::load_model(model_path).ok());
     let decode_path = {
         let _span = onnx_genai_ort::prof_span!("engine.detect_decode_path");
         detect_model_decode_path(
-            session,
             metadata.model.as_ref().and_then(|model| model.io.as_ref()),
-            metadata_max_context,
-            shared_kv_max_len,
             sliding_window,
-            decoder_graph.as_ref(),
             sink_tokens,
         )?
     };
     Ok(MetadataResolution {
         metadata,
-        metadata_max_context,
         decode_path,
     })
 }
@@ -1020,7 +973,6 @@ fn build_governor_and_scheduler(
             config.allow_runtime_override,
             governor_kv_config,
             device_weight_package_bytes(&model_directory.model_path),
-            None,
             authority_provider,
             Some(authority_domain),
         )
@@ -1131,7 +1083,6 @@ fn load_draft_model(
     config: &EngineConfig,
     environment: &Environment,
     session_options: &SessionOptions,
-    metadata_max_context: Option<usize>,
     governor: &EngineResourceGovernor,
 ) -> anyhow::Result<Option<DraftModel>> {
     let draft = if let Some(draft_model_path) = &config.draft_model {
@@ -1161,15 +1112,7 @@ fn load_draft_model(
             // path were introduced without explicitly loading draft metadata.
             // If a draft model needs its own SWA + sinks, load its
             // inference_metadata.yaml and pass the values from there.
-            detect_model_decode_path(
-                &draft_session,
-                None,
-                metadata_max_context,
-                None,
-                None,
-                None,
-                0,
-            )?;
+            detect_model_decode_path(None, None, 0)?;
         let draft_kv_model = infer_kv_model_info(
             &draft_session,
             draft_io.as_ref(),

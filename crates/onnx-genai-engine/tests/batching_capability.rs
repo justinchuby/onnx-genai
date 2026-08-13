@@ -1,6 +1,6 @@
-//! `Engine::batching_capability()` must match what the decode path can actually
-//! do, for the ORT decode paths that a CPU CI machine can load. The native path
-//! is covered by a unit test in `engine::runtime` (it needs no model files).
+//! `Engine::batching_capability()` must match the functional past/present path
+//! selected for bare decoder metadata. Workflow KV services cover composite
+//! shared/paged serving; the native path has a unit test in `engine::runtime`.
 
 use onnx_genai_engine::{Engine, EngineConfig};
 use onnx_genai_ort::SessionOptions;
@@ -19,38 +19,6 @@ fn cpu_engine(model_dir: &Path) -> anyhow::Result<Engine> {
         EngineConfig::default(),
         SessionOptions::default().with_intra_op_threads(1),
     )
-}
-
-/// The static-cache fixture decodes a shared batch, so the reported capability
-/// must say batching is supported AND a real `continuous_batch_manager` must be
-/// constructible at that width. If the two ever disagreed, the capability report
-/// would be lying to operators — which is the whole failure this issue is about.
-#[test]
-fn static_cache_capability_matches_batched_manager() -> anyhow::Result<()> {
-    let fixture = fixture("tiny-llm-scatter")?;
-    let engine = cpu_engine(&fixture)?;
-
-    let capability = engine.batching_capability();
-    assert!(
-        capability.supports_batching(),
-        "static-cache decode supports batching: {}",
-        capability.reason()
-    );
-    assert_eq!(
-        capability.max_concurrent_sequences(),
-        None,
-        "static-cache batching is bounded by memory, not a fixed cap"
-    );
-    assert!(capability.allows(4));
-    assert_eq!(capability.effective_max_batch(4), 4);
-
-    // Reality check: the capability's positive claim is backed by a real
-    // batched manager at the same width.
-    assert!(
-        engine.continuous_batch_manager(4).is_ok(),
-        "static-cache engine must build a width-4 continuous batch manager"
-    );
-    Ok(())
 }
 
 /// The plain past/present fixture has no shared KV buffer on the CPU EP, so it

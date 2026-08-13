@@ -492,13 +492,6 @@ impl ResolvedIo {
                 "io.kv_inputs and io.kv_outputs must be declared together (positional KV pairing)"
             ),
         };
-        if let Some(update) = io.kv_update.as_deref()
-            && !matches!(update, "append" | "shared_buffer")
-        {
-            anyhow::bail!(
-                "io.kv_update declares unsupported update '{update}'; supported KV updates: append, shared_buffer"
-            );
-        }
         let state_pairs = resolve_state_pairs(session, io.state_pairs.as_deref(), &kv_pairs)?;
         let position_ids_input = resolve_position_program(session, io, positions)?;
 

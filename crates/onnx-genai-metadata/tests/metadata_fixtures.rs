@@ -59,6 +59,19 @@ fn removed_top_level_execution_surfaces_are_rejected() {
 }
 
 #[test]
+fn removed_legacy_kv_selection_surfaces_are_rejected() {
+    for document in [
+        "kv_cache: { native_dtype: float16 }\n",
+        "model:\n  io:\n    kv_update: shared_buffer\n",
+        "model:\n  runtime_configurable:\n    kv_cache: { dtype: [float16] }\n",
+    ] {
+        let error = serde_yaml::from_str::<InferenceMetadata>(document)
+            .expect_err("legacy KV selection metadata must not deserialize");
+        assert!(error.to_string().contains("unknown field"), "{error}");
+    }
+}
+
+#[test]
 fn serialized_compiler_bookkeeping_is_rejected() {
     for field in [
         "graph: { kind: sequence, steps: [] }",

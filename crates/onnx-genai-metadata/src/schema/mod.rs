@@ -63,10 +63,6 @@ pub struct InferenceMetadata {
     #[serde(default)]
     pub model: Option<ModelCapabilities>,
 
-    /// KV-cache storage, quantization tolerance, and operational semantics.
-    #[serde(default)]
-    pub kv_cache: Option<KvCacheSpec>,
-
     /// Model weight quantization intent, independent of the packed representation.
     #[serde(default)]
     pub quantization: Option<QuantizationIntent>,
@@ -261,14 +257,6 @@ mod schema_vocabulary {
     );
 
     extensible_string!(
-        /// Paired KV-cache update-semantics vocabulary.
-        KvUpdateKind,
-        kv_update_kind,
-        KV_UPDATE_KIND,
-        ["append", "shared_buffer"]
-    );
-
-    extensible_string!(
         /// Loop-carried state initialization vocabulary.
         StateInitKind,
         state_init_kind,
@@ -444,10 +432,6 @@ mod schema_helpers {
 
     pub(super) fn thumbnail_order(schema: &mut Schema) {
         extensible_string_enum(schema, super::schema_vocabulary::THUMBNAIL_ORDER);
-    }
-
-    pub(super) fn kv_update_kind(schema: &mut Schema) {
-        extensible_string_enum(schema, super::schema_vocabulary::KV_UPDATE_KIND);
     }
 
     pub(super) fn state_init_kind(schema: &mut Schema) {

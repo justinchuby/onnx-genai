@@ -11,6 +11,3 @@ model:
     kv_outputs:
       - present.0.key
       - present.0.value
-    kv_update: shared_buffer
-kv_cache:
-  native_dtype: float32

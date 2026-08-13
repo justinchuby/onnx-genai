@@ -114,21 +114,6 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn cap_kv_len_uncapped_returns_model_max() {
-        assert_eq!(cap_kv_len(32_768, None), 32_768);
-    }
-
-    #[test]
-    fn cap_kv_len_caps_when_smaller() {
-        assert_eq!(cap_kv_len(40_960, Some(512)), 512);
-    }
-
-    #[test]
-    fn cap_kv_len_ignores_cap_larger_than_model_max() {
-        assert_eq!(cap_kv_len(512, Some(40_960)), 512);
-    }
-
-    #[test]
     fn paged_kv_fork_shares_prefix_then_diverges_copy_on_write() -> anyhow::Result<()> {
         let mut cache = PagedKvCache::new(4, 8);
         let parent = cache.create_sequence();
@@ -613,7 +598,6 @@ mod tests {
             audio_features_input: None,
             cross_kv_inputs: None,
             cross_kv_outputs: None,
-            kv_update: None,
             state_pairs: None,
             optional_inputs: BTreeMap::new(),
             static_cache: None,
@@ -1835,25 +1819,15 @@ mod tests {
     }
 
     #[test]
-    fn scatter_fixture_uses_static_cache_decode_session_with_stable_greedy_output()
-    -> anyhow::Result<()> {
+    fn scatter_fixture_does_not_select_static_cache_from_metadata() -> anyhow::Result<()> {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm-scatter")
             .canonicalize()?;
-        let mut engine = Engine::from_dir(&fixture, EngineConfig::default())?;
-        assert!(matches!(
+        let engine = Engine::from_dir(&fixture, EngineConfig::default())?;
+        assert!(!matches!(
             engine.decode_path,
-            ModelDecodePath::StaticCache { max_len } if max_len > 0
+            ModelDecodePath::StaticCache { .. }
         ));
-        let mut request = GenerateRequest::new("hello");
-        request.options.max_new_tokens = 3;
-        request.options.temperature = 0.0;
-        request.options.stop_on_eos = false;
-
-        let result = engine.generate(request)?;
-
-        assert_eq!(result.token_ids, vec![23, 15, 28]);
-        assert_eq!(result.finish_reason, FinishReason::MaxTokens);
         Ok(())
     }
 

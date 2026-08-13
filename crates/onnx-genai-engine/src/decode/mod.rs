@@ -41,8 +41,7 @@ pub(crate) use logits::extract_next_token_logits_from_outputs;
 #[cfg(feature = "native-backend")]
 pub(crate) use metadata::{KeySequenceLengthsPolicy, key_sequence_lengths_policy};
 pub(crate) use metadata::{
-    detect_model_decode_path, shared_kv_buffer_len_from_metadata, sink_tokens_from_metadata,
-    sliding_window_from_metadata,
+    detect_model_decode_path, sink_tokens_from_metadata, sliding_window_from_metadata,
 };
 pub(crate) use state::DecodeState;
 #[cfg(feature = "native-backend")]
@@ -60,6 +59,9 @@ use logits::{extract_logits_value_next, extract_logits_value_sequence};
 #[derive(Debug, Clone)]
 /// Model-I/O strategy used to construct the appropriate [`DecodeBackend`].
 pub(crate) enum ModelDecodePath {
+    /// Explicit generic static-cache execution. Metadata loading no longer
+    /// selects this path; callers must opt into the low-level static-cache API.
+    #[allow(dead_code)]
     StaticCache {
         max_len: usize,
     },

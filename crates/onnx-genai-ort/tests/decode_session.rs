@@ -202,6 +202,25 @@ fn shared_buffer_decode_matches_naive_repass() {
 }
 
 #[test]
+fn artifact_metadata_does_not_implicitly_select_shared_buffer() {
+    let _guard = ort_test_lock().lock().expect("ORT test lock");
+    let session = Session::new(
+        test_environment(),
+        &tiny_sharedbuffer_llm(),
+        deterministic_session_options(),
+    )
+    .expect("shared-buffer session");
+
+    let decode = DecodeSession::new_with_io(
+        &session,
+        DecodeSessionOptions::default(),
+        Some(&declared_io("tiny-llm-sharedbuffer")),
+    )
+    .expect("functional past/present decode session");
+    assert_eq!(decode.mode(), DecodeKvMode::ZeroCopyRebind);
+}
+
+#[test]
 fn exported_kv_handoff_continues_decode_identically() {
     // Emulates the hybrid prefill/decode handoff: session A runs the prompt
     // "prefill", its KV is exported and imported into a second DecodeSession B
