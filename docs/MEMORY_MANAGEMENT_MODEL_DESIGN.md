@@ -26,7 +26,7 @@ specialized allocation and caching data planes.
 
 | ID | Contract | Responsibility |
 | --- | --- | --- |
-| **C1** | Resource authority | Within the runtime, one authority owns each distinct physical memory pool. Devices with private memory use a device authority; devices sharing physical memory alias the same host/unified authority. |
+| **C1** | Resource authority | Within one `ProcessMemoryManager`, one authority owns each distinct physical memory pool. Devices with private memory use a device authority; devices sharing physical memory alias the same host/unified authority. |
 | **C2** | Lease and allowance | A holder acquires an RAII lease before retaining physical memory. Additional mappings or OS residency budgets use authority-scoped allowances, not a second physical charge. |
 | **C3** | Allocator and backing | `DeviceAllocator` obtains memory; `VirtualBacking` reserves, maps, and unmaps address space. Neither decides admission or eviction policy. |
 | **C4** | Capacity transaction | Any capacity-changing operation follows `plan -> reserve -> expose provisional view -> execute -> commit`, with rollback before commit. |
@@ -55,22 +55,30 @@ These contracts must preserve the following invariants:
 
 ```mermaid
 flowchart TD
-    Client["Application / local API clients"] --> GenAI
-    GenAI["GenAI Server or embedded GenAI Runtime"] --> Registry["ModelRegistry"]
+    Client["Local API clients"] --> Foundry["Foundry Local / GenAI Server"]
+    Foundry --> GenAI["GenAI orchestration (optional)"]
+    Embedded["Embedded GenAI application"] --> GenAI
+    Standalone["Standalone ORT application"] --> Env
+
+    GenAI --> Registry["ModelRegistry"]
     GenAI --> Router["RequestRouter"]
     Registry -->|"load / switch / unload"| Engine
     Router -->|"requests / priority / latency policy"| Engine
 
-    subgraph ORT["ORT Runtime / OrtEnv — process-wide authority owner"]
+    subgraph Memory["ProcessMemoryManager — process-wide authority owner"]
         Resources["MemoryAuthorityRegistry + TopologyProvider"]
         Authorities["Host/UnifiedAuthority + DeviceAuthorities"]
         Resources --> Authorities
     end
 
-    GenAI -->|"create once; configure limits"| Resources
-    Resources -->|"snapshots / metrics"| GenAI
+    Foundry -->|"create/configure limits"| Resources
+    Embedded -->|"create or use default"| Resources
+    Standalone -->|"create or use default"| Resources
+    Resources -->|"snapshots / metrics"| Foundry
+    Resources -->|"lease / pressure API"| GenAI
     Resources -->|"lease API"| Engine["GenAI Engine / Scheduler(s)"]
-    Resources -->|"shared allocators + authority handles"| Session["ORT InferenceSession(s) — graph executors"]
+    Resources -->|"allocator adapters + snapshots"| Env["ORT Runtime / OrtEnv"]
+    Env -->|"shared allocators + authority handles"| Session["ORT InferenceSession(s) — graph executors"]
     Engine -->|"bind model/state views; Run"| Session
 
     Authorities -->|"leases / allowances / pressure"| Weights["Model residency: weights + captures"]
@@ -89,8 +97,10 @@ flowchart TD
 
 | Design component | Contract and invariant coverage |
 | --- | --- |
+| Foundry Local / embedding application | C8; I3, I8 |
 | GenAI server/runtime and model registry | C2, C4, C5, C7-C9; I3, I5, I6, I8, I10 |
-| ORT runtime / `OrtEnv` authority owner | C1, C2, C5, C7, C8; I1-I3, I6-I8 |
+| `ProcessMemoryManager` authority owner | C1, C2, C5, C7, C8; I1-I3, I6-I8 |
+| ORT runtime / `OrtEnv` allocator adapter | C2, C3, C8; I2, I3, I7 |
 | Resource registry and topology provider | C1, C7, C8; I1, I8 |
 | Device and host authorities | C1, C2, C5, C8; I1, I2, I3, I6, I7 |
 | Scheduler and admission | C4, C7-C9; I4, I5, I8, I10 |
@@ -100,25 +110,39 @@ flowchart TD
 | ORT allocator and I/O-binding adapters | C2, C3, C6, C8, C9; I2, I3, I10 |
 | Persistent state manager | C2, C4, C6, C9; I4-I6, I10 |
 
-**Authority ownership.** In the proposed architecture, a process-wide memory
-service associated with ORT/`OrtEnv` owns the resource registry and authorities.
-`InferenceSession` remains the graph executor; multiple sessions obtain shared
-allocators and leases from that service. GenAI is not a second graph runtime: it
-creates/configures the environment, owns model/request orchestration, leases
-external weights and state, binds them to sessions, and calls `Run`. An embedded
-caller uses the same service without HTTP. Today `OrtEnv` can share allocators,
-but the complete authority and reclaim protocol are proposed additions.
+**Authority ownership.** `ProcessMemoryManager` is a process-wide,
+GenAI-independent service. It owns topology, authorities, leases, pressure, and
+resource telemetry. Foundry Local, a GenAI server, an embedded application, or a
+standalone ORT application owns its lifetime and configures policy. Plain ORT
+creates a default manager when the application does not supply one.
+
+`OrtEnv` is ORT's process-level environment for logging, shared thread pools, EP
+setup, and environment-registered allocators. It is not the graph executor and
+does not own placement or eviction policy. It receives allocator adapters backed
+by `ProcessMemoryManager`; `InferenceSession` remains the graph executor, and
+multiple sessions allocate through those shared adapters.
+
+GenAI is not a second graph runtime. It owns model/request orchestration, leases
+external weights and state from the same manager, binds them to sessions, and
+calls `Run`. Thus ORT works with or without GenAI, while both paths use the same
+physical accounting when GenAI is present.
 
 The model registry takes model-level leases before constructing engines/sessions
 and returns them on unload or demotion. The request router supplies priority and
 latency policy; engine schedulers perform C4 admission. The resource API
 configures C8 limits and reads the same snapshots used for admission.
 
-**Control plane.** Within the `OrtEnv` service, `DeviceMemoryAuthority` owns the
-ledger and stable `MemoryAuthorityId` for one distinct device-local pool.
+**Control plane.** Within `ProcessMemoryManager`, `DeviceMemoryAuthority` owns
+the ledger and stable `MemoryAuthorityId` for one distinct device-local pool.
 Devices sharing physical memory resolve to the host/unified authority instead.
 One process-local `HostGovernor` covers host resources shared by all sessions
 and devices; cross-process enforcement is out of scope.
+
+**Fast path.** Governance is not a callback on every tensor or kernel.
+Allocators bulk-lease arena regions; persistent weights/state lease on growth;
+suballocation stays inside the local arena. Admission and reclaim run at model,
+request-step, arena-growth, and limit-change boundaries. The ordinary ORT
+allocation hot path therefore remains a local allocator operation.
 
 **Data plane.** `DeviceAllocator` answers *where bytes come from*;
 `MemoryGovernor` answers *whether they may be retained*. `VirtualBacking`
@@ -137,8 +161,9 @@ continue to optimize transient reuse.
 
 | Surface | Proposed change |
 | --- | --- |
-| `OrtEnv` / process runtime | Registry keyed by physical adapter/topology identity so sessions and EPs share C1. |
-| Session / EP creation | Inject the authority before arenas, initializers, or state allocate; late adoption only records accomplished allocations. |
+| Process foundation | Add a GenAI-independent `ProcessMemoryManager`, with a default for standalone ORT and injection for hosts such as Foundry Local. |
+| `OrtEnv` | Register shared allocator adapters backed by that manager; keep logging/thread/EP responsibilities separate from resource policy. |
+| Session / EP creation | Inject manager-backed allocators/authority handles before arenas, initializers, or state allocate; late adoption only records accomplished allocations. |
 | ORT arenas | Bulk-lease regions; report in-use, cached/reclaimable, pinned, and opaque bytes; add soft limits and `release_to(target)`. |
 | Planning | Report persistent and bounded activation/workspace peaks for model and request admission. |
 | Persistent state | Replace KV-specific ownership with C9 `StateBundle`, using external `OrtValue`/I/O Binding or the same EP-private contract. |
