@@ -1515,7 +1515,7 @@ impl Engine {
                 max_len,
                 ..
             } => max_len,
-            ModelDecodePath::PastPresent { .. } | ModelDecodePath::Legacy => None,
+            ModelDecodePath::PastPresent { .. } | ModelDecodePath::Generic => None,
         }
     }
 
@@ -2460,7 +2460,7 @@ mod tests {
             prefix_cache: PrefixCache::new(),
             token_prefix_cache: Vec::new(),
             kv_model: None,
-            decode_path: ModelDecodePath::Legacy,
+            decode_path: ModelDecodePath::Generic,
             scheduler: Scheduler::with_byte_budget(
                 scheduler_config,
                 onnx_genai_scheduler::ByteBudget::new(10),

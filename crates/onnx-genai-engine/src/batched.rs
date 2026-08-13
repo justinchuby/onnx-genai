@@ -906,11 +906,10 @@ impl Engine {
                          only one sequence can be decoded at a time"
                     .to_string(),
             },
-            ModelDecodePath::Legacy => BatchingCapability {
+            ModelDecodePath::Generic => BatchingCapability {
                 max_concurrent_sequences: Some(1),
-                reason: "this legacy past/present model has no shared KV buffer \
-                         and cannot batch: continuous batching requires a \
-                         static-cache or shared-buffer past/present model"
+                reason: "this generic graph-I/O decode path has no declared \
+                         batchable KV service and cannot batch"
                     .to_string(),
             },
         }
@@ -1036,7 +1035,7 @@ impl Engine {
                      opted into at launch"
                 );
             }
-            ModelDecodePath::Legacy => {
+            ModelDecodePath::Generic => {
                 // This string is pinned CHARACTER BY CHARACTER by the README, by
                 // check-perf-claims.test.js, and by batch_driver.rs's test. It
                 // stays on one line and byte-identical: an operator matches a
@@ -1230,7 +1229,7 @@ impl Engine {
                 max_len,
                 ..
             } => max_len,
-            ModelDecodePath::PastPresent { .. } | ModelDecodePath::Legacy => None,
+            ModelDecodePath::PastPresent { .. } | ModelDecodePath::Generic => None,
         };
         match runtime_max {
             Some(runtime_max) => {

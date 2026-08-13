@@ -73,7 +73,7 @@ pub(crate) enum ModelDecodePath {
         /// alongside the sliding window. `None`/`0` disables sink retention.
         sink_tokens: Option<usize>,
     },
-    Legacy,
+    Generic,
 }
 
 /// Engine-facing boundary over low-level ORT forward-pass/KV-buffer sessions.

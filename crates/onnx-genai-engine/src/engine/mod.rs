@@ -198,7 +198,7 @@ mod tests {
             prefix_cache: PrefixCache::new(),
             token_prefix_cache: Vec::new(),
             kv_model: None,
-            decode_path: ModelDecodePath::Legacy,
+            decode_path: ModelDecodePath::Generic,
             scheduler: Scheduler::new(onnx_genai_scheduler::SchedulerConfig::default()),
             governor,
             sessions,

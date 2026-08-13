@@ -118,7 +118,7 @@ impl DecodeState {
         fixed_state_budget_bytes: u64,
     ) -> anyhow::Result<Self> {
         match path {
-            ModelDecodePath::Legacy => Self::new_with_io_positions_and_state_budget(
+            ModelDecodePath::Generic => Self::new_with_io_positions_and_state_budget(
                 session,
                 io,
                 positions,
@@ -128,7 +128,7 @@ impl DecodeState {
                 let resolved = ResolvedIo::resolve_with_positions(session, io, positions)?;
                 if !resolved.state_pairs.is_empty() || positions.is_some() {
                     anyhow::bail!(
-                        "static-cache decode does not support declared generic positions or fixed loop-carried state; select the past/present or legacy decode path"
+                        "static-cache decode does not support declared generic positions or fixed loop-carried state; select the past/present or generic decode path"
                     );
                 }
                 Ok(Self {
