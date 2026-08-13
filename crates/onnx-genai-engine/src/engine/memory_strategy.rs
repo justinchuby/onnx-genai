@@ -650,6 +650,10 @@ pub(crate) fn cuda_policy_from_memory_strategy_plan(
         // memory-strategy decision, so it is read straight from the environment
         // rather than threaded through the runtime-application config.
         byte_aware_residency: onnx_runtime_ep_cuda::byte_aware_residency_from_env(),
+        // Eviction-order probe (#888): default LRU (byte-identical to shipped),
+        // read straight from the environment like the byte-aware knob above so
+        // the eviction-order investigation needs no runtime-application field.
+        evict_order_probe: onnx_runtime_ep_cuda::evict_order_probe_from_env(),
     }
 }
 

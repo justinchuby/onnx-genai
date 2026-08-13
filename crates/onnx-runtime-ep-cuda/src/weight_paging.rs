@@ -332,7 +332,34 @@ pub const WEIGHT_OFFLOAD_SCAN_RESISTANT_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_S
 /// graph OFF rules out captured-VA baking as the sole cause. Whether this is a
 /// bug in the byte-aware admission loop or a **latent defect in the existing
 /// offload path** (exposed, not caused, by reordering evictions) was not
-/// isolated here and is worth a separate investigation.
+/// isolated in #886 and was investigated separately in **#888 — resolved
+/// below**.
+///
+/// **#888 resolution: it is the retain-vs-bypass *flip*, not eviction order.**
+/// Byte-aware changes two independent things at once — it starts *retaining*
+/// large tensors that the shipped path streams transiently, **and** it evicts
+/// the *smallest* resident instead of the front-of-order oldest. These were
+/// separated with [`WEIGHT_OFFLOAD_EVICT_ORDER_ENV`], which changes only the
+/// eviction victim while keeping the shipped always-bypass decision. On
+/// qwen14b-zp, both `mru` (reverse recency) **and** `smallest` (byte-aware's
+/// exact victim, under 10,192 evictions) stay **byte-identical** to the LRU
+/// baseline with clean ledgers — so decode correctness does **not** depend on
+/// eviction order (explanation 1, not 2). The corruption is caused solely by
+/// promoting a would-be-bypass tensor into a retained, stable-slot resident that
+/// is then served as a *hit* (no re-fill) across steps. It is **not** a
+/// copy/compute fence hazard ([`WEIGHT_OFFLOAD_SYNC_BEFORE_FILL_ENV`] draining
+/// both streams before every fill does not fix it) and **not** captured-VA
+/// baking (graph-OFF still corrupts). One concrete consistency bug in this
+/// change was found and confirmed to occur — a *slotted* key that later bypasses
+/// gets `stable_slot = true` yet never rejoins `pages`
+/// ([`WEIGHT_OFFLOAD_RETAIN_SLOTTED_ENV`] closes it) — but closing it does
+/// **not** stop the corruption, so the primary value-corruption path is deeper
+/// in retaining/re-admitting large stable-slot tensors (granule-level checksums
+/// across steps are the remaining decider). Since the shipped size-blind path
+/// never retains large tensors, it is unaffected; a #864 hybrid that pins a
+/// *static* hot set (retain once, never churn) avoids this path, whereas any
+/// scheme that evicts and re-admits large stable-slot residents inherits the
+/// same hazard.
 ///
 /// The count-vs-byte residency gap therefore cannot be closed by an eviction-
 /// order change alone; it needs the structural lever deferred by #837 (a
@@ -392,6 +419,108 @@ pub fn byte_aware_residency_from_env() -> bool {
     byte_aware_from_env_value(std::env::var(WEIGHT_OFFLOAD_BYTE_AWARE_ENV).ok().as_deref())
 }
 
+/// Sub-knob (default `lru` = shipped behaviour) selecting the **eviction victim
+/// order** used on the size-blind `StableResident`/`Lru` admission path, without
+/// changing the retain-vs-bypass decision at all (#888).
+///
+/// This exists purely to answer the #888 discriminating question: byte-aware
+/// residency (#886) changed *two* independent things at once — it started
+/// *retaining* large tensors that used to bypass, **and** it started evicting
+/// the *smallest* resident instead of the front-of-order oldest one. If merely
+/// changing the eviction victim — while keeping the shipped size-blind
+/// always-bypass semantics — is enough to corrupt decode output, the surrounding
+/// offload path harbours a latent order-dependent defect (explanation 2). If
+/// only the full byte-aware policy (which also flips pages from bypass to
+/// retained) corrupts, the defect is specific to that retain change
+/// (explanation 1). Default (`lru`, or unset) is byte-identical to the shipped
+/// path; every other value is opt-in and experimental.
+pub const WEIGHT_OFFLOAD_EVICT_ORDER_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_EVICT_ORDER";
+
+/// Eviction victim ordering for the size-blind admission path. Only the victim
+/// changes; the always-bypass decision, the strong-count-1 evictable predicate,
+/// and the pre-eviction stream drain are all identical to the shipped path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum EvictOrderProbe {
+    /// Front-of-order oldest evictable page — the shipped `next_evictable_key`
+    /// behaviour. Byte-identical default.
+    #[default]
+    Lru,
+    /// Most-recently-used evictable page (reverse recency). A "trivially
+    /// different but still-correct" order: it only ever targets `strong_count
+    /// == 1` pages, exactly like LRU.
+    Mru,
+    /// Smallest evictable page by bytes — the eviction *target* byte-aware uses,
+    /// but decoupled from byte-aware's retain-large decision.
+    Smallest,
+    /// Largest evictable page by bytes.
+    Largest,
+}
+
+/// Parse [`WEIGHT_OFFLOAD_EVICT_ORDER_ENV`]. Unset or unrecognised keeps the
+/// shipped `Lru` order, so the default path stays byte-identical.
+pub(crate) fn evict_order_from_env_value(value: Option<&str>) -> EvictOrderProbe {
+    match value.map(|value| value.trim().to_ascii_lowercase()) {
+        Some(value) => match value.as_str() {
+            "mru" | "reverse" => EvictOrderProbe::Mru,
+            "smallest" | "small" => EvictOrderProbe::Smallest,
+            "largest" | "large" => EvictOrderProbe::Largest,
+            _ => EvictOrderProbe::Lru,
+        },
+        None => EvictOrderProbe::Lru,
+    }
+}
+
+/// Read [`WEIGHT_OFFLOAD_EVICT_ORDER_ENV`] from the process environment.
+#[must_use]
+pub fn evict_order_probe_from_env() -> EvictOrderProbe {
+    evict_order_from_env_value(
+        std::env::var(WEIGHT_OFFLOAD_EVICT_ORDER_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// #888 diagnostic env: when truthy, drain the compute and copy streams
+/// immediately before every H2D page-in fill. Default OFF (byte-identical).
+/// Used to classify whether byte-aware residency's corruption is a
+/// write-after-read hazard on the shared physical granule pool (would be fixed
+/// by this drain) or a pure aliasing/logic bug (would not).
+const WEIGHT_OFFLOAD_SYNC_BEFORE_FILL_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_SYNC_BEFORE_FILL";
+
+fn sync_before_fill_enabled() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        matches!(
+            std::env::var(WEIGHT_OFFLOAD_SYNC_BEFORE_FILL_ENV)
+                .ok()
+                .as_deref()
+                .map(|value| value.trim().to_ascii_lowercase()),
+            Some(ref value) if matches!(value.as_str(), "1" | "true" | "yes" | "on")
+        )
+    })
+}
+
+/// #888 diagnostic env: when truthy, byte-aware admission never *bypasses* a key
+/// that already owns a stable VA slot — it re-retains it into residency instead.
+/// Default OFF. This closes the one `stable_slot`/residency disagreement that is
+/// reachable only under byte-aware (a once-retained tensor squeezed below the
+/// resident set and re-entering as a bypass), letting an A/B on the same binary
+/// test whether that disagreement is byte-aware's corruption mechanism.
+const WEIGHT_OFFLOAD_RETAIN_SLOTTED_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_RETAIN_SLOTTED";
+
+fn retain_slotted_enabled() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        matches!(
+            std::env::var(WEIGHT_OFFLOAD_RETAIN_SLOTTED_ENV)
+                .ok()
+                .as_deref()
+                .map(|value| value.trim().to_ascii_lowercase()),
+            Some(ref value) if matches!(value.as_str(), "1" | "true" | "yes" | "on")
+        )
+    })
+}
+
 /// Whether/how the CUDA EP should page offloaded weights into a bounded VRAM
 /// residency cache. Disabled by default so the resident fast path is untouched
 /// and byte-identical.
@@ -422,6 +551,12 @@ pub struct DeviceOffloadPolicy {
     /// unless `scan_resistant_dense` is also on, since it only refines the
     /// `StableResident` bypass decision.
     pub byte_aware_residency: bool,
+    /// Eviction victim ordering for the size-blind admission path (#888
+    /// investigation). Default [`EvictOrderProbe::Lru`] is byte-identical to the
+    /// shipped path; other values only change *which* unreferenced page is
+    /// evicted for physical room, isolating whether decode correctness depends
+    /// on eviction order independently of byte-aware's retain change.
+    pub evict_order_probe: EvictOrderProbe,
 }
 
 impl Default for DeviceOffloadPolicy {
@@ -434,6 +569,7 @@ impl Default for DeviceOffloadPolicy {
             async_pagein: false,
             scan_resistant_dense: true,
             byte_aware_residency: false,
+            evict_order_probe: EvictOrderProbe::Lru,
         }
     }
 }
@@ -461,6 +597,11 @@ impl DeviceOffloadPolicy {
         );
         let byte_aware_residency =
             byte_aware_from_env_value(std::env::var(WEIGHT_OFFLOAD_BYTE_AWARE_ENV).ok().as_deref());
+        let evict_order_probe = evict_order_from_env_value(
+            std::env::var(WEIGHT_OFFLOAD_EVICT_ORDER_ENV)
+                .ok()
+                .as_deref(),
+        );
         Self {
             enabled,
             managed_no_spill: false,
@@ -469,6 +610,7 @@ impl DeviceOffloadPolicy {
             async_pagein,
             scan_resistant_dense,
             byte_aware_residency,
+            evict_order_probe,
         }
     }
 }
@@ -945,6 +1087,11 @@ pub struct CudaWeightResidency {
     /// the shipped path is byte-identical; opt in via
     /// `ONNX_GENAI_WEIGHT_OFFLOAD_BYTE_AWARE=1`.
     byte_aware: bool,
+    /// Eviction victim ordering for the size-blind admission path (#888). Only
+    /// changes which unreferenced page is chosen for physical room; the
+    /// always-bypass decision is unchanged. Default [`EvictOrderProbe::Lru`] is
+    /// byte-identical to the shipped path.
+    evict_order_probe: EvictOrderProbe,
     physical: OnceLock<PhysicalAdmission>,
     /// Reused pinned host staging buffers for weight page-ins. Shared so every
     /// page-in draws from the same bounded free-list instead of page-locking a
@@ -1236,6 +1383,7 @@ impl CudaWeightResidency {
             runtime: Arc::clone(&runtime),
             scan_resistant_dense: false,
             byte_aware: false,
+            evict_order_probe: EvictOrderProbe::Lru,
             physical: OnceLock::new(),
             staging_pool: PinnedStagingPool::new(Arc::clone(&runtime)),
             inner: Mutex::new(ResidencyInner {
@@ -1287,6 +1435,7 @@ impl CudaWeightResidency {
             runtime: Arc::clone(&runtime),
             scan_resistant_dense: false,
             byte_aware: false,
+            evict_order_probe: EvictOrderProbe::Lru,
             physical: OnceLock::new(),
             staging_pool: PinnedStagingPool::new(Arc::clone(&runtime)),
             inner: Mutex::new(ResidencyInner {
@@ -1414,6 +1563,15 @@ impl CudaWeightResidency {
     /// scan-resistant dense residency is also on.
     pub fn with_byte_aware_residency(mut self, byte_aware: bool) -> Self {
         self.byte_aware = byte_aware;
+        self
+    }
+
+    /// Select the eviction victim order for the size-blind admission path (#888
+    /// investigation). Default [`EvictOrderProbe::Lru`] is byte-identical to the
+    /// shipped path; other orders isolate whether decode correctness depends on
+    /// eviction order independently of byte-aware's retain-vs-bypass change.
+    pub fn with_evict_order_probe(mut self, evict_order_probe: EvictOrderProbe) -> Self {
+        self.evict_order_probe = evict_order_probe;
         self
     }
 
@@ -1681,9 +1839,16 @@ impl CudaWeightResidency {
                 .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))?,
         };
 
-        let bypass = match self
-            .admit_committed_span(&mut inner, physical, &allowance, ptr, len, eviction, fill)
-        {
+        let bypass = match self.admit_committed_span(
+            &mut inner,
+            physical,
+            &allowance,
+            ptr,
+            len,
+            eviction,
+            reused_slot.is_some(),
+            fill,
+        ) {
             Ok(bypass) => bypass,
             Err(error) => {
                 // A reused slot's VA is persistent (its physical is already
@@ -1701,6 +1866,25 @@ impl CudaWeightResidency {
         // page keeps its throwaway VA and is freed outright on Drop, so two
         // concurrent bypass page-ins can never alias one physical granule.
         let stable_slot = reused_slot.is_some() || !bypass;
+        // #888 diagnostic: a *slotted* key that admission decides to *bypass*
+        // is the one place `stable_slot` (drives Drop) and residency (drives
+        // hits) disagree — the page is decommitted-but-VA-kept yet never joins
+        // `pages`. This case is unreachable on the shipped size-blind path
+        // (slotted keys are the retained smalls, which stay resident) but
+        // reachable under byte-aware, where a once-retained large tensor can be
+        // squeezed below the resident set and re-enter as a bypass. Emit once so
+        // its occurrence during a corrupting run is observable even though the
+        // harness bails at the 3-token early-EOS.
+        if reused_slot.is_some() && bypass {
+            static SLOTTED_BYPASS_SEEN: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !SLOTTED_BYPASS_SEEN.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "weight_paging_diag[#888]: slotted-key bypass occurred (key={key}, \
+                     len={len}) — stable_slot/residency disagreement reachable under byte-aware"
+                );
+            }
+        }
         if stable_slot && reused_slot.is_none() {
             inner.slots.insert(
                 key,
@@ -1752,6 +1936,7 @@ impl CudaWeightResidency {
         ptr: NonNull<u8>,
         len: usize,
         eviction: WeightEvictionPolicy,
+        has_stable_slot: bool,
         fill: F,
     ) -> Result<bool, WeightHandleError>
     where
@@ -1801,6 +1986,27 @@ impl CudaWeightResidency {
                                 |current| Some(current.saturating_sub(excess)),
                             );
                         }
+                        // #888 diagnostic: optionally drain the compute stream
+                        // immediately before the H2D fill so no in-flight kernel
+                        // can still be reading a physical granule this span just
+                        // (re)committed from the shared pool. If enabling this
+                        // makes byte-aware residency correct, the corruption is a
+                        // write-after-read hazard on the shared granule pool
+                        // exposed by retaining (and re-committing) large tensors,
+                        // not a pure aliasing/logic bug. Default OFF /
+                        // byte-identical.
+                        if sync_before_fill_enabled() {
+                            self.runtime.synchronize().map_err(|error| {
+                                WeightHandleError::DeviceBinding(format!(
+                                    "sync-before-fill compute drain: {error}"
+                                ))
+                            })?;
+                            self.runtime.copy_stream().synchronize().map_err(|error| {
+                                WeightHandleError::DeviceBinding(format!(
+                                    "sync-before-fill copy drain: {error}"
+                                ))
+                            })?;
+                        }
                         fill.take().expect("VMM page fill runs once")(
                             &self.runtime,
                             ptr.as_ptr() as CUdeviceptr,
@@ -1838,9 +2044,10 @@ impl CudaWeightResidency {
                 // default-OFF and never set on the shipped path; see
                 // `WEIGHT_OFFLOAD_BYTE_AWARE_ENV` for the measured evidence.
                 bypass = !(self.byte_aware
-                    && inner
-                        .smallest_evictable()
-                        .is_some_and(|(_, smallest)| (len as u64) > smallest));
+                    && (has_stable_slot && retain_slotted_enabled()
+                        || inner
+                            .smallest_evictable()
+                            .is_some_and(|(_, smallest)| (len as u64) > smallest)));
             }
 
             if evictions >= max_evictions {
@@ -1859,12 +2066,13 @@ impl CudaWeightResidency {
             let before_required_mapped = required_mapped;
             // Byte-aware admission evicts the smallest evictable resident so a
             // large incoming tensor displaces cheap smalls rather than another
-            // large tensor; size-blind residency evicts in LRU order (#837
-            // item 3).
+            // large tensor; size-blind residency evicts by `evict_order_probe`,
+            // which is front-of-order LRU on the shipped default path and only
+            // varies under the #888 eviction-order investigation knob.
             let evicted_key = if self.byte_aware {
                 inner.smallest_evictable().map(|(key, _)| key)
             } else {
-                inner.next_evictable_key(eviction)
+                inner.evictable_key_by_probe(self.evict_order_probe, eviction)
             };
             let Some(evicted_key) = evicted_key else {
                 return Err(WeightHandleError::DeviceBinding(format!(
@@ -2238,6 +2446,45 @@ impl ResidencyInner {
         best
     }
 
+    /// Select the eviction victim for the size-blind admission path under the
+    /// #888 eviction-order probe. [`EvictOrderProbe::Lru`] delegates to
+    /// [`Self::next_evictable_key`], so the default path is byte-identical to
+    /// the shipped code. Every variant applies the identical "evictable" filter
+    /// (`Arc::strong_count == 1`), so no order can ever target a page still read
+    /// by an in-flight kernel — the only thing that changes is *which*
+    /// unreferenced page is freed for physical room.
+    fn evictable_key_by_probe(
+        &self,
+        probe: EvictOrderProbe,
+        eviction: WeightEvictionPolicy,
+    ) -> Option<u64> {
+        let is_evictable = |key: u64| -> bool {
+            self.pages
+                .get(&key)
+                .is_some_and(|page| Arc::strong_count(page) == 1)
+        };
+        match probe {
+            EvictOrderProbe::Lru => self.next_evictable_key(eviction),
+            EvictOrderProbe::Mru => self
+                .policy
+                .order
+                .iter()
+                .rev()
+                .copied()
+                .find(|&k| is_evictable(k)),
+            EvictOrderProbe::Smallest => self.smallest_evictable().map(|(key, _)| key),
+            EvictOrderProbe::Largest => {
+                let mut best: Option<(u64, u64)> = None;
+                for (&key, &bytes) in &self.policy.bytes_by_key {
+                    if is_evictable(key) && best.is_none_or(|(_, best_bytes)| bytes > best_bytes) {
+                        best = Some((key, bytes));
+                    }
+                }
+                best.map(|(key, _)| key)
+            }
+        }
+    }
+
     fn remove_page(&mut self, key: u64) {
         if self.pages.remove(&key).is_some()
             && let Some(bytes) = self.policy.remove_page(key)
@@ -2402,6 +2649,39 @@ mod tests {
         assert!(byte_aware_from_env_value(Some("true")));
         assert!(byte_aware_from_env_value(Some("YES")));
         assert!(byte_aware_from_env_value(Some("  On ")));
+    }
+
+    #[test]
+    fn evict_order_env_defaults_lru_and_parses_variants() {
+        // Unset and unrecognised keep the shipped front-of-order LRU victim, so
+        // the default path is byte-identical (#888).
+        assert_eq!(evict_order_from_env_value(None), EvictOrderProbe::Lru);
+        assert_eq!(evict_order_from_env_value(Some("")), EvictOrderProbe::Lru);
+        assert_eq!(
+            evict_order_from_env_value(Some("lru")),
+            EvictOrderProbe::Lru
+        );
+        assert_eq!(
+            evict_order_from_env_value(Some("nonsense")),
+            EvictOrderProbe::Lru
+        );
+        // Opt-in experimental orders (case/whitespace-insensitive).
+        assert_eq!(
+            evict_order_from_env_value(Some("mru")),
+            EvictOrderProbe::Mru
+        );
+        assert_eq!(
+            evict_order_from_env_value(Some(" Reverse ")),
+            EvictOrderProbe::Mru
+        );
+        assert_eq!(
+            evict_order_from_env_value(Some("SMALLEST")),
+            EvictOrderProbe::Smallest
+        );
+        assert_eq!(
+            evict_order_from_env_value(Some("large")),
+            EvictOrderProbe::Largest
+        );
     }
 
     #[test]
