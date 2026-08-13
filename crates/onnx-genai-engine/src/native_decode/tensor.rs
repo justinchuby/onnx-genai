@@ -480,11 +480,34 @@ pub(crate) fn make_empty_input_tensor(
 /// ([`NativeDecodeSession::run_fused_batch_prefill`]): a genuine batch axis with
 /// an empty past, so weight streaming is exercised across `N` independent rows
 /// without a batched KV *layout* (stage 2b). `batch == 1` is byte-identical to
-/// [`make_empty_input_tensor`].
+/// [`make_empty_input_tensor`]. For a non-empty past see
+/// [`make_past_input_tensor_batched`].
 pub(crate) fn make_empty_input_tensor_batched(
     session: &InferenceSession,
     name: &str,
     batch: usize,
+) -> anyhow::Result<Tensor> {
+    make_past_input_tensor_batched(session, name, batch, 0)
+}
+
+/// Batch-aware past-KV builder that seeds a **non-empty** sequence axis of
+/// `past_len` zero-filled positions (batch axis 0 = `batch` rows).
+///
+/// Stage 2b (#750) uses this to drive the batch-N fused forward with a genuine
+/// length-`L` batched KV past ([`NativeDecodeSession::run_fused_batch_forward`]):
+/// unlike the stage 2a empty-past probe, this exercises the ONNX attention
+/// **batch coupling across QKV / mask / past-KV** at `N > 1` with real past
+/// content, and — crucially for the memory trade — commits `batch × past_len`
+/// worth of KV so the weight-residency reclaim under the elastic budget (#866)
+/// becomes observable in `htod_bytes_per_token`. Growable seq axes are seeded to
+/// `past_len`; fixed-size recurrent feature axes keep their static extent and
+/// ignore `past_len`. `past_len == 0` is byte-identical to
+/// [`make_empty_input_tensor_batched`].
+pub(crate) fn make_past_input_tensor_batched(
+    session: &InferenceSession,
+    name: &str,
+    batch: usize,
+    past_len: usize,
 ) -> anyhow::Result<Tensor> {
     let meta = session
         .inputs()
@@ -503,13 +526,14 @@ pub(crate) fn make_empty_input_tensor_batched(
         let value = if axis == 0 {
             batch
         } else if axis == seq_axis {
-            // Growable KV caches start with an empty sequence axis; fixed-size
-            // recurrent states (hybrid linear-attention conv_state /
-            // recurrent_state) carry a static feature dim here and must be seeded
-            // at full extent so the first forward sees a zero-filled state.
+            // Growable KV caches carry the requested `past_len` on the sequence
+            // axis; fixed-size recurrent states (hybrid linear-attention
+            // conv_state / recurrent_state) carry a static feature dim here and
+            // must be seeded at full extent so the first forward sees a
+            // zero-filled state.
             match dim {
                 Dim::Static(value) => value,
-                Dim::Symbolic(_) => 0,
+                Dim::Symbolic(_) => past_len,
             }
         } else if let Dim::Static(value) = dim {
             value
