@@ -11,12 +11,9 @@ devices. The no-model suite needs no ONNX Runtime model or GPU:
 
 Model scenarios are gated by `bench-ort` and use the committed tiny fixtures:
 
-- end-to-end generation tokens/second (`tiny-llm-scatter`)
-- prefill latency by context length (`tiny-llm-scatter`)
-- static batch throughput by batch size (`tiny-llm-scatter`)
-- scheduler-driven continuous-batch versus sequential throughput at 1/2/4/8
-  concurrent rows, with Criterion latency distributions (`tiny-llm-scatter`)
-- prefix-cache prefill speedup: cold versus warm (prefix-primed) prefill (`tiny-llm-scatter`)
+- end-to-end generation tokens/second (`tiny-llm`)
+- prefill latency by context length (`tiny-llm`)
+- prefix-cache prefill speedup: cold versus warm (prefix-primed) prefill (`tiny-llm`)
 
 Run the comparable suite:
 
