@@ -2999,9 +2999,16 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
         .with_context(|| format!("load pipeline engine {}", model_dir.display()))?;
     let tokenizer =
         Tokenizer::from_file(tokenizer_file(model_dir)).context("load pipeline tokenizer.json")?;
-    let prompt_tokens = tokenizer
-        .encode(&args.prompt)
-        .context("tokenize pipeline prompt")?;
+    let prompt_tokens = if let Some(ids_path) = args.prompt_ids.as_ref() {
+        let raw = std::fs::read_to_string(ids_path)
+            .with_context(|| format!("read prompt ids from {}", ids_path.display()))?;
+        serde_json::from_str::<Vec<u32>>(raw.trim())
+            .with_context(|| format!("parse prompt ids JSON from {}", ids_path.display()))?
+    } else {
+        tokenizer
+            .encode(&args.prompt)
+            .context("tokenize pipeline prompt")?
+    };
     if prompt_tokens.is_empty() {
         bail!("pipeline prompt tokenized to an empty sequence");
     }
@@ -3043,6 +3050,7 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
                     args.decode_skip
                 );
             }
+            let generated_tokens = result.token_ids.len();
             if let Some(reference) = &reference_tokens {
                 if reference != &result.token_ids {
                     bail!("pipeline greedy decode was not deterministic across measured runs");
@@ -3052,34 +3060,22 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
                 reference_text = Some(result.text);
             }
 
-            let prefill_ms = token_times[0].as_secs_f64() * 1_000.0;
-            // A measured prefill that reused KV from the prefix cache did not
-            // process those tokens, so reporting it as prompt-processing
-            // throughput overstates prefill by however much it reused. This is
-            // easy to hit by accident: --warmups replays the *same* prompt, so
-            // the measured run reads back a fully cached prefix and reports a
-            // prefill that is independent of prompt length (#1529).
-            let prefill_new_tokens = prompt_tokens.saturating_sub(cache_hit);
-            let prefill_note = if cache_hit > 0 {
-                format!(
-                    " prefix_cache_hit={cache_hit}/{prompt_tokens} \
-                     WARNING: only {prefill_new_tokens} tokens were actually processed; \
-                     this is NOT prompt-processing throughput (re-run with --warmups 0 \
-                     or a distinct prompt per run)"
-                )
-            } else if prefill_new_tokens > 0 {
-                format!(
-                    " prefill_throughput={:.1} tok/s ({prefill_new_tokens} tokens)",
-                    prefill_new_tokens as f64 * 1_000.0 / prefill_ms
-                )
-            } else {
-                String::new()
-            };
-            let decode_tokens = token_times.len() - args.decode_skip;
-            let decode_wall =
-                token_times[token_times.len() - 1] - token_times[args.decode_skip - 1];
-            let ms_per_token = decode_wall.as_secs_f64() * 1_000.0 / decode_tokens as f64;
-            let tok_per_s = decode_tokens as f64 / decode_wall.as_secs_f64();
+            let diagnostic = engine.workflow_performance_diagnostic();
+            if diagnostic.last_emit_timestamps_ns.len() != generated_tokens {
+                bail!(
+                    "workflow emitted {} timing events for {} generated tokens",
+                    diagnostic.last_emit_timestamps_ns.len(),
+                    generated_tokens
+                );
+            }
+            let prefill_ms = diagnostic.last_emit_timestamps_ns[0] as f64 / 1_000_000.0;
+            let decode_tokens = diagnostic.last_emit_timestamps_ns.len() - args.decode_skip;
+            let decode_ns = diagnostic.last_emit_timestamps_ns
+                [diagnostic.last_emit_timestamps_ns.len() - 1]
+                - diagnostic.last_emit_timestamps_ns[args.decode_skip - 1];
+            let decode_wall = Duration::from_nanos(u64::try_from(decode_ns)?);
+            let ms_per_token = decode_ns as f64 / 1_000_000.0 / decode_tokens as f64;
+            let tok_per_s = decode_tokens as f64 * 1_000_000_000.0 / decode_ns as f64;
             println!(
                 "steady_run {run}: prefill={prefill_ms:.3} ms{prefill_note} \
                  decode_tokens={decode_tokens} \
@@ -3101,6 +3097,31 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
             args.warmups,
             args.decode_skip
         );
+        let diagnostic = engine.workflow_performance_diagnostic();
+        for island in diagnostic.islands {
+            println!(
+                "workflow_island {}: components={:?} runs={} session_runs={} eager={} stable={} \
+                 captures={} replays={} syncs={} h2d={}/{}B d2h={}/{}B d2d={}/{}B \
+                 elapsed={:.3}ms fallback={:?}",
+                island.id,
+                island.components,
+                island.runs,
+                island.session_runs,
+                island.eager_runs,
+                island.stable_binding_runs,
+                island.captures,
+                island.replays,
+                island.device_synchronizations,
+                island.host_to_device_copies,
+                island.host_to_device_bytes,
+                island.device_to_host_copies,
+                island.device_to_host_bytes,
+                island.device_to_device_copies,
+                island.device_to_device_bytes,
+                island.total_run_ns as f64 / 1_000_000.0,
+                island.fallback_reason
+            );
+        }
         if let Some(tokens) = reference_tokens {
             println!("generated_token_ids: {tokens:?}");
         }
