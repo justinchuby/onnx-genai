@@ -646,6 +646,10 @@ pub(crate) fn cuda_policy_from_memory_strategy_plan(
         // #715 removed prefetch. Keep the policy on measured demand page-in.
         async_pagein: false,
         scan_resistant_dense: application.scan_resistant_dense,
+        // Byte-aware residency is an opt-in A/B knob (#837 item 3), not a
+        // memory-strategy decision, so it is read straight from the environment
+        // rather than threaded through the runtime-application config.
+        byte_aware_residency: onnx_runtime_ep_cuda::byte_aware_residency_from_env(),
     }
 }
 

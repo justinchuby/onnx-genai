@@ -445,16 +445,26 @@ fn print_weight_offload_observability(emitted_tokens: u64) {
         .byte_hit_rate()
         .map(|rate| format!("{:.2}%", rate * 100.0))
         .unwrap_or_else(|| "n/a".to_string());
+    // Byte-weighted attribution of the bypass count: what share of streamed
+    // bytes is bypass traffic that residency policy keeps no benefit from and
+    // re-streams every step (#837 item 3).
+    let bypassed_byte_share = stats
+        .bypassed_byte_share()
+        .map(|rate| format!("{:.2}%", rate * 100.0))
+        .unwrap_or_else(|| "n/a".to_string());
     println!(
         "weight_offload_cache: page_ins={} hits={} hit_rate={} byte_hit_rate={} \
-         hit_bytes={} evictions={} bypassed_page_ins={}",
+         hit_bytes={} evictions={} bypassed_page_ins={} bypassed_page_in_bytes={} \
+         bypassed_byte_share={}",
         stats.page_ins,
         stats.hits,
         hit_rate,
         byte_hit_rate,
         stats.hit_bytes,
         stats.evictions,
-        stats.bypassed_page_ins
+        stats.bypassed_page_ins,
+        stats.bypassed_page_in_bytes,
+        bypassed_byte_share
     );
     print_weight_offload_amortization(&stats, emitted_tokens);
     println!(
