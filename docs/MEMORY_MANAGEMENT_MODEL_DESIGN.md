@@ -15,7 +15,7 @@ configured limit an incomplete view of actual machine pressure.
 We want one or more models to use the machine efficiently across heterogeneous
 devices: offload when VRAM is insufficient, commit only what the workload uses,
 share spare capacity across models and sessions, and preserve headroom for
-other applications. A unified authority coordinates these existing memory
+other applications. A unified control plane coordinates these existing memory
 mechanisms; it does not replace their specialized allocation and caching
 strategies.
 
@@ -26,12 +26,12 @@ specialized allocation and caching data planes.
 
 | ID | Contract | Responsibility |
 | --- | --- | --- |
-| **C1** | Resource authority | One authority owns the capacity and accounting for a physical resource domain: one per accelerator and one per machine-wide host pool. |
-| **C2** | Lease | A holder acquires an RAII lease for a tier, byte count, role, and holder identity before retaining physical memory. Dropping or shrinking the lease returns capacity. |
+| **C1** | Resource authority | Within the runtime, one authority owns each distinct physical memory pool. Devices with private memory use a device authority; devices sharing physical memory alias the same host/unified authority. |
+| **C2** | Lease and allowance | A holder acquires an RAII lease before retaining physical memory. Additional mappings or OS residency budgets use authority-scoped allowances, not a second physical charge. |
 | **C3** | Allocator and backing | `DeviceAllocator` obtains memory; `VirtualBacking` reserves, maps, and unmaps address space. Neither decides admission or eviction policy. |
-| **C4** | Capacity transaction | Growth follows `plan -> reserve -> expose provisional view -> execute -> commit`, with rollback before commit. |
+| **C4** | Capacity transaction | Any capacity-changing operation follows `plan -> reserve -> expose provisional view -> execute -> commit`, with rollback before commit. |
 | **C5** | Reclaimable holder | Under pressure, the authority requests bytes from a registered holder. The holder selects safe victims and reports what it actually released. |
-| **C6** | Model memory view | A backend exposes either contiguous tensors or cache blocks plus a block table. The view remains valid for the model execution that consumes it. |
+| **C6** | Model memory view | A backend exposes contiguous, blocks-plus-table, indexed, or opaque state views. The view remains valid for the execution that consumes it. |
 | **C7** | Topology and capability | The platform reports capacity, tier aliasing, mapping granularity, transfer paths, and supported model views. Selection is capability-driven. |
 | **C8** | Reconfiguration and observability | Authorities expose used, available, oversubscribed, and role-attributed bytes; limits may be lowered only through the reclaim protocol. |
 | **C9** | Persistent state bundle | Every model declares all loop-carried state and its lifetime, growth/update pattern, model view, and checkpoint/fork/migrate capabilities. The engine transacts the complete bundle, not only attention KV. |
@@ -40,13 +40,13 @@ These contracts must preserve the following invariants:
 
 | ID | Invariant |
 | --- | --- |
-| **I1 — Single accounting authority** | Every physical byte is charged to exactly one authority. Shared mappings and prefix aliases do not create a second physical charge. |
-| **I2 — Charge before commit** | Physical allocation or mapping is preceded by a lease or transactional grant. Already-committed bytes are recorded even when that reveals oversubscription. |
+| **I1 — Single accounting authority** | Every managed physical byte is charged to exactly one authority. Shared mappings and prefix aliases may consume allowances but do not create a second physical charge. |
+| **I2 — Charge before commit** | Physical allocation or mapping is preceded by a lease or transactional grant/allowance. Already-committed bytes are recorded even when that reveals oversubscription. |
 | **I3 — Fail closed** | A denied lease, authority mismatch, or required managed-memory initialization failure never falls back to ungoverned allocation. |
-| **I4 — Exclusive ownership state** | Capacity is exactly one of free, transaction-reserved, or committed to a holder. |
-| **I5 — Transaction consistency** | A pre-commit failure restores the prior request, cache, and capture state. If components can diverge after commit begins, the engine becomes unhealthy rather than continuing. |
-| **I6 — Live-state safety** | The authority never takes memory directly. Leased, pinned, or in-flight data cannot be reclaimed. |
-| **I7 — Non-blocking governance** | No thread waits while holding an authority lock, and allocator callbacks do not wait for reclaim. A waiter is woken only after capacity is charged. |
+| **I4 — Exclusive ownership state** | Physical capacity and allowances are exactly one of free, transaction-reserved, or committed to a holder. |
+| **I5 — Transaction consistency** | A pre-commit failure restores the prior request, complete state bundle, and capture state. If components can diverge after commit begins, the engine becomes unhealthy rather than continuing. |
+| **I6 — Live-state safety** | The authority never takes memory directly. The holder may release it, but cannot select pinned or in-flight data for reclaim. |
+| **I7 — Non-blocking governance** | No thread waits while holding an authority lock, and allocator callbacks do not wait for reclaim. A waiter is woken only after capacity or allowance is reserved. |
 | **I8 — Bytes are authoritative** | Tokens, blocks, and pages are derived from exact model geometry and queried platform granularity; admission includes rounding and transient migration peaks. |
 | **I9 — Remap synchronization** | A virtual mapping is not changed while a kernel, transfer, or captured graph may access it. |
 | **I10 — State-complete commit** | KV, recurrent state, convolution state, sampler/search state, and request progress commit or roll back at the same logical step. |
@@ -58,15 +58,15 @@ Local Runtime / OrtEnv
 ResourceRegistry + TopologyProvider (C1, C7, C8)
                         |
                         v
-Engine / Scheduler: plan and reserve complete model + request work (C4)
+Engine / Scheduler: plan complete model + StateBundle work (C4, C9, I10)
                         |
                         v
 +--------------------------------------------------------------------+
 | Memory control plane                                               |
-| HostAuthority (machine RAM/disk) | DeviceAuthority[physical device] |
+| Host/UnifiedAuthority       | DeviceAuthority[distinct local pool] |
 | roles: weights | state | activation | workspace | runtime overhead |
 +-----------------------------+--------------------------------------+
-                              | leases / grants / pressure
+                              | physical leases / allowances / pressure
             +-----------------+-------------------+
             |                 |                   |
             v                 v                   v
@@ -89,19 +89,21 @@ hot / warm / cold      prefix + request state  cached / reclaimable
 
 | Design component | Contract and invariant coverage |
 | --- | --- |
+| Resource registry and topology provider | C1, C7, C8; I1, I8 |
 | Device and host authorities | C1, C2, C5, C8; I1, I2, I3, I6, I7 |
-| Scheduler and admission | C4, C7, C8; I4, I5, I8 |
-| Weight residency manager | C2, C5; I2, I6 |
-| Paged KV backend | C2, C4, C6; I2, I4, I5 |
-| Contiguous-VA VMM backend | C2, C3, C4, C6, C7; I1-I5, I8, I9 |
-| ORT allocator and I/O-binding adapters | C2, C3, C6, C8; I2, I3 |
+| Scheduler and admission | C4, C7-C9; I4, I5, I8, I10 |
+| Weight residency manager | C2, C4, C5; I2, I5, I6 |
+| Paged KV backend | C2, C4, C6, C9; I2, I4, I5, I10 |
+| Contiguous-VA VMM backend | C2-C4, C6, C7, C9; I1-I5, I8-I10 |
+| ORT allocator and I/O-binding adapters | C2, C3, C6, C8, C9; I2, I3, I10 |
 | Persistent state manager | C2, C4, C6, C9; I4-I6, I10 |
 
 **Control plane.** `DeviceMemoryAuthority` owns the ledger and stable
-`MemoryAuthorityId` for one physical-device compatibility domain. Server
-engines sharing a device share this authority. `HostGovernor` is machine-wide
-because offload, pinned staging, and disk are shared by every device. Its
-ticketed protocol charges a grant before waking a requester.
+`MemoryAuthorityId` for one distinct device-local pool. Devices sharing physical
+memory resolve to the host/unified authority instead. One process-local
+`HostGovernor` covers host resources shared by all participating sessions and
+devices; cross-process enforcement is out of scope. Its ticketed protocol
+charges a grant before waking a requester.
 
 **Data plane.** `DeviceAllocator` answers *where bytes come from*;
 `MemoryGovernor` answers *whether they may be retained*. `VirtualBacking`
@@ -126,7 +128,7 @@ continue to optimize transient reuse.
 | Planning | Report persistent and bounded activation/workspace peaks for model and request admission. |
 | Persistent state | Replace KV-specific ownership with C9 `StateBundle`, using external `OrtValue`/I/O Binding or the same EP-private contract. |
 | Weights | EP-visible stable slots with `ensure_resident` and reclaim; I/O Binding alone cannot page internal initializers. |
-| Graph capture | Bind capture to addresses, shapes, view kind, and mapping generation; remap/page-in only outside replay after fences. |
+| Graph capture | Bind capture to addresses, shapes, view kind, and backing compatibility. Track mapping generations for fencing; compatible same-VA remap need not invalidate capture. |
 | Windows | Feed DXGI local/non-local budgets and change events into C7/C8; `gpu_mem_limit` remains only an arena limit. |
 
 The minimal integration can live above ORT using registered allocators and
@@ -162,7 +164,8 @@ with a stable pool/table buffer and bucketed table shapes.
 
 ### Capacity transaction
 
-Paged and VMM-backed KV use the same step protocol:
+Every C9 state bundle—including paged or VMM-backed KV—uses the same step
+protocol:
 
 ```text
 plan -> reserve bytes and pages -> expose provisional model view -> execute
@@ -173,8 +176,9 @@ plan -> reserve bytes and pages -> expose provisional model view -> execute
 For VMM growth, `prepare_mapped_growth` may transfer allowance from a registered
 reclaimable weight holder before any new granule is mapped. For paged attention,
 the reservation owns blocks before they appear in a committed request table.
+Fixed recurrent/conv state is checkpointed or written to provisional storage.
 If collaborators disagree after commit begins, the engine fails terminally
-rather than continue with divergent cache and request state.
+rather than continue with divergent state.
 
 ### Extensibility and backend selection
 
@@ -184,14 +188,13 @@ Implementations extend the contracts, not the engine: custom
 device-specific `KvPageStoreFactory`, and holder-specific reclaim policy all
 remain replaceable.
 
-Backend selection must be capability-driven, not model-name-driven:
+Model-view and allocator selection are independent and capability-driven:
 
-1. Use paged attention when the model declares block-table inputs and the EP
-   implements the operator.
-2. Use contiguous-VA VMM when the model expects flat KV tensors and the EP can
-   reserve/map device virtual memory.
-3. Use the existing static/shared-buffer path when neither contract is
-   available.
+1. Use a blocks-plus-table view when the graph and EP implement paged attention.
+   Its block pool may still allocate from VMM.
+2. Use a flat contiguous-VA view when the graph expects flat state tensors and
+   the EP can reserve/remap virtual memory.
+3. Use static/shared buffers when neither dynamic view is available.
 
 Granularity and topology are capabilities too. A 2 MiB CUDA granule can be
 efficient for large, low-concurrency contexts but wasteful for many short
@@ -204,7 +207,7 @@ do not double-admit it.
 | Scenario | Authority layout | Expected behavior |
 | --- | --- | --- |
 | **CPU only** | One host authority covers weights, KV, ORT arenas, and workspace; mmap/disk is colder backing. | Reserve KV and peak execution bytes. Reclaim allocator caches and derived/prepacked weights before live KV; deny work rather than force system paging. |
-| **CPU + discrete NVIDIA GPU + Intel NPU** | GPU and NPU each have a device authority and share one host authority for staging/offload. C7 reports PCIe paths, model views, and whether NPU memory is local or shared. | Place partitions first, then lease each resource. Demotion reserves host capacity before transfer. State stays fixed on an EP that cannot remap or migrate it. |
+| **CPU + discrete NVIDIA GPU + Intel NPU** | The GPU has a device authority. The NPU uses another only if it has private memory; otherwise it aliases the host authority. All share host staging/offload. | C7 reports paths and views. Place partitions, then atomically lease every resource/allowance; reserve host capacity before demotion. State stays fixed on an EP that cannot migrate it. |
 | **CPU + GPU with unified memory** | Host and GPU views alias one physical authority; their limits are not additive. Track wired/resident and pageable/reclaimable bytes separately. | CPU/GPU movement is a residency change, not a second allocation. Admission protects machine headroom; reclaim respects wired GPU work and bandwidth. Apple Silicon/Metal is the primary example. |
 
 These scenarios are selected from C7. The upper layers use the same leases and
@@ -239,11 +242,13 @@ pressure; `SharedSystemMemory` is a maximum, not free capacity.
 
 Treat those budgets as external ceilings: preserve headroom, react to budget
 events, and track non-local residency, host RAM, and pinned memory separately.
-WDDM is address-stable but placement and latency are opaque. The preferred
-policy is a governed resident hot set plus host-mapped cold, single-touch
-weights—not copy-map-evict churn. Managed no-spill CUDA VMM pools remain hard
-bounds and cannot assume WDDM spill. CUDA managed memory is distinct and
-reports limited support on Windows, so all behavior is capability-queried.
+A host-backed GPU allocation takes one host physical lease plus a non-local
+residency allowance, not two physical leases. WDDM is address-stable but
+placement and latency are opaque. The preferred policy is a governed resident
+hot set plus host-mapped cold, single-touch weights—not copy-map-evict churn.
+Managed no-spill CUDA VMM pools remain hard bounds and cannot assume WDDM spill.
+CUDA managed memory is distinct and reports limited support on Windows, so all
+behavior is capability-queried.
 
 Cross-process coordination, cluster placement, and universal disk spill are
 out of scope. The first production target is one process, one or more devices,
