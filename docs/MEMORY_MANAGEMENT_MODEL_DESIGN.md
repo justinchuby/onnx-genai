@@ -110,10 +110,37 @@ flowchart TD
     Foundry -->|"resource limits / policy"| Memory
     Standalone --> Env
     Standalone -->|"create or use default manager"| Memory
-    Engine -->|"C2/C4 requests"| LeaseAPI
+    Engine -->|"plan / prepare C4 transaction"| LeaseAPI
+    Weights -->|"reserve + register reclaim holder"| LeaseAPI
+    State -->|"reserve + register reclaim holder"| LeaseAPI
+    Weights -->|"allocate/map after grant"| Allocators
+    State -->|"allocate/map after grant"| Allocators
     Engine -->|"bind model/state views; Run"| Session
     Weights -->|"stable weight views"| Session
     State -->|"C6 state views"| Session
+```
+
+The holders do go through the authorities. The engine prepares the aggregate C4
+transaction, but the component that retains bytes owns the resulting lease:
+weight residency owns weight leases, `StateBundle` owns state leases, and ORT/EP
+arenas own their bulk leases. Policy never allocates first and accounts later.
+
+```mermaid
+sequenceDiagram
+    participant H as WeightResidency / StateBundle / Arena
+    participant G as MemoryGovernor
+    participant A as DeviceAllocator / VirtualBacking
+    participant S as InferenceSession / EP
+
+    H->>G: reserve or prepare mapped growth
+    G-->>H: MemoryLease / MappedGrowthGrant
+    H->>A: allocate or map using the grant
+    A-->>H: stable allocation / model view
+    H->>S: bind or publish C6 view
+    Note over H,S: Holder keeps the lease while bytes and view remain live
+    G->>H: pressure notification outside allocator locks
+    H->>A: fence work and release a safe victim
+    H-->>G: report bytes actually released
 ```
 
 | Diagram node | Responsibility | Contract / invariant coverage |
