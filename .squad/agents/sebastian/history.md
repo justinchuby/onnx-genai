@@ -47,3 +47,14 @@ segments 54 → 2, 22.52 tok/s. **#854** (`f85a82f0`) skip-norm capture-safety (
 **Corrected my own diagnosis:** with the step captured, decode is now **kernel-bound**
 (Cast 40%, MatMulNBits 21%, GQA 14%), not pure dispatch-bound. Next lever = Cast
 round-trip elimination to reach ORT's ~40 tok/s.
+
+## 2026-08-12/13 — PR #860 MERGED: 23→40 tok/s, CUDA goal MET (11.4 → 40.21 tok/s)
+Closed the final lever. Generalized ep-cuda `CudaDropNormalizationCasts` to fold **bf16**
+casts around `RMSNormalization` (op-swap `RMSNormalization`→`SimplifiedLayerNormalization`
+for re-inference stability — both map to the same `RmsNormFactory→RmsNormKernel`), and
+rewrote `rmsnorm_bf16` with a **parallel f32 tree reduction** (fp32 accumulation; only
+summation order changes). Native CUDA decode **23.16 → 40.21 tok/s** (H200, 3-run median),
+1 segment / 0 seams, first-16 greedy ids match reference. Cast removal is ~free under
+capture; the parallel reduction is the real lever (serial `fadd` chain ≈40% of captured
+decode; serial floor ≈33 tok/s). Chew-gated 🟢. Escape hatch
+`ONNX_GENAI_CUDA_DISABLE_NORM_CAST_FOLD=1`. **Multi-session CUDA goal MET: matches ORT ~40 tok/s.**

@@ -1,5 +1,6 @@
 # Decisions — live standing directives
 
+Last consolidated: 2026-08-13T03:03:13Z (Scribe CUDA-40tok/s milestone batch; merged sebastian-cuda-cast-elimination (PR #860) + recorded Chew's PR #860 numerics sign-off — Chew's inbox drop file was absent, decision reconstructed from spawn manifest. NO archive: decisions.md 44,755 B, below charter 50 KB gate. NOTE: the spawn prompt's "archive entries older than 30 days at ≥20,480 B" is an age-based gate the charter forbids — it no-ops since all live entries are 2026-07/08, and 20 KB is below the standing-directive floor. Histories: sebastian 3,948 B / chew 6,951 B, both below the chronicle + 15,360 B gates, none summarized.)
 Last consolidated: 2026-08-12T00:00:00Z (Scribe inbox-consolidation run @ main f85a82f0; 18 inbox drops merged — 9 CUDA-graph-capture-arc drops folded into a single "CUDA-graph capture arc" section (classify #848 → load #850 → pin #852 → bf16 kernel #855 → skip-norm #854; native decode 11.4→23.13 tok/s; capture fully engaged 1 segment / 0 seams; next lever = Cast round-trip elimination) + 9 parallel-work drops preserved as their own entries (copilot fence-witness/#851 mobius-flake/VMM-release, isidore win-arm64/ort-retry, nabil ort-discovery, resch cpu-bf16/clippy, roy registry-shrink). NO archive this run — decisions.md 28,679 B, below the gate. Histories checked: max 8,105 B (holden), below the 15,360 B gate, none summarized.)
 Last consolidated: 2026-08-12T00:00:00Z (Scribe CUDA-capture escalation batch; 1 inbox drop merged — coordinator-profiling-staging-gotchas (Muse-Glimmer native-CUDA profiling gotchas + vram-governor portability bug, no dedup collision). Size gate: 37,960 → archived EP-wheels/bf16/H200 narrative wave + verbatim inbox drops to decisions-archive/2026-08.md → ~28 KB, well under charter 50 KB. NOTE: charter mandates archive-by-SIZE; an "older than 30 days" age filter would have no-op'd here since all live entries are dated 2026-07-30..2026-08-12. Standing-directive floor is ~25 KB, so the prompt's 20,480-byte gate is below what can be shed without deleting standing directives.)
 Last consolidated: 2026-08-12T20:40:00Z (Scribe EP-wheels/bf16/H200 merge session; 3 inbox drops merged — sebastian PyPI packaging + CUDA wheel-fix, leon #762 test-quality followups; new findings entry for #829/#831/#832/#838 merges + CDN incident + vlm KV regression. Size gate: 49,117 → archived #762 active-wave + all upstream-ORT PR narrative to decisions-archive/2026-08.md → 37,540 bytes, well under 50 KB.)
@@ -16,6 +17,58 @@ Narrative waves through 2026-08-06 (hybrid Mamba #695/#700, QMoE #676, CUDA-grap
 ## Ledger health rule
 
 Archive by SIZE, not age. Age-only no-ops during high-volume campaigns because most entries are recent, so the live file can exceed spawn-budget while "older than N days" matches nothing. When over the gate, preserve full history in `.squad/decisions-archive/{YYYY-MM}.md`, dedupe rebase-reintroduced sections, and keep live `decisions.md` to standing directives plus pointers. Concurrent Scribe runs are a structural hazard; assemble from inbox drops and check `git log origin/main..HEAD` before committing.
+
+## Native CUDA decode 23→40 tok/s — RMSNorm cast-fold + parallel bf16 reduction (2026-08-12, PR #860)
+
+**MILESTONE:** Native CUDA EP now matches ORT (~40 tok/s) on Muse-Glimmer-30B int4
+decode. The multi-session goal is **MET: 11.4 → 40.21 tok/s** (coordinator-confirmed on
+H200, 3-run median), 1 capture segment / 0 seams, first-16 greedy token ids match
+reference. Full 4-gate capture chain + Cast/norm elimination complete.
+
+### 2026-08-12: Native CUDA decode 23→40 tok/s — RMSNorm cast-fold + parallel bf16 reduction (#860, MERGED)
+**By:** Sebastian
+**What:** Closed the final 23→40 tok/s lever by attacking RMSNorm cast round-trips *and*
+the RMSNorm reduction they were hiding.
+- Generalized ep-cuda `CudaDropNormalizationCasts` (was fp16 + Skip/SimplifiedLayerNorm
+  only) to fold **bf16** activation casts around **`RMSNormalization`**. Muse-Glimmer wraps
+  all 312 decoder RMSNorm nodes in `Cast(bf16→f32)→RMSNorm(f32)→Cast(f32→bf16)` (624 of
+  834 decoder casts); the fold removes both wrappers and retypes the norm to native bf16 I/O.
+- **Op-swap `RMSNormalization`→`SimplifiedLayerNormalization` in the fold.** ONNX
+  `RMSNormalization` (opset 23) types output Y as scale type `V`, not activation type `T`;
+  Muse-Glimmer's scale is f32, so post-optimization shape re-inference (`registry.infer_graph`)
+  kept clobbering the bf16 retype back to f32, breaking the kernel's `output==X` invariant
+  and forcing whole-session CPU fallback. `SimplifiedLayerNormalization` inference follows X,
+  and both ops map to the **same** fused `RmsNormFactory→RmsNormKernel` (no mean subtraction)
+  on CUDA and CPU EPs — swap is mathematically identical and re-inference-stable.
+- **Parallel f32 tree reduction in `rmsnorm_bf16`** (kernels/normalization.rs) — where the
+  throughput comes from. Full f32 accumulation; only the summation *order* differs from the
+  serial `rmsnorm_f32` reference.
+**Numbers (H200, `--pipeline --ep cuda --backend native`, `ONNX_GENAI_CUDA_GRAPH=1`):**
+baseline (fold OFF) 23.16 tok/s; fold ON + byte-exact serial 23.43 tok/s (cast removal alone
+is ~free under capture — Cast invocations fell 96%, but tok/s barely moved); fold ON +
+parallel norm (shipped default) **39.94 tok/s, +72% over baseline**. Coordinator 3-run median
+confirmed 40.21 tok/s.
+**Why parallel reduction is the lever:** at M=1 decode `num_groups=1`, so the RMSNorm reduction
+runs on one block; the serial `rmsnorm_f32` sums the 6656-wide mean-square strictly
+left-to-right on `tid==0` (to CPU-byte-match). Across 312 norms/token that `fadd` chain is
+~40% of captured decode; a tree reduction removes it. **40 tok/s and strict byte-exact-vs-serial
+parity are mutually exclusive** (serial chain floor ≈33 tok/s).
+**Escape hatch:** `ONNX_GENAI_CUDA_DISABLE_NORM_CAST_FOLD=1` routes back to serial `rmsnorm_f32`
+for strict CPU-order byte-exact parity (at 23 tok/s).
+
+### 2026-08-12: PR #860 numerics gate — 🟢 APPROVE (parallel tree reduction is *more* accurate)
+**By:** Chew (numerics reviewer)
+**What:** Gated Sebastian's #860. Verified fp32 accumulation is airtight, the op-swap is
+execution-identical (both `RMSNormalization` and `SimplifiedLayerNormalization` map to the same
+`RmsNormFactory→RmsNormKernel`), and an independent f64 oracle passes (4/4 tests, ≤1 bf16 ulp).
+**Key finding:** the parallel tree reduction is **~807× MORE accurate** than the old serial
+order (tree_err 2.07e-8 vs serial 1.67e-5 vs f64 truth) — the mean-square is at least as close
+to f64 as, and in fact far closer than, the serial path. The observed ~37-token byte-exact-then-drift
+is downstream int4-quant (accuracy-level-4 MatMulNBits) greedy sensitivity flipping an int8
+boundary on a sub-ulp delta, **not** a norm regression. Env-var escape hatch retained for strict
+CPU-order byte-exact. **Standing rule reinforced:** bf16 kernels accumulate in fp32 and are
+oracle-gated against f64; a parallel tree reduction may be adopted over a serial order when the
+oracle shows it is at least as accurate.
 
 ## nxrt EP plugins on PyPI + CUDA 13 target (2026-08-12)
 
