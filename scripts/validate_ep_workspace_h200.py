@@ -47,6 +47,21 @@ Self-test on any host (no GPU required)::
 
     cargo build -p onnx-runtime-ep-shared-mock-plugin
     python scripts/validate_ep_workspace_h200.py --self-test
+
+Every check here is meant to be capable of failing, and each one was driven red
+before being trusted:
+
+* ``NXRT_HARNESS_FORCE_PERSISTENT=1`` makes the mock declare
+  `SessionPersistent`, the executor declines, and the serve checks go red.
+* ``--atol 0 --rtol 0`` turns the numerics comparison red.
+* ``--model attention --batch 1 --q-seq 1`` is refused as UNVALIDATED rather
+  than measured.
+* ``NXRT_HARNESS_RETAIN_SESSION=1`` holds a session across unregister; the
+  teardown diagnostic must fire. The clean run runs this as a control, because
+  "no diagnostic" is only evidence when a diagnostic could have appeared.
+* the `nsys` path requires the capture to parse and to contain a kernel-launch
+  API that grows with step count; an unreadable or empty report is a failure,
+  not a clean allocation count.
 """
 
 from __future__ import annotations
@@ -88,6 +103,10 @@ ASYNC_ALLOC_APIS = (
     "cudaMallocAsync",
     "cudaFreeAsync",
 )
+# A run that dispatched work must show launches. If none are parsed, the
+# capture or the parse is broken, and "no allocations" from a broken capture is
+# not evidence of anything.
+LAUNCH_APIS = ("cudaLaunchKernel", "cuLaunchKernel", "cudaLaunchKernelExC", "cuLaunchKernelEx")
 
 
 # ─── device / environment probing ────────────────────────────────────────────
@@ -523,11 +542,16 @@ def teardown_phase(args) -> tuple[int, dict]:
         )
         # Everything ORT hands out that can hold the shared EP has to be gone
         # before the library is unregistered, or the teardown diagnostic is
-        # measuring this harness rather than the executor.
-        del devices, so, sess
-        sessions.clear()
-        options.clear()
-        gc.collect()
+        # measuring this harness rather than the executor. The control run
+        # (`NXRT_HARNESS_RETAIN_SESSION=1`) deliberately skips this, to prove
+        # the diagnostic still fires when something really is holding on.
+        if os.environ.get("NXRT_HARNESS_RETAIN_SESSION") == "1":
+            result.data["retained_session"] = "control run: a live session is held across unregister"
+        else:
+            del devices, so, sess
+            sessions.clear()
+            options.clear()
+            gc.collect()
     finally:
         ort.unregister_execution_provider_library(args.registration_name)
 
@@ -557,6 +581,10 @@ def teardown_phase(args) -> tuple[int, dict]:
             f"largest per-GPU growth across teardown = {worst} MiB "
             f"(tolerance {args.leak_tolerance_mib} MiB)",
         )
+    else:
+        # Said out loud, because a teardown section with no leak line reads as
+        # "no leak" and it means "not measured".
+        result.data["no_device_memory_leak"] = "NOT MEASURED - nvidia-smi unavailable, so the leak dimension is untested"
     return (FAILED if result.failed() else VALIDATED), {"checks": result.checks, "data": result.data}
 
 
@@ -603,13 +631,16 @@ def normalize_api_name(name: str) -> str:
     return re.sub(r"_v\d+$", "", name.strip())
 
 
-def parse_nsys_api_sum(text: str) -> dict:
-    """Count allocation APIs in an `nsys stats --report cuda_api_sum` report.
+def parse_nsys_api_table(text: str) -> dict:
+    """Every API row in an `nsys stats --report cuda_api_sum` report.
 
     Accepts both the CSV form (`--format csv`) and the whitespace table.
-    Names are matched exactly after stripping the `_vN` ABI suffix, so
-    `cuMemAlloc_v2` counts as `cuMemAlloc` while `cudaMallocAsync` stays a
-    separate question.
+    Names are normalised by stripping the `_vN` ABI suffix, so `cuMemAlloc_v2`
+    counts as `cuMemAlloc` while `cudaMallocAsync` stays a separate question.
+
+    Returns every API, not just the allocation ones, because "no allocation
+    rows" and "this report was not understood" are otherwise the same answer,
+    and only one of them is evidence.
     """
     rows: list[tuple[str, int]] = []
     lines = [line for line in text.splitlines() if line.strip()]
@@ -643,9 +674,14 @@ def parse_nsys_api_sum(text: str) -> dict:
     counts: dict[str, int] = {}
     for raw, calls in rows:
         name = normalize_api_name(raw)
-        if name in ALLOC_APIS or name in ASYNC_ALLOC_APIS:
-            counts[name] = counts.get(name, 0) + calls
+        counts[name] = counts.get(name, 0) + calls
     return counts
+
+
+def parse_nsys_api_sum(text: str) -> dict:
+    """The allocation APIs only, out of [`parse_nsys_api_table`]."""
+    table = parse_nsys_api_table(text)
+    return {name: calls for name, calls in table.items() if name in ALLOC_APIS or name in ASYNC_ALLOC_APIS}
 
 
 def _looks_numeric(field: str) -> bool:
@@ -699,6 +735,21 @@ def check_nsys_parser() -> list[tuple[str, bool, str]]:
             parse_nsys_api_sum("Time (%),Total Time (ns),Num Calls,Name\n100.0,1,512,cudaLaunchKernel\n") == {},
             "a trace with no allocation APIs must produce an empty count, not a default",
         ),
+        (
+            "nsys_parser_distinguishes_clean_from_unreadable",
+            parse_nsys_api_table("Time (%),Total Time (ns),Num Calls,Name\n100.0,1,512,cudaLaunchKernel\n") != {}
+            and parse_nsys_api_table("") == {}
+            and parse_nsys_api_table("**** cuda_api_sum: no data ****") == {},
+            "a clean report still parses rows; an empty or unreadable one parses none, "
+            "which is what makes the fail-closed capture check possible",
+        ),
+        (
+            "nsys_parser_finds_the_launch_positive_control",
+            any(
+                api in parse_nsys_api_table(NSYS_SAMPLE_TABLE) for api in LAUNCH_APIS
+            ),
+            f"a launch API must be visible in a real report: {sorted(parse_nsys_api_table(NSYS_SAMPLE_TABLE))}",
+        ),
     ]
 
 
@@ -751,9 +802,10 @@ def child_command(args, phase: str, steps: int | None = None) -> list[str]:
     return cmd
 
 
-def run_child(args, phase: str, steps: int | None = None, under_nsys: Path | None = None):
+def run_child(args, phase: str, steps: int | None = None, under_nsys: Path | None = None, extra_env: dict | None = None):
     env = dict(os.environ)
     env["NXRT_EP_WORKSPACE_TRACE"] = "1"
+    env.update(extra_env or {})
     cmd = child_command(args, phase, steps)
     if under_nsys is not None:
         nsys_cmd = [
@@ -777,6 +829,20 @@ def run_child(args, phase: str, steps: int | None = None, under_nsys: Path | Non
 
 def emit(result_code: int, payload: dict) -> None:
     print("__RESULT__" + json.dumps({"code": result_code, **payload}))
+
+
+def teardown_blockers(stderr: str) -> list[str]:
+    """Lines where the executor reported it could not take exclusive ownership
+    of the shared EP and therefore skipped `shutdown()`.
+
+    Matched on two independent phrases from `release_ep_factory_with_teardown`
+    so a reworded diagnostic degrades to a noisier match rather than to silence.
+    """
+    return [
+        line
+        for line in stderr.splitlines()
+        if "ReleaseEpFactory called while" in line or "Skipping explicit shutdown" in line
+    ]
 
 
 def print_checks(title: str, record: dict) -> bool:
@@ -900,7 +966,9 @@ def main() -> int:
         else:
             out_small = Path(f"{args.nsys_output}_n{args.steps}")
             out_large = Path(f"{args.nsys_output}_n{args.steps * 4}")
-            counts = {}
+            counts: dict[str, dict] = {}
+            tables: dict[str, dict] = {}
+            capture_ok = True
             for label, out, steps in (("n", out_small, args.steps), ("4n", out_large, args.steps * 4)):
                 proc_n, _ = run_child(args, "run", steps=steps, under_nsys=out)
                 rep = out.with_suffix(".nsys-rep")
@@ -910,30 +978,65 @@ def main() -> int:
                     text=True,
                     check=False,
                 )
-                counts[label] = parse_nsys_api_sum(stats.stdout)
+                tables[label] = parse_nsys_api_table(stats.stdout)
+                counts[label] = {
+                    api: n for api, n in tables[label].items() if api in ALLOC_APIS or api in ASYNC_ALLOC_APIS
+                }
                 print(f"\n── nsys cuda_api_sum ({steps} steps) " + "─" * 26)
                 print(f"        report: {rep}")
+                print(f"        apis parsed: {len(tables[label])}")
                 for api, num in sorted(counts[label].items()):
                     print(f"        {api}: {num} calls")
+
+                # An empty parse and a clean trace are indistinguishable unless
+                # the capture is proven to have produced a report this parser
+                # understood. Everything below is fail-closed for that reason.
+                if proc_n.returncode not in (VALIDATED, FAILED):
+                    print(f"  [FAIL] the profiled child exited {proc_n.returncode}; the capture is not a run")
+                    capture_ok = False
+                if stats.returncode != 0:
+                    print(f"  [FAIL] nsys stats exited {stats.returncode}: {stats.stderr.strip()[:300]}")
+                    capture_ok = False
+                if not tables[label]:
+                    print("  [FAIL] no API rows parsed out of the report: either the capture is")
+                    print("         empty or this nsys writes a format this parser does not read.")
+                    print("         An empty allocation count from an unparsed report is not evidence.")
+                    capture_ok = False
+                elif not any(api in tables[label] for api in LAUNCH_APIS):
+                    print(f"  [FAIL] no kernel-launch API ({'/'.join(LAUNCH_APIS)}) in the report;")
+                    print("         a run that dispatched work cannot have launched nothing, so the")
+                    print("         capture does not cover the steady-state loop")
+                    capture_ok = False
                 if not counts[label]:
                     print("        no cuMemAlloc/cuMemFree/cudaMalloc/cudaFree rows in the capture")
-                if proc_n.returncode not in (VALIDATED, FAILED):
-                    print(f"        (child exited {proc_n.returncode})")
-            grew = {
-                api: (counts["n"].get(api, 0), counts["4n"].get(api, 0))
-                for api in set(counts["n"]) | set(counts["4n"])
-                if counts["4n"].get(api, 0) > counts["n"].get(api, 0)
-            }
-            blocking_grew = {api: pair for api, pair in grew.items() if api in ALLOC_APIS}
-            async_grew = {api: pair for api, pair in grew.items() if api in ASYNC_ALLOC_APIS}
-            print("\n  allocation APIs that scale with step count: " + (str(grew) if grew else "none"))
-            if async_grew and not blocking_grew:
-                print(f"  note: stream-ordered variants scaled ({async_grew}); requirement 3 names")
-                print("        the blocking APIs, but this says the arena is growing per step")
-            if blocking_grew:
-                print("  [FAIL] a blocking allocation API grew with the number of steps: the")
-                print(f"         workspace path is allocating per dispatch {blocking_grew}")
+
+            if not capture_ok:
                 overall_ok = False
+            else:
+                launched = {
+                    label: sum(tables[label].get(api, 0) for api in LAUNCH_APIS) for label in ("n", "4n")
+                }
+                print(f"\n  positive control, kernel launches: n={launched['n']} 4n={launched['4n']}")
+                if launched["4n"] <= launched["n"]:
+                    print("  [FAIL] launches did not grow with step count, so this pair of captures")
+                    print("         cannot distinguish a per-step allocation from a one-off one")
+                    overall_ok = False
+
+                grew = {
+                    api: (counts["n"].get(api, 0), counts["4n"].get(api, 0))
+                    for api in set(counts["n"]) | set(counts["4n"])
+                    if counts["4n"].get(api, 0) > counts["n"].get(api, 0)
+                }
+                blocking_grew = {api: pair for api, pair in grew.items() if api in ALLOC_APIS}
+                async_grew = {api: pair for api, pair in grew.items() if api in ASYNC_ALLOC_APIS}
+                print("  allocation APIs that scale with step count: " + (str(grew) if grew else "none"))
+                if async_grew and not blocking_grew:
+                    print(f"  note: stream-ordered variants scaled ({async_grew}); requirement 3 names")
+                    print("        the blocking APIs, but this says the arena is growing per step")
+                if blocking_grew:
+                    print("  [FAIL] a blocking allocation API grew with the number of steps: the")
+                    print(f"         workspace path is allocating per dispatch {blocking_grew}")
+                    overall_ok = False
 
     proc_t, record_t = run_child(args, "teardown")
     if record_t is None:
@@ -941,12 +1044,28 @@ def main() -> int:
         print(proc_t.stderr[-4000:], file=sys.stderr)
         return FAILED
     overall_ok &= print_checks("two-session teardown", record_t)
-    blockers = [line for line in proc_t.stderr.splitlines() if "ReleaseEpFactory called while" in line]
+    blockers = teardown_blockers(proc_t.stderr)
     print(f"        teardown blocker diagnostics: {len(blockers)}")
     for line in blockers:
         print(f"        > {line}")
     if blockers:
+        print("  [FAIL] the explicit shutdown path was skipped: something still held the")
+        print("         shared EP when the library was unregistered")
         overall_ok = False
+    else:
+        # "No diagnostic" is only evidence if a diagnostic could have appeared.
+        # The control run holds a session across unregister, which must trip it.
+        proc_c, _ = run_child(args, "teardown", extra_env={"NXRT_HARNESS_RETAIN_SESSION": "1"})
+        control = teardown_blockers(proc_c.stderr)
+        print(f"  control (session deliberately retained): {len(control)} blocker diagnostic(s), child exited {proc_c.returncode}")
+        if proc_c.returncode < 0:
+            print("        (the control run unregisters the library under a live session, which is")
+            print("         an ORT contract violation; the diagnostic is the last thing printed")
+            print("         before the unload takes the process down, and that is the point of it)")
+        if not control:
+            print("  [FAIL] holding a live session across unregister produced no diagnostic, so")
+            print("         the clean run above cannot be read as evidence that teardown was clean")
+            overall_ok = False
 
     print("\n" + ("VALIDATED" if overall_ok else "FAILED"))
     return VALIDATED if overall_ok else FAILED
