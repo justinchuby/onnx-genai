@@ -49,7 +49,6 @@ TARGET="x86_64-unknown-linux-gnu"
 # tree contains no ort-sys/CUDA dependency that needs a native toolchain.
 # Matches ci.yml lines 91–118 minus mlas-sys (Linux-only, needs native gcc).
 CRATES_FULL=(
-    onnx-genai-comfyui-config
     onnx-genai-metadata
     onnx-genai-genai-config
     onnx-genai-kv
@@ -89,7 +88,6 @@ CRATES_FULL=(
 #   onnx-runtime-cpuinfo                     — cmake build script needs gcc
 #   mlas-sys                                 — Linux-only native build
 CRATES_NO_FFI=(
-    onnx-genai-comfyui-config
     onnx-genai-metadata
     onnx-genai-genai-config
     onnx-genai-kv
