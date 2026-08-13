@@ -55,50 +55,69 @@ These contracts must preserve the following invariants:
 
 ```mermaid
 flowchart TD
-    Client["Local API clients"] --> Foundry["Foundry Local / GenAI Server"]
-    Foundry --> GenAI["GenAI orchestration (optional)"]
-    Embedded["Embedded GenAI application"] --> GenAI
+    Client["Local API clients"] --> Foundry
     Standalone["Standalone ORT application"] --> Env
+    Embedded["Embedded GenAI application"] --> GenApi
 
-    GenAI --> Registry["ModelRegistry"]
-    GenAI --> Router["RequestRouter"]
-    Registry -->|"load / switch / unload"| Engine
-    Router -->|"requests / priority / latency policy"| Engine
-
-    subgraph Memory["ProcessMemoryManager — process-wide authority owner"]
-        Resources["MemoryAuthorityRegistry + TopologyProvider"]
-        Authorities["Host/UnifiedAuthority + DeviceAuthorities"]
-        Resources --> Authorities
+    subgraph Product["Foundry Local — product / service boundary"]
+        Foundry["Public API + model catalog/package lifecycle<br/>multi-model routing + policy + observability"]
     end
 
+    subgraph Generation["ORT GenAI — generation-runtime boundary (may merge into ORT)"]
+        GenApi["Generation API"]
+        ModelRuntime["Model loader / engine factory"]
+        RequestRuntime["Request scheduler / tokenizer / sampler"]
+        Engine["Generation Engine(s)"]
+        Weights["Model residency: weights + captures"]
+        State["StateBundle + KvPageStore policy<br/>KV + recurrent + conv + prefixes"]
+        GenApi --> ModelRuntime
+        GenApi --> RequestRuntime
+        ModelRuntime -->|"load / switch / unload"| Engine
+        RequestRuntime -->|"requests / priority / latency"| Engine
+        Engine --> Weights
+        Engine --> State
+    end
+
+    subgraph ORTCore["ORT — foundational runtime / graph execution"]
+        subgraph Memory["ProcessMemoryManager — process-wide authority owner"]
+            Resources["MemoryAuthorityRegistry + TopologyProvider"]
+            Authorities["Host/UnifiedAuthority + DeviceAuthorities"]
+            Resources --> Authorities
+        end
+        Env["ORT Runtime / OrtEnv"]
+        Session["ORT InferenceSession(s) — graph executors"]
+        Arenas["ORT / EP arenas: activation + workspace"]
+        Allocators["DeviceAllocator / VirtualBacking"]
+        Kernels["EP kernels / captured graph"]
+        Resources -->|"allocator adapters + snapshots"| Env
+        Env -->|"shared allocators + authority handles"| Session
+        Session --> Arenas
+        Arenas --> Allocators
+        Session -->|"dispatch"| Kernels
+        Allocators -->|"backing memory"| Kernels
+    end
+
+    Foundry -->|"generation/model operations"| GenApi
     Foundry -->|"create/configure limits"| Resources
     Embedded -->|"create or use default"| Resources
     Standalone -->|"create or use default"| Resources
     Resources -->|"snapshots / metrics"| Foundry
-    Resources -->|"lease / pressure API"| GenAI
-    Resources -->|"lease API"| Engine["GenAI Engine / Scheduler(s)"]
-    Resources -->|"allocator adapters + snapshots"| Env["ORT Runtime / OrtEnv"]
-    Env -->|"shared allocators + authority handles"| Session["ORT InferenceSession(s) — graph executors"]
+    Resources -->|"lease API"| Engine
     Engine -->|"bind model/state views; Run"| Session
 
-    Authorities -->|"leases / allowances / pressure"| Weights["Model residency: weights + captures"]
-    Authorities --> State["StateBundle: KV + recurrent + conv + prefixes"]
-    Authorities --> Arenas["ORT / EP arenas: activation + workspace"]
-    Engine --> Weights
-    Engine --> State
-    Session --> Arenas
-
-    Weights --> Data["Data planes: DeviceAllocator / VirtualBacking / KvPageStore"]
-    State --> Data
-    Arenas --> Data
-    Data -->|"flat VA / blocks + table / indexed or opaque state"| Kernels["EP kernels / captured graph"]
-    Session -->|"dispatch"| Kernels
+    Authorities -->|"leases / allowances / pressure"| Weights
+    Authorities --> State
+    Authorities --> Arenas
+    Weights -->|"allocate backing"| Allocators
+    State -->|"allocate backing"| Allocators
+    Weights -->|"stable weight views"| Session
+    State -->|"C6 state views"| Session
 ```
 
 | Design component | Contract and invariant coverage |
 | --- | --- |
 | Foundry Local / embedding application | C8; I3, I8 |
-| GenAI server/runtime and model registry | C2, C4, C5, C7-C9; I3, I5, I6, I8, I10 |
+| ORT GenAI generation runtime | C2, C4-C9; I3-I10 |
 | `ProcessMemoryManager` authority owner | C1, C2, C5, C7, C8; I1-I3, I6-I8 |
 | ORT runtime / `OrtEnv` allocator adapter | C2, C3, C8; I2, I3, I7 |
 | Resource registry and topology provider | C1, C7, C8; I1, I8 |
@@ -110,11 +129,17 @@ flowchart TD
 | ORT allocator and I/O-binding adapters | C2, C3, C6, C8, C9; I2, I3, I10 |
 | Persistent state manager | C2, C4, C6, C9; I4-I6, I10 |
 
+| Logical boundary | Owns | Does not own |
+| --- | --- | --- |
+| **Foundry Local** | Product/API lifecycle, model catalog and package acquisition, process/service lifecycle, multi-model routing, user policy, limits, and observability. | Physical accounting, per-token state, generation semantics, or graph execution. |
+| **ORT GenAI** | Model/pipeline interpretation, tokenization and sampling, request scheduling, continuous batching, C9 state, prefix caching, residency victim selection, and model-switch mechanics. | Physical capacity or EP/kernel implementation. |
+| **ORT** | `ProcessMemoryManager`, `OrtEnv` allocator integration, graph planning/execution, `InferenceSession`, EP allocators, kernels, and capture. | Product policy, model catalog, or service routing. |
+
 **Authority ownership.** `ProcessMemoryManager` is a process-wide,
 GenAI-independent service. It owns topology, authorities, leases, pressure, and
-resource telemetry. Foundry Local, a GenAI server, an embedded application, or a
-standalone ORT application owns its lifetime and configures policy. Plain ORT
-creates a default manager when the application does not supply one.
+resource telemetry. Foundry Local, an embedded application, or a standalone ORT
+application owns its lifetime and configures policy. Plain ORT creates a default
+manager when the application does not supply one.
 
 `OrtEnv` is ORT's process-level environment for logging, shared thread pools, EP
 setup, and environment-registered allocators. It is not the graph executor and
@@ -122,15 +147,23 @@ does not own placement or eviction policy. It receives allocator adapters backed
 by `ProcessMemoryManager`; `InferenceSession` remains the graph executor, and
 multiple sessions allocate through those shared adapters.
 
-GenAI is not a second graph runtime. It owns model/request orchestration, leases
-external weights and state from the same manager, binds them to sessions, and
-calls `Run`. Thus ORT works with or without GenAI, while both paths use the same
-physical accounting when GenAI is present.
+ORT GenAI is not a second graph executor. It owns generation semantics and
+model/request orchestration, leases external weights and state from the manager,
+binds them to sessions, and calls `Run`. Thus ORT works with or without ORT
+GenAI, while both paths use the same physical accounting when GenAI is present.
 
-The model registry takes model-level leases before constructing engines/sessions
-and returns them on unload or demotion. The request router supplies priority and
-latency policy; engine schedulers perform C4 admission. The resource API
-configures C8 limits and reads the same snapshots used for admission.
+This repository currently combines Foundry-like service surfaces and ORT
+GenAI-like generation runtime in one implementation. The diagram shows the
+target logical boundaries, not required package boundaries. If ORT GenAI merges
+into ORT, the `Generation` subgraph moves into the ORT distribution; Foundry
+still calls the Generation API, and the generation module still uses
+`ProcessMemoryManager` and `InferenceSession` only through these contracts.
+
+The ORT GenAI model runtime takes model-level leases before constructing
+engines/sessions and returns them on unload or demotion. Foundry supplies
+cross-model routing and product policy; ORT GenAI schedulers perform C4
+admission. Foundry's resource API configures C8 limits and reads the same
+snapshots used for admission.
 
 **Control plane.** Within `ProcessMemoryManager`, `DeviceMemoryAuthority` owns
 the ledger and stable `MemoryAuthorityId` for one distinct device-local pool.
