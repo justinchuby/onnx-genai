@@ -283,14 +283,14 @@ graph {
   node { input: "target_tokens" input: "proposed_tokens" output: "accepted" op_type: "Equal" }
   node { input: "accepted" output: "accepted_i64" op_type: "Cast"
          attribute { name: "to" i: 7 type: 2 } }
-  node { input: "accepted_i64" output: "accepted_count" op_type: "ReduceSum"
-         attribute { name: "axes" ints: -1 type: 7 }
+  node { input: "accepted_i64" input: "axes" output: "accepted_count" op_type: "ReduceSum"
          attribute { name: "keepdims" i: 0 type: 2 } }
   node { input: "proposed_tokens" output: "accepted_tokens" op_type: "Identity" }
   node { input: "accepted_count" input: "zero" output: "done" op_type: "Greater" }
   name: "speculative_acceptance"
   initializer { dims: 1 data_type: 7 name: "zero"
                 raw_data: "\000\000\000\000\000\000\000\000" }
+  initializer { dims: 1 data_type: 7 int64_data: -1 name: "axes" }
   input { name: "target_scores" type { tensor_type { elem_type: 1 shape {
     dim { dim_param: "batch" } dim { dim_param: "draft_sequence" }
     dim { dim_param: "vocabulary" }
@@ -308,7 +308,7 @@ graph {
     dim { dim_param: "batch" }
   }}}}
 }
-opset_import { domain: "" version: 12 }
+opset_import { domain: "" version: 13 }
 "#;
 
 const ADD_STATE: &str = r#"
@@ -1107,10 +1107,27 @@ pipeline:
         ["min_p_filter", "sampler", "termination"]
     );
     assert_eq!(diagnostics[0].runs, 2);
+    assert_eq!(diagnostics[0].session_runs, 2);
+    assert_eq!(diagnostics[0].eager_runs, 1);
+    assert_eq!(diagnostics[0].stable_binding_runs, 1);
+    assert_eq!(diagnostics[0].component_boundaries_elided, 2);
+    assert_eq!(diagnostics[0].linked_node_count, 7);
+    assert_eq!(diagnostics[0].host_to_device_copies, 0);
+    assert_eq!(diagnostics[0].device_to_host_copies, 0);
+    assert!(diagnostics[0].host_to_host_copies > 0);
+    assert!(diagnostics[0].stable_binding_bytes > 0);
+    assert!(diagnostics[0].total_run_ns > 0);
     assert_eq!(
         diagnostics[0].fallback_reason.as_deref(),
         Some("island is not placed on CUDA")
     );
+    let performance = engine.workflow_performance_diagnostic();
+    assert_eq!(performance.runs, 2);
+    assert_eq!(performance.last_component_invocations, 3);
+    assert_eq!(performance.last_emit_events, 2);
+    assert_eq!(performance.last_emitted_elements, 2);
+    assert!(performance.last_ttft_ns.is_some());
+    assert!(performance.last_elements_per_second > 0.0);
     Ok(())
 }
 
@@ -2434,42 +2451,64 @@ pipeline:
         -1, -1, -1, 3, -1, // state 2: token 3
         -1, -1, -1, -1, 3, // state 3: token 4
     ];
-    let request =
-        PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
-            .with_input("proposed", Value::from_slice_i64(&[1, 2, 4], &[1, 3])?)
-            .with_input("target", Value::from_slice_f32(&target, &[1, 3, 5])?)
-            .with_input(
-                "logits",
-                Value::from_slice_f32(&[9.0, 8.0, 7.0, 1.0, 6.0], &[1, 5])?,
-            )
-            .with_input("grammar_state", Value::from_slice_i64(&[0], &[1])?)
-            .with_input(
-                "transition_table",
-                Value::from_slice_i64(&transitions, &[4, 5])?,
-            )
-            .with_input("zero_length", Value::from_slice_i64(&[0], &[1])?)
-            .with_input("evaluated", Value::from_slice_i64(&[3], &[1])?)
-            .with_input("current_k", Value::from_slice_i64(&[2], &[1])?)
-            .with_input(
-                "estimates",
-                Value::from_slice_f32(&[0.0, 0.0, 0.0, 0.0], &[1, 4])?,
-            )
-            .with_input(
-                "filled",
-                Value::from_raw_bytes(vec![1], &[1], onnx_genai_ort::DataType::Bool)?,
-            )
-            .with_input("draft_ms", Value::from_slice_f32(&[1.0], &[1])?)
-            .with_input("target_ms", Value::from_slice_f32(&[2.0], &[1])?)
-            .with_input(
-                "continue",
-                Value::from_raw_bytes(vec![1], &[], onnx_genai_ort::DataType::Bool)?,
-            )
-            .with_input("iterations", Value::from_slice_i64(&[1], &[])?);
-    let output = engine.run_pipeline(request)?;
+    let request = || -> anyhow::Result<PipelineGenerateRequest> {
+        Ok(
+            PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
+                .with_input("proposed", Value::from_slice_i64(&[1, 2, 4], &[1, 3])?)
+                .with_input("target", Value::from_slice_f32(&target, &[1, 3, 5])?)
+                .with_input(
+                    "logits",
+                    Value::from_slice_f32(&[9.0, 8.0, 7.0, 1.0, 6.0], &[1, 5])?,
+                )
+                .with_input("grammar_state", Value::from_slice_i64(&[0], &[1])?)
+                .with_input(
+                    "transition_table",
+                    Value::from_slice_i64(&transitions, &[4, 5])?,
+                )
+                .with_input("zero_length", Value::from_slice_i64(&[0], &[1])?)
+                .with_input("evaluated", Value::from_slice_i64(&[3], &[1])?)
+                .with_input("current_k", Value::from_slice_i64(&[2], &[1])?)
+                .with_input(
+                    "estimates",
+                    Value::from_slice_f32(&[0.0, 0.0, 0.0, 0.0], &[1, 4])?,
+                )
+                .with_input(
+                    "filled",
+                    Value::from_raw_bytes(vec![1], &[1], onnx_genai_ort::DataType::Bool)?,
+                )
+                .with_input("draft_ms", Value::from_slice_f32(&[1.0], &[1])?)
+                .with_input("target_ms", Value::from_slice_f32(&[2.0], &[1])?)
+                .with_input(
+                    "continue",
+                    Value::from_raw_bytes(vec![1], &[], onnx_genai_ort::DataType::Bool)?,
+                )
+                .with_input("iterations", Value::from_slice_i64(&[1], &[])?),
+        )
+    };
+    let output = engine.run_pipeline(request()?)?;
+    engine.run_pipeline(request()?)?;
+    engine.run_pipeline(request()?)?;
     assert_eq!(output["tokens"].shape(), [1, 3]);
     assert_eq!(output["tokens"].to_vec_i64()?, [1, 2, 3]);
     assert_eq!(output["next_k"].to_vec_i64()?, [3]);
     assert_eq!(output["final_grammar_state"].to_vec_i64()?, [2]);
+    let islands = engine.execution_island_diagnostics();
+    assert!(
+        islands.iter().any(|island| {
+            island.components == ["verifier", "min_length"]
+                && island.component_boundaries_elided == 1
+        }),
+        "{islands:?}"
+    );
+    assert!(islands.iter().any(|island| {
+        island.components == ["adaptive", "guided_sampler"]
+            && island.component_boundaries_elided == 1
+    }));
+    for island in islands.iter().filter(|island| island.capture_eligible) {
+        assert_eq!(island.captures, 1);
+        assert!(island.replays >= 1);
+        assert_eq!(island.fallback_reason, None);
+    }
     Ok(())
 }
 
