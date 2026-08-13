@@ -54,29 +54,37 @@ These contracts must preserve the following invariants:
 ## Proposed design
 
 ```text
-Server / Engine / Scheduler
-   plans work in bytes and requests capacity
-                    |
-                    v
- +----------------------------------------------------------+
- | Memory control plane                                     |
- | DeviceMemoryAuthority (one per physical device)          |
- | HostGovernor          (one per machine; host RAM/disk)    |
- | roles: weights | KV | activation | workspace | overhead  |
- +-------------------------+--------------------------------+
-                           | leases / growth grants / pressure
-             +-------------+------------------+
-             |                                |
-             v                                v
- Weight residency holder              KV memory backend
- mmap -> host -> device                +----------------------+
- holder chooses reclaim                | Paged: block tables  |
-                                      | VMM: stable flat VA  |
-                                      +----------+-----------+
-                                                 |
-                                                 v
-                                DeviceAllocator / VirtualBacking
-                                ORT allocator, CUDA VMM, CPU mmap
+Local Runtime / OrtEnv
+ResourceRegistry + TopologyProvider (C1, C7, C8)
+                        |
+                        v
+Engine / Scheduler: plan and reserve complete model + request work (C4)
+                        |
+                        v
++--------------------------------------------------------------------+
+| Memory control plane                                               |
+| HostAuthority (machine RAM/disk) | DeviceAuthority[physical device] |
+| roles: weights | state | activation | workspace | runtime overhead |
++-----------------------------+--------------------------------------+
+                              | leases / grants / pressure
+            +-----------------+-------------------+
+            |                 |                   |
+            v                 v                   v
+Model residency        StateBundle owner       ORT / EP arenas
+weights + captures     KV + recurrent + conv   activation + workspace
+hot / warm / cold      prefix + request state  cached / reclaimable
+            |                 |                   |
+            +-----------------+-------------------+
+                              | allocation + model-view contracts
+                              v
++--------------------------------------------------------------------+
+| Data planes                                                        |
+| DeviceAllocator / VirtualBacking / KvPageStore                     |
+| flat stable VA | blocks + table | fixed/indexed/opaque state       |
++-----------------------------+--------------------------------------+
+                              |
+                              v
+            ORT session / EP kernels / captured graph
 ```
 
 | Design component | Contract and invariant coverage |
