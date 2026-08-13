@@ -3580,6 +3580,7 @@ impl KernelFactory for MatMulNBitsFactory {
                 .unwrap_or(1e-5),
             last_call_capture_safe: AtomicBool::new(false),
             bf16_scratch: Mutex::new(Bf16Scratch::new(self.runtime.clone())),
+            bf16_const_cache: Mutex::new(Bf16ConstCache::new(self.runtime.clone())),
         }))
     }
 }
@@ -3671,6 +3672,101 @@ impl Drop for Bf16Scratch {
     }
 }
 
+/// Persistent per-kernel cache of the Float16-staged **constant** inputs on the
+/// BFloat16 activation path. A node's scales / zero-point-scales / gamma are
+/// immutable weights, but the original `run_bf16` re-cast them from BFloat16 to
+/// Float16 into an ephemeral arena on *every* decode step. For Muse-Glimmer that
+/// is ~3.3 GB/token of pure-copy traffic (≈25% of the int4 weight traffic) doing
+/// nothing but reproducing an identical Float16 buffer. This cache stages each
+/// constant once (keyed by its device pointer + element count) and reuses the
+/// result across steps. Converting BFloat16→Float16 in one staging pass is
+/// byte-identical whether done once or per step, so decode output is unchanged.
+#[derive(Debug)]
+struct Bf16ConstCache {
+    runtime: Arc<CudaRuntime>,
+    ptr: CUdeviceptr,
+    cap: usize,
+    /// One entry per cached constant: `(src_ptr, numel, byte_offset)`.
+    slots: Vec<(CUdeviceptr, usize, usize)>,
+}
+
+impl Bf16ConstCache {
+    fn new(runtime: Arc<CudaRuntime>) -> Self {
+        Self {
+            runtime,
+            ptr: 0,
+            cap: 0,
+            slots: Vec::new(),
+        }
+    }
+
+    /// Return the Float16 device pointers holding the staged copies of the
+    /// BFloat16 constants described by `consts` (`(src_ptr, numel)` each),
+    /// casting them on first use and reusing them thereafter. The staged buffer
+    /// is allocated once (before CUDA-graph capture, during warmup) and never
+    /// grows again for a given node, so replays hit only cache lookups.
+    fn staged(&mut self, consts: &[(CUdeviceptr, usize)]) -> Result<Vec<CUdeviceptr>> {
+        let matches =
+            self.slots.len() == consts.len()
+                && self.slots.iter().zip(consts).all(
+                    |((src, numel, _), (want_src, want_numel))| {
+                        *src == *want_src && *numel == *want_numel
+                    },
+                );
+        if !matches {
+            self.rebuild(consts)?;
+        }
+        Ok(self
+            .slots
+            .iter()
+            .map(|(_, _, offset)| self.ptr + *offset as CUdeviceptr)
+            .collect())
+    }
+
+    fn rebuild(&mut self, consts: &[(CUdeviceptr, usize)]) -> Result<()> {
+        const ALIGN: usize = 256;
+        let f16 = std::mem::size_of::<half::f16>();
+        let round = |bytes: usize| bytes.div_ceil(ALIGN) * ALIGN;
+        let mut slots = Vec::with_capacity(consts.len());
+        let mut total = 0usize;
+        for (src, numel) in consts {
+            slots.push((*src, *numel, total));
+            total += round(numel * f16);
+        }
+        if total > self.cap {
+            if self.ptr != 0 {
+                // SAFETY: exclusively owned; freed once before replacement.
+                unsafe { self.runtime.free_raw(self.ptr)? };
+                self.ptr = 0;
+            }
+            self.ptr = self.runtime.alloc_raw(total.max(1))?;
+            self.cap = total;
+        }
+        for (src, numel, offset) in &slots {
+            super::cast::launch_cast_raw(
+                &self.runtime,
+                cuptr(*src as *const c_void),
+                DataType::BFloat16,
+                self.ptr + *offset as CUdeviceptr,
+                DataType::Float16,
+                *numel,
+            )?;
+        }
+        self.slots = slots;
+        Ok(())
+    }
+}
+
+impl Drop for Bf16ConstCache {
+    fn drop(&mut self) {
+        if self.ptr != 0 {
+            // SAFETY: this persistent buffer is exclusively owned by the kernel.
+            let _ = unsafe { self.runtime.free_raw(self.ptr) };
+            self.ptr = 0;
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct MatMulNBitsKernel {
     runtime: Arc<CudaRuntime>,
@@ -3703,6 +3799,9 @@ pub struct MatMulNBitsKernel {
     last_call_capture_safe: AtomicBool,
     /// Reusable Float16 staging arena for the BFloat16 activation path.
     bf16_scratch: Mutex<Bf16Scratch>,
+    /// Persistent Float16 staging of the BFloat16 *constant* inputs (scales,
+    /// gamma) so they are cast once rather than re-cast every decode step.
+    bf16_const_cache: Mutex<Bf16ConstCache>,
 }
 
 impl MatMulNBitsKernel {
@@ -4167,17 +4266,33 @@ impl MatMulNBitsKernel {
         require_dtype("A", inputs[0].dtype, DataType::BFloat16)?;
         require_dtype("Y", outputs[0].dtype, DataType::BFloat16)?;
 
+        // The scale slots are immutable weights (general path: input 2; the
+        // gate/up SwiGLU fusion adds a second scale at input 4). They dominate
+        // the BFloat16 staging traffic (~25% of the int4 weight bytes/token for
+        // Muse-Glimmer), so stage them once into the persistent const cache and
+        // reuse across decode steps. Every other BFloat16 input is either the
+        // per-step activation (input 0) or a per-token residual bound into the
+        // bias slot — both genuinely dynamic — so they keep going through the
+        // per-call arena. Caching keys on the weight pointer + element count and
+        // never uses pointer identity for the dynamic slots (a reused activation
+        // buffer has a stable pointer but changing contents).
+        let cache_slots: &[usize] = if self.gate_up_swiglu { &[2, 4] } else { &[2] };
+        let is_cached = |index: usize, dtype: DataType| {
+            dtype == DataType::BFloat16 && cache_slots.contains(&index)
+        };
+
         // Lay out per-call Float16 regions inside the reusable arena: one region
-        // per BFloat16 input, plus one for the Float16 result. Regions are padded
-        // so each begins aligned for the tuned fp16 kernels' vectorized loads.
+        // per dynamic BFloat16 input, plus one for the Float16 result. Regions
+        // are padded so each begins aligned for the tuned fp16 kernels'
+        // vectorized loads.
         const ALIGN: usize = 256;
         let f16 = std::mem::size_of::<half::f16>();
         let round = |bytes: usize| bytes.div_ceil(ALIGN) * ALIGN;
 
         let mut offsets: Vec<Option<usize>> = Vec::with_capacity(inputs.len());
         let mut total = 0usize;
-        for input in inputs {
-            if input.dtype == DataType::BFloat16 {
+        for (index, input) in inputs.iter().enumerate() {
+            if input.dtype == DataType::BFloat16 && !is_cached(index, input.dtype) {
                 offsets.push(Some(total));
                 total += round(input.numel() * f16);
             } else {
@@ -4187,6 +4302,39 @@ impl MatMulNBitsKernel {
         let out_off = total;
         let out_n = outputs[0].numel();
         total += round(out_n * f16);
+
+        // Stage the constant scale slots once into the persistent cache (this is
+        // allocation-free on every call after the first warmup call, so the
+        // captured decode graph only replays cache hits).
+        let cached: Vec<(usize, CUdeviceptr)> = {
+            let consts: Vec<(CUdeviceptr, usize)> = cache_slots
+                .iter()
+                .filter(|index| **index < inputs.len() && is_cached(**index, inputs[**index].dtype))
+                .map(|index| {
+                    (
+                        cuptr(inputs[*index].data_ptr::<u8>() as *const c_void) as CUdeviceptr,
+                        inputs[*index].numel(),
+                    )
+                })
+                .collect();
+            if consts.is_empty() {
+                Vec::new()
+            } else {
+                let mut cache = self
+                    .bf16_const_cache
+                    .lock()
+                    .map_err(|_| error("MatMulNBits bf16 const cache mutex poisoned"))?;
+                let ptrs = cache.staged(&consts)?;
+                cache_slots
+                    .iter()
+                    .filter(|index| {
+                        **index < inputs.len() && is_cached(**index, inputs[**index].dtype)
+                    })
+                    .zip(ptrs)
+                    .map(|(index, ptr)| (*index, ptr))
+                    .collect()
+            }
+        };
 
         // Hold the arena for the whole call: the staging casts, the reused fp16
         // matmul, and the narrowing cast all run stream-ordered against it. The
@@ -4198,7 +4346,17 @@ impl MatMulNBitsKernel {
         let base = arena.ensure(total)?;
 
         let mut f16_inputs: Vec<TensorView> = Vec::with_capacity(inputs.len());
-        for (input, offset) in inputs.iter().zip(offsets.iter()) {
+        for (index, (input, offset)) in inputs.iter().zip(offsets.iter()).enumerate() {
+            if let Some((_, cached_ptr)) = cached.iter().find(|(slot, _)| *slot == index) {
+                f16_inputs.push(TensorView::new(
+                    DevicePtr(raw_ptr(*cached_ptr) as *const c_void),
+                    DataType::Float16,
+                    input.shape,
+                    input.strides,
+                    input.device,
+                ));
+                continue;
+            }
             match offset {
                 Some(off) => {
                     let ptr = base + *off as CUdeviceptr;
@@ -6923,6 +7081,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
             bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
         };
         kernel.run(&inputs, &mut outputs, None).unwrap();
         runtime.synchronize().unwrap();
@@ -7203,6 +7362,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
             bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
         };
         kernel.run(&inputs, &mut outputs, None).unwrap();
         runtime.synchronize().unwrap();
@@ -7355,6 +7515,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 rmsnorm_epsilon: 1e-5,
                 last_call_capture_safe: AtomicBool::new(false),
                 bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+                bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
             };
             let staged_source = format!("{GEMV_F16_SRC}\n{STAGED_DOWN_REFERENCE_SRC}");
             let staged_function = runtime
@@ -8100,6 +8261,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
             bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
         };
         kernel.run(&inputs, &mut outputs, None).unwrap();
         runtime.synchronize().unwrap();
@@ -8359,6 +8521,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
             bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
         };
 
         match bits {
@@ -8629,6 +8792,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
             bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
         };
         let kernel_fold = MatMulNBitsKernel {
             runtime: runtime.clone(),
@@ -8645,6 +8809,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
             bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
         };
         kernel_nobias
             .launch_f16_gemv_variant(
@@ -8904,6 +9069,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 rmsnorm_epsilon: 1e-5,
                 last_call_capture_safe: AtomicBool::new(false),
                 bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+                bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
             };
             // Reference: two standalone MatMulNBits projections.
             if m == 1 {
@@ -9323,6 +9489,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 rmsnorm_epsilon: epsilon,
                 last_call_capture_safe: AtomicBool::new(false),
                 bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+                bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
             };
             let fused_swiglu = MatMulNBitsKernel {
                 runtime: runtime.clone(),
@@ -9339,6 +9506,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 rmsnorm_epsilon: epsilon,
                 last_call_capture_safe: AtomicBool::new(false),
                 bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+                bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
             };
 
             // Reference: normalize the activation (production prefill norm
@@ -9790,6 +9958,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 rmsnorm_epsilon: epsilon,
                 last_call_capture_safe: AtomicBool::new(false),
                 bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+                bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
             };
 
             // ── Reference: preceding GEMV → skip_rmsnorm → following GEMV ──
@@ -10041,6 +10210,251 @@ extern "C" __global__ void ref_silu_mul_f16(
                     );
                 }
             }
+        }
+    }
+
+    /// The BFloat16 activation path caches its Float16-staged **constant** scales
+    /// across calls (see [`Bf16ConstCache`]) instead of re-casting them every
+    /// step. This must stay bit-identical to inline per-call staging: converting
+    /// BFloat16 -> Float16 yields the same bits whether done once or repeatedly,
+    /// and the tuned fp16 GEMV then reads identical scales. This test runs the
+    /// bf16 path twice (cache miss, then cache hit) and compares it, bit for bit,
+    /// to a reference that stages every bf16 input to Float16 inline.
+    #[test]
+    fn bf16_scale_cache_is_bit_exact_to_inline_staging() {
+        use half::bf16;
+
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping MatMulNBits bf16 scale-cache test: CUDA runtime unavailable");
+            return;
+        };
+
+        let k = 256usize;
+        let n = 64usize;
+        let block_size = 32usize;
+        let k_blocks = k / block_size;
+        let blob_size = block_size / 2; // int4: two weights per byte
+
+        let mut state = 0x0bad_c0de_dead_beefu64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+
+        let activation_bf16: Vec<bf16> = (0..k).map(|_| bf16::from_f32(next())).collect();
+        let packed: Vec<u8> = (0..n * k_blocks * blob_size)
+            .map(|_| next().to_bits() as u8)
+            .collect();
+        let scales_bf16: Vec<bf16> = (0..n * k_blocks)
+            .map(|_| bf16::from_f32(0.015 + 0.01 * (next() * 0.5 + 0.5)))
+            .collect();
+        let zero_points: Vec<u8> = (0..n * k_blocks.div_ceil(2))
+            .map(|_| ((next() * 0.5 + 0.5) * 255.0).round().clamp(0.0, 255.0) as u8)
+            .collect();
+
+        let device = DeviceId::cuda(0);
+        let a_shape = [1usize, k];
+        let a_strides = [k as i64, 1];
+        let b_shape = [n, k_blocks, blob_size];
+        let b_strides = [(k_blocks * blob_size) as i64, blob_size as i64, 1];
+        let scales_shape = [n, k_blocks];
+        let scales_strides = [k_blocks as i64, 1];
+        let zp_shape = [n, k_blocks.div_ceil(2)];
+        let zp_strides = [k_blocks.div_ceil(2) as i64, 1];
+        let y_shape = [1usize, n];
+        let y_strides = [n as i64, 1];
+
+        let act_dev = runtime.alloc_raw(activation_bf16.len() * 2).unwrap();
+        let packed_dev = runtime.alloc_raw(packed.len()).unwrap();
+        let scales_dev = runtime.alloc_raw(scales_bf16.len() * 2).unwrap();
+        let zp_dev = runtime.alloc_raw(zero_points.len()).unwrap();
+        let out1_dev = runtime.alloc_raw(n * 2).unwrap();
+        let out2_dev = runtime.alloc_raw(n * 2).unwrap();
+        // SAFETY: device buffers exactly cover their source slices.
+        unsafe {
+            runtime.htod(as_bytes(&activation_bf16), act_dev).unwrap();
+            runtime.htod(&packed, packed_dev).unwrap();
+            runtime.htod(as_bytes(&scales_bf16), scales_dev).unwrap();
+            runtime.htod(&zero_points, zp_dev).unwrap();
+        }
+
+        let inputs = vec![
+            TensorView::new(
+                device_ptr(act_dev),
+                DataType::BFloat16,
+                &a_shape,
+                &a_strides,
+                device,
+            ),
+            TensorView::new(
+                device_ptr(packed_dev),
+                DataType::Uint8,
+                &b_shape,
+                &b_strides,
+                device,
+            ),
+            TensorView::new(
+                device_ptr(scales_dev),
+                DataType::BFloat16,
+                &scales_shape,
+                &scales_strides,
+                device,
+            ),
+            TensorView::new(
+                device_ptr(zp_dev),
+                DataType::Uint8,
+                &zp_shape,
+                &zp_strides,
+                device,
+            ),
+        ];
+
+        let kernel = MatMulNBitsKernel {
+            runtime: runtime.clone(),
+            k,
+            n,
+            bits: 4,
+            block_size,
+            accuracy_level: 0,
+            accuracy4_workspace: None,
+            fold_bias_post_round: false,
+            gate_up_swiglu: false,
+            decomposed_silu: false,
+            rmsnorm_prologue: false,
+            rmsnorm_epsilon: 1e-5,
+            last_call_capture_safe: AtomicBool::new(false),
+            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+        };
+
+        let mut out1 = [TensorMut::new(
+            device_ptr_mut(out1_dev),
+            DataType::BFloat16,
+            &y_shape,
+            &y_strides,
+            device,
+        )];
+        kernel.run(&inputs, &mut out1, None).unwrap();
+        let mut out2 = [TensorMut::new(
+            device_ptr_mut(out2_dev),
+            DataType::BFloat16,
+            &y_shape,
+            &y_strides,
+            device,
+        )];
+        kernel.run(&inputs, &mut out2, None).unwrap();
+        runtime.synchronize().unwrap();
+
+        // Reference: stage every bf16 input to Float16 inline (no cache) and run
+        // the fp16 GEMV directly, then narrow to BFloat16 exactly as run_bf16 does.
+        let act_f16_dev = runtime.alloc_raw(k * 2).unwrap();
+        let scales_f16_dev = runtime.alloc_raw(scales_bf16.len() * 2).unwrap();
+        let ref_f16_dev = runtime.alloc_raw(n * 2).unwrap();
+        let ref_bf16_dev = runtime.alloc_raw(n * 2).unwrap();
+        super::super::cast::launch_cast_raw(
+            &runtime,
+            cuptr(act_dev as *const c_void),
+            DataType::BFloat16,
+            act_f16_dev,
+            DataType::Float16,
+            k,
+        )
+        .unwrap();
+        super::super::cast::launch_cast_raw(
+            &runtime,
+            cuptr(scales_dev as *const c_void),
+            DataType::BFloat16,
+            scales_f16_dev,
+            DataType::Float16,
+            scales_bf16.len(),
+        )
+        .unwrap();
+        let ref_inputs = vec![
+            TensorView::new(
+                device_ptr(act_f16_dev),
+                DataType::Float16,
+                &a_shape,
+                &a_strides,
+                device,
+            ),
+            TensorView::new(
+                device_ptr(packed_dev),
+                DataType::Uint8,
+                &b_shape,
+                &b_strides,
+                device,
+            ),
+            TensorView::new(
+                device_ptr(scales_f16_dev),
+                DataType::Float16,
+                &scales_shape,
+                &scales_strides,
+                device,
+            ),
+            TensorView::new(
+                device_ptr(zp_dev),
+                DataType::Uint8,
+                &zp_shape,
+                &zp_strides,
+                device,
+            ),
+        ];
+        let mut ref_f16 = [TensorMut::new(
+            device_ptr_mut(ref_f16_dev),
+            DataType::Float16,
+            &y_shape,
+            &y_strides,
+            device,
+        )];
+        kernel.run(&ref_inputs, &mut ref_f16, None).unwrap();
+        super::super::cast::launch_cast_raw(
+            &runtime,
+            ref_f16_dev,
+            DataType::Float16,
+            ref_bf16_dev,
+            DataType::BFloat16,
+            n,
+        )
+        .unwrap();
+        runtime.synchronize().unwrap();
+
+        let mut got1 = vec![bf16::ZERO; n];
+        let mut got2 = vec![bf16::ZERO; n];
+        let mut want = vec![bf16::ZERO; n];
+        // SAFETY: each host buffer matches its device source.
+        unsafe {
+            runtime.dtoh(as_bytes_mut(&mut got1), out1_dev).unwrap();
+            runtime.dtoh(as_bytes_mut(&mut got2), out2_dev).unwrap();
+            runtime.dtoh(as_bytes_mut(&mut want), ref_bf16_dev).unwrap();
+            for buffer in [
+                act_dev,
+                packed_dev,
+                scales_dev,
+                zp_dev,
+                out1_dev,
+                out2_dev,
+                act_f16_dev,
+                scales_f16_dev,
+                ref_f16_dev,
+                ref_bf16_dev,
+            ] {
+                runtime.free_raw(buffer).unwrap();
+            }
+        }
+
+        for index in 0..n {
+            assert_eq!(
+                got1[index].to_bits(),
+                got2[index].to_bits(),
+                "cached bf16 scale path is non-deterministic across steps at column {index}"
+            );
+            assert_eq!(
+                got1[index].to_bits(),
+                want[index].to_bits(),
+                "cached bf16 scale path diverged from inline staging at column {index}"
+            );
         }
     }
 }
