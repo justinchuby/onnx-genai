@@ -53,55 +53,44 @@ These contracts must preserve the following invariants:
 
 ## Proposed design
 
-```text
-Application / local API clients
-                        |
-                        v
-+--------------------------------------------------------------------+
-| GenAI Server (or embedded GenAI Runtime)                            |
-| ModelRegistry: load / switch / unload | RequestRouter: queue/priority|
-| Resource API: limits / policy / snapshots / metrics                |
-+-------------------------------+------------------------------------+
-                                | owns process services; creates engines
-                                v
-Local Runtime / OrtEnv: ResourceRegistry + TopologyProvider (C1,C7,C8)
-                                |
-                  +-------------+----------------+
-                  | authority/topology handles   |
-                  v                              v
- Engine / Scheduler [per model/pipeline] --bind/run--> ORT Session / EPs
- plan Model + StateBundle (C4,C9,I10)
-                  |
-                  v
-+--------------------------------------------------------------------+
-| Memory control plane                                               |
-| Host/UnifiedAuthority       | DeviceAuthority[distinct local pool] |
-| roles: weights | state | activation | workspace | runtime overhead |
-+-----------------------------+--------------------------------------+
-                              | physical leases / allowances / pressure
-            +-----------------+-------------------+
-            |                 |                   |
-            v                 v                   v
-Model residency        StateBundle owner       ORT / EP arenas
-weights + captures     KV + recurrent + conv   activation + workspace
-hot / warm / cold      prefix + request state  cached / reclaimable
-            |                 |                   |
-            +-----------------+-------------------+
-                              | allocation + model-view contracts
-                              v
-+--------------------------------------------------------------------+
-| Data planes                                                        |
-| DeviceAllocator / VirtualBacking / KvPageStore                     |
-| flat stable VA | blocks + table | fixed/indexed/opaque state       |
-+-----------------------------+--------------------------------------+
-                              |
-                              v
-                   EP kernels / captured graph
+```mermaid
+flowchart TD
+    Client["Application / local API clients"] --> GenAI
+    GenAI["GenAI Server or embedded GenAI Runtime"] --> Registry["ModelRegistry"]
+    GenAI --> Router["RequestRouter"]
+    Registry -->|"load / switch / unload"| Engine
+    Router -->|"requests / priority / latency policy"| Engine
+
+    subgraph ORT["ORT Runtime / OrtEnv — process-wide authority owner"]
+        Resources["MemoryAuthorityRegistry + TopologyProvider"]
+        Authorities["Host/UnifiedAuthority + DeviceAuthorities"]
+        Resources --> Authorities
+    end
+
+    GenAI -->|"create once; configure limits"| Resources
+    Resources -->|"snapshots / metrics"| GenAI
+    Resources -->|"lease API"| Engine["GenAI Engine / Scheduler(s)"]
+    Resources -->|"shared allocators + authority handles"| Session["ORT InferenceSession(s) — graph executors"]
+    Engine -->|"bind model/state views; Run"| Session
+
+    Authorities -->|"leases / allowances / pressure"| Weights["Model residency: weights + captures"]
+    Authorities --> State["StateBundle: KV + recurrent + conv + prefixes"]
+    Authorities --> Arenas["ORT / EP arenas: activation + workspace"]
+    Engine --> Weights
+    Engine --> State
+    Session --> Arenas
+
+    Weights --> Data["Data planes: DeviceAllocator / VirtualBacking / KvPageStore"]
+    State --> Data
+    Arenas --> Data
+    Data -->|"flat VA / blocks + table / indexed or opaque state"| Kernels["EP kernels / captured graph"]
+    Session -->|"dispatch"| Kernels
 ```
 
 | Design component | Contract and invariant coverage |
 | --- | --- |
-| GenAI server/runtime and model registry | C1, C2, C4, C5, C7-C9; I3, I5-I8, I10 |
+| GenAI server/runtime and model registry | C2, C4, C5, C7-C9; I3, I5, I6, I8, I10 |
+| ORT runtime / `OrtEnv` authority owner | C1, C2, C5, C7, C8; I1-I3, I6-I8 |
 | Resource registry and topology provider | C1, C7, C8; I1, I8 |
 | Device and host authorities | C1, C2, C5, C8; I1, I2, I3, I6, I7 |
 | Scheduler and admission | C4, C7-C9; I4, I5, I8, I10 |
@@ -111,20 +100,25 @@ hot / warm / cold      prefix + request state  cached / reclaimable
 | ORT allocator and I/O-binding adapters | C2, C3, C6, C8, C9; I2, I3, I10 |
 | Persistent state manager | C2, C4, C6, C9; I4-I6, I10 |
 
-**Server/runtime interaction.** The server owns the process-local resource
-registry and authorities. The model registry requests model-level leases before
-constructing an engine/ORT session and returns them on unload or demotion. The
-request router supplies priority and latency policy; each engine scheduler
-performs byte admission and C4 transactions. The resource API configures C8
-limits and reads the same authority snapshots used for admission. An embedded
-caller uses the identical runtime services without the HTTP layer.
+**Authority ownership.** In the proposed architecture, a process-wide memory
+service associated with ORT/`OrtEnv` owns the resource registry and authorities.
+`InferenceSession` remains the graph executor; multiple sessions obtain shared
+allocators and leases from that service. GenAI is not a second graph runtime: it
+creates/configures the environment, owns model/request orchestration, leases
+external weights and state, binds them to sessions, and calls `Run`. An embedded
+caller uses the same service without HTTP. Today `OrtEnv` can share allocators,
+but the complete authority and reclaim protocol are proposed additions.
 
-**Control plane.** `DeviceMemoryAuthority` owns the ledger and stable
-`MemoryAuthorityId` for one distinct device-local pool. Devices sharing physical
-memory resolve to the host/unified authority instead. One process-local
-`HostGovernor` covers host resources shared by all participating sessions and
-devices; cross-process enforcement is out of scope. Its ticketed protocol
-charges a grant before waking a requester.
+The model registry takes model-level leases before constructing engines/sessions
+and returns them on unload or demotion. The request router supplies priority and
+latency policy; engine schedulers perform C4 admission. The resource API
+configures C8 limits and reads the same snapshots used for admission.
+
+**Control plane.** Within the `OrtEnv` service, `DeviceMemoryAuthority` owns the
+ledger and stable `MemoryAuthorityId` for one distinct device-local pool.
+Devices sharing physical memory resolve to the host/unified authority instead.
+One process-local `HostGovernor` covers host resources shared by all sessions
+and devices; cross-process enforcement is out of scope.
 
 **Data plane.** `DeviceAllocator` answers *where bytes come from*;
 `MemoryGovernor` answers *whether they may be retained*. `VirtualBacking`
