@@ -594,7 +594,7 @@ either default-domain `Attention` Phase-2a, or `StandardAttention` on a
 against the native CUDA EP, and capture
 
 ```sh
-nsys profile --trace=cuda,nvtx -o ws_check <runner>
+nsys profile --trace=cuda,nvtx -o ws_check python scripts/your_runner.py
 nsys stats --report cuda_api_sum ws_check.nsys-rep | grep -E 'cuMemAlloc|cuMemFree'
 ```
 
