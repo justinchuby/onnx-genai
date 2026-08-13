@@ -1,9 +1,16 @@
 //! ORT Values (tensors).
 
+use std::borrow::Cow;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
 use crate::{MemoryInfo, OrtError, Result};
+
+/// Alignment that satisfies every [`DataType`] element type.
+///
+/// The widest element this crate supports is 8 bytes (`Int64`/`Uint64`), so a
+/// buffer aligned to this is aligned for every tensor dtype.
+const MAX_ELEMENT_ALIGN: usize = 8;
 
 /// Tensor data types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +44,17 @@ impl DataType {
             | DataType::Bool => 1,
             DataType::Int64 | DataType::Uint64 => 8,
         }
+    }
+
+    /// Alignment one element must be stored at.
+    ///
+    /// Every dtype here is a scalar whose alignment equals its size, but this is
+    /// stated separately from [`size_of`](Self::size_of) because it answers a
+    /// different question: `size_of` sizes an allocation, while this is the
+    /// precondition `slice::from_raw_parts` and `ptr::write` impose on the
+    /// pointer ORT hands back for the tensor's data.
+    pub fn align_of(&self) -> usize {
+        self.size_of()
     }
 
     pub(crate) fn to_onnx(self) -> onnx_genai_ort_sys::ONNXTensorElementDataType {
@@ -92,7 +110,7 @@ enum TensorBacking {
     /// Raw little-endian element bytes for a tensor of arbitrary dtype (used by
     /// the backend-neutral component-session seam, which carries host tensors as
     /// opaque bytes).
-    Bytes(Vec<u8>),
+    Bytes(ElementBytes),
     Alias(Arc<Value>),
     /// Memory this `Value` does not own.
     ///
@@ -110,6 +128,69 @@ enum TensorBacking {
         host_accessible: bool,
     },
     None,
+}
+
+/// Owned tensor bytes whose data pointer is aligned for **every** [`DataType`].
+///
+/// `Vec<u8>` only guarantees `align_of::<u8>() == 1`, and an *empty* `Vec<u8>`
+/// is not even a real allocation: its pointer is the dangling address `0x1`.
+/// `CreateTensorWithDataAsOrtValue` stores whatever pointer it is given and
+/// `GetTensorMutableData` hands that same pointer straight back, so a
+/// `Vec<u8>`-backed tensor read as `Float16`/`Float32`/`Int64` would build a
+/// slice from a pointer that is not aligned for its element type — undefined
+/// behaviour, which Rust's debug UB checks turn into a non-unwinding abort.
+///
+/// The caller's allocation is kept whenever it already satisfies
+/// [`MAX_ELEMENT_ALIGN`] (which every non-empty `malloc`/`HeapAlloc` block does
+/// in practice), so the common path stays a move with no extra copy. Otherwise
+/// the bytes are re-homed into a `u64`-backed allocation, which the allocator
+/// must return 8-byte aligned. Either way the pointer handed to ORT is aligned
+/// for any dtype the tensor can carry.
+enum ElementBytes {
+    /// The caller's `Vec<u8>`, kept because it is already suitably aligned.
+    Borrowed(Vec<u8>),
+    /// Re-homed bytes: `words` holds `len` meaningful bytes plus tail padding.
+    Realigned { words: Vec<u64>, len: usize },
+}
+
+impl ElementBytes {
+    fn new(data: Vec<u8>) -> Self {
+        if !data.is_empty() && (data.as_ptr() as usize).is_multiple_of(MAX_ELEMENT_ALIGN) {
+            return Self::Borrowed(data);
+        }
+        let len = data.len();
+        // `max(1)` keeps this a real allocation even for an empty tensor, so the
+        // pointer ORT receives is a genuine aligned address rather than `Vec`'s
+        // dangling `align_of::<u64>()` sentinel.
+        let mut words = vec![0u64; len.div_ceil(MAX_ELEMENT_ALIGN).max(1)];
+        // SAFETY: `words` owns at least `len` bytes (rounded up to whole u64s)
+        // and does not overlap `data`; both are read/written as bytes, which has
+        // alignment 1, so no alignment precondition applies to either side.
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), words.as_mut_ptr().cast::<u8>(), len);
+        }
+        Self::Realigned { words, len }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Borrowed(data) => data.len(),
+            Self::Realigned { len, .. } => *len,
+        }
+    }
+
+    /// Pointer to the first byte, aligned to [`MAX_ELEMENT_ALIGN`].
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        let ptr = match self {
+            Self::Borrowed(data) => data.as_mut_ptr(),
+            Self::Realigned { words, .. } => words.as_mut_ptr().cast::<u8>(),
+        };
+        debug_assert!(
+            (ptr as usize).is_multiple_of(MAX_ELEMENT_ALIGN),
+            "ElementBytes must hand ORT a pointer aligned for every element type"
+        );
+        ptr
+    }
 }
 
 /// An ORT tensor value.
@@ -246,6 +327,18 @@ impl Value {
                     .to_owned(),
             ));
         }
+        // Every reader reaches this buffer as `*mut dtype`, and building a slice
+        // or writing through a pointer that is not aligned for its element type
+        // is undefined behaviour. This is the one constructor whose buffer we do
+        // not allocate, so it is the only place the invariant can be violated —
+        // report it here, where the caller can still fix the allocation.
+        if !(data as usize).is_multiple_of(dtype.align_of()) {
+            return Err(OrtError::InvalidArgument(format!(
+                "external buffer at {data:p} is not aligned to {} bytes as {dtype:?} elements \
+                 require; allocate it with at least element alignment",
+                dtype.align_of()
+            )));
+        }
         validate_shape(shape, None)?;
         let elements = shape
             .iter()
@@ -377,7 +470,7 @@ impl Value {
     /// component-session seam, which carries host tensors as opaque bytes so any
     /// dtype round-trips without a per-dtype host representation. `shape` must be
     /// fully static and `data.len()` must equal `numel * dtype.size_of()`.
-    pub fn from_raw_bytes(mut data: Vec<u8>, shape: &[i64], dtype: DataType) -> Result<Self> {
+    pub fn from_raw_bytes(data: Vec<u8>, shape: &[i64], dtype: DataType) -> Result<Self> {
         validate_shape(shape, None)?;
         let numel = shape.iter().fold(1usize, |acc, &dim| acc * dim as usize);
         let expected = numel * dtype.size_of();
@@ -391,6 +484,11 @@ impl Value {
                 expected
             )));
         }
+        // A `Vec<u8>` is only 1-byte aligned (and an empty one is the dangling
+        // address `0x1`), but ORT hands this exact pointer back to every reader,
+        // which casts it to the element type. Re-home it when necessary so the
+        // tensor's data pointer is aligned for `dtype`.
+        let mut data = ElementBytes::new(data);
         let ptr = create_tensor_with_data(data.as_mut_ptr().cast(), data.len(), shape, dtype)?;
         Ok(Self {
             ptr,
@@ -467,19 +565,30 @@ impl Value {
             ));
         }
         let bytes = self.numel() * self.dtype.size_of();
+        // A zero-element tensor borrows nothing, so it never needs a data
+        // pointer — ORT may return null or a dangling sentinel for one.
+        if bytes == 0 {
+            return Ok(&[]);
+        }
         let ptr = tensor_data_ptr(self.ptr.as_ptr())?;
         // SAFETY: `ptr` points to at least `bytes` contiguous bytes of this
         // tensor's row-major allocation, checked host-resident above and kept
         // alive by `self`, which also bounds the returned slice's lifetime.
+        // `u8` has alignment 1, so any non-null `ptr` satisfies the alignment
+        // precondition.
         Ok(unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), bytes) })
     }
 
     pub fn to_raw_bytes(&self) -> Result<Vec<u8>> {
         self.ensure_host_accessible("to_raw_bytes")?;
         let bytes = self.numel() * self.dtype.size_of();
+        if bytes == 0 {
+            return Ok(Vec::new());
+        }
         let ptr = tensor_data_ptr(self.ptr.as_ptr())?;
         // SAFETY: `ptr` points to at least `bytes` contiguous bytes of this
-        // host-resident tensor's row-major allocation, kept alive by `self`.
+        // host-resident tensor's row-major allocation, kept alive by `self`;
+        // `u8` has alignment 1, so any non-null `ptr` is suitably aligned.
         let slice = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), bytes) };
         Ok(slice.to_vec())
     }
@@ -508,15 +617,20 @@ impl Value {
             DataType::Float32 => self.to_vec_f32(),
             DataType::Float16 => {
                 let numel = self.numel();
+                if numel == 0 {
+                    return Ok(Vec::new());
+                }
                 let data = tensor_data_ptr(self.ptr.as_ptr())?;
                 // SAFETY: an fp16 tensor holds `numel` contiguous u16 elements at
-                // `data`, valid until this Value is released; we only read here.
-                let bits = unsafe { std::slice::from_raw_parts(data.cast::<u16>(), numel) };
+                // `data`, valid until this Value is released; we only read here,
+                // and `tensor_elements` upholds the alignment precondition.
+                let bits = unsafe { tensor_elements::<u16>(data.cast::<u16>(), numel) };
                 // Reinterpret the raw bits as f16 and widen with half's vectorized
                 // slice conversion (hardware F16C when available), which is far
                 // faster than a per-element `from_bits().to_f32()` scalar loop on
                 // the hot logits path (~152K elements per decode step).
-                let halves: &[half::f16] = half::slice::HalfBitsSliceExt::reinterpret_cast(bits);
+                let halves: &[half::f16] =
+                    half::slice::HalfBitsSliceExt::reinterpret_cast(&bits[..]);
                 Ok(half::slice::HalfFloatSliceExt::to_f32_vec(halves))
             }
             DataType::BFloat16 => Ok(self
@@ -566,22 +680,23 @@ impl Value {
         let data = tensor_data_ptr(self.ptr.as_ptr())?;
         // SAFETY: the tensor owns `numel` contiguous elements of `dtype` at
         // `data`, valid until the value is released; we only read the final row
-        // `[offset, offset + vocab)`, which is in bounds by construction.
+        // `[offset, offset + vocab)`, which is in bounds by construction. The
+        // row base is stepped in bytes so the arithmetic stays valid even when
+        // `data` is not element-aligned, and `tensor_elements` then upholds the
+        // alignment precondition itself.
+        let row_base = unsafe { data.cast::<u8>().add(offset * self.dtype.size_of()) };
         let index = match self.dtype {
             DataType::Float32 => {
-                let row =
-                    unsafe { std::slice::from_raw_parts(data.cast::<f32>().add(offset), vocab) };
-                argmax_row_f32(row)
+                let row = unsafe { tensor_elements::<f32>(row_base.cast::<f32>(), vocab) };
+                argmax_row_f32(&row)
             }
             DataType::Float16 => {
-                let bits =
-                    unsafe { std::slice::from_raw_parts(data.cast::<u16>().add(offset), vocab) };
-                argmax_f16_bits(bits)
+                let bits = unsafe { tensor_elements::<u16>(row_base.cast::<u16>(), vocab) };
+                argmax_f16_bits(&bits)
             }
             DataType::BFloat16 => {
-                let bits =
-                    unsafe { std::slice::from_raw_parts(data.cast::<u16>().add(offset), vocab) };
-                argmax_bf16_bits(bits)
+                let bits = unsafe { tensor_elements::<u16>(row_base.cast::<u16>(), vocab) };
+                argmax_bf16_bits(&bits)
             }
             other => {
                 return Err(OrtError::InvalidArgument(format!(
@@ -666,9 +781,13 @@ impl Value {
                 self.numel()
             )));
         }
-        let dst = tensor_data_ptr(self.ptr.as_ptr())?.cast::<i64>();
+        if data.is_empty() {
+            return Ok(());
+        }
+        let dst = tensor_elements_mut_ptr::<i64>(self.ptr.as_ptr(), self.dtype)?;
         // SAFETY: `dst` points to at least `numel()` contiguous i64 elements
-        // owned by this tensor; we write only the first `data.len()` of them.
+        // owned by this tensor and is element-aligned (checked above); we write
+        // only the first `data.len()` of them.
         unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len()) };
         Ok(())
     }
@@ -702,10 +821,10 @@ impl Value {
         if count == 0 {
             return Ok(());
         }
-        let base = tensor_data_ptr(self.ptr.as_ptr())?.cast::<i64>();
+        let base = tensor_elements_mut_ptr::<i64>(self.ptr.as_ptr(), self.dtype)?;
         // SAFETY: `[start, start+count)` lies within the `numel()` contiguous
-        // i64 elements owned by this tensor (checked above), so each written
-        // element is in bounds.
+        // i64 elements owned by this tensor (checked above) and `base` is
+        // element-aligned, so each written element is in bounds and aligned.
         unsafe {
             let dst = base.add(start);
             for offset in 0..count {
@@ -847,18 +966,22 @@ impl Value {
         let start = row
             .checked_mul(row_len)
             .ok_or_else(|| OrtError::InvalidArgument("row offset overflow".into()))?;
+        if row_len == 0 {
+            return Ok(());
+        }
         match &mut self.backing {
             TensorBacking::F32(data) => data[start..start + row_len].fill(0.0),
             TensorBacking::F16(data) => data[start..start + row_len].fill(0),
             TensorBacking::None => match self.dtype {
                 DataType::Float32 => {
-                    let ptr = tensor_data_ptr(self.ptr.as_ptr())?.cast::<f32>();
+                    let ptr = tensor_elements_mut_ptr::<f32>(self.ptr.as_ptr(), self.dtype)?;
                     // SAFETY: `start..start + row_len` lies within this tensor's
-                    // row-major allocation, and ORT returned a mutable data pointer.
+                    // row-major allocation, ORT returned a mutable data pointer,
+                    // and the pointer is element-aligned (checked above).
                     unsafe { std::slice::from_raw_parts_mut(ptr.add(start), row_len) }.fill(0.0);
                 }
                 DataType::Float16 | DataType::BFloat16 => {
-                    let ptr = tensor_data_ptr(self.ptr.as_ptr())?.cast::<u16>();
+                    let ptr = tensor_elements_mut_ptr::<u16>(self.ptr.as_ptr(), self.dtype)?;
                     // SAFETY: same bounds/invariants as the Float32 branch.
                     unsafe { std::slice::from_raw_parts_mut(ptr.add(start), row_len) }.fill(0);
                 }
@@ -907,6 +1030,9 @@ impl Value {
             .ok_or_else(|| {
                 OrtError::InvalidArgument(format!("tensor shape too large: {:?}", self.shape))
             })?;
+        if row_len == 0 || sources.is_empty() {
+            return Ok(());
+        }
         match &mut self.backing {
             TensorBacking::F32(data) => {
                 let mut prefix = Vec::with_capacity(sources.len() * row_len);
@@ -926,29 +1052,33 @@ impl Value {
             }
             TensorBacking::None => match self.dtype {
                 DataType::Float32 => {
-                    let ptr = tensor_data_ptr(self.ptr.as_ptr())?.cast::<f32>();
+                    let ptr = tensor_elements_mut_ptr::<f32>(self.ptr.as_ptr(), self.dtype)?;
                     let mut prefix = Vec::with_capacity(sources.len() * row_len);
                     for &src in sources {
-                        // SAFETY: `src` was range-checked above.
+                        // SAFETY: `src` was range-checked above and `ptr` is
+                        // element-aligned (checked by `tensor_elements_mut_ptr`).
                         let row =
                             unsafe { std::slice::from_raw_parts(ptr.add(src * row_len), row_len) };
                         prefix.extend_from_slice(row);
                     }
-                    // SAFETY: the prefix length is at most the tensor allocation.
+                    // SAFETY: the prefix length is at most the tensor allocation,
+                    // and `ptr` is element-aligned.
                     unsafe {
                         std::slice::from_raw_parts_mut(ptr, prefix.len()).copy_from_slice(&prefix);
                     }
                 }
                 DataType::Float16 | DataType::BFloat16 => {
-                    let ptr = tensor_data_ptr(self.ptr.as_ptr())?.cast::<u16>();
+                    let ptr = tensor_elements_mut_ptr::<u16>(self.ptr.as_ptr(), self.dtype)?;
                     let mut prefix = Vec::with_capacity(sources.len() * row_len);
                     for &src in sources {
-                        // SAFETY: `src` was range-checked above.
+                        // SAFETY: same bounds/alignment invariants as the
+                        // Float32 branch.
                         let row =
                             unsafe { std::slice::from_raw_parts(ptr.add(src * row_len), row_len) };
                         prefix.extend_from_slice(row);
                     }
-                    // SAFETY: the prefix length is at most the tensor allocation.
+                    // SAFETY: the prefix length is at most the tensor allocation,
+                    // and `ptr` is element-aligned.
                     unsafe {
                         std::slice::from_raw_parts_mut(ptr, prefix.len()).copy_from_slice(&prefix);
                     }
@@ -1181,6 +1311,12 @@ fn tensor_data_to_vec<T: Copy>(
     value: *mut onnx_genai_ort_sys::OrtValue,
     len: usize,
 ) -> Result<Vec<T>> {
+    // A zero-element tensor has nothing to copy, and ORT is entitled to hand
+    // back any pointer for it (including a caller's dangling `Vec` sentinel).
+    // Answer without asking for the data pointer at all.
+    if len == 0 {
+        return Ok(Vec::new());
+    }
     let api = crate::error::api()?;
     let get_data = api
         .GetTensorMutableData
@@ -1193,9 +1329,72 @@ fn tensor_data_to_vec<T: Copy>(
         return Err(OrtError::NullPointer);
     }
 
-    // SAFETY: caller ensures `T` matches the tensor dtype and `len` is numel.
-    let slice = unsafe { std::slice::from_raw_parts(data.cast::<T>(), len) };
-    Ok(slice.to_vec())
+    // SAFETY: caller ensures `T` matches the tensor dtype and `len` is numel, so
+    // `data` covers `len` contiguous `T`s that stay valid until the value is
+    // released. `tensor_elements` handles the alignment precondition itself.
+    Ok(unsafe { tensor_elements::<T>(data.cast::<T>(), len) }.into_owned())
+}
+
+/// Read-only view of `len` elements of `T` at a raw ORT tensor data pointer.
+///
+/// `slice::from_raw_parts` requires the pointer to be aligned for `T` **even
+/// when `len` is 0**, and ORT hands back whatever pointer the tensor holds — it
+/// does not re-align a buffer supplied through `CreateTensorWithDataAsOrtValue`.
+/// This borrows in place on the fast path (every tensor this crate allocates,
+/// and every ORT-allocated output, is element-aligned) and falls back to an
+/// owned byte-wise copy when it is not, so a misaligned buffer is read
+/// correctly instead of being turned into an unaligned slice.
+///
+/// # Safety
+///
+/// `ptr` must point to `len` contiguous, initialized `T`s that outlive the
+/// returned borrow, and `T` must be a plain-old-data type for which every bit
+/// pattern of `size_of::<T>()` bytes is a valid value.
+unsafe fn tensor_elements<'a, T: Copy>(ptr: *const T, len: usize) -> Cow<'a, [T]> {
+    if len == 0 {
+        return Cow::Borrowed(&[]);
+    }
+    if ptr.is_aligned() {
+        // SAFETY: aligned, non-null, and valid for `len` elements per the
+        // function contract.
+        return Cow::Borrowed(unsafe { std::slice::from_raw_parts(ptr, len) });
+    }
+    let mut out = Vec::<T>::with_capacity(len);
+    // SAFETY: both sides are copied as bytes (alignment 1), the source is valid
+    // for `len * size_of::<T>()` bytes per the contract, and `out` has exactly
+    // that much freshly reserved capacity in a distinct allocation. `T` is POD,
+    // so the copied bytes initialize `len` valid values.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            ptr.cast::<u8>(),
+            out.as_mut_ptr().cast::<u8>(),
+            std::mem::size_of::<T>() * len,
+        );
+        out.set_len(len);
+    }
+    Cow::Owned(out)
+}
+
+/// Pointer to this tensor's elements as `*mut T`, for **in-place** writes.
+///
+/// The mutating helpers cannot route around a misaligned buffer the way
+/// [`tensor_elements`] does — writing through a staging copy would not update
+/// the tensor — so misalignment is reported instead of being ignored. Our own
+/// constructors guarantee alignment, so this can only fire for a buffer handed
+/// in through [`Value::from_external_memory`].
+fn tensor_elements_mut_ptr<T>(
+    value: *mut onnx_genai_ort_sys::OrtValue,
+    dtype: DataType,
+) -> Result<*mut T> {
+    let ptr = tensor_data_ptr(value)?.cast::<T>();
+    if !ptr.is_aligned() {
+        return Err(OrtError::InvalidArgument(format!(
+            "tensor data pointer {ptr:p} is not aligned to {} bytes as {dtype:?} elements \
+             require, so it cannot be written in place",
+            std::mem::align_of::<T>()
+        )));
+    }
+    Ok(ptr)
 }
 
 /// Index of the maximum value in `row`, ignoring NaNs.
