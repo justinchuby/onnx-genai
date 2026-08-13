@@ -11,11 +11,3 @@ model:
     kv_outputs:
       - present.0.key
       - present.0.value
-
-# Author-declared generation defaults. do_sample=true is what a reasoning
-# model ships *because* greedy decoding degenerates; the runtime honors it
-# unless the caller forces --greedy (sampling resolution order, #385/#392).
-generation:
-  do_sample: true
-  temperature: 0.6
-  top_k: 20

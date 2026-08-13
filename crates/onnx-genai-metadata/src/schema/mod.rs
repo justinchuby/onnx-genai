@@ -30,12 +30,14 @@ pub use pipeline::*;
 
 /// ONNX inference metadata consumed by runtimes and emitted by model builders.
 ///
-/// Every top-level section is optional for incremental adoption. Unknown fields
-/// are allowed and must be ignored by readers for forward compatibility.
+/// Every top-level section is optional for incremental adoption. The v1 surface
+/// is closed so removed scheduling and model-family fields fail fast.
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[schemars(
+    deny_unknown_fields,
     title = "ONNX Inference Metadata",
-    description = "Portable, runtime-agnostic inference metadata for ONNX generative models. All top-level sections are optional, and unknown fields are permitted for forward-compatible schema evolution.",
+    description = "Portable, runtime-agnostic inference metadata for ONNX generative models. The v1 top-level surface is closed; executable composite packages use pipeline.workflow.",
     extend("$id" = "https://github.com/onnx/onnx/issues/8184"),
     transform = schema_helpers::inference_metadata_constraints
 )]
@@ -73,10 +75,6 @@ pub struct InferenceMetadata {
     #[serde(default)]
     pub pipeline: Option<PipelineSpec>,
 
-    /// Generic inference strategy, including speculative decoding.
-    #[serde(default)]
-    pub strategy: Option<StrategySpec>,
-
     /// Standalone speculative proposer declaration.
     ///
     /// This is the preferred native source for speculator discovery;
@@ -85,27 +83,9 @@ pub struct InferenceMetadata {
     #[serde(default, alias = "speculator_config")]
     pub speculative: Option<SpeculatorConfig>,
 
-    /// Structured-output formats and model training conventions.
-    #[serde(default)]
-    pub structured_output: Option<StructuredOutputSpec>,
-
     /// Minimum and beneficial hardware capabilities used for distribution matching.
     #[serde(default)]
     pub hardware_requirements: Option<HardwareRequirements>,
-
-    /// Author-declared text-generation / search defaults.
-    ///
-    /// Populated from an onnxruntime-genai `genai_config.json` `search` block.
-    /// Every field is optional; readers treat an absent value as "use the
-    /// runtime default".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub generation: Option<GenerationDefaults>,
-
-    /// Special / control token ids declared by the model author.
-    ///
-    /// Populated from the model-level token id fields of a `genai_config.json`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tokens: Option<SpecialTokens>,
 
     /// Declared, architecture-neutral input preprocessing programs.
     ///

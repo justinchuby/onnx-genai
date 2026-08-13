@@ -42,6 +42,16 @@ pipeline:
 }
 
 #[test]
+fn removed_top_level_execution_surfaces_are_rejected() {
+    for field in ["strategy", "structured_output", "generation", "tokens"] {
+        let document = format!("{field}: {{}}\n");
+        let error = serde_yaml::from_str::<InferenceMetadata>(&document)
+            .expect_err("removed top-level execution metadata must not deserialize");
+        assert!(error.to_string().contains("unknown field"), "{error}");
+    }
+}
+
+#[test]
 fn serialized_compiler_bookkeeping_is_rejected() {
     for field in [
         "graph: { kind: sequence, steps: [] }",
