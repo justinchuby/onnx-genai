@@ -555,6 +555,30 @@ impl Value {
         Ok(device_type == onnx_genai_ort_sys::OrtMemoryInfoDeviceType_CPU)
     }
 
+    /// Return the allocator device ID recorded on this tensor.
+    pub fn device_id(&self) -> Result<i32> {
+        let api = crate::error::api()?;
+        let get_memory_info = api
+            .GetTensorMemoryInfo
+            .ok_or(OrtError::ApiUnavailable("GetTensorMemoryInfo"))?;
+        let get_device_id = api
+            .MemoryInfoGetId
+            .ok_or(OrtError::ApiUnavailable("MemoryInfoGetId"))?;
+        let mut memory_info = std::ptr::null();
+        // SAFETY: `self.ptr` is a valid tensor OrtValue. ORT owns the returned
+        // OrtMemoryInfo for the lifetime of the value.
+        crate::error::check_status(unsafe {
+            get_memory_info(self.ptr.as_ptr(), &mut memory_info)
+        })?;
+        if memory_info.is_null() {
+            return Err(OrtError::NullPointer);
+        }
+        let mut device_id = 0;
+        // SAFETY: `memory_info` is valid and `device_id` is a live out-parameter.
+        crate::error::check_status(unsafe { get_device_id(memory_info, &mut device_id) })?;
+        Ok(device_id)
+    }
+
     /// Borrow the tensor's raw little-endian element bytes.
     ///
     /// The borrowing counterpart to [`to_raw_bytes`](Self::to_raw_bytes), for
@@ -1586,6 +1610,7 @@ mod host_residency_tests {
     fn a_host_tensor_reports_host_residency_and_lends_its_bytes() {
         let value = Value::from_slice_f32(&[1.0, 2.0], &[2]).expect("build a host tensor");
         assert!(value.is_host_resident().expect("memory info is available"));
+        assert_eq!(value.device_id().expect("device ID is available"), 0);
         assert_eq!(
             value.as_raw_bytes().expect("host bytes are borrowable"),
             &[1.0f32, 2.0]

@@ -73,9 +73,14 @@ adjacent pure, effect-free ONNX invokes on the same device into one execution is
 SSA tensors remain internal graph values, so ORT can optimize across decoder, logits-processing,
 sampling, and termination components without host round trips.
 
-Control flow, device changes, explicit effects, application-overridable components, and stateful
-host adapters delimit islands. This preserves adapter ordering and prevents a fused session from
-silently ignoring a per-request component replacement.
+CUDA island outputs remain device-resident in the workflow value store. The interpreter
+materializes them on the host only for host control, stateful host adapters, ragged emission, or
+public package outputs; separate same-device islands exchange device tensors without a CPU hop.
+
+Control flow, device changes, explicit effects, and stateful host adapters delimit islands. The
+default implementation of an application-overridable pure ONNX component remains fusible. A
+request selecting a replacement executes the preserved unfused invoke sequence, so the fused
+default cannot silently ignore a per-request replacement.
 
 CUDA capture is decided per island and concrete shape signature. Eligibility requires:
 
@@ -140,6 +145,10 @@ contract ID/version, semantic binding set, tensor port ABI, and effects. Concret
 may differ because the runtime remaps them through `contract.bindings`. This is the extension
 point for fundamentally custom sampling policy; changing temperature, top-k, top-p, seed, or a
 grammar mask uses ordinary workflow inputs instead.
+
+The planner links the default pure ONNX implementation normally. Selecting a replacement switches
+that island invocation to its validated component sequence; host/stateful replacements therefore
+form an explicit optimization boundary without slowing the default path.
 
 ### Termination predicate: `onnx-genai.termination-predicate@1`
 

@@ -407,8 +407,16 @@ impl PipelineEngine {
             .find(|(_, output)| output.role == WorkflowOutputRole::Tokens)
             .map(|(name, _)| name)
             .context("workflow generate() requires one package output with role: tokens")?;
-        let tokens = values
+        let token_value = values
             .get(output)
+            .or_else(|| values.get(&format!("{output}.row.0")));
+        if values.contains_key(&format!("{output}.row.1")) {
+            anyhow::bail!(
+                "workflow generate() cannot flatten multi-row ragged output '{output}'; use \
+                 run_pipeline() to consume row streams"
+            );
+        }
+        let tokens = token_value
             .with_context(|| format!("workflow did not emit tokens output '{output}'"))?
             .to_vec_i64()?
             .into_iter()

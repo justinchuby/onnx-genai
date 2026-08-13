@@ -1052,11 +1052,19 @@ pipeline:
           parameters: { operation: min_p }
       sampler:
         implementation: { kind: onnx, artifact: sampler.onnx.textproto }
+        application_overridable: true
         contract:
           id: onnx-genai.token-sampler
           version: "1"
           bindings: { logits: logits, token: token }
           parameters: { mode: greedy }
+      alternate_sampler:
+        implementation: { kind: onnx, artifact: alternate-sampler.onnx.textproto }
+        contract:
+          id: onnx-genai.token-sampler
+          version: "1"
+          bindings: { logits: logits, token: token }
+          parameters: { mode: alternate }
       termination:
         implementation: { kind: onnx, artifact: eos.onnx.textproto }
         contract:
@@ -1091,6 +1099,7 @@ pipeline:
         &[
             ("min-p.onnx.textproto", MIN_P_FILTER),
             ("sampler.onnx.textproto", SIMPLE_GREEDY),
+            ("alternate-sampler.onnx.textproto", SIMPLE_GREEDY),
             ("eos.onnx.textproto", EOS_PREDICATE),
         ],
     )?;
@@ -1141,6 +1150,24 @@ pipeline:
     assert_eq!(performance.last_emitted_elements, 2);
     assert!(performance.last_ttft_ns.is_some());
     assert!(performance.last_elements_per_second > 0.0);
+
+    let mut generate = GenerateRequest::new(GeneratePrompt::TokenIds(vec![]));
+    generate.options.min_p = 0.5;
+    let output = engine.run_pipeline(
+        PipelineGenerateRequest::new(generate)
+            .with_input(
+                "logits",
+                Value::from_slice_f32(&[4.0, 3.0, 1.0, 0.0], &[1, 4])?,
+            )
+            .with_input("eos", Value::from_slice_i64(&[0], &[1])?)
+            .with_component_override("sampler", "alternate_sampler"),
+    )?;
+    assert_eq!(output["token"].to_vec_i64()?, [0]);
+    assert_eq!(
+        engine.execution_island_diagnostics()[0].runs,
+        2,
+        "a selected replacement must execute the preserved unfused sequence"
+    );
     Ok(())
 }
 
@@ -3165,10 +3192,7 @@ pipeline:
     let root = package("speculative-branch", metadata, &[])?;
     let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
 
-    for (accept, tokens, kv, rng) in [
-        (true, vec![11], vec![1.0, 2.0], vec![4]),
-        (false, vec![22], vec![3.0, 4.0], vec![8]),
-    ] {
+    for (accept, tokens) in [(true, vec![11]), (false, vec![22])] {
         let request = PipelineGenerateRequest::new(GenerateRequest {
             prompt: GeneratePrompt::TokenIds(vec![]),
             options: Default::default(),
@@ -3187,8 +3211,8 @@ pipeline:
 
         assert_eq!(outputs["final"].to_vec_i64()?, tokens);
         assert_eq!(outputs["event.0"].to_vec_i64()?, tokens);
-        assert_eq!(outputs["selected.kv"].to_vec_f32()?, kv);
-        assert_eq!(outputs["selected.rng"].to_vec_i64()?, rng);
+        assert!(!outputs.contains_key("selected.kv"));
+        assert!(!outputs.contains_key("selected.rng"));
         assert!(!outputs.contains_key("event.secret"));
         assert!(
             !outputs.contains_key(if accept {
