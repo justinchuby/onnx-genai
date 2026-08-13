@@ -25,10 +25,6 @@ name = "weight_offload_native_cuda_e2e"
 required-features = ["cuda", "native-backend"]
 
 [[test]]
-name = "native_step_component_parity"
-required-features = ["native-backend"]
-
-[[test]]
 name = "native_cuda_captured_step_inputs_parity"
 required-features = ["cuda", "native-backend"]
 
