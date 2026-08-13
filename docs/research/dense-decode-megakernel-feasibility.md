@@ -476,6 +476,74 @@ tax and no numerics gate.
   (not the modeled chain) to convert the +5.3% ceiling into a realized number, once Batty
   has a candidate collapse in `optimizer.rs`.
 
+### 8.5 REALIZED on the production graph — bf16 SiLU/SwiGLU-mul collapse (measured, this H200)
+
+The §8.4 ceiling (+5.3%) is a bound on collapsing *all* ~22 glue nodes/layer. Auditing the
+**real** Muse-Glimmer-30B decoder graph against the landed fused epilogues shows most of that
+glue is **not** byte-exactly collapsible here — so the realized number is bounded well below
+the ceiling. What the real graph actually contains, per 52-layer decoder (runtime op histogram,
+`ONNX_GENAI_PROFILE_OPS=1`, eager, one forward):
+
+| op_type | count | /layer | collapsible byte-exact? |
+|---|---|---|---|
+| `MatMulNBits` | 417 | 8 | no — irreducible int4 GEMV (§7, #898); out of scope |
+| `GroupQueryAttention` | 52 | 1 | no — GQA-decode; out of scope |
+| `SimplifiedLayerNormalization` | 312 | 6 | **no for bf16** — see below |
+| `Add` | 311 | 6 | ~208 are constant `gamma+1` folds (#872 `CudaFoldConstantAdd` REGRESSED −2.8%, not shipped); ~104 are residual adds |
+| `Mul` | 210 | 4 | 52 are the SwiGLU multiply → **collapsed here** |
+| `Reshape` | 208 | 4 | structural/kernel-coupled (GQA head-split); not a standalone deletion |
+| `Sigmoid` | 104 | 2 | 52 are the MLP SiLU gate → **collapsed here**; 52 are the attention-output gate `sigmoid(gate)*attn` (not self-gated SiLU) |
+| `Cast` | 2 | ~0 | already folded 834 → 2 by `CudaDropNormalizationCasts` + `CudaFoldConstantCast` |
+
+**Why the elementwise/norm fusions were dormant on this model:** every SiLU/SwiGLU fusion was
+gated to `Float16`, but Muse-Glimmer's activation stream is **bf16**, so `CudaSiluFusion` never
+fired. The architecture is Gemma3-style *sandwich* norm — the residual `Add` comes **after** the
+post-norm (`x + norm(y)`), so #854's `SkipSimplifiedLayerNormalization` (which computes
+`norm(x + skip)`) does apply across the layer seam, **but only f32/f16 skip kernels exist**: the
+f16 skip kernel rounds the residual sum to f16 *before* the RMS reduction (byte-exact), whereas
+the f32-template path (the only one bf16 could reach) accumulates over the **unrounded** fp32 sum.
+That changes the reduction vs the standalone bf16 `Add`→norm → **not byte-exact → flagged for
+Chew/Sebastian (needs a bf16 skip kernel that rounds the sum), NOT implemented here.**
+
+**What shipped (byte-exact, reuses #867):** extend `CudaSiluFusion` to accept `BFloat16`. The
+standalone `Sigmoid(x)` + `Mul(x, sigmoid)` + `Mul(silu, up)` chain then collapses through
+`CudaSiluFusion` → `CudaSwiGluFusion` into the tagged decomposed `Mul[_cuda_silu_mul]`, which the
+runtime lowers to the already-landed **`decomposed_silu_mul_bf16`** kernel. That kernel is
+documented (and here confirmed) to reproduce the standalone per-op bf16 rounding exactly — sigmoid
+and the products each rounded via `__float2bfloat16_rn`. `CudaGateUpSwiGluFusion` requires an fp16
+activation, so it stays dormant on bf16: **the int4 GEMVs are left untouched** (per §7 / #898), and
+only the glue nodes collapse.
+
+**Measured (H200, `CUDA_VISIBLE_DEVICES=0`, `ONNX_GENAI_CUDA_GRAPH=1`, `--steady --warmups 1
+--runs 3 --tokens 128`, 3 interleaved A/B rounds on the same release binary):**
+
+| metric | before | after |
+|---|---|---|
+| decode | 21.19 ms/token | 20.99 ms/token |
+| throughput | **47.20 tok/s** (mean; 47.18/47.24/47.19) | **47.63 tok/s** (mean; 47.55/47.74/47.60) |
+| glue nodes/layer | ~22 | ~20 |
+| `Sigmoid` (per forward) | 104 | **52** |
+| `Mul` (per forward) | 210 | **158** |
+| total decoder nodes | 2458 | **2354** (−104; −2/layer) |
+| greedy tokens (24-tok, deterministic) | `[24, 372, 1045, 10016, …, 1740, 2885]` | **identical (byte/token-exact)** |
+
+**Realized decode delta: 47.20 → 47.63 tok/s = +0.9% (−0.19 ms/token), byte-exact.**
+
+**Interpretation — a small-but-real SHIP, far below the +5.3% ceiling, honestly bounded by what
+is collapsible.** The +5.3% assumed all ~22 glue nodes/layer collapse; on the real bf16 graph only
+the **2** SiLU/SwiGLU-mul nodes/layer are byte-exactly collapsible with a landed kernel. The
+larger glue populations are each blocked for a concrete reason: the 6 norms/layer have no
+byte-exact bf16 skip kernel (reduction-rounding mismatch → Chew), the 4 constant `gamma+1`
+adds/layer are a **measured regression** (#872), and the 4 reshapes/layer are GQA head-split
+metadata coupled to the attention kernel, not free-standing deletions. Removing 104 dispatch-bound
+nodes recovers ~0.19 ms/token — consistent with the §8.1 ~0.9 µs/node replay floor plus the small
+real memory traffic of the 52 removed `Sigmoid` launches over the 19968-wide intermediate. The
+glue that remains interleaves with the dominant GEMV serial cost (§8.3 caveat), so realized ≤
+ceiling as predicted. **Verdict: SHIP** — zero-risk, byte-exact, no GEMV touch, no numerics
+reorder, no Chew gate; it simply activates the landed #867 bf16 kernel that the `Float16`-only pass
+gate was hiding. Further glue collapse on this model requires a **bf16 skip-RMSNorm kernel that
+rounds the residual sum** (Sebastian/Chew) before #854's fold can fire byte-exactly on bf16.
+
 ---
 
 - Env: `source /home/justinchu/onnx-genai/.cudaenv.sh`; `CUDA_VISIBLE_DEVICES=0 ONNX_GENAI_CUDA_DEVICE=0`.
