@@ -484,8 +484,13 @@ const ADAPTIVE_PROPOSAL_BUDGET: &str = r#"
 ir_version: 8
 graph {
   node { input: "current_k" input: "one" output: "increased" op_type: "Add" }
+  node { input: "draft_ms" input: "target_ms" output: "target_slower" op_type: "Less" }
   node {
-    input: "filled_proposal_budget" input: "increased" input: "current_k"
+    input: "filled_proposal_budget" input: "target_slower"
+    output: "should_increase" op_type: "And"
+  }
+  node {
+    input: "should_increase" input: "increased" input: "current_k"
     output: "next_k" op_type: "Where"
   }
   node { input: "estimates" output: "next_estimates" op_type: "Identity" }
@@ -2503,7 +2508,10 @@ pipeline:
         -1, -1, -1, 3, -1, // state 2: token 3
         -1, -1, -1, -1, 3, // state 3: token 4
     ];
-    let request = || -> anyhow::Result<PipelineGenerateRequest> {
+    let request = |current_k: i64,
+                   draft_ms: f32,
+                   target_ms: f32|
+     -> anyhow::Result<PipelineGenerateRequest> {
         Ok(
             PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
                 .with_input("proposed", Value::from_slice_i64(&[1, 2, 4], &[1, 3])?)
@@ -2519,7 +2527,7 @@ pipeline:
                 )
                 .with_input("zero_length", Value::from_slice_i64(&[0], &[1])?)
                 .with_input("evaluated", Value::from_slice_i64(&[3], &[1])?)
-                .with_input("current_k", Value::from_slice_i64(&[2], &[1])?)
+                .with_input("current_k", Value::from_slice_i64(&[current_k], &[1])?)
                 .with_input(
                     "estimates",
                     Value::from_slice_f32(&[0.0, 0.0, 0.0, 0.0], &[1, 4])?,
@@ -2528,8 +2536,8 @@ pipeline:
                     "filled",
                     Value::from_raw_bytes(vec![1], &[1], onnx_genai_ort::DataType::Bool)?,
                 )
-                .with_input("draft_ms", Value::from_slice_f32(&[1.0], &[1])?)
-                .with_input("target_ms", Value::from_slice_f32(&[2.0], &[1])?)
+                .with_input("draft_ms", Value::from_slice_f32(&[draft_ms], &[1])?)
+                .with_input("target_ms", Value::from_slice_f32(&[target_ms], &[1])?)
                 .with_input(
                     "continue",
                     Value::from_raw_bytes(vec![1], &[], onnx_genai_ort::DataType::Bool)?,
@@ -2537,13 +2545,26 @@ pipeline:
                 .with_input("iterations", Value::from_slice_i64(&[1], &[])?),
         )
     };
-    let output = engine.run_pipeline(request()?)?;
-    engine.run_pipeline(request()?)?;
-    engine.run_pipeline(request()?)?;
+    let output = engine.run_pipeline(request(2, 1.0, 2.0)?)?;
+    let changed_k = engine.run_pipeline(request(4, 1.0, 2.0)?)?;
+    let target_faster = engine.run_pipeline(request(4, 3.0, 2.0)?)?;
     assert_eq!(output["tokens.row.0"].shape(), [1, 3]);
     assert_eq!(output["tokens.row.0"].to_vec_i64()?, [1, 2, 3]);
     assert_eq!(output["next_k"].to_vec_i64()?, [3]);
     assert_eq!(output["final_grammar_state"].to_vec_i64()?, [2]);
+    assert_eq!(changed_k["next_k"].to_vec_i64()?, [5]);
+    assert_eq!(target_faster["next_k"].to_vec_i64()?, [4]);
+    for changed in [&changed_k, &target_faster] {
+        assert_eq!(
+            changed["tokens.row.0"].to_vec_i64()?,
+            output["tokens.row.0"].to_vec_i64()?,
+            "advisory K and telemetry must not change semantic token distribution"
+        );
+        assert_eq!(
+            changed["final_grammar_state"].to_vec_i64()?,
+            output["final_grammar_state"].to_vec_i64()?
+        );
+    }
     let islands = engine.execution_island_diagnostics();
     assert!(
         islands.iter().any(|island| {
