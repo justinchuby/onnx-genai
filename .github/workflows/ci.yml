@@ -625,10 +625,13 @@ jobs:
       # These crates depend on the downloaded ONNX Runtime distribution above.
       # The set is still derived from the workspace inventory, not hand-copied
       # here; adding a new ORT-backed crate means classifying it in the script.
+      # Serialize because several integration tests temporarily select sessions
+      # through process-wide environment variables.
       - name: Test ORT-backed workspace crates
         run: >-
           cargo test --locked
           $(python .github/scripts/workspace_test_packages.py cargo-args ort-backed)
+          -- --test-threads=1
       - name: Execute checked-in Mobius workflow packages
         run: >-
           cargo test --locked -p onnx-genai-engine
