@@ -176,6 +176,15 @@ struct Args {
     /// weight-streaming amortization. Leads the before/after ~1/N table.
     #[arg(long, value_delimiter = ',')]
     fused_forward_amortization: Option<Vec<usize>>,
+    /// Stage 2b (#750): drive the batch-N fused forward with a **non-empty**
+    /// length-L batched KV past for each `N@L` pair in this comma-separated list
+    /// (e.g. `1@0,8@0,1@512,8@512`). Resets the weight-offload counters around
+    /// each so `htod_bytes_per_token` / `page_ins_per_token` show how the
+    /// weight-residency reclaim under the elastic budget (#866) rises as `N` and
+    /// `L` grow the committed KV — the KV-multiplication trade the stage 2a
+    /// empty-past probe could not surface.
+    #[arg(long, value_delimiter = ',')]
+    fused_forward_kv_sweep: Option<Vec<String>>,
 }
 
 fn categorical_sampling_enabled(args: &Args) -> bool {
@@ -602,6 +611,72 @@ fn run_fused_forward_amortization(
     Ok(())
 }
 
+/// Stage 2b (#750): sweep the batch-N fused forward across `N@L` (batch @
+/// past_len) pairs, resetting the weight-offload counters around each so the
+/// KV-multiplication trade is visible — as `N` and `L` grow the committed KV,
+/// the elastic weight budget (#866) reclaims weight residency and
+/// `htod_bytes_per_token` rises. Leads with the deterministic per-token counters
+/// exactly as the amortization sweep does.
+fn run_fused_forward_kv_sweep(
+    session: &mut NativeDecodeSession,
+    prompt_tokens: &[u32],
+    pairs: &[String],
+) -> Result<()> {
+    if pairs.is_empty() {
+        bail!("--fused-forward-kv-sweep requires at least one N@L pair");
+    }
+    let parsed = pairs
+        .iter()
+        .map(|pair| {
+            let (batch, past) = pair
+                .split_once('@')
+                .with_context(|| format!("--fused-forward-kv-sweep pair '{pair}' must be N@L"))?;
+            let batch: usize = batch
+                .trim()
+                .parse()
+                .with_context(|| format!("invalid batch N in '{pair}'"))?;
+            let past: usize = past
+                .trim()
+                .parse()
+                .with_context(|| format!("invalid past_len L in '{pair}'"))?;
+            if batch == 0 {
+                bail!("--fused-forward-kv-sweep batch N must be > 0 in '{pair}'");
+            }
+            Ok((batch, past))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let own_pid = std::process::id();
+    println!(
+        "fused_forward_kv_sweep: own_pid={own_pid} pairs={parsed:?} \
+         (rows are independent length-1 sequences over a zero-seeded length-L batched past; stateless eager forward)"
+    );
+    report_foreign_compute_apps(own_pid);
+
+    // One-time warmup outside every measurement window.
+    let warm = fused_tokens(prompt_tokens, 1);
+    let _ = session
+        .run_fused_batch_forward(&warm, 0)
+        .context("warmup fused forward")?;
+
+    for (batch, past_len) in parsed {
+        report_foreign_compute_apps(own_pid);
+        let tokens = fused_tokens(prompt_tokens, batch);
+        onnx_runtime_ep_cuda::reset_global_offload_stats();
+        let rows = session
+            .run_fused_batch_forward(&tokens, past_len)
+            .with_context(|| format!("fused forward at batch {batch} past_len {past_len}"))?;
+        assert_eq!(
+            rows.len(),
+            batch,
+            "fused forward must emit one row per token"
+        );
+        println!("--- fused_forward batch={batch} past_len={past_len} ---");
+        print_weight_offload_observability(batch as u64);
+    }
+    Ok(())
+}
+
 /// Build `batch` token ids for the fused-forward probe by cycling the prompt.
 /// Token *values* never affect weight-streaming counters (residency is keyed by
 /// weight identity, not by token), so cycling a real prompt is representative.
@@ -952,6 +1027,14 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
 fn main() -> Result<()> {
     let args = Args::parse();
     validate_backend(&args)?;
+    eprintln!(
+        "profile_native: WEIGHT_OFFLOAD_BYTE_AWARE={:?} WEIGHT_OFFLOAD_EVICT_ORDER={:?} \
+         MANAGED_WEIGHT_STREAMING={:?} CUDA_GRAPH={:?}",
+        std::env::var("ONNX_GENAI_WEIGHT_OFFLOAD_BYTE_AWARE").ok(),
+        std::env::var("ONNX_GENAI_WEIGHT_OFFLOAD_EVICT_ORDER").ok(),
+        std::env::var("ONNX_GENAI_MANAGED_WEIGHT_STREAMING").ok(),
+        std::env::var("ONNX_GENAI_CUDA_GRAPH").ok(),
+    );
     if args.tokens == 0 || args.runs == 0 {
         bail!("--tokens and --runs must be greater than zero");
     }
@@ -1023,6 +1106,9 @@ fn main() -> Result<()> {
     println!("profile_native: {}", describe_sampling(&args));
     if let Some(batch_sizes) = args.fused_forward_amortization.clone() {
         return run_fused_forward_amortization(&mut session, &prompt_tokens, &batch_sizes);
+    }
+    if let Some(pairs) = args.fused_forward_kv_sweep.clone() {
+        return run_fused_forward_kv_sweep(&mut session, &prompt_tokens, &pairs);
     }
     if let Some(dump_path) = args.dump_logprobs.as_ref() {
         let dump_prompt_tokens = if let Some(ids_path) = args.prompt_ids.as_ref() {

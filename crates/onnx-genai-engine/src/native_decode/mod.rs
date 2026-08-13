@@ -239,13 +239,41 @@ impl NativeDecodeSession {
         &mut self,
         token_ids: &[TokenId],
     ) -> anyhow::Result<Vec<Vec<f32>>> {
+        self.run_fused_batch_forward(token_ids, 0)
+    }
+
+    /// Stage 2b (#750): the stage 2a fused forward generalized to a **non-empty
+    /// batched KV past** of `past_len` positions per row.
+    ///
+    /// Every row is a single new token at position `past_len` attending over
+    /// `past_len` zero-seeded past-KV positions: `input_ids [N,1]`,
+    /// `attention_mask [N, past_len + 1]` (all valid), `position_ids [N,1] =
+    /// past_len` (or `[rank,N,1]` for mrope) and `past_key_values.* [N, heads,
+    /// past_len, head_dim]`. Unlike stage 2a's empty past, this drives the ONNX
+    /// attention **batch coupling across QKV / mask / past-KV** at `N > 1` with
+    /// real past content — the coupling `persistent_state_shapes` pins to batch 1
+    /// in the persistent decode path — and commits `N × past_len` of KV so the
+    /// weight-residency reclaim under the elastic budget (#866) is observable as
+    /// `htod_bytes_per_token` rising with `N` and `past_len`.
+    ///
+    /// Still a **stateless** probe: it never touches `self.past`,
+    /// `self.current_len`, or the CUDA persistent bindings, so `cuda.rs` KV
+    /// governance is untouched and CUDA-graph capture is not engaged (`past_len =
+    /// 0` is byte-identical to [`run_fused_batch_prefill`]). Row `i` is
+    /// byte-identical to a batch-1 forward of `token_ids[i]` at the same
+    /// `past_len` (the rows are independent; zero past is identical per row).
+    pub fn run_fused_batch_forward(
+        &mut self,
+        token_ids: &[TokenId],
+        past_len: usize,
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
         if token_ids.is_empty() {
-            bail!("run_fused_batch_prefill requires at least one token");
+            bail!("run_fused_batch_forward requires at least one token");
         }
         let batch = token_ids.len();
         if self.has_eager_step_inputs() {
             bail!(
-                "run_fused_batch_prefill supports token-id decoders only; this decoder declares inputs_embeds/routed per-step ports"
+                "run_fused_batch_forward supports token-id decoders only; this decoder declares inputs_embeds/routed per-step ports"
             );
         }
         let token_input = self
@@ -264,28 +292,35 @@ impl NativeDecodeSession {
             .map(|&id| i64::from(id))
             .collect::<Vec<_>>();
         let mut owned: Vec<(String, Tensor)> = Vec::with_capacity(3 + self.kv_inputs.len());
-        // input_ids: [N, 1] — one token per row.
+        // input_ids: [N, 1] — one new token per row.
         owned.push((token_input, Tensor::from_i64(&[batch, 1], &ids)?));
-        // attention_mask: [N, 1] — each row's single token is valid.
+        // attention_mask: [N, past_len + 1] — every past position and the new
+        // token are valid (uniform length, no ragged admission).
         if let Some(mask) = mask_input {
-            owned.push((mask, Tensor::from_i64(&[batch, 1], &vec![1i64; batch])?));
+            let mask_len = past_len + 1;
+            owned.push((
+                mask,
+                Tensor::from_i64(&[batch, mask_len], &vec![1i64; batch * mask_len])?,
+            ));
         }
-        // position_ids: every row is position 0. Rank 1 -> [N, 1]; a multi-axis
-        // mrope decoder (rank > 1) -> [rank, N, 1]. All-zero because past is empty.
+        // position_ids: every row's new token is at position `past_len`. Rank 1
+        // -> [N, 1]; a multi-axis mrope decoder (rank > 1) -> [rank, N, 1].
         if let Some(position) = position_input {
+            let pos = i64::try_from(past_len).context("past_len exceeds i64 range")?;
             let tensor = if self.position_rank <= 1 {
-                Tensor::from_i64(&[batch, 1], &vec![0i64; batch])?
+                Tensor::from_i64(&[batch, 1], &vec![pos; batch])?
             } else {
                 Tensor::from_i64(
                     &[self.position_rank, batch, 1],
-                    &vec![0i64; self.position_rank * batch],
+                    &vec![pos; self.position_rank * batch],
                 )?
             };
             owned.push((position, tensor));
         }
-        // Empty past for every KV / recurrent-state input, batch axis = N.
+        // Length-`past_len` batched past for every KV / recurrent-state input,
+        // batch axis = N.
         for name in &self.kv_inputs {
-            let tensor = make_empty_input_tensor_batched(&self.session, name, batch)?;
+            let tensor = make_past_input_tensor_batched(&self.session, name, batch, past_len)?;
             owned.push((name.clone(), tensor));
         }
 

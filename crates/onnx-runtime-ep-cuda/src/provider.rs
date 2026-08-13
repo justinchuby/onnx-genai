@@ -230,7 +230,8 @@ impl CudaExecutionProvider {
                 CudaWeightResidency::new(runtime.clone(), budget)
                     .with_async_pagein(offload_policy.async_pagein)
                     .with_scan_resistant_dense(offload_policy.scan_resistant_dense)
-                    .with_byte_aware_residency(offload_policy.byte_aware_residency),
+                    .with_byte_aware_residency(offload_policy.byte_aware_residency)
+                    .with_evict_order_probe(offload_policy.evict_order_probe),
             )
         });
         let provider = Self {

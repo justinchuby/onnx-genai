@@ -123,3 +123,78 @@ fn native_fused_batch_prefill_rejects_empty() {
     let mut session = synthetic_session();
     assert!(session.run_fused_batch_prefill(&[]).is_err());
 }
+
+#[test]
+fn native_fused_batch_forward_with_past_row_identical_to_batch_one() {
+    // Stage 2b: the batch-N fused forward over a *non-empty* length-L batched KV
+    // past must keep rows independent — row `i` bit-for-bit equal to a batch-1
+    // forward of the same token at the same past length. This exercises the ONNX
+    // attention batch coupling across QKV / mask / past-KV at N > 1 with real
+    // past content, which the stage 2a empty-past probe did not.
+    const TOKENS: [u32; 4] = [3, 17, 5, 29];
+    const PAST_LEN: usize = 6;
+
+    let mut session = synthetic_session();
+
+    let batched = session
+        .run_fused_batch_forward(&TOKENS, PAST_LEN)
+        .expect("batch-N fused forward with past");
+    assert_eq!(batched.len(), TOKENS.len());
+
+    for (index, &token) in TOKENS.iter().enumerate() {
+        let single = session
+            .run_fused_batch_forward(&[token], PAST_LEN)
+            .expect("batch-1 fused forward with past");
+        assert_eq!(single.len(), 1);
+        assert_eq!(
+            bits(&batched[index]),
+            bits(&single[0]),
+            "row {index} (token {token}) of the batch-{} forward at past_len {PAST_LEN} must be byte-identical to its batch-1 forward",
+            TOKENS.len()
+        );
+    }
+}
+
+#[test]
+fn native_fused_batch_forward_with_past_is_stateless() {
+    // A non-empty batched past must still leave the persistent decode state
+    // untouched (cuda.rs KV governance is not engaged).
+    let mut session = synthetic_session();
+    assert_eq!(session.current_len(), 0);
+
+    let _ = session
+        .run_fused_batch_forward(&[1, 2, 3], 8)
+        .expect("fused batch forward with past");
+    assert_eq!(
+        session.current_len(),
+        0,
+        "probe must not advance decode state even with a non-empty past"
+    );
+
+    let logits = session.decode(&[7], 0).expect("decode after probe");
+    assert_eq!(logits.len(), 1);
+    assert_eq!(session.current_len(), 1);
+}
+
+#[test]
+fn native_fused_batch_forward_past_zero_matches_prefill() {
+    // past_len == 0 must be byte-identical to the stage 2a empty-past prefill.
+    const TOKENS: [u32; 3] = [2, 11, 30];
+    let mut session = synthetic_session();
+
+    let prefill = session
+        .run_fused_batch_prefill(&TOKENS)
+        .expect("fused batch prefill");
+    let forward = session
+        .run_fused_batch_forward(&TOKENS, 0)
+        .expect("fused batch forward past_len=0");
+
+    assert_eq!(prefill.len(), forward.len());
+    for (index, (a, b)) in prefill.iter().zip(&forward).enumerate() {
+        assert_eq!(
+            bits(a),
+            bits(b),
+            "row {index}: run_fused_batch_forward(_, 0) must equal run_fused_batch_prefill"
+        );
+    }
+}
