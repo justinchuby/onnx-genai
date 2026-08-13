@@ -161,7 +161,7 @@ fn last_axis_growing_symbol(shape: &Shape) -> Option<SymbolId> {
 ///      `Attention`, `IndexShare`, and `CompressedSparseAttention`), including
 ///      CSA ratio-4's growing `selections` symbol on the **last** axis of
 ///      output 5 ([`KvCacheSlots::last_axis_outputs`]) — see
-///      [`collect_structural_growing_symbols`].
+///      [`collect_structural_growing_symbols_excluding`].
 ///   2. A GENERIC scan of the model's DECLARED past/present KV I/O — every graph
 ///      input named `past…`/output named `present…` with a rank-4 KV layout
 ///      `[batch, kv_heads, sequence, head_dim]` whose penultimate (sequence) axis
@@ -184,19 +184,39 @@ fn last_axis_growing_symbol(shape: &Shape) -> Option<SymbolId> {
 /// [`Graph::symbol_unifications`]: onnx_runtime_ir::Graph::symbol_unifications
 /// [`Graph::symbol_derivations`]: onnx_runtime_ir::Graph::symbol_derivations
 pub(super) fn compute_capture_growing_symbols(graph: &Graph) -> HashSet<SymbolId> {
+    compute_capture_growing_symbols_excluding(graph, &HashSet::new())
+}
+
+/// As [`compute_capture_growing_symbols`], but treating every symbol in `pinned`
+/// as a CONSTANT capacity axis: it is dropped from the structural seed (so the
+/// lineage closure never propagates it) and force-excluded from the returned set.
+/// See [`super::Executor::pin_fixed_capacity_kv_capture_symbols`] for why a
+/// fixed-capacity device-valid-length KV seq axis is safe to pin.
+pub(super) fn compute_capture_growing_symbols_excluding(
+    graph: &Graph,
+    pinned: &HashSet<SymbolId>,
+) -> HashSet<SymbolId> {
     // Denylist seed: only the STRUCTURALLY-GROWING KV symbols (plus any opaque
     // unknowable-extent symbol shape inference could not resolve). A symbol that
     // is not proven growing is treated as capturable.
-    let mut growing = collect_structural_growing_symbols(graph);
+    let mut growing = collect_structural_growing_symbols_excluding(graph, pinned);
     growing.extend(graph.symbol_opaque.iter().copied());
     close_disqualifying_set(graph, &mut growing);
+    if !pinned.is_empty() {
+        growing.retain(|sym| !pinned.contains(sym));
+    }
     growing
 }
 
 /// Collect the STRUCTURALLY-growing KV-length symbols from the graph — the raw
 /// seed, before any lineage closure. See [`compute_capture_growing_symbols`] for
 /// the source enumeration (recognized attention ops ∪ generic declared KV I/O).
-fn collect_structural_growing_symbols(graph: &Graph) -> HashSet<SymbolId> {
+/// Any symbol in `pinned` is removed from the seed (a fixed-capacity KV seq axis
+/// pinned to a constant capacity).
+fn collect_structural_growing_symbols_excluding(
+    graph: &Graph,
+    pinned: &HashSet<SymbolId>,
+) -> HashSet<SymbolId> {
     let mut growing = HashSet::new();
     for node in graph.nodes.values() {
         let Some(slots) = attention_kv_cache_slots(node) else {
@@ -254,7 +274,63 @@ fn collect_structural_growing_symbols(graph: &Graph) -> HashSet<SymbolId> {
             growing.insert(sym);
         }
     }
+    if !pinned.is_empty() {
+        growing.retain(|sym| !pinned.contains(sym));
+    }
     growing
+}
+
+/// The KV sequence-axis symbols that a fixed-capacity, device-valid-length
+/// attention path pins CONSTANT at the bound physical capacity. On this path the
+/// kernel's launch grid is capacity-sized (bounded by the physically-allocated
+/// `max_len`) and the valid attended length is read on-device (GQA's `seqlens_k`,
+/// mask-driven `Attention`'s additive-mask frontier, `IndexShare`'s
+/// attention-bias frontier), so a captured replay is shape-static: the seq axis
+/// never changes extent between steps. These symbols are therefore safe to ADMIT
+/// into capture — but only when the runtime actually binds the cache at fixed
+/// physical capacity, which is why this is applied through the engine-gated
+/// [`super::Executor::pin_fixed_capacity_kv_capture_symbols`] and never at build.
+///
+/// Only the CAPACITY form of each op contributes: the gate is
+/// [`kernel_input_uses_physical_capacity`] over the node's past-KV inputs, which
+/// is `false` for the growing-concat / paged / mask-less forms (and for
+/// `CompressedSparseAttention`, which has no past-KV inputs). A growing/paged KV
+/// path thus keeps its symbol in the disqualifying set and stays vetoed.
+pub(super) fn collect_capacity_pinned_kv_symbols(graph: &Graph) -> HashSet<SymbolId> {
+    let mut pinned = HashSet::new();
+    for node in graph.nodes.values() {
+        let Some(slots) = attention_kv_cache_slots(node) else {
+            continue;
+        };
+        // Require that EVERY past-KV input is read as physical capacity (the
+        // device-valid-length path). An op with no past inputs (CSA) or any
+        // growing-concat input does not qualify.
+        let capacity_form = !slots.past_inputs.is_empty()
+            && slots
+                .past_inputs
+                .iter()
+                .all(|&idx| super::geometry::kernel_input_uses_physical_capacity(node, idx));
+        if !capacity_form {
+            continue;
+        }
+        for &idx in slots.past_inputs {
+            if let Some(Some(vid)) = node.inputs.get(idx).copied()
+                && let Some(value) = graph.try_value(vid)
+                && let Some(sym) = kv_growing_symbol(&value.shape)
+            {
+                pinned.insert(sym);
+            }
+        }
+        for &idx in slots.present_outputs {
+            if let Some(&vid) = node.outputs.get(idx)
+                && let Some(value) = graph.try_value(vid)
+                && let Some(sym) = kv_growing_symbol(&value.shape)
+            {
+                pinned.insert(sym);
+            }
+        }
+    }
+    pinned
 }
 
 /// The capture classifier's mode. See [`compute_capture_disqualifying_symbols`].
@@ -315,10 +391,35 @@ pub(super) fn compute_capture_disqualifying_symbols(graph: &Graph) -> HashSet<Sy
     };
     if std::env::var("ONNX_GENAI_LOG_GROWING_SYMBOLS").is_ok() {
         eprintln!(
-            "[onnx-genai-capture] classifier={mode:?} build-time disqualifying-symbol set: \
-             {} symbol(s): {:?}",
+            "[onnx-genai-capture] classifier={mode:?} build-time disqualifying-symbol set:              {} symbol(s): {:?}",
             set.len(),
             set
+        );
+    }
+    set
+}
+
+/// As [`compute_capture_disqualifying_symbols`], but with `pinned` treated as
+/// constant capacity axes (see [`collect_capacity_pinned_kv_symbols`] and
+/// [`super::Executor::pin_fixed_capacity_kv_capture_symbols`]): each pinned
+/// symbol is dropped from the seed so the closure never propagates it, and is
+/// force-excluded from the result.
+pub(super) fn compute_capture_disqualifying_symbols_excluding(
+    graph: &Graph,
+    pinned: &HashSet<SymbolId>,
+) -> HashSet<SymbolId> {
+    let mode = CaptureClassifier::from_env();
+    let set = match mode {
+        CaptureClassifier::FailSafe => compute_not_pinned_symbols_excluding(graph, pinned),
+        CaptureClassifier::Denylist => compute_capture_growing_symbols_excluding(graph, pinned),
+    };
+    if std::env::var("ONNX_GENAI_LOG_GROWING_SYMBOLS").is_ok() {
+        eprintln!(
+            "[onnx-genai-capture] classifier={mode:?} build-time disqualifying-symbol set: \
+             {} symbol(s): {:?} (pinned-capacity KV: {:?})",
+            set.len(),
+            set,
+            pinned,
         );
     }
     set
@@ -335,7 +436,19 @@ pub(super) fn compute_capture_disqualifying_symbols(graph: &Graph) -> HashSet<Sy
 /// symbol derived purely from pinned sources (`Reshape`/`Flatten` of
 /// batch/heads) stays capturable and the capture collapse is preserved.
 pub(super) fn compute_not_pinned_symbols(graph: &Graph) -> HashSet<SymbolId> {
-    let mut set = collect_structural_growing_symbols(graph);
+    compute_not_pinned_symbols_excluding(graph, &HashSet::new())
+}
+
+/// As [`compute_not_pinned_symbols`], but with `pinned` dropped from the
+/// structural seed and force-excluded from the result (fixed-capacity KV seq
+/// axes pinned constant). A pinned KV seq symbol is a DECLARED root (id < floor,
+/// with no provenance edge), so it can only enter via the structural seed; the
+/// minted/opaque seeds below never introduce it.
+pub(super) fn compute_not_pinned_symbols_excluding(
+    graph: &Graph,
+    pinned: &HashSet<SymbolId>,
+) -> HashSet<SymbolId> {
+    let mut set = collect_structural_growing_symbols_excluding(graph, pinned);
     set.extend(graph.symbol_opaque.iter().copied());
 
     // Without a persisted floor (inference did not run) we cannot tell a minted
@@ -365,6 +478,9 @@ pub(super) fn compute_not_pinned_symbols(graph: &Graph) -> HashSet<SymbolId> {
     }
 
     close_disqualifying_set(graph, &mut set);
+    if !pinned.is_empty() {
+        set.retain(|sym| !pinned.contains(sym));
+    }
     set
 }
 

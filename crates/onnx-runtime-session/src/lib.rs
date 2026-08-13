@@ -1413,6 +1413,24 @@ impl InferenceSession {
         self.exec.reset_device_graph()
     }
 
+    /// Pin the fixed-capacity KV sequence-axis symbols CONSTANT so CUDA-graph
+    /// capture ADMITS the attention nodes (`GroupQueryAttention` in particular)
+    /// instead of vetoing each as a growing-seq eager seam. Returns the total
+    /// number of symbols pinned across this session's executors.
+    ///
+    /// Call this ONLY once the engine has bound fixed-capacity, device-resident
+    /// KV (physical `[.., max_len, ..]`, valid length read on-device) and CUDA
+    /// graphs are enabled — see
+    /// [`executor::Executor::pin_fixed_capacity_kv_capture_symbols`] for the full
+    /// correctness argument. A growing/paged KV decoder must NOT call this.
+    pub fn pin_fixed_capacity_kv_capture_symbols(&mut self) -> usize {
+        let mut pinned = self.exec.pin_fixed_capacity_kv_capture_symbols();
+        if let Some(inline) = self.decode_inline_exec.as_mut() {
+            pinned += inline.pin_fixed_capacity_kv_capture_symbols();
+        }
+        pinned
+    }
+
     /// Number of captured device-graph segments installed by the most recent
     /// [`Self::try_capture_with_device_bindings`] call.
     ///
