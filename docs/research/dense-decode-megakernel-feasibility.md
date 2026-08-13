@@ -1,7 +1,7 @@
 # Dense-decode megakernel feasibility (Muse-Glimmer-30B, native CUDA, M=1)
 
 **Author:** Sebastian (Performance/Systems). **Date:** 2026-08-13. **Branch:** `squad/dense-decode-megakernel`.
-**Status:** Phase A gate **PASSED** → Phase B glue micro-benchmark run → **P1.5 fused-int4-GEMV + grid.sync-capture probes run** → **GO to prototype P2 as a persistent multi-CTA cooperative kernel** (see §5, §6).
+**Status:** Phase A gate **PASSED** → Phase B glue micro-benchmark → P1.5 fused-int4-GEMV + grid.sync-capture probes → **P2-prototype multi-CTA cooperative megakernel MEASURED → NO-GO for the GEMV megakernel** (see §7). The real remaining lever is graph-side glue node-collapse (Batty), not a cooperative megakernel.
 
 > **Headline.** Native decode of Muse-Glimmer-30B is confirmed **latency-bound on a
 > ~2568-node serial launch chain** (~21.4 ms/token, 46.7 tok/s on H200 at
@@ -29,6 +29,22 @@
 > capture and instantiates a graph. **Net: P2 stays GO, now scoped concretely as a
 > persistent multi-CTA cooperative megakernel** (grid.sync barriers between the
 > resident sub-GEMVs), not a single giant CTA. See §6.
+>
+> **P2-prototype update (2026-08-13) — the decisive negative.** The multi-CTA
+> cooperative megakernel P1.5 pinned was actually **built and measured** (MLP
+> triple-GEMV block: gate/up → SiLU·Mul → down, grid sized to occupancy = 1056
+> co-resident CTAs, `grid.sync` seams, activations in L2-resident global scratch).
+> Result vs the identical-math per-op baseline: **−3.2% (megakernel is ~3% SLOWER),
+> reproducible, byte-exact (0 ulp).** The launch-collapse win the whole thesis
+> rested on is **already captured by CUDA-graph replay** for the GEMV-dominated
+> path, and the multi-CTA design must *pay* a `grid.sync` tax (**2.23 µs/barrier**
+> on the full 1056-CTA grid). The GEMVs are genuine full-device weight-read work a
+> megakernel cannot accelerate — it only reorganizes them and adds barriers.
+> **Revised verdict: NO-GO on the whole-layer GEMV megakernel (P2).** The only
+> component with recoverable overhead is the tiny elementwise/norm **glue**, and
+> that is better attacked **graph-side** (Batty's node-count collapse to shrink the
+> captured graph's replay overhead) — cheaper, lower-risk, and no numerics gate.
+> See §7.
 
 ---
 
@@ -145,6 +161,12 @@ All above 47.25; the lever is real.
 
 ## 5. Go/no-go for P2 (whole-step integration)
 
+> **⚠️ SUPERSEDED by §7 (2026-08-13).** This section's **GO** was based on Phase A/B
+> headroom + the *projection* that a megakernel recovers ~85% of the chain. §7 then
+> **built and measured** the multi-CTA cooperative megakernel and found **no
+> recovery on the GEMV-dominated path (−3.2%)**. The verdict below is retained for
+> provenance; **the operative verdict is §7's NO-GO for the GEMV megakernel.**
+
 **GO — but staged, because P2 is a multi-week capture-safe kernel effort, not a quick win.**
 
 - **Why the #769 P0 no-go does not apply:** P0 was a per-op persistent **QMoE** kernel on
@@ -258,15 +280,117 @@ internal alloc/free and dynamic parallelism inside the kernel (#854/#867 rules).
 to persistent multi-CTA cooperative. Fund the P2 prototype behind an env flag with a
 graph-break fallback and the Chew numerics gate.
 
+> **Superseded by §7:** §6's "GO (staged prototype)" was correct on *architecture*
+> (multi-CTA, capturable) but was still a projection on the *payoff*. §7 built that
+> exact architecture and measured the payoff — see the NO-GO below.
+
+---
+
+## 7. P2-prototype — multi-CTA cooperative megakernel BUILT & MEASURED (the go/no-go)
+
+P1.5 pinned the only viable architecture: a **persistent multi-CTA cooperative
+kernel** (grid sized to occupancy so every sub-GEMV reads its int4 weights across the
+full device, `grid.sync` barriers between sub-GEMVs, activations passed through
+L2-resident global scratch — not one CTA's shared memory). §7 **builds that kernel**
+for the MLP triple-GEMV block (`gate/up → SiLU·Mul → down`, the largest self-contained
+GEMV chain in a decoder layer) and measures per-MLP GPU time vs the current per-op
+launch sequence on **identical tensors and identical int4 dequant math** (block-32,
+fp32 accumulate, same `block_sum` order on both sides — so the recovered *fraction*,
+the `grid.sync` cost, and the achieved occupancy are apples-to-apples).
+
+### 7.1 Measured result (H200, median of 200 iters, 3 repeats)
+
+| Variant | Launches | GPU time / layer-MLP | vs baseline |
+|---|---|---|---|
+| Per-op baseline (grid = N, full-device) | 4 | **0.656 ms** | 1× |
+| **Multi-CTA cooperative megakernel** (1 coop launch, `grid.sync` seams) | 1 | **0.676–0.680 ms** | **1.03× — ~3% SLOWER** |
+
+- **Recovered fraction: −3.2%** (reproducible: −3.5%, −3.5%, −2.9%). The megakernel is
+  *slightly slower*, not faster.
+- **Occupancy:** mega kernel = 8 blocks/SM → **1056 co-resident CTAs** across 132 SMs
+  (cooperative launch supported, `CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH=1`).
+- **`grid.sync` barrier cost = 2.23 µs/barrier** on the full 1056-CTA grid; the MLP
+  megakernel pays 2 (a full layer would pay ~6–8 at the QKV/RoPE/GQA/O/norm/SiLU seams
+  → ~13–18 µs/layer × 52 ≈ **0.7–0.9 ms/token of pure barrier tax**).
+- **Numerics: max_abs = 0, max_ulp = 0 — byte-exact.** Multi-CTA + grid.sync does not
+  reorder any reduction (no Chew gate needed for this structure).
+
+### 7.2 Why the megakernel does not win (the mechanism)
+
+The whole megakernel thesis was: collapse ~49 launches/layer → 1, recovering per-launch
+overhead + activation DRAM round-trips. Two measured facts kill that for the
+GEMV-dominated path:
+
+1. **CUDA-graph replay already removes the launch overhead.** Phase A measured eager
+   27.6 ms/token → captured 21.4 ms — capture already recovered ~6.1 ms of CPU-side
+   launch cost. Under graph replay the per-node residual cost is small; there is little
+   left for a megakernel to recover on the fat GEMV launches (each ~0.16 ms of real
+   work here).
+2. **The multi-CTA design must pay a `grid.sync` tax** (2.23 µs × barriers) that the
+   per-op baseline never pays — and this tax scales with the number of fused seams. It
+   roughly cancels (here, slightly exceeds) the launch/round-trip savings.
+
+The GEMVs themselves are genuine **full-device weight-read work** — the per-op kernels
+already fan weight reads across all 132 SMs (that's why P1.5's single-CTA was 926×
+worse). A megakernel does the *same* reads; it cannot make them faster, it only
+reorganizes them and adds barriers. The activation round-trips it removes (gate/up/act
+scratch, ~80 KB each) are already L2-resident, so removing them saves ~nothing.
+
+### 7.3 Caveats (stated, not papered over)
+
+- **Representative kernel, not the production f16 dp4a split-K GEMV.** Absolute ms is
+  ~10× the production kernel's, so the *fraction* transfers but the absolute per-layer
+  budget does not (same caveat as §6.1). A faster production GEMV makes fixed launch
+  overhead a *larger* relative share — but it makes the `grid.sync` tax a larger share
+  too, and graph replay still removes the launch overhead regardless. The mechanism in
+  §7.2 is kernel-speed-independent.
+- **Eager-timed baseline.** The real decode replays a captured graph, where the
+  baseline's per-launch overhead is *even lower* → the megakernel's (already negative)
+  edge only gets worse.
+- **MLP subset, not the full layer.** The MLP is the largest GEMV block; attention adds
+  QKV/O GEMVs + GQA-decode + more norm/RoPE seams (more barriers), which pushes the
+  megakernel further behind, not ahead.
+
+### 7.4 Revised P2 verdict — **NO-GO on the GEMV megakernel; redirect to graph-side collapse**
+
+- **NO-GO:** funding the multi-week whole-layer cooperative GEMV megakernel + its
+  capture-safety/numerics gating is **not justified** — the measured per-layer recovery
+  is **negative** on the GEMV-dominated path. The architecture is sound and capturable;
+  the *payoff isn't there* because graph replay already banked the launch win and the
+  GEMVs are irreducible full-device work.
+- **The real remaining lever is graph-side, and it's Batty's, not a kernel megakernel.**
+  The only decode component with recoverable overhead is the elementwise/norm **glue**
+  (Phase B: 85.6% of the *glue* GPU time is fusible). Attack it by **collapsing glue
+  nodes in the graph/optimizer** (`optimizer.rs`, Batty) to shrink the captured graph's
+  replay overhead — this needs no cooperative kernel, no `grid.sync` tax, and no numerics
+  reorder. Sebastian's kernel-side contribution is limited to the already-landed fused
+  epilogues (#867 SwiGLU-mul, #854 skip-RMSNorm) that let Batty delete standalone nodes.
+- **Projected tok/s from a GEMV megakernel: ~0% (decode stays ~47 tok/s).** The §4
+  "~62 → ~100+ tok/s" projection assumed ~85% chain recovery; §7 shows that recovery
+  does **not** apply to the GEMVs, so the projection does not hold for a megakernel.
+  Realistic upside now lives entirely in glue node-count reduction (bounded, graph-side)
+  plus any GQA-decode kernel improvement — both cheaper than a megakernel.
+
+### 7.5 If anyone still wants to chase a megakernel later
+
+The one scenario not excluded here: a design that **overlaps the next layer's int4
+weight prefetch with the current layer's compute** (software-pipelined, Hazy-style) to
+hide Long-Scoreboard global-load latency — that attacks the *GEMV* time itself, which
+§7 shows is the actual floor, rather than launch overhead (already gone). That is a
+fundamentally harder kernel than node-collapse and should only be scoped if graph-side
+glue collapse + GQA tuning are exhausted and still short of target. It would still face
+the `grid.sync`/occupancy/register-pressure constraints from §6.
+
 ---
 
 - Env: `source /home/justinchu/onnx-genai/.cudaenv.sh`; `CUDA_VISIBLE_DEVICES=0 ONNX_GENAI_CUDA_DEVICE=0`.
 - Baseline/eager/op-mix: `profile_native` as in §1 (`ONNX_GENAI_CUDA_GRAPH=0/1`, `ONNX_GENAI_PROFILE_OPS=1`).
-- Phase B / P1.5 micro-bench (throwaway, `#[ignore]`, never shipped):
+- Phase B / P1.5 / P2-prototype micro-bench (throwaway, `#[ignore]`, never shipped):
   `cargo test --release -p onnx-runtime-ep-cuda --features cuda --test megakernel_headroom_gpu -- --ignored --nocapture`.
-  Tests: `megakernel_headroom_probe` (glue), `megakernel_int4_mlp_probe` (fused int4 MLP vs per-op),
-  `grid_sync_capture_gate_probe` (cooperative-launch-under-capture gate).
+  Tests: `megakernel_headroom_probe` (glue), `megakernel_int4_mlp_probe` (fused single-CTA int4 MLP vs per-op),
+  `grid_sync_capture_gate_probe` (cooperative-launch-under-capture gate),
+  `megakernel_multicta_mlp_probe` (§7: persistent multi-CTA cooperative MLP vs per-op + grid.sync barrier cost).
   Knobs: `NXRT_MK_HIDDEN` (6656), `NXRT_MK_INTER` (19968), `NXRT_MK_GLUE_OPS` (22),
-  `NXRT_MK_ITERS` (200), `NXRT_MK_MLP_ITERS` (50), `NXRT_MK_LAYERS` (52).
+  `NXRT_MK_ITERS` (200), `NXRT_MK_MLP_ITERS` (50), `NXRT_MK_MC_ITERS` (200), `NXRT_MK_LAYERS` (52).
 - Model dir: `.../olive-recipes/meta-models-Muse-Glimmer-30B/cuda/int4/models` (`--pipeline`; never write through the symlink).
 - Profilers (ncu/nsys) are blocked in-sandbox (`RmProfilingAdminOnly=1`); all numbers are built-in op timer + CUDA-event + wall-clock, per the profiling skill.

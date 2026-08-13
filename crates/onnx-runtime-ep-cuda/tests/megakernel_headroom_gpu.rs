@@ -802,3 +802,567 @@ extern "C" __global__ void coop_noop(int* p) {
     runtime.synchronize().ok();
     unsafe { runtime.free_raw(p).ok() };
 }
+
+// ===========================================================================
+// P2-prototype — persistent MULTI-CTA cooperative one-layer megakernel.
+//
+// P1.5 pinned the architecture: single-CTA residency is 926x too slow (one SM
+// ~= 1/132 of device weight-read bandwidth), and grid.sync IS capturable, so
+// the megakernel must be a persistent MULTI-CTA cooperative kernel — every
+// sub-GEMV reads its int4 weights across the FULL device, activations pass
+// between sub-GEMVs through small L2-resident global scratch synchronized by
+// grid.sync (NOT pinned to one CTA's shared memory).
+//
+// This probe builds that kernel for the MLP triple-GEMV block (gate/up ->
+// SiLU-mul -> down, the largest self-contained GEMV chain in a decoder layer)
+// and measures per-MLP GPU time vs the current per-op launch sequence on
+// IDENTICAL tensors. The int4 GEMV math is a representative block-32 f32-accum
+// dequant used on BOTH sides, so the recovered *fraction*, the grid.sync
+// barrier cost, and the achieved occupancy are apples-to-apples even though the
+// absolute ms is not the production f16 split-K dp4a kernel's absolute ms
+// (same caveat as P1.5 §6.1). Also measures the standalone grid.sync barrier
+// cost, the fixed per-seam overhead the projection must pay.
+//
+// Throwaway `#[ignore]`; not wired into any dispatch path.
+// ===========================================================================
+
+// Shared int4 dequant GEMV (block-32, symmetric zp=8, fp32 accumulate,
+// identical block_sum order to matmul_nbits_gemv_f32). `gemv_grid` is the
+// per-op baseline entry (grid-stride over columns so ONE launch with any grid
+// size covers all N). Duplicated verbatim into MEGA_SRC below so the fused and
+// per-op paths run byte-identical math.
+const MC_GEMV_DEV: &str = r#"
+__device__ __forceinline__ float mc_warp_sum(float v) {
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
+    return v;
+}
+__device__ __forceinline__ float mc_block_sum(float value) {
+    __shared__ float ws[32];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    value = mc_warp_sum(value);
+    if (lane == 0) ws[warp] = value;
+    __syncthreads();
+    value = threadIdx.x < ((blockDim.x + 31) >> 5) ? ws[lane] : 0.0f;
+    return warp == 0 ? mc_warp_sum(value) : 0.0f;
+}
+__device__ __forceinline__ float mc_gemv_col(
+    const float* act, const unsigned char* packed, const float* scales,
+    int k, int col) {
+    const int k_blocks = k >> 5;
+    const int blob = 16;
+    float value = 0.0f;
+    for (int depth = threadIdx.x; depth < k; depth += blockDim.x) {
+        int block = depth >> 5;
+        int within = depth & 31;
+        int base = (col * k_blocks + block) * blob;
+        unsigned char byte = packed[base + (within >> 1)];
+        int q = (within & 1) ? (byte >> 4) : (byte & 15);
+        float s = scales[col * k_blocks + block];
+        value += act[depth] * (float)(q - 8) * s;
+    }
+    return mc_block_sum(value);
+}
+"#;
+
+fn base_src() -> String {
+    format!(
+        "{MC_GEMV_DEV}\n{}",
+        r#"
+extern "C" __global__ void gemv_grid(
+    const float* act, const unsigned char* packed, const float* scales,
+    float* out, int k, int n) {
+    for (int col = blockIdx.x; col < n; col += gridDim.x) {
+        float v = mc_gemv_col(act, packed, scales, k, col);
+        if (threadIdx.x == 0) out[col] = v;
+        __syncthreads();
+    }
+}
+extern "C" __global__ void silu_mul_grid(
+    const float* g, const float* u, float* out, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += gridDim.x * blockDim.x) {
+        float x = g[i];
+        out[i] = (x / (1.0f + expf(-x))) * u[i];
+    }
+}
+"#
+    )
+}
+
+fn mega_src() -> String {
+    format!(
+        "#include <cooperative_groups.h>\nnamespace cg = cooperative_groups;\n{MC_GEMV_DEV}\n{}",
+        r#"
+// Persistent multi-CTA cooperative MLP: grid sized to occupancy so all CTAs are
+// co-resident. Each sub-GEMV grid-strides its columns across the WHOLE grid
+// (full-device weight reads). Activations pass through L2-resident global
+// scratch, synchronized by grid.sync (2 barriers: after gate+up, after silu).
+extern "C" __global__ void mlp_mega_coop(
+    const float* xin,
+    const unsigned char* gp, const float* gs,
+    const unsigned char* up_packed, const float* us,
+    const unsigned char* dp, const float* ds,
+    float* gsc, float* usc, float* asc, float* out,
+    int h, int inter) {
+    cg::grid_group grid = cg::this_grid();
+    for (int col = blockIdx.x; col < inter; col += gridDim.x) {
+        float v = mc_gemv_col(xin, gp, gs, h, col);
+        if (threadIdx.x == 0) gsc[col] = v;
+        __syncthreads();
+    }
+    for (int col = blockIdx.x; col < inter; col += gridDim.x) {
+        float v = mc_gemv_col(xin, up_packed, us, h, col);
+        if (threadIdx.x == 0) usc[col] = v;
+        __syncthreads();
+    }
+    grid.sync();
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < inter;
+         i += gridDim.x * blockDim.x) {
+        float x = gsc[i];
+        asc[i] = (x / (1.0f + expf(-x))) * usc[i];
+    }
+    grid.sync();
+    for (int col = blockIdx.x; col < h; col += gridDim.x) {
+        float v = mc_gemv_col(asc, dp, ds, inter, col);
+        if (threadIdx.x == 0) out[col] = v;
+        __syncthreads();
+    }
+}
+// Standalone grid.sync cost: `reps` back-to-back barriers, nothing else.
+extern "C" __global__ void barrier_only(int reps, int* sink) {
+    cg::grid_group grid = cg::this_grid();
+    int acc = 0;
+    for (int r = 0; r < reps; ++r) { grid.sync(); acc += r; }
+    if (threadIdx.x == 0 && blockIdx.x == 0) sink[0] = acc;
+}
+"#
+    )
+}
+
+// Discover NVRTC include dirs so cooperative_groups.h (and the libcudacxx
+// `cuda/std/*` headers it pulls in) resolve. Prefer a self-consistent toolkit
+// include set (CG header + its `cccl` libcudacxx subdir) over the wheel headers.
+fn coop_include_paths() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push_if = |dir: std::path::PathBuf, marker: &str| {
+        if dir.join(marker).exists() {
+            let s = dir.to_string_lossy().into_owned();
+            if !out.contains(&s) {
+                out.push(s);
+            }
+        }
+    };
+    // Toolkit roots that ship both the CG header and the cccl libcudacxx tree.
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    for var in ["CUDA_HOME", "CUDA_PATH"] {
+        if let Some(root) = std::env::var_os(var) {
+            roots.push(std::path::PathBuf::from(root));
+        }
+    }
+    for g in glob_cuda_roots() {
+        roots.push(g);
+    }
+    for root in roots {
+        for inc in [
+            root.join("include"),
+            root.join("targets/x86_64-linux/include"),
+        ] {
+            // CG header dir first, then its cccl libcudacxx subdir.
+            push_if(inc.clone(), "cooperative_groups.h");
+            push_if(inc.join("cccl"), "cuda/std/type_traits");
+            push_if(inc.clone(), "cuda/std/type_traits");
+        }
+    }
+    // Wheel fallback (may still miss cuda/std; only used if toolkit absent).
+    if let Some(paths) = std::env::var_os("LD_LIBRARY_PATH") {
+        for p in std::env::split_paths(&paths) {
+            if let Some(nvidia) = p.parent().and_then(|x| x.parent()) {
+                push_if(nvidia.join("cuda_runtime/include"), "cooperative_groups.h");
+            }
+        }
+    }
+    out
+}
+
+fn glob_cuda_roots() -> Vec<std::path::PathBuf> {
+    let mut v = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/usr/local") {
+        for e in entries.flatten() {
+            let name = e.file_name();
+            if name.to_string_lossy().starts_with("cuda") {
+                v.push(e.path());
+            }
+        }
+    }
+    v.push("/usr/local/cuda".into());
+    v
+}
+
+// Compile `src` to CUBIN (sm_90) with the given includes and return a raw
+// CUfunction for `entry` — needed because cudarc hides cu_function and only the
+// raw handle can be passed to cuLaunchCooperativeKernel / raw occupancy.
+fn cubin_function(
+    src: &str,
+    entry: &str,
+    includes: &[String],
+) -> Option<cudarc::driver::sys::CUfunction> {
+    use cudarc::driver::result;
+    use std::ffi::{CString, c_void};
+    let source = CString::new(src).ok()?;
+    let name = CString::new("nxrt_mc_mod").ok()?;
+    let program =
+        cudarc::nvrtc::result::create_program(source.as_c_str(), Some(name.as_c_str())).ok()?;
+    let mut opts: Vec<String> = vec!["--gpu-architecture=sm_90".into()];
+    for inc in includes {
+        opts.push(format!("--include-path={inc}"));
+    }
+    if let Err(e) = unsafe { cudarc::nvrtc::result::compile_program(program, &opts) } {
+        let log = unsafe { cudarc::nvrtc::result::get_program_log(program) }
+            .ok()
+            .map(|b| {
+                unsafe { std::ffi::CStr::from_ptr(b.as_ptr()) }
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .unwrap_or_default();
+        eprintln!("[mk2] cubin compile failed for {entry}: {e:?}\n{log}");
+        let _ = unsafe { cudarc::nvrtc::result::destroy_program(program) };
+        return None;
+    }
+    let mut size = 0usize;
+    unsafe { cudarc::nvrtc::sys::nvrtcGetCUBINSize(program, &mut size) }
+        .result()
+        .ok()?;
+    let mut image = vec![0u8; size];
+    unsafe { cudarc::nvrtc::sys::nvrtcGetCUBIN(program, image.as_mut_ptr().cast()) }
+        .result()
+        .ok()?;
+    let _ = unsafe { cudarc::nvrtc::result::destroy_program(program) };
+    let module = unsafe { result::module::load_data(image.as_ptr() as *const c_void) }.ok()?;
+    unsafe { result::module::get_function(module, CString::new(entry).ok()?) }.ok()
+}
+
+#[test]
+#[ignore = "requires a CUDA device; run with --ignored --nocapture"]
+fn megakernel_multicta_mlp_probe() {
+    use cudarc::driver::result;
+    use cudarc::driver::sys::{CUdevice_attribute, CUevent_flags};
+    use std::ffi::c_void;
+
+    let ep = match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
+        Ok(Ok(ep)) => ep,
+        _ => {
+            eprintln!("[mk2] no CUDA runtime; skipping");
+            return;
+        }
+    };
+    let runtime = ep.runtime();
+    let stream = runtime.stream().clone();
+    let ctx = stream.context().clone();
+
+    let h = env_usize("NXRT_MK_HIDDEN", 6656);
+    let inter = env_usize("NXRT_MK_INTER", 19968);
+    let iters = env_usize("NXRT_MK_MC_ITERS", 200);
+    let block = 256u32;
+    let kb_gate = h / 32;
+    let kb_down = inter / 32;
+    let blob = 16usize;
+
+    // Baseline per-op kernels (CudaFunction via runtime — normal launches).
+    let bsrc = base_src();
+    let gemv = runtime
+        .nvrtc_function(
+            "nxrt_mc_base",
+            Box::leak(bsrc.clone().into_boxed_str()),
+            "gemv_grid",
+        )
+        .unwrap();
+    let silu = runtime
+        .nvrtc_function(
+            "nxrt_mc_base",
+            Box::leak(bsrc.into_boxed_str()),
+            "silu_mul_grid",
+        )
+        .unwrap();
+
+    // Megakernel + barrier probe: raw CUfunction (cooperative launch path).
+    let includes = coop_include_paths();
+    if includes.is_empty() {
+        eprintln!("[mk2] no cooperative_groups.h include dir found; skipping");
+        return;
+    }
+    let msrc = mega_src();
+    let mega = match cubin_function(&msrc, "mlp_mega_coop", &includes) {
+        Some(f) => f,
+        None => {
+            eprintln!("[mk2] mega kernel compile failed; skipping");
+            return;
+        }
+    };
+    let barrier = cubin_function(&msrc, "barrier_only", &includes).unwrap();
+
+    // Device support + occupancy-based cooperative grid sizing.
+    let coop_supported = ctx
+        .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COOPERATIVE_LAUNCH)
+        .unwrap_or(0);
+    let sm_count = ctx
+        .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+        .unwrap() as u32;
+    let occ = unsafe {
+        result::occupancy::max_active_block_per_multiprocessor_with_flags(mega, block as i32, 0, 0)
+    }
+    .unwrap_or(1) as u32;
+    let coop_grid = (occ * sm_count).max(1);
+    eprintln!(
+        "[mk2] device: SMs={}, coop_launch_supported={}, mega occupancy={} blocks/SM => cooperative grid={} CTAs ({} resident/SM)",
+        sm_count, coop_supported, occ, coop_grid, occ
+    );
+    if coop_supported == 0 {
+        eprintln!("[mk2] cooperative launch unsupported; skipping");
+        return;
+    }
+
+    // Buffers (deterministic fills reused from the P1.5 helpers).
+    let mk = |bytes: usize, data: &[u8]| {
+        let p = runtime.alloc_raw(bytes).unwrap();
+        unsafe { runtime.htod(data, p).unwrap() };
+        p
+    };
+    let gate_packed = mk(
+        inter * kb_gate * blob,
+        &fill_bytes(inter * kb_gate * blob, 11),
+    );
+    let up_packed = mk(
+        inter * kb_gate * blob,
+        &fill_bytes(inter * kb_gate * blob, 22),
+    );
+    let down_packed = mk(h * kb_down * blob, &fill_bytes(h * kb_down * blob, 33));
+    let gate_scales = mk(
+        inter * kb_gate * 4,
+        &fill_f32(inter * kb_gate, 44, 0.01, 0.0),
+    );
+    let up_scales = mk(
+        inter * kb_gate * 4,
+        &fill_f32(inter * kb_gate, 55, 0.01, 0.0),
+    );
+    let down_scales = mk(h * kb_down * 4, &fill_f32(h * kb_down, 66, 0.01, 0.0));
+    let xin = mk(h * 4, &fill_f32(h, 77, 0.2, -0.1));
+    let gsc = runtime.alloc_raw(inter * 4).unwrap();
+    let usc = runtime.alloc_raw(inter * 4).unwrap();
+    let asc = runtime.alloc_raw(inter * 4).unwrap();
+    let base_out = runtime.alloc_raw(h * 4).unwrap();
+    let mega_out = runtime.alloc_raw(h * 4).unwrap();
+    let sink = runtime.alloc_raw(4).unwrap();
+
+    let time_ms = |launch: &mut dyn FnMut()| -> f32 {
+        let s = ctx
+            .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+            .unwrap();
+        let e = ctx
+            .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+            .unwrap();
+        s.record(&stream).unwrap();
+        launch();
+        e.record(&stream).unwrap();
+        s.elapsed_ms(&e).unwrap()
+    };
+
+    let hi = h as i32;
+    let interi = inter as i32;
+
+    // --- baseline: 4 per-op launches (gate GEMV, up GEMV, silu-mul, down GEMV) ---
+    let run_baseline = || {
+        let gcfg = LaunchConfig {
+            grid_dim: (inter as u32, 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut b = stream.launch_builder(&gemv);
+        b.arg(&xin)
+            .arg(&gate_packed)
+            .arg(&gate_scales)
+            .arg(&gsc)
+            .arg(&hi)
+            .arg(&interi);
+        unsafe { b.launch(gcfg) }.unwrap();
+        let mut b = stream.launch_builder(&gemv);
+        b.arg(&xin)
+            .arg(&up_packed)
+            .arg(&up_scales)
+            .arg(&usc)
+            .arg(&hi)
+            .arg(&interi);
+        unsafe { b.launch(gcfg) }.unwrap();
+        let scfg = LaunchConfig {
+            grid_dim: ((inter as u32).div_ceil(block), 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut b = stream.launch_builder(&silu);
+        b.arg(&gsc).arg(&usc).arg(&asc).arg(&interi);
+        unsafe { b.launch(scfg) }.unwrap();
+        let dcfg = LaunchConfig {
+            grid_dim: (h as u32, 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut b = stream.launch_builder(&gemv);
+        b.arg(&asc)
+            .arg(&down_packed)
+            .arg(&down_scales)
+            .arg(&base_out)
+            .arg(&interi)
+            .arg(&hi);
+        unsafe { b.launch(dcfg) }.unwrap();
+    };
+
+    // --- mega: 1 cooperative launch, grid = occupancy x SMs, grid.sync seams ---
+    let run_mega = || {
+        let mut a_xin = xin;
+        let mut a_gp = gate_packed;
+        let mut a_gs = gate_scales;
+        let mut a_up = up_packed;
+        let mut a_us = up_scales;
+        let mut a_dp = down_packed;
+        let mut a_ds = down_scales;
+        let mut a_gsc = gsc;
+        let mut a_usc = usc;
+        let mut a_asc = asc;
+        let mut a_out = mega_out;
+        let mut a_h = hi;
+        let mut a_inter = interi;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_xin as *mut _ as *mut c_void,
+            &mut a_gp as *mut _ as *mut c_void,
+            &mut a_gs as *mut _ as *mut c_void,
+            &mut a_up as *mut _ as *mut c_void,
+            &mut a_us as *mut _ as *mut c_void,
+            &mut a_dp as *mut _ as *mut c_void,
+            &mut a_ds as *mut _ as *mut c_void,
+            &mut a_gsc as *mut _ as *mut c_void,
+            &mut a_usc as *mut _ as *mut c_void,
+            &mut a_asc as *mut _ as *mut c_void,
+            &mut a_out as *mut _ as *mut c_void,
+            &mut a_h as *mut _ as *mut c_void,
+            &mut a_inter as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            result::launch_cooperative_kernel(
+                mega,
+                (coop_grid, 1, 1),
+                (block, 1, 1),
+                0,
+                stream.cu_stream(),
+                &mut params,
+            )
+        }
+        .unwrap();
+    };
+
+    run_baseline();
+    run_mega();
+    runtime.synchronize().unwrap();
+
+    let base_ms = median(
+        (0..iters)
+            .map(|_| time_ms(&mut || run_baseline()))
+            .collect(),
+    );
+    runtime.synchronize().unwrap();
+    let mega_ms = median((0..iters).map(|_| time_ms(&mut || run_mega())).collect());
+    runtime.synchronize().unwrap();
+
+    // --- standalone grid.sync barrier cost ---
+    let bar_reps = 1000i32;
+    let mut a_reps = bar_reps;
+    let mut a_sink = sink;
+    let mut run_barriers = || {
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_reps as *mut _ as *mut c_void,
+            &mut a_sink as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            result::launch_cooperative_kernel(
+                barrier,
+                (coop_grid, 1, 1),
+                (block, 1, 1),
+                0,
+                stream.cu_stream(),
+                &mut params,
+            )
+        }
+        .unwrap();
+    };
+    run_barriers();
+    runtime.synchronize().unwrap();
+    let bar_ms = median(
+        (0..iters.min(50))
+            .map(|_| time_ms(&mut || run_barriers()))
+            .collect(),
+    );
+    runtime.synchronize().unwrap();
+    let per_barrier_us = bar_ms * 1000.0 / bar_reps as f32;
+
+    eprintln!(
+        "[mk2] per-op baseline MLP (4 launches, grid=N):        {:.4} ms/layer-MLP",
+        base_ms
+    );
+    eprintln!(
+        "[mk2] multi-CTA cooperative mega MLP (1 coop launch):  {:.4} ms/layer-MLP",
+        mega_ms
+    );
+    let recovered = (base_ms - mega_ms) / base_ms * 100.0;
+    eprintln!(
+        "[mk2] recovered fraction = {:.1}%  (mega/baseline = {:.3}x)",
+        recovered,
+        mega_ms / base_ms
+    );
+    eprintln!(
+        "[mk2] grid.sync barrier cost = {:.3} us/barrier (full {}-CTA grid); mega pays 2/MLP",
+        per_barrier_us, coop_grid
+    );
+
+    // Numerics: identical dequant + reduction order => byte-exact.
+    let mut bh = vec![0u8; h * 4];
+    let mut mh = vec![0u8; h * 4];
+    unsafe {
+        runtime.dtoh(&mut bh, base_out).unwrap();
+        runtime.dtoh(&mut mh, mega_out).unwrap();
+    }
+    let rd = |b: &[u8], i: usize| {
+        f32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]])
+    };
+    let mut max_abs = 0.0f32;
+    let mut max_ulp = 0i64;
+    for i in 0..h {
+        let (a, b) = (rd(&bh, i), rd(&mh, i));
+        max_abs = max_abs.max((a - b).abs());
+        max_ulp = max_ulp.max((a.to_bits() as i64 - b.to_bits() as i64).abs());
+    }
+    eprintln!(
+        "[mk2] numerics mega-vs-baseline: max_abs={:.3e}, max_ulp={} (0 => byte-exact)",
+        max_abs, max_ulp
+    );
+
+    unsafe {
+        for p in [
+            gate_packed,
+            up_packed,
+            down_packed,
+            gate_scales,
+            up_scales,
+            down_scales,
+            xin,
+            gsc,
+            usc,
+            asc,
+            base_out,
+            mega_out,
+            sink,
+        ] {
+            runtime.free_raw(p).ok();
+        }
+    }
+    assert!(base_ms > 0.0 && mega_ms > 0.0);
+}
