@@ -633,10 +633,7 @@ pub(crate) fn build_handle_with_authorities(
         authorities,
     )?;
     let fim_config = engine.fim_config().cloned();
-    // Capture the model author's declared generation defaults before the engine
-    // is moved into the driver, so every request built for this handle can honor
-    // a model that ships `do_sample: true` instead of forcing greedy.
-    let generation_defaults = engine.metadata().generation.clone();
+    let generation_defaults = None;
     // Refuse an explicit `--max-batch > 1` the decode path cannot honor, rather
     // than accepting it and silently falling back to per-request decoding. The
     // check is sourced from the engine's decode path, not from whether an ORT

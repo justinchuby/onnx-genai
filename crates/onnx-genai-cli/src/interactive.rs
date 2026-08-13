@@ -771,16 +771,9 @@ impl Backend {
         }
     }
 
-    /// The model author's declared generation defaults, when the loaded package
-    /// ships them. Single-model text engines expose their `genai_config.json`
-    /// `search` block or native inference metadata `generation` block; pipelines
-    /// report `None` (their sampling is governed by the pipeline plan, not a
-    /// single decoder's declared defaults).
+    /// Legacy hook retained while callers migrate to request-provided policy inputs.
     pub(super) fn generation_defaults(&self) -> Option<&GenerationDefaults> {
-        match self {
-            Self::Text(engine) => engine.metadata().generation.as_ref(),
-            Self::Pipeline(_) => None,
-        }
+        None
     }
 
     pub(super) fn generate(

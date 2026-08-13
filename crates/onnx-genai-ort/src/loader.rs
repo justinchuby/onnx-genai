@@ -3,10 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use onnx_genai_metadata::{
-    PipelineSpec, PreprocessingSpec, SpeculatorDescriptor, detect_speculator, load_metadata,
-    load_pipeline_spec,
-};
+use onnx_genai_metadata::{PipelineSpec, PreprocessingSpec, load_metadata, load_pipeline_spec};
 use onnx_model_package::{ModelPackage, SelectionRequest, is_model_package_directory};
 
 use crate::{
@@ -35,8 +32,6 @@ pub struct ModelDirectory {
     pub metadata_path: Option<PathBuf>,
     /// Resolved compatibility configuration path, including package references.
     pub genai_config_path: Option<PathBuf>,
-    /// Detected standalone speculator declaration, if present.
-    pub speculator: Option<SpeculatorDescriptor>,
 }
 
 impl ModelDirectory {
@@ -86,7 +81,6 @@ impl ModelDirectory {
         .iter()
         .map(|name| root.join(name))
         .find(|path| path.is_file());
-        let speculator = detect_speculator(root);
         let genai_config_path = onnx_genai_genai_config::find_in_dir(root);
 
         Ok(Self {
@@ -95,7 +89,6 @@ impl ModelDirectory {
             tokenizer_path,
             metadata_path,
             genai_config_path,
-            speculator,
         })
     }
 
@@ -143,14 +136,12 @@ impl ModelDirectory {
         let genai_config_path = selected
             .genai_config_path
             .or_else(|| onnx_genai_genai_config::find_in_dir(&selected.variant_directory));
-        let speculator = detect_speculator(&selected.variant_directory);
         Ok(Self {
             root: selected.variant_directory,
             model_path: selected.model_path,
             tokenizer_path,
             metadata_path,
             genai_config_path,
-            speculator,
         })
     }
 }
