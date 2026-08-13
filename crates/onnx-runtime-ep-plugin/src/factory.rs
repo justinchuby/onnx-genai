@@ -363,9 +363,18 @@ pub enum SharedEpTeardown {
     /// `shutdown()` failed; the EP is still dropped.
     ShutdownFailed,
     /// Other surfaces (allocators, sync streams, data transfer, `OrtEp`s) were
-    /// still alive, so `shutdown()` could not run. The EP's `Drop` releases its
-    /// resources once the last surface goes away.
-    StillReferenced { strong_count: usize },
+    /// still alive, or a `Weak` handle to the shared EP was outstanding, so
+    /// `shutdown()` could not run. The EP's `Drop` releases its resources once
+    /// the last strong reference goes away.
+    ///
+    /// Both counts are reported because they are separately sufficient to block
+    /// teardown: `Arc::get_mut` refuses when `strong_count > 1` **or** when any
+    /// `Weak` exists, and reporting only `strong_count` produced the nonsense
+    /// diagnostic "0 other reference(s) are still alive" in the weak-only case.
+    StillReferenced {
+        strong_count: usize,
+        weak_count: usize,
+    },
 }
 
 /// Explicitly tear down a factory's shared EP, then drop the factory.
@@ -393,7 +402,10 @@ pub enum SharedEpTeardown {
 /// embedder that leaked a handle) we do **not** shut down out from under them.
 /// The invariant then in force is **Drop-only**: `Arc` drops the EP when the
 /// last surface releases it, and the EP's own `Drop` frees its device
-/// resources.
+/// resources. `Arc::get_mut` is also refused while any `Weak` handle exists
+/// even if this factory holds the only strong reference, so the diagnostic
+/// reports `weak_count` alongside `strong_count` and names whichever of the two
+/// actually blocked exclusive access.
 ///
 /// A poisoned EP mutex is recovered rather than propagated, matching
 /// [`crate::ep::EpHandle::with`] and `EpRef::with_ep`: refusing to shut down
@@ -446,15 +458,32 @@ pub unsafe fn release_ep_factory_with_teardown(
             }
             None => {
                 let strong_count = Arc::strong_count(&shared);
+                let weak_count = Arc::weak_count(&shared);
+                // `Arc::get_mut` returns `None` for either reason, and the two
+                // call for different follow-up, so name the one that applies.
+                let blocker = if strong_count > 1 {
+                    format!(
+                        "{} other strong reference(s) to the shared EP are still alive \
+                         (allocator / sync stream / data transfer / OrtEp)",
+                        strong_count - 1
+                    )
+                } else {
+                    format!(
+                        "the factory holds the only strong reference, but {weak_count} Weak \
+                         handle(s) to the shared EP are outstanding, which is also enough to \
+                         block exclusive access"
+                    )
+                };
                 eprintln!(
-                    "nxrt ep plugin: ReleaseEpFactory called while {} other reference(s) to \
-                     the shared EP are still alive (allocator / sync stream / data transfer / \
-                     OrtEp). ORT should release those before releasing the factory. Skipping \
-                     explicit shutdown() and falling back to the Drop-only invariant: the EP \
-                     is released when the last surface goes away.",
-                    strong_count - 1
+                    "nxrt ep plugin: ReleaseEpFactory called while {blocker}. ORT should release \
+                     those before releasing the factory. Skipping explicit shutdown() and falling \
+                     back to the Drop-only invariant: the EP is released when the last strong \
+                     reference goes away. (strong_count={strong_count}, weak_count={weak_count})"
                 );
-                SharedEpTeardown::StillReferenced { strong_count }
+                SharedEpTeardown::StillReferenced {
+                    strong_count,
+                    weak_count,
+                }
             }
         },
     };
@@ -1236,7 +1265,10 @@ mod tests {
         let (outcome, status) = unsafe { release_ep_factory_with_teardown(raw) };
         assert_eq!(
             outcome,
-            SharedEpTeardown::StillReferenced { strong_count: 2 },
+            SharedEpTeardown::StillReferenced {
+                strong_count: 2,
+                weak_count: 0
+            },
             "a shared EP with a live surface must not be shut down"
         );
         assert!(status.is_null());
@@ -1261,6 +1293,53 @@ mod tests {
             shutdowns.load(Ordering::SeqCst),
             0,
             "the Drop-only path must not retroactively call shutdown()"
+        );
+    }
+
+    /// A `Weak` handle alone blocks `Arc::get_mut`, so teardown must report
+    /// `weak_count` and must not describe the situation as "0 other
+    /// reference(s) are still alive".
+    ///
+    /// Falsifier for the previous diagnostic: with only `strong_count`
+    /// reported, this case yielded `StillReferenced { strong_count: 1 }` and
+    /// printed `strong_count - 1 == 0` — a message that names no blocker at
+    /// all. Deleting `weak_count` from the outcome, or computing it as
+    /// `strong_count - 1`, turns this test red.
+    #[test]
+    fn releasing_the_factory_reports_weak_handles_as_the_blocker() {
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let shared = counting_ep(&shutdowns, &drops, Ok(()));
+        // An embedder that kept a Weak (no strong reference at all).
+        let weak = Arc::downgrade(&shared);
+        let raw = raw_shared_factory(Some(shared));
+
+        // SAFETY: `raw` came from `raw_shared_factory`.
+        let (outcome, status) = unsafe { release_ep_factory_with_teardown(raw) };
+        assert!(status.is_null());
+        assert_eq!(
+            outcome,
+            SharedEpTeardown::StillReferenced {
+                strong_count: 1,
+                weak_count: 1
+            },
+            "a live Weak handle blocks Arc::get_mut even though the factory holds the only \
+             strong reference; the outcome must say so instead of reporting one strong owner \
+             and no blocker"
+        );
+        assert_eq!(
+            shutdowns.load(Ordering::SeqCst),
+            0,
+            "shutdown() must not run while exclusive access is refused"
+        );
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "the last strong reference went away with the factory, so Drop still ran"
+        );
+        assert!(
+            weak.upgrade().is_none(),
+            "the Weak must not be upgradable after the EP was dropped"
         );
     }
 
