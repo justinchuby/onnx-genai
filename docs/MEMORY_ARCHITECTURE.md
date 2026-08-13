@@ -2048,6 +2048,51 @@ into page-aligned transfer tiles.
 
 ### 3.5 Residency Policy
 
+> **Measured facts about the CUDA weight-residency policy (2026-08-13). Read these
+> before changing admission or eviction — two of them cost a full investigation each.**
+>
+> **1. Decode correctness does *not* depend on eviction order (#888/#892).** Default
+> LRU, MRU (reverse recency), and smallest-first all produce **byte-identical tokens**,
+> the last driven to 10,816 page-ins with the count hit rate at 22%. An earlier
+> speculation that "the scan-resistant recency discipline is load-bearing for
+> correctness" is **refuted** — recency is load-bearing for *hit rate* only.
+>
+> **2. But evicting and re-admitting large stable-slot residents *does* corrupt output.**
+> A byte-aware policy (#886) silently collapsed greedy generation 16 → 3 tokens whenever
+> offload actually engaged, with **and without** CUDA graph capture. The corruption
+> tracks the **retain flip**, not the reorder — isolated by a probe that changes only the
+> eviction victim while keeping the shipped always-bypass decision. It is not captured-VA
+> baking (graph-OFF corrupts too) and not a copy/compute fence (a full drain of both
+> streams before every fill does not fix it). The exact value-corruption line is **not**
+> isolated; settling it needs granule-level checksums across steps, and
+> `compute-sanitizer` is unavailable on this box.
+>
+> **Design consequence:** a **static** hot set — retain once, never evict, never
+> re-admit — provably does not exercise the corrupting path, which is why #864's hybrid
+> is safe in that shape. Any **dynamic** scheme that churns large weight pages (#866's
+> elastic reclaim, #750 admission, any future byte-aware policy) **must assert token
+> identity rather than assume it.** The default size-blind path is safe because it never
+> retains large tensors, so the buggy path is unreachable.
+>
+> **3. The residency gap is an *admission* problem, not an eviction problem
+> (#837/#886).** ~90% of the recoverable 1.158 GB/step is bypass traffic: 11% of
+> page-in events carrying **44.6% of streamed bytes**, because `StableResident` bypasses
+> a tensor when `!can_fit(bytes)` (`weight_paging.rs`), which is *arrival-order
+> first-fit*. Small tensors (avg 7.8 MB retained) win the free budget; large projections
+> (avg 49.9 MB) then fail `can_fit` on every subsequent step and re-stream forever,
+> **never entering the eviction population at all**. That is the mechanical reason an
+> eviction reorder cannot close the gap — it cannot promote a tensor refused admission.
+>
+> **4. Judge policy on the byte-weighted hit rate.** The count-based rate weights a
+> 10 KiB norm like an 11 MiB projection: raising the budget once moved `hit_rate`
+> 57.09% → 81.31% while the gap to the streaming floor **widened** 1.78× → 2.30×.
+> `GlobalOffloadStats::byte_hit_rate()` exists for this (#869).
+>
+> **Open (#893):** MRU measured *better* than the shipped LRU on `qwen14b-zp` —
+> page-ins 3,008 → 2,160, `byte_hit_rate` 70.16% → 79.15%, byte-identical — which is
+> plausible since a cyclic layer scan is the textbook LRU pathology (#723 measured plain
+> LRU at 0 hits / 6,936). Not acted on: one model, one budget, and favourable.
+
 - Shared attention, router, normalization, embeddings, and other dense weights have
   higher base priority than routed experts because they are touched predictably.
 - Expert admission combines frequency, recency, bytes, measured load cost, and tokens
