@@ -654,7 +654,7 @@ preprocessing:
         name: image.pixel_values
         content: pixels
         dtype: float32
-        contract: { dtype: float32, rank: 4, shape: [batch, 3, 2, 2] }
+        contract: { dtype: float32, rank: 4, shape: [total_patches, 3, 2, 2] }
       - source: grid
         name: image.grid
         content: original_size
@@ -681,7 +681,7 @@ pipeline:
         required: true
     outputs:
       result:
-        contract: { dtype: float32, rank: 4, shape: [batch, 3, 2, 2] }
+        contract: { dtype: float32, rank: 4, shape: [total_patches, 3, 2, 2] }
         role: image
         stage: post_adapter
     components:
@@ -691,31 +691,31 @@ pipeline:
           inputs:
             encoded: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
           outputs:
-            pixel_values: { dtype: float32, rank: 4, shape: [batch, 3, 2, 2] }
+            pixel_values: { dtype: float32, rank: 4, shape: [total_patches, 3, 2, 2] }
             grid: { dtype: int64, rank: 2, shape: [1, 2] }
         effects: []
       vision:
         implementation: { kind: onnx, artifact: vision.onnx.textproto }
         ports:
           inputs:
-            pixel_values: { dtype: float32, rank: 4, shape: [batch, 3, 2, 2] }
+            pixel_values: { dtype: float32, rank: 4, shape: [total_patches, 3, 2, 2] }
             grid: { dtype: int64, rank: 2, shape: [1, 2] }
           outputs:
-            image_features: { dtype: float32, rank: 4, shape: [batch, 3, 2, 2] }
+            image_features: { dtype: float32, rank: 4, shape: [total_patches, 3, 2, 2] }
       embedding:
         implementation: { kind: onnx, artifact: embedding.onnx.textproto }
         ports:
           inputs:
-            input: { dtype: float32, rank: 4, shape: [batch, 3, 2, 2] }
+            input: { dtype: float32, rank: 4, shape: [total_patches, 3, 2, 2] }
           outputs:
-            output: { dtype: float32, rank: 4, shape: [batch, 3, 2, 2] }
+            output: { dtype: float32, rank: 4, shape: [total_patches, 3, 2, 2] }
       decoder:
         implementation: { kind: onnx, artifact: decoder.onnx.textproto }
         ports:
           inputs:
-            input: { dtype: float32, rank: 4, shape: [batch, 3, 2, 2] }
+            input: { dtype: float32, rank: 4, shape: [total_patches, 3, 2, 2] }
           outputs:
-            output: { dtype: float32, rank: 4, shape: [batch, 3, 2, 2] }
+            output: { dtype: float32, rank: 4, shape: [total_patches, 3, 2, 2] }
     steps:
         - kind: invoke
           component: preprocess

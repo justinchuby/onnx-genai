@@ -1174,7 +1174,7 @@ impl PipelineEngine {
                 pixels.name
             )
         })?;
-        let target_shape = resolve_workflow_shape(pixel_contract, package_symbols)?;
+        let target_shape = resolve_workflow_adapter_shape(pixel_contract, package_symbols)?;
         let processor = onnx_genai_preprocess::image::ImagePreprocessor::from_input_and_program(
             &target_shape,
             program,
@@ -1782,6 +1782,23 @@ fn resolve_workflow_shape(
                     "workflow adapter output requires unresolved dimension '{symbol}' for allocation"
                 )
             }),
+        })
+        .collect()
+}
+
+fn resolve_workflow_adapter_shape(
+    contract: &TensorContract,
+    symbols: &HashMap<String, i64>,
+) -> anyhow::Result<Vec<i64>> {
+    let shape = contract
+        .shape
+        .as_ref()
+        .context("workflow adapter output requires a declared shape")?;
+    shape
+        .iter()
+        .map(|dimension| match dimension {
+            TensorDimension::Fixed(value) => Ok(*value),
+            TensorDimension::Symbol(symbol) => Ok(symbols.get(symbol).copied().unwrap_or(-1)),
         })
         .collect()
 }
