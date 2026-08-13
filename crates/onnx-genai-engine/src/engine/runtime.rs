@@ -275,32 +275,6 @@ fn native_workspace_query_rows(
     prompt_rows.max(verify_rows)
 }
 
-fn metadata_eos_token_ids(metadata: &InferenceMetadata) -> Vec<TokenId> {
-    metadata
-        .tokens
-        .as_ref()
-        .and_then(|tokens| tokens.eos_token_id.as_ref())
-        .into_iter()
-        .flatten()
-        .filter_map(|&id| TokenId::try_from(id).ok())
-        .collect()
-}
-
-#[cfg(test)]
-mod eos_tests {
-    use super::*;
-
-    #[test]
-    fn metadata_eos_token_ids_preserves_multiple_valid_ids() {
-        let metadata: InferenceMetadata = serde_json::from_value(serde_json::json!({
-            "tokens": { "eos_token_id": [151645, -1, 4294967296_u64, 151643] }
-        }))
-        .unwrap();
-
-        assert_eq!(metadata_eos_token_ids(&metadata), vec![151645, 151643]);
-    }
-}
-
 impl Engine {
     fn admit_generate_request_with_scheduler(
         &mut self,
@@ -345,13 +319,7 @@ impl Engine {
     }
 
     fn default_eos_token_ids(&self) -> Vec<TokenId> {
-        let mut ids = metadata_eos_token_ids(&self.metadata);
-        for id in self.tokenizer.eos_token_ids() {
-            if !ids.contains(&id) {
-                ids.push(id);
-            }
-        }
-        ids
+        self.tokenizer.eos_token_ids()
     }
 
     fn apply_eos_defaults(&self, options: &mut GenerateOptions) {

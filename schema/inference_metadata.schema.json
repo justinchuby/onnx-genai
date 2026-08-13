@@ -31,31 +31,6 @@
       ],
       "type": "object"
     },
-    "AcceptanceMethod": {
-      "description": "Speculative acceptance-rule vocabulary.",
-      "oneOf": [
-        {
-          "enum": [
-            "rejection_sampling",
-            "greedy",
-            "typical"
-          ],
-          "title": "Known standard value"
-        },
-        {
-          "not": {
-            "enum": [
-              "rejection_sampling",
-              "greedy",
-              "typical"
-            ]
-          },
-          "title": "Forward-compatible extension value",
-          "type": "string"
-        }
-      ],
-      "type": "string"
-    },
     "AttentionConfig": {
       "description": "Build-time attention architecture and dimensions.",
       "properties": {
@@ -363,72 +338,6 @@
       ],
       "type": "string"
     },
-    "DraftConfig": {
-      "description": "Draft-token producer configuration.",
-      "properties": {
-        "depth": {
-          "description": "Self-speculative early-exit depth.",
-          "format": "uint",
-          "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "heads": {
-          "description": "Named draft-head layout or selection.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "ngram": {
-          "description": "Runtime-specific n-gram or prompt-lookup configuration."
-        },
-        "producer": {
-          "$ref": "#/$defs/DraftProducer",
-          "description": "Producer family: `draft_model`, `self_speculative`, `ngram`, or `extra_heads`."
-        },
-        "session": {
-          "description": "Named runtime session or pipeline component used as the producer.",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "producer"
-      ],
-      "type": "object"
-    },
-    "DraftProducer": {
-      "description": "Speculative draft-producer vocabulary.",
-      "oneOf": [
-        {
-          "enum": [
-            "draft_model",
-            "self_speculative",
-            "ngram",
-            "extra_heads"
-          ],
-          "title": "Known standard value"
-        },
-        {
-          "not": {
-            "enum": [
-              "draft_model",
-              "self_speculative",
-              "ngram",
-              "extra_heads"
-            ]
-          },
-          "title": "Forward-compatible extension value",
-          "type": "string"
-        }
-      ],
-      "type": "string"
-    },
     "ForkPrecisionPolicy": {
       "description": "KV fork-precision policy vocabulary.",
       "oneOf": [
@@ -453,120 +362,6 @@
         }
       ],
       "type": "string"
-    },
-    "GenerationDefaults": {
-      "description": "Author-declared text-generation defaults (sampling and beam search).\n\nMirrors the `search` section of an onnxruntime-genai `genai_config.json`.\nEvery field is optional so only values the author declared are carried over.",
-      "properties": {
-        "diversity_penalty": {
-          "description": "Diversity penalty for diverse beam groups.",
-          "format": "float",
-          "type": [
-            "number",
-            "null"
-          ]
-        },
-        "do_sample": {
-          "description": "Whether to randomize sampling through `top_k`/`top_p` (else greedy).",
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "early_stopping": {
-          "description": "Whether beam search stops once enough beams have finished.",
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "length_penalty": {
-          "description": "Exponential length penalty used with beam search.",
-          "format": "float",
-          "type": [
-            "number",
-            "null"
-          ]
-        },
-        "max_length": {
-          "description": "Maximum final sequence length.",
-          "format": "uint",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "min_length": {
-          "description": "Minimum final sequence length.",
-          "format": "uint",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "no_repeat_ngram_size": {
-          "description": "Disallow repeating n-grams of this size (`0` = disabled).",
-          "format": "uint",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "num_beams": {
-          "description": "Number of beams for beam search (`1` = no beam search).",
-          "format": "uint",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "num_return_sequences": {
-          "description": "Number of sequences returned after search.",
-          "format": "uint",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "repetition_penalty": {
-          "description": "Penalty applied to already-generated tokens (`1.0` = no penalty).",
-          "format": "float",
-          "type": [
-            "number",
-            "null"
-          ]
-        },
-        "temperature": {
-          "description": "Softmax temperature applied before sampling.",
-          "format": "float",
-          "type": [
-            "number",
-            "null"
-          ]
-        },
-        "top_k": {
-          "description": "Number of highest-probability tokens kept for top-k filtering.",
-          "format": "uint",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "top_p": {
-          "description": "Nucleus (top-p) cumulative-probability threshold.",
-          "format": "float",
-          "type": [
-            "number",
-            "null"
-          ]
-        }
-      },
-      "type": "object"
     },
     "HardwareRequirements": {
       "description": "Model-side hardware requirements and distribution-matching hints.",
@@ -2157,31 +1952,6 @@
       ],
       "type": "string"
     },
-    "PerformanceHints": {
-      "description": "Publisher-provided speculative decoding performance guidance.",
-      "properties": {
-        "expected_acceptance_rate": {
-          "description": "Expected fraction of proposed tokens accepted, from 0.0 through 1.0.",
-          "format": "float",
-          "maximum": 1.0,
-          "minimum": 0.0,
-          "type": [
-            "number",
-            "null"
-          ]
-        },
-        "optimal_k": {
-          "description": "Recommended number of draft tokens per verification step.",
-          "format": "uint",
-          "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        }
-      },
-      "type": "object"
-    },
     "PipelineSpec": {
       "additionalProperties": false,
       "description": "Executable package described by the universal typed workflow IR.",
@@ -2253,29 +2023,6 @@
         }
       },
       "type": "object"
-    },
-    "ProposalTopology": {
-      "description": "Speculative proposal-topology vocabulary.",
-      "oneOf": [
-        {
-          "enum": [
-            "linear",
-            "tree"
-          ],
-          "title": "Known standard value"
-        },
-        {
-          "not": {
-            "enum": [
-              "linear",
-              "tree"
-            ]
-          },
-          "title": "Forward-compatible extension value",
-          "type": "string"
-        }
-      ],
-      "type": "string"
     },
     "ProposalType": {
       "description": "Speculator proposal architecture.\n\nKnown spellings are enumerated in the generated schema while unknown\nstrings remain valid to preserve forward compatibility.",
@@ -2744,79 +2491,6 @@
       ],
       "type": "string"
     },
-    "SpecialTokens": {
-      "description": "Special / control token ids declared by a model author.\n\nEvery field is optional; `eos_token_id` is normalized to a list because\nonnxruntime-genai accepts either a scalar or an array for it.",
-      "properties": {
-        "bos_token_id": {
-          "description": "Beginning-of-stream token id.",
-          "format": "int64",
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "decoder_start_token_id": {
-          "description": "Token an encoder-decoder model starts decoding with, when not `bos`.",
-          "format": "int64",
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "eos_token_id": {
-          "description": "End-of-stream token ids (one or more).",
-          "items": {
-            "format": "int64",
-            "type": "integer"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "image_token_id": {
-          "description": "Image placeholder token id (VLMs).",
-          "format": "int64",
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "pad_token_id": {
-          "description": "Padding token id.",
-          "format": "int64",
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "sep_token_id": {
-          "description": "Separator token id.",
-          "format": "int64",
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "video_token_id": {
-          "description": "Video placeholder token id (VLMs).",
-          "format": "int64",
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "vision_start_token_id": {
-          "description": "Vision-segment start token id (VLMs).",
-          "format": "int64",
-          "type": [
-            "integer",
-            "null"
-          ]
-        }
-      },
-      "type": "object"
-    },
     "SpeculativeModelInfo": {
       "description": "Build-time support for self-contained speculative decoding.",
       "properties": {
@@ -3205,164 +2879,6 @@
       ],
       "type": "object"
     },
-    "StrategyKind": {
-      "description": "Generic inference-strategy vocabulary.",
-      "oneOf": [
-        {
-          "enum": [
-            "speculative"
-          ],
-          "title": "Known standard value"
-        },
-        {
-          "not": {
-            "enum": [
-              "speculative"
-            ]
-          },
-          "title": "Forward-compatible extension value",
-          "type": "string"
-        }
-      ],
-      "type": "string"
-    },
-    "StrategySpec": {
-      "description": "Generic inference strategy declaration.",
-      "properties": {
-        "acceptance": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/AcceptanceMethod"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Draft-token acceptance rule."
-        },
-        "draft": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/DraftConfig"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Draft-token producer configuration for speculative decoding."
-        },
-        "kind": {
-          "$ref": "#/$defs/StrategyKind",
-          "description": "Strategy vocabulary entry, such as `speculative`."
-        },
-        "performance_hints": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/PerformanceHints"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Model-publisher performance guidance."
-        },
-        "tokens_per_step": {
-          "description": "Number of draft tokens attempted per verification step.",
-          "format": "uint",
-          "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "topology": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ProposalTopology"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Proposal topology, such as `linear` or `tree`."
-        },
-        "verify": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/VerifyConfig"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Verification configuration for speculative decoding."
-        }
-      },
-      "required": [
-        "kind"
-      ],
-      "type": "object"
-    },
-    "StructuredOutputFormat": {
-      "description": "Structured-output constraint-format vocabulary.",
-      "oneOf": [
-        {
-          "enum": [
-            "json_schema",
-            "regex",
-            "context_free_grammar",
-            "choice"
-          ],
-          "title": "Known standard value"
-        },
-        {
-          "not": {
-            "enum": [
-              "json_schema",
-              "regex",
-              "context_free_grammar",
-              "choice"
-            ]
-          },
-          "title": "Forward-compatible extension value",
-          "type": "string"
-        }
-      ],
-      "type": "string"
-    },
-    "StructuredOutputSpec": {
-      "description": "Structured-output capabilities and model formatting conventions.",
-      "properties": {
-        "stop_sequences": {
-          "description": "Literal token sequences that terminate a structured response.",
-          "items": {
-            "type": "string"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "supported_formats": {
-          "description": "Supported constraint formats, such as JSON Schema, regular expressions, or CFGs.",
-          "items": {
-            "$ref": "#/$defs/StructuredOutputFormat"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "training_format": {
-          "description": "Format in which the model was trained to emit tool calls or structured values.",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "type": "object"
-    },
     "TensorContract": {
       "additionalProperties": false,
       "description": "Typed tensor contract used at package and component boundaries.",
@@ -3482,51 +2998,6 @@
         }
       ],
       "type": "string"
-    },
-    "VerificationMethod": {
-      "description": "Speculative verification-method vocabulary.",
-      "oneOf": [
-        {
-          "enum": [
-            "single_forward"
-          ],
-          "title": "Known standard value"
-        },
-        {
-          "not": {
-            "enum": [
-              "single_forward"
-            ]
-          },
-          "title": "Forward-compatible extension value",
-          "type": "string"
-        }
-      ],
-      "type": "string"
-    },
-    "VerifyConfig": {
-      "description": "Draft-token verification configuration.",
-      "properties": {
-        "method": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/VerificationMethod"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Verification method, such as `single_forward`."
-        },
-        "session": {
-          "description": "Named verifier session or pipeline component.",
-          "type": [
-            "string",
-            "null"
-          ]
-        }
-      },
-      "type": "object"
     },
     "WorkflowBranchOutput": {
       "additionalProperties": false,
@@ -4114,6 +3585,7 @@
   },
   "$id": "https://github.com/onnx/onnx/issues/8184",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
   "allOf": [
     {
       "not": {
@@ -4139,19 +3611,8 @@
       }
     }
   ],
-  "description": "Portable, runtime-agnostic inference metadata for ONNX generative models. All top-level sections are optional, and unknown fields are permitted for forward-compatible schema evolution.",
+  "description": "Portable, runtime-agnostic inference metadata for ONNX generative models. The v1 top-level surface is closed; executable composite packages use pipeline.workflow.",
   "properties": {
-    "generation": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/GenerationDefaults"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "description": "Author-declared text-generation / search defaults.\n\nPopulated from an onnxruntime-genai `genai_config.json` `search` block.\nEvery field is optional; readers treat an absent value as \"use the\nruntime default\"."
-    },
     "hardware_requirements": {
       "anyOf": [
         {
@@ -4267,39 +3728,6 @@
       ],
       "deprecated": true,
       "description": "Deprecated alias for `speculative`."
-    },
-    "strategy": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/StrategySpec"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "description": "Generic inference strategy, including speculative decoding."
-    },
-    "structured_output": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/StructuredOutputSpec"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "description": "Structured-output formats and model training conventions."
-    },
-    "tokens": {
-      "anyOf": [
-        {
-          "$ref": "#/$defs/SpecialTokens"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "description": "Special / control token ids declared by the model author.\n\nPopulated from the model-level token id fields of a `genai_config.json`."
     }
   },
   "title": "ONNX Inference Metadata",

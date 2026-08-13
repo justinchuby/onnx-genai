@@ -135,12 +135,8 @@ fn empty_metadata() -> InferenceMetadata {
         quantization: None,
         preprocessing: None,
         pipeline: None,
-        strategy: None,
         speculative: None,
-        structured_output: None,
         hardware_requirements: None,
-        generation: None,
-        tokens: None,
     }
 }
 
