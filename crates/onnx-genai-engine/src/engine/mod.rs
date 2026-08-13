@@ -83,8 +83,7 @@ pub use governor::{EngineGovernorError, EngineResourceGovernor, resolve_device_v
 #[cfg(feature = "native-cuda")]
 pub(crate) use load::managed_vmm_default_enabled;
 pub(crate) use load::{
-    force_managed_weight_streaming_enabled, kv_pages_for_budget, session_device_domain,
-    validate_shared_authority_limit,
+    force_managed_weight_streaming_enabled, session_device_domain, validate_shared_authority_limit,
 };
 #[cfg(feature = "native-backend")]
 pub(crate) use memory_plan::Holder;
