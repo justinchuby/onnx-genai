@@ -1106,6 +1106,18 @@ Three consequences worth internalising before measuring anything here:
   cliff, not a capability, and the governor cannot account for it.
 - **The arena failing where the baseline succeeds is the arena being correct.**
   `cuMemCreate` allocates physical device pages and cannot pretend otherwise.
+- **Open (#862): allocating device pages is not the same as keeping them.**
+  `cuMemCreate` cannot fake the *allocation*, but whether WDDM may later **page our
+  mapped granules out to host RAM under demand** is **not established**. A steady
+  ordinary `cuMemAlloc` hog on this box *was* observed being paged out — pressure
+  produced slowdown, not failure. If our granules share that fate, then
+  `peak_committed_physical_bytes < managed_limit_bytes` and
+  `oversubscribed_bytes == 0` are guarantees **in our ledger only**, and every
+  "no WDDM spill" claim below is scoped to accounting rather than physical
+  residency. It would also be the best explanation for this box's wall-clock
+  spreads (identical work: 24–223 s, 700–929 s; 3.9–28 tok/s). Until #862 answers
+  this, do not treat "committed under the limit" as proof of device residency,
+  and prefer leaving real headroom over lending to the last byte.
 
 Users can opt out via NVIDIA Control Panel → *CUDA — Sysmem Fallback Policy* →
 *Prefer No Sysmem Fallback*, which makes floors measurable again. The better
@@ -1225,6 +1237,37 @@ it brackets is worse than no counter, because it is believed. The same is true o
 a counter that is emitted with nothing writing it — a row reading `0.00` cannot
 be distinguished from a row that was never measured, which is why #715 removed
 the dead ones and added a test that every emitted counter has a live writer.
+
+**Two more instances of this mode landed on 2026-08-12, both in accounting
+rather than timing.**
+
+*The instrument measured a real thing that was not the thing named.*
+`total_weight_bytes` reported the **file size** of the external-data blob, and
+`qwen14b-zp`'s blob is **50.0% dead space** — 920 initializers reference
+8,329,906,176 bytes of a 16,652,453,888-byte file, contiguously, with the first
+blob at offset 8,322,547,712 (an orphaned prefix from a re-export that never
+truncated). So the runtime believed the model had **2.00× more weights than it
+has**, and strategy inference, budget resolution and `fits_resolved_device_budget`
+all consumed that. The model is over the resolved device budget by **0.599 GB**,
+not the ~8.9 GB that number implied — a 14× error in the margin, and the
+difference between "nearly fits" and "stream the whole model forever". Fixed in
+#856 (#853): the loader now sums what initializers reference and warns when file
+size exceeds it by >10%.
+
+**What caught it was arithmetic that could not close.** Measured traffic was
+4.11 GB/step against a theoretical floor of 10.53 GB/step for a full per-step
+scan — *below* the floor, which is impossible. Same habit as dividing bytes by
+time: compute the bound the number must obey, and when it is violated, suspect
+the instrument before the system.
+
+*The number was right and the conclusion drawn from it was not.* Raising the
+weight budget moved the residency `hit_rate` from **57.09% to 81.31%** — while
+the gap to the streaming floor **widened** from 1.78× to 2.30×. The count-based
+rate weights a 10 KiB norm like an 11 MiB projection, and misses skew large
+(~11.9 MB average page-in). `htod_bytes` is what decode pays for, so a
+byte-weighted rate was added alongside it; optimizing the count-based number can
+improve the report while moving no bytes at all. **A rate over a population whose
+members have wildly different costs is not a cost metric.**
 
 ### The pattern underneath all three
 
@@ -1828,6 +1871,43 @@ They are not repeated here so status and byte formulas have one source of truth.
 
 Treats immutable model weights as a three-tier hierarchy within a single session.
 This is the design from [WEIGHT_OFFLOAD.md](./WEIGHT_OFFLOAD.md), consolidated here.
+
+> **The weight budget is what the KV reservation leaves behind, and it is never
+> renegotiated (#857, open).** At load, `engine/load.rs` computes
+>
+> ```text
+> weight_budget = resolved_device_budget − kv_bytes_per_token × max_context
+> 6,116,140,442 = 7,726,753,178 − 1,610,612,736     (qwen14b-zp, exact to the byte)
+> ```
+>
+> `max_context` is the model's **declared** `max_sequence_length` (8,192), not what
+> the request uses, and `set_weight_residency_budget` is called once. So a 16-token
+> run holds **1.611 GB** of device budget for KV it never commits (measured
+> committed KV in that run: 402,653,184 bytes) while weights stream **3.94 GB per
+> decode step** because they do not fit.
+>
+> Measured by changing only `max_sequence_length` 8192 → 1024, same weights
+> (hard-linked, byte-identical), same binary, same prompt:
+>
+> | | ctx 8192 | ctx 1024 |
+> |---|---:|---:|
+> | weight `budget_bytes` | 6,116,140,442 | 7,525,426,586 |
+> | `htod_bytes_per_token` | 3,943,690,240 | 1,850,486,784 (**2.13× less**) |
+> | `page_ins_per_token` | 372 | 162 |
+> | `hit_rate` | 57.09% | 81.31% |
+>
+> Token IDs byte-identical. So the reservation is genuinely recoverable and
+> converts almost 1:1 into reduced streaming. **Shipping a smaller
+> `max_sequence_length` is not the fix** — that configuration simply cannot serve
+> longer sequences. The reservation exists to guarantee a sequence can reach its
+> declared maximum, so the fix is an **elastic** weight budget with a guaranteed
+> reclaim path, not a smaller reservation. Note the arena banner's "dynamic
+> KV/weight lending" is accurate about the handle pool but overstates the lending:
+> KV's *reservation* is deducted up front and never revisited.
+>
+> Note also the gap to the floor **widened** (1.78× → 2.30×) as the budget grew:
+> policy efficiency (#837 item 3) and this budget split are independent and
+> multiplicative levers.
 
 ### 3.1 Components
 
