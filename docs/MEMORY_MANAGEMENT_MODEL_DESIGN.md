@@ -56,8 +56,7 @@ These contracts must preserve the following invariants:
 ```mermaid
 flowchart TD
     Client["Local API clients"] --> Foundry
-    Standalone["Standalone ORT application"] --> Env
-    Embedded["Embedded GenAI application"] --> GenApi
+    Standalone["Standalone ORT application<br/>(bypasses ORT GenAI)"]
 
     subgraph Product["Foundry Local — product / service boundary"]
         Foundry["Public API + model catalog/package lifecycle<br/>multi-model routing + policy + observability"]
@@ -79,18 +78,15 @@ flowchart TD
     end
 
     subgraph ORTCore["ORT — foundational runtime / graph execution"]
-        subgraph Memory["ProcessMemoryManager — process-wide authority owner"]
-            Resources["MemoryAuthorityRegistry + TopologyProvider"]
-            Authorities["Host/UnifiedAuthority + DeviceAuthorities"]
-            Resources --> Authorities
-        end
-        Env["ORT Runtime / OrtEnv"]
+        Memory["ProcessMemoryManager<br/>registry + topology + authorities"]
+        Env["OrtEnv<br/>logging + threads + allocator registration"]
         Session["ORT InferenceSession(s) — graph executors"]
         Arenas["ORT / EP arenas: activation + workspace"]
         Allocators["DeviceAllocator / VirtualBacking"]
         Kernels["EP kernels / captured graph"]
-        Resources -->|"allocator adapters + snapshots"| Env
+        Memory -->|"allocator adapters"| Env
         Env -->|"shared allocators + authority handles"| Session
+        Memory -->|"bulk grants / soft limits"| Arenas
         Session --> Arenas
         Arenas --> Allocators
         Session -->|"dispatch"| Kernels
@@ -98,18 +94,11 @@ flowchart TD
     end
 
     Foundry -->|"generation/model operations"| GenApi
-    Foundry -->|"create/configure limits"| Resources
-    Embedded -->|"create or use default"| Resources
-    Standalone -->|"create or use default"| Resources
-    Resources -->|"snapshots / metrics"| Foundry
-    Resources -->|"lease API"| Engine
+    Foundry -->|"resource limits / policy"| Memory
+    Standalone --> Env
+    Standalone -->|"create or use default manager"| Memory
+    Engine -->|"C2/C4 lease requests + holder registration"| Memory
     Engine -->|"bind model/state views; Run"| Session
-
-    Authorities -->|"leases / allowances / pressure"| Weights
-    Authorities --> State
-    Authorities --> Arenas
-    Weights -->|"allocate backing"| Allocators
-    State -->|"allocate backing"| Allocators
     Weights -->|"stable weight views"| Session
     State -->|"C6 state views"| Session
 ```
@@ -158,6 +147,10 @@ target logical boundaries, not required package boundaries. If ORT GenAI merges
 into ORT, the `Generation` subgraph moves into the ORT distribution; Foundry
 still calls the Generation API, and the generation module still uses
 `ProcessMemoryManager` and `InferenceSession` only through these contracts.
+
+The diagram intentionally shows only dependency and request direction. Pressure
+notifications, lease results, and metrics flow back over the same contracts;
+they are responses/callbacks, not reverse ownership dependencies.
 
 The ORT GenAI model runtime takes model-level leases before constructing
 engines/sessions and returns them on unload or demotion. Foundry supplies
