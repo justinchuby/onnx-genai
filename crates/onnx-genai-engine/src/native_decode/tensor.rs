@@ -18,6 +18,39 @@ pub(crate) fn extract_logits(tensor: &Tensor) -> anyhow::Result<Vec<Vec<f32>>> {
     }
 }
 
+/// Extract per-*row* logits from a batched single-token forward whose logits
+/// tensor is `[batch, 1, vocab]` (batch axis leading, query-seq collapsed to 1),
+/// returning one `[vocab]` vector per batch row. Unlike [`extract_logits`],
+/// which interprets a rank-3 tensor as `[1, seq, vocab]` and keeps the query-seq
+/// rows of a single sequence, this keeps every batch row — the stage 2a
+/// batch-N fused-forward result shape.
+pub(crate) fn extract_batch_row_logits(
+    tensor: &Tensor,
+    batch: usize,
+) -> anyhow::Result<Vec<Vec<f32>>> {
+    let values = tensor_to_f32(tensor)?;
+    let vocab = match tensor.shape.as_slice() {
+        [b, seq, vocab] if *b == batch && *seq == 1 && *vocab > 0 => *vocab,
+        [b, vocab] if *b == batch && *vocab > 0 => *vocab,
+        shape => bail!(
+            "unsupported batched logits tensor shape {shape:?} for batch {batch}; expected [{batch}, 1, vocab] or [{batch}, vocab]"
+        ),
+    };
+    if values.len() < batch * vocab {
+        bail!(
+            "batched logits tensor {:?} yielded {} values, need {}",
+            tensor.shape,
+            values.len(),
+            batch * vocab
+        );
+    }
+    Ok(values
+        .chunks(vocab)
+        .take(batch)
+        .map(<[f32]>::to_vec)
+        .collect())
+}
+
 pub(crate) fn argmax_logits_tensor(tensor: &Tensor) -> anyhow::Result<TokenId> {
     let (value_count, vocab) = match tensor.shape.as_slice() {
         [vocab] if *vocab > 0 => (*vocab, *vocab),
@@ -436,6 +469,23 @@ pub(crate) fn make_empty_input_tensor(
     session: &InferenceSession,
     name: &str,
 ) -> anyhow::Result<Tensor> {
+    make_empty_input_tensor_batched(session, name, 1)
+}
+
+/// Batch-aware variant of [`make_empty_input_tensor`]: builds an empty (zero
+/// sequence-length) past-KV / recurrent-state tensor with the batch axis (axis
+/// 0) set to `batch` rows instead of the single-sequence default of `1`.
+///
+/// Stage 2a uses this for the stateless batch-N fused-forward probe
+/// ([`NativeDecodeSession::run_fused_batch_prefill`]): a genuine batch axis with
+/// an empty past, so weight streaming is exercised across `N` independent rows
+/// without a batched KV *layout* (stage 2b). `batch == 1` is byte-identical to
+/// [`make_empty_input_tensor`].
+pub(crate) fn make_empty_input_tensor_batched(
+    session: &InferenceSession,
+    name: &str,
+    batch: usize,
+) -> anyhow::Result<Tensor> {
     let meta = session
         .inputs()
         .iter()
@@ -451,7 +501,7 @@ pub(crate) fn make_empty_input_tensor(
     let mut shape = Vec::with_capacity(meta.shape.len());
     for (axis, dim) in meta.shape.iter().copied().enumerate() {
         let value = if axis == 0 {
-            1
+            batch
         } else if axis == seq_axis {
             // Growable KV caches start with an empty sequence axis; fixed-size
             // recurrent states (hybrid linear-attention conv_state /

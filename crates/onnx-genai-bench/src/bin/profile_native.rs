@@ -169,6 +169,13 @@ struct Args {
     /// Seed for reproducible categorical sampling across measured runs.
     #[arg(long, default_value_t = 0)]
     seed: u64,
+    /// Stage 2a (#750): run the batch-N stateless fused forward
+    /// ([`NativeDecodeSession::run_fused_batch_prefill`]) for each batch size in
+    /// this comma-separated list, resetting the CUDA weight-offload counters
+    /// around each so `htod_bytes_per_token` / `page_ins_per_token` isolate the
+    /// weight-streaming amortization. Leads the before/after ~1/N table.
+    #[arg(long, value_delimiter = ',')]
+    fused_forward_amortization: Option<Vec<usize>>,
 }
 
 fn categorical_sampling_enabled(args: &Args) -> bool {
@@ -531,6 +538,108 @@ fn configure_ort_provider(args: &Args) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Stage 2a (#750): measure weight-streaming amortization of the batch-N
+/// stateless fused forward. For each batch size `N`, reset the global CUDA
+/// weight-offload counters, run exactly one fused forward over `N` rows, and
+/// report `htod_bytes` / `page_ins` both in total and per emitted row. Because
+/// the offload residency is keyed purely by weight identity (no batch axis), a
+/// single forward pages each weight in at most once regardless of `N`, so the
+/// per-row figures fall ~`1/N` — the deterministic, batch-invariant signature
+/// that "amortization happened", led ahead of any wall-clock number.
+fn run_fused_forward_amortization(
+    session: &mut NativeDecodeSession,
+    prompt_tokens: &[u32],
+    batch_sizes: &[usize],
+) -> Result<()> {
+    if batch_sizes.is_empty() {
+        bail!("--fused-forward-amortization requires at least one batch size");
+    }
+    let own_pid = std::process::id();
+    println!(
+        "fused_forward_amortization: own_pid={own_pid} batch_sizes={batch_sizes:?} \
+         (rows are independent length-1 sequences, empty past; stateless eager forward)"
+    );
+    report_foreign_compute_apps(own_pid);
+
+    // One-time warmup outside every measurement window so first-touch admission
+    // and any lazy CUDA setup are not attributed to a batch size.
+    let warm = fused_tokens(prompt_tokens, 1);
+    let _ = session
+        .run_fused_batch_prefill(&warm)
+        .context("warmup fused forward")?;
+
+    for &batch in batch_sizes {
+        if batch == 0 {
+            bail!("--fused-forward-amortization batch sizes must be > 0");
+        }
+        report_foreign_compute_apps(own_pid);
+        let tokens = fused_tokens(prompt_tokens, batch);
+        onnx_runtime_ep_cuda::reset_global_offload_stats();
+        let rows = session
+            .run_fused_batch_prefill(&tokens)
+            .with_context(|| format!("fused forward at batch {batch}"))?;
+        assert_eq!(
+            rows.len(),
+            batch,
+            "fused forward must emit one row per token"
+        );
+        let emitted = batch as u64;
+        println!("--- fused_forward batch={batch} ---");
+        print_weight_offload_observability(emitted);
+    }
+    Ok(())
+}
+
+/// Build `batch` token ids for the fused-forward probe by cycling the prompt.
+/// Token *values* never affect weight-streaming counters (residency is keyed by
+/// weight identity, not by token), so cycling a real prompt is representative.
+fn fused_tokens(prompt_tokens: &[u32], batch: usize) -> Vec<u32> {
+    (0..batch)
+        .map(|index| prompt_tokens[index % prompt_tokens.len()])
+        .collect()
+}
+
+/// Print any CUDA compute processes that are NOT this profiler, so a contended
+/// run is labeled as such in its own log (per #851). Our own PID is expected
+/// and filtered out; a non-empty foreign list is flagged loudly.
+fn report_foreign_compute_apps(own_pid: u32) {
+    let output = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-compute-apps=pid,used_memory",
+            "--format=csv,noheader",
+        ])
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            let foreign: Vec<&str> = text
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .filter(|line| {
+                    line.split(',')
+                        .next()
+                        .and_then(|pid| pid.trim().parse::<u32>().ok())
+                        != Some(own_pid)
+                })
+                .collect();
+            if foreign.is_empty() {
+                println!("gpu_contention_check: clear (only own_pid={own_pid})");
+            } else {
+                println!(
+                    "gpu_contention_check: CONTENDED — foreign compute apps present: {foreign:?} \
+                     (label this run contended)"
+                );
+            }
+        }
+        Ok(output) => println!(
+            "gpu_contention_check: nvidia-smi exited with status {} (skipping check)",
+            output.status
+        ),
+        Err(error) => println!("gpu_contention_check: nvidia-smi unavailable ({error})"),
+    }
 }
 
 fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Result<()> {
@@ -902,6 +1011,9 @@ fn main() -> Result<()> {
         args.runs
     );
     println!("profile_native: {}", describe_sampling(&args));
+    if let Some(batch_sizes) = args.fused_forward_amortization.clone() {
+        return run_fused_forward_amortization(&mut session, &prompt_tokens, &batch_sizes);
+    }
     if let Some(dump_path) = args.dump_logprobs.as_ref() {
         let dump_prompt_tokens = if let Some(ids_path) = args.prompt_ids.as_ref() {
             let raw = std::fs::read_to_string(ids_path)
