@@ -52,6 +52,32 @@ ONNX port contracts may be omitted when the artifact is authoritative. Declare o
 bindings, bounds/overrides, cross-component constraints, or adapter ports that ONNX cannot describe.
 Device transfers are planner-derived from resource placement rather than authored workflow nodes.
 
+## Execution islands and graph capture
+
+Workflow component boundaries are semantic composition boundaries, not mandatory ORT session,
+kernel-launch, or CUDA Graph boundaries. After validation and SSA lowering, the planner links
+adjacent pure, effect-free ONNX invokes on the same device into one execution island. Intermediate
+SSA tensors remain internal graph values, so ORT can optimize across decoder, logits-processing,
+sampling, and termination components without host round trips.
+
+Control flow, device changes, explicit effects, application-overridable components, and stateful
+host adapters delimit islands. This preserves adapter ordering and prevents a fused session from
+silently ignoring a per-request component replacement.
+
+CUDA capture is decided per island and concrete shape signature. Eligibility requires:
+
+- a CUDA placement with stable device-resident I/O bindings;
+- static or runtime-specialized bounded shapes, with no data-dependent allocation/control ops;
+- no implicit ONNX RNG (counter RNG seed/offset must be tensor inputs/state);
+- no host control or external mutation inside the island; and
+- kernels accepted by the selected execution provider during capture.
+
+The first run resolves artifact-inferred dynamic extents and establishes stable bindings. A
+subsequent equal-shape run captures, then later runs replay. Unsupported graph features, allocator
+failure, shape changes, or provider capture errors fall back to ordinary island execution rather
+than changing workflow semantics. `PipelineEngine::execution_island_diagnostics()` reports each
+island's components, device, eligibility, run/capture/replay counts, and fallback reason.
+
 ## Versioned component contracts
 
 `contract` describes semantics; it never selects execution behavior. Execution is always ordinary
@@ -77,7 +103,7 @@ non-tensor contract data. New policy implementations require metadata plus ONNX,
 |---|---|
 | `logits` | floating `[B,V]` or `[B,S,V]`; sample the final position |
 | `token` | `int64[B]` |
-| `temperature`, `top_k`, `top_p` | request-provided scalar or `[B]` when used |
+| `temperature`, `top_k`, `top_p`, `min_p` | request-provided scalar or `[B]` when used |
 | `grammar_mask` | optional request/adapter-provided `bool[B,V]` |
 | `rng_seed`, `rng_offset` | required for seeded stochastic mode, `int64[B]` |
 | `rng_next_offset` | seeded mode output, `int64[B]` |
@@ -86,6 +112,11 @@ non-tensor contract data. New policy implementations require metadata plus ONNX,
 they are never baked into the artifact, so ordinary request option changes do not regenerate
 ONNX. Seed and offset are explicit counter-based RNG state (for example Philox or Threefry),
 loop-carried as semantic state.
+
+Min-p filtering is ordinary parameterized ONNX policy math. A fixed-shape implementation may keep
+tokens satisfying `logit >= max_logit + log(min_p)` before normalized categorical sampling. The
+request supplies `min_p`; it is never baked into the artifact, and the `[B,V]` shape remains
+capture eligible.
 
 A component may set `application_overridable: true`. The application can then select another
 package-declared ONNX component for that invocation. The replacement must implement the same

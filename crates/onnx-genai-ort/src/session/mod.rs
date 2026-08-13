@@ -172,6 +172,122 @@ pub struct Session {
 }
 
 impl Session {
+    /// Load an ONNX model from serialized protobuf bytes.
+    ///
+    /// This is used by workflow execution-island lowering, which links several
+    /// package components into one optimizer-visible ORT session without
+    /// materializing a generated model file.
+    pub fn from_model_bytes(
+        env: &Environment,
+        model_name: impl Into<String>,
+        bytes: &[u8],
+        options: SessionOptions,
+    ) -> Result<Self> {
+        Self::from_model_bytes_with_external_files(env, model_name, bytes, &[], options)
+    }
+
+    /// Load an in-memory model and supply its external-data files from memory.
+    ///
+    /// File names must exactly match `TensorProto.external_data.location`.
+    /// ORT copies the referenced initializer ranges during session creation, so
+    /// the provided buffers need not outlive this call.
+    pub fn from_model_bytes_with_external_files(
+        env: &Environment,
+        model_name: impl Into<String>,
+        bytes: &[u8],
+        external_files: &[(String, Vec<u8>)],
+        options: SessionOptions,
+    ) -> Result<Self> {
+        let api = crate::error::api()?;
+        let create_session =
+            |opts: &SessionOptions| -> Result<*mut onnx_genai_ort_sys::OrtSession> {
+                let session_options = RawSessionOptions::new(env, opts)?;
+                if !external_files.is_empty() {
+                    let add = api.AddExternalInitializersFromFilesInMemory.ok_or(
+                        OrtError::ApiUnavailable("AddExternalInitializersFromFilesInMemory"),
+                    )?;
+                    let names = external_files
+                        .iter()
+                        .map(|(name, _)| {
+                            CString::new(name.as_str()).map_err(|_| {
+                                OrtError::InvalidArgument(format!(
+                                    "external initializer file name contains NUL: {name}"
+                                ))
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let name_ptrs = names.iter().map(|name| name.as_ptr()).collect::<Vec<_>>();
+                    let buffers = external_files
+                        .iter()
+                        .map(|(_, bytes)| bytes.as_ptr().cast_mut().cast())
+                        .collect::<Vec<_>>();
+                    let lengths = external_files
+                        .iter()
+                        .map(|(_, bytes)| bytes.len())
+                        .collect::<Vec<_>>();
+                    // SAFETY: all arrays contain `external_files.len()` entries
+                    // and their strings/buffers remain live through the call.
+                    crate::error::check_status(unsafe {
+                        add(
+                            session_options.as_ptr().cast_mut(),
+                            name_ptrs.as_ptr(),
+                            buffers.as_ptr(),
+                            lengths.as_ptr(),
+                            external_files.len(),
+                        )
+                    })?;
+                }
+                let create = api
+                    .CreateSessionFromArray
+                    .ok_or(OrtError::ApiUnavailable("CreateSessionFromArray"))?;
+                let mut ptr = std::ptr::null_mut();
+                // SAFETY: `env` and `session_options` are live handles, `bytes`
+                // remains valid for the call, and `ptr` is an out-parameter.
+                crate::error::check_status(unsafe {
+                    create(
+                        env.as_ptr(),
+                        bytes.as_ptr().cast(),
+                        bytes.len(),
+                        session_options.as_ptr(),
+                        &mut ptr,
+                    )
+                })?;
+                Ok(ptr)
+            };
+        let allow_cpu_fallback = options.auto_selected
+            || (requested_non_cpu_provider(&options) && !requested_strict_provider(&options));
+        let (ptr, effective_providers) = match create_session(&options) {
+            Ok(ptr) => (ptr, options.execution_providers.clone()),
+            Err(err) if allow_cpu_fallback => {
+                tracing::warn!(
+                    "ORT in-memory session creation failed with requested execution \
+                     provider(s): {err}; retrying with CPU"
+                );
+                let cpu_options = SessionOptions::cpu();
+                let ptr = create_session(&cpu_options)?;
+                (ptr, cpu_options.execution_providers)
+            }
+            Err(err) => return Err(err),
+        };
+        let ptr = NonNull::new(ptr).ok_or(OrtError::NullPointer)?;
+        let inputs = query_io(ptr.as_ptr(), IoKind::Input)?;
+        let outputs = query_io(ptr.as_ptr(), IoKind::Output)?;
+        let input_names = inputs.iter().map(|info| info.name.clone()).collect();
+        let output_names = outputs.iter().map(|info| info.name.clone()).collect();
+        let model_name = model_name.into();
+        tracing::info!("Loading in-memory model: {model_name}");
+        Ok(Self {
+            ptr,
+            _model_path: model_name,
+            input_names,
+            output_names,
+            inputs,
+            outputs,
+            execution_providers: effective_providers,
+            graph_capture: options.graph_capture,
+        })
+    }
+
     /// Load a model from an ONNX file.
     pub fn new(env: &Environment, path: &Path, options: SessionOptions) -> Result<Self> {
         if !path.exists() {
@@ -674,6 +790,50 @@ impl Session {
                 );
                 Ok(None)
             }
+        }
+    }
+
+    /// Create an allocator for this session's execution device when supported.
+    ///
+    /// This is the generic counterpart to the decode KV allocation path. It is
+    /// used by execution-island I/O binding so CUDA graph capture sees stable,
+    /// device-resident input and output addresses.
+    pub fn device_allocator(&self) -> Result<Option<Allocator>> {
+        self.device_kv_allocator()
+    }
+
+    /// Bind an output for allocation on this session's execution device.
+    ///
+    /// Returns `false` when the session has no supported device allocator.
+    pub fn bind_output_to_execution_device(
+        &self,
+        binding: &mut IoBinding,
+        name: &str,
+    ) -> Result<bool> {
+        #[cfg(feature = "cuda")]
+        if let Some(device_id) = self.cuda_device_id() {
+            binding.bind_output_to_device(name, &MemoryInfo::cuda(device_id)?)?;
+            return Ok(true);
+        }
+        #[cfg(not(feature = "cuda"))]
+        let _ = (binding, name);
+        Ok(false)
+    }
+
+    /// Synchronize this session's CUDA device before or after external buffer copies.
+    pub fn synchronize_device(&self) -> Result<()> {
+        if !self.is_cuda() {
+            return Ok(());
+        }
+        #[cfg(feature = "cuda")]
+        {
+            crate::cuda_rt::device_synchronize()
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            Err(OrtError::InvalidArgument(
+                "CUDA session synchronization requested from a build without CUDA support".into(),
+            ))
         }
     }
 }

@@ -151,6 +151,7 @@ fn collect_workflow_capabilities(node: &WorkflowNode, capabilities: &mut BTreeSe
         WorkflowNode::Transfer { .. } => {
             capabilities.insert("explicit_transfer".to_string());
         }
+        WorkflowNode::ExecutionIsland { .. } => {}
     }
 }
 
@@ -263,7 +264,8 @@ fn validate_preprocessing_workflow(metadata: &InferenceMetadata, errors: &mut Ve
             }
             WorkflowNode::Invoke { .. }
             | WorkflowNode::Emit { .. }
-            | WorkflowNode::Transfer { .. } => {}
+            | WorkflowNode::Transfer { .. }
+            | WorkflowNode::ExecutionIsland { .. } => {}
         }
     }
     let Ok(compiled) = crate::compile_workflow(workflow) else {
@@ -1478,6 +1480,7 @@ fn validate_workflow_node(
                 value_contracts.insert(output.clone(), contract);
             }
         }
+        WorkflowNode::ExecutionIsland { .. } => {}
     }
 }
 
