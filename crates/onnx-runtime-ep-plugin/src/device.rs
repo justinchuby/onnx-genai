@@ -254,13 +254,11 @@ unsafe extern "C" fn device_alloc(
             .with_ep(|ep| ep.allocate(request, DEVICE_ALLOC_ALIGNMENT))
         {
             Ok(Ok(buf)) => {
+                // `DeviceBuffer::as_ptr` unwraps a `NonNull<c_void>`, so a
+                // successful `allocate` cannot yield null and no null check is
+                // needed here. `Free` can therefore always read the pointer it
+                // is given as a real allocation.
                 let p = buf.as_ptr() as *mut std::os::raw::c_void;
-                if p.is_null() {
-                    // An allocator that reports success with a null pointer
-                    // would make `Free` unable to distinguish "empty tensor"
-                    // from "failure". Fail the allocation instead.
-                    return ptr::null_mut();
-                }
                 // Recover from a poisoned lock rather than dropping the record:
                 // an unrecorded allocation is one `device_free` can never
                 // reclaim, so poisoning would silently turn into a device-memory
