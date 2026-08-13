@@ -411,6 +411,7 @@ pub mod unary_math;
 pub mod unique;
 pub mod unsqueeze;
 pub mod varlen_attention;
+pub mod weight_transpose;
 pub mod where_op;
 pub mod window;
 
