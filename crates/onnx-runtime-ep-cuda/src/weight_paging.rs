@@ -313,19 +313,33 @@ pub const WEIGHT_OFFLOAD_SCAN_RESISTANT_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_S
 /// shows that whenever this policy *actually engages* (offload active, i.e. the
 /// only regime where it could help), it **violates the token-identity hard
 /// constraint**: greedy decode collapses to 3 tokens instead of 16, both with
-/// (`ONNX_GENAI_CUDA_GRAPH=1`) and without CUDA-graph capture. The failure is a
-/// normal early-EOS from `profile_native::main` ("generation emitted 3 tokens"),
-/// not a weight/CUDA admission error, so the size-greedy eviction is corrupting
-/// decode numerics — evicting-by-size reorders physical granule churn in a way
-/// the scan-resistant recency discipline does not, and that discipline turns out
-/// to be load-bearing for *correctness* on the managed path, not just for hit
-/// rate. Runs where offload never engaged (short/non-steady, `page_ins=0`) stay
-/// byte-identical precisely because this branch never ran. The count-vs-byte
-/// residency gap therefore cannot be closed by an eviction-order change alone;
-/// it needs the structural lever deferred by #837 (a dedicated transient staging
-/// zone so a large tensor can be handed to the kernel *without* evicting a
-/// resident page). Kept default-OFF and wired only so the rejected approach and
-/// its evidence are reviewable; the default (size-blind) path is unaffected.
+/// (`ONNX_GENAI_CUDA_GRAPH=1`) and without CUDA-graph capture.
+///
+/// The failure is **silent numeric corruption, not an admission error** — proven
+/// by the profiler's error-propagation structure: `generate_with_callback` is
+/// `?`-propagated with `.context("steady measured generation")` *before* the
+/// `bail!("generation emitted N tokens")` check, so the observed `bail!` means
+/// generation returned `Ok` with only 3 tokens (an early EOS), not that a
+/// `WeightHandleError` surfaced. A residency policy decides *what is resident*,
+/// not *what is computed*: both the resident-hit and bypass paths fill the
+/// correct bytes at a stable per-tensor VA, and every eviction here only targets
+/// `strong_count == 1` pages after draining **both** the compute and copy
+/// streams. Under those guards a change of eviction *target* (smallest-by-bytes
+/// instead of `next_evictable_index`'s front-of-order oldest page) should be
+/// value-neutral. That it is not implicates state that depends on eviction
+/// *order* — most plausibly the physical granule / retained-handle pool
+/// accounting — rather than the policy decision itself. Reproduction with CUDA
+/// graph OFF rules out captured-VA baking as the sole cause. Whether this is a
+/// bug in the byte-aware admission loop or a **latent defect in the existing
+/// offload path** (exposed, not caused, by reordering evictions) was not
+/// isolated here and is worth a separate investigation.
+///
+/// The count-vs-byte residency gap therefore cannot be closed by an eviction-
+/// order change alone; it needs the structural lever deferred by #837 (a
+/// dedicated transient staging zone so a large tensor can be handed to the
+/// kernel *without* evicting a resident page). Kept default-OFF and wired only
+/// so the rejected approach and its evidence are reviewable; the default
+/// (size-blind) path is unaffected.
 pub const WEIGHT_OFFLOAD_BYTE_AWARE_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_BYTE_AWARE";
 
 /// Parse [`WEIGHT_OFFLOAD_ASYNC_PAGEIN_ENV`]. Async page-in is **default-on**:
