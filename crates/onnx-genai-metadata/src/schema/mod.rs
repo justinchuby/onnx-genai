@@ -222,54 +222,6 @@ mod schema_vocabulary {
     );
 
     extensible_string!(
-        /// Generic inference-strategy vocabulary.
-        StrategyKind,
-        strategy_kind,
-        STRATEGY_KIND,
-        ["speculative"]
-    );
-
-    extensible_string!(
-        /// Speculative draft-producer vocabulary.
-        DraftProducer,
-        draft_producer,
-        DRAFT_PRODUCER,
-        ["draft_model", "self_speculative", "ngram", "extra_heads"]
-    );
-
-    extensible_string!(
-        /// Speculative verification-method vocabulary.
-        VerificationMethod,
-        verification_method,
-        VERIFICATION_METHOD,
-        ["single_forward"]
-    );
-
-    extensible_string!(
-        /// Speculative acceptance-rule vocabulary.
-        AcceptanceMethod,
-        acceptance_method,
-        ACCEPTANCE_METHOD,
-        ["rejection_sampling", "greedy", "typical"]
-    );
-
-    extensible_string!(
-        /// Speculative proposal-topology vocabulary.
-        ProposalTopology,
-        proposal_topology,
-        PROPOSAL_TOPOLOGY,
-        ["linear", "tree"]
-    );
-
-    extensible_string!(
-        /// Structured-output constraint-format vocabulary.
-        StructuredOutputFormat,
-        structured_output_format,
-        STRUCTURED_OUTPUT_FORMAT,
-        ["json_schema", "regex", "context_free_grammar", "choice"]
-    );
-
-    extensible_string!(
         /// Generic image transform-operation vocabulary.
         ImageTransformOp,
         image_transform_op,
@@ -495,30 +447,6 @@ mod schema_helpers {
 
     pub(super) fn precision(schema: &mut Schema) {
         extensible_string_enum(schema, super::schema_vocabulary::PRECISION);
-    }
-
-    pub(super) fn strategy_kind(schema: &mut Schema) {
-        extensible_string_enum(schema, super::schema_vocabulary::STRATEGY_KIND);
-    }
-
-    pub(super) fn draft_producer(schema: &mut Schema) {
-        extensible_string_enum(schema, super::schema_vocabulary::DRAFT_PRODUCER);
-    }
-
-    pub(super) fn verification_method(schema: &mut Schema) {
-        extensible_string_enum(schema, super::schema_vocabulary::VERIFICATION_METHOD);
-    }
-
-    pub(super) fn acceptance_method(schema: &mut Schema) {
-        extensible_string_enum(schema, super::schema_vocabulary::ACCEPTANCE_METHOD);
-    }
-
-    pub(super) fn proposal_topology(schema: &mut Schema) {
-        extensible_string_enum(schema, super::schema_vocabulary::PROPOSAL_TOPOLOGY);
-    }
-
-    pub(super) fn structured_output_format(schema: &mut Schema) {
-        extensible_string_enum(schema, super::schema_vocabulary::STRUCTURED_OUTPUT_FORMAT);
     }
 
     pub(super) fn image_transform_op(schema: &mut Schema) {
