@@ -59,6 +59,7 @@ pub(crate) struct ExecutionIsland {
     pub components: Vec<String>,
     pub inputs: BTreeMap<String, String>,
     pub outputs: BTreeMap<String, String>,
+    fallback: WorkflowNode,
     session: Session,
     capture_eligible: bool,
     capture_disabled: Cell<bool>,
@@ -102,6 +103,54 @@ struct StableIslandBinding {
 impl ExecutionIsland {
     pub(crate) fn component_count(&self) -> usize {
         self.components.len()
+    }
+
+    pub(crate) fn cuda_device_id(&self) -> Option<i32> {
+        self.session.cuda_device_id()
+    }
+
+    pub(crate) fn materialize_host(&self, value: &Value) -> anyhow::Result<Value> {
+        if value.is_host_resident()? {
+            return clone_value(value);
+        }
+
+        let device_id = self.session.cuda_device_id().with_context(|| {
+            format!(
+                "execution island {} cannot materialize a non-host value without a CUDA device",
+                self.id
+            )
+        })?;
+        let host = Value::empty(value.shape(), value.dtype())?;
+        self.record_copy(value, &host)?;
+        host.copy_from_cuda(value, device_id)?;
+        Ok(host)
+    }
+
+    pub(crate) fn uses_override(&self, overrides: &HashMap<String, String>) -> bool {
+        self.components
+            .iter()
+            .any(|component| overrides.contains_key(component))
+    }
+
+    pub(crate) fn fallback(&self) -> &WorkflowNode {
+        &self.fallback
+    }
+
+    fn clone_output_for_store(&self, output: &Value) -> anyhow::Result<Value> {
+        let Some(device_id) = self.session.cuda_device_id() else {
+            self.record_host_copy(output);
+            return clone_value(output);
+        };
+        let allocator = self.device_allocator.as_ref().with_context(|| {
+            format!(
+                "execution island {} has a CUDA output but no device allocator",
+                self.id
+            )
+        })?;
+        let stored = Value::empty_in(output.shape(), output.dtype(), allocator)?;
+        self.record_copy(output, &stored)?;
+        stored.copy_from_cuda(output, device_id)?;
+        Ok(stored)
     }
 
     fn diagnostic(&self) -> ExecutionIslandDiagnostic {
@@ -149,11 +198,7 @@ impl ExecutionIsland {
     ) -> anyhow::Result<()> {
         let started = Instant::now();
         self.record_device_memory();
-        if self
-            .components
-            .iter()
-            .any(|component| component_overrides.contains_key(component))
-        {
+        if self.uses_override(component_overrides) {
             bail!(
                 "execution island {} contains an application-overridden component; \
                  the caller must execute its unfused fallback",
@@ -230,16 +275,7 @@ impl ExecutionIsland {
             }
             for (port, output) in &stable.outputs {
                 let value_ref = &self.outputs[port];
-                let output = if let Some(device_id) = self.session.cuda_device_id() {
-                    let host = Value::empty(output.shape(), output.dtype())?;
-                    self.record_copy(output, &host)?;
-                    host.copy_from_cuda(output, device_id)?;
-                    host
-                } else {
-                    self.record_host_copy(output);
-                    clone_value(output)?
-                };
-                values.insert(value_ref.clone(), output);
+                values.insert(value_ref.clone(), self.clone_output_for_store(output)?);
             }
             self.record_elapsed(started);
             return Ok(());
@@ -247,7 +283,7 @@ impl ExecutionIsland {
 
         // Warmup resolves any artifact-inferred dynamic output extents. The next
         // equal-shape run uses stable buffers and becomes capture/replay eligible.
-        if self.capture_eligible {
+        if self.device_allocator.is_some() {
             let allocator = self.device_allocator.as_ref().with_context(|| {
                 format!(
                     "execution island {} is capture eligible but has no device allocator",
@@ -299,10 +335,7 @@ impl ExecutionIsland {
             self.next_graph_id.set(graph_id + 1);
             for (port, output) in &stable_outputs {
                 let value_ref = &self.outputs[port];
-                let host = Value::empty(output.shape(), output.dtype())?;
-                self.record_copy(output, &host)?;
-                host.copy_from_cuda(output, device_id)?;
-                values.insert(value_ref.clone(), host);
+                values.insert(value_ref.clone(), self.clone_output_for_store(output)?);
             }
             self.record_stable_binding_bytes(&stable_inputs, &stable_outputs);
             bindings.insert(
@@ -410,12 +443,14 @@ impl ExecutionIsland {
                     .set(self.host_to_host_bytes.get() + bytes);
             }
             (true, false) => {
+                self.record_device_synchronization();
                 self.host_to_device_copies
                     .set(self.host_to_device_copies.get() + 1);
                 self.host_to_device_bytes
                     .set(self.host_to_device_bytes.get() + bytes);
             }
             (false, true) => {
+                self.record_device_synchronization();
                 self.device_to_host_copies
                     .set(self.device_to_host_copies.get() + 1);
                 self.device_to_host_bytes
@@ -593,7 +628,6 @@ fn pure_onnx_device(
 
 fn is_fusible_component(component: &WorkflowComponent) -> bool {
     component.effects.is_empty()
-        && !component.application_overridable
         && matches!(
             component.implementation,
             ComponentImplementation::Onnx { .. }
@@ -727,7 +761,7 @@ fn build_execution_island(
         &linked.external_files,
         options,
     )?;
-    let device_allocator = if structurally_capture_eligible {
+    let device_allocator = if device.starts_with("cuda:") {
         session.device_allocator()?
     } else {
         None
@@ -748,6 +782,17 @@ fn build_execution_island(
         components,
         inputs: linked.inputs,
         outputs: linked.outputs,
+        fallback: WorkflowNode::Sequence {
+            nodes: invocations
+                .iter()
+                .map(|invocation| WorkflowNode::Invoke {
+                    component: invocation.component.clone(),
+                    inputs: invocation.inputs.clone(),
+                    outputs: invocation.outputs.clone(),
+                    effects: BTreeMap::new(),
+                })
+                .collect(),
+        },
         session,
         capture_eligible,
         capture_disabled: Cell::new(false),
@@ -1135,7 +1180,7 @@ mod tests {
         assert!(!is_fusible_component(&onnx));
         onnx.effects.clear();
         onnx.application_overridable = true;
-        assert!(!is_fusible_component(&onnx));
+        assert!(is_fusible_component(&onnx));
 
         let adapter = component(ComponentImplementation::Adapter {
             abi: "onnx-genai.grammar-guidance".into(),

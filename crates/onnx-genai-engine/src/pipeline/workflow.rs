@@ -259,6 +259,62 @@ fn resolve_component_invocation<'a>(
 }
 
 impl PipelineEngine {
+    fn materialize_workflow_value(
+        &self,
+        values: &mut PipelineTensors,
+        name: &str,
+    ) -> anyhow::Result<()> {
+        let value = values
+            .get(name)
+            .with_context(|| format!("workflow value '{name}' is unavailable"))?;
+        if value.is_host_resident()? {
+            return Ok(());
+        }
+        let device_id = value.device_id()?;
+        let island = self
+            .execution_islands
+            .iter()
+            .find(|island| island.cuda_device_id() == Some(device_id))
+            .with_context(|| {
+                format!(
+                    "workflow has a value on CUDA device {device_id} but no execution island for \
+                     that device"
+                )
+            })?;
+        let host = island.materialize_host(value)?;
+        values.insert(name.to_string(), host);
+        Ok(())
+    }
+
+    fn package_outputs(&self, mut values: PipelineTensors) -> anyhow::Result<PipelineTensors> {
+        let mut outputs = PipelineTensors::new();
+        for output in self.workflow.outputs.keys() {
+            let row_prefix = format!("{output}.row.");
+            let event_prefix = format!("{output}.");
+            let names = values
+                .keys()
+                .filter(|name| {
+                    *name == output
+                        || name.starts_with(&row_prefix)
+                        || (name.starts_with(&event_prefix)
+                            && name[event_prefix.len()..]
+                                .chars()
+                                .all(|character| character.is_ascii_digit()))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            for name in names {
+                self.materialize_workflow_value(&mut values, &name)?;
+                outputs.insert(
+                    name.clone(),
+                    values
+                        .remove(&name)
+                        .with_context(|| format!("workflow package output '{name}' disappeared"))?,
+                );
+            }
+        }
+        Ok(outputs)
+    }
     pub fn workflow_performance_diagnostic(&self) -> WorkflowPerformanceDiagnostic {
         let counters = self.workflow_performance.borrow();
         let elapsed_seconds = counters.last_elapsed_ns as f64 / 1_000_000_000.0;
@@ -403,7 +459,7 @@ impl PipelineEngine {
         counters.last_component_invocations = telemetry.component_invocations;
         counters.last_emit_events = telemetry.emit_events;
         counters.last_emitted_elements = telemetry.emitted_elements;
-        Ok(values)
+        self.package_outputs(values)
     }
     fn run_workflow_node(
         &self,
@@ -532,6 +588,9 @@ impl PipelineEngine {
                         }
                     }
                     ComponentImplementation::Adapter { abi, version, .. } => {
+                        for value in inputs.values() {
+                            self.materialize_workflow_value(values, value)?;
+                        }
                         if let Some(execute) =
                             workflow_adapter_registry().get(&(abi.as_str(), version.as_str()))
                         {
@@ -575,6 +634,7 @@ impl PipelineEngine {
                     component_overrides,
                     telemetry,
                 )?;
+                self.materialize_workflow_value(values, max_iterations)?;
                 for carry in carried {
                     let state = workflow.state.get(&carry.cell).with_context(|| {
                         format!("workflow loop carries undeclared state '{}'", carry.cell)
@@ -606,6 +666,7 @@ impl PipelineEngine {
                     );
                 }
                 for index in 0..limit {
+                    self.materialize_workflow_value(values, continue_when)?;
                     let active_rows = workflow_bool_rows(values, continue_when)?;
                     if !active_rows.iter().any(|active| *active) {
                         break;
@@ -638,14 +699,35 @@ impl PipelineEngine {
                         telemetry,
                     )?;
                     for carry in carried {
+                        let state = workflow.state.get(&carry.cell).with_context(|| {
+                            format!("workflow loop carries undeclared state '{}'", carry.cell)
+                        })?;
+                        match &state.recurrence {
+                            onnx_genai_metadata::ShapeRecurrence::Growing {
+                                increment,
+                                max,
+                                ..
+                            } => {
+                                self.materialize_workflow_value(values, increment)?;
+                                self.materialize_workflow_value(values, max)?;
+                            }
+                            onnx_genai_metadata::ShapeRecurrence::Bounded { max, .. } => {
+                                self.materialize_workflow_value(values, max)?;
+                            }
+                            onnx_genai_metadata::ShapeRecurrence::Invariant => {}
+                        }
+                        if active_rows.len() > 1
+                            && active_rows.iter().any(|active| !*active)
+                            && state.service_group.is_none()
+                        {
+                            self.materialize_workflow_value(values, &carry.next)?;
+                            self.materialize_workflow_value(values, &carry.body_output)?;
+                        }
                         let current = values.get(&carry.next).with_context(|| {
                             format!("workflow loop value '{}' is unavailable", carry.next)
                         })?;
                         let next = values.get(&carry.body_output).with_context(|| {
                             format!("workflow loop body did not produce '{}'", carry.body_output)
-                        })?;
-                        let state = workflow.state.get(&carry.cell).with_context(|| {
-                            format!("workflow loop carries undeclared state '{}'", carry.cell)
                         })?;
                         validate_state_recurrence(&carry.cell, current, next, state, values)?;
                         let next_value = merge_inactive_rows(
@@ -675,6 +757,7 @@ impl PipelineEngine {
                 outputs,
                 effects: _,
             } => {
+                self.materialize_workflow_value(values, predicate)?;
                 let key = workflow_scalar_key(values, predicate)?;
                 let (selected, is_default) = if let Some(case) = cases.get(&key) {
                     (case, false)
@@ -748,6 +831,13 @@ impl PipelineEngine {
                 mode,
                 ..
             } => {
+                self.materialize_workflow_value(values, value)?;
+                if let Some(when) = when {
+                    self.materialize_workflow_value(values, when)?;
+                }
+                if let Some(valid_length) = valid_length {
+                    self.materialize_workflow_value(values, valid_length)?;
+                }
                 let tensor =
                     clone_value(values.get(value).with_context(|| {
                         format!("workflow emit value '{value}' is unavailable")
@@ -863,6 +953,20 @@ impl PipelineEngine {
                 let island = self.execution_islands.get(*id).with_context(|| {
                     format!("workflow references unknown execution island {id}")
                 })?;
+                if island.uses_override(component_overrides) {
+                    self.run_workflow_node(
+                        island.fallback(),
+                        workflow,
+                        values,
+                        symbols,
+                        dynamic_symbols,
+                        emit_counts,
+                        final_state_refs,
+                        component_overrides,
+                        telemetry,
+                    )?;
+                    return Ok(());
+                }
                 telemetry.component_invocations += island.component_count() as u64;
                 island.run(values, component_overrides)?;
             }
@@ -2025,7 +2129,7 @@ fn merge_inactive_rows(
     if active.len() == 1 || active.iter().all(|active| *active) {
         return clone_value(next);
     }
-    if service_managed && current.shape() != next.shape() {
+    if service_managed {
         // Per-row logical lengths and inactive-row storage are owned by the bound service.
         return clone_value(next);
     }
