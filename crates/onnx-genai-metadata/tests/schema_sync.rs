@@ -34,9 +34,6 @@ fn generated_schema_preserves_all_root_constraints() {
     let constraints = schema["allOf"].as_array().expect("root allOf array");
 
     assert!(constraints.iter().any(|constraint| {
-        constraint["not"]["required"] == serde_json::json!(["speculative", "speculator_config"])
-    }));
-    assert!(constraints.iter().any(|constraint| {
         constraint["not"]["required"] == serde_json::json!(["pipeline", "model"])
             && constraint["not"]["properties"]["model"]["required"] == serde_json::json!(["io"])
     }));

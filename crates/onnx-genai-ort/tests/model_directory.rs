@@ -55,13 +55,3 @@ fn unknown_proposal_type_is_preserved() {
         SpeculatorProposerStatus::Unknown("future-tree-v2".to_string())
     );
 }
-
-#[test]
-fn native_inference_metadata_takes_precedence() {
-    let speculator =
-        detect_speculator(&fixture("speculator-native")).expect("speculator is detected");
-
-    assert_eq!(speculator.proposal_type, ProposalType::Mtp);
-    assert_eq!(speculator.num_speculative_tokens, 3);
-    assert_eq!(speculator.source, SpeculatorConfigSource::InferenceMetadata);
-}

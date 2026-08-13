@@ -2,10 +2,7 @@
 
 use crate::logits::{StopSequence, TokenId};
 use onnx_genai_kv::{CachePriority, DEFAULT_CHUNK_SIZE, KvDType, LocalTieredConfig, SequenceId};
-use onnx_genai_metadata::{
-    GenerationDefaults, MtpHiddenLayout as MetadataMtpHiddenLayout, MtpKvMode as MetadataMtpKvMode,
-    MtpProposerSpec,
-};
+use onnx_genai_metadata::GenerationDefaults;
 use onnx_genai_ort::{Eagle3DraftKvMode, MtpDraftKvMode};
 use onnx_genai_scheduler::{Priority, ResourceLimit, ResourceLimits, SchedulerConfig};
 use serde::Deserialize;
@@ -283,44 +280,6 @@ impl ResolvedMtpConfig {
             mtp_hidden_output: "mtp_hidden".into(),
             mtp_state_output: None,
             cache_scope: MtpCacheScope::ProposalLocal,
-        }
-    }
-
-    /// Resolve metadata-only MTP settings without expanding the stable public
-    /// hand-authored [`MtpConfig`] surface.
-    pub(crate) fn from_sidecar_descriptor(spec: &MtpProposerSpec, vocab_size: usize) -> Self {
-        let public_config = MtpConfig {
-            head_model: spec.model.clone(),
-            target_hidden_output: spec.target_hidden_output.clone(),
-            embedding_weights: PathBuf::from(&spec.embedding_initializer),
-            lm_head_weights: PathBuf::from(&spec.lm_head_initializer),
-            vocab_size,
-            hidden_size: spec.target_hidden_size,
-            kv_mode: MtpDraftKvMode::GrowCache,
-            num_speculative_tokens: spec.num_speculative_tokens,
-        };
-        Self {
-            public_config,
-            target_hidden_layout: match spec.target_hidden_layout {
-                MetadataMtpHiddenLayout::Bsh => MtpHiddenLayout::Bsh,
-                MetadataMtpHiddenLayout::Bshc => MtpHiddenLayout::Bshc,
-            },
-            embedding_weights: MtpWeightSource::TargetInitializer(
-                spec.embedding_initializer.clone(),
-            ),
-            lm_head_weights: MtpWeightSource::TargetInitializer(spec.lm_head_initializer.clone()),
-            hc_mult: spec.hc_mult,
-            mtp_hidden_output: spec.mtp_hidden_output.clone(),
-            // A head that threads a recurrent state declares its output name; a
-            // pure-attention (proposal-local) head declares none. The metadata
-            // schema keeps this optional, so honor exactly what was declared
-            // rather than inventing a phantom "mtp_state" output the head does
-            // not expose (which would make `MtpDecodeSession` reject it).
-            mtp_state_output: spec.mtp_state_output.clone(),
-            cache_scope: match spec.kv_mode {
-                MetadataMtpKvMode::ProposalLocal => MtpCacheScope::ProposalLocal,
-                MetadataMtpKvMode::AcceptedPrefix => MtpCacheScope::AcceptedPrefix,
-            },
         }
     }
 }
@@ -1575,135 +1534,6 @@ pub(crate) fn validate_shared_kv_proposer_config(
 #[cfg(test)]
 mod mtp_config_tests {
     use super::*;
-    use onnx_genai_metadata::{
-        InferenceMetadata, SpeculatorProposerStatus, resolve_speculator_config,
-    };
-    use std::path::Path;
-
-    #[test]
-    fn mobius_sidecar_metadata_builds_complete_mtp_config() {
-        let metadata: InferenceMetadata = serde_yaml::from_str(
-            r#"
-speculative:
-  proposal_type: mtp
-  model: mtp/model.onnx
-  num_speculative_tokens: 4
-  target_hidden_output: hidden_states
-  target_hidden_layout: BSHC
-  target_hidden_size: 4096
-  hc_mult: 4
-  mtp_hidden_output: mtp_hidden
-  mtp_state_output: mtp_state
-  kv_mode: proposal_local
-  embedding:
-    source: target_initializer
-    name: model.embed_tokens.weight
-  lm_head:
-    source: target_initializer
-    name: lm_head.weight
-"#,
-        )
-        .expect("metadata parses");
-        let descriptor = resolve_speculator_config(
-            Path::new("/models/deepseek-v4"),
-            metadata.speculative.expect("speculative descriptor"),
-        );
-        let SpeculatorProposerStatus::Mtp(spec) = descriptor.proposer else {
-            panic!("MTP descriptor did not resolve");
-        };
-        let config = ResolvedMtpConfig::from_sidecar_descriptor(&spec, 129_280);
-
-        assert_eq!(
-            config.public_config.head_model,
-            Path::new("/models/deepseek-v4/mtp/model.onnx")
-        );
-        assert_eq!(config.public_config.target_hidden_output, "hidden_states");
-        assert_eq!(config.target_hidden_layout, MtpHiddenLayout::Bshc);
-        assert_eq!(
-            config.embedding_weights,
-            MtpWeightSource::TargetInitializer("model.embed_tokens.weight".into())
-        );
-        assert_eq!(
-            config.lm_head_weights,
-            MtpWeightSource::TargetInitializer("lm_head.weight".into())
-        );
-        assert_eq!(config.public_config.vocab_size, 129_280);
-        assert_eq!(config.public_config.hidden_size, 4096);
-        assert_eq!(config.hc_mult, 4);
-        assert_eq!(config.mtp_hidden_output, "mtp_hidden");
-        assert_eq!(config.mtp_state_output.as_deref(), Some("mtp_state"));
-        assert_eq!(config.public_config.kv_mode, MtpDraftKvMode::GrowCache);
-        assert_eq!(config.cache_scope, MtpCacheScope::ProposalLocal);
-        assert_eq!(config.public_config.num_speculative_tokens, 4);
-        validate_resolved_mtp_config(&config).expect("resolved config validates");
-    }
-
-    #[test]
-    fn proposal_local_head_without_declared_state_output_stays_none() {
-        // A pure-attention (proposal-local) MTP head — like the real
-        // Qwen3.8 int4 artifact — declares no `mtp_state_output`. The optional
-        // field must resolve to `None` rather than a phantom "mtp_state" name
-        // that `MtpDecodeSession` would then require the head to expose.
-        let metadata: InferenceMetadata = serde_yaml::from_str(
-            r#"
-speculative:
-  proposal_type: mtp
-  model: mtp/model.onnx
-  num_speculative_tokens: 1
-  target_hidden_output: hidden_states.63
-  target_hidden_layout: BSH
-  target_hidden_size: 5120
-  hc_mult: 1
-  mtp_hidden_output: mtp_hidden
-  kv_mode: proposal_local
-  embedding:
-    source: target_initializer
-    name: model.embed_tokens.weight
-  lm_head:
-    source: target_initializer
-    name: lm_head.weight
-"#,
-        )
-        .expect("metadata parses");
-        let descriptor = resolve_speculator_config(
-            Path::new("/models/qwen38-mtp"),
-            metadata.speculative.expect("speculative descriptor"),
-        );
-        let SpeculatorProposerStatus::Mtp(spec) = descriptor.proposer else {
-            panic!("MTP descriptor did not resolve");
-        };
-        assert_eq!(spec.mtp_state_output, None);
-        let config = ResolvedMtpConfig::from_sidecar_descriptor(&spec, 248_320);
-        assert_eq!(config.mtp_state_output, None);
-        assert_eq!(config.hc_mult, 1);
-        assert_eq!(config.cache_scope, MtpCacheScope::ProposalLocal);
-        validate_resolved_mtp_config(&config).expect("resolved config validates");
-    }
-
-    #[test]
-    fn malformed_mtp_metadata_is_rejected_before_config_construction() {
-        let metadata: InferenceMetadata = serde_yaml::from_str(
-            r#"
-speculative:
-  proposal_type: mtp
-  model: mtp/model.onnx
-  target_hidden_size: 4096
-  hc_mult: 4
-  embedding:
-    source: target_initializer
-    name: model.embed_tokens.weight
-"#,
-        )
-        .expect("metadata syntax parses");
-        let descriptor = resolve_speculator_config(
-            Path::new("/models/deepseek-v4"),
-            metadata.speculative.expect("speculative descriptor"),
-        );
-        assert_eq!(
-            descriptor.proposer,
-            SpeculatorProposerStatus::Unknown("mtp metadata is missing `lm_head`".into())
-        );
-    }
 
     #[test]
     fn mtp_validation_enforces_hc_layout_and_state_contract() {

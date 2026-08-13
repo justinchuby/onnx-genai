@@ -135,7 +135,6 @@ fn empty_metadata() -> InferenceMetadata {
         quantization: None,
         preprocessing: None,
         pipeline: None,
-        speculative: None,
         hardware_requirements: None,
     }
 }
@@ -163,9 +162,9 @@ fn model_capabilities(
         io: None,
         attention: Some(attention),
         max_sequence_length,
-        speculative: None,
         runtime_configurable,
         mixture_of_experts: None,
+        speculative: None,
     }
 }
 

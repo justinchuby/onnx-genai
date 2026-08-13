@@ -43,7 +43,14 @@ pipeline:
 
 #[test]
 fn removed_top_level_execution_surfaces_are_rejected() {
-    for field in ["strategy", "structured_output", "generation", "tokens"] {
+    for field in [
+        "strategy",
+        "structured_output",
+        "generation",
+        "tokens",
+        "speculative",
+        "speculator_config",
+    ] {
         let document = format!("{field}: {{}}\n");
         let error = serde_yaml::from_str::<InferenceMetadata>(&document)
             .expect_err("removed top-level execution metadata must not deserialize");
