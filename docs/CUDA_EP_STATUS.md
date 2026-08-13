@@ -564,16 +564,29 @@ Everything in this list is about the PR #830 delta or was never in #832's scope:
   each request is a real `cuMemAlloc` and the capture-safety argument narrows to
   "no free", not "no allocation").
 
-  > What is now known, on **CPU** with ORT 1.28 and the shared-mock plugin (run
-  > `python scripts/validate_ep_workspace_h200.py --self-test`): across 29
-  > serves ORT returned 29 **distinct** blocks inside a ~239 KiB window — a
-  > reused arena region with a moving offset, not one reused block — and the
-  > blocks were **64-byte aligned against a 256-byte request**, with the
-  > executor's align-up moving the pointer by up to 192 bytes. On this
-  > allocator the over-allocate-and-align-up in `prepare_workspace` is
-  > load-bearing, not defensive. Whether the H200 CUDA allocator behaves the
-  > same is exactly what the harness measures on device, and is **not**
-  > answered by the CPU result;
+  > What is now known, on **CPU** with ORT 1.28 and the shared-mock plugin, from
+  > `python scripts/validate_ep_workspace_h200.py --self-test` (the default,
+  > `--steps 64`), reproduced identically on three consecutive runs:
+  >
+  > ```
+  > served: 69   distinct_blocks: 69   block_span_bytes: 587776
+  > reused_single_block: False        ort_met_requested_alignment: False
+  > ```
+  >
+  > So the scratch is **arena-backed but not a single reused block**: all 69
+  > serves got distinct addresses inside a ~574 KiB window — a reused *region*
+  > with a moving offset. And ORT did **not** meet the kernel's 256-byte
+  > request on its own; `align_workspace_window` had to move the pointer
+  > (`skew_bytes_observed: [0, 128]` on these runs). The over-allocate in
+  > `workspace_block_bytes` and the align-up in `prepare_workspace` are
+  > therefore **load-bearing, not defensive**.
+  >
+  > The two conclusions above (`distinct_blocks == served`,
+  > `ort_met_requested_alignment: False`) reproduce run to run. The concrete
+  > addresses and the `block_alignment_observed` histogram do **not** — the
+  > arena's base address varies per process — so treat those as illustrative.
+  > Whether the H200 CUDA allocator behaves the same way is exactly what the
+  > harness measures on device, and is **not** answered by this CPU result;
 - whether declining `SessionPersistent` leaves `GroupQueryAttention` and
   `StandardAttention`'s single-token decode geometry on a correct self-owned
   path under the plugin executor specifically (#832 validated the *native* path

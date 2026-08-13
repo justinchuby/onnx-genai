@@ -645,16 +645,23 @@ def parse_nsys_api_table(text: str) -> dict:
     rows: list[tuple[str, int]] = []
     lines = [line for line in text.splitlines() if line.strip()]
 
-    # Pick the form from the header, not from "did the CSV reader produce
-    # something": the whitespace table has thousands separators in it, so
-    # csv.reader happily shreds it into plausible-looking garbage.
-    header_fields = [f.strip() for f in lines[0].split(",")] if lines else []
-    is_csv = "Num Calls" in header_fields and "Name" in header_fields
+    # Find the header wherever it is, not at line 0: real `nsys stats` prints
+    # its own preamble ("Generating SQLite file...", "** CUDA API Summary
+    # (cuda_api_sum):") ahead of the table. Deciding the format from the first
+    # line alone would drop a perfectly good CSV report into the whitespace
+    # parser, which reads no rows out of it, which now fails the run.
+    header_at = None
+    header_fields: list[str] = []
+    for index, line in enumerate(lines):
+        fields = [f.strip() for f in line.split(",")]
+        if "Num Calls" in fields and "Name" in fields:
+            header_at, header_fields = index, fields
+            break
 
-    if is_csv:
+    if header_at is not None:
         calls_at = header_fields.index("Num Calls")
         name_at = header_fields.index("Name")
-        for row in csv.reader(lines[1:]):
+        for row in csv.reader(lines[header_at + 1 :]):
             if len(row) <= max(calls_at, name_at):
                 continue
             calls = row[calls_at].strip().replace(",", "")
@@ -707,6 +714,16 @@ NSYS_SAMPLE_CSV = """Time (%),Total Time (ns),Num Calls,Avg (ns),Med (ns),Min (n
 0.4,80000,3,2666.6,2500.0,2100,3300,500.0,cuMemFree_v2
 """
 
+# What `nsys stats` really writes: its own progress chatter, then a banner, then
+# the table. A parser that only looks at line 0 for the header drops all of it.
+NSYS_SAMPLE_CSV_WITH_PREAMBLE = (
+    "Generating SQLite file ws_check_n64.sqlite from ws_check_n64.nsys-rep\n"
+    "Processing [ws_check_n64.sqlite] with [/opt/nvidia/nsight-systems/host-linux-x64/reports/cuda_api_sum.py]...\n"
+    "\n"
+    "** CUDA API Summary (cuda_api_sum):\n"
+    "\n" + NSYS_SAMPLE_CSV
+)
+
 
 def check_nsys_parser() -> list[tuple[str, bool, str]]:
     """The nsys parser is the one part of this harness that cannot be exercised
@@ -749,6 +766,13 @@ def check_nsys_parser() -> list[tuple[str, bool, str]]:
                 api in parse_nsys_api_table(NSYS_SAMPLE_TABLE) for api in LAUNCH_APIS
             ),
             f"a launch API must be visible in a real report: {sorted(parse_nsys_api_table(NSYS_SAMPLE_TABLE))}",
+        ),
+        (
+            "nsys_parser_skips_the_stats_preamble",
+            parse_nsys_api_table(NSYS_SAMPLE_CSV_WITH_PREAMBLE) == parse_nsys_api_table(NSYS_SAMPLE_CSV),
+            "nsys stats prints progress lines and a banner before the table; finding the "
+            f"header only at line 0 would fail a clean capture. got "
+            f"{parse_nsys_api_table(NSYS_SAMPLE_CSV_WITH_PREAMBLE)}",
         ),
     ]
 
