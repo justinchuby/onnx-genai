@@ -77,6 +77,13 @@ const GATE_UP_SWIGLU_SUPPORTED_BITS: i64 = 4;
 pub(crate) struct CudaSwiGluFusion;
 
 /// Lower an exact `x * Sigmoid(x)` pair to the CUDA EP's fused SiLU kernel.
+///
+/// Fires on fp16 **and** bf16 activations: the fused SwiGLU epilogue has a
+/// byte-exact decomposed kernel for each (`decomposed_silu_mul_{f16,bf16}`),
+/// so collapsing the standalone `Sigmoid` + `Mul(x, sigmoid)` glue keeps greedy
+/// tokens byte-identical. bf16 decoders (e.g. Muse-Glimmer-30B) export SwiGLU as
+/// that standalone pair, so bf16 support is what lets the per-layer glue node
+/// collapse into the already-landed fused launch.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct CudaSiluFusion;
 
@@ -130,7 +137,16 @@ impl OptimizationPass for CudaSiluFusion {
             let Some(x) = sigmoid.inputs[0] else {
                 continue;
             };
-            if graph.value(x).dtype != DataType::Float16 {
+            // The fused SwiGLU epilogue has a byte-exact decomposed kernel for
+            // both fp16 (`decomposed_silu_mul_f16`) and bf16
+            // (`decomposed_silu_mul_bf16`): each rounds the intermediate
+            // `sigmoid` and the `x * sigmoid` product back to the narrow dtype
+            // exactly as the standalone `Sigmoid`/`Mul` ops do, so greedy tokens
+            // stay byte-identical. bf16 decoders such as Muse-Glimmer-30B export
+            // the SwiGLU as a standalone `Sigmoid` + `Mul(x, sigmoid)` pair in
+            // their native bf16 stream; without bf16 here the ~2 glue nodes per
+            // layer never collapse into the fused launch.
+            if !matches!(graph.value(x).dtype, DataType::Float16 | DataType::BFloat16) {
                 continue;
             }
             let sigmoid_output = sigmoid.outputs[0];
@@ -2708,6 +2724,81 @@ mod tests {
                 .nodes
                 .values()
                 .all(|node| node.attr(SILU_MUL_FUSION_ATTR).is_none())
+        );
+    }
+
+    /// `Sigmoid(x)` + `Mul(x, sigmoid)` + `Mul(silu, up)` in a narrow stream
+    /// collapses through `CudaSiluFusion` -> `CudaSwiGluFusion` into a single
+    /// tagged decomposed `Mul[_cuda_silu_mul]`, deleting the standalone
+    /// `Sigmoid` and the intermediate `Mul`. The plain (non-projection) `up`
+    /// value means `CudaGateUpSwiGluFusion` cannot fold the GEMVs, so the glue
+    /// collapse is observed in isolation.
+    fn decomposed_swiglu_glue_graph(dtype: DataType) -> Graph {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let x = value(&mut graph, "x", dtype, 7);
+        let up = value(&mut graph, "up", dtype, 7);
+        let sigmoid_out = value(&mut graph, "sigmoid", dtype, 7);
+        let silu_out = value(&mut graph, "silu", dtype, 7);
+        let output = value(&mut graph, "output", dtype, 7);
+        graph.add_input(x);
+        graph.add_input(up);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Sigmoid",
+            vec![Some(x)],
+            vec![sigmoid_out],
+        ));
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Mul",
+            vec![Some(x), Some(sigmoid_out)],
+            vec![silu_out],
+        ));
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Mul",
+            vec![Some(silu_out), Some(up)],
+            vec![output],
+        ));
+        graph.add_output(output);
+        graph
+    }
+
+    #[test]
+    fn collapses_bf16_decomposed_swiglu_glue() {
+        let mut graph = decomposed_swiglu_glue_graph(DataType::BFloat16);
+        CudaSiluFusion.run(&mut graph, &PassContext::new()).unwrap();
+        CudaSwiGluFusion
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        assert_eq!(graph.num_nodes(), 1, "Sigmoid + inner Mul must be removed");
+        let fused = graph.nodes.values().next().unwrap();
+        assert_eq!(fused.op_type, "Mul");
+        assert_eq!(
+            fused.attr(SILU_MUL_FUSION_ATTR).and_then(Attribute::as_int),
+            Some(1)
+        );
+        assert_eq!(
+            fused.attr(DECOMPOSED_SILU_ATTR).and_then(Attribute::as_int),
+            Some(1),
+            "the bf16 fused Mul must carry the decomposed marker so the runtime \
+             selects the byte-exact decomposed_silu_mul_bf16 kernel"
+        );
+        assert!(graph.validate().is_ok());
+    }
+
+    #[test]
+    fn leaves_fp32_decomposed_swiglu_glue_separate() {
+        let mut graph = decomposed_swiglu_glue_graph(DataType::Float32);
+        CudaSiluFusion.run(&mut graph, &PassContext::new()).unwrap();
+
+        // No fp32 decomposed-SiLU kernel: the Sigmoid must not lower to Silu.
+        assert_eq!(graph.num_nodes(), 3);
+        assert!(
+            graph.nodes.values().all(|node| node.op_type != "Silu"),
+            "fp32 has no byte-exact decomposed SiLU kernel; must stay unfused"
         );
     }
 
