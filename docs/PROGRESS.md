@@ -429,15 +429,31 @@ See [`deepseek-native-status-2026-07-25.md`](deepseek-native-status-2026-07-25.m
   ~91 ms/step at measured bandwidths. `byte_hit_rate` 71.8% against an achievable 85.7%
   (`B/W`). **Attributed:** bypassed page-ins account for **44.63% of streamed bytes
   (~1.05 GB/step) — about 90% of the recoverable gap**, so the previously unexplained
-  counter is the gap, not a side issue. Governs Linux, forced-managed Windows, and — the
+  counter is the gap, not a side issue. **One approach already rejected on measurement:**
+  byte-aware residency **corrupts decode output** — token identity violated, generation
+  collapsing to 3 tokens — whenever offload actually engages on the managed streaming path,
+  with and without CUDA graph; the default-off path is unaffected. The byte-identical token
+  constraint is what caught it, which is the reason that constraint is non-negotiable on
+  every change in this area. Governs Linux, forced-managed Windows, and — the
   reason it still matters after #874 — the hybrid, whose entire thesis is that we choose
-  residency better than the driver does blind.
+  residency better than the driver does blind, and whose payoff #880 sizes at ~9.7×
+  realistic / ~15–24× at large N against ~5.6 GB/s host-mapped reads.
 - [ ] **#750 native multi-request batching.** Structurally batch-1 today; `--max-batch` is
   honestly reported as ineffective (#758). Stage 1 (#844) confirmed the premise **and its
   condition**: batching amortizes the weight stream only if implemented as **one fused
   forward with `M = N`** — N independent forwards would miss every weight N times per step
-  on an over-budget model and amortize nothing. Staged 2a (fused forward + batch-N binding),
-  2b (batched KV), 2c (wire `continuous_batch_manager`).
+  on an over-budget model and amortize nothing. **Stage 2a landed and measured (#884):** a
+  stateless batch-N fused forward over length-1 rows with an empty past gives
+  **batch-invariant totals** (`htod_bytes` 3,575,949,312 and `page_ins` 301 identical at
+  N = 1/2/4/8, `evictions` 0) with **per-token figures falling exactly `1/N`** — the
+  signature of amortization, and one the offload knob cannot manufacture since it controls
+  *whether* weights stream, not the ratio. Also a well-evidenced **staging correction**:
+  assumptions #1 (input binding) and #2 (KV batch) are inseparable for an attention decoder
+  (`persistent_state_shapes` pins KV batch axis 0 = 1, the mask is `[1, max_len]`, ONNX
+  attention couples the batch dim across QKV/mask/past/present), so 2a used the stateless
+  escape hatch #844 anticipated and left `cuda.rs` untouched. Remaining: **2b** batched KV
+  + recapture accounting (batch-N *decode* capture must be quantified, not assumed), **2c**
+  wire `continuous_batch_manager`.
 - [ ] **#851 — intermittent `ILLEGAL_ADDRESS` in the mobius gate.** Parked, not solved.
   Three hypotheses eliminated (not gate flakiness — 8/8 strict solo; not kept-graph replay —
   25/25 isolated; not a relocated weight mapping — the fault targets a freshly allocated
