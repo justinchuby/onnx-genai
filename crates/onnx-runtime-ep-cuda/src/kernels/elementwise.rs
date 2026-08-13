@@ -232,6 +232,39 @@ extern "C" __global__ void decomposed_silu_mul_f16(
         y[i] = __float2half_rn(__fmul_rn(silu_h, __half2float(b[i])));
     }
 }
+
+// BFloat16 decomposed SwiGLU: byte-identical to the standalone two-op
+// `Sigmoid`/`Mul(x, sigmoid)` bf16 graph. Sigmoid and the silu product are each
+// rounded to bf16 (via `store_float<__nv_bfloat16>` = `__float2bfloat16_rn`,
+// the same rounding the standalone `sigmoid_bf16` / `mul_bf16` ops use), so the
+// fused epilogue reproduces the unfused graph's per-op bf16 rounding exactly.
+// All intermediate math runs in fp32 (bf16 carries ~8 mantissa bits).
+__device__ float op_decomposed_silu_bf16(float x) {
+    const float sigmoid_b =
+        load_float<__nv_bfloat16>(store_float<__nv_bfloat16>(op_sigmoid(x)));
+    return load_float<__nv_bfloat16>(
+        store_float<__nv_bfloat16>(__fmul_rn(x, sigmoid_b)));
+}
+
+extern "C" __global__ void decomposed_silu_mul_bf16(
+    const __nv_bfloat16* a, const __nv_bfloat16* b, __nv_bfloat16* y,
+    const unsigned long long n) {
+    for (unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (unsigned long long)gridDim.x * blockDim.x) {
+        const float silu_b = op_decomposed_silu_bf16(load_float<__nv_bfloat16>(a[i]));
+        y[i] = store_float<__nv_bfloat16>(
+            __fmul_rn(silu_b, load_float<__nv_bfloat16>(b[i])));
+    }
+}
+
+extern "C" __global__ void decomposed_silu_bf16(
+    const __nv_bfloat16* x, __nv_bfloat16* y, const unsigned long long n) {
+    for (unsigned long long i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (unsigned long long)gridDim.x * blockDim.x) {
+        y[i] = store_float<__nv_bfloat16>(
+            op_decomposed_silu_bf16(load_float<__nv_bfloat16>(x[i])));
+    }
+}
 #endif
 "#;
 
@@ -519,14 +552,14 @@ impl UnaryKernel {
             .map_err(|_| EpError::KernelFailed(format!("cuda_ep {op}: {n} elements exceed u64")))?;
         let x_ptr = cuptr(x.data_ptr::<u8>() as *const c_void);
         let y_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
-        if self.decomposed_silu && dtype != FloatDtype::F16 {
+        if self.decomposed_silu && !matches!(dtype, FloatDtype::F16 | FloatDtype::Bf16) {
             return Err(EpError::KernelFailed(format!(
-                "cuda_ep {op}: decomposed SiLU rounding requires float16, got {:?}",
+                "cuda_ep {op}: decomposed SiLU rounding requires float16 or bfloat16, got {:?}",
                 x.dtype
             )));
         }
         let entry = if self.decomposed_silu {
-            "decomposed_silu_f16".to_string()
+            format!("decomposed_silu_{}", dtype.suffix())
         } else {
             self.op.entry(dtype)
         };
@@ -956,14 +989,14 @@ impl SiluMulKernel {
             current_signature.as_ref(),
         )?;
 
-        if self.decomposed && dtype != FloatDtype::F16 {
+        if self.decomposed && !matches!(dtype, FloatDtype::F16 | FloatDtype::Bf16) {
             return Err(EpError::KernelFailed(format!(
-                "cuda_ep {OP}: decomposed SiLU fusion requires float16, got {:?}",
+                "cuda_ep {OP}: decomposed SiLU fusion requires float16 or bfloat16, got {:?}",
                 gate.dtype
             )));
         }
         let entry = if self.decomposed {
-            "decomposed_silu_mul_f16".to_string()
+            format!("decomposed_silu_mul_{}", dtype.suffix())
         } else {
             format!("silu_mul_{}", dtype.suffix())
         };
@@ -1101,7 +1134,7 @@ pub(crate) fn u64_bytes(values: &[u64]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use half::f16;
+    use half::{bf16, f16};
     use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut};
     use onnx_runtime_ir::DeviceId;
 
@@ -1148,6 +1181,9 @@ mod tests {
         assert!(POINTWISE_SRC.contains("DEFINE_SILU_MUL(float, f32)"));
         assert!(POINTWISE_SRC.contains("silu_mul_f16("));
         assert!(POINTWISE_SRC.contains("DEFINE_SILU_MUL(__nv_bfloat16, bf16)"));
+        assert!(POINTWISE_SRC.contains("decomposed_silu_mul_f16("));
+        assert!(POINTWISE_SRC.contains("decomposed_silu_mul_bf16("));
+        assert!(POINTWISE_SRC.contains("decomposed_silu_bf16("));
         for op in ["add", "sub", "mul", "min", "max"] {
             assert!(
                 POINTWISE_SRC.contains(&format!("DEFINE_BINARY_I64({op},")),
@@ -1350,6 +1386,119 @@ mod tests {
                 error <= 2.0e-3,
                 "index {index}: silu({x}) * {} expected {expected}, got {} (error {error})",
                 b.to_f32(),
+                actual.to_f32()
+            );
+        }
+
+        unsafe {
+            runtime.free_raw(gate_dev).unwrap();
+            runtime.free_raw(up_dev).unwrap();
+            runtime.free_raw(output_dev).unwrap();
+        }
+    }
+
+    #[test]
+    fn decomposed_silu_mul_bf16_is_byte_exact_vs_two_op_bf16_reference() {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let runtime = std::panic::catch_unwind(|| CudaRuntime::new(0).ok().map(Arc::new))
+            .ok()
+            .flatten();
+        std::panic::set_hook(previous_hook);
+        let Some(runtime) = runtime else {
+            eprintln!("skipping decomposed SiluMul bf16 parity test: CUDA runtime unavailable");
+            return;
+        };
+        if runtime.require_nvrtc_half_headers("SiluMul").is_err() {
+            eprintln!("skipping decomposed SiluMul bf16 parity test: half headers unavailable");
+            return;
+        }
+
+        // Include the fp16-rounding-sensitive small magnitudes and both signs so
+        // the bf16 per-op rounding boundaries (Sigmoid → bf16, gate*sigmoid →
+        // bf16, silu*up → bf16) are all exercised.
+        let gate = [-9.0f32, -2.0, -0.25, -0.03125, 0.0, 0.125, 1.0, 3.0, 9.0].map(bf16::from_f32);
+        let up = [-1.5f32, 0.5, 2.0, -3.0, 4.0, -0.75, 1.25, 0.25, -2.0].map(bf16::from_f32);
+        let mut output = [bf16::ZERO; 9];
+        let bytes = std::mem::size_of_val(&gate);
+        let gate_dev = runtime.alloc_raw(bytes).unwrap();
+        let up_dev = runtime.alloc_raw(bytes).unwrap();
+        let output_dev = runtime.alloc_raw(bytes).unwrap();
+        let as_bytes = |values: &[bf16]| unsafe {
+            std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+        };
+        unsafe {
+            runtime.htod(as_bytes(&gate), gate_dev).unwrap();
+            runtime.htod(as_bytes(&up), up_dev).unwrap();
+        }
+
+        let shape = [1usize, gate.len()];
+        let strides = [gate.len() as i64, 1];
+        let device = DeviceId::cuda(0);
+        let inputs = [
+            TensorView::new(
+                DevicePtr(gate_dev as usize as *const c_void),
+                DataType::BFloat16,
+                &shape,
+                &strides,
+                device,
+            ),
+            TensorView::new(
+                DevicePtr(up_dev as usize as *const c_void),
+                DataType::BFloat16,
+                &shape,
+                &strides,
+                device,
+            ),
+        ];
+        let mut outputs = [TensorMut::new(
+            DevicePtrMut(output_dev as usize as *mut c_void),
+            DataType::BFloat16,
+            &shape,
+            &strides,
+            device,
+        )];
+        SiluMulKernel {
+            runtime: runtime.clone(),
+            decomposed: true,
+            last_capture_safe_signature: Mutex::new(None),
+            capture_seq_independent: false,
+        }
+        .execute(&inputs, &mut outputs)
+        .unwrap();
+        runtime.synchronize().unwrap();
+        let output_bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                output.as_mut_ptr().cast::<u8>(),
+                std::mem::size_of_val(&output),
+            )
+        };
+        unsafe { runtime.dtoh(output_bytes, output_dev).unwrap() };
+
+        // Reference reproduces the unfused two-op bf16 graph exactly:
+        //   s   = bf16(sigmoid_f32(gate))      (the Sigmoid node's bf16 output)
+        //   sil = bf16(gate * s)               (the first Mul's bf16 output)
+        //   y   = bf16(sil * up)               (the second Mul's bf16 output)
+        // All intermediate arithmetic is fp32 (sigmoid via f64 exp → f32, exactly
+        // like the device `op_sigmoid`), rounded to bf16 at each op boundary.
+        for (index, ((&a, &b), &actual)) in gate.iter().zip(&up).zip(&output).enumerate() {
+            let x = a.to_f32();
+            let sigmoid = if x >= 0.0 {
+                1.0f32 / (1.0 + (-f64::from(x)).exp() as f32)
+            } else {
+                let e = f64::from(x).exp() as f32;
+                e / (1.0 + e)
+            };
+            let sigmoid_b = bf16::from_f32(sigmoid).to_f32();
+            let silu_b = bf16::from_f32(x * sigmoid_b).to_f32();
+            let expected = bf16::from_f32(silu_b * b.to_f32());
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "index {index}: decomposed silu bf16 mismatch for gate={x} up={} \
+                 expected {} got {}",
+                b.to_f32(),
+                expected.to_f32(),
                 actual.to_f32()
             );
         }
