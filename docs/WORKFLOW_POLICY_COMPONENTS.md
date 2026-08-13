@@ -50,6 +50,10 @@ sequences, branches, and loops.
 
 Loops are pre-test: `continue_when` is evaluated before iteration zero, so false initially produces
 a zero-trip loop and leaves every carry at its initial value. It may be `bool[]` or `bool[B]`.
+`termination: generation_eos` marks only an autoregressive generation loop whose predicate
+represents EOS completion. When the request sets `stop_on_eos: false`, that loop runs exactly
+`max_iterations` without inspecting a device-resident predicate. Other loops retain
+`termination: predicate` (the default) and always evaluate `continue_when`.
 Inactive rows retain their previous carried values while active rows advance. `max_iterations` is
 an integer safety bound. Branch predicates remain invocation-level scalars; row-wise tensor choice
 is ordinary ONNX policy math rather than host control flow.
@@ -248,6 +252,7 @@ steps:
     inputs: { text: prompt }
     outputs: { tokens: prompt_tokens }
   - kind: loop
+    termination: generation_eos
     setup: []                    # once on loop entry
     steps:                       # each generated token
       - kind: invoke
@@ -344,6 +349,7 @@ steps:
     inputs: { image_features: image_features, tokens: prompt_tokens }
     outputs: { embeddings: embeddings }
   - kind: loop                   # decoder body per token
+    termination: generation_eos
     setup: []
     steps:
       - kind: invoke

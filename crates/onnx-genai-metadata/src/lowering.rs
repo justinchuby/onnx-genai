@@ -88,6 +88,7 @@ impl Compiler<'_> {
                 steps,
                 continue_when,
                 max_iterations,
+                termination,
                 iteration,
                 carried,
             } => {
@@ -137,6 +138,7 @@ impl Compiler<'_> {
                     body: Box::new(body),
                     continue_when: continue_when.clone(),
                     max_iterations: max_iterations.clone(),
+                    termination: termination.clone(),
                     iteration: iteration.clone(),
                     carried: lowered_carries,
                     effects: loop_effects,
