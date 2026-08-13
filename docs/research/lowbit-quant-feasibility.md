@@ -4,7 +4,7 @@
 **Model:** Muse-Glimmer-30B, `cuda/int4` Olive package · **HW:** H200 SXM (HBM3e ≈ 4.8 TB/s) · **Regime:** M=1 captured decode, `ONNX_GENAI_CUDA_GRAPH=1`
 **Baseline:** 47.25 tok/s median (native CUDA, capture 1 seg / 0 seams), the current ceiling after the #855/#854/#860/#867/#870 arc.
 
-> **Headline (read this first).** At 47.25 tok/s the decoder reads **15.3 GB of weights/token at only 724 GB/s — 15% of the H200's 4.8 TB/s roofline.** Decode is **NOT weight-bandwidth-bound** — and this is now **confirmed by direct measurement** (§Bandwidth Probe): a kernel-level A/B that cuts the packed-weight DRAM footprint to **¼** raises decode only **47.29 → 48.62 tok/s (+2.8%)**. The binding constraint is the **serial ~2568-node dependency chain (~8.2 µs/node)**. Therefore the naive "halve the bytes → double tok/s" projection is **empirically false**, and even *int2-everywhere* would gain **≈+2%, not +80%**. Combined with a 🔴 accuracy cliff and an **L-sized tooling+kernel dependency we do not have** (only int4 weights exist; our GEMV supports only bits∈{4,8}; sub-4-bit needs re-quant from the fp16 source), **lower-bit quant is a measured NO-GO as the next lever.** The evidence-backed next move is **drastic node-count collapse (decode megakernel)** — the only axis the probe leaves open.
+> **Headline (read this first).** At 47.25 tok/s the decoder reads **15.3 GB of weights/token at only 724 GB/s — 15% of the H200's 4.8 TB/s roofline.** Decode is **NOT weight-bandwidth-bound** — and this is now **confirmed by direct measurement** (§Bandwidth Probe): a kernel-level A/B that cuts the packed-weight DRAM footprint to **¼** raises decode only **47.29 → 48.62 tok/s (+2.8%)**. The binding constraint is the **serial ~2568-node dependency chain (~8.2 µs/node)**. Therefore the naive "halve the bytes → double tok/s" projection is **empirically false**, and even *int2-everywhere* would gain **≈+2%, not +80%**. Combined with a 🔴 accuracy cliff and an **L-sized tooling+kernel dependency we do not have** (only int4 weights exist; our GEMV supports only bits∈{4,8}; sub-4-bit needs re-quant from the fp16 source), **lower-bit quant is a measured NO-GO as the next lever — *on the H200/datacenter tier.*** The evidence-backed next move *there* is **drastic node-count collapse (decode megakernel)**. **⚠️ This verdict is device-dependent (§6):** on bandwidth-starved consumer/edge GPUs the same weight read stops being latency-hidden and lower-bit quant regains real value — as a **speed** lever below the ~0.7 TB/s crossover, and as a **fit** lever below ~12 GB VRAM (a 30B int4 ≈ 15 GB won't even load). Keep lowbit on the roadmap for that tier, gated on re-running the byte-fold probe on a representative consumer GPU.
 
 ---
 
@@ -147,9 +147,42 @@ To get any sub-4-bit weights we must **re-quantize from the bf16 source** with a
 
 ---
 
-## 6. Recommendation & the reopened lever
+## 6. Machine-class sensitivity — the byte axis is device-dependent
 
-**Ranking** by (measured tok/s gain × accuracy safety × impl+tooling cost) — gains now use the **measured** ~3.5% weight-bound fraction, not the pre-probe Amdahl estimate:
+**The NO-GO above is H200-specific, not universal.** The probe measured *this* box (H200, ~4.8 TB/s HBM3). The reason the byte axis is dead here is that on the H200 the weight read is almost entirely **hidden behind** the serial launch-latency chain — it is not the binding constraint. On a **bandwidth-starved** device the *same* 15.3 GB/token weight read stops being hidden and becomes the bottleneck, and lower-bit quant regains real value. So the conclusion must be device-tiered.
+
+**Two-component model (per token).** Treat wall time as two largely-overlapping components:
+
+- `T_latency` — the dispatch/launch-latency chain of the ~2568-node graph. Under graph replay this is dominated by GPU-side per-kernel latency (grid launch + block scheduling + minimum memory-latency tail), ~device-independent in the sense that it does **not** scale with HBM bandwidth. On the H200 we measured this floor at ~21 ms/token (~8.2 µs/node × 2568).
+- `T_weightread` = 15.3 GB / `B_device` — the time to stream int4 weights from VRAM each token.
+
+Per-token time ≈ `max(T_latency, T_weightread)` in the fully-overlapped limit (the truth is between `max` and the sum; the probe shows H200 is near the fully-hidden `max`-dominated regime). On the H200:
+
+- `T_weightread` = 15.3 GB / 4.8 TB/s = **3.19 ms** — naively ~15% of the 21.15 ms/token roofline, yet the probe shows only **~3–4%** is *exposed*, i.e. almost all of it overlaps `T_latency`. **`T_latency` dominates → latency-bound → byte cuts are ~free-riding on hidden time → lower-bit useless for speed.**
+
+**The crossover.** As `B_device` falls, `T_weightread` grows (it's inversely proportional to bandwidth) while `T_latency` stays roughly fixed. Once `T_weightread` exceeds the hidden headroom under `T_latency`, weight reads stop being hidden, the byte-fold slope steepens, and lower-bit quant's payoff climbs from the H200's ~3% toward the naive roofline (up to ~1/bits-ratio). Rough crossover: weight read stops being hidden once `15.3 GB / B_device ≳ T_latency` — i.e. below **B_device ≈ 15.3 GB / 21 ms ≈ 0.73 TB/s** the weight read alone exceeds the H200 latency floor and the device tips bandwidth-bound. **⚠️ This is an EXTRAPOLATION from a single-device measurement; the crossover band is a model, not a measurement. Projections below are marked as projections — no fabricated cross-device tok/s.**
+
+**Device-tier table** (bandwidth + VRAM are widely-published spec-sheet *ranges*, not benchmarks I ran; 15.3 GB = the int4 Muse-Glimmer-30B weight footprint from §1):
+
+| tier | example GPUs | mem BW (spec range) | VRAM | fits 15.3 GB int4? | regime (projected) | lowbit value (projected) |
+|---|---|---|---|---|---|---|
+| Datacenter | H200 / H100 | ~3.3–4.8 TB/s | 80–141 GB | ✅ fits | **latency-bound** (measured on H200) | 🟥 ~useless for speed |
+| High-end consumer | RTX 4090 / 5090 | ~1.0–1.8 TB/s | 24–32 GB | ✅ fits | mixed / near crossover | 🟡 modest speed help |
+| Mid consumer | RTX 4060 / 4070 | ~270–500 GB/s | 8–12 GB | ⚠️ often won't fit | **bandwidth-bound** + fit pressure | 🟢 speed **and** fit |
+| Laptop / iGPU / Jetson / edge | mobile dGPU, Orin, iGPU | ~100–270 GB/s | ≤8 GB | ❌ can't fit 15 GB | **strongly bandwidth-bound** | 🟢 **required to run at all** |
+
+At B_device ≈ 300 GB/s a full int4 weight read is `15.3/0.3 ≈ 51 ms/token` — **~2.4× the H200 latency floor**, so it is now the dominant term and halving the bytes (int2) would roughly halve *that* term. The byte axis that is dead on H200 is the primary lever here (projection).
+
+**The two distinct values of lowbit, separated.** These are independent and must not be conflated:
+
+1. **Speed** — only pays off in the bandwidth-bound regime (mid-consumer and below). On H200 it does not; on a 300 GB/s device it plausibly does (projection).
+2. **Fit-ability / footprint** — a 30B model at int4 ≈ **15 GB won't load** on ≤12 GB devices at all. int3 (~11.5 GB) / int2 (~7.7 GB) shrinks it enough to *run*. **This is a portability win entirely independent of the speed roofline** and may be the stronger motivation: on an 8 GB laptop GPU the choice is not "faster vs slower" but "runs vs doesn't run." Fit-ability does not care that H200 is latency-bound.
+
+---
+
+## 7. Recommendation & the reopened lever
+
+**Ranking** *(H200/datacenter tier — see §6 for the consumer/edge picture, where rows 1–4 move up)* by (measured tok/s gain × accuracy safety × impl+tooling cost) — gains use the **measured** ~3.5% weight-bound fraction, not the pre-probe Amdahl estimate:
 
 | rank | option | measured-grounded gain | accuracy | cost | verdict |
 |---|---|---|---|---|---|
@@ -160,7 +193,14 @@ To get any sub-4-bit weights we must **re-quantize from the bf16 source** with a
 | 4 | 2:4 sparse int4 | ~+1–2% | 🟡 | **L** (no M=1 HW benefit) | 🟥 NO-GO for decode |
 | 5 | NF4/AF4 | 0% bytes | 🟢 | S | ➖ enabler only, irrelevant given the probe |
 
-**Go/no-go — MEASURED:** 🟥 **NO-GO on lower-bit quantization (all variants) as the next perf lever.** The bandwidth probe empirically caps the entire byte-reduction direction at **~+3% best case (bytes→0)**; the largest safe byte cut (int2, −45%) buys **~+1.6%**, behind a 🔴 accuracy cliff and an L-sized source-weights + recipe + new-kernel dependency we don't have. Byte reduction would only matter *after* the node-count floor is broken (i.e. once decode is actually bandwidth-bound again — which it currently is not, by measurement).
+**Go/no-go — MEASURED, and now DEVICE-CONDITIONED (see §6):** the blanket NO-GO applies **only to the H200/datacenter tier we measured**:
+
+- **H200 / datacenter (measured):** 🟥 **NO-GO for speed.** The bandwidth probe empirically caps the byte-reduction direction at **~+3% best case (bytes→0)**; int2 (−45%) buys ~+1.6%, behind a 🔴 accuracy cliff and an L-sized source-weights+recipe+kernel dependency. On this tier the lever is the **megakernel / node-collapse** below.
+- **Consumer / edge (projected, §6):** 🟢/🟡 **KEEP ON ROADMAP.** As `B_device` drops below the ~0.7 TB/s crossover the weight read stops being hidden and lower-bit quant becomes a real **speed** lever, and below ~12 GB VRAM it is the only way to **fit** a 30B model at all (int4 ≈ 15 GB won't load). The fit-ability win is independent of the speed roofline and may be the stronger motivation.
+  - **Concrete gate before investing:** we only have an H200 here and therefore **cannot measure** the consumer/edge regime — the next validation step is to run **this same `ONNX_GENAI_WEIGHT_FOLD` byte-fold probe on a representative consumer/edge GPU** (e.g. RTX 4070 ~500 GB/s and a ≤8 GB laptop dGPU). If the probe slope there is steep (byte cut → large tok/s gain), lowbit is a GO for that tier.
+  - The **accuracy path is device-independent** (Fact Checker: int3 / ~3.5 bpw imatrix / SpQR 🟢; int2 needs codebook/trellis methods 🟡; scalar int2 🔴; **all** require re-quant from the fp16 source — which we do not have staged — plus new sub-4-bit kernels).
+
+The largest safe byte cut still matters *only* where the device is bandwidth-bound; on H200 it would only matter after the node-count floor is broken (i.e. once decode is bandwidth-bound again — which it currently is not, by measurement).
 
 **Reopened lever — decode megakernel.** The probe leaves exactly one axis open: the serial ~2568-node latency chain. The fusion arc (#872/#873) only disproved *marginal* fusion (removing 4–8% of nodes → flat/regressive); it did **not** test *drastic* collapse. A persistent/megakernel that fuses a whole decoder layer's elementwise+norm+GEMV epilogue chain into few launches — keeping activations resident and paying per-kernel latency a handful of times per layer instead of ~49 — is the only direction consistent with all three measurements (byte-fold flat, marginal-fusion flat, 15% HBM util). It is a large effort and itself needs a prototype/probe (fuse one layer, measure the per-layer node count and tok/s), but it is the **true next lever** and should replace lower-bit quant on the roadmap.
 
