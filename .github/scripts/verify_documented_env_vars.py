@@ -60,6 +60,9 @@ KNOWN_UNIMPLEMENTED: dict[str, str] = {
     "ONNX_GENAI_GPU_LAYERS": "documented in WEIGHT_OFFLOAD.md as not implemented; "
     "use serving.memory.weights.device_policy = gpu_layers:N instead (#678)",
     "ONNX_GENAI_WEIGHT_PREFETCH": "documented in WEIGHT_OFFLOAD.md as not implemented",
+    "ONNX_GENAI_WEIGHT_FOLD": "throwaway bandwidth-probe flag in "
+    "research/lowbit-quant-feasibility.md, which states in both §5 and the "
+    "appendix that the probe code was reverted and is not shipped",
     "NXRT_AUTO_INSTALL_CUDA": "referenced in prose about a proposed installer step",
     "NXRT_SQNBIT_PREFILL_MIN": "referenced in prose about a proposed tuning knob",
     "ONNX_GENAI_BASE_URL": "client-side variable read by external tooling, not by this workspace",
