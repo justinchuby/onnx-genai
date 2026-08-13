@@ -10,9 +10,9 @@ use onnx_genai_engine::logits::{
     MinPProcessor, RepetitionPenaltyProcessor, TemperatureProcessor, TopKProcessor, TopPProcessor,
 };
 use onnx_genai_engine::{
-    DecodePrecision, Engine, EngineConfig, EngineDecodeBackend, GenerateOptions, GenerateRequest,
-    NativeDecodeDevice, NativeDecodeSession, PipelineEngine, PipelineGenerateRequest,
-    ProcessorChain, parse_resource_limit,
+    DecodePrecision, Engine, EngineConfig, EngineDecodeBackend, GenerateOptions, GeneratePrompt,
+    GenerateRequest, NativeDecodeDevice, NativeDecodeSession, PipelineEngine,
+    PipelineGenerateRequest, ProcessorChain, parse_resource_limit,
 };
 use onnx_genai_ort::{Tokenizer, available_execution_providers, profile};
 use onnx_runtime_session::InferenceSession;
@@ -290,8 +290,10 @@ fn request(args: &Args, tokens: usize) -> GenerateRequest {
     request
 }
 
-fn pipeline_request(args: &Args, tokens: usize) -> PipelineGenerateRequest {
-    PipelineGenerateRequest::new(request(args, tokens))
+fn pipeline_request(args: &Args, tokens: usize, prompt_tokens: &[u32]) -> PipelineGenerateRequest {
+    let mut request = request(args, tokens);
+    request.prompt = GeneratePrompt::TokenIds(prompt_tokens.to_vec());
+    PipelineGenerateRequest::new(request)
 }
 
 fn describe_sampling(args: &Args) -> String {
@@ -905,10 +907,18 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
     apply_vram_limit_env(&mut config)?;
     let mut engine = PipelineEngine::from_dir_with_config(model_dir, config)
         .with_context(|| format!("load pipeline engine {}", model_dir.display()))?;
+    let tokenizer =
+        Tokenizer::from_file(tokenizer_file(model_dir)).context("load pipeline tokenizer.json")?;
+    let prompt_tokens = tokenizer
+        .encode(&args.prompt)
+        .context("tokenize pipeline prompt")?;
+    if prompt_tokens.is_empty() {
+        bail!("pipeline prompt tokenized to an empty sequence");
+    }
     for _ in 0..args.warmups {
         std::hint::black_box(
             engine
-                .generate_with_pipeline_request(pipeline_request(args, args.tokens))
+                .generate_with_pipeline_request(pipeline_request(args, args.tokens, &prompt_tokens))
                 .context("pipeline warmup generation")?,
         );
     }
@@ -927,7 +937,10 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
                 Ok(())
             };
             let result = engine
-                .generate_with_callback(pipeline_request(args, args.tokens), Some(&mut callback))
+                .generate_with_callback(
+                    pipeline_request(args, args.tokens, &prompt_tokens),
+                    Some(&mut callback),
+                )
                 .context("steady pipeline measured generation")?;
             if token_times.len() <= args.decode_skip {
                 bail!(
@@ -987,7 +1000,7 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
     for _ in 0..args.runs {
         let start = Instant::now();
         let result = engine
-            .generate_with_pipeline_request(pipeline_request(args, args.tokens))
+            .generate_with_pipeline_request(pipeline_request(args, args.tokens, &prompt_tokens))
             .context("pipeline measured generation")?;
         elapsed += start.elapsed();
         generated += result.token_ids.len();
