@@ -37,3 +37,13 @@ dispatched Batty (LOAD) + Deckard (CLASSIFY); I pair on CAPTURE + re-measure onc
 unblocked. Shared team goal: **beat ORT 40 tok/s via CUDA-graph capture**. Prior
 #840 (629fbf90) merged: real cudaMemGetInfo device-capacity + CudaFoldConstantCast,
 native decode 10.2→11.4 tok/s (+11.8%).
+
+## 2026-08-12/13 — CUDA capture arc COMPLETE (shared: 11.4 → 23.13 tok/s)
+Owned diagnosis + escalation + the two CUDA-EP kernel blockers. **#855** (`1022b912`)
+`gqa_decode_bf16` capture-safe kernel (fp32 accumulation; Chew-gated, max_abs 1.953e-3):
+segments 54 → 2, 22.52 tok/s. **#854** (`f85a82f0`) skip-norm capture-safety (persistent
+`NormBf16Scratch`, demote on `grew` only when `is_capturing()`): segments 2 → 1, 0 seams,
+23.13 tok/s (+33% vs capture OFF). Built on #848 (Deckard) / #850 (Batty) / #852 (Leon).
+**Corrected my own diagnosis:** with the step captured, decode is now **kernel-bound**
+(Cast 40%, MatMulNBits 21%, GQA 14%), not pure dispatch-bound. Next lever = Cast
+round-trip elimination to reach ORT's ~40 tok/s.

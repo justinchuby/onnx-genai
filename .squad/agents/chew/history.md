@@ -59,3 +59,11 @@ _Pre-2026-08-11 dated entries archived to `history-archive.md`. 2026-08-11 detai
 - **Coverage:** 17 → 20 BF16 tests, 103 → 106 total LayerNorm suite. All pass.
 - **Hygiene:** Removed 2× "B5" internal labels; fixed SrcDispatcher comment; aligned tolerance comments with checker reality (`absolute + relative × |expected|`, numpy.isclose).
 - **Commit:** `a12c7ddde3`. Delta review by Holden: no blockers. PR remains draft (vcpkg bootstrap TLS infra flake in CI).
+
+## 2026-08-12/13 — CUDA capture arc: bf16 GQA kernel numerics accepted (shared: 11.4 → 23.13 tok/s)
+Reviewed the accuracy gate on Sebastian's `gqa_decode_bf16` (**#855**, `1022b912`):
+parity vs an f64-accumulated softmax oracle fed bf16-rounded inputs, fp32 accumulation
+preserved (bf16 only at load/store), measured max_abs=1.953e-3 / max_rel=3.888e-3 within
+justified bounds (abs<2e-2, rel<1e-1). Byte-exact greedy parity. Part of the 5-blocker
+chain that took Muse-Glimmer native decode **11.4 → 23.13 tok/s** (capture fully engaged).
+Reinforced rule: bf16 kernels accumulate in fp32, oracle-gate against f64.
