@@ -2272,6 +2272,58 @@ mod tests {
     }
 
     #[test]
+    fn kv_reclaims_the_full_lent_budget_from_weights_across_bucketed_growth() {
+        // Models #857: the weight zone borrows the KV full-context reservation
+        // (device=100, weights hold the full 100 mapped, KV zone starts empty).
+        // A sequence must still reach its full reservation (30 here) by
+        // reclaiming from the weight holder one KV growth bucket at a time.
+        let governor = LedgerGovernor::new(LeaseLedger::new(100, 0, 0));
+        let weights = Arc::new(TestMappedHolder::new(
+            mapped_allowance(&governor, 100, MemoryRole::Weights, 1),
+            100,
+            // Weights can always shed what is asked of them between decode
+            // steps: no page is pinned at KV-growth time.
+            u64::MAX,
+            0,
+        ));
+        let holder: Arc<dyn ReclaimableMappedHolder> = weights.clone();
+        let _registration = governor
+            .register_reclaimable_mapped_holder(&holder)
+            .expect("register weights as a reclaimable holder");
+        let kv = mapped_allowance(&governor, 0, MemoryRole::KvCache, 2);
+
+        let full_reservation = 30u64;
+        let bucket = 10u64;
+        let mut committed = 0u64;
+        while committed < full_reservation {
+            governor
+                .prepare_mapped_growth(&kv, bucket)
+                .expect("KV growth must always reclaim its reserved bytes from weights")
+                .commit()
+                .expect("commit KV growth");
+            committed += bucket;
+            assert_eq!(kv.mapped_bytes(), committed);
+            // No spill: the device tier never exceeds its ceiling.
+            assert_eq!(governor.oversubscribed_bytes(Tier::Device), 0);
+        }
+        assert_eq!(
+            kv.mapped_bytes(),
+            full_reservation,
+            "the sequence reached its full declared reservation via reclaim"
+        );
+        assert_eq!(
+            weights.mapped_bytes(),
+            100 - full_reservation,
+            "weights shed exactly the reclaimed bytes and no more"
+        );
+        assert_eq!(
+            kv.limit(),
+            full_reservation,
+            "the reclaimed allowance limit moved permanently to KV"
+        );
+    }
+
+    #[test]
     fn mapped_growth_refuses_after_unassigned_allowance_is_exhausted() {
         let governor = LedgerGovernor::new(LeaseLedger::new(20, 0, 0));
         let requester = mapped_allowance(
