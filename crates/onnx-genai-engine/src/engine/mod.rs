@@ -29,7 +29,7 @@ pub(crate) use anyhow::Context;
 pub(crate) use onnx_genai_kv::{
     Device, KvCacheOps, KvDType, LocalTieredConnector, PagedKvCache, PrefixCache,
 };
-pub(crate) use onnx_genai_metadata::{InferenceMetadata, ProposalType, SpeculatorProposerStatus};
+pub(crate) use onnx_genai_metadata::InferenceMetadata;
 pub(crate) use onnx_genai_ort::{
     DataType, Eagle3DecodeSession, Environment, ModelDirectory, MtpDecodeSession, Session,
     SessionOptions, SharedKvProposerSession, Tokenizer,

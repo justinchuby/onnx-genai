@@ -75,14 +75,6 @@ pub struct InferenceMetadata {
     #[serde(default)]
     pub pipeline: Option<PipelineSpec>,
 
-    /// Standalone speculative proposer declaration.
-    ///
-    /// This is the preferred native source for speculator discovery;
-    /// HuggingFace `config.json` is a compatibility fallback. The deprecated
-    /// `speculator_config` alias is accepted on input.
-    #[serde(default, alias = "speculator_config")]
-    pub speculative: Option<SpeculatorConfig>,
-
     /// Minimum and beneficial hardware capabilities used for distribution matching.
     #[serde(default)]
     pub hardware_requirements: Option<HardwareRequirements>,
@@ -330,13 +322,6 @@ mod schema_helpers {
     use serde_json::{Value, json};
 
     pub(super) fn inference_metadata_constraints(schema: &mut Schema) {
-        add_alias(
-            schema,
-            "speculative",
-            "speculator_config",
-            "Deprecated alias for `speculative`.",
-        );
-        forbid_both(schema, "speculative", "speculator_config");
         schema
             .ensure_object()
             .entry("allOf")

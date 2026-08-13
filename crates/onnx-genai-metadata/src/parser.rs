@@ -9,7 +9,6 @@ use std::path::{Path, PathBuf};
 /// Source used to discover a speculator declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpeculatorConfigSource {
-    InferenceMetadata,
     HuggingFaceConfig,
 }
 
@@ -188,14 +187,6 @@ impl SpeculatorDescriptor {
             lm_head_initializer: lm_head.name.clone(),
         })
     }
-}
-
-/// Resolve a parsed speculative declaration without re-reading metadata.
-pub fn resolve_speculator_config(
-    model_dir: &Path,
-    config: SpeculatorConfig,
-) -> SpeculatorDescriptor {
-    SpeculatorDescriptor::from_config(model_dir, config, SpeculatorConfigSource::InferenceMetadata)
 }
 
 /// Resolve a `shared_kv` speculator into a supported proposer status.
@@ -450,32 +441,11 @@ pub fn load_pipeline_spec(path: &Path) -> Result<PipelineSpec, crate::MetadataEr
     Ok(spec)
 }
 
-/// Detect a speculator package, preferring native inference metadata over the
-/// HuggingFace `config.json` compatibility format.
+/// Detect a legacy HuggingFace speculator package from `config.json`.
 ///
 /// Detection is best-effort so malformed or unrelated external configuration
 /// does not change normal model-directory loading behavior.
 pub fn detect_speculator(model_dir: &Path) -> Option<SpeculatorDescriptor> {
-    for name in [
-        "inference_metadata.yaml",
-        "inference_metadata.yml",
-        "inference_metadata.json",
-    ] {
-        let path = model_dir.join(name);
-        if !path.is_file() {
-            continue;
-        }
-        if let Ok(metadata) = load_metadata(&path)
-            && let Some(config) = metadata.speculative
-        {
-            return Some(SpeculatorDescriptor::from_config(
-                model_dir,
-                config,
-                SpeculatorConfigSource::InferenceMetadata,
-            ));
-        }
-    }
-
     let config_path = model_dir.join("config.json");
     let content = std::fs::read_to_string(config_path).ok()?;
     let config = serde_json::from_str::<HuggingFaceModelConfig>(&content)
@@ -497,7 +467,17 @@ struct HuggingFaceModelConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::InferenceMetadata;
+
+    #[derive(serde::Deserialize)]
+    struct LegacySpeculatorDocument {
+        speculative: SpeculatorConfig,
+    }
+
+    fn parse_legacy_speculator(document: &str) -> SpeculatorConfig {
+        serde_yaml::from_str::<LegacySpeculatorDocument>(document)
+            .expect("legacy speculator config parses")
+            .speculative
+    }
 
     const SHARED_KV_YAML: &str = "\
 speculative:
@@ -518,9 +498,7 @@ speculative:
 
     #[test]
     fn shared_kv_metadata_round_trips_into_supported_descriptor() {
-        let metadata: InferenceMetadata =
-            serde_yaml::from_str(SHARED_KV_YAML).expect("shared_kv metadata parses");
-        let config = metadata.speculative.expect("speculative section present");
+        let config = parse_legacy_speculator(SHARED_KV_YAML);
         assert_eq!(config.proposal_type, ProposalType::SharedKv);
         assert_eq!(config.num_speculative_tokens, 3);
         assert_eq!(config.backbone_hidden_size, Some(16));
@@ -534,7 +512,7 @@ speculative:
         let descriptor = SpeculatorDescriptor::from_config(
             Path::new("/models/shared-kv"),
             config,
-            SpeculatorConfigSource::InferenceMetadata,
+            SpeculatorConfigSource::HuggingFaceConfig,
         );
         let SpeculatorProposerStatus::SharedKv(spec) = descriptor.proposer else {
             panic!("expected a supported shared_kv proposer");
@@ -574,8 +552,7 @@ speculative:
       target_layers: [0]
 "
             );
-            let metadata: InferenceMetadata = serde_yaml::from_str(&yaml).expect("metadata parses");
-            let config = metadata.speculative.expect("speculative section present");
+            let config = parse_legacy_speculator(&yaml);
             assert!(
                 matches!(config.proposal_type, ProposalType::Unknown(_)),
                 "expected Unknown for legacy value '{legacy}', got {:?}",
@@ -584,7 +561,7 @@ speculative:
             let descriptor = SpeculatorDescriptor::from_config(
                 Path::new("/models/shared-kv"),
                 config,
-                SpeculatorConfigSource::InferenceMetadata,
+                SpeculatorConfigSource::HuggingFaceConfig,
             );
             assert!(
                 matches!(descriptor.proposer, SpeculatorProposerStatus::Unknown(_)),
@@ -595,7 +572,7 @@ speculative:
 
     #[test]
     fn shared_kv_defaults_output_names() {
-        let metadata: InferenceMetadata = serde_yaml::from_str(
+        let config = parse_legacy_speculator(
             "\
 speculative:
   proposal_type: shared-kv
@@ -607,13 +584,11 @@ speculative:
     - name: sliding_attention
       target_layers: [0]
 ",
-        )
-        .expect("shared_kv metadata parses");
-        let config = metadata.speculative.expect("speculative section present");
+        );
         let descriptor = SpeculatorDescriptor::from_config(
             Path::new("/models/shared-kv"),
             config,
-            SpeculatorConfigSource::InferenceMetadata,
+            SpeculatorConfigSource::HuggingFaceConfig,
         );
         let SpeculatorProposerStatus::SharedKv(spec) = descriptor.proposer else {
             panic!("expected a supported shared_kv proposer");
@@ -644,7 +619,7 @@ speculative:
 
     #[test]
     fn shared_kv_explicit_execution_contract_and_ports_are_preserved() {
-        let metadata: InferenceMetadata = serde_yaml::from_str(
+        let config = parse_legacy_speculator(
             "\
 speculative:
   proposal_type: shared_kv
@@ -666,12 +641,11 @@ speculative:
       target_key_input: target_cache_key
       target_value_input: target_cache_value
 ",
-        )
-        .expect("explicit proposer metadata parses");
+        );
         let descriptor = SpeculatorDescriptor::from_config(
             Path::new("/models/explicit"),
-            metadata.speculative.expect("speculative section"),
-            SpeculatorConfigSource::InferenceMetadata,
+            config,
+            SpeculatorConfigSource::HuggingFaceConfig,
         );
         let SpeculatorProposerStatus::SharedKv(spec) = descriptor.proposer else {
             panic!("expected shared-KV proposer");
@@ -701,19 +675,17 @@ speculative:
 
     #[test]
     fn shared_kv_missing_required_field_is_unknown() {
-        let metadata: InferenceMetadata = serde_yaml::from_str(
+        let config = parse_legacy_speculator(
             "\
 speculative:
   proposal_type: shared_kv
   model: assistant/model.onnx
 ",
-        )
-        .expect("shared_kv metadata parses");
-        let config = metadata.speculative.expect("speculative section present");
+        );
         let descriptor = SpeculatorDescriptor::from_config(
             Path::new("/models/shared-kv"),
             config,
-            SpeculatorConfigSource::InferenceMetadata,
+            SpeculatorConfigSource::HuggingFaceConfig,
         );
         assert!(matches!(
             descriptor.proposer,
@@ -726,7 +698,7 @@ speculative:
     /// never aborts model loading — the engine treats it as absent.
     #[test]
     fn shared_kv_empty_binding_groups_degrade_to_unknown() {
-        let metadata: InferenceMetadata = serde_yaml::from_str(
+        let config = parse_legacy_speculator(
             "\
 speculative:
   proposal_type: shared_kv
@@ -734,14 +706,12 @@ speculative:
   backbone_hidden_size: 8
   vocab_size: 16
 ",
-        )
-        .expect("shared_kv metadata parses");
-        let config = metadata.speculative.expect("speculative section present");
+        );
         assert!(config.shared_kv.is_empty());
         let descriptor = SpeculatorDescriptor::from_config(
             Path::new("/models/shared-kv"),
             config,
-            SpeculatorConfigSource::InferenceMetadata,
+            SpeculatorConfigSource::HuggingFaceConfig,
         );
         assert!(matches!(
             descriptor.proposer,
@@ -751,7 +721,7 @@ speculative:
 
     #[test]
     fn shared_kv_empty_target_layers_degrade_to_unknown() {
-        let metadata: InferenceMetadata = serde_yaml::from_str(
+        let config = parse_legacy_speculator(
             "\
 speculative:
   proposal_type: shared_kv
@@ -761,14 +731,12 @@ speculative:
   shared_kv:
     - name: sliding_attention
 ",
-        )
-        .expect("shared_kv metadata parses");
-        let config = metadata.speculative.expect("speculative section present");
+        );
         assert!(config.shared_kv[0].target_layers.is_empty());
         let descriptor = SpeculatorDescriptor::from_config(
             Path::new("/models/shared-kv"),
             config,
-            SpeculatorConfigSource::InferenceMetadata,
+            SpeculatorConfigSource::HuggingFaceConfig,
         );
         assert!(matches!(
             descriptor.proposer,

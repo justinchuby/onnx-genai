@@ -239,13 +239,8 @@ impl Engine {
         let kv_cache = allocate_kv_cache(&config, kv_model.as_ref(), &governor)?;
 
         // Stage: speculative-assistant loading (mode resolution then per-mode heads).
-        let (speculative_mode, resolved_mtp_config) = resolve_speculative_mode(
-            config.speculative_mode.clone(),
-            &metadata,
-            &model_directory,
-            &session,
-            draft.is_some(),
-        )?;
+        let (speculative_mode, resolved_mtp_config) =
+            resolve_speculative_mode(config.speculative_mode.clone(), draft.is_some())?;
         let mtp = load_mtp_model(
             resolved_mtp_config,
             &session,
@@ -788,8 +783,8 @@ impl Engine {
         if let Some(trace) = trace {
             native_session.set_trace_context(trace);
         }
-        let (native_shared_kv_proposer, speculative_mode) =
-            load_native_shared_kv_proposer(&metadata, &model_directory.root, native_device)?;
+        let native_shared_kv_proposer = None;
+        let speculative_mode = SpeculativeMode::None;
         let environment = {
             let _span = onnx_genai_ort::prof_span!("engine.ort_environment");
             Environment::new("onnx-genai-engine")
@@ -1783,32 +1778,11 @@ fn allocate_kv_cache(
 
 fn resolve_speculative_mode(
     requested_mode: SpeculativeMode,
-    metadata: &InferenceMetadata,
-    model_directory: &ModelDirectory,
-    session: &Session,
     draft_present: bool,
 ) -> anyhow::Result<(SpeculativeMode, Option<ResolvedMtpConfig>)> {
     let (speculative_mode, resolved_mtp_config) = match requested_mode {
         SpeculativeMode::None if draft_present => (SpeculativeMode::DraftModel, None),
-        // No explicit mode: adopt a shared-KV draft proposer advertised by
-        // the model's own inference metadata, if the target exposes an f32
-        // hidden output the assistant can be seeded from.
-        SpeculativeMode::None => {
-            if let Some(config) =
-                mtp_config_from_metadata(metadata, &model_directory.root, session)?
-            {
-                (
-                    SpeculativeMode::Mtp(config.public_config.clone()),
-                    Some(config),
-                )
-            } else {
-                (
-                    shared_kv_mode_from_metadata(&model_directory.root, session)
-                        .unwrap_or(SpeculativeMode::None),
-                    None,
-                )
-            }
-        }
+        SpeculativeMode::None => (SpeculativeMode::None, None),
         SpeculativeMode::Mtp(config) => (
             SpeculativeMode::Mtp(config.clone()),
             Some(ResolvedMtpConfig::from_manual(config)),
