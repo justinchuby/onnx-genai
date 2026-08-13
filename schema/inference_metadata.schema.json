@@ -2487,6 +2487,13 @@
       ],
       "type": "object"
     },
+    "WorkflowLoopTermination": {
+      "enum": [
+        "predicate",
+        "generation_eos"
+      ],
+      "type": "string"
+    },
     "WorkflowManifest": {
       "additionalProperties": false,
       "properties": {
@@ -2772,6 +2779,10 @@
                 "$ref": "#/$defs/WorkflowStep"
               },
               "type": "array"
+            },
+            "termination": {
+              "$ref": "#/$defs/WorkflowLoopTermination",
+              "default": "predicate"
             }
           },
           "required": [

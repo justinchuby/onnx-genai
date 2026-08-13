@@ -51,12 +51,14 @@ pub struct WorkflowExecutionPlan<'a> {
     dynamic_symbols: std::collections::HashSet<String>,
     session_id: Option<String>,
     component_overrides: HashMap<String, String>,
+    max_iterations_only: bool,
 }
 
 #[derive(Default)]
 struct WorkflowRunTelemetry {
     started: Option<std::time::Instant>,
     first_emit_ns: Option<u128>,
+    max_iterations_only: bool,
     loop_iterations: u64,
     component_invocations: u64,
     emit_events: u64,
@@ -440,6 +442,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
             dynamic_symbols,
             session_id,
             component_overrides,
+            max_iterations_only: !request.options.stop_on_eos,
         })
     }
 
@@ -475,6 +478,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
         let started = std::time::Instant::now();
         let mut telemetry = WorkflowRunTelemetry {
             started: Some(started),
+            max_iterations_only: self.max_iterations_only,
             ..WorkflowRunTelemetry::default()
         };
         let engine = self.engine;
@@ -747,6 +751,7 @@ impl PipelineEngine {
                 body,
                 continue_when,
                 max_iterations,
+                termination,
                 iteration,
                 carried,
                 effects: _,
@@ -798,8 +803,15 @@ impl PipelineEngine {
                     );
                 }
                 for index in 0..limit {
-                    self.materialize_workflow_value(values, continue_when)?;
-                    let active_rows = workflow_bool_rows(values, continue_when)?;
+                    let max_iterations_only = telemetry.max_iterations_only
+                        && *termination
+                            == onnx_genai_metadata::WorkflowLoopTermination::GenerationEos;
+                    let active_rows = if max_iterations_only {
+                        workflow_active_rows_without_inspection(values, continue_when)?
+                    } else {
+                        self.materialize_workflow_value(values, continue_when)?;
+                        workflow_bool_rows(values, continue_when)?
+                    };
                     if !active_rows.iter().any(|active| *active) {
                         break;
                     }
@@ -855,30 +867,48 @@ impl PipelineEngine {
                             self.materialize_workflow_value(values, &carry.next)?;
                             self.materialize_workflow_value(values, &carry.body_output)?;
                         }
-                        let current = values.get(&carry.next).with_context(|| {
-                            format!("workflow loop value '{}' is unavailable", carry.next)
-                        })?;
-                        let next = values.get(&carry.body_output).with_context(|| {
-                            format!("workflow loop body did not produce '{}'", carry.body_output)
-                        });
-                        if state.service_group.is_some() && next.is_err() {
+                        if state.service_group.is_some() && !values.contains_key(&carry.body_output)
+                        {
                             final_state_refs.insert(carry.cell.clone(), carry.next.clone());
                             continue;
                         }
-                        let next = next?;
-                        validate_state_recurrence(&carry.cell, current, next, state, values)?;
-                        let next_value = merge_inactive_rows(
-                            current,
-                            next,
-                            &active_rows,
-                            state.service_group.is_some(),
-                        )
-                        .with_context(|| {
-                            format!(
-                                "workflow loop carry '{}' cannot preserve inactive rows",
-                                carry.cell
+                        {
+                            let current = values.get(&carry.next).with_context(|| {
+                                format!("workflow loop value '{}' is unavailable", carry.next)
+                            })?;
+                            let next = values.get(&carry.body_output).with_context(|| {
+                                format!(
+                                    "workflow loop body did not produce '{}'",
+                                    carry.body_output
+                                )
+                            })?;
+                            validate_state_recurrence(&carry.cell, current, next, state, values)?;
+                        }
+                        let next_value = if active_rows.iter().all(|active| *active) {
+                            share_workflow_value(values, &carry.body_output)?
+                        } else {
+                            let current = values.get(&carry.next).with_context(|| {
+                                format!("workflow loop value '{}' is unavailable", carry.next)
+                            })?;
+                            let next = values.get(&carry.body_output).with_context(|| {
+                                format!(
+                                    "workflow loop body did not produce '{}'",
+                                    carry.body_output
+                                )
+                            })?;
+                            merge_inactive_rows(
+                                current,
+                                next,
+                                &active_rows,
+                                state.service_group.is_some(),
                             )
-                        })?;
+                            .with_context(|| {
+                                format!(
+                                    "workflow loop carry '{}' cannot preserve inactive rows",
+                                    carry.cell
+                                )
+                            })?
+                        };
                         values.insert(carry.next.clone(), next_value);
                         final_state_refs.insert(carry.cell.clone(), carry.next.clone());
                     }
@@ -2485,6 +2515,48 @@ fn merge_inactive_rows(
     Value::from_raw_bytes(merged, next.shape(), next.dtype()).map_err(Into::into)
 }
 
+fn share_workflow_value(values: &mut PipelineTensors, name: &str) -> anyhow::Result<Value> {
+    if let Some(alias) = values.get(name).and_then(Value::try_alias_clone) {
+        return alias.map_err(Into::into);
+    }
+    let owner = values
+        .remove(name)
+        .with_context(|| format!("workflow value '{name}' is unavailable"))?;
+    let shape = owner.shape().to_vec();
+    let retained = Value::into_alias_with_shape(owner, &shape)?;
+    let shared = retained
+        .try_alias_clone()
+        .context("new workflow value alias must retain its shared owner")??;
+    values.insert(name.to_string(), retained);
+    Ok(shared)
+}
+
+fn workflow_active_rows_without_inspection(
+    values: &PipelineTensors,
+    name: &str,
+) -> anyhow::Result<Vec<bool>> {
+    let value = values
+        .get(name)
+        .with_context(|| format!("workflow predicate value '{name}' is unavailable"))?;
+    anyhow::ensure!(
+        value.dtype() == DataType::Bool,
+        "workflow predicate '{name}' must have bool dtype"
+    );
+    anyhow::ensure!(
+        value.shape().len() <= 1,
+        "workflow predicate '{name}' must be a scalar or rank-one row tensor"
+    );
+    let rows = value
+        .shape()
+        .first()
+        .copied()
+        .map(usize::try_from)
+        .transpose()?
+        .unwrap_or(1);
+    anyhow::ensure!(rows > 0, "workflow predicate '{name}' must not be empty");
+    Ok(vec![true; rows])
+}
+
 fn workflow_bool_rows(values: &PipelineTensors, name: &str) -> anyhow::Result<Vec<bool>> {
     let value = values
         .get(name)
@@ -2636,6 +2708,27 @@ mod workflow_scalar_tests {
         let merged =
             merge_inactive_rows(&current, &next, &[true, false], false).expect("merge active rows");
         assert_eq!(merged.to_vec_i64().expect("merged values"), [10, 20, 3, 4]);
+    }
+
+    #[test]
+    fn shared_loop_output_remains_available_for_multiple_carries() {
+        let mut values = PipelineTensors::new();
+        values.insert(
+            "body.output".to_string(),
+            Value::from_slice_i64(&[7, 8], &[2]).expect("body output"),
+        );
+
+        let first = share_workflow_value(&mut values, "body.output").expect("first carry alias");
+        let second = share_workflow_value(&mut values, "body.output").expect("second carry alias");
+
+        assert_eq!(first.to_vec_i64().expect("first values"), [7, 8]);
+        assert_eq!(second.to_vec_i64().expect("second values"), [7, 8]);
+        assert_eq!(
+            values["body.output"]
+                .to_vec_i64()
+                .expect("retained output values"),
+            [7, 8]
+        );
     }
 
     #[test]

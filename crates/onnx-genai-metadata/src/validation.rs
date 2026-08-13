@@ -1192,6 +1192,7 @@ fn validate_workflow_node(
             iteration,
             carried,
             effects: loop_effects,
+            termination: _,
         } => {
             validate_workflow_node(
                 setup,

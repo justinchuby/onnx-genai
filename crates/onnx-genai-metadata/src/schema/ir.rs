@@ -249,6 +249,8 @@ pub enum WorkflowStep {
         steps: Vec<WorkflowStep>,
         continue_when: String,
         max_iterations: String,
+        #[serde(default)]
+        termination: WorkflowLoopTermination,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         iteration: Option<WorkflowLoopIteration>,
         #[serde(default)]
@@ -271,6 +273,14 @@ pub enum WorkflowStep {
         output: String,
         mode: WorkflowEmitMode,
     },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowLoopTermination {
+    #[default]
+    Predicate,
+    GenerationEos,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
@@ -298,6 +308,7 @@ pub enum WorkflowNode {
         body: Box<WorkflowNode>,
         continue_when: String,
         max_iterations: String,
+        termination: WorkflowLoopTermination,
         /// Optional zero-based induction value, scoped to this loop's body and continue_when.
         iteration: Option<WorkflowLoopIteration>,
         carried: Vec<WorkflowLoopCarry>,

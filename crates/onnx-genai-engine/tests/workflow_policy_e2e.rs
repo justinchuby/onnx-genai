@@ -1746,6 +1746,7 @@ pipeline:
               mode: append
         continue_when: active
         max_iterations: iterations
+        termination: generation_eos
         carried:
           - cell: rng
             initial: rng.current
@@ -1783,6 +1784,28 @@ pipeline:
     .with_input("max_iterations", Value::from_slice_i64(&[10], &[1])?);
     let output = engine.run_pipeline(request)?;
     assert_eq!(output["tokens"].to_vec_i64()?, [1, 1, 1]);
+
+    let options = onnx_genai_engine::GenerateOptions {
+        max_new_tokens: 4,
+        seed: Some(7),
+        stop_on_eos: false,
+        ..Default::default()
+    };
+    let request = PipelineGenerateRequest::new(GenerateRequest {
+        prompt: GeneratePrompt::TokenIds(vec![]),
+        options,
+    })
+    .with_input("logits", Value::from_slice_f32(&[0.1, 0.9, 0.0], &[1, 3])?)
+    .with_input("offset", Value::from_slice_i64(&[0], &[1])?)
+    .with_input("eos", Value::from_slice_i64(&[1], &[1])?)
+    .with_input(
+        "initial_continue",
+        Value::from_raw_bytes(vec![1], &[1], DataType::Bool)?,
+    )
+    .with_input("iteration", Value::from_slice_i64(&[0], &[1])?)
+    .with_input("max_iterations", Value::from_slice_i64(&[4], &[1])?);
+    let output = engine.run_pipeline(request)?;
+    assert_eq!(output["tokens"].to_vec_i64()?, [1, 1, 1, 1]);
     Ok(())
 }
 
