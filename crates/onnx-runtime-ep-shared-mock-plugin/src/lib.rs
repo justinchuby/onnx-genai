@@ -186,6 +186,19 @@ counter_export!(
      grow this counter, or every decode step pays for planning it already did."
 );
 
+/// Cumulative count of node-operand placement resolutions the executor
+/// performed (`onnx_runtime_ep_plugin::compute::workspace_placement_queries`).
+///
+/// Not a mock-side counter: it reads the executor's own static, because the
+/// property under test is that the *executor* does not ask ORT where a node's
+/// operands live unless it is about to place a workspace there. A dispatch that
+/// needs no workspace, or whose `SessionPersistent` request is declined, must
+/// not grow this.
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_mock_shared_ep_placement_queries() -> usize {
+    onnx_runtime_ep_plugin::compute::workspace_placement_queries()
+}
+
 /// Select the workspace lifetime the mock `Add` kernel declares.
 ///
 /// `0` = `StepScoped` (the request the executor serves from ORT scratch),
@@ -214,6 +227,7 @@ pub extern "C" fn nxrt_mock_shared_ep_reset_counters() {
     ] {
         c.store(0, Ordering::SeqCst);
     }
+    onnx_runtime_ep_plugin::compute::reset_workspace_placement_queries();
     PERSISTENT_WORKSPACE.store(false, Ordering::SeqCst);
     // `EP_INSTANCES_CREATED`, `EP_INSTANCES_LIVE`, `EP_SHUTDOWN_CALLS` and
     // `EP_ALLOC_LIVE` are lifetime invariants, not per-scenario counters, and

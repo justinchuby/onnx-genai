@@ -1096,3 +1096,139 @@ fn a_changed_shape_gets_its_own_workspace_plan() {
         ((*api).ReleaseEnv.unwrap())(env);
     }
 }
+
+/// A declined `SessionPersistent` request must not cost an ORT placement query.
+///
+/// Resolving where a node's operands live is `2n` FFI calls plus `n-1`
+/// `CompareMemoryInfo` calls, and the answer is only ever used to place a
+/// workspace. If the executor derives it before deciding whether it will serve
+/// one, every declining node on every dispatch pays for an answer that is
+/// thrown away — which is what revision 3 did.
+///
+/// Falsifier: move the `operand_mem_info` call in `prepare_workspace` back
+/// above the `lifetime != StepScoped` gate and this test goes red.
+#[test]
+fn a_declined_workspace_never_asks_ort_where_the_operands_live() {
+    let _lock = lock_ort_ep();
+    let Some(fx) = Fixture::acquire("a_declined_workspace_never_asks_ort") else {
+        return;
+    };
+    fx.reset_counters();
+    fx.set_persistent_workspace(true);
+    let api = fx.api;
+    let model = fixture_model("add_1x4");
+    let reg_name = CString::new("shared_mock_lazy_declined").unwrap();
+    const RUNS: usize = 4;
+
+    unsafe {
+        let env =
+            create_env_with_plugin(api, "nxrt_shared_lazy_declined", &reg_name, &fx.plugin_path);
+        let device = find_our_ep_device(api, env);
+        let (session, options) = create_session_on_our_ep(api, env, device, &model);
+
+        for run in 1..=RUNS {
+            let got = run_1x4(
+                api,
+                session,
+                &[c"X", c"Y"],
+                &[[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]],
+                c"Z",
+            );
+            assert_close(
+                got,
+                [6.0, 8.0, 10.0, 12.0],
+                &format!("add_1x4 declined run {run}"),
+            );
+        }
+
+        // Guard against a vacuous pass: the declining path must actually have
+        // been exercised.
+        assert!(
+            fx.counter("nxrt_mock_shared_ep_persistent_declined") >= RUNS,
+            "the SessionPersistent path never ran ({} declines for {RUNS} runs), so this test \
+             would pass even if placement were still derived eagerly",
+            fx.counter("nxrt_mock_shared_ep_persistent_declined")
+        );
+        assert_eq!(
+            fx.counter("nxrt_mock_shared_ep_placement_queries"),
+            0,
+            "the executor asked ORT where the operands live for a node whose workspace request \
+             it then declined. That is {} wasted FFI round trips per dispatch, on every node of \
+             every decode step.",
+            fx.counter("nxrt_mock_shared_ep_placement_queries")
+        );
+
+        ((*api).ReleaseSession.unwrap())(session);
+        ((*api).ReleaseSessionOptions.unwrap())(options);
+        let status = ((*api).UnregisterExecutionProviderLibrary.unwrap())(env, reg_name.as_ptr());
+        check_status(api, status, "UnregisterExecutionProviderLibrary");
+        ((*api).ReleaseEnv.unwrap())(env);
+    }
+}
+
+/// The other half of the same contract: a node that *is* served must query.
+///
+/// `chain_add_mul` mixes both kinds of node in one fused subgraph — two `Add`
+/// nodes that receive a `StepScoped` workspace and one `Mul` node that declares
+/// [`WorkspaceRequirement::NONE`]. Exactly the served dispatches may resolve
+/// placement, so the query count must equal the served-workspace count: any
+/// higher and the zero-byte `Mul` is paying too, any lower and a served
+/// workspace was placed without checking where its kernel runs.
+#[test]
+fn only_the_nodes_that_receive_a_workspace_query_placement() {
+    let _lock = lock_ort_ep();
+    let Some(fx) = Fixture::acquire("only_served_nodes_query_placement") else {
+        return;
+    };
+    fx.reset_counters();
+    let api = fx.api;
+    let model = fixture_model("chain_add_mul");
+    let reg_name = CString::new("shared_mock_lazy_served").unwrap();
+
+    unsafe {
+        let env =
+            create_env_with_plugin(api, "nxrt_shared_lazy_served", &reg_name, &fx.plugin_path);
+        let device = find_our_ep_device(api, env);
+        let (session, options) = create_session_on_our_ep(api, env, device, &model);
+
+        let got = run_1x4(
+            api,
+            session,
+            &[c"A", c"B", c"C", c"D"],
+            &[
+                [1.0, 2.0, 3.0, 4.0],
+                [1.0, 1.0, 1.0, 1.0],
+                [2.0, 2.0, 2.0, 2.0],
+                [0.0, 0.0, 0.0, 0.0],
+            ],
+            c"T",
+        );
+        assert_close(got, [4.0, 6.0, 8.0, 10.0], "chain_add_mul (lazy placement)");
+
+        let served = fx.counter("nxrt_mock_shared_ep_workspace_ok");
+        let queries = fx.counter("nxrt_mock_shared_ep_placement_queries");
+        let mul_ran = fx.counter("nxrt_mock_shared_ep_mul_executed");
+        assert!(
+            served >= 2 && mul_ran >= 1,
+            "the fixture did not exercise both kinds of node (served={served}, mul={mul_ran}), \
+             so the equality below would prove nothing"
+        );
+        assert_eq!(
+            queries, served,
+            "placement was resolved {queries} times for {served} served workspaces. Equality is \
+             the contract: the zero-workspace Mul node must not query, and every served node \
+             must."
+        );
+        assert_eq!(
+            fx.counter("nxrt_mock_shared_ep_workspace_missing"),
+            0,
+            "deferring the placement query must never turn into serving no workspace"
+        );
+
+        ((*api).ReleaseSession.unwrap())(session);
+        ((*api).ReleaseSessionOptions.unwrap())(options);
+        let status = ((*api).UnregisterExecutionProviderLibrary.unwrap())(env, reg_name.as_ptr());
+        check_status(api, status, "UnregisterExecutionProviderLibrary");
+        ((*api).ReleaseEnv.unwrap())(env);
+    }
+}

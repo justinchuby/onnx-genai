@@ -15,6 +15,7 @@
 
 use std::collections::HashSet;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use onnx_genai_ort_sys as ort;
@@ -774,6 +775,27 @@ const WORKSPACE_PLAN_CACHE_CAPACITY: usize = 8;
 /// executor. So the duplicate is removed on the executor side instead, by not
 /// re-asking a question whose answer cannot have changed.
 ///
+/// # What this is worth, stated exactly
+///
+/// The baseline matters. On `main` the executor never called
+/// `workspace_requirement` at all, so:
+///
+/// * versus the uncached version of this seam, the second search per dispatch
+///   is gone;
+/// * versus `main`, the steady state is approximately **neutral** — a repeated
+///   operand signature costs a `Mutex` acquire plus a linear scan of at most
+///   [`WORKSPACE_PLAN_CACHE_CAPACITY`] entries, and each *new* signature still
+///   costs one heuristic search `main` never paid;
+/// * the kernel-side plan inside `blas::governed_gemm` is untouched and still
+///   happens once per dispatch.
+///
+/// Hit rate follows the shapes, not the kernel. A stable geometry hits after
+/// the first dispatch. A growing-KV `StepScoped` attention, whose operand
+/// shapes change every decode step, can miss on **every** step; the cache is
+/// then bounded overhead (one extra search per step) rather than a saving.
+/// Only shapes that recur — fixed geometries, and the many decode GEMMs whose
+/// cuBLASLt signature is stable across steps — benefit.
+///
 /// # Correctness
 ///
 /// * The key is the full operand metadata (dtype, presence, shape) for every
@@ -1002,6 +1024,45 @@ pub(crate) enum OperandMemInfo {
     Divergent { first: usize, other: usize },
 }
 
+/// Where to look to decide which device a node's workspace must live on.
+///
+/// Kept as one value so it can be threaded through `prepare_workspace` without
+/// resolving anything: the ORT input indices are cheap to carry, the answer
+/// they produce is not.
+#[derive(Clone, Copy)]
+struct PlacementSources<'a> {
+    /// Kernel-context input indices bound to ORT for *this* node. Outputs are
+    /// deliberately absent; see [`operand_mem_info`].
+    ort_inputs: &'a [usize],
+    /// Memory info to fall back to when the node binds no ORT inputs at all
+    /// (every operand is a fused-subgraph intermediate).
+    subgraph_fallback: Option<*const ort::OrtMemoryInfo>,
+}
+
+/// Number of times a node's workspace placement has been resolved through ORT.
+///
+/// Incremented by [`operand_mem_info`], which is the only place this executor
+/// asks ORT where a node's operands live for the purpose of placing a
+/// workspace. Read it with [`workspace_placement_queries`].
+///
+/// This is deliberately *not* `cfg(test)`-gated. The property it exists to
+/// pin — that a dispatch which needs no workspace never pays for a placement
+/// query — is only observable through a real ORT `Run` against the built
+/// cdylib, which is compiled without `cfg(test)`. A gated counter would leave
+/// the claim tested in a configuration nobody ships.
+static WORKSPACE_PLACEMENT_QUERIES: AtomicUsize = AtomicUsize::new(0);
+
+/// Cumulative count of workspace placement resolutions (see
+/// [`WORKSPACE_PLACEMENT_QUERIES`]).
+pub fn workspace_placement_queries() -> usize {
+    WORKSPACE_PLACEMENT_QUERIES.load(Ordering::Relaxed)
+}
+
+/// Reset the workspace placement counter. For tests and diagnostics only.
+pub fn reset_workspace_placement_queries() {
+    WORKSPACE_PLACEMENT_QUERIES.store(0, Ordering::Relaxed);
+}
+
 /// Derive the memory device of **one node's own operands**.
 ///
 /// `ort_operands` lists the kernel-context input indices this node actually
@@ -1028,17 +1089,35 @@ pub(crate) enum OperandMemInfo {
 /// reports [`OperandMemInfo::Unavailable`] — no comparison is claimed that was
 /// not performed. A single-operand node never needs the comparator.
 ///
+/// # Inputs only
+///
+/// Every handle consulted here comes from `OrtApi::KernelContext_GetInput`.
+/// Outputs are never queried, for two reasons: ORT does not require an output
+/// to be materialised before `Compute` runs, and the output the kernel is about
+/// to write is not evidence about where its *compute* happens. So "this node's
+/// operands" means, precisely, its ORT-bound **inputs** — nothing here inspects
+/// output placement, and no claim is made about it.
+///
+/// # Cost
+///
+/// Each call performs `2 * n` ORT FFI calls for `n` ORT-bound operands, plus
+/// `n - 1` `CompareMemoryInfo` calls. [`prepare_workspace`] therefore calls
+/// this **only after** it knows a workspace is both non-empty and servable, so
+/// a CPU node, a zero-byte requirement, or a declined `SessionPersistent`
+/// request pays nothing. [`WORKSPACE_PLACEMENT_QUERIES`] counts the calls that
+/// do happen.
+///
 /// # Safety
 ///
 /// `api` must be valid and `ctx` a valid `OrtKernelContext*`.
 unsafe fn operand_mem_info(
     api: &ort::OrtApi,
     ctx: *mut ort::OrtKernelContext,
-    ort_operands: &[usize],
-    subgraph_fallback: Option<*const ort::OrtMemoryInfo>,
+    sources: PlacementSources<'_>,
 ) -> OperandMemInfo {
-    let Some((&first_idx, rest)) = ort_operands.split_first() else {
-        return match subgraph_fallback {
+    WORKSPACE_PLACEMENT_QUERIES.fetch_add(1, Ordering::Relaxed);
+    let Some((&first_idx, rest)) = sources.ort_inputs.split_first() else {
+        return match sources.subgraph_fallback {
             Some(ptr) => OperandMemInfo::FromIntermediates(ptr),
             None => OperandMemInfo::Unavailable,
         };
@@ -1059,6 +1138,12 @@ unsafe fn operand_mem_info(
         let mut equal: std::os::raw::c_int = 0;
         let status = unsafe { compare(first, other, &mut equal) };
         if !status.is_null() {
+            // ORT allocated this status and handed us ownership; dropping the
+            // pointer would leak it. Released inline rather than through a new
+            // shared helper, to keep this fix to the one site this PR adds.
+            if let Some(release) = api.ReleaseStatus {
+                unsafe { release(status) };
+            }
             return OperandMemInfo::Unavailable;
         }
         if equal != 0 {
@@ -1120,13 +1205,19 @@ unsafe fn alloc_scratch(
 ///
 /// # Where the workspace is placed
 ///
-/// Against the memory info of **this node's own ORT-bound operands**, derived
-/// by [`operand_mem_info`], not against input 0 of the fused subgraph. When the
-/// node binds several ORT operands they are compared with
-/// `OrtApi::CompareMemoryInfo` and a disagreement is an error, not a guess.
-/// A node whose operands are all intermediate buffers inherits the
-/// subgraph-level memory info those buffers were allocated from, which is the
-/// same device by construction.
+/// Against the memory info of **this node's own ORT-bound inputs**, derived by
+/// [`operand_mem_info`], not against input 0 of the fused subgraph. "Operands"
+/// here means kernel-context *inputs* only: nothing consults output placement,
+/// and no claim is made about it. When the node binds several ORT inputs they
+/// are compared with `OrtApi::CompareMemoryInfo` and a disagreement is an
+/// error, not a guess. A node whose inputs are all intermediate buffers
+/// inherits the subgraph-level memory info those buffers were allocated from,
+/// which is the same device by construction.
+///
+/// The derivation is **lazy**: it runs below, after the zero-byte and
+/// `StepScoped` gates, so a node with no workspace requirement and a node whose
+/// `SessionPersistent` request is declined issue no ORT placement calls at all.
+/// [`workspace_placement_queries`] counts the ones that do run.
 ///
 /// Every failure to determine the device is a hard error *for a request that
 /// needs serving*, never a silent host allocation: a device kernel handed host
@@ -1145,12 +1236,25 @@ unsafe fn alloc_scratch(
 /// # Planning cost
 ///
 /// The requirement is memoized per node by [`WorkspacePlanCache`], keyed on the
-/// exact operand metadata. Without it, a `SessionPersistent` declarer whose
-/// `workspace_requirement` runs a cuBLASLt heuristic search (`MatMul`, `Gemm`,
-/// `FusedEpilogue`, `MatMulNBits`' f32 dequant path) paid for that search here,
-/// had the result declined, and then paid for it a second time inside its own
-/// `execute` — twice per node per decode step. See [`WorkspacePlanCache`] for
-/// the correctness argument.
+/// exact operand metadata. Be precise about what that buys:
+///
+/// * It removes **this seam's own** repeat search. Without the cache, a
+///   `SessionPersistent` declarer whose `workspace_requirement` runs a cuBLASLt
+///   heuristic search (`MatMul`, `Gemm`, `FusedEpilogue`, `MatMulNBits`' f32
+///   dequant path) paid for that search here on *every* dispatch, had the
+///   result declined, and then planned again inside its own `execute`.
+/// * It does **not** remove the kernel-side plan. `blas::governed_gemm` still
+///   plans once per dispatch inside `execute`; nothing here reaches into it.
+/// * So against `main` — which never called `workspace_requirement` at all —
+///   the steady state is approximately **neutral**, not a halving: a repeated
+///   operand signature costs a lock plus a short linear scan, and each *new*
+///   signature costs one extra heuristic search that `main` did not perform.
+/// * Hit rate is a property of the shapes. A stable geometry (fixed batch and
+///   sequence length) hits; a growing-KV `StepScoped` attention whose operand
+///   shapes change every decode step can **miss on every step**, and then the
+///   cache is pure overhead bounded by one extra search per step.
+///
+/// See [`WorkspacePlanCache`] for the correctness argument.
 ///
 /// # Lifetimes
 ///
@@ -1213,11 +1317,11 @@ unsafe fn alloc_scratch(
 ///
 /// # Safety
 ///
-/// `api`, `ctx` and the pointer inside `mem_info` must be valid.
+/// `api`, `ctx` and `placement.subgraph_fallback` (when `Some`) must be valid.
 unsafe fn prepare_workspace(
     api: &ort::OrtApi,
     ctx: *mut ort::OrtKernelContext,
-    mem_info: OperandMemInfo,
+    placement: PlacementSources<'_>,
     kernel: &dyn Kernel,
     plans: &WorkspacePlanCache,
     inputs: &[TensorView<'_>],
@@ -1261,7 +1365,12 @@ unsafe fn prepare_workspace(
     let total =
         workspace_block_bytes(bytes, alignment).map_err(|e| format!("{node_label}: {e}"))?;
 
-    let mem_info = match mem_info {
+    // Placement is resolved *here*, past every gate, and not by the caller.
+    // Asking ORT where a node's operands live costs `2n` FFI calls plus `n-1`
+    // comparisons, and for a CPU node, a zero-byte requirement or a declined
+    // `SessionPersistent` request the answer is never used. Every dispatch used
+    // to pay it; now only a dispatch that is actually about to be served does.
+    let mem_info = match unsafe { operand_mem_info(api, ctx, placement) } {
         OperandMemInfo::Uniform(ptr) | OperandMemInfo::FromIntermediates(ptr) => ptr,
         OperandMemInfo::Unavailable => {
             return Err(format!(
@@ -1637,6 +1746,8 @@ unsafe extern "C" fn compute_execute(
                     }
                 };
                 // This node's own ORT-bound operands — not subgraph input 0.
+                // Resolved lazily inside `prepare_workspace`, so a node that
+                // needs no workspace never queries ORT for placement.
                 let node_ort_operands: Vec<usize> = sources
                     .iter()
                     .filter_map(|src| match src {
@@ -1644,19 +1755,14 @@ unsafe extern "C" fn compute_execute(
                         NodeInputSource::Buffer(_) | NodeInputSource::Absent => None,
                     })
                     .collect();
-                let node_mem_info = unsafe {
-                    operand_mem_info(
-                        api_ref,
-                        kernel_context,
-                        &node_ort_operands,
-                        scratch_mem_info,
-                    )
-                };
                 let workspace = match unsafe {
                     prepare_workspace(
                         api_ref,
                         kernel_context,
-                        node_mem_info,
+                        PlacementSources {
+                            ort_inputs: &node_ort_operands,
+                            subgraph_fallback: scratch_mem_info,
+                        },
                         &*entry.kernel,
                         plans,
                         &kernel_inputs,
@@ -1806,22 +1912,18 @@ unsafe extern "C" fn compute_execute(
                 }
             };
             // The single-node subgraph's operands are this node's operands, but
-            // only the present ones are ORT-bound.
+            // only the present ones are ORT-bound. Placement is resolved lazily
+            // inside `prepare_workspace`, past the zero-byte and lifetime gates.
             let node_ort_operands: Vec<usize> =
                 entry.input_slots.iter().flatten().copied().collect();
-            let node_mem_info = unsafe {
-                operand_mem_info(
-                    api_ref,
-                    kernel_context,
-                    &node_ort_operands,
-                    scratch_mem_info,
-                )
-            };
             let workspace = match unsafe {
                 prepare_workspace(
                     api_ref,
                     kernel_context,
-                    node_mem_info,
+                    PlacementSources {
+                        ort_inputs: &node_ort_operands,
+                        subgraph_fallback: scratch_mem_info,
+                    },
                     &*entry.kernel,
                     plans,
                     &kernel_inputs,
