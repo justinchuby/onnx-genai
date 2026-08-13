@@ -17,27 +17,6 @@ fn fixture(name: &str) -> PathBuf {
     repository_root().join("tests/fixtures").join(name)
 }
 
-/// A 4x4 solid-color PNG written to the target directory.
-fn sample_png() -> PathBuf {
-    let directory = repository_root().join("target/test-fixtures");
-    std::fs::create_dir_all(&directory).unwrap();
-    let path = directory.join("repl-sample.png");
-    // Several tests want this file and cargo runs them in parallel, so it is
-    // written to a per-test temporary and renamed into place. Writing the shared
-    // path directly lets one test read what another is still writing, which
-    // surfaces as "the image format could not be determined".
-    let staging = directory.join(format!(
-        "repl-sample-{}-{:?}.png",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    image::RgbImage::from_pixel(4, 4, image::Rgb([10, 200, 90]))
-        .save(&staging)
-        .expect("the sample PNG must be written");
-    std::fs::rename(&staging, &path).expect("the sample PNG must be published atomically");
-    path
-}
-
 /// Run the REPL with `script` on stdin and return its output.
 ///
 /// The script is fed all at once; the REPL exits on the trailing empty line or
@@ -98,22 +77,12 @@ fn completed_turns(output: &str) -> usize {
         .expect("the /session summary must report a completed-turns count")
 }
 
-fn vlm() -> PathBuf {
-    fixture("tiny-vlm-image-input")
-}
-
 fn text_model() -> PathBuf {
     fixture("tiny-llm")
 }
 
 #[test]
 fn the_banner_reports_the_modalities_the_model_accepts() {
-    let vlm_banner = text(&repl(&vlm(), &["--raw"], "\n"));
-    assert!(
-        vlm_banner.contains("text + image input"),
-        "banner: {vlm_banner}"
-    );
-
     let text_banner = text(&repl(&text_model(), &[], "\n"));
     assert!(
         text_banner.contains("(text input)"),
@@ -218,44 +187,9 @@ fn system_and_raw_and_reset_acknowledge_their_effect() {
 }
 
 #[test]
-fn an_image_attachment_runs_the_turn_and_is_cleared_afterwards() {
-    let image = sample_png();
-    let script = format!(
-        "/image {} describe <image>\ndescribe <image>\n\n",
-        image.display()
-    );
-    let output = text(&repl(&vlm(), &["--raw", "--max-new-tokens", "2"], &script));
-
-    // First turn: the staged image is consumed and the model answers.
-    assert!(
-        output.contains(&format!("(sending {})", image.display())),
-        "{output}"
-    );
-    assert!(output.contains("img"), "{output}");
-    // Second turn: the attachment was cleared, so the same prompt now fails for
-    // want of an image rather than silently reusing the previous one.
-    assert!(
-        output.contains("the turn carried no attachment"),
-        "the staged image must not leak into the next turn: {output}"
-    );
-}
-
-#[test]
-fn reset_drops_a_staged_attachment_before_it_is_sent() {
-    let image = sample_png();
-    let script = format!("/image {} \n/reset\ndescribe <image>\n\n", image.display());
-    let output = text(&repl(&vlm(), &["--raw", "--max-new-tokens", "2"], &script));
-
-    assert!(
-        output.contains("the turn carried no attachment"),
-        "/reset must discard the staged image: {output}"
-    );
-}
-
-#[test]
 fn a_rejected_attachment_keeps_the_session_alive() {
     let script = "/audio /nonexistent.wav\n/help\n\n";
-    let output = repl(&vlm(), &["--raw"], script);
+    let output = repl(&text_model(), &["--raw"], script);
     let stdout = stdout_text(&output);
     let stderr = stderr_text(&output);
 
@@ -268,46 +202,12 @@ fn a_rejected_attachment_keeps_the_session_alive() {
 
 #[test]
 fn a_missing_attachment_path_is_reported_with_usage() {
-    let output = repl(&vlm(), &["--raw"], "/image\n/help\n\n");
+    let output = repl(&text_model(), &["--raw"], "/image\n/help\n\n");
     let stdout = stdout_text(&output);
     let stderr = stderr_text(&output);
 
     assert!(stderr.contains("usage: /image <path>"), "{stderr}");
     assert!(stdout.contains("/system <text>"), "{stdout}");
-}
-
-#[test]
-fn a_nonexistent_attachment_file_names_the_path() {
-    let output = text(&repl(
-        &vlm(),
-        &["--raw"],
-        "/image ./definitely-missing.png\n\n",
-    ));
-
-    assert!(output.contains("definitely-missing.png"), "{output}");
-    assert!(output.contains("How:"), "{output}");
-}
-
-#[test]
-fn preloaded_attachments_apply_to_the_first_turn() {
-    let image = sample_png();
-    let output = text(&repl(
-        &vlm(),
-        &[
-            "--raw",
-            "--max-new-tokens",
-            "2",
-            "--image",
-            image.to_str().unwrap(),
-        ],
-        "describe <image>\n\n",
-    ));
-
-    assert!(
-        output.contains(&format!("(sending {})", image.display())),
-        "a --image passed to `run` must be staged for the first turn: {output}"
-    );
-    assert!(output.contains("img"), "{output}");
 }
 
 #[test]
@@ -890,37 +790,6 @@ fn the_request_stochastic_regime_still_terminates_without_hanging() {
          empty-close drop, or admission drop); completed={completed} \
          reasoning_drops={reasoning_drops} empty_close_drops={empty_close_drops} \
          admission_drops={admission_drops}: {combined}"
-    );
-}
-
-#[test]
-fn a_second_question_about_the_same_image_reuses_the_encoder() {
-    // The reason multimodal reuse exists: a follow-up about the same picture
-    // should not re-run the vision encoder, and `--profile` is where a user can
-    // see that it did not.
-    let image = sample_png();
-    let path = image.to_str().unwrap();
-    let script = format!("/image {path} describe it\n/image {path} and again\n\n");
-    let output = repl_with_global_flags(
-        &fixture("tiny-vlm-image-input"),
-        &["--profile"],
-        &["--max-new-tokens", "2"],
-        &script,
-    );
-    let text = text(&output);
-
-    assert!(
-        output.status.success(),
-        "the REPL must exit cleanly: {text}"
-    );
-    assert!(
-        text.contains("encoder cache"),
-        "the profile must report encoder reuse: {text}"
-    );
-    // The first turn runs the encoder; the second must find it memoized.
-    assert!(
-        text.contains("1 hit / 0 run"),
-        "the follow-up turn must hit the memoized encoder output: {text}"
     );
 }
 

@@ -997,6 +997,8 @@ fn workflow_state_results(node: &WorkflowNode) -> BTreeMap<String, String> {
     }
 }
 
+// Recursive validation threads each independent symbol/effect table explicitly.
+#[allow(clippy::too_many_arguments)]
 fn validate_workflow_node(
     node: &WorkflowNode,
     workflow: &WorkflowSpec,

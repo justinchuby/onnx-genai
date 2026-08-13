@@ -54,6 +54,8 @@ pub(crate) struct IslandInvocation {
     pub outputs: BTreeMap<String, String>,
 }
 
+type IslandBindingKey = Vec<(String, Vec<i64>)>;
+
 pub(crate) struct ExecutionIsland {
     pub id: usize,
     pub components: Vec<String>,
@@ -64,7 +66,7 @@ pub(crate) struct ExecutionIsland {
     capture_eligible: bool,
     capture_disabled: Cell<bool>,
     device: String,
-    bindings: RefCell<HashMap<Vec<(String, Vec<i64>)>, StableIslandBinding>>,
+    bindings: RefCell<HashMap<IslandBindingKey, StableIslandBinding>>,
     device_allocator: Option<Allocator>,
     linked_node_count: usize,
     external_initializer_bytes: u64,
