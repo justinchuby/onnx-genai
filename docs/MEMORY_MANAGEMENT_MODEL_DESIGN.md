@@ -78,15 +78,28 @@ flowchart TD
     end
 
     subgraph ORTCore["ORT — foundational runtime / graph execution"]
-        Memory["ProcessMemoryManager<br/>registry + topology + authorities"]
-        Env["OrtEnv<br/>logging + threads + allocator registration"]
-        Session["ORT InferenceSession(s) — graph executors"]
-        Arenas["ORT / EP arenas: activation + workspace"]
-        Allocators["DeviceAllocator / VirtualBacking"]
-        Kernels["EP kernels / captured graph"]
-        Memory -->|"allocator adapters"| Env
-        Env -->|"shared allocators + authority handles"| Session
-        Memory -->|"bulk grants / soft limits"| Arenas
+        Memory["ProcessMemoryManager<br/>owns budgets, pressure, and telemetry"]
+        Topology["TopologyProvider<br/>physical pools, aliasing, granularity, links"]
+        Registry["MemoryAuthorityRegistry<br/>one authority per physical pool"]
+        Host["HostGovernor<br/>host RAM/disk tickets + pressure"]
+        Device["DeviceMemoryAuthority(s)<br/>device ledger + mapped growth"]
+        LeaseAPI["MemoryGovernor contract<br/>leases, allowances, holder registration"]
+        Adapters["Governed allocator adapters<br/>bulk leases + local suballocation"]
+        Env["OrtEnv<br/>logging, threads, allocator registration"]
+        Session["InferenceSession(s)<br/>graph plan, bind, Run"]
+        Arenas["ORT / EP arenas<br/>activation + workspace pools"]
+        Allocators["DeviceAllocator / VirtualBacking<br/>allocate, reserve, map, unmap"]
+        Kernels["EP kernels / captured graph<br/>consume C6 model views"]
+        Memory --> Topology
+        Topology --> Registry
+        Registry --> Host
+        Registry --> Device
+        Host -->|"implements"| LeaseAPI
+        Device -->|"implements"| LeaseAPI
+        LeaseAPI --> Adapters
+        Adapters --> Env
+        Env --> Session
+        Adapters --> Arenas
         Session --> Arenas
         Arenas --> Allocators
         Session -->|"dispatch"| Kernels
@@ -97,26 +110,30 @@ flowchart TD
     Foundry -->|"resource limits / policy"| Memory
     Standalone --> Env
     Standalone -->|"create or use default manager"| Memory
-    Engine -->|"C2/C4 lease requests + holder registration"| Memory
+    Engine -->|"C2/C4 requests"| LeaseAPI
     Engine -->|"bind model/state views; Run"| Session
     Weights -->|"stable weight views"| Session
     State -->|"C6 state views"| Session
 ```
 
-| Design component | Contract and invariant coverage |
-| --- | --- |
-| Foundry Local / embedding application | C8; I3, I8 |
-| ORT GenAI generation runtime | C2, C4-C9; I3-I10 |
-| `ProcessMemoryManager` authority owner | C1, C2, C5, C7, C8; I1-I3, I6-I8 |
-| ORT runtime / `OrtEnv` allocator adapter | C2, C3, C8; I2, I3, I7 |
-| Resource registry and topology provider | C1, C7, C8; I1, I8 |
-| Device and host authorities | C1, C2, C5, C8; I1, I2, I3, I6, I7 |
-| Scheduler and admission | C4, C7-C9; I4, I5, I8, I10 |
-| Weight residency manager | C2, C4, C5; I2, I5, I6 |
-| Paged KV backend | C2, C4, C6, C9; I2, I4, I5, I10 |
-| Contiguous-VA VMM backend | C2-C4, C6, C7, C9; I1-I5, I8-I10 |
-| ORT allocator and I/O-binding adapters | C2, C3, C6, C8, C9; I2, I3, I10 |
-| Persistent state manager | C2, C4, C6, C9; I4-I6, I10 |
+| Diagram node | Responsibility | Contract / invariant coverage |
+| --- | --- | --- |
+| Foundry Local | Hosts product APIs, packages, multi-model routing, resource policy, and observability. | C8; I3, I8 |
+| ORT GenAI | Implements generation semantics, scheduling, model/state residency policy, and C4 transactions. | C2, C4-C9; I3-I10 |
+| `ProcessMemoryManager` | Owns the process-wide resource service and configuration/telemetry entry point. | C1, C7, C8; I1, I8 |
+| `TopologyProvider` | Reports distinct/aliased pools, capacities, mapping granularity, and transfer paths. | C7; I8 |
+| `MemoryAuthorityRegistry` | Resolves each physical pool to exactly one stable authority. | C1; I1 |
+| `HostGovernor` | Accounts host RAM/disk and arbitrates ticketed, non-blocking pressure across sessions/devices. | C1, C2, C5, C8; I1-I3, I6, I7 |
+| `DeviceMemoryAuthority` | Accounts one device-local pool and coordinates leases, mapped allowances, and growth. | C1, C2, C5, C8; I1-I3, I6-I9 |
+| `MemoryGovernor` | Common lease/allowance/reclaim interface implemented by host and device authorities. | C2, C5, C8; I2, I3, I6, I7 |
+| Governed allocator adapters | Convert bulk grants into fast ORT/EP-local suballocation. | C2, C3; I2, I3, I7 |
+| `OrtEnv` | Provides ORT process context and registers shared allocator adapters; owns no resource policy. | C3, C8; I3, I7 |
+| `InferenceSession` | Plans and executes one graph, binds C6 views, and reports persistent/transient needs. | C4, C6, C8; I5, I8-I10 |
+| Model residency | Chooses hot/warm/cold weights and capture-safe stable slots; releases only safe victims. | C2, C4-C6; I2, I5, I6, I9 |
+| `StateBundle` / `KvPageStore` | Owns KV, recurrent/conv, prefix, fork, checkpoint, and migration semantics. | C2, C4-C6, C9; I2, I4-I6, I9, I10 |
+| ORT/EP arenas | Pool activations/workspace under bulk leases and return reclaimable regions. | C2-C5; I2-I7 |
+| `DeviceAllocator` / `VirtualBacking` | Performs allocation and VA reserve/map/unmap without making policy. | C3; I2, I3, I9 |
+| EP kernels / capture | Consume declared model views; captured work pins compatible addresses/shapes. | C6, C9; I5, I9, I10 |
 
 | Logical boundary | Owns | Does not own |
 | --- | --- | --- |
