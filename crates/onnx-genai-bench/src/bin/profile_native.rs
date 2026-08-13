@@ -1027,6 +1027,14 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
 fn main() -> Result<()> {
     let args = Args::parse();
     validate_backend(&args)?;
+    eprintln!(
+        "profile_native: WEIGHT_OFFLOAD_BYTE_AWARE={:?} WEIGHT_OFFLOAD_EVICT_ORDER={:?} \
+         MANAGED_WEIGHT_STREAMING={:?} CUDA_GRAPH={:?}",
+        std::env::var("ONNX_GENAI_WEIGHT_OFFLOAD_BYTE_AWARE").ok(),
+        std::env::var("ONNX_GENAI_WEIGHT_OFFLOAD_EVICT_ORDER").ok(),
+        std::env::var("ONNX_GENAI_MANAGED_WEIGHT_STREAMING").ok(),
+        std::env::var("ONNX_GENAI_CUDA_GRAPH").ok(),
+    );
     if args.tokens == 0 || args.runs == 0 {
         bail!("--tokens and --runs must be greater than zero");
     }
