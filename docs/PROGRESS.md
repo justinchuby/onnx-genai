@@ -11,9 +11,9 @@ macOS-arm64 + win_amd64) and **`nxrt-ep-cuda`** (CUDA 13, manylinux_2_28_x86_64)
 CI = fmt/build/test + **blocking clippy** + Miri unsafe-crate soundness + scheduled
 `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-08-13T04:22:00Z_
+_Last updated: 2026-08-13T06:34:00Z_
 
-**Current `origin/main` implementation HEAD:** `1002e360`.
+**Current `origin/main` implementation HEAD:** `887e3742`.
 
 ---
 
@@ -29,8 +29,11 @@ _Last updated: 2026-08-13T04:22:00Z_
   CUDA-graph capture chain (#848/#850/#852/#855/#854 → 1 segment / 0 seams) plus a bf16
   RMSNorm cast-fold + parallel f32 tree reduction (#860 → 40.21) and a MatMulNBits
   constant-scale cache (#867 → 47.25). Capture collapses ~1600 launches/token into one
-  replay; first-16 greedy ids match reference. `GroupQueryAttention` (~41% of eager
-  decode) is the next open lever.
+  replay; first-16 greedy ids match reference. **Three independent A/B experiments
+  (#870/#872/#873) then proved this is the architectural ceiling:** native CUDA int4
+  decode of this model is **weight-bandwidth/compute-floor bound at ~47.25 tok/s on H200**,
+  NOT launch-dispatch bound — so `GroupQueryAttention` (~41% of eager decode) is *not* a
+  lever, and node/launch fusion cannot help.
 - **Large / hybrid models run native-only** where ORT cannot load them: GLM-4-9B
   (partial-RoPE GQA, ORT rejects the schema), DeepSeek-V2-Lite (MLA + QMoE), and
   Qwen3.5/3.6-**27B** hybrid Gated-DeltaNet — all load and decode on native CUDA via a
@@ -131,7 +134,35 @@ _Last updated: 2026-08-13T04:22:00Z_
   whether cast once or per step, so the full 128-token greedy sequence is bit-identical;
   MatMulNBits eager share drops ~44% → **~31%**, capture stays **1 segment / 0 seams**. The
   cache fills on the pre-capture warmup call so replays hit only lookups (no alloc, no
-  cast). `GroupQueryAttention` is now the largest eager share (~41%) — the next open lever.
+  cast). `GroupQueryAttention` is now the largest eager share (~41%) — tested next as the
+  candidate lever.
+
+### 2026-08-13 — Native CUDA decode ceiling: bandwidth-bound at ~47 tok/s (#870/#872/#873)
+
+- **Three independent A/B experiments conclusively prove native CUDA int4 decode of
+  Muse-Glimmer-30B is weight-bandwidth/compute-floor bound at ~47.25 tok/s on H200, NOT
+  launch-dispatch bound** — so the `GroupQueryAttention` (~41% eager) "next open lever" is
+  disproven and node/launch fusion is a dead end on this model:
+  - **#870 (GQA cheapening): flat.** Cheapening the GQA kernel's inner loop under capture
+    did not move tok/s — decode is not GQA-compute bound.
+  - **#872 (−208 cheap Add nodes): −2.8% regression.** A byte-exact constant-Add fold that
+    removed 208 cheap elementwise nodes/token *hurt* throughput (47.17 → 45.85 captured),
+    shipped as a doc-only negative finding.
+  - **#873 (−104 expensive QKV GEMV launches): flat.** Fusing the 3 per-layer attention
+    projections into one wider `MatMulNBits` (417 → 313 MatMulNBits/token, +52 Split,
+    capture stays 1 segment / 0 seams) is byte-exact (all 64 greedy ids identical) but
+    throughput is flat (47.33 → 47.26 median over 3 interleaved trials).
+- **Why:** at M=1 decode reads each disjoint int4 weight blob exactly once from DRAM (the
+  roofline is bytes-moved, not launches), so neither cheap-node nor expensive-launch
+  fusion can cut bytes moved — a wider fused GEMV moves the same total bytes as the
+  separate ones. 47.25 tok/s (already +18% vs ORT's ~40) is the architectural ceiling; we
+  bank the win.
+- **Disposition:** the correct, byte-exact `CudaQkvProjectionFusion` pass (#873) is
+  retained **opt-in / disabled-by-default** (`ONNX_GENAI_CUDA_ENABLE_QKV_FUSION=1`) for
+  future dispatch-bound architectures (e.g. fp16 activations, higher launch-latency-to-
+  bandwidth shapes); the default binary keeps the three separate GEMVs.
+- **Real levers to beat 47 are not node fusion:** reduce weight **bytes/token** (lower-bit
+  quant, sparsity) or switch kernel family (a decode megakernel). Future work.
 
 ### 2026-08-12 — EP plugins run inside ONNX Runtime and ship on PyPI
 
