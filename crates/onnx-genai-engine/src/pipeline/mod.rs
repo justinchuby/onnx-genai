@@ -209,7 +209,7 @@ impl PipelineEngine {
             .map(|layer| layer.bytes)
             .max()
             .unwrap_or(0);
-        let resolved_vram_bytes = resolve_vram_limit_bytes(&config.limits)?;
+        let resolved_vram_bytes = resolve_vram_limit_bytes(&config.limits, None)?;
         #[cfg(feature = "cuda")]
         let memory_strategy_overrides = crate::engine::memory_strategy_overrides_from_cuda_env(
             onnx_runtime_ep_cuda::DeviceOffloadPolicy::from_env(),
@@ -244,6 +244,7 @@ impl PipelineEngine {
             &config,
             None,
             model_weights_bytes,
+            None,
             authority_provider.as_ref(),
             &authority_domain,
         )?;
