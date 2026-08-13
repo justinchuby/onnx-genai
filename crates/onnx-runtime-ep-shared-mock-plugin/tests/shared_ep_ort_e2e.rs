@@ -1097,10 +1097,10 @@ fn a_changed_shape_gets_its_own_workspace_plan() {
     }
 }
 
-/// A declined `SessionPersistent` request must not cost an ORT placement query.
+/// A declined `SessionPersistent` request must not resolve operand placement.
 ///
-/// Resolving where a node's operands live is `2n` FFI calls plus `n-1`
-/// `CompareMemoryInfo` calls, and the answer is only ever used to place a
+/// Resolving where a node's operands live costs up to `2n` ORT FFI calls plus
+/// `n-1` `CompareMemoryInfo` calls, and the answer is only ever used to place a
 /// workspace. If the executor derives it before deciding whether it will serve
 /// one, every declining node on every dispatch pays for an answer that is
 /// thrown away — which is what revision 3 did.
@@ -1152,9 +1152,9 @@ fn a_declined_workspace_never_asks_ort_where_the_operands_live() {
         assert_eq!(
             fx.counter("nxrt_mock_shared_ep_placement_queries"),
             0,
-            "the executor asked ORT where the operands live for a node whose workspace request \
-             it then declined. That is {} wasted FFI round trips per dispatch, on every node of \
-             every decode step.",
+            "the executor resolved where the operands live for a node whose workspace request \
+             it then declined. That is {} wasted placement resolutions per dispatch, on every \
+             node of every decode step.",
             fx.counter("nxrt_mock_shared_ep_placement_queries")
         );
 
@@ -1222,7 +1222,7 @@ fn only_the_nodes_that_receive_a_workspace_query_placement() {
         assert_eq!(
             fx.counter("nxrt_mock_shared_ep_workspace_missing"),
             0,
-            "deferring the placement query must never turn into serving no workspace"
+            "deferring the placement resolution must never turn into serving no workspace"
         );
 
         ((*api).ReleaseSession.unwrap())(session);

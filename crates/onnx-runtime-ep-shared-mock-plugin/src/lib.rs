@@ -186,14 +186,18 @@ counter_export!(
      grow this counter, or every decode step pays for planning it already did."
 );
 
-/// Cumulative count of node-operand placement resolutions the executor
+/// Cumulative count of node-operand placement **resolutions** the executor
 /// performed (`onnx_runtime_ep_plugin::compute::workspace_placement_queries`).
 ///
 /// Not a mock-side counter: it reads the executor's own static, because the
-/// property under test is that the *executor* does not ask ORT where a node's
+/// property under test is that the *executor* does not work out where a node's
 /// operands live unless it is about to place a workspace there. A dispatch that
 /// needs no workspace, or whose `SessionPersistent` request is declined, must
 /// not grow this.
+///
+/// A resolution is not the same as an ORT call: a node whose operands are all
+/// fused-subgraph intermediates resolves placement from the subgraph memory
+/// info without calling ORT at all. This counts decisions, not FFI.
 #[unsafe(no_mangle)]
 pub extern "C" fn nxrt_mock_shared_ep_placement_queries() -> usize {
     onnx_runtime_ep_plugin::compute::workspace_placement_queries()

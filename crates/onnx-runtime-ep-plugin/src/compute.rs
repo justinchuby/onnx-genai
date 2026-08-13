@@ -1039,15 +1039,20 @@ struct PlacementSources<'a> {
     subgraph_fallback: Option<*const ort::OrtMemoryInfo>,
 }
 
-/// Number of times a node's workspace placement has been resolved through ORT.
+/// Number of times a node's workspace placement has been **resolved**.
 ///
-/// Incremented by [`operand_mem_info`], which is the only place this executor
-/// asks ORT where a node's operands live for the purpose of placing a
-/// workspace. Read it with [`workspace_placement_queries`].
+/// Incremented once per [`operand_mem_info`] call, which is the only place this
+/// executor decides where a node's workspace must live. Read it with
+/// [`workspace_placement_queries`].
+///
+/// It counts *resolutions*, not ORT calls: the
+/// [`OperandMemInfo::FromIntermediates`] path resolves placement from the
+/// subgraph-level memory info and makes **no** ORT call at all, so a resolution
+/// is an upper bound on the FFI a dispatch pays, not a measure of it.
 ///
 /// This is deliberately *not* `cfg(test)`-gated. The property it exists to
-/// pin — that a dispatch which needs no workspace never pays for a placement
-/// query — is only observable through a real ORT `Run` against the built
+/// pin — that a dispatch which needs no workspace never resolves placement —
+/// is only observable through a real ORT `Run` against the built
 /// cdylib, which is compiled without `cfg(test)`. A gated counter would leave
 /// the claim tested in a configuration nobody ships.
 static WORKSPACE_PLACEMENT_QUERIES: AtomicUsize = AtomicUsize::new(0);
@@ -1100,12 +1105,16 @@ pub fn reset_workspace_placement_queries() {
 ///
 /// # Cost
 ///
-/// Each call performs `2 * n` ORT FFI calls for `n` ORT-bound operands, plus
-/// `n - 1` `CompareMemoryInfo` calls. [`prepare_workspace`] therefore calls
+/// For `n` ORT-bound inputs this performs `2 * n` ORT FFI calls plus `n - 1`
+/// `CompareMemoryInfo` calls; the [`OperandMemInfo::FromIntermediates`] path
+/// (no ORT-bound inputs) performs none. [`prepare_workspace`] therefore calls
 /// this **only after** it knows a workspace is both non-empty and servable, so
-/// a CPU node, a zero-byte requirement, or a declined `SessionPersistent`
-/// request pays nothing. [`WORKSPACE_PLACEMENT_QUERIES`] counts the calls that
-/// do happen.
+/// a dispatch that requests **zero bytes** and one whose `SessionPersistent`
+/// request is **declined** resolve nothing. Note the gates are about the
+/// *requirement*, not the device: a kernel on a CPU-placed node that does ask
+/// for a step-scoped workspace still resolves placement, which is exactly what
+/// tells the executor to serve it from host memory.
+/// [`WORKSPACE_PLACEMENT_QUERIES`] counts the resolutions that do happen.
 ///
 /// # Safety
 ///
@@ -1216,8 +1225,10 @@ unsafe fn alloc_scratch(
 ///
 /// The derivation is **lazy**: it runs below, after the zero-byte and
 /// `StepScoped` gates, so a node with no workspace requirement and a node whose
-/// `SessionPersistent` request is declined issue no ORT placement calls at all.
-/// [`workspace_placement_queries`] counts the ones that do run.
+/// `SessionPersistent` request is declined resolve no placement at all. The
+/// gates are on the *requirement*, not on the device — a node that genuinely
+/// needs a step-scoped workspace resolves placement wherever it runs.
+/// [`workspace_placement_queries`] counts the resolutions that do run.
 ///
 /// Every failure to determine the device is a hard error *for a request that
 /// needs serving*, never a silent host allocation: a device kernel handed host
@@ -1366,10 +1377,10 @@ unsafe fn prepare_workspace(
         workspace_block_bytes(bytes, alignment).map_err(|e| format!("{node_label}: {e}"))?;
 
     // Placement is resolved *here*, past every gate, and not by the caller.
-    // Asking ORT where a node's operands live costs `2n` FFI calls plus `n-1`
-    // comparisons, and for a CPU node, a zero-byte requirement or a declined
-    // `SessionPersistent` request the answer is never used. Every dispatch used
-    // to pay it; now only a dispatch that is actually about to be served does.
+    // Resolving it costs up to `2n` ORT FFI calls plus `n-1` comparisons, and
+    // for a zero-byte requirement or a declined `SessionPersistent` request the
+    // answer is never used. Every dispatch used to pay it; now only a dispatch
+    // that is actually about to be served does.
     let mem_info = match unsafe { operand_mem_info(api, ctx, placement) } {
         OperandMemInfo::Uniform(ptr) | OperandMemInfo::FromIntermediates(ptr) => ptr,
         OperandMemInfo::Unavailable => {

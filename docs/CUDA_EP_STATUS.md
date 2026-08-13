@@ -144,16 +144,23 @@ inputs to compare, gets an error naming the node instead of a workspace from
 an arbitrarily chosen device. That error is only reachable when a workspace is
 actually requested — nodes that need none are untouched.
 
-**Derived lazily.** Each derivation costs `2n` ORT FFI calls for `n` ORT-bound
-inputs plus `n-1` comparisons, and the answer is only ever used to place a
+**Derived lazily.** A derivation costs up to `2n` ORT FFI calls for `n`
+ORT-bound inputs plus `n-1` comparisons — and none at all when every operand is
+a fused-subgraph intermediate — and the answer is only ever used to place a
 workspace. `prepare_workspace` therefore resolves it **after** the zero-byte and
-`StepScoped` gates, so a node that needs no workspace, and a node whose
-`SessionPersistent` request is declined, issue no placement calls at all. Two
-real-ORT falsifiers pin this from both sides: a declined dispatch must record
-**zero** placement queries, and a mixed `chain_add_mul` subgraph must record
-**exactly** as many queries as workspaces served — higher means the zero-byte
-`Mul` node is paying, lower means a workspace was placed without checking where
-its kernel runs. Both go red when the derivation is moved back above the gates.
+`StepScoped` gates, so a dispatch that requests **zero bytes** and one whose
+`SessionPersistent` request is **declined** resolve no placement at all. The
+gates are on the *requirement*, not on the device: a node that genuinely needs a
+step-scoped workspace resolves placement wherever it runs, including on CPU,
+because that is precisely what tells the executor to serve it from host memory.
+
+Two real-ORT falsifiers pin this from both sides: a declined dispatch must
+record **zero** placement resolutions, and a mixed `chain_add_mul` subgraph must
+record **exactly** as many as workspaces served — higher means the zero-byte
+`Mul` node is paying, lower means a workspace was placed without working out
+where its kernel runs. Both go red when the derivation is moved back above the
+gates. The counter measures *resolutions*, not FFI calls, since the
+intermediates path resolves without calling ORT.
 
 **Status handling at the new call site.** The `CompareMemoryInfo` call releases
 the `OrtStatus` it may return, inline, via `OrtApi::ReleaseStatus`. The two
@@ -162,6 +169,16 @@ older `GetMemoryInfo`/`GetScratchBuffer` status sites reached from here
 and still drop their status without releasing it or reading its message; that is
 a **pre-existing leak on a failure path**, is out of scope for this PR, and is
 recorded here as follow-up rather than fixed behind a new shared abstraction.
+
+Stated exactly, because this PR does change the site *count*: on `main` the
+`GetMemoryInfo` leak was reachable once per dispatch (subgraph input 0); with
+per-node derivation it is reachable up to once per ORT-bound input of each
+**served** node, so a subgraph with `n` such inputs across its served nodes has
+up to `n` reachable sites instead of one. The leak is unchanged in kind and
+still confined to a failure path that **aborts the `Run`** — an unreadable
+placement is a hard error, not a retry loop — so it cannot accumulate across
+steps of a healthy session. Fixing it means releasing and reading the message at
+all three sites, which is follow-up scope, not this PR.
 
 > **Scope limit, stated precisely.** This per-node derivation covers the
 > *workspace* path only. Fused-subgraph **intermediate** buffers still derive
@@ -444,8 +461,8 @@ executor honours the workspace contract. `PlainMulKernel` (op `Mul`) declares
 | `session_persistent_workspace_is_declined_not_downgraded` | `persistent_downgraded == 0` **and** `persistent_declined > 0` |
 | `workspace_plans_do_not_repeat_for_an_unchanged_shape` | 12 `Run`s of one shape ⇒ the plan counter never moves past what Run 1 needed |
 | `a_changed_shape_gets_its_own_workspace_plan` | on a dynamic-batch model, alternating `[1,4]`/`[3,4]` plans once per *distinct* shape and never serves a stale plan — the kernel rejects an undersized workspace, so a stale plan is a `Run` failure, not a silent pass |
-| `a_declined_workspace_never_asks_ort_where_the_operands_live` | a declined `SessionPersistent` dispatch records **zero** placement queries, with `persistent_declined >= RUNS` guarding against a vacuous pass |
-| `only_the_nodes_that_receive_a_workspace_query_placement` | on `chain_add_mul`, placement queries **equal** workspaces served — the zero-workspace `Mul` never queries, and every served `Add` does |
+| `a_declined_workspace_never_asks_ort_where_the_operands_live` | a declined `SessionPersistent` dispatch records **zero** placement resolutions, with `persistent_declined >= RUNS` guarding against a vacuous pass |
+| `only_the_nodes_that_receive_a_workspace_query_placement` | on `chain_add_mul`, placement resolutions **equal** workspaces served — the zero-workspace `Mul` never resolves, and every served `Add` does |
 | `shared_ep_two_sessions_share_one_instance` | one EP instance across two sessions |
 | `shared_ep_shutdown_runs_once_at_library_unregister` | exactly one `shutdown()` at unregister |
 
@@ -498,7 +515,7 @@ Falsifications demonstrated for this revision, with the exact observed output:
 | Drop `dtype` + `present` from the key | *"an f16 dispatch must not be served the f32 plan — left: 256, right: 128"*; *"an absent optional operand must not be served the plan that charged for it — left: 128, right: 64"* |
 | Delete the `WorkspacePlanCache::lookup` fast path | 5 unit tests red (*"16 dispatches of one unchanged shape must run the planner once, not 17"*) and both E2E plan tests red: *"12 Runs of one unchanged shape re-planned the workspace: 12 plans where the first Run already needed 1"* — i.e. exactly linear growth |
 | Restore the pre-fix `weak_count = strong_count - 1` | both teardown tests red; the diagnostic prints the self-contradicting *"…but 0 Weak handle(s) … are outstanding, which is also enough to block exclusive access"* |
-| Move `operand_mem_info` back above the zero-byte / `StepScoped` gates | both placement falsifiers red: *"the executor asked ORT where the operands live for a node whose workspace request it then declined … 4 wasted FFI round trips per dispatch"* and *"placement was resolved 3 times for 2 served workspaces"* |
+| Move `operand_mem_info` back above the zero-byte / `StepScoped` gates | both placement falsifiers red: *"the executor resolved where the operands live for a node whose workspace request it then declined … 4 wasted placement resolutions per dispatch"* and *"placement was resolved 3 times for 2 served workspaces"* |
 
 Each mutation was reverted and the suite re-run green before committing.
 
