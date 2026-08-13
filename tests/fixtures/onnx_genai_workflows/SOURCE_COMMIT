@@ -1,0 +1,4 @@
+Repository: https://github.com/onnxruntime/mobius.git
+Commit: 92bc47efbd0b955c3f6e7cc4c741f3cd8a494506
+Base package commit: 3b0445aec64868e7f8ecce51fd7db3aba57455de
+Path: tests/fixtures/onnx_genai_workflows/
