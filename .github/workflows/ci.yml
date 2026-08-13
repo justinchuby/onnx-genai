@@ -842,6 +842,10 @@ jobs:
         run: >-
           cargo test --locked
           $(python .github/scripts/workspace_test_packages.py cargo-args ort-backed)
+      - name: Execute checked-in Mobius workflow packages
+        run: >-
+          cargo test --locked -p onnx-genai-engine
+          --test mobius_workflow_conformance
       # `native-backend` is CPU-runnable: it selects the native CPU EP/session
       # crates, while CUDA-only engine integration tests are behind
       # required-features = ["native-cuda"] and are not selected here.
