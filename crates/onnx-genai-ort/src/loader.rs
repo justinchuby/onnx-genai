@@ -389,7 +389,8 @@ pub struct PipelineModels {
     pub tokenizers: BTreeMap<String, Tokenizer>,
     pub shared_tokenizer: Option<Tokenizer>,
     pub directory: PipelineModelDirectory,
-    _environment: Option<Environment>,
+    session_options: SessionOptions,
+    _environment: Environment,
 }
 
 impl PipelineModels {
@@ -457,6 +458,7 @@ impl PipelineModels {
             tokenizers,
             shared_tokenizer,
             directory,
+            session_options: options,
             _environment: environment,
         })
     }
@@ -486,6 +488,16 @@ impl PipelineModels {
         self.graph_io_metadata
             .get(component)
             .map(|graph| graph as &dyn GraphIo)
+    }
+
+    /// Environment shared by package sessions and generated execution islands.
+    pub fn environment(&self) -> &Environment {
+        &self._environment
+    }
+
+    /// Session options used to load package components.
+    pub fn session_options(&self) -> SessionOptions {
+        self.session_options.clone()
     }
 }
 

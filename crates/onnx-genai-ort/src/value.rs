@@ -763,6 +763,94 @@ impl Value {
         Ok(tensor_data_ptr(self.ptr.as_ptr())? as usize)
     }
 
+    /// Copy a host tensor into this existing host tensor without changing its
+    /// OrtValue or buffer address. Stable workflow-island bindings use this to
+    /// refresh request/loop inputs while preserving CUDA Graph replay addresses.
+    pub fn copy_from_host(&self, source: &Value) -> Result<()> {
+        self.ensure_host_accessible("copy_from_host destination")?;
+        source.ensure_host_accessible("copy_from_host source")?;
+        if self.dtype != source.dtype || self.shape != source.shape {
+            return Err(OrtError::InvalidArgument(format!(
+                "copy_from_host requires identical tensors, destination {:?} {:?}, source {:?} {:?}",
+                self.dtype, self.shape, source.dtype, source.shape
+            )));
+        }
+        let bytes = self
+            .numel()
+            .checked_mul(self.dtype.size_of())
+            .ok_or_else(|| {
+                OrtError::InvalidArgument("copy_from_host tensor byte size overflows".into())
+            })?;
+        let destination = tensor_data_ptr(self.ptr.as_ptr())?;
+        let source = tensor_data_ptr(source.ptr.as_ptr())?;
+        // SAFETY: shape/dtype equality guarantees both tensor buffers contain
+        // at least `bytes` bytes and do not overlap (distinct OrtValues).
+        unsafe { std::ptr::copy_nonoverlapping(source, destination, bytes) };
+        Ok(())
+    }
+
+    /// Copy an identically typed/shaped tensor between host and CUDA memory.
+    ///
+    /// CPU-to-CPU copies use ordinary host memory. Any copy involving device
+    /// memory uses the selected CUDA device explicitly so callers can refresh
+    /// stable graph-capture buffers without replacing their addresses.
+    pub fn copy_from_cuda(&self, source: &Value, device_id: i32) -> Result<()> {
+        if self.shape != source.shape || self.dtype != source.dtype {
+            return Err(OrtError::InvalidArgument(format!(
+                "CUDA tensor copy requires identical tensors, destination {:?} {:?}, source {:?} {:?}",
+                self.dtype, self.shape, source.dtype, source.shape
+            )));
+        }
+        let destination_host = self.is_host_resident()?;
+        let source_host = source.is_host_resident()?;
+        if destination_host && source_host {
+            return self.copy_from_host(source);
+        }
+        #[cfg(feature = "cuda")]
+        {
+            let bytes = self
+                .numel()
+                .checked_mul(self.dtype.size_of())
+                .ok_or_else(|| {
+                    OrtError::InvalidArgument("CUDA tensor copy byte size overflows".into())
+                })?;
+            let destination = self.data_ptr_addr()?;
+            let source_ptr = source.data_ptr_addr()?;
+            let _guard = crate::cuda_rt::DeviceGuard::set(device_id)?;
+            match (destination_host, source_host) {
+                (false, true) => {
+                    crate::cuda_rt::memcpy_host_to_device(destination, source.as_raw_bytes()?)?
+                }
+                (true, false) => {
+                    // SAFETY: destination is a host tensor with exactly `bytes`
+                    // writable bytes and remains alive for the copy.
+                    let destination_bytes =
+                        unsafe { std::slice::from_raw_parts_mut(destination as *mut u8, bytes) };
+                    crate::cuda_rt::memcpy_device_to_host(destination_bytes, source_ptr)?
+                }
+                (false, false) => {
+                    crate::cuda_rt::memcpy_device_to_device(destination, source_ptr, bytes)?
+                }
+                (true, true) => unreachable!(),
+            }
+            return Ok(());
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = device_id;
+            Err(OrtError::InvalidArgument(
+                "tensor copy involves CUDA memory but this build has no CUDA support".into(),
+            ))
+        }
+    }
+
+    /// Copy this tensor into a newly allocated CPU tensor.
+    pub fn to_host_from_cuda(&self, device_id: i32) -> Result<Self> {
+        let host = Self::empty(&self.shape, self.dtype)?;
+        host.copy_from_cuda(self, device_id)?;
+        Ok(host)
+    }
+
     /// Overwrite the leading `data.len()` Int64 elements of this tensor in
     /// place, leaving the tensor's OrtValue (and its buffer address) unchanged.
     ///

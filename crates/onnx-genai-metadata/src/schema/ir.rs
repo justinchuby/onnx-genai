@@ -133,6 +133,7 @@ pub enum RuntimeInputRole {
     SamplingTemperature,
     SamplingTopK,
     SamplingTopP,
+    SamplingMinP,
     Constraint,
     SessionId,
 }
@@ -319,6 +320,10 @@ pub enum WorkflowNode {
         input: String,
         output: String,
         device: DeviceKind,
+    },
+    /// Planner-lowered optimizer/capture unit. Never serialized.
+    ExecutionIsland {
+        id: usize,
     },
 }
 

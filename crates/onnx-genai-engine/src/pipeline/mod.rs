@@ -23,7 +23,10 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+mod islands;
 mod workflow;
+
+pub use islands::ExecutionIslandDiagnostic;
 
 pub type PipelineTensors = HashMap<String, Value>;
 
@@ -89,6 +92,7 @@ pub struct PipelineEngine {
     decode_backend: EngineDecodeBackend,
     workflow: WorkflowSpec,
     compiled_workflow: CompiledWorkflow,
+    execution_islands: Vec<islands::ExecutionIsland>,
     workflow_session_state: RefCell<HashMap<(String, String), Value>>,
     preprocessing: Option<PreprocessingSpec>,
 }
@@ -246,8 +250,13 @@ impl PipelineEngine {
             .map_err(|error| anyhow::anyhow!("Failed to load workflow components: {error}"))?;
 
         let workflow = directory.spec.workflow;
-        let compiled_workflow = onnx_genai_metadata::compile_workflow(&workflow)
+        let mut compiled_workflow = onnx_genai_metadata::compile_workflow(&workflow)
             .map_err(|error| anyhow::anyhow!("Failed to lower workflow metadata: {error}"))?;
+        let execution_islands =
+            islands::plan_execution_islands(&mut compiled_workflow.graph, &workflow, &models)
+                .map_err(|error| {
+                    anyhow::anyhow!("Failed to plan workflow execution islands: {error}")
+                })?;
         Ok(Self {
             models,
             resource_governor,
@@ -255,6 +264,7 @@ impl PipelineEngine {
             decode_backend,
             workflow,
             compiled_workflow,
+            execution_islands,
             workflow_session_state: RefCell::new(HashMap::new()),
             preprocessing: directory.preprocessing,
         })

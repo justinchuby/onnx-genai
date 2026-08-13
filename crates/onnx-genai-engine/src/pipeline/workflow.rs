@@ -710,6 +710,12 @@ impl PipelineEngine {
                     .with_context(|| format!("workflow transfer value '{input}' is unavailable"))?;
                 values.insert(output.clone(), clone_value(tensor)?);
             }
+            WorkflowNode::ExecutionIsland { id } => {
+                let island = self.execution_islands.get(*id).with_context(|| {
+                    format!("workflow references unknown execution island {id}")
+                })?;
+                island.run(values, component_overrides)?;
+            }
         }
         Ok(())
     }
@@ -1160,6 +1166,7 @@ fn workflow_request_value(
         RuntimeInputRole::SamplingTemperature => scalar_f32(request.options.temperature).map(Some),
         RuntimeInputRole::SamplingTopK => scalar_i64(request.options.top_k as i64).map(Some),
         RuntimeInputRole::SamplingTopP => scalar_f32(request.options.top_p).map(Some),
+        RuntimeInputRole::SamplingMinP => scalar_f32(request.options.min_p).map(Some),
         RuntimeInputRole::Media | RuntimeInputRole::Constraint | RuntimeInputRole::SessionId => {
             Ok(None)
         }
@@ -1630,7 +1637,9 @@ fn workflow_emitted_outputs(node: &WorkflowNode) -> std::collections::HashSet<St
             WorkflowNode::Emit { output, .. } => {
                 outputs.insert(output.clone());
             }
-            WorkflowNode::Invoke { .. } | WorkflowNode::Transfer { .. } => {}
+            WorkflowNode::Invoke { .. }
+            | WorkflowNode::Transfer { .. }
+            | WorkflowNode::ExecutionIsland { .. } => {}
         }
     }
     let mut outputs = std::collections::HashSet::new();

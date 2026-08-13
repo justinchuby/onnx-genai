@@ -88,6 +88,67 @@ graph {
 opset_import { domain: "" version: 12 }
 "#;
 
+const SIMPLE_GREEDY: &str = r#"
+ir_version: 8
+graph {
+  node {
+    input: "logits" output: "token" op_type: "ArgMax"
+    attribute { name: "axis" i: -1 type: INT }
+    attribute { name: "keepdims" i: 0 type: INT }
+  }
+  name: "simple_greedy"
+  input { name: "logits" type { tensor_type { elem_type: 1 shape {
+    dim { dim_param: "batch" } dim { dim_param: "vocabulary" }
+  }}}}
+  output { name: "token" type { tensor_type { elem_type: 7 shape {
+    dim { dim_param: "batch" }
+  }}}}
+}
+opset_import { domain: "" version: 13 }
+"#;
+
+const EXTERNAL_BIAS: &str = r#"
+ir_version: 8
+graph {
+  node { input: "logits" input: "bias" output: "adjusted" op_type: "Add" }
+  name: "external_bias"
+  initializer {
+    dims: 4
+    data_type: 1
+    name: "bias"
+    external_data { key: "location" value: "bias.bin" }
+    external_data { key: "offset" value: "0" }
+    external_data { key: "length" value: "16" }
+    data_location: EXTERNAL
+  }
+  input { name: "logits" type { tensor_type { elem_type: 1 shape {
+    dim { dim_param: "batch" } dim { dim_value: 4 }
+  }}}}
+  output { name: "adjusted" type { tensor_type { elem_type: 1 shape {
+    dim { dim_param: "batch" } dim { dim_value: 4 }
+  }}}}
+}
+opset_import { domain: "" version: 13 }
+"#;
+
+const ADD_PAIR: &str = r#"
+ir_version: 8
+graph {
+  node { input: "left" input: "right" output: "sum" op_type: "Add" }
+  name: "add_pair"
+  input { name: "left" type { tensor_type { elem_type: 1 shape {
+    dim { dim_param: "batch" } dim { dim_value: 4 }
+  }}}}
+  input { name: "right" type { tensor_type { elem_type: 1 shape {
+    dim { dim_param: "batch" } dim { dim_value: 4 }
+  }}}}
+  output { name: "sum" type { tensor_type { elem_type: 1 shape {
+    dim { dim_param: "batch" } dim { dim_value: 4 }
+  }}}}
+}
+opset_import { domain: "" version: 13 }
+"#;
+
 const CACHE_DECODER: &str = r#"
 ir_version: 8
 graph {
@@ -105,6 +166,56 @@ graph {
   }}}}
   output { name: "present_key_values" type { tensor_type { elem_type: 1 shape {
     dim { dim_param: "batch" } dim { dim_param: "present_sequence" }
+  }}}}
+}
+opset_import { domain: "" version: 13 }
+"#;
+
+const MIN_P_FILTER: &str = r#"
+ir_version: 8
+graph {
+  node {
+    input: "logits" output: "max_logit" op_type: "ReduceMax"
+    attribute { name: "axes" ints: 1 type: INTS }
+    attribute { name: "keepdims" i: 1 type: INT }
+  }
+  node { input: "min_p" output: "log_min_p" op_type: "Log" }
+  node { input: "max_logit" input: "log_min_p" output: "threshold" op_type: "Add" }
+  node {
+    input: "logits" input: "threshold" output: "keep" op_type: "GreaterOrEqual"
+  }
+  node {
+    input: "keep" input: "logits" input: "negative"
+    output: "filtered_logits" op_type: "Where"
+  }
+  name: "min_p_filter"
+  initializer { data_type: 1 float_data: -1000000000 name: "negative" }
+  input { name: "logits" type { tensor_type { elem_type: 1 shape {
+    dim { dim_param: "batch" } dim { dim_param: "vocabulary" }
+  }}}}
+  input { name: "min_p" type { tensor_type { elem_type: 1 shape {
+    dim { dim_value: 1 }
+  }}}}
+  output { name: "filtered_logits" type { tensor_type { elem_type: 1 shape {
+    dim { dim_param: "batch" } dim { dim_param: "vocabulary" }
+  }}}}
+}
+opset_import { domain: "" version: 13 }
+"#;
+
+const EOS_PREDICATE: &str = r#"
+ir_version: 8
+graph {
+  node { input: "token" input: "eos" output: "done" op_type: "Equal" }
+  name: "eos_predicate"
+  input { name: "token" type { tensor_type { elem_type: 7 shape {
+    dim { dim_param: "batch" }
+  }}}}
+  input { name: "eos" type { tensor_type { elem_type: 7 shape {
+    dim { dim_value: 1 }
+  }}}}
+  output { name: "done" type { tensor_type { elem_type: 9 shape {
+    dim { dim_param: "batch" }
   }}}}
 }
 opset_import { domain: "" version: 13 }
@@ -879,6 +990,271 @@ pipeline:
             .with_input("max_context", Value::from_slice_i64(&[3], &[1])?),
     )?;
     assert_eq!(output["final_cache"].to_vec_f32()?, [1.0, 2.0, 2.0]);
+    Ok(())
+}
+
+#[test]
+fn pure_policy_chain_lowers_to_one_execution_island() -> anyhow::Result<()> {
+    let metadata = r#"
+pipeline:
+  workflow:
+    manifest:
+      ir_version: "1.0"
+      onnx_opsets: { ai.onnx: 13 }
+      adapter_abis: {}
+      custom_op_versions: {}
+      capabilities: [workflow_ssa, linear_effects, typed_emit]
+    inputs:
+      logits:
+        contract: { dtype: float32, rank: 2, shape: [batch, vocabulary] }
+        role: { kind: opaque }
+        source: { kind: application, name: logits }
+        required: true
+      min_p:
+        contract: { dtype: float32, rank: 1, shape: [1] }
+        role: { kind: runtime, version: "1", role: sampling_min_p }
+        source: { kind: request, field: sampling_min_p }
+        required: true
+      eos:
+        contract: { dtype: int64, rank: 1, shape: [1] }
+        role: { kind: opaque }
+        source: { kind: application, name: eos }
+        required: true
+    outputs:
+      token:
+        contract: { dtype: int64, rank: 1, shape: [batch] }
+        role: tokens
+        stage: pre_adapter
+      done:
+        contract: { dtype: bool, rank: 1, shape: [batch] }
+        role: tensor
+        stage: pre_adapter
+    components:
+      min_p_filter:
+        implementation: { kind: onnx, artifact: min-p.onnx.textproto }
+        contract:
+          id: onnx-genai.logits-processor
+          version: "1"
+          bindings: { logits: logits, min_p: min_p, filtered_logits: filtered_logits }
+          parameters: { operation: min_p }
+      sampler:
+        implementation: { kind: onnx, artifact: sampler.onnx.textproto }
+        contract:
+          id: onnx-genai.token-sampler
+          version: "1"
+          bindings: { logits: logits, token: token }
+          parameters: { mode: greedy }
+      termination:
+        implementation: { kind: onnx, artifact: eos.onnx.textproto }
+        contract:
+          id: onnx-genai.termination-predicate
+          version: "1"
+          bindings: { tokens: token, eos_ids: eos, done: done }
+    steps:
+      - kind: invoke
+        component: min_p_filter
+        inputs: { logits: logits, min_p: min_p }
+        outputs: { filtered_logits: filtered }
+      - kind: invoke
+        component: sampler
+        inputs: { logits: filtered }
+        outputs: { token: sampled }
+      - kind: invoke
+        component: termination
+        inputs: { token: sampled, eos: eos }
+        outputs: { done: is_done }
+      - kind: emit
+        value: sampled
+        output: token
+        mode: replace
+      - kind: emit
+        value: is_done
+        output: done
+        mode: replace
+"#;
+    let root = package(
+        "execution-island-min-p",
+        metadata,
+        &[
+            ("min-p.onnx.textproto", MIN_P_FILTER),
+            ("sampler.onnx.textproto", SIMPLE_GREEDY),
+            ("eos.onnx.textproto", EOS_PREDICATE),
+        ],
+    )?;
+    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+    let run = |engine: &mut onnx_genai_engine::PipelineEngine, min_p: f32| {
+        let mut generate = GenerateRequest::new(GeneratePrompt::TokenIds(vec![]));
+        generate.options.min_p = min_p;
+        engine.run_pipeline(
+            PipelineGenerateRequest::new(generate)
+                .with_input(
+                    "logits",
+                    Value::from_slice_f32(&[4.0, 3.0, 1.0, 0.0], &[1, 4])?,
+                )
+                .with_input("eos", Value::from_slice_i64(&[0], &[1])?),
+        )
+    };
+    let first = run(&mut engine, 0.5)?;
+    assert_eq!(first["token"].to_vec_i64()?, [0]);
+    assert_eq!(first["done"].as_raw_bytes()?, [1]);
+    let second = run(&mut engine, 0.1)?;
+    assert_eq!(second["token"].to_vec_i64()?, [0]);
+
+    let diagnostics = engine.execution_island_diagnostics();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(
+        diagnostics[0].components,
+        ["min_p_filter", "sampler", "termination"]
+    );
+    assert_eq!(diagnostics[0].runs, 2);
+    assert_eq!(
+        diagnostics[0].fallback_reason.as_deref(),
+        Some("island is not placed on CUDA")
+    );
+    Ok(())
+}
+
+#[test]
+fn execution_island_references_external_weights_without_inlining() -> anyhow::Result<()> {
+    let metadata = r#"
+pipeline:
+  workflow:
+    manifest:
+      ir_version: "1.0"
+      onnx_opsets: { ai.onnx: 13 }
+      adapter_abis: {}
+      custom_op_versions: {}
+      capabilities: [workflow_ssa, linear_effects, typed_emit]
+    inputs:
+      logits:
+        contract: { dtype: float32, rank: 2, shape: [batch, 4] }
+        role: { kind: opaque }
+        source: { kind: application, name: logits }
+        required: true
+    outputs:
+      token:
+        contract: { dtype: int64, rank: 1, shape: [batch] }
+        role: tokens
+        stage: pre_adapter
+    components:
+      bias:
+        implementation: { kind: onnx, artifact: bias.onnx }
+      sampler:
+        implementation: { kind: onnx, artifact: sampler.onnx.textproto }
+    steps:
+      - kind: invoke
+        component: bias
+        inputs: { logits: logits }
+        outputs: { adjusted: adjusted }
+      - kind: invoke
+        component: sampler
+        inputs: { logits: adjusted }
+        outputs: { token: sampled }
+      - kind: emit
+        value: sampled
+        output: token
+        mode: replace
+"#;
+    let root = package(
+        "execution-island-external-data",
+        metadata,
+        &[
+            ("bias.onnx.textproto", EXTERNAL_BIAS),
+            ("sampler.onnx.textproto", SIMPLE_GREEDY),
+        ],
+    )?;
+    let bias = [0.0_f32, 0.0, 10.0, 0.0]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect::<Vec<_>>();
+    let bias_path = root.join("bias.bin");
+    fs::write(&bias_path, bias)?;
+    fs::write(
+        root.join("bias.onnx"),
+        onnx_runtime_loader::read_model_binary(root.join("bias.onnx.textproto"))?,
+    )?;
+
+    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+    let output = engine.run_pipeline(
+        PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
+            .with_input(
+                "logits",
+                Value::from_slice_f32(&[4.0, 3.0, 1.0, 0.0], &[1, 4])?,
+            ),
+    )?;
+    assert_eq!(output["token"].to_vec_i64()?, [2]);
+    assert_eq!(engine.execution_island_diagnostics().len(), 1);
+    Ok(())
+}
+
+#[test]
+fn execution_island_disambiguates_sanitized_value_names() -> anyhow::Result<()> {
+    let metadata = r#"
+pipeline:
+  workflow:
+    manifest:
+      ir_version: "1.0"
+      onnx_opsets: { ai.onnx: 13 }
+      adapter_abis: {}
+      custom_op_versions: {}
+      capabilities: [workflow_ssa, linear_effects, typed_emit]
+    inputs:
+      logits.raw:
+        contract: { dtype: float32, rank: 2, shape: [batch, 4] }
+        role: { kind: opaque }
+        source: { kind: application, name: logits.raw }
+        required: true
+      logits_raw:
+        contract: { dtype: float32, rank: 2, shape: [batch, 4] }
+        role: { kind: opaque }
+        source: { kind: application, name: logits_raw }
+        required: true
+    outputs:
+      token:
+        contract: { dtype: int64, rank: 1, shape: [batch] }
+        role: tokens
+        stage: pre_adapter
+    components:
+      add:
+        implementation: { kind: onnx, artifact: add.onnx.textproto }
+      sampler:
+        implementation: { kind: onnx, artifact: sampler.onnx.textproto }
+    steps:
+      - kind: invoke
+        component: add
+        inputs: { left: logits.raw, right: logits_raw }
+        outputs: { sum: combined }
+      - kind: invoke
+        component: sampler
+        inputs: { logits: combined }
+        outputs: { token: sampled }
+      - kind: emit
+        value: sampled
+        output: token
+        mode: replace
+"#;
+    let root = package(
+        "execution-island-name-collision",
+        metadata,
+        &[
+            ("add.onnx.textproto", ADD_PAIR),
+            ("sampler.onnx.textproto", SIMPLE_GREEDY),
+        ],
+    )?;
+    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+    let output = engine.run_pipeline(
+        PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
+            .with_input(
+                "logits.raw",
+                Value::from_slice_f32(&[10.0, 0.0, 0.0, 0.0], &[1, 4])?,
+            )
+            .with_input(
+                "logits_raw",
+                Value::from_slice_f32(&[0.0, 0.0, 0.0, 5.0], &[1, 4])?,
+            ),
+    )?;
+    assert_eq!(output["token"].to_vec_i64()?, [0]);
+    assert_eq!(engine.execution_island_diagnostics().len(), 1);
     Ok(())
 }
 
