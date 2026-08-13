@@ -7127,6 +7127,580 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         (worst_abs, worst_rel, max_out, all_finite)
     }
 
+    fn zc_env_usize(key: &str, default: usize) -> usize {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(default)
+    }
+
+    /// Deterministic int4/fp16 decode GEMV inputs for the #864 zero-copy probe.
+    /// Mirrors the block-32 asymmetric (`zp`) layout the real `qwen14b-zp`
+    /// decode path feeds `matmul_nbits_gemv_f16_scales_f16_zp` / its split-K
+    /// sibling: `packed` is `n * k_blocks * blob_size` bytes (two int4 nibbles
+    /// per byte), `scales` is fp16, `zero_points` is a per-(col, block) nibble.
+    #[allow(clippy::type_complexity)]
+    fn zc_make_inputs(
+        k: usize,
+        n: usize,
+        block_size: usize,
+    ) -> (Vec<f16>, Vec<u8>, Vec<f16>, Vec<u8>) {
+        let k_blocks = k / block_size;
+        let blob_size = block_size / 2;
+        let zp_row_bytes = k_blocks.div_ceil(2);
+
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+
+        let mut activation = vec![f16::ZERO; k];
+        for slot in activation.iter_mut() {
+            *slot = f16::from_f32(next());
+        }
+
+        // Packed int4 codes, two nibbles per byte, laid out exactly as the
+        // kernel unpacks: `packed[(col * k_blocks + block) * blob_size + pair]`.
+        let mut packed = vec![0u8; n * k_blocks * blob_size];
+        for byte in packed.iter_mut() {
+            let low = ((next() * 0.5 + 0.5) * 15.0).round().clamp(0.0, 15.0) as u8;
+            let high = ((next() * 0.5 + 0.5) * 15.0).round().clamp(0.0, 15.0) as u8;
+            *byte = low | (high << 4);
+        }
+
+        let mut scales = vec![f16::ZERO; n * k_blocks];
+        for slot in scales.iter_mut() {
+            *slot = f16::from_f32(0.015 + 0.01 * (next() * 0.5 + 0.5));
+        }
+
+        // Asymmetric per-(col, block) int4 zero points, packed low/high nibble.
+        let mut zp_packed = vec![0u8; n * zp_row_bytes];
+        for col in 0..n {
+            for block in 0..k_blocks {
+                let code = ((next() * 0.5 + 0.5) * 15.0).round().clamp(0.0, 15.0) as u8;
+                let byte = &mut zp_packed[col * zp_row_bytes + block / 2];
+                if block & 1 == 0 {
+                    *byte = (*byte & 0xf0) | code;
+                } else {
+                    *byte = (*byte & 0x0f) | (code << 4);
+                }
+            }
+        }
+
+        (activation, packed, scales, zp_packed)
+    }
+
+    fn zc_kernel(
+        runtime: &Arc<CudaRuntime>,
+        k: usize,
+        n: usize,
+        block_size: usize,
+    ) -> MatMulNBitsKernel {
+        MatMulNBitsKernel {
+            runtime: runtime.clone(),
+            k,
+            n,
+            bits: 4,
+            block_size,
+            accuracy_level: 4,
+            accuracy4_workspace: None,
+            fold_bias_post_round: false,
+            gate_up_swiglu: false,
+            decomposed_silu: false,
+            rmsnorm_prologue: false,
+            rmsnorm_epsilon: 1e-5,
+            last_call_capture_safe: AtomicBool::new(false),
+            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+        }
+    }
+
+    /// #864 — the decisive measurement this issue asks for. The 11.4 GB/s
+    /// zero-copy figure on #864/#877 was an *upper bound* measured with a
+    /// perfectly sequential `cuMemcpyDtoD` pull from mapped host memory. This
+    /// runs the **real** int4/fp16 decode GEMV (`MatMulNBits`, the exact kernel
+    /// plus launch config the engine selects) twice — once with its `packed`
+    /// weight pointer from `cuMemAlloc` (VRAM) and once from
+    /// `cuMemHostGetDevicePointer` over a `cuMemHostRegister(DEVICEMAP|
+    /// READ_ONLY)` host buffer — with **only the weight pointer differing**.
+    /// Everything else (activation, scales, zero-points, output) stays resident.
+    ///
+    /// It reports effective GB/s (packed_bytes / kernel_time, best-of-N) for
+    /// both arms so the numbers are directly comparable to #877's table, and
+    /// asserts the two arms' outputs are **bit-identical** (a zero-copy read
+    /// that changes the result is a correctness failure, not a perf question).
+    ///
+    /// Sizes are swept because the ~11.9 MB average per-tensor page-in fits in
+    /// this GPU's L2: at that size repeated VRAM reads are L2-cached and
+    /// *overstate* device bandwidth, inflating the ratio in the hybrid's favour.
+    /// The larger sizes exceed L2 and report the true cold DRAM-vs-PCIe rate the
+    /// real 8.33 GB layer walk sees (each weight read once per step, evicted
+    /// long before reuse). The honest ratio is the large-size one.
+    ///
+    /// `#[ignore]`: needs a live CUDA device and page-locks host RAM; it is a
+    /// measurement, not a CI gate. Run solo with the GPU otherwise idle:
+    ///   cargo test -p onnx-runtime-ep-cuda --features cuda --release \
+    ///     zerocopy_kernel_host_mapped_vs_vram -- --ignored --nocapture --test-threads=1
+    #[test]
+    #[ignore]
+    fn zerocopy_kernel_host_mapped_vs_vram_bandwidth() {
+        use cudarc::driver::result::event;
+        use cudarc::driver::sys;
+
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping zero-copy kernel probe: CUDA runtime unavailable");
+            return;
+        };
+        if runtime
+            .require_nvrtc_half_headers("zero-copy kernel probe")
+            .is_err()
+        {
+            eprintln!("skipping zero-copy kernel probe: fp16 NVRTC headers unavailable");
+            return;
+        }
+        runtime.bind().unwrap();
+
+        const CU_MEMHOSTREGISTER_DEVICEMAP: u32 = 0x02;
+        const CU_MEMHOSTREGISTER_READ_ONLY: u32 = 0x08;
+
+        let k = zc_env_usize("ZC_K", 5120);
+        let block_size = zc_env_usize("ZC_BLOCK", 32);
+        let reps = zc_env_usize("ZC_REPS", 7).max(3);
+        assert!(
+            k.is_multiple_of(block_size),
+            "K must be a multiple of block_size"
+        );
+        let k_blocks = k / block_size;
+        let blob_size = block_size / 2;
+        let zp_row_bytes = k_blocks.div_ceil(2);
+        let row_bytes = k_blocks * blob_size;
+
+        let sizes_mib: Vec<usize> = std::env::var("ZC_SIZES_MIB")
+            .ok()
+            .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+            .unwrap_or_else(|| vec![12, 64, 128, 256, 384]);
+
+        let caps = runtime.capabilities();
+        println!(
+            "\n=== #864 zero-copy REAL-kernel bandwidth probe ===\n\
+             SMs={} K={k} block_size={block_size} k_blocks={k_blocks} row_bytes/col={row_bytes} best-of-{reps}\n\
+             (packed = int4 weights; only the packed pointer differs VRAM vs host-mapped)\n",
+            caps.multiprocessor_count(),
+        );
+        println!(
+            "{:>10} {:>9} {:>12} {:>12} {:>8} {:>10}",
+            "packedMiB", "N", "VRAM GB/s", "host GB/s", "ratio", "match"
+        );
+
+        for mib in sizes_mib {
+            let target = mib * (1usize << 20);
+            let n = (target / row_bytes).max(1);
+            let packed_bytes = n * row_bytes;
+            let packed_mib = packed_bytes as f64 / (1u64 << 20) as f64;
+
+            let (activation, packed, scales, zp_packed) = zc_make_inputs(k, n, block_size);
+
+            // Resident buffers (identical for both arms).
+            let activation_dev = runtime.alloc_raw(activation.len() * 2).unwrap();
+            let scales_dev = runtime.alloc_raw(scales.len() * 2).unwrap();
+            let zp_dev = runtime.alloc_raw(zp_packed.len().max(1)).unwrap();
+            let output_dev = runtime.alloc_raw(n * 2).unwrap();
+            // VRAM copy of the weights (the arm the managed path streams into).
+            let packed_vram = runtime.alloc_raw(packed_bytes).unwrap();
+
+            // SAFETY: each device buffer was sized to its source slice.
+            unsafe {
+                runtime.htod(as_bytes(&activation), activation_dev).unwrap();
+                runtime.htod(as_bytes(&scales), scales_dev).unwrap();
+                runtime.htod(&zp_packed, zp_dev).unwrap();
+                runtime.htod(&packed, packed_vram).unwrap();
+            }
+
+            // Host-mapped weights: page-lock the same bytes READ_ONLY and take a
+            // device-addressable pointer into them (the zero-copy cold path).
+            let host_ptr = packed.as_ptr() as *mut c_void;
+            // SAFETY: `packed` outlives the registration; it is unregistered
+            // below before `packed` is dropped, and never reallocated meanwhile.
+            unsafe {
+                sys::cuMemHostRegister_v2(
+                    host_ptr,
+                    packed_bytes,
+                    CU_MEMHOSTREGISTER_DEVICEMAP | CU_MEMHOSTREGISTER_READ_ONLY,
+                )
+                .result()
+                .expect("cuMemHostRegister(DEVICEMAP|READ_ONLY)");
+            }
+            let mut packed_host_dptr: CUdeviceptr = 0;
+            // SAFETY: `host_ptr` was just registered with DEVICEMAP.
+            unsafe {
+                sys::cuMemHostGetDevicePointer_v2(&mut packed_host_dptr, host_ptr, 0)
+                    .result()
+                    .expect("cuMemHostGetDevicePointer");
+            }
+
+            let kernel = zc_kernel(&runtime, k, n, block_size);
+
+            let a_shape = [1usize, k];
+            let a_strides = [k as i64, 1];
+            let b_shape = [n, k_blocks, blob_size];
+            let b_strides = [(k_blocks * blob_size) as i64, blob_size as i64, 1];
+            let s_shape = [n, k_blocks];
+            let s_strides = [k_blocks as i64, 1];
+            let zp_shape = [n, zp_row_bytes];
+            let zp_strides = [zp_row_bytes as i64, 1];
+            let y_shape = [1usize, n];
+            let y_strides = [n as i64, 1];
+            let device = DeviceId::cuda(0);
+
+            let make_inputs = |packed_ptr: CUdeviceptr| {
+                vec![
+                    TensorView::new(
+                        device_ptr(activation_dev),
+                        DataType::Float16,
+                        &a_shape,
+                        &a_strides,
+                        device,
+                    ),
+                    TensorView::new(
+                        device_ptr(packed_ptr),
+                        DataType::Uint8,
+                        &b_shape,
+                        &b_strides,
+                        device,
+                    ),
+                    TensorView::new(
+                        device_ptr(scales_dev),
+                        DataType::Float16,
+                        &s_shape,
+                        &s_strides,
+                        device,
+                    ),
+                    TensorView::new(
+                        device_ptr(zp_dev),
+                        DataType::Uint8,
+                        &zp_shape,
+                        &zp_strides,
+                        device,
+                    ),
+                ]
+            };
+
+            let time_arm = |packed_ptr: CUdeviceptr| -> Vec<f32> {
+                let inputs = make_inputs(packed_ptr);
+                let mut outputs = [TensorMut::new(
+                    device_ptr_mut(output_dev),
+                    DataType::Float16,
+                    &y_shape,
+                    &y_strides,
+                    device,
+                )];
+                // Warm up (first call also compiles the NVRTC module).
+                kernel.run(&inputs, &mut outputs, None).unwrap();
+                runtime.synchronize().unwrap();
+                let mut times = Vec::with_capacity(reps);
+                for _ in 0..reps {
+                    let start = event::create(sys::CUevent_flags::CU_EVENT_DEFAULT).unwrap();
+                    let end = event::create(sys::CUevent_flags::CU_EVENT_DEFAULT).unwrap();
+                    // SAFETY: both events were just created on this context; the
+                    // launch enqueues on the same stream between the records.
+                    unsafe {
+                        event::record(start, runtime.stream_ptr()).unwrap();
+                        kernel.run(&inputs, &mut outputs, None).unwrap();
+                        event::record(end, runtime.stream_ptr()).unwrap();
+                        event::synchronize(end).unwrap();
+                        times.push(event::elapsed(start, end).unwrap());
+                        event::destroy(start).ok();
+                        event::destroy(end).ok();
+                    }
+                }
+                times
+            };
+
+            // VRAM arm, then read its output.
+            let vram_times = time_arm(packed_vram);
+            let mut got_vram = vec![f16::ZERO; n];
+            // SAFETY: `output_dev` holds `n` fp16 values.
+            unsafe {
+                runtime
+                    .dtoh(as_bytes_mut(&mut got_vram), output_dev)
+                    .unwrap()
+            };
+
+            // Host-mapped arm, then read its output.
+            let host_times = time_arm(packed_host_dptr);
+            let mut got_host = vec![f16::ZERO; n];
+            // SAFETY: `output_dev` holds `n` fp16 values.
+            unsafe {
+                runtime
+                    .dtoh(as_bytes_mut(&mut got_host), output_dev)
+                    .unwrap()
+            };
+
+            let best_ms = |t: &[f32]| t.iter().cloned().fold(f32::INFINITY, f32::min);
+            let med_ms = |t: &[f32]| {
+                let mut s = t.to_vec();
+                s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                s[s.len() / 2]
+            };
+            let gbps = |ms: f32| (packed_bytes as f64) / (ms as f64 / 1e3) / 1e9;
+            let vram_gbps = gbps(best_ms(&vram_times));
+            let host_gbps = gbps(best_ms(&host_times));
+
+            let bit_match = got_vram
+                .iter()
+                .zip(got_host.iter())
+                .all(|(a, b)| a.to_bits() == b.to_bits());
+
+            println!(
+                "{:>10.1} {:>9} {:>12.2} {:>12.2} {:>7.2}x {:>10}",
+                packed_mib,
+                n,
+                vram_gbps,
+                host_gbps,
+                vram_gbps / host_gbps,
+                if bit_match { "yes" } else { "NO" }
+            );
+            println!(
+                "           spread: VRAM best={:.4} med={:.4} ms  host best={:.4} med={:.4} ms",
+                best_ms(&vram_times),
+                med_ms(&vram_times),
+                best_ms(&host_times),
+                med_ms(&host_times),
+            );
+
+            // Release this size's resources before the next (host RAM is
+            // page-locked; VRAM is scarce). Not in a Drop guard — asserting in
+            // Drop trips STATUS_STACK_BUFFER_OVERRUN in this tree.
+            // SAFETY: `host_ptr` is still registered and `packed` still alive.
+            unsafe {
+                sys::cuMemHostUnregister(host_ptr)
+                    .result()
+                    .expect("cuMemHostUnregister");
+            }
+            // SAFETY: each pointer came from this runtime's `alloc_raw`, freed once.
+            unsafe {
+                runtime.free_raw(activation_dev).unwrap();
+                runtime.free_raw(scales_dev).unwrap();
+                runtime.free_raw(zp_dev).unwrap();
+                runtime.free_raw(output_dev).unwrap();
+                runtime.free_raw(packed_vram).unwrap();
+            }
+            drop(packed);
+
+            assert!(
+                bit_match,
+                "zero-copy host-mapped read produced a DIFFERENT result than the VRAM read \
+                 (packed={packed_mib:.1} MiB, N={n}) — correctness failure"
+            );
+        }
+    }
+
+    /// #864 second question: can CUDA graph capture bake a **host-mapped**
+    /// device pointer into a captured `MatMulNBits` launch and replay it
+    /// correctly? Capture is a hard gate on the streaming path (`captures > 0`,
+    /// `fallbacks == 0`, #796); if host-mapped pointers cannot be captured the
+    /// hybrid's cold path is incompatible with capture. This captures the real
+    /// decode GEMV reading its weights zero-copy from host memory, replays it,
+    /// and asserts the replayed output matches an eager host-mapped run.
+    ///
+    /// `#[ignore]`: needs a live CUDA device. Run solo:
+    ///   cargo test -p onnx-runtime-ep-cuda --features cuda --release \
+    ///     zerocopy_kernel_capture_with_host_mapped_pointer -- --ignored --nocapture --test-threads=1
+    #[test]
+    #[ignore]
+    fn zerocopy_kernel_capture_with_host_mapped_pointer() {
+        use cudarc::driver::sys;
+
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping capture probe: CUDA runtime unavailable");
+            return;
+        };
+        if runtime.require_nvrtc_half_headers("capture probe").is_err() {
+            eprintln!("skipping capture probe: fp16 NVRTC headers unavailable");
+            return;
+        }
+        runtime.bind().unwrap();
+
+        const CU_MEMHOSTREGISTER_DEVICEMAP: u32 = 0x02;
+        const CU_MEMHOSTREGISTER_READ_ONLY: u32 = 0x08;
+
+        let k = zc_env_usize("ZC_K", 5120);
+        let block_size = zc_env_usize("ZC_BLOCK", 32);
+        let n = zc_env_usize("ZC_CAPTURE_N", 4608);
+        assert!(k.is_multiple_of(block_size));
+        let k_blocks = k / block_size;
+        let blob_size = block_size / 2;
+        let zp_row_bytes = k_blocks.div_ceil(2);
+        let packed_bytes = n * k_blocks * blob_size;
+
+        let (activation, packed, scales, zp_packed) = zc_make_inputs(k, n, block_size);
+
+        let activation_dev = runtime.alloc_raw(activation.len() * 2).unwrap();
+        let scales_dev = runtime.alloc_raw(scales.len() * 2).unwrap();
+        let zp_dev = runtime.alloc_raw(zp_packed.len().max(1)).unwrap();
+        let output_dev = runtime.alloc_raw(n * 2).unwrap();
+
+        // SAFETY: each device buffer was sized to its source slice.
+        unsafe {
+            runtime.htod(as_bytes(&activation), activation_dev).unwrap();
+            runtime.htod(as_bytes(&scales), scales_dev).unwrap();
+            runtime.htod(&zp_packed, zp_dev).unwrap();
+        }
+
+        let host_ptr = packed.as_ptr() as *mut c_void;
+        // SAFETY: `packed` outlives the registration and is unregistered below.
+        unsafe {
+            sys::cuMemHostRegister_v2(
+                host_ptr,
+                packed_bytes,
+                CU_MEMHOSTREGISTER_DEVICEMAP | CU_MEMHOSTREGISTER_READ_ONLY,
+            )
+            .result()
+            .expect("cuMemHostRegister(DEVICEMAP|READ_ONLY)");
+        }
+        let mut packed_host_dptr: CUdeviceptr = 0;
+        // SAFETY: `host_ptr` was just registered with DEVICEMAP.
+        unsafe {
+            sys::cuMemHostGetDevicePointer_v2(&mut packed_host_dptr, host_ptr, 0)
+                .result()
+                .expect("cuMemHostGetDevicePointer");
+        }
+
+        let kernel = zc_kernel(&runtime, k, n, block_size);
+
+        let a_shape = [1usize, k];
+        let a_strides = [k as i64, 1];
+        let b_shape = [n, k_blocks, blob_size];
+        let b_strides = [(k_blocks * blob_size) as i64, blob_size as i64, 1];
+        let s_shape = [n, k_blocks];
+        let s_strides = [k_blocks as i64, 1];
+        let zp_shape = [n, zp_row_bytes];
+        let zp_strides = [zp_row_bytes as i64, 1];
+        let y_shape = [1usize, n];
+        let y_strides = [n as i64, 1];
+        let device = DeviceId::cuda(0);
+
+        let inputs = vec![
+            TensorView::new(
+                device_ptr(activation_dev),
+                DataType::Float16,
+                &a_shape,
+                &a_strides,
+                device,
+            ),
+            TensorView::new(
+                device_ptr(packed_host_dptr),
+                DataType::Uint8,
+                &b_shape,
+                &b_strides,
+                device,
+            ),
+            TensorView::new(
+                device_ptr(scales_dev),
+                DataType::Float16,
+                &s_shape,
+                &s_strides,
+                device,
+            ),
+            TensorView::new(
+                device_ptr(zp_dev),
+                DataType::Uint8,
+                &zp_shape,
+                &zp_strides,
+                device,
+            ),
+        ];
+        let mut outputs = [TensorMut::new(
+            device_ptr_mut(output_dev),
+            DataType::Float16,
+            &y_shape,
+            &y_strides,
+            device,
+        )];
+
+        // Eager reference (also compiles the NVRTC module before capture).
+        kernel.run(&inputs, &mut outputs, None).unwrap();
+        runtime.synchronize().unwrap();
+        let mut eager = vec![f16::ZERO; n];
+        // SAFETY: `output_dev` holds `n` fp16 values.
+        unsafe { runtime.dtoh(as_bytes_mut(&mut eager), output_dev).unwrap() };
+
+        // Clobber the output so a broken replay cannot masquerade as a pass.
+        // SAFETY: `output_dev` holds `n` fp16 values.
+        unsafe {
+            runtime
+                .htod(as_bytes(&vec![f16::ONE; n]), output_dev)
+                .unwrap()
+        };
+
+        let captured = runtime
+            .begin_graph_capture(&[&kernel as &dyn Kernel])
+            .is_ok();
+        let mut replay_match = false;
+        if captured {
+            kernel.run(&inputs, &mut outputs, None).unwrap();
+            match runtime.end_graph_capture() {
+                Ok(()) => {
+                    for _ in 0..4 {
+                        runtime.replay_graph().unwrap();
+                    }
+                    runtime.synchronize().unwrap();
+                    let mut got = vec![f16::ZERO; n];
+                    // SAFETY: `output_dev` holds `n` fp16 values.
+                    unsafe { runtime.dtoh(as_bytes_mut(&mut got), output_dev).unwrap() };
+                    replay_match = got
+                        .iter()
+                        .zip(eager.iter())
+                        .all(|(a, b)| a.to_bits() == b.to_bits());
+                    runtime.reset_graph().ok();
+                    println!(
+                        "\n=== #864 capture-with-host-mapped-pointer probe ===\n\
+                         capture: SUPPORTED; replay output bit-identical to eager: {}",
+                        if replay_match { "YES" } else { "NO" }
+                    );
+                }
+                Err(e) => {
+                    runtime.abort_graph_capture().ok();
+                    println!(
+                        "\n=== #864 capture-with-host-mapped-pointer probe ===\n\
+                         capture: end_graph_capture FAILED: {e:?}"
+                    );
+                }
+            }
+        } else {
+            println!(
+                "\n=== #864 capture-with-host-mapped-pointer probe ===\n\
+                 capture: begin_graph_capture declined (kernel/audit not capturable in this build)"
+            );
+        }
+
+        // SAFETY: `host_ptr` is still registered and `packed` still alive.
+        unsafe {
+            sys::cuMemHostUnregister(host_ptr)
+                .result()
+                .expect("cuMemHostUnregister");
+        }
+        // SAFETY: each pointer came from this runtime's `alloc_raw`, freed once.
+        unsafe {
+            runtime.free_raw(activation_dev).unwrap();
+            runtime.free_raw(scales_dev).unwrap();
+            runtime.free_raw(zp_dev).unwrap();
+            runtime.free_raw(output_dev).unwrap();
+        }
+        drop(packed);
+
+        if captured {
+            assert!(
+                replay_match,
+                "graph replay with a host-mapped weight pointer produced a different result \
+                 than the eager host-mapped run"
+            );
+        }
+    }
+
     /// Dequant-reference parity for the int8 (bits=8) fp16-activation decode
     /// GEMV at arbitrary `(k, n)`. Exercises the vectorised four-lane/eight-block
     /// path against an f64 oracle; `explicit_zp` toggles the symmetric zp=128
