@@ -11,9 +11,9 @@ macOS-arm64 + win_amd64) and **`nxrt-ep-cuda`** (CUDA 13, manylinux_2_28_x86_64)
 CI = fmt/build/test + **blocking clippy** + Miri unsafe-crate soundness + scheduled
 `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-08-13T03:08:00Z_
+_Last updated: 2026-08-13T04:22:00Z_
 
-**Current `origin/main` implementation HEAD:** `b871c869`.
+**Current `origin/main` implementation HEAD:** `1002e360`.
 
 ---
 
@@ -24,11 +24,13 @@ _Last updated: 2026-08-13T03:08:00Z_
   bit-exact or native-more-accurate vs an fp32 oracle, zero fallbacks. The ORT 1.28
   three-config fairness benchmark measured native **1.23–2.74×** faster than
   ORT-GenAI-direct (Qwen2.5-0.5B 557 vs 203 tok/s = 2.74×; DeepSeek-R1-1.5B 1.23×).
-- **Muse-Glimmer-30B (dense int4, bf16 decoder, heavy GQA) decodes at ORT parity on
-  native CUDA** — **11.4 → 40.21 tok/s** (matches ORT's ~40) after a 4-gate CUDA-graph
-  capture chain (#848/#850/#852/#855/#854 → 1 segment / 0 seams) plus a bf16 RMSNorm
-  cast-fold + parallel f32 tree reduction (#860). Capture collapses ~1600 launches/token
-  into one replay; first-16 greedy ids match reference.
+- **Muse-Glimmer-30B (dense int4, bf16 decoder, heavy GQA) decodes faster than ORT on
+  native CUDA** — **11.4 → 47.25 tok/s (clearly beats ORT's ~40, +18%)** after a 4-gate
+  CUDA-graph capture chain (#848/#850/#852/#855/#854 → 1 segment / 0 seams) plus a bf16
+  RMSNorm cast-fold + parallel f32 tree reduction (#860 → 40.21) and a MatMulNBits
+  constant-scale cache (#867 → 47.25). Capture collapses ~1600 launches/token into one
+  replay; first-16 greedy ids match reference. `GroupQueryAttention` (~41% of eager
+  decode) is the next open lever.
 - **Large / hybrid models run native-only** where ORT cannot load them: GLM-4-9B
   (partial-RoPE GQA, ORT rejects the schema), DeepSeek-V2-Lite (MLA + QMoE), and
   Qwen3.5/3.6-**27B** hybrid Gated-DeltaNet — all load and decode on native CUDA via a
@@ -80,7 +82,7 @@ _Last updated: 2026-08-13T03:08:00Z_
 
 ## Recent milestones (2026-07-28 → 2026-08-13) — newest first
 
-### 2026-08-13 — Muse-Glimmer-30B native CUDA decode reaches ORT parity (40 tok/s)
+### 2026-08-13 — Muse-Glimmer-30B native CUDA decode beats ORT (47 tok/s)
 
 - **11.4 → 40.21 tok/s (native now matches ORT's ~40) on Muse-Glimmer-30B** (dense int4,
   52 layers, **bf16** decoder, hidden 6656, heavy GQA num_kv_heads=2, vocab 202048). The
@@ -116,6 +118,20 @@ _Last updated: 2026-08-13T03:08:00Z_
   tokens then shows expected sub-ulp greedy sensitivity (accuracy-level-4 int4 quant);
   `ONNX_GENAI_CUDA_DISABLE_NORM_CAST_FOLD=1` restores the strict CPU-order byte-exact
   serial path (at ~23 tok/s).
+- **MatMulNBits scale-cache lever (#867): 40.21 → 47.25 tok/s — native now clearly beats
+  ORT (~47 vs ~40, +18%).** With launches captured, decode is kernel-bound and MatMulNBits
+  was the dominant op (~44% of eager decode). The bf16 activation path re-cast **every**
+  input bf16→f16 each decode step, including the immutable int4 block **scales** — ~3.3
+  GB/token of pure-copy traffic (≈25% of the int4 weight traffic) plus 417 redundant cast
+  launches reproducing an identical f16 buffer. A persistent per-kernel `Bf16ConstCache`
+  stages the constant scale slots **once** (general path input 2; gate/up SwiGLU inputs 2
+  and 4) and reuses them across steps; the per-step activation and any per-token residual
+  bound into the bias slot stay on the ephemeral arena (caching never keys on pointer
+  identity for those dynamic slots). Byte-exact — bf16→f16 yields identical f16 bits
+  whether cast once or per step, so the full 128-token greedy sequence is bit-identical;
+  MatMulNBits eager share drops ~44% → **~31%**, capture stays **1 segment / 0 seams**. The
+  cache fills on the pre-capture warmup call so replays hit only lookups (no alloc, no
+  cast). `GroupQueryAttention` is now the largest eager share (~41%) — the next open lever.
 
 ### 2026-08-12 — EP plugins run inside ONNX Runtime and ship on PyPI
 
