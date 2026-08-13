@@ -206,6 +206,7 @@ impl Session {
                     let add = api.AddExternalInitializersFromFilesInMemory.ok_or(
                         OrtError::ApiUnavailable("AddExternalInitializersFromFilesInMemory"),
                     )?;
+                    #[cfg(not(windows))]
                     let names = external_files
                         .iter()
                         .map(|(name, _)| {
@@ -214,6 +215,21 @@ impl Session {
                                     "external initializer file name contains NUL: {name}"
                                 ))
                             })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    #[cfg(windows)]
+                    let names = external_files
+                        .iter()
+                        .map(|(name, _)| {
+                            if name.contains('\0') {
+                                return Err(OrtError::InvalidArgument(format!(
+                                    "external initializer file name contains NUL: {name}"
+                                )));
+                            }
+                            Ok(name
+                                .encode_utf16()
+                                .chain(std::iter::once(0))
+                                .collect::<Vec<_>>())
                         })
                         .collect::<Result<Vec<_>>>()?;
                     let name_ptrs = names.iter().map(|name| name.as_ptr()).collect::<Vec<_>>();

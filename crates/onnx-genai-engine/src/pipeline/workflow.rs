@@ -3,6 +3,13 @@
 use super::*;
 use crate::decode::clone_value;
 
+type ResolvedComponentInvocation<'a> = (
+    &'a str,
+    &'a onnx_genai_metadata::WorkflowComponent,
+    std::collections::BTreeMap<String, String>,
+    std::collections::BTreeMap<String, String>,
+);
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct WorkflowPerformanceDiagnostic {
     pub runs: u64,
@@ -204,12 +211,7 @@ fn resolve_component_invocation<'a>(
     inputs: &std::collections::BTreeMap<String, String>,
     outputs: &std::collections::BTreeMap<String, String>,
     overrides: &HashMap<String, String>,
-) -> anyhow::Result<(
-    &'a str,
-    &'a onnx_genai_metadata::WorkflowComponent,
-    std::collections::BTreeMap<String, String>,
-    std::collections::BTreeMap<String, String>,
-)> {
+) -> anyhow::Result<ResolvedComponentInvocation<'a>> {
     let Some(replacement_name) = overrides.get(component) else {
         return Ok((component, declaration, inputs.clone(), outputs.clone()));
     };
@@ -465,6 +467,8 @@ impl PipelineEngine {
         counters.last_emitted_elements = telemetry.emitted_elements;
         self.package_outputs(values)
     }
+    // Recursive execution threads the explicit interpreter stores and telemetry.
+    #[allow(clippy::too_many_arguments)]
     fn run_workflow_node(
         &self,
         node: &WorkflowNode,
@@ -2058,9 +2062,7 @@ fn emit_workflow_rows(
         );
     }
     for row in 0..rows {
-        let active = guards.map_or(true, |values| {
-            values[if values.len() == 1 { 0 } else { row }]
-        });
+        let active = guards.is_none_or(|values| values[if values.len() == 1 { 0 } else { row }]);
         if !active {
             continue;
         }
