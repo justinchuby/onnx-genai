@@ -52,6 +52,7 @@ pub mod gather_block_quantized;
 pub mod gemm;
 pub mod global_reduction;
 mod gqa_decode;
+mod gqa_decode_bf16;
 mod gqa_decode_fp16;
 pub mod grid_sample;
 pub mod group_normalization;
