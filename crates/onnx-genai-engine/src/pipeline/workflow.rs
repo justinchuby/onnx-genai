@@ -763,11 +763,17 @@ impl PipelineEngine {
                     .as_deref()
                     .map(|length| workflow_usize_rows(values, length))
                     .transpose()?;
-                let row_count = guards
-                    .as_ref()
-                    .map_or(1, Vec::len)
-                    .max(lengths.as_ref().map_or(1, Vec::len));
-                if row_count > 1 {
+                let row_prefix = format!("{output}.row.");
+                let row_control = values.keys().any(|name| name.starts_with(&row_prefix))
+                    || [when.as_deref(), valid_length.as_deref()]
+                        .into_iter()
+                        .flatten()
+                        .any(|name| {
+                            values
+                                .get(name)
+                                .is_some_and(|control| control.shape().len() == 1)
+                        });
+                if row_control {
                     emit_workflow_rows(
                         values,
                         &tensor,
@@ -2230,6 +2236,30 @@ mod workflow_scalar_tests {
         );
         assert!(!values.contains_key("tokens.row.1"));
         assert_eq!(telemetry.emit_events, 1);
+    }
+
+    #[test]
+    fn single_row_vector_control_still_uses_ragged_output_namespace() {
+        let tensor = Value::from_slice_i64(&[10, 11, 12], &[1, 3]).expect("row tensor");
+        let mut values = PipelineTensors::new();
+        let mut counts = HashMap::new();
+        let mut telemetry = WorkflowRunTelemetry::default();
+        emit_workflow_rows(
+            &mut values,
+            &tensor,
+            "tokens",
+            &WorkflowEmitMode::Replace,
+            None,
+            Some(&[2]),
+            &mut counts,
+            &mut telemetry,
+        )
+        .expect("row emit");
+        assert_eq!(
+            values["tokens.row.0"].to_vec_i64().expect("row values"),
+            [10, 11]
+        );
+        assert!(!values.contains_key("tokens"));
     }
 
     #[test]

@@ -478,6 +478,8 @@ pub struct KvServiceContract {
 pub struct KvServiceGroupContract {
     pub sequence_axis: usize,
     pub layout: String,
+    /// Semantic state cell containing the current logical sequence length for each row.
+    pub logical_lengths: String,
     #[serde(default)]
     pub storage: KvStorageMode,
     #[serde(default)]

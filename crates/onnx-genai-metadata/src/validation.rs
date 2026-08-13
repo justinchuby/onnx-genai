@@ -754,6 +754,36 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
                     "KV service group '{group_name}' layout must not be empty"
                 ));
             }
+            match workflow.state.get(&group.logical_lengths) {
+                Some(lengths) => {
+                    validate_integer_control_contract(
+                        &lengths.contract,
+                        &format!(
+                            "KV service group '{group_name}' logical_lengths state '{}'",
+                            group.logical_lengths
+                        ),
+                        errors,
+                    );
+                    if lengths.contract.rank != 1 {
+                        errors.push(format!(
+                            "KV service group '{group_name}' logical_lengths state '{}' must be \
+                             rank one with one value per row",
+                            group.logical_lengths
+                        ));
+                    }
+                    if lengths.class != crate::schema::WorkflowStateClass::Semantic {
+                        errors.push(format!(
+                            "KV service group '{group_name}' logical_lengths state '{}' must be \
+                             semantic for checkpoint/replay",
+                            group.logical_lengths
+                        ));
+                    }
+                }
+                None => errors.push(format!(
+                    "KV service group '{group_name}' references unknown logical_lengths state '{}'",
+                    group.logical_lengths
+                )),
+            }
             for (component_name, cells) in &group.ports {
                 let Some(component) = workflow.components.get(component_name) else {
                     errors.push(format!(
@@ -822,6 +852,13 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
             errors.push(
                 "pipeline.workflow.serving.kv_service.groups must declare at least one bound \
                  state group"
+                    .to_string(),
+            );
+        }
+        if !serving.kv_service.groups.is_empty() && serving.accepted_len.is_none() {
+            errors.push(
+                "pipeline.workflow.serving.accepted_len is required when KV service groups are \
+                 declared"
                     .to_string(),
             );
         }

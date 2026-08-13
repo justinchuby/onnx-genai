@@ -4,7 +4,7 @@ use std::process::Command;
 #[test]
 fn validator_cli_accepts_checked_in_conformance_package() {
     let fixture =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/north_star_minimal.yaml");
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/validator_package");
     let output = Command::new(env!("CARGO_BIN_EXE_validate_metadata"))
         .arg(&fixture)
         .output()
@@ -18,10 +18,12 @@ fn validator_cli_accepts_checked_in_conformance_package() {
 
 #[test]
 fn validator_cli_fails_closed() {
-    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/validator_missing_artifact");
     let output = Command::new(env!("CARGO_BIN_EXE_validate_metadata"))
-        .arg(fixture.join("invalid.yaml"))
+        .arg(fixture)
         .output()
         .expect("validator CLI runs");
     assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("missing.onnx"));
 }
