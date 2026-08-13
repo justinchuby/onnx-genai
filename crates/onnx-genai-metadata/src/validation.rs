@@ -618,6 +618,21 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
                         }
                     }
                 }
+                if component.application_overridable && component.contract.is_none() {
+                    errors.push(format!(
+                        "workflow component '{name}' is application-overridable but has no versioned contract"
+                    ));
+                }
+                if component.application_overridable
+                    && !matches!(
+                        component.implementation,
+                        crate::schema::ComponentImplementation::Onnx { .. }
+                    )
+                {
+                    errors.push(format!(
+                        "workflow component '{name}' is application-overridable but is not an ONNX component"
+                    ));
+                }
             }
         }
     }

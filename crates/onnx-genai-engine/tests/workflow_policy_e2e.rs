@@ -35,12 +35,79 @@ graph {
       dim { dim_param: "batch" } dim { dim_param: "vocabulary" }
     }}}
   }
+  input { name: "temperature" type { tensor_type { elem_type: 1 shape {
+    dim { dim_value: 1 }
+  }}}}
+  input { name: "top_k" type { tensor_type { elem_type: 7 shape {
+    dim { dim_value: 1 }
+  }}}}
+  input { name: "top_p" type { tensor_type { elem_type: 1 shape {
+    dim { dim_value: 1 }
+  }}}}
+  input { name: "grammar_mask" type { tensor_type { elem_type: 9 shape {
+    dim { dim_param: "batch" } dim { dim_param: "vocabulary" }
+  }}}}
   output {
     name: "token_ids"
     type { tensor_type { elem_type: 7 shape { dim { dim_param: "batch" } }}}
   }
 }
 opset_import { domain: "" version: 12 }
+"#;
+
+const ARGMIN_SAMPLER: &str = r#"
+ir_version: 8
+graph {
+  node {
+    input: "scores"
+    output: "tokens"
+    op_type: "ArgMin"
+    attribute { name: "axis" i: -1 type: 2 }
+    attribute { name: "keepdims" i: 0 type: 2 }
+  }
+  name: "application_sampler"
+  input { name: "scores" type { tensor_type { elem_type: 1 shape {
+    dim { dim_param: "batch" } dim { dim_param: "vocabulary" }
+  }}}}
+  input { name: "temp" type { tensor_type { elem_type: 1 shape {
+    dim { dim_value: 1 }
+  }}}}
+  input { name: "k" type { tensor_type { elem_type: 7 shape {
+    dim { dim_value: 1 }
+  }}}}
+  input { name: "p" type { tensor_type { elem_type: 1 shape {
+    dim { dim_value: 1 }
+  }}}}
+  input { name: "mask" type { tensor_type { elem_type: 9 shape {
+    dim { dim_param: "batch" } dim { dim_param: "vocabulary" }
+  }}}}
+  output { name: "tokens" type { tensor_type { elem_type: 7 shape {
+    dim { dim_param: "batch" }
+  }}}}
+}
+opset_import { domain: "" version: 12 }
+"#;
+
+const CACHE_DECODER: &str = r#"
+ir_version: 8
+graph {
+  node {
+    input: "past_key_values" input: "token_state"
+    output: "present_key_values" op_type: "Concat"
+    attribute { name: "axis" i: 1 type: INT }
+  }
+  name: "cache_decoder"
+  input { name: "past_key_values" type { tensor_type { elem_type: 1 shape {
+    dim { dim_param: "batch" } dim { dim_param: "past_sequence" }
+  }}}}
+  input { name: "token_state" type { tensor_type { elem_type: 1 shape {
+    dim { dim_param: "batch" } dim { dim_value: 1 }
+  }}}}
+  output { name: "present_key_values" type { tensor_type { elem_type: 1 shape {
+    dim { dim_param: "batch" } dim { dim_param: "present_sequence" }
+  }}}}
+}
+opset_import { domain: "" version: 13 }
 "#;
 
 const EULER: &str = r#"
@@ -566,6 +633,26 @@ pipeline:
         role: { kind: opaque }
         source: { kind: application, name: logits }
         required: true
+      temperature:
+        contract: { dtype: float32, rank: 1, shape: [1] }
+        role: { kind: runtime, version: "1", role: sampling_temperature }
+        source: { kind: request, field: sampling_temperature }
+        required: true
+      top_k:
+        contract: { dtype: int64, rank: 1, shape: [1] }
+        role: { kind: runtime, version: "1", role: sampling_top_k }
+        source: { kind: request, field: sampling_top_k }
+        required: true
+      top_p:
+        contract: { dtype: float32, rank: 1, shape: [1] }
+        role: { kind: runtime, version: "1", role: sampling_top_p }
+        source: { kind: request, field: sampling_top_p }
+        required: true
+      grammar_mask:
+        contract: { dtype: bool, rank: 2, shape: [batch, vocabulary] }
+        role: { kind: opaque }
+        source: { kind: application, name: grammar_mask }
+        required: true
     outputs:
       token:
         contract: { dtype: int64, rank: 1, shape: [batch] }
@@ -574,18 +661,54 @@ pipeline:
     components:
       sampler:
         implementation: { kind: onnx, artifact: sampler.onnx.textproto }
+        application_overridable: true
         contract:
           id: onnx-genai.token-sampler
           version: "1"
           bindings:
             logits: logits
+            temperature: temperature
+            top_k: top_k
+            top_p: top_p
+            grammar_mask: grammar_mask
             token: token_ids
           parameters:
             mode: greedy
+      application_sampler:
+        implementation: { kind: onnx, artifact: application-sampler.onnx.textproto }
+        contract:
+          id: onnx-genai.token-sampler
+          version: "1"
+          bindings:
+            logits: scores
+            temperature: temp
+            top_k: k
+            top_p: p
+            grammar_mask: mask
+            token: tokens
+          parameters:
+            implementation: application
+      incompatible_sampler:
+        implementation: { kind: onnx, artifact: incompatible-sampler.onnx.textproto }
+        contract:
+          id: onnx-genai.token-sampler
+          version: "2"
+          bindings:
+            logits: scores
+            temperature: temp
+            top_k: k
+            top_p: p
+            grammar_mask: mask
+            token: tokens
     steps:
         - kind: invoke
           component: sampler
-          inputs: { logits: logits }
+          inputs:
+            logits: logits
+            temperature: temperature
+            top_k: top_k
+            top_p: top_p
+            grammar_mask: grammar_mask
           outputs: { token_ids: sampled }
         - kind: emit
           value: sampled
@@ -599,23 +722,163 @@ pipeline:
     let invalid_root = package(
         "greedy-invalid-port",
         &invalid,
-        &[("sampler.onnx.textproto", GREEDY)],
+        &[
+            ("sampler.onnx.textproto", GREEDY),
+            ("application-sampler.onnx.textproto", ARGMIN_SAMPLER),
+            ("incompatible-sampler.onnx.textproto", ARGMIN_SAMPLER),
+        ],
     )?;
     let error = Engine::from_pipeline_dir(&invalid_root, EngineConfig::default())
         .err()
         .expect("unknown inferred ONNX port must fail at load");
-    assert!(error.to_string().contains("unknown output port 'typo'"));
+    assert!(
+        error
+            .to_string()
+            .contains("invocation port 'typo' is not covered by its semantic contract ABI"),
+        "{error:#}"
+    );
 
-    let root = package("greedy", metadata, &[("sampler.onnx.textproto", GREEDY)])?;
+    let root = package(
+        "greedy",
+        metadata,
+        &[
+            ("sampler.onnx.textproto", GREEDY),
+            ("application-sampler.onnx.textproto", ARGMIN_SAMPLER),
+            ("incompatible-sampler.onnx.textproto", ARGMIN_SAMPLER),
+        ],
+    )?;
     let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
-    let request =
-        PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
-            .with_input(
-                "logits",
-                Value::from_slice_f32(&[0.1, 0.7, 0.2, 2.0, 1.0, 3.0], &[2, 3])?,
-            );
+    let logits = || Value::from_slice_f32(&[0.1, 0.7, 0.2, 2.0, 1.0, 3.0], &[2, 3]);
+    let mask = || Value::from_raw_bytes(vec![1; 6], &[2, 3], DataType::Bool);
+    let mut generate = GenerateRequest::new(GeneratePrompt::TokenIds(vec![]));
+    generate.options.temperature = 0.75;
+    generate.options.top_k = 17;
+    generate.options.top_p = 0.9;
+    let request = PipelineGenerateRequest::new(generate.clone())
+        .with_input("logits", logits()?)
+        .with_input("grammar_mask", mask()?);
     let output = engine.run_pipeline(request)?;
     assert_eq!(output["token"].to_vec_i64()?, [1, 2]);
+
+    let error = engine
+        .run_pipeline(
+            PipelineGenerateRequest::new(generate.clone())
+                .with_input("logits", logits()?)
+                .with_input("grammar_mask", mask()?)
+                .with_component_override("sampler", "incompatible_sampler"),
+        )
+        .err()
+        .expect("a replacement with a different ABI version must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("has contract onnx-genai.token-sampler@2")
+    );
+
+    generate.options.temperature = 0.2;
+    generate.options.top_k = 3;
+    generate.options.top_p = 0.5;
+    let output = engine.run_pipeline(
+        PipelineGenerateRequest::new(generate)
+            .with_input("logits", logits()?)
+            .with_input("grammar_mask", mask()?)
+            .with_component_override("sampler", "application_sampler"),
+    )?;
+    assert_eq!(output["token"].to_vec_i64()?, [0, 1]);
+    Ok(())
+}
+
+#[test]
+fn decoder_present_kv_is_direct_loop_carry() -> anyhow::Result<()> {
+    let metadata = r#"
+pipeline:
+  workflow:
+    manifest:
+      ir_version: "1.0"
+      onnx_opsets: { ai.onnx: 13 }
+      adapter_abis: {}
+      custom_op_versions: {}
+      capabilities: [workflow_ssa, linear_effects, typed_emit, nested_control_flow]
+    inputs:
+      initial_cache:
+        contract: { dtype: float32, rank: 2, shape: [batch, cache] }
+        role: { kind: opaque }
+        source: { kind: application, name: initial_cache }
+        required: true
+      token_state:
+        contract: { dtype: float32, rank: 2, shape: [batch, 1] }
+        role: { kind: opaque }
+        source: { kind: application, name: token_state }
+        required: true
+      iterations:
+        contract: { dtype: int64, rank: 1, shape: [1] }
+        role: { kind: opaque }
+        source: { kind: application, name: iterations }
+        required: true
+      continue:
+        contract: { dtype: bool, rank: 0, shape: [] }
+        role: { kind: opaque }
+        source: { kind: application, name: continue }
+        required: true
+      one:
+        contract: { dtype: int64, rank: 1, shape: [1] }
+        role: { kind: opaque }
+        source: { kind: application, name: one }
+        required: true
+      max_context:
+        contract: { dtype: int64, rank: 1, shape: [1] }
+        role: { kind: opaque }
+        source: { kind: application, name: max_context }
+        required: true
+    outputs:
+      final_cache:
+        contract: { dtype: float32, rank: 2, shape: [batch, cache] }
+        role: tensor
+        stage: pre_adapter
+    components:
+      decoder:
+        implementation: { kind: onnx, artifact: decoder.onnx.textproto }
+    state:
+      cache:
+        contract: { dtype: float32, rank: 2, shape: [batch, cache] }
+        scope: invocation
+        initializer: initial_cache
+        recurrence: { kind: growing, axis: 1, increment: one, max: max_context }
+    steps:
+      - kind: loop
+        setup: []
+        steps:
+          - kind: invoke
+            component: decoder
+            inputs: { past_key_values: cache, token_state: token_state }
+            outputs: { present_key_values: cache.next }
+        condition: continue
+        max_iterations: iterations
+        carried: [{ cell: cache, initial: initial_cache, next: cache.next }]
+      - kind: emit
+        value: cache
+        output: final_cache
+        mode: replace
+"#;
+    let root = package(
+        "decoder-direct-kv-carry",
+        metadata,
+        &[("decoder.onnx.textproto", CACHE_DECODER)],
+    )?;
+    let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+    let output = engine.run_pipeline(
+        PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
+            .with_input("initial_cache", Value::from_slice_f32(&[1.0], &[1, 1])?)
+            .with_input("token_state", Value::from_slice_f32(&[2.0], &[1, 1])?)
+            .with_input("iterations", Value::from_slice_i64(&[2], &[1])?)
+            .with_input(
+                "continue",
+                Value::from_raw_bytes(vec![1], &[], DataType::Bool)?,
+            )
+            .with_input("one", Value::from_slice_i64(&[1], &[1])?)
+            .with_input("max_context", Value::from_slice_i64(&[3], &[1])?),
+    )?;
+    assert_eq!(output["final_cache"].to_vec_f32()?, [1.0, 2.0, 2.0]);
     Ok(())
 }
 

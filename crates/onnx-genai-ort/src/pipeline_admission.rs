@@ -105,8 +105,103 @@ fn validate_workflow_signatures(
             }
         }
     }
+    validate_component_replacement_signatures(workflow, signatures)?;
     validate_workflow_invocations(&workflow.steps, workflow, signatures)?;
     Ok(())
+}
+
+fn validate_component_replacement_signatures(
+    workflow: &onnx_genai_metadata::WorkflowSpec,
+    signatures: &BTreeMap<String, ComponentSignature>,
+) -> Result<()> {
+    for (target_name, target) in &workflow.components {
+        if !target.application_overridable {
+            continue;
+        }
+        let target_contract = target.contract.as_ref().ok_or_else(|| {
+            OrtError::InvalidArgument(format!(
+                "overridable component '{target_name}' has no versioned contract"
+            ))
+        })?;
+        let target_signature = signatures.get(target_name).ok_or_else(|| {
+            OrtError::InvalidArgument(format!(
+                "overridable component '{target_name}' has no inspected ONNX model"
+            ))
+        })?;
+        for (replacement_name, replacement) in &workflow.components {
+            if replacement_name == target_name {
+                continue;
+            }
+            let Some(replacement_contract) = &replacement.contract else {
+                continue;
+            };
+            if replacement_contract.id != target_contract.id
+                || replacement_contract.version != target_contract.version
+            {
+                continue;
+            }
+            let Some(replacement_signature) = signatures.get(replacement_name) else {
+                continue;
+            };
+            for (role, target_port) in &target_contract.bindings {
+                let replacement_port = replacement_contract.bindings.get(role).ok_or_else(|| {
+                    OrtError::InvalidArgument(format!(
+                        "replacement component '{replacement_name}' lacks semantic port '{role}' \
+                         required by '{target_name}'"
+                    ))
+                })?;
+                let (target_direction, target_port_signature) =
+                    semantic_port_signature(target_name, role, target_port, target_signature)?;
+                let (replacement_direction, replacement_port_signature) = semantic_port_signature(
+                    replacement_name,
+                    role,
+                    replacement_port,
+                    replacement_signature,
+                )?;
+                if target_direction != replacement_direction
+                    || !port_signatures_compatible(
+                        target_port_signature,
+                        replacement_port_signature,
+                    )
+                {
+                    return Err(OrtError::InvalidArgument(format!(
+                        "replacement component '{replacement_name}' semantic port '{role}' is \
+                         incompatible with '{target_name}'"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn port_signatures_compatible(left: &PortSignature, right: &PortSignature) -> bool {
+    left.dtype == right.dtype
+        && left.rank() == right.rank()
+        && left
+            .shape
+            .iter()
+            .zip(&right.shape)
+            .all(|(left, right)| match (left, right) {
+                (PortDimension::Static(left), PortDimension::Static(right)) => left == right,
+                _ => true,
+            })
+}
+
+fn semantic_port_signature<'a>(
+    component: &str,
+    role: &str,
+    port: &str,
+    signature: &'a ComponentSignature,
+) -> Result<(&'static str, &'a PortSignature)> {
+    match (signature.inputs.get(port), signature.outputs.get(port)) {
+        (Some(signature), None) => Ok(("input", signature)),
+        (None, Some(signature)) => Ok(("output", signature)),
+        _ => Err(OrtError::InvalidArgument(format!(
+            "component '{component}' semantic port '{role}' binds '{port}', which is not exactly \
+             one ONNX input or output"
+        ))),
+    }
 }
 
 fn validate_workflow_invocations(
@@ -129,6 +224,67 @@ fn validate_workflow_invocations(
                         "workflow invokes unknown component '{component}'"
                     ))
                 })?;
+                if declaration.application_overridable {
+                    let contract = declaration.contract.as_ref().ok_or_else(|| {
+                        OrtError::InvalidArgument(format!(
+                            "overridable component '{component}' has no versioned contract"
+                        ))
+                    })?;
+                    for port in inputs.keys().chain(outputs.keys()) {
+                        if !contract.bindings.values().any(|binding| binding == port) {
+                            return Err(OrtError::InvalidArgument(format!(
+                                "overridable component '{component}' invocation port '{port}' is \
+                                 not covered by its semantic contract ABI"
+                            )));
+                        }
+                    }
+                    for (replacement_name, replacement) in &workflow.components {
+                        if replacement_name == component {
+                            continue;
+                        }
+                        let Some(replacement_contract) = &replacement.contract else {
+                            continue;
+                        };
+                        if replacement_contract.id != contract.id
+                            || replacement_contract.version != contract.version
+                        {
+                            continue;
+                        }
+                        let Some(replacement_signature) = signatures.get(replacement_name) else {
+                            continue;
+                        };
+                        let remapped_inputs = remap_invocation_ports(
+                            component,
+                            contract,
+                            replacement_name,
+                            replacement_contract,
+                            inputs,
+                        )?;
+                        let remapped_outputs = remap_invocation_ports(
+                            component,
+                            contract,
+                            replacement_name,
+                            replacement_contract,
+                            outputs,
+                        )?;
+                        validate_invocation_ports(
+                            replacement_name,
+                            "input",
+                            &remapped_inputs,
+                            &replacement_signature.inputs,
+                            Some(&replacement_signature.defaulted_inputs),
+                            true,
+                        )?;
+                        validate_invocation_ports(
+                            replacement_name,
+                            "output",
+                            &remapped_outputs,
+                            &replacement_signature.outputs,
+                            None,
+                            false,
+                        )?;
+                    }
+                }
                 if matches!(
                     declaration.implementation,
                     onnx_genai_metadata::ComponentImplementation::Onnx { .. }
@@ -180,6 +336,37 @@ fn validate_workflow_invocations(
         }
     }
     Ok(())
+}
+
+fn remap_invocation_ports(
+    target_name: &str,
+    target_contract: &onnx_genai_metadata::ComponentContract,
+    replacement_name: &str,
+    replacement_contract: &onnx_genai_metadata::ComponentContract,
+    ports: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>> {
+    ports
+        .iter()
+        .map(|(port, value)| {
+            let role = target_contract
+                .bindings
+                .iter()
+                .find_map(|(role, bound)| (bound == port).then_some(role))
+                .ok_or_else(|| {
+                    OrtError::InvalidArgument(format!(
+                        "overridable component '{target_name}' invocation port '{port}' is not \
+                         covered by its semantic contract ABI"
+                    ))
+                })?;
+            let replacement_port = replacement_contract.bindings.get(role).ok_or_else(|| {
+                OrtError::InvalidArgument(format!(
+                    "replacement component '{replacement_name}' lacks semantic port '{role}' \
+                     required by '{target_name}'"
+                ))
+            })?;
+            Ok((replacement_port.clone(), value.clone()))
+        })
+        .collect()
 }
 
 fn validate_invocation_ports(

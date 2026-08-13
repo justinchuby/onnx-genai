@@ -40,6 +40,8 @@ pub struct PipelineGenerateRequest {
     pub inputs: PipelineTensors,
     /// Identity used by session-scoped workflow state cells.
     pub session_id: Option<String>,
+    /// Application-selected package components that replace overridable components.
+    pub component_overrides: HashMap<String, String>,
 }
 
 impl PipelineGenerateRequest {
@@ -48,6 +50,7 @@ impl PipelineGenerateRequest {
             request,
             inputs: HashMap::new(),
             session_id: None,
+            component_overrides: HashMap::new(),
         }
     }
 
@@ -58,6 +61,16 @@ impl PipelineGenerateRequest {
 
     pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
         self.session_id = Some(session_id.into());
+        self
+    }
+
+    pub fn with_component_override(
+        mut self,
+        component: impl Into<String>,
+        replacement: impl Into<String>,
+    ) -> Self {
+        self.component_overrides
+            .insert(component.into(), replacement.into());
         self
     }
 }

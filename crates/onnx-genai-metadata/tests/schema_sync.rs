@@ -75,6 +75,7 @@ fn generated_schema_preserves_all_root_constraints() {
         );
     }
     assert!(!serialized.contains("\"kind\":{\"const\":\"transfer\""));
+    assert!(serialized.contains("\"application_overridable\""));
 }
 
 fn schema_path() -> PathBuf {
