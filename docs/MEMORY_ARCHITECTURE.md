@@ -1106,18 +1106,32 @@ Three consequences worth internalising before measuring anything here:
   cliff, not a capability, and the governor cannot account for it.
 - **The arena failing where the baseline succeeds is the arena being correct.**
   `cuMemCreate` allocates physical device pages and cannot pretend otherwise.
-- **Open (#862): allocating device pages is not the same as keeping them.**
-  `cuMemCreate` cannot fake the *allocation*, but whether WDDM may later **page our
-  mapped granules out to host RAM under demand** is **not established**. A steady
-  ordinary `cuMemAlloc` hog on this box *was* observed being paged out — pressure
-  produced slowdown, not failure. If our granules share that fate, then
-  `peak_committed_physical_bytes < managed_limit_bytes` and
-  `oversubscribed_bytes == 0` are guarantees **in our ledger only**, and every
-  "no WDDM spill" claim below is scoped to accounting rather than physical
-  residency. It would also be the best explanation for this box's wall-clock
-  spreads (identical work: 24–223 s, 700–929 s; 3.9–28 tok/s). Until #862 answers
-  this, do not treat "committed under the limit" as proof of device residency,
-  and prefer leaving real headroom over lending to the last byte.
+- **Allocating device pages is not the same as keeping them — WDDM pages *our*
+  granules out too (#863, measured).** `cuMemCreate` cannot fake the allocation,
+  but it confers no pin. Proven single-process: a `cuMemCreate` + `cuMemMap` +
+  `cuMemSetAccess` allocator mirroring the engine arena committed **and touched
+  every byte** of 9,984 MiB on an 8,188 MiB card; device-resident stayed capped at
+  ~7,942 MiB while the process host working set reached 9.49 GB — roughly 2 GB of
+  our own committed granules spilled to host RAM.
+
+  Therefore **`peak_committed_physical_bytes < managed_limit_bytes` and
+  `oversubscribed_bytes == 0` are guarantees about our ledger, not about physical
+  residency.** Every "no WDDM spill" claim in this document and in PR validations
+  (including #836's) should be read that way: the accounting is correct; the
+  residency implication is not. The spill is a **latency** effect, transparent to
+  kernel correctness — it does not corrupt results, and it is not the #851 fault.
+
+  Two practical consequences. Our no-spill accounting keeps total committed under
+  the resolved budget, so we do not normally provoke this ourselves; the exposure
+  is **system-wide** pressure, which our ledger cannot see. And our residency is
+  **advisory on WDDM exactly as the driver's is** — we can choose *what* to keep
+  and in what order, and we know the layer walk where the driver is blind, but we
+  cannot force anything to stay. It is also the best explanation for this box's
+  wall-clock spreads (identical work: 24–223 s, 700–1,383 s; 3.9–28 tok/s).
+
+  **Scoped to WDDM.** Under TCC, `cuMemCreate` should fail at the physical limit
+  rather than spill; do not let this propagate to other platforms (the #783
+  lesson). Repro: `bench-bins/vram_hog_vmm.py`.
 
 Users can opt out via NVIDIA Control Panel → *CUDA — Sysmem Fallback Policy* →
 *Prefer No Sysmem Fallback*, which makes floors measurable again. The better
