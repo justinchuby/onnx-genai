@@ -2,7 +2,7 @@
 
 **Status:** Design proposal  
 **Date:** 2026-08-13  
-**Scope:** Process-local device, host, and optional disk-backed memory for inference and generation
+**Scope:** Local inference memory, from per-process enforcement through optional Foundry-managed multi-process and multi-node coordination
 
 ## Summary
 
@@ -22,16 +22,17 @@ strategies.
 The design introduces one shared memory control plane while retaining
 specialized allocation and caching data planes.
 
-**Decision:** place a GenAI-independent `ProcessMemoryManager` in the ORT
-foundation; let ORT GenAI own generation/state policy and Foundry Local own
-product policy. Sessions, model residency, state holders, and arenas all lease
-from the same authorities through the contracts below.
+**Decision:** place a GenAI-independent `ProcessMemoryManager` in each ORT
+process. Foundry Local optionally owns a `ServingMemoryCoordinator` that
+delegates coarse quotas to its participating processes; the OS/driver remains
+the ultimate arbiter for the whole machine. ORT GenAI owns generation/state
+policy, while sessions, residency holders, state, and arenas lease locally.
 
 ## Contracts
 
 | ID | Contract | Responsibility |
 | --- | --- | --- |
-| **C1** | Resource authority | Within one `ProcessMemoryManager`, each distinct physical pool has one canonical authority identity. A governor may expose several tiers, but devices sharing physical memory alias the same authority and mismatched identities fail before use. |
+| **C1** | Resource authority | Within one accounting scope, each distinct physical pool has one canonical authority identity. Devices sharing physical memory alias the same authority and mismatched identities fail before use. |
 | **C2** | Lease and allowance | Before retaining physical memory, a holder acquires an RAII lease identifying authority, tier, bytes, role, and holder. Mappings or OS residency budgets use authority-scoped allowances, not a second physical charge. |
 | **C3** | Allocator and backing | ORT defines `DeviceAllocator`/`VirtualBacking`; an EP, host backend, or embedder supplies implementations; `ProcessMemoryManager` holds shared handles. Holders borrow them after admission, and neither mechanism decides policy. |
 | **C4** | Capacity transaction | An operation that changes committed model/request state, transfers capacity between holders/tiers, or changes a model-visible mapping follows `plan -> reserve -> expose provisional view -> execute -> commit`. Suballocation within an existing lease does not. |
@@ -40,12 +41,13 @@ from the same authorities through the contracts below.
 | **C7** | Topology and capability | The platform reports capacity, tier aliasing, mapping granularity, transfer paths, and supported model views. Selection is capability-driven. |
 | **C8** | Reconfiguration and observability | Authorities expose used, available, oversubscribed, and role-attributed bytes. Lowering a limit uses prepare/reclaim/commit; if the target cannot be met, the old limit remains and completed actions are reported. |
 | **C9** | Persistent state bundle | Every model declares all loop-carried state and its lifetime, growth/update pattern, model view, and checkpoint/fork/migrate capabilities. The engine transacts the complete bundle, not only attention KV. |
+| **C10** | Cooperative hierarchy | A Foundry-owned `ServingMemoryCoordinator` may delegate coarse per-process/device/host quotas to participating `ProcessMemoryManager`s. Non-participating programs remain outside the hierarchy; cross-node coordination grants node quotas and placement, never page-level allocations. |
 
 These contracts must preserve the following invariants:
 
 | ID | Invariant |
 | --- | --- |
-| **I1 — Single accounting authority** | Every managed physical byte is charged to exactly one authority. Shared mappings and prefix aliases may consume allowances but do not create a second physical charge. |
+| **I1 — Single accounting authority** | Within each scope, every managed physical byte is charged once. Parent quota and child process leases are linked hierarchical attribution, not independently grantable copies of the same capacity. |
 | **I2 — Charge before commit** | Physical allocation or mapping is preceded by a lease or transactional grant/allowance. Already-committed bytes are recorded even when that reveals oversubscription. |
 | **I3 — Fail closed** | Managed mode never silently escapes the authority after denial, mismatch, or initialization failure. An explicit compatibility mode may delegate to the OS, but must report that hard limits no longer apply. |
 | **I4 — Exclusive ownership state** | At the authority level, physical capacity and allowances are exactly one of free, transaction-reserved, or committed to a holder; an arena may suballocate inside its committed lease. |
@@ -55,16 +57,22 @@ These contracts must preserve the following invariants:
 | **I8 — Bytes are authoritative** | Tokens, blocks, and pages are derived from exact model geometry and queried platform granularity; admission includes rounding and transient migration peaks. |
 | **I9 — Remap synchronization** | A virtual mapping is not changed while a kernel, transfer, or captured graph may access it. |
 | **I10 — State-complete commit** | KV, recurrent state, convolution state, sampler/search state, and request progress commit or roll back at the same logical step. |
+| **I11 — Honest enforcement scope** | Hard guarantees cover only participating processes and delegated quotas. External programs are observed through OS/driver budgets and safety margins, never represented as reclaimable holders. |
 
 ## Proposed design
 
 ```mermaid
 flowchart TD
+    OS["OS / driver<br/>ultimate machine arbiter + budget signals"]
+    Cluster["ClusterCoordinator (optional)<br/>node placement + coarse node quota"]
     Client["Local API clients"] --> Foundry
     Standalone["Standalone ORT application<br/>(bypasses ORT GenAI)"]
+    Embedded["Embedded GenAI application"] --> GenApi
 
     subgraph Product["Foundry Local — product / service boundary"]
         Foundry["Public API + model catalog/package lifecycle<br/>multi-model routing + policy + observability"]
+        Serving["ServingMemoryCoordinator<br/>cooperative quotas across Foundry workers"]
+        Foundry --> Serving
     end
 
     subgraph Generation["ORT GenAI — generation-runtime boundary (may merge into ORT)"]
@@ -83,11 +91,11 @@ flowchart TD
     end
 
     subgraph ORTCore["ORT — foundational runtime / graph execution"]
-        Memory["ProcessMemoryManager<br/>owns budgets, pressure, and telemetry"]
+        Memory["ProcessMemoryManager (one per ORT process)<br/>enforces delegated/local budgets"]
         Topology["TopologyProvider<br/>physical pools, aliasing, granularity, links"]
         Registry["MemoryAuthorityRegistry<br/>one authority per physical pool"]
-        Host["HostGovernor<br/>host RAM + disk authorities; ticketed pressure"]
-        Device["DeviceMemoryAuthority(s)<br/>device ledger + mapped growth"]
+        Host["Process HostGovernor<br/>delegated host/disk quota + ticketed pressure"]
+        Device["Process DeviceMemoryAuthority(s)<br/>delegated device quota + mapped growth"]
         LeaseAPI["MemoryGovernor contract<br/>leases, allowances, holder registration"]
         Txn["CapacityTransactionCoordinator<br/>reserve/commit across authorities"]
         Adapters["Governed allocator adapters<br/>bulk leases + local suballocation"]
@@ -117,8 +125,12 @@ flowchart TD
         Allocators -->|"backing memory"| Kernels
     end
 
+    OS -->|"budget / pressure signals"| Serving
+    OS -->|"budget / pressure signals"| Memory
+    Cluster -->|"node placement / quota"| Serving
     Foundry -->|"generation/model operations"| GenApi
-    Foundry -->|"resource limits / policy"| Memory
+    Serving -->|"coarse process/device/host quotas"| Memory
+    Embedded -->|"create or use local manager"| Memory
     Standalone --> Env
     Standalone -->|"create or use default manager"| Memory
     Standalone -->|"create / Run"| Session
@@ -164,13 +176,16 @@ sequenceDiagram
 
 | Diagram node | Responsibility | Contract / invariant coverage |
 | --- | --- | --- |
-| Foundry Local | Hosts product APIs, packages, multi-model routing, resource policy, and observability. | C8; I3, I8 |
+| OS / driver | Arbitrates the whole machine, including non-participating programs, and exposes changing budget/pressure signals. | I11 |
+| `ClusterCoordinator` | Chooses node/model placement and coarse node quotas; never handles token/page allocations. | C10; I11 |
+| Foundry Local | Hosts product APIs, packages, multi-model routing, resource policy, and observability. | C8, C10; I3, I8, I11 |
+| `ServingMemoryCoordinator` | Coordinates quotas only across Foundry-managed workers on one node and reclaims abandoned process quotas. | C10; I1, I7, I8, I11 |
 | ORT GenAI | Implements generation semantics, scheduling, model/state residency policy, and C4 transactions. | C2, C4-C9; I3-I10 |
-| `ProcessMemoryManager` | Owns the process-wide resource service and configuration/telemetry entry point. | C1, C7, C8; I1, I8 |
+| `ProcessMemoryManager` | Enforces local or delegated quotas and owns the resource/allocator registries for one ORT process. | C1, C7, C8, C10; I1, I8, I11 |
 | `TopologyProvider` | Reports distinct/aliased pools, capacities, mapping granularity, and transfer paths. | C7; I8 |
 | `MemoryAuthorityRegistry` | Resolves each physical pool to exactly one stable authority. | C1; I1 |
-| `HostGovernor` | Owns distinct host-RAM/disk authority identities and arbitrates ticketed pressure across sessions/devices. | C1, C2, C5, C8; I1-I3, I6, I7 |
-| `DeviceMemoryAuthority` | Accounts one device-local pool and coordinates leases, mapped allowances, and growth. | C1, C2, C5, C8; I1-I3, I6-I9 |
+| Process `HostGovernor` | Enforces the process's host/disk quota and arbitrates ticketed pressure across its sessions/devices. | C1, C2, C5, C8, C10; I1-I3, I6, I7 |
+| Process `DeviceMemoryAuthority` | Enforces one delegated/local device quota and coordinates leases, mapped allowances, and growth. | C1, C2, C5, C8, C10; I1-I3, I6-I9 |
 | `MemoryGovernor` | Common lease/allowance/reclaim interface; every grant names the exact underlying authority even when one governor exposes several tiers. | C2, C5, C8; I2, I3, I6, I7 |
 | `CapacityTransactionCoordinator` | Reserves all participating authorities before publishing a cross-tier/device state change. | C4; I4, I5, I7, I8, I10 |
 | Governed allocator adapters | Convert bulk grants into fast ORT/EP-local suballocation. | C2, C3; I2, I3, I7 |
@@ -185,15 +200,17 @@ sequenceDiagram
 
 | Logical boundary | Owns | Does not own |
 | --- | --- | --- |
-| **Foundry Local** | Product/API lifecycle, model catalog and package acquisition, process/service lifecycle, multi-model routing, user policy, limits, and observability. | Physical accounting, per-token state, generation semantics, or graph execution. |
+| **Foundry Local** | Product/API lifecycle, model catalog and package acquisition, process/service lifecycle, multi-model routing, user policy, observability, and cooperative worker quotas. | Physical allocation, non-Foundry processes, per-token state, generation semantics, or graph execution. |
 | **ORT GenAI** | Model/pipeline interpretation, tokenization and sampling, request scheduling, continuous batching, C9 state, prefix caching, residency victim selection, and model-switch mechanics. | Physical capacity or EP/kernel implementation. |
 | **ORT** | `ProcessMemoryManager`, `OrtEnv` allocator integration, graph planning/execution, `InferenceSession`, EP allocators, kernels, and capture. | Product policy, model catalog, or service routing. |
 
-**Authority ownership.** `ProcessMemoryManager` is a process-wide,
-GenAI-independent service. It owns topology, authorities, leases, pressure, and
-resource telemetry. Foundry Local, an embedded application, or a standalone ORT
-application owns its lifetime and configures policy. Plain ORT creates a default
-manager when the application does not supply one.
+**Authority ownership.** Each ORT process owns one GenAI-independent
+`ProcessMemoryManager`. Standalone ORT derives a conservative local budget from
+operator configuration and OS/driver signals. Under Foundry, a
+`ServingMemoryCoordinator` owns only the cooperative Foundry domain: it delegates
+coarse quotas to registered workers and reclaims those quotas on process exit or
+heartbeat/epoch failure. It does not own raw allocators or memory from unrelated
+programs. The OS/driver remains the final machine-wide arbiter.
 
 `OrtEnv` is ORT's process-level environment for logging, shared thread pools, EP
 setup, and environment-registered allocators. It is not the graph executor and
@@ -219,15 +236,17 @@ they are responses/callbacks, not reverse ownership dependencies.
 
 The ORT GenAI model runtime takes model-level leases before constructing
 engines/sessions and returns them on unload or demotion. Foundry supplies
-cross-model routing and product policy; ORT GenAI schedulers perform C4
-admission. Foundry's resource API configures C8 limits and reads the same
-snapshots used for admission.
+cross-model routing and product policy; its resource API configures the serving
+quota and aggregates worker snapshots. ORT GenAI schedulers perform C4 admission
+inside each delegated process quota.
 
-**Control plane.** Within `ProcessMemoryManager`, `DeviceMemoryAuthority` owns
-the ledger and stable `MemoryAuthorityId` for one distinct device-local pool.
-Devices sharing physical memory resolve to the host/unified authority instead.
-One process-local `HostGovernor` covers host resources shared by all sessions
-and devices; cross-process enforcement is out of scope.
+**Control plane.** Within a process, `DeviceMemoryAuthority` owns the child
+ledger for one device quota; shared physical memory resolves to the process
+host/unified authority. A process `HostGovernor` covers all sessions and devices
+in that process. Across Foundry workers, `ServingMemoryCoordinator` enforces
+`sum(process quotas) <= serving quota`. External consumers are not charged to
+this hierarchy; observed OS pressure can only shrink future admission and
+trigger cooperative reclaim.
 
 **Allocator ownership.** ORT owns the allocator ABI, while the active EP,
 host backend, or embedder constructs the implementation. It registers the raw
@@ -262,6 +281,9 @@ continue to optimize transient reuse.
 | Surface | Proposed change |
 | --- | --- |
 | Process foundation | Add a GenAI-independent `ProcessMemoryManager`, with a default for standalone ORT and injection for hosts such as Foundry Local. |
+| Foundry coordination | Add an optional `ServingMemoryCoordinator` with worker registration, delegated per-pool quotas, heartbeat/epoch cleanup, and aggregate snapshots. |
+| OS/driver integration | Treat DXGI/NVML/host-memory budgets as changing external ceilings and preserve operator-selected headroom for non-participating applications. |
+| Cluster integration | Delegate only coarse node/model quotas and placement; keep allocation, paging, and step transactions node/process-local. |
 | `OrtEnv` | Register shared allocator adapters backed by that manager; keep logging/thread/EP responsibilities separate from resource policy. |
 | EP / device registration | Construct the raw allocator/backing and register its shared handle and capabilities with the manager before any session allocates. |
 | Session creation | Inject manager-backed allocator/authority handles before arenas, initializers, or state allocate; late adoption only records accomplished allocations. |
@@ -352,6 +374,9 @@ do not double-admit it.
 | **CPU only** | One host authority covers weights, KV, ORT arenas, and workspace; mmap/disk is colder backing. | Reserve KV and peak execution bytes. Reclaim allocator caches and derived/prepacked weights before live KV; deny work rather than force system paging. |
 | **CPU + discrete NVIDIA GPU + Intel NPU** | The GPU has a device authority. The NPU uses another only if it has private memory; otherwise it aliases the host authority. All share host staging/offload. | C7 reports paths and views. Place partitions, then atomically lease every resource/allowance; reserve host capacity before demotion. State stays fixed on an EP that cannot migrate it. |
 | **CPU + GPU with unified memory** | Host and GPU views alias one physical authority; their limits are not additive. Track wired/resident and pageable/reclaimable bytes separately. | CPU/GPU movement is a residency change, not a second allocation. Admission protects machine headroom; reclaim respects wired GPU work and bandwidth. Apple Silicon/Metal is the primary example. |
+| **One GPU, multiple Foundry ORT processes** | `ServingMemoryCoordinator` holds one cooperative serving quota and delegates child quotas; each process owns its CUDA context, allocator, and local authority. | The sum of delegated quotas stays bounded. Worker exit/heartbeat failure returns its quota. External processes remain OS-managed and reduce effective headroom. |
+| **Multi-GPU node** | One physical-pool quota per GPU plus one shared host quota. Each worker receives only the device/host subleases needed by its placement. | Model/tensor/pipeline-parallel admission reserves all participating device, host, and communication peaks before load or step commit. |
+| **Multi-node Foundry deployment** | Each node has a `ServingMemoryCoordinator`; a `ClusterCoordinator` assigns node/model placement and coarse node quotas. | Page allocation, reclaim, and token-step transactions stay local. Node failure invalidates its epoch and triggers placement/recovery, not distributed allocator rollback. |
 
 These scenarios are selected from C7. The upper layers use the same leases and
 transactions; only the authority graph, allocation mechanism, and legal
@@ -383,8 +408,9 @@ memory**. GPU virtual addresses remain stable while VidMm may back them with
 local VRAM or system memory. DXGI local/non-local budgets change with system
 pressure; `SharedSystemMemory` is a maximum, not free capacity.
 
-Treat those budgets as external ceilings: preserve headroom, react to budget
-events, and track non-local residency, host RAM, and pinned memory separately.
+The serving coordinator and each process manager treat those budgets as
+external ceilings: preserve headroom, react to budget events, and track
+non-local residency, host RAM, and pinned memory separately.
 A host-backed GPU allocation takes one host physical lease plus a non-local
 residency allowance, not two physical leases. WDDM is address-stable but
 placement and latency are opaque. The preferred policy is a governed resident
@@ -393,9 +419,9 @@ Managed no-spill CUDA VMM pools remain hard bounds and cannot assume WDDM spill.
 CUDA managed memory is distinct and reports limited support on Windows, so all
 behavior is capability-queried.
 
-Cross-process coordination, cluster placement, and universal disk spill are
-out of scope. The first production target is one process, one or more devices,
-truthful limits, deterministic rollback, and no ungoverned escape path.
+Hard cross-product enforcement and distributed page allocation remain out of
+scope. The first increment is one process; Foundry multi-process/node
+coordination layers coarse quotas above the same local contracts.
 
 ## Related work
 
@@ -420,6 +446,7 @@ under explicit cross-component contracts.
 | --- | --- |
 | Independent fixed budgets for ORT, weights, and KV | Simple and predictable, but strands capacity and requires the user to guess the right split before load. One model can fail while another pool retains unused bytes. |
 | One global allocator | Conflates policy with mechanism. Activations, KV, weights, shared prefixes, and virtual mappings have different lifetimes and ownership rules; some ORT and EP allocations also occur behind specialized arenas. |
+| Universal machine memory broker | Cannot enroll or reclaim arbitrary applications and would overstate its authority. The OS/driver remains global arbiter; Foundry coordinates only registered workers. |
 | GenAI-owned authority | Coordinates generation state, but excludes standalone ORT and couples physical accounting to generation semantics. Foundry/GenAI should configure and consume the authority, not define it. |
 | `OrtEnv`-owned policy | Gives sessions a shared lifetime but mixes machine policy with logging/thread/EP environment responsibilities. `OrtEnv` should register adapters backed by the independent manager. |
 | Paged attention only | Efficient for high concurrency, but requires exported block-table inputs and a compatible attention operator. It cannot transparently serve existing ORT graphs that declare flat past/present tensors. |
@@ -443,10 +470,11 @@ and hardware measurements summarized in `MEMORY_ARCHITECTURE.md`.
 | **Unsafe remap/commit** | **Medium end to end** | Same-VA graph replay, stable weight slots, prefix multi-map/refcounts, and mapped-growth transactions pass GPU tests. In-flight unmap and multi-model/multi-stream stress remain unsupported. |
 | **Offload thrash/corruption** | **Low-medium** | Cyclic LRU measured 0% hits versus 74.18% for a stable set; WDDM cold reads beat managed churn. Dynamic stable-slot re-admission has unresolved corruption. Ship static hybrid first; gate dynamic policy on token identity, bytes/token, and tail latency. |
 | **Pressure deadlock/starvation** | **Medium-high for host protocol; medium end to end** | Ticketed `HostGovernor` has TLA/refinement, priority aging, cancellation, and conformance tests. Cross-tier device/host reclaim with real holders still needs stress and fault campaigns. |
+| **Coordinator quota leak** | **Medium-low** | A crashed or partitioned Foundry worker can leave delegated capacity unavailable. Use process handles plus heartbeat/epoch fencing, idempotent quota return, and conservative re-admission after coordinator restart. |
 | **Incomplete state bundle** | **Medium** | Native recurrent-prefix parity and KV transaction tests exist, while ORT hybrid reuse deliberately recomputes because full C9 restore is absent. Require state-schema identity and complete-bundle commit before enabling a cache hit. |
 | **Host pressure** | **Medium-low** | Ticketed `HostGovernor` has TLA/refinement and conformance tests; RSS, pinned, disk, and WDDM non-local pressure are not yet one physical authority. |
 | **Topology errors** | **Low-medium** | CUDA/WDDM are measured; Intel NPU and true UMA graphs need capability/admission conformance. |
-| **External consumers** | **Low** | A process-local authority cannot reclaim opaque or other-process allocations; telemetry and reserve provide backpressure, not a hard guarantee. |
+| **External consumers** | **Low** | Neither process nor Foundry coordinators can reclaim unrelated programs. OS/driver telemetry and safety reserve provide best-effort coexistence, never a hard machine-wide guarantee. |
 
 ## References
 
