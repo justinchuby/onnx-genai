@@ -38,6 +38,45 @@ pub(crate) struct MemoryStrategyPlanInput<'a> {
     pub(crate) managed_vmm: bool,
     pub(crate) overrides: MemoryStrategyOverrides,
     pub(crate) advisory_only: bool,
+    /// True when the platform provides an OS shared-memory weight fallback
+    /// (Windows/WDDM: "shared GPU memory" in host RAM, read in place over PCIe).
+    /// #864 measured this ~30x faster than managed weight streaming for the
+    /// single-touch decode access pattern, because copying a weight into VRAM
+    /// only to evict it before any re-read is pure overhead. Set by the loader
+    /// to `cfg!(windows)`. On Linux there is no such fallback, so an over-budget
+    /// model must stream (or it does not run at all) and this stays `false`,
+    /// leaving the managed path untouched (#783: do not inherit a WDDM-specific
+    /// conclusion on other platforms).
+    pub(crate) shared_memory_weight_fallback: bool,
+    /// When `true`, force the managed weight-streaming path even where the
+    /// shared-memory fallback would otherwise be auto-preferred (#864). Opt-in
+    /// via `ONNX_GENAI_MANAGED_WEIGHT_STREAMING`; unrecognized values keep the
+    /// faster fallback (see [`force_managed_weight_streaming_from_env_value`]).
+    pub(crate) force_managed_weight_streaming: bool,
+}
+
+/// Environment knob forcing the managed weight-streaming path even where the
+/// WDDM shared-memory fallback would otherwise be auto-preferred (#864).
+pub(crate) const MANAGED_WEIGHT_STREAMING_ENV: &str = "ONNX_GENAI_MANAGED_WEIGHT_STREAMING";
+
+/// Parse [`MANAGED_WEIGHT_STREAMING_ENV`]. Forcing managed streaming is an
+/// opt-**in**: unset (`None`) or any unrecognized value keeps the faster WDDM
+/// shared-memory fallback, and only `1`/`true`/`yes`/`on`
+/// (case/whitespace-insensitive) force the managed path.
+///
+/// This deliberately follows the "unrecognized falls to the safe default" shape
+/// of [`onnx_runtime_ep_cuda::scan_resistant_from_env_value`] rather than the
+/// `ONNX_GENAI_WEIGHT_OFFLOAD_ASYNC_PAGEIN` trap, where an unrecognized value
+/// silently selects the *slow* path. Here the safe default is the fast
+/// fallback, so an unrecognized value must NOT force the slow managed path.
+pub(crate) fn force_managed_weight_streaming_from_env_value(value: Option<&str>) -> bool {
+    match value {
+        Some(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        None => false,
+    }
 }
 
 pub(crate) fn analyze_model_memory(model_path: &Path) -> GraphMemoryEvidence {
@@ -122,6 +161,28 @@ pub(crate) fn build_memory_strategy_plan(input: MemoryStrategyPlanInput<'_>) -> 
     };
 
     let forced_offload = input.overrides.weight_offload == Some(true);
+    let explicit_vram_limit = matches!(input.config.limits.vram_limit, ResourceLimit::Bytes(_));
+    let device_budget_override = input.overrides.device_budget_bytes.is_some();
+    // #864: over-budget weights would auto-enable managed weight streaming here.
+    // But on WDDM the OS pages non-resident weights from "shared GPU memory"
+    // (host RAM) in place over PCIe, which for the single-touch decode access
+    // pattern is ~30x faster than copying each weight into VRAM only to evict it
+    // before any re-read. Only the *inferred* default is affected: an explicit
+    // ONNX_GENAI_WEIGHT_OFFLOAD, --vram-limit, or device-budget override still
+    // selects managed streaming (they are honored, not overridden), as does the
+    // ONNX_GENAI_MANAGED_WEIGHT_STREAMING force knob.
+    let inferred_over_budget_streaming = matches!(
+        inferred_strategy,
+        MemoryStrategy::DynamicWeightResidency | MemoryStrategy::MoeRoutingAware
+    ) && input.inferred_policy_enabled
+        && !forced_offload
+        && !device_budget_override
+        && !explicit_vram_limit;
+    // Gated on the platform fallback (Windows/WDDM). On Linux this stays false,
+    // so nothing below changes managed streaming there (#783).
+    let prefer_shared_memory_fallback = inferred_over_budget_streaming
+        && input.shared_memory_weight_fallback
+        && !input.force_managed_weight_streaming;
     let (strategy, strategy_source, strategy_reason) = if forced_offload {
         match input.graph.access_pattern {
             WeightAccessPattern::SequentialDense => (
@@ -140,6 +201,15 @@ pub(crate) fn build_memory_strategy_plan(input: MemoryStrategyPlanInput<'_>) -> 
                 "the offload override is preserved, but the graph access pattern is unsupported",
             ),
         }
+    } else if prefer_shared_memory_fallback {
+        (
+            MemoryStrategy::Compatibility,
+            DecisionSource::CompatibilityDefault,
+            "weights exceed the device budget, but on WDDM the OS shared-memory fallback pages \
+             them from host RAM over PCIe faster than managed streaming for the single-touch \
+             decode pattern (#864 measured ~30x on medians), so managed weight streaming stays \
+             off by default; set ONNX_GENAI_MANAGED_WEIGHT_STREAMING=1 to force it",
+        )
     } else if matches!(
         inferred_strategy,
         MemoryStrategy::DynamicWeightResidency | MemoryStrategy::MoeRoutingAware
@@ -178,6 +248,13 @@ pub(crate) fn build_memory_strategy_plan(input: MemoryStrategyPlanInput<'_>) -> 
     let compatibility_application = compatibility_application(&input, fits);
     let application = if input.advisory_only {
         compatibility_application
+    } else if prefer_shared_memory_fallback {
+        // #864: hand residency to the WDDM shared-memory fallback. This is the
+        // exact application the measured WDDM arm reports — offload off, managed
+        // no-spill off (so the physical-handle pool does not cap the load below
+        // the weights and refuse them), no governed device budget. Residency
+        // becomes the OS's job; the trade is stated in the plan decision below.
+        wddm_shared_memory_application(&input)
     } else {
         match strategy {
             MemoryStrategy::FullResident => MemoryPolicyApplication {
@@ -309,6 +386,41 @@ pub(crate) fn build_memory_strategy_plan(input: MemoryStrategyPlanInput<'_>) -> 
     }
     decisions.push(strategy_decision);
 
+    if inferred_over_budget_streaming && input.shared_memory_weight_fallback {
+        let (value, source, reason): (&str, DecisionSource, &str) = if prefer_shared_memory_fallback
+        {
+            (
+                "shared_memory_fallback_preferred",
+                DecisionSource::CompatibilityDefault,
+                "#864: WDDM demand-pages over-budget weights from host RAM over PCIe ~30x faster \
+                 than managed streaming for the single-touch decode pattern, so managed weight \
+                 streaming was auto-disabled. Residency is now managed by the OS; on a host with \
+                 little free RAM an over-budget model may thrash. Set \
+                 ONNX_GENAI_MANAGED_WEIGHT_STREAMING=1 to force managed streaming.",
+            )
+        } else {
+            (
+                "managed_streaming_forced",
+                DecisionSource::ExplicitOverride,
+                "ONNX_GENAI_MANAGED_WEIGHT_STREAMING forced managed weight streaming despite the \
+                 WDDM shared-memory fallback that #864 measured ~30x faster.",
+            )
+        };
+        decisions.push(MemoryStrategyDecision::new(
+            "weight_streaming_platform_policy",
+            value,
+            source,
+            reason,
+            format!(
+                "shared_memory_weight_fallback={} force_managed_weight_streaming={} total_weight_bytes={} resolved_device_budget_bytes={}",
+                input.shared_memory_weight_fallback,
+                input.force_managed_weight_streaming,
+                input.model_weight_bytes,
+                input.resolved_vram_bytes
+            ),
+        ));
+    }
+
     if input.config.device_policy != DevicePolicy::Auto {
         decisions.push(MemoryStrategyDecision::new(
             "device_policy",
@@ -404,6 +516,24 @@ pub(crate) fn build_memory_strategy_plan(input: MemoryStrategyPlanInput<'_>) -> 
     }
 }
 
+/// #864: the application selected when the WDDM shared-memory fallback is
+/// preferred over managed weight streaming. Offload is off (the OS pages the
+/// weights), managed no-spill is off (so the physical-handle pool does not cap
+/// the load below the weight bytes and refuse them — the whole point is to let
+/// WDDM hold the over-budget remainder in host RAM), and no governed device
+/// budget is enforced. This mirrors the arm #864 measured as ~30x faster.
+fn wddm_shared_memory_application(input: &MemoryStrategyPlanInput<'_>) -> MemoryPolicyApplication {
+    MemoryPolicyApplication {
+        weight_offload_enabled: false,
+        device_budget_bytes: None,
+        scan_resistant_dense: input.overrides.scan_resistant_dense.unwrap_or(true),
+        managed_no_spill: false,
+        managed_limit_bytes: None,
+        device_budget_is_override: false,
+        auto_enabled_from_vram_limit: false,
+    }
+}
+
 fn compatibility_application(
     input: &MemoryStrategyPlanInput<'_>,
     fits: bool,
@@ -464,6 +594,23 @@ pub(crate) fn log_memory_strategy_plan(plan: &MemoryStrategyPlan, scope: &'stati
         plan = %serde_json::to_string(plan).unwrap_or_else(|_| format!("{plan:?}")),
         "memory strategy plan details"
     );
+    if let Some(decision) = plan
+        .decisions
+        .iter()
+        .find(|decision| decision.field == "weight_streaming_platform_policy")
+    {
+        tracing::warn!(
+            scope,
+            policy = %decision.value,
+            weight_offload_enabled = plan.runtime_application().weight_offload_enabled,
+            managed_no_spill = plan.runtime_application().managed_no_spill,
+            total_weight_bytes = plan.total_weight_bytes,
+            resolved_device_budget_bytes = ?plan.resolved_device_budget_bytes,
+            evidence = %decision.evidence,
+            "{}",
+            decision.reason
+        );
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -644,11 +791,15 @@ mod tests {
         weights: u64,
         overrides: MemoryStrategyOverrides,
     ) -> MemoryStrategyPlan {
-        plan_with_managed(config, graph, limit, weights, overrides, false)
+        plan_with_managed(
+            config, graph, limit, weights, overrides, false, false, false,
+        )
     }
 
     /// Build a plan as the native CUDA loader does under the #755 managed VMM
     /// default: inference drives policy and the managed no-spill path is on.
+    /// Models a platform WITHOUT the WDDM shared-memory fallback (e.g. Linux),
+    /// so #864's auto-disable does not fire and over-budget models still stream.
     fn input_managed(
         config: &EngineConfig,
         graph: GraphMemoryEvidence,
@@ -656,9 +807,34 @@ mod tests {
         weights: u64,
         overrides: MemoryStrategyOverrides,
     ) -> MemoryStrategyPlan {
-        plan_with_managed(config, graph, limit, weights, overrides, true)
+        plan_with_managed(config, graph, limit, weights, overrides, true, false, false)
     }
 
+    /// As [`input_managed`], but models a platform WITH the WDDM shared-memory
+    /// weight fallback available (Windows). #864's auto-disable applies here.
+    fn input_managed_wddm(
+        config: &EngineConfig,
+        graph: GraphMemoryEvidence,
+        limit: u64,
+        weights: u64,
+        overrides: MemoryStrategyOverrides,
+    ) -> MemoryStrategyPlan {
+        plan_with_managed(config, graph, limit, weights, overrides, true, true, false)
+    }
+
+    /// As [`input_managed_wddm`], but with `ONNX_GENAI_MANAGED_WEIGHT_STREAMING`
+    /// forcing the managed path despite the fallback.
+    fn input_managed_wddm_forced(
+        config: &EngineConfig,
+        graph: GraphMemoryEvidence,
+        limit: u64,
+        weights: u64,
+        overrides: MemoryStrategyOverrides,
+    ) -> MemoryStrategyPlan {
+        plan_with_managed(config, graph, limit, weights, overrides, true, true, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn plan_with_managed(
         config: &EngineConfig,
         graph: GraphMemoryEvidence,
@@ -666,6 +842,8 @@ mod tests {
         weights: u64,
         overrides: MemoryStrategyOverrides,
         managed_default: bool,
+        shared_memory_weight_fallback: bool,
+        force_managed_weight_streaming: bool,
     ) -> MemoryStrategyPlan {
         let explicit_bytes = matches!(config.limits.vram_limit, ResourceLimit::Bytes(_));
         let managed_vmm = managed_default || explicit_bytes;
@@ -682,6 +860,8 @@ mod tests {
             managed_vmm,
             overrides,
             advisory_only: false,
+            shared_memory_weight_fallback,
+            force_managed_weight_streaming,
         })
     }
 
@@ -742,7 +922,11 @@ mod tests {
     #[test]
     fn managed_default_no_flag_over_budget_model_auto_streams() {
         // #755: over-budget under the managed default automatically enables weight
-        // streaming instead of failing, with no explicit --vram-limit set.
+        // streaming instead of failing, with no explicit --vram-limit set. This
+        // is the behaviour on a platform WITHOUT the WDDM shared-memory fallback
+        // (e.g. Linux): #864's auto-disable does not apply, so managed streaming
+        // stays the only way to run an over-budget model. `input_managed` models
+        // `shared_memory_weight_fallback = false`.
         let config = EngineConfig::default();
         let plan = input_managed(
             &config,
@@ -757,10 +941,18 @@ mod tests {
         assert!(plan.application.auto_enabled_from_vram_limit);
         assert_eq!(plan.application.device_budget_bytes, Some(64));
         assert_eq!(plan.application.managed_limit_bytes, Some(64));
+        assert!(
+            !plan
+                .decisions
+                .iter()
+                .any(|d| d.field == "weight_streaming_platform_policy"),
+            "no WDDM policy decision without the shared-memory fallback: {plan:?}"
+        );
     }
 
     #[test]
     fn managed_default_over_budget_moe_auto_streams() {
+        // Non-WDDM (Linux) path, as `managed_default_no_flag_over_budget_model_auto_streams`.
         let config = EngineConfig::default();
         let plan = input_managed(
             &config,
@@ -772,6 +964,183 @@ mod tests {
         assert_eq!(plan.strategy, MemoryStrategy::MoeRoutingAware);
         assert!(plan.application.weight_offload_enabled);
         assert!(plan.application.managed_no_spill);
+    }
+
+    #[test]
+    fn wddm_over_budget_prefers_shared_memory_and_disables_streaming() {
+        // #864: on WDDM the auto-enabled managed streaming default is ~30x slower
+        // than letting the OS page over-budget weights from host RAM. The inferred
+        // strategy is still DynamicWeightResidency, but the effective strategy
+        // becomes Compatibility with offload OFF, managed no-spill OFF (so the
+        // physical pool does not cap and refuse the over-budget weights), and no
+        // governed device budget — the exact arm #864 measured as faster.
+        let config = EngineConfig::default();
+        let plan = input_managed_wddm(
+            &config,
+            graph_with_boundary("", "MatMul"),
+            64,
+            128,
+            MemoryStrategyOverrides::default(),
+        );
+        assert_eq!(
+            plan.inferred_strategy,
+            MemoryStrategy::DynamicWeightResidency
+        );
+        assert_eq!(plan.strategy, MemoryStrategy::Compatibility);
+        assert!(!plan.application.weight_offload_enabled);
+        assert!(!plan.application.managed_no_spill);
+        assert_eq!(plan.application.device_budget_bytes, None);
+        assert_eq!(plan.application.managed_limit_bytes, None);
+        assert!(!plan.application.auto_enabled_from_vram_limit);
+        let decision = plan
+            .decisions
+            .iter()
+            .find(|d| d.field == "weight_streaming_platform_policy")
+            .expect("WDDM policy decision must be recorded loudly");
+        assert_eq!(decision.value, "shared_memory_fallback_preferred");
+        assert_eq!(decision.source, DecisionSource::CompatibilityDefault);
+    }
+
+    #[test]
+    fn wddm_over_budget_moe_prefers_shared_memory() {
+        let config = EngineConfig::default();
+        let plan = input_managed_wddm(
+            &config,
+            graph_with_boundary("com.microsoft", "QMoE"),
+            64,
+            128,
+            MemoryStrategyOverrides::default(),
+        );
+        assert_eq!(plan.inferred_strategy, MemoryStrategy::MoeRoutingAware);
+        assert_eq!(plan.strategy, MemoryStrategy::Compatibility);
+        assert!(!plan.application.weight_offload_enabled);
+        assert!(!plan.application.managed_no_spill);
+    }
+
+    #[test]
+    fn wddm_fitting_model_is_unaffected_and_stays_full_resident() {
+        // The #864 auto-disable is scoped to over-budget models. A fitting model
+        // on WDDM must still be FullResident with managed no-spill ON.
+        let config = EngineConfig::default();
+        let plan = input_managed_wddm(
+            &config,
+            graph_with_boundary("", "MatMul"),
+            256,
+            128,
+            MemoryStrategyOverrides::default(),
+        );
+        assert_eq!(plan.strategy, MemoryStrategy::FullResident);
+        assert!(!plan.application.weight_offload_enabled);
+        assert!(plan.application.managed_no_spill);
+        assert_eq!(plan.application.managed_limit_bytes, Some(256));
+        assert!(
+            !plan
+                .decisions
+                .iter()
+                .any(|d| d.field == "weight_streaming_platform_policy"),
+            "fitting models must not trigger the WDDM streaming policy: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn wddm_explicit_offload_request_is_still_honored() {
+        // Requirement 1: an explicit ONNX_GENAI_WEIGHT_OFFLOAD=1 must still enable
+        // managed streaming even on WDDM. Only the inferred default changes.
+        let config = EngineConfig::default();
+        let plan = input_managed_wddm(
+            &config,
+            graph_with_boundary("", "MatMul"),
+            64,
+            128,
+            MemoryStrategyOverrides {
+                weight_offload: Some(true),
+                ..MemoryStrategyOverrides::default()
+            },
+        );
+        assert_eq!(plan.strategy, MemoryStrategy::DynamicWeightResidency);
+        assert!(plan.application.weight_offload_enabled);
+    }
+
+    #[test]
+    fn wddm_explicit_device_budget_override_is_still_honored() {
+        // Requirement 1: an explicit device-budget override selects managed
+        // streaming even on WDDM.
+        let config = EngineConfig::default();
+        let plan = input_managed_wddm(
+            &config,
+            graph_with_boundary("", "MatMul"),
+            64,
+            128,
+            MemoryStrategyOverrides {
+                device_budget_bytes: Some(32),
+                ..MemoryStrategyOverrides::default()
+            },
+        );
+        assert_eq!(plan.strategy, MemoryStrategy::DynamicWeightResidency);
+        assert!(plan.application.weight_offload_enabled);
+        assert_eq!(plan.application.device_budget_bytes, Some(32));
+    }
+
+    #[test]
+    fn wddm_explicit_vram_limit_is_still_honored() {
+        // Requirement 1: an explicit --vram-limit is an override, so managed
+        // streaming is honored even on WDDM. `config_with_vram` sets a byte limit;
+        // `input_managed_wddm` still models the shared-memory fallback present.
+        let config = config_with_vram(64);
+        let plan = input_managed_wddm(
+            &config,
+            graph_with_boundary("", "MatMul"),
+            64,
+            128,
+            MemoryStrategyOverrides::default(),
+        );
+        assert_eq!(plan.strategy, MemoryStrategy::DynamicWeightResidency);
+        assert!(plan.application.weight_offload_enabled);
+        assert!(plan.application.managed_no_spill);
+    }
+
+    #[test]
+    fn managed_streaming_force_knob_overrides_wddm_default() {
+        // Requirement 4: ONNX_GENAI_MANAGED_WEIGHT_STREAMING forces the managed
+        // path even where the WDDM fallback would otherwise be preferred.
+        let config = EngineConfig::default();
+        let plan = input_managed_wddm_forced(
+            &config,
+            graph_with_boundary("", "MatMul"),
+            64,
+            128,
+            MemoryStrategyOverrides::default(),
+        );
+        assert_eq!(plan.strategy, MemoryStrategy::DynamicWeightResidency);
+        assert!(plan.application.weight_offload_enabled);
+        assert!(plan.application.managed_no_spill);
+        let decision = plan
+            .decisions
+            .iter()
+            .find(|d| d.field == "weight_streaming_platform_policy")
+            .expect("forced managed streaming must still be recorded");
+        assert_eq!(decision.value, "managed_streaming_forced");
+        assert_eq!(decision.source, DecisionSource::ExplicitOverride);
+    }
+
+    #[test]
+    fn force_managed_weight_streaming_env_parsing() {
+        // Opt-in truthy; unrecognized values keep the fast fallback (unlike the
+        // ASYNC_PAGEIN trap, an unrecognized value here does NOT select managed).
+        assert!(!force_managed_weight_streaming_from_env_value(None));
+        assert!(force_managed_weight_streaming_from_env_value(Some("1")));
+        assert!(force_managed_weight_streaming_from_env_value(Some("true")));
+        assert!(force_managed_weight_streaming_from_env_value(Some("YES")));
+        assert!(force_managed_weight_streaming_from_env_value(Some("  On ")));
+        assert!(!force_managed_weight_streaming_from_env_value(Some("0")));
+        assert!(!force_managed_weight_streaming_from_env_value(Some(
+            "false"
+        )));
+        assert!(!force_managed_weight_streaming_from_env_value(Some("")));
+        assert!(!force_managed_weight_streaming_from_env_value(Some(
+            "maybe"
+        )));
+        assert!(!force_managed_weight_streaming_from_env_value(Some("2")));
     }
 
     #[test]

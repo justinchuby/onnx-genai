@@ -166,6 +166,10 @@ impl Engine {
             managed_vmm: matches!(config.limits.vram_limit, ResourceLimit::Bytes(_)),
             overrides: MemoryStrategyOverrides::default(),
             advisory_only: true,
+            // ORT backend: no managed offload happens here (advisory only), but
+            // keep the platform signal consistent with the native path.
+            shared_memory_weight_fallback: cfg!(windows),
+            force_managed_weight_streaming: force_managed_weight_streaming_enabled(),
         });
         log_memory_strategy_plan(&memory_strategy_plan, "single_model_ort");
         fail_explicit_vram_limit_without_offload(
@@ -472,6 +476,13 @@ impl Engine {
             managed_vmm,
             overrides: memory_strategy_overrides,
             advisory_only: !native_cuda_load,
+            // #864: on Windows/WDDM the OS shared-memory fallback pages over-budget
+            // weights from host RAM over PCIe, ~30x faster than managed streaming
+            // for the single-touch decode pattern. Gate the auto-disable on that
+            // platform property (cfg!(windows)); on Linux there is no such fallback
+            // so managed streaming stays the only over-budget path (#783).
+            shared_memory_weight_fallback: cfg!(windows),
+            force_managed_weight_streaming: force_managed_weight_streaming_enabled(),
         });
         log_memory_strategy_plan(&memory_strategy_plan, "single_model_native");
         #[cfg(feature = "cuda")]
@@ -1346,6 +1357,16 @@ fn dynamic_lending_enabled() -> bool {
 /// explicit opt-out: `ONNX_GENAI_LEGACY_ALLOCATOR=1` (the documented #755 knob),
 /// or the pre-#755 `ONNX_GENAI_DYNAMIC_KV_WEIGHT_LENDING=0`, which also restored
 /// the compatibility fallback and is honored for back-compat.
+/// Whether `ONNX_GENAI_MANAGED_WEIGHT_STREAMING` forces the managed
+/// weight-streaming path even where the WDDM shared-memory fallback would
+/// otherwise be auto-preferred (#864). Unconditional: read on every native load
+/// (any backend) so the operator override is honored regardless of features.
+pub(crate) fn force_managed_weight_streaming_enabled() -> bool {
+    force_managed_weight_streaming_from_env_value(
+        std::env::var(MANAGED_WEIGHT_STREAMING_ENV).ok().as_deref(),
+    )
+}
+
 #[cfg(all(feature = "cuda", feature = "native-backend"))]
 pub(crate) fn managed_vmm_default_enabled() -> bool {
     let legacy_allocator_opt_out =
