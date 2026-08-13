@@ -203,6 +203,20 @@ pub extern "C" fn nxrt_mock_shared_ep_placement_queries() -> usize {
     onnx_runtime_ep_plugin::compute::workspace_placement_queries()
 }
 
+/// The same counter under the name the CUDA and CPU plugins export, so one
+/// validation harness reads the same symbol whichever cdylib it is pointed at.
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_workspace_placement_queries() -> usize {
+    onnx_runtime_ep_plugin::compute::workspace_placement_queries()
+}
+
+/// Number of nodes this EP compiled, under the name the CUDA and CPU plugins
+/// export. Distinguishes "ORT selected our EP" from "ORT gave our EP a node".
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_compiled_node_count() -> usize {
+    onnx_runtime_ep_plugin::ep::compiled_node_count()
+}
+
 /// Select the workspace lifetime the mock `Add` kernel declares.
 ///
 /// `0` = `StepScoped` (the request the executor serves from ORT scratch),

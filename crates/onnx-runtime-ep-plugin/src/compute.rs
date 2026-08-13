@@ -1411,10 +1411,67 @@ unsafe fn prepare_workspace(
     let aligned = align_workspace_window(base as usize, total, bytes, alignment)
         .map_err(|e| format!("{node_label}: {e}"))?;
 
+    if workspace_trace_enabled() {
+        eprintln!(
+            "{}",
+            workspace_trace_line(node_label, base as usize, aligned, bytes, total, alignment)
+        );
+    }
+
     Ok(Some(WorkspaceView::new(
         DevicePtrMut(aligned as *mut c_void),
         bytes,
     )))
+}
+
+/// `true` when `NXRT_EP_WORKSPACE_TRACE=1` asks every **served** workspace to
+/// print the block it was cut from.
+///
+/// Off by default and read once. The trace exists because two questions about
+/// `KernelContext_GetScratchBuffer` can only be answered on a real device, and
+/// neither is answerable from a counter: whether ORT hands back the *same*
+/// storage on every step (arena-backed and reused) or a fresh block each time,
+/// and what alignment the returned block actually has versus the alignment the
+/// kernel asked for. Both are properties of the pointer, so the pointer is what
+/// gets reported.
+fn workspace_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("NXRT_EP_WORKSPACE_TRACE").as_deref() == Ok("1"))
+}
+
+/// Format one served-workspace trace record.
+///
+/// Split from the emission site so the format is unit-testable without an ORT
+/// kernel context: a reader of the trace is going to compare `block=` across
+/// steps and read `block_align=` against `align=`, so both have to be derived
+/// here rather than left for the reader to compute.
+///
+/// `block_align` is the largest power of two that divides the block ORT
+/// returned, capped at 4096 — the useful question is "did ORT already meet the
+/// kernel's alignment", not the exact 2-adic valuation of the address.
+fn workspace_trace_line(
+    node_label: &str,
+    base: usize,
+    aligned: usize,
+    bytes: usize,
+    total: usize,
+    alignment: usize,
+) -> String {
+    let block_align = if base == 0 {
+        0
+    } else {
+        let mut a: usize = 1;
+        while a < 4096 && base.is_multiple_of(a << 1) {
+            a <<= 1;
+        }
+        a
+    };
+    format!(
+        "nxrt ep plugin: workspace served node={node_label} bytes={bytes} align={alignment} \
+         requested_block={total} block=0x{base:x} block_align={block_align} \
+         ptr=0x{aligned:x} skew={}",
+        aligned - base
+    )
 }
 
 /// Bytes to request so that aligning up to `alignment` always lands inside the
@@ -3823,7 +3880,7 @@ mod tests {
 
 #[cfg(test)]
 mod workspace_math_tests {
-    use super::{align_workspace_window, workspace_block_bytes};
+    use super::{align_workspace_window, workspace_block_bytes, workspace_trace_line};
 
     /// The over-allocation must be exactly enough that align-up always fits —
     /// no more (wasted device memory per dispatch) and no less (out-of-bounds).
@@ -3882,6 +3939,71 @@ mod workspace_math_tests {
         // aligning up leaves fewer than 64 bytes.
         let err = align_workspace_window(0x1001, 64, 64, 256).expect_err("must reject");
         assert!(err.contains("escapes"), "got: {err}");
+    }
+
+    /// The trace exists to answer two device-only questions from the pointer
+    /// itself, so it must report the block address (comparable across steps)
+    /// and the alignment ORT actually delivered — not a restatement of what the
+    /// kernel asked for.
+    #[test]
+    fn a_trace_line_reports_the_block_the_reader_has_to_compare() {
+        let line = workspace_trace_line(
+            "Attention_0",
+            0x7f00_0000_1000,
+            0x7f00_0000_1000,
+            96,
+            351,
+            256,
+        );
+        assert!(
+            line.contains("block=0x7f0000001000"),
+            "the block address is what identifies reuse across steps: {line}"
+        );
+        assert!(
+            line.contains("ptr=0x7f0000001000"),
+            "the served pointer must be shown next to the block: {line}"
+        );
+        assert!(
+            line.contains("skew=0"),
+            "an already-aligned block must report zero skew: {line}"
+        );
+        assert!(
+            line.contains("bytes=96")
+                && line.contains("align=256")
+                && line.contains("requested_block=351"),
+            "the request the block answers must travel with it: {line}"
+        );
+    }
+
+    /// `block_align` is the load-bearing field: it says whether ORT's scratch
+    /// already met the kernel's alignment or the executor had to skew the
+    /// pointer, which is the difference between "ORT aligns for us" and "our
+    /// over-allocation is doing the work".
+    #[test]
+    fn block_alignment_is_measured_from_the_address_not_assumed() {
+        let under = workspace_trace_line("n", 0x1040, 0x1100, 8, 263, 256);
+        assert!(
+            under.contains("block_align=64"),
+            "0x1040 is 64-byte aligned and no more: {under}"
+        );
+        assert!(
+            under.contains("skew=192"),
+            "the executor had to move the pointer 192 bytes to reach 256: {under}"
+        );
+
+        let over = workspace_trace_line("n", 0x2000, 0x2000, 8, 263, 256);
+        assert!(
+            over.contains("block_align=4096"),
+            "measurement must saturate at the 4096 cap, not report 256: {over}"
+        );
+    }
+
+    /// A null block never reaches the trace (`alloc_scratch` rejects it), but
+    /// the formatter must not loop forever if it ever did.
+    #[test]
+    fn a_zero_block_reports_zero_alignment_instead_of_looping() {
+        let line = workspace_trace_line("n", 0, 0, 8, 8, 8);
+        assert!(line.contains("block_align=0"), "got: {line}");
     }
 }
 
