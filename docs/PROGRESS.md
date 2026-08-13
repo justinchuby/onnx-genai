@@ -85,6 +85,69 @@ _Last updated: 2026-08-13T06:34:00Z_
 
 ## Recent milestones (2026-07-28 → 2026-08-13) — newest first
 
+### 2026-08-13 — Over-budget models on Windows: ~100× from *not* streaming, and the memory line's accounting corrected
+
+This line is about the **other** regime: models whose weights do **not** fit device
+memory. It is separate from, and does not interact with, the dispatch-bound work below —
+see "two regimes" at the end.
+
+- **#874 — stop auto-enabling managed weight streaming on Windows/WDDM.** On `qwen14b-zp`
+  (8.33 GB weights vs a 7.73 GB budget), byte-identical output, solo with `nvidia-smi`
+  verified empty before every run: **8.09 tok/s with `htod_bytes_per_token = 0`** (true
+  zero-copy — kernels read weights in place from host RAM over PCIe) against **0.11 tok/s**
+  for managed streaming; `main` immediately prior measured 0.05–0.08, so **~100× end to
+  end**. The cause is structural: each weight is read *exactly once per decode step*
+  (922 initializers, ~867 lookups/step), so both paths move the same bytes over the same
+  link, but ours added a CPU memcpy into pinned staging, a VRAM allocation, a `cuMemMap`,
+  an eviction and a synchronize — **to buy VRAM residency discarded before it is ever
+  re-read**. Explicit requests (`ONNX_GENAI_WEIGHT_OFFLOAD=1`, `--vram-limit`, a budget
+  override) are still honoured; `ONNX_GENAI_MANAGED_WEIGHT_STREAMING=1` forces the managed
+  path back, parsed so an *unrecognized* value keeps the fast default. **Linux is
+  unchanged and must stay so** — with no shared-memory fallback an over-budget model simply
+  fails there, so managed streaming competes with "does not run", not with something
+  faster (#783's lesson about not inheriting a platform-specific conclusion).
+- **#866 — elastic weight budget against KV occupancy.** The weight budget was
+  `resolved_device_budget − kv_bytes_per_token × max_context`, computed once and never
+  renegotiated, so a 16-token run idled **1.611 GB** holding KV it never committed.
+  Lending it back with a guaranteed reclaim path (tested through the *production* reclaim
+  code, so max-context reachability is preserved) cut `htod_bytes_per_token` **3.94 →
+  2.35 GB (1.68×)** and byte-weighted hit rate **+20.3 points**, byte-identical tokens.
+  Keeps a tunable 512 MiB headroom rather than lending to the last byte, and can never
+  drop below what the static reservation granted.
+- **#853/#856 — `total_weight_bytes` was 2.00× too large.** It measured *file size*, and
+  `qwen14b-zp`'s external-data blob is **50.0% orphaned prefix** (920 initializers
+  reference 8.33 GB of a 16.65 GB file, contiguously, first blob at offset 8,322,547,712 —
+  a re-export that never truncated). The model is over budget by **0.599 GB, not ~8.9 GB**.
+  Found by arithmetic that could not close: measured traffic sat *below* its own
+  theoretical floor, which is impossible. The loader now sums what initializers reference
+  and warns when file size exceeds it by >10%.
+- **#863 — `no-spill` is an accounting guarantee, not physical residency, on WDDM.**
+  Proven single-process: a `cuMemCreate`+`cuMemMap`+`cuMemSetAccess` allocator mirroring
+  the engine arena committed **and touched every byte** of 9,984 MiB on an 8,188 MiB card;
+  device-resident capped at ~7,942 MiB while the host working set reached 9.49 GB.
+  Refined by a second measurement: **solo and under `managed_limit`, no-spill holds
+  physically** (`nvidia-smi` tracks us 1:1); spill is specifically the **system-wide
+  over-commit** case, invisible to our ledger because our own committed bytes do not change.
+- **#869 — byte-weighted residency hit rate.** The count-based rate weights a 10 KiB norm
+  like an 11 MiB projection: raising the budget once moved `hit_rate` 57.09% → 81.31%
+  while the gap to the streaming floor **widened** 1.78× → 2.30×. `htod_bytes` is what
+  decode pays for, so policy work is now judged on `byte_hit_rate`.
+- **#877 — hybrid feasibility measured.** `cuMemHostRegister(READ_ONLY|DEVICEMAP)` on a
+  read-only weight mapping succeeds at 3.1 ms/GiB; a device read of mapped host memory runs
+  at **11.41 GB/s** vs **11.28** for an explicit HtoD copy and **110.46** already-resident.
+  **This reversed the hybrid's assumed priority order:** zero-copy is *not* a bandwidth win
+  (1.01×) — it removes the copy's second pass and its machinery — while **the resident hot
+  set is worth ~9.7×**. So maximise residency first, de-copy the remainder second.
+
+**Two regimes, and wins do not transfer between them.** When weights fit, decode is
+**node-dispatch bound** (#870: 2,568 graph nodes/token at ~8.17 µs/node; cheapening any
+single kernel's inner loop is flat). When they do not fit, decode is **PCIe-streaming
+bound** and kernel work is irrelevant. Node-count reduction is invisible in the streaming
+regime; everything above is invisible on a model that fits. Report bytes-moved-per-token
+alongside throughput (#844's amortization line) — that counter distinguishes the regimes
+where wall-clock cannot, and on this box wall-clock is not evidence (identical
+configurations have ranged 3.9–28 tok/s, much of it WDDM paging our own memory).
+
 ### 2026-08-13 — Muse-Glimmer-30B native CUDA decode beats ORT (47 tok/s)
 
 - **11.4 → 40.21 tok/s (native now matches ORT's ~40) on Muse-Glimmer-30B** (dense int4,
@@ -339,9 +402,35 @@ short spine (full day-by-day is archived).
 ### DeepSeek native support
 See [`deepseek-native-status-2026-07-25.md`](deepseek-native-status-2026-07-25.md).
 
-- [ ] **Full-model QMoE coherence:** validate native CUDA QMoE with a complete DeepSeek-V2
-  package and real tokenizer. The real-shape conformance artifact proves exact
-  routing/token parity but decodes only decimal token IDs.
+- [ ] **The #864 hybrid — resident hot set + zero-copy cold reads.** The only route to
+  *beating* the OS on over-budget models rather than merely no longer losing to it (#874
+  buys the ~100× by not choosing the slow path; it does not make us faster than WDDM). One
+  risk is unresolved and is being measured: the #877 figure comes from a **sequential**
+  `cuMemcpyDtoD` from mapped host memory, which is the right proxy for a kernel reading in
+  place but is **not** a strided GEMV — PCIe punishes small scattered transactions where
+  VRAM does not, so a real kernel could be far worse and that would kill the zero-copy half.
+  Also untested: whether a host-mapped device pointer can be baked into a **captured** graph
+  (`captures > 0`, `fallbacks == 0` are hard gates, #796).
+- [ ] **#837 item 3 — residency policy gap.** Post-#866 the policy sits **1.97× above its
+  own streaming floor** (2.349 vs 1.191 GB/step), i.e. **1.158 GB/step recoverable**, worth
+  ~91 ms/step at measured bandwidths. `byte_hit_rate` 71.8% against an achievable 85.7%
+  (`B/W`). `bypassed_page_ins` (704/run, ~12% of page-in events) has never been attributed
+  and should be ruled in or out first. Governs Linux, forced-managed Windows, and — the
+  reason it still matters after #874 — the hybrid, whose entire thesis is that we choose
+  residency better than the driver does blind.
+- [ ] **#750 native multi-request batching.** Structurally batch-1 today; `--max-batch` is
+  honestly reported as ineffective (#758). Stage 1 (#844) confirmed the premise **and its
+  condition**: batching amortizes the weight stream only if implemented as **one fused
+  forward with `M = N`** — N independent forwards would miss every weight N times per step
+  on an over-budget model and amortize nothing. Staged 2a (fused forward + batch-N binding),
+  2b (batched KV), 2c (wire `continuous_batch_manager`).
+- [ ] **#851 — intermittent `ILLEGAL_ADDRESS` in the mobius gate.** Parked, not solved.
+  Three hypotheses eliminated (not gate flakiness — 8/8 strict solo; not kept-graph replay —
+  25/25 isolated; not a relocated weight mapping — the fault targets a freshly allocated
+  buffer, so it is a deferred fault whose reported node is the detection site). Never a data
+  mismatch across ~49 runs, only whole-process crashes. Blocked on `compute-sanitizer`
+  (no CUDA toolkit on this box) and on a card large enough to reproduce genuine
+  multi-process oversubscription without contention confounds.
 - [ ] **GPU-resident ORT QMoE baseline:** still unavailable — ORT 1.28 crashes on QMoE
   through both the backend and GenAI-direct paths (#766), and the earlier reference inserted
   four `Memcpy` nodes at 0% sustained GPU utilization. No native-vs-ORT QMoE perf claim is
