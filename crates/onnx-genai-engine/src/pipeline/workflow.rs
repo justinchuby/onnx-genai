@@ -41,6 +41,186 @@ pub(super) fn supports_workflow_adapter(abi: &str, version: &str) -> bool {
     workflow_adapter_registry().contains_key(&(abi, version))
 }
 
+fn validate_component_overrides(
+    workflow: &WorkflowSpec,
+    overrides: &HashMap<String, String>,
+) -> anyhow::Result<()> {
+    for (target_name, replacement_name) in overrides {
+        let target = workflow.components.get(target_name).with_context(|| {
+            format!("component override target '{target_name}' is not declared by the package")
+        })?;
+        if !target.application_overridable {
+            anyhow::bail!(
+                "workflow component '{target_name}' does not allow application replacement"
+            );
+        }
+        let replacement = workflow.components.get(replacement_name).with_context(|| {
+            format!("replacement component '{replacement_name}' is not declared by the package")
+        })?;
+        if !matches!(target.implementation, ComponentImplementation::Onnx { .. })
+            || !matches!(
+                replacement.implementation,
+                ComponentImplementation::Onnx { .. }
+            )
+        {
+            anyhow::bail!(
+                "component override '{target_name}' -> '{replacement_name}' requires ONNX components"
+            );
+        }
+        let target_contract = target.contract.as_ref().with_context(|| {
+            format!("overridable component '{target_name}' has no versioned contract")
+        })?;
+        let replacement_contract = replacement.contract.as_ref().with_context(|| {
+            format!("replacement component '{replacement_name}' has no versioned contract")
+        })?;
+        if target_contract.id != replacement_contract.id
+            || target_contract.version != replacement_contract.version
+        {
+            anyhow::bail!(
+                "replacement component '{replacement_name}' has contract {}@{}, expected {}@{} \
+                 for '{target_name}'",
+                replacement_contract.id,
+                replacement_contract.version,
+                target_contract.id,
+                target_contract.version
+            );
+        }
+        if target_contract
+            .bindings
+            .keys()
+            .collect::<std::collections::BTreeSet<_>>()
+            != replacement_contract
+                .bindings
+                .keys()
+                .collect::<std::collections::BTreeSet<_>>()
+        {
+            anyhow::bail!(
+                "replacement component '{replacement_name}' does not implement the complete \
+                 semantic port ABI of '{target_name}'"
+            );
+        }
+        if target.effects != replacement.effects {
+            anyhow::bail!(
+                "replacement component '{replacement_name}' does not match the effect ABI of \
+                 '{target_name}'"
+            );
+        }
+        validate_replacement_port_contracts(target_name, target, replacement_name, replacement)?;
+    }
+    Ok(())
+}
+
+fn validate_replacement_port_contracts(
+    target_name: &str,
+    target: &onnx_genai_metadata::WorkflowComponent,
+    replacement_name: &str,
+    replacement: &onnx_genai_metadata::WorkflowComponent,
+) -> anyhow::Result<()> {
+    let target_bindings = &target
+        .contract
+        .as_ref()
+        .with_context(|| format!("overridable component '{target_name}' has no contract"))?
+        .bindings;
+    let replacement_bindings = &replacement
+        .contract
+        .as_ref()
+        .with_context(|| format!("replacement component '{replacement_name}' has no contract"))?
+        .bindings;
+    for (role, target_port) in target_bindings {
+        let replacement_port = &replacement_bindings[role];
+        let target_input = target.ports.inputs.get(target_port);
+        let replacement_input = replacement.ports.inputs.get(replacement_port);
+        let target_output = target.ports.outputs.get(target_port);
+        let replacement_output = replacement.ports.outputs.get(replacement_port);
+        if target_input.is_some() != replacement_input.is_some()
+            || target_output.is_some() != replacement_output.is_some()
+        {
+            anyhow::bail!(
+                "replacement component '{replacement_name}' semantic port '{role}' has a \
+                 different direction from '{target_name}'"
+            );
+        }
+        if let (Some(expected), Some(actual)) = (target_input, replacement_input)
+            && expected != actual
+        {
+            anyhow::bail!(
+                "replacement component '{replacement_name}' input '{replacement_port}' is \
+                 incompatible with '{target_name}.{target_port}'"
+            );
+        }
+        if let (Some(expected), Some(actual)) = (target_output, replacement_output)
+            && expected != actual
+        {
+            anyhow::bail!(
+                "replacement component '{replacement_name}' output '{replacement_port}' is \
+                 incompatible with '{target_name}.{target_port}'"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn resolve_component_invocation<'a>(
+    workflow: &'a WorkflowSpec,
+    component: &'a str,
+    declaration: &'a onnx_genai_metadata::WorkflowComponent,
+    inputs: &std::collections::BTreeMap<String, String>,
+    outputs: &std::collections::BTreeMap<String, String>,
+    overrides: &HashMap<String, String>,
+) -> anyhow::Result<(
+    &'a str,
+    &'a onnx_genai_metadata::WorkflowComponent,
+    std::collections::BTreeMap<String, String>,
+    std::collections::BTreeMap<String, String>,
+)> {
+    let Some(replacement_name) = overrides.get(component) else {
+        return Ok((component, declaration, inputs.clone(), outputs.clone()));
+    };
+    let (replacement_name, replacement) = workflow
+        .components
+        .get_key_value(replacement_name)
+        .with_context(|| format!("replacement component '{replacement_name}' is undeclared"))?;
+    let target_bindings = &declaration
+        .contract
+        .as_ref()
+        .with_context(|| format!("overridable component '{component}' has no contract"))?
+        .bindings;
+    let replacement_bindings = &replacement
+        .contract
+        .as_ref()
+        .with_context(|| format!("replacement component '{replacement_name}' has no contract"))?
+        .bindings;
+    let remap = |ports: &std::collections::BTreeMap<String, String>| {
+        ports
+            .iter()
+            .map(|(port, value)| {
+                let role = target_bindings
+                    .iter()
+                    .find_map(|(role, bound)| (bound == port).then_some(role))
+                    .with_context(|| {
+                        format!(
+                            "overridable component '{component}' invoked port '{port}' is not \
+                             covered by its semantic contract ABI"
+                        )
+                    })?;
+                let replacement_port = replacement_bindings.get(role).with_context(|| {
+                    format!(
+                        "replacement component '{replacement_name}' has no binding for semantic \
+                         port '{role}'"
+                    )
+                })?;
+                Ok((replacement_port.clone(), value.clone()))
+            })
+            .collect::<anyhow::Result<std::collections::BTreeMap<_, _>>>()
+    };
+    Ok((
+        replacement_name.as_str(),
+        replacement,
+        remap(inputs)?,
+        remap(outputs)?,
+    ))
+}
+
 impl PipelineEngine {
     pub(crate) fn run_workflow(
         &self,
@@ -50,8 +230,10 @@ impl PipelineEngine {
             request,
             inputs,
             session_id,
+            component_overrides,
         } = request;
         let workflow = &self.workflow;
+        validate_component_overrides(workflow, &component_overrides)?;
         let mut values = self.bind_workflow_inputs(workflow, &request, inputs)?;
         for (cell, state) in &workflow.state {
             if state.scope != onnx_genai_metadata::WorkflowStateScope::Session {
@@ -107,6 +289,7 @@ impl PipelineEngine {
             &dynamic_symbols,
             &mut emit_counts,
             &mut final_state_refs,
+            &component_overrides,
         )?;
         for output in workflow_emitted_outputs(&self.compiled_workflow.graph) {
             let Some(value) = values.get(&output) else {
@@ -152,6 +335,7 @@ impl PipelineEngine {
         dynamic_symbols: &std::collections::HashSet<String>,
         emit_counts: &mut HashMap<String, usize>,
         final_state_refs: &mut HashMap<String, String>,
+        component_overrides: &HashMap<String, String>,
     ) -> anyhow::Result<()> {
         match node {
             WorkflowNode::Sequence { nodes } => {
@@ -164,6 +348,7 @@ impl PipelineEngine {
                         dynamic_symbols,
                         emit_counts,
                         final_state_refs,
+                        component_overrides,
                     )?;
                 }
             }
@@ -179,9 +364,26 @@ impl PipelineEngine {
                     .with_context(|| format!("workflow component '{component}' is undeclared"))?;
                 match &declaration.implementation {
                     ComponentImplementation::Onnx { .. } => {
-                        let session = self.models.session(component).with_context(|| {
-                            format!("workflow ONNX component '{component}' was not loaded")
-                        })?;
+                        let (
+                            selected_component,
+                            selected_declaration,
+                            selected_inputs,
+                            selected_outputs,
+                        ) = resolve_component_invocation(
+                            workflow,
+                            component,
+                            declaration,
+                            inputs,
+                            outputs,
+                            component_overrides,
+                        )?;
+                        let session =
+                            self.models.session(selected_component).with_context(|| {
+                                format!(
+                                    "workflow ONNX component '{selected_component}' selected for \
+                                 '{component}' was not loaded"
+                                )
+                            })?;
                         // Component dimensions are invocation-local. A decoder, for example, may
                         // bind `sequence` to the prompt length in setup and to one in the loop.
                         // Values crossing the package boundary were already checked there; the
@@ -189,19 +391,21 @@ impl PipelineEngine {
                         // spelling in separate contract scopes.
                         let mut component_symbols = HashMap::new();
                         let component_dynamic_symbols = std::collections::HashSet::new();
-                        let resolved = inputs
+                        let resolved = selected_inputs
                             .iter()
                             .map(|(port, value)| {
                                 values
                                     .get(value)
                                     .with_context(|| {
                                         format!(
-                                            "workflow component '{component}' input '{port}' \
+                                            "workflow component '{selected_component}' input '{port}' \
                                              references unavailable value '{value}'"
                                         )
                                     })
                                     .and_then(|tensor| {
-                                        if let Some(contract) = declaration.ports.inputs.get(port) {
+                                        if let Some(contract) =
+                                            selected_declaration.ports.inputs.get(port)
+                                        {
                                             validate_workflow_value(
                                                 value,
                                                 tensor,
@@ -216,10 +420,10 @@ impl PipelineEngine {
                             .collect::<anyhow::Result<Vec<_>>>()?;
                         let produced = session.run(&resolved)?;
                         for (port, tensor) in session.output_names().iter().zip(produced) {
-                            let Some(value) = outputs.get(port) else {
+                            let Some(value) = selected_outputs.get(port) else {
                                 continue;
                             };
-                            if let Some(contract) = declaration.ports.outputs.get(port) {
+                            if let Some(contract) = selected_declaration.ports.outputs.get(port) {
                                 validate_workflow_value(
                                     value,
                                     &tensor,
@@ -286,6 +490,7 @@ impl PipelineEngine {
                     dynamic_symbols,
                     emit_counts,
                     final_state_refs,
+                    component_overrides,
                 )?;
                 for carry in carried {
                     let state = workflow.state.get(&carry.cell).with_context(|| {
@@ -338,6 +543,7 @@ impl PipelineEngine {
                         dynamic_symbols,
                         emit_counts,
                         final_state_refs,
+                        component_overrides,
                     )?;
                     for carry in carried {
                         let current = values.get(&carry.current).with_context(|| {
@@ -389,6 +595,7 @@ impl PipelineEngine {
                     dynamic_symbols,
                     emit_counts,
                     &mut branch_state_refs,
+                    component_overrides,
                 )?;
 
                 // Emits are explicit side effects at the package boundary, so selected-branch

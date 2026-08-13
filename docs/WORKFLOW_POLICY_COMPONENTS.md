@@ -77,12 +77,22 @@ non-tensor contract data. New policy implementations require metadata plus ONNX,
 |---|---|
 | `logits` | floating `[B,V]` or `[B,S,V]`; sample the final position |
 | `token` | `int64[B]` |
-| `temperature`, `top_k`, `top_p` | optional scalar or `[B]` |
+| `temperature`, `top_k`, `top_p` | request-provided scalar or `[B]` when used |
+| `grammar_mask` | optional request/adapter-provided `bool[B,V]` |
 | `rng_seed`, `rng_offset` | required for seeded stochastic mode, `int64[B]` |
 | `rng_next_offset` | seeded mode output, `int64[B]` |
 
-`parameters.mode` is `greedy` or `seeded_stochastic`. Seed and offset are explicit counter-based
-RNG state (for example Philox or Threefry), loop-carried as semantic state.
+`parameters.mode` is `greedy` or `seeded_stochastic`. Sampling controls are typed workflow inputs;
+they are never baked into the artifact, so ordinary request option changes do not regenerate
+ONNX. Seed and offset are explicit counter-based RNG state (for example Philox or Threefry),
+loop-carried as semantic state.
+
+A component may set `application_overridable: true`. The application can then select another
+package-declared ONNX component for that invocation. The replacement must implement the same
+contract ID/version, semantic binding set, tensor port ABI, and effects. Concrete ONNX port names
+may differ because the runtime remaps them through `contract.bindings`. This is the extension
+point for fundamentally custom sampling policy; changing temperature, top-k, top-p, seed, or a
+grammar mask uses ordinary workflow inputs instead.
 
 ### Termination predicate: `onnx-genai.termination-predicate@1`
 
@@ -113,8 +123,13 @@ values used by subsequent steps. `emit.valid_length: accepted_len` streams only 
 ### Generic state update: `onnx-genai.state-update@1`
 
 Inputs: `current` and `update`; output: `next`. All three use the component's declared or inferred
-tensor contracts. Append, scatter, truncate, rollback, and accumulate are ONNX math, never host
-state-update opcodes.
+tensor contracts. This component is optional and exists only when tensor math is required, such
+as dense gather, truncate, rollback, or format conversion. Normal decoder present-KV is directly
+carried to next-iteration past-KV; it does not require a `kv_update.onnx`.
+
+Physical shared-buffer or paged-KV allocation, append, slot assignment, compaction, and in-place
+mutation are generic runtime KV services driven by declared serving values and resource
+contracts. They are not workflow policy math and are not modeled as host state-update opcodes.
 
 ### Adaptive proposal budget: `onnx-genai.adaptive-proposal-budget@1`
 
@@ -156,7 +171,12 @@ steps:
         outputs: { logits: logits, cache: cache.next }
       - kind: invoke
         component: sampler
-        inputs: { logits: logits }
+        inputs:
+          logits: logits
+          temperature: temperature
+          top_k: top_k
+          top_p: top_p
+          grammar_mask: grammar_mask
         outputs: { token_ids: token }
       - kind: emit
         value: token
@@ -167,6 +187,10 @@ steps:
     carried:
       - { cell: cache, next: cache.next }
 ```
+
+Here `cache.next` is the decoder's present-KV output and becomes `cache` on the next iteration.
+The carry describes logical dataflow and bounded growth; the generic KV service may realize it
+with shared or paged storage without adding a workflow component.
 
 ### Vision-language
 

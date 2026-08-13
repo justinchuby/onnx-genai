@@ -180,6 +180,10 @@ pub struct WorkflowComponent {
     pub ports: ComponentPorts,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contract: Option<ComponentContract>,
+    /// Allow an application to select another declared component with the same
+    /// versioned contract ABI for this invocation.
+    #[serde(default)]
+    pub application_overridable: bool,
     #[serde(default)]
     pub effects: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
