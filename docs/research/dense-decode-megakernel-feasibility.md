@@ -1,7 +1,7 @@
 # Dense-decode megakernel feasibility (Muse-Glimmer-30B, native CUDA, M=1)
 
 **Author:** Sebastian (Performance/Systems). **Date:** 2026-08-13. **Branch:** `squad/dense-decode-megakernel`.
-**Status:** Phase A gate **PASSED** → Phase B glue micro-benchmark → P1.5 fused-int4-GEMV + grid.sync-capture probes → **P2-prototype multi-CTA cooperative megakernel MEASURED → NO-GO for the GEMV megakernel** (see §7). The real remaining lever is graph-side glue node-collapse (Batty), not a cooperative megakernel.
+**Status:** Phase A gate **PASSED** → Phase B glue micro-benchmark → P1.5 fused-int4-GEMV + grid.sync-capture probes → **P2-prototype multi-CTA cooperative megakernel MEASURED → NO-GO for the GEMV megakernel** (see §7) → **§8 glue node-collapse validated UNDER graph replay → GO** (the real lever, Batty's `optimizer.rs`, +5.3% ceiling, byte-exact).
 
 > **Headline.** Native decode of Muse-Glimmer-30B is confirmed **latency-bound on a
 > ~2568-node serial launch chain** (~21.4 ms/token, 46.7 tok/s on H200 at
@@ -45,6 +45,17 @@
 > that is better attacked **graph-side** (Batty's node-count collapse to shrink the
 > captured graph's replay overhead) — cheaper, lower-risk, and no numerics gate.
 > See §7.
+>
+> **§8 update (2026-08-13) — the §7.4 redirect is now MEASURED, not assumed.** The
+> obvious objection to §7.4 was self-referential: §7's own mechanism (1) is "graph
+> replay already removes launch overhead," and glue node-collapse targets that same
+> overhead — so does it also collapse to ~0 under replay? **Measured directly:** the
+> ~22-op glue chain captured as 22 graph nodes vs 1 fused node, **timed under graph
+> replay**, still recovers **74–75%** (byte-exact), because a **~0.90 µs/node dispatch
+> floor SURVIVES replay** (replay cuts eager ~2.3 µs/op to ~0.9 µs/node, not to zero).
+> Unlike the megakernel, collapse pays **no grid.sync tax** and reorders no reductions.
+> **Verdict: GO on graph-side glue node-collapse** (Batty, `optimizer.rs`), bounded
+> upside **~+5% decode (46.7 → ~49 tok/s)** — cheap, low-risk, no Chew gate. See §8.
 
 ---
 
@@ -383,13 +394,98 @@ the `grid.sync`/occupancy/register-pressure constraints from §6.
 
 ---
 
+## 8. Glue node-collapse UNDER graph replay — the kill-gate for §7.4's redirect (measured, this H200)
+
+§7.4 redirected the lever to **graph-side glue node-collapse** (Batty, `optimizer.rs`).
+But §7's own NO-GO mechanism (1) was *"CUDA-graph replay already removes the per-launch
+overhead"* — and glue node-collapse targets that **same** launch overhead. The Phase B
+85.6% glue recovery (§3) was measured **eager**, where every launch pays its full cost.
+Under the production decode path every op is a **node in a captured graph replayed each
+token**, so the launch cost is largely pre-paid. **If replay amortizes per-node dispatch
+to ~0, glue collapse dies exactly like the megakernel did.** This section measures that
+directly — the gate before staffing a multi-week `optimizer.rs` pass.
+
+**Method.** Build both (a) the per-op glue sequence (G = 22 in-place SiLU round-trips on
+the H = 6656 bf16 vector) and (b) the fused single launch (same 22 ops chained in
+registers, one launch), **capture EACH into its own CUDA graph**, and time **graph
+replay** (median ≥ 200 iters, CUDA events). Plus a launch-floor pair — a graph of 22
+`trivial` nodes vs a graph of 1 — to isolate any residual **per-node** replay cost
+independent of memory traffic. Test: `glue_collapse_replay_gate_probe`.
+
+### 8.1 Measured result (H200, median of 200 iters, 4 repeats)
+
+| Path | per-op (22 nodes) | fused (1 node) | recovered |
+|---|---|---|---|
+| **Eager** (reference; reproduces Phase B) | 0.048–0.051 ms | 0.0077–0.0078 ms | **84–85%** |
+| **Under CUDA-graph replay** (production path) | **0.0280 ms** | **0.0069–0.0073 ms** | **74.0–75.5%** |
+
+- **Launch-floor under replay:** 22 trivial nodes 0.0219 ms vs 1 node 0.0030 ms →
+  **~0.90 µs/node residual dispatch cost that SURVIVES replay.**
+- **Numerics:** per-op-graph vs fused-graph `max_abs = 0.000e0` — **byte-exact (0 ulp)**.
+- **Whole-model projection (52 layers, anchored to the 21.4 ms/token baseline):** glue
+  ~1.46 ms/token → ~0.37 ms/token, **saves ~1.08–1.10 ms/token → 46.7 → ~49.2 tok/s
+  (+5.3–5.4%)**. *(Projection — see caveats.)*
+
+### 8.2 Interpretation — the gate PASSES; glue collapse is a real lever, unlike the megakernel
+
+**Graph replay does NOT make per-node dispatch free.** It cuts the eager per-op cost
+(~2.3 µs/op) down to a **~0.90 µs/node floor — but that floor persists under replay**.
+Collapsing 22 nodes → 1 removes 21 × ~0.90 µs ≈ **19 µs of the 28 µs** per-op replay time.
+That is why the recovery stays high (**74–75%**) even under replay, where the megakernel's
+recovery went **negative** (−3.2%, §7). The two results are consistent, not contradictory:
+
+| | #898 GEMV megakernel | §8 glue node-collapse |
+|---|---|---|
+| What it collapses | irreducible full-device **GEMV** weight-read work | tiny **L2-resident** elementwise/norm ops = pure dispatch overhead |
+| Recoverable cost under replay | ~none (GEMVs are real work; launch already amortized) | **~0.9 µs/node dispatch floor that survives replay** |
+| Extra cost paid | **grid.sync tax** (2.23 µs/barrier × ~6–8/layer) | **none** — ordinary fused launch, no cooperative kernel |
+| Numerics | byte-exact but adds barriers | **byte-exact, no reduction reorder** |
+| Verdict | **NO-GO** (−3.2%) | **GO** (+5.3% ceiling, cheap, graph-side) |
+
+The §7 concern is therefore **empirically disproven for glue**: replay amortizes per-node
+dispatch by ~2.5×, not to zero, and node-collapse recovers the residual with no grid.sync
+tax and no numerics gate.
+
+### 8.3 Caveats (stated, not papered over)
+
+- **Modeled glue chain, not the exact production op set.** The probe uses an in-place
+  SiLU round-trip on the H-vector as a representative dispatch-bound glue op; the real
+  chain (RoPE, RMSNorm, residual add, cast, SiLU-mul over the 19968-wide intermediate)
+  differs in width and count. The **~0.9 µs/node dispatch floor** is the transferable
+  quantity; absolute ms is representative, not the production kernels' absolute ms.
+- **The +5.3% is a CEILING, not a promise.** It assumes the full per-op glue replay time
+  is on the critical path and fully removable. In the real graph, glue nodes **interleave
+  with the GEMV nodes that remain the dominant serial cost**, so realized decode gain ≤
+  this ceiling. Marked as a **projection**.
+- **~0.9 µs/node is this device/driver's replay dispatch floor**; it will differ on other
+  GPUs/driver versions. The *direction* (dispatch floor survives replay) is the robust finding.
+
+### 8.4 Verdict — **GO on graph-side glue node-collapse (bounded, cheap, Batty)**
+
+- **GO, gate PASSED.** Under the production graph-replay path, collapsing the ~22 glue
+  nodes/layer recovers **74–75%** of their replay time (~1.08 ms/token, ~5% of the 21.4 ms
+  token), **byte-exact**, with **no grid.sync tax** — the opposite outcome to the §7 GEMV
+  megakernel. This is the lever §7.4 pointed at, now **measured under the real path**, not
+  assumed.
+- **Costed plan for Batty (`optimizer.rs`):** fuse/collapse the elementwise+norm chain in
+  the captured graph (target ~49 nodes/layer → a handful), leaning on the already-landed
+  fused epilogues (#867 SwiGLU-mul, #854 skip-RMSNorm) so standalone nodes can be deleted.
+  No cooperative kernel, no `grid.sync`, no numerics-reorder → **no Chew gate**. Bounded
+  upside **~+5% decode** (46.7 → ~49 tok/s); low risk, small surface.
+- **Next validation step:** measure node-collapse on the **real** captured decode graph
+  (not the modeled chain) to convert the +5.3% ceiling into a realized number, once Batty
+  has a candidate collapse in `optimizer.rs`.
+
+---
+
 - Env: `source /home/justinchu/onnx-genai/.cudaenv.sh`; `CUDA_VISIBLE_DEVICES=0 ONNX_GENAI_CUDA_DEVICE=0`.
 - Baseline/eager/op-mix: `profile_native` as in §1 (`ONNX_GENAI_CUDA_GRAPH=0/1`, `ONNX_GENAI_PROFILE_OPS=1`).
 - Phase B / P1.5 / P2-prototype micro-bench (throwaway, `#[ignore]`, never shipped):
   `cargo test --release -p onnx-runtime-ep-cuda --features cuda --test megakernel_headroom_gpu -- --ignored --nocapture`.
   Tests: `megakernel_headroom_probe` (glue), `megakernel_int4_mlp_probe` (fused single-CTA int4 MLP vs per-op),
   `grid_sync_capture_gate_probe` (cooperative-launch-under-capture gate),
-  `megakernel_multicta_mlp_probe` (§7: persistent multi-CTA cooperative MLP vs per-op + grid.sync barrier cost).
+  `megakernel_multicta_mlp_probe` (§7: persistent multi-CTA cooperative MLP vs per-op + grid.sync barrier cost),
+  `glue_collapse_replay_gate_probe` (§8: glue per-op vs fused, both captured into a CUDA graph and timed under replay + per-node replay floor).
   Knobs: `NXRT_MK_HIDDEN` (6656), `NXRT_MK_INTER` (19968), `NXRT_MK_GLUE_OPS` (22),
   `NXRT_MK_ITERS` (200), `NXRT_MK_MLP_ITERS` (50), `NXRT_MK_MC_ITERS` (200), `NXRT_MK_LAYERS` (52).
 - Model dir: `.../olive-recipes/meta-models-Muse-Glimmer-30B/cuda/int4/models` (`--pipeline`; never write through the symlink).

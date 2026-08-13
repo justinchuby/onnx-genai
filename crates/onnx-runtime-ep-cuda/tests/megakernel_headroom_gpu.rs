@@ -1366,3 +1366,272 @@ fn megakernel_multicta_mlp_probe() {
     }
     assert!(base_ms > 0.0 && mega_ms > 0.0);
 }
+
+// ===========================================================================
+// §8 — Glue node-collapse UNDER CUDA-GRAPH REPLAY (the real production path).
+//
+// The #898 megakernel NO-GO's mechanism (1) was: "CUDA-graph replay already
+// removes the per-launch overhead." Glue node-collapse (Batty, optimizer.rs)
+// targets that SAME launch overhead, and the Phase B 85.6% glue-fusion recovery
+// was measured EAGER (each launch pays its full launch cost). Under the
+// production decode path every op is a node in a CAPTURED graph replayed each
+// token, so the launch cost is largely pre-paid. This probe measures whether
+// collapsing the ~22-op glue chain into one launch recovers anything UNDER
+// REPLAY, not eager — the kill-gate before staffing a multi-week optimizer.rs
+// node-collapse pass.
+//
+// Method: build BOTH (a) the per-op glue sequence and (b) the fused single
+// launch, capture EACH into its own CUDA graph, and time graph replay (median
+// >=200 iters, CUDA events). Report eager A/B (reference) vs under-replay A/B
+// (the operative number), plus a trivial-launch graph (G nodes vs 1 node) to
+// isolate residual per-node replay cost. Throwaway `#[ignore]`.
+// ===========================================================================
+#[test]
+#[ignore = "requires a CUDA device; run with --ignored --nocapture"]
+fn glue_collapse_replay_gate_probe() {
+    use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
+
+    let ep = match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
+        Ok(Ok(ep)) => ep,
+        _ => {
+            eprintln!("[mk8] no CUDA runtime; skipping");
+            return;
+        }
+    };
+    let runtime = ep.runtime();
+    runtime
+        .require_nvrtc_half_headers("glue-replay-gate")
+        .expect("bf16 NVRTC headers");
+    let stream = runtime.stream().clone();
+    let ctx = stream.context().clone();
+
+    let hidden = env_usize("NXRT_MK_HIDDEN", 6656);
+    let glue_ops = env_usize("NXRT_MK_GLUE_OPS", 22);
+    let iters = env_usize("NXRT_MK_ITERS", 200);
+    let layers = env_usize("NXRT_MK_LAYERS", 52);
+
+    let trivial = runtime.nvrtc_function(MODULE, SRC, "trivial").unwrap();
+    let glue = runtime.nvrtc_function(MODULE, SRC, "glue_op").unwrap();
+    let fused = runtime.nvrtc_function(MODULE, SRC, "glue_fused").unwrap();
+
+    let block = 256u32;
+    let grid = (hidden as u32).div_ceil(block);
+    let cfg = LaunchConfig {
+        grid_dim: (grid, 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let cfg1 = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (1, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    let scratch = runtime.alloc_raw(std::mem::size_of::<i32>()).unwrap();
+    let buf_bytes = hidden * std::mem::size_of::<u16>();
+    let buf = runtime.alloc_raw(buf_bytes).unwrap();
+    let seed_bf16: u16 = 0x2E66; // ~0.1 in bf16
+    let seed = vec![seed_bf16; hidden];
+    let seed_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(seed.as_ptr().cast(), std::mem::size_of_val(seed.as_slice()))
+    };
+    unsafe { runtime.htod(seed_bytes, buf).unwrap() };
+
+    let time_ms = |launch: &mut dyn FnMut()| -> f32 {
+        let start = ctx
+            .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+            .unwrap();
+        let end = ctx
+            .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+            .unwrap();
+        start.record(&stream).unwrap();
+        launch();
+        end.record(&stream).unwrap();
+        start.elapsed_ms(&end).unwrap()
+    };
+
+    // Eager launch closures (reference — same as Phase B).
+    let launch_glue_eager = |k: usize| {
+        let mut b = stream.launch_builder(&glue);
+        let n = hidden as i32;
+        let bias = 0.0f32;
+        b.arg(&buf).arg(&n).arg(&bias);
+        for _ in 0..k {
+            unsafe { b.launch(cfg) }.unwrap();
+        }
+    };
+    let launch_fused_eager = || {
+        let mut b = stream.launch_builder(&fused);
+        let n = hidden as i32;
+        let bias = 0.0f32;
+        let reps = glue_ops as i32;
+        b.arg(&buf).arg(&n).arg(&bias).arg(&reps);
+        unsafe { b.launch(cfg) }.unwrap();
+    };
+
+    // --- Capture helper: run `body` under stream capture, instantiate a graph.
+    let capture = |body: &mut dyn FnMut()| {
+        stream
+            .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+            .expect("begin capture");
+        body();
+        stream
+            .end_capture(CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH)
+            .expect("end capture")
+            .expect("graph built")
+    };
+
+    // Build the three graphs: per-op glue (G nodes), fused glue (1 node), and
+    // the launch-floor pair (G trivial nodes vs 1 trivial node) to isolate any
+    // residual per-node replay cost independent of memory traffic.
+    let g_glue = capture(&mut || launch_glue_eager(glue_ops));
+    let g_fused = capture(&mut || launch_fused_eager());
+    let g_triv_k = capture(&mut || {
+        let mut b = stream.launch_builder(&trivial);
+        b.arg(&scratch);
+        for _ in 0..glue_ops {
+            unsafe { b.launch(cfg1) }.unwrap();
+        }
+    });
+    let g_triv_1 = capture(&mut || {
+        let mut b = stream.launch_builder(&trivial);
+        b.arg(&scratch);
+        unsafe { b.launch(cfg1) }.unwrap();
+    });
+    g_glue.upload().ok();
+    g_fused.upload().ok();
+    runtime.synchronize().unwrap();
+
+    let median_replay = |g: &cudarc::driver::CudaGraph| -> f32 {
+        // warm
+        for _ in 0..8 {
+            g.launch().unwrap();
+        }
+        runtime.synchronize().unwrap();
+        let mut s = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            s.push(time_ms(&mut || {
+                g.launch().unwrap();
+            }));
+        }
+        runtime.synchronize().unwrap();
+        median(s)
+    };
+    let median_eager = |launch: &mut dyn FnMut()| -> f32 {
+        for _ in 0..8 {
+            launch();
+        }
+        runtime.synchronize().unwrap();
+        let mut s = Vec::with_capacity(iters);
+        for _ in 0..iters {
+            s.push(time_ms(launch));
+        }
+        runtime.synchronize().unwrap();
+        median(s)
+    };
+
+    // --- EAGER A/B (reference, reproduces Phase B under this harness) ---
+    let eager_glue_ms = median_eager(&mut || launch_glue_eager(glue_ops));
+    let eager_fused_ms = median_eager(&mut || launch_fused_eager());
+    let eager_recovered = (eager_glue_ms - eager_fused_ms) / eager_glue_ms * 100.0;
+    eprintln!(
+        "[mk8] EAGER  glue G={} @H={}: per-op {:.4} ms -> fused {:.4} ms => recovered {:.1}%",
+        glue_ops, hidden, eager_glue_ms, eager_fused_ms, eager_recovered
+    );
+
+    // --- UNDER-REPLAY A/B (the operative number) ---
+    let replay_glue_ms = median_replay(&g_glue);
+    let replay_fused_ms = median_replay(&g_fused);
+    let replay_recovered = (replay_glue_ms - replay_fused_ms) / replay_glue_ms * 100.0;
+    eprintln!(
+        "[mk8] REPLAY glue G={} @H={}: per-op {:.4} ms -> fused {:.4} ms => recovered {:.1}%",
+        glue_ops, hidden, replay_glue_ms, replay_fused_ms, replay_recovered
+    );
+
+    // --- launch-floor under replay: G trivial nodes vs 1 trivial node ---
+    let replay_triv_k = median_replay(&g_triv_k);
+    let replay_triv_1 = median_replay(&g_triv_1);
+    let per_node_replay_us = (replay_triv_k - replay_triv_1) / (glue_ops as f32 - 1.0) * 1000.0;
+    eprintln!(
+        "[mk8] REPLAY launch-floor: {} trivial nodes {:.4} ms vs 1 node {:.4} ms => \
+         {:.3} us/node residual replay cost",
+        glue_ops, replay_triv_k, replay_triv_1, per_node_replay_us
+    );
+
+    // --- numerics: per-op graph vs fused graph, single replay each, reseeded ---
+    unsafe { runtime.htod(seed_bytes, buf).unwrap() };
+    g_glue.launch().unwrap();
+    runtime.synchronize().unwrap();
+    let mut unfused_out = vec![0u8; buf_bytes];
+    unsafe { runtime.dtoh(&mut unfused_out, buf).unwrap() };
+    unsafe { runtime.htod(seed_bytes, buf).unwrap() };
+    g_fused.launch().unwrap();
+    runtime.synchronize().unwrap();
+    let mut fused_out = vec![0u8; buf_bytes];
+    unsafe { runtime.dtoh(&mut fused_out, buf).unwrap() };
+    let read_bf16 = |bytes: &[u8], i: usize| -> f32 {
+        let raw = u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]);
+        half::bf16::from_bits(raw).to_f32()
+    };
+    let mut max_abs = 0.0f32;
+    for i in 0..hidden {
+        max_abs = max_abs.max((read_bf16(&unfused_out, i) - read_bf16(&fused_out, i)).abs());
+    }
+    eprintln!(
+        "[mk8] numerics per-op-graph vs fused-graph max_abs={:.3e} (bf16 round-trip drift only)",
+        max_abs
+    );
+
+    // --- whole-model projection under replay ---
+    // Baseline captured decode ~21.4 ms/token (Phase A). Per-op glue time under
+    // replay across 52 layers is the recoverable envelope; the fused version is
+    // what a perfect optimizer.rs node-collapse would leave.
+    let glue_per_token_replay = replay_glue_ms * layers as f32;
+    let fused_per_token_replay = replay_fused_ms * layers as f32;
+    let baseline_tok_ms = 21.4f32;
+    let saved_ms = glue_per_token_replay - fused_per_token_replay;
+    let proj_tok_ms = (baseline_tok_ms - saved_ms).max(0.1);
+    let base_tps = 1000.0 / baseline_tok_ms;
+    let proj_tps = 1000.0 / proj_tok_ms;
+    eprintln!(
+        "[mk8] projection UNDER REPLAY: glue {:.3} ms/token -> fused {:.3} ms/token \
+         (52 layers), saves {:.3} ms/token; {:.2} -> {:.2} tok/s (+{:.1}%)",
+        glue_per_token_replay,
+        fused_per_token_replay,
+        saved_ms,
+        base_tps,
+        proj_tps,
+        (proj_tps - base_tps) / base_tps * 100.0
+    );
+
+    // --- verdict ---
+    if replay_recovered < 10.0 {
+        eprintln!(
+            "[mk8] === VERDICT: under graph replay, glue node-collapse recovers only {:.1}% \
+             ({:.3} ms/token, ~{:.1}% of the 21.4 ms token) => NO-GO: launches are already \
+             amortized by replay; decode is at its latency floor. STOP the decode push. ===",
+            replay_recovered,
+            saved_ms,
+            saved_ms / baseline_tok_ms * 100.0
+        );
+    } else {
+        eprintln!(
+            "[mk8] === VERDICT: under graph replay, glue node-collapse still recovers {:.1}% \
+             ({:.3} ms/token) => GO: graph replay does NOT make per-node dispatch free \
+             (~{:.2} us/node residual floor survives replay); collapsing ~{} glue nodes/layer \
+             into fewer fused launches removes it with an ordinary launch (no grid.sync tax, \
+             unlike the #898 megakernel). Hand Batty a costed optimizer.rs node-collapse plan. ===",
+            replay_recovered, saved_ms, per_node_replay_us, glue_ops
+        );
+    }
+
+    unsafe {
+        runtime.free_raw(scratch).unwrap();
+        runtime.free_raw(buf).unwrap();
+    }
+    assert!(
+        max_abs < 5e-2,
+        "fused vs per-op drifted beyond bf16 round-trip"
+    );
+    assert!(replay_glue_ms > 0.0 && replay_fused_ms > 0.0);
+}
