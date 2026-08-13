@@ -89,6 +89,7 @@ static KERNEL_EXECUTE_WITHOUT_WORKSPACE: AtomicUsize = AtomicUsize::new(0);
 static KERNEL_MUL_EXECUTED: AtomicUsize = AtomicUsize::new(0);
 static KERNEL_PERSISTENT_DECLINED: AtomicUsize = AtomicUsize::new(0);
 static KERNEL_PERSISTENT_DOWNGRADED: AtomicUsize = AtomicUsize::new(0);
+static KERNEL_WORKSPACE_PLANS: AtomicUsize = AtomicUsize::new(0);
 
 /// When set, `WorkspaceAddKernel` declares a `SessionPersistent` workspace.
 static PERSISTENT_WORKSPACE: AtomicBool = AtomicBool::new(false);
@@ -176,6 +177,14 @@ counter_export!(
      `KernelContext_GetScratchBuffer` memory when `Compute` returns, so that \
      block is recycled behind the kernel's back on the next `Run`."
 );
+counter_export!(
+    nxrt_mock_shared_ep_workspace_plans,
+    KERNEL_WORKSPACE_PLANS,
+    "Cumulative `Kernel::workspace_requirement` calls the executor actually \
+     made. Stands in for the cuBLASLt heuristic search the CUDA GEMM kernels \
+     run inside that method: repeated `Run`s of an unchanged shape must not \
+     grow this counter, or every decode step pays for planning it already did."
+);
 
 /// Select the workspace lifetime the mock `Add` kernel declares.
 ///
@@ -201,6 +210,7 @@ pub extern "C" fn nxrt_mock_shared_ep_reset_counters() {
         &KERNEL_MUL_EXECUTED,
         &KERNEL_PERSISTENT_DECLINED,
         &KERNEL_PERSISTENT_DOWNGRADED,
+        &KERNEL_WORKSPACE_PLANS,
     ] {
         c.store(0, Ordering::SeqCst);
     }
@@ -421,6 +431,11 @@ impl Kernel for WorkspaceAddKernel {
         &self,
         inputs: &[TensorMetadata<'_>],
     ) -> EpResult<WorkspaceRequirement> {
+        // Stands in for the cuBLASLt heuristic search a real CUDA GEMM kernel
+        // runs here. The executor must not repeat it for a shape it has already
+        // planned; `workspace_plans_do_not_repeat_for_an_unchanged_shape`
+        // asserts on this counter.
+        KERNEL_WORKSPACE_PLANS.fetch_add(1, Ordering::SeqCst);
         let numel: usize = inputs
             .first()
             .map(|m| m.shape.iter().product())
@@ -447,10 +462,12 @@ impl Kernel for WorkspaceAddKernel {
         workspace: Option<WorkspaceView>,
     ) -> EpResult<()> {
         if PERSISTENT_WORKSPACE.load(Ordering::SeqCst) {
-            // Mirrors a real persistent-declaring kernel (GroupQueryAttention,
-            // MatMulNBits' bf16 arena): the executor has no session-persistent
-            // device arena, so it must decline with `None` and let the kernel
-            // fall back to scratch it owns and controls the lifetime of.
+            // Mirrors a real persistent-declaring kernel with a self-owned
+            // fallback (`GroupQueryAttention`, or `StandardAttention` on its
+            // single-token decode geometry): the executor has no
+            // session-persistent device arena, so it must decline with `None`
+            // and let the kernel fall back to scratch it owns and controls the
+            // lifetime of.
             if workspace.is_some() {
                 KERNEL_PERSISTENT_DOWNGRADED.fetch_add(1, Ordering::SeqCst);
                 return Err(EpError::KernelFailed(

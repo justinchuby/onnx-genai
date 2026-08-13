@@ -15,6 +15,7 @@
 
 use std::collections::HashSet;
 use std::ffi::c_void;
+use std::sync::{Mutex, PoisonError};
 
 use onnx_genai_ort_sys as ort;
 use onnx_runtime_ep_api::kernel::{
@@ -697,6 +698,174 @@ impl IntermediateBuf {
 // ExportedComputeInfo
 // ──────────────────────────────────────────────────────────────────────────────
 
+// ──────────────────────────────────────────────────────────────────────────────
+// Workspace plan cache
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// One operand's contribution to a [`WorkspaceSignature`] — exactly the three
+/// fields a kernel sees in [`TensorMetadata`], and nothing else.
+///
+/// It must stay exactly those three: `Kernel::workspace_requirement` is handed
+/// `TensorMetadata { dtype, shape, present }`, so two dispatches whose operands
+/// agree on all three are indistinguishable to the kernel, and any field the key
+/// drops is a way to serve a plan computed for different operands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OperandKey {
+    dtype: DataType,
+    present: bool,
+    shape: Vec<usize>,
+}
+
+impl OperandKey {
+    fn matches(&self, metadata: &TensorMetadata<'_>) -> bool {
+        self.dtype == metadata.dtype
+            && self.present == metadata.present
+            && self.shape.as_slice() == metadata.shape
+    }
+}
+
+/// Owned copy of the metadata a [`WorkspaceRequirement`] was computed from.
+type WorkspaceSignature = Vec<OperandKey>;
+
+fn signature_matches(signature: &WorkspaceSignature, metadata: &[TensorMetadata<'_>]) -> bool {
+    signature.len() == metadata.len()
+        && signature
+            .iter()
+            .zip(metadata)
+            .all(|(key, meta)| key.matches(meta))
+}
+
+fn signature_of(metadata: &[TensorMetadata<'_>]) -> WorkspaceSignature {
+    metadata
+        .iter()
+        .map(|meta| OperandKey {
+            dtype: meta.dtype,
+            present: meta.present,
+            shape: meta.shape.to_vec(),
+        })
+        .collect()
+}
+
+/// How many distinct operand signatures one node remembers a plan for.
+///
+/// Sized for the shapes a decoder actually alternates between (prefill, one or
+/// two decode extents, a padded variant) with headroom, while staying small
+/// enough that a linear scan under the lock is cheaper than the planning call it
+/// avoids. Overflow is a miss, never a wrong answer.
+const WORKSPACE_PLAN_CACHE_CAPACITY: usize = 8;
+
+/// Memoizes `Kernel::workspace_requirement` per node, keyed by the exact
+/// operand metadata the requirement was derived from.
+///
+/// # Why this exists
+///
+/// `prepare_workspace` must ask the kernel what it needs before it can decide
+/// whether it can serve it. For the cuBLASLt-backed CUDA kernels (`MatMul`,
+/// `Gemm`, `FusedEpilogue`, `MatMulNBits`' f32 dequant path) answering that
+/// question runs a full `cublasLtMatmulAlgoGetHeuristic` search — and because
+/// those kernels declare `WorkspaceLifetime::SessionPersistent`, which this
+/// executor declines, the kernel then plans a *second* time inside its own
+/// `execute`. Every node of every decode step paid for two heuristic searches
+/// and used one.
+///
+/// The kernel-side re-plan cannot be removed from here: `plan_gemm` returns the
+/// selected algorithm and matrix layouts, not just a byte count, and the kernel
+/// re-derives and re-validates the size it was handed rather than trusting the
+/// executor. So the duplicate is removed on the executor side instead, by not
+/// re-asking a question whose answer cannot have changed.
+///
+/// # Correctness
+///
+/// * The key is the full operand metadata (dtype, presence, shape) for every
+///   operand, so a hit is only possible when the kernel would be asked exactly
+///   the same question. Dynamic shapes, dtype changes and optional-input
+///   presence changes are all misses.
+/// * Nothing is shared between nodes: each `CompiledKernelEntry` gets its own
+///   cache, so one node's plan can never be served to another.
+/// * The lock is never held across the kernel call, so concurrent `Run`s on the
+///   same session plan in parallel; a duplicated concurrent computation is
+///   harmless because it produces the same value.
+/// * Planning errors are never cached — a failing `workspace_requirement` is
+///   re-raised on every dispatch, exactly as before.
+/// * A poisoned lock is recovered with `PoisonError::into_inner`, matching
+///   `EpHandle::with` and `release_ep_factory_with_teardown`: a panic in some
+///   unrelated dispatch must not turn every later dispatch into a hard error.
+///
+/// # What this assumes of the kernel
+///
+/// That `workspace_requirement` is a function of the operand metadata alone for
+/// a given kernel instance. That is the contract the native session executor
+/// already relies on (it plans once during prepare and reuses the reservation
+/// for every later `Run`), and it holds for every kernel in this workspace.
+/// A kernel that violates it is not silently mis-served: the CUDA consumers
+/// re-derive their requirement in `execute_with_workspace` and reject a
+/// workspace that is too small (`governed_workspace_ptr`, `std_attention_carve`,
+/// `gqa` sub-range carving) rather than reading past the end.
+struct WorkspacePlanCache {
+    plans: Mutex<Vec<(WorkspaceSignature, WorkspaceRequirement)>>,
+}
+
+impl WorkspacePlanCache {
+    fn new() -> Self {
+        Self {
+            plans: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Look up the plan for `metadata`, computing and remembering it on a miss.
+    fn get_or_plan(
+        &self,
+        metadata: &[TensorMetadata<'_>],
+        plan: impl FnOnce() -> Result<WorkspaceRequirement, String>,
+    ) -> Result<WorkspaceRequirement, String> {
+        if let Some(hit) = self.lookup(metadata) {
+            return Ok(hit);
+        }
+        let requirement = plan()?;
+        self.remember(signature_of(metadata), requirement);
+        Ok(requirement)
+    }
+
+    fn lookup(&self, metadata: &[TensorMetadata<'_>]) -> Option<WorkspaceRequirement> {
+        let mut plans = self.plans.lock().unwrap_or_else(PoisonError::into_inner);
+        let idx = plans
+            .iter()
+            .position(|(signature, _)| signature_matches(signature, metadata))?;
+        // Move-to-front so the hot signature stays ahead of a one-off prefill
+        // shape once the cache is full.
+        let entry = plans.remove(idx);
+        let requirement = entry.1;
+        plans.insert(0, entry);
+        Some(requirement)
+    }
+
+    fn remember(&self, signature: WorkspaceSignature, requirement: WorkspaceRequirement) {
+        let mut plans = self.plans.lock().unwrap_or_else(PoisonError::into_inner);
+        // A concurrent dispatch may have inserted the same signature while this
+        // one was planning. Overwrite rather than duplicate: both computed the
+        // same answer from the same metadata.
+        if let Some(slot) = plans
+            .iter_mut()
+            .find(|(existing, _)| *existing == signature)
+        {
+            slot.1 = requirement;
+            return;
+        }
+        if plans.len() >= WORKSPACE_PLAN_CACHE_CAPACITY {
+            plans.pop();
+        }
+        plans.insert(0, (signature, requirement));
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.plans
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+}
+
 /// Heap-allocated compute info whose raw pointer is returned as
 /// `OrtNodeComputeInfo*`.
 ///
@@ -708,6 +877,10 @@ pub struct ExportedComputeInfo {
     pub entries: Vec<CompiledKernelEntry>,
     /// Optional routing table for multi-node fused subgraphs.
     pub routing: Option<SubgraphRouting>,
+    /// One [`WorkspacePlanCache`] per entry in `entries`, same index. Built in
+    /// [`ExportedComputeInfo::new`] so it is always exactly as long as
+    /// `entries`.
+    workspace_plans: Vec<WorkspacePlanCache>,
 }
 
 /// Per-session state created by `CreateState`.
@@ -717,6 +890,7 @@ struct ComputeState {
 
 impl ExportedComputeInfo {
     pub fn new(entries: Vec<CompiledKernelEntry>) -> Self {
+        let workspace_plans = entries.iter().map(|_| WorkspacePlanCache::new()).collect();
         Self {
             vtable: ort::OrtNodeComputeInfo {
                 ort_version_supported: ort::ORT_API_VERSION,
@@ -726,12 +900,20 @@ impl ExportedComputeInfo {
             },
             entries,
             routing: None,
+            workspace_plans,
         }
     }
 
     /// Attach a subgraph routing table (for multi-node fused subgraphs).
     pub fn set_routing(&mut self, routing: SubgraphRouting) {
         self.routing = Some(routing);
+    }
+
+    /// Plan cache for node `idx`. `None` when the index is out of range, which
+    /// a caller must treat as a hard error rather than by planning uncached:
+    /// a length mismatch means the two vectors have drifted.
+    fn workspace_plan_cache(&self, idx: usize) -> Option<&WorkspacePlanCache> {
+        self.workspace_plans.get(idx)
     }
 }
 
@@ -752,10 +934,16 @@ unsafe extern "C" fn compute_create_state(
     result.unwrap_or_else(|_| fail_status("CreateState: internal panic"))
 }
 
-/// Returns the `OrtMemoryInfo*` of the EP's tensor memory, read from input 0's
-/// `OrtValue`. For a device EP (CUDA) this is device memory; for the CPU EP it
-/// is host memory. Used to allocate intermediate scratch on the correct device
-/// so multi-node fused subgraphs keep their intermediates where the kernels run.
+/// Returns the `OrtMemoryInfo*` of the EP's tensor memory, read from **fused
+/// subgraph input 0**'s `OrtValue`. For a device EP (CUDA) this is device
+/// memory; for the CPU EP it is host memory.
+///
+/// This is the memory info intermediate buffers are allocated against — the
+/// exact derivation #832 validated on H200 — and it is deliberately unchanged
+/// here. It is a *subgraph*-level fact, not a per-node one: for a fused
+/// multi-node subgraph, node `k > 0` may take none of its operands from ORT.
+/// The per-node derivation used for kernel workspaces is
+/// [`operand_mem_info`]; see its docs for what is and is not guaranteed.
 ///
 /// Returns `None` when there are no inputs or the memory info cannot be read; in
 /// that case callers fall back to host-owned intermediate buffers.
@@ -767,10 +955,23 @@ unsafe fn device_mem_info(
     api: &ort::OrtApi,
     ctx: *mut ort::OrtKernelContext,
 ) -> Option<*const ort::OrtMemoryInfo> {
+    unsafe { ort_input_mem_info(api, ctx, 0) }
+}
+
+/// Memory info of the `OrtValue` bound to kernel-context input `index`.
+///
+/// # Safety
+///
+/// `api` must be valid and `ctx` a valid `OrtKernelContext*`.
+unsafe fn ort_input_mem_info(
+    api: &ort::OrtApi,
+    ctx: *mut ort::OrtKernelContext,
+    index: usize,
+) -> Option<*const ort::OrtMemoryInfo> {
     let get_input = api.KernelContext_GetInput?;
     let get_mem_info = api.GetTensorMemoryInfo?;
     let mut value: *const ort::OrtValue = std::ptr::null();
-    let status = unsafe { get_input(ctx, 0, &mut value) };
+    let status = unsafe { get_input(ctx, index, &mut value) };
     if !status.is_null() || value.is_null() {
         return None;
     }
@@ -780,6 +981,94 @@ unsafe fn device_mem_info(
         return None;
     }
     Some(mem_info)
+}
+
+/// Where one node's operands live, as far as ORT will tell us.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OperandMemInfo {
+    /// Every ORT-bound operand of this node reported the same memory info (or
+    /// there was exactly one, so there was nothing to disagree with).
+    Uniform(*const ort::OrtMemoryInfo),
+    /// This node binds no ORT operand at all — in a fused subgraph every one of
+    /// its inputs comes from an intermediate buffer, which was allocated
+    /// against the subgraph-level [`device_mem_info`]. That is then the right
+    /// answer for this node too, and it is what is carried here.
+    FromIntermediates(*const ort::OrtMemoryInfo),
+    /// The memory device could not be read (no inputs, or ORT refused).
+    Unavailable,
+    /// Two ORT-bound operands of the same node reported **different** memory
+    /// infos, so "the device this node runs on" is not determined by its
+    /// operands. Carries the two kernel-context input indices that disagreed.
+    Divergent { first: usize, other: usize },
+}
+
+/// Derive the memory device of **one node's own operands**.
+///
+/// `ort_operands` lists the kernel-context input indices this node actually
+/// reads, in node-operand order, with absent optional operands and
+/// intermediate-buffer operands already filtered out. `subgraph_fallback` is
+/// [`device_mem_info`], used only when the node binds no ORT operand at all.
+///
+/// # What this guarantees, and what it does not
+///
+/// It guarantees the returned memory info is the one ORT reported for an
+/// operand **of this node** — not, as before, for input 0 of the whole fused
+/// subgraph, which for node `k > 0` may be a different tensor on a different
+/// device entirely.
+///
+/// When the node binds more than one ORT operand, every one of them is compared
+/// against the first with `OrtApi::CompareMemoryInfo`, and a disagreement is
+/// reported as [`OperandMemInfo::Divergent`] rather than resolved by guessing.
+/// This is a real check on real handles, not an assumption: mixed-device
+/// operands are legal in ORT (an op may declare `OrtMemTypeCPUInput` for a
+/// small control operand), and in that case the operands genuinely do not
+/// determine where the kernel's compute runs.
+///
+/// If `CompareMemoryInfo` is unavailable on the host API, a multi-operand node
+/// reports [`OperandMemInfo::Unavailable`] — no comparison is claimed that was
+/// not performed. A single-operand node never needs the comparator.
+///
+/// # Safety
+///
+/// `api` must be valid and `ctx` a valid `OrtKernelContext*`.
+unsafe fn operand_mem_info(
+    api: &ort::OrtApi,
+    ctx: *mut ort::OrtKernelContext,
+    ort_operands: &[usize],
+    subgraph_fallback: Option<*const ort::OrtMemoryInfo>,
+) -> OperandMemInfo {
+    let Some((&first_idx, rest)) = ort_operands.split_first() else {
+        return match subgraph_fallback {
+            Some(ptr) => OperandMemInfo::FromIntermediates(ptr),
+            None => OperandMemInfo::Unavailable,
+        };
+    };
+    let Some(first) = (unsafe { ort_input_mem_info(api, ctx, first_idx) }) else {
+        return OperandMemInfo::Unavailable;
+    };
+    if rest.is_empty() {
+        return OperandMemInfo::Uniform(first);
+    }
+    let Some(compare) = api.CompareMemoryInfo else {
+        return OperandMemInfo::Unavailable;
+    };
+    for &idx in rest {
+        let Some(other) = (unsafe { ort_input_mem_info(api, ctx, idx) }) else {
+            return OperandMemInfo::Unavailable;
+        };
+        let mut equal: std::os::raw::c_int = 0;
+        let status = unsafe { compare(first, other, &mut equal) };
+        if !status.is_null() {
+            return OperandMemInfo::Unavailable;
+        }
+        if equal != 0 {
+            return OperandMemInfo::Divergent {
+                first: first_idx,
+                other: idx,
+            };
+        }
+    }
+    OperandMemInfo::Uniform(first)
 }
 
 /// Allocates `bytes` of scratch memory via ORT for the given `mem_info`. The
@@ -820,15 +1109,28 @@ unsafe fn alloc_scratch(
 ///
 /// The workspace has to live on the device the kernel runs on. The mechanism
 /// that was hardware-validated on H200 in #832 for fused-subgraph intermediates
-/// is [`alloc_scratch`] (`OrtApi::KernelContext_GetScratchBuffer`) against the
-/// memory info of the kernel's own operands, so workspaces reuse exactly that
-/// path: ORT owns the bytes for the duration of the `Compute` call, which is
-/// precisely a step-scoped workspace's lifetime, and this executor never issues
-/// a device free. A per-dispatch `ExecutionProvider::allocate`/`deallocate`
-/// pair would instead put a synchronous `cuMemAlloc`/`cuMemFree` on every node
-/// of every decode step — the exact cost #832 removed from `MatMulNBits` with a
-/// cached grow-only arena — and a device free is illegal during CUDA-graph
-/// capture.
+/// is [`alloc_scratch`] (`OrtApi::KernelContext_GetScratchBuffer`), so
+/// workspaces reuse exactly that path: ORT owns the bytes for the duration of
+/// the `Compute` call, which is precisely a step-scoped workspace's lifetime,
+/// and this executor never issues a device free. A per-dispatch
+/// `ExecutionProvider::allocate`/`deallocate` pair would instead put a
+/// synchronous `cuMemAlloc`/`cuMemFree` on every node of every decode step —
+/// the exact cost #832 removed from `MatMulNBits` with a cached grow-only
+/// arena — and a device free is illegal during CUDA-graph capture.
+///
+/// # Where the workspace is placed
+///
+/// Against the memory info of **this node's own ORT-bound operands**, derived
+/// by [`operand_mem_info`], not against input 0 of the fused subgraph. When the
+/// node binds several ORT operands they are compared with
+/// `OrtApi::CompareMemoryInfo` and a disagreement is an error, not a guess.
+/// A node whose operands are all intermediate buffers inherits the
+/// subgraph-level memory info those buffers were allocated from, which is the
+/// same device by construction.
+///
+/// Every failure to determine the device is a hard error *for a request that
+/// needs serving*, never a silent host allocation: a device kernel handed host
+/// memory dereferences it as device memory.
 ///
 /// # Alignment
 ///
@@ -837,47 +1139,87 @@ unsafe fn alloc_scratch(
 /// over-allocation** (`bytes + alignment - 1`) followed by align-up inside the
 /// returned block. Every arithmetic step is checked and the aligned window is
 /// re-verified to lie inside the allocation before it is handed out.
+/// [`alloc_scratch`] already rejects a null block, so there is exactly one
+/// null check on this path.
+///
+/// # Planning cost
+///
+/// The requirement is memoized per node by [`WorkspacePlanCache`], keyed on the
+/// exact operand metadata. Without it, a `SessionPersistent` declarer whose
+/// `workspace_requirement` runs a cuBLASLt heuristic search (`MatMul`, `Gemm`,
+/// `FusedEpilogue`, `MatMulNBits`' f32 dequant path) paid for that search here,
+/// had the result declined, and then paid for it a second time inside its own
+/// `execute` — twice per node per decode step. See [`WorkspacePlanCache`] for
+/// the correctness argument.
 ///
 /// # Lifetimes
 ///
 /// * [`WorkspaceLifetime::StepScoped`] — served from ORT scratch, as above.
+///   The step-scoped consumers in `onnx-runtime-ep-cuda` are the default-domain
+///   `Attention` Phase-2a scratch and `StandardAttention` whenever it is *not*
+///   a single-token, single-batch decode (`batch == 1 && q_seq == 1`) — i.e.
+///   prefill and batched dispatch.
 /// * [`WorkspaceLifetime::SessionPersistent`] — **explicitly declined**
 ///   (`Ok(None)`), never downgraded. ORT reclaims scratch when `Compute`
 ///   returns, so serving a persistent request from it would hand the kernel
 ///   memory that is recycled behind its back on the next `Run`. There is no
 ///   session-persistent device arena at this seam, so the request is passed
-///   through as `None` and the kernel decides: it either falls back to its own
-///   documented self-owned scratch (`GroupQueryAttentionKernel::execute`'s
-///   pooled reference-score slot, `StandardAttention`'s pooled score/staged-K/V
-///   scratch, `MatMulNBits`'s bf16 `Bf16Scratch` arena from #832) or fails
-///   closed in its own `execute_with_workspace`, where it knows the answer.
-///   This seam must not guess.
+///   through as `None` and the kernel decides. This seam must not guess.
 ///
-///   Not every persistent declarer has a self-owned path: `BlockQuantizedMoE`
-///   and `IndexShare` hard-error without executor-provided persistent memory,
-///   as does `MatMulNBits`'s f32 dequant-cuBLASLt path. Those already fail this
-///   way on the plugin path on `main`, so declining neither fixes nor worsens
-///   them; supporting them requires a real persistent arena here.
+/// ## What declining actually does, per declarer
 ///
-///   Declining is what preserves #832's H200-validated plugin path: on `main`
-///   the executor called bare `Kernel::execute`, and
-///   [`Kernel::execute_with_workspace`] defaults to forwarding there, so `None`
-///   reproduces `main` node for node. Hard-failing here would instead have
-///   turned every GQA-bearing model into a plugin-path error on hardware that
-///   runs it today.
+/// Declining is **not** uniformly a self-owned fallback. Every
+/// `SessionPersistent` declarer in `onnx-runtime-ep-cuda`, and what each does
+/// with `None`:
 ///
-/// `mem_info` is `None` when the memory device of the kernel's operands could
-/// not be read; a workspace request is then rejected rather than served from
-/// host memory that a device kernel would dereference.
+/// * **Self-owned fallback — correct, no error.**
+///   * `GroupQueryAttention` (`group_query_attention.rs`): the composite
+///     request (scores, packed Q/K/V staging, BSH↔BNSH transposes) is served
+///     from its own pooled `GqaWorkspace` slots.
+///   * `StandardAttention` (`standard_attention.rs`), single-token single-batch
+///     decode only — every other geometry is `StepScoped` and *is* served: the
+///     score and staged-K/V scratch is pooled or per-call inside `run`.
+///   * `MatMulNBits` bf16 activations: the `Bf16Scratch` staging arena is
+///     always self-owned and is listed here only because it is easy to assume
+///     otherwise — that path declares [`WorkspaceRequirement::NONE`], so it is
+///     unaffected by the decline in either direction.
+/// * **Hard error, but only when the cuBLASLt heuristic asks for bytes.**
+///   `MatMul`, `Gemm`, `FusedEpilogue` and `MatMulNBits`' f32
+///   dequant-cuBLASLt path all route through
+///   `blas::governed_workspace_requirement`, which reports
+///   [`WorkspaceRequirement::NONE`] when the heuristic selects **0** bytes and
+///   `SessionPersistent` otherwise. On the declined path
+///   `blas::governed_workspace_ptr` returns `Ok(0)` for a 0-byte requirement
+///   and errors — *"governed cuBLASLt workspace requires N bytes, but none was
+///   supplied"* — for a non-zero one. Which of the two happens is a property of
+///   the algorithm cuBLASLt picks for that shape, dtype, device and library
+///   version, not a static property of the kernel; many decode-shaped GEMMs
+///   select 0 bytes and are unaffected.
+/// * **Unconditional hard error.** `BlockQuantizedMoE`
+///   (`block_quantized_moe.rs`) and `IndexShare` (`index_share.rs`) declare
+///   `SessionPersistent` for every geometry and have no self-owned path; both
+///   their `execute` and their `execute_with_workspace(None)` return an error.
+///
+/// Declining is what preserves #832's H200-validated plugin path: on `main`
+/// the executor called bare `Kernel::execute`, and
+/// [`Kernel::execute_with_workspace`] defaults to forwarding there, so `None`
+/// reproduces `main` node for node — including for the kernels that error,
+/// which error on `main` too. Hard-failing here instead would have turned every
+/// GQA-bearing model into a plugin-path error on hardware that runs it today.
+/// The cost of declining is that `BlockQuantizedMoE`, `IndexShare`, and any
+/// GEMM whose heuristic asks for workspace bytes remain **incompatible with the
+/// plugin path**; making them work needs a real session-persistent device arena
+/// at this seam, which is future work and is not claimed here.
 ///
 /// # Safety
 ///
-/// `api`, `ctx` and `mem_info` must be valid.
+/// `api`, `ctx` and the pointer inside `mem_info` must be valid.
 unsafe fn prepare_workspace(
     api: &ort::OrtApi,
     ctx: *mut ort::OrtKernelContext,
-    mem_info: Option<*const ort::OrtMemoryInfo>,
+    mem_info: OperandMemInfo,
     kernel: &dyn Kernel,
+    plans: &WorkspacePlanCache,
     inputs: &[TensorView<'_>],
     node_label: &str,
 ) -> Result<Option<WorkspaceView>, String> {
@@ -885,9 +1227,11 @@ unsafe fn prepare_workspace(
         .iter()
         .map(|v| TensorMetadata::new(v.dtype, v.shape, !v.is_absent()))
         .collect();
-    let requirement: WorkspaceRequirement = kernel
-        .workspace_requirement(&metadata)
-        .map_err(|e| format!("{node_label}: workspace_requirement failed: {e}"))?;
+    let requirement: WorkspaceRequirement = plans.get_or_plan(&metadata, || {
+        kernel
+            .workspace_requirement(&metadata)
+            .map_err(|e| format!("{node_label}: workspace_requirement failed: {e}"))
+    })?;
     if requirement.bytes == 0 {
         return Ok(None);
     }
@@ -917,23 +1261,33 @@ unsafe fn prepare_workspace(
     let total =
         workspace_block_bytes(bytes, alignment).map_err(|e| format!("{node_label}: {e}"))?;
 
-    let mem_info = mem_info.ok_or_else(|| {
-        format!(
-            "{node_label}: kernel requires {bytes} bytes of {alignment}-byte-aligned workspace, \
-             but the memory device of its operands could not be read, so the workspace cannot be \
-             placed where the kernel runs. Failing closed rather than handing a device kernel \
-             host memory."
-        )
-    })?;
+    let mem_info = match mem_info {
+        OperandMemInfo::Uniform(ptr) | OperandMemInfo::FromIntermediates(ptr) => ptr,
+        OperandMemInfo::Unavailable => {
+            return Err(format!(
+                "{node_label}: kernel requires {bytes} bytes of {alignment}-byte-aligned \
+                 workspace, but the memory device of its operands could not be read, so the \
+                 workspace cannot be placed where the kernel runs. Failing closed rather than \
+                 handing a device kernel host memory."
+            ));
+        }
+        OperandMemInfo::Divergent { first, other } => {
+            return Err(format!(
+                "{node_label}: kernel requires {bytes} bytes of {alignment}-byte-aligned \
+                 workspace, but its operands do not agree on a memory device: kernel-context \
+                 inputs {first} and {other} report different OrtMemoryInfo (CompareMemoryInfo). \
+                 The operands therefore do not determine where this kernel's compute runs. \
+                 Failing closed rather than guessing a device."
+            ));
+        }
+    };
 
     let base = unsafe { alloc_scratch(api, ctx, mem_info, total) }
         .map_err(|e| format!("{node_label}: workspace scratch allocation failed: {e}"))?;
 
-    if base.is_null() {
-        return Err(format!(
-            "{node_label}: workspace scratch allocation returned a null pointer"
-        ));
-    }
+    // `alloc_scratch` already rejects a null block, so no second null check
+    // here: a duplicated guard reads as two independent defences and is really
+    // one, which is worse than none for a reviewer counting them.
     let aligned = align_workspace_window(base as usize, total, bytes, alignment)
         .map_err(|e| format!("{node_label}: {e}"))?;
 
@@ -996,13 +1350,19 @@ fn align_workspace_window(
 /// Every dispatch goes through [`prepare_workspace`] →
 /// [`Kernel::execute_with_workspace`], never bare [`Kernel::execute`]. A kernel
 /// declaring a non-zero [`WorkspaceLifetime::StepScoped`] requirement gets
-/// correctly-aligned scratch on the same memory device as its operands, taken
-/// from ORT (`KernelContext_GetScratchBuffer`) and reclaimed by ORT when
-/// `Compute` returns — the same mechanism #832 validated on an H200 for fused
-/// subgraph intermediates. A [`WorkspaceLifetime::SessionPersistent`] request
-/// is **declined** (`None`), never downgraded to recycled step-scoped memory.
+/// correctly-aligned scratch on the memory device reported by **that node's own
+/// ORT-bound operands** (see [`operand_mem_info`]), taken from ORT
+/// (`KernelContext_GetScratchBuffer`) and reclaimed by ORT when `Compute`
+/// returns — the same mechanism #832 validated on an H200 for fused subgraph
+/// intermediates. A [`WorkspaceLifetime::SessionPersistent`] request is
+/// **declined** (`None`), never downgraded to recycled step-scoped memory; see
+/// [`prepare_workspace`] for the per-kernel consequences of that decline.
 /// Kernels declaring [`WorkspaceRequirement::NONE`] behave exactly as before:
 /// `execute_with_workspace`'s default forwards to `execute`.
+///
+/// Intermediate buffers keep #832's derivation — the subgraph-level
+/// [`device_mem_info`] — deliberately unchanged, since that is the allocation
+/// that ran on hardware.
 ///
 /// # Safety
 ///
@@ -1267,12 +1627,38 @@ unsafe extern "C" fn compute_execute(
                 };
 
                 let node_label = format!("Compute: node {node_idx}");
+                let plans = match exported.workspace_plan_cache(node_idx) {
+                    Some(plans) => plans,
+                    None => {
+                        return fail_status(&format!(
+                            "{node_label}: no workspace plan cache for this node (entries and \
+                             workspace_plans have drifted)"
+                        ));
+                    }
+                };
+                // This node's own ORT-bound operands — not subgraph input 0.
+                let node_ort_operands: Vec<usize> = sources
+                    .iter()
+                    .filter_map(|src| match src {
+                        NodeInputSource::Ort(i) => Some(*i),
+                        NodeInputSource::Buffer(_) | NodeInputSource::Absent => None,
+                    })
+                    .collect();
+                let node_mem_info = unsafe {
+                    operand_mem_info(
+                        api_ref,
+                        kernel_context,
+                        &node_ort_operands,
+                        scratch_mem_info,
+                    )
+                };
                 let workspace = match unsafe {
                     prepare_workspace(
                         api_ref,
                         kernel_context,
-                        scratch_mem_info,
+                        node_mem_info,
                         &*entry.kernel,
+                        plans,
                         &kernel_inputs,
                         &node_label,
                     )
@@ -1410,12 +1796,34 @@ unsafe extern "C" fn compute_execute(
                     }
                 }
             }
+            let plans = match exported.workspace_plan_cache(0) {
+                Some(plans) => plans,
+                None => {
+                    return fail_status(
+                        "Compute: node 0: no workspace plan cache for this node (entries and \
+                         workspace_plans have drifted)",
+                    );
+                }
+            };
+            // The single-node subgraph's operands are this node's operands, but
+            // only the present ones are ORT-bound.
+            let node_ort_operands: Vec<usize> =
+                entry.input_slots.iter().flatten().copied().collect();
+            let node_mem_info = unsafe {
+                operand_mem_info(
+                    api_ref,
+                    kernel_context,
+                    &node_ort_operands,
+                    scratch_mem_info,
+                )
+            };
             let workspace = match unsafe {
                 prepare_workspace(
                     api_ref,
                     kernel_context,
-                    scratch_mem_info,
+                    node_mem_info,
                     &*entry.kernel,
+                    plans,
                     &kernel_inputs,
                     "Compute: node 0",
                 )
@@ -3361,5 +3769,402 @@ mod workspace_math_tests {
         // aligning up leaves fewer than 64 bytes.
         let err = align_workspace_window(0x1001, 64, 64, 256).expect_err("must reject");
         assert!(err.contains("escapes"), "got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod workspace_plan_cache_tests {
+    //! Falsifiers for [`WorkspacePlanCache`].
+    //!
+    //! The cache exists to stop `prepare_workspace` re-running an expensive
+    //! `Kernel::workspace_requirement` (a cuBLASLt heuristic search on the CUDA
+    //! GEMM kernels) on every dispatch of a shape it has already planned. Every
+    //! test here therefore asserts on the **observed number of planning calls**
+    //! and on **which requirement was returned** — never on a summary of the
+    //! cache's own state — so a cache that silently returns the wrong plan
+    //! cannot pass by reporting a plausible hit count.
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use onnx_runtime_ep_api::kernel::{TensorMetadata, WorkspaceRequirement};
+    use onnx_runtime_ir::DataType;
+
+    use super::{WORKSPACE_PLAN_CACHE_CAPACITY, WorkspacePlanCache};
+
+    fn requirement(bytes: u64) -> WorkspaceRequirement {
+        WorkspaceRequirement {
+            bytes,
+            alignment: 256,
+            ..WorkspaceRequirement::NONE
+        }
+    }
+
+    /// Stands in for a kernel whose `workspace_requirement` is expensive: it
+    /// counts how many times it actually ran and derives the answer from the
+    /// metadata, so a stale hit is visible as a wrong byte count.
+    struct CountingPlanner {
+        calls: AtomicUsize,
+    }
+
+    impl CountingPlanner {
+        fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        /// Derive a distinct answer for every distinguishable metadata list, so
+        /// serving one signature's plan for another is detectable by value.
+        fn plan(&self, metadata: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut bytes = 0u64;
+            for meta in metadata {
+                let numel: usize = meta.shape.iter().product();
+                let elem = meta.dtype.byte_size().max(1);
+                let present = u64::from(meta.present);
+                bytes += (numel * elem) as u64 * present;
+            }
+            Ok(requirement(bytes.max(1)))
+        }
+    }
+
+    fn meta<'a>(dtype: DataType, shape: &'a [usize], present: bool) -> TensorMetadata<'a> {
+        TensorMetadata::new(dtype, shape, present)
+    }
+
+    /// The point of the cache: the second dispatch of an unchanged shape must
+    /// not re-run the planner. Falsifier — delete the lookup and the call count
+    /// becomes 2.
+    #[test]
+    fn a_repeated_signature_plans_exactly_once() {
+        let cache = WorkspacePlanCache::new();
+        let planner = CountingPlanner::new();
+        let shape = [4usize, 8];
+        let metadata = [meta(DataType::Float32, &shape, true)];
+
+        let first = cache
+            .get_or_plan(&metadata, || planner.plan(&metadata))
+            .expect("plan");
+        for _ in 0..16 {
+            let again = cache
+                .get_or_plan(&metadata, || planner.plan(&metadata))
+                .expect("plan");
+            assert_eq!(
+                again, first,
+                "a cache hit must return the same requirement the planner produced"
+            );
+        }
+        assert_eq!(
+            planner.calls(),
+            1,
+            "16 dispatches of one unchanged shape must run the planner once, not 17"
+        );
+    }
+
+    /// A different shape is a different question. Falsifier — drop `shape` from
+    /// the key and the second call returns 128 bytes for a 256-byte geometry.
+    #[test]
+    fn a_changed_shape_is_replanned_and_not_served_stale() {
+        let cache = WorkspacePlanCache::new();
+        let planner = CountingPlanner::new();
+        let small = [4usize, 8];
+        let large = [4usize, 16];
+
+        let small_meta = [meta(DataType::Float32, &small, true)];
+        let large_meta = [meta(DataType::Float32, &large, true)];
+        let small_req = cache
+            .get_or_plan(&small_meta, || planner.plan(&small_meta))
+            .expect("plan");
+        let large_req = cache
+            .get_or_plan(&large_meta, || planner.plan(&large_meta))
+            .expect("plan");
+
+        assert_eq!(small_req.bytes, 4 * 8 * 4);
+        assert_eq!(
+            large_req.bytes,
+            4 * 16 * 4,
+            "the larger geometry must get its own plan, not the smaller one's"
+        );
+        assert_eq!(planner.calls(), 2);
+
+        // And both remain individually correct once cached.
+        assert_eq!(
+            cache
+                .get_or_plan(&small_meta, || planner.plan(&small_meta))
+                .expect("plan"),
+            small_req
+        );
+        assert_eq!(
+            cache
+                .get_or_plan(&large_meta, || planner.plan(&large_meta))
+                .expect("plan"),
+            large_req
+        );
+        assert_eq!(planner.calls(), 2, "both shapes must now be cached");
+    }
+
+    /// Same shape, different dtype: the workspace of an f32 GEMM is not the
+    /// workspace of an f16 one. Falsifier — drop `dtype` from the key and this
+    /// returns the f32 size for f16 operands.
+    #[test]
+    fn a_changed_dtype_is_replanned_and_not_served_stale() {
+        let cache = WorkspacePlanCache::new();
+        let planner = CountingPlanner::new();
+        let shape = [64usize];
+
+        let f32_meta = [meta(DataType::Float32, &shape, true)];
+        let f16_meta = [meta(DataType::Float16, &shape, true)];
+        let f32_req = cache
+            .get_or_plan(&f32_meta, || planner.plan(&f32_meta))
+            .expect("plan");
+        let f16_req = cache
+            .get_or_plan(&f16_meta, || planner.plan(&f16_meta))
+            .expect("plan");
+
+        assert_eq!(f32_req.bytes, 64 * 4);
+        assert_eq!(
+            f16_req.bytes,
+            64 * 2,
+            "an f16 dispatch must not be served the f32 plan"
+        );
+        assert_eq!(planner.calls(), 2);
+    }
+
+    /// Optional-input presence changes the requirement for real kernels
+    /// (`MatMulNBits` charges the cuBLASLt epilogue only when `bias` is bound;
+    /// `GroupQueryAttention` charges packed staging only for packed QKV).
+    /// Falsifier — drop `present` from the key and the absent-bias dispatch is
+    /// served the with-bias plan.
+    #[test]
+    fn a_changed_presence_is_replanned_and_not_served_stale() {
+        let cache = WorkspacePlanCache::new();
+        let planner = CountingPlanner::new();
+        let a = [16usize];
+        let bias = [16usize];
+
+        let with_bias = [
+            meta(DataType::Float32, &a, true),
+            meta(DataType::Float32, &bias, true),
+        ];
+        let without_bias = [
+            meta(DataType::Float32, &a, true),
+            meta(DataType::Float32, &bias, false),
+        ];
+        let with = cache
+            .get_or_plan(&with_bias, || planner.plan(&with_bias))
+            .expect("plan");
+        let without = cache
+            .get_or_plan(&without_bias, || planner.plan(&without_bias))
+            .expect("plan");
+
+        assert_eq!(with.bytes, 16 * 4 * 2);
+        assert_eq!(
+            without.bytes,
+            16 * 4,
+            "an absent optional operand must not be served the plan that charged for it"
+        );
+        assert_eq!(planner.calls(), 2);
+    }
+
+    /// A different operand count is a different question too — an arity change
+    /// must never collide with a prefix of a longer signature.
+    #[test]
+    fn a_changed_operand_count_is_replanned() {
+        let cache = WorkspacePlanCache::new();
+        let planner = CountingPlanner::new();
+        let shape = [8usize];
+
+        let one = [meta(DataType::Float32, &shape, true)];
+        let two = [
+            meta(DataType::Float32, &shape, true),
+            meta(DataType::Float32, &shape, true),
+        ];
+        let one_req = cache
+            .get_or_plan(&one, || planner.plan(&one))
+            .expect("plan");
+        let two_req = cache
+            .get_or_plan(&two, || planner.plan(&two))
+            .expect("plan");
+
+        assert_eq!(one_req.bytes, 8 * 4);
+        assert_eq!(two_req.bytes, 8 * 4 * 2);
+        assert_eq!(planner.calls(), 2);
+    }
+
+    /// Overflowing the capacity must degrade to re-planning, never to a wrong
+    /// answer. Falsifier — evict by overwriting an arbitrary slot instead of
+    /// the least-recently-used one and the returned bytes stop matching the
+    /// signature that asked.
+    #[test]
+    fn exceeding_capacity_still_answers_every_signature_correctly() {
+        let cache = WorkspacePlanCache::new();
+        let planner = CountingPlanner::new();
+        let shapes: Vec<[usize; 1]> = (1..=(WORKSPACE_PLAN_CACHE_CAPACITY * 3))
+            .map(|n| [n])
+            .collect();
+
+        for _ in 0..3 {
+            for shape in &shapes {
+                let metadata = [meta(DataType::Float32, shape.as_slice(), true)];
+                let got = cache
+                    .get_or_plan(&metadata, || planner.plan(&metadata))
+                    .expect("plan");
+                assert_eq!(
+                    got.bytes,
+                    (shape[0] * 4) as u64,
+                    "signature {shape:?} was served another signature's plan"
+                );
+            }
+        }
+        assert!(
+            cache.len() <= WORKSPACE_PLAN_CACHE_CAPACITY,
+            "the cache must stay bounded, found {} entries",
+            cache.len()
+        );
+    }
+
+    /// The hot signature must survive a one-off shape (a single prefill step
+    /// among many decode steps). Falsifier — remove the move-to-front on hit
+    /// and the interleaved decode signature is evicted, so the planner runs
+    /// once per iteration instead of once in total.
+    #[test]
+    fn the_hot_signature_survives_a_flood_of_one_off_shapes() {
+        let cache = WorkspacePlanCache::new();
+        let planner = CountingPlanner::new();
+        let hot = [4096usize];
+        let hot_meta = [meta(DataType::Float32, &hot, true)];
+
+        cache
+            .get_or_plan(&hot_meta, || planner.plan(&hot_meta))
+            .expect("plan");
+        let after_hot = planner.calls();
+
+        for n in 1..=(WORKSPACE_PLAN_CACHE_CAPACITY - 1) {
+            let cold = [n];
+            let cold_meta = [meta(DataType::Float32, &cold, true)];
+            cache
+                .get_or_plan(&cold_meta, || planner.plan(&cold_meta))
+                .expect("plan");
+            // Touch the hot signature between cold ones, as decode does.
+            cache
+                .get_or_plan(&hot_meta, || planner.plan(&hot_meta))
+                .expect("plan");
+        }
+        assert_eq!(
+            planner.calls(),
+            after_hot + (WORKSPACE_PLAN_CACHE_CAPACITY - 1),
+            "only the cold signatures may have been planned; the hot one must have stayed cached"
+        );
+    }
+
+    /// A planning error must reach the caller and must not be remembered: the
+    /// next dispatch has to ask again, exactly as it did before the cache
+    /// existed. Falsifier — cache the error and the second call count stays 1.
+    #[test]
+    fn a_planning_error_is_propagated_and_never_cached() {
+        let cache = WorkspacePlanCache::new();
+        let calls = AtomicUsize::new(0);
+        let shape = [2usize];
+        let metadata = [meta(DataType::Float32, &shape, true)];
+
+        for expected in 1..=3 {
+            let err = cache
+                .get_or_plan(&metadata, || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err("cuBLASLt heuristic found no algorithm".to_string())
+                })
+                .expect_err("the planner failed, so the dispatch must fail");
+            assert!(err.contains("no algorithm"), "got: {err}");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                expected,
+                "a failed plan must not be remembered as an answer"
+            );
+        }
+    }
+
+    /// Concurrent `Run`s share one `ExportedComputeInfo`, so they share this
+    /// cache. Every thread must get the plan for *its own* signature.
+    ///
+    /// Falsifier — replace the keyed store with a single last-plan slot and
+    /// threads start reading each other's requirements; this asserts on the
+    /// value, so that shows up as a wrong byte count rather than as a hit-rate
+    /// change nobody notices.
+    #[test]
+    fn concurrent_dispatches_never_read_each_others_plans() {
+        let cache = Arc::new(WorkspacePlanCache::new());
+        let planner = Arc::new(CountingPlanner::new());
+        let threads: Vec<_> = (1usize..=8)
+            .map(|id| {
+                let cache = Arc::clone(&cache);
+                let planner = Arc::clone(&planner);
+                std::thread::spawn(move || {
+                    for _ in 0..200 {
+                        let shape = [id * 32];
+                        let metadata = [meta(DataType::Float32, shape.as_slice(), true)];
+                        let got = cache
+                            .get_or_plan(&metadata, || planner.plan(&metadata))
+                            .expect("plan");
+                        assert_eq!(
+                            got.bytes,
+                            (id * 32 * 4) as u64,
+                            "thread {id} was served another thread's plan"
+                        );
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("no thread may panic");
+        }
+        assert!(
+            cache.len() <= WORKSPACE_PLAN_CACHE_CAPACITY,
+            "the cache must stay bounded under concurrency, found {} entries",
+            cache.len()
+        );
+        assert!(
+            planner.calls() < 8 * 200,
+            "the cache must still be doing work under concurrency, saw {} plans for 1600 \
+             dispatches",
+            planner.calls()
+        );
+    }
+
+    /// A poisoned lock must not turn every later dispatch into a hard error —
+    /// the same `PoisonError::into_inner` policy the EP handle and the factory
+    /// teardown use. Falsifier — swap to `.lock().unwrap()` and this panics.
+    #[test]
+    fn a_poisoned_cache_lock_is_recovered_not_propagated() {
+        let cache = Arc::new(WorkspacePlanCache::new());
+        let planner = CountingPlanner::new();
+        let shape = [12usize];
+        let metadata = [meta(DataType::Float32, &shape, true)];
+        cache
+            .get_or_plan(&metadata, || planner.plan(&metadata))
+            .expect("plan");
+
+        let poisoner = {
+            let cache = Arc::clone(&cache);
+            std::thread::spawn(move || {
+                let _guard = cache.plans.lock().expect("not yet poisoned");
+                panic!("poison the cache lock");
+            })
+        };
+        assert!(poisoner.join().is_err(), "the poisoning thread must panic");
+
+        let got = cache
+            .get_or_plan(&metadata, || planner.plan(&metadata))
+            .expect("a poisoned lock must not fail the dispatch");
+        assert_eq!(got.bytes, 12 * 4);
+        assert_eq!(
+            planner.calls(),
+            1,
+            "the cached plan must survive the poisoning"
+        );
     }
 }

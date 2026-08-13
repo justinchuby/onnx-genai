@@ -862,3 +862,237 @@ fn session_persistent_workspace_is_declined_not_downgraded() {
     }
     fx.set_persistent_workspace(false);
 }
+
+/// Run a `[rows,4]` f32 `Add` model on a dynamic-batch fixture and return the
+/// flattened output.
+///
+/// # Safety
+/// `api`/`session` must be valid.
+unsafe fn run_rows_x4(
+    api: *const ort::OrtApi,
+    session: *mut ort::OrtSession,
+    input_names: &[&CStr],
+    input_data: &[Vec<f32>],
+    rows: usize,
+    output_name: &CStr,
+) -> Vec<f32> {
+    assert_eq!(input_names.len(), input_data.len());
+    let mut mem_info: *mut ort::OrtMemoryInfo = ptr::null_mut();
+    let status = unsafe {
+        ((*api).CreateCpuMemoryInfo.unwrap())(
+            ort::OrtDeviceAllocator,
+            ort::OrtMemTypeDefault,
+            &mut mem_info,
+        )
+    };
+    unsafe { check_status(api, status, "CreateCpuMemoryInfo") };
+
+    let shape: [i64; 2] = [rows as i64, 4];
+    let mut owned: Vec<Vec<f32>> = input_data.to_vec();
+    let mut values: Vec<*mut ort::OrtValue> = Vec::with_capacity(owned.len());
+    for buf in owned.iter_mut() {
+        assert_eq!(buf.len(), rows * 4, "input buffer must match [rows,4]");
+        let mut v: *mut ort::OrtValue = ptr::null_mut();
+        let status = unsafe {
+            ((*api).CreateTensorWithDataAsOrtValue.unwrap())(
+                mem_info,
+                buf.as_mut_ptr().cast(),
+                buf.len() * std::mem::size_of::<f32>(),
+                shape.as_ptr(),
+                2,
+                ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+                &mut v,
+            )
+        };
+        unsafe { check_status(api, status, "CreateTensorWithDataAsOrtValue") };
+        values.push(v);
+    }
+
+    let name_ptrs: Vec<*const std::os::raw::c_char> =
+        input_names.iter().map(|n| n.as_ptr()).collect();
+    let const_values: Vec<*const ort::OrtValue> = values.iter().map(|v| *v as *const _).collect();
+    let out_names = [output_name.as_ptr()];
+    let mut output: *mut ort::OrtValue = ptr::null_mut();
+    let status = unsafe {
+        ((*api).Run.unwrap())(
+            session,
+            ptr::null(),
+            name_ptrs.as_ptr(),
+            const_values.as_ptr(),
+            const_values.len(),
+            out_names.as_ptr(),
+            1,
+            &mut output,
+        )
+    };
+    unsafe { check_status(api, status, "Run") };
+    assert!(!output.is_null(), "Run produced a null output value");
+
+    let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
+    let status = unsafe { ((*api).GetTensorMutableData.unwrap())(output, &mut data_ptr) };
+    unsafe { check_status(api, status, "GetTensorMutableData") };
+    let result = unsafe { std::slice::from_raw_parts(data_ptr as *const f32, rows * 4) }.to_vec();
+
+    unsafe { ((*api).ReleaseValue.unwrap())(output) };
+    for v in values {
+        unsafe { ((*api).ReleaseValue.unwrap())(v) };
+    }
+    unsafe { ((*api).ReleaseMemoryInfo.unwrap())(mem_info) };
+    result
+}
+
+/// Repeated `Run`s of an unchanged shape must plan the workspace once.
+///
+/// `Kernel::workspace_requirement` is where the CUDA GEMM kernels run a
+/// `cublasLtMatmulAlgoGetHeuristic` search. Before the executor memoized it,
+/// every dispatch ran that search, had the result declined as
+/// `SessionPersistent`, and then the kernel ran it a *second* time inside
+/// `execute` — twice per node per decode step, for one usable plan.
+///
+/// Falsifier: delete `WorkspacePlanCache::lookup` (or key it on anything the
+/// kernel cannot see) and this counter grows by one per `Run`, so `plans_total`
+/// becomes `plans_after_first * RUNS` and the assertion fails with the exact
+/// numbers.
+#[test]
+fn workspace_plans_do_not_repeat_for_an_unchanged_shape() {
+    let _lock = lock_ort_ep();
+    let Some(fx) = Fixture::acquire("workspace_plans_do_not_repeat") else {
+        return;
+    };
+    fx.reset_counters();
+    let api = fx.api;
+    let model = fixture_model("add_1x4");
+    let reg_name = CString::new("shared_mock_plan_cache").unwrap();
+    const RUNS: usize = 12;
+
+    unsafe {
+        let env = create_env_with_plugin(api, "nxrt_shared_plan_cache", &reg_name, &fx.plugin_path);
+        let device = find_our_ep_device(api, env);
+        let (session, options) = create_session_on_our_ep(api, env, device, &model);
+
+        let first = run_1x4(
+            api,
+            session,
+            &[c"X", c"Y"],
+            &[[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]],
+            c"Z",
+        );
+        assert_close(first, [6.0, 8.0, 10.0, 12.0], "add_1x4 run 1");
+        let plans_after_first = fx.counter("nxrt_mock_shared_ep_workspace_plans");
+        assert!(
+            plans_after_first >= 1,
+            "the kernel was never asked for a workspace requirement, so this test proves nothing"
+        );
+
+        for run in 2..=RUNS {
+            let got = run_1x4(
+                api,
+                session,
+                &[c"X", c"Y"],
+                &[[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]],
+                c"Z",
+            );
+            assert_close(got, [6.0, 8.0, 10.0, 12.0], &format!("add_1x4 run {run}"));
+        }
+
+        let plans_total = fx.counter("nxrt_mock_shared_ep_workspace_plans");
+        assert_eq!(
+            plans_total, plans_after_first,
+            "{RUNS} Runs of one unchanged shape re-planned the workspace: {plans_total} plans \
+             where the first Run already needed {plans_after_first}. Each of those is a cuBLASLt \
+             heuristic search on the CUDA kernels."
+        );
+        assert!(
+            fx.counter("nxrt_mock_shared_ep_workspace_ok") >= RUNS,
+            "every Run must still have been served a real workspace: {} served for {RUNS} runs",
+            fx.counter("nxrt_mock_shared_ep_workspace_ok")
+        );
+        assert_eq!(
+            fx.counter("nxrt_mock_shared_ep_workspace_missing"),
+            0,
+            "caching the plan must never turn into serving no workspace"
+        );
+        assert_eq!(
+            fx.counter("nxrt_mock_shared_ep_alloc_calls"),
+            0,
+            "workspaces must still come from ORT scratch, not per-dispatch EP allocate/free"
+        );
+
+        ((*api).ReleaseSession.unwrap())(session);
+        ((*api).ReleaseSessionOptions.unwrap())(options);
+        let status = ((*api).UnregisterExecutionProviderLibrary.unwrap())(env, reg_name.as_ptr());
+        check_status(api, status, "UnregisterExecutionProviderLibrary");
+        ((*api).ReleaseEnv.unwrap())(env);
+    }
+}
+
+/// A cached plan must never be served to a different shape.
+///
+/// Counter-test to the one above: on a dynamic-batch model, alternating between
+/// two row counts must re-plan on every *change* of shape (so the workspace is
+/// sized for the geometry that asked) while still avoiding a re-plan for a
+/// repeat of a shape already seen. The kernel writes `numel` f32 sums through
+/// the workspace and rejects one that is too small, so a stale 1-row plan
+/// served to a 3-row dispatch is a `Run` failure, not a silent pass.
+///
+/// Falsifier: drop `shape` from the cache key and the 3-row Run fails with
+/// *"workspace too small — need 48 bytes, got 16"*.
+#[test]
+fn a_changed_shape_gets_its_own_workspace_plan() {
+    let _lock = lock_ort_ep();
+    let Some(fx) = Fixture::acquire("changed_shape_gets_its_own_plan") else {
+        return;
+    };
+    fx.reset_counters();
+    let api = fx.api;
+    let model = fixture_model("add_dynamic_dim");
+    let reg_name = CString::new("shared_mock_dynamic_plan").unwrap();
+
+    unsafe {
+        let env = create_env_with_plugin(api, "nxrt_shared_dyn_plan", &reg_name, &fx.plugin_path);
+        let device = find_our_ep_device(api, env);
+        let (session, options) = create_session_on_our_ep(api, env, device, &model);
+
+        let mut expected_plans = 0usize;
+        // rows → (x, y) with a distinct value per element so a wrong-length
+        // workspace cannot accidentally produce the right answer.
+        for (round, rows) in [1usize, 3, 1, 3, 3, 1].into_iter().enumerate() {
+            let x: Vec<f32> = (0..rows * 4).map(|i| i as f32).collect();
+            let y: Vec<f32> = (0..rows * 4).map(|i| (i * 10) as f32).collect();
+            let want: Vec<f32> = x.iter().zip(&y).map(|(a, b)| a + b).collect();
+            let got = run_rows_x4(api, session, &[c"X", c"Y"], &[x, y], rows, c"Z");
+            assert_eq!(
+                got, want,
+                "round {round} (rows={rows}) produced the wrong sums, which is what a stale \
+                 workspace plan looks like when the buffer happens to be big enough"
+            );
+            // Rounds 0 and 1 are the first sighting of rows=1 and rows=3.
+            if round < 2 {
+                expected_plans += 1;
+            }
+            assert_eq!(
+                fx.counter("nxrt_mock_shared_ep_workspace_plans"),
+                expected_plans,
+                "round {round} (rows={rows}): expected {expected_plans} cumulative plans — one \
+                 per distinct shape, none for a repeat"
+            );
+        }
+
+        assert_eq!(
+            fx.counter("nxrt_mock_shared_ep_workspace_missing"),
+            0,
+            "every dispatch must have been served a workspace"
+        );
+        assert_eq!(
+            fx.counter("nxrt_mock_shared_ep_alloc_calls"),
+            0,
+            "dynamic shapes must not reintroduce per-dispatch EP allocate/free"
+        );
+
+        ((*api).ReleaseSession.unwrap())(session);
+        ((*api).ReleaseSessionOptions.unwrap())(options);
+        let status = ((*api).UnregisterExecutionProviderLibrary.unwrap())(env, reg_name.as_ptr());
+        check_status(api, status, "UnregisterExecutionProviderLibrary");
+        ((*api).ReleaseEnv.unwrap())(env);
+    }
+}
