@@ -19,7 +19,15 @@ environment aliases with zero code references.
 Every `ONNX_GENAI_*` or `NXRT_*` name appearing in `docs/` must either
 
 * appear somewhere in `crates/**/*.rs`, or
+* appear in a repository script (`scripts/**/*.{py,sh,ps1}`), or
 * be listed in `KNOWN_UNIMPLEMENTED` below, with a reason.
+
+Scripts count because a documented knob a repository runner reads is
+implemented, and the failure this gate exists to catch — a name a user can set
+with no error and no effect — is the same whether the reader is a crate or a
+runner. The allowlist is unaffected: no `KNOWN_UNIMPLEMENTED` entry appears in
+`scripts/`, so widening the search cannot turn an honest caveat into a false
+"implemented".
 
 Adding a variable to the allowlist is deliberate and reviewable. Forgetting to
 wire one up is not silent.
@@ -80,6 +88,9 @@ def main() -> int:
     repo = Path(__file__).resolve().parents[2]
     documented = collect(repo / "docs", "*.md")
     in_code = collect(repo / "crates", "*.rs")
+    for pattern in ("*.py", "*.sh", "*.ps1"):
+        for name, where in collect(repo / "scripts", pattern).items():
+            in_code.setdefault(name, set()).update(where)
 
     missing = {
         name: sorted(where)
