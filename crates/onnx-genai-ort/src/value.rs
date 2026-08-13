@@ -1226,7 +1226,7 @@ impl Value {
         Ok(())
     }
 
-    /// Create a no-copy CPU tensor alias over the prefix of an existing tensor.
+    /// Create a no-copy tensor alias over the prefix of an existing tensor.
     ///
     /// The returned OrtValue has its own shape but points at the same underlying
     /// tensor data as `owner`. `owner` is kept alive by the alias backing.
@@ -1247,7 +1247,9 @@ impl Value {
             )));
         }
         let data = tensor_data_ptr(owner.ptr.as_ptr())?;
-        let ptr = create_tensor_with_data(
+        let memory_info = tensor_memory_info(owner.ptr.as_ptr())?;
+        let ptr = create_tensor_with_data_at(
+            memory_info,
             data,
             alias_numel * owner.dtype.size_of(),
             shape,
@@ -1259,6 +1261,12 @@ impl Value {
             dtype: owner.dtype,
             backing: TensorBacking::Alias(owner),
         })
+    }
+
+    /// Convert an owned tensor into a no-copy alias with the requested shape.
+    #[allow(clippy::arc_with_non_send_sync)]
+    pub fn into_alias_with_shape(owner: Value, shape: &[i64]) -> Result<Self> {
+        Self::alias_with_shape(Arc::new(owner), shape)
     }
 
     /// If this value is a no-copy alias over a shared owner, produce another
@@ -1355,6 +1363,16 @@ fn create_tensor_with_data_in(
     dtype: DataType,
     memory_info: &MemoryInfo,
 ) -> Result<NonNull<onnx_genai_ort_sys::OrtValue>> {
+    create_tensor_with_data_at(memory_info.as_ptr(), data, bytes, shape, dtype)
+}
+
+fn create_tensor_with_data_at(
+    memory_info: *const onnx_genai_ort_sys::OrtMemoryInfo,
+    data: *mut std::ffi::c_void,
+    bytes: usize,
+    shape: &[i64],
+    dtype: DataType,
+) -> Result<NonNull<onnx_genai_ort_sys::OrtValue>> {
     let mut ptr = std::ptr::null_mut();
     let api = crate::error::api()?;
     let create = api
@@ -1365,7 +1383,7 @@ fn create_tensor_with_data_in(
     // the caller's contract for the external one. `shape` is valid for the call.
     crate::error::check_status(unsafe {
         create(
-            memory_info.as_ptr(),
+            memory_info,
             data,
             bytes,
             shape.as_ptr(),
@@ -1375,6 +1393,23 @@ fn create_tensor_with_data_in(
         )
     })?;
     NonNull::new(ptr).ok_or(OrtError::NullPointer)
+}
+
+fn tensor_memory_info(
+    value: *const onnx_genai_ort_sys::OrtValue,
+) -> Result<*const onnx_genai_ort_sys::OrtMemoryInfo> {
+    let api = crate::error::api()?;
+    let get_memory_info = api
+        .GetTensorMemoryInfo
+        .ok_or(OrtError::ApiUnavailable("GetTensorMemoryInfo"))?;
+    let mut memory_info = std::ptr::null();
+    // SAFETY: `value` is a valid tensor OrtValue and ORT owns the returned
+    // memory-info object for the tensor's lifetime.
+    crate::error::check_status(unsafe { get_memory_info(value, &mut memory_info) })?;
+    if memory_info.is_null() {
+        return Err(OrtError::NullPointer);
+    }
+    Ok(memory_info)
 }
 
 fn tensor_shape_and_type(
@@ -1928,7 +1963,7 @@ mod cuda_device_write_tests {
 
     const TINY_LLM: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../tests/fixtures/tiny-llm/model.onnx"
+        "/../../tests/fixtures/tiny-llm-sharedbuffer/model.onnx"
     );
 
     /// Build a CUDA session and return its device KV allocator together with the
@@ -2025,6 +2060,36 @@ mod cuda_device_write_tests {
         assert_eq!(&read_back[prefix.len()..], &[-1_i64, -1]);
 
         release_cuda_resources_in_order(tensor, allocator, session, env);
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA GPU + CUDA-enabled ONNX Runtime"]
+    fn cuda_alias_preserves_device_residency_without_copying() {
+        let Some((env, session, allocator, device_id)) = cuda_device_allocator() else {
+            return;
+        };
+        let owner = Value::empty_in(&[4], DataType::Int64, &allocator).expect("device allocation");
+        let bytes = [1_i64, 2, 3, 4]
+            .into_iter()
+            .flat_map(i64::to_ne_bytes)
+            .collect::<Vec<_>>();
+        crate::cuda_rt::memcpy_host_to_device(owner.data_ptr_addr().unwrap(), &bytes)
+            .expect("host-to-device copy");
+        let owner_ptr = owner.data_ptr_addr().unwrap();
+        let alias = Value::into_alias_with_shape(owner, &[2]).expect("device alias");
+        let alias_clone = alias
+            .try_alias_clone()
+            .expect("alias backing")
+            .expect("alias clone");
+        assert_eq!(alias.device_id().expect("alias device"), device_id);
+        assert_eq!(alias.data_ptr_addr().unwrap(), owner_ptr);
+        assert_eq!(alias_clone.data_ptr_addr().unwrap(), owner_ptr);
+        assert_eq!(read_device_i64(&alias, 2), vec![1, 2]);
+        drop(alias_clone);
+        drop(alias);
+        drop(allocator);
+        drop(session);
+        drop(env);
     }
 
     #[test]

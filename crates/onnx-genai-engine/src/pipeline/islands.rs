@@ -4,7 +4,9 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Context, bail};
-use onnx_genai_metadata::{ComponentImplementation, WorkflowComponent, WorkflowNode, WorkflowSpec};
+use onnx_genai_metadata::{
+    ComponentImplementation, KvStorageMode, WorkflowComponent, WorkflowNode, WorkflowSpec,
+};
 use onnx_genai_ort::{Allocator, IoBinding, Session, Value};
 use onnx_runtime_loader::proto::onnx::{
     GraphProto, ModelProto, TensorProto, TensorShapeProto, TypeProto, ValueInfoProto, tensor_proto,
@@ -62,6 +64,9 @@ pub(crate) struct ExecutionIsland {
     pub components: Vec<String>,
     pub inputs: BTreeMap<String, String>,
     pub outputs: BTreeMap<String, String>,
+    aliasable_output_values: HashSet<String>,
+    shared_buffer_inputs: HashMap<String, String>,
+    shared_buffer_output_values: HashSet<String>,
     fallback: WorkflowNode,
     session: Session,
     capture_eligible: bool,
@@ -93,6 +98,7 @@ pub(crate) struct ExecutionIsland {
     device_memory_min_free_bytes: Cell<Option<u64>>,
     total_run_ns: Cell<u128>,
     fallback_reason: RefCell<Option<String>>,
+    execution_generation: Cell<u64>,
 }
 
 struct StableIslandBinding {
@@ -101,9 +107,15 @@ struct StableIslandBinding {
     outputs: Vec<(String, Value)>,
     captured: bool,
     graph_id: i32,
+    service_generation: u64,
+    source_ptrs: Vec<usize>,
 }
 
 impl ExecutionIsland {
+    pub(crate) fn begin_execution(&self, generation: u64) {
+        self.execution_generation.set(generation);
+    }
+
     pub(crate) fn component_count(&self) -> usize {
         self.components.len()
     }
@@ -139,10 +151,26 @@ impl ExecutionIsland {
         &self.fallback
     }
 
-    fn clone_output_for_store(&self, output: &Value) -> anyhow::Result<Value> {
+    fn clone_output_for_store(&self, value_ref: &str, output: &Value) -> anyhow::Result<Value> {
+        // Stable binding outputs own their allocation for the lifetime of the
+        // island. Workflow SSA values only need a view until the next island
+        // invocation, so retain that allocation instead of allocating and
+        // copying every boundary tensor.
+        if self.session.cuda_device_id().is_some()
+            && self.aliasable_output_values.contains(value_ref)
+            && let Some(aliased) = output.try_alias_clone()
+        {
+            return aliased.map_err(|error| {
+                anyhow::anyhow!(
+                    "execution island {} could not alias a stable output: {error}",
+                    self.id
+                )
+            });
+        }
         let Some(device_id) = self.session.cuda_device_id() else {
             self.record_host_copy(output);
-            return clone_value(output);
+            return Value::from_raw_bytes(output.to_raw_bytes()?, output.shape(), output.dtype())
+                .map_err(Into::into);
         };
         let allocator = self.device_allocator.as_ref().with_context(|| {
             format!(
@@ -200,7 +228,7 @@ impl ExecutionIsland {
         component_overrides: &HashMap<String, String>,
     ) -> anyhow::Result<()> {
         let started = Instant::now();
-        self.record_device_memory();
+        self.record_device_memory_if_due();
         if self.uses_override(component_overrides) {
             bail!(
                 "execution island {} contains an application-overridden component; \
@@ -228,25 +256,42 @@ impl ExecutionIsland {
             .iter()
             .map(|(_, value)| (format!("{:?}", value.dtype()), value.shape().to_vec()))
             .collect::<Vec<_>>();
+        let source_ptrs = resolved
+            .iter()
+            .map(|(_, value)| value.data_ptr_addr())
+            .collect::<Result<Vec<_>, _>>()?;
         self.runs.set(self.runs.get() + 1);
 
         let mut bindings = self.bindings.borrow_mut();
         if let Some(stable) = bindings.get_mut(&signature) {
             self.stable_binding_runs
                 .set(self.stable_binding_runs.get() + 1);
-            for ((_, source), (_, destination)) in resolved.iter().zip(&stable.inputs) {
+            let reset_services = stable.service_generation != self.execution_generation.get();
+            for (index, ((name, source), (_, destination))) in
+                resolved.iter().zip(&stable.inputs).enumerate()
+            {
+                let source_ptr = source_ptrs[index];
+                let source_changed = stable.source_ptrs[index] != source_ptr;
+                let shared_service = self.shared_buffer_inputs.contains_key(*name);
+                if (shared_service && !reset_services) || (!shared_service && !source_changed) {
+                    continue;
+                }
                 self.record_copy(source, destination)?;
-                if let Some(device_id) = self.session.cuda_device_id() {
+                if source.numel() == 0 {
+                    continue;
+                } else if let Some(device_id) = self.session.cuda_device_id() {
                     destination.copy_from_cuda(source, device_id)?;
                 } else {
                     destination.copy_from_host(source)?;
                 }
+                stable.source_ptrs[index] = source_ptr;
             }
+            stable.service_generation = self.execution_generation.get();
             let replay = stable.captured;
             let capture_enabled = self.capture_eligible
                 && self.session.graph_capture()
                 && !self.capture_disabled.get();
-            let result = if capture_enabled {
+            let mut result = if capture_enabled {
                 self.record_device_synchronization();
                 self.session.synchronize_device()?;
                 self.session_runs.set(self.session_runs.get() + 1);
@@ -256,9 +301,18 @@ impl ExecutionIsland {
                 self.session_runs.set(self.session_runs.get() + 1);
                 self.session.run_with_binding(&stable.binding)
             };
+            if capture_enabled && let Err(capture_error) = result {
+                *self.fallback_reason.borrow_mut() = Some(format!(
+                    "island graph capture/replay failed; continuing with stable binding: \
+                     {capture_error}"
+                ));
+                self.capture_disabled.set(true);
+                self.session_runs.set(self.session_runs.get() + 1);
+                result = self.session.run_with_binding(&stable.binding);
+            }
             if let Err(error) = result {
                 *self.fallback_reason.borrow_mut() = Some(format!(
-                    "stable island binding/capture failed; executing eagerly: {error}"
+                    "stable island binding failed; executing eagerly: {error}"
                 ));
                 self.capture_disabled.set(true);
                 self.eager_runs.set(self.eager_runs.get() + 1);
@@ -278,7 +332,10 @@ impl ExecutionIsland {
             }
             for (port, output) in &stable.outputs {
                 let value_ref = &self.outputs[port];
-                values.insert(value_ref.clone(), self.clone_output_for_store(output)?);
+                values.insert(
+                    value_ref.clone(),
+                    self.clone_output_for_store(value_ref, output)?,
+                );
             }
             self.record_elapsed(started);
             return Ok(());
@@ -304,11 +361,31 @@ impl ExecutionIsland {
             for (name, source) in &resolved {
                 let stable = Value::empty_in(source.shape(), source.dtype(), allocator)?;
                 self.record_copy(source, &stable)?;
-                stable.copy_from_cuda(source, device_id)?;
+                if source.numel() != 0 {
+                    stable.copy_from_cuda(source, device_id)?;
+                }
                 binding.bind_input(name, &stable)?;
                 stable_inputs.push(((*name).to_string(), stable));
             }
             for name in self.session.output_names() {
+                if let Some(input_name) = self
+                    .shared_buffer_inputs
+                    .iter()
+                    .find_map(|(input, output)| (output == name).then_some(input))
+                {
+                    let input = stable_inputs
+                        .iter()
+                        .find_map(|(name, value)| (name == input_name).then_some(value))
+                        .with_context(|| {
+                            format!(
+                                "execution island {} shared output '{name}' has no stable input \
+                                 '{input_name}'",
+                                self.id
+                            )
+                        })?;
+                    binding.bind_output(name, input)?;
+                    continue;
+                }
                 if !self
                     .session
                     .bind_output_to_execution_device(&mut binding, name)?
@@ -331,6 +408,15 @@ impl ExecutionIsland {
             }
             let mut stable_outputs = Vec::new();
             for (name, output) in self.session.output_names().iter().zip(produced) {
+                if self
+                    .shared_buffer_inputs
+                    .values()
+                    .any(|shared| shared == name)
+                {
+                    continue;
+                }
+                let shape = output.shape().to_vec();
+                let output = Value::into_alias_with_shape(output, &shape)?;
                 binding.bind_output(name, &output)?;
                 stable_outputs.push((name.clone(), output));
             }
@@ -338,7 +424,10 @@ impl ExecutionIsland {
             self.next_graph_id.set(graph_id + 1);
             for (port, output) in &stable_outputs {
                 let value_ref = &self.outputs[port];
-                values.insert(value_ref.clone(), self.clone_output_for_store(output)?);
+                values.insert(
+                    value_ref.clone(),
+                    self.clone_output_for_store(value_ref, output)?,
+                );
             }
             self.record_stable_binding_bytes(&stable_inputs, &stable_outputs);
             bindings.insert(
@@ -349,6 +438,8 @@ impl ExecutionIsland {
                     outputs: stable_outputs,
                     captured: false,
                     graph_id,
+                    service_generation: self.execution_generation.get(),
+                    source_ptrs,
                 },
             );
             self.record_elapsed(started);
@@ -369,7 +460,10 @@ impl ExecutionIsland {
         }
         let mut stable_outputs = Vec::new();
         for (name, output) in self.session.output_names().iter().zip(&produced) {
-            let stable = Value::empty(output.shape(), output.dtype())?;
+            let stable = Value::into_alias_with_shape(
+                Value::empty(output.shape(), output.dtype())?,
+                output.shape(),
+            )?;
             self.record_host_copy(output);
             binding.bind_output(name, &stable)?;
             stable_outputs.push((name.clone(), stable));
@@ -385,6 +479,8 @@ impl ExecutionIsland {
                 outputs: stable_outputs,
                 captured: false,
                 graph_id,
+                service_generation: self.execution_generation.get(),
+                source_ptrs,
             },
         );
         self.store_outputs(values, produced)?;
@@ -393,9 +489,16 @@ impl ExecutionIsland {
     }
 
     fn record_elapsed(&self, started: Instant) {
-        self.record_device_memory();
+        self.record_device_memory_if_due();
         self.total_run_ns
             .set(self.total_run_ns.get() + started.elapsed().as_nanos());
+    }
+
+    fn record_device_memory_if_due(&self) {
+        let runs = self.runs.get();
+        if runs == 0 || runs.is_multiple_of(128) {
+            self.record_device_memory();
+        }
     }
 
     fn record_device_memory(&self) {
@@ -491,6 +594,9 @@ impl ExecutionIsland {
                     self.id
                 )
             })?;
+            if self.shared_buffer_output_values.contains(value_ref) {
+                continue;
+            }
             values.insert(value_ref.clone(), tensor);
         }
         Ok(())
@@ -510,11 +616,19 @@ pub(crate) fn plan_execution_islands(
     graph: &mut WorkflowNode,
     workflow: &WorkflowSpec,
     models: &onnx_genai_ort::PipelineModels,
+    aliasable_output_values: &HashSet<String>,
 ) -> anyhow::Result<Vec<ExecutionIsland>> {
     let mut uses = HashMap::<String, usize>::new();
     collect_value_uses(graph, &mut uses);
     let mut islands = Vec::new();
-    lower_node(graph, workflow, models, &uses, &mut islands)?;
+    lower_node(
+        graph,
+        workflow,
+        models,
+        &uses,
+        aliasable_output_values,
+        &mut islands,
+    )?;
     Ok(islands)
 }
 
@@ -523,12 +637,20 @@ fn lower_node(
     workflow: &WorkflowSpec,
     models: &onnx_genai_ort::PipelineModels,
     uses: &HashMap<String, usize>,
+    aliasable_output_values: &HashSet<String>,
     islands: &mut Vec<ExecutionIsland>,
 ) -> anyhow::Result<()> {
     match node {
         WorkflowNode::Sequence { nodes } => {
             for child in nodes.iter_mut() {
-                lower_node(child, workflow, models, uses, islands)?;
+                lower_node(
+                    child,
+                    workflow,
+                    models,
+                    uses,
+                    aliasable_output_values,
+                    islands,
+                )?;
             }
             let mut lowered = Vec::new();
             let mut index = 0;
@@ -561,6 +683,7 @@ fn lower_node(
                     workflow,
                     models,
                     uses,
+                    aliasable_output_values,
                 ) {
                     Ok(island) => {
                         let id = island.id;
@@ -585,15 +708,43 @@ fn lower_node(
             *nodes = lowered;
         }
         WorkflowNode::Loop { setup, body, .. } => {
-            lower_node(setup, workflow, models, uses, islands)?;
-            lower_node(body, workflow, models, uses, islands)?;
+            lower_node(
+                setup,
+                workflow,
+                models,
+                uses,
+                aliasable_output_values,
+                islands,
+            )?;
+            lower_node(
+                body,
+                workflow,
+                models,
+                uses,
+                aliasable_output_values,
+                islands,
+            )?;
         }
         WorkflowNode::Branch { cases, default, .. } => {
             for case in cases.values_mut() {
-                lower_node(case, workflow, models, uses, islands)?;
+                lower_node(
+                    case,
+                    workflow,
+                    models,
+                    uses,
+                    aliasable_output_values,
+                    islands,
+                )?;
             }
             if let Some(default) = default {
-                lower_node(default, workflow, models, uses, islands)?;
+                lower_node(
+                    default,
+                    workflow,
+                    models,
+                    uses,
+                    aliasable_output_values,
+                    islands,
+                )?;
             }
         }
         WorkflowNode::Invoke { .. }
@@ -732,6 +883,7 @@ fn build_execution_island(
     workflow: &WorkflowSpec,
     models: &onnx_genai_ort::PipelineModels,
     uses: &HashMap<String, usize>,
+    aliasable_output_values: &HashSet<String>,
 ) -> anyhow::Result<ExecutionIsland> {
     let internal_uses = invocations
         .iter()
@@ -753,6 +905,52 @@ fn build_execution_island(
         .cloned()
         .collect::<HashSet<_>>();
     let linked = link_models(id, &invocations, models, &boundary_outputs)?;
+    let mut shared_buffer_inputs = HashMap::new();
+    let mut shared_buffer_output_values = HashSet::new();
+    if let Some(serving) = &workflow.serving {
+        for group in serving
+            .kv_service
+            .groups
+            .values()
+            .filter(|group| group.storage == KvStorageMode::SharedBuffer)
+        {
+            for invocation in &invocations {
+                let Some(aliases) = group.ports.get(&invocation.component) else {
+                    continue;
+                };
+                for alias in aliases.values() {
+                    let Some(input_value) = invocation.inputs.get(&alias.input) else {
+                        continue;
+                    };
+                    let Some(output_value) = invocation.outputs.get(&alias.output) else {
+                        continue;
+                    };
+                    let input_name = linked
+                        .inputs
+                        .iter()
+                        .find_map(|(name, value)| (value == input_value).then_some(name.clone()))
+                        .with_context(|| {
+                            format!(
+                                "execution island {id} cannot bind shared KV input '{}.{}'",
+                                invocation.component, alias.input
+                            )
+                        })?;
+                    let output_name = linked
+                        .outputs
+                        .iter()
+                        .find_map(|(name, value)| (value == output_value).then_some(name.clone()))
+                        .with_context(|| {
+                            format!(
+                                "execution island {id} cannot bind shared KV output '{}.{}'",
+                                invocation.component, alias.output
+                            )
+                        })?;
+                    shared_buffer_inputs.insert(input_name, output_name);
+                    shared_buffer_output_values.insert(output_value.clone());
+                }
+            }
+        }
+    }
     let options = models.session_options();
     let capture_requested = options.graph_capture;
     let structurally_capture_eligible =
@@ -785,6 +983,9 @@ fn build_execution_island(
         components,
         inputs: linked.inputs,
         outputs: linked.outputs,
+        aliasable_output_values: aliasable_output_values.clone(),
+        shared_buffer_inputs,
+        shared_buffer_output_values,
         fallback: WorkflowNode::Sequence {
             nodes: invocations
                 .iter()
@@ -836,6 +1037,7 @@ fn build_execution_island(
         } else {
             None
         }),
+        execution_generation: Cell::new(0),
     })
 }
 
@@ -882,12 +1084,7 @@ fn link_models(
             .with_context(|| format!("component '{}' has no model path", invocation.component))?;
         let bytes = onnx_runtime_loader::read_model_binary(path)?;
         let mut source = ModelProto::decode(bytes.as_slice())?;
-        if !source.functions.is_empty() {
-            bail!(
-                "component '{}' contains model-local functions",
-                invocation.component
-            );
-        }
+        merge_local_functions(&mut model.functions, &mut source, id, index);
         model.ir_version = model.ir_version.max(source.ir_version);
         for import in source.opset_import.drain(..) {
             // A node serialized against an older schema is not automatically valid under a newer
@@ -1110,6 +1307,76 @@ fn alpha_rename_graph_dim_params(graph: &mut GraphProto, prefix: &str) {
     {
         if let Some(value_type) = &mut value_info.r#type {
             alpha_rename_type_dim_params(value_type, prefix, &mut symbols);
+        }
+    }
+}
+
+fn merge_local_functions(
+    target: &mut Vec<onnx_runtime_loader::proto::onnx::FunctionProto>,
+    source: &mut ModelProto,
+    island_id: usize,
+    component_index: usize,
+) {
+    let mut functions_to_add = Vec::new();
+    let mut function_names = HashMap::new();
+    for mut function in source.functions.drain(..) {
+        let key = (
+            function.domain.clone(),
+            function.name.clone(),
+            function.overload.clone(),
+        );
+        let existing = target.iter().find(|existing| {
+            existing.domain == function.domain
+                && existing.name == function.name
+                && existing.overload == function.overload
+        });
+        let selected_name = match existing {
+            Some(existing) if existing.encode_to_vec() == function.encode_to_vec() => {
+                function.name.clone()
+            }
+            Some(_) => format!(
+                "island{island_id}_component{component_index}__{}",
+                function.name
+            ),
+            None => function.name.clone(),
+        };
+        if existing.is_none() || selected_name != function.name {
+            function.name = selected_name.clone();
+            functions_to_add.push(function);
+        }
+        function_names.insert(key, selected_name);
+    }
+    if function_names.is_empty() {
+        return;
+    }
+    if let Some(graph) = source.graph.as_mut() {
+        rename_function_calls(&mut graph.node, &function_names);
+    }
+    for function in &mut functions_to_add {
+        rename_function_calls(&mut function.node, &function_names);
+    }
+    target.extend(functions_to_add);
+}
+
+fn rename_function_calls(
+    nodes: &mut [onnx_runtime_loader::proto::onnx::NodeProto],
+    names: &HashMap<(String, String, String), String>,
+) {
+    for node in nodes {
+        if let Some(name) = names.get(&(
+            node.domain.clone(),
+            node.op_type.clone(),
+            node.overload.clone(),
+        )) {
+            node.op_type = name.clone();
+        }
+        for attribute in &mut node.attribute {
+            if let Some(graph) = attribute.g.as_mut() {
+                rename_function_calls(&mut graph.node, names);
+            }
+            for graph in &mut attribute.graphs {
+                rename_function_calls(&mut graph.node, names);
+            }
         }
     }
 }
@@ -1346,5 +1613,51 @@ mod tests {
             (symbol(&second.input[0]).to_string(), 5_i64),
         ]);
         assert_eq!(runtime_extents.len(), 2);
+    }
+
+    #[test]
+    fn linker_preserves_unique_local_function_identity_and_renames_collisions() {
+        fn source(op_type: &str) -> ModelProto {
+            ModelProto {
+                graph: Some(GraphProto {
+                    node: vec![onnx_runtime_loader::proto::onnx::NodeProto {
+                        domain: "com.microsoft".into(),
+                        op_type: "SkipNorm".into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                functions: vec![onnx_runtime_loader::proto::onnx::FunctionProto {
+                    domain: "com.microsoft".into(),
+                    name: "SkipNorm".into(),
+                    node: vec![onnx_runtime_loader::proto::onnx::NodeProto {
+                        op_type: op_type.into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+        }
+
+        let mut linked = ModelProto::default();
+        let mut first = source("Add");
+        merge_local_functions(&mut linked.functions, &mut first, 0, 0);
+        assert_eq!(linked.functions[0].name, "SkipNorm");
+        assert_eq!(first.graph.unwrap().node[0].op_type, "SkipNorm");
+
+        let mut identical = source("Add");
+        merge_local_functions(&mut linked.functions, &mut identical, 0, 1);
+        assert_eq!(linked.functions.len(), 1);
+        assert_eq!(identical.graph.unwrap().node[0].op_type, "SkipNorm");
+
+        let mut collision = source("Mul");
+        merge_local_functions(&mut linked.functions, &mut collision, 0, 2);
+        assert_eq!(linked.functions.len(), 2);
+        assert_eq!(linked.functions[1].name, "island0_component2__SkipNorm");
+        assert_eq!(
+            collision.graph.unwrap().node[0].op_type,
+            "island0_component2__SkipNorm"
+        );
     }
 }

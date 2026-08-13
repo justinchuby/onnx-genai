@@ -18,8 +18,8 @@ use onnx_genai_metadata::{
     WorkflowNode, WorkflowOutputRole, WorkflowSpec,
 };
 use onnx_genai_ort::{DataType, PipelineModelDirectory, PipelineModels, SessionOptions, Value};
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -27,7 +27,7 @@ mod islands;
 mod workflow;
 
 pub use islands::ExecutionIslandDiagnostic;
-pub use workflow::WorkflowPerformanceDiagnostic;
+pub use workflow::{WorkflowExecutionPlan, WorkflowPerformanceDiagnostic};
 
 pub type PipelineTensors = HashMap<String, Value>;
 
@@ -93,8 +93,10 @@ pub struct PipelineEngine {
     decode_backend: EngineDecodeBackend,
     workflow: WorkflowSpec,
     compiled_workflow: CompiledWorkflow,
+    movable_emit_values: HashSet<String>,
     execution_islands: Vec<islands::ExecutionIsland>,
     workflow_performance: RefCell<workflow::WorkflowPerformanceCounters>,
+    workflow_execution_generation: Cell<u64>,
     workflow_session_state: RefCell<HashMap<(String, String), Value>>,
     preprocessing: Option<PreprocessingSpec>,
 }
@@ -255,11 +257,17 @@ impl PipelineEngine {
         let workflow = directory.spec.workflow;
         let mut compiled_workflow = onnx_genai_metadata::compile_workflow(&workflow)
             .map_err(|error| anyhow::anyhow!("Failed to lower workflow metadata: {error}"))?;
-        let execution_islands =
-            islands::plan_execution_islands(&mut compiled_workflow.graph, &workflow, &models)
-                .map_err(|error| {
-                    anyhow::anyhow!("Failed to plan workflow execution islands: {error}")
-                })?;
+        let movable_emit_values =
+            workflow::compile_movable_emit_values(&compiled_workflow.graph, &workflow);
+        let aliasable_output_values =
+            workflow::compile_aliasable_output_values(&compiled_workflow.graph);
+        let execution_islands = islands::plan_execution_islands(
+            &mut compiled_workflow.graph,
+            &workflow,
+            &models,
+            &aliasable_output_values,
+        )
+        .map_err(|error| anyhow::anyhow!("Failed to plan workflow execution islands: {error}"))?;
         Ok(Self {
             models,
             resource_governor,
@@ -267,8 +275,10 @@ impl PipelineEngine {
             decode_backend,
             workflow,
             compiled_workflow,
+            movable_emit_values,
             execution_islands,
             workflow_performance: RefCell::new(workflow::WorkflowPerformanceCounters::default()),
+            workflow_execution_generation: Cell::new(0),
             workflow_session_state: RefCell::new(HashMap::new()),
             preprocessing: directory.preprocessing,
         })
@@ -307,6 +317,14 @@ impl PipelineEngine {
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineTensors> {
         self.run_workflow(request)
+    }
+
+    /// Compile request bindings and reusable interpreter state for repeated execution.
+    pub fn prepare_workflow_execution(
+        &self,
+        request: PipelineGenerateRequest,
+    ) -> anyhow::Result<WorkflowExecutionPlan<'_>> {
+        WorkflowExecutionPlan::new(self, request)
     }
 
     pub fn checkpoint_session(

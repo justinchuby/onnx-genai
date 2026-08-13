@@ -12,8 +12,9 @@
 use std::fs;
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use anyhow::Context;
 use onnx_genai_engine::{
     Engine, EngineConfig, GeneratePrompt, GenerateRequest, PipelineGenerateRequest,
 };
@@ -237,9 +238,8 @@ impl StableRunner {
     }
 
     fn run(&mut self, inputs: &[(&str, &Value)]) -> anyhow::Result<Vec<Value>> {
-        for ((expected, destination), (actual, source)) in self.inputs.iter().zip(inputs) {
+        for ((expected, _), (actual, _)) in self.inputs.iter().zip(inputs) {
             anyhow::ensure!(expected == actual, "native runner input order changed");
-            copy_value(source, destination, self.session.cuda_device_id())?;
         }
         if self.capture {
             self.session.synchronize_device()?;
@@ -263,6 +263,9 @@ impl StableRunner {
 }
 
 fn copy_value(source: &Value, destination: &Value, device: Option<i32>) -> anyhow::Result<()> {
+    if source.numel() == 0 {
+        return Ok(());
+    }
     if let Some(device) = device {
         destination.copy_from_cuda(source, device)?;
     } else {
@@ -438,42 +441,24 @@ fn benchmark_case(
         started.elapsed()
     };
     let native_cold_start = {
-        let (values, names) = native_inputs(logits.clone(), min_p)?;
-        let inputs = names
-            .iter()
-            .zip(&values)
-            .map(|(name, value)| (*name, value))
-            .collect::<Vec<_>>();
         let started = Instant::now();
-        black_box(native.run(&inputs)?);
+        black_box(native.run(&initial)?);
         started.elapsed()
     };
 
+    let mut workflow = engine.prepare_workflow_execution(workflow_request(logits.clone())?)?;
     for _ in 0..3 {
-        black_box(engine.run_pipeline(workflow_request(logits.clone())?)?);
-        let (values, names) = native_inputs(logits.clone(), min_p)?;
-        let inputs = names
-            .iter()
-            .zip(&values)
-            .map(|(name, value)| (*name, value))
-            .collect::<Vec<_>>();
-        black_box(native.run(&inputs)?);
+        black_box(workflow.execute()?);
+        black_box(native.run(&initial)?);
     }
     let workflow_ttft = {
-        let request = workflow_request(logits.clone())?;
         let started = Instant::now();
-        black_box(engine.run_pipeline(request)?);
+        black_box(workflow.execute()?);
         started.elapsed()
     };
     let native_ttft = {
-        let (values, names) = native_inputs(logits.clone(), min_p)?;
-        let inputs = names
-            .iter()
-            .zip(&values)
-            .map(|(name, value)| (*name, value))
-            .collect::<Vec<_>>();
         let started = Instant::now();
-        black_box(native.run(&inputs)?);
+        black_box(native.run(&initial)?);
         started.elapsed()
     };
 
@@ -485,21 +470,14 @@ fn benchmark_case(
         let mut native_elapsed = std::time::Duration::ZERO;
         for iteration in 0..iterations {
             let mut run_workflow = || -> anyhow::Result<()> {
-                let request = workflow_request(logits.clone())?;
                 let started = Instant::now();
-                black_box(engine.run_pipeline(request)?);
+                black_box(workflow.execute()?);
                 workflow_elapsed += started.elapsed();
                 Ok(())
             };
             let mut run_native = || -> anyhow::Result<()> {
-                let (values, names) = native_inputs(logits.clone(), min_p)?;
-                let inputs = names
-                    .iter()
-                    .zip(&values)
-                    .map(|(name, value)| (*name, value))
-                    .collect::<Vec<_>>();
                 let started = Instant::now();
-                black_box(native.run(&inputs)?);
+                black_box(native.run(&initial)?);
                 native_elapsed += started.elapsed();
                 Ok(())
             };
@@ -570,6 +548,46 @@ fn configure_ep() -> (&'static str, bool) {
 }
 
 #[test]
+fn prepared_workflow_refreshes_replaced_input_slots() -> anyhow::Result<()> {
+    unsafe {
+        std::env::set_var("ONNX_GENAI_EP", "cpu");
+        std::env::set_var("ONNX_GENAI_CUDA_GRAPH", "0");
+    }
+    let root = package(
+        "prepared-input-refresh",
+        &workflow_metadata("decoder", "decoder.onnx.textproto"),
+        &[
+            ("decoder.onnx.textproto", DECODER),
+            ("sampler.onnx.textproto", SAMPLER),
+            ("termination.onnx.textproto", TERMINATION),
+        ],
+        DECODER_NATIVE,
+    )?;
+    let mut first = vec![0_u8; BATCH * VOCAB * std::mem::size_of::<f32>()];
+    for row in 0..BATCH {
+        first[(row * VOCAB + 3) * 4..(row * VOCAB + 3) * 4 + 4]
+            .copy_from_slice(&10_f32.to_le_bytes());
+    }
+    let engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
+    let mut plan = engine.prepare_workflow_execution(workflow_request(first)?)?;
+    let first_outputs = plan.execute()?;
+    assert_eq!(first_outputs["token"].to_vec_i64()?, vec![3; BATCH]);
+
+    let mut second = vec![0_u8; BATCH * VOCAB * std::mem::size_of::<f32>()];
+    for row in 0..BATCH {
+        second[(row * VOCAB + 5) * 4..(row * VOCAB + 5) * 4 + 4]
+            .copy_from_slice(&10_f32.to_le_bytes());
+    }
+    plan.set_input(
+        "logits",
+        Value::from_raw_bytes(second, &[BATCH as i64, VOCAB as i64], DataType::Float32)?,
+    )?;
+    assert_eq!(plan.execute()?["token"].to_vec_i64()?, vec![5; BATCH]);
+    assert_eq!(first_outputs["token"].to_vec_i64()?, vec![3; BATCH]);
+    Ok(())
+}
+
+#[test]
 #[ignore = "performance conformance is hardware-sensitive and must run on an idle benchmark host"]
 fn workflow_islands_are_competitive_with_native_composites() -> anyhow::Result<()> {
     let (ep, _) = configure_ep();
@@ -580,7 +598,7 @@ fn workflow_islands_are_competitive_with_native_composites() -> anyhow::Result<(
     let minimum_ratio = std::env::var("ONNX_GENAI_WORKFLOW_PERF_MIN_RATIO")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(0.90);
+        .unwrap_or(0.98);
     let samples = std::env::var("ONNX_GENAI_WORKFLOW_PERF_SAMPLES")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -631,5 +649,133 @@ fn workflow_islands_are_competitive_with_native_composites() -> anyhow::Result<(
         minimum_ratio,
         maximum_ttft_overhead_ms,
     )?;
+    Ok(())
+}
+
+fn muse_inputs() -> anyhow::Result<Vec<(String, Value)>> {
+    let mut inputs = vec![
+        (
+            "inputs_embeds".to_string(),
+            Value::from_raw_bytes(vec![0; 2 * 6656], &[1, 1, 6656], DataType::BFloat16)?,
+        ),
+        (
+            "attention_mask".to_string(),
+            Value::from_slice_i64(&[1, 1], &[1, 2])?,
+        ),
+    ];
+    for layer in 0..52 {
+        for kind in ["key", "value"] {
+            inputs.push((
+                format!("past_key_values.{layer}.{kind}"),
+                Value::from_raw_bytes(vec![0; 2 * 2 * 128], &[1, 2, 1, 128], DataType::BFloat16)?,
+            ));
+        }
+    }
+    inputs.push(("eos".to_string(), Value::from_slice_i64(&[0], &[1])?));
+    Ok(inputs)
+}
+
+#[test]
+#[ignore = "requires the local 30B Muse decoder package and an idle H200"]
+fn real_muse_policy_chain_matches_direct_ort() -> anyhow::Result<()> {
+    let root = std::env::var("ONNX_GENAI_MUSE_WORKFLOW_PACKAGE")
+        .context("ONNX_GENAI_MUSE_WORKFLOW_PACKAGE must point at the generated Muse package")?;
+    let root = Path::new(&root);
+    let iterations = std::env::var("ONNX_GENAI_WORKFLOW_PERF_ITERS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(200);
+    let samples = std::env::var("ONNX_GENAI_WORKFLOW_PERF_SAMPLES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(5);
+    let engine = Engine::from_pipeline_dir(root, EngineConfig::default())?;
+    println!(
+        "real Muse planned islands: {:?}",
+        engine.workflow_performance_diagnostic().islands
+    );
+    let workflow_inputs = muse_inputs()?;
+    let mut request =
+        PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(Vec::new())));
+    for (name, value) in workflow_inputs {
+        request = request.with_input(name, value);
+    }
+    let mut workflow = engine.prepare_workflow_execution(request)?;
+
+    let environment = Environment::new("muse-real-workflow-performance")?;
+    let native_values = muse_inputs()?;
+    let native_inputs = native_values
+        .iter()
+        .map(|(name, value)| (name.as_str(), value))
+        .collect::<Vec<_>>();
+    let mut native = StableRunner::new(
+        &environment,
+        &root.join("native.onnx"),
+        SessionOptions::default(),
+        &native_inputs,
+        &[
+            ("token", &[1], DataType::Int64),
+            ("done", &[1], DataType::Bool),
+        ],
+    )?;
+
+    for _ in 0..3 {
+        black_box(workflow.execute()?);
+        black_box(native.run(&native_inputs)?);
+    }
+    let workflow_ttft = {
+        let started = Instant::now();
+        black_box(workflow.execute()?);
+        started.elapsed()
+    };
+    let native_ttft = {
+        let started = Instant::now();
+        black_box(native.run(&native_inputs)?);
+        started.elapsed()
+    };
+    let mut ratios = Vec::with_capacity(samples);
+    let mut workflow_rates = Vec::with_capacity(samples);
+    let mut native_rates = Vec::with_capacity(samples);
+    for sample in 0..samples {
+        let mut workflow_elapsed = Duration::ZERO;
+        let mut native_elapsed = Duration::ZERO;
+        for iteration in 0..iterations {
+            let workflow_first = (sample + iteration) % 2 == 0;
+            if workflow_first {
+                let started = Instant::now();
+                black_box(workflow.execute()?);
+                workflow_elapsed += started.elapsed();
+                let started = Instant::now();
+                black_box(native.run(&native_inputs)?);
+                native_elapsed += started.elapsed();
+            } else {
+                let started = Instant::now();
+                black_box(native.run(&native_inputs)?);
+                native_elapsed += started.elapsed();
+                let started = Instant::now();
+                black_box(workflow.execute()?);
+                workflow_elapsed += started.elapsed();
+            }
+        }
+        let workflow_rate = iterations as f64 / workflow_elapsed.as_secs_f64();
+        let native_rate = iterations as f64 / native_elapsed.as_secs_f64();
+        workflow_rates.push(workflow_rate);
+        native_rates.push(native_rate);
+        ratios.push(workflow_rate / native_rate);
+    }
+    let median = |values: &mut Vec<f64>| {
+        values.sort_by(f64::total_cmp);
+        values[values.len() / 2]
+    };
+    println!(
+        "real-muse+sampler+termination: workflow={:.2} tok/s native={:.2} tok/s ratio={:.3} \
+         workflow_ttft={workflow_ttft:?} native_ttft={native_ttft:?}",
+        median(&mut workflow_rates),
+        median(&mut native_rates),
+        median(&mut ratios),
+    );
+    for island in engine.workflow_performance_diagnostic().islands {
+        println!("island={island:?}");
+    }
     Ok(())
 }
