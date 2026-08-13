@@ -31,7 +31,7 @@ steps:
         component: update
         inputs: { current: state, update: delta }
         outputs: { next: state.next }
-    condition: continue
+    continue_when: continue
     max_iterations: max_iterations
     carried:
       - cell: state
@@ -47,6 +47,16 @@ Effects are inferred from structure. Pure ONNX components with tensor-threaded R
 effect. `effects` on a component are reserved for real external mutation: emit streams, session
 mutation, telemetry, or stateful adapter ABIs. The compiler threads and joins those effects through
 sequences, branches, and loops.
+
+Loops are pre-test: `continue_when` is evaluated before iteration zero, so false initially produces
+a zero-trip loop and leaves every carry at its initial value. It may be `bool[]` or `bool[B]`.
+Inactive rows retain their previous carried values while active rows advance. `max_iterations` is
+an integer safety bound. Branch predicates remain invocation-level scalars; row-wise tensor choice
+is ordinary ONNX policy math rather than host control flow.
+
+`emit.when` optionally suppresses an event. `emit.valid_length` accepts `int[B]` and emits a ragged
+event per active row, slicing each row to its runtime prefix. This defines EOS behavior explicitly:
+a workflow may emit the EOS token, suppress it with `when`, or emit a zero-length row.
 
 ONNX port contracts may be omitted when the artifact is authoritative. Declare only semantic
 bindings, bounds/overrides, cross-component constraints, or adapter ports that ONNX cannot describe.
@@ -169,8 +179,9 @@ contracts. They are not workflow policy math and are not modeled as host state-u
 
 Bindings cover `current_k`, `accepted`, `evaluated`, `committed_tokens`,
 `filled_proposal_budget`, `draft_ms`, `target_ms`, `estimates`, `next_k`, and `next_estimates`.
-Estimate state is advisory and request-scoped; changing or resetting it must not change output
-correctness or distribution.
+Estimate state is advisory and may be invocation- or session-scoped. It may be reset or dropped and
+is excluded from semantic checkpoints; changing it must not change output correctness or
+distribution.
 
 ## Versioned adapters
 
@@ -216,7 +227,7 @@ steps:
         value: token
         output: tokens
         mode: append
-    condition: continue
+    continue_when: continue
     max_iterations: max_output_tokens
     carried:
       - { cell: cache, next: cache.next }
@@ -225,6 +236,40 @@ steps:
 Here `cache.next` is the decoder's present-KV output and becomes `cache` on the next iteration.
 The carry describes logical dataflow and bounded growth; the generic KV service may realize it
 with shared or paged storage without adding a workflow component.
+
+Logical cache cells bind explicitly to named KV service groups:
+
+```yaml
+state:
+  cache:
+    contract: { dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim] }
+    class: semantic
+    scope: invocation
+    initializer: empty_cache
+    recurrence: { kind: growing, axis: 2, increment: accepted_len, max: max_context }
+    service_group: decoder_cache
+serving:
+  active: active
+  done: done
+  accepted_len: accepted_len
+  slot_ids: slot_ids
+  kv_service:
+    paging: paged
+    allocation: runtime
+    compaction: true
+    groups:
+      decoder_cache:
+        sequence_axis: 2
+        layout: bnsh
+        storage: shared_buffer
+        ports:
+          decoder:
+            cache: { input: past_key_values, output: present_key_values }
+```
+
+The service group is the allocation contract: it owns paging, slots, per-row lengths, compaction,
+and permitted past/present aliasing. The workflow carry remains logical decoder dataflow. A separate
+state-update ONNX component is used only for real tensor transforms such as gather or truncation.
 
 ### Vision-language
 
@@ -249,7 +294,7 @@ steps:
         component: decoder
         inputs: { embeddings: embeddings, cache: cache }
         outputs: { logits: logits, cache: cache.next }
-    condition: continue
+    continue_when: continue
     max_iterations: max_output_tokens
     carried: [{ cell: cache, next: cache.next }]
 ```
@@ -273,7 +318,7 @@ steps:
         component: solver
         inputs: { state: latent, estimate: estimate, step: diffusion_step }
         outputs: { next_state: latent.next }
-    condition: continue
+    continue_when: continue
     max_iterations: num_steps
     iteration:
       value: diffusion_step
@@ -292,3 +337,18 @@ steps:
 Package `inputs` and `outputs` are the only public boundary. `emit` is the only streaming/final
 publication primitive, with `replace`, `append`, or `event` mode and optional integer
 `valid_length`.
+
+## Producer validation
+
+The Rust library entry point `onnx_genai_metadata::load_pipeline_spec` parses and runs semantic
+validation. CI and external producers can use the fail-closed CLI:
+
+```bash
+cargo run -p onnx-genai-metadata --bin validate_metadata -- \
+  path/to/package-or-inference_metadata.yaml
+```
+
+A package directory resolves `inference_metadata.yaml`, `.yml`, or `.json`. The command accepts
+multiple paths, reports each invalid document with an actionable error, and exits nonzero if any
+fails. JSON Schema is useful for authoring, but this validator is authoritative for cross-component
+SSA, recurrence, KV service-group, contract-binding, and capability invariants.

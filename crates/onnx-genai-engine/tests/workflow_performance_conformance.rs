@@ -309,7 +309,7 @@ pipeline:
       onnx_opsets: {{ ai.onnx: 13 }}
       adapter_abis: {{}}
       custom_op_versions: {{}}
-      capabilities: [workflow_ssa, linear_effects, typed_emit]
+      capabilities: [workflow_ssa, typed_emit]
     inputs:
       logits:
         contract: {{ dtype: float32, rank: 2, shape: [{BATCH}, {VOCAB}] }}
@@ -319,7 +319,7 @@ pipeline:
       min_p:
         contract: {{ dtype: float32, rank: 1, shape: [1] }}
         role: {{ kind: runtime, version: "1", role: sampling_min_p }}
-        source: {{ kind: request, field: sampling_min_p }}
+        source: {{ kind: request }}
         required: true
       eos:
         contract: {{ dtype: int64, rank: 1, shape: [1] }}

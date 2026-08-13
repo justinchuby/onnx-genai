@@ -363,17 +363,6 @@
       ],
       "type": "string"
     },
-    "DeviceKind": {
-      "enum": [
-        "cpu",
-        "cuda",
-        "direct_ml",
-        "core_ml",
-        "web_gpu",
-        "npu"
-      ],
-      "type": "string"
-    },
     "DraftConfig": {
       "description": "Draft-token producer configuration.",
       "properties": {
@@ -1326,6 +1315,22 @@
       ],
       "type": "string"
     },
+    "KvPortAlias": {
+      "additionalProperties": false,
+      "properties": {
+        "input": {
+          "type": "string"
+        },
+        "output": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "input",
+        "output"
+      ],
+      "type": "object"
+    },
     "KvQuantTolerance": {
       "description": "Precision tolerance for key and value cache components.",
       "properties": {
@@ -1364,6 +1369,13 @@
           "default": false,
           "type": "boolean"
         },
+        "groups": {
+          "additionalProperties": {
+            "$ref": "#/$defs/KvServiceGroupContract"
+          },
+          "default": {},
+          "type": "object"
+        },
         "paging": {
           "$ref": "#/$defs/KvPagingMode"
         }
@@ -1373,6 +1385,46 @@
         "allocation"
       ],
       "type": "object"
+    },
+    "KvServiceGroupContract": {
+      "additionalProperties": false,
+      "properties": {
+        "layout": {
+          "type": "string"
+        },
+        "ports": {
+          "additionalProperties": {
+            "additionalProperties": {
+              "$ref": "#/$defs/KvPortAlias"
+            },
+            "type": "object"
+          },
+          "default": {},
+          "type": "object"
+        },
+        "sequence_axis": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "storage": {
+          "$ref": "#/$defs/KvStorageMode",
+          "default": "separate"
+        }
+      },
+      "required": [
+        "sequence_axis",
+        "layout"
+      ],
+      "type": "object"
+    },
+    "KvStorageMode": {
+      "enum": [
+        "separate",
+        "shared_buffer",
+        "paged"
+      ],
+      "type": "string"
     },
     "KvStrideDescriptor": {
       "description": "A fully explicit KV-cache stride descriptor.\n\nThis is the general form the two named layouts expand into, and the shape a\nfuture layout (e.g. token-major) is expressed in without adding an enum\nvariant. The `reservation_*` fields describe a binding that is a **view into\na larger reservation** rather than the owner of its whole buffer:\ntoken-major stores every layer's tokens in one reservation and hands each\n`(layer, side)` a sub-view, so its per-token (seq) stride is taken over the\nreservation's total token count and its data starts at a non-zero offset.\nBoth historical layouts are whole-buffer bindings: `offset == 0` and no\nreservation override.",
@@ -3455,59 +3507,6 @@
       },
       "type": "object"
     },
-    "WorkflowBatchingContract": {
-      "oneOf": [
-        {
-          "additionalProperties": false,
-          "properties": {
-            "kind": {
-              "const": "none",
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "axis": {
-              "format": "uint",
-              "minimum": 0,
-              "type": "integer"
-            },
-            "kind": {
-              "const": "stack",
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind",
-            "axis"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "kind": {
-              "const": "ragged",
-              "type": "string"
-            },
-            "offsets": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "kind",
-            "offsets"
-          ],
-          "type": "object"
-        }
-      ]
-    },
     "WorkflowBranchOutput": {
       "additionalProperties": false,
       "properties": {
@@ -3585,16 +3584,6 @@
             "inputs": {},
             "outputs": {}
           }
-        },
-        "resources": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/WorkflowResourceContract"
-            },
-            {
-              "type": "null"
-            }
-          ]
         }
       },
       "required": [
@@ -3627,7 +3616,7 @@
           ]
         },
         "required": {
-          "default": false,
+          "default": true,
           "type": "boolean"
         },
         "role": {
@@ -3649,17 +3638,13 @@
         {
           "additionalProperties": false,
           "properties": {
-            "field": {
-              "$ref": "#/$defs/RuntimeInputRole"
-            },
             "kind": {
               "const": "request",
               "type": "string"
             }
           },
           "required": [
-            "kind",
-            "field"
+            "kind"
           ],
           "type": "object"
         },
@@ -3773,15 +3758,6 @@
       ],
       "type": "object"
     },
-    "WorkflowMemoryClass": {
-      "enum": [
-        "default",
-        "device",
-        "host",
-        "pinned"
-      ],
-      "type": "string"
-    },
     "WorkflowOutput": {
       "additionalProperties": false,
       "properties": {
@@ -3812,47 +3788,6 @@
         "event"
       ],
       "type": "string"
-    },
-    "WorkflowResourceContract": {
-      "additionalProperties": false,
-      "properties": {
-        "allowed_devices": {
-          "default": [],
-          "items": {
-            "$ref": "#/$defs/DeviceKind"
-          },
-          "type": "array"
-        },
-        "batching": {
-          "$ref": "#/$defs/WorkflowBatchingContract"
-        },
-        "concurrency": {
-          "format": "uint",
-          "minimum": 0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "memory_class": {
-          "$ref": "#/$defs/WorkflowMemoryClass"
-        },
-        "preferred_device": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/DeviceKind"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        }
-      },
-      "required": [
-        "memory_class",
-        "batching"
-      ],
-      "type": "object"
     },
     "WorkflowSpec": {
       "additionalProperties": false,
@@ -3930,6 +3865,12 @@
         },
         "scope": {
           "$ref": "#/$defs/WorkflowStateScope"
+        },
+        "service_group": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "session": {
           "anyOf": [
@@ -4027,7 +3968,7 @@
               },
               "type": "array"
             },
-            "condition": {
+            "continue_when": {
               "type": "string"
             },
             "iteration": {
@@ -4064,7 +4005,7 @@
           "required": [
             "kind",
             "steps",
-            "condition",
+            "continue_when",
             "max_iterations"
           ],
           "type": "object"
@@ -4131,6 +4072,12 @@
             },
             "value": {
               "type": "string"
+            },
+            "when": {
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [

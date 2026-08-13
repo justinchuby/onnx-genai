@@ -4,6 +4,58 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::schema::{InferenceMetadata, PipelineSpec, WorkflowNode, WorkflowSpec};
 
+struct ContractObligation {
+    id: &'static str,
+    version: &'static str,
+    action: &'static str,
+    inputs: &'static [&'static str],
+    outputs: &'static [&'static str],
+}
+
+const CONTRACT_OBLIGATIONS: &[ContractObligation] = &[
+    ContractObligation {
+        id: "onnx-genai.grammar-guidance",
+        version: "1",
+        action: "clone",
+        inputs: &["state"],
+        outputs: &["next_state"],
+    },
+    ContractObligation {
+        id: "onnx-genai.grammar-guidance",
+        version: "1",
+        action: "lookahead",
+        inputs: &["state", "tokens", "valid_length", "transition_table"],
+        outputs: &[
+            "next_state",
+            "consumed_length",
+            "logits_mask",
+            "forced_tokens",
+            "forced_length",
+        ],
+    },
+    ContractObligation {
+        id: "onnx-genai.grammar-guidance",
+        version: "1",
+        action: "commit",
+        inputs: &["state", "tokens", "valid_length", "transition_table"],
+        outputs: &["next_state", "consumed_length"],
+    },
+    ContractObligation {
+        id: "onnx-genai.telemetry",
+        version: "1",
+        action: "start",
+        inputs: &[],
+        outputs: &["timestamp"],
+    },
+    ContractObligation {
+        id: "onnx-genai.telemetry",
+        version: "1",
+        action: "elapsed",
+        inputs: &["timestamp"],
+        outputs: &["duration_ms"],
+    },
+];
+
 /// Capabilities this runtime supports.
 pub struct RuntimeCapabilities {
     pub supported: Vec<String>,
@@ -53,7 +105,6 @@ pub fn derived_capabilities(metadata: &InferenceMetadata) -> BTreeSet<String> {
     let workflow = &pipeline.workflow;
     capabilities.extend(workflow.manifest.capabilities.iter().cloned());
     capabilities.insert("workflow_ssa".to_string());
-    capabilities.insert("linear_effects".to_string());
     if workflow.serving.is_some() {
         capabilities.insert("serving_service_contract".to_string());
     }
@@ -110,11 +161,7 @@ fn collect_workflow_capabilities(node: &WorkflowNode, capabilities: &mut BTreeSe
                 collect_workflow_capabilities(node, capabilities);
             }
         }
-        WorkflowNode::Invoke { effects, .. } => {
-            if !effects.is_empty() {
-                capabilities.insert("linear_effects".to_string());
-            }
-        }
+        WorkflowNode::Invoke { .. } => {}
         WorkflowNode::Loop {
             setup,
             body,
@@ -455,6 +502,19 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
 
     for (name, input) in &workflow.inputs {
         validate_runtime_dtype(&format!("workflow input '{name}'"), &input.contract, errors);
+        if matches!(input.source, crate::schema::WorkflowInputSource::Request)
+            && !matches!(input.role, crate::schema::SemanticInputRole::Runtime { .. })
+        {
+            errors.push(format!(
+                "workflow request input '{name}' must declare one versioned runtime role"
+            ));
+        }
+        if !input.required && input.default.is_none() {
+            errors.push(format!(
+                "workflow input '{name}' cannot be optional without a literal default; model \
+                 presence explicitly with a required value and predicate"
+            ));
+        }
     }
     for (name, output) in &workflow.outputs {
         validate_runtime_dtype(
@@ -546,37 +606,25 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
                     Some(crate::schema::ScalarValue::String(action)) => Some(action.as_str()),
                     _ => None,
                 };
-                let supported = match contract.id.as_str() {
-                    "onnx-genai.grammar-guidance" => {
-                        matches!(action, Some("clone" | "lookahead" | "commit"))
-                    }
-                    "onnx-genai.telemetry" => matches!(action, Some("start" | "elapsed")),
-                    _ => true,
-                };
-                if !supported {
+                let known_contract = CONTRACT_OBLIGATIONS
+                    .iter()
+                    .any(|entry| entry.id == contract.id && entry.version == contract.version);
+                let obligation = CONTRACT_OBLIGATIONS.iter().find(|entry| {
+                    entry.id == contract.id
+                        && entry.version == contract.version
+                        && action == Some(entry.action)
+                });
+                if known_contract && obligation.is_none() {
                     errors.push(format!(
                         "workflow adapter component '{name}' has unsupported action {:?} for \
                              contract {}@{}",
                         action, contract.id, contract.version
                     ));
                 }
-                let required_bindings: &[&str] = match (contract.id.as_str(), action) {
-                    ("onnx-genai.grammar-guidance", _) => &[
-                        "state",
-                        "tokens",
-                        "valid_length",
-                        "transition_table",
-                        "next_state",
-                        "consumed_length",
-                        "logits_mask",
-                        "forced_tokens",
-                        "forced_length",
-                    ],
-                    ("onnx-genai.telemetry", Some("start")) => &["timestamp"],
-                    ("onnx-genai.telemetry", Some("elapsed")) => &["timestamp", "duration_ms"],
-                    _ => &[],
-                };
-                for role in required_bindings {
+                for role in obligation
+                    .into_iter()
+                    .flat_map(|entry| entry.inputs.iter().chain(entry.outputs))
+                {
                     if !contract.bindings.contains_key(*role) {
                         errors.push(format!(
                             "workflow adapter component '{name}' contract {}@{} is missing \
@@ -585,28 +633,12 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
                         ));
                     }
                 }
-                let (input_roles, output_roles): (&[&str], &[&str]) =
-                    match (contract.id.as_str(), action) {
-                        ("onnx-genai.grammar-guidance", _) => (
-                            &["state", "tokens", "valid_length", "transition_table"],
-                            &[
-                                "next_state",
-                                "consumed_length",
-                                "logits_mask",
-                                "forced_tokens",
-                                "forced_length",
-                            ],
-                        ),
-                        ("onnx-genai.telemetry", Some("start")) => (&[], &["timestamp"]),
-                        ("onnx-genai.telemetry", Some("elapsed")) => {
-                            (&["timestamp"], &["duration_ms"])
-                        }
-                        _ => (&[], &[]),
-                    };
-                for (direction, roles, ports) in [
-                    ("input", input_roles, &component.ports.inputs),
-                    ("output", output_roles, &component.ports.outputs),
-                ] {
+                for (direction, roles, ports) in obligation.into_iter().flat_map(|entry| {
+                    [
+                        ("input", entry.inputs, &component.ports.inputs),
+                        ("output", entry.outputs, &component.ports.outputs),
+                    ]
+                }) {
                     for role in roles {
                         if contract
                             .bindings
@@ -620,22 +652,22 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
                         }
                     }
                 }
-                if component.application_overridable && component.contract.is_none() {
-                    errors.push(format!(
-                        "workflow component '{name}' is application-overridable but has no versioned contract"
-                    ));
-                }
-                if component.application_overridable
-                    && !matches!(
-                        component.implementation,
-                        crate::schema::ComponentImplementation::Onnx { .. }
-                    )
-                {
-                    errors.push(format!(
-                        "workflow component '{name}' is application-overridable but is not an ONNX component"
-                    ));
-                }
             }
+        }
+        if component.application_overridable && component.contract.is_none() {
+            errors.push(format!(
+                "workflow component '{name}' is application-overridable but has no versioned contract"
+            ));
+        }
+        if component.application_overridable
+            && !matches!(
+                component.implementation,
+                crate::schema::ComponentImplementation::Onnx { .. }
+            )
+        {
+            errors.push(format!(
+                "workflow component '{name}' is application-overridable but is not an ONNX component"
+            ));
         }
     }
     for (name, state) in &workflow.state {
@@ -643,14 +675,6 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
         if state.scope == crate::schema::WorkflowStateScope::Invocation && state.session.is_some() {
             errors.push(format!(
                 "workflow state '{name}' has session lease settings but invocation scope"
-            ));
-        }
-        if state.class == crate::schema::WorkflowStateClass::Advisory
-            && state.scope != crate::schema::WorkflowStateScope::Invocation
-        {
-            errors.push(format!(
-                "workflow advisory state '{name}' must use invocation scope so it resets per \
-                 request and is never serialized as session state"
             ));
         }
         if let Some(session) = &state.session {
@@ -687,6 +711,92 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
                 state.contract.rank
             ));
         }
+        if let Some(group_name) = &state.service_group {
+            let group = workflow
+                .serving
+                .as_ref()
+                .and_then(|serving| serving.kv_service.groups.get(group_name));
+            let Some(group) = group else {
+                errors.push(format!(
+                    "workflow state '{name}' binds unknown KV service group '{group_name}'"
+                ));
+                continue;
+            };
+            if group.sequence_axis >= state.contract.rank {
+                errors.push(format!(
+                    "KV service group '{group_name}' sequence_axis {} is outside state '{name}' rank {}",
+                    group.sequence_axis, state.contract.rank
+                ));
+            }
+            if dynamic_axis.is_some_and(|axis| axis != group.sequence_axis) {
+                errors.push(format!(
+                    "workflow state '{name}' recurrence axis {dynamic_axis:?} disagrees with KV \
+                     service group '{group_name}' sequence_axis {}",
+                    group.sequence_axis
+                ));
+            }
+            if let crate::schema::ShapeRecurrence::Growing { increment, .. } = &state.recurrence
+                && let Some(serving) = &workflow.serving
+                && serving.accepted_len.as_deref() != Some(increment)
+            {
+                errors.push(format!(
+                    "KV service state '{name}' grows by '{increment}', but serving.accepted_len \
+                     does not bind that per-row value"
+                ));
+            }
+        }
+    }
+
+    if let Some(kv_service) = workflow.serving.as_ref().map(|serving| &serving.kv_service) {
+        for (group_name, group) in &kv_service.groups {
+            if group.layout.trim().is_empty() {
+                errors.push(format!(
+                    "KV service group '{group_name}' layout must not be empty"
+                ));
+            }
+            for (component_name, cells) in &group.ports {
+                let Some(component) = workflow.components.get(component_name) else {
+                    errors.push(format!(
+                        "KV service group '{group_name}' binds unknown component '{component_name}'"
+                    ));
+                    continue;
+                };
+                let inferred_ports = component.ports.inputs.is_empty()
+                    && component.ports.outputs.is_empty()
+                    && matches!(
+                        component.implementation,
+                        crate::schema::ComponentImplementation::Onnx { .. }
+                    );
+                for (cell_name, alias) in cells {
+                    match workflow.state.get(cell_name) {
+                        Some(state)
+                            if state.service_group.as_deref() == Some(group_name.as_str()) => {}
+                        Some(_) => errors.push(format!(
+                            "KV service group '{group_name}' port alias references state \
+                             '{cell_name}' bound to another service group"
+                        )),
+                        None => errors.push(format!(
+                            "KV service group '{group_name}' port alias references unknown state \
+                             '{cell_name}'"
+                        )),
+                    }
+                    if !inferred_ports && !component.ports.inputs.contains_key(&alias.input) {
+                        errors.push(format!(
+                            "KV service group '{group_name}' component '{component_name}' input \
+                             alias '{}' is not a declared port",
+                            alias.input
+                        ));
+                    }
+                    if !inferred_ports && !component.ports.outputs.contains_key(&alias.output) {
+                        errors.push(format!(
+                            "KV service group '{group_name}' component '{component_name}' output \
+                             alias '{}' is not a declared port",
+                            alias.output
+                        ));
+                    }
+                }
+            }
+        }
     }
 
     let mut values = workflow.inputs.keys().cloned().collect::<BTreeSet<_>>();
@@ -707,8 +817,48 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
         "pipeline.workflow.steps",
         errors,
     );
+    if let Some(serving) = &workflow.serving {
+        if serving.kv_service.groups.is_empty() {
+            errors.push(
+                "pipeline.workflow.serving.kv_service.groups must declare at least one bound \
+                 state group"
+                    .to_string(),
+            );
+        }
+        for (role, value) in [
+            ("active", Some(&serving.active)),
+            ("done", Some(&serving.done)),
+            ("accepted_len", serving.accepted_len.as_ref()),
+            ("slot_ids", Some(&serving.slot_ids)),
+        ] {
+            let Some(value) = value else {
+                continue;
+            };
+            require_workflow_value(
+                value,
+                &values,
+                &format!("pipeline.workflow.serving.{role}"),
+                errors,
+            );
+            if let Some(contract) = value_contracts.get(value) {
+                if matches!(role, "active" | "done") {
+                    validate_bool_control_contract(
+                        contract,
+                        &format!("pipeline.workflow.serving.{role}"),
+                        errors,
+                    );
+                } else {
+                    validate_integer_control_contract(
+                        contract,
+                        &format!("pipeline.workflow.serving.{role}"),
+                        errors,
+                    );
+                }
+            }
+        }
+    }
 
-    let mut used = BTreeSet::from(["workflow_ssa".to_string(), "linear_effects".to_string()]);
+    let mut used = BTreeSet::from(["workflow_ssa".to_string()]);
     if workflow.serving.is_some() {
         used.insert("serving_service_contract".to_string());
     }
@@ -733,24 +883,6 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
         .any(|state| state.class == crate::schema::WorkflowStateClass::Advisory)
     {
         used.insert("advisory_state".to_string());
-    }
-    for component in workflow.components.values() {
-        match component
-            .contract
-            .as_ref()
-            .map(|contract| contract.id.as_str())
-        {
-            Some("onnx-genai.adaptive-proposal-budget") => {
-                used.insert("adaptive_proposal_budget".to_string());
-            }
-            Some("onnx-genai.grammar-guidance") => {
-                used.insert("grammar_guidance_adapter".to_string());
-            }
-            Some("onnx-genai.telemetry") => {
-                used.insert("telemetry_adapter".to_string());
-            }
-            _ => {}
-        }
     }
     collect_workflow_capabilities(&compiled.graph, &mut used);
     for capability in used.difference(&workflow.manifest.capabilities) {
@@ -933,7 +1065,7 @@ fn validate_workflow_node(
         WorkflowNode::Loop {
             setup,
             body,
-            condition,
+            continue_when,
             max_iterations,
             iteration,
             carried,
@@ -1081,6 +1213,15 @@ fn validate_workflow_node(
                     errors,
                 );
             }
+            require_workflow_value(
+                continue_when,
+                &body_values,
+                &format!("{path}.continue_when"),
+                errors,
+            );
+            if let Some(contract) = body_contracts.get(continue_when) {
+                validate_bool_control_contract(contract, &format!("{path}.continue_when"), errors);
+            }
             validate_workflow_node(
                 body,
                 workflow,
@@ -1091,15 +1232,6 @@ fn validate_workflow_node(
                 &format!("{path}.body"),
                 errors,
             );
-            require_workflow_value(
-                condition,
-                &body_values,
-                &format!("{path}.condition"),
-                errors,
-            );
-            if let Some(contract) = body_contracts.get(condition) {
-                validate_predicate_contract(contract, &format!("{path}.condition"), errors);
-            }
             for carry in carried {
                 require_workflow_value(
                     &carry.body_output,
@@ -1420,6 +1552,7 @@ fn validate_workflow_node(
         }
         WorkflowNode::Emit {
             value,
+            when,
             valid_length,
             output,
             effect_name,
@@ -1427,6 +1560,12 @@ fn validate_workflow_node(
             ..
         } => {
             require_workflow_value(value, values, &format!("{path}.value"), errors);
+            if let Some(when) = when {
+                require_workflow_value(when, values, &format!("{path}.when"), errors);
+                if let Some(contract) = value_contracts.get(when) {
+                    validate_bool_control_contract(contract, &format!("{path}.when"), errors);
+                }
+            }
             if let Some(valid_length) = valid_length {
                 require_workflow_value(
                     valid_length,
@@ -1435,7 +1574,7 @@ fn validate_workflow_node(
                     errors,
                 );
                 if let Some(contract) = value_contracts.get(valid_length) {
-                    validate_integer_scalar_contract(
+                    validate_integer_control_contract(
                         contract,
                         &format!("{path}.valid_length"),
                         errors,
@@ -1516,6 +1655,35 @@ fn validate_integer_scalar_contract(
             }
         }
         _ => errors.push(format!("{path} must be a scalar or rank-one tensor")),
+    }
+}
+
+fn validate_integer_control_contract(
+    contract: &crate::schema::TensorContract,
+    path: &str,
+    errors: &mut Vec<String>,
+) {
+    if !matches!(
+        contract.dtype.as_str(),
+        "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16" | "uint32" | "uint64"
+    ) {
+        errors.push(format!("{path} must have an integer dtype"));
+    }
+    if !matches!(contract.rank, 0 | 1) {
+        errors.push(format!("{path} must be a scalar or rank-one tensor"));
+    }
+}
+
+fn validate_bool_control_contract(
+    contract: &crate::schema::TensorContract,
+    path: &str,
+    errors: &mut Vec<String>,
+) {
+    if contract.dtype != "bool" {
+        errors.push(format!("{path} must have bool dtype"));
+    }
+    if !matches!(contract.rank, 0 | 1) {
+        errors.push(format!("{path} must be a scalar or rank-one row tensor"));
     }
 }
 

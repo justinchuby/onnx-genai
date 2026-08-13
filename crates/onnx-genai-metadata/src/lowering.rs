@@ -86,7 +86,7 @@ impl Compiler<'_> {
             WorkflowStep::Loop {
                 setup,
                 steps,
-                condition,
+                continue_when,
                 max_iterations,
                 iteration,
                 carried,
@@ -135,7 +135,7 @@ impl Compiler<'_> {
                 Ok(WorkflowNode::Loop {
                     setup: Box::new(setup),
                     body: Box::new(body),
-                    condition: condition.clone(),
+                    continue_when: continue_when.clone(),
                     max_iterations: max_iterations.clone(),
                     iteration: iteration.clone(),
                     carried: lowered_carries,
@@ -225,11 +225,13 @@ impl Compiler<'_> {
             }
             WorkflowStep::Emit {
                 value,
+                when,
                 valid_length,
                 output,
                 mode,
             } => Ok(WorkflowNode::Emit {
                 value: value.clone(),
+                when: when.clone(),
                 valid_length: valid_length.clone(),
                 output: output.clone(),
                 mode: mode.clone(),
