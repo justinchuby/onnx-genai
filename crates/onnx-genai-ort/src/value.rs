@@ -2112,3 +2112,267 @@ mod external_memory_tests {
         assert_eq!(value.to_vec_i64().expect("read back"), vec![5, 6, 7, 8]);
     }
 }
+
+/// Regression coverage for the unaligned / zero-length tensor data pointer that
+/// aborted `CLI ORT` on `main`.
+///
+/// `Value::from_raw_bytes` handed ORT the pointer of a `Vec<u8>`, which is only
+/// 1-byte aligned and, when empty, is `Vec`'s dangling sentinel `0x1` rather
+/// than an allocation. ORT stores that pointer verbatim and returns it from
+/// `GetTensorMutableData`, so reading the tensor back as its element type built
+/// a slice from a pointer not aligned for `T`. `slice::from_raw_parts` requires
+/// alignment **even at length 0**, so the debug UB check aborted the process
+/// (SIGABRT on Linux, `STATUS_STACK_BUFFER_OVERRUN` on Windows).
+///
+/// These are deterministic on every platform: the dangling-`Vec` sentinel, the
+/// `from_raw_parts` precondition, and the synthetic misaligned pointers below
+/// do not depend on the host allocator, the OS, or test ordering.
+#[cfg(test)]
+mod element_alignment_tests {
+    use super::*;
+
+    /// Every dtype, with the accessor a caller would actually reach for.
+    fn read_back_empty(dtype: DataType) -> usize {
+        let value = Value::from_raw_bytes(Vec::new(), &[0, 8], dtype)
+            .unwrap_or_else(|e| panic!("build an empty {dtype:?} tensor: {e}"));
+        assert_eq!(value.numel(), 0, "{dtype:?}");
+        match dtype {
+            DataType::Float32 => value.to_vec_f32().expect("f32 read").len(),
+            DataType::Float16 => value.to_vec_f16_bits().expect("f16 read").len(),
+            DataType::BFloat16 => value.to_vec_bf16_bits().expect("bf16 read").len(),
+            DataType::Int64 => value.to_vec_i64().expect("i64 read").len(),
+            _ => value.to_raw_bytes().expect("raw read").len(),
+        }
+    }
+
+    /// The exact abort: an empty tensor of a multi-byte dtype, read back as its
+    /// element type. Every one of these panicked the process before the fix; the
+    /// 1-byte dtypes are included so the case that *did* work stays working.
+    #[test]
+    fn an_empty_tensor_reads_back_empty_for_every_dtype() {
+        for dtype in [
+            DataType::Float32,
+            DataType::Float16,
+            DataType::BFloat16,
+            DataType::Int64,
+            DataType::Int32,
+            DataType::Uint32,
+            DataType::Int16,
+            DataType::Uint16,
+            DataType::Int8,
+            DataType::Uint8,
+            DataType::Uint64,
+            DataType::Bool,
+            DataType::Float8E4M3,
+            DataType::Float8E5M2,
+        ] {
+            assert_eq!(read_back_empty(dtype), 0, "{dtype:?} must read back empty");
+        }
+    }
+
+    /// The invariant itself, asserted on the address ORT hands back rather than
+    /// on a symptom: a `Vec<u8>`-backed tensor must still expose an
+    /// element-aligned data pointer, empty or not.
+    #[test]
+    fn a_raw_bytes_tensor_exposes_an_element_aligned_data_pointer() {
+        for dtype in [
+            DataType::Float32,
+            DataType::Float16,
+            DataType::BFloat16,
+            DataType::Int64,
+            DataType::Int32,
+            DataType::Bool,
+        ] {
+            for rows in [0i64, 1, 3] {
+                let bytes = vec![0u8; (rows as usize) * 8 * dtype.size_of()];
+                let value = Value::from_raw_bytes(bytes, &[rows, 8], dtype)
+                    .unwrap_or_else(|e| panic!("build {dtype:?} [{rows}, 8]: {e}"));
+                let address = value.data_ptr_addr().expect("data pointer");
+                assert!(
+                    address.is_multiple_of(dtype.align_of()),
+                    "{dtype:?} [{rows}, 8]: ORT returned {address:#x}, which is not aligned to \
+                     {} bytes",
+                    dtype.align_of()
+                );
+                assert!(
+                    address > 0xffff,
+                    "{dtype:?} [{rows}, 8]: {address:#x} is a dangling sentinel, not an allocation"
+                );
+            }
+        }
+    }
+
+    /// Non-empty bytes must survive the aligned backing unchanged — the fix must
+    /// not silently truncate, pad, or reorder the tail that does not fill a
+    /// whole 8-byte word.
+    #[test]
+    fn raw_bytes_round_trip_through_the_aligned_backing() {
+        // 5 x u16 = 10 bytes: not a multiple of the 8-byte backing word, so the
+        // partial tail word is exercised.
+        let bits: Vec<u16> = vec![0x3C00, 0x0001, 0xFFFF, 0x8000, 0x1234];
+        let bytes: Vec<u8> = bits.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let value = Value::from_raw_bytes(bytes.clone(), &[5], DataType::Float16)
+            .expect("build a 5-element fp16 tensor");
+        assert_eq!(value.to_raw_bytes().expect("raw bytes"), bytes);
+        assert_eq!(value.to_vec_f16_bits().expect("f16 bits"), bits);
+    }
+
+    /// In-place writers must still work on a `Vec<u8>`-backed Int64 tensor,
+    /// whose backing had alignment 1 before the fix — `copy_nonoverlapping` and
+    /// `ptr::write` impose the same alignment precondition as `from_raw_parts`.
+    #[test]
+    fn in_place_i64_writes_work_on_a_raw_bytes_backed_tensor() {
+        let value = Value::from_raw_bytes(vec![0u8; 4 * 8], &[4], DataType::Int64)
+            .expect("build an i64 tensor from raw bytes");
+        value.write_i64_prefix(&[11, 22]).expect("prefix write");
+        value.fill_i64_range(2, 2, -7).expect("range fill");
+        assert_eq!(
+            value.to_vec_i64().expect("read back"),
+            vec![11, 22, -7, -7],
+            "in-place writes through a raw-bytes backing must land"
+        );
+    }
+
+    /// A deliberately misaligned pointer, built by offsetting an 8-aligned
+    /// allocation by one byte so the misalignment is guaranteed on every
+    /// platform rather than left to the allocator.
+    #[test]
+    fn tensor_elements_copies_rather_than_borrowing_a_misaligned_pointer() {
+        let mut storage = [0u64; 4];
+        let base = storage.as_mut_ptr().cast::<u8>();
+        assert!(
+            (base as usize).is_multiple_of(8),
+            "u64 storage is 8-aligned"
+        );
+        // SAFETY: `base + 1 .. base + 13` is inside the 32-byte allocation.
+        let misaligned = unsafe { base.add(1) };
+        let expected: [u32; 3] = [0xDEAD_BEEF, 0x0000_0001, 0xFFFF_FFFF];
+        // SAFETY: writing 12 bytes at offset 1 of a 32-byte allocation, as bytes
+        // (alignment 1), from a distinct source.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                expected.as_ptr().cast::<u8>(),
+                misaligned,
+                std::mem::size_of_val(&expected),
+            );
+        }
+
+        // SAFETY: 3 initialized `u32`s worth of bytes live at `misaligned`, and
+        // `storage` outlives the returned view.
+        let view = unsafe { tensor_elements::<u32>(misaligned.cast::<u32>(), 3) };
+        assert!(
+            matches!(view, Cow::Owned(_)),
+            "a misaligned pointer must be copied, never borrowed as a slice"
+        );
+        assert_eq!(
+            &view[..],
+            &expected[..],
+            "the copy must preserve the values"
+        );
+    }
+
+    /// The fast path must stay a borrow: a copy on every aligned read would be a
+    /// silent per-token regression on the logits path.
+    #[test]
+    fn tensor_elements_borrows_an_aligned_pointer_in_place() {
+        let storage = [1u32, 2, 3, 4];
+        // SAFETY: `storage` is a live, aligned `[u32; 4]` that outlives the view.
+        let view = unsafe { tensor_elements::<u32>(storage.as_ptr(), 4) };
+        assert!(
+            matches!(view, Cow::Borrowed(_)),
+            "an aligned pointer must be borrowed in place, not copied"
+        );
+        assert_eq!(&view[..], &storage[..]);
+    }
+
+    /// Length 0 must never dereference or even align-check the pointer: this is
+    /// the precondition the abort actually tripped.
+    #[test]
+    fn tensor_elements_yields_an_empty_slice_for_a_misaligned_zero_length_read() {
+        // `0x1` is exactly what `Vec::<u8>::new().as_mut_ptr()` produces and what
+        // ORT handed back in the failing job.
+        let dangling = std::ptr::without_provenance::<u16>(1);
+        // SAFETY: `len` is 0, so no element is read and the pointer is never
+        // dereferenced.
+        let view = unsafe { tensor_elements::<u16>(dangling, 0) };
+        assert!(view.is_empty());
+        assert!(matches!(view, Cow::Borrowed(_)));
+    }
+
+    /// An external buffer is the only one this crate does not allocate, so it is
+    /// the only remaining way to violate the invariant. It must be refused at
+    /// the boundary, loudly, instead of becoming UB on the first read.
+    #[test]
+    fn an_unaligned_external_buffer_is_refused_with_a_named_alignment() {
+        let mut storage = [0u64; 4];
+        let base = storage.as_mut_ptr().cast::<u8>();
+        // SAFETY: one byte into a 32-byte allocation.
+        let misaligned = unsafe { base.add(1) };
+        let info = MemoryInfo::cpu().expect("cpu memory info");
+        let error = unsafe {
+            Value::from_external_memory(misaligned.cast(), 16, &[2, 2], DataType::Float32, &info)
+        }
+        .map(|_| ())
+        .expect_err("a 1-byte-offset buffer is not aligned for f32");
+        let message = error.to_string();
+        assert!(
+            message.contains("not aligned") && message.contains('4'),
+            "the error must name the alignment f32 requires: {message}"
+        );
+    }
+
+    /// The rejection must be about alignment, not about external buffers: a
+    /// correctly aligned one still works.
+    #[test]
+    fn an_aligned_external_buffer_is_still_accepted() {
+        let mut storage = [0u64; 4];
+        let info = MemoryInfo::cpu().expect("cpu memory info");
+        let value = unsafe {
+            Value::from_external_memory(
+                storage.as_mut_ptr().cast(),
+                std::mem::size_of_val(&storage),
+                &[2, 2],
+                DataType::Float32,
+                &info,
+            )
+        }
+        .expect("an 8-aligned buffer is aligned for f32");
+        assert_eq!(value.to_vec_f32().expect("read back"), vec![0.0; 4]);
+    }
+
+    /// `clone_owned` deep-copies through the same accessors, so an empty tensor
+    /// of a multi-byte dtype used to abort there too.
+    #[test]
+    fn clone_owned_round_trips_an_empty_float16_tensor() {
+        let value =
+            Value::from_raw_bytes(Vec::new(), &[0, 8], DataType::Float16).expect("empty fp16");
+        let cloned = value.clone_owned().expect("clone an empty fp16 tensor");
+        assert_eq!(cloned.dtype(), DataType::Float16);
+        assert_eq!(cloned.shape(), &[0, 8]);
+        assert!(cloned.to_vec_f16_bits().expect("read back").is_empty());
+    }
+
+    /// `to_vec_f32_lossy` widens fp16 through its own `from_raw_parts` site, so
+    /// it needs the same zero-length rule as `tensor_data_to_vec`.
+    #[test]
+    fn lossy_f32_widening_handles_an_empty_half_tensor() {
+        for dtype in [DataType::Float16, DataType::BFloat16, DataType::Float32] {
+            let value = Value::from_raw_bytes(Vec::new(), &[0, 8], dtype)
+                .unwrap_or_else(|e| panic!("empty {dtype:?}: {e}"));
+            assert!(
+                value.to_vec_f32_lossy().expect("widen").is_empty(),
+                "{dtype:?} must widen to an empty vec"
+            );
+        }
+    }
+
+    /// The borrowing byte accessor must answer an empty tensor without asking
+    /// ORT for a data pointer at all.
+    #[test]
+    fn byte_accessors_answer_an_empty_tensor_without_a_data_pointer() {
+        let value =
+            Value::from_raw_bytes(Vec::new(), &[0, 8], DataType::Float16).expect("empty fp16");
+        assert!(value.as_raw_bytes().expect("borrowed bytes").is_empty());
+        assert!(value.to_raw_bytes().expect("copied bytes").is_empty());
+    }
+}
