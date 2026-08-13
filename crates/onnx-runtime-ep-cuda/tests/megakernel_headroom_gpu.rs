@@ -289,3 +289,516 @@ fn megakernel_headroom_probe() {
         "fused vs unfused drifted more than bf16 round-trip explains"
     );
 }
+
+// ===========================================================================
+// P1.5 — real fused-int4-GEMV one-layer megakernel probe + grid.sync-under-
+// capture gate. Extends the Phase B glue-only recovery number with the part
+// that actually gates the multi-week P2: (Exp 1) can a cooperative launch —
+// the only launch path a persistent multi-CTA megakernel with grid.sync can
+// use — even be *captured* into the decode CUDA graph? and (Exp 2) what does
+// a single-CTA fused int4 MLP (gate/up/silu-mul/down with the 19968-wide
+// intermediate held resident, zero activation DRAM round-trips) cost versus
+// the current per-op int4 GEMV launch sequence on identical tensors?
+//
+// Both are throwaway measurement kernels — NOT wired into any dispatch path.
+// ===========================================================================
+
+// Faithful f32-activation int4 decode GEMV (block-32, symmetric zero-point 8,
+// nibble unpack, fp32 accumulate + block_sum) — same math/order as the
+// production `matmul_nbits_gemv_f32` reference. Used BOTH as the per-op
+// baseline (grid = N columns, one block reduces one column over K, full-device
+// parallel weight reads) AND, inlined, inside the fused single-CTA megakernel
+// so the two are byte-comparable. `fused_mlp` keeps sx[H] and sact[I] resident
+// in dynamic shared memory across the whole MLP: only the packed weights stream
+// from DRAM, the 19968-wide intermediate never touches global memory.
+const MLP_SRC: &str = r#"
+__device__ __forceinline__ float warp_sum(float v) {
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
+    return v;
+}
+__device__ __forceinline__ float block_sum(float value) {
+    __shared__ float warp_sums[32];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    value = warp_sum(value);
+    if (lane == 0) warp_sums[warp] = value;
+    __syncthreads();
+    value = threadIdx.x < ((blockDim.x + 31) >> 5) ? warp_sums[lane] : 0.0f;
+    return warp == 0 ? warp_sum(value) : 0.0f;
+}
+
+// One int4 GEMV output column, symmetric zp=8, block_size=32, blob=16 bytes.
+// `act` lives in `src` (global for the baseline, shared for the fused kernel).
+__device__ __forceinline__ float gemv_col_f32(
+    const float* act, const unsigned char* packed, const float* scales,
+    int k, int col) {
+    const int k_blocks = k >> 5;      // block_size 32
+    const int blob = 16;              // 32 int4 = 16 bytes
+    float value = 0.0f;
+    for (int depth = threadIdx.x; depth < k; depth += blockDim.x) {
+        int block = depth >> 5;
+        int within = depth & 31;
+        int base = (col * k_blocks + block) * blob;
+        unsigned char byte = packed[base + (within >> 1)];
+        int q = (within & 1) ? (byte >> 4) : (byte & 15);
+        float s = scales[col * k_blocks + block];
+        value += act[depth] * (float)(q - 8) * s;
+    }
+    return block_sum(value);
+}
+
+// Per-op baseline GEMV: grid = N, block reduces one column over K.
+extern "C" __global__ void gemv_ref(
+    const float* act, const unsigned char* packed, const float* scales,
+    float* out, int k, int n) {
+    int col = blockIdx.x;
+    if (col >= n) return;
+    float v = gemv_col_f32(act, packed, scales, k, col);
+    if (threadIdx.x == 0) out[col] = v;
+}
+
+// Per-op baseline SiLU-mul: out[i] = silu(gate[i]) * up[i].
+extern "C" __global__ void silu_mul(
+    const float* gate, const float* up, float* out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float g = gate[i];
+    out[i] = (g / (1.0f + expf(-g))) * up[i];
+}
+
+// Fused single-CTA MLP megakernel: one block executes the whole MLP with the
+// hidden input and the 19968-wide intermediate resident in shared memory.
+// Reduction order (thread stride + block_sum) is identical to gemv_ref, so the
+// output is byte-exact-capable vs the per-op baseline (no reduction reorder).
+extern "C" __global__ void fused_mlp(
+    const float* xin,
+    const unsigned char* gate_packed, const float* gate_scales,
+    const unsigned char* up_packed, const float* up_scales,
+    const unsigned char* down_packed, const float* down_scales,
+    float* out, int h, int inter) {
+    extern __shared__ float smem[];
+    float* sx = smem;           // [h]
+    float* sact = smem + h;     // [inter]
+    for (int i = threadIdx.x; i < h; i += blockDim.x) sx[i] = xin[i];
+    __syncthreads();
+    // gate/up GEMV over K=h, fused SiLU-mul, intermediate stays in shared.
+    for (int col = 0; col < inter; ++col) {
+        float g = gemv_col_f32(sx, gate_packed, gate_scales, h, col);
+        float u = gemv_col_f32(sx, up_packed, up_scales, h, col);
+        if (threadIdx.x == 0) sact[col] = (g / (1.0f + expf(-g))) * u;
+        __syncthreads();
+    }
+    // down GEMV over K=inter, reading the resident intermediate from shared.
+    for (int col = 0; col < h; ++col) {
+        float v = gemv_col_f32(sact, down_packed, down_scales, inter, col);
+        if (threadIdx.x == 0) out[col] = v;
+        __syncthreads();
+    }
+}
+"#;
+
+// Deterministic pseudo-random byte fill (no rand dep; stable across runs).
+fn fill_bytes(n: usize, seed: u64) -> Vec<u8> {
+    let mut s = seed | 1;
+    let mut v = Vec::with_capacity(n);
+    for _ in 0..n {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        v.push((s >> 24) as u8);
+    }
+    v
+}
+
+fn fill_f32(n: usize, seed: u64, scale: f32, bias: f32) -> Vec<u8> {
+    let mut s = seed | 1;
+    let mut out = Vec::with_capacity(n * 4);
+    for _ in 0..n {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        let u = ((s >> 40) as f32) / ((1u64 << 24) as f32); // [0,1)
+        out.extend_from_slice(&(u * scale + bias).to_le_bytes());
+    }
+    out
+}
+
+#[test]
+#[ignore = "requires a CUDA device; run with --ignored --nocapture"]
+fn megakernel_int4_mlp_probe() {
+    use cudarc::driver::sys::CUfunction_attribute;
+
+    let ep = match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
+        Ok(Ok(ep)) => ep,
+        _ => {
+            eprintln!("[mk15-mlp] no CUDA runtime; skipping");
+            return;
+        }
+    };
+    let runtime = ep.runtime();
+    let stream = runtime.stream().clone();
+    let ctx = stream.context().clone();
+
+    // Real Muse-Glimmer-30B MLP shapes, block-32 int4.
+    let h = env_usize("NXRT_MK_HIDDEN", 6656);
+    let inter = env_usize("NXRT_MK_INTER", 19968);
+    let iters = env_usize("NXRT_MK_MLP_ITERS", 50);
+    let block = 256u32;
+    assert_eq!(h % 32, 0);
+    assert_eq!(inter % 32, 0);
+    let kb_gate = h / 32; // k_blocks for gate/up (K = h)
+    let kb_down = inter / 32; // k_blocks for down  (K = inter)
+    let blob = 16usize;
+
+    let gemv = runtime
+        .nvrtc_function("nxrt_mk_mlp", MLP_SRC, "gemv_ref")
+        .unwrap();
+    let silu = runtime
+        .nvrtc_function("nxrt_mk_mlp", MLP_SRC, "silu_mul")
+        .unwrap();
+    let fused = runtime
+        .nvrtc_function("nxrt_mk_mlp", MLP_SRC, "fused_mlp")
+        .unwrap();
+
+    // Opt in to the 104 KiB dynamic shared the fused kernel needs (H200 SM = 227 KiB).
+    let smem_bytes = ((h + inter) * std::mem::size_of::<f32>()) as u32;
+    fused
+        .set_attribute(
+            CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            smem_bytes as i32,
+        )
+        .expect("opt in to dynamic shared mem");
+
+    // Device buffers: packed weights + scales for gate/up/down, activations, outputs.
+    let alloc = |bytes: usize, data: &[u8]| {
+        let p = runtime.alloc_raw(bytes).unwrap();
+        unsafe { runtime.htod(data, p).unwrap() };
+        p
+    };
+    let gate_packed = alloc(
+        inter * kb_gate * blob,
+        &fill_bytes(inter * kb_gate * blob, 11),
+    );
+    let up_packed = alloc(
+        inter * kb_gate * blob,
+        &fill_bytes(inter * kb_gate * blob, 22),
+    );
+    let down_packed = alloc(h * kb_down * blob, &fill_bytes(h * kb_down * blob, 33));
+    let gate_scales = alloc(
+        inter * kb_gate * 4,
+        &fill_f32(inter * kb_gate, 44, 0.01, 0.0),
+    );
+    let up_scales = alloc(
+        inter * kb_gate * 4,
+        &fill_f32(inter * kb_gate, 55, 0.01, 0.0),
+    );
+    let down_scales = alloc(h * kb_down * 4, &fill_f32(h * kb_down, 66, 0.01, 0.0));
+    let xin = alloc(h * 4, &fill_f32(h, 77, 0.2, -0.1));
+    let gate_out = runtime.alloc_raw(inter * 4).unwrap();
+    let up_out = runtime.alloc_raw(inter * 4).unwrap();
+    let act_out = runtime.alloc_raw(inter * 4).unwrap();
+    let base_out = runtime.alloc_raw(h * 4).unwrap();
+    let fused_out = runtime.alloc_raw(h * 4).unwrap();
+
+    let time_ms = |launch: &mut dyn FnMut()| -> f32 {
+        let start = ctx
+            .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+            .unwrap();
+        let end = ctx
+            .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+            .unwrap();
+        start.record(&stream).unwrap();
+        launch();
+        end.record(&stream).unwrap();
+        start.elapsed_ms(&end).unwrap()
+    };
+
+    // --- baseline: 4 separate launches (gate GEMV, up GEMV, silu-mul, down GEMV) ---
+    let hi = h as i32;
+    let interi = inter as i32;
+    let run_baseline = || {
+        let gcfg = LaunchConfig {
+            grid_dim: (inter as u32, 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut b = stream.launch_builder(&gemv);
+        b.arg(&xin)
+            .arg(&gate_packed)
+            .arg(&gate_scales)
+            .arg(&gate_out)
+            .arg(&hi)
+            .arg(&interi);
+        unsafe { b.launch(gcfg) }.unwrap();
+        let mut b = stream.launch_builder(&gemv);
+        b.arg(&xin)
+            .arg(&up_packed)
+            .arg(&up_scales)
+            .arg(&up_out)
+            .arg(&hi)
+            .arg(&interi);
+        unsafe { b.launch(gcfg) }.unwrap();
+        let scfg = LaunchConfig {
+            grid_dim: ((inter as u32).div_ceil(block), 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut b = stream.launch_builder(&silu);
+        b.arg(&gate_out).arg(&up_out).arg(&act_out).arg(&interi);
+        unsafe { b.launch(scfg) }.unwrap();
+        let dcfg = LaunchConfig {
+            grid_dim: (h as u32, 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut b = stream.launch_builder(&gemv);
+        b.arg(&act_out)
+            .arg(&down_packed)
+            .arg(&down_scales)
+            .arg(&base_out)
+            .arg(&interi)
+            .arg(&hi);
+        unsafe { b.launch(dcfg) }.unwrap();
+    };
+
+    // --- fused single-CTA megakernel: 1 launch, intermediate resident in shared ---
+    let run_fused = || {
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: smem_bytes,
+        };
+        let mut b = stream.launch_builder(&fused);
+        b.arg(&xin)
+            .arg(&gate_packed)
+            .arg(&gate_scales)
+            .arg(&up_packed)
+            .arg(&up_scales)
+            .arg(&down_packed)
+            .arg(&down_scales)
+            .arg(&fused_out)
+            .arg(&hi)
+            .arg(&interi);
+        unsafe { b.launch(cfg) }.unwrap();
+    };
+
+    run_baseline();
+    run_fused();
+    runtime.synchronize().unwrap();
+
+    let mut base_samples = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        base_samples.push(time_ms(&mut || run_baseline()));
+    }
+    runtime.synchronize().unwrap();
+    let mut fused_samples = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        fused_samples.push(time_ms(&mut || run_fused()));
+    }
+    runtime.synchronize().unwrap();
+
+    let base_ms = median(base_samples);
+    let fused_ms = median(fused_samples);
+    eprintln!(
+        "[mk15-mlp] per-op baseline MLP (4 launches, full-device parallel): {:.4} ms/layer",
+        base_ms
+    );
+    eprintln!(
+        "[mk15-mlp] fused single-CTA MLP (1 launch, intermediate resident):  {:.4} ms/layer",
+        fused_ms
+    );
+    eprintln!(
+        "[mk15-mlp] fused/baseline ratio = {:.2}x  (>1 => single-CTA is SLOWER: \
+         loses full-device weight-read parallelism; a real megakernel MUST be multi-CTA)",
+        fused_ms / base_ms
+    );
+
+    // Numerics: identical dequant + reduction order => byte-exact-capable.
+    let mut base_host = vec![0u8; h * 4];
+    let mut fused_host = vec![0u8; h * 4];
+    unsafe {
+        runtime.dtoh(&mut base_host, base_out).unwrap();
+        runtime.dtoh(&mut fused_host, fused_out).unwrap();
+    }
+    let rd = |b: &[u8], i: usize| {
+        f32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]])
+    };
+    let mut max_abs = 0.0f32;
+    let mut max_ulp = 0i64;
+    for i in 0..h {
+        let a = rd(&base_host, i);
+        let b = rd(&fused_host, i);
+        max_abs = max_abs.max((a - b).abs());
+        max_ulp = max_ulp.max((a.to_bits() as i64 - b.to_bits() as i64).abs());
+    }
+    eprintln!(
+        "[mk15-mlp] numerics fused-vs-baseline: max_abs={:.3e}, max_ulp={} \
+         (0 => byte-exact; fp32 accumulate + identical block_sum order preserved)",
+        max_abs, max_ulp
+    );
+
+    unsafe {
+        for p in [
+            gate_packed,
+            up_packed,
+            down_packed,
+            gate_scales,
+            up_scales,
+            down_scales,
+            xin,
+            gate_out,
+            up_out,
+            act_out,
+            base_out,
+            fused_out,
+        ] {
+            runtime.free_raw(p).unwrap();
+        }
+    }
+
+    // The MLP is ~2/3 of a decoder layer's GEMV FLOPs (gate+up+down vs the
+    // 4 attention projections); reported per-layer numbers in the doc combine
+    // this with the measured attention/glue costs.
+    assert!(base_ms > 0.0 && fused_ms > 0.0);
+}
+
+#[test]
+#[ignore = "requires a CUDA device; run with --ignored --nocapture"]
+fn grid_sync_capture_gate_probe() {
+    use cudarc::driver::result;
+    use cudarc::driver::sys::{
+        CUgraphInstantiate_flags, CUstreamCaptureMode, CUstreamCaptureStatus,
+    };
+    use std::ffi::{CString, c_void};
+
+    let ep = match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
+        Ok(Ok(ep)) => ep,
+        _ => {
+            eprintln!("[mk15-coop] no CUDA runtime; skipping");
+            return;
+        }
+    };
+    let runtime = ep.runtime();
+    let stream = runtime.stream().clone();
+
+    // A persistent multi-CTA megakernel with grid-wide producer/consumer sync
+    // (cg::this_grid().sync()) can ONLY be launched with cuLaunchCooperativeKernel.
+    // The decisive P2 question is whether that launch path is capturable into the
+    // decode CUDA graph. The kernel body is irrelevant to the launch-API gate, so
+    // we use a trivial co-resident kernel (avoids NVRTC cooperative_groups.h dep).
+    let coop_src = r#"
+extern "C" __global__ void coop_noop(int* p) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) p[0] += 1;
+}
+"#;
+    // Raw CUfunction (cudarc's CudaFunction hides cu_function) so we can call
+    // cuLaunchCooperativeKernel directly. Compile to CUBIN (sm_90, this H200) and
+    // load it via cuModuleLoadData — the same fallback the runtime uses to dodge
+    // the "unsupported PTX toolchain" JIT check when NVRTC is newer than the driver.
+    let source = CString::new(coop_src).unwrap();
+    let name = CString::new("coop_mod").unwrap();
+    let program =
+        match cudarc::nvrtc::result::create_program(source.as_c_str(), Some(name.as_c_str())) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[mk15-coop] NVRTC create_program failed ({e:?}); skipping");
+                return;
+            }
+        };
+    let options = vec!["--gpu-architecture=sm_90".to_string()];
+    if let Err(e) = unsafe { cudarc::nvrtc::result::compile_program(program, &options) } {
+        eprintln!("[mk15-coop] NVRTC compile failed ({e:?}); skipping");
+        let _ = unsafe { cudarc::nvrtc::result::destroy_program(program) };
+        return;
+    }
+    let mut size = 0usize;
+    unsafe { cudarc::nvrtc::sys::nvrtcGetCUBINSize(program, &mut size) }
+        .result()
+        .unwrap();
+    let mut image = vec![0u8; size];
+    unsafe { cudarc::nvrtc::sys::nvrtcGetCUBIN(program, image.as_mut_ptr().cast()) }
+        .result()
+        .unwrap();
+    let _ = unsafe { cudarc::nvrtc::result::destroy_program(program) };
+    let module = unsafe { result::module::load_data(image.as_ptr() as *const c_void) }.unwrap();
+    let func = unsafe { result::module::get_function(module, CString::new("coop_noop").unwrap()) }
+        .unwrap();
+
+    let p = runtime.alloc_raw(std::mem::size_of::<i32>()).unwrap();
+    let mut ptr = p;
+    let mut params: Vec<*mut c_void> = vec![&mut ptr as *mut _ as *mut c_void];
+
+    // (A) sanity: cooperative launch works OUTSIDE capture on this device.
+    let coop_ok = unsafe {
+        result::launch_cooperative_kernel(
+            func,
+            (1, 1, 1),
+            (32, 1, 1),
+            0,
+            stream.cu_stream(),
+            &mut params,
+        )
+    };
+    runtime.synchronize().ok();
+    match &coop_ok {
+        Ok(()) => {
+            eprintln!("[mk15-coop] (A) cooperative launch OUTSIDE capture: OK (device supports it)")
+        }
+        Err(e) => {
+            eprintln!(
+                "[mk15-coop] (A) cooperative launch unsupported on device: {e:?}; skipping gate"
+            );
+            unsafe { runtime.free_raw(p).ok() };
+            return;
+        }
+    }
+
+    // (B) THE GATE: attempt the same cooperative launch DURING stream capture.
+    stream
+        .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+        .expect("begin capture");
+    let launch_during_capture = unsafe {
+        result::launch_cooperative_kernel(
+            func,
+            (1, 1, 1),
+            (32, 1, 1),
+            0,
+            stream.cu_stream(),
+            &mut params,
+        )
+    };
+    let status_after = stream.capture_status();
+    // End capture regardless, to clean up the (possibly invalidated) stream.
+    let graph = stream
+        .end_capture(CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH);
+
+    let captured_ok = launch_during_capture.is_ok()
+        && matches!(
+            status_after,
+            Ok(CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE)
+        )
+        && matches!(graph, Ok(Some(_)));
+
+    eprintln!(
+        "[mk15-coop] (B) cooperative launch DURING capture: launch={:?}, status_after={:?}, graph_built={}",
+        launch_during_capture.map(|_| "Ok"),
+        status_after,
+        matches!(graph, Ok(Some(_)))
+    );
+    if captured_ok {
+        eprintln!(
+            "[mk15-coop] === VERDICT: grid.sync/cooperative launch IS capturable => \
+             a multi-CTA persistent megakernel COULD live inside the decode graph ==="
+        );
+    } else {
+        eprintln!(
+            "[mk15-coop] === VERDICT: cooperative launch is NOT capturable (invalidates capture) => \
+             a grid.sync megakernel CANNOT be captured; P2 must use a single giant CTA \
+             (bandwidth-starved) OR an eager (uncaptured) seam for the megakernel ==="
+        );
+    }
+
+    // Drain any capture error so the shared runtime stream stays usable.
+    runtime.synchronize().ok();
+    unsafe { runtime.free_raw(p).ok() };
+}
