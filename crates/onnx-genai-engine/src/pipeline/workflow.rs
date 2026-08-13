@@ -258,6 +258,10 @@ fn resolve_component_invocation<'a>(
     ))
 }
 
+fn session_state_value_name(cell: &str) -> String {
+    format!("__session_state.{cell}")
+}
+
 impl PipelineEngine {
     fn materialize_workflow_value(
         &self,
@@ -371,7 +375,7 @@ impl PipelineEngine {
                 .borrow()
                 .get(&(session_id.clone(), cell.clone()))
             {
-                values.insert(state.initializer.clone(), clone_value(value)?);
+                values.insert(session_state_value_name(cell), clone_value(value)?);
             }
         }
         let mut symbols = HashMap::new();
@@ -639,12 +643,16 @@ impl PipelineEngine {
                     let state = workflow.state.get(&carry.cell).with_context(|| {
                         format!("workflow loop carries undeclared state '{}'", carry.cell)
                     })?;
-                    let initializer = values.get(&carry.current).with_context(|| {
-                        format!(
-                            "workflow state '{}' loop initializer '{}' is unavailable after setup",
-                            carry.cell, carry.current
-                        )
-                    })?;
+                    let initializer = values
+                        .get(&session_state_value_name(&carry.cell))
+                        .or_else(|| values.get(&carry.current))
+                        .with_context(|| {
+                            format!(
+                                "workflow state '{}' loop initializer '{}' is unavailable after \
+                                 setup",
+                                carry.cell, carry.current
+                            )
+                        })?;
                     validate_workflow_value(
                         &carry.current,
                         initializer,
