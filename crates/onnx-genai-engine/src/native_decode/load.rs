@@ -262,11 +262,15 @@ impl NativeDecodeSession {
         path: impl AsRef<Path>,
         device: NativeDecodeDevice,
         io: Option<&ModelIoSpec>,
+        metadata_max_len: Option<usize>,
     ) -> anyhow::Result<Self> {
         Self::load_with_cuda_options_and_io(
             path,
             device,
-            NativeDecodeCudaOptions::default(),
+            NativeDecodeCudaOptions {
+                metadata_max_len,
+                ..NativeDecodeCudaOptions::default()
+            },
             io,
             None,
             None,
@@ -278,13 +282,17 @@ impl NativeDecodeSession {
         path: impl AsRef<Path>,
         device: NativeDecodeDevice,
         io: Option<&ModelIoSpec>,
+        metadata_max_len: Option<usize>,
         offload_policy: onnx_runtime_ep_cuda::DeviceOffloadPolicy,
         governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
     ) -> anyhow::Result<Self> {
         Self::load_with_cuda_options_and_io(
             path,
             device,
-            NativeDecodeCudaOptions::default(),
+            NativeDecodeCudaOptions {
+                metadata_max_len,
+                ..NativeDecodeCudaOptions::default()
+            },
             io,
             Some(governor),
             Some(offload_policy),
@@ -357,6 +365,22 @@ impl NativeDecodeSession {
     /// Wrap an already-built native session, validating its decoder-with-past I/O.
     pub fn from_session(session: InferenceSession) -> anyhow::Result<Self> {
         Self::from_session_with_cuda_options(session, NativeDecodeCudaOptions::default())
+    }
+
+    /// Wrap an already-built native session with an explicit [`ModelIoSpec`],
+    /// used when the graph's ports cannot be disambiguated by shape/dtype alone
+    /// (e.g. the synthetic decoder whose `input_ids`/`attention_mask`/
+    /// `position_ids` are all `[-1, -1]` Int64). The declared spec is
+    /// authoritative.
+    pub fn from_session_with_io(
+        session: InferenceSession,
+        io: &ModelIoSpec,
+    ) -> anyhow::Result<Self> {
+        Self::from_session_with_cuda_options_and_io(
+            session,
+            NativeDecodeCudaOptions::default(),
+            Some(io),
+        )
     }
 
     #[cfg(test)]
@@ -667,9 +691,12 @@ impl NativeDecodeSession {
                     .with_context(|| {
                         format!("missing CUDA inputs_embeds input metadata for '{name}'")
                     })?;
-                if !matches!(meta.dtype, DataType::Float32 | DataType::Float16) {
+                if !matches!(
+                    meta.dtype,
+                    DataType::Float32 | DataType::Float16 | DataType::BFloat16
+                ) {
                     bail!(
-                        "native CUDA inputs_embeds input '{name}' must be f32 or f16, got {:?} {:?}",
+                        "native CUDA inputs_embeds input '{name}' must be f32, f16 or bf16, got {:?} {:?}",
                         meta.dtype,
                         meta.shape
                     );

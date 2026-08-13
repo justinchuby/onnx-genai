@@ -506,6 +506,7 @@ impl Executor {
             capture_warm_seeded: HashMap::new(),
             capture_quarantine_ops: HashSet::new(),
             capture_growing_symbols,
+            capacity_pinned_kv_symbols: HashSet::new(),
             last_capture_failed_node: None,
             views: HashMap::new(),
             pinned: HashSet::new(),

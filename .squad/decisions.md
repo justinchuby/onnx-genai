@@ -1,5 +1,13 @@
 # Decisions — live standing directives
 
+Last consolidated: 2026-08-13T14:45:00Z (Scribe lowbit-nogo-probe batch @ main 26bd410f; merged 2 inbox drops — sebastian-lowbit-feasibility + fact-checker-lowbit-accuracy — into new "Lower-bit quant — MEASURED no-go; ceiling is latency-bound not bandwidth-bound" section [PR #885]. KEY: byte-fold probe (−75% weight DRAM → +2.8%, HBM util ~15%) REFUTES the earlier "weight-bandwidth-bound" attribution; decode is LATENCY-bound on the ~2568-node serial chain (~8.2 µs/node). Appended a Correction note to the #870/#872/#873 fusion-arc entry (ceiling VALUE + "marginal fusion not a lever" stand; mechanism + lower-bit future-lever were wrong). Also corrected the mechanism wording in docs/PROGRESS.md (#875 lines) + bumped HEAD → 26bd410f. Megakernel/node-collapse REOPENED as true lever. Size gate: after merge decisions.md hit 53,745 B (>50 KB) → archived the detailed #870/#871/#872/#873 fusion-arc sub-entries to decisions-archive/2026-08.md (milestone conclusion + correction kept live) → 49,381 B, under the 50 KB gate. Histories: appended probe+NO-GO to sebastian/fact-checker history.md; checked chronicle + 15,360 B gates.)
+
+Last consolidated: 2026-08-13T05:15:00Z (Scribe fusion-arc batch @ main 887e3742; merged 4 inbox drops — chew-pr871-numerics, batty-fusion-contract, batty-qkv-contract, sebastian-bf16-swiglu-fusion-contract, sebastian-gqa-not-a-capture-lever — into the "Fusion arc — 47.25 tok/s is the architectural ceiling" milestone section [PRs #870/#871/#872/#873]. KEY CONCLUSION: three byte-exact A/B experiments prove native int4 decode of Muse-Glimmer-30B is weight-bandwidth/compute-floor bound at ~47.25 tok/s, NOT dispatch-bound — node/launch fusion (cheap OR expensive) does not help; #873 QKV fusion retained opt-in behind ONNX_GENAI_CUDA_ENABLE_QKV_FUSION=1. Size gate: after merge decisions.md exceeded 50 KB → archived the detailed #867 MatMulNBits narrative to decisions-archive/2026-08.md, kept milestone + standing numerics rule live. Histories: appended #871/#872/#873 + ceiling to sebastian/chew/batty history.md; all < 15,360 B chronicle gate, none summarized.)
+Last consolidated: 2026-08-13T04:10:00Z (Scribe CUDA-47tok/s-beats-ORT batch @ main 1002e360; merged sebastian-cuda-matmulnbits-gemv (PR #867, MatMulNBits bf16 constant-scale cache, native decode 40.21 → 47.25 tok/s — native now clearly beats ORT ~40, +18%). Size gate: 49,418 B + drop would exceed 50 KB → archived the detailed 23→40 (#860) narrative to decisions-archive/2026-08.md, kept its standing numerics rule live → decisions.md now 48,855 B, under charter 50 KB gate. Histories: appended PR #867 milestone to sebastian/history.md; checked all histories against the chronicle + 15,360 B gates — none summarized.)
+Last consolidated: 2026-08-13T03:03:13Z (Scribe CUDA-40tok/s milestone batch; merged sebastian-cuda-cast-elimination (PR #860) + recorded Chew's PR #860 numerics sign-off — Chew's inbox drop file was absent, decision reconstructed from spawn manifest. NO archive: decisions.md 44,755 B, below charter 50 KB gate. NOTE: the spawn prompt's "archive entries older than 30 days at ≥20,480 B" is an age-based gate the charter forbids — it no-ops since all live entries are 2026-07/08, and 20 KB is below the standing-directive floor. Histories: sebastian 3,948 B / chew 6,951 B, both below the chronicle + 15,360 B gates, none summarized.)
+Last consolidated: 2026-08-12T00:00:00Z (Scribe inbox-consolidation run @ main f85a82f0; 18 inbox drops merged — 9 CUDA-graph-capture-arc drops folded into a single "CUDA-graph capture arc" section (classify #848 → load #850 → pin #852 → bf16 kernel #855 → skip-norm #854; native decode 11.4→23.13 tok/s; capture fully engaged 1 segment / 0 seams; next lever = Cast round-trip elimination) + 9 parallel-work drops preserved as their own entries (copilot fence-witness/#851 mobius-flake/VMM-release, isidore win-arm64/ort-retry, nabil ort-discovery, resch cpu-bf16/clippy, roy registry-shrink). NO archive this run — decisions.md 28,679 B, below the gate. Histories checked: max 8,105 B (holden), below the 15,360 B gate, none summarized.)
+Last consolidated: 2026-08-12T00:00:00Z (Scribe CUDA-capture escalation batch; 1 inbox drop merged — coordinator-profiling-staging-gotchas (Muse-Glimmer native-CUDA profiling gotchas + vram-governor portability bug, no dedup collision). Size gate: 37,960 → archived EP-wheels/bf16/H200 narrative wave + verbatim inbox drops to decisions-archive/2026-08.md → ~28 KB, well under charter 50 KB. NOTE: charter mandates archive-by-SIZE; an "older than 30 days" age filter would have no-op'd here since all live entries are dated 2026-07-30..2026-08-12. Standing-directive floor is ~25 KB, so the prompt's 20,480-byte gate is below what can be shed without deleting standing directives.)
+Last consolidated: 2026-08-12T20:40:00Z (Scribe EP-wheels/bf16/H200 merge session; 3 inbox drops merged — sebastian PyPI packaging + CUDA wheel-fix, leon #762 test-quality followups; new findings entry for #829/#831/#832/#838 merges + CDN incident + vlm KV regression. Size gate: 49,117 → archived #762 active-wave + all upstream-ORT PR narrative to decisions-archive/2026-08.md → 37,540 bytes, well under 50 KB.)
 Last consolidated: 2026-08-12T15:52:00Z (Scribe nxrt-ep PyPI-publish session; 2 inbox drops merged — coordinator-nxrt-ep-cuda13 + copilot-vmm-push-summary; no dedup collisions. Size gate: 43,278 → ~50 KB, under 50 KB charter threshold, nothing archived.)
 Last consolidated: 2026-08-12T06:00:00Z (Scribe #762 memory-safety wave; 6 inbox drops merged; wave narratives archived to decisions-archive/2026-08.md; live file compacted)
 Last consolidated: 2026-08-12T04:30:00Z (Scribe #31974 coverage wave; 2 inbox drops merged; narrative waves from 2026-08-10 through 2026-08-12 archived to decisions-archive/2026-08.md; live file compacted from 50,788 bytes to ~19 KB)
@@ -13,6 +21,112 @@ Narrative waves through 2026-08-06 (hybrid Mamba #695/#700, QMoE #676, CUDA-grap
 ## Ledger health rule
 
 Archive by SIZE, not age. Age-only no-ops during high-volume campaigns because most entries are recent, so the live file can exceed spawn-budget while "older than N days" matches nothing. When over the gate, preserve full history in `.squad/decisions-archive/{YYYY-MM}.md`, dedupe rebase-reintroduced sections, and keep live `decisions.md` to standing directives plus pointers. Concurrent Scribe runs are a structural hazard; assemble from inbox drops and check `git log origin/main..HEAD` before committing.
+
+## Native CUDA decode — 47 tok/s, now BEATS ORT (2026-08-13, PR #867)
+
+**MILESTONE:** Native CUDA EP now **CLEARLY BEATS ORT** on Muse-Glimmer-30B int4 decode:
+**47.25 vs ~40 tok/s (+18%)** (coordinator-confirmed on H200, 3-run median 47.25/47.28/47.24).
+Full arc: 11.4 → 23.13 → 40.21 → **47.25 tok/s**, 1 capture segment / 0 seams, first-16 greedy
+token ids match reference, full 128-token sequence byte-identical. The detailed 23→40 (#860)
+narrative is archived in `.squad/decisions-archive/2026-08.md`; its standing numerics rule is
+retained below.
+
+### 2026-08-13: MatMulNBits bf16 decode — cache the Float16-staged constant scales (40.21 → 47.25, #867 MERGED)
+**By:** Sebastian. A persistent per-kernel `Bf16ConstCache` stages the immutable int4 block
+scales bf16→f16 **once** (not per decode step), removing ~3.3 GB/token pure-copy traffic + 417
+redundant cast launches/token. tok/s **40.21 → 47.25 (+17.7%)**, byte-exact (no Chew gate),
+capture-stable. Full detailed narrative archived to `.squad/decisions-archive/2026-08.md`
+(under "Archived by Scribe 2026-08-13T05:15Z").
+
+### Standing numerics rule (retained from PR #860 gate, Chew)
+bf16 kernels accumulate in fp32 and are oracle-gated against an f64 truth model; a parallel tree
+reduction may be adopted over a serial order when the oracle shows it is at least as accurate (the
+#860 RMSNorm tree reduction was ~807× more accurate than the serial order). The
+`ONNX_GENAI_CUDA_DISABLE_NORM_CAST_FOLD=1` escape hatch routes back to serial `rmsnorm_f32` for
+strict CPU-order byte-exact parity (at ~23 tok/s).
+
+## Fusion arc — 47.25 tok/s is the architectural CEILING for native CUDA int4 decode (2026-08-13, PRs #870/#871/#872/#873)
+
+**KEY CONCLUSION (record prominently):** Three independent, byte-exact A/B experiments —
+**#870** (GQA / inner-loop cheapening), **#872** (cheap constant-`Add` fold, −208 nodes/token),
+and **#873** (QKV projection fusion, −104 **expensive** GEMV launches/token) — conclusively prove
+native CUDA int4 decode of **Muse-Glimmer-30B is weight-bandwidth / compute-floor bound at
+~47.25 tok/s (H200)**, NOT launch-dispatch bound. Graph node/launch fusion (cheap OR expensive)
+does not help because at M=1 decode each disjoint int4 weight is read exactly once — a
+DRAM-bandwidth roofline. **To beat 47 you must cut weight BYTES/token** (lower-bit quant,
+sparsity) or move to a **different kernel family (megakernel)** — NOT node fusion. Native
+decisively beats ORT (**47.25 vs ~40, +18%**). **The perf arc is concluded at the ceiling;
+no code perf change shipped, one opt-in pass retained.**
+
+> **Correction (2026-08-13, per probe #885):** the mechanism named above ("weight-bandwidth /
+> compute-floor bound") is **wrong**. A controlled weight-DRAM byte-fold probe (#885) measured
+> that cutting weight bytes read to 25% raises tok/s only 47.29 → 48.62 (**+2.8%**, HBM util
+> ~15%) — decode is **latency-bound on the ~2568-node serial dependency chain (~8.2 µs/node)**,
+> NOT weight-bandwidth-bound. The ceiling VALUE (~47.25) and the "marginal node/launch fusion is
+> not a lever" conclusion still stand; only the WHY changes. Consequently the "cut weight
+> BYTES/token (lower-bit quant, sparsity)" future-lever above is a **MEASURED no-go** (see the
+> Lower-bit quant section below), and **drastic per-layer node-collapse (decode megakernel,
+> activations resident) is REOPENED as the true next lever.**
+
+### Detailed #870/#871/#872/#873 sub-entries → archived
+The four detailed per-PR narratives (bf16 SiLU #871, GQA-not-a-lever #870, cheap-Add regression #872, QKV-fusion-flat #873) are in `.squad/decisions-archive/2026-08.md` ("Archived by Scribe 2026-08-13T14:45Z"). The milestone conclusion + latency-bound correction above are the live record; #873's `CudaQkvProjectionFusion` stays opt-in via `ONNX_GENAI_CUDA_ENABLE_QKV_FUSION=1`.
+
+**Profiling note (all four investigations):** hardware profilers remain blocked in-sandbox (ncu
+absent; nsys "Creating threads in this process is forbidden by design"; RmProfilingAdminOnly=1).
+All numbers from the built-in op timer + `ONNX_GENAI_PROFILE_OPS`/`cuGraphGetNodes` node counts +
+capture-safe env-gated A/B on a single release binary.
+
+## Lower-bit quant — MEASURED no-go; ceiling is latency-bound not bandwidth-bound (2026-08-13, PR #885)
+
+**KEY CONCLUSION (record prominently):** Research asked whether lower-bit quant (int3/int2/mixed/
+2:4/NF4) could beat ~47 tok/s on Muse-Glimmer-30B native CUDA decode. **NET RESULT: a MEASURED
+🟥 NO-GO** — and the probe that settled it also **corrected the earlier bandwidth-bound
+mis-attribution.** Decode is **latency-bound on the serial ~2568-node dependency chain
+(~8.2 µs/node × 2568 ≈ 21 ms/token)**, NOT weight-bandwidth-bound. Reconciles both prior
+negatives: not bandwidth (byte-fold flat) AND not marginal-node-sensitive (#872/#873 flat/worse).
+**Megakernel / drastic per-layer node-collapse (activations resident) is the reopened true lever.**
+
+### 2026-08-13: Bandwidth probe (#885 MERGED, docs-only) — the mechanism is latency, not bytes
+**By:** Sebastian (Perf). Full brief: `docs/research/lowbit-quant-feasibility.md`.
+**Byte budget** (measured from the real ONNX, 417 MatMulNBits, bits=4/bs=32/asymmetric/bf16-scales):
+packed weights 13 254 MB + bf16 scales 1 657 MB + int4 zero-points 414 MB = **15 325 MB/token**
+= at 47 tok/s only **724 GB/s = ~15% of the H200's 4.8 TB/s HBM roofline** (if bandwidth-bound
+we'd be ~313 tok/s). The bf16 scale floor does NOT shrink with fewer bits, so int2-everywhere is
+only 0.554× bytes, not 0.5×.
+**Controlled probe** (throwaway/reverted, `ONNX_GENAI_WEIGHT_FOLD=D` folds the int4 GEMV weight-read
+column so DRAM footprint → 1/D with loop-trip/instruction/launch/node-count byte-identical; H200,
+CUDA_GRAPH=1, --pipeline, 3×128-tok median):
+| weight DRAM | tok/s | Δ |
+|---|---|---|
+| full (D=1) | **47.29** | — |
+| half (D=2) | 47.98 | +1.5% |
+| quarter (D=4) | 48.62 | +2.8% |
+
+−75% weight DRAM → **+2.8%** ⇒ weight-DRAM-bound fraction ≈ **3–4%**. int2-everywhere (−45% bytes)
+projects to **≈+1.6% (~48 tok/s)**, not the naive +14%/+80%. **Lower-bit quant (all variants) =
+MEASURED 🟥 NO-GO** as the next lever.
+
+### 2026-08-13: Accuracy reality-check (Fact Checker) — every sub-4-bit path also needs a re-quant
+**By:** Fact Checker (independent, accuracy lens only; read-only, no kernels touched). Full brief:
+merged from `fact-checker-lowbit-accuracy.md`.
+- **int3 weight-only (imatrix/AWQ-class, ~3.5 bpw / SpQR mixed):** 🟢 credible — small real quality
+  tax, least-risky sub-4-bit lever.
+- **int2 scalar / Q2_K:** 🔴 accuracy-prohibitive (cliff) — do not ship for quality-sensitive output.
+- **int2 via codebook/trellis (QuIP#/AQLM/QTIP):** 🟡 SOTA-for-2-bit but still a visible FP16 gap at
+  30B, AND replaces scalar dequant with LUT/trellis decode that **spends the bandwidth win back** —
+  accuracy win and bandwidth win are coupled, not independent.
+- **Mixed-precision (SpQR/LLM-MQ, ~2.5–3.5 avg bit):** 🟢 accuracy / 🟡 kernel+tooling (irregular
+  layout + outlier FP16 sidecar).
+- **2:4 structured sparsity:** 🟡 needs a fine-tune for quality; no M=1 tensor-core benefit anyway.
+- **Load-bearing blockers:** (1) we only HAVE int4 — EVERY sub-4-bit method must re-quantize/calibrate
+  from the **fp16/bf16 SOURCE** checkpoint (re-squeezing the existing int4 compounds error → collapse);
+  (2) ORT-stack tooling for sub-4-bit >7B is immature (GGUF/imatrix ships it but off-stack; Olive not
+  demonstrated). Chew is the numerics gate if any sub-4-bit path is ever funded.
+
+**Disposition:** no code/quant change made or planned. Lower-bit quant replaced on the roadmap by a
+one-layer decode-megakernel prototype (the only direction consistent with all three measurements:
+byte-fold flat, marginal fusion flat/worse, ~15% HBM util). Decision drops merged & deleted:
+`sebastian-lowbit-feasibility.md`, `fact-checker-lowbit-accuracy.md`.
 
 ## nxrt EP plugins on PyPI + CUDA 13 target (2026-08-12)
 
@@ -96,34 +210,6 @@ concurrency).
 #797) — #807 added a debug-only freeze guard, single-stream helper, and an inventory. Negative
 results delivered as first-class outcomes. Never extrapolate an unmeasured number (`qwen14b-zp`
 lacks `inference_metadata.yaml`, not native-loadable #384 — reported as not measured).
-
-## Current active wave — 2026-08-12 (#762 Opus memory-safety wave)
-
-### PR #762 — Memory safety defects in absent optional output machinery (draft, ready to leave draft)
-
-**By:** Nabil (B1+B2), Batty (corrective wave), Sebastian (S1/S2/S3), Challenger (fourth adversarial review)
-**Commits:** af45043fd (Nabil), b906ab2bb (Batty), a5448fa36 (Sebastian)
-
-**B1 (heap buffer overflow):** Scratch buffers for absent optional outputs sized from slot dtype byte size (2 bytes for f16/bf16) but TensorMut hardcoded to Float32 — 2× overflow on every f16/bf16 op with omitted optional output. Fix: dtype from `output_dtypes[slot]`, buffer sized `max(byte_size, 8)`, `TensorMut.absent` flag, fail-closed on Undefined.
-
-**B2 (routed path positional compaction):** Fused multi-node path skipped allocation for absent slots then re-paired sinks through shortened iterators — panic or misroute. Fix: `RoutedSlotKind` enum (Ort/Buffer/Absent) keeps every slot index aligned end-to-end.
-
-**Corrective wave (Batty):** EP assignment assertion (Add/SkipLayerNormalization/Mul pinned to cpu_ep); `end_version: since` → `i32::MAX`; `struct_size` loader validation; `NXRT_REQUIRE_ORT_TESTS=1` fail-loud gate (verified by renaming all 16 ort-prebuilt dirs); `matmul_initializer_weights` fixture; 5 `.gitignore` negations.
-
-**Challenger (v4 review):** 0 blockers. S1: canary test size mismatch (byte_size vs max(byte_size,8)); S2: mark_absent advisory-only; S3: phantom intermediate buffer slots. Ready to leave draft.
-
-**Sebastian (S1/S2/S3):** `production_scratch_alloc()` helper extracted; `TensorMut::validate_write_dtype()` added; `NodeOutputSink::Absent` variant — `num_intermediate_buffers` no longer inflated. Removed 4 no-op identity transmutes.
-
-**Test counts:** 280 passed, 0 failed (269 baseline → 280). Clippy + fmt clean. Miri: 4/4 canary tests clean.
-
-### CUDA test honesty: dummy_fill_and_crossover whitelisted (PR #789)
-
-**By:** Cohaagen — Added `dummy_fill_and_crossover` to `ALWAYS_RUN` in `.github/scripts/verify_cuda_test_honesty.py`, mirroring `capture_sync_contract` carve-out. Four pure-CPU deterministic probes that legitimately pass on no-CUDA host were not whitelisted. Unblocks CUDA compile lane for all PRs on current main. One-line whitelist + justification comment; no test behavior changes.
-
-### cuBLASLt GEMM workspace: session-persistent shared peak
-
-**By:** Copilot — MatMul, Gemm, MatMulNBits, FusedMatMulBias, and FusedGemm report the selected cuBLASLt heuristic `workspaceSize` and share one session-persistent executor peak. Attention Phase-2a remains in step-scoped composite buffer. Planning and execution use the same plan helper; reject any shortfall deterministically.
-
 
 ## Durable lessons — #762 absent-slot machinery (2026-08-12)
 
@@ -283,263 +369,66 @@ This **narrows** the earlier Apple framework policy entry (Accelerate/BNNS/vDSP 
 ---
 
 
-## Archived narrative waves pointer (2026-08-12)
+## 2026-08-12: Profiling Muse-Glimmer-30B on native CUDA — two gotchas + a portability bug
 
-All wave narratives from 2026-08-10 (EP plugin export), 2026-08-11 (PR #762 parity, upstream CI correction, Apple MLAS f16 cast), and 2026-08-12 (CUDA MatMulNBits, Apple framework infra, rejection-response wave, PR #31973 threshold fixes) are in `.squad/decisions-archive/2026-08.md` under "ARCHIVED 2026-08-12T04:30:00Z".
+**By:** Squad (Coordinator), for Justin Chu (merged from inbox: coordinator-profiling-staging-gotchas.md)
+**What:**
+1. **Multimodal genai_config ≠ single-decoder profiling.** Muse-Glimmer's genai_config.json declares `vision`+`embedding`+`decoder`, so the compat translation resolves `shape()==Multimodal` and NEVER builds the single-decoder `model.io` block (kv_inputs/kv_outputs). Result: `profile_native --model <dir>` (single-decoder path) fails governor init with "cannot derive the KV memory budget ... declare model.io.kv_inputs". This is NOT a KV-geometry regression — the KV tensor head dims are concrete ([batch,2,seq,128]). Fix for profiling: stage a decoder-only dir with a genai_config.json that has vision/embedding stripped (shape()==SingleDecoder), model.onnx+data+tokenizer.json co-located. Staged copy lives at /tmp/muse-glimmer-staged. Alternative: `profile_native --pipeline` against the real multimodal dir.
+2. **profile_native model resolver** needs a dir containing BOTH model.onnx AND tokenizer.json (not the decoder/ subdir alone, not the top-level models/ dir).
+3. **PORTABILITY BUG (real):** `resolve_vram_limit_bytes` resolves the default `Fraction(0.90)` vram_limit against `fallback_capacity_providers` = PROVISIONAL 8 GiB (governor.rs:93), never the real device. So on any GPU (even 143GB H200) the governor caps device leases at ~7.2GB and models >7.2GB fail to load resident. profile_native has no vram flag; `ONNX_GENAI_VRAM_LIMIT` is wired only into the server CLI. Sebastian is fixing this via real cuMemGetInfo device-capacity detection (branch squad/native-cuda-decode-perf). [UPDATE: landed in batch #840 / 629fbf90 — real cudaMemGetInfo device-capacity detection + CudaFoldConstantCast pass; native decode 10.2→11.4 tok/s, +11.8%.]
 
-**Status snapshot (2026-08-12T04:30:00Z):**
-
-| PR | Status | Head |
-|----|--------|------|
-| #31985 | **MERGED** `f2dfa4e9eb` | — |
-| #31973 | Draft — threshold + comment fixes landed | — |
-| #31974 | Draft — coverage wave landed (`a12c7ddde3`), no blockers |  |
-| #31988 | Draft — **parked pending GPU** | `dc1e173e4b` |
-| #31993 | Draft | `02a9f34` |
-| #32001 | Draft | `0d924a421b` |
-| #32003 | Draft | `23dcfddaaf` |
-
-## 2026-08-12 — BF16 PrePack and generic-broadcast coverage (PR #31974 Opus v2 wave)
-
-**By:** Chew (coverage), Holden (delta review), Coordinator (verification)
-
-### Durable lessons
-
-- **Test the path real models take.** BF16 scale/bias are always constant initializers in practice — they route through `PrePack()` at session init (bf16→f32 conversion). The graph-input path was well tested; the PrePack path had zero coverage. `is_initializer=true` in OpTester triggers PrePack. Coverage gaps on paths models always take are worse than gaps on exotic paths.
-- **Internal blocker labels (`B1`–`B6`, `N1`–`N4`) are a leak class.** They mean nothing upstream and reveal internal process. Sweep for them alongside `squad`, `nxrt`, persona names, and internal issue numbers before every push.
-- **When correcting a tolerance comment, verify against the checker, not intuition.** The real behaviour is `absolute + relative × |expected|` (numpy.isclose semantics, `checkers.cc:117-120`). A stated absolute tolerance understates effective tolerance. Confirm the regression-detecting margin survives the relative component — here it did: 0.00011 effective vs 0.004 pre-fix error (36× margin).
-- **Apple/macOS CI dependency downloads fail often and before compilation.** Observed causes: cpuinfo, XNNPACK, eigen3, FXdiv (`status_code: 60`) and vcpkg bootstrap (`curl failed to verify the legitimacy of the server`). `gh run rerun` refuses fork-PR jobs; only retrigger is a push. Do not mark ready while CI is red even when the failure is provably infra.
-
-### Test counts after coverage wave (fresh build, coordinator-verified)
-
-- 20/20 BF16 tests pass (was 17)
-- 106/106 LayerNorm suite tests pass (was 103)
-- 7/7 SkipLayerNorm PrePack validation tests pass
-
+**Why:** Two agents already lost time re-hitting the model-path/KV errors when profiling this multimodal 30B. The provisional-8GB cap silently forces weight offload/paging, which corrupts perf measurements. Recording so the team stops re-deriving it.
 
 ---
 
-## 2026-08-12 — PR #762 EP plugin parity: ready-for-review lessons
+## CUDA-graph capture arc — Muse-Glimmer-30B native decode 11.4 → 23.13 tok/s (2026-08-12)
 
-**By:** Rachael, Coco, Isidore, Gaff, Freysa, Coordinator
+Full 5-blocker narrative (CLASSIFY #848 → LOAD #850 → PIN #852 → bf16 GQA kernel #855 →
+SKIP-NORM #854; capture 54 seg/53 seams → 1 seg/0 seams; 11.4 → 23.13 tok/s) archived to
+`.squad/decisions-archive/2026-08.md` (under "Archived by Scribe 2026-08-13T05:15Z"). The arc
+then continued 23 → 40.21 (#860) → 47.25 (#867) → ceiling (#870/#872/#873, above).
 
-### Durable lessons
+**Durable lessons (retained):** (a) a metadata-declared feature (sliding_window) must be
+validated against **graph-truth**, not trusted blind — a vestigial window silently forced the
+non-capturable path. (b) The capture classifier's growing-symbol veto is a **false positive for
+fixed-capacity device-KV**; pin the seq symbol engine-side, keeping the kernel
+`capture_support()` gate as an independent backstop. (c) A capture-safety flag sampled right
+after a warm-time arena grow reads false at the worst moment — gate the demotion on
+`is_capturing()`. (d) bf16 kernels accumulate in fp32; bf16 only at load/store boundaries,
+oracle-gated against f64 softmax.
 
-- **#762 reached ready after five full Opus reviews plus a focused delta.** Each round found real defects: guessed output dtypes, a use-after-free, a panic bomb making the success path unreachable, compacted optional slots, a forgeable name-based sentinel, and a 2× heap buffer overflow. Rounds four and five found progressively smaller issues — the rate of discovery, not the absence of findings, is what signalled readiness.
+## Parallel-work decisions (2026-08-12)
 
-- **Extract shared helpers rather than "keeping copies in sync".** Two `find_ort_lib_dir` copies had already diverged before anyone noticed; a `tests/common/` module plus `#[path]` includes made drift impossible. The same reasoning applied to `scratch_alloc_bytes`, where drift meant a heap overflow.
+### Enforce async-copy fence-safety with a type-level completion witness (#843, Copilot)
+When a host buffer is the *source* of an async H2D copy and later reused/freed (pinned-staging pool), reuse must be ordered after the copy **completes**, not enqueues. Enforce with a type, not a comment: the host-syncing copy primitive (`CudaRuntime::htod_async_elapsed_ms`) returns a `CopyCompleted` witness (zero-sized, field private to the `runtime` module — unforgeable); the reuse path (`PinnedStagingPool::release`/`PooledStaging::retire`) **consumes** one, so reuse is unreachable without proof the copy finished. A future switch to non-blocking copy fails to compile until a witness is threaded post-fence. `Drop` cannot *require* an argument → make `retire(self, CopyCompleted)` explicit and demote `Drop` to a leak-safe free-only fallback (never returns to pool; catch misuse with a `pinned_alloc_calls` counter). **Never assert in `Drop`** on this codebase (STATUS_STACK_BUFFER_OVERRUN). Compile-time only — no runtime/perf change.
 
-- **A validator nothing calls is a claim, not a mechanism.** `validate_write_dtype` had no production caller; the honest resolution was to document it as a test-exercised contract helper and name the real guard, not to leave it implying runtime enforcement.
+### mobius_seqmajor parity gate is intrinsically flaky ~10–20% solo — issue #851 (Copilot)
+`mobius_seqmajor_growth_parity_native_cuda` is flaky **even solo on a clean base** (coordinator measured 4/5 on clean `dccb40e8`; combined ~1 failure per ~10 solo runs) — an earlier "5/5 solo reliable" claim was under-sampled and is **retracted**. Mechanism hypothesis (#851): seq-major + capture ON + KV-growth retains a captured graph whose baked-in **weight** pointer is invalidated when a growth commit remaps backing in the shared VMM arena → replay dereferences a stale ptr → intermittent `CUDA_ERROR_ILLEGAL_ADDRESS` on a weight `cuMemcpyHtoD` (node/layer varies run-to-run). **A single green run is ~80–90% reliable, NOT 100%** — do not treat one pass as proof; do not dismiss a red without classifying it (crash vs data-mismatch). Contention adds its OWN OOM-family reds on top of the ~15% intrinsic flake, so a contended red is still worth a solo re-run — but a **solo red is a real signal to preserve**. Operational triage (still valid): check `nvidia-smi --query-compute-apps`; prefer a verified-solo window; a real return-to-pool-before-fence corruption fails the bit-identical parity subtest *deterministically and solo*.
 
-- **Prefer leaking to calling through an unvalidated vtable pointer.** An undersized `struct_size` means `release` may not exist; jumping through whatever follows is arbitrary code execution from a malformed plugin.
+### VMM releases counted as driver unmap runs (Copilot)
+`GlobalVmmStats::releases` now counts contiguous `cuMemUnmap` operations rather than individual granules (adjacent weight-page granules are unmapped in one driver call). Keeps the metric honest about release-side driver churn reduction; committed-byte gauges still track the full released quantity.
 
-- **Marking ready over red CI requires documented baseline comparison.** Identify the shared root cause, reproduce it on `main` in a clean worktree, and show the branch does not touch the implicated crate. Always measure with `--no-fail-fast` and rebuilt binaries — the plain command truncates totals and stale binaries report stale counts.
+### Windows ARM64 wheel for nxrt-ep-cpu (#829, Isidore)
+Per Justin ("我们的ep也要发 windows arm 64的wheel"), added a `win_arm64` matrix row (`os: windows-11-arm`, `archs: ARM64`) to the **cpu** job of `.github/workflows/publish-ep-plugins.yml`. CUDA EP out of scope (no CUDA on Windows ARM64). **Critical caveat:** official CPython has **no `win_arm64` build for 3.10** (ARM64 Windows CPython starts at 3.11), so the global `build="cp310-*"` selector matches nothing there. The ARM64 row overrides `CIBW_BUILD: cp311-*` and setup-python to 3.11; other rows keep 3.10. The wheel is ABI-less (`py3-none-win_arm64`, bundles a plain C-ABI cdylib), so any CPython ≥3.11 drives the build. `rustup` installs the native `aarch64-pc-windows-msvc` toolchain (no cross-compile). Build-only CI (run 31623032180) validated the runner provisioning.
 
-### Merged inbox drops
+### Harden ort-sys ORT download against transient network flakes (#829, Isidore)
+`onnx-genai-ort/ort-sys/build.rs::download_prebuilt` used `--retry 3` but not `--retry-all-errors`, so curl exit 52 (`CURLE_GOT_NOTHING`, empty reply) — not in curl's default retryable set — failed the whole job. **`--retry-all-errors` is NOT portable**: it's a curl ≥7.71.0 flag and the manylinux_2_28 (AlmaLinux 8) build container ships curl 7.61.1, which rejects it (exit 2). Fix: a **Rust-level retry loop** (4 attempts, success = `status.success()` AND `http_code == "200"`, 3s/6s/12s backoff) plus portable curl flags 7.61 supports (`--retry 5 --retry-delay 2 --connect-timeout 30 --max-time 300`). Preserves the exact 404/missing-asset panic messages on the final attempt; checksum/magic verification runs only after success.
 
-- `rachael-762-gate.md` — `NXRT_REQUIRE_ORT_TESTS` gate hardening: `find_ort_lib_dir` honours `CARGO_TARGET_DIR`; all skip paths through gate; CI lane enabled.
-- `coco-762-scratch.md` — `scratch_alloc_bytes` single source of truth; `validate_write_dtype` wired into tests; unroutable graphs fail at Compile.
-- `isidore-762-abi.md` — CUDA `end_version i32::MAX` per-family; `offset_of!` for vtable offsets; undersized-vtable guard (leak-not-UB policy).
-- `gaff-762-delta.md` — delta review; no blockers; two substantive follow-ups (both addressed by Freysa).
-- `freysa-762-final.md` — `tests/common/ort_discovery.rs` via `#[path]`; `validate_write_dtype` documented as test-only.
-- `iran-762-clippy.md` — clippy identical-branch fix in `loader.rs`; `||` merge preserving `struct_size` short-circuit.
+### Unify ORT library filename via `ort_discovery::ort_lib_name()` (#762, Nabil)
+`plugin_ort_e2e.rs` hardcoded `"libonnxruntime.so"` in 7 sites, panicking on Windows (`onnxruntime.dll`)/macOS (`.dylib`). Standing rules: all tests use `ort_discovery::ort_lib_name()` (never a hardcoded string); use `PathBuf::join` (never string concat) for path construction; `skip_if_missing!` is the ONLY skip mechanism in EP e2e tests (respects `NXRT_REQUIRE_ORT_TESTS=1`) — a hand-rolled match in `diag_ort_ep_api_nullcheck` bypassed the fail-loud gate and was fixed. Windows/macOS correct-by-construction (`cfg!(target_os)`), CI-verified only.
 
-## 2026-08-12 — PR #32003 CUDA matmul_4bits_common.cuh narrative fix + PTX evidence (Batty)
+### Native bfloat16 coverage for the CPU EP — all ops (#831, Resch)
+Per Justin ("全面检查cpu ep对bfloat16的原生支持 一口气支持所有op"). Audit of all **194 registered op keys**: the CPU EP already had broad first-class bf16 via the shared compute-in-f32 machinery (`dtype.rs` `dispatch_arith`/`dispatch_float` + `to_dense_f32_widen`/`write_dense_f32_narrow`); no op special-cased f16 while forgetting bf16. Only 4 f32-locked kernels that already compute in f32 rejected non-f32 at their gate — widened `DFT`, `VarlenAttention` (`pkg.nxrt`), `MoE` (`com.microsoft`), `IndexShare` (`pkg.nxrt`) to accept f32/f16/bf16 via the same helpers. Deliberately excluded (bf16 not a valid native type): integer/bitwise ops, quantized-int ops (`QLinearMatMul`, `DynamicQuantizeLinear`), `CompressedSparseAttention` (FP8/FP4 compressed-cache contract), and int/bool-output value-agnostic ops. **Principle: compute in f32, widen on read, narrow on write — never a bespoke bf16 arithmetic path.** Regression lock: data-driven `tests/bf16_conformance.rs` (~68 nodes, f32-vs-bf16). Compliant with Justin's instruction-availability directive by construction: bf16↔f32 widen/narrow is an exact scalar op requiring no CPU feature; the one native bf16 arithmetic path (`_mm512_dpbf16_ps` in `x86_bf16.rs`, used by MatMul/Gemm) is runtime-gated with a proven portable fallback.
 
-**By:** Batty (corrections), Coordinator (independent PTX verification)
-**PR:** microsoft/onnxruntime#32003
+### Fix arch-gated `dot_kernel` unused-param clippy error blocking CI (Resch)
+Main's quality lane (`RUSTFLAGS="-D warnings" cargo clippy --all-targets`) was RED: `borrowed_affine_int4_matmul` (`matmul_nbits.rs`) takes `dot_kernel: DotKernel` referenced only inside `#[cfg(target_arch="aarch64")]` blocks → `unused_variables` hard error on x86_64. Fix: `let _ = dot_kernel;` at the function top — mirrors the in-file convention (three sibling helpers at ~3779/4272/4448 already do this; chosen over `cfg_attr(...allow...)` for DRY consistency). No behavior change.
 
-### Corrections made to PR body
+### Fix server registry shrink test assertion (#821, Roy)
+`failed_runtime_shrink_preserves_policy_and_ledger_limit`: updated assertion from `error.contains("committed bytes")` to `error.contains("cannot satisfy lowered resource limit")`. Commit `c7633eec4` (#740, VMM handle pooling) changed the wording "committed bytes"→"leased bytes" without updating the test. The stable prefix is the only anchor covering both rejection paths (`state.rs` pooled-unmapped + `memory_authority.rs` mapped-or-leased, which have different suffixes); the test's purpose (reject+rollback shrink-below-usage) is also guarded behaviorally by a snapshot-rollback assertion, not just the string.
 
-1. **`(void)` unused-parameter guards — labelled "defensive; not reproduced locally".** `nvcc 12.0 --compiler-options="-Wall -Wextra -Wunused-parameter"` at sm_53 and sm_80 produced zero diagnostics. `cudafe` strips the dead `#else` host body before the host compiler runs, so the guard cannot be shown to suppress anything.
+## Archived narrative waves pointer
 
-2. **Strict-aliasing claim narrowed to specific component reads.** The pun fixed is `uint32_t` member → `half2`/`__nv_bfloat162` lvalue. `reinterpret_cast<half2*>(sums)` (same-type vectorised access) is deliberately retained and explicitly noted; the PR body no longer implies the file is pun-free.
+Full wave narratives are archived in `.squad/decisions-archive/2026-08.md` and `.squad/decisions-archive/2026-07.md`.
 
-3. **"New template instantiations" wording removed.** That framing was a leftover from the parent PR this was split out of; it does not apply to this standalone one-file fix.
-
-### PTX codegen-equivalence evidence (Coordinator-verified)
-
-Compiled minimal TU (base and head copies of `matmul_4bits_common.cuh` with `GPU_WARP_SIZE` shim, instantiating `half` + `__nv_bfloat16` overloads) for **sm_53, 70, 75, 80, 86, 90 × {-O0, -O3}**. Result: **12/12 pairs raw byte-identical**, no normalisation required. Toolchain: nvcc CUDA 12.0 V12.0.140.
-
-### Durable lessons
-
-- **PTX equivalence is a cheap, strong argument for a "codegen-neutral" refactor.** Compiling base and head to PTX across target architectures at -O0 and -O3 and diffing turns "this should be equivalent" into evidence. It needs only `nvcc`, no GPU. 12/12 pairs were raw byte-identical here.
-- **Do not claim a warning was fixed without the exact diagnostic.** The `(void)` guards could not be shown to suppress anything: `cudafe` strips the dead `#else` host body before the host compiler runs. "Defensive; not reproduced" is the honest wording.
-- **Narrow a safety claim to what was actually fixed.** Equivalent-looking `reinterpret_cast<half2*>(sums)` array access was deliberately kept as the canonical CUDA vectorised idiom, so claiming the file is now free of type-punning would have been false.
-- **Wording inherited from a parent PR goes stale on a split.** "New template instantiations" made sense in the PR this was split out of and was simply wrong in a standalone one-file fix — re-read the whole body after splitting.
-
-**Status:** PR #32003 marked ready for review.
-
-Last consolidated: 2026-08-12T08:30:00Z (Scribe #32003 PTX-evidence wave; 1 inbox drop merged: batty-32003-ptx.md)
-
-
-## 2026-08-12 — PR #32001: Comprehensive --use_apple_accelerate validation (Resch + Holden + Zhora)
-
-**By:** Resch (initial fix), Holden (focused review), Zhora (deduplication)
-**PR:** microsoft/onnxruntime#32001 — `onnxruntime_USE_APPLE_ACCELERATE` CMake option
-**Head:** `3a0bd75aa3`
-
-### What happened
-
-`build.py` only checked `is_macOS()` for `--use_apple_accelerate`, so Intel Macs,
-x86_64 cross-compiles, iOS, tvOS, visionOS, and Mac Catalyst all passed Python
-validation and then silently downgraded in CMake — contrary to the PR body's "fails
-loudly" promise.
-
-Resch added rejections in `build_args.py` (`parser.error()`) and `build.py` (`BuildError`).
-Holden's review found S1: the `build.py` copy was dead code (unreachable). Zhora
-consolidated to a single site, keeping only `build_args.py` as the canonical validation
-home. 13/13 tests pass; ruff clean; PR ready.
-
-### Rejection set
-
-| Target | Flag(s) | Guard |
-|--------|---------|-------|
-| Non-macOS (Linux, Windows) | `is_macOS()` returns False | `parser.error()` |
-| Intel Mac / x86_64 cross | `getattr(args, "osx_arch", None)` not in `("arm64", "arm64e")` | `parser.error()` |
-| iOS | `getattr(args, "ios", False)` | `parser.error()` |
-| tvOS | `getattr(args, "tvos", False)` | `parser.error()` |
-| visionOS | `getattr(args, "visionos", False)` | `parser.error()` |
-| Mac Catalyst | `getattr(args, "macos", None) == "Catalyst"` | `parser.error()` |
-| universal2 | not a valid `--osx_arch` choice | argparse-level rejection |
-
-### Durable lessons
-
-- **Duplicated validation is the fourth instance of the copy-drift failure family.** Two `find_ort_lib_dir` copies diverged silently; a scratch-sizing formula duplicated between production and tests left a heap overflow canary ineffective; an MLAS dispatch threshold restated as a literal in a test disagreed with production on RISC-V. The rule is now explicit: **never maintain two copies of a rule — extract, or have one delegate to the other.**
-
-- **Verify the copy that actually executes.** The `build.py` validation block was reviewed line-by-line and was dead code; `build_args.py` exits first. Trace control flow before trusting a review of a duplicated site.
-
-- **Argument validation belongs at parse time.** `parser.error()` in `build_args.py` fails cleanly before any build work starts; raising later in `build.py` is both later and, here, unreachable.
-
-- **Error messages should name their actual cause.** "Only supported on macOS arm64" is misleading on an Intel Mac, where the host *is* macOS and only the architecture is wrong.
-
-- **Body-versus-code agreement deserves explicit checking every round.** #32001 had three separate rounds where the PR body promised behaviour the code did not implement — a `FATAL_ERROR` that had become warn-and-disable, claims of x86_64/universal2/iOS support, and a loud-failure promise that only checked `is_macOS()`.
-
-### Merged inbox drops
-
-- `resch-32001-validation.md` — initial comprehensive validation + 9 new tests
-- `holden-32001-focused.md` — focused review; S1 dead-code finding; no blockers
-- `zhora-32001-dedupe.md` — deduplication to single validation site
-
-Last consolidated: 2026-08-12T09:45:00Z (Scribe #32001 ready wave; 3 inbox drops merged: resch-32001-validation.md, holden-32001-focused.md, zhora-32001-dedupe.md)
-
-## Durable lessons — #31993 NaN semantics + AArch64 runtime evidence (2026-08-12)
-
-- **QEMU + a cross-compiler turns "unverifiable on this host" into real runtime evidence.** `g++-aarch64-linux-gnu` plus `qemu-aarch64-static` executed the actual NEON kernel and settled a NaN-semantics question no amount of code reading could. Reach for this before declaring an architecture untestable — but label it emulation, not hardware.
-- **Hardware and software NaN handling differ in more than the quiet bit.** `FCVTN` preserves the payload; the scalar reference canonicalizes to `0x7E00`. Assert NaN-ness (exponent all ones, mantissa non-zero) and sign only; keep raw-bit equality for non-NaN values.
-- **"Compiles and links" is not "runs".** #31993's CI lane only built macOS arm64; `onnxruntime_mlas_test` was never executed, while the PR body implied otherwise. Check whether a lane actually runs the tests before citing it as validation.
-- **A PR can change behaviour for types it does not mention.** #31974 is a BF16 PR that also alters pre-existing **MLFloat16** stat precision and registration. Diff every touched overload, not just the new one, and disclose it.
-- **Verify an agent's "no behaviour change" claim against the diff.** Sapper's was wrong on both counts and would have shipped an undisclosed change to existing fp16 output.
-
-### Merged inbox drops (2026-08-12 final review wave)
-
-- `iran-31993-nan-runtime.md` — NaN assertion fix, QEMU runtime evidence, FEAT_FP16 correction
-- `sapper-31974-ab.md` — PrePack A/B testing decision
-
-Last consolidated: 2026-08-12T10:15:00Z (Scribe final-review-wave; 2 inbox drops merged: iran-31993-nan-runtime.md, sapper-31974-ab.md)
-
-## 2026-08-12 — PR #31973 N1: arch-specific test guard + benchmarks (Batty, Challenger, Deckard)
-
-**By:** Batty (N1 fix + benchmarks), Challenger (delta review), Deckard (wording fix), Coordinator (verification)
-**PR:** microsoft/onnxruntime#31973 — MLAS AVX2 LayerNorm kernel
-**Head:** `4a16925a88`
-
-### What happened
-
-Three separate instances of the same cross-arch test bug appeared on this PR family:
-1. A production `NormSize < 8` gate suppressed the RVV kernel on RISC-V.
-2. A test restated the x86 dispatch threshold as a literal.
-3. Six precision suites asserted centered-two-pass properties but on RISC-V ran against the RVV uncentered kernel.
-
-Batty closed N1 (instance 3) by adding `HasCenteredTwoPassKernel()` — a compile-time predicate guarded by the same `#if defined(MLAS_TARGET_AMD64) || defined(MLAS_TARGET_IX86)` as the production gate. Six precision suites now `GTEST_SKIP` when this returns false; on x86 they run and assert as before. Batty also produced benchmark numbers on AMD EPYC 9V74 (AVX2/FMA, no AVX-512): LayerNorm 6.8–11.9× over scalar Welford fp32 at N=128–4096, RMSNorm 2.3–3.6×, 1000 iterations, p50 median.
-
-Challenger (delta review) confirmed no blockers: guard correctly scoped, benchmark baseline (Welford fp32) fair, 41/2 → 43/43 build verified. One nit: `mlas.h` said "x86-64" while the `#if` also covers 32-bit `MLAS_TARGET_IX86`. Deckard fixed this to "x86 (32-bit and 64-bit)" across `mlas.h`, `layernorm_kernel_avx2.cpp`, and six `GTEST_SKIP` messages (`4a16925a88`). Both PRs marked ready for review.
-
-### Durable lessons
-
-- **Arch-specific assumptions leaked into tests three separate times on one PR.** When a kernel is architecture-specific, its assertions are too — gate them with a predicate mirroring the production `#if`, never a restated literal. Use `HasCenteredTwoPassKernel()` as the pattern.
-- **Publish benchmarks only with the baseline named and the scope bounded.** The numbers here are defensible because the baseline provably mirrors `layer_norm_impl.cc` (Welford fp32 for LayerNorm, single-pass sum-of-squares for RMSNorm), and the PR body states it is a per-row in-process microbenchmark with no end-to-end claim.
-- **Making a comment more readable can make it less accurate.** "AMD64/IX86" → "x86-64" read better but excluded 32-bit x86, which the `#if` covers. "x86 (32-bit and 64-bit)" achieves both.
-- **This host can measure x86 honestly** (AVX2/FMA, no AVX-512) — x86 performance claims should be measured rather than omitted on this host.
-
-### Merged inbox drops
-
-- `batty-31973-n1.md` — `HasCenteredTwoPassKernel()` guard decision
-- `challenger-31973-delta.md` — delta review verdict
-- `deckard-31973-wording.md` — "x86" wording fix
-
-Last consolidated: 2026-08-12T11:30:00Z (Scribe #31973/#31974 ready wave; 3 inbox drops merged)
-
-## 2026-08-12 — PR #31973 evidence-accuracy wave (Mariette, Gaff, Coordinator)
-
-**By:** Mariette (kernel/numerics), Gaff (focused review), Coordinator (reproduction + correction)
-**PR:** microsoft/onnxruntime#31973 — MLAS AVX2 LayerNorm kernel
-**Head:** `fbf322f76b`
-
-### What happened
-
-Two evidence blockers were found and fixed by Mariette.
-
-**B1 — Accuracy headline was not reproducible.** The original body compared the production scalar path against a deleted implementation; no reader could re-run the comparison. Replaced with figures printed by the committed test:
-
-| Path | Error vs fp64 oracle |
-|------|---------------------|
-| Scalar Welford fp32 (baseline) | 9.3573e-01 |
-| AVX2 centered two-pass (kernel) | 3.2976e-02 |
-
-Kernel is **28.4× more accurate** at base=1e5, spread=1e-2, N=1024, eps=1e-6. Sweep: 180 cases / 0 failures / worst 2.2318e-02.
-
-**B2 — RMSNorm benchmark exercised dead work.** Benchmark passed non-null `MeanOut` for simplified mode; production always passes `nullptr`. Fixed. RMSNorm speedups rose ~15-30% at larger sizes.
-
-**Additional fixes:** dispatch assertion on first warmup iteration; non-zero case-count assertion on fp64 sweep; stale label (`avx2_welford` → `avx2_centered`); SCENARIO 3 comment corrected; scalar-vs-kernel division disclosure added.
-
-**Gaff review:** Reproduced all accuracy figures to 4 significant figures. Confirmed `nullptr` MeanOut matches production at `layer_norm_impl.cc:507`. One nit: RMSNorm ~3.3x at NormSize 256 is optimistic (Gaff measured ~2.84x, ~14% lower). NormSize 15 RMSNorm body says ~0.83x; Gaff measured 1.00x — body is conservative. No blockers.
-
-**Coordinator correction:** Coordinator had published benchmark figures (6.8x LayerNorm 128, prior RMSNorm values) before reproducing them. Shared-runner variance was ~15%, exceeding published precision. PR body was corrected to lead with reproducible accuracy figures, widen variance disclosure to ~15%, and round table to 1-2 significant figures.
-
-### Durable lessons
-
-- **Never publish a measurement a reader cannot re-run.** Evidence must come from committed code, printed by a test, with the exact command given. Comparing against a deleted implementation is not evidence.
-- **Benchmark the arguments production actually passes.** Check argument shapes against the real call site before trusting a ratio. Non-null `MeanOut` in simplified mode charged dead work and hid the fast path.
-- **Do not publish more precision than a shared runner supports.** 6.3x vs 6.8x (LayerNorm 128) and 2.84x vs 3.30x (RMSNorm 256) represent ~15% spread on the same host. Round, state the spread, and point at the reproduce command as source of truth.
-- **Assert that a benchmark dispatched what it claims to measure**, and that a parameter sweep generated a non-zero number of cases. Without these, a benchmark can silently time the fallback and a sweep can silently prove nothing.
-- **The coordinator published these errors.** They were caught by review, not self-check. When writing a PR body from agent-reported figures, reproduce the figures first — the same standard applied to agents applies to the coordinator.
-
-### Merged inbox drops
-
-- `mariette-31973-evidence.md` — B1/B2 fix decisions
-- `gaff-31973-evidence.md` — focused evidence review verdict
-
-Last consolidated: 2026-08-12T13:30:00Z (Scribe #31973 evidence-accuracy wave; 2 inbox drops merged)
-
-## Merged inbox drops (2026-08-12 prior waves, merged this session)
-
-- `coco-32001-lint.md` — ruff lint fixes for test_build_args.py (PR #32001)
-- `pris-31993-ctest.md` — macOS arm64 CI already runs tests; no add_test needed (PR #31993)
-- `rachael-32001-crosstarget.md` — cross-target rejection for --use_apple_accelerate (PR #32001)
-- `holden-final-two.md` — final review of PR #32001 and PR #31993; both ready to leave draft
-
-Last consolidated: 2026-08-12T13:30:00Z (4 additional prior-wave inbox drops merged)
-
-## 2026-08-12 — PR #31974 regression wave (Leon, Coco, Coordinator)
-
-**By:** Leon (cleanup commit `59b84aca7a`), Coco (fix `e036e53d31`), Coordinator (bisect + verification)
-**PR:** microsoft/onnxruntime#31974 — MLAS BF16 LayerNorm
-
-### What happened
-
-Leon's final-cleanup commit added PrePack counter assertions and an MLFloat16 stat test. It also flipped `is_packed`'s default from `false` to `true` in `LayerNormImpl::PrePack`. `ConvertMLFloat16ToFloatIfNeeded` only sets the flag inside narrow-float branches — for float inputs it is a no-op. Nine float `LayerNormTest` cases broke with "Missing Input: Scale". Coordinator bisected; Coco root-caused and fixed (one-line restore). Both PRs (#31973, #31974) now show 0 CI failures.
-
-### Durable lessons — #31974 regression wave
-
-- **A filtered test run hides regressions outside the filter.** `*LayerNormBFloat16*` stayed green at 21/21 while nine float `LayerNormTest` cases were broken. Always run the **full** relevant suite before reporting, not just the filter matching the feature under change.
-- **A flag that is only set on some code paths must default to the safe value.** `is_packed` was flipped to default `true`, but `ConvertMLFloat16ToFloatIfNeeded` only sets it inside narrow-float branches — so the float path inherited a `true` it never earned and skipped reading its inputs. Default to the conservative value and set it explicitly where the work actually happens.
-- **Verifying an assertion is non-vacuous can also surface unrelated breakage.** Forcing `is_packed = false` to test the counter assertion is what prompted the full-suite run that exposed the regression.
-- **Two coordinator-published numbers were wrong:** the stat round-trip cost was quoted as ~0.4% generally when that is the bf16 figure (fp16 is ~0.049%), and "780x the tolerance" ignored the checker's relative term — the honest margins are ~36x (bf16) and ~4.4x (fp16). Derive published figures from the actual checker semantics, not the bare tolerance constant.
-
-### Merged inbox drops
-
-- `leon-31974-prepack.md` — PrePack counter assertion and MLFloat16 stats coverage decisions
-- `coco-31974-regression.md` — float LayerNorm regression root-cause and fix
-
-Last consolidated: 2026-08-12T14:00:00Z (Scribe #31974 regression wave; 2 inbox drops merged)
+- **2026-08-12T00-00-00Z (Scribe CUDA-capture escalation batch):** the EP-wheels / bf16 / H200 merge wave (2026-08-12T20:40:00Z), its status snapshot table (#31985 merged, #31973/#31974/#31988/#31993/#32001/#32003 drafts), and the three verbatim inbox drops (sebastian nxrt-ep-pypi packaging, sebastian nxrt-ep-cuda wheelfix, leon #762 test-followups) were moved to `.squad/decisions-archive/2026-08.md` to keep the live ledger lean.
+- Earlier 2026-08-10/11/12 waves (EP plugin export, PR #762 parity, upstream CI correction, Apple MLAS f16 cast, CUDA MatMulNBits, rejection-response, PR #31973/#31974 threshold+regression fixes) are also in `.squad/decisions-archive/2026-08.md`.

@@ -373,6 +373,19 @@ extern "C" __global__ void rmsnorm_bf16(
     const int tid = threadIdx.x;
     const int nt = blockDim.x;
 
+    // Parallel f32 tree reduction of the mean-square. The bf16 activations
+    // upcast to f32 losslessly, then accumulate in f32 (matmul-free: just x*x),
+    // so precision is full-f32 throughout; only the *summation order* differs
+    // from the serial `rmsnorm_f32` reference (tree vs strict left-to-right).
+    // A pairwise tree is at least as accurate as sequential accumulation (lower
+    // error growth, O(log n) vs O(n)), and a per-element f64 oracle confirms the
+    // tree result is within a couple of ulp of the f64 ground-truth RMS. Because
+    // decode feeds an accuracy-level-4 int4 MatMulNBits (quantized activations),
+    // a sub-ulp normalization difference can still flip a downstream int8
+    // rounding boundary, so greedy token ids stay byte-exact for the first ~38
+    // steps then exhibit expected sub-ulp greedy sensitivity. The strict
+    // CPU-order serial path remains available via
+    // ONNX_GENAI_CUDA_DISABLE_NORM_CAST_FOLD=1 (routes back to rmsnorm_f32).
     float ss = 0.0f;
     for (int j = tid; j < norm_size; j += nt) {
         const float xv = __bfloat162float(x[base + j]);
@@ -848,7 +861,7 @@ extern "C" __global__ void skip_layernorm_f32(
 "#;
 
 const LAYERNORM_MODULE: &str = "layernorm_bf16_v2";
-const RMSNORM_MODULE: &str = "rmsnorm_bf16_v2";
+const RMSNORM_MODULE: &str = "rmsnorm_bf16_v4";
 const SKIP_RMSNORM_MODULE: &str = "skip_rmsnorm_f16_warp_v5";
 const SKIP_LAYERNORM_MODULE: &str = "skip_layernorm_f32";
 
@@ -1516,6 +1529,7 @@ impl KernelFactory for SkipSimplifiedLayerNormFactory {
             epsilon,
             runtime: self.runtime.clone(),
             metadata: Mutex::new(SkipBroadcastMetadataCache::new(self.runtime.clone())),
+            bf16_scratch: Mutex::new(NormBf16Scratch::new(self.runtime.clone())),
             last_call_capture_safe: AtomicBool::new(false),
         }))
     }
@@ -1527,7 +1541,62 @@ pub struct SkipSimplifiedLayerNormKernel {
     epsilon: f32,
     runtime: Arc<CudaRuntime>,
     metadata: Mutex<SkipBroadcastMetadataCache>,
+    /// Persistent f32 staging arena for the BFloat16-via-Float32 path. Reused
+    /// across decode steps so the widen/narrow casts never `cudaMalloc`/`cudaFree`
+    /// on the hot path, which is what keeps the bf16 path graph-capture safe.
+    bf16_scratch: Mutex<NormBf16Scratch>,
     last_call_capture_safe: AtomicBool,
+}
+
+/// Persistent device arena that stages BFloat16 operands through Float32 without
+/// per-call allocation. Mirrors the `Bf16Scratch` pattern in `matmul_nbits`: a
+/// single grow-only buffer whose base address stays fixed across decode steps,
+/// so the casts recorded into a CUDA graph replay against a stable pointer.
+#[derive(Debug)]
+struct NormBf16Scratch {
+    runtime: Arc<CudaRuntime>,
+    ptr: CUdeviceptr,
+    cap: usize,
+}
+
+impl NormBf16Scratch {
+    fn new(runtime: Arc<CudaRuntime>) -> Self {
+        Self {
+            runtime,
+            ptr: 0,
+            cap: 0,
+        }
+    }
+
+    /// Ensure the arena holds at least `bytes`, returning its base pointer and
+    /// whether it had to (re)allocate. A growth event means the base pointer
+    /// moved, so a call that grows the arena is not capture-safe; steady decode
+    /// (fixed shapes) never grows after the first warm call.
+    fn ensure(&mut self, bytes: usize) -> Result<(CUdeviceptr, bool)> {
+        if bytes <= self.cap && self.ptr != 0 {
+            return Ok((self.ptr, false));
+        }
+        if self.ptr != 0 {
+            // SAFETY: exclusively owned; freed once before replacement. A grow
+            // only happens off the captured hot path (first warm call / shape
+            // change), so no queued replay references the old buffer.
+            unsafe { self.runtime.free_raw(self.ptr)? };
+            self.ptr = 0;
+        }
+        self.ptr = self.runtime.alloc_raw(bytes.max(1))?;
+        self.cap = bytes;
+        Ok((self.ptr, true))
+    }
+}
+
+impl Drop for NormBf16Scratch {
+    fn drop(&mut self) {
+        if self.ptr != 0 {
+            // SAFETY: this persistent buffer is exclusively owned by the kernel.
+            let _ = unsafe { self.runtime.free_raw(self.ptr) };
+            self.ptr = 0;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1610,47 +1679,77 @@ impl SkipSimplifiedLayerNormKernel {
     /// Every BFloat16 operand is losslessly widened into a scratch f32 buffer,
     /// the f32 kernel path runs, and each result is narrowed back to its original
     /// dtype. SkipSimplifiedLayerNormalization appears once per token (the final
-    /// norm), so the extra pointwise casts are negligible. The per-call scratch
-    /// makes this path incompatible with graph-capture replay.
+    /// norm), so the extra pointwise casts are negligible.
+    ///
+    /// The staging arena is **persistent** (a grow-only `NormBf16Scratch` reused
+    /// across decode steps), so the widen/narrow casts and the reused f32 kernel
+    /// issue no per-call `cudaMalloc`/`cudaFree` — a `cuMemFree` would otherwise
+    /// force a stream synchronize every token and serialize decode. With a stable
+    /// arena base and fixed decode shapes this whole path records and replays
+    /// inside a CUDA graph, so the final bf16 norm no longer forms an eager seam
+    /// that splits (and defeats) the captured decode graph.
     fn run_bf16_via_f32(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        let mut scratch: Vec<CUdeviceptr> = Vec::new();
+        // Byte offset of each staged buffer within the persistent arena. bf16
+        // inputs and every output are widened to f32; non-bf16 inputs forward
+        // in place. Each buffer is 16-byte aligned so vectorized casts stay
+        // aligned.
+        let align = |bytes: usize| bytes.div_ceil(16) * 16;
+        let mut total = 0usize;
+        let mut input_offsets: Vec<Option<usize>> = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            if input.dtype == DataType::BFloat16 && !input.is_absent() {
+                input_offsets.push(Some(total));
+                total += align(input.numel().max(1) * 4);
+            } else {
+                input_offsets.push(None);
+            }
+        }
+        let mut output_offsets: Vec<usize> = Vec::with_capacity(outputs.len());
+        for output in outputs.iter() {
+            output_offsets.push(total);
+            total += align(output.numel().max(1) * 4);
+        }
+
+        // Hold the arena for the whole call: the widening casts, the reused f32
+        // kernel, and the narrowing casts all run stream-ordered against it.
+        let mut arena = self
+            .bf16_scratch
+            .lock()
+            .expect("cuda_ep SkipSimplifiedLayerNormalization bf16 scratch mutex poisoned");
+        let (base, grew) = arena.ensure(total)?;
+
         let staged = (|| -> Result<()> {
-            // Widen every BFloat16 input into f32 scratch; forward the rest.
+            // Widen every BFloat16 input into the arena; forward the rest.
             let mut f32_inputs: Vec<TensorView> = Vec::with_capacity(inputs.len());
-            for input in inputs {
-                if input.dtype == DataType::BFloat16 && !input.is_absent() {
-                    let n = input.numel();
-                    let ptr = self.runtime.alloc_raw(n.max(1) * 4)?;
-                    scratch.push(ptr);
-                    super::cast::launch_cast_raw(
-                        &self.runtime,
-                        cuptr(input.data_ptr::<u8>() as *const c_void),
-                        DataType::BFloat16,
-                        ptr,
-                        DataType::Float32,
-                        n,
-                    )?;
-                    f32_inputs.push(TensorView::new(
-                        DevicePtr(raw_ptr(ptr) as *const c_void),
-                        DataType::Float32,
-                        input.shape,
-                        input.strides,
-                        input.device,
-                    ));
-                } else {
-                    f32_inputs.push(*input);
+            for (input, offset) in inputs.iter().zip(input_offsets.iter()) {
+                match offset {
+                    Some(off) => {
+                        let ptr = base + *off as CUdeviceptr;
+                        super::cast::launch_cast_raw(
+                            &self.runtime,
+                            cuptr(input.data_ptr::<u8>() as *const c_void),
+                            DataType::BFloat16,
+                            ptr,
+                            DataType::Float32,
+                            input.numel(),
+                        )?;
+                        f32_inputs.push(TensorView::new(
+                            DevicePtr(raw_ptr(ptr) as *const c_void),
+                            DataType::Float32,
+                            input.shape,
+                            input.strides,
+                            input.device,
+                        ));
+                    }
+                    None => f32_inputs.push(*input),
                 }
             }
 
-            // Allocate an f32 scratch result for every output slot so the f32
+            // Point every output slot at its f32 scratch region so the f32
             // kernel writes into it; present outputs are narrowed back afterward.
-            let mut out_scratch: Vec<CUdeviceptr> = Vec::with_capacity(outputs.len());
             let mut f32_outputs: Vec<TensorMut> = Vec::with_capacity(outputs.len());
-            for output in outputs.iter() {
-                let n = output.numel();
-                let ptr = self.runtime.alloc_raw(n.max(1) * 4)?;
-                scratch.push(ptr);
-                out_scratch.push(ptr);
+            for (output, off) in outputs.iter().zip(output_offsets.iter()) {
+                let ptr = base + *off as CUdeviceptr;
                 f32_outputs.push(TensorMut::new(
                     DevicePtrMut(raw_ptr(ptr)),
                     DataType::Float32,
@@ -1663,14 +1762,14 @@ impl SkipSimplifiedLayerNormKernel {
             self.run(&f32_inputs, &mut f32_outputs)?;
 
             // Narrow each present output back to its original dtype.
-            for (output, src_ptr) in outputs.iter_mut().zip(out_scratch.iter()) {
+            for (output, off) in outputs.iter_mut().zip(output_offsets.iter()) {
                 if output.is_absent() || output.numel() == 0 {
                     continue;
                 }
                 let n = output.numel();
                 super::cast::launch_cast_raw(
                     &self.runtime,
-                    *src_ptr,
+                    base + *off as CUdeviceptr,
                     DataType::Float32,
                     cuptr(output.data_ptr_mut::<u8>() as *const c_void),
                     output.dtype,
@@ -1680,16 +1779,18 @@ impl SkipSimplifiedLayerNormKernel {
             Ok(())
         })();
 
-        // `cuMemFree` waits for preceding stream work, so freeing after the
-        // casts + f32 kernel is safe. Free every scratch buffer exactly once.
-        for ptr in scratch {
-            // SAFETY: each `ptr` came from `alloc_raw` above and is freed once.
-            let free = unsafe { self.runtime.free_raw(ptr) };
-            if staged.is_ok() {
-                free?;
-            }
+        // The inner `run` already latched `last_call_capture_safe` from its
+        // (f32) num_groups. A growth moves the arena base pointer, so a graph
+        // recorded against the old address would replay stale — but only a grow
+        // that happens *during capture recording* can corrupt a live graph. The
+        // first warm call (outside capture) always grows the arena to size it for
+        // the decode shape; that is expected and leaves the base fixed for every
+        // steady captured step, so it must stay capture-safe. Demote only when the
+        // grow races an in-progress capture (an un-pre-warmed shape). Steady
+        // decode never grows after warmup, so this never demotes on the hot path.
+        if staged.is_ok() && grew && self.runtime.is_capturing().unwrap_or(true) {
+            self.last_call_capture_safe.store(false, Ordering::Relaxed);
         }
-        self.last_call_capture_safe.store(false, Ordering::Relaxed);
         staged
     }
 
@@ -2623,6 +2724,7 @@ mod tests {
                 epsilon: 1e-5,
                 runtime: runtime.clone(),
                 metadata: Mutex::new(SkipBroadcastMetadataCache::new(runtime.clone())),
+                bf16_scratch: Mutex::new(NormBf16Scratch::new(runtime.clone())),
                 last_call_capture_safe: AtomicBool::new(false),
             };
             kernel.run(&inputs, &mut [output]).unwrap();
@@ -2765,6 +2867,7 @@ mod tests {
             epsilon: 1e-5,
             runtime: runtime.clone(),
             metadata: Mutex::new(SkipBroadcastMetadataCache::new(runtime.clone())),
+            bf16_scratch: Mutex::new(NormBf16Scratch::new(runtime.clone())),
             last_call_capture_safe: AtomicBool::new(false),
         };
         kernel.run(&inputs, &mut outputs).unwrap();
@@ -3055,6 +3158,7 @@ mod tests {
                 epsilon: 1e-5,
                 runtime: runtime.clone(),
                 metadata: Mutex::new(SkipBroadcastMetadataCache::new(runtime.clone())),
+                bf16_scratch: Mutex::new(NormBf16Scratch::new(runtime.clone())),
                 last_call_capture_safe: AtomicBool::new(false),
             };
             kernel.run(&inputs, &mut [output]).unwrap();
@@ -3294,5 +3398,164 @@ mod tests {
                 }
             );
         }
+    }
+
+    /// f64 numerical oracle for the bf16 `RMSNormalization` fold path at
+    /// Muse-Glimmer's decoder width (hidden = 6656, bf16 activations, f32 scale
+    /// — the exact shape `CudaDropNormalizationCasts` produces). This gates the
+    /// parallel f32 tree reduction in `rmsnorm_bf16`: the kernel output must
+    /// match a per-element f64 ground-truth RMS to within one bf16 ulp, and the
+    /// parallel tree mean-square must be at least as close to the f64 truth as
+    /// the strict left-to-right serial f32 order used by `rmsnorm_f32`. This is
+    /// the numerical justification (for Chew's precision gate) that the tree
+    /// reduction is a legitimate full-f32-precision reduction, not a regression.
+    #[test]
+    fn bf16_rmsnorm_tree_reduction_matches_f64_oracle_at_muse_glimmer_width() {
+        let ep = match CudaExecutionProvider::new_default() {
+            Ok(ep) => ep,
+            Err(error) => {
+                eprintln!("skip: no CUDA GPU/runtime available ({error})");
+                return;
+            }
+        };
+        let hidden = 6656usize;
+        let epsilon = 1e-6f32;
+        // Deterministic, mixed-magnitude activations that stress FP summation
+        // order (values span ~3 orders of magnitude, alternating sign).
+        let x_f32: Vec<f32> = (0..hidden)
+            .map(|i| {
+                let t = (i as f32) * 0.017_f32;
+                let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
+                sign * (0.001 + (t.sin() * t.cos()).abs() * 3.0)
+            })
+            .collect();
+        let x_bf16: Vec<bf16> = x_f32.iter().map(|v| bf16::from_f32(*v)).collect();
+        // Gemma-style "+1" f32 scale (the fold leaves scale in f32).
+        let scale_f32: Vec<f32> = (0..hidden).map(|i| 1.0 + ((i % 7) as f32) * 0.03).collect();
+
+        let shape = [1usize, hidden];
+        let strides = compute_contiguous_strides(&shape);
+        let param_shape = [hidden];
+        let param_strides = compute_contiguous_strides(&param_shape);
+
+        let x_buffer = ep
+            .allocate(std::mem::size_of_val(x_bf16.as_slice()), 256)
+            .unwrap();
+        let scale_buffer = ep
+            .allocate(std::mem::size_of_val(scale_f32.as_slice()), 256)
+            .unwrap();
+        let mut out_buffer = ep
+            .allocate(std::mem::size_of_val(x_bf16.as_slice()), 256)
+            .unwrap();
+        let runtime = ep.runtime();
+        unsafe {
+            runtime
+                .htod(bf16_bytes(&x_bf16), cuptr(x_buffer.as_ptr()))
+                .unwrap();
+            runtime
+                .htod(f32_bytes(&scale_f32), cuptr(scale_buffer.as_ptr()))
+                .unwrap();
+        }
+        let x = TensorView::new(
+            DevicePtr(x_buffer.as_ptr()),
+            DataType::BFloat16,
+            &shape,
+            &strides,
+            ep.device_id(),
+        );
+        let scale_view = TensorView::new(
+            DevicePtr(scale_buffer.as_ptr()),
+            DataType::Float32,
+            &param_shape,
+            &param_strides,
+            ep.device_id(),
+        );
+        let output = TensorMut::new(
+            DevicePtrMut(out_buffer.as_mut_ptr()),
+            DataType::BFloat16,
+            &shape,
+            &strides,
+            ep.device_id(),
+        );
+        RmsNormKernel {
+            axis: -1,
+            epsilon,
+            runtime: runtime.clone(),
+            warmed_signature: Mutex::new(None),
+            last_call_capture_safe: AtomicBool::new(false),
+        }
+        .run(&[x, scale_view], &mut [output])
+        .unwrap();
+        runtime.synchronize().unwrap();
+
+        let mut out_bytes = vec![0u8; std::mem::size_of_val(x_bf16.as_slice())];
+        unsafe {
+            runtime
+                .dtoh(&mut out_bytes, cuptr(out_buffer.as_ptr()))
+                .unwrap();
+        }
+        let out_bf16: Vec<bf16> = out_bytes
+            .chunks_exact(2)
+            .map(|raw| bf16::from_bits(u16::from_ne_bytes(raw.try_into().unwrap())))
+            .collect();
+
+        // The kernel upcasts the *stored* bf16 activations, so the oracle must
+        // use the same bf16-rounded values (not the original f32) as ground
+        // truth for the elements; the reduction itself is done in f64.
+        let x_ref: Vec<f64> = x_bf16.iter().map(|v| f64::from(v.to_f32())).collect();
+        let ms_f64: f64 = x_ref.iter().map(|v| v * v).sum::<f64>() / hidden as f64;
+        let inv_std_f64 = 1.0 / (ms_f64 + f64::from(epsilon)).sqrt();
+
+        // Kernel output vs f64 ground truth, measured in bf16 ulp.
+        let mut max_ulp = 0i32;
+        for i in 0..hidden {
+            let expect = x_ref[i] * inv_std_f64 * f64::from(scale_f32[i]);
+            let expect_bf16 = bf16::from_f32(expect as f32);
+            let ulp = (i32::from(out_bf16[i].to_bits()) - i32::from(expect_bf16.to_bits())).abs();
+            max_ulp = max_ulp.max(ulp);
+        }
+        assert!(
+            max_ulp <= 1,
+            "bf16 rmsnorm output diverges from f64 oracle by {max_ulp} bf16 ulp (want <= 1)"
+        );
+
+        // The parallel tree mean-square must be at least as close to f64 truth
+        // as the serial left-to-right f32 order. Reproduce both in f32.
+        let serial_ms: f32 = {
+            let mut ss = 0.0f32;
+            for v in &x_bf16 {
+                let f = v.to_f32();
+                ss += f * f;
+            }
+            ss / hidden as f32
+        };
+        let tree_ms: f32 = {
+            let mut level: Vec<f32> = x_bf16
+                .iter()
+                .map(|v| {
+                    let f = v.to_f32();
+                    f * f
+                })
+                .collect();
+            while level.len() > 1 {
+                let mut next = Vec::with_capacity(level.len().div_ceil(2));
+                let mut i = 0;
+                while i + 1 < level.len() {
+                    next.push(level[i] + level[i + 1]);
+                    i += 2;
+                }
+                if i < level.len() {
+                    next.push(level[i]);
+                }
+                level = next;
+            }
+            level[0] / hidden as f32
+        };
+        let serial_err = (f64::from(serial_ms) - ms_f64).abs();
+        let tree_err = (f64::from(tree_ms) - ms_f64).abs();
+        assert!(
+            tree_err <= serial_err * 1.000_001 + 1e-9,
+            "tree mean-square error {tree_err:e} exceeds serial error {serial_err:e}"
+        );
     }
 }

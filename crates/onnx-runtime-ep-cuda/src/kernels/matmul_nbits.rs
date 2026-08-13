@@ -3580,6 +3580,7 @@ impl KernelFactory for MatMulNBitsFactory {
                 .unwrap_or(1e-5),
             last_call_capture_safe: AtomicBool::new(false),
             bf16_scratch: Mutex::new(Bf16Scratch::new(self.runtime.clone())),
+            bf16_const_cache: Mutex::new(Bf16ConstCache::new(self.runtime.clone())),
         }))
     }
 }
@@ -3671,6 +3672,101 @@ impl Drop for Bf16Scratch {
     }
 }
 
+/// Persistent per-kernel cache of the Float16-staged **constant** inputs on the
+/// BFloat16 activation path. A node's scales / zero-point-scales / gamma are
+/// immutable weights, but the original `run_bf16` re-cast them from BFloat16 to
+/// Float16 into an ephemeral arena on *every* decode step. For Muse-Glimmer that
+/// is ~3.3 GB/token of pure-copy traffic (≈25% of the int4 weight traffic) doing
+/// nothing but reproducing an identical Float16 buffer. This cache stages each
+/// constant once (keyed by its device pointer + element count) and reuses the
+/// result across steps. Converting BFloat16→Float16 in one staging pass is
+/// byte-identical whether done once or per step, so decode output is unchanged.
+#[derive(Debug)]
+struct Bf16ConstCache {
+    runtime: Arc<CudaRuntime>,
+    ptr: CUdeviceptr,
+    cap: usize,
+    /// One entry per cached constant: `(src_ptr, numel, byte_offset)`.
+    slots: Vec<(CUdeviceptr, usize, usize)>,
+}
+
+impl Bf16ConstCache {
+    fn new(runtime: Arc<CudaRuntime>) -> Self {
+        Self {
+            runtime,
+            ptr: 0,
+            cap: 0,
+            slots: Vec::new(),
+        }
+    }
+
+    /// Return the Float16 device pointers holding the staged copies of the
+    /// BFloat16 constants described by `consts` (`(src_ptr, numel)` each),
+    /// casting them on first use and reusing them thereafter. The staged buffer
+    /// is allocated once (before CUDA-graph capture, during warmup) and never
+    /// grows again for a given node, so replays hit only cache lookups.
+    fn staged(&mut self, consts: &[(CUdeviceptr, usize)]) -> Result<Vec<CUdeviceptr>> {
+        let matches =
+            self.slots.len() == consts.len()
+                && self.slots.iter().zip(consts).all(
+                    |((src, numel, _), (want_src, want_numel))| {
+                        *src == *want_src && *numel == *want_numel
+                    },
+                );
+        if !matches {
+            self.rebuild(consts)?;
+        }
+        Ok(self
+            .slots
+            .iter()
+            .map(|(_, _, offset)| self.ptr + *offset as CUdeviceptr)
+            .collect())
+    }
+
+    fn rebuild(&mut self, consts: &[(CUdeviceptr, usize)]) -> Result<()> {
+        const ALIGN: usize = 256;
+        let f16 = std::mem::size_of::<half::f16>();
+        let round = |bytes: usize| bytes.div_ceil(ALIGN) * ALIGN;
+        let mut slots = Vec::with_capacity(consts.len());
+        let mut total = 0usize;
+        for (src, numel) in consts {
+            slots.push((*src, *numel, total));
+            total += round(numel * f16);
+        }
+        if total > self.cap {
+            if self.ptr != 0 {
+                // SAFETY: exclusively owned; freed once before replacement.
+                unsafe { self.runtime.free_raw(self.ptr)? };
+                self.ptr = 0;
+            }
+            self.ptr = self.runtime.alloc_raw(total.max(1))?;
+            self.cap = total;
+        }
+        for (src, numel, offset) in &slots {
+            super::cast::launch_cast_raw(
+                &self.runtime,
+                cuptr(*src as *const c_void),
+                DataType::BFloat16,
+                self.ptr + *offset as CUdeviceptr,
+                DataType::Float16,
+                *numel,
+            )?;
+        }
+        self.slots = slots;
+        Ok(())
+    }
+}
+
+impl Drop for Bf16ConstCache {
+    fn drop(&mut self) {
+        if self.ptr != 0 {
+            // SAFETY: this persistent buffer is exclusively owned by the kernel.
+            let _ = unsafe { self.runtime.free_raw(self.ptr) };
+            self.ptr = 0;
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct MatMulNBitsKernel {
     runtime: Arc<CudaRuntime>,
@@ -3703,6 +3799,9 @@ pub struct MatMulNBitsKernel {
     last_call_capture_safe: AtomicBool,
     /// Reusable Float16 staging arena for the BFloat16 activation path.
     bf16_scratch: Mutex<Bf16Scratch>,
+    /// Persistent Float16 staging of the BFloat16 *constant* inputs (scales,
+    /// gamma) so they are cast once rather than re-cast every decode step.
+    bf16_const_cache: Mutex<Bf16ConstCache>,
 }
 
 impl MatMulNBitsKernel {
@@ -4167,17 +4266,33 @@ impl MatMulNBitsKernel {
         require_dtype("A", inputs[0].dtype, DataType::BFloat16)?;
         require_dtype("Y", outputs[0].dtype, DataType::BFloat16)?;
 
+        // The scale slots are immutable weights (general path: input 2; the
+        // gate/up SwiGLU fusion adds a second scale at input 4). They dominate
+        // the BFloat16 staging traffic (~25% of the int4 weight bytes/token for
+        // Muse-Glimmer), so stage them once into the persistent const cache and
+        // reuse across decode steps. Every other BFloat16 input is either the
+        // per-step activation (input 0) or a per-token residual bound into the
+        // bias slot — both genuinely dynamic — so they keep going through the
+        // per-call arena. Caching keys on the weight pointer + element count and
+        // never uses pointer identity for the dynamic slots (a reused activation
+        // buffer has a stable pointer but changing contents).
+        let cache_slots: &[usize] = if self.gate_up_swiglu { &[2, 4] } else { &[2] };
+        let is_cached = |index: usize, dtype: DataType| {
+            dtype == DataType::BFloat16 && cache_slots.contains(&index)
+        };
+
         // Lay out per-call Float16 regions inside the reusable arena: one region
-        // per BFloat16 input, plus one for the Float16 result. Regions are padded
-        // so each begins aligned for the tuned fp16 kernels' vectorized loads.
+        // per dynamic BFloat16 input, plus one for the Float16 result. Regions
+        // are padded so each begins aligned for the tuned fp16 kernels'
+        // vectorized loads.
         const ALIGN: usize = 256;
         let f16 = std::mem::size_of::<half::f16>();
         let round = |bytes: usize| bytes.div_ceil(ALIGN) * ALIGN;
 
         let mut offsets: Vec<Option<usize>> = Vec::with_capacity(inputs.len());
         let mut total = 0usize;
-        for input in inputs {
-            if input.dtype == DataType::BFloat16 {
+        for (index, input) in inputs.iter().enumerate() {
+            if input.dtype == DataType::BFloat16 && !is_cached(index, input.dtype) {
                 offsets.push(Some(total));
                 total += round(input.numel() * f16);
             } else {
@@ -4187,6 +4302,39 @@ impl MatMulNBitsKernel {
         let out_off = total;
         let out_n = outputs[0].numel();
         total += round(out_n * f16);
+
+        // Stage the constant scale slots once into the persistent cache (this is
+        // allocation-free on every call after the first warmup call, so the
+        // captured decode graph only replays cache hits).
+        let cached: Vec<(usize, CUdeviceptr)> = {
+            let consts: Vec<(CUdeviceptr, usize)> = cache_slots
+                .iter()
+                .filter(|index| **index < inputs.len() && is_cached(**index, inputs[**index].dtype))
+                .map(|index| {
+                    (
+                        cuptr(inputs[*index].data_ptr::<u8>() as *const c_void) as CUdeviceptr,
+                        inputs[*index].numel(),
+                    )
+                })
+                .collect();
+            if consts.is_empty() {
+                Vec::new()
+            } else {
+                let mut cache = self
+                    .bf16_const_cache
+                    .lock()
+                    .map_err(|_| error("MatMulNBits bf16 const cache mutex poisoned"))?;
+                let ptrs = cache.staged(&consts)?;
+                cache_slots
+                    .iter()
+                    .filter(|index| {
+                        **index < inputs.len() && is_cached(**index, inputs[**index].dtype)
+                    })
+                    .zip(ptrs)
+                    .map(|(index, ptr)| (*index, ptr))
+                    .collect()
+            }
+        };
 
         // Hold the arena for the whole call: the staging casts, the reused fp16
         // matmul, and the narrowing cast all run stream-ordered against it. The
@@ -4198,7 +4346,17 @@ impl MatMulNBitsKernel {
         let base = arena.ensure(total)?;
 
         let mut f16_inputs: Vec<TensorView> = Vec::with_capacity(inputs.len());
-        for (input, offset) in inputs.iter().zip(offsets.iter()) {
+        for (index, (input, offset)) in inputs.iter().zip(offsets.iter()).enumerate() {
+            if let Some((_, cached_ptr)) = cached.iter().find(|(slot, _)| *slot == index) {
+                f16_inputs.push(TensorView::new(
+                    DevicePtr(raw_ptr(*cached_ptr) as *const c_void),
+                    DataType::Float16,
+                    input.shape,
+                    input.strides,
+                    input.device,
+                ));
+                continue;
+            }
             match offset {
                 Some(off) => {
                     let ptr = base + *off as CUdeviceptr;
@@ -6923,6 +7081,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
             bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
         };
         kernel.run(&inputs, &mut outputs, None).unwrap();
         runtime.synchronize().unwrap();
@@ -6966,6 +7125,580 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             max_out = max_out.max(e.abs());
         }
         (worst_abs, worst_rel, max_out, all_finite)
+    }
+
+    fn zc_env_usize(key: &str, default: usize) -> usize {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(default)
+    }
+
+    /// Deterministic int4/fp16 decode GEMV inputs for the #864 zero-copy probe.
+    /// Mirrors the block-32 asymmetric (`zp`) layout the real `qwen14b-zp`
+    /// decode path feeds `matmul_nbits_gemv_f16_scales_f16_zp` / its split-K
+    /// sibling: `packed` is `n * k_blocks * blob_size` bytes (two int4 nibbles
+    /// per byte), `scales` is fp16, `zero_points` is a per-(col, block) nibble.
+    #[allow(clippy::type_complexity)]
+    fn zc_make_inputs(
+        k: usize,
+        n: usize,
+        block_size: usize,
+    ) -> (Vec<f16>, Vec<u8>, Vec<f16>, Vec<u8>) {
+        let k_blocks = k / block_size;
+        let blob_size = block_size / 2;
+        let zp_row_bytes = k_blocks.div_ceil(2);
+
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+
+        let mut activation = vec![f16::ZERO; k];
+        for slot in activation.iter_mut() {
+            *slot = f16::from_f32(next());
+        }
+
+        // Packed int4 codes, two nibbles per byte, laid out exactly as the
+        // kernel unpacks: `packed[(col * k_blocks + block) * blob_size + pair]`.
+        let mut packed = vec![0u8; n * k_blocks * blob_size];
+        for byte in packed.iter_mut() {
+            let low = ((next() * 0.5 + 0.5) * 15.0).round().clamp(0.0, 15.0) as u8;
+            let high = ((next() * 0.5 + 0.5) * 15.0).round().clamp(0.0, 15.0) as u8;
+            *byte = low | (high << 4);
+        }
+
+        let mut scales = vec![f16::ZERO; n * k_blocks];
+        for slot in scales.iter_mut() {
+            *slot = f16::from_f32(0.015 + 0.01 * (next() * 0.5 + 0.5));
+        }
+
+        // Asymmetric per-(col, block) int4 zero points, packed low/high nibble.
+        let mut zp_packed = vec![0u8; n * zp_row_bytes];
+        for col in 0..n {
+            for block in 0..k_blocks {
+                let code = ((next() * 0.5 + 0.5) * 15.0).round().clamp(0.0, 15.0) as u8;
+                let byte = &mut zp_packed[col * zp_row_bytes + block / 2];
+                if block & 1 == 0 {
+                    *byte = (*byte & 0xf0) | code;
+                } else {
+                    *byte = (*byte & 0x0f) | (code << 4);
+                }
+            }
+        }
+
+        (activation, packed, scales, zp_packed)
+    }
+
+    fn zc_kernel(
+        runtime: &Arc<CudaRuntime>,
+        k: usize,
+        n: usize,
+        block_size: usize,
+    ) -> MatMulNBitsKernel {
+        MatMulNBitsKernel {
+            runtime: runtime.clone(),
+            k,
+            n,
+            bits: 4,
+            block_size,
+            accuracy_level: 4,
+            accuracy4_workspace: None,
+            fold_bias_post_round: false,
+            gate_up_swiglu: false,
+            decomposed_silu: false,
+            rmsnorm_prologue: false,
+            rmsnorm_epsilon: 1e-5,
+            last_call_capture_safe: AtomicBool::new(false),
+            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+        }
+    }
+
+    /// #864 — the decisive measurement this issue asks for. The 11.4 GB/s
+    /// zero-copy figure on #864/#877 was an *upper bound* measured with a
+    /// perfectly sequential `cuMemcpyDtoD` pull from mapped host memory. This
+    /// runs the **real** int4/fp16 decode GEMV (`MatMulNBits`, the exact kernel
+    /// plus launch config the engine selects) twice — once with its `packed`
+    /// weight pointer from `cuMemAlloc` (VRAM) and once from
+    /// `cuMemHostGetDevicePointer` over a `cuMemHostRegister(DEVICEMAP|
+    /// READ_ONLY)` host buffer — with **only the weight pointer differing**.
+    /// Everything else (activation, scales, zero-points, output) stays resident.
+    ///
+    /// It reports effective GB/s (packed_bytes / kernel_time, best-of-N) for
+    /// both arms so the numbers are directly comparable to #877's table, and
+    /// asserts the two arms' outputs are **bit-identical** (a zero-copy read
+    /// that changes the result is a correctness failure, not a perf question).
+    ///
+    /// Sizes are swept because the ~11.9 MB average per-tensor page-in fits in
+    /// this GPU's L2: at that size repeated VRAM reads are L2-cached and
+    /// *overstate* device bandwidth, inflating the ratio in the hybrid's favour.
+    /// The larger sizes exceed L2 and report the true cold DRAM-vs-PCIe rate the
+    /// real 8.33 GB layer walk sees (each weight read once per step, evicted
+    /// long before reuse). The honest ratio is the large-size one.
+    ///
+    /// `#[ignore]`: needs a live CUDA device and page-locks host RAM; it is a
+    /// measurement, not a CI gate. Run solo with the GPU otherwise idle:
+    ///   cargo test -p onnx-runtime-ep-cuda --features cuda --release \
+    ///     zerocopy_kernel_host_mapped_vs_vram -- --ignored --nocapture --test-threads=1
+    #[test]
+    #[ignore]
+    fn zerocopy_kernel_host_mapped_vs_vram_bandwidth() {
+        use cudarc::driver::result::event;
+        use cudarc::driver::sys;
+
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping zero-copy kernel probe: CUDA runtime unavailable");
+            return;
+        };
+        if runtime
+            .require_nvrtc_half_headers("zero-copy kernel probe")
+            .is_err()
+        {
+            eprintln!("skipping zero-copy kernel probe: fp16 NVRTC headers unavailable");
+            return;
+        }
+        runtime.bind().unwrap();
+
+        const CU_MEMHOSTREGISTER_DEVICEMAP: u32 = 0x02;
+        const CU_MEMHOSTREGISTER_READ_ONLY: u32 = 0x08;
+
+        let k = zc_env_usize("ZC_K", 5120);
+        let block_size = zc_env_usize("ZC_BLOCK", 32);
+        let reps = zc_env_usize("ZC_REPS", 7).max(3);
+        assert!(
+            k.is_multiple_of(block_size),
+            "K must be a multiple of block_size"
+        );
+        let k_blocks = k / block_size;
+        let blob_size = block_size / 2;
+        let zp_row_bytes = k_blocks.div_ceil(2);
+        let row_bytes = k_blocks * blob_size;
+
+        let sizes_mib: Vec<usize> = std::env::var("ZC_SIZES_MIB")
+            .ok()
+            .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+            .unwrap_or_else(|| vec![12, 64, 128, 256, 384]);
+
+        let caps = runtime.capabilities();
+        println!(
+            "\n=== #864 zero-copy REAL-kernel bandwidth probe ===\n\
+             SMs={} K={k} block_size={block_size} k_blocks={k_blocks} row_bytes/col={row_bytes} best-of-{reps}\n\
+             (packed = int4 weights; only the packed pointer differs VRAM vs host-mapped)\n",
+            caps.multiprocessor_count(),
+        );
+        println!(
+            "{:>10} {:>9} {:>12} {:>12} {:>8} {:>10}",
+            "packedMiB", "N", "VRAM GB/s", "host GB/s", "ratio", "match"
+        );
+
+        for mib in sizes_mib {
+            let target = mib * (1usize << 20);
+            let n = (target / row_bytes).max(1);
+            let packed_bytes = n * row_bytes;
+            let packed_mib = packed_bytes as f64 / (1u64 << 20) as f64;
+
+            let (activation, packed, scales, zp_packed) = zc_make_inputs(k, n, block_size);
+
+            // Resident buffers (identical for both arms).
+            let activation_dev = runtime.alloc_raw(activation.len() * 2).unwrap();
+            let scales_dev = runtime.alloc_raw(scales.len() * 2).unwrap();
+            let zp_dev = runtime.alloc_raw(zp_packed.len().max(1)).unwrap();
+            let output_dev = runtime.alloc_raw(n * 2).unwrap();
+            // VRAM copy of the weights (the arm the managed path streams into).
+            let packed_vram = runtime.alloc_raw(packed_bytes).unwrap();
+
+            // SAFETY: each device buffer was sized to its source slice.
+            unsafe {
+                runtime.htod(as_bytes(&activation), activation_dev).unwrap();
+                runtime.htod(as_bytes(&scales), scales_dev).unwrap();
+                runtime.htod(&zp_packed, zp_dev).unwrap();
+                runtime.htod(&packed, packed_vram).unwrap();
+            }
+
+            // Host-mapped weights: page-lock the same bytes READ_ONLY and take a
+            // device-addressable pointer into them (the zero-copy cold path).
+            let host_ptr = packed.as_ptr() as *mut c_void;
+            // SAFETY: `packed` outlives the registration; it is unregistered
+            // below before `packed` is dropped, and never reallocated meanwhile.
+            unsafe {
+                sys::cuMemHostRegister_v2(
+                    host_ptr,
+                    packed_bytes,
+                    CU_MEMHOSTREGISTER_DEVICEMAP | CU_MEMHOSTREGISTER_READ_ONLY,
+                )
+                .result()
+                .expect("cuMemHostRegister(DEVICEMAP|READ_ONLY)");
+            }
+            let mut packed_host_dptr: CUdeviceptr = 0;
+            // SAFETY: `host_ptr` was just registered with DEVICEMAP.
+            unsafe {
+                sys::cuMemHostGetDevicePointer_v2(&mut packed_host_dptr, host_ptr, 0)
+                    .result()
+                    .expect("cuMemHostGetDevicePointer");
+            }
+
+            let kernel = zc_kernel(&runtime, k, n, block_size);
+
+            let a_shape = [1usize, k];
+            let a_strides = [k as i64, 1];
+            let b_shape = [n, k_blocks, blob_size];
+            let b_strides = [(k_blocks * blob_size) as i64, blob_size as i64, 1];
+            let s_shape = [n, k_blocks];
+            let s_strides = [k_blocks as i64, 1];
+            let zp_shape = [n, zp_row_bytes];
+            let zp_strides = [zp_row_bytes as i64, 1];
+            let y_shape = [1usize, n];
+            let y_strides = [n as i64, 1];
+            let device = DeviceId::cuda(0);
+
+            let make_inputs = |packed_ptr: CUdeviceptr| {
+                vec![
+                    TensorView::new(
+                        device_ptr(activation_dev),
+                        DataType::Float16,
+                        &a_shape,
+                        &a_strides,
+                        device,
+                    ),
+                    TensorView::new(
+                        device_ptr(packed_ptr),
+                        DataType::Uint8,
+                        &b_shape,
+                        &b_strides,
+                        device,
+                    ),
+                    TensorView::new(
+                        device_ptr(scales_dev),
+                        DataType::Float16,
+                        &s_shape,
+                        &s_strides,
+                        device,
+                    ),
+                    TensorView::new(
+                        device_ptr(zp_dev),
+                        DataType::Uint8,
+                        &zp_shape,
+                        &zp_strides,
+                        device,
+                    ),
+                ]
+            };
+
+            let time_arm = |packed_ptr: CUdeviceptr| -> Vec<f32> {
+                let inputs = make_inputs(packed_ptr);
+                let mut outputs = [TensorMut::new(
+                    device_ptr_mut(output_dev),
+                    DataType::Float16,
+                    &y_shape,
+                    &y_strides,
+                    device,
+                )];
+                // Warm up (first call also compiles the NVRTC module).
+                kernel.run(&inputs, &mut outputs, None).unwrap();
+                runtime.synchronize().unwrap();
+                let mut times = Vec::with_capacity(reps);
+                for _ in 0..reps {
+                    let start = event::create(sys::CUevent_flags::CU_EVENT_DEFAULT).unwrap();
+                    let end = event::create(sys::CUevent_flags::CU_EVENT_DEFAULT).unwrap();
+                    // SAFETY: both events were just created on this context; the
+                    // launch enqueues on the same stream between the records.
+                    unsafe {
+                        event::record(start, runtime.stream_ptr()).unwrap();
+                        kernel.run(&inputs, &mut outputs, None).unwrap();
+                        event::record(end, runtime.stream_ptr()).unwrap();
+                        event::synchronize(end).unwrap();
+                        times.push(event::elapsed(start, end).unwrap());
+                        event::destroy(start).ok();
+                        event::destroy(end).ok();
+                    }
+                }
+                times
+            };
+
+            // VRAM arm, then read its output.
+            let vram_times = time_arm(packed_vram);
+            let mut got_vram = vec![f16::ZERO; n];
+            // SAFETY: `output_dev` holds `n` fp16 values.
+            unsafe {
+                runtime
+                    .dtoh(as_bytes_mut(&mut got_vram), output_dev)
+                    .unwrap()
+            };
+
+            // Host-mapped arm, then read its output.
+            let host_times = time_arm(packed_host_dptr);
+            let mut got_host = vec![f16::ZERO; n];
+            // SAFETY: `output_dev` holds `n` fp16 values.
+            unsafe {
+                runtime
+                    .dtoh(as_bytes_mut(&mut got_host), output_dev)
+                    .unwrap()
+            };
+
+            let best_ms = |t: &[f32]| t.iter().cloned().fold(f32::INFINITY, f32::min);
+            let med_ms = |t: &[f32]| {
+                let mut s = t.to_vec();
+                s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                s[s.len() / 2]
+            };
+            let gbps = |ms: f32| (packed_bytes as f64) / (ms as f64 / 1e3) / 1e9;
+            let vram_gbps = gbps(best_ms(&vram_times));
+            let host_gbps = gbps(best_ms(&host_times));
+
+            let bit_match = got_vram
+                .iter()
+                .zip(got_host.iter())
+                .all(|(a, b)| a.to_bits() == b.to_bits());
+
+            println!(
+                "{:>10.1} {:>9} {:>12.2} {:>12.2} {:>7.2}x {:>10}",
+                packed_mib,
+                n,
+                vram_gbps,
+                host_gbps,
+                vram_gbps / host_gbps,
+                if bit_match { "yes" } else { "NO" }
+            );
+            println!(
+                "           spread: VRAM best={:.4} med={:.4} ms  host best={:.4} med={:.4} ms",
+                best_ms(&vram_times),
+                med_ms(&vram_times),
+                best_ms(&host_times),
+                med_ms(&host_times),
+            );
+
+            // Release this size's resources before the next (host RAM is
+            // page-locked; VRAM is scarce). Not in a Drop guard — asserting in
+            // Drop trips STATUS_STACK_BUFFER_OVERRUN in this tree.
+            // SAFETY: `host_ptr` is still registered and `packed` still alive.
+            unsafe {
+                sys::cuMemHostUnregister(host_ptr)
+                    .result()
+                    .expect("cuMemHostUnregister");
+            }
+            // SAFETY: each pointer came from this runtime's `alloc_raw`, freed once.
+            unsafe {
+                runtime.free_raw(activation_dev).unwrap();
+                runtime.free_raw(scales_dev).unwrap();
+                runtime.free_raw(zp_dev).unwrap();
+                runtime.free_raw(output_dev).unwrap();
+                runtime.free_raw(packed_vram).unwrap();
+            }
+            drop(packed);
+
+            assert!(
+                bit_match,
+                "zero-copy host-mapped read produced a DIFFERENT result than the VRAM read \
+                 (packed={packed_mib:.1} MiB, N={n}) — correctness failure"
+            );
+        }
+    }
+
+    /// #864 second question: can CUDA graph capture bake a **host-mapped**
+    /// device pointer into a captured `MatMulNBits` launch and replay it
+    /// correctly? Capture is a hard gate on the streaming path (`captures > 0`,
+    /// `fallbacks == 0`, #796); if host-mapped pointers cannot be captured the
+    /// hybrid's cold path is incompatible with capture. This captures the real
+    /// decode GEMV reading its weights zero-copy from host memory, replays it,
+    /// and asserts the replayed output matches an eager host-mapped run.
+    ///
+    /// `#[ignore]`: needs a live CUDA device. Run solo:
+    ///   cargo test -p onnx-runtime-ep-cuda --features cuda --release \
+    ///     zerocopy_kernel_capture_with_host_mapped_pointer -- --ignored --nocapture --test-threads=1
+    #[test]
+    #[ignore]
+    fn zerocopy_kernel_capture_with_host_mapped_pointer() {
+        use cudarc::driver::sys;
+
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping capture probe: CUDA runtime unavailable");
+            return;
+        };
+        if runtime.require_nvrtc_half_headers("capture probe").is_err() {
+            eprintln!("skipping capture probe: fp16 NVRTC headers unavailable");
+            return;
+        }
+        runtime.bind().unwrap();
+
+        const CU_MEMHOSTREGISTER_DEVICEMAP: u32 = 0x02;
+        const CU_MEMHOSTREGISTER_READ_ONLY: u32 = 0x08;
+
+        let k = zc_env_usize("ZC_K", 5120);
+        let block_size = zc_env_usize("ZC_BLOCK", 32);
+        let n = zc_env_usize("ZC_CAPTURE_N", 4608);
+        assert!(k.is_multiple_of(block_size));
+        let k_blocks = k / block_size;
+        let blob_size = block_size / 2;
+        let zp_row_bytes = k_blocks.div_ceil(2);
+        let packed_bytes = n * k_blocks * blob_size;
+
+        let (activation, packed, scales, zp_packed) = zc_make_inputs(k, n, block_size);
+
+        let activation_dev = runtime.alloc_raw(activation.len() * 2).unwrap();
+        let scales_dev = runtime.alloc_raw(scales.len() * 2).unwrap();
+        let zp_dev = runtime.alloc_raw(zp_packed.len().max(1)).unwrap();
+        let output_dev = runtime.alloc_raw(n * 2).unwrap();
+
+        // SAFETY: each device buffer was sized to its source slice.
+        unsafe {
+            runtime.htod(as_bytes(&activation), activation_dev).unwrap();
+            runtime.htod(as_bytes(&scales), scales_dev).unwrap();
+            runtime.htod(&zp_packed, zp_dev).unwrap();
+        }
+
+        let host_ptr = packed.as_ptr() as *mut c_void;
+        // SAFETY: `packed` outlives the registration and is unregistered below.
+        unsafe {
+            sys::cuMemHostRegister_v2(
+                host_ptr,
+                packed_bytes,
+                CU_MEMHOSTREGISTER_DEVICEMAP | CU_MEMHOSTREGISTER_READ_ONLY,
+            )
+            .result()
+            .expect("cuMemHostRegister(DEVICEMAP|READ_ONLY)");
+        }
+        let mut packed_host_dptr: CUdeviceptr = 0;
+        // SAFETY: `host_ptr` was just registered with DEVICEMAP.
+        unsafe {
+            sys::cuMemHostGetDevicePointer_v2(&mut packed_host_dptr, host_ptr, 0)
+                .result()
+                .expect("cuMemHostGetDevicePointer");
+        }
+
+        let kernel = zc_kernel(&runtime, k, n, block_size);
+
+        let a_shape = [1usize, k];
+        let a_strides = [k as i64, 1];
+        let b_shape = [n, k_blocks, blob_size];
+        let b_strides = [(k_blocks * blob_size) as i64, blob_size as i64, 1];
+        let s_shape = [n, k_blocks];
+        let s_strides = [k_blocks as i64, 1];
+        let zp_shape = [n, zp_row_bytes];
+        let zp_strides = [zp_row_bytes as i64, 1];
+        let y_shape = [1usize, n];
+        let y_strides = [n as i64, 1];
+        let device = DeviceId::cuda(0);
+
+        let inputs = vec![
+            TensorView::new(
+                device_ptr(activation_dev),
+                DataType::Float16,
+                &a_shape,
+                &a_strides,
+                device,
+            ),
+            TensorView::new(
+                device_ptr(packed_host_dptr),
+                DataType::Uint8,
+                &b_shape,
+                &b_strides,
+                device,
+            ),
+            TensorView::new(
+                device_ptr(scales_dev),
+                DataType::Float16,
+                &s_shape,
+                &s_strides,
+                device,
+            ),
+            TensorView::new(
+                device_ptr(zp_dev),
+                DataType::Uint8,
+                &zp_shape,
+                &zp_strides,
+                device,
+            ),
+        ];
+        let mut outputs = [TensorMut::new(
+            device_ptr_mut(output_dev),
+            DataType::Float16,
+            &y_shape,
+            &y_strides,
+            device,
+        )];
+
+        // Eager reference (also compiles the NVRTC module before capture).
+        kernel.run(&inputs, &mut outputs, None).unwrap();
+        runtime.synchronize().unwrap();
+        let mut eager = vec![f16::ZERO; n];
+        // SAFETY: `output_dev` holds `n` fp16 values.
+        unsafe { runtime.dtoh(as_bytes_mut(&mut eager), output_dev).unwrap() };
+
+        // Clobber the output so a broken replay cannot masquerade as a pass.
+        // SAFETY: `output_dev` holds `n` fp16 values.
+        unsafe {
+            runtime
+                .htod(as_bytes(&vec![f16::ONE; n]), output_dev)
+                .unwrap()
+        };
+
+        let captured = runtime
+            .begin_graph_capture(&[&kernel as &dyn Kernel])
+            .is_ok();
+        let mut replay_match = false;
+        if captured {
+            kernel.run(&inputs, &mut outputs, None).unwrap();
+            match runtime.end_graph_capture() {
+                Ok(()) => {
+                    for _ in 0..4 {
+                        runtime.replay_graph().unwrap();
+                    }
+                    runtime.synchronize().unwrap();
+                    let mut got = vec![f16::ZERO; n];
+                    // SAFETY: `output_dev` holds `n` fp16 values.
+                    unsafe { runtime.dtoh(as_bytes_mut(&mut got), output_dev).unwrap() };
+                    replay_match = got
+                        .iter()
+                        .zip(eager.iter())
+                        .all(|(a, b)| a.to_bits() == b.to_bits());
+                    runtime.reset_graph().ok();
+                    println!(
+                        "\n=== #864 capture-with-host-mapped-pointer probe ===\n\
+                         capture: SUPPORTED; replay output bit-identical to eager: {}",
+                        if replay_match { "YES" } else { "NO" }
+                    );
+                }
+                Err(e) => {
+                    runtime.abort_graph_capture().ok();
+                    println!(
+                        "\n=== #864 capture-with-host-mapped-pointer probe ===\n\
+                         capture: end_graph_capture FAILED: {e:?}"
+                    );
+                }
+            }
+        } else {
+            println!(
+                "\n=== #864 capture-with-host-mapped-pointer probe ===\n\
+                 capture: begin_graph_capture declined (kernel/audit not capturable in this build)"
+            );
+        }
+
+        // SAFETY: `host_ptr` is still registered and `packed` still alive.
+        unsafe {
+            sys::cuMemHostUnregister(host_ptr)
+                .result()
+                .expect("cuMemHostUnregister");
+        }
+        // SAFETY: each pointer came from this runtime's `alloc_raw`, freed once.
+        unsafe {
+            runtime.free_raw(activation_dev).unwrap();
+            runtime.free_raw(scales_dev).unwrap();
+            runtime.free_raw(zp_dev).unwrap();
+            runtime.free_raw(output_dev).unwrap();
+        }
+        drop(packed);
+
+        if captured {
+            assert!(
+                replay_match,
+                "graph replay with a host-mapped weight pointer produced a different result \
+                 than the eager host-mapped run"
+            );
+        }
     }
 
     /// Dequant-reference parity for the int8 (bits=8) fp16-activation decode
@@ -7203,6 +7936,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
             bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
         };
         kernel.run(&inputs, &mut outputs, None).unwrap();
         runtime.synchronize().unwrap();
@@ -7355,6 +8089,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 rmsnorm_epsilon: 1e-5,
                 last_call_capture_safe: AtomicBool::new(false),
                 bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+                bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
             };
             let staged_source = format!("{GEMV_F16_SRC}\n{STAGED_DOWN_REFERENCE_SRC}");
             let staged_function = runtime
@@ -8100,6 +8835,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
             bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
         };
         kernel.run(&inputs, &mut outputs, None).unwrap();
         runtime.synchronize().unwrap();
@@ -8359,6 +9095,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
             bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
         };
 
         match bits {
@@ -8629,6 +9366,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
             bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
         };
         let kernel_fold = MatMulNBitsKernel {
             runtime: runtime.clone(),
@@ -8645,6 +9383,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             rmsnorm_epsilon: 1e-5,
             last_call_capture_safe: AtomicBool::new(false),
             bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
         };
         kernel_nobias
             .launch_f16_gemv_variant(
@@ -8904,6 +9643,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 rmsnorm_epsilon: 1e-5,
                 last_call_capture_safe: AtomicBool::new(false),
                 bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+                bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
             };
             // Reference: two standalone MatMulNBits projections.
             if m == 1 {
@@ -9323,6 +10063,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 rmsnorm_epsilon: epsilon,
                 last_call_capture_safe: AtomicBool::new(false),
                 bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+                bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
             };
             let fused_swiglu = MatMulNBitsKernel {
                 runtime: runtime.clone(),
@@ -9339,6 +10080,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 rmsnorm_epsilon: epsilon,
                 last_call_capture_safe: AtomicBool::new(false),
                 bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+                bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
             };
 
             // Reference: normalize the activation (production prefill norm
@@ -9790,6 +10532,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                 rmsnorm_epsilon: epsilon,
                 last_call_capture_safe: AtomicBool::new(false),
                 bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+                bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
             };
 
             // ── Reference: preceding GEMV → skip_rmsnorm → following GEMV ──
@@ -10041,6 +10784,251 @@ extern "C" __global__ void ref_silu_mul_f16(
                     );
                 }
             }
+        }
+    }
+
+    /// The BFloat16 activation path caches its Float16-staged **constant** scales
+    /// across calls (see [`Bf16ConstCache`]) instead of re-casting them every
+    /// step. This must stay bit-identical to inline per-call staging: converting
+    /// BFloat16 -> Float16 yields the same bits whether done once or repeatedly,
+    /// and the tuned fp16 GEMV then reads identical scales. This test runs the
+    /// bf16 path twice (cache miss, then cache hit) and compares it, bit for bit,
+    /// to a reference that stages every bf16 input to Float16 inline.
+    #[test]
+    fn bf16_scale_cache_is_bit_exact_to_inline_staging() {
+        use half::bf16;
+
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping MatMulNBits bf16 scale-cache test: CUDA runtime unavailable");
+            return;
+        };
+
+        let k = 256usize;
+        let n = 64usize;
+        let block_size = 32usize;
+        let k_blocks = k / block_size;
+        let blob_size = block_size / 2; // int4: two weights per byte
+
+        let mut state = 0x0bad_c0de_dead_beefu64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+
+        let activation_bf16: Vec<bf16> = (0..k).map(|_| bf16::from_f32(next())).collect();
+        let packed: Vec<u8> = (0..n * k_blocks * blob_size)
+            .map(|_| next().to_bits() as u8)
+            .collect();
+        let scales_bf16: Vec<bf16> = (0..n * k_blocks)
+            .map(|_| bf16::from_f32(0.015 + 0.01 * (next() * 0.5 + 0.5)))
+            .collect();
+        let zero_points: Vec<u8> = (0..n * k_blocks.div_ceil(2))
+            .map(|_| ((next() * 0.5 + 0.5) * 255.0).round().clamp(0.0, 255.0) as u8)
+            .collect();
+
+        let device = DeviceId::cuda(0);
+        let a_shape = [1usize, k];
+        let a_strides = [k as i64, 1];
+        let b_shape = [n, k_blocks, blob_size];
+        let b_strides = [(k_blocks * blob_size) as i64, blob_size as i64, 1];
+        let scales_shape = [n, k_blocks];
+        let scales_strides = [k_blocks as i64, 1];
+        let zp_shape = [n, k_blocks.div_ceil(2)];
+        let zp_strides = [k_blocks.div_ceil(2) as i64, 1];
+        let y_shape = [1usize, n];
+        let y_strides = [n as i64, 1];
+
+        let act_dev = runtime.alloc_raw(activation_bf16.len() * 2).unwrap();
+        let packed_dev = runtime.alloc_raw(packed.len()).unwrap();
+        let scales_dev = runtime.alloc_raw(scales_bf16.len() * 2).unwrap();
+        let zp_dev = runtime.alloc_raw(zero_points.len()).unwrap();
+        let out1_dev = runtime.alloc_raw(n * 2).unwrap();
+        let out2_dev = runtime.alloc_raw(n * 2).unwrap();
+        // SAFETY: device buffers exactly cover their source slices.
+        unsafe {
+            runtime.htod(as_bytes(&activation_bf16), act_dev).unwrap();
+            runtime.htod(&packed, packed_dev).unwrap();
+            runtime.htod(as_bytes(&scales_bf16), scales_dev).unwrap();
+            runtime.htod(&zero_points, zp_dev).unwrap();
+        }
+
+        let inputs = vec![
+            TensorView::new(
+                device_ptr(act_dev),
+                DataType::BFloat16,
+                &a_shape,
+                &a_strides,
+                device,
+            ),
+            TensorView::new(
+                device_ptr(packed_dev),
+                DataType::Uint8,
+                &b_shape,
+                &b_strides,
+                device,
+            ),
+            TensorView::new(
+                device_ptr(scales_dev),
+                DataType::BFloat16,
+                &scales_shape,
+                &scales_strides,
+                device,
+            ),
+            TensorView::new(
+                device_ptr(zp_dev),
+                DataType::Uint8,
+                &zp_shape,
+                &zp_strides,
+                device,
+            ),
+        ];
+
+        let kernel = MatMulNBitsKernel {
+            runtime: runtime.clone(),
+            k,
+            n,
+            bits: 4,
+            block_size,
+            accuracy_level: 0,
+            accuracy4_workspace: None,
+            fold_bias_post_round: false,
+            gate_up_swiglu: false,
+            decomposed_silu: false,
+            rmsnorm_prologue: false,
+            rmsnorm_epsilon: 1e-5,
+            last_call_capture_safe: AtomicBool::new(false),
+            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+        };
+
+        let mut out1 = [TensorMut::new(
+            device_ptr_mut(out1_dev),
+            DataType::BFloat16,
+            &y_shape,
+            &y_strides,
+            device,
+        )];
+        kernel.run(&inputs, &mut out1, None).unwrap();
+        let mut out2 = [TensorMut::new(
+            device_ptr_mut(out2_dev),
+            DataType::BFloat16,
+            &y_shape,
+            &y_strides,
+            device,
+        )];
+        kernel.run(&inputs, &mut out2, None).unwrap();
+        runtime.synchronize().unwrap();
+
+        // Reference: stage every bf16 input to Float16 inline (no cache) and run
+        // the fp16 GEMV directly, then narrow to BFloat16 exactly as run_bf16 does.
+        let act_f16_dev = runtime.alloc_raw(k * 2).unwrap();
+        let scales_f16_dev = runtime.alloc_raw(scales_bf16.len() * 2).unwrap();
+        let ref_f16_dev = runtime.alloc_raw(n * 2).unwrap();
+        let ref_bf16_dev = runtime.alloc_raw(n * 2).unwrap();
+        super::super::cast::launch_cast_raw(
+            &runtime,
+            cuptr(act_dev as *const c_void),
+            DataType::BFloat16,
+            act_f16_dev,
+            DataType::Float16,
+            k,
+        )
+        .unwrap();
+        super::super::cast::launch_cast_raw(
+            &runtime,
+            cuptr(scales_dev as *const c_void),
+            DataType::BFloat16,
+            scales_f16_dev,
+            DataType::Float16,
+            scales_bf16.len(),
+        )
+        .unwrap();
+        let ref_inputs = vec![
+            TensorView::new(
+                device_ptr(act_f16_dev),
+                DataType::Float16,
+                &a_shape,
+                &a_strides,
+                device,
+            ),
+            TensorView::new(
+                device_ptr(packed_dev),
+                DataType::Uint8,
+                &b_shape,
+                &b_strides,
+                device,
+            ),
+            TensorView::new(
+                device_ptr(scales_f16_dev),
+                DataType::Float16,
+                &scales_shape,
+                &scales_strides,
+                device,
+            ),
+            TensorView::new(
+                device_ptr(zp_dev),
+                DataType::Uint8,
+                &zp_shape,
+                &zp_strides,
+                device,
+            ),
+        ];
+        let mut ref_f16 = [TensorMut::new(
+            device_ptr_mut(ref_f16_dev),
+            DataType::Float16,
+            &y_shape,
+            &y_strides,
+            device,
+        )];
+        kernel.run(&ref_inputs, &mut ref_f16, None).unwrap();
+        super::super::cast::launch_cast_raw(
+            &runtime,
+            ref_f16_dev,
+            DataType::Float16,
+            ref_bf16_dev,
+            DataType::BFloat16,
+            n,
+        )
+        .unwrap();
+        runtime.synchronize().unwrap();
+
+        let mut got1 = vec![bf16::ZERO; n];
+        let mut got2 = vec![bf16::ZERO; n];
+        let mut want = vec![bf16::ZERO; n];
+        // SAFETY: each host buffer matches its device source.
+        unsafe {
+            runtime.dtoh(as_bytes_mut(&mut got1), out1_dev).unwrap();
+            runtime.dtoh(as_bytes_mut(&mut got2), out2_dev).unwrap();
+            runtime.dtoh(as_bytes_mut(&mut want), ref_bf16_dev).unwrap();
+            for buffer in [
+                act_dev,
+                packed_dev,
+                scales_dev,
+                zp_dev,
+                out1_dev,
+                out2_dev,
+                act_f16_dev,
+                scales_f16_dev,
+                ref_f16_dev,
+                ref_bf16_dev,
+            ] {
+                runtime.free_raw(buffer).unwrap();
+            }
+        }
+
+        for index in 0..n {
+            assert_eq!(
+                got1[index].to_bits(),
+                got2[index].to_bits(),
+                "cached bf16 scale path is non-deterministic across steps at column {index}"
+            );
+            assert_eq!(
+                got1[index].to_bits(),
+                want[index].to_bits(),
+                "cached bf16 scale path diverged from inline staging at column {index}"
+            );
         }
     }
 }

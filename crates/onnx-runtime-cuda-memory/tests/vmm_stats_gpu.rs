@@ -83,13 +83,16 @@ fn the_counters_follow_a_full_allocate_and_free_cycle() {
     );
     assert_eq!(reserved.committed_bytes, 0);
 
-    let pointer = allocator.allocate(4096, 256).expect("4 KiB fits");
+    let allocation_bytes = 8 << 20;
+    let pointer = allocator
+        .allocate(allocation_bytes, 256)
+        .expect("8 MiB fits");
 
     let live = global_vmm_stats();
     assert_eq!(live.allocations, 1, "the span handed out must be counted");
     assert!(
         live.commits >= 1,
-        "backing a 4 KiB request must map at least one granule"
+        "backing an 8 MiB request must map at least one granule"
     );
     let (committed, _) = allocator.committed_and_reserved();
     assert_eq!(
@@ -103,7 +106,7 @@ fn the_counters_follow_a_full_allocate_and_free_cycle() {
     );
 
     // SAFETY: the pointer came from this allocator and is still live.
-    unsafe { allocator.deallocate(pointer, 4096, 256) };
+    unsafe { allocator.deallocate(pointer, allocation_bytes, 256) };
 
     let freed = global_vmm_stats();
     assert_eq!(
@@ -111,9 +114,9 @@ fn the_counters_follow_a_full_allocate_and_free_cycle() {
         "releasing the last allocation in a granule must unmap it and say so"
     );
     assert_eq!(
-        freed.releases, live.commits,
-        "every granule mapped must be unmapped; a shortfall here is a leak the \
-         driver would not report until allocation failed"
+        freed.releases, 1,
+        "one contiguous allocation must be retired with one cuMemUnmap run, \
+         not one driver call per physical granule"
     );
     assert_eq!(
         freed.peak_committed_bytes, live.committed_bytes,

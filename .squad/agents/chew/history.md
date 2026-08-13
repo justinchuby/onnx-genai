@@ -59,3 +59,31 @@ _Pre-2026-08-11 dated entries archived to `history-archive.md`. 2026-08-11 detai
 - **Coverage:** 17 → 20 BF16 tests, 103 → 106 total LayerNorm suite. All pass.
 - **Hygiene:** Removed 2× "B5" internal labels; fixed SrcDispatcher comment; aligned tolerance comments with checker reality (`absolute + relative × |expected|`, numpy.isclose).
 - **Commit:** `a12c7ddde3`. Delta review by Holden: no blockers. PR remains draft (vcpkg bootstrap TLS infra flake in CI).
+
+## 2026-08-12/13 — CUDA capture arc: bf16 GQA kernel numerics accepted (shared: 11.4 → 23.13 tok/s)
+Reviewed the accuracy gate on Sebastian's `gqa_decode_bf16` (**#855**, `1022b912`):
+parity vs an f64-accumulated softmax oracle fed bf16-rounded inputs, fp32 accumulation
+preserved (bf16 only at load/store), measured max_abs=1.953e-3 / max_rel=3.888e-3 within
+justified bounds (abs<2e-2, rel<1e-1). Byte-exact greedy parity. Part of the 5-blocker
+chain that took Muse-Glimmer native decode **11.4 → 23.13 tok/s** (capture fully engaged).
+Reinforced rule: bf16 kernels accumulate in fp32, oracle-gate against f64.
+
+## 2026-08-12/13 — PR #860 numerics gate 🟢: parallel reduction is *more* accurate (CUDA goal MET)
+Gated Sebastian's RMSNorm cast-fold + parallel bf16 tree reduction. Verified fp32
+accumulation airtight, op-swap execution-identical (same `RmsNormFactory→RmsNormKernel`),
+independent f64 oracle 4/4 (≤1 bf16 ulp). **Key finding:** tree reduction is **~807× MORE
+accurate** than the old serial order (tree_err 2.07e-8 vs serial 1.67e-5 vs f64 truth). The
+~37-token drift is downstream int4-quant greedy sensitivity, not a norm regression. Part of
+the arc taking native CUDA decode **11.4 → 40.21 tok/s** — goal MET (matches ORT ~40 tok/s).
+Rule reinforced: a parallel tree reduction may replace a serial order when the f64 oracle
+shows it is at least as accurate.
+
+## 2026-08-13 — PR #871 numerics gate 🟢: bf16 decomposed SiLU is 0-ulp byte-exact
+Gated Sebastian's bf16 decomposed SiLU/SiLU-Mul kernels (#871). Verified fp32 accumulation
+airtight, bf16 only at load/store; **byte-exact, 0 ulp bit-identical** vs the unfused two-op
+graph and an f64 oracle; 5/5 silu tests on H200. Confirmed it fixes a hard-crash portability
+defect (bf16 decomposed SiLU previously errored `"requires float16"`). No further numerics-gated
+fusion pursued: the fusion arc concluded that **native int4 decode of Muse-Glimmer-30B is
+weight-bandwidth/compute-floor bound at ~47.25 tok/s (H200)** (the architectural ceiling), so
+node/launch fusion — cheap or expensive — cannot help. Rule reinforced: bf16 accumulate in fp32,
+oracle-gate against f64.

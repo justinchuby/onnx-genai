@@ -22,4 +22,78 @@ S3: `NodeOutputSink::Absent` variant — `build_subgraph_routing` no longer allo
 Nits: removed 4 no-op identity transmutes.
 280 passed / 0 failed. Clippy clean. fmt clean. Miri: 4/4 canary tests clean.
 
+### 2026-08-12 — PR #832 H200 CUDA validation build fix (MERGED `2b62c620`)
+Added the missing `bf16_scratch` field (`Mutex<Bf16Scratch>`, `Mutex::new(Bf16Scratch::new(runtime.clone()))`) to 11 `MatMulNBitsKernel` test initializers in `crates/onnx-runtime-ep-cuda/src/kernels/matmul_nbits.rs`. Verified `cargo test --no-run -p onnx-runtime-ep-cuda --features cuda` green. Merged as part of the H200 (Muse-Glimmer-30B) CUDA EP validation wave.
+
 Full pre-compaction history in `history-archive.md`.
+
+### 2026-08-12 — CUDA-graph capture escalation (background, agent sebastian-3)
+Redirected post-#840 to investigate why CUDA-graph capture does not engage for
+Muse-Glimmer native decode. Delivered a cross-domain escalation: **3 stacked
+blockers** — (1) LOAD (engine native pipeline can't load the model), (2) CLASSIFY
+(vestigial SWA mis-classification on decode path), (3) CAPTURE (infra proven, gated
+behind 1+2). No perf PR (model can't load on engine native path yet). Coordinator
+dispatched Batty (LOAD) + Deckard (CLASSIFY); I pair on CAPTURE + re-measure once
+unblocked. Shared team goal: **beat ORT 40 tok/s via CUDA-graph capture**. Prior
+#840 (629fbf90) merged: real cudaMemGetInfo device-capacity + CudaFoldConstantCast,
+native decode 10.2→11.4 tok/s (+11.8%).
+
+## 2026-08-12/13 — CUDA capture arc COMPLETE (shared: 11.4 → 23.13 tok/s)
+Owned diagnosis + escalation + the two CUDA-EP kernel blockers. **#855** (`1022b912`)
+`gqa_decode_bf16` capture-safe kernel (fp32 accumulation; Chew-gated, max_abs 1.953e-3):
+segments 54 → 2, 22.52 tok/s. **#854** (`f85a82f0`) skip-norm capture-safety (persistent
+`NormBf16Scratch`, demote on `grew` only when `is_capturing()`): segments 2 → 1, 0 seams,
+23.13 tok/s (+33% vs capture OFF). Built on #848 (Deckard) / #850 (Batty) / #852 (Leon).
+**Corrected my own diagnosis:** with the step captured, decode is now **kernel-bound**
+(Cast 40%, MatMulNBits 21%, GQA 14%), not pure dispatch-bound. Next lever = Cast
+round-trip elimination to reach ORT's ~40 tok/s.
+
+## 2026-08-12/13 — PR #860 MERGED: 23→40 tok/s, CUDA goal MET (11.4 → 40.21 tok/s)
+Closed the final lever. Generalized ep-cuda `CudaDropNormalizationCasts` to fold **bf16**
+casts around `RMSNormalization` (op-swap `RMSNormalization`→`SimplifiedLayerNormalization`
+for re-inference stability — both map to the same `RmsNormFactory→RmsNormKernel`), and
+rewrote `rmsnorm_bf16` with a **parallel f32 tree reduction** (fp32 accumulation; only
+summation order changes). Native CUDA decode **23.16 → 40.21 tok/s** (H200, 3-run median),
+1 segment / 0 seams, first-16 greedy ids match reference. Cast removal is ~free under
+capture; the parallel reduction is the real lever (serial `fadd` chain ≈40% of captured
+decode; serial floor ≈33 tok/s). Chew-gated 🟢. Escape hatch
+`ONNX_GENAI_CUDA_DISABLE_NORM_CAST_FOLD=1`. **Multi-session CUDA goal MET: matches ORT ~40 tok/s.**
+
+## 2026-08-13 — PR #867 MERGED: 40→47 tok/s, native CUDA now BEATS ORT
+Cached the Float16-staged constant int4 scales. `MatMulNBitsKernel::run_bf16` was re-casting
+the immutable int4 scale slots bf16→f16 into an ephemeral arena **every** decode step
+(~3.3 GB/token, ~25% of int4 weight traffic, 417 redundant cast launches). Added a persistent
+per-kernel `Bf16ConstCache` that stages the constant scale slots once (general path input 2;
+SwiGLU-fusion inputs 2 and 4) and reuses them; dynamic slots (activation input 0, bias
+residual) stay on the ephemeral arena. Capture-safe (alloc+cast on pre-capture warmup; replays
+hit lookups only). Native decode **40.21 → 47.25 tok/s** (H200, 3-run median), MatMulNBits eager
+share ~44%→~31%, 1 segment / 0 seams, full 128-token sequence byte-identical. **Byte-exact by
+construction — no Chew gate**; test `bf16_scale_cache_is_bit_exact_to_inline_staging`.
+**MILESTONE: native CUDA EP now clearly beats ORT — 47.25 vs ~40 tok/s, +18%.** Next lever
+(deferred): GQA is now the largest eager share (~41%); full bf16-native GEMV / accuracy_level=4
+DP4A int8 remain open, both numerics-gated.
+
+## 2026-08-13 — bf16 SwiGLU kernels (#871) + GQA null finding (#870); 47.25 is the CEILING
+Shipped **#871** (bf16 decomposed SiLU/SiLU-Mul kernels `decomposed_silu_mul_bf16`/
+`decomposed_silu_bf16` in `elementwise.rs`) — fixes a real portability **hard crash**
+(bf16 decomposed SiLU previously errored `"requires float16"`); byte-exact **0 ulp** vs f64
+oracle, **Chew 🟢**, 5/5 silu tests on H200. Its graph SwiGLU-Mul fold is FLAT (−104 cheapest
+nodes). **#870** (doc-only): decode is 2568 nodes/token × ~8.17 µs/node; cheapening any single
+kernel inner loop (GQA seq-loop, GEMV depth-loops) is flat → GQA not a viable lever. Full gate_up
+bf16 fold went non-deterministic (f16-staging); safe version needs a bf16-native fused
+`gate_up_swiglu` kernel + Chew — deferred. **CONCLUSION (with Batty #872/#873): native int4 decode
+of Muse-Glimmer-30B is weight-bandwidth/compute-floor bound at ~47.25 tok/s (H200), NOT
+dispatch-bound. 47.25 is the architectural ceiling; beat it via fewer weight bytes/token or a
+megakernel, NOT node fusion.**
+
+## 2026-08-13 — Lower-bit quant NO-GO + mechanism correction (#885, docs-only)
+Researched whether lower-bit quant could beat ~47 tok/s. Byte budget: decoder reads **15.325
+GB weights/token** = 724 GB/s at 47 tok/s = only **~15% of H200 HBM roofline**. Ran a controlled
+weight-DRAM byte-fold probe (`ONNX_GENAI_WEIGHT_FOLD=D`, throwaway/reverted, node-count
+byte-identical): full **47.29** → half **47.98** (+1.5%) → quarter **48.62** (+2.8%). Weight-DRAM-
+bound fraction ≈ **3–4%**; int2-everywhere (−45% bytes) projects ≈+1.6%. **VERDICT: lower-bit quant
+(int3/int2/mixed/2:4/NF4) is a MEASURED 🟥 NO-GO.** **KEY CORRECTION:** this REFUTES the earlier
+"weight-bandwidth/compute-floor bound" attribution (#870/#872/#873) — decode is **LATENCY-bound
+on the ~2568-node serial chain (~8.2 µs/node)**, not bandwidth-bound. Ceiling VALUE (~47) and
+"marginal fusion isn't a lever" still stand; only the WHY changes. **Megakernel / drastic per-layer
+node-collapse REOPENED as the true next lever.** Brief: `docs/research/lowbit-quant-feasibility.md`.

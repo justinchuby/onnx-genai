@@ -42,3 +42,14 @@ Full pre-compaction history in `history-archive.md`.
 **Outcome:** Resch wired the API in; 8 conformance tests now assert specific op assignments to `"cpu_ep"`.
 
 **Lesson reinforced:** Verify an API's absence before deferring on it. Check the generated bindings.
+
+## 2026-08-13 — Lower-bit quant accuracy reality-check (parallel to Sebastian's #885 probe)
+Independent accuracy-lens check on sub-4-bit for the 30B dense model (read-only, no kernels).
+**Findings:** int3 (~3.5 bpw imatrix/AWQ) + SpQR-style mixed = 🟢 credible (small tax); int2 scalar
+/Q2_K = 🔴 accuracy cliff; int2 via codebook/trellis (QuIP#/AQLM/QTIP) = 🟡 but adds LUT/trellis
+decode that **spends the bandwidth win back** (accuracy & bandwidth coupled); 2:4 sparsity needs a
+fine-tune + no M=1 HW benefit. **Load-bearing blocker:** we only HAVE int4 — EVERY sub-4-bit path
+must re-quantize from the **fp16/bf16 SOURCE** (re-squeezing int4 → collapse); ORT-stack tooling
+for sub-4-bit >7B is immature. Combined with Sebastian's measured byte-fold probe (−75% DRAM →
++2.8%), lower-bit quant is a **MEASURED 🟥 NO-GO** and the ceiling is **latency-bound on the ~2568-
+node serial chain**, not weight-bandwidth-bound. Chew is the numerics gate if any path is funded.

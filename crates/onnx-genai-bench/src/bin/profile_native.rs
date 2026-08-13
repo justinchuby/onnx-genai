@@ -12,10 +12,29 @@ use onnx_genai_engine::logits::{
 use onnx_genai_engine::{
     DecodePrecision, Engine, EngineConfig, EngineDecodeBackend, GenerateOptions, GenerateRequest,
     NativeDecodeDevice, NativeDecodeSession, PipelineEngine, PipelineGenerateRequest,
-    ProcessorChain,
+    ProcessorChain, parse_resource_limit,
 };
 use onnx_genai_ort::{Tokenizer, available_execution_providers, profile};
 use onnx_runtime_session::InferenceSession;
+
+/// Honor `ONNX_GENAI_VRAM_LIMIT` in the profiler, mirroring the server CLI.
+///
+/// The real fix for large-model residency is real CUDA device-capacity
+/// detection in the governor (so the default `Fraction(0.90)` just works), but
+/// this convenience lets an operator pin an explicit ceiling (bytes, `8GiB`,
+/// `0.9`, or `auto`) without going through the server.
+fn apply_vram_limit_env(config: &mut EngineConfig) -> Result<()> {
+    match std::env::var("ONNX_GENAI_VRAM_LIMIT") {
+        Ok(raw) if !raw.trim().is_empty() => {
+            let limit = parse_resource_limit(raw.trim())
+                .map_err(|error| anyhow::anyhow!("invalid ONNX_GENAI_VRAM_LIMIT: {error}"))?;
+            eprintln!("profile_native: ONNX_GENAI_VRAM_LIMIT -> vram_limit={limit:?}");
+            config.limits.vram_limit = limit;
+        }
+        _ => {}
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum ExecutionProvider {
@@ -150,6 +169,13 @@ struct Args {
     /// Seed for reproducible categorical sampling across measured runs.
     #[arg(long, default_value_t = 0)]
     seed: u64,
+    /// Stage 2a (#750): run the batch-N stateless fused forward
+    /// ([`NativeDecodeSession::run_fused_batch_prefill`]) for each batch size in
+    /// this comma-separated list, resetting the CUDA weight-offload counters
+    /// around each so `htod_bytes_per_token` / `page_ins_per_token` isolate the
+    /// weight-streaming amortization. Leads the before/after ~1/N table.
+    #[arg(long, value_delimiter = ',')]
+    fused_forward_amortization: Option<Vec<usize>>,
 }
 
 fn categorical_sampling_enabled(args: &Args) -> bool {
@@ -384,16 +410,70 @@ fn weight_offload_hit_rate(stats: &onnx_runtime_ep_cuda::GlobalOffloadStats) -> 
     (lookups > 0).then(|| stats.hits as f64 / lookups as f64 * 100.0)
 }
 
-fn print_weight_offload_observability() {
+/// Ratio of an accumulated counter to the number of emitted tokens.
+///
+/// This is the batch-invariant quantity the #750 measurement protocol requires
+/// leading every batch-1 vs batch-N comparison: on a streaming-bound model the
+/// weight bytes streamed per decode step are (near-)constant in batch size `B`,
+/// so `htod_bytes / emitted_tokens` and `page_ins / emitted_tokens` should fall
+/// ~1/B while wall-clock throughput stays noisy. Returns `None` when no tokens
+/// were emitted so the caller reports `n/a` rather than dividing by zero.
+fn per_emitted_token(total: u64, emitted_tokens: u64) -> Option<f64> {
+    (emitted_tokens > 0).then(|| total as f64 / emitted_tokens as f64)
+}
+
+fn print_weight_offload_amortization(
+    stats: &onnx_runtime_ep_cuda::GlobalOffloadStats,
+    emitted_tokens: u64,
+) {
+    let fmt = |value: Option<f64>| {
+        value
+            .map(|ratio| format!("{ratio:.1}"))
+            .unwrap_or_else(|| "n/a".to_string())
+    };
+    println!(
+        "weight_offload_amortization: emitted_tokens={} htod_bytes_per_token={} \
+         page_ins_per_token={}",
+        emitted_tokens,
+        fmt(per_emitted_token(stats.htod_bytes, emitted_tokens)),
+        fmt(per_emitted_token(stats.page_ins, emitted_tokens))
+    );
+}
+
+fn print_weight_offload_observability(emitted_tokens: u64) {
     let stats = onnx_runtime_ep_cuda::global_offload_stats();
     let hit_rate = weight_offload_hit_rate(&stats)
         .map(|rate| format!("{rate:.2}%"))
         .unwrap_or_else(|| "n/a".to_string());
+    // The byte-weighted rate is the one residency policy must be judged on: the
+    // count-based rate weights a 10 KiB norm like an 11 MiB projection, so it can
+    // improve while streamed bytes get worse (#857, #837 item 3).
+    let byte_hit_rate = stats
+        .byte_hit_rate()
+        .map(|rate| format!("{:.2}%", rate * 100.0))
+        .unwrap_or_else(|| "n/a".to_string());
+    // Byte-weighted attribution of the bypass count: what share of streamed
+    // bytes is bypass traffic that residency policy keeps no benefit from and
+    // re-streams every step (#837 item 3).
+    let bypassed_byte_share = stats
+        .bypassed_byte_share()
+        .map(|rate| format!("{:.2}%", rate * 100.0))
+        .unwrap_or_else(|| "n/a".to_string());
     println!(
-        "weight_offload_cache: page_ins={} hits={} hit_rate={} evictions={} \
-         bypassed_page_ins={}",
-        stats.page_ins, stats.hits, hit_rate, stats.evictions, stats.bypassed_page_ins
+        "weight_offload_cache: page_ins={} hits={} hit_rate={} byte_hit_rate={} \
+         hit_bytes={} evictions={} bypassed_page_ins={} bypassed_page_in_bytes={} \
+         bypassed_byte_share={}",
+        stats.page_ins,
+        stats.hits,
+        hit_rate,
+        byte_hit_rate,
+        stats.hit_bytes,
+        stats.evictions,
+        stats.bypassed_page_ins,
+        stats.bypassed_page_in_bytes,
+        bypassed_byte_share
     );
+    print_weight_offload_amortization(&stats, emitted_tokens);
     println!(
         "weight_offload_timing: materialize_ms={:.3} htod_ms={:.3} \
          admit_sync_ms={:.3} vram_alloc_ms={:.3} vram_free_ms={:.3}",
@@ -410,6 +490,16 @@ fn print_weight_offload_observability() {
         stats.mapped_physical_bytes,
         stats.physical_owned_bytes,
         stats.htod_bytes
+    );
+    let htod_gbps = if stats.htod_ns > 0 {
+        stats.htod_bytes as f64 / (stats.htod_ns as f64 / 1_000_000_000.0) / 1e9
+    } else {
+        0.0
+    };
+    println!(
+        "weight_offload_staging: pinned_alloc_calls={} pinned_reuses={} \
+         effective_htod_gbps={:.3}",
+        stats.pinned_alloc_calls, stats.pinned_reuses, htod_gbps
     );
 }
 
@@ -460,6 +550,108 @@ fn configure_ort_provider(args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// Stage 2a (#750): measure weight-streaming amortization of the batch-N
+/// stateless fused forward. For each batch size `N`, reset the global CUDA
+/// weight-offload counters, run exactly one fused forward over `N` rows, and
+/// report `htod_bytes` / `page_ins` both in total and per emitted row. Because
+/// the offload residency is keyed purely by weight identity (no batch axis), a
+/// single forward pages each weight in at most once regardless of `N`, so the
+/// per-row figures fall ~`1/N` — the deterministic, batch-invariant signature
+/// that "amortization happened", led ahead of any wall-clock number.
+fn run_fused_forward_amortization(
+    session: &mut NativeDecodeSession,
+    prompt_tokens: &[u32],
+    batch_sizes: &[usize],
+) -> Result<()> {
+    if batch_sizes.is_empty() {
+        bail!("--fused-forward-amortization requires at least one batch size");
+    }
+    let own_pid = std::process::id();
+    println!(
+        "fused_forward_amortization: own_pid={own_pid} batch_sizes={batch_sizes:?} \
+         (rows are independent length-1 sequences, empty past; stateless eager forward)"
+    );
+    report_foreign_compute_apps(own_pid);
+
+    // One-time warmup outside every measurement window so first-touch admission
+    // and any lazy CUDA setup are not attributed to a batch size.
+    let warm = fused_tokens(prompt_tokens, 1);
+    let _ = session
+        .run_fused_batch_prefill(&warm)
+        .context("warmup fused forward")?;
+
+    for &batch in batch_sizes {
+        if batch == 0 {
+            bail!("--fused-forward-amortization batch sizes must be > 0");
+        }
+        report_foreign_compute_apps(own_pid);
+        let tokens = fused_tokens(prompt_tokens, batch);
+        onnx_runtime_ep_cuda::reset_global_offload_stats();
+        let rows = session
+            .run_fused_batch_prefill(&tokens)
+            .with_context(|| format!("fused forward at batch {batch}"))?;
+        assert_eq!(
+            rows.len(),
+            batch,
+            "fused forward must emit one row per token"
+        );
+        let emitted = batch as u64;
+        println!("--- fused_forward batch={batch} ---");
+        print_weight_offload_observability(emitted);
+    }
+    Ok(())
+}
+
+/// Build `batch` token ids for the fused-forward probe by cycling the prompt.
+/// Token *values* never affect weight-streaming counters (residency is keyed by
+/// weight identity, not by token), so cycling a real prompt is representative.
+fn fused_tokens(prompt_tokens: &[u32], batch: usize) -> Vec<u32> {
+    (0..batch)
+        .map(|index| prompt_tokens[index % prompt_tokens.len()])
+        .collect()
+}
+
+/// Print any CUDA compute processes that are NOT this profiler, so a contended
+/// run is labeled as such in its own log (per #851). Our own PID is expected
+/// and filtered out; a non-empty foreign list is flagged loudly.
+fn report_foreign_compute_apps(own_pid: u32) {
+    let output = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-compute-apps=pid,used_memory",
+            "--format=csv,noheader",
+        ])
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            let foreign: Vec<&str> = text
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .filter(|line| {
+                    line.split(',')
+                        .next()
+                        .and_then(|pid| pid.trim().parse::<u32>().ok())
+                        != Some(own_pid)
+                })
+                .collect();
+            if foreign.is_empty() {
+                println!("gpu_contention_check: clear (only own_pid={own_pid})");
+            } else {
+                println!(
+                    "gpu_contention_check: CONTENDED — foreign compute apps present: {foreign:?} \
+                     (label this run contended)"
+                );
+            }
+        }
+        Ok(output) => println!(
+            "gpu_contention_check: nvidia-smi exited with status {} (skipping check)",
+            output.status
+        ),
+        Err(error) => println!("gpu_contention_check: nvidia-smi unavailable ({error})"),
+    }
+}
+
 fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Result<()> {
     if args.synthetic {
         bail!("--steady requires a real model directory");
@@ -490,6 +682,7 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
         ..EngineConfig::default()
     };
     config.native_device = Some(device);
+    apply_vram_limit_env(&mut config)?;
     let mut engine = Engine::from_dir(model_dir, config).with_context(|| {
         format!(
             "load {} engine {}",
@@ -593,7 +786,7 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
         println!("generated_token_ids: {tokens:?}");
     }
     print_cuda_observability(&engine, cuda_before.as_ref());
-    print_weight_offload_observability();
+    print_weight_offload_observability(generated as u64);
     print_vmm_observability(&engine);
     if profile::enabled() {
         println!("{}", profile::report(generated as u64));
@@ -634,6 +827,7 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
         ExecutionProvider::Cpu => NativeDecodeDevice::Cpu,
         ExecutionProvider::Cuda => NativeDecodeDevice::Cuda { index: None },
     });
+    apply_vram_limit_env(&mut config)?;
     let mut engine = PipelineEngine::from_dir_with_config(model_dir, config)
         .with_context(|| format!("load pipeline engine {}", model_dir.display()))?;
     for _ in 0..args.warmups {
@@ -827,6 +1021,9 @@ fn main() -> Result<()> {
         args.runs
     );
     println!("profile_native: {}", describe_sampling(&args));
+    if let Some(batch_sizes) = args.fused_forward_amortization.clone() {
+        return run_fused_forward_amortization(&mut session, &prompt_tokens, &batch_sizes);
+    }
     if let Some(dump_path) = args.dump_logprobs.as_ref() {
         let dump_prompt_tokens = if let Some(ids_path) = args.prompt_ids.as_ref() {
             let raw = std::fs::read_to_string(ids_path)
@@ -1011,6 +1208,7 @@ fn main() -> Result<()> {
         "weight_offload_cache: page_ins={} hits={} evictions={}",
         offload.page_ins, offload.hits, offload.evictions
     );
+    print_weight_offload_amortization(&offload, generated as u64);
     if profile::enabled() {
         println!("{}", profile::report(generated as u64));
     }
@@ -1050,6 +1248,18 @@ mod tests {
             weight_offload_hit_rate(&onnx_runtime_ep_cuda::GlobalOffloadStats::default()),
             None
         );
+    }
+
+    #[test]
+    fn per_emitted_token_divides_counter_by_tokens() {
+        // 65,772,419,072 htod bytes over 16 emitted tokens is the #837 baseline;
+        // the ratio (~4.11 GB/token) is the batch-invariant quantity a batch-N
+        // run must drive down, and is far more stable than wall-clock tok/s.
+        assert_eq!(per_emitted_token(65_772_419_072, 16), Some(4_110_776_192.0));
+        assert_eq!(per_emitted_token(5_535, 16), Some(345.9375));
+        // No emitted tokens must report `n/a`, never divide by zero.
+        assert_eq!(per_emitted_token(1_000, 0), None);
+        assert_eq!(per_emitted_token(0, 8), Some(0.0));
     }
 
     #[test]

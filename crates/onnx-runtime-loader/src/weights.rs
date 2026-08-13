@@ -626,6 +626,74 @@ impl WeightStore {
     }
 }
 
+/// Bytes of initializer payload the graph actually **references**, split into
+/// inline (inside the protobuf) and external (in sibling data files).
+///
+/// This exists because a model's on-disk size is only an upper bound on its
+/// weights. An external-data file may contain regions no initializer points at
+/// — most commonly when a re-export appends fresh tensors and never truncates
+/// the original, leaving an orphaned prefix. `qwen14b-zp` is exactly 50% such
+/// dead space, which made the runtime believe it had 2.00x more weights than it
+/// does and skewed every budget and residency decision derived from that number
+/// (#853).
+///
+/// Parses only the graph protobuf. It never opens, maps, or reads the external
+/// data files, so it stays cheap enough for the load-time budget path: the
+/// `.onnx` is typically a few MB even when the weights are tens of GB.
+///
+/// Initializers with an explicit `length` contribute that; external ones
+/// without a declared length fall back to the geometry implied by their shape
+/// and dtype, which is what [`resolve_initializer`] would use.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReferencedWeightBytes {
+    pub inline: u64,
+    pub external: u64,
+}
+
+impl ReferencedWeightBytes {
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        self.inline.saturating_add(self.external)
+    }
+}
+
+/// Sum the initializer payload [`ReferencedWeightBytes`] a model's graph
+/// references. See that type for why file size is not a substitute.
+#[must_use]
+pub fn referenced_weight_bytes(model: &ModelProto) -> ReferencedWeightBytes {
+    let mut totals = ReferencedWeightBytes::default();
+    let Some(graph) = model.graph.as_ref() else {
+        return totals;
+    };
+    for init in &graph.initializer {
+        let dims: Vec<usize> = init.dims.iter().map(|&d| d.max(0) as usize).collect();
+        let declared_geometry = DataType::from_onnx(init.data_type).and_then(|dtype| {
+            TensorData::from_raw(dtype, dims, Vec::new()).checked_expected_bytes()
+        });
+        if init.data_location == tensor_proto::DataLocation::External as i32 {
+            let declared_length = init
+                .external_data
+                .iter()
+                .find(|kv| kv.key == "length")
+                .and_then(|kv| kv.value.parse::<u64>().ok());
+            let bytes = declared_length
+                .or_else(|| declared_geometry.map(|bytes| bytes as u64))
+                .unwrap_or(0);
+            totals.external = totals.external.saturating_add(bytes);
+        } else {
+            // Inline payloads are already counted by the graph file's own size,
+            // but report them so a caller can tell the two apart.
+            let bytes = if init.raw_data.is_empty() {
+                declared_geometry.map_or(0, |bytes| bytes as u64)
+            } else {
+                init.raw_data.len() as u64
+            };
+            totals.inline = totals.inline.saturating_add(bytes);
+        }
+    }
+    totals
+}
+
 /// Resolve all initializers, memory-mapping external data relative to
 /// `model_dir`. `name_map` maps initializer names to the graph value ids
 /// created by the [`graph_builder`](crate::graph_builder).

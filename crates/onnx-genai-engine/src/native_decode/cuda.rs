@@ -1390,10 +1390,13 @@ impl DecodeCudaState {
                 .iter()
                 .find(|meta| meta.name == *past)
                 .with_context(|| format!("missing CUDA KV input metadata for '{past}'"))?;
-            if !matches!(meta.dtype, DataType::Float32 | DataType::Float16) || meta.shape.len() != 4
+            if !matches!(
+                meta.dtype,
+                DataType::Float32 | DataType::Float16 | DataType::BFloat16
+            ) || meta.shape.len() != 4
             {
                 bail!(
-                    "CUDA KV input '{past}' must be rank-4 f32 or f16, got {:?} {:?}",
+                    "CUDA KV input '{past}' must be rank-4 f32, f16 or bf16, got {:?} {:?}",
                     meta.dtype,
                     meta.shape
                 );
@@ -1460,12 +1463,19 @@ impl DecodeCudaState {
         max_len: usize,
         fixed: bool,
     ) -> anyhow::Result<(Vec<usize>, Vec<usize>)> {
-        if !matches!(dtype, DataType::Float32 | DataType::Float16) {
-            bail!("CUDA decoder state input '{name}' must be f32 or f16, got {dtype:?} {shape:?}");
+        if !matches!(
+            dtype,
+            DataType::Float32 | DataType::Float16 | DataType::BFloat16
+        ) {
+            bail!(
+                "CUDA decoder state input '{name}' must be f32, f16 or bf16, got {dtype:?} {shape:?}"
+            );
         }
         if !fixed {
             if shape.len() != 4 {
-                bail!("CUDA KV input '{name}' must be rank-4 f32 or f16, got {dtype:?} {shape:?}");
+                bail!(
+                    "CUDA KV input '{name}' must be rank-4 f32, f16 or bf16, got {dtype:?} {shape:?}"
+                );
             }
             let mut physical_shape = Vec::with_capacity(4);
             for (axis, dim) in shape.iter().copied().enumerate() {
@@ -2339,11 +2349,13 @@ impl DecodeCudaState {
             .iter()
             .find(|meta| meta.name == io.logits)
             .with_context(|| format!("missing CUDA logits output metadata for '{}'", io.logits))?;
-        if !matches!(logits_meta.dtype, DataType::Float32 | DataType::Float16)
-            || logits_meta.shape.is_empty()
+        if !matches!(
+            logits_meta.dtype,
+            DataType::Float32 | DataType::Float16 | DataType::BFloat16
+        ) || logits_meta.shape.is_empty()
         {
             bail!(
-                "CUDA logits output '{}' must be non-scalar f32 or f16, got {:?} {:?}",
+                "CUDA logits output '{}' must be non-scalar f32, f16 or bf16, got {:?} {:?}",
                 io.logits,
                 logits_meta.dtype,
                 logits_meta.shape
@@ -2638,6 +2650,28 @@ impl DecodeCudaState {
         // decoder; the eager owned path stays as the byte-identical fallback.
         let capture_step_inputs =
             graph_enabled && !captured_step_inputs.is_empty() && capture_step_inputs_enabled();
+
+        // Pin the fixed-capacity KV sequence-axis symbols CONSTANT so CUDA-graph
+        // capture ADMITS the GroupQueryAttention (and capacity-Attention) nodes
+        // instead of vetoing each per-layer node as a growing-seq eager seam. The
+        // runtime has just bound fixed-capacity, device-resident KV at physical
+        // `[.., max_len, ..]` with the valid attended length read on-device, so
+        // the attention kernels' launch grids are capacity-sized (constant within
+        // a capture) and a captured replay is shape-static. Gated on
+        // `graph_enabled`: a growing/paged KV decoder clears it and never pins,
+        // preserving the classifier's growing-seq veto for those paths. KV growth
+        // / capacity-bucket rebucket invalidates and re-captures the graph, so a
+        // pinned symbol is never replayed against a stale grid.
+        if graph_enabled {
+            let pinned = session.pin_fixed_capacity_kv_capture_symbols();
+            if pinned > 0 {
+                tracing::debug!(
+                    max_len,
+                    pinned,
+                    "native CUDA decode: pinned fixed-capacity KV seq symbol(s) for graph capture"
+                );
+            }
+        }
 
         Ok(Self {
             logical_len: 0,

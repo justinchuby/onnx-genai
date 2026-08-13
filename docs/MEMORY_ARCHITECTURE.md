@@ -31,11 +31,10 @@ when in fact it is 1955 lines.
 | L4 ClusterCoordinator | §6 | **design only** | no type exists |
 | Lease contract | §1.1 | **implemented** | `crates/onnx-runtime-memory-governor` |
 | Allocator contract | §1.2, §1.3, §1.5 | **implemented on all three backends** | `onnx-runtime-memory-governor/src/allocator.rs`; CPU EP, ONNX Runtime and CUDA EP each implement it |
-| Virtual contiguity | §1.6 | **implemented; managed no-spill VMM is the default for native CUDA (#755)** | `crates/onnx-runtime-virtual-memory`; `CudaVmmAllocator` in `onnx-runtime-cuda-memory` reserves one range and maps 2 MiB granules on demand, leasing each before it maps it. On native CUDA the authority-governed VMM/pool path is now selected **by default, without a flag** (#755): memory-strategy inference runs unconditionally (#752) and drives policy, so a plain `serve` gets managed **no-spill** mode and does not rely on WDDM shared-memory fallback. An explicit `serve --vram-limit <bytes>` now **overrides the inferred device budget** rather than being the trigger. When the resolved budget cannot hold the package weights the runtime **automatically enables weight streaming/offload** instead of failing, so being larger than the budget is a supported configuration; a model that fits stays `FullResident` and does **not** page. Failure to construct the required VMM arena/pool is fatal before model allocation and names both the requested limit and provider failure; it never silently falls back to ungoverned `cuMemAlloc`. The legacy allocator remains reachable for one release via `ONNX_GENAI_LEGACY_ALLOCATOR=1` (back-compat: `ONNX_GENAI_DYNAMIC_KV_WEIGHT_LENDING=0`), which restores the compatibility fallback. The resolved budget, chosen strategy and offload state are printed at startup and exposed in `/v1/resources` (`memory_strategy`). |
+| Virtual contiguity | §1.6 | **implemented; managed no-spill VMM is the default for native CUDA (#755)** | `crates/onnx-runtime-virtual-memory`; `CudaVmmAllocator` in `onnx-runtime-cuda-memory` reserves one range and maps 2 MiB granules on demand, leasing each before it maps it. On native CUDA the authority-governed VMM/pool path is now selected **by default, without a flag** (#755): memory-strategy inference runs unconditionally (#752) and drives policy, so a plain `serve` gets managed **no-spill** mode and does not rely on WDDM shared-memory fallback. An explicit `serve --vram-limit <bytes>` now **overrides the inferred device budget** rather than being the trigger. When the resolved budget cannot hold the package weights the runtime **automatically enables weight streaming/offload** instead of failing, so being larger than the budget is a supported configuration; a model that fits stays `FullResident` and does **not** page. **Exception (#864): on Windows/WDDM the OS shared-memory fallback pages over-budget weights from host RAM over PCIe ~30× faster than managed streaming for the single-touch decode access pattern, so managed weight streaming is *not* auto-enabled there — the effective strategy becomes `Compatibility` (`weight_offload_enabled=false`, `managed_no_spill=false`).** This affects only the *inferred* default: an explicit `ONNX_GENAI_WEIGHT_OFFLOAD=1`, `--vram-limit`, or device-budget override still selects managed streaming, and `ONNX_GENAI_MANAGED_WEIGHT_STREAMING=1` forces it. On Linux there is no shared-memory fallback, so the managed path is unchanged (#783). Failure to construct the required VMM arena/pool is fatal before model allocation and names both the requested limit and provider failure; it never silently falls back to ungoverned `cuMemAlloc`. The legacy allocator remains reachable for one release via `ONNX_GENAI_LEGACY_ALLOCATOR=1` (back-compat: `ONNX_GENAI_DYNAMIC_KV_WEIGHT_LENDING=0`), which restores the compatibility fallback. The resolved budget, chosen strategy and offload state are printed at startup and exposed in `/v1/resources` (`memory_strategy`). |
 | Composability of the memory paths | — | **authority-governed native path implemented** | The historical independent VMM and weight-offload toggles did not compose (#704). On native CUDA — by default under #755, or under an explicit byte limit — native CUDA constructs one authority before the allocator, charges the physical-handle pool once, registers reloadable weight residency explicitly, and admits KV/workspace growth transactionally. The compatibility path remains available through the legacy-allocator opt-out; performance parity with WDDM remains separate work. |
-| Weight offload vs the OS | — | **27x slower than doing nothing; cause identified 2026-08-06** | WDDM demand-paging reaches 6.01 tok/s on a model that does not fit; our managed offload path is far behind. The gap now has a named mechanism rather than a mystery: the residency cache never served a single weight without copying it (see the row below), so every decode step re-staged 7.33 GiB and paid 6,936 `cuMemAlloc`/`cuMemFree` pairs. Measured with CUDA events, that places **~39% of step time downstream of one eviction-policy defect** — `h2d_copy` 18.8%, `staging_fill` 9.0%, `vram_free` 9.0%, `vram_alloc` 2.3%. The remainder is not yet accounted for, and graph capture — worth **2.6x** in isolation, ranges non-overlapping — is disabled on **every** offload runffload reaches 0.22. The largest known cause is stated only in a warning: *"weight offload is incompatible with CUDA graph capture; capture disabled"*. On a Windows consumer GPU a user is currently better off leaving offload off (#705) |
-| `--vram-limit` | — | **override, not trigger; managed no-spill is the default (#755)** | Under #755 memory-strategy inference runs on every native CUDA load and selects managed no-spill by default; `--vram-limit` now **overrides** the inferred device budget rather than being what turns the managed path on. If package weights exceed the resolved budget, weight offload is enabled automatically and its allowance is derived as `budget − governed device state`; the same authority owns physical VMM handles, mapped weights, KV, and workspace. A 6 GiB qwen2.5-14b int4 live run loaded, generated the expected `Paris`, stayed at 5,534,384,128 owned bytes, rejected an 8K request pre-header with 429, and completed four queued short requests without overlap-only rejection. Crossing the first physical KV-growth boundary transferred 201,326,592 bytes through one grant and reported 201,326,592 mapped KV bytes; later governed capacity exhaustion returned 429 rather than 500/OOM. Managed initialization failure is an early arithmetic/provider error, while `ONNX_GENAI_LEGACY_ALLOCATOR=1` (back-compat `ONNX_GENAI_DYNAMIC_KV_WEIGHT_LENDING=0`) restores the prior non-VMM/WDDM-capable compatibility fallback. Limitation: the native server's FIFO per-request engine queue verified ordering and absence of overlap-only rejection, but did not demonstrate simultaneous live KV accumulation. Caveat carried, not closed: `activations_bytes=unknown` and `runtime_overhead_bytes=unknown` are not subtracted (#514). PRs #717, #736. |
-| Managed no-spill VMM default (#755) | — | **implemented; measured on native CUDA** | Memory-strategy inference selects the managed no-spill VMM path by default (no flag) on native CUDA, and auto-enables weight streaming when the resolved budget cannot hold the weights. Locked by the ignored live test `qwen2_5_0_5b_managed_vmm_default_e2e` (Qwen2.5-0.5B int4 mobius, same process): **(A)** default no flag → `strategy=FullResident`, `weight_offload_enabled=false`, `managed_no_spill=true`, resolved budget 7,730,940,928 bytes, committed 381,681,664 device bytes, **0 page-ins** (a fitting model does not start paging); **(B)** synthetic over-budget via an explicit 268,435,456-byte `--vram-limit` → `strategy=DynamicWeightResidency`, `weight_offload_enabled=true`, `managed_no_spill=true`, streaming engaged with **434 page-ins / 432 evictions**, committed bounded to 90,177,536 device bytes (« the cap — no WDDM spill), and at that extreme synthetic cap the residency arithmetic **refused cleanly** ("no page is evictable") rather than spilling; **(C)** `ONNX_GENAI_LEGACY_ALLOCATOR=1` → `managed_no_spill=false` (legacy allocator observable); **(D)** an explicit `--vram-limit` overrides the resolved device budget. Deterministic counters only; wall-clock omitted (this box ranged 3.9–28 tok/s across identical runs, and other agents build concurrently). A native large-model run that genuinely exceeds VRAM was not measured: `qwen14b-zp` lacks `inference_metadata.yaml` (#384), so the over-budget condition was synthesized with a small explicit budget, as noted. CUDA-graph segment count is not a public counter; capture-ON-under-offload on the stable-VA path is pinned by the #796 unit tests, not re-measured here. |
+| Weight offload vs the OS | — | **fixed 2026-08-12: WDDM shared memory is now the default on Windows for inferred-over-budget models (#874)** | Measured directly on `qwen14b-zp` (8.33 GB weights vs a 7.73 GB budget), same binary, same prompt, byte-identical output, solo with `nvidia-smi` verified empty before every run: **WDDM 8.09/7.78 tok/s with `htod_bytes_per_token = 0`** (true zero-copy — the kernel reads weights in place from host RAM over PCIe) against **managed streaming 0.11 tok/s**. On `main` immediately prior the managed default measured 0.05–0.08 tok/s, so the end-to-end effect on this box is ~100×. **The cause is structural, not a tuning gap:** each weight is read *exactly once per decode step* (922 initializers, ~867 lookups/step, `SequentialDense`), so both paths move the same bytes over the same link, but ours adds a CPU memcpy into pinned staging, a VRAM allocation, a `cuMemMap`, an eviction and a synchronize — to buy VRAM residency that is discarded before it is ever re-read. **Copying to VRAM only pays off when the data is re-read from VRAM before eviction, and there is no intra-step reuse.** #874 therefore stops auto-enabling managed streaming on Windows when the OS fallback is available; explicit requests (`ONNX_GENAI_WEIGHT_OFFLOAD=1`, `--vram-limit`, a device-budget override) are still honoured, and `ONNX_GENAI_MANAGED_WEIGHT_STREAMING=1` forces the managed path back (parsed so an *unrecognized* value keeps the fast default — the inverse of the `ASYNC_PAGEIN` trap). Linux is unchanged and must stay so: with no shared-memory fallback an over-budget model simply fails there, so managed streaming competes with "does not run", not with something faster (#783's lesson about not inheriting a platform-specific conclusion). Trade stated plainly: the `Compatibility` arm has **no device budget** (`managed_limit_bytes=None`), so on a host short of RAM an over-budget model can thrash, and the governor cannot see system-wide pressure (#863). Keeping the no-spill arena while merely disabling offload is **not** an option — the physical-handle pool is a hard cap and `cuMemCreate` cannot spill, so with nothing paging the remainder the load fails outright. The durable fix remains the hybrid in #864: a resident hot set **plus zero-copy cold reads**, which is what would beat the OS rather than merely stop losing to it. **Feasibility is measured** (`scripts/zero_copy_host_map_probe.py`, #877; real-kernel follow-up #880): `cuMemHostRegister(READ_ONLY|DEVICEMAP)` on a read-only weight mapping succeeds and costs 3.1 ms per GiB, and **CUDA graph capture with a host-mapped weight pointer is supported, replaying bit-identically to eager** (#880) — so the cold path does not forfeit the `captures > 0` / `fallbacks == 0` gates. On bandwidth, **the sequential-proxy figure was optimistic by ~2× and is superseded**: #877 measured 11.41 GB/s with a `cuMemcpyDtoD` *from* mapped host memory, but #880 ran the **real strided int4 GEMV** — the exact kernel and launch config the engine selects — with only the weight pointer differing, and measured **~5.6 GB/s steady-state** from host-mapped memory against **~100–133 GB/s** resident, outputs bit-identical at every size. **Use 5.6 GB/s, not 11.4, when sizing the hybrid's cold path.** The correction is corroborated independently: WDDM reaches ~8 tok/s on qwen14b-zp by keeping ~7.7 GB resident and reading the ~0.6 GB remainder from host each step ≈ 4.8 GB/s of PCIe traffic — the same order, and impossible if zero-copy were ~1 GB/s. Sweeping the packed size mattered: the realistic ~12 MiB per-tensor read fits this GPU's L2, so a single-point measurement there compares a cached read against a PCIe read; the ≥64 MiB points are the honest ones, since the real 8.33 GB layer walk reads each weight once and vastly exceeds L2. Two consequences, the second of which **reverses the priority order originally assumed on #864**: zero-copy is **not** a bandwidth win (1.01× against an explicit copy) — it removes the copy's *second* pass and its machinery (staging fill, VRAM alloc, `cuMemMap`, eviction, synchronize), which subsumes #837 items 1–2 rather than competing with them; and **the resident hot set is worth ~9.7× at the realistic per-op shape, rising to ~15–24× at large N**, so maximising residency comes first and de-copying the remainder second. Registering all 8.33 GB of referenced weights also page-locks that much host RAM, which needs a policy on smaller hosts. Historical figures this row previously carried (6.01 tok/s WDDM, 27× behind, `h2d_copy` 18.8% / `staging_fill` 9.0% / `vram_free` 9.0% / `vram_alloc` 2.3%, capture disabled under offload) are superseded: capture now runs under offload (#796) and the eviction-policy defect was fixed (#723). #705, #864, #874, #877, #880 || `--vram-limit` | — | **override, not trigger; managed no-spill is the default (#755)** | Under #755 memory-strategy inference runs on every native CUDA load and selects managed no-spill by default; `--vram-limit` now **overrides** the inferred device budget rather than being what turns the managed path on. If package weights exceed the resolved budget, weight offload is enabled automatically and its allowance is derived as `budget − governed device state`; the same authority owns physical VMM handles, mapped weights, KV, and workspace. A 6 GiB qwen2.5-14b int4 live run loaded, generated the expected `Paris`, stayed at 5,534,384,128 owned bytes, rejected an 8K request pre-header with 429, and completed four queued short requests without overlap-only rejection. Crossing the first physical KV-growth boundary transferred 201,326,592 bytes through one grant and reported 201,326,592 mapped KV bytes; later governed capacity exhaustion returned 429 rather than 500/OOM. Managed initialization failure is an early arithmetic/provider error, while `ONNX_GENAI_LEGACY_ALLOCATOR=1` (back-compat `ONNX_GENAI_DYNAMIC_KV_WEIGHT_LENDING=0`) restores the prior non-VMM/WDDM-capable compatibility fallback. Limitation: the native server's FIFO per-request engine queue verified ordering and absence of overlap-only rejection, but did not demonstrate simultaneous live KV accumulation. Caveat carried, not closed: `activations_bytes=unknown` and `runtime_overhead_bytes=unknown` are not subtracted (#514). PRs #717, #736. || Managed no-spill VMM default (#755) | — | **implemented; measured on native CUDA** | Memory-strategy inference selects the managed no-spill VMM path by default (no flag) on native CUDA, and auto-enables weight streaming when the resolved budget cannot hold the weights. Locked by the ignored live test `qwen2_5_0_5b_managed_vmm_default_e2e` (Qwen2.5-0.5B int4 mobius, same process): **(A)** default no flag → `strategy=FullResident`, `weight_offload_enabled=false`, `managed_no_spill=true`, resolved budget 7,730,940,928 bytes, committed 381,681,664 device bytes, **0 page-ins** (a fitting model does not start paging); **(B)** synthetic over-budget via an explicit 268,435,456-byte `--vram-limit` → `strategy=DynamicWeightResidency`, `weight_offload_enabled=true`, `managed_no_spill=true`, streaming engaged with **434 page-ins / 432 evictions**, committed bounded to 90,177,536 device bytes (« the cap — no WDDM spill), and at that extreme synthetic cap the residency arithmetic **refused cleanly** ("no page is evictable") rather than spilling; **(C)** `ONNX_GENAI_LEGACY_ALLOCATOR=1` → `managed_no_spill=false` (legacy allocator observable); **(D)** an explicit `--vram-limit` overrides the resolved device budget. Deterministic counters only; wall-clock omitted (this box ranged 3.9–28 tok/s across identical runs, and other agents build concurrently). A native large-model run that genuinely exceeds VRAM was not measured: `qwen14b-zp` lacks `inference_metadata.yaml` (#384), so the over-budget condition was synthesized with a small explicit budget, as noted. CUDA-graph segment count is not a public counter; capture-ON-under-offload on the stable-VA path is pinned by the #796 unit tests, not re-measured here. |
+| WDDM prefers OS shared-memory over managed streaming by default (#864) | — | **implemented; measured on native CUDA (`qwen14b-zp`, genuinely over budget)** | On Windows/WDDM the #755 auto-enable of managed weight streaming for an *inferred* over-budget model is now skipped in favor of the OS shared-memory fallback (weights sit in host RAM and are read in place over PCIe), which #864 measured ~30× faster for the single-touch decode access pattern — copying a weight into VRAM only to evict it before any intra-step re-read is pure overhead. The effective strategy becomes `Compatibility` with `weight_offload_enabled=false`, `managed_no_spill=false`, no governed device budget; residency is handed to the OS (trade: on a host with little free RAM an over-budget model may thrash — the governor cannot see system-wide pressure, per #863). Decided in `memory_strategy.rs` (policy change only; the residency cache, arena, and offload implementation are untouched). Gated on `cfg!(windows)` as a pragmatic stand-in for WDDM — detecting WDDM vs TCC at this layer would cross into architecture; under TCC `cuMemCreate` fails at the physical limit rather than spilling, so TCC-mode Windows users needing the managed path use the force knob. **Scope guards:** honored, not overridden — an explicit `ONNX_GENAI_WEIGHT_OFFLOAD=1`, `--vram-limit`, or `ONNX_GENAI_WEIGHT_OFFLOAD_DEVICE_BYTES` still selects managed streaming; `ONNX_GENAI_MANAGED_WEIGHT_STREAMING=1` forces it (opt-in, unrecognized values keep the fast fallback — deliberately *not* the `ASYNC_PAGEIN` trap shape); Linux is unchanged (no fallback exists, #783). Measured direct A/B, same binary, same prompt, GPU verified clear before every run, **token IDs byte-identical across all 7 runs**: WDDM default n=4 **median 7.18 tok/s** (7.10–7.67), prefill ~191 ms, `htod_bytes_per_token=0`, `page_ins_per_token=0`; forced managed (`ONNX_GENAI_MANAGED_WEIGHT_STREAMING=1`) n=3 **median 0.86 tok/s** (0.84–0.88), prefill ~1,097 ms, `htod_bytes_per_token=3,943,690,240`, `page_ins_per_token=372` — **8.3× on medians on a quiet box** (the issue's 30.7× was under this box's characteristic noise; the deterministic counters match exactly and confirm which path ran). Unit-locked in `memory_strategy.rs` (`wddm_over_budget_prefers_shared_memory_and_disables_streaming`, the WDDM/MoE/fitting/override/force variants, and `managed_default_no_flag_over_budget_model_auto_streams` proving Linux still streams). |
 | Weight residency cache (CUDA) | — | **had a 0% hit rate for its entire life; fixed 2026-08-06** | `evict_to_fit` was a plain LRU evicting from the least-recently-used end, while the decode weight walk is a **cyclic sequential scan** over the layers — the pessimal pairing, which returns the hit rate to zero at *every* capacity. Measured: **6,936 page-ins, 0 hits, at both 3 GB and 6 GB budgets**, with staged bytes identical (7,870,916,608 per step) because miss traffic under this pathology is invariant to capacity. Rivals eliminated on hardware: the budget knob works (peak resident 3.0 vs 6.0 GB) and staged bytes reconcile with `page_ins × page size`. A stable-resident-subset policy measures **74.18%** against a `B/W ≈ 76%` ceiling, page-ins 6,936 → 1,791, evictions 6,286 → **0**. #720, PR #723 |
 | KV page storage | — | **contract opened 2026-08-06; still host-only** | `onnx-genai-kv` implements paging, ref-counting/CoW, prefix sharing and quantization layout, and **never touched device memory**: storage was host `Vec`, `Device::Gpu(0)` a label on a struct field, and a tier migration one enum assignment moving zero bytes. Documented as a placeholder in `tiered.rs` from the start — the seam was designed in and the GPU backend behind it was never built. `PageTable` now holds `Box<dyn KvPageStore>` so a third party can supply a store without patching the crate; host stores expose slices, device stores expose an opaque span, and a host view of a device page requires explicit materialization. Stages 2–5 in #721. PR #726. Device KV paging is **not** owned by `onnx-genai-kv`: under the VMM design it is owned by the CUDA VMM layer (`CudaVmmAllocator`, the #740 physical-handle pool), with committed-granule admission (#745) and growth grants (#748). `native_decode/cuda.rs` still has no `PageTable`/`PagedKvCache` consumer, and `paged_gqa.rs` is a batch-1 CPU primitive. |
 | Captured graphs across a VMM remap | — | **verified on hardware 2026-08-06** | A CUDA graph instantiated before `cuMemUnmap`/`cuMemCreate`/`cuMemMap` at the same virtual address replays correctly afterwards and writes into the **new** physical pages — sentinel-proven, closing the page-recycling confound. The growth-shaped case passes, and one physical handle mapped at two virtual addresses is readable by captured work through either. Untested and treated as unsafe: unmapping while a replay is in flight. `cuMemMap` during capture returns `CUDA_SUCCESS` but is **not** proven replayable, so growth is issued outside the captured segment. This is the premise under #721 stage 4 and under re-scoping #716, and its stated falsifier did not fire. PR #727 |
@@ -471,7 +470,10 @@ Four tiny live fragments open four complete physical windows.
 ```
 
 Each head owns its full `max_seq × head_dim` stripe. Across the model, the
-near-empty floor is therefore `layers × 2 × kv_heads` windows.
+near-empty floor is therefore `layers × 2 × kv_heads` windows — **but only when
+the per-head stride is a fixed full context.** The engine grows a packed bucket
+instead, so this figure does not describe its head-major path; see the floor
+table below and #841.
 
 **Seq-major BSNH is dense within each buffer, but K and V remain separate for
 every layer:**
@@ -534,9 +536,40 @@ measured 2 MiB CUDA granule:
 
 | Layout | Floor unit | Near-empty floor | Evidence/status |
 |---|---:|---:|---|
-| BNSH head-major | `layers × 2 × kv_heads = 768` | ~1.5 GiB | Default; geometry measured in #772/#776/#787 |
-| BSNH seq-major | `layers × 2 = 96` | ~192 MiB | **Driver-level residency measured** (`vmm_kv_layout_residency_gpu`); see below |
+| BNSH head-major, **fixed full-context stride** | `layers × 2 × kv_heads = 768` | ~1.5 GiB | Geometry measured in #772/#776/#787 — but **the engine never instantiates this stride**; see below |
+| BNSH head-major, **as the engine actually runs it** | `layers × 2 = 96` | ~192 MiB | **Measured on qwen14b** (#841): head-major grows a *packed* bucket, so it already sits on the dense floor |
+| BSNH seq-major | `layers × 2 = 96` | ~192 MiB | Driver-level residency (`vmm_kv_layout_residency_gpu`); **byte-identical to head-major end to end** (#841) |
 | token-major across all layers | `1` per sequence | ~2 MiB | **768× measured reduction**, #787; not implemented |
+
+> **The 768-granule head-major figure is the wrong baseline for the engine, and
+> the `kv_heads×` ("8×") saving seq-major was pursued for does not exist on the
+> path the engine actually runs.** Measured end to end on qwen14b in #841, with
+> on-demand commit *active* (`growth_events ≥ 1`, i.e. not the pinned-knob
+> artifact of #834): head-major and seq-major commit **byte-identical** physical
+> KV (402,653,184 B at both bucket 512 and 1024), with byte-identical tokens.
+>
+> The mechanism is in `native_decode/cuda.rs`: head-major sets
+> `new_shape[2] = new_capacity` on growth, so its per-head stride is *the current
+> bucket*, not a fixed full context. It therefore re-packs **dense** and lands on
+> the same `layers × 2` granules as seq-major. The 768-granule floor is a property
+> of a *fixed full-context-stride* head-major layout — each head stripe
+> `max_len × head_dim × elem` apart, so a short prefix scatters one granule per
+> head — and the engine deliberately never builds that. Head-major runs at
+> **0.25× of the 768 figure**, not 4× above the seq-major floor.
+>
+> **Seq-major's real, measured advantage is growth cost, not committed bytes:**
+> on the 512→1024 step head-major moved `kv_bytes_moved = 100,667,392 B` and
+> invalidated its captured graph, while seq-major moved **0 bytes** and kept the
+> capture (`growth_keeps`). That is what the layout chain (#782/#792/#794/#797/
+> #801/#812/#827) actually bought, and it is worth having — it is simply not a
+> residency saving.
+>
+> **Lesson.** The `layers × 2 × kv_heads` floor was derived from layout geometry
+> and then compared against the engine without first checking which stride the
+> engine builds. `cuda.rs` had said "head-major grows a *packed* bucket whose
+> per-head stride is `new_capacity` (the bucket, not a fixed full context)" since
+> #827 — the arithmetic was right, the baseline was not. Before quoting a floor,
+> confirm the code instantiates the geometry that floor assumes.
 
 > **These floors are properties of the layout geometry, not of what the runtime
 > currently commits on the end-to-end engine path.** Measured in #794 on both
@@ -561,6 +594,12 @@ measured 2 MiB CUDA granule:
 > |---|---:|---:|---:|---:|---:|
 > | qwen2.5-0.5b | 4 MiB (2 granules) | 2 MiB (1 granule) | **2× = kv_heads** | 192 MiB (96 granules) | 96 MiB (48 granules) |
 > | qwen14b | 16 MiB (8 granules) | 2 MiB (1 granule) | **8× = kv_heads** | 1536 MiB (768 granules) | 192 MiB (96 granules) |
+>
+> **This ratio is real but does not transfer to the engine.** It is measured on a
+> *fixed full-context stride*, as the paragraph above states. The engine's
+> head-major path grows a **packed** bucket instead (`new_shape[2] =
+> new_capacity`), so end to end the two layouts commit byte-identical physical KV
+> (#841). See the floor table earlier in this section.
 >
 > The same test also grows a seq-major fixed-stride binding **under a captured
 > replay** (granule 0 → 3 at a stable VA) and observes **0 re-captures** — the
@@ -1066,6 +1105,32 @@ Three consequences worth internalising before measuring anything here:
   cliff, not a capability, and the governor cannot account for it.
 - **The arena failing where the baseline succeeds is the arena being correct.**
   `cuMemCreate` allocates physical device pages and cannot pretend otherwise.
+- **Allocating device pages is not the same as keeping them — WDDM pages *our*
+  granules out too (#863, measured).** `cuMemCreate` cannot fake the allocation,
+  but it confers no pin. Proven single-process: a `cuMemCreate` + `cuMemMap` +
+  `cuMemSetAccess` allocator mirroring the engine arena committed **and touched
+  every byte** of 9,984 MiB on an 8,188 MiB card; device-resident stayed capped at
+  ~7,942 MiB while the process host working set reached 9.49 GB — roughly 2 GB of
+  our own committed granules spilled to host RAM.
+
+  Therefore **`peak_committed_physical_bytes < managed_limit_bytes` and
+  `oversubscribed_bytes == 0` are guarantees about our ledger, not about physical
+  residency.** Every "no WDDM spill" claim in this document and in PR validations
+  (including #836's) should be read that way: the accounting is correct; the
+  residency implication is not. The spill is a **latency** effect, transparent to
+  kernel correctness — it does not corrupt results, and it is not the #851 fault.
+
+  Two practical consequences. Our no-spill accounting keeps total committed under
+  the resolved budget, so we do not normally provoke this ourselves; the exposure
+  is **system-wide** pressure, which our ledger cannot see. And our residency is
+  **advisory on WDDM exactly as the driver's is** — we can choose *what* to keep
+  and in what order, and we know the layer walk where the driver is blind, but we
+  cannot force anything to stay. It is also the best explanation for this box's
+  wall-clock spreads (identical work: 24–223 s, 700–1,383 s; 3.9–28 tok/s).
+
+  **Scoped to WDDM.** Under TCC, `cuMemCreate` should fail at the physical limit
+  rather than spill; do not let this propagate to other platforms (the #783
+  lesson). Repro: `bench-bins/vram_hog_vmm.py`.
 
 Users can opt out via NVIDIA Control Panel → *CUDA — Sysmem Fallback Policy* →
 *Prefer No Sysmem Fallback*, which makes floors measurable again. The better
@@ -1185,6 +1250,37 @@ it brackets is worse than no counter, because it is believed. The same is true o
 a counter that is emitted with nothing writing it — a row reading `0.00` cannot
 be distinguished from a row that was never measured, which is why #715 removed
 the dead ones and added a test that every emitted counter has a live writer.
+
+**Two more instances of this mode landed on 2026-08-12, both in accounting
+rather than timing.**
+
+*The instrument measured a real thing that was not the thing named.*
+`total_weight_bytes` reported the **file size** of the external-data blob, and
+`qwen14b-zp`'s blob is **50.0% dead space** — 920 initializers reference
+8,329,906,176 bytes of a 16,652,453,888-byte file, contiguously, with the first
+blob at offset 8,322,547,712 (an orphaned prefix from a re-export that never
+truncated). So the runtime believed the model had **2.00× more weights than it
+has**, and strategy inference, budget resolution and `fits_resolved_device_budget`
+all consumed that. The model is over the resolved device budget by **0.599 GB**,
+not the ~8.9 GB that number implied — a 14× error in the margin, and the
+difference between "nearly fits" and "stream the whole model forever". Fixed in
+#856 (#853): the loader now sums what initializers reference and warns when file
+size exceeds it by >10%.
+
+**What caught it was arithmetic that could not close.** Measured traffic was
+4.11 GB/step against a theoretical floor of 10.53 GB/step for a full per-step
+scan — *below* the floor, which is impossible. Same habit as dividing bytes by
+time: compute the bound the number must obey, and when it is violated, suspect
+the instrument before the system.
+
+*The number was right and the conclusion drawn from it was not.* Raising the
+weight budget moved the residency `hit_rate` from **57.09% to 81.31%** — while
+the gap to the streaming floor **widened** from 1.78× to 2.30×. The count-based
+rate weights a 10 KiB norm like an 11 MiB projection, and misses skew large
+(~11.9 MB average page-in). `htod_bytes` is what decode pays for, so a
+byte-weighted rate was added alongside it; optimizing the count-based number can
+improve the report while moving no bytes at all. **A rate over a population whose
+members have wildly different costs is not a cost metric.**
 
 ### The pattern underneath all three
 
@@ -1788,6 +1884,43 @@ They are not repeated here so status and byte formulas have one source of truth.
 
 Treats immutable model weights as a three-tier hierarchy within a single session.
 This is the design from [WEIGHT_OFFLOAD.md](./WEIGHT_OFFLOAD.md), consolidated here.
+
+> **The weight budget is what the KV reservation leaves behind, and it is never
+> renegotiated (#857, open).** At load, `engine/load.rs` computes
+>
+> ```text
+> weight_budget = resolved_device_budget − kv_bytes_per_token × max_context
+> 6,116,140,442 = 7,726,753,178 − 1,610,612,736     (qwen14b-zp, exact to the byte)
+> ```
+>
+> `max_context` is the model's **declared** `max_sequence_length` (8,192), not what
+> the request uses, and `set_weight_residency_budget` is called once. So a 16-token
+> run holds **1.611 GB** of device budget for KV it never commits (measured
+> committed KV in that run: 402,653,184 bytes) while weights stream **3.94 GB per
+> decode step** because they do not fit.
+>
+> Measured by changing only `max_sequence_length` 8192 → 1024, same weights
+> (hard-linked, byte-identical), same binary, same prompt:
+>
+> | | ctx 8192 | ctx 1024 |
+> |---|---:|---:|
+> | weight `budget_bytes` | 6,116,140,442 | 7,525,426,586 |
+> | `htod_bytes_per_token` | 3,943,690,240 | 1,850,486,784 (**2.13× less**) |
+> | `page_ins_per_token` | 372 | 162 |
+> | `hit_rate` | 57.09% | 81.31% |
+>
+> Token IDs byte-identical. So the reservation is genuinely recoverable and
+> converts almost 1:1 into reduced streaming. **Shipping a smaller
+> `max_sequence_length` is not the fix** — that configuration simply cannot serve
+> longer sequences. The reservation exists to guarantee a sequence can reach its
+> declared maximum, so the fix is an **elastic** weight budget with a guaranteed
+> reclaim path, not a smaller reservation. Note the arena banner's "dynamic
+> KV/weight lending" is accurate about the handle pool but overstates the lending:
+> KV's *reservation* is deducted up front and never revisited.
+>
+> Note also the gap to the floor **widened** (1.78× → 2.30×) as the budget grew:
+> policy efficiency (#837 item 3) and this budget split are independent and
+> multiplicative levers.
 
 ### 3.1 Components
 

@@ -103,3 +103,15 @@ See [`docs/PROGRESS.md`](docs/PROGRESS.md) for the project’s test, conformance
 - Keep commits coherent and independently buildable/reviewable.
 
 The repository’s active `main` ruleset requires linear history; the non-author review and cherry-pick workflow is recorded throughout `.squad/decisions.md`.
+
+## 11. Run portably across hardware tiers
+
+**The runtime must run correctly on whatever CPU, GPU, and memory tier it lands on—detecting capabilities at runtime and degrading gracefully, never demanding a specific fast ISA, arch, or footprint.**
+
+- Detect CPU instruction sets at runtime and take the fast path when present (AVX-512/AVX2/NEON/SVE), with a correct portable scalar/generic fallback; a missing fast ISA slows execution, it never fails to run.
+- Compile/JIT GPU kernels to the device actually present; do not assume one SM/arch or bake in datacenter constants—tune from queried device properties. Cross-reference the consumer-GPU audit.
+- Memory-bandwidth and VRAM tier shape the bottleneck: a feature needing more VRAM/bandwidth than the tier has must degrade or clearly opt out, not crash. A 30B int4 model (~15 GB weights) fits an H200 but not an 8–12 GB consumer GPU—fail clearly per Rule 5 or offer a smaller-footprint path, never silently OOM.
+- Perf claims are tier-scoped: state the device/EP/tier a benchmark or "ceiling" was measured on; never generalize one device (e.g. H200) into a universal conclusion. A lever flat on one tier may win on a bandwidth-starved or VRAM-limited tier.
+- No hard runtime dependency on a specific vendor toolkit, driver, or arch beyond the declared minimum—keep the graceful-degradation contract consistent with Rule 2 and Rule 5.
+
+See [`docs/portability/2026-07-25-cuda-consumer-gpu-audit.md`](docs/portability/2026-07-25-cuda-consumer-gpu-audit.md), [`docs/CROSS_PLATFORM.md`](docs/CROSS_PLATFORM.md), [`docs/benchmarks/2026-07-25-gqa-decode-avx512.md`](docs/benchmarks/2026-07-25-gqa-decode-avx512.md), and [`docs/research/lowbit-quant-feasibility.md`](docs/research/lowbit-quant-feasibility.md).

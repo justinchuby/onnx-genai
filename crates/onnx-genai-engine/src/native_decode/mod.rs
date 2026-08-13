@@ -208,6 +208,113 @@ impl NativeDecodeSession {
         self.kv_inputs.len() / 2
     }
 
+    /// Stage 2a (#750): run **one fused forward** over `token_ids.len()`
+    /// independent single-token rows on the batch axis, with an **empty past**,
+    /// returning one `[vocab]` logits row per batch row.
+    ///
+    /// This is the batch-N *input binding + fused forward* validated in isolation
+    /// from the batched KV *layout* (stage 2b). Every row is a fresh length-1
+    /// sequence at position 0: `input_ids [N,1]`, `attention_mask [N,1]`,
+    /// `position_ids [N,1]` (or `[rank,N,1]` for multi-axis mrope) and empty
+    /// `past_key_values.* [N, heads, 0, head_dim]`. Because the past is empty
+    /// there is no KV row addressing to change, and the present-KV outputs are
+    /// materialized and discarded. The rows are genuinely independent (no
+    /// cross-row attention), so row `i` is byte-identical to a batch-1 forward of
+    /// `token_ids[i]` — the guard `native_fused_batch_prefill_row_identical`
+    /// asserts exactly this.
+    ///
+    /// The point being measured is **weight-streaming amortization**: the CUDA
+    /// weight-offload residency is keyed purely by weight identity with no batch
+    /// dimension, so this single forward pages each weight in at most once and
+    /// emits `N` rows — `htod_bytes` is (near-)batch-invariant, so
+    /// `htod_bytes / N` falls ~`1/N`.
+    ///
+    /// This is a stateless probe: it runs a plain eager `session.run` with owned
+    /// inputs and does **not** touch the persistent decode state (`self.past`,
+    /// `self.current_len`, the CUDA persistent bindings), so it never engages
+    /// CUDA-graph capture (an eager forward is not captured) and leaves an
+    /// in-progress decode untouched. Decoders with `inputs_embeds`/routed
+    /// per-step ports are rejected — the probe only binds token ids.
+    pub fn run_fused_batch_prefill(
+        &mut self,
+        token_ids: &[TokenId],
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        if token_ids.is_empty() {
+            bail!("run_fused_batch_prefill requires at least one token");
+        }
+        let batch = token_ids.len();
+        if self.has_eager_step_inputs() {
+            bail!(
+                "run_fused_batch_prefill supports token-id decoders only; this decoder declares inputs_embeds/routed per-step ports"
+            );
+        }
+        let token_input = self
+            .step_input_name(NativeStepInputSource::TokenIds)
+            .context("native decoder has no token input binding")?
+            .to_owned();
+        let mask_input = self
+            .step_input_name(NativeStepInputSource::AttentionMask)
+            .map(str::to_owned);
+        let position_input = self
+            .step_input_name(NativeStepInputSource::PositionIds)
+            .map(str::to_owned);
+
+        let ids = token_ids
+            .iter()
+            .map(|&id| i64::from(id))
+            .collect::<Vec<_>>();
+        let mut owned: Vec<(String, Tensor)> = Vec::with_capacity(3 + self.kv_inputs.len());
+        // input_ids: [N, 1] — one token per row.
+        owned.push((token_input, Tensor::from_i64(&[batch, 1], &ids)?));
+        // attention_mask: [N, 1] — each row's single token is valid.
+        if let Some(mask) = mask_input {
+            owned.push((mask, Tensor::from_i64(&[batch, 1], &vec![1i64; batch])?));
+        }
+        // position_ids: every row is position 0. Rank 1 -> [N, 1]; a multi-axis
+        // mrope decoder (rank > 1) -> [rank, N, 1]. All-zero because past is empty.
+        if let Some(position) = position_input {
+            let tensor = if self.position_rank <= 1 {
+                Tensor::from_i64(&[batch, 1], &vec![0i64; batch])?
+            } else {
+                Tensor::from_i64(
+                    &[self.position_rank, batch, 1],
+                    &vec![0i64; self.position_rank * batch],
+                )?
+            };
+            owned.push((position, tensor));
+        }
+        // Empty past for every KV / recurrent-state input, batch axis = N.
+        for name in &self.kv_inputs {
+            let tensor = make_empty_input_tensor_batched(&self.session, name, batch)?;
+            owned.push((name.clone(), tensor));
+        }
+
+        let bindings = owned
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+            .collect::<Vec<_>>();
+        let outputs = match self.session.run(&bindings) {
+            Ok(outputs) => outputs,
+            Err(error) => {
+                let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
+                bail!("native fused batch forward failed{diagnosis}: {error}");
+            }
+        };
+        let logits = self
+            .session
+            .outputs()
+            .iter()
+            .zip(outputs)
+            .find(|(meta, _)| meta.name == self.logits)
+            .map(|(_, tensor)| tensor)
+            .with_context(|| format!("native decoder omitted logits output '{}'", self.logits))?;
+        let rows = extract_batch_row_logits(&logits, batch)?;
+        if rows.iter().flatten().any(|value| !value.is_finite()) {
+            bail!("native fused batch forward produced non-finite logits");
+        }
+        Ok(rows)
+    }
+
     pub(crate) fn supports_past_snapshots(&self) -> bool {
         self.cuda.is_none() && self.cpu_kv.is_none() && self.has_recurrent_state()
     }

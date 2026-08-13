@@ -329,6 +329,37 @@ fn undeclared_required_audio_input_never_receives_a_fallback() -> anyhow::Result
     Ok(())
 }
 
+/// The counterpart to the test above, differing only in whether a producer is
+/// declared: a required input whose only declared producer is presence-gated is
+/// rejected at load time, not silently seeded with an empty tensor at run time.
+///
+/// This pins the boundary the seeding fix depends on. Package admission already
+/// forbids this shape, and it names the three legitimate ways to express the
+/// intent. The auto-seed must not become a fourth, unchecked one that resurrects
+/// the very substitution `undeclared_required_...` above forbids — so the failure
+/// must stay at admission, with a message that tells the author what to declare.
+#[test]
+fn a_presence_gated_producer_for_a_required_input_is_rejected_at_admission() -> anyhow::Result<()> {
+    let metadata = autoregressive_metadata(false, true);
+    let dir = autoregressive_fixture("declared-producer-absent", &metadata)?;
+
+    let error = Engine::from_pipeline_dir(&dir, EngineConfig::default())
+        .err()
+        .expect("a required input fed only by a gated producer must not be admitted");
+
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("embedding.audio_features")
+            && message.contains("unavailable when presence key 'audio' is absent"),
+        "the error must name the endpoint and why its source is absent: {message}"
+    );
+    assert!(
+        message.contains("optional_inputs"),
+        "the error must name the declaration that fixes it: {message}"
+    );
+    Ok(())
+}
+
 fn prompt_only_fixture(name: &str, optional: bool) -> anyhow::Result<PathBuf> {
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-codec");
     let root = fixture_root(name)?;

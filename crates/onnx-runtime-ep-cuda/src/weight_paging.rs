@@ -29,7 +29,8 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_ir::DataType;
 use onnx_runtime_memory_governor::{DeviceAllocator, Tier};
 
-use crate::runtime::{CudaRuntime, PinnedStaging, raw_ptr};
+use crate::pinned_pool::PinnedStagingPool;
+use crate::runtime::{CopyCompleted, CudaRuntime, PinnedStaging, raw_ptr};
 
 /// Alignment for stable-VA weight slots (issue #716). The VMM arena rounds
 /// commits to the 2 MiB device granule (#776) regardless, so this only governs
@@ -41,12 +42,25 @@ const WEIGHT_SLOT_ALIGN: usize = 256;
 /// benchmark measurement windows while caches remain alive.
 static GLOBAL_PAGE_INS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_HITS: AtomicU64 = AtomicU64::new(0);
+/// Bytes served from residency without an H2D copy. Pairs with
+/// [`GLOBAL_HTOD_BYTES`] to give a byte-weighted hit rate; see
+/// [`ResidencyInner::record_hit`] for why the count-based rate misleads.
+static GLOBAL_HIT_BYTES: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_EVICTIONS: AtomicU64 = AtomicU64::new(0);
 // Page-ins under scan-resistant admission that could not be admitted to the
 // resident set and were handed back to the caller transiently (issue #716:
 // a non-zero value since capture arm means the resident set is NOT stable, so
 // whole-step CUDA graph capture must stay declined for correctness).
 static GLOBAL_BYPASSED_PAGE_INS: AtomicU64 = AtomicU64::new(0);
+// Weight **bytes** streamed H2D by bypassed page-ins (issue #837 item 3). Every
+// bypass still runs the full host->device copy — so these bytes are already
+// inside `GLOBAL_HTOD_BYTES` — but the page is handed back transiently and never
+// joins the resident set, so the identical bytes are re-streamed on the next
+// decode step. This is the byte-weighted attribution of the bypass count: it
+// answers "how much of `htod_bytes` is bypass traffic that residency policy
+// left on the table" directly, rather than inferring it from the ~11.9 MB
+// average page-in size.
+static GLOBAL_BYPASSED_PAGE_IN_BYTES: AtomicU64 = AtomicU64::new(0);
 // Time spent filling the host staging buffer from mmap regions. This is a
 // host-blocking CPU memcpy span and contains no CUDA synchronization.
 static GLOBAL_MATERIALIZE_NS: AtomicU64 = AtomicU64::new(0);
@@ -117,8 +131,17 @@ fn eviction_made_committed_progress(
 pub struct GlobalOffloadStats {
     pub page_ins: u64,
     pub hits: u64,
+    /// Bytes served from residency (no H2D copy). With [`Self::htod_bytes`] this
+    /// gives the **byte-weighted** hit rate, which is what streaming cost
+    /// actually tracks — see [`Self::byte_hit_rate`].
+    pub hit_bytes: u64,
     pub evictions: u64,
     pub bypassed_page_ins: u64,
+    /// Weight bytes streamed H2D by bypassed page-ins. A subset of
+    /// [`Self::htod_bytes`]: these bytes were copied device-ward but the page was
+    /// not retained, so they are re-streamed every decode step. See
+    /// [`Self::bypassed_byte_share`].
+    pub bypassed_page_in_bytes: u64,
     pub materialize_ns: u64,
     pub htod_ns: u64,
     pub admit_sync_ns: u64,
@@ -134,6 +157,44 @@ pub struct GlobalOffloadStats {
     pub content_resident_bytes: u64,
     pub physical_owned_bytes: u64,
     pub mapped_physical_bytes: u64,
+    /// Real `cuMemHostAlloc` calls issued by the pinned staging pool (issue
+    /// #837). A page-in that reuses a pooled buffer does not increment this, so
+    /// on the not-fit streaming path this stays far below `page_ins`.
+    pub pinned_alloc_calls: u64,
+    /// Page-ins whose pinned staging buffer was served from the pool free-list.
+    pub pinned_reuses: u64,
+}
+
+impl GlobalOffloadStats {
+    /// Fraction of requested weight **bytes** served from residency.
+    ///
+    /// Prefer this over `hits / (hits + page_ins)` when judging residency policy:
+    /// the count-based rate weights a 10 KiB norm the same as an 11 MiB
+    /// projection, so it can improve while the bytes actually streamed get
+    /// worse. Measured on qwen14b-zp, raising the weight budget moved the count
+    /// rate 57.09% -> 81.31% while the byte gap to the streaming floor widened
+    /// from 1.78x to 2.30x (#857, #837 item 3).
+    ///
+    /// `None` when no weight bytes were requested in the window.
+    #[must_use]
+    pub fn byte_hit_rate(&self) -> Option<f64> {
+        let requested = self.hit_bytes.checked_add(self.htod_bytes)?;
+        (requested > 0).then(|| self.hit_bytes as f64 / requested as f64)
+    }
+
+    /// Fraction of streamed weight **bytes** (`htod_bytes`) attributable to
+    /// bypassed page-ins — page-ins copied device-ward but never retained, so
+    /// they are re-streamed every decode step. This is the byte-weighted
+    /// attribution of the bypass count (#837 item 3): a large share means the
+    /// residency policy is spending H2D bandwidth on traffic it keeps no benefit
+    /// from, and is the first thing to rule in or out when explaining the gap
+    /// between `htod_bytes_per_token` and the streaming floor `W - B`.
+    ///
+    /// `None` when no bytes were streamed in the window.
+    #[must_use]
+    pub fn bypassed_byte_share(&self) -> Option<f64> {
+        (self.htod_bytes > 0).then(|| self.bypassed_page_in_bytes as f64 / self.htod_bytes as f64)
+    }
 }
 
 /// Read the process-global weight-offload counters.
@@ -141,8 +202,10 @@ pub fn global_offload_stats() -> GlobalOffloadStats {
     GlobalOffloadStats {
         page_ins: GLOBAL_PAGE_INS.load(Ordering::Relaxed),
         hits: GLOBAL_HITS.load(Ordering::Relaxed),
+        hit_bytes: GLOBAL_HIT_BYTES.load(Ordering::Relaxed),
         evictions: GLOBAL_EVICTIONS.load(Ordering::Relaxed),
         bypassed_page_ins: GLOBAL_BYPASSED_PAGE_INS.load(Ordering::Relaxed),
+        bypassed_page_in_bytes: GLOBAL_BYPASSED_PAGE_IN_BYTES.load(Ordering::Relaxed),
         materialize_ns: GLOBAL_MATERIALIZE_NS.load(Ordering::Relaxed),
         htod_ns: GLOBAL_HTOD_NS.load(Ordering::Relaxed),
         admit_sync_ns: GLOBAL_ADMIT_SYNC_NS.load(Ordering::Relaxed),
@@ -158,6 +221,8 @@ pub fn global_offload_stats() -> GlobalOffloadStats {
         content_resident_bytes: GLOBAL_CONTENT_RESIDENT_BYTES.load(Ordering::Relaxed),
         physical_owned_bytes: crate::virtual_memory::total_physical_pool_owned_bytes(),
         mapped_physical_bytes: GLOBAL_WEIGHT_MAPPED_BYTES.load(Ordering::Relaxed),
+        pinned_alloc_calls: crate::pinned_pool::global_pinned_alloc_calls(),
+        pinned_reuses: crate::pinned_pool::global_pinned_reuses(),
     }
 }
 
@@ -171,8 +236,10 @@ pub fn global_offload_stats() -> GlobalOffloadStats {
 pub fn reset_global_offload_stats() {
     GLOBAL_PAGE_INS.store(0, Ordering::Relaxed);
     GLOBAL_HITS.store(0, Ordering::Relaxed);
+    GLOBAL_HIT_BYTES.store(0, Ordering::Relaxed);
     GLOBAL_EVICTIONS.store(0, Ordering::Relaxed);
     GLOBAL_BYPASSED_PAGE_INS.store(0, Ordering::Relaxed);
+    GLOBAL_BYPASSED_PAGE_IN_BYTES.store(0, Ordering::Relaxed);
     GLOBAL_MATERIALIZE_NS.store(0, Ordering::Relaxed);
     GLOBAL_HTOD_NS.store(0, Ordering::Relaxed);
     GLOBAL_ADMIT_SYNC_NS.store(0, Ordering::Relaxed);
@@ -183,6 +250,7 @@ pub fn reset_global_offload_stats() {
     GLOBAL_HTOD_BYTES.store(0, Ordering::Relaxed);
     GLOBAL_VRAM_ALLOC_NS.store(0, Ordering::Relaxed);
     GLOBAL_VRAM_FREE_NS.store(0, Ordering::Relaxed);
+    crate::pinned_pool::reset_pinned_pool_counters();
 }
 
 /// Environment switch that enables the CUDA device residency cache. Reuses the
@@ -221,6 +289,59 @@ pub const WEIGHT_OFFLOAD_ASYNC_PAGEIN_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_ASY
 /// reduced evictions from 6,286 to 0 in the same harness.
 pub const WEIGHT_OFFLOAD_SCAN_RESISTANT_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_SCAN_RESISTANT";
 
+/// Sub-knob (default OFF / opt-IN) selecting **byte-aware** residency on top of
+/// scan-resistant dense residency. Set to `1`/`true`/`yes`/`on` to enable.
+///
+/// Scan-resistant `StableResident` makes a size-blind admission decision: once
+/// the budget is full, every subsequent distinct tensor is streamed transiently
+/// (a "bypass") regardless of its size, and the resident set stays whatever
+/// first-fit tensors happened to land in the remaining headroom — which biases
+/// toward *small* tensors, because a small tensor fits the leftover budget while
+/// a large one does not. Measured on qwen14b-zp (#837 item 3), that leaves
+/// bypasses at 11% of page-in *events* but **44.6% of streamed bytes** (avg
+/// bypass 49.9 MB vs 7.8 MB for retained page-ins): the policy streams the large
+/// projections transiently and re-streams them every decode step.
+///
+/// Byte-aware residency instead admits an incoming tensor into the resident set
+/// (evicting the *smallest* evictable resident to make room) whenever it is
+/// strictly larger than that smallest resident, and evicts smallest-first. This
+/// converges the resident set to the top-`B`-bytes tensors, driving the
+/// byte-weighted hit rate toward the `B/W` ceiling. Default OFF.
+///
+/// **EXPERIMENTAL — KNOWN UNSAFE, DO NOT ENABLE (#837 item 3).** A/B measurement
+/// on qwen14b-zp (managed streaming, `ONNX_GENAI_MANAGED_WEIGHT_STREAMING=1`)
+/// shows that whenever this policy *actually engages* (offload active, i.e. the
+/// only regime where it could help), it **violates the token-identity hard
+/// constraint**: greedy decode collapses to 3 tokens instead of 16, both with
+/// (`ONNX_GENAI_CUDA_GRAPH=1`) and without CUDA-graph capture.
+///
+/// The failure is **silent numeric corruption, not an admission error** — proven
+/// by the profiler's error-propagation structure: `generate_with_callback` is
+/// `?`-propagated with `.context("steady measured generation")` *before* the
+/// `bail!("generation emitted N tokens")` check, so the observed `bail!` means
+/// generation returned `Ok` with only 3 tokens (an early EOS), not that a
+/// `WeightHandleError` surfaced. A residency policy decides *what is resident*,
+/// not *what is computed*: both the resident-hit and bypass paths fill the
+/// correct bytes at a stable per-tensor VA, and every eviction here only targets
+/// `strong_count == 1` pages after draining **both** the compute and copy
+/// streams. Under those guards a change of eviction *target* (smallest-by-bytes
+/// instead of `next_evictable_index`'s front-of-order oldest page) should be
+/// value-neutral. That it is not implicates state that depends on eviction
+/// *order* — most plausibly the physical granule / retained-handle pool
+/// accounting — rather than the policy decision itself. Reproduction with CUDA
+/// graph OFF rules out captured-VA baking as the sole cause. Whether this is a
+/// bug in the byte-aware admission loop or a **latent defect in the existing
+/// offload path** (exposed, not caused, by reordering evictions) was not
+/// isolated here and is worth a separate investigation.
+///
+/// The count-vs-byte residency gap therefore cannot be closed by an eviction-
+/// order change alone; it needs the structural lever deferred by #837 (a
+/// dedicated transient staging zone so a large tensor can be handed to the
+/// kernel *without* evicting a resident page). Kept default-OFF and wired only
+/// so the rejected approach and its evidence are reviewable; the default
+/// (size-blind) path is unaffected.
+pub const WEIGHT_OFFLOAD_BYTE_AWARE_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_BYTE_AWARE";
+
 /// Parse [`WEIGHT_OFFLOAD_ASYNC_PAGEIN_ENV`]. Async page-in is **default-on**:
 /// unset (`None`) enables it. When a value *is* present, this is opt-**in**, not
 /// opt-out — only `1`/`true`/`yes`/`on` keep async enabled, and every other
@@ -250,6 +371,27 @@ pub(crate) fn scan_resistant_from_env_value(value: Option<&str>) -> bool {
     }
 }
 
+/// Parse [`WEIGHT_OFFLOAD_BYTE_AWARE_ENV`]. Byte-aware residency defaults **OFF**
+/// (opt-in): only `1`/`true`/`yes`/`on` (case/whitespace-insensitive) enable it,
+/// every other value — including unset — keeps the size-blind admission path.
+pub(crate) fn byte_aware_from_env_value(value: Option<&str>) -> bool {
+    match value {
+        Some(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        None => false,
+    }
+}
+
+/// Read [`WEIGHT_OFFLOAD_BYTE_AWARE_ENV`] from the process environment. Exposed
+/// so the engine's memory-strategy policy can opt this experimental A/B knob in
+/// without threading a new field through the whole runtime-application config.
+#[must_use]
+pub fn byte_aware_residency_from_env() -> bool {
+    byte_aware_from_env_value(std::env::var(WEIGHT_OFFLOAD_BYTE_AWARE_ENV).ok().as_deref())
+}
+
 /// Whether/how the CUDA EP should page offloaded weights into a bounded VRAM
 /// residency cache. Disabled by default so the resident fast path is untouched
 /// and byte-identical.
@@ -273,6 +415,13 @@ pub struct DeviceOffloadPolicy {
     /// MoE boundaries stay on LRU even when this is enabled to avoid regressing
     /// skewed expert selection.
     pub scan_resistant_dense: bool,
+    /// Use byte-aware admission on top of scan-resistant residency: keep the
+    /// largest tensors resident instead of whatever first-fit smalls landed in
+    /// the leftover budget. Default-off / opt-in via
+    /// `ONNX_GENAI_WEIGHT_OFFLOAD_BYTE_AWARE=1` (#837 item 3). Has no effect
+    /// unless `scan_resistant_dense` is also on, since it only refines the
+    /// `StableResident` bypass decision.
+    pub byte_aware_residency: bool,
 }
 
 impl Default for DeviceOffloadPolicy {
@@ -284,6 +433,7 @@ impl Default for DeviceOffloadPolicy {
             device_budget_bytes: None,
             async_pagein: false,
             scan_resistant_dense: true,
+            byte_aware_residency: false,
         }
     }
 }
@@ -309,6 +459,8 @@ impl DeviceOffloadPolicy {
                 .ok()
                 .as_deref(),
         );
+        let byte_aware_residency =
+            byte_aware_from_env_value(std::env::var(WEIGHT_OFFLOAD_BYTE_AWARE_ENV).ok().as_deref());
         Self {
             enabled,
             managed_no_spill: false,
@@ -316,6 +468,7 @@ impl DeviceOffloadPolicy {
             device_budget_bytes,
             async_pagein,
             scan_resistant_dense,
+            byte_aware_residency,
         }
     }
 }
@@ -379,6 +532,7 @@ pub struct CudaWeightPage {
 
 enum WeightAllocation {
     Runtime,
+    Retired,
     Vmm {
         allocator: Arc<crate::vmm_allocator::CudaVmmAllocator>,
         allowance: onnx_runtime_memory_governor::MappedAllowance,
@@ -406,6 +560,65 @@ struct StableWeightSlot {
 }
 
 impl CudaWeightPage {
+    fn release_allocation(&mut self, synchronize_streams: bool) {
+        let allocation = std::mem::replace(&mut self.allocation, WeightAllocation::Retired);
+        match allocation {
+            WeightAllocation::Runtime => {
+                let _ = unsafe { self.runtime.free_raw(self.ptr) };
+            }
+            WeightAllocation::Retired => {}
+            WeightAllocation::Vmm {
+                allocator,
+                allowance,
+                stable_slot,
+            } => {
+                // VMM unmap does not wait for users of the VA. Normal Drop
+                // drains both streams; the eviction batch may do that once
+                // up front and retire several pages without repeating it.
+                if synchronize_streams
+                    && (self.runtime.synchronize().is_err()
+                        || self.runtime.copy_stream().synchronize().is_err())
+                {
+                    self.allocation = WeightAllocation::Vmm {
+                        allocator,
+                        allowance,
+                        stable_slot,
+                    };
+                    return;
+                }
+                if let Some(ptr) = NonNull::new(self.ptr as *mut u8) {
+                    // Stable slots retain VA for graph-baked pointers. Never
+                    // assert here: this remains reachable from Drop.
+                    let unmapped = if stable_slot {
+                        allocator
+                            .decommit_allocation_range(
+                                ptr,
+                                self.len,
+                                WEIGHT_SLOT_ALIGN,
+                                0,
+                                self.len,
+                            )
+                            .unwrap_or(0)
+                    } else {
+                        allocator.deallocate_span(ptr)
+                    };
+                    allowance.unmap(unmapped);
+                    let _ = GLOBAL_WEIGHT_MAPPED_BYTES.fetch_update(
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        |current| Some(current.saturating_sub(unmapped)),
+                    );
+                }
+            }
+        }
+    }
+
+    fn retire_after_stream_sync(&mut self) {
+        let free_start = std::time::Instant::now();
+        self.release_allocation(false);
+        add_duration(&GLOBAL_VRAM_FREE_NS, free_start.elapsed());
+    }
+
     /// Allocate a VRAM page and copy `bytes` host→device into it. The bytes are
     /// the canonical (compressed) backing of the tensor, so the page is
     /// byte-identical to a resident upload. Frees the allocation on copy failure.
@@ -509,7 +722,7 @@ impl CudaWeightPage {
         shape: Vec<usize>,
         len: usize,
         staging: PinnedStaging,
-    ) -> Result<(Self, u64, PinnedStaging), WeightHandleError> {
+    ) -> Result<(Self, u64, PinnedStaging, CopyCompleted), WeightHandleError> {
         if len == 0 {
             return Err(WeightHandleError::MissingRegions);
         }
@@ -534,12 +747,13 @@ impl CudaWeightPage {
             shape,
         };
         let staged = &staging.as_slice()[..len];
-        let copy_ms = unsafe { runtime.htod_async_elapsed_ms(staged, ptr) }.map_err(|error| {
-            WeightHandleError::DeviceBinding(format!("measured H2D copy: {error}"))
-        })?;
+        let (copy_ms, completed) =
+            unsafe { runtime.htod_async_elapsed_ms(staged, ptr) }.map_err(|error| {
+                WeightHandleError::DeviceBinding(format!("measured H2D copy: {error}"))
+            })?;
         GLOBAL_HTOD_NS.fetch_add((copy_ms * 1_000_000.0) as u64, Ordering::Relaxed);
         GLOBAL_HTOD_BYTES.fetch_add(len as u64, Ordering::Relaxed);
-        Ok((page, 0, staging))
+        Ok((page, 0, staging, completed))
     }
 
     /// Opaque device pointer to the paged bytes, for a kernel `TensorView`.
@@ -622,53 +836,7 @@ impl Drop for CudaWeightPage {
         // SAFETY: `ptr` came from this runtime's `alloc_raw` in `bind_block_quantized_moe`
         // and is freed exactly once here; no alias to it escapes `CudaWeightPage`.
         let free_start = std::time::Instant::now();
-        match &self.allocation {
-            WeightAllocation::Runtime => {
-                let _ = unsafe { self.runtime.free_raw(self.ptr) };
-            }
-            WeightAllocation::Vmm {
-                allocator,
-                allowance,
-                stable_slot,
-            } => {
-                // Unlike cuMemFree, unmapping a VMM span does not implicitly
-                // wait for kernels that still reference its virtual address.
-                // Retire the mapping only after both CUDA streams are idle so
-                // a pooled handle cannot be recycled under in-flight work.
-                if self.runtime.synchronize().is_err()
-                    || self.runtime.copy_stream().synchronize().is_err()
-                {
-                    return;
-                }
-                if let Some(ptr) = NonNull::new(self.ptr as *mut u8) {
-                    // A stable slot (issue #716) unmaps only the physical
-                    // granules and KEEPS the reserved VA so the next page-in of
-                    // this key reuses the identical device pointer a captured
-                    // graph baked. A transient bypass page frees its throwaway
-                    // VA outright. Never assert in Drop (STATUS_STACK_BUFFER_-
-                    // OVERRUN on Windows): decommit failures fall back to zero.
-                    let unmapped = if *stable_slot {
-                        allocator
-                            .decommit_allocation_range(
-                                ptr,
-                                self.len,
-                                WEIGHT_SLOT_ALIGN,
-                                0,
-                                self.len,
-                            )
-                            .unwrap_or(0)
-                    } else {
-                        allocator.deallocate_span(ptr)
-                    };
-                    allowance.unmap(unmapped);
-                    let _ = GLOBAL_WEIGHT_MAPPED_BYTES.fetch_update(
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                        |current| Some(current.saturating_sub(unmapped)),
-                    );
-                }
-            }
-        }
+        self.release_allocation(true);
         add_duration(&GLOBAL_VRAM_FREE_NS, free_start.elapsed());
     }
 }
@@ -771,7 +939,18 @@ impl<S: MmapRegionSource + ?Sized> LazyDeviceWeightBinder for CudaWeightPager<'_
 pub struct CudaWeightResidency {
     runtime: Arc<CudaRuntime>,
     scan_resistant_dense: bool,
+    /// Byte-aware admission (#837 item 3): keep the largest tensors resident by
+    /// evicting the smallest evictable resident to admit a strictly-larger
+    /// incoming tensor, instead of streaming it transiently. Default false so
+    /// the shipped path is byte-identical; opt in via
+    /// `ONNX_GENAI_WEIGHT_OFFLOAD_BYTE_AWARE=1`.
+    byte_aware: bool,
     physical: OnceLock<PhysicalAdmission>,
+    /// Reused pinned host staging buffers for weight page-ins. Shared so every
+    /// page-in draws from the same bounded free-list instead of page-locking a
+    /// fresh buffer per miss (issue #837). See [`crate::pinned_pool`] for the
+    /// fence-safety argument.
+    staging_pool: Arc<PinnedStagingPool>,
     inner: Mutex<ResidencyInner>,
 }
 
@@ -890,6 +1069,65 @@ impl WeightResidencyPolicy {
         }
     }
 
+    /// Pure CPU model of the byte-aware `StableResident` admission decision the
+    /// GPU VMM path implements in `admit_committed_span` (#837 item 3): a page
+    /// that does not fit is *retained* only when room can be made by evicting
+    /// **strictly smaller** residents (smallest first); otherwise it bypasses.
+    /// Refusing to evict an equal-or-larger peer is what keeps the largest
+    /// tensors a *stable* resident set instead of thrashing them against each
+    /// other. Lets the convergence-to-largest property be regression-tested
+    /// without a GPU. The GPU path's physical-eviction loop differs in mechanism
+    /// but shares this decision, which is what governs the byte-weighted hit
+    /// rate.
+    #[cfg(test)]
+    fn access_byte_aware(&mut self, key: u64, bytes: u64) -> WeightPolicyAccess {
+        if self.bytes_by_key.contains_key(&key) {
+            self.record_hit(key);
+            return WeightPolicyAccess {
+                hit: true,
+                admitted: false,
+                evicted: Vec::new(),
+            };
+        }
+        if !self.can_fit(bytes) {
+            // Room can only be made from residents strictly smaller than the
+            // incoming page; equal/larger peers are never displaced.
+            let reclaimable: u64 = self
+                .bytes_by_key
+                .values()
+                .filter(|&&resident| resident < bytes)
+                .sum();
+            let free = self.budget.saturating_sub(self.resident_bytes);
+            if free.saturating_add(reclaimable) < bytes {
+                self.record_page_in();
+                return WeightPolicyAccess {
+                    hit: false,
+                    admitted: false,
+                    evicted: Vec::new(),
+                };
+            }
+        }
+        let mut evicted = Vec::new();
+        while !self.can_fit(bytes) {
+            let Some((&smallest_key, _)) = self
+                .bytes_by_key
+                .iter()
+                .filter(|&(_, &resident)| resident < bytes)
+                .min_by_key(|&(_, &resident)| resident)
+            else {
+                break;
+            };
+            self.remove_page(smallest_key);
+            evicted.push(smallest_key);
+        }
+        self.insert_page(key, bytes);
+        WeightPolicyAccess {
+            hit: false,
+            admitted: true,
+            evicted,
+        }
+    }
+
     fn can_fit(&self, incoming: u64) -> bool {
         self.resident_bytes.saturating_add(incoming) <= self.budget
     }
@@ -995,9 +1233,11 @@ impl CudaWeightResidency {
     pub fn new(runtime: Arc<CudaRuntime>, budget_bytes: u64) -> Self {
         replace_global_budget(0, budget_bytes);
         Self {
-            runtime,
+            runtime: Arc::clone(&runtime),
             scan_resistant_dense: false,
+            byte_aware: false,
             physical: OnceLock::new(),
+            staging_pool: PinnedStagingPool::new(Arc::clone(&runtime)),
             inner: Mutex::new(ResidencyInner {
                 policy: WeightResidencyPolicy::new(budget_bytes),
                 lease: None,
@@ -1044,9 +1284,11 @@ impl CudaWeightResidency {
         )?;
         replace_global_budget(0, lease.bytes());
         Ok(Self {
-            runtime,
+            runtime: Arc::clone(&runtime),
             scan_resistant_dense: false,
+            byte_aware: false,
             physical: OnceLock::new(),
+            staging_pool: PinnedStagingPool::new(Arc::clone(&runtime)),
             inner: Mutex::new(ResidencyInner {
                 policy: WeightResidencyPolicy::new(lease.bytes()),
                 lease: Some(lease),
@@ -1167,6 +1409,14 @@ impl CudaWeightResidency {
         self
     }
 
+    /// Select byte-aware admission (#837 item 3). Only refines the
+    /// `StableResident` bypass decision, so it has no effect unless
+    /// scan-resistant dense residency is also on.
+    pub fn with_byte_aware_residency(mut self, byte_aware: bool) -> Self {
+        self.byte_aware = byte_aware;
+        self
+    }
+
     /// Use the production VMM arena and its existing physical-memory authority
     /// for weight pages. The configured cache budget remains an observability
     /// value; admission is governed by incremental authority-owned bytes, not
@@ -1278,12 +1528,16 @@ impl CudaWeightResidency {
             return Ok(hit);
         }
         let len = weight.region_bytes_len();
+        // Draw a reusable pinned staging buffer from the bounded pool instead of
+        // page-locking a fresh `cuMemHostAlloc` per page-in (issue #837). The
+        // buffer returns to the pool only after the (host-blocking) H2D copy
+        // below completes — see `pinned_pool` for the fence-safety argument.
         let mut staging = self
-            .runtime
-            .alloc_pinned(len)
+            .staging_pool
+            .acquire(len)
             .map_err(|error| WeightHandleError::DeviceBinding(format!("pinned alloc: {error}")))?;
         let materialize_start = std::time::Instant::now();
-        fill_staging_from_regions(weight, source, &mut staging)?;
+        fill_staging_from_regions(weight, source, staging.staging_mut())?;
         add_duration(&GLOBAL_MATERIALIZE_NS, materialize_start.elapsed());
         if self.physical.get().is_some() {
             return self.resident_vmm_with(
@@ -1292,25 +1546,36 @@ impl CudaWeightResidency {
                 weight.shape.clone(),
                 len,
                 self.eviction_for(weight.boundary),
+                // `staging` (a `PooledStaging`) is moved into the fill closure.
+                // `htod_async_elapsed_ms` host-synchronizes the copy before it
+                // returns and yields a `CopyCompleted` witness; `retire` consumes
+                // that witness to return the buffer to the pool, so reuse is
+                // structurally gated on the copy having completed.
                 move |runtime, ptr| {
                     let staged = &staging.as_slice()[..len];
-                    let copy_ms =
+                    let (copy_ms, completed) =
                         unsafe { runtime.htod_async_elapsed_ms(staged, ptr) }.map_err(|error| {
                             WeightHandleError::DeviceBinding(format!("measured H2D copy: {error}"))
                         })?;
                     GLOBAL_HTOD_NS.fetch_add((copy_ms * 1_000_000.0) as u64, Ordering::Relaxed);
                     GLOBAL_HTOD_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+                    staging.retire(completed);
                     Ok(())
                 },
             );
         }
-        let (page, _, _staging) = CudaWeightPage::upload_staged_async(
+        // Non-VMM branch: `upload_staged_async` consumes the buffer, performs a
+        // host-blocking copy, and hands it back with a `CopyCompleted` witness.
+        // Return it to the pool with that witness (copy complete), then admit.
+        let raw_staging = staging.into_inner();
+        let (page, _, raw_staging, completed) = CudaWeightPage::upload_staged_async(
             &self.runtime,
             weight.dtype,
             weight.shape.clone(),
             len,
-            staging,
+            raw_staging,
         )?;
+        self.staging_pool.release(raw_staging, completed);
         self.admit(key, Arc::new(page), self.eviction_for(weight.boundary))
     }
 
@@ -1458,7 +1723,7 @@ impl CudaWeightResidency {
             shape,
         });
         if bypass {
-            inner.record_bypassed_page_in();
+            inner.record_bypassed_page_in(len as u64);
         } else {
             inner.insert_page(key, Arc::clone(&page), len as u64);
         }
@@ -1496,6 +1761,7 @@ impl CudaWeightResidency {
         let max_evictions = inner.pages.len();
         let mut evictions = 0usize;
         let mut bypass = false;
+        let mut streams_drained = false;
         loop {
             let required_owned = physical
                 .allocator
@@ -1554,7 +1820,27 @@ impl CudaWeightResidency {
                     }
                 }
             } else if eviction == WeightEvictionPolicy::StableResident {
-                bypass = true;
+                // Size-blind `StableResident` always bypasses here: once the
+                // budget is full every distinct tensor streams transiently,
+                // which biases residency toward small first-fit tensors and
+                // streams the large projections every step (#837 item 3).
+                //
+                // Byte-aware admission instead retains the incoming page (falls
+                // through to evict the *smallest* resident below) whenever it is
+                // strictly larger than the smallest evictable resident, so the
+                // resident set converges to the top-`B`-bytes tensors. A page no
+                // larger than the smallest resident still bypasses, so a small
+                // tensor never displaces a large one to become resident.
+                //
+                // NOTE (#837 item 3): `self.byte_aware` is EXPERIMENTAL and
+                // measured UNSAFE — when this branch actually engages it
+                // corrupts decode output (token-identity failure). It is
+                // default-OFF and never set on the shipped path; see
+                // `WEIGHT_OFFLOAD_BYTE_AWARE_ENV` for the measured evidence.
+                bypass = !(self.byte_aware
+                    && inner
+                        .smallest_evictable()
+                        .is_some_and(|(_, smallest)| (len as u64) > smallest));
             }
 
             if evictions >= max_evictions {
@@ -1571,7 +1857,16 @@ impl CudaWeightResidency {
                 .map_or(0, |stats| stats.snapshot().total_owned_bytes);
             let before_required_owned = required_owned;
             let before_required_mapped = required_mapped;
-            let Some(evicted_key) = inner.next_evictable_key(eviction) else {
+            // Byte-aware admission evicts the smallest evictable resident so a
+            // large incoming tensor displaces cheap smalls rather than another
+            // large tensor; size-blind residency evicts in LRU order (#837
+            // item 3).
+            let evicted_key = if self.byte_aware {
+                inner.smallest_evictable().map(|(key, _)| key)
+            } else {
+                inner.next_evictable_key(eviction)
+            };
+            let Some(evicted_key) = evicted_key else {
                 return Err(WeightHandleError::DeviceBinding(format!(
                     "weight residency requires {required_mapped} incremental mapped bytes with \
                      {zone_available} bytes of weight-zone headroom and {required_owned} \
@@ -1579,7 +1874,18 @@ impl CudaWeightResidency {
                      headroom, and no page is evictable"
                 )));
             };
-            inner.remove_page(evicted_key);
+            if !streams_drained {
+                let sync_start = std::time::Instant::now();
+                self.runtime.synchronize().map_err(|error| {
+                    WeightHandleError::DeviceBinding(format!("compute stream sync: {error}"))
+                })?;
+                self.runtime.copy_stream().synchronize().map_err(|error| {
+                    WeightHandleError::DeviceBinding(format!("copy stream sync: {error}"))
+                })?;
+                add_duration(&GLOBAL_ADMIT_SYNC_NS, sync_start.elapsed());
+                streams_drained = true;
+            }
+            inner.remove_page_after_stream_sync(evicted_key);
             evictions += 1;
             let after_owned = physical
                 .allocator
@@ -1683,7 +1989,7 @@ impl CudaWeightResidency {
             return Ok(existing);
         }
         if eviction == WeightEvictionPolicy::StableResident && !inner.policy.can_fit(bytes) {
-            inner.record_bypassed_page_in();
+            inner.record_bypassed_page_in(bytes);
             return Ok(page);
         }
         inner.evict_to_fit(bytes, eviction);
@@ -1862,9 +2168,21 @@ impl Drop for CudaWeightResidency {
 impl ResidencyInner {
     /// Record a cache hit for `key`: mark it most-recently-used and bump the
     /// per-instance and process-global hit counters.
+    ///
+    /// Also accumulates the **bytes** served from residency. The count-based hit
+    /// rate is a poor proxy for streaming cost, because the resident set skews
+    /// toward many small tensors (norms, biases) while misses skew toward few
+    /// large ones. Measured on qwen14b-zp: raising the weight budget moved the
+    /// count hit rate 57.09% -> 81.31% while the byte gap to the streaming floor
+    /// *widened* from 1.78x to 2.30x (#857). `htod_bytes` drives cost, so the
+    /// byte-weighted rate `hit_bytes / (hit_bytes + htod_bytes)` is the metric
+    /// residency-policy work must be judged on (#837 item 3).
     fn record_hit(&mut self, key: u64) {
         self.policy.record_hit(key);
         GLOBAL_HITS.fetch_add(1, Ordering::Relaxed);
+        if let Some(page) = self.pages.get(&key) {
+            GLOBAL_HIT_BYTES.fetch_add(page.len as u64, Ordering::Relaxed);
+        }
     }
 
     /// Insert a freshly paged-in `page` of `bytes` under `key`, updating the
@@ -1881,10 +2199,11 @@ impl ResidencyInner {
 
     /// Count a miss whose freshly paged-in allocation is returned directly to
     /// the caller instead of becoming part of the resident set.
-    fn record_bypassed_page_in(&mut self) {
+    fn record_bypassed_page_in(&mut self, bytes: u64) {
         self.policy.record_page_in();
         GLOBAL_PAGE_INS.fetch_add(1, Ordering::Relaxed);
         GLOBAL_BYPASSED_PAGE_INS.fetch_add(1, Ordering::Relaxed);
+        GLOBAL_BYPASSED_PAGE_IN_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
     fn next_evictable_key(&self, eviction: WeightEvictionPolicy) -> Option<u64> {
@@ -1897,10 +2216,50 @@ impl ResidencyInner {
             .map(|index| self.policy.order[index])
     }
 
+    /// Smallest evictable resident page as `(key, bytes)`, or `None` when no
+    /// page is evictable.
+    ///
+    /// "Evictable" is the same predicate [`Self::next_evictable_key`] uses: the
+    /// cache must be the page's sole owner (`Arc::strong_count == 1`), so a page
+    /// still read by an in-flight kernel is never a candidate. Byte-aware
+    /// admission uses this to displace only the cheapest resident, protecting
+    /// the large tensors that dominate streaming cost (#837 item 3).
+    fn smallest_evictable(&self) -> Option<(u64, u64)> {
+        let mut best: Option<(u64, u64)> = None;
+        for (&key, &bytes) in &self.policy.bytes_by_key {
+            let evictable = self
+                .pages
+                .get(&key)
+                .is_some_and(|page| Arc::strong_count(page) == 1);
+            if evictable && best.is_none_or(|(_, best_bytes)| bytes < best_bytes) {
+                best = Some((key, bytes));
+            }
+        }
+        best
+    }
+
     fn remove_page(&mut self, key: u64) {
         if self.pages.remove(&key).is_some()
             && let Some(bytes) = self.policy.remove_page(key)
         {
+            let _ = GLOBAL_CONTENT_RESIDENT_BYTES.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |current| Some(current.saturating_sub(bytes)),
+            );
+            GLOBAL_EVICTIONS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn remove_page_after_stream_sync(&mut self, key: u64) {
+        let Some(page) = self.pages.remove(&key) else {
+            return;
+        };
+        let bytes = self.policy.remove_page(key);
+        if let Ok(mut page) = Arc::try_unwrap(page) {
+            page.retire_after_stream_sync();
+        }
+        if let Some(bytes) = bytes {
             let _ = GLOBAL_CONTENT_RESIDENT_BYTES.fetch_update(
                 Ordering::Relaxed,
                 Ordering::Relaxed,
@@ -1967,6 +2326,54 @@ mod tests {
     }
 
     #[test]
+    fn byte_hit_rate_diverges_from_the_count_based_rate() {
+        // The failure mode this metric exists to catch, from the #857
+        // measurement: raising the weight budget moved the count-based hit rate
+        // 57.09% -> 81.31% while the bytes actually streamed stayed dominant,
+        // because hits skew small (norms, biases) and misses skew large
+        // (projections, ~11.9 MB average page-in on qwen14b).
+        let stats = GlobalOffloadStats {
+            hits: 9,
+            page_ins: 1,
+            hit_bytes: 9 * 10 * 1024,     // nine 10 KiB tensors
+            htod_bytes: 12 * 1024 * 1024, // one 12 MiB tensor
+            ..GlobalOffloadStats::default()
+        };
+        let count_rate = stats.hits as f64 / (stats.hits + stats.page_ins) as f64;
+        let byte_rate = stats.byte_hit_rate().expect("bytes were requested");
+        assert!(
+            (count_rate - 0.90).abs() < 1e-9,
+            "count-based rate looks excellent: {count_rate}"
+        );
+        assert!(
+            byte_rate < 0.01,
+            "byte-weighted rate tells the truth about streaming cost: {byte_rate}"
+        );
+    }
+
+    #[test]
+    fn byte_hit_rate_is_none_when_no_bytes_were_requested() {
+        assert_eq!(GlobalOffloadStats::default().byte_hit_rate(), None);
+    }
+
+    #[test]
+    fn bypassed_byte_share_attributes_streamed_bytes() {
+        // No bytes streamed -> no attribution, never a divide-by-zero.
+        assert_eq!(GlobalOffloadStats::default().bypassed_byte_share(), None);
+        // Bypass bytes are a subset of htod_bytes: 3 MiB of a 12 MiB stream.
+        let stats = GlobalOffloadStats {
+            htod_bytes: 12 * 1024 * 1024,
+            bypassed_page_in_bytes: 3 * 1024 * 1024,
+            ..GlobalOffloadStats::default()
+        };
+        let share = stats.bypassed_byte_share().expect("bytes were streamed");
+        assert!(
+            (share - 0.25).abs() < 1e-9,
+            "one quarter of stream: {share}"
+        );
+    }
+
+    #[test]
     fn scan_resistant_env_defaults_on_with_lru_opt_out() {
         assert!(scan_resistant_from_env_value(None));
         assert!(scan_resistant_from_env_value(Some("1")));
@@ -1979,6 +2386,22 @@ mod tests {
         assert!(!scan_resistant_from_env_value(Some("  off ")));
         assert!(scan_resistant_from_env_value(Some("")));
         assert!(scan_resistant_from_env_value(Some("maybe")));
+    }
+
+    #[test]
+    fn byte_aware_env_defaults_off_and_opts_in() {
+        // Opt-in: unset and every non-truthy value stay OFF, so the shipped path
+        // is byte-identical unless the operator explicitly enables the A/B knob.
+        assert!(!byte_aware_from_env_value(None));
+        assert!(!byte_aware_from_env_value(Some("0")));
+        assert!(!byte_aware_from_env_value(Some("false")));
+        assert!(!byte_aware_from_env_value(Some("")));
+        assert!(!byte_aware_from_env_value(Some("maybe")));
+        // Only the canonical truthy spellings enable it.
+        assert!(byte_aware_from_env_value(Some("1")));
+        assert!(byte_aware_from_env_value(Some("true")));
+        assert!(byte_aware_from_env_value(Some("YES")));
+        assert!(byte_aware_from_env_value(Some("  On ")));
     }
 
     #[test]
@@ -2469,6 +2892,125 @@ mod tests {
                 "stable-subset residency should recover B/W for B={capacity}/{WORKING_SET}"
             );
         }
+    }
+
+    /// The core #837 item-3 claim, modelled on CPU: when small tensors are
+    /// touched *before* the large ones each cycle, size-blind `StableResident`
+    /// lets the smalls win the first-fit race and crowds the large projections
+    /// out of the budget, streaming them every step. Byte-aware admission
+    /// evicts those smalls to seat the large tensors, so its **byte-weighted**
+    /// hit rate is materially higher and it streams strictly fewer bytes.
+    ///
+    /// This exercises the admission *decision function* in isolation — an
+    /// abstract residency model with no CUDA-graph capture, no physical granule
+    /// churn, and no in-flight-read lifecycle. It confirms the size-greedy rule
+    /// does what it claims *on paper*. It does **not** validate the real GPU
+    /// path: the on-device A/B (see `WEIGHT_OFFLOAD_BYTE_AWARE_ENV`) shows the
+    /// same rule corrupts decode output when it actually engages, which is why
+    /// the knob is default-OFF and unshipped. Keep both facts together.
+    #[test]
+    fn byte_aware_beats_stable_subset_when_smalls_crowd_out_larges() {
+        // Six 1-byte "norms/biases" touched first, then two 10-byte
+        // "projections". W = 26 bytes; budget seats both projections (20) plus
+        // two norms with room to spare, but only if the norms do not squat it.
+        let order: [(u64, u64); 8] = [
+            (0, 1),
+            (1, 1),
+            (2, 1),
+            (3, 1),
+            (4, 1),
+            (5, 1),
+            (6, 10),
+            (7, 10),
+        ];
+        const BUDGET: u64 = 22;
+        const WARMUP: u64 = 4;
+        const MEASURED: u64 = 6;
+
+        let byte_hits = |byte_aware: bool| -> (u64, u64) {
+            let mut policy = WeightResidencyPolicy::new(BUDGET);
+            let mut hit_bytes = 0u64;
+            let mut streamed_bytes = 0u64;
+            for cycle in 0..(WARMUP + MEASURED) {
+                let measuring = cycle >= WARMUP;
+                for (key, bytes) in order {
+                    let access = if byte_aware {
+                        policy.access_byte_aware(key, bytes)
+                    } else {
+                        policy.access(key, bytes, WeightEvictionPolicy::StableResident)
+                    };
+                    if measuring {
+                        if access.hit {
+                            hit_bytes += bytes;
+                        } else {
+                            streamed_bytes += bytes;
+                        }
+                    }
+                }
+            }
+            (hit_bytes, streamed_bytes)
+        };
+
+        let (blind_hit, blind_stream) = byte_hits(false);
+        let (aware_hit, aware_stream) = byte_hits(true);
+        let blind_rate = blind_hit as f64 / (blind_hit + blind_stream) as f64;
+        let aware_rate = aware_hit as f64 / (aware_hit + aware_stream) as f64;
+
+        assert!(
+            aware_rate > blind_rate + 0.15,
+            "byte-aware residency must materially raise the byte-weighted hit rate when \
+             smalls crowd out larges: blind={blind_rate:.3} aware={aware_rate:.3}"
+        );
+        // The point is a smaller `htod_bytes`, not just a nicer count-based report.
+        assert!(
+            aware_stream < blind_stream,
+            "byte-aware residency must stream fewer bytes: \
+             blind={blind_stream} aware={aware_stream}"
+        );
+    }
+
+    /// The honest limit of the policy, also locked in: when the *large* tensors
+    /// alone exceed the budget, no admission order can hold them all, so
+    /// byte-aware must not thrash the large set against itself (strictly-smaller
+    /// eviction) and must not regress below size-blind `StableResident`. This is
+    /// the case that a naive "evict the smallest to admit any larger page" rule
+    /// gets wrong, and the reason the policy refuses to displace equal/larger
+    /// peers (#837 item 3).
+    #[test]
+    fn byte_aware_does_not_thrash_when_larges_exceed_budget() {
+        // Five 10-byte projections (50 bytes) against a 22-byte budget: at most
+        // two can ever be resident, and a clean cyclic scan of five is pessimal
+        // for any evict-to-admit rule.
+        let order: [(u64, u64); 5] = [(0, 10), (1, 10), (2, 10), (3, 10), (4, 10)];
+        const BUDGET: u64 = 22;
+        const WARMUP: u64 = 4;
+        const MEASURED: u64 = 6;
+
+        let steady_stream = |byte_aware: bool| -> u64 {
+            let mut policy = WeightResidencyPolicy::new(BUDGET);
+            let mut streamed = 0u64;
+            for cycle in 0..(WARMUP + MEASURED) {
+                for (key, bytes) in order {
+                    let access = if byte_aware {
+                        policy.access_byte_aware(key, bytes)
+                    } else {
+                        policy.access(key, bytes, WeightEvictionPolicy::StableResident)
+                    };
+                    if cycle >= WARMUP && !access.hit {
+                        streamed += bytes;
+                    }
+                }
+            }
+            streamed
+        };
+
+        assert!(
+            steady_stream(true) <= steady_stream(false),
+            "byte-aware must not stream more than size-blind when larges exceed budget: \
+             aware={} blind={}",
+            steady_stream(true),
+            steady_stream(false)
+        );
     }
 
     #[test]

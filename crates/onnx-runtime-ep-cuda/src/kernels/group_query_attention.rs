@@ -26,6 +26,7 @@ use crate::runtime::{CudaRuntime, cuptr};
 use super::attention::{AttentionDtype, run_attention_phase2a};
 use super::flash_attention;
 use super::gqa_decode;
+use super::gqa_decode_bf16;
 use super::gqa_decode_fp16;
 
 const PREP_SRC: &str = r#"
@@ -1929,7 +1930,8 @@ impl GroupQueryAttentionKernel {
         let capture_candidate = requested_present_capacity
             .filter(|&present_capacity| {
                 (q.dtype == DataType::Float32
-                    || (q.dtype == DataType::Float16 && gqa_decode_fp16::supported(q_seq, dim)))
+                    || (q.dtype == DataType::Float16 && gqa_decode_fp16::supported(q_seq, dim))
+                    || (q.dtype == DataType::BFloat16 && gqa_decode_bf16::supported(q_seq, dim)))
                     && q_seq == 1
                     && k_seq <= 1
                     && has_past_key
@@ -2638,6 +2640,8 @@ impl GroupQueryAttentionKernel {
             KvCachePath::F32DecodeRead
         } else if q.dtype == DataType::Float16 && gqa_decode_fp16::supported(q_seq, dim) {
             KvCachePath::Fp16DecodeRead
+        } else if q.dtype == DataType::BFloat16 && gqa_decode_bf16::supported(q_seq, dim) {
+            KvCachePath::Bf16DecodeRead
         } else if q.dtype == DataType::Float32 {
             KvCachePath::ReferenceRead
         } else {
@@ -2730,6 +2734,45 @@ impl GroupQueryAttentionKernel {
             // CUDA graph. Unsupported fp16 shapes (e.g. prefill Sq>1) still fall
             // through to the phase-2a path below.
             gqa_decode_fp16::run(
+                &self.runtime,
+                batch,
+                self.num_heads,
+                self.kv_num_heads,
+                q_seq,
+                dim,
+                present_capacity,
+                self.num_heads / self.kv_num_heads,
+                scale,
+                q_bnsh,
+                present_k_ptr,
+                present_v_ptr,
+                attention_out,
+                totals_gpu,
+                local_window_i,
+                self.softcap,
+                &self.kv_strides,
+            )?;
+        } else if q.dtype == DataType::BFloat16 && gqa_decode_bf16::supported(q_seq, dim) {
+            onnx_runtime_ep_api::record_kernel_variant!(
+                "attention_gqa_decode_bf16_splitk",
+                "capture-safe bf16 split-K flash-decode: q_seq={}, even head_dim={} (<=256); \
+                 active split count (up to {}) chosen on-device from the valid length \
+                 and a host occupancy target that fills the multiprocessors",
+                q_seq,
+                dim,
+                gqa_decode_bf16::MAX_SPLITS
+            );
+            // Capture-safe bf16 flash-decode sibling of the fp16 branch above.
+            // Same launcher signature/units and capture-safety contract; passes
+            // the bf16 device pointers for query/present-K/present-V/output.
+            // Reads the valid length on-device from `totals_gpu` and allocates
+            // only fixed-size dynamic shared memory, so it records/replays inside
+            // a CUDA graph. This is the branch that makes bfloat16 decoders (e.g.
+            // Muse-Glimmer) capture-eligible: without it every bf16 GQA node
+            // declined at the kernel gate and forced an eager device seam that
+            // defeated whole-graph capture. Unsupported bf16 shapes (e.g. prefill
+            // Sq>1) still fall through to the phase-2a path below.
+            gqa_decode_bf16::run(
                 &self.runtime,
                 batch,
                 self.num_heads,
@@ -3059,7 +3102,7 @@ impl Kernel for GroupQueryAttentionKernel {
         match self.last_capture_safe_signature.lock() {
             Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
             Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
-                "requires a warmed f32/fp16 q_seq==1 k_seq<=1 fixed-capacity device-KV decode path; the current signature was not warmed as capture-safe",
+                "requires a warmed f32/fp16/bf16 q_seq==1 k_seq<=1 fixed-capacity device-KV decode path; the current signature was not warmed as capture-safe",
             ),
             Err(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
                 "GroupQueryAttention capture signature is unavailable because its state lock was poisoned",

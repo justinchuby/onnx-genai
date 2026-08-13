@@ -2031,6 +2031,7 @@ dependencies = [
  "criterion",
  "onnx-genai-engine",
  "onnx-genai-kv",
+ "onnx-genai-metadata",
  "onnx-genai-ort",
  "onnx-genai-runtime-config",
  "onnx-runtime-ep-cpu",
@@ -2430,6 +2431,7 @@ dependencies = [
  "onnx-runtime-memory-governor",
  "onnx-runtime-optimizer",
  "onnx-runtime-quantization",
+ "onnx-runtime-shape-inference",
  "onnx-runtime-virtual-memory",
  "thiserror 2.0.19",
 ]

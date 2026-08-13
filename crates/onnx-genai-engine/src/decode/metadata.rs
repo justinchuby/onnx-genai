@@ -84,8 +84,24 @@ pub(crate) fn detect_model_decode_path(
     metadata_max_context: Option<usize>,
     shared_kv_max_len: Option<usize>,
     sliding_window: Option<usize>,
+    sliding_window_graph: Option<&onnx_runtime_ir::Graph>,
     sink_tokens: usize,
 ) -> anyhow::Result<ModelDecodePath> {
+    // A `sliding_window` declared in `inference_metadata.yaml` is only *active*
+    // when the exported decoder graph actually enforces a local-attention window
+    // on its attention ops (an ORT `GroupQueryAttention` with a positive
+    // `local_window_size`). If the window is declared in metadata but the graph
+    // computes GLOBAL attention (e.g. Muse-Glimmer-30B: 52 GQA ops, none with
+    // `local_window_size`; `genai_config.json` declares no window and
+    // `past_present_share_buffer: true`), the window is vestigial and must NOT
+    // route the model onto the capture-unstable growing/paged KV path. Treat it
+    // as global attention so it can reach the capture-stable shared-buffer path.
+    //
+    // When no graph is supplied (best-effort inspection unavailable) the declared
+    // window is kept, preserving the prior behavior for real SWA models
+    // (Gemma/Mistral-style) whose graph we could not read.
+    let sliding_window = effective_sliding_window(sliding_window, sliding_window_graph);
+
     if let Some(signature) = StaticCacheDecodeSession::detect(session, io)? {
         if sliding_window.is_some() {
             anyhow::bail!(
@@ -169,6 +185,74 @@ pub(crate) fn detect_model_decode_path(
     }
 
     Ok(ModelDecodePath::Legacy)
+}
+
+/// Resolve the *effective* sliding window used for decode-path selection.
+///
+/// A `sliding_window` value originates from our own `inference_metadata.yaml`
+/// (`model.attention.sliding_window`); it is not necessarily what the exported
+/// decoder graph computes. This returns the declared window only when the graph
+/// truly enforces a local-attention window (see [`graph_enforces_sliding_window`]).
+/// When the window is declared in metadata but the graph computes global
+/// attention, it is vestigial and dropped (`None`), so the model is not forced
+/// onto the capture-unstable growing/paged KV path. When no graph is available
+/// to inspect, the declared window is kept unchanged to avoid regressing real
+/// sliding-window models whose graph we could not read.
+pub(crate) fn effective_sliding_window(
+    declared: Option<usize>,
+    graph: Option<&onnx_runtime_ir::Graph>,
+) -> Option<usize> {
+    let window = declared?;
+    match graph {
+        Some(graph) if !graph_enforces_sliding_window(graph) => {
+            tracing::debug!(
+                sliding_window = window,
+                "inference metadata declares a sliding_window but the decoder graph carries no local-attention window (no GQA local_window_size); treating attention as global and routing to the shared-buffer/fixed-capacity KV path"
+            );
+            None
+        }
+        _ => Some(window),
+    }
+}
+
+/// Op types whose attributes can carry a trained local-attention window.
+fn is_windowable_attention_op(op_type: &str) -> bool {
+    matches!(
+        op_type,
+        "GroupQueryAttention" | "MultiHeadAttention" | "Attention" | "SparseAttention"
+    )
+}
+
+/// Whether the decoder graph actually enforces a local (sliding) attention
+/// window on any of its attention operators.
+///
+/// Graph-truth basis for SWA classification: an ORT `GroupQueryAttention` (or a
+/// related attention op) enforces a window only when it carries a positive
+/// `local_window_size` attribute (ORT's default is `-1`, meaning full/global
+/// attention). Real sliding-window exports (Gemma/Mistral-style) set this
+/// attribute; a model with a metadata-only, graph-unenforced window
+/// (Muse-Glimmer-30B) does not. Control-flow subgraph bodies are traversed so a
+/// window buried in an `If`/`Loop`/`Scan` body is still detected.
+pub(crate) fn graph_enforces_sliding_window(graph: &onnx_runtime_ir::Graph) -> bool {
+    graph.nodes.values().any(node_enforces_local_window)
+}
+
+fn node_enforces_local_window(node: &onnx_runtime_ir::Node) -> bool {
+    if is_windowable_attention_op(&node.op_type)
+        && node
+            .attr("local_window_size")
+            .and_then(|attr| attr.as_int())
+            .is_some_and(|window| window > 0)
+    {
+        return true;
+    }
+    node.attributes.values().any(|attr| match attr {
+        onnx_runtime_ir::Attribute::Graph(subgraph) => graph_enforces_sliding_window(subgraph),
+        onnx_runtime_ir::Attribute::Graphs(subgraphs) => {
+            subgraphs.iter().any(graph_enforces_sliding_window)
+        }
+        _ => false,
+    })
 }
 
 /// Sliding-window size declared by the model, if present and valid.

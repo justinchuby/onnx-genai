@@ -133,6 +133,13 @@ pub(crate) struct Executor {
     /// non-growing, not unified with a growing one) is absent from this set, so
     /// ops carrying it stay capturable — preserving the 154→34 collapse.
     pub(super) capture_growing_symbols: HashSet<SymbolId>,
+    /// KV sequence-axis symbols pinned CONSTANT to their bound physical capacity
+    /// by [`Self::pin_fixed_capacity_kv_capture_symbols`] once the engine has
+    /// bound fixed-capacity, device-valid-length KV (see
+    /// [`super::kernel_cache::collect_capacity_pinned_kv_symbols`]). Empty until
+    /// the engine calls the pin; recorded for diagnostics/tests and to document
+    /// which symbols were removed from `capture_growing_symbols`.
+    pub(super) capacity_pinned_kv_symbols: HashSet<SymbolId>,
     /// Node whose kernel returned an error while recording a captured segment,
     /// set transiently by [`Self::run_plan_segmented`] so the capture retry loop
     /// can quarantine its op-type. `None` outside a failed capture pass.

@@ -11,9 +11,9 @@ macOS-arm64 + win_amd64) and **`nxrt-ep-cuda`** (CUDA 13, manylinux_2_28_x86_64)
 CI = fmt/build/test + **blocking clippy** + Miri unsafe-crate soundness + scheduled
 `cargo-audit`. Coverage ~77% line.
 
-_Last updated: 2026-08-12T16:20:00Z_
+_Last updated: 2026-08-13T14:45:00Z_
 
-**Current `origin/main` implementation HEAD:** `431ccf15`.
+**Current `origin/main` implementation HEAD:** `26bd410f`.
 
 ---
 
@@ -24,6 +24,18 @@ _Last updated: 2026-08-12T16:20:00Z_
   bit-exact or native-more-accurate vs an fp32 oracle, zero fallbacks. The ORT 1.28
   three-config fairness benchmark measured native **1.23–2.74×** faster than
   ORT-GenAI-direct (Qwen2.5-0.5B 557 vs 203 tok/s = 2.74×; DeepSeek-R1-1.5B 1.23×).
+- **Muse-Glimmer-30B (dense int4, bf16 decoder, heavy GQA) decodes faster than ORT on
+  native CUDA** — **11.4 → 47.25 tok/s (clearly beats ORT's ~40, +18%)** after a 4-gate
+  CUDA-graph capture chain (#848/#850/#852/#855/#854 → 1 segment / 0 seams) plus a bf16
+  RMSNorm cast-fold + parallel f32 tree reduction (#860 → 40.21) and a MatMulNBits
+  constant-scale cache (#867 → 47.25). Capture collapses ~1600 launches/token into one
+  replay; first-16 greedy ids match reference. **Three independent A/B experiments
+  (#870/#872/#873) then proved this is the architectural ceiling:** native CUDA int4
+  decode of this model is **latency-bound on the serial ~2568-node dependency chain
+  (~8.2 µs/node); measured NOT weight-bandwidth-bound — a 4× weight-byte cut yields only
+  +2.8%, HBM util ~15% (#885)** — so `GroupQueryAttention` (~41% of eager decode) is *not* a
+  lever, and marginal node/launch fusion cannot help. Lower-bit quant/sparsity is a measured
+  no-go (#885); drastic per-layer node-collapse (decode megakernel) is the reopened lever.
 - **Large / hybrid models run native-only** where ORT cannot load them: GLM-4-9B
   (partial-RoPE GQA, ORT rejects the schema), DeepSeek-V2-Lite (MLA + QMoE), and
   Qwen3.5/3.6-**27B** hybrid Gated-DeltaNet — all load and decode on native CUDA via a
@@ -73,7 +85,167 @@ _Last updated: 2026-08-12T16:20:00Z_
 
 ---
 
-## Recent milestones (2026-07-28 → 2026-08-12) — newest first
+## Recent milestones (2026-07-28 → 2026-08-13) — newest first
+
+### 2026-08-13 — Over-budget models on Windows: ~100× from *not* streaming, and the memory line's accounting corrected
+
+This line is about the **other** regime: models whose weights do **not** fit device
+memory. It is separate from, and does not interact with, the dispatch-bound work below —
+see "two regimes" at the end.
+
+- **#874 — stop auto-enabling managed weight streaming on Windows/WDDM.** On `qwen14b-zp`
+  (8.33 GB weights vs a 7.73 GB budget), byte-identical output, solo with `nvidia-smi`
+  verified empty before every run: **8.09 tok/s with `htod_bytes_per_token = 0`** (true
+  zero-copy — kernels read weights in place from host RAM over PCIe) against **0.11 tok/s**
+  for managed streaming; `main` immediately prior measured 0.05–0.08, so **~100× end to
+  end**. The cause is structural: each weight is read *exactly once per decode step*
+  (922 initializers, ~867 lookups/step), so both paths move the same bytes over the same
+  link, but ours added a CPU memcpy into pinned staging, a VRAM allocation, a `cuMemMap`,
+  an eviction and a synchronize — **to buy VRAM residency discarded before it is ever
+  re-read**. Explicit requests (`ONNX_GENAI_WEIGHT_OFFLOAD=1`, `--vram-limit`, a budget
+  override) are still honoured; `ONNX_GENAI_MANAGED_WEIGHT_STREAMING=1` forces the managed
+  path back, parsed so an *unrecognized* value keeps the fast default. **Linux is
+  unchanged and must stay so** — with no shared-memory fallback an over-budget model simply
+  fails there, so managed streaming competes with "does not run", not with something
+  faster (#783's lesson about not inheriting a platform-specific conclusion).
+- **#866 — elastic weight budget against KV occupancy.** The weight budget was
+  `resolved_device_budget − kv_bytes_per_token × max_context`, computed once and never
+  renegotiated, so a 16-token run idled **1.611 GB** holding KV it never committed.
+  Lending it back with a guaranteed reclaim path (tested through the *production* reclaim
+  code, so max-context reachability is preserved) cut `htod_bytes_per_token` **3.94 →
+  2.35 GB (1.68×)** and byte-weighted hit rate **+20.3 points**, byte-identical tokens.
+  Keeps a tunable 512 MiB headroom rather than lending to the last byte, and can never
+  drop below what the static reservation granted.
+- **#853/#856 — `total_weight_bytes` was 2.00× too large.** It measured *file size*, and
+  `qwen14b-zp`'s external-data blob is **50.0% orphaned prefix** (920 initializers
+  reference 8.33 GB of a 16.65 GB file, contiguously, first blob at offset 8,322,547,712 —
+  a re-export that never truncated). The model is over budget by **0.599 GB, not ~8.9 GB**.
+  Found by arithmetic that could not close: measured traffic sat *below* its own
+  theoretical floor, which is impossible. The loader now sums what initializers reference
+  and warns when file size exceeds it by >10%.
+- **#863 — `no-spill` is an accounting guarantee, not physical residency, on WDDM.**
+  Proven single-process: a `cuMemCreate`+`cuMemMap`+`cuMemSetAccess` allocator mirroring
+  the engine arena committed **and touched every byte** of 9,984 MiB on an 8,188 MiB card;
+  device-resident capped at ~7,942 MiB while the host working set reached 9.49 GB.
+  Refined by a second measurement: **solo and under `managed_limit`, no-spill holds
+  physically** (`nvidia-smi` tracks us 1:1); spill is specifically the **system-wide
+  over-commit** case, invisible to our ledger because our own committed bytes do not change.
+- **#869 — byte-weighted residency hit rate.** The count-based rate weights a 10 KiB norm
+  like an 11 MiB projection: raising the budget once moved `hit_rate` 57.09% → 81.31%
+  while the gap to the streaming floor **widened** 1.78× → 2.30×. `htod_bytes` is what
+  decode pays for, so policy work is now judged on `byte_hit_rate`.
+- **#877/#880 — hybrid feasibility measured, then the figure corrected.**
+  `cuMemHostRegister(READ_ONLY|DEVICEMAP)` on a read-only weight mapping succeeds at
+  3.1 ms/GiB, and **CUDA graph capture with a host-mapped weight pointer is SUPPORTED**,
+  replaying bit-identically to eager (#880) — so the cold path keeps the #796 capture gates.
+  #877's sequential `cuMemcpyDtoD` proxy read mapped host memory at 11.41 GB/s, but **#880
+  ran the real strided int4 GEMV** (same kernel and launch config the engine selects, only
+  the weight pointer differing) and measured **~5.6 GB/s steady-state** against
+  **~100–133 GB/s** resident, outputs bit-identical at every size. **The proxy was
+  optimistic by ~2×; size the hybrid's cold path at 5.6, not 11.4.** Corroborated
+  independently: WDDM's ~8 tok/s on `qwen14b-zp` implies ~0.6 GB/step of host reads ≈
+  4.8 GB/s of PCIe traffic — the same order, and impossible if zero-copy were ~1 GB/s.
+  Sweeping the packed size mattered: the realistic ~12 MiB per-tensor read fits this GPU's
+  L2, so a single point there compares a *cached* read against a PCIe read; the ≥64 MiB
+  points are the honest ones. **This reversed the hybrid's assumed priority order:**
+  zero-copy is *not* a bandwidth win (1.01× against an explicit copy) — it removes the
+  copy's second pass and its machinery — while **the resident hot set is worth ~9.7× at the
+  realistic shape, ~15–24× at large N**. So maximise residency first, de-copy the remainder
+  second. A ~2× penalty is not the ~10× that would have killed the design.
+
+**Two regimes, and wins do not transfer between them.** When weights fit, decode is
+**node-dispatch bound** (#870: 2,568 graph nodes/token at ~8.17 µs/node; cheapening any
+single kernel's inner loop is flat). When they do not fit, decode is **PCIe-streaming
+bound** and kernel work is irrelevant. Node-count reduction is invisible in the streaming
+regime; everything above is invisible on a model that fits. Report bytes-moved-per-token
+alongside throughput (#844's amortization line) — that counter distinguishes the regimes
+where wall-clock cannot, and on this box wall-clock is not evidence (identical
+configurations have ranged 3.9–28 tok/s, much of it WDDM paging our own memory).
+
+### 2026-08-13 — Muse-Glimmer-30B native CUDA decode beats ORT (47 tok/s)
+
+- **11.4 → 40.21 tok/s (native now matches ORT's ~40) on Muse-Glimmer-30B** (dense int4,
+  52 layers, **bf16** decoder, hidden 6656, heavy GQA num_kv_heads=2, vocab 202048). The
+  decode was dispatch/launch-overhead bound (~1600 kernel launches/token, GPU ~99% idle);
+  the fix was a 4-gate CUDA-graph-capture chain followed by a kernel/graph lever:
+  - **Gate 1 — classify onto shared-buffer KV (#848):** vestigial `sliding_window`
+    detected via graph truth (`local_window_size`) so Muse-Glimmer lands on the
+    capture-stable fixed-capacity KV path, not the growing/paged path.
+  - **Gate 2 — native pipeline embed load (#850):** `PipelineEngine` runs the embedding
+    component on the native CUDA EP, so the model loads + greedy-decodes end-to-end on
+    `--pipeline --backend native --ep cuda`.
+  - **Gate 3 — GQA KV seq-symbol pin (#852):** pins the 52 GQA nodes' fixed-capacity KV
+    seq symbols, dropping the classifier's disqualifying-symbol set 53 → 0.
+  - **Gate 4 — bf16 capture-safe GQA decode kernel (#855/#854):** new `gqa_decode_bf16`
+    device-length split-K decode (fp32 accumulation) admits bf16 q_seq==1 aliased device
+    KV as capture-safe, plus a skip-norm capture-safety flag fix → **54 → 1 segment / 0
+    seams**, lifting decode to ~23 tok/s.
+- **Cast / RMSNorm elimination lever (#860):** generalized the ep-cuda
+  `CudaDropNormalizationCasts` pass to fold **bf16** casts around **`RMSNormalization`**
+  (Muse-Glimmer wraps all 312 RMSNorm nodes in `Cast(bf16→f32)→RMSNorm→Cast(f32→bf16)`,
+  624 of 834 decoder casts). The fold **op-swaps `RMSNormalization` →
+  `SimplifiedLayerNormalization`** so the session's post-optimization shape re-inference
+  stays bf16 (ONNX RMSNormalization output Y follows the *scale* dtype `V`, not activation
+  `T`; both ops map to the same fused `RmsNormKernel`). Honest attribution: the cast-fold
+  alone is ~free under capture (**23.16 → 23.43 tok/s** — casts are cheap once launches are
+  captured); the real lever is `rmsnorm_bf16`'s **parallel f32 tree reduction** replacing
+  the serial single-thread mean-square (~40% of captured decode at M=1) → **23.16 → 40.21
+  tok/s** (median of 40.13/40.29/40.21).
+- **Correctness / capture:** capture stays **1 segment / 0 seams**, first-16 greedy ids
+  match the reference exactly. The parallel tree reduction is full f32 precision and, per
+  Chew's numerics review 🟢, **~807× more accurate than the old serial order** (within 1
+  bf16 ulp of an f64 oracle at hidden 6656). Greedy decode is byte-exact for the first ~37
+  tokens then shows expected sub-ulp greedy sensitivity (accuracy-level-4 int4 quant);
+  `ONNX_GENAI_CUDA_DISABLE_NORM_CAST_FOLD=1` restores the strict CPU-order byte-exact
+  serial path (at ~23 tok/s).
+- **MatMulNBits scale-cache lever (#867): 40.21 → 47.25 tok/s — native now clearly beats
+  ORT (~47 vs ~40, +18%).** With launches captured, decode is kernel-bound and MatMulNBits
+  was the dominant op (~44% of eager decode). The bf16 activation path re-cast **every**
+  input bf16→f16 each decode step, including the immutable int4 block **scales** — ~3.3
+  GB/token of pure-copy traffic (≈25% of the int4 weight traffic) plus 417 redundant cast
+  launches reproducing an identical f16 buffer. A persistent per-kernel `Bf16ConstCache`
+  stages the constant scale slots **once** (general path input 2; gate/up SwiGLU inputs 2
+  and 4) and reuses them across steps; the per-step activation and any per-token residual
+  bound into the bias slot stay on the ephemeral arena (caching never keys on pointer
+  identity for those dynamic slots). Byte-exact — bf16→f16 yields identical f16 bits
+  whether cast once or per step, so the full 128-token greedy sequence is bit-identical;
+  MatMulNBits eager share drops ~44% → **~31%**, capture stays **1 segment / 0 seams**. The
+  cache fills on the pre-capture warmup call so replays hit only lookups (no alloc, no
+  cast). `GroupQueryAttention` is now the largest eager share (~41%) — tested next as the
+  candidate lever.
+
+### 2026-08-13 — Native CUDA decode ceiling: latency-bound at ~47 tok/s (#870/#872/#873, mechanism corrected by #885)
+
+- **Three independent A/B experiments conclusively prove native CUDA int4 decode of
+  Muse-Glimmer-30B hits an architectural ceiling at ~47.25 tok/s on H200, NOT
+  launch-dispatch bound** — so the `GroupQueryAttention` (~41% eager) "next open lever" is
+  disproven and marginal node/launch fusion is a dead end on this model:
+  - **#870 (GQA cheapening): flat.** Cheapening the GQA kernel's inner loop under capture
+    did not move tok/s — decode is not GQA-compute bound.
+  - **#872 (−208 cheap Add nodes): −2.8% regression.** A byte-exact constant-Add fold that
+    removed 208 cheap elementwise nodes/token *hurt* throughput (47.17 → 45.85 captured),
+    shipped as a doc-only negative finding.
+  - **#873 (−104 expensive QKV GEMV launches): flat.** Fusing the 3 per-layer attention
+    projections into one wider `MatMulNBits` (417 → 313 MatMulNBits/token, +52 Split,
+    capture stays 1 segment / 0 seams) is byte-exact (all 64 greedy ids identical) but
+    throughput is flat (47.33 → 47.26 median over 3 interleaved trials).
+- **Why (mechanism corrected 2026-08-13 by probe #885):** decode is **latency-bound on the
+  serial ~2568-node dependency chain (~8.2 µs/node × 2568 ≈ 21 ms/token)**, NOT
+  weight-bandwidth-bound. A controlled weight-DRAM byte-fold probe measured that cutting weight
+  bytes read to 25% raises tok/s only 47.29 → 48.62 (**+2.8%**, HBM util ~15%); int2-everywhere
+  projects to ≈+1.6%. That is why neither cheap-node (#872) nor expensive-launch (#873) fusion
+  moves throughput — the critical path is serial node latency, not bytes moved. 47.25 tok/s
+  (already +18% vs ORT's ~40) is the architectural ceiling; we bank the win.
+- **Disposition:** the correct, byte-exact `CudaQkvProjectionFusion` pass (#873) is
+  retained **opt-in / disabled-by-default** (`ONNX_GENAI_CUDA_ENABLE_QKV_FUSION=1`) for
+  future dispatch-bound architectures (e.g. fp16 activations, higher launch-latency-to-
+  bandwidth shapes); the default binary keeps the three separate GEMVs.
+- **Real levers to beat 47 are not marginal node fusion, and NOT lower-bit quant:** lower-bit
+  quant/sparsity (int3/int2/mixed/2:4/NF4) is a **measured 🟥 no-go** (#885 — byte-fold flat,
+  ~15% HBM util, and every sub-4-bit path needs a re-quant from the fp16 source + immature
+  ORT tooling). The only direction consistent with all three measurements is **drastic
+  per-layer node-collapse — a decode megakernel (activations resident, few launches/layer),
+  REOPENED as the true next lever.** Future work.
 
 ### 2026-08-12 — EP plugins run inside ONNX Runtime and ship on PyPI
 
@@ -250,9 +422,53 @@ short spine (full day-by-day is archived).
 ### DeepSeek native support
 See [`deepseek-native-status-2026-07-25.md`](deepseek-native-status-2026-07-25.md).
 
-- [ ] **Full-model QMoE coherence:** validate native CUDA QMoE with a complete DeepSeek-V2
-  package and real tokenizer. The real-shape conformance artifact proves exact
-  routing/token parity but decodes only decimal token IDs.
+- [ ] **The #864 hybrid — resident hot set + zero-copy cold reads.** The only route to
+  *beating* the OS on over-budget models rather than merely no longer losing to it (#874
+  buys the ~100× by not choosing the slow path; it does not make us faster than WDDM).
+  **Both halves are now measured and sound (#880):** a real strided GEMV reads host-mapped
+  weights at ~5.6 GB/s with bit-identical outputs, and capture works with a host-mapped
+  pointer — the two risks that could have killed it. Size the cold path at **5.6 GB/s**
+  (not #877's 11.4 proxy) and treat the resident hot set as the dominant lever. Remaining
+  unknowns are policy rather than feasibility: registering all 8.33 GB page-locks that much
+  host RAM, which needs a rule on smaller hosts, and which weights belong in the hot set is
+  #837 item 3's question.
+- [ ] **#837 item 3 — residency policy gap.** Post-#866 the policy sits **1.97× above its
+  own streaming floor** (2.349 vs 1.191 GB/step), i.e. **1.158 GB/step recoverable**, worth
+  ~91 ms/step at measured bandwidths. `byte_hit_rate` 71.8% against an achievable 85.7%
+  (`B/W`). **Attributed:** bypassed page-ins account for **44.63% of streamed bytes
+  (~1.05 GB/step) — about 90% of the recoverable gap**, so the previously unexplained
+  counter is the gap, not a side issue. **One approach already rejected on measurement:**
+  byte-aware residency **corrupts decode output** — token identity violated, generation
+  collapsing to 3 tokens — whenever offload actually engages on the managed streaming path,
+  with and without CUDA graph; the default-off path is unaffected. The byte-identical token
+  constraint is what caught it, which is the reason that constraint is non-negotiable on
+  every change in this area. Governs Linux, forced-managed Windows, and — the
+  reason it still matters after #874 — the hybrid, whose entire thesis is that we choose
+  residency better than the driver does blind, and whose payoff #880 sizes at ~9.7×
+  realistic / ~15–24× at large N against ~5.6 GB/s host-mapped reads.
+- [ ] **#750 native multi-request batching.** Structurally batch-1 today; `--max-batch` is
+  honestly reported as ineffective (#758). Stage 1 (#844) confirmed the premise **and its
+  condition**: batching amortizes the weight stream only if implemented as **one fused
+  forward with `M = N`** — N independent forwards would miss every weight N times per step
+  on an over-budget model and amortize nothing. **Stage 2a landed and measured (#884):** a
+  stateless batch-N fused forward over length-1 rows with an empty past gives
+  **batch-invariant totals** (`htod_bytes` 3,575,949,312 and `page_ins` 301 identical at
+  N = 1/2/4/8, `evictions` 0) with **per-token figures falling exactly `1/N`** — the
+  signature of amortization, and one the offload knob cannot manufacture since it controls
+  *whether* weights stream, not the ratio. Also a well-evidenced **staging correction**:
+  assumptions #1 (input binding) and #2 (KV batch) are inseparable for an attention decoder
+  (`persistent_state_shapes` pins KV batch axis 0 = 1, the mask is `[1, max_len]`, ONNX
+  attention couples the batch dim across QKV/mask/past/present), so 2a used the stateless
+  escape hatch #844 anticipated and left `cuda.rs` untouched. Remaining: **2b** batched KV
+  + recapture accounting (batch-N *decode* capture must be quantified, not assumed), **2c**
+  wire `continuous_batch_manager`.
+- [ ] **#851 — intermittent `ILLEGAL_ADDRESS` in the mobius gate.** Parked, not solved.
+  Three hypotheses eliminated (not gate flakiness — 8/8 strict solo; not kept-graph replay —
+  25/25 isolated; not a relocated weight mapping — the fault targets a freshly allocated
+  buffer, so it is a deferred fault whose reported node is the detection site). Never a data
+  mismatch across ~49 runs, only whole-process crashes. Blocked on `compute-sanitizer`
+  (no CUDA toolkit on this box) and on a card large enough to reproduce genuine
+  multi-process oversubscription without contention confounds.
 - [ ] **GPU-resident ORT QMoE baseline:** still unavailable — ORT 1.28 crashes on QMoE
   through both the backend and GenAI-direct paths (#766), and the earlier reference inserted
   four `Memcpy` nodes at 0% sustained GPU utilization. No native-vs-ORT QMoE perf claim is

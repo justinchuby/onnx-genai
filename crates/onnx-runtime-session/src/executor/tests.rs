@@ -5719,3 +5719,308 @@ fn a_misaligned_external_buffer_is_refused() {
         "the error must say the problem is alignment, got: {message}"
     );
 }
+
+// PR (GQA fixed-capacity KV capture pin): a `GroupQueryAttention` node reads its
+// past-KV inputs (3/4) as PHYSICAL CAPACITY and derives the valid attended
+// length on-device (`seqlens_k`), so when the engine binds the cache at a fixed
+// capacity the KV seq axis is CONSTANT across a captured replay. This locks the
+// pin: `collect_capacity_pinned_kv_symbols` picks up the GQA KV seq symbol,
+// `compute_capture_disqualifying_symbols_excluding` drops it (and its lineage
+// closure), and the GQA node PLUS a KV-cache-sized consumer become
+// capture-eligible — where without the pin they stay eager.
+#[test]
+fn gqa_fixed_capacity_kv_seq_symbol_is_pinned_and_admits_the_node() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    let batch = graph.create_symbol(None);
+    let seq = graph.create_symbol(None);
+    let seq_kv = graph.create_symbol(None);
+
+    let embeds = graph.create_named_value(
+        "inputs_embeds",
+        DataType::Float32,
+        vec![sym(batch), sym(seq), st(256)],
+    );
+    graph.add_input(embeds);
+    let past_key = graph.create_named_value(
+        "past_key_values.0.key",
+        DataType::Float32,
+        vec![sym(batch), st(2), sym(seq_kv), st(128)],
+    );
+    graph.add_input(past_key);
+    let past_value = graph.create_named_value(
+        "past_key_values.0.value",
+        DataType::Float32,
+        vec![sym(batch), st(2), sym(seq_kv), st(128)],
+    );
+    graph.add_input(past_value);
+    let attn_out = graph.create_named_value(
+        "attn_out",
+        DataType::Float32,
+        vec![sym(batch), sym(seq), st(256)],
+    );
+    let present_key = graph.create_named_value(
+        "present.0.key",
+        DataType::Float32,
+        vec![sym(batch), st(2), sym(seq_kv), st(128)],
+    );
+    let present_value = graph.create_named_value(
+        "present.0.value",
+        DataType::Float32,
+        vec![sym(batch), st(2), sym(seq_kv), st(128)],
+    );
+    let mut gqa = Node::new(
+        NodeId(0),
+        "GroupQueryAttention",
+        vec![
+            Some(embeds),
+            Some(embeds),
+            Some(embeds),
+            Some(past_key),
+            Some(past_value),
+        ],
+        vec![attn_out, present_key, present_value],
+    );
+    gqa.domain = "com.microsoft".to_string();
+    graph.insert_node(gqa.clone());
+
+    let kv_out = graph.create_named_value(
+        "kv_sized_consumer_out",
+        DataType::Float32,
+        vec![sym(batch), st(2), sym(seq_kv), st(128)],
+    );
+    let kv_consumer = Node::new(NodeId(1), "Sigmoid", vec![Some(present_key)], vec![kv_out]);
+
+    // Baseline (no pin): the GQA node and the KV-sized consumer are BOTH vetoed.
+    let baseline = compute_capture_disqualifying_symbols(&graph);
+    assert!(
+        baseline.contains(&seq_kv),
+        "without the pin the GQA KV seq symbol must be disqualifying, got {baseline:?}"
+    );
+    assert!(
+        !node_capture_seq_independent(&graph, &gqa, &baseline),
+        "without the pin the GQA node must stay eager"
+    );
+    assert!(
+        !node_capture_seq_independent(&graph, &kv_consumer, &baseline),
+        "without the pin the KV-cache-sized consumer must stay eager"
+    );
+
+    // The pin: GQA's fixed-capacity KV seq symbol is collected and excluded.
+    let pinned = collect_capacity_pinned_kv_symbols(&graph);
+    assert!(
+        pinned.contains(&seq_kv),
+        "the GQA fixed-capacity KV seq symbol must be pinned, got {pinned:?}"
+    );
+    let pinned_set = compute_capture_disqualifying_symbols_excluding(&graph, &pinned);
+    assert!(
+        !pinned_set.contains(&seq_kv),
+        "the pinned KV seq symbol must be excluded from the disqualifying set, got {pinned_set:?}"
+    );
+    assert!(
+        node_capture_seq_independent(&graph, &gqa, &pinned_set),
+        "with the pin the GQA node must be capture-eligible"
+    );
+    assert!(
+        node_capture_seq_independent(&graph, &kv_consumer, &pinned_set),
+        "with the pin a fixed-capacity-KV-sized consumer must be capture-eligible"
+    );
+
+    // Idempotent: re-deriving the pin from the graph yields the same set.
+    assert_eq!(
+        collect_capacity_pinned_kv_symbols(&graph),
+        pinned,
+        "the pin must be a pure, idempotent function of the graph"
+    );
+}
+
+// GUARD (don't blanket-disable the veto): a GENUINELY GROWING KV path — one whose
+// attention op does NOT read its cache as physical capacity — must NOT be pinned,
+// so its symbol stays disqualifying and the node stays eager.
+//
+// (1) A default-domain, CAUSAL `Attention` derives past length from the growing
+//     cache extent (not from a mask frontier), so its cache is not physical
+//     capacity: not pinned.
+// (2) `CompressedSparseAttention` has NO past-KV inputs (its records grow from
+//     total_sequence_length), so it cannot be a capacity form: not pinned.
+#[test]
+fn growing_kv_paths_are_not_pinned_and_stay_vetoed() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    let batch = graph.create_symbol(None);
+    let attn_seq_kv = graph.create_symbol(None);
+    let csa_records = graph.create_symbol(None);
+
+    // (1) Causal default-domain Attention (growing-concat KV, no mask input at 3).
+    let q = graph.create_named_value("q", DataType::Float32, vec![sym(batch), st(1), st(512)]);
+    graph.add_input(q);
+    let attn_past_key = graph.create_named_value(
+        "attn_past_key",
+        DataType::Float32,
+        vec![sym(batch), st(4), sym(attn_seq_kv), st(128)],
+    );
+    graph.add_input(attn_past_key);
+    let attn_past_value = graph.create_named_value(
+        "attn_past_value",
+        DataType::Float32,
+        vec![sym(batch), st(4), sym(attn_seq_kv), st(128)],
+    );
+    graph.add_input(attn_past_value);
+    let mut attention = Node::new(
+        NodeId(0),
+        "Attention",
+        vec![
+            Some(q),
+            Some(q),
+            Some(q),
+            None,
+            Some(attn_past_key),
+            Some(attn_past_value),
+        ],
+        vec![],
+    );
+    attention
+        .attributes
+        .insert("is_causal".into(), Attribute::Int(1));
+    graph.insert_node(attention);
+
+    // (2) CompressedSparseAttention: records grow on outputs 1/3, no past inputs.
+    let csa_q =
+        graph.create_named_value("csa_q", DataType::Float32, vec![sym(batch), st(1), st(512)]);
+    graph.add_input(csa_q);
+    let csa_records_out = graph.create_named_value(
+        "csa_records",
+        DataType::Float32,
+        vec![sym(batch), st(4), sym(csa_records), st(64)],
+    );
+    graph.add_output(csa_records_out);
+    let mut csa = Node::new(
+        NodeId(1),
+        "CompressedSparseAttention",
+        vec![Some(csa_q)],
+        vec![csa_q, csa_records_out, csa_q, csa_records_out],
+    );
+    csa.domain = "com.microsoft".to_string();
+    graph.insert_node(csa);
+
+    let pinned = collect_capacity_pinned_kv_symbols(&graph);
+    assert!(
+        !pinned.contains(&attn_seq_kv),
+        "a causal (growing-concat) Attention KV symbol must NOT be pinned, got {pinned:?}"
+    );
+    assert!(
+        !pinned.contains(&csa_records),
+        "a CSA records symbol (no past-KV inputs) must NOT be pinned, got {pinned:?}"
+    );
+
+    let set = compute_capture_disqualifying_symbols_excluding(&graph, &pinned);
+    assert!(
+        set.contains(&attn_seq_kv) && set.contains(&csa_records),
+        "genuinely growing KV symbols must stay disqualifying, got {set:?}"
+    );
+}
+
+// Executor-level integration of the pin: building a decode executor over a GQA
+// graph seeds the GQA KV seq symbol as disqualifying (every GQA layer eager);
+// after `pin_fixed_capacity_kv_capture_symbols` the symbol is excluded and the
+// pinned set is recorded. Locks the engine-facing entry point end to end.
+#[test]
+fn executor_pin_fixed_capacity_kv_admits_gqa() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    graph.opset_imports.insert("com.microsoft".into(), 1);
+
+    let sym = Dim::Symbolic;
+    let st = Dim::Static;
+
+    let batch = graph.create_symbol(None);
+    let seq_kv = graph.create_symbol(None);
+
+    let q = graph.create_named_value("q", DataType::Float32, vec![sym(batch), st(1), st(256)]);
+    graph.add_input(q);
+    let past_key = graph.create_named_value(
+        "past_key_values.0.key",
+        DataType::Float32,
+        vec![sym(batch), st(2), sym(seq_kv), st(128)],
+    );
+    graph.add_input(past_key);
+    let past_value = graph.create_named_value(
+        "past_key_values.0.value",
+        DataType::Float32,
+        vec![sym(batch), st(2), sym(seq_kv), st(128)],
+    );
+    graph.add_input(past_value);
+    let attn_out = graph.create_named_value(
+        "attn_out",
+        DataType::Float32,
+        vec![sym(batch), st(1), st(256)],
+    );
+    graph.add_output(attn_out);
+    let present_key = graph.create_named_value(
+        "present.0.key",
+        DataType::Float32,
+        vec![sym(batch), st(2), sym(seq_kv), st(128)],
+    );
+    graph.add_output(present_key);
+    let present_value = graph.create_named_value(
+        "present.0.value",
+        DataType::Float32,
+        vec![sym(batch), st(2), sym(seq_kv), st(128)],
+    );
+    graph.add_output(present_value);
+    let mut gqa = Node::new(
+        NodeId(0),
+        "GroupQueryAttention",
+        vec![Some(q), Some(q), Some(q), Some(past_key), Some(past_value)],
+        vec![attn_out, present_key, present_value],
+    );
+    gqa.domain = "com.microsoft".to_string();
+    gqa.attributes.insert("num_heads".into(), Attribute::Int(8));
+    gqa.attributes
+        .insert("kv_num_heads".into(), Attribute::Int(2));
+    let gqa_node_id = gqa.id;
+    graph.insert_node(gqa);
+
+    let mut exec = Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+    )
+    .unwrap();
+
+    let gqa_node = exec.graph.node(gqa_node_id).clone();
+    assert!(
+        exec.capture_growing_symbols.contains(&seq_kv),
+        "before the pin the GQA KV seq symbol must be disqualifying"
+    );
+    assert!(
+        !node_capture_seq_independent(&exec.graph, &gqa_node, &exec.capture_growing_symbols),
+        "before the pin the GQA node must be classifier-vetoed"
+    );
+
+    let pinned = exec.pin_fixed_capacity_kv_capture_symbols();
+    assert!(
+        pinned >= 1,
+        "at least the GQA KV seq symbol must be pinned, got {pinned}"
+    );
+    assert!(
+        exec.capacity_pinned_kv_symbols.contains(&seq_kv),
+        "the executor must record the pinned KV symbol"
+    );
+    assert!(
+        !exec.capture_growing_symbols.contains(&seq_kv),
+        "after the pin the KV seq symbol must be excluded from the disqualifying set"
+    );
+    assert!(
+        node_capture_seq_independent(&exec.graph, &gqa_node, &exec.capture_growing_symbols),
+        "after the pin the GQA node must be admitted to capture"
+    );
+}
