@@ -172,53 +172,57 @@ impl OptimizationPass for CudaSiluFusion {
     }
 }
 
-/// Drop the redundant `Cast` pairs that some exporters (e.g. Phi-4-mini) wrap
-/// around every simplified-layer-norm, running the norm directly on its fp16
-/// activations instead.
+/// Drop the redundant `Cast` pairs that some exporters (e.g. Phi-4-mini,
+/// Muse-Glimmer) wrap around every simplified-layer-norm / RMS-norm, running the
+/// norm directly on its narrow (fp16 or bf16) activations instead.
 ///
 /// ## The pattern
 ///
 /// Certain decoders export each `SimplifiedLayerNormalization` /
-/// `SkipSimplifiedLayerNormalization` in fp32: each fp16 activation input is
-/// preceded by a `Cast(fp16 → fp32)`, and each fp32 result is followed by a
-/// `Cast(fp32 → fp16)` back to the residual stream. A 32-layer decoder emits
-/// ~256 of these tiny `Cast` kernels per token — a per-token launch/round-trip
+/// `SkipSimplifiedLayerNormalization` / `RMSNormalization` in fp32: each narrow
+/// (fp16 or bf16) activation input is preceded by a `Cast(narrow → fp32)`, and
+/// each fp32 result is followed by a `Cast(fp32 → narrow)` back to the residual
+/// stream. A 32-layer fp16 decoder emits ~256 of these tiny `Cast` kernels per
+/// token; a 52-layer bf16 decoder such as Muse-Glimmer emits ~624 (a `Cast`
+/// pair around every one of its 312 RMS-norms) — a per-token launch/round-trip
 /// cost that is pure overhead. Models like Qwen2.5 instead run the same norm in
-/// fp16 with **no** surrounding casts.
+/// their native storage dtype with **no** surrounding casts.
 ///
 /// ## Where the win lands
 ///
 /// Removing the casts shrinks the graph and drops hundreds of kernels per
-/// token, but the throughput benefit is concentrated in the **eager** decode
-/// path, where each removed kernel is a saved launch. Measured on Phi-4-mini
-/// (H200): eager decode improves ~25 %. When the decode step is CUDA-graph
-/// captured (Phi's production path, zero fallbacks), replay already amortizes
-/// per-kernel launch overhead, so the captured-path decode throughput is flat
-/// (within run-to-run noise). The pass is still net-positive there — fewer
-/// kernels, a smaller captured graph, and a real prefill/eager win — but it is
-/// not the lever that closes Phi's captured-path gap to ORT (that is
-/// GroupQueryAttention, tracked separately).
+/// token. On the **eager** decode path each removed kernel is a saved launch
+/// (measured on Phi-4-mini/H200: ~25 %). On a **CUDA-graph captured** decode
+/// step, replay amortizes per-kernel launch overhead, so for a norm count that
+/// is a small slice of the graph (Phi's fp16 path) captured throughput is flat
+/// within noise. But when the cast kernels themselves dominate captured GPU
+/// time — Muse-Glimmer's 626 casts/token are ~40 % of decode, each reading and
+/// writing the full hidden state — removing them removes real memory traffic
+/// from every replay, which is a direct captured-path speedup.
 ///
 /// ## The rewrite
 ///
-/// For a matching norm this pass rewires each activation input to the fp16
-/// value feeding its `Cast`, retypes the consumed norm outputs to fp16, and
-/// bypasses/deletes the surrounding `Cast` nodes. The CUDA norm kernels already
-/// accept fp16 activations with fp32 accumulation (and either fp16 or fp32
-/// `gamma`), so the fp32 scale weight is left untouched — the arithmetic is the
-/// same fp32-accumulate / fp16-rounded scheme those kernels use for natively
-/// fp16 models such as Qwen2.5.
+/// For a matching norm this pass rewires each activation input to the narrow
+/// value feeding its `Cast`, retypes the consumed norm outputs to that same
+/// narrow dtype, and bypasses/deletes the surrounding `Cast` nodes. The CUDA
+/// norm kernels already accept fp16/bf16 activations with fp32 accumulation (and
+/// either a narrow or fp32 `gamma`/`scale`), so the fp32 scale weight is left
+/// untouched — the arithmetic is the same fp32-accumulate / narrow-rounded
+/// scheme those kernels use for natively fp16/bf16 models. (Muse-Glimmer's RMS
+/// scale is a constant `Cast(weight_bf16 → fp32) + 1` expression on input 1,
+/// which is not an activation index and so is left exactly as exported.)
 ///
 /// ## Generality and safety
 ///
 /// The rewrite is driven purely by topology + tensor dtypes, never by model
 /// identity:
-/// * the node is a simplified-layer-norm in its expected domain;
+/// * the node is a simplified-layer-norm / RMS-norm in its expected domain;
 /// * every activation data input is produced by a `Cast(→ fp32)` whose source
-///   is fp16 (weights are producer-less initializers, so they never match and
-///   are left alone);
-/// * every consumed norm output feeds only `Cast(→ fp16)` nodes and is not a
-///   graph output;
+///   is the **same** narrow float dtype (fp16 or bf16), and weights are
+///   producer-less initializers or non-activation inputs, so they never match
+///   and are left alone;
+/// * every consumed norm output feeds only `Cast(→ narrow)` nodes (matching the
+///   activation dtype) and is not a graph output;
 /// * an optional norm bias is required absent (kept conservative).
 ///
 /// When any condition fails the norm is left exactly as exported. Input `Cast`
@@ -241,10 +245,15 @@ fn norm_cast_fold_disabled() -> bool {
 /// A planned rewrite of one cast-wrapped normalization node.
 struct NormCastFoldPlan {
     node_id: NodeId,
-    /// Full input vector with each fp16-cast activation input rewired to the
-    /// pre-cast fp16 source value.
+    /// The narrow activation storage dtype (fp16 or bf16) the norm is rewired to
+    /// run on directly. Every un-cast activation input and every retyped output
+    /// share this dtype.
+    narrow_dtype: DataType,
+    /// Full input vector with each cast activation input rewired to the pre-cast
+    /// narrow (fp16/bf16) source value.
     new_inputs: Vec<Option<ValueId>>,
-    /// Norm outputs to retype from fp32 to fp16 (the consumed float results).
+    /// Norm outputs to retype from fp32 to the narrow activation dtype (the
+    /// consumed float results).
     retyped_outputs: Vec<ValueId>,
     /// `(cast_output, norm_output, cast_node)` triples: downstream uses of
     /// `cast_output` are moved onto `norm_output` and the `Cast` is deleted.
@@ -296,11 +305,29 @@ impl CudaDropNormalizationCasts {
         // 1. Rewire the norm onto its pre-cast fp16 activation inputs.
         let mut node = graph.node(plan.node_id).clone();
         node.inputs = plan.new_inputs;
+        // `RMSNormalization` (ai.onnx opset 23) is the one supported norm whose
+        // output element type follows the *scale* (`V`), not the activation `X`
+        // (`T`) — see the ONNX schema and `rms_norm` in the shape-inference
+        // crate. Muse-Glimmer keeps an f32 scale (`Add(Cast(weight_bf16→f32), 1)`)
+        // even for its bf16 activations, so re-running shape inference after this
+        // pass would clobber the narrow output we just retyped back to f32 (the
+        // scale dtype), leaving a bf16-in / f32-out norm the kernel rejects.
+        // `SimplifiedLayerNormalization` is the identical operation (RMS scaling,
+        // no mean subtraction) whose output follows `X`; both ops map to the same
+        // fused `RmsNormKernel` on the CUDA and CPU EPs (see
+        // `kernels/mod.rs`). Converting the folded node preserves the exact
+        // arithmetic (fp32 accumulation, f32 scale, single round-to-nearest-even
+        // on the narrow output — byte-identical to the removed `Cast`) while
+        // letting inference keep the narrow output dtype.
+        if node.op_type == "RMSNormalization" && matches!(node.domain.as_str(), "" | "ai.onnx") {
+            node.op_type = "SimplifiedLayerNormalization".into();
+        }
         graph.replace_node(plan.node_id, node);
 
-        // 2. Retype the consumed float outputs to fp16 to match the inputs.
+        // 2. Retype the consumed float outputs to the narrow activation dtype to
+        //    match the inputs.
         for output in plan.retyped_outputs {
-            graph.value_mut(output).dtype = DataType::Float16;
+            graph.value_mut(output).dtype = plan.narrow_dtype;
         }
 
         // 3. Bypass and delete the output `Cast` nodes.
@@ -326,20 +353,27 @@ impl CudaDropNormalizationCasts {
 impl CudaDropNormalizationCasts {
     /// The activation (non-weight) input indices for a supported simplified
     /// layer-norm, or `None` if the node is not one. `SkipSimplified*` takes
-    /// `(input, skip, gamma[, bias])`; the plain `Simplified*` takes
-    /// `(X, scale)`. Only the data inputs are candidates for un-casting; the
-    /// weight (`gamma` / `scale`) and any bias are producer-less initializers.
+    /// `(input, skip, gamma[, bias])`; the plain `Simplified*` / `RMSNormalization`
+    /// take `(X, scale)`. Only the data inputs are candidates for un-casting; the
+    /// weight (`gamma` / `scale`) and any bias are left untouched (they may be
+    /// producer-less initializers or a constant `weight + 1` scale expression).
     fn activation_input_indices(node: &onnx_runtime_ir::Node) -> Option<&'static [usize]> {
         match (node.op_type.as_str(), node.domain.as_str()) {
             ("SkipSimplifiedLayerNormalization", MICROSOFT_DOMAIN) => Some(&[0, 1]),
             ("SimplifiedLayerNormalization", "" | "ai.onnx") => Some(&[0]),
+            ("RMSNormalization", "" | "ai.onnx") => Some(&[0]),
             _ => None,
         }
     }
 
-    /// If `value` is produced by a `Cast(fp16 → fp32)`, return the `Cast` node
-    /// and its fp16 source value.
-    fn fp32_cast_from_fp16(&self, graph: &Graph, value: ValueId) -> Option<(NodeId, ValueId)> {
+    /// If `value` is produced by a `Cast(narrow → fp32)` where `narrow` is a
+    /// narrow float storage dtype (fp16 or bf16), return the `Cast` node, its
+    /// narrow source value, and that narrow dtype.
+    fn fp32_cast_from_narrow(
+        &self,
+        graph: &Graph,
+        value: ValueId,
+    ) -> Option<(NodeId, ValueId, DataType)> {
         let producer = graph.try_value(value)?.producer?;
         let node = graph.try_node(producer)?;
         if node.op_type != "Cast" || !matches!(node.domain.as_str(), "" | "ai.onnx") {
@@ -349,10 +383,11 @@ impl CudaDropNormalizationCasts {
             return None;
         }
         let source = node.inputs.first().copied().flatten()?;
-        if graph.try_value(source)?.dtype != DataType::Float16 {
+        let source_dtype = graph.try_value(source)?.dtype;
+        if source_dtype != DataType::Float16 && source_dtype != DataType::BFloat16 {
             return None;
         }
-        Some((producer, source))
+        Some((producer, source, source_dtype))
     }
 
     fn plan_fold(&self, graph: &Graph, node_id: NodeId) -> Option<NormCastFoldPlan> {
@@ -366,18 +401,35 @@ impl CudaDropNormalizationCasts {
             return None;
         }
 
-        // Every activation input must be a fp16 → fp32 `Cast`; rewire it to the
-        // fp16 source.
+        // A narrowed `RMSNormalization` is rewritten to `SimplifiedLayerNormalization`
+        // (identical arithmetic, output follows `X`) so shape inference keeps the
+        // narrow output dtype. That synonym only carries the single normalized
+        // output, so decline any `RMSNormalization` that also emits the optional
+        // `InvStdDev` stat (whose f32 dtype the synonym's inference would not
+        // preserve). Muse-Glimmer's decode norms emit only `Y`.
+        if node.op_type == "RMSNormalization" && node.outputs.len() != 1 {
+            return None;
+        }
+
+        // Every activation input must be a narrow (fp16/bf16) → fp32 `Cast`;
+        // rewire it to the narrow source. All activation inputs must share the
+        // same narrow dtype.
         let mut new_inputs = node.inputs.clone();
         let mut dead_input_casts = Vec::new();
+        let mut narrow_dtype: Option<DataType> = None;
         for &index in activation_indices {
             let value = node.inputs.get(index).copied().flatten()?;
-            let (cast_id, source) = self.fp32_cast_from_fp16(graph, value)?;
+            let (cast_id, source, source_dtype) = self.fp32_cast_from_narrow(graph, value)?;
+            if *narrow_dtype.get_or_insert(source_dtype) != source_dtype {
+                return None;
+            }
             new_inputs[index] = Some(source);
             dead_input_casts.push(cast_id);
         }
+        let narrow_dtype = narrow_dtype?;
 
-        // Every consumed float output must feed only `Cast(→ fp16)` nodes.
+        // Every consumed float output must feed only `Cast(→ narrow)` nodes,
+        // where `narrow` matches the activation dtype.
         let mut retyped_outputs = Vec::new();
         let mut output_cast_bypass = Vec::new();
         for &output in &node.outputs {
@@ -393,7 +445,7 @@ impl CudaDropNormalizationCasts {
                 if cast.op_type != "Cast" || !matches!(cast.domain.as_str(), "" | "ai.onnx") {
                     return None;
                 }
-                if cast_target(cast)? != DataType::Float16 {
+                if cast_target(cast)? != narrow_dtype {
                     return None;
                 }
                 let cast_output = *cast.outputs.first()?;
@@ -403,7 +455,7 @@ impl CudaDropNormalizationCasts {
         }
 
         // The primary (normalized) output must actually be one we retyped; the
-        // kernel requires the output dtype to match the fp16 input dtype.
+        // kernel requires the output dtype to match the narrow input dtype.
         let primary = *node.outputs.first()?;
         if !retyped_outputs.contains(&primary) {
             return None;
@@ -411,6 +463,7 @@ impl CudaDropNormalizationCasts {
 
         Some(NormCastFoldPlan {
             node_id,
+            narrow_dtype,
             new_inputs,
             retyped_outputs,
             output_cast_bypass,
@@ -4212,6 +4265,225 @@ mod tests {
         }
         assert_eq!(graph.value(norm_a).dtype, DataType::Float16);
         assert_eq!(graph.value(norm_b).dtype, DataType::Float16);
+        assert!(graph.validate().is_ok());
+    }
+
+    /// A bf16 `RMSNormalization` exported in fp32 with a `Cast(bf16 -> f32)` on
+    /// its activation input and a `Cast(f32 -> bf16)` on its result — the
+    /// Muse-Glimmer shape. The `scale` weight stays fp32 (in the real model it is
+    /// a constant `Cast(weight_bf16 -> f32) + 1` expression; here we model it as a
+    /// plain fp32 initializer, since the pass only touches activation index 0).
+    fn cast_wrapped_rms_norm_graph_bf16(hidden: usize) -> (Graph, ValueId, ValueId) {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+
+        let x_bf16 = value(&mut graph, "x_bf16", DataType::BFloat16, hidden);
+        graph.add_input(x_bf16);
+        let scale = vec1d(&mut graph, "scale", DataType::Float32, hidden);
+        graph.set_initializer(
+            scale,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float32,
+                vec![hidden],
+                vec![0u8; hidden * 4],
+            )),
+        );
+
+        let x_f32 = cast_node(&mut graph, "x_f32", x_bf16, DataType::Float32, hidden);
+        let norm_out = value(&mut graph, "norm_out", DataType::Float32, hidden);
+        let mut rms = Node::new(
+            NodeId(0),
+            "RMSNormalization",
+            vec![Some(x_f32), Some(scale)],
+            vec![norm_out],
+        );
+        rms.attributes
+            .insert("epsilon".into(), Attribute::Float(1e-6));
+        graph.insert_node(rms);
+
+        let normalized = cast_node(
+            &mut graph,
+            "normalized",
+            norm_out,
+            DataType::BFloat16,
+            hidden,
+        );
+        graph.add_output(normalized);
+        (graph, x_bf16, scale)
+    }
+
+    #[test]
+    fn drops_casts_around_fp32_wrapped_bf16_rms_norm() {
+        let hidden = 128;
+        let (mut graph, x_bf16, scale) = cast_wrapped_rms_norm_graph_bf16(hidden);
+
+        CudaDropNormalizationCasts
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        // Every wrapping Cast is gone.
+        assert_eq!(
+            graph.nodes.values().filter(|n| n.op_type == "Cast").count(),
+            0,
+            "all bf16 cast wrappers must be removed"
+        );
+
+        // The narrowed `RMSNormalization` is rewritten to the identical-arithmetic
+        // `SimplifiedLayerNormalization` (whose output follows `X`, not the scale),
+        // so re-running shape inference keeps the bf16 output instead of clobbering
+        // it back to the f32 scale dtype.
+        assert!(
+            graph
+                .nodes
+                .values()
+                .all(|n| n.op_type != "RMSNormalization"),
+            "narrowed RMSNormalization must be converted to SimplifiedLayerNormalization"
+        );
+        let rms = graph
+            .nodes
+            .values()
+            .find(|n| n.op_type == "SimplifiedLayerNormalization")
+            .expect("converted norm node retained");
+        assert_eq!(rms.domain, "", "converted norm stays in the ai.onnx domain");
+        assert_eq!(
+            rms.inputs,
+            vec![Some(x_bf16), Some(scale)],
+            "activation input rewired to bf16 source; scale untouched"
+        );
+        // Its consumed float output is retyped to bf16, matching the input.
+        assert_eq!(graph.value(rms.outputs[0]).dtype, DataType::BFloat16);
+        // The fp32 scale weight is preserved (kernel upcasts activation, applies
+        // fp32 scale).
+        assert_eq!(graph.value(scale).dtype, DataType::Float32);
+        // Graph output is now the norm's bf16 output.
+        assert_eq!(graph.outputs.len(), 1);
+        assert_eq!(graph.value(graph.outputs[0]).dtype, DataType::BFloat16);
+        assert!(graph.validate().is_ok());
+
+        // Re-running shape inference (as the session does after optimization) must
+        // preserve the bf16 output — the whole point of the op conversion.
+        let registry = onnx_runtime_shape_inference::InferenceRegistry::default_registry();
+        let opsets = graph.opset_imports.clone();
+        registry
+            .infer_graph(
+                &mut graph,
+                &opsets,
+                onnx_runtime_shape_inference::MergePolicy::Permissive,
+            )
+            .unwrap();
+        let rms_out = graph
+            .nodes
+            .values()
+            .find(|n| n.op_type == "SimplifiedLayerNormalization")
+            .expect("converted norm retained after inference")
+            .outputs[0];
+        assert_eq!(
+            graph.value(rms_out).dtype,
+            DataType::BFloat16,
+            "re-inference must keep the narrow (bf16) output, not the f32 scale dtype"
+        );
+    }
+
+    #[test]
+    fn leaves_native_bf16_rms_norm_untouched() {
+        // A bf16 `RMSNormalization` already exported without cast wrappers must
+        // be left byte-for-byte unchanged.
+        let hidden = 128;
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        let x = value(&mut graph, "x", DataType::BFloat16, hidden);
+        graph.add_input(x);
+        let scale = vec1d(&mut graph, "scale", DataType::BFloat16, hidden);
+        graph.set_initializer(
+            scale,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::BFloat16,
+                vec![hidden],
+                vec![0u8; hidden * 2],
+            )),
+        );
+        let norm_out = value(&mut graph, "norm_out", DataType::BFloat16, hidden);
+        let mut rms = Node::new(
+            NodeId(0),
+            "RMSNormalization",
+            vec![Some(x), Some(scale)],
+            vec![norm_out],
+        );
+        rms.attributes
+            .insert("epsilon".into(), Attribute::Float(1e-6));
+        graph.insert_node(rms);
+        graph.add_output(norm_out);
+
+        let before = graph.nodes.len();
+        CudaDropNormalizationCasts
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        assert_eq!(graph.nodes.len(), before, "no nodes added or removed");
+        let rms = graph
+            .nodes
+            .values()
+            .find(|n| n.op_type == "RMSNormalization")
+            .expect("norm retained");
+        assert_eq!(rms.inputs, vec![Some(x), Some(scale)]);
+        assert_eq!(graph.value(norm_out).dtype, DataType::BFloat16);
+    }
+
+    #[test]
+    fn leaves_mixed_narrow_dtype_norm_untouched() {
+        // A norm whose two activation inputs are cast from *different* narrow
+        // dtypes (one fp16, one bf16) is malformed for a single-dtype fold and
+        // must be left exactly as exported.
+        let hidden = 128;
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+        graph.opset_imports.insert(MICROSOFT_DOMAIN.into(), 1);
+
+        let a = value(&mut graph, "a", DataType::Float16, hidden);
+        let b = value(&mut graph, "b", DataType::BFloat16, hidden);
+        graph.add_input(a);
+        graph.add_input(b);
+        let gamma = vec1d(&mut graph, "gamma", DataType::Float32, hidden);
+        graph.set_initializer(
+            gamma,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float32,
+                vec![hidden],
+                vec![0u8; hidden * 4],
+            )),
+        );
+
+        let in0 = cast_node(&mut graph, "in0", a, DataType::Float32, hidden);
+        let in1 = cast_node(&mut graph, "in1", b, DataType::Float32, hidden);
+        let norm_out = value(&mut graph, "norm_out", DataType::Float32, hidden);
+        let mut skip = Node::new(
+            NodeId(0),
+            "SkipSimplifiedLayerNormalization",
+            vec![Some(in0), Some(in1), Some(gamma)],
+            vec![norm_out],
+        );
+        skip.domain = MICROSOFT_DOMAIN.into();
+        graph.insert_node(skip);
+        let normalized = cast_node(
+            &mut graph,
+            "normalized",
+            norm_out,
+            DataType::Float16,
+            hidden,
+        );
+        graph.add_output(normalized);
+
+        let casts_before = graph.nodes.values().filter(|n| n.op_type == "Cast").count();
+        CudaDropNormalizationCasts
+            .run(&mut graph, &PassContext::new())
+            .unwrap();
+
+        assert_eq!(
+            graph.nodes.values().filter(|n| n.op_type == "Cast").count(),
+            casts_before,
+            "a mixed fp16/bf16 activation norm must not be folded"
+        );
+        assert_eq!(graph.value(norm_out).dtype, DataType::Float32);
         assert!(graph.validate().is_ok());
     }
 
