@@ -544,6 +544,65 @@ reorder, no Chew gate; it simply activates the landed #867 bf16 kernel that the 
 gate was hiding. Further glue collapse on this model requires a **bf16 skip-RMSNorm kernel that
 rounds the residual sum** (Sebastian/Chew) before #854's fold can fire byte-exactly on bf16.
 
+### 8.6 REALIZED — byte-exact bf16 skip-RMSNorm kernel + fold (measured, this H200)
+
+This closes the §8.5 blocker: the missing **byte-exact bf16 skip kernel**. Muse-Glimmer-30B
+(Gemma3 sandwich-norm) has 6 `SimplifiedLayerNormalization`/layer × 52 = 312 norm nodes, each
+residual seam being `Add(residual, sublayer_out) → SimplifiedLayerNormalization`. #854's
+`SkipSimplifiedLayerNormalization` fold applies across the seam, but until now no bf16 skip kernel
+existed that is **bit-identical** to the standalone `Add(bf16)` + `rmsnorm_bf16` pair, so Batty
+(#900) could not collapse the norms.
+
+**What was built (kept, proven byte-exact):**
+- A new **`skip_rmsnorm_bf16`** NVRTC kernel (`kernels/normalization.rs`): computes
+  `sum = __float2bfloat16_rn(f32(residual) + f32(x))` (bit-for-bit what a standalone bf16 `Add`
+  writes), stores that bf16-rounded sum as the next layer's residual, then runs the **identical**
+  `rmsnorm_bf16` block-tree reduction (fp32 accumulate over the *rounded* sum, same `NORM_BLOCK=256`
+  reduction config). So `y` and the residual `sum` are bit-identical to running the two ops
+  separately. Guarded native dispatch with a graceful `run_bf16_via_f32` fallback for non-dense /
+  bias / header-unavailable cases (Rule 11 portability). **GPU-verified 0-ulp** vs standalone
+  `Add(bf16)`→`rmsnorm_bf16` at H=6656 for both bf16 and f32 gamma
+  (`bf16_native_skip_rmsnorm_is_byte_exact_with_{bf16,f32}_gamma`).
+- An optimizer fold **`CudaSkipRmsNormFusion`** that collapses the `Add → SimplifiedLayerNormalization`
+  seam into one `com.microsoft::SkipSimplifiedLayerNormalization`, deleting the standalone `Add` +
+  norm launches (bf16/f32-gamma-over-bf16 only; fp16 is left to `CudaSkipRmsNormMatMulFusion`).
+
+**Numeric fidelity (Chew gate): byte-exact.** Real-model greedy stream, fold OFF vs ON, is
+**bit-identical** (48/48 tokens; 128-token run also identical):
+`[24, 372, 1045, 10016, 328, 2885, 262, 5091, 8811, 511, 917, 4921, 768, …]`. The fold is byte-exact
+by construction (the kernel rounds the residual sum before the reduction, and the reduction order is
+unchanged), so no reduction is reordered — **no numerics divergence.**
+
+**Measured decode A/B (H200, `ONNX_GENAI_CUDA_GRAPH=1`, `--steady --warmups 1 --runs 3 --tokens 128`,
+interleaved on one release binary):**
+
+| metric | fold OFF (default) | fold ON |
+|---|---|---|
+| `SkipSimplifiedLayerNormalization` nodes | 4 | **104** (2 seams/layer × 52) |
+| standalone `Add` + norm seams removed | — | 104 `Add` + 104 norm folded away |
+| decode | 20.93 ms/token | 21.25 ms/token |
+| throughput | **47.77 tok/s** | **47.06 tok/s (−1.5%)** |
+| greedy tokens | reference | **byte-identical** |
+
+**Verdict — kernel SHIP, fold NO-SHIP (opt-in, default OFF).** The fold is byte-exact but a measured
+**~1.5% regression** under CUDA-graph replay, and the per-op eager timer *confirms the mechanism*: in
+eager the fused glue is faster (Add+norm+skip summed 355.6 → 349.0 ms — the launch saving is real),
+but under **graph replay those launches are already amortized** (§8.1 ~0.9 µs/node floor), so the only
+thing left is that one heavier single-CTA `skip` kernel replaces a fast **multi-CTA** `Add` (whole-GPU)
+plus a single-CTA norm. At M=1 the norm reduction is single-CTA (all H=6656 in one block), and folding
+the residual add *into* it **serializes** work that the standalone `Add` had spread across all 132 SMs —
+the exact structural reason the multi-CTA GEMV megakernel was NO-GO (§7) and glue collapse only paid
++0.9% (§8.5). Decode is confirmed at its launch-amortized latency floor; collapsing these two nodes
+recovers nothing and the serialized add costs net-negative.
+
+The **kernel is kept** (proven byte-exact, portability-gated) because it is the prerequisite for the
+*only* path that could win on bf16: folding the norm into the neighbouring **multi-CTA int4 GEMV**
+prologue/epilogue (the bf16 analogue of `CudaSkipRmsNormMatMulFusion`, which keeps the reduction
+distributed across the GEMV's CTAs instead of a standalone single-CTA launch) — a larger GEMV-kernel
+job, not this fold. The fold itself is **retained behind `ONNX_GENAI_CUDA_ENABLE_SKIP_RMSNORM_FUSION`
+(default OFF)** purely for A/B and for a future bandwidth-bound device where the multi-CTA-Add-vs-single-CTA-skip
+trade may flip. **No production regression: the default binary is unchanged (47.77 tok/s == baseline).**
+
 ---
 
 - Env: `source /home/justinchu/onnx-genai/.cudaenv.sh`; `CUDA_VISIBLE_DEVICES=0 ONNX_GENAI_CUDA_DEVICE=0`.

@@ -100,6 +100,11 @@ pub(crate) fn cuda_optimization_passes() -> Vec<Box<dyn OptimizationPass>> {
         // Runs before the fusions so they see the fp16-native normalization
         // form (no `Cast` wrappers) that the rest of the pipeline expects.
         Box::new(CudaDropNormalizationCasts),
+        // Collapse the now-clean bf16 residual `Add → SimplifiedLayerNormalization`
+        // seam into a single byte-exact `SkipSimplifiedLayerNormalization`. Placed
+        // before the MatMulNBits fusions so it does not race the residual `Add`
+        // (which is an activation+activation add, never a bias add).
+        Box::new(CudaSkipRmsNormFusion),
         Box::new(CudaMatMulNBitsBiasFusion),
         Box::new(CudaSwiGluFusion),
         Box::new(CudaGateUpSwiGluFusion),
@@ -489,6 +494,212 @@ impl CudaDropNormalizationCasts {
             retyped_outputs,
             output_cast_bypass,
             dead_input_casts,
+        })
+    }
+}
+
+/// Opt-in switch for [`CudaSkipRmsNormFusion`]. The fold is **off by default**:
+/// it is byte-exact but, on a launch-amortized CUDA-graph decode (the production
+/// path), collapsing the residual `Add` + norm into one `SkipSimplifiedLayerNorm`
+/// launch measured a small *regression* on H200 (~-1.7%, 47.9 -> 47.1 tok/s),
+/// matching the established finding (#898/#899) that M=1 decode sits at its
+/// launch-amortized latency floor, so node-collapse recovers ~0 and the single
+/// heavier skip kernel is net-negative. The kernel itself is proven byte-exact
+/// and kept for future bf16 GEMV-prologue fusion work; the fold is retained,
+/// gated off, purely for A/B measurement. Set to a non-empty, non-`0` value to
+/// enable it (e.g. on a bandwidth-bound device where the trade may flip).
+const SKIP_RMSNORM_FUSION_ENABLE_ENV: &str = "ONNX_GENAI_CUDA_ENABLE_SKIP_RMSNORM_FUSION";
+
+fn skip_rmsnorm_fusion_enabled() -> bool {
+    std::env::var_os(SKIP_RMSNORM_FUSION_ENABLE_ENV)
+        .is_some_and(|value| value != "0" && !value.is_empty())
+}
+
+/// Collapse a residual `Add(a, b) → SimplifiedLayerNormalization(sum, gamma)`
+/// seam into a single `com.microsoft::SkipSimplifiedLayerNormalization`, deleting
+/// the standalone `Add` and norm launches.
+///
+/// ## Why this is byte-exact (and only for bf16)
+///
+/// The native bf16 `SkipSimplifiedLayerNormalization` kernel
+/// (`skip_rmsnorm_bf16`) rounds the residual sum to bf16 **before** the RMS
+/// reduction — bit-for-bit what a standalone bf16 `Add` writes
+/// (`__float2bfloat16_rn(f32(a) + f32(b))`) — and reuses the identical
+/// `rmsnorm_bf16` block-tree reduction. So the fused node produces exactly the
+/// same `y` (normalized output) and `sum` (residual reused by the next layer) as
+/// running the two ops separately; greedy tokens are unchanged. The residual
+/// `sum` value is reused in place, so the next block's residual `Add` transparently
+/// consumes the fused node's output.
+///
+/// This holds **only for bf16**: the fp16 skip kernels use a warp reduction whose
+/// order differs from `Add(f16)` + `rmsnorm_f16`, so folding fp16 here would not
+/// be byte-exact (that path is instead handled, into the neighbouring GEMVs, by
+/// [`CudaSkipRmsNormMatMulFusion`], which explicitly requires fp16). f32 has no
+/// fused Skip kernel gain worth the risk. The pass therefore fires only when the
+/// residual and gamma are bf16/f32 over bf16 activations, and defers to the f32
+/// staging fallback for anything exotic (bias, broadcast skip). Off by default;
+/// enable for A/B with `ONNX_GENAI_CUDA_ENABLE_SKIP_RMSNORM_FUSION` (see that env
+/// const for the H200 regression rationale).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CudaSkipRmsNormFusion;
+
+struct SkipRmsNormFoldPlan {
+    add_id: NodeId,
+    norm_id: NodeId,
+    a: ValueId,
+    b: ValueId,
+    gamma: ValueId,
+    normalized_out: ValueId,
+    residual_sum: ValueId,
+    epsilon: f32,
+    stat_shape: onnx_runtime_ir::Shape,
+}
+
+impl OptimizationPass for CudaSkipRmsNormFusion {
+    fn name(&self) -> &str {
+        "CudaSkipRmsNormFusion"
+    }
+
+    fn run(&self, graph: &mut Graph, _ctx: &PassContext) -> OptimizerResult<()> {
+        if !skip_rmsnorm_fusion_enabled() {
+            return Ok(());
+        }
+        let norm_ids: Vec<NodeId> = graph
+            .nodes
+            .iter()
+            .filter_map(|(id, node)| {
+                (node.op_type == "SimplifiedLayerNormalization" && node.is_default_domain())
+                    .then_some(id)
+            })
+            .collect();
+
+        let mut plans: Vec<SkipRmsNormFoldPlan> = Vec::new();
+        let mut used_adds: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+        for norm_id in norm_ids {
+            if let Some(plan) = self.plan_fold(graph, norm_id) {
+                // Each residual `Add` may feed only one fold; two norms sharing an
+                // Add would both claim its output as their residual sum.
+                if !used_adds.insert(plan.add_id) {
+                    continue;
+                }
+                plans.push(plan);
+            }
+        }
+
+        let changed = !plans.is_empty();
+        for plan in plans {
+            // Delete the `Add` first, leaving its output value alive (its other
+            // consumer — the next block's residual add — keeps it referenced) but
+            // producer-less, so the skip node can reclaim it as `sum` output[3].
+            graph.remove_node(plan.add_id);
+
+            let mean_v = graph.create_value(DataType::Float32, plan.stat_shape.clone());
+            let invstd_v = graph.create_value(DataType::Float32, plan.stat_shape.clone());
+
+            let mut skip = Node::new(
+                NodeId(0),
+                "SkipSimplifiedLayerNormalization",
+                vec![Some(plan.a), Some(plan.b), Some(plan.gamma)],
+                vec![plan.normalized_out, mean_v, invstd_v, plan.residual_sum],
+            );
+            skip.domain = MICROSOFT_DOMAIN.to_string();
+            skip.attributes
+                .insert("epsilon".into(), Attribute::Float(plan.epsilon));
+            // Reuse the norm's NodeId (and reclaim `normalized_out`/`residual_sum`
+            // producers) by replacing the norm node in place.
+            graph.replace_node(plan.norm_id, skip);
+            graph
+                .opset_imports
+                .entry(MICROSOFT_DOMAIN.to_string())
+                .or_insert(1);
+        }
+
+        if changed {
+            graph.validate().map_err(OptimizerError::from)?;
+        }
+        Ok(())
+    }
+}
+
+impl CudaSkipRmsNormFusion {
+    fn plan_fold(&self, graph: &Graph, norm_id: NodeId) -> Option<SkipRmsNormFoldPlan> {
+        let norm = graph.try_node(norm_id)?;
+        // Only the single normalized output; a norm that also emits stats is left
+        // alone (the folded kernel's stats are unused placeholders).
+        if norm.outputs.len() != 1 || norm.inputs.len() < 2 {
+            return None;
+        }
+        let norm_input = norm.inputs[0]?;
+        let gamma = norm.inputs[1]?;
+        if norm.inputs.get(2).copied().flatten().is_some() {
+            return None; // no bias slot support in the byte-exact fused path
+        }
+        let normalized_out = *norm.outputs.first()?;
+        if graph.value(normalized_out).is_graph_output {
+            return None;
+        }
+        // The fused kernel is byte-exact only for bf16 activations.
+        if graph.value(norm_input).dtype != DataType::BFloat16 {
+            return None;
+        }
+        // gamma must be bf16 or f32 (a final multiplicand only; both are read at
+        // full precision by the kernel).
+        let gamma_dtype = graph.value(gamma).dtype;
+        if gamma_dtype != DataType::BFloat16 && gamma_dtype != DataType::Float32 {
+            return None;
+        }
+
+        // The norm input must be produced by a dense elementwise residual `Add`.
+        let add_id = graph.try_value(norm_input)?.producer?;
+        let add = graph.try_node(add_id)?;
+        if add.op_type != "Add"
+            || !add.is_default_domain()
+            || add.inputs.len() != 2
+            || add.outputs.len() != 1
+        {
+            return None;
+        }
+        let a = add.inputs[0]?;
+        let b = add.inputs[1]?;
+        let residual_sum = *add.outputs.first()?;
+        if residual_sum != norm_input || graph.value(residual_sum).is_graph_output {
+            return None;
+        }
+        // Both residual operands must be dense bf16 with identical shapes (no
+        // broadcast), so the fused kernel's per-element bf16-rounded add matches
+        // the standalone `Add(bf16)` bit-for-bit.
+        let a_meta = graph.value(a);
+        let b_meta = graph.value(b);
+        let sum_meta = graph.value(residual_sum);
+        if a_meta.dtype != DataType::BFloat16 || b_meta.dtype != DataType::BFloat16 {
+            return None;
+        }
+        if a_meta.shape != sum_meta.shape || b_meta.shape != sum_meta.shape {
+            return None;
+        }
+        // The hidden (last) dim must be known; per-group stat outputs then span
+        // the leading dims.
+        if sum_meta.shape.is_empty() {
+            return None;
+        }
+        let stat_shape: onnx_runtime_ir::Shape =
+            sum_meta.shape[..sum_meta.shape.len() - 1].to_vec();
+
+        let epsilon = norm
+            .attr("epsilon")
+            .and_then(Attribute::as_float)
+            .unwrap_or(1e-5);
+
+        Some(SkipRmsNormFoldPlan {
+            add_id,
+            norm_id,
+            a,
+            b,
+            gamma,
+            normalized_out,
+            residual_sum,
+            epsilon,
+            stat_shape,
         })
     }
 }
@@ -2668,6 +2879,176 @@ mod tests {
 
     fn value(graph: &mut Graph, name: &str, dtype: DataType, width: usize) -> ValueId {
         graph.create_named_value(name, dtype, vec![Dim::Static(1), Dim::Static(width)])
+    }
+
+    /// Build the bf16 residual seam `CudaSkipRmsNormFusion` targets:
+    /// `Add(a, b) → SimplifiedLayerNormalization(sum, gamma) → Identity → out`,
+    /// with the residual sum also feeding a second consumer (the next block's
+    /// residual add) so its rewiring onto the fused node's `sum` output is
+    /// observable.
+    fn bf16_skip_seam_graph(hidden: usize, gamma_dtype: DataType) -> Graph {
+        let mut graph = Graph::new();
+        graph.opset_imports.insert(String::new(), 17);
+
+        let a = value(&mut graph, "a", DataType::BFloat16, hidden);
+        let b = value(&mut graph, "b", DataType::BFloat16, hidden);
+        graph.add_input(a);
+        graph.add_input(b);
+        let sum = value(&mut graph, "sum", DataType::BFloat16, hidden);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(a), Some(b)],
+            vec![sum],
+        ));
+
+        let gamma = vec1d(&mut graph, "gamma", gamma_dtype, hidden);
+        graph.set_initializer(
+            gamma,
+            WeightRef::Inline(TensorData::from_raw(
+                gamma_dtype,
+                vec![hidden],
+                vec![0u8; hidden * gamma_dtype.byte_size()],
+            )),
+        );
+        let normalized = value(&mut graph, "normalized", DataType::BFloat16, hidden);
+        let mut norm = Node::new(
+            NodeId(0),
+            "SimplifiedLayerNormalization",
+            vec![Some(sum), Some(gamma)],
+            vec![normalized],
+        );
+        norm.attributes
+            .insert("epsilon".into(), Attribute::Float(9.999_999e-7));
+        graph.insert_node(norm);
+
+        // Norm output sink.
+        let out = value(&mut graph, "out", DataType::BFloat16, hidden);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Identity",
+            vec![Some(normalized)],
+            vec![out],
+        ));
+        graph.add_output(out);
+
+        // Second consumer of the residual sum (the next block's residual add).
+        let next_res = value(&mut graph, "next_res", DataType::BFloat16, hidden);
+        let next_sum = value(&mut graph, "next_sum", DataType::BFloat16, hidden);
+        graph.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(sum), Some(next_res)],
+            vec![next_sum],
+        ));
+        graph.add_input(next_res);
+        graph.add_output(next_sum);
+
+        graph
+    }
+
+    #[test]
+    fn folds_bf16_residual_add_norm_into_skip_node() {
+        for gamma_dtype in [DataType::BFloat16, DataType::Float32] {
+            let mut graph = bf16_skip_seam_graph(6656, gamma_dtype);
+            let a = value_id_by_name(&graph, "a");
+            let b = value_id_by_name(&graph, "b");
+            let gamma = value_id_by_name(&graph, "gamma");
+            let sum = value_id_by_name(&graph, "sum");
+            let normalized = value_id_by_name(&graph, "normalized");
+
+            CudaSkipRmsNormFusion
+                .run(&mut graph, &PassContext::new())
+                .unwrap();
+
+            // The fold is opt-in; without the flag the seam is left intact.
+            assert!(
+                graph
+                    .nodes
+                    .values()
+                    .any(|n| n.op_type == "SimplifiedLayerNormalization"),
+                "default (flag unset) leaves the standalone norm (gamma={gamma_dtype:?})"
+            );
+
+            // SAFETY: single-threaded test; env is restored before returning.
+            unsafe { std::env::set_var(SKIP_RMSNORM_FUSION_ENABLE_ENV, "1") };
+            let result = CudaSkipRmsNormFusion.run(&mut graph, &PassContext::new());
+            unsafe { std::env::remove_var(SKIP_RMSNORM_FUSION_ENABLE_ENV) };
+            result.unwrap();
+            assert!(
+                graph
+                    .nodes
+                    .values()
+                    .all(|n| n.op_type != "SimplifiedLayerNormalization"),
+                "the standalone norm must be deleted (gamma={gamma_dtype:?})"
+            );
+            let skip_nodes: Vec<&Node> = graph
+                .nodes
+                .values()
+                .filter(|n| n.op_type == "SkipSimplifiedLayerNormalization")
+                .collect();
+            assert_eq!(
+                skip_nodes.len(),
+                1,
+                "exactly one skip node (gamma={gamma_dtype:?})"
+            );
+            let skip = skip_nodes[0];
+            assert_eq!(skip.domain, MICROSOFT_DOMAIN);
+            assert_eq!(
+                skip.inputs,
+                vec![Some(a), Some(b), Some(gamma)],
+                "skip inputs = [a, b, gamma] (gamma={gamma_dtype:?})"
+            );
+            // Output[0] = normalized (reused), output[3] = residual sum (reused).
+            assert_eq!(skip.outputs[0], normalized);
+            assert_eq!(skip.outputs[3], sum);
+            assert_eq!(skip.outputs.len(), 4);
+
+            // The residual sum is now produced by the skip node and still feeds
+            // the next block's residual add.
+            assert_eq!(graph.value(sum).producer, Some(skip.id));
+            let sum_consumers = graph.consumers(sum);
+            assert_eq!(sum_consumers.len(), 1);
+            assert_eq!(graph.node(sum_consumers[0]).op_type, "Add");
+
+            // No standalone residual Add feeding the (now gone) norm remains for
+            // that seam: only the *next* block's Add survives.
+            assert_eq!(
+                graph.nodes.values().filter(|n| n.op_type == "Add").count(),
+                1,
+                "only the next-block residual Add remains (gamma={gamma_dtype:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn skip_rmsnorm_fusion_skips_fp16_seam() {
+        // fp16 activations are NOT byte-exact under the bf16 fused kernel, so the
+        // pass must leave the fp16 seam untouched.
+        let mut graph = bf16_skip_seam_graph(6656, DataType::Float16);
+        // Retype the activations to fp16.
+        for name in ["a", "b", "sum", "normalized", "out", "next_res", "next_sum"] {
+            let id = value_id_by_name(&graph, name);
+            graph.value_mut(id).dtype = DataType::Float16;
+        }
+        // SAFETY: single-threaded test; env is restored before returning.
+        unsafe { std::env::set_var(SKIP_RMSNORM_FUSION_ENABLE_ENV, "1") };
+        let result = CudaSkipRmsNormFusion.run(&mut graph, &PassContext::new());
+        unsafe { std::env::remove_var(SKIP_RMSNORM_FUSION_ENABLE_ENV) };
+        result.unwrap();
+        assert!(
+            graph
+                .nodes
+                .values()
+                .any(|n| n.op_type == "SimplifiedLayerNormalization"),
+            "fp16 seam must be left for CudaSkipRmsNormMatMulFusion, not folded here"
+        );
+        assert!(
+            graph
+                .nodes
+                .values()
+                .all(|n| n.op_type != "SkipSimplifiedLayerNormalization"),
+        );
     }
 
     fn swiglu_graph(dtype: DataType, gate_width: usize, up_width: usize) -> Graph {
