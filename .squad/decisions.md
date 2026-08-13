@@ -1,5 +1,7 @@
 # Decisions — live standing directives
 
+Last consolidated: 2026-08-13T18:57:00Z (Scribe decode-latency-floor batch, local state; merged 3 inbox drops — sebastian-glue-replay-gate (#899) + batty-glue-node-collapse (#900) + sebastian-bf16-skip-rmsnorm (#903) — into ONE "Decode latency-floor: node-collapse arc" section, deduped against the megakernel/glue/lowbit sections. KEY MILESTONE: native CUDA int4 batch-1 decode is confirmed at its launch-amortized LATENCY FLOOR from THREE independent directions — megakernel NO-GO (#898), glue-collapse +0.9% ceiling (#899/#900), skip-RMSNorm fold −1.5% regression (#903); consistent mechanism = at M=1 folding parallel work into a single-CTA reduction serializes what per-op spread across 132 SMs. Native ~47.6–47.8 tok/s (beats ORT ~40). SHIPPED: #900 bf16 SiLU/SwiGLU-mul glue collapse (+0.9%, byte-exact, Rule 11 portability fix) + #903 bf16 skip-RMSNorm KERNEL (0-ulp byte-exact); NO-SHIP as default: #903 standalone fold (−1.5%, opt-in behind ONNX_GENAI_CUDA_ENABLE_SKIP_RMSNORM_FUSION default OFF). Only speculative remaining lever = norm-into-GEMV-prologue fusion (NOT funded). Size gate: adding the section would exceed 50 KB → archived the 2026-08-12 VMM/offload/streaming + #762 absent-slot durable-lessons narratives to decisions-archive/2026-08.md → decisions.md now ~48.4 KB, under gate. Histories: appended #903 to sebastian, #900 to batty; checked chronicle + 15,360 B gates.)
+
 Last consolidated: 2026-08-13T17:07:00Z (Scribe megakernel-P2-NO-GO batch, local state; merged 6 inbox drops — sebastian-megakernel-feasibility + sebastian-megakernel-p15 + sebastian-megakernel-multicta (folded into one "Dense-decode megakernel arc" section), sebastian-lowbit-machine-tiers, roy-portability-rule (RULES.md §11), copilot-eviction-order-correctness (#888). KEY SEMANTIC CORRECTION: the persistent multi-CTA cooperative GEMV megakernel — earlier reopened as "the true remaining latency lever" — was BUILT AND MEASURED a 🟥 NO-GO (~3% SLOWER, 0.656→0.676–0.680 ms/layer-MLP, byte-exact 0-ulp; grid.sync 2.23 µs/barrier; PR #898 @ main 0790849c). Annotated all three prior "megakernel is the reopened lever" claims (#885 correction block, lowbit section, lowbit KEY-CONCLUSION) to reflect the NO-GO; the surviving datacenter lever is graph-side glue node-collapse (Batty, optimizer.rs). Lower-bit quant remains H200 NO-GO but is device-dependent (kept on roadmap for consumer/edge). Size gate: after merge decisions.md would exceed 50 KB → archived the 2026-08-12 Profiling gotchas + Parallel-work decisions sections to decisions-archive/2026-08.md → under gate. Histories: appended multi-CTA NO-GO to sebastian, graph-side node-collapse-is-primary-lever to batty; checked chronicle + 15,360 B gates.) 
 
 Last consolidated: 2026-08-13T14:45:00Z (Scribe lowbit-nogo-probe batch @ main 26bd410f; merged 2 inbox drops — sebastian-lowbit-feasibility + fact-checker-lowbit-accuracy — into new "Lower-bit quant — MEASURED no-go; ceiling is latency-bound not bandwidth-bound" section [PR #885]. KEY: byte-fold probe (−75% weight DRAM → +2.8%, HBM util ~15%) REFUTES the earlier "weight-bandwidth-bound" attribution; decode is LATENCY-bound on the ~2568-node serial chain (~8.2 µs/node). Appended a Correction note to the #870/#872/#873 fusion-arc entry (ceiling VALUE + "marginal fusion not a lever" stand; mechanism + lower-bit future-lever were wrong). Also corrected the mechanism wording in docs/PROGRESS.md (#875 lines) + bumped HEAD → 26bd410f. Megakernel/node-collapse REOPENED as true lever. Size gate: after merge decisions.md hit 53,745 B (>50 KB) → archived the detailed #870/#871/#872/#873 fusion-arc sub-entries to decisions-archive/2026-08.md (milestone conclusion + correction kept live) → 49,381 B, under the 50 KB gate. Histories: appended probe+NO-GO to sebastian/fact-checker history.md; checked chronicle + 15,360 B gates.)
@@ -194,6 +196,68 @@ software-pipelined design overlapping next-layer int4 weight prefetch with curre
 `sebastian-megakernel-feasibility.md`, `sebastian-megakernel-p15.md`,
 `sebastian-megakernel-multicta.md`.
 
+## Decode latency-floor: node-collapse arc — glue collapse ships +0.9%, skip-RMSNorm fold is a no-ship; batch-1 latency FLOOR three-way confirmed (2026-08-13, PRs #899/#900/#903)
+
+**KEY MILESTONE (record prominently):** Native CUDA int4 **batch-1 decode is now confirmed at its
+launch-amortized LATENCY FLOOR from THREE independent directions** — GEMV megakernel NO-GO (#898),
+graph-side glue-collapse +0.9% ceiling (#899/#900), and skip-RMSNorm fold −1.5% regression (#903).
+The consistent mechanism across all three: **at M=1, folding parallel work into a single-CTA
+reduction serializes what per-op spread across 132 SMs.** CUDA-graph replay already amortizes
+per-launch overhead (~0.9 µs/node dispatch floor survives replay), so any scheme that trades
+whole-GPU multi-CTA parallelism for a fused single-CTA launch is strictly heavier. Native decode
+sits at **~47.6–47.8 tok/s** (beats the ORT backend ~40). The only speculative remaining decode
+lever is **norm-into-GEMV-prologue fusion** (bf16 analogue of `CudaSkipRmsNormMatMulFusion`, keeps
+the reduction distributed across the GEMV's CTAs) — a larger GEMV-kernel job, uncertain payoff,
+**NOT yet funded.** Docs: `docs/research/dense-decode-megakernel-feasibility.md` §8/§8.5/§8.6.
+
+### 2026-08-13: Glue node-collapse is a GO — survives graph replay (#899, Sebastian)
+Before staffing a multi-week `optimizer.rs` pass, Sebastian measured whether glue collapse recovers
+anything **under graph replay** (the real production decode path), since #898's own mechanism was
+"replay already removes per-launch overhead." Per-op glue chain (22 nodes) vs fused (1 node), each
+captured into a CUDA graph and timed under replay: eager recovers 84–85%, **under replay 74.0–75.5%
+recovered — a ~0.9 µs/node residual dispatch cost SURVIVES replay** (22 trivial graph nodes vs 1),
+byte-exact 0-ulp. Whole-model projection was **+5.3% ceiling** (46.7 → ~49.2 tok/s) — a projection,
+since glue nodes interleave with the dominant GEMVs. **GO** — the opposite of the megakernel because
+glue ops are tiny L2-resident dispatch-bound work (not irreducible GEMV work) and collapse uses an
+ordinary fused launch (no grid.sync tax, no reduction reorder, no Chew gate).
+
+### 2026-08-13: Glue collapse REALIZED — bf16 SiLU/SwiGLU-mul, +0.9% byte-exact (#900, Batty)
+Converted the #899 ceiling into a measured number on the production Muse-Glimmer-30B decode graph.
+**Root cause:** `CudaSiluFusion` (`crates/onnx-runtime-ep-cuda/src/optimizer.rs`) was gated to
+**Float16 only** and never fired on the bf16 stream — extended to accept **BFloat16** (a portability
+fix under Rule 11). The standalone `Sigmoid`+`Mul`+`Mul` glue then collapses through
+`CudaSiluFusion`→`CudaSwiGluFusion` into the tagged `Mul[_cuda_silu_mul]`, lowered to the landed
+`decomposed_silu_mul_bf16` epilogue (#867). **Measured (H200, CUDA_GRAPH=1, interleaved A/B):
+47.20 → 47.63 tok/s = +0.9%**, byte-exact (24-token stream bit-identical), node count 22→20
+glue/layer (−104 total: `Sigmoid` 104→52, `Mul` 210→158). `CudaGateUpSwiGluFusion` needs an fp16
+activation so stays dormant → **int4 GEMVs untouched**. **SHIP** (small-but-real). Honest bound vs
+the +5.3% ceiling: only the 2 SiLU/SwiGLU-mul nodes/layer are byte-exactly collapsible; bigger levers
+blocked — (1) **6 norms/layer** need a byte-exact bf16 skip-RMSNorm kernel (see #903); (2) **~208
+`gamma+1` Adds/layer** already MEASURED −2.8% (#872) — do not re-attempt; (3) **4 reshapes/layer** are
+GQA head-split metadata coupled to the attention kernel, not free deletions.
+
+### 2026-08-13: bf16 skip-RMSNorm — KERNEL ships byte-exact, standalone FOLD is a no-ship (#903, Sebastian)
+Closed the #900 blocker by building the missing **byte-exact bf16 skip-RMSNorm kernel** for
+Gemma3 sandwich-norm (6 norms/layer × 52 = 312 nodes, seam `Add(residual, sublayer)→
+SimplifiedLayerNormalization`). The `skip_rmsnorm_bf16` NVRTC kernel
+(`crates/onnx-runtime-ep-cuda/src/kernels/normalization.rs`) computes
+`sum = __float2bfloat16_rn(f32(residual)+f32(x))` (bit-for-bit a standalone bf16 `Add`), then the
+identical `rmsnorm_bf16` block-tree reduction. **Numeric fidelity (Chew gate): BYTE-EXACT, 0-ulp** —
+GPU unit tests bit-identical vs standalone `Add`→`rmsnorm_bf16` at H=6656; real-model greedy stream
+fold OFF vs ON bit-identical (128/128 tokens). **KERNEL: SHIP.**
+**But the standalone fold REGRESSES:** perf A/B (H200, CUDA_GRAPH=1, interleaved) — fold OFF (default)
+**47.77 tok/s**, fold ON **47.06 tok/s = −1.5%** (104 seams folded). **Why:** at M=1 the RMS reduction
+is single-CTA (all H=6656 in one block); folding the residual add into it **serializes** work the
+standalone `Add` spread across all 132 SMs. Under replay the launch saving is already banked, so the
+fused single-CTA skip kernel is strictly heavier than `multi-CTA Add + single-CTA norm` — same
+structural reason as the megakernel NO-GO. **FOLD: NO-SHIP as default** — retained opt-in behind
+**`ONNX_GENAI_CUDA_ENABLE_SKIP_RMSNORM_FUSION` (default OFF)**; default binary unchanged (47.77 tok/s
+== baseline). The kernel is the prerequisite for the only bf16 path that could win: folding the norm
+into the neighbouring **multi-CTA int4 GEMV prologue/epilogue** (keeps the reduction distributed) —
+a larger GEMV-kernel job, NOT this fold, and NOT yet funded. **Do NOT self-merge** — Chew gates
+numerics. Drops merged & deleted: `sebastian-glue-replay-gate.md`, `batty-glue-node-collapse.md`,
+`sebastian-bf16-skip-rmsnorm.md`.
+
 ## Hardware-tier portability is now an explicit project rule — RULES.md §11 (2026-08-13)
 
 **By:** Roy (Lead), req. by Justin (@justinchuby). Branch `squad/rules-portability`. Governance doc
@@ -265,65 +329,12 @@ crates/onnx-runtime-python/pyproject.toml.
 **Why:** User directive "记得用cuda 13"; keeps EP wheel consistent with the main nxrt CUDA
 wheel toolchain.
 
-## VMM / offload / streaming / batching push — durable results (2026-08-12)
-
-**By:** Copilot (coordinator). Every claim is backed by a merged, executable test;
-refutations are recorded alongside confirmations.
-
-**Governing rule (#772/#776/#787):** `cuMemMap` maps whole granule-aligned windows onto
-whole physical granules, so `committed bytes = granule × (windows containing ≥1 live byte)`.
-**Layout controls residency** — the allocator cannot compact what layout scattered.
-`CU_MEM_ALLOC_GRANULARITY_MINIMUM == RECOMMENDED == 2 MiB` here, so the floor is fixable
-only by layout, not by shrinking the granule. Minimum mapping granularity spans ~500× across
-platforms (Level Zero/Vulkan ~64 KiB, CPU mmap 4 KiB) → layout must be a queried per-EP,
-per-platform capability (#783), not a constant.
-
-**Confirmed:**
-- Floor is layout-determined: 768 granules (~1.5 GiB) head-major → 96 (~192 MiB) seq-major →
-  1/seq (~2 MiB) token-major = **768× reduction** (#787).
-- Strided reads are not the obstacle: seq/head bandwidth ratio 0.80–1.02; 192 KB token-major
-  stride measured 1.000 at 6 GiB working set — reads are DRAM-bound independent of stride
-  (device memory already 2 MiB-page backed) (#778/#787).
-- Offload and capture no longer mutually exclusive (#796): weights page under a stable VA;
-  page-in remaps physical granules instead of returning a new pointer. Unblocked #755.
-- Managed no-spill VMM is default, auto weight-streaming when a model exceeds budget (#798);
-  a fitting model does not page (`FullResident`, offload off, 0 page-ins).
-- Prefix sharing is sound (#793/#803): one handle maps into N=8 sequences under captured
-  replay; ledger charges once, alive until last sharer, additional sharer costs 0 bytes.
-
-**Refuted (and why it mattered):**
-- "seq-major landed ⇒ 8× floor realised" — false: #794 measured head-major and seq-major
-  committing identical bytes (bindings didn't consume the layout descriptor); fixed #797.
-- "decoder structurally declines capture" — false (#804): `captures=0` came from a cached
-  `ONNX_GENAI_CUDA_GRAPH=0` in a long-lived test process. #794/#801 misattributed it.
-- "fixed KV stride removes growth-triggered re-capture" — true in mechanism, irrelevant:
-  engine invalidates the graph unconditionally on growth (#805).
-- "tokens per granule" KV cost model — wrong for head-major (retracted), exactly right for
-  token-major. Layout is the whole story.
-
-**#736 audit recurring finding (six slices):** 4/5 completed slices found **over-reservation**
-(bytes charged on a path that never uses them), not ungoverned allocation — #751 IndexShare,
-#795 GQA WS_SCORES (~128 MiB f32-only), #799 cuBLASLt GEMM (32 MiB heuristic ceiling, measured
-0–96 B), #802 default-domain Attention scores (genuinely needed), #806 GQA QKV staging. Guidance
-in `MEMORY_ARCHITECTURE.md`: **start from use, not from allocation** — governing a bypass without
-sizing it to use converts invisible waste into charged waste (tightens #745 admission, reduces
-concurrency).
-
-**Method notes:** order-dependent test state cost two wrong conclusions this week
-(process-frozen `RuntimeConfig` #804; CUDA context warmed by alphabetically-earlier sibling
-#797) — #807 added a debug-only freeze guard, single-stream helper, and an inventory. Negative
-results delivered as first-class outcomes. Never extrapolate an unmeasured number (`qwen14b-zp`
-lacks `inference_metadata.yaml`, not native-loadable #384 — reported as not measured).
-
-## Durable lessons — #762 absent-slot machinery (2026-08-12)
-
-- **The absent-slot machinery has now produced four distinct defects:** compacted output slots, absent inputs aliased to input 0, a forgeable name-based sentinel, and a 2× heap buffer overflow. Any change touching optional-slot handling deserves disproportionate scrutiny.
-- **Allocate and interpret with the same dtype.** Sizing a buffer from one dtype while handing the consumer a different one is a memory-safety bug. Derive both from one source and fail closed when it is unknown.
-- **A canary test must mirror production allocation exactly.** Canaries allocating at `byte_size` while production used `max(byte_size, 8)` could not detect wrong-dtype writes — the padding absorbed them. A test that passes for a reason unrelated to its claim is the most-repeated defect on this PR.
-- **Verify a fail-loud gate by actually creating the failure condition.** Renaming one `ort-prebuilt` directory was a false negative; only renaming all 16 proved the gate fires.
-- **Third false "API does not exist" deferral.** `MemoryDevice_GetDeviceId` and `Session_GetEpGraphAssignmentInfo` (twice) were all claimed unavailable and all existed — the latter already in use in our own tree. Check the generated bindings before deferring.
-- **Merging upstream `main` into a long-lived branch:** resolve append-only archives and `.gitignore` as **unions**, never by taking one side, or user work is silently lost.
-
+## VMM/offload/streaming + #762 absent-slot durable lessons → archived (2026-08-12)
+The full "VMM / offload / streaming / batching push — durable results" narrative and the
+"#762 absent-slot machinery" durable lessons are archived in `.squad/decisions-archive/2026-08.md`
+("Archived by Scribe 2026-08-13T18:57Z"). Standing takeaway retained: **layout controls VMM
+residency** (committed bytes = granule × windows with ≥1 live byte); **start governance from use,
+not allocation**; optional-slot handling deserves disproportionate scrutiny (four distinct defects).
 
 ## Extension contract standing directive (#524)
 

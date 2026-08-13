@@ -111,3 +111,19 @@ recoverable-overhead lever is graph-side glue node-collapse (Batty, `optimizer.r
 the already-landed fused epilogues (#867, #854) that enable node deletion. Merged PR #898
 (main @ 0790849c). Staged arc (superseded): Phase A/B feasibility GO → P1.5 (single-CTA 926× slower,
 grid.sync capturable) → P2 multi-CTA NO-GO. Doc: `docs/research/dense-decode-megakernel-feasibility.md` §7.
+
+## 2026-08-13 — bf16 skip-RMSNorm KERNEL byte-exact SHIP; standalone FOLD −1.5% NO-SHIP (#903)
+Closed #900's blocker: built the missing byte-exact **bf16 skip-RMSNorm kernel** for Gemma3
+sandwich-norm (`skip_rmsnorm_bf16` NVRTC, `crates/onnx-runtime-ep-cuda/src/kernels/normalization.rs`).
+`sum = __float2bfloat16_rn(f32(residual)+f32(x))` (bit-for-bit a standalone bf16 `Add`) then the
+identical `rmsnorm_bf16` block-tree reduction. **BYTE-EXACT 0-ulp** (GPU unit tests bit-identical;
+real-model fold OFF vs ON bit-identical, 128/128 tokens). **KERNEL: SHIP.** But the standalone
+`CudaSkipRmsNormFusion` fold **REGRESSES −1.5%** under graph replay (fold OFF 47.77 → ON 47.06
+tok/s, 104 seams): at M=1 the single-CTA RMS reduction serializes the residual `Add` that the
+standalone spread across 132 SMs; replay already banks the launch saving. **FOLD: NO-SHIP as
+default** — retained opt-in behind `ONNX_GENAI_CUDA_ENABLE_SKIP_RMSNORM_FUSION` (default OFF).
+This is the THIRD independent confirmation of the batch-1 decode LATENCY FLOOR (with #898 megakernel
+NO-GO and #899/#900 glue-collapse +0.9% ceiling). **Next lever (NOT funded):** fold the bf16 norm
+into the neighbouring multi-CTA int4 GEMV prologue/epilogue (bf16 analogue of
+`CudaSkipRmsNormMatMulFusion`) — keeps the reduction distributed. Do NOT self-merge (Chew gates
+numerics). Doc §8.6.

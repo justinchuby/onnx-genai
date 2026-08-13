@@ -95,3 +95,18 @@ kernel, no grid.sync tax, no numerics reorder. Sebastian's landed fused epilogue
 #854 skip-RMSNorm) are the kernel-side enablers that let standalone nodes be deleted. NOTE: my #872
 `CudaFoldConstantAdd` (208 cheap Adds) REGRESSED and #873 QKV fusion was FLAT — so target the glue
 round-trips, not marginal disjoint-weight GEMV fusion.
+
+## 2026-08-13 — Glue node-collapse REALIZED: bf16 SiLU/SwiGLU-mul, +0.9% byte-exact (#900)
+Converted #899's +5.3% glue-collapse ceiling into a measured number on the production
+Muse-Glimmer-30B decode graph. **Root cause:** `CudaSiluFusion` (`optimizer.rs`) was gated to
+**Float16 only** and never fired on the bf16 stream — extended it to accept **BFloat16** (a
+portability fix under Rule 11). The standalone `Sigmoid`+`Mul`+`Mul` glue then collapses through
+`CudaSiluFusion`→`CudaSwiGluFusion` into the tagged `Mul[_cuda_silu_mul]`, lowered to Sebastian's
+landed `decomposed_silu_mul_bf16` epilogue (#867). **Measured +0.9% (47.20→47.63 tok/s), byte-exact**
+(24-token stream bit-identical), node count 22→20 glue/layer (−104 total; `Sigmoid` 104→52,
+`Mul` 210→158). `CudaGateUpSwiGluFusion` needs an fp16 activation so stays dormant → int4 GEMVs
+untouched. **SHIP.** Honest bound: only the 2 SiLU/SwiGLU-mul nodes/layer are byte-exactly
+collapsible here; bigger levers blocked — 6 norms/layer needed a bf16 skip kernel (Sebastian #903:
+kernel byte-exact but fold regresses −1.5%), 208 gamma+1 Adds already −2.8% (#872), 4 reshapes
+kernel-coupled. Realized ≤ ceiling as §8.3 predicted. Lesson: activate dormant byte-exact fusions
+before chasing new kernels; check the dtype gate first.
