@@ -364,52 +364,163 @@ mod tests {
         assert_eq!(cache.len(), 2);
     }
 
-    /// A real allocator address-reuse round: buffers of two shapes are freed
-    /// and re-acquired repeatedly, so later rounds land on addresses that
-    /// earlier rounds already cached under a *different* shape. Each shape
-    /// always carries the same data, so a correct cache is content-stable
-    /// whether a round hits or misses; a shape-blind cache serves the other
-    /// shape's transpose. The number of rounds that actually recycled an
-    /// address is printed so the test cannot pass vacuously.
+    /// A deterministic stand-in for an allocator that recycles addresses.
+    ///
+    /// One backing allocation is filled once and then handed out as logical
+    /// tensors of different shapes, every one of them based at the same
+    /// address. That is precisely the situation a recycling allocator creates —
+    /// one address naming successive tensors of different geometry — but it is
+    /// produced by construction instead of by asking the platform allocator to
+    /// please reuse a freed block.
+    ///
+    /// Contents are a pure function of the element index, so every prefix has
+    /// stable contents for the whole run: revisiting a shape must observe the
+    /// same bytes it was first cached with, otherwise the cache's documented
+    /// same-key behaviour (see `same_address_same_shape_is_stale_until_cleared`)
+    /// would be indistinguishable from the shape-blindness under test.
+    struct RecyclingArena {
+        storage: Vec<f32>,
+    }
+
+    impl RecyclingArena {
+        fn new(capacity: usize) -> Self {
+            let mut storage = vec![0.0f32; capacity];
+            for (i, v) in storage.iter_mut().enumerate() {
+                *v = 1.0 + i as f32 * 0.5;
+            }
+            Self { storage }
+        }
+
+        fn base_addr(&self) -> usize {
+            self.storage.as_ptr() as usize
+        }
+
+        /// The `[k, n]` tensor at the arena's base address.
+        fn tensor(&self, k: usize, n: usize) -> &[f32] {
+            &self.storage[..k * n]
+        }
+    }
+
+    /// The transpose a geometry was first served at the arena's address.
+    struct FirstVisit {
+        shape: (usize, usize),
+        transpose: Arc<Vec<f32>>,
+    }
+
+    /// #845 falsifier — address reuse across incompatible shapes, deterministic.
+    ///
+    /// Eight rounds walk four geometries that all live at one address: two that
+    /// share a length and differ only in orientation (`[8, 32]` / `[32, 8]`),
+    /// one shorter (`[4, 6]`) and one longer (`[16, 24]`) than what the cache
+    /// already holds for that address, and then a repeat of each so the second
+    /// visit must *hit* the entry the first visit created.
+    ///
+    /// Under the old address-only key every round after the first is served the
+    /// first round's transpose, which fails here in three distinct ways: wrong
+    /// contents for the equal-length reorientation, a too-short buffer for the
+    /// grow round (the release-mode out-of-bounds read, exercised below by
+    /// walking every output row), and a too-long buffer for the shrink round.
+    ///
+    /// This test used to allocate and free a fresh `Vec` per round and rely on
+    /// the platform allocator to recycle the address, with `reused > 0` as the
+    /// non-vacuity guard. glibc obliges; the Windows heap does not have to, and
+    /// on the Windows CI lane it recycled nothing (`0/8`), so the guard failed
+    /// the run. The invariant under test is a property of the *cache key*, not
+    /// of any allocator, so the reuse is now constructed rather than hoped for:
+    /// the guard below asserts full reuse (`7/8` collisions, all at one
+    /// address) and is therefore stronger than the probabilistic one it
+    /// replaces, on every platform.
     #[test]
     fn allocator_address_reuse_across_shapes() {
         let cache = cache();
-        let mut reused = 0usize;
-        let mut seen: Vec<usize> = Vec::new();
+        // Capacity is the largest geometry; every other shape is a prefix of it.
+        let arena = RecyclingArena::new(16 * 24);
+        let base = arena.base_addr();
 
-        for round in 0..8 {
-            // Data depends only on the shape: within one cache lifetime a given
-            // (address, k, n) is defined to map to one transpose, so the round
-            // must not change the contents behind a live key.
-            let (k, n, seed) = if round % 2 == 0 {
-                (8usize, 32usize, 11.0f32)
-            } else {
-                (32, 8, 77.0)
-            };
-            let mut buf = vec![0.0f32; k * n];
-            fill(&mut buf, seed);
-            let addr = buf.as_ptr() as usize;
-            if seen.contains(&addr) {
+        // Equal-length reorientation, shrink, grow — then the same four again.
+        const ROUNDS: [(usize, usize); 8] = [
+            (8, 32),
+            (32, 8),
+            (4, 6),
+            (16, 24),
+            (8, 32),
+            (32, 8),
+            (4, 6),
+            (16, 24),
+        ];
+
+        let mut reused = 0usize;
+        let mut first_visits: Vec<FirstVisit> = Vec::new();
+
+        for (round, &(k, n)) in ROUNDS.iter().enumerate() {
+            let src = arena.tensor(k, n);
+            assert_eq!(
+                src.as_ptr() as usize,
+                base,
+                "round {round}: arena handed out a different address, so this round \
+                 would not collide with the entries the earlier rounds cached"
+            );
+            if round > 0 {
                 reused += 1;
             }
-            seen.push(addr);
 
             let bt = cache
-                .get_or_insert_transpose(&buf, k, n)
-                .expect("transpose");
-            assert_eq!(bt.len(), n * k, "round {round}: wrong transpose length");
+                .get_or_insert_transpose(src, k, n)
+                .expect("transpose of a well-formed [k, n] slice");
+
+            assert_eq!(
+                bt.len(),
+                n * k,
+                "round {round}: cache served a {}-element transpose for the \
+                 {}-element [{k}, {n}] tensor at address {base:#x}",
+                bt.len(),
+                n * k
+            );
             assert_eq!(
                 bt.as_slice(),
-                reference_transpose(&buf, k, n),
+                reference_transpose(src, k, n),
                 "round {round}: transpose does not match this round's [{k}, {n}] data"
             );
-            drop(buf);
+
+            // Out-of-bounds coverage that survives `--release`: the consumer
+            // (`neon_thin_m_tile`) walks `B_T` row by row, so touch the last
+            // element of every output row. A stale, shorter entry indexes past
+            // its end, which a slice bounds-checks in release too — the kernel's
+            // raw-pointer walk over the same entry would not.
+            for j in 0..n {
+                assert_eq!(
+                    bt[j * k + (k - 1)],
+                    src[(k - 1) * n + j],
+                    "round {round}: row {j} of the [{n}, {k}] transpose is not \
+                     backed by this tensor's data"
+                );
+            }
+
+            match first_visits.iter().find(|v| v.shape == (k, n)) {
+                None => first_visits.push(FirstVisit {
+                    shape: (k, n),
+                    transpose: bt,
+                }),
+                Some(first) => assert!(
+                    Arc::ptr_eq(&first.transpose, &bt),
+                    "round {round}: [{k}, {n}] at address {base:#x} missed the entry \
+                     its first visit created, so the key is not stable"
+                ),
+            }
         }
-        println!("allocator_address_reuse_across_shapes: {reused}/8 rounds reused an address");
-        assert!(
-            reused > 0,
-            "no address was recycled, so this run exercised nothing — the shape-keyed \
-             collision this test targets never occurred"
+
+        assert_eq!(
+            reused,
+            ROUNDS.len() - 1,
+            "every round after the first must land on the address an earlier \
+             round already cached under a different geometry"
+        );
+        assert_eq!(
+            cache.len(),
+            4,
+            "one entry per distinct geometry at this address: {} entries means the \
+             key is either collapsing distinct shapes or failing to reuse them",
+            cache.len()
         );
     }
 
