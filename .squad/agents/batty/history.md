@@ -71,3 +71,15 @@ seed, KV context ceiling threaded). End-to-end load + byte-exact parity. Prerequ
 #2 of the 5-blocker chain (#848 → #850 → #852 → #855 → #854). Team result: native
 decode **11.4 → 23.13 tok/s**, capture fully engaged (1 segment / 0 seams). Next lever
 = Cast round-trip elimination (overlaps my decode-graph domain).
+
+## 2026-08-13 — Fusion arc: 47.25 tok/s is the CEILING (#872 doc-only, #873 opt-in)
+**#872** (doc-only): `CudaFoldConstantAdd` removed 208 cheap constant `Add` nodes/token but
+**REGRESSED −2.8%** (47.17→45.85) — not shipped. **#873** (MERGED): `CudaQkvProjectionFusion`
+(`optimizer.rs`) fused 3 per-layer q/k/v int4 projections into 1 wider `MatMulNBits` + `Split`,
+removing **104 EXPENSIVE GEMV launches/token** (417→313); byte-exact; tok/s **FLAT** (47.33→47.26).
+No new kernel. **Retained DISABLED-BY-DEFAULT** behind `ONNX_GENAI_CUDA_ENABLE_QKV_FUSION=1`;
+preserved for future dispatch-bound architectures. **CONCLUSION (with #870 GQA + #871/#872):
+native int4 decode of Muse-Glimmer-30B is weight-bandwidth/compute-floor bound at ~47.25 tok/s
+(H200), NOT dispatch-bound — the 3 projections read disjoint int4 weights so fusing cannot cut
+bytes. 47.25 is the architectural ceiling. A fused-launch QKV epilogue kernel is NOT worth
+building (still bandwidth-bound).**

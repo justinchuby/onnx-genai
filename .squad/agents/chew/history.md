@@ -77,3 +77,13 @@ accurate** than the old serial order (tree_err 2.07e-8 vs serial 1.67e-5 vs f64 
 the arc taking native CUDA decode **11.4 → 40.21 tok/s** — goal MET (matches ORT ~40 tok/s).
 Rule reinforced: a parallel tree reduction may replace a serial order when the f64 oracle
 shows it is at least as accurate.
+
+## 2026-08-13 — PR #871 numerics gate 🟢: bf16 decomposed SiLU is 0-ulp byte-exact
+Gated Sebastian's bf16 decomposed SiLU/SiLU-Mul kernels (#871). Verified fp32 accumulation
+airtight, bf16 only at load/store; **byte-exact, 0 ulp bit-identical** vs the unfused two-op
+graph and an f64 oracle; 5/5 silu tests on H200. Confirmed it fixes a hard-crash portability
+defect (bf16 decomposed SiLU previously errored `"requires float16"`). No further numerics-gated
+fusion pursued: the fusion arc concluded that **native int4 decode of Muse-Glimmer-30B is
+weight-bandwidth/compute-floor bound at ~47.25 tok/s (H200)** (the architectural ceiling), so
+node/launch fusion — cheap or expensive — cannot help. Rule reinforced: bf16 accumulate in fp32,
+oracle-gate against f64.

@@ -1,5 +1,6 @@
 # Decisions — live standing directives
 
+Last consolidated: 2026-08-13T05:15:00Z (Scribe fusion-arc batch @ main 887e3742; merged 4 inbox drops — chew-pr871-numerics, batty-fusion-contract, batty-qkv-contract, sebastian-bf16-swiglu-fusion-contract, sebastian-gqa-not-a-capture-lever — into the "Fusion arc — 47.25 tok/s is the architectural ceiling" milestone section [PRs #870/#871/#872/#873]. KEY CONCLUSION: three byte-exact A/B experiments prove native int4 decode of Muse-Glimmer-30B is weight-bandwidth/compute-floor bound at ~47.25 tok/s, NOT dispatch-bound — node/launch fusion (cheap OR expensive) does not help; #873 QKV fusion retained opt-in behind ONNX_GENAI_CUDA_ENABLE_QKV_FUSION=1. Size gate: after merge decisions.md exceeded 50 KB → archived the detailed #867 MatMulNBits narrative to decisions-archive/2026-08.md, kept milestone + standing numerics rule live. Histories: appended #871/#872/#873 + ceiling to sebastian/chew/batty history.md; all < 15,360 B chronicle gate, none summarized.)
 Last consolidated: 2026-08-13T04:10:00Z (Scribe CUDA-47tok/s-beats-ORT batch @ main 1002e360; merged sebastian-cuda-matmulnbits-gemv (PR #867, MatMulNBits bf16 constant-scale cache, native decode 40.21 → 47.25 tok/s — native now clearly beats ORT ~40, +18%). Size gate: 49,418 B + drop would exceed 50 KB → archived the detailed 23→40 (#860) narrative to decisions-archive/2026-08.md, kept its standing numerics rule live → decisions.md now 48,855 B, under charter 50 KB gate. Histories: appended PR #867 milestone to sebastian/history.md; checked all histories against the chronicle + 15,360 B gates — none summarized.)
 Last consolidated: 2026-08-13T03:03:13Z (Scribe CUDA-40tok/s milestone batch; merged sebastian-cuda-cast-elimination (PR #860) + recorded Chew's PR #860 numerics sign-off — Chew's inbox drop file was absent, decision reconstructed from spawn manifest. NO archive: decisions.md 44,755 B, below charter 50 KB gate. NOTE: the spawn prompt's "archive entries older than 30 days at ≥20,480 B" is an age-based gate the charter forbids — it no-ops since all live entries are 2026-07/08, and 20 KB is below the standing-directive floor. Histories: sebastian 3,948 B / chew 6,951 B, both below the chronicle + 15,360 B gates, none summarized.)
 Last consolidated: 2026-08-12T00:00:00Z (Scribe inbox-consolidation run @ main f85a82f0; 18 inbox drops merged — 9 CUDA-graph-capture-arc drops folded into a single "CUDA-graph capture arc" section (classify #848 → load #850 → pin #852 → bf16 kernel #855 → skip-norm #854; native decode 11.4→23.13 tok/s; capture fully engaged 1 segment / 0 seams; next lever = Cast round-trip elimination) + 9 parallel-work drops preserved as their own entries (copilot fence-witness/#851 mobius-flake/VMM-release, isidore win-arm64/ort-retry, nabil ort-discovery, resch cpu-bf16/clippy, roy registry-shrink). NO archive this run — decisions.md 28,679 B, below the gate. Histories checked: max 8,105 B (holden), below the 15,360 B gate, none summarized.)
@@ -29,33 +30,11 @@ narrative is archived in `.squad/decisions-archive/2026-08.md`; its standing num
 retained below.
 
 ### 2026-08-13: MatMulNBits bf16 decode — cache the Float16-staged constant scales (40.21 → 47.25, #867 MERGED)
-**By:** Sebastian
-**What:** On the native CUDA decode path, `MatMulNBitsKernel::run_bf16` staged **every**
-BFloat16 input to Float16 into an ephemeral arena on *every* decode step before the tuned fp16
-GEMV. The int4 block scales are immutable weights (N × ceil(K/32) elems/node) yet were re-cast
-bf16→f16 each step — ~3.3 GB/token pure-copy traffic across 417 matmuls (≈25% of the 13.2
-GB/token int4 weight traffic) + 417 redundant cast launches. Fix: a persistent per-kernel
-`Bf16ConstCache` stages the constant scale slots **once** (general path: input 2; gate/up SwiGLU
-fusion: inputs 2 and 4) and reuses the f16 copies across steps. Dynamic slots — activation
-(input 0) and any per-token residual in the bias slot — stay on the ephemeral arena; caching
-never keys on pointer identity for them (a reused activation buffer has a stable pointer but
-changing contents).
-**Numbers (H200, CUDA_VISIBLE_DEVICES=0, ONNX_GENAI_CUDA_GRAPH=1, --pipeline --backend native
---steady --warmups 1 --runs 3 --tokens 128):** tok/s **40.21 → 47.25 median (+17.7%)**, a clear
-win over ORT's ~40; MatMulNBits eager per-op share **~44% → ~31%**; capture **1 segment / 0
-seams** (unchanged); full 128-token greedy sequence unchanged.
-**Why byte-exact (no Chew gate):** bf16→f16 conversion yields identical f16 bits whether done
-once (cached) or per step, and the downstream fp16 GEMV reads identical scales → decode output
-is bit-for-bit identical. Unit test `bf16_scale_cache_is_bit_exact_to_inline_staging` proves the
-cached path is bit-identical to inline per-call staging and deterministic across steps. No change
-to accumulation precision.
-**Capture-safety:** persistent buffer is allocated + populated on the pre-capture warmup call
-(cache miss → alloc + one cast/constant); captured replays hit only lookups (no alloc, no cast),
-so the graph stays capture-stable — same lifecycle as the existing `Bf16Scratch` arena.
-**Follow-up lever (deferred):** GroupQueryAttention is now the largest eager share (~41%). A
-fuller bf16-native GEMV (bf16 in/out, no f16 round-trip) or the accuracy_level=4 DP4A
-int8-activation path remain open, but both carry a numerics cost (Chew gate) and were deferred —
-Muse-Glimmer's nodes declare no accuracy_level, so DP4A is not currently exercised.
+**By:** Sebastian. A persistent per-kernel `Bf16ConstCache` stages the immutable int4 block
+scales bf16→f16 **once** (not per decode step), removing ~3.3 GB/token pure-copy traffic + 417
+redundant cast launches/token. tok/s **40.21 → 47.25 (+17.7%)**, byte-exact (no Chew gate),
+capture-stable. Full detailed narrative archived to `.squad/decisions-archive/2026-08.md`
+(under "Archived by Scribe 2026-08-13T05:15Z").
 
 ### Standing numerics rule (retained from PR #860 gate, Chew)
 bf16 kernels accumulate in fp32 and are oracle-gated against an f64 truth model; a parallel tree
@@ -63,6 +42,81 @@ reduction may be adopted over a serial order when the oracle shows it is at leas
 #860 RMSNorm tree reduction was ~807× more accurate than the serial order). The
 `ONNX_GENAI_CUDA_DISABLE_NORM_CAST_FOLD=1` escape hatch routes back to serial `rmsnorm_f32` for
 strict CPU-order byte-exact parity (at ~23 tok/s).
+
+## Fusion arc — 47.25 tok/s is the architectural CEILING for native CUDA int4 decode (2026-08-13, PRs #870/#871/#872/#873)
+
+**KEY CONCLUSION (record prominently):** Three independent, byte-exact A/B experiments —
+**#870** (GQA / inner-loop cheapening), **#872** (cheap constant-`Add` fold, −208 nodes/token),
+and **#873** (QKV projection fusion, −104 **expensive** GEMV launches/token) — conclusively prove
+native CUDA int4 decode of **Muse-Glimmer-30B is weight-bandwidth / compute-floor bound at
+~47.25 tok/s (H200)**, NOT launch-dispatch bound. Graph node/launch fusion (cheap OR expensive)
+does not help because at M=1 decode each disjoint int4 weight is read exactly once — a
+DRAM-bandwidth roofline. **To beat 47 you must cut weight BYTES/token** (lower-bit quant,
+sparsity) or move to a **different kernel family (megakernel)** — NOT node fusion. Native
+decisively beats ORT (**47.25 vs ~40, +18%**). **The perf arc is concluded at the ceiling;
+no code perf change shipped, one opt-in pass retained.**
+
+### 2026-08-13: bf16 decomposed SiLU/SiLU-Mul kernels — fixes a portability CRASH (#871 MERGED, Chew 🟢)
+**By:** Sebastian; gated by Chew.
+**What:** Added `decomposed_silu_mul_bf16` + `decomposed_silu_bf16` NVRTC kernels and admitted
+`BFloat16` in the decomposed path of `SiluMulKernel`/`UnaryKernel` (`kernels/elementwise.rs`).
+Previously bf16 hit a hard `"decomposed SiLU fusion requires float16"` error — a **real
+portability defect (hard crash)**. Sigmoid and the silu product each round to bf16 via the same
+`__float2bfloat16_rn` as the standalone ops; all intermediate math fp32. Also enables the graph
+`CudaSiluFusion`/SwiGLU-Mul fold (Sigmoid+Mul → `silu_mul`) once its bf16 gate in `optimizer.rs`
+is opened.
+**Chew gate → 🟢 APPROVE:** fp32 accumulation airtight; **byte-exact, 0 ulp bit-identical vs f64
+oracle** (unfused two-op graph); 5/5 silu tests pass on H200. Decision drop:
+chew-pr871-numerics.md.
+**Perf:** its own graph SwiGLU-Mul fold is FLAT (−104 *cheapest* nodes/token → tok/s flat within
+noise) — consistent with the dispatch-independence finding below. The full gate_up bf16 fold
+(−312 nodes) went **non-deterministic** through the f16-staging fused dual-scale path; making it
+safe needs a bf16-native fused `gate_up_swiglu` kernel (fp32 accumulate, no f16 round-trip) +
+Chew gate — a scoped follow-up, NOT pursued given the ceiling.
+
+### 2026-08-13: GQA / inner-loop cheapening is NOT a decode lever (#870, doc-only)
+**By:** Sebastian. Under CUDA-graph capture, decode is 2568 nodes/token × ~8.17 µs/node = the
+~21 ms/token floor. Cheapening ANY single kernel's inner loop — GQA seq-loop (cap to 1 key:
+47.52), general f16 GEMV depth-loops (47.13), MLP int4 GEMV loops (47.17), split_fill 2→8
+(47.27) — leaves tok/s flat; forcing split_fill=1 (−52 nodes, serializes the loop-carried
+flash-softmax dep) is WORSE (46.31). GQA seq-length work is <2% of decode. No GQA PR (a no-op
+that risks parity). `gqa_decode_bf16` is already bf16-native I/O, fp32 accumulate, vectorized.
+
+### 2026-08-13: Cheap-node fusion (−208 constant `Add` nodes/token) REGRESSES −2.8% (#872 MERGED, doc-only)
+**By:** Batty. Folded the per-token constant `Add(Cast(weight_bf16→f32), 1.0)` RMS-norm "weight+1"
+scale into a resident f32 initializer (`CudaFoldConstantAdd`), removing **208 Add nodes/token**
+(byte-exact, full 128-token sequence identical, capture 1seg/0seams). A/B on ONE binary
+(`ONNX_GENAI_CUDA_DISABLE_CONST_ADD_FOLD=1`): captured **47.17 (off) → 45.85 (on) = −2.8%,
+reproducibly WORSE**; eager 36.72 → 36.14 (also worse). **Not shipped** (a default-on regression
+/ default-off dead code is churn for zero gain; PR is doc-only). The 8.17 µs/node figure is an
+*average* over a skewed distribution dominated by the expensive serial GEMV/GQA critical path,
+NOT a savable per-node cost for cheap off-critical-path glue. Suspected mechanism (unconfirmed):
+cold-read/scheduling perturbation — the folded gamma is now a cold resident initializer instead
+of a warm-in-L2 `Add` output; footprint ~unchanged. Decision drop: batty-fusion-contract.md.
+
+### 2026-08-13: QKV projection fusion (−104 EXPENSIVE GEMV launches/token) is FLAT → retained OPT-IN (#873 MERGED)
+**By:** Batty. `CudaQkvProjectionFusion` (`optimizer.rs`) column-concatenates the 3 per-layer
+`q_proj`(N=4096)/`k_proj`(N=256)/`v_proj`(N=256) int4 weight/scale/zero-point initializers into
+one wider `[N=4608]` `MatMulNBits` + a `Split(axis=-1,[4096,256,256])` — **no new kernel** (reuses
+the existing MatMulNBits + capture-safe Split). MatMulNBits **417 → 313** (−104 GEMV launches/token,
+2/layer×52), +52 Split, GQA 52 unchanged, capture 1seg/0seams. **BYTE-EXACT** (each output column's
+dequant + K-reduction untouched; all 64 generated ids identical; first-16 match reference
+`[24,372,1045,10016,328,2885,262,5091,8811,511,917,4921,768,328,2885,262]`) — no Chew flag.
+**Throughput FLAT / marginally worse:** baseline 47.33 → fused 47.26 (−0.07, within noise).
+**This is the decisive dispatch-vs-bandwidth test:** removing 104 *expensive* launches yields ZERO
+gain → decode is bandwidth/compute-floor bound; the 3 projections read disjoint int4 weights so
+fusing cannot cut bytes moved. **Disposition:** correct + tested (4 unit tests) + byte-exact, so
+**retained but DISABLED-BY-DEFAULT**, opt-in via `ONNX_GENAI_CUDA_ENABLE_QKV_FUSION=1`; default
+binary keeps the 3 separate GEMVs (47.33). Preserved for future dispatch-bound architectures
+(fp16 activations, higher launch-latency-to-bandwidth shapes). A fused-launch QKV epilogue kernel
+(Q/K/V to 3 destinations, dropping the 52 Splits) is **NOT worth building** — still bandwidth-bound.
+Decision drops: batty-qkv-contract.md, sebastian-bf16-swiglu-fusion-contract.md,
+sebastian-gqa-not-a-capture-lever.md.
+
+**Profiling note (all four investigations):** hardware profilers remain blocked in-sandbox (ncu
+absent; nsys "Creating threads in this process is forbidden by design"; RmProfilingAdminOnly=1).
+All numbers from the built-in op timer + `ONNX_GENAI_PROFILE_OPS`/`cuGraphGetNodes` node counts +
+capture-safe env-gated A/B on a single release binary.
 
 ## nxrt EP plugins on PyPI + CUDA 13 target (2026-08-12)
 
@@ -319,27 +373,19 @@ This **narrows** the earlier Apple framework policy entry (Accelerate/BNNS/vDSP 
 
 ## CUDA-graph capture arc — Muse-Glimmer-30B native decode 11.4 → 23.13 tok/s (2026-08-12)
 
-**By:** Sebastian (Perf/CUDA-EP), Deckard (Systems), Batty (Engine), Leon (KV & Buffers), Chew (precision review). Consolidated from 9 inbox drops. Every tok/s figure is measured (H200, `--pipeline --backend native --ep cuda`, int4, steady 128 tok, greedy parity preserved throughout: ids `[24, 372, 1045, 10016, 328, 2885, 262, 5091, ...]`).
+Full 5-blocker narrative (CLASSIFY #848 → LOAD #850 → PIN #852 → bf16 GQA kernel #855 →
+SKIP-NORM #854; capture 54 seg/53 seams → 1 seg/0 seams; 11.4 → 23.13 tok/s) archived to
+`.squad/decisions-archive/2026-08.md` (under "Archived by Scribe 2026-08-13T05:15Z"). The arc
+then continued 23 → 40.21 (#860) → 47.25 (#867) → ceiling (#870/#872/#873, above).
 
-**The 5-blocker chain (each merged; all prerequisites landed in order):**
-
-1. **CLASSIFY — #848 (Deckard).** `detect_model_decode_path` (`decode/metadata.rs`) no longer routes a model to the capture-unstable growing/paged KV path merely because `inference_metadata.yaml` declares a `sliding_window`. A window is active **only when the exported graph enforces it** — an attention op (`GroupQueryAttention`/`MHA`/`Attention`/`SparseAttention`) carrying `local_window_size > 0` (graph-truth; ORT default -1 = global). New `graph_enforces_sliding_window()` + `effective_sliding_window()` (conservative: keep window when no graph readable, so Gemma/Mistral SWA never regress). Muse-Glimmer's 52 GQA ops carry **no** `local_window_size` (global attention); its `sliding_window:2048` was vestigial (only in our generated metadata; `genai_config.json` declares none + `past_present_share_buffer:true`).
-
-2. **LOAD — #850 (Batty).** `PipelineEngine` now loads+decodes Muse-Glimmer end-to-end on the native CUDA EP. Previously the multimodal (vision+embedding+decoder) pipeline routed its **embedding** component to ORT, which lacks bf16 `Where(16)`, so load failed. Fixes: embeds-producer reclassified `prompt_only → every_step` (an `inputs_embeds`-driven decoder needs a fresh embedding per step); every_step components load on the decoder's CUDA device; skip ORT sessions for all components on the native backend (they'd reject bf16 `Where`/int4 `MatMulNBits`); lazy native prologue with inactive-component skip; empty `[0,hidden]` image-features seed for text-only prompts; bf16 acceptance on the native decode target (`native_decode/{load,cuda}.rs`, gates relaxed `f32|f16` → `f32|f16|bf16`); KV context ceiling threaded from `model.max_sequence_length`. Byte-exact greedy parity vs the `muse_decode` raw-session harness.
-
-3. **PIN — #852 (Leon).** Capture engaged after #848+#850 but delivered zero speedup: the captured step fragmented into 54 segments / 53 eager seams (52 GQA + 1 SkipSimplifiedLayerNorm). Root cause: the build-time capture classifier seeds the GQA present/past KV penultimate seq axis as a **growing symbol** and force-declines every GQA node — a false positive for the fixed-capacity device-valid-length KV the runtime actually binds. Fix: an **engine-gated symbol exclusion** — at the point fixed-capacity device KV is bound, pin the GQA KV seq-axis symbols CONSTANT (`collect_capacity_pinned_kv_symbols` + `Executor::pin_fixed_capacity_kv_capture_symbols`, called only when `graph_enabled`). Growing-concat / paged / mask-less attention paths do NOT qualify → genuinely growing KV stays vetoed. **Two-gate AND preserved**: node captures only if (classifier: seq-independent) AND (kernel `capture_support()`: Supported) — the pin removes only the classifier gate; the kernel gate remains an authoritative backstop. Result: disqualifying set 53 → 0, but segments stayed 54 — GQA nodes now declined at the **CUDA-EP kernel gate** because Muse-Glimmer is bf16 and only f32/f16 GQA decode kernels existed. The pin is a necessary prerequisite for GQA capture on ANY model.
-
-4. **bf16 KERNEL — #855 (Sebastian).** Added `gqa_decode_bf16` — a bf16 device-length split-K GQA flash-decode kernel mirroring `gqa_decode_fp16` (`__nv_bfloat16`/`__nv_bfloat162`, **fp32 accumulation preserved** — matmul + softmax in fp32, bf16 only at load/store; distinct NVRTC module key to avoid fp16 cache collision). Wired into `group_query_attention.rs` (`capture_candidate` dtype gate, read-path, dispatch) + `KvCachePath::Bf16DecodeRead`/`decode_module_key_bf16()`. Accuracy (Chew is standing precision reviewer): parity vs an f64-accumulated softmax oracle fed bf16-rounded inputs → max_abs=1.953e-3, max_rel=3.888e-3, within justified bounds (abs<2e-2, rel<1e-1; bf16's 8-bit mantissa ~8× coarser than fp16). Segments 54 → 2 (1 residual eager seam: bf16 SkipSimplifiedLayerNorm); throughput ~14.5 → 22.52 tok/s.
-
-5. **SKIP-NORM — #854 (Sebastian).** Removed the last eager seam. `SkipSimplifiedLayerNormKernel`'s bf16-via-f32 path now uses a persistent grow-only f32 staging arena (`NormBf16Scratch`, mirroring `matmul_nbits::Bf16Scratch`) instead of per-call `cudaMalloc`/`cudaFree` (a `cuMemFree` forces a per-token stream sync → capture-unsafe seam). The bug: the first warm call *grows* the arena and the pre-capture audit sampled `capture_support()` right after, so `grew` demoted the flag at exactly that moment. Fix: only demote on `grew` when `is_capturing()` (a grow racing an in-progress capture is unsafe; the first warm-time grow sizes the arena once and leaves the base fixed for steady replay). Segments 2 → **1 captured segment, 0 eager seams** (whole decode step captures as one graph). Measured: capture OFF 17.35 tok/s → capture ON **23.13 tok/s (+33%)**.
-
-**Prior groundwork (#840 / 629fbf90, Sebastian):** real `cudaMemGetInfo` device-capacity detection (fixed a portability bug where the default `Fraction(0.90)` resolved against a provisional 8 GiB cap, failing 15.3 GB models even on a 143 GiB H200) + `CudaFoldConstantCast` EP pass (folds 208 constant norm-weight `Cast(bf16→f32)`/token). Native decode 10.2 → 11.4 tok/s. Diagnosis that redirected the arc: decode is **dispatch/launch-overhead bound** (~1600 launches/token, GPU 0–2% idle), not GEMV-bound — CUDA-graph capture over fixed KV is the only lever to close the gap to ORT.
-
-**H200 hardware validation (#832, Sebastian):** CUDA EP validated on physical H200 (Muse-Glimmer-30B, zero CPU fallbacks). Fixed runtime bf16 dtype rejections despite 100% placement: `Clip(int64)`, `MatMulNBits` (bf16 activations → stage bf16→f16, reuse tuned f16 GEMV, cached grow-only `Bf16Scratch`; 5.87→11.08 tok/s), `GroupQueryAttention` (bf16 cos/sin cache), `SkipSimplifiedLayerNorm` (bf16). Also enabled the shared-EP plugin `CreateEp` path (was silently CPU-falling-back) and fixed device intermediates for multi-node fused subgraphs (`KernelContext_GetScratchBuffer`, was `vec![0u8]` host ptr → `CUDA_ERROR_ILLEGAL_ADDRESS`).
-
-**Next lever (post-arc):** decode is now **kernel-bound**, not dispatch-bound (per-op: Cast 40%, MatMulNBits 21%, GQA 14%). The dominant remaining cost is **Cast bf16↔f32 round-trips** (~626 calls/token). Closing 23 → ORT's ~40 tok/s needs **Cast round-trip elimination** — native bf16 data path / fuse Cast into MatMulNBits + norm consumers, extending `CudaFoldConstantCast`. Substantial EP graph-rewrite / kernel-io-dtype effort (overlaps Batty's decode-graph domain), tracked separately.
-
-**Durable lessons:** (a) a metadata-declared feature (sliding_window) must be validated against **graph-truth**, not trusted blind — a vestigial window silently forced the non-capturable path. (b) The capture classifier's growing-symbol veto is a **false positive for fixed-capacity device-KV**; pin the seq symbol engine-side (the engine knows the binding is fixed; `Executor::build` does not), keeping the kernel `capture_support()` gate as an independent backstop. (c) A capture-safety flag sampled right after a warm-time arena grow reads false at the worst moment — gate the demotion on `is_capturing()`. (d) bf16 kernels accumulate in fp32; bf16 only at load/store boundaries, oracle-gated against f64 softmax.
+**Durable lessons (retained):** (a) a metadata-declared feature (sliding_window) must be
+validated against **graph-truth**, not trusted blind — a vestigial window silently forced the
+non-capturable path. (b) The capture classifier's growing-symbol veto is a **false positive for
+fixed-capacity device-KV**; pin the seq symbol engine-side, keeping the kernel
+`capture_support()` gate as an independent backstop. (c) A capture-safety flag sampled right
+after a warm-time arena grow reads false at the worst moment — gate the demotion on
+`is_capturing()`. (d) bf16 kernels accumulate in fp32; bf16 only at load/store boundaries,
+oracle-gated against f64 softmax.
 
 ## Parallel-work decisions (2026-08-12)
 

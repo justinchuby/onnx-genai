@@ -72,3 +72,16 @@ construction — no Chew gate**; test `bf16_scale_cache_is_bit_exact_to_inline_s
 **MILESTONE: native CUDA EP now clearly beats ORT — 47.25 vs ~40 tok/s, +18%.** Next lever
 (deferred): GQA is now the largest eager share (~41%); full bf16-native GEMV / accuracy_level=4
 DP4A int8 remain open, both numerics-gated.
+
+## 2026-08-13 — bf16 SwiGLU kernels (#871) + GQA null finding (#870); 47.25 is the CEILING
+Shipped **#871** (bf16 decomposed SiLU/SiLU-Mul kernels `decomposed_silu_mul_bf16`/
+`decomposed_silu_bf16` in `elementwise.rs`) — fixes a real portability **hard crash**
+(bf16 decomposed SiLU previously errored `"requires float16"`); byte-exact **0 ulp** vs f64
+oracle, **Chew 🟢**, 5/5 silu tests on H200. Its graph SwiGLU-Mul fold is FLAT (−104 cheapest
+nodes). **#870** (doc-only): decode is 2568 nodes/token × ~8.17 µs/node; cheapening any single
+kernel inner loop (GQA seq-loop, GEMV depth-loops) is flat → GQA not a viable lever. Full gate_up
+bf16 fold went non-deterministic (f16-staging); safe version needs a bf16-native fused
+`gate_up_swiglu` kernel + Chew — deferred. **CONCLUSION (with Batty #872/#873): native int4 decode
+of Muse-Glimmer-30B is weight-bandwidth/compute-floor bound at ~47.25 tok/s (H200), NOT
+dispatch-bound. 47.25 is the architectural ceiling; beat it via fewer weight bytes/token or a
+megakernel, NOT node fusion.**
