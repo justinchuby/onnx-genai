@@ -6,40 +6,24 @@
 Foundry-managed multi-process and multi-node coordination
 **Supporting detail:** [design appendix](./MEMORY_MANAGEMENT_MODEL_DESIGN_APPENDIX.md)
 
-## Decision
+## Motivation
 
 Memory is currently retained independently by ORT/EP arenas, model weights,
 generation state, and backend caches. The pools cannot safely lend or reclaim
 capacity across components, so memory is stranded and configured limits do not
 describe actual process pressure.
 
-We will:
+To address this, the proposal introduces:
 
-1. Put a GenAI-independent `ProcessMemoryManager` in each ORT process.
-2. Let Foundry Local optionally own a `ServingMemoryCoordinator` that delegates
+1. A GenAI-independent `ProcessMemoryManager` in each ORT process.
+2. An optional Foundry Local `ServingMemoryCoordinator` that delegates
    coarse quotas only to participating Foundry workers.
-3. Treat the OS/driver as the ultimate machine-wide arbiter; unrelated programs
+3. The OS/driver as the ultimate machine-wide arbiter; unrelated programs
    are external pressure, not reclaimable holders.
-4. Keep ORT GenAI responsible for generation/state policy and ORT responsible
+4. ORT GenAI responsible for generation/state policy and ORT responsible
    for graph execution, allocator contracts, EPs, and kernels.
-5. Use one memory control plane with multiple model-view/data-plane mechanisms:
+5. One memory control plane with multiple model-view/data-plane mechanisms:
    flat VMM, blocks-plus-table, static buffers, and fixed/indexed state.
-
-## Supersedes and refines
-
-If accepted, this proposal changes the following canonical statements in
-[`MEMORY_ARCHITECTURE.md`](./MEMORY_ARCHITECTURE.md):
-
-| Existing decision | Replacement | Rationale |
-|---|---|---|
-| `MachineRuntime` is the process-level ownership object (§4.0). | `ProcessMemoryManager` is the GenAI-independent ORT process service; product/generation responsibilities stay above it. | Makes the same local contracts available to standalone ORT and Foundry workers. |
-| One `HostGovernor` is the machine authority (§5.1, D1, D7). | A process `HostGovernor` enforces its child quota; optional Foundry `ServingMemoryCoordinator` bounds cooperative workers. | We cannot enroll or reclaim arbitrary applications. The OS remains global arbiter; Foundry guarantees only its delegated domain. |
-| `ClusterCoordinator` owns both single-machine sharing and cross-node coordination (§6.1, D5). | `ServingMemoryCoordinator` owns Foundry worker quotas on one node; `ClusterCoordinator` owns node placement/coarse node quota only. | Page/token operations must remain local. Cross-process physical weight/KV dedup is deferred. |
-| Device authority registry is effectively server-owned ([`ServerMemoryAuthorities`](../crates/onnx-genai-server/src/state.rs)). | The server object evolves into the serving quota coordinator; each process owns its local authority/provider/allocator registry. | Standalone ORT must use the same local contracts without a GenAI/server dependency. |
-| PagedAttention is “[not built, and not the plan](./MEMORY_ARCHITECTURE.md#implementation-status)” for native CUDA. | Flat VMM remains the native/default path; blocks-plus-table is an optional capability for compatible exported models and EPs. | VMM preserves existing kernels, while paged views may win for high concurrency or finer allocation quanta. |
-
-On acceptance, the canonical document must add a forward pointer to this
-proposal and mark the superseded statements above.
 
 ## Contracts
 
@@ -267,6 +251,22 @@ safe victims.
 | VMM granularity | Query geometry/granularity and select view by committed/useful byte ratio. Token-major's measured reduction is not implemented. |
 | External programs | Best-effort coexistence via OS budgets and safety reserve; no machine-wide hard guarantee. |
 | Serving coordinator failure | Authenticate spawned workers; fence on heartbeat/epoch failure; keep quota charged until process exit; use idempotent return and restart reconciliation. |
+
+## Relationship to existing design
+
+If accepted, this proposal refines or supersedes these statements in
+[`MEMORY_ARCHITECTURE.md`](./MEMORY_ARCHITECTURE.md):
+
+| Existing design | Proposed refinement |
+|---|---|
+| `MachineRuntime` is the process-level ownership object (§4.0). | `ProcessMemoryManager` is the GenAI-independent ORT process service; product/generation responsibilities stay above it. |
+| One `HostGovernor` is the machine authority (§5.1, D1, D7). | A process governor enforces its child quota; optional Foundry coordination bounds cooperative workers, while the OS remains global arbiter. |
+| `ClusterCoordinator` owns single-machine sharing and cross-node coordination (§6.1, D5). | `ServingMemoryCoordinator` owns Foundry worker quotas on one node; `ClusterCoordinator` owns placement/coarse node quota. |
+| Device authorities are effectively server-owned ([`ServerMemoryAuthorities`](../crates/onnx-genai-server/src/state.rs)). | The server object becomes the serving quota coordinator; each process owns local authority/provider/allocator registries. |
+| PagedAttention is “[not built, and not the plan](./MEMORY_ARCHITECTURE.md#implementation-status)” for native CUDA. | Flat VMM remains native/default; blocks-plus-table is optional for compatible exported models and EPs. |
+
+On acceptance, the canonical document must point to this proposal and mark the
+superseded statements.
 
 Detailed evidence, topology examples, WDDM behavior, state mechanisms, related
 work, and current implementation gaps are in the
