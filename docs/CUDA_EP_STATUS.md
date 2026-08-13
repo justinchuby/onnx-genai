@@ -35,7 +35,7 @@ Batty (Engine — PR #830 revision 4)
 | `SessionPersistent` workspaces are declined, never downgraded | **Host-tested** (real ORT + demonstrated falsifier) | §4, §6.3 |
 | Which CUDA kernels decline, and what each does about it | **Source audit** of `onnx-runtime-ep-cuda` (not a runtime measurement) | §4.1 |
 | A workspace plan is computed once per (node, operand signature), not once per dispatch | **Host-tested** (real ORT counter + 10 unit falsifiers, all demonstrated red) | §4, §6.3 |
-| Workspace memory info comes from the dispatching node's own operands | **Host-tested** (compiles + ORT E2E); the multi-operand agreement check is **compile-verified only** — no host test produces divergent operands | §4 |
+| Workspace memory info comes from the dispatching node's own ORT **inputs**, resolved only after the zero-byte and `StepScoped` gates | **Host-tested** (compiles + ORT E2E; two placement-query falsifiers); the multi-input agreement check is **compile-verified only** — no host test produces divergent operands | §4 |
 | Fused-subgraph *intermediates* use subgraph input 0's memory info | **H200-validated as-is** (#832); **no** device guard claimed | §4 |
 | Workspace over-allocation / align-up / overflow / containment arithmetic | **Host-tested** (unit falsifiers) | §4 |
 | Shared-EP teardown runs `shutdown()` exactly once on the normal path | **Host-tested** (real ORT + unit falsifiers) | §5, §6.2 |
@@ -128,14 +128,40 @@ memory info of the **dispatching node's own ORT-bound operands**
 is exactly a step-scoped workspace's lifetime, so this executor never issues a
 device free and nothing here is unsafe during graph capture.
 
-For a node with more than one ORT-bound operand, the derivation additionally
-verifies the operands agree, via `OrtApi::CompareMemoryInfo`. Mixed placement is
+**Inputs only.** "The node's operands" means, precisely, the handles ORT returns
+from `KernelContext_GetInput` for that node. Outputs are never consulted: ORT
+does not require an output to be materialised before `Compute` runs, and the
+tensor the kernel is about to write is not evidence about where its compute
+happens. So this is an **input-derived** placement, and no claim is made about
+output placement anywhere in this PR.
+
+For a node with more than one ORT-bound input, the derivation additionally
+verifies the inputs agree, via `OrtApi::CompareMemoryInfo`. Mixed placement is
 legal in ORT (`OrtMemTypeCPUInput` operands sit in host memory), so the
-executor **fails closed** rather than guessing: a node whose operands disagree,
+executor **fails closed** rather than guessing: a node whose inputs disagree,
 or one where `CompareMemoryInfo` is unavailable and the node has several
-operands to compare, gets an error naming the node instead of a workspace from
+inputs to compare, gets an error naming the node instead of a workspace from
 an arbitrarily chosen device. That error is only reachable when a workspace is
 actually requested — nodes that need none are untouched.
+
+**Derived lazily.** Each derivation costs `2n` ORT FFI calls for `n` ORT-bound
+inputs plus `n-1` comparisons, and the answer is only ever used to place a
+workspace. `prepare_workspace` therefore resolves it **after** the zero-byte and
+`StepScoped` gates, so a node that needs no workspace, and a node whose
+`SessionPersistent` request is declined, issue no placement calls at all. Two
+real-ORT falsifiers pin this from both sides: a declined dispatch must record
+**zero** placement queries, and a mixed `chain_add_mul` subgraph must record
+**exactly** as many queries as workspaces served — higher means the zero-byte
+`Mul` node is paying, lower means a workspace was placed without checking where
+its kernel runs. Both go red when the derivation is moved back above the gates.
+
+**Status handling at the new call site.** The `CompareMemoryInfo` call releases
+the `OrtStatus` it may return, inline, via `OrtApi::ReleaseStatus`. The two
+older `GetMemoryInfo`/`GetScratchBuffer` status sites reached from here
+(`ort_input_mem_info`, `alloc_scratch`) are carried over verbatim from `main`
+and still drop their status without releasing it or reading its message; that is
+a **pre-existing leak on a failure path**, is out of scope for this PR, and is
+recorded here as follow-up rather than fixed behind a new shared abstraction.
 
 > **Scope limit, stated precisely.** This per-node derivation covers the
 > *workspace* path only. Fused-subgraph **intermediate** buffers still derive
@@ -159,17 +185,41 @@ rejected in exactly **one** place — `alloc_scratch`, which returns `Err` for
 both a failed status and a null block. `prepare_workspace` used to re-check the
 same pointer afterwards; that second check was unreachable and has been removed,
 because two guards for one condition invite a future edit that "fixes" one of
-them and leaves the other looking authoritative.
+them and leaves the other looking authoritative. The same reasoning removed a
+second dead guard added earlier in this PR: `device_alloc` null-checked the
+pointer out of a successful `ExecutionProvider::allocate`, but
+`DeviceBuffer::as_ptr` unwraps a `NonNull<c_void>`, so that branch could not be
+taken. The zero-size normalisation it sat next to is unchanged and still
+falsifier-tested.
 
 **Workspace-plan memoization.** `Kernel::workspace_requirement` is not free: on
 the cuBLASLt-backed kernels it runs `plan_gemm` →
-`cublasLtMatmulAlgoGetHeuristic`. Because the executor asked for the requirement
-and the kernel then re-derived its own plan inside `execute`, every dispatch ran
-that search **twice** and used one result. `prepare_workspace` now routes the
-call through a per-node `WorkspacePlanCache`, keyed on the full operand
-metadata — `(dtype, present, shape)` per operand, which is exactly and only what
-`TensorMetadata` shows a kernel, so a cache hit means the kernel would have been
-asked an identical question.
+`cublasLtMatmulAlgoGetHeuristic`. Revision 3 of this PR introduced a call to it
+on every dispatch, had the answer declined, and left the kernel to plan again
+inside `execute` — two searches per dispatch where one result was used.
+`prepare_workspace` now routes the call through a per-node
+`WorkspacePlanCache`, keyed on the full operand metadata — `(dtype, present,
+shape)` per operand, which is exactly and only what `TensorMetadata` shows a
+kernel, so a cache hit means the kernel would have been asked an identical
+question.
+
+**What that is worth, against the right baseline.** The cache removes
+*revision 3's own* second search. It does **not** touch the kernel-side plan:
+`blas::governed_gemm` still plans once per dispatch inside `execute`, and this
+seam cannot reach into it. Against `main` — which never called
+`workspace_requirement` at all — the steady state is therefore approximately
+**neutral**, not a halving: a repeated operand signature costs a mutex acquire
+plus a linear scan of at most 8 entries, and each *new* signature costs one
+heuristic search `main` did not perform. No speedup over `main` is claimed here,
+and none has been measured.
+
+**Where hits actually occur.** Hit rate is a property of the shapes, not of the
+kernel. A stable geometry (fixed batch and sequence length, or a GEMM whose
+cuBLASLt signature does not move between decode steps) hits after its first
+dispatch. A growing-KV `StepScoped` attention, whose operand shapes change every
+token, can **miss on every step**; there the cache is bounded overhead — one
+extra search per step — rather than a saving. Both cases are correct; only the
+first is faster.
 
 Properties, each pinned by a test that has been shown to go red without it:
 
@@ -189,12 +239,13 @@ Properties, each pinned by a test that has been shown to go red without it:
   — never a wrong answer — and the hot signature survives a flood of one-off
   shapes.
 
-Honest residual: the *first* dispatch of each distinct signature still plans
-twice (once here, once in the kernel). Removing the kernel-side plan is not
-possible from this seam — `plan_gemm` returns the algorithm and matrix layouts,
-not just a byte count, and the kernel re-validates the supplied size
-independently. Steady-state decoding, which is where the cost lives, plans once
-per shape per node.
+Honest residual: **every** dispatch of a served kernel still plans once inside
+the kernel, and each distinct signature plans one extra time here. Removing the
+kernel-side plan is not possible from this seam — `plan_gemm` returns the
+algorithm and matrix layouts, not just a byte count, and the kernel re-validates
+the supplied size independently. So the cache bounds this seam's cost at one
+search per signature per node; it does not make the plugin path faster than
+`main`.
 
 **Lifetime.** `StepScoped` is served as above. `SessionPersistent` is
 **declined** (`None`) — never downgraded. Serving it from scratch would hand the
@@ -330,6 +381,17 @@ live bug; it is pinned by
 `releasing_the_factory_reports_weak_handles_as_the_blocker`, which builds the
 weak-only case explicitly.
 
+**And when the counts race.** `Arc::get_mut` and the two count reads are three
+separate atomic operations, so a concurrent owner can release *between* them and
+leave the diagnostic reading `strong=1, weak=0` — i.e. claiming that nothing
+blocked an access that was nevertheless refused. Exclusive access is now retried
+once in that exact case: if the blocker really did disappear, the retry succeeds
+and `shutdown()` runs (which is legal, since `get_mut` succeeding *is* the proof
+of exclusivity). If it is refused a second time with the counts still reading
+exclusive, the message says so — references are being manipulated concurrently
+with `ReleaseEpFactory` — instead of naming a blocker the counts do not
+support.
+
 **Compute-info holder audit.** On `main`, `ExportedComputeInfo` holds *no* EP
 reference — workspaces and intermediates both come from ORT scratch — so a live
 compute info can never keep the EP alive or block teardown, in either ordering.
@@ -382,6 +444,8 @@ executor honours the workspace contract. `PlainMulKernel` (op `Mul`) declares
 | `session_persistent_workspace_is_declined_not_downgraded` | `persistent_downgraded == 0` **and** `persistent_declined > 0` |
 | `workspace_plans_do_not_repeat_for_an_unchanged_shape` | 12 `Run`s of one shape ⇒ the plan counter never moves past what Run 1 needed |
 | `a_changed_shape_gets_its_own_workspace_plan` | on a dynamic-batch model, alternating `[1,4]`/`[3,4]` plans once per *distinct* shape and never serves a stale plan — the kernel rejects an undersized workspace, so a stale plan is a `Run` failure, not a silent pass |
+| `a_declined_workspace_never_asks_ort_where_the_operands_live` | a declined `SessionPersistent` dispatch records **zero** placement queries, with `persistent_declined >= RUNS` guarding against a vacuous pass |
+| `only_the_nodes_that_receive_a_workspace_query_placement` | on `chain_add_mul`, placement queries **equal** workspaces served — the zero-workspace `Mul` never queries, and every served `Add` does |
 | `shared_ep_two_sessions_share_one_instance` | one EP instance across two sessions |
 | `shared_ep_shutdown_runs_once_at_library_unregister` | exactly one `shutdown()` at unregister |
 
@@ -389,6 +453,13 @@ The mock `WorkspaceAddKernel` counts its own `workspace_requirement` calls
 (`nxrt_mock_shared_ep_workspace_plans`), standing in for the cuBLASLt heuristic
 search a real GEMM kernel runs there. It is the only way to observe the plan
 cache through a real ORT `Run` without hardware.
+
+`nxrt_mock_shared_ep_placement_queries` is different in kind: it re-exports the
+*executor's* own counter (`compute::workspace_placement_queries`), not a
+mock-side one, because the property under test is what the executor does before
+it decides to serve. That counter is deliberately not `cfg(test)`-gated — the
+cdylib ORT loads is built without `cfg(test)`, so a gated counter would leave
+the claim tested only in a configuration nobody ships.
 
 Every EP-allocation assertion is now `alloc_calls == 0`: workspaces and
 intermediates must come from ORT scratch, so **this suite fails if per-dispatch
@@ -427,6 +498,7 @@ Falsifications demonstrated for this revision, with the exact observed output:
 | Drop `dtype` + `present` from the key | *"an f16 dispatch must not be served the f32 plan — left: 256, right: 128"*; *"an absent optional operand must not be served the plan that charged for it — left: 128, right: 64"* |
 | Delete the `WorkspacePlanCache::lookup` fast path | 5 unit tests red (*"16 dispatches of one unchanged shape must run the planner once, not 17"*) and both E2E plan tests red: *"12 Runs of one unchanged shape re-planned the workspace: 12 plans where the first Run already needed 1"* — i.e. exactly linear growth |
 | Restore the pre-fix `weak_count = strong_count - 1` | both teardown tests red; the diagnostic prints the self-contradicting *"…but 0 Weak handle(s) … are outstanding, which is also enough to block exclusive access"* |
+| Move `operand_mem_info` back above the zero-byte / `StepScoped` gates | both placement falsifiers red: *"the executor asked ORT where the operands live for a node whose workspace request it then declined … 4 wasted FFI round trips per dispatch"* and *"placement was resolved 3 times for 2 served workspaces"* |
 
 Each mutation was reverted and the suite re-run green before committing.
 
