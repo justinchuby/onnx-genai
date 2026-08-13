@@ -159,7 +159,7 @@ impl ModelDirectory {
     }
 }
 
-/// Bytes the model's graph and weights occupy on disk.
+/// Bytes the model's weights actually occupy.
 ///
 /// ONNX keeps large initializers in a sibling *external data* file rather than
 /// inside the `.onnx` protobuf, so the graph file alone understates a model's
@@ -168,8 +168,56 @@ impl ModelDirectory {
 /// (`<model>.onnx.data`, `<model>.onnx_data`, …), which is a property of the
 /// ONNX format, not of any model family.
 ///
-/// Reads directory metadata only; it never opens the weights themselves.
+/// **File size is only an upper bound.** An external-data file can contain
+/// regions no initializer references — most commonly when a re-export appends
+/// fresh tensors without truncating the original, orphaning a prefix. One local
+/// export was exactly 50% dead space, so reporting file size told the runtime it
+/// had 2.00x more weights than it did, and every budget, fits/doesn't-fit and
+/// residency decision derived from that number was skewed (#853). So this parses
+/// the graph and sums what the initializers actually reference, falling back to
+/// file size only when the graph cannot be read.
+///
+/// Reads the graph protobuf (a few MB even for tens of GB of weights) plus
+/// directory metadata; it never opens the weight blobs themselves.
 pub fn model_weight_bytes(model_path: &Path) -> u64 {
+    let file_total = model_weight_file_bytes(model_path);
+    let Ok(bytes) = onnx_runtime_loader::read_model_binary(model_path) else {
+        return file_total;
+    };
+    let Ok(model) = onnx_runtime_loader::proto::decode_model(&bytes) else {
+        return file_total;
+    };
+    let referenced = onnx_runtime_loader::weights::referenced_weight_bytes(&model);
+    let graph_bytes = std::fs::metadata(model_path)
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    // The graph file is charged whole (it carries inline payloads plus the
+    // protobuf itself); only the external blobs are narrowed to what is
+    // referenced.
+    let total = graph_bytes.saturating_add(referenced.external);
+    // A materially oversized external blob is a defective export. Paying for it
+    // silently in budget decisions, disk, and page cache is worse than saying so.
+    if file_total > total && total > 0 {
+        let waste = file_total - total;
+        if waste.saturating_mul(10) > file_total {
+            tracing::warn!(
+                model = %model_path.display(),
+                file_bytes = file_total,
+                referenced_bytes = total,
+                unreferenced_bytes = waste,
+                "external data contains unreferenced regions; using referenced bytes as the \
+                 weight total. Repacking the export would reclaim this on disk"
+            );
+        }
+    }
+    total
+}
+
+/// On-disk size of the graph file plus its external-data siblings.
+///
+/// The upper bound [`model_weight_bytes`] narrows; used as its fallback when the
+/// graph cannot be parsed.
+fn model_weight_file_bytes(model_path: &Path) -> u64 {
     let Some(file_name) = model_path.file_name().and_then(|name| name.to_str()) else {
         return 0;
     };
@@ -1108,6 +1156,71 @@ mod weight_bytes_tests {
 
         assert_eq!(model_weight_bytes(&dir.join("decoder.onnx")), 1_010);
         assert_eq!(model_weight_bytes(&dir.join("encoder.onnx")), 2_020);
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unreferenced_external_regions_are_excluded_from_the_weight_total() {
+        let dir = scratch("dead-external-prefix");
+        // A minimal ONNX graph with one external initializer of 1,024 bytes at
+        // offset 4,096, hand-encoded so the test owns the exact layout: the
+        // first 4 KiB of the blob is orphaned, which is the shape of a re-export
+        // that appended fresh tensors without truncating the original (#853).
+        //
+        // Wire format, all length-delimited (tag = field << 3 | 2):
+        //   ModelProto.graph = 7, GraphProto.initializer = 5,
+        //   TensorProto: dims = 1 (varint), data_type = 2 (varint), name = 8,
+        //                external_data = 13, data_location = 14 (varint),
+        //   StringStringEntryProto: key = 1, value = 2.
+        fn len_delim(field: u32, payload: &[u8]) -> Vec<u8> {
+            let mut out = vec![u8::try_from((field << 3) | 2).unwrap()];
+            let mut len = payload.len();
+            loop {
+                let mut byte = u8::try_from(len & 0x7f).unwrap();
+                len >>= 7;
+                if len > 0 {
+                    byte |= 0x80;
+                }
+                out.push(byte);
+                if len == 0 {
+                    break;
+                }
+            }
+            out.extend_from_slice(payload);
+            out
+        }
+        fn entry(key: &str, value: &str) -> Vec<u8> {
+            let mut out = len_delim(1, key.as_bytes());
+            out.extend(len_delim(2, value.as_bytes()));
+            out
+        }
+
+        let mut tensor = vec![0x08, 0x80, 0x04]; // dims: 512
+        tensor.extend([0x10, 0x0a]); // data_type: 10 (FLOAT16) -> 512 * 2 = 1,024
+        tensor.extend(len_delim(8, b"w")); // name
+        tensor.extend(len_delim(13, &entry("location", "model.onnx.data")));
+        tensor.extend(len_delim(13, &entry("offset", "4096")));
+        tensor.extend(len_delim(13, &entry("length", "1024")));
+        tensor.extend([0x70, 0x01]); // data_location: EXTERNAL
+        let graph = len_delim(5, &tensor);
+        let graph_bytes = len_delim(7, &graph);
+        let graph_len = graph_bytes.len() as u64;
+
+        fs::write(dir.join("model.onnx"), &graph_bytes).unwrap();
+        // 5,120 bytes on disk, of which only the last 1,024 are referenced.
+        fs::write(dir.join("model.onnx.data"), vec![0_u8; 5_120]).unwrap();
+
+        assert_eq!(
+            model_weight_bytes(&dir.join("model.onnx")),
+            graph_len + 1_024,
+            "the 4 KiB orphaned prefix must not be charged as weights"
+        );
+        assert_eq!(
+            model_weight_file_bytes(&dir.join("model.onnx")),
+            graph_len + 5_120,
+            "the file-size upper bound still sees the whole blob"
+        );
 
         fs::remove_dir_all(dir).unwrap();
     }
