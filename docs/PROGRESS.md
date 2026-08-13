@@ -132,12 +132,24 @@ see "two regimes" at the end.
   like an 11 MiB projection: raising the budget once moved `hit_rate` 57.09% → 81.31%
   while the gap to the streaming floor **widened** 1.78× → 2.30×. `htod_bytes` is what
   decode pays for, so policy work is now judged on `byte_hit_rate`.
-- **#877 — hybrid feasibility measured.** `cuMemHostRegister(READ_ONLY|DEVICEMAP)` on a
-  read-only weight mapping succeeds at 3.1 ms/GiB; a device read of mapped host memory runs
-  at **11.41 GB/s** vs **11.28** for an explicit HtoD copy and **110.46** already-resident.
-  **This reversed the hybrid's assumed priority order:** zero-copy is *not* a bandwidth win
-  (1.01×) — it removes the copy's second pass and its machinery — while **the resident hot
-  set is worth ~9.7×**. So maximise residency first, de-copy the remainder second.
+- **#877/#880 — hybrid feasibility measured, then the figure corrected.**
+  `cuMemHostRegister(READ_ONLY|DEVICEMAP)` on a read-only weight mapping succeeds at
+  3.1 ms/GiB, and **CUDA graph capture with a host-mapped weight pointer is SUPPORTED**,
+  replaying bit-identically to eager (#880) — so the cold path keeps the #796 capture gates.
+  #877's sequential `cuMemcpyDtoD` proxy read mapped host memory at 11.41 GB/s, but **#880
+  ran the real strided int4 GEMV** (same kernel and launch config the engine selects, only
+  the weight pointer differing) and measured **~5.6 GB/s steady-state** against
+  **~100–133 GB/s** resident, outputs bit-identical at every size. **The proxy was
+  optimistic by ~2×; size the hybrid's cold path at 5.6, not 11.4.** Corroborated
+  independently: WDDM's ~8 tok/s on `qwen14b-zp` implies ~0.6 GB/step of host reads ≈
+  4.8 GB/s of PCIe traffic — the same order, and impossible if zero-copy were ~1 GB/s.
+  Sweeping the packed size mattered: the realistic ~12 MiB per-tensor read fits this GPU's
+  L2, so a single point there compares a *cached* read against a PCIe read; the ≥64 MiB
+  points are the honest ones. **This reversed the hybrid's assumed priority order:**
+  zero-copy is *not* a bandwidth win (1.01× against an explicit copy) — it removes the
+  copy's second pass and its machinery — while **the resident hot set is worth ~9.7× at the
+  realistic shape, ~15–24× at large N**. So maximise residency first, de-copy the remainder
+  second. A ~2× penalty is not the ~10× that would have killed the design.
 
 **Two regimes, and wins do not transfer between them.** When weights fit, decode is
 **node-dispatch bound** (#870: 2,568 graph nodes/token at ~8.17 µs/node; cheapening any
@@ -404,18 +416,20 @@ See [`deepseek-native-status-2026-07-25.md`](deepseek-native-status-2026-07-25.m
 
 - [ ] **The #864 hybrid — resident hot set + zero-copy cold reads.** The only route to
   *beating* the OS on over-budget models rather than merely no longer losing to it (#874
-  buys the ~100× by not choosing the slow path; it does not make us faster than WDDM). One
-  risk is unresolved and is being measured: the #877 figure comes from a **sequential**
-  `cuMemcpyDtoD` from mapped host memory, which is the right proxy for a kernel reading in
-  place but is **not** a strided GEMV — PCIe punishes small scattered transactions where
-  VRAM does not, so a real kernel could be far worse and that would kill the zero-copy half.
-  Also untested: whether a host-mapped device pointer can be baked into a **captured** graph
-  (`captures > 0`, `fallbacks == 0` are hard gates, #796).
+  buys the ~100× by not choosing the slow path; it does not make us faster than WDDM).
+  **Both halves are now measured and sound (#880):** a real strided GEMV reads host-mapped
+  weights at ~5.6 GB/s with bit-identical outputs, and capture works with a host-mapped
+  pointer — the two risks that could have killed it. Size the cold path at **5.6 GB/s**
+  (not #877's 11.4 proxy) and treat the resident hot set as the dominant lever. Remaining
+  unknowns are policy rather than feasibility: registering all 8.33 GB page-locks that much
+  host RAM, which needs a rule on smaller hosts, and which weights belong in the hot set is
+  #837 item 3's question.
 - [ ] **#837 item 3 — residency policy gap.** Post-#866 the policy sits **1.97× above its
   own streaming floor** (2.349 vs 1.191 GB/step), i.e. **1.158 GB/step recoverable**, worth
   ~91 ms/step at measured bandwidths. `byte_hit_rate` 71.8% against an achievable 85.7%
-  (`B/W`). `bypassed_page_ins` (704/run, ~12% of page-in events) has never been attributed
-  and should be ruled in or out first. Governs Linux, forced-managed Windows, and — the
+  (`B/W`). **Attributed:** bypassed page-ins account for **44.63% of streamed bytes
+  (~1.05 GB/step) — about 90% of the recoverable gap**, so the previously unexplained
+  counter is the gap, not a side issue. Governs Linux, forced-managed Windows, and — the
   reason it still matters after #874 — the hybrid, whose entire thesis is that we choose
   residency better than the driver does blind.
 - [ ] **#750 native multi-request batching.** Structurally batch-1 today; `--max-batch` is
