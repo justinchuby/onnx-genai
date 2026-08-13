@@ -13,8 +13,12 @@ use std::path::PathBuf;
 
 fn root(name: &str) -> anyhow::Result<PathBuf> {
     let root = std::env::var_os("MOBIUS_WORKFLOW_CONFORMANCE_DIR")
-        .ok_or_else(|| anyhow::anyhow!("MOBIUS_WORKFLOW_CONFORMANCE_DIR must be set"))?;
-    Ok(PathBuf::from(root).join(name))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/onnx_genai_workflows")
+        });
+    Ok(root.join(name))
 }
 
 fn options(max_new_tokens: usize) -> GenerateOptions {
