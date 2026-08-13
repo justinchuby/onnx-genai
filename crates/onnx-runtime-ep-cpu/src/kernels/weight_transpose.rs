@@ -450,19 +450,24 @@ mod tests {
         ];
 
         let mut reused = 0usize;
+        let mut seen_addrs: Vec<usize> = Vec::new();
         let mut first_visits: Vec<FirstVisit> = Vec::new();
 
         for (round, &(k, n)) in ROUNDS.iter().enumerate() {
             let src = arena.tensor(k, n);
+            // Observe the address rather than assume it: `reused` counts rounds
+            // that landed on an address an earlier round had already cached
+            // under a different geometry, exactly as the old test counted them.
+            let addr = src.as_ptr() as usize;
+            if seen_addrs.contains(&addr) {
+                reused += 1;
+            }
+            seen_addrs.push(addr);
             assert_eq!(
-                src.as_ptr() as usize,
-                base,
+                addr, base,
                 "round {round}: arena handed out a different address, so this round \
                  would not collide with the entries the earlier rounds cached"
             );
-            if round > 0 {
-                reused += 1;
-            }
 
             let bt = cache
                 .get_or_insert_transpose(src, k, n)
