@@ -583,6 +583,6 @@ mod tests {
             f32_after >= f32_before + 2,
             "both f32 shapes must be cached"
         );
-        assert!(f16_after >= f16_before + 1, "the f16 entry must be cached");
+        assert!(f16_after > f16_before, "the f16 entry must be cached");
     }
 }
