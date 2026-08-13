@@ -37,6 +37,22 @@ pub(crate) struct WorkflowPerformanceCounters {
     last_emitted_elements: u64,
 }
 
+/// Persistent execution state for repeated runs of one compiled workflow.
+///
+/// Preparing once caches request/literal binding, input validation, symbol
+/// resolution, component override validation, and the input value slots. Each
+/// execution retains those inputs while discarding transient SSA and emit values.
+pub struct WorkflowExecutionPlan<'a> {
+    engine: &'a PipelineEngine,
+    values: PipelineTensors,
+    input_names: Vec<String>,
+    input_aliases: HashMap<String, String>,
+    initial_symbols: HashMap<String, i64>,
+    dynamic_symbols: std::collections::HashSet<String>,
+    session_id: Option<String>,
+    component_overrides: HashMap<String, String>,
+}
+
 #[derive(Default)]
 struct WorkflowRunTelemetry {
     started: Option<std::time::Instant>,
@@ -351,36 +367,24 @@ impl PipelineEngine {
         &self,
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineTensors> {
-        let started = std::time::Instant::now();
-        let mut telemetry = WorkflowRunTelemetry {
-            started: Some(started),
-            ..WorkflowRunTelemetry::default()
-        };
+        WorkflowExecutionPlan::new(self, request)?.execute()
+    }
+}
+
+impl<'a> WorkflowExecutionPlan<'a> {
+    pub(crate) fn new(
+        engine: &'a PipelineEngine,
+        request: PipelineGenerateRequest,
+    ) -> anyhow::Result<Self> {
         let PipelineGenerateRequest {
             request,
             inputs,
             session_id,
             component_overrides,
         } = request;
-        let workflow = &self.workflow;
+        let workflow = &engine.workflow;
         validate_component_overrides(workflow, &component_overrides)?;
-        let mut values = self.bind_workflow_inputs(workflow, &request, inputs)?;
-        for (cell, state) in &workflow.state {
-            if state.scope != onnx_genai_metadata::WorkflowStateScope::Session {
-                continue;
-            }
-            let session_id = session_id.as_ref().with_context(|| {
-                format!("session-scoped workflow state '{cell}' requires a session id")
-            })?;
-            if let Some(value) = self
-                .workflow_session_state
-                .borrow()
-                .get(&(session_id.clone(), cell.clone()))
-            {
-                values.insert(session_state_value_name(cell), clone_value(value)?);
-            }
-        }
-        let mut symbols = HashMap::new();
+        let values = engine.bind_workflow_inputs(workflow, &request, inputs)?;
         let dynamic_symbols = workflow
             .state
             .values()
@@ -398,31 +402,123 @@ impl PipelineEngine {
                 onnx_genai_metadata::ShapeRecurrence::Invariant => None,
             })
             .collect::<std::collections::HashSet<_>>();
+        let mut initial_symbols = HashMap::new();
         for (name, input) in &workflow.inputs {
             if let Some(value) = values.get(name) {
                 validate_workflow_value(
                     name,
                     value,
                     &input.contract,
-                    &mut symbols,
+                    &mut initial_symbols,
                     &dynamic_symbols,
                 )?;
             }
         }
+        let input_names = values.keys().cloned().collect::<Vec<_>>();
+        let input_aliases = workflow
+            .inputs
+            .iter()
+            .filter_map(|(name, input)| match &input.source {
+                WorkflowInputSource::Application { name: alias } => {
+                    Some((alias.clone(), name.clone()))
+                }
+                _ => None,
+            })
+            .chain(
+                workflow
+                    .inputs
+                    .keys()
+                    .map(|name| (name.clone(), name.clone())),
+            )
+            .collect();
+        Ok(Self {
+            engine,
+            values,
+            input_names,
+            input_aliases,
+            initial_symbols,
+            dynamic_symbols,
+            session_id,
+            component_overrides,
+        })
+    }
+
+    /// Replace a prepared package/application input without rebuilding the plan.
+    pub fn set_input(&mut self, name: &str, value: Value) -> anyhow::Result<()> {
+        let package_name = self
+            .input_aliases
+            .get(name)
+            .with_context(|| format!("workflow execution plan has no input '{name}'"))?;
+        let input = self
+            .engine
+            .workflow
+            .inputs
+            .get(package_name)
+            .with_context(|| format!("workflow package input '{package_name}' is undeclared"))?;
+        let mut symbols = self.initial_symbols.clone();
+        validate_workflow_value(
+            package_name,
+            &value,
+            &input.contract,
+            &mut symbols,
+            &self.dynamic_symbols,
+        )?;
+        self.values.insert(package_name.clone(), value);
+        if !self.input_names.contains(package_name) {
+            self.input_names.push(package_name.clone());
+        }
+        Ok(())
+    }
+
+    /// Execute the already-bound workflow and retain its input slots for replay.
+    pub fn execute(&mut self) -> anyhow::Result<PipelineTensors> {
+        let started = std::time::Instant::now();
+        let mut telemetry = WorkflowRunTelemetry {
+            started: Some(started),
+            ..WorkflowRunTelemetry::default()
+        };
+        let engine = self.engine;
+        let generation = engine.workflow_execution_generation.get().wrapping_add(1);
+        engine.workflow_execution_generation.set(generation);
+        for island in &engine.execution_islands {
+            island.begin_execution(generation);
+        }
+        let workflow = &engine.workflow;
+        let mut values = std::mem::take(&mut self.values);
+        for (cell, state) in &workflow.state {
+            if state.scope != onnx_genai_metadata::WorkflowStateScope::Session {
+                continue;
+            }
+            let session_id = self.session_id.as_ref().with_context(|| {
+                format!("session-scoped workflow state '{cell}' requires a session id")
+            })?;
+            if let Some(value) = engine
+                .workflow_session_state
+                .borrow()
+                .get(&(session_id.clone(), cell.clone()))
+            {
+                values.insert(session_state_value_name(cell), clone_value(value)?);
+            }
+        }
+        let mut symbols = self.initial_symbols.clone();
         let mut emit_counts = HashMap::new();
         let mut final_state_refs = HashMap::new();
-        self.run_workflow_node(
-            &self.compiled_workflow.graph,
+        let result = engine.run_workflow_node(
+            &engine.compiled_workflow.graph,
             workflow,
             &mut values,
             &mut symbols,
-            &dynamic_symbols,
+            &self.dynamic_symbols,
             &mut emit_counts,
             &mut final_state_refs,
-            &component_overrides,
+            &self.component_overrides,
             &mut telemetry,
-        )?;
-        for output in workflow_emitted_outputs(&self.compiled_workflow.graph) {
+        );
+        if let Err(error) = result {
+            self.retain_inputs(&mut values);
+            return Err(error);
+        }
+        for output in workflow_emitted_outputs(&engine.compiled_workflow.graph) {
             let Some(value) = values.get(&output) else {
                 continue;
             };
@@ -431,9 +527,15 @@ impl PipelineEngine {
                 .get(&output)
                 .with_context(|| format!("workflow emitted undeclared output '{output}'"))?
                 .contract;
-            validate_workflow_value(&output, value, contract, &mut symbols, &dynamic_symbols)?;
+            validate_workflow_value(
+                &output,
+                value,
+                contract,
+                &mut symbols,
+                &self.dynamic_symbols,
+            )?;
         }
-        if let Some(session_id) = session_id {
+        if let Some(session_id) = &self.session_id {
             let mut updates = Vec::new();
             for (cell, state) in &workflow.state {
                 if state.scope != onnx_genai_metadata::WorkflowStateScope::Session {
@@ -450,13 +552,13 @@ impl PipelineEngine {
                 })?;
                 updates.push(((session_id.clone(), cell.clone()), clone_value(value)?));
             }
-            let mut session_state = self.workflow_session_state.borrow_mut();
+            let mut session_state = engine.workflow_session_state.borrow_mut();
             for (key, value) in updates {
                 session_state.insert(key, value);
             }
         }
         let elapsed_ns = started.elapsed().as_nanos();
-        let mut counters = self.workflow_performance.borrow_mut();
+        let mut counters = engine.workflow_performance.borrow_mut();
         counters.runs += 1;
         counters.total_elapsed_ns += elapsed_ns;
         counters.last_elapsed_ns = elapsed_ns;
@@ -465,8 +567,26 @@ impl PipelineEngine {
         counters.last_component_invocations = telemetry.component_invocations;
         counters.last_emit_events = telemetry.emit_events;
         counters.last_emitted_elements = telemetry.emitted_elements;
-        self.package_outputs(values)
+        drop(counters);
+        let inputs = self.take_inputs(&mut values);
+        let outputs = engine.package_outputs(values);
+        self.values = inputs;
+        outputs
     }
+
+    fn retain_inputs(&mut self, values: &mut PipelineTensors) {
+        self.values = self.take_inputs(values);
+    }
+
+    fn take_inputs(&self, values: &mut PipelineTensors) -> PipelineTensors {
+        self.input_names
+            .iter()
+            .filter_map(|name| values.remove(name).map(|value| (name.clone(), value)))
+            .collect()
+    }
+}
+
+impl PipelineEngine {
     // Recursive execution threads the explicit interpreter stores and telemetry.
     #[allow(clippy::too_many_arguments)]
     fn run_workflow_node(
@@ -740,7 +860,12 @@ impl PipelineEngine {
                         })?;
                         let next = values.get(&carry.body_output).with_context(|| {
                             format!("workflow loop body did not produce '{}'", carry.body_output)
-                        })?;
+                        });
+                        if state.service_group.is_some() && next.is_err() {
+                            final_state_refs.insert(carry.cell.clone(), carry.next.clone());
+                            continue;
+                        }
+                        let next = next?;
                         validate_state_recurrence(&carry.cell, current, next, state, values)?;
                         let next_value = merge_inactive_rows(
                             current,
@@ -850,10 +975,15 @@ impl PipelineEngine {
                 if let Some(valid_length) = valid_length {
                     self.materialize_workflow_value(values, valid_length)?;
                 }
-                let tensor =
+                let tensor = if self.movable_emit_values.contains(value) {
+                    values
+                        .remove(value)
+                        .with_context(|| format!("workflow emit value '{value}' is unavailable"))?
+                } else {
                     clone_value(values.get(value).with_context(|| {
                         format!("workflow emit value '{value}' is unavailable")
-                    })?)?;
+                    })?)?
+                };
                 let output_contract = workflow.outputs.get(output).with_context(|| {
                     format!("workflow emit references undeclared output '{output}'")
                 })?;
@@ -1940,6 +2070,166 @@ fn workflow_emitted_outputs(node: &WorkflowNode) -> std::collections::HashSet<St
     }
     let mut outputs = std::collections::HashSet::new();
     collect(node, &mut outputs);
+    outputs
+}
+
+pub(super) fn compile_movable_emit_values(
+    node: &WorkflowNode,
+    workflow: &WorkflowSpec,
+) -> std::collections::HashSet<String> {
+    fn collect_uses(node: &WorkflowNode, uses: &mut HashMap<String, usize>) {
+        let mut used = |value: &str| *uses.entry(value.to_string()).or_default() += 1;
+        match node {
+            WorkflowNode::Sequence { nodes } => {
+                for node in nodes {
+                    collect_uses(node, uses);
+                }
+            }
+            WorkflowNode::Invoke { inputs, .. } => {
+                for value in inputs.values() {
+                    used(value);
+                }
+            }
+            WorkflowNode::Loop {
+                setup,
+                body,
+                continue_when,
+                max_iterations,
+                carried,
+                ..
+            } => {
+                used(continue_when);
+                used(max_iterations);
+                for carry in carried {
+                    used(&carry.current);
+                    used(&carry.body_output);
+                }
+                collect_uses(setup, uses);
+                collect_uses(body, uses);
+            }
+            WorkflowNode::Branch {
+                predicate,
+                cases,
+                default,
+                outputs,
+                ..
+            } => {
+                used(predicate);
+                for phi in outputs.values() {
+                    for value in phi.cases.values() {
+                        used(value);
+                    }
+                    if let Some(value) = &phi.default {
+                        used(value);
+                    }
+                }
+                for case in cases.values() {
+                    collect_uses(case, uses);
+                }
+                if let Some(default) = default {
+                    collect_uses(default, uses);
+                }
+            }
+            WorkflowNode::Emit {
+                value,
+                when,
+                valid_length,
+                ..
+            } => {
+                used(value);
+                if let Some(value) = when {
+                    used(value);
+                }
+                if let Some(value) = valid_length {
+                    used(value);
+                }
+            }
+            WorkflowNode::Transfer { input, .. } => used(input),
+            WorkflowNode::ExecutionIsland { .. } => {}
+        }
+    }
+
+    fn collect_emits(node: &WorkflowNode, emits: &mut std::collections::HashSet<String>) {
+        match node {
+            WorkflowNode::Sequence { nodes } => {
+                for node in nodes {
+                    collect_emits(node, emits);
+                }
+            }
+            WorkflowNode::Loop { setup, body, .. } => {
+                collect_emits(setup, emits);
+                collect_emits(body, emits);
+            }
+            WorkflowNode::Branch { cases, default, .. } => {
+                for case in cases.values() {
+                    collect_emits(case, emits);
+                }
+                if let Some(default) = default {
+                    collect_emits(default, emits);
+                }
+            }
+            WorkflowNode::Emit {
+                value,
+                when: None,
+                valid_length: None,
+                mode: WorkflowEmitMode::Replace,
+                ..
+            } => {
+                emits.insert(value.clone());
+            }
+            WorkflowNode::Invoke { .. }
+            | WorkflowNode::Emit { .. }
+            | WorkflowNode::Transfer { .. }
+            | WorkflowNode::ExecutionIsland { .. } => {}
+        }
+    }
+
+    let mut uses = HashMap::new();
+    collect_uses(node, &mut uses);
+    let mut emits = std::collections::HashSet::new();
+    collect_emits(node, &mut emits);
+    emits.retain(|value| uses.get(value) == Some(&1) && !workflow.inputs.contains_key(value));
+    emits
+}
+
+pub(super) fn compile_aliasable_output_values(
+    node: &WorkflowNode,
+) -> std::collections::HashSet<String> {
+    fn collect_single_run_outputs(
+        node: &WorkflowNode,
+        repeated: bool,
+        outputs: &mut std::collections::HashSet<String>,
+    ) {
+        match node {
+            WorkflowNode::Sequence { nodes } => {
+                for node in nodes {
+                    collect_single_run_outputs(node, repeated, outputs);
+                }
+            }
+            WorkflowNode::Invoke {
+                outputs: produced, ..
+            } if !repeated => outputs.extend(produced.values().cloned()),
+            WorkflowNode::Loop { setup, body, .. } => {
+                collect_single_run_outputs(setup, repeated, outputs);
+                collect_single_run_outputs(body, true, outputs);
+            }
+            WorkflowNode::Branch { cases, default, .. } => {
+                for case in cases.values() {
+                    collect_single_run_outputs(case, repeated, outputs);
+                }
+                if let Some(default) = default {
+                    collect_single_run_outputs(default, repeated, outputs);
+                }
+            }
+            WorkflowNode::Invoke { .. }
+            | WorkflowNode::Emit { .. }
+            | WorkflowNode::Transfer { .. }
+            | WorkflowNode::ExecutionIsland { .. } => {}
+        }
+    }
+
+    let mut outputs = std::collections::HashSet::new();
+    collect_single_run_outputs(node, false, &mut outputs);
     outputs
 }
 
