@@ -1,7 +1,7 @@
 # Dense-decode megakernel feasibility (Muse-Glimmer-30B, native CUDA, M=1)
 
 **Author:** Sebastian (Performance/Systems). **Date:** 2026-08-13. **Branch:** `squad/dense-decode-megakernel`.
-**Status:** Phase A gate **PASSED** → Phase B micro-benchmark run → **GO to prototype P2** (staged; see §5).
+**Status:** Phase A gate **PASSED** → Phase B glue micro-benchmark run → **P1.5 fused-int4-GEMV + grid.sync-capture probes run** → **GO to prototype P2 as a persistent multi-CTA cooperative kernel** (see §5, §6).
 
 > **Headline.** Native decode of Muse-Glimmer-30B is confirmed **latency-bound on a
 > ~2568-node serial launch chain** (~21.4 ms/token, 46.7 tok/s on H200 at
@@ -16,6 +16,19 @@
 > **~62 tok/s conservative (+33%) to ~100+ tok/s (2×+)**. This is a *different* op
 > chain than the #769 P0 QMoE-MoE megakernel (Amdahl-capped ~13%, NO-SHIP); that
 > result does not bind the dense path.
+>
+> **P1.5 update (2026-08-13).** Two decisive follow-up probes now bound the P2
+> *architecture*: (1) a **single-CTA** fused int4 MLP that holds the 19968-wide
+> intermediate resident in shared memory is **926× SLOWER** than the per-op int4
+> GEMV baseline (byte-exact, 0 ulp) — residency alone is a dead end because one SM
+> is ~1/132 of the device's weight-read bandwidth; the megakernel **must be
+> multi-CTA**. (2) The feared blocker for a multi-CTA design — whether a
+> **cooperative launch (`cuLaunchCooperativeKernel`, the only launch path for
+> `grid.sync`) can be captured into the decode CUDA graph** — is empirically
+> **CLEARED**: on this H200/driver the cooperative launch records into an active
+> capture and instantiates a graph. **Net: P2 stays GO, now scoped concretely as a
+> persistent multi-CTA cooperative megakernel** (grid.sync barriers between the
+> resident sub-GEMVs), not a single giant CTA. See §6.
 
 ---
 
@@ -138,14 +151,10 @@ All above 47.25; the lever is real.
   the 35B-A3B **MoE** path (Amdahl-capped ~13% of decode, regressed). The dense
   Muse-Glimmer path is a completely different op chain (417 dense int4 GEMV + 52 GQA +
   1145 glue) that P0 never touched, and Phase A/B show its recoverable overhead is ~85%.
-- **Recommended next step (P1.5, before full P2):** build the *real* one-layer dense
-  megakernel with actual int4 weights — RMSNorm → QKV MatMulNBits → RoPE → GQA → O-proj →
-  residual → RMSNorm → gate/up MatMulNBits → SiLU·Mul → down → residual — keeping
-  intermediates in registers/shared (chunked producer/consumer at the GQA softmax
-  boundary), behind an env flag, measured vs the current per-op layer. This closes the one
-  gap in this brief: Phase B measured the **glue** recovery (the 70%-of-nodes component)
-  and the launch floor directly, but did **not** yet build the fused int4 GEMV path — that
-  per-layer number is what should gate funding the full P2 pipeline integration.
+- **P1.5 (done, §6):** the real fused int4 GEMV per-layer number and the
+  grid.sync-capture gate — this brief's Phase B measured only the **glue** recovery
+  (70%-of-nodes component) and the launch floor; §6 adds the GEMV/residency and
+  capture-architecture findings that actually scope the P2 build.
 - **P2 risks to budget:** (1) capture-safety — the megakernel must do no alloc/free/sync
   internally (all scratch pre-staged, per the #854/#867 capture rules); (2) numerics —
   fused RMSNorm/softmax reductions reorder fp32 sums → **Chew gate** + f64 oracle
@@ -155,12 +164,109 @@ All above 47.25; the lever is real.
 
 ---
 
-## Appendix — reproducibility
+## 6. P1.5 — real fused int4 GEMV + grid.sync-under-capture (measured, this H200)
+
+Two throwaway `#[ignore]` probes were added to the Phase B harness
+(`tests/megakernel_headroom_gpu.rs`; `megakernel_int4_mlp_probe`,
+`grid_sync_capture_gate_probe`). Both use faithful block-32 int4 dequant (nibble
+unpack, symmetric zp=8, fp32 accumulate + `block_sum`, identical math/order to the
+production `matmul_nbits_gemv_f32` reference). Real Muse-Glimmer MLP shapes:
+gate/up `6656→19968`, down `19968→6656`, block_size 32.
+
+### 6.1 Single-CTA fused int4 MLP vs per-op baseline
+
+The fused kernel is one block that keeps the hidden input **and** the 19968-wide
+SiLU·Mul intermediate resident in 104 KiB of opt-in dynamic shared memory across
+the whole MLP — **zero activation DRAM round-trips**, only packed weights stream
+from DRAM. Baseline = the current 4 separate launches (gate GEMV, up GEMV, SiLU·Mul,
+down GEMV), each with `grid = N` columns so weight reads fan out across all SMs.
+
+| Variant | Launches | GPU time / layer-MLP | vs baseline |
+|---|---|---|---|
+| Per-op baseline (full-device parallel) | 4 | **0.664 ms** | 1× |
+| Fused **single-CTA** (intermediate resident) | 1 | **615.3 ms** | **926× SLOWER** |
+
+Numerics: **max_abs = 0, max_ulp = 0 — byte-exact.** Identical dequant + identical
+`block_sum` reduction order means residency fusion does *not* reorder any sum;
+byte-exact greedy parity is preserved (no Chew gate needed for pure structural
+residency; it *would* be needed for any reduction-reordering GQA-softmax/RMSNorm
+tree-collapse in the full kernel).
+
+> **Absolute-number caveat (be honest):** the baseline here is my *reference* f32
+> int4 GEMV, which is slower than the production f16-staged split-K dp4a kernel and
+> is not the captured path, so **0.664 ms/MLP-layer is NOT the decode budget**
+> (whole-token wall is ~21.4 ms / 52 layers ≈ 0.41 ms/layer for *everything*). The
+> finding is the **926× ratio and the byte-exactness**, not the absolute time.
+
+**Interpretation.** Residency-only fusion (the trick that won 85.6% on the tiny
+6656-wide *glue* vectors in Phase B) is **catastrophic on the weight-heavy GEMVs**:
+one SM pulls the ~199 MB of MLP weights alone and serializes all 26 624 output
+columns, losing the ~132× full-device weight-read parallelism the per-op kernels
+get for free. **Conclusion: a dense-layer megakernel cannot be single-CTA** — it
+must be multi-CTA so weight reads stay spread across the whole GPU, which forces a
+grid-wide barrier (`grid.sync`) to keep activations resident across the sub-GEMV
+dependency boundaries. That makes §6.2 the gating question.
+
+### 6.2 grid.sync / cooperative-launch under CUDA-graph capture — the P2 gate
+
+A persistent multi-CTA megakernel with grid-wide producer/consumer sync can only be
+launched with `cuLaunchCooperativeKernel`. The decisive P2 question: **can that
+launch be captured into the decode CUDA graph** (decode replays a captured graph)?
+Probe: compile a trivial co-resident cooperative kernel to CUBIN (sm_90), (A) launch
+it cooperatively outside capture, then (B) begin thread-local stream capture, attempt
+the cooperative launch, read capture status, and end capture.
+
+| Step | Result |
+|---|---|
+| (A) cooperative launch outside capture | **OK** — device supports cooperative launch |
+| (B) cooperative launch **during** capture | launch = **Ok**, capture status = **ACTIVE** (not invalidated), `end_capture` → **graph instantiated** |
+
+**Verdict: grid.sync IS capturable on this H200/driver.** The most-feared P2
+architecture blocker — "a cooperative megakernel can't live inside the captured
+decode graph, forcing an eager seam" — **does not fire here.** Caveats to budget,
+not fabricate around: (i) this is driver/CTK-version-dependent — older drivers
+historically returned `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED` for cooperative launch
+under capture, so P2 must keep a graph-break fallback path and gate on a runtime
+capability check; (ii) a real `grid.sync` requires the whole grid **co-resident**, so
+the grid must be sized to `occupancy × SM count` (via
+`cuOccupancyMaxActiveBlocksPerMultiprocessor`), not to the problem size — a hard
+design constraint but not a capture blocker; (iii) capture-safety still forbids any
+internal alloc/free and dynamic parallelism inside the kernel (#854/#867 rules).
+
+### 6.3 What P1.5 changes for P2
+
+- **Design is now concrete:** P2 = a **persistent multi-CTA cooperative megakernel**,
+  grid sized to occupancy, `grid.sync` barriers between the resident sub-GEMVs, small
+  activation vectors + norm/RoPE/SiLU state held in shared/registers, weights + KV
+  streamed from DRAM with full-device parallelism. The single-CTA residency shortcut
+  is ruled out.
+- **The biggest risk retired:** capture-compatibility of the cooperative launch is
+  measured-OK, so P2 is not forced onto an eager (uncaptured) seam on this platform.
+- **Remaining P2 risks (unchanged from §5 + refined):** occupancy/co-residency grid
+  sizing at H=6656 register/smem pressure; hosting GEMVs of different N (19968 vs 6656)
+  under one fixed cooperative grid; numerics (any fused RMSNorm/GQA-softmax reduction
+  reorder → **Chew** gate + f64 oracle); driver-version portability of captured
+  cooperative launch (keep a graph-break fallback).
+- **Recovery expectation:** Phase B already banked 85.6% recovery on the glue (70% of
+  nodes). P1.5 shows the GEMV portion can't be *sped up* by fusion (it's real
+  compute/weight-read work done in parallel), but it *can* be folded into the same
+  cooperative kernel to erase its per-node launch/schedule overhead and its activation
+  round-trips — which is where the §4 whole-model **~62 → ~100+ tok/s** projection
+  comes from. The multi-CTA megakernel is the vehicle that captures both.
+
+**P2 go/no-go: GO (staged prototype).** Capture blocker cleared; architecture pinned
+to persistent multi-CTA cooperative. Fund the P2 prototype behind an env flag with a
+graph-break fallback and the Chew numerics gate.
+
+---
 
 - Env: `source /home/justinchu/onnx-genai/.cudaenv.sh`; `CUDA_VISIBLE_DEVICES=0 ONNX_GENAI_CUDA_DEVICE=0`.
 - Baseline/eager/op-mix: `profile_native` as in §1 (`ONNX_GENAI_CUDA_GRAPH=0/1`, `ONNX_GENAI_PROFILE_OPS=1`).
-- Phase B micro-bench (throwaway, `#[ignore]`, never shipped):
+- Phase B / P1.5 micro-bench (throwaway, `#[ignore]`, never shipped):
   `cargo test --release -p onnx-runtime-ep-cuda --features cuda --test megakernel_headroom_gpu -- --ignored --nocapture`.
-  Knobs: `NXRT_MK_HIDDEN` (6656), `NXRT_MK_GLUE_OPS` (22), `NXRT_MK_ITERS` (200), `NXRT_MK_LAYERS` (52).
+  Tests: `megakernel_headroom_probe` (glue), `megakernel_int4_mlp_probe` (fused int4 MLP vs per-op),
+  `grid_sync_capture_gate_probe` (cooperative-launch-under-capture gate).
+  Knobs: `NXRT_MK_HIDDEN` (6656), `NXRT_MK_INTER` (19968), `NXRT_MK_GLUE_OPS` (22),
+  `NXRT_MK_ITERS` (200), `NXRT_MK_MLP_ITERS` (50), `NXRT_MK_LAYERS` (52).
 - Model dir: `.../olive-recipes/meta-models-Muse-Glimmer-30B/cuda/int4/models` (`--pipeline`; never write through the symlink).
 - Profilers (ncu/nsys) are blocked in-sandbox (`RmProfilingAdminOnly=1`); all numbers are built-in op timer + CUDA-event + wall-clock, per the profiling skill.
