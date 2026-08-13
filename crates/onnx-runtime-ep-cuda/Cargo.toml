@@ -65,6 +65,7 @@ features = ["std", "driver", "cublaslt", "cudnn", "nvrtc", "f16", "dynamic-loadi
 
 [dev-dependencies]
 onnx-runtime-loader = { workspace = true }
+onnx-runtime-shape-inference = { workspace = true }
 onnx-runtime-cuda-memory = { path = "../onnx-runtime-cuda-memory", version = "=0.1.0-dev.5", default-features = false }
 onnx-runtime-memory-governor = { workspace = true }
 

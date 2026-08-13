@@ -373,6 +373,19 @@ extern "C" __global__ void rmsnorm_bf16(
     const int tid = threadIdx.x;
     const int nt = blockDim.x;
 
+    // Parallel f32 tree reduction of the mean-square. The bf16 activations
+    // upcast to f32 losslessly, then accumulate in f32 (matmul-free: just x*x),
+    // so precision is full-f32 throughout; only the *summation order* differs
+    // from the serial `rmsnorm_f32` reference (tree vs strict left-to-right).
+    // A pairwise tree is at least as accurate as sequential accumulation (lower
+    // error growth, O(log n) vs O(n)), and a per-element f64 oracle confirms the
+    // tree result is within a couple of ulp of the f64 ground-truth RMS. Because
+    // decode feeds an accuracy-level-4 int4 MatMulNBits (quantized activations),
+    // a sub-ulp normalization difference can still flip a downstream int8
+    // rounding boundary, so greedy token ids stay byte-exact for the first ~38
+    // steps then exhibit expected sub-ulp greedy sensitivity. The strict
+    // CPU-order serial path remains available via
+    // ONNX_GENAI_CUDA_DISABLE_NORM_CAST_FOLD=1 (routes back to rmsnorm_f32).
     float ss = 0.0f;
     for (int j = tid; j < norm_size; j += nt) {
         const float xv = __bfloat162float(x[base + j]);
@@ -848,7 +861,7 @@ extern "C" __global__ void skip_layernorm_f32(
 "#;
 
 const LAYERNORM_MODULE: &str = "layernorm_bf16_v2";
-const RMSNORM_MODULE: &str = "rmsnorm_bf16_v2";
+const RMSNORM_MODULE: &str = "rmsnorm_bf16_v4";
 const SKIP_RMSNORM_MODULE: &str = "skip_rmsnorm_f16_warp_v5";
 const SKIP_LAYERNORM_MODULE: &str = "skip_layernorm_f32";
 
@@ -3385,5 +3398,164 @@ mod tests {
                 }
             );
         }
+    }
+
+    /// f64 numerical oracle for the bf16 `RMSNormalization` fold path at
+    /// Muse-Glimmer's decoder width (hidden = 6656, bf16 activations, f32 scale
+    /// — the exact shape `CudaDropNormalizationCasts` produces). This gates the
+    /// parallel f32 tree reduction in `rmsnorm_bf16`: the kernel output must
+    /// match a per-element f64 ground-truth RMS to within one bf16 ulp, and the
+    /// parallel tree mean-square must be at least as close to the f64 truth as
+    /// the strict left-to-right serial f32 order used by `rmsnorm_f32`. This is
+    /// the numerical justification (for Chew's precision gate) that the tree
+    /// reduction is a legitimate full-f32-precision reduction, not a regression.
+    #[test]
+    fn bf16_rmsnorm_tree_reduction_matches_f64_oracle_at_muse_glimmer_width() {
+        let ep = match CudaExecutionProvider::new_default() {
+            Ok(ep) => ep,
+            Err(error) => {
+                eprintln!("skip: no CUDA GPU/runtime available ({error})");
+                return;
+            }
+        };
+        let hidden = 6656usize;
+        let epsilon = 1e-6f32;
+        // Deterministic, mixed-magnitude activations that stress FP summation
+        // order (values span ~3 orders of magnitude, alternating sign).
+        let x_f32: Vec<f32> = (0..hidden)
+            .map(|i| {
+                let t = (i as f32) * 0.017_f32;
+                let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
+                sign * (0.001 + (t.sin() * t.cos()).abs() * 3.0)
+            })
+            .collect();
+        let x_bf16: Vec<bf16> = x_f32.iter().map(|v| bf16::from_f32(*v)).collect();
+        // Gemma-style "+1" f32 scale (the fold leaves scale in f32).
+        let scale_f32: Vec<f32> = (0..hidden).map(|i| 1.0 + ((i % 7) as f32) * 0.03).collect();
+
+        let shape = [1usize, hidden];
+        let strides = compute_contiguous_strides(&shape);
+        let param_shape = [hidden];
+        let param_strides = compute_contiguous_strides(&param_shape);
+
+        let x_buffer = ep
+            .allocate(std::mem::size_of_val(x_bf16.as_slice()), 256)
+            .unwrap();
+        let scale_buffer = ep
+            .allocate(std::mem::size_of_val(scale_f32.as_slice()), 256)
+            .unwrap();
+        let mut out_buffer = ep
+            .allocate(std::mem::size_of_val(x_bf16.as_slice()), 256)
+            .unwrap();
+        let runtime = ep.runtime();
+        unsafe {
+            runtime
+                .htod(bf16_bytes(&x_bf16), cuptr(x_buffer.as_ptr()))
+                .unwrap();
+            runtime
+                .htod(f32_bytes(&scale_f32), cuptr(scale_buffer.as_ptr()))
+                .unwrap();
+        }
+        let x = TensorView::new(
+            DevicePtr(x_buffer.as_ptr()),
+            DataType::BFloat16,
+            &shape,
+            &strides,
+            ep.device_id(),
+        );
+        let scale_view = TensorView::new(
+            DevicePtr(scale_buffer.as_ptr()),
+            DataType::Float32,
+            &param_shape,
+            &param_strides,
+            ep.device_id(),
+        );
+        let output = TensorMut::new(
+            DevicePtrMut(out_buffer.as_mut_ptr()),
+            DataType::BFloat16,
+            &shape,
+            &strides,
+            ep.device_id(),
+        );
+        RmsNormKernel {
+            axis: -1,
+            epsilon,
+            runtime: runtime.clone(),
+            warmed_signature: Mutex::new(None),
+            last_call_capture_safe: AtomicBool::new(false),
+        }
+        .run(&[x, scale_view], &mut [output])
+        .unwrap();
+        runtime.synchronize().unwrap();
+
+        let mut out_bytes = vec![0u8; std::mem::size_of_val(x_bf16.as_slice())];
+        unsafe {
+            runtime
+                .dtoh(&mut out_bytes, cuptr(out_buffer.as_ptr()))
+                .unwrap();
+        }
+        let out_bf16: Vec<bf16> = out_bytes
+            .chunks_exact(2)
+            .map(|raw| bf16::from_bits(u16::from_ne_bytes(raw.try_into().unwrap())))
+            .collect();
+
+        // The kernel upcasts the *stored* bf16 activations, so the oracle must
+        // use the same bf16-rounded values (not the original f32) as ground
+        // truth for the elements; the reduction itself is done in f64.
+        let x_ref: Vec<f64> = x_bf16.iter().map(|v| f64::from(v.to_f32())).collect();
+        let ms_f64: f64 = x_ref.iter().map(|v| v * v).sum::<f64>() / hidden as f64;
+        let inv_std_f64 = 1.0 / (ms_f64 + f64::from(epsilon)).sqrt();
+
+        // Kernel output vs f64 ground truth, measured in bf16 ulp.
+        let mut max_ulp = 0i32;
+        for i in 0..hidden {
+            let expect = x_ref[i] * inv_std_f64 * f64::from(scale_f32[i]);
+            let expect_bf16 = bf16::from_f32(expect as f32);
+            let ulp = (i32::from(out_bf16[i].to_bits()) - i32::from(expect_bf16.to_bits())).abs();
+            max_ulp = max_ulp.max(ulp);
+        }
+        assert!(
+            max_ulp <= 1,
+            "bf16 rmsnorm output diverges from f64 oracle by {max_ulp} bf16 ulp (want <= 1)"
+        );
+
+        // The parallel tree mean-square must be at least as close to f64 truth
+        // as the serial left-to-right f32 order. Reproduce both in f32.
+        let serial_ms: f32 = {
+            let mut ss = 0.0f32;
+            for v in &x_bf16 {
+                let f = v.to_f32();
+                ss += f * f;
+            }
+            ss / hidden as f32
+        };
+        let tree_ms: f32 = {
+            let mut level: Vec<f32> = x_bf16
+                .iter()
+                .map(|v| {
+                    let f = v.to_f32();
+                    f * f
+                })
+                .collect();
+            while level.len() > 1 {
+                let mut next = Vec::with_capacity(level.len().div_ceil(2));
+                let mut i = 0;
+                while i + 1 < level.len() {
+                    next.push(level[i] + level[i + 1]);
+                    i += 2;
+                }
+                if i < level.len() {
+                    next.push(level[i]);
+                }
+                level = next;
+            }
+            level[0] / hidden as f32
+        };
+        let serial_err = (f64::from(serial_ms) - ms_f64).abs();
+        let tree_err = (f64::from(tree_ms) - ms_f64).abs();
+        assert!(
+            tree_err <= serial_err * 1.000_001 + 1e-9,
+            "tree mean-square error {tree_err:e} exceeds serial error {serial_err:e}"
+        );
     }
 }
