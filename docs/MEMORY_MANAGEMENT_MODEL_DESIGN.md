@@ -33,7 +33,7 @@ from the same authorities through the contracts below.
 | --- | --- | --- |
 | **C1** | Resource authority | Within one `ProcessMemoryManager`, each distinct physical pool has one canonical authority identity. A governor may expose several tiers, but devices sharing physical memory alias the same authority and mismatched identities fail before use. |
 | **C2** | Lease and allowance | Before retaining physical memory, a holder acquires an RAII lease identifying authority, tier, bytes, role, and holder. Mappings or OS residency budgets use authority-scoped allowances, not a second physical charge. |
-| **C3** | Allocator and backing | `DeviceAllocator` obtains memory; `VirtualBacking` reserves, maps, and unmaps address space. Neither decides admission or eviction policy. |
+| **C3** | Allocator and backing | ORT defines `DeviceAllocator`/`VirtualBacking`; an EP, host backend, or embedder supplies implementations; `ProcessMemoryManager` holds shared handles. Holders borrow them after admission, and neither mechanism decides policy. |
 | **C4** | Capacity transaction | An operation that changes committed model/request state, transfers capacity between holders/tiers, or changes a model-visible mapping follows `plan -> reserve -> expose provisional view -> execute -> commit`. Suballocation within an existing lease does not. |
 | **C5** | Reclaimable holder | Pressure is a non-blocking, cancellable ticket carrying target bytes, priority, deadline, and configuration generation. The holder selects safe victims and may legitimately release zero. |
 | **C6** | Model memory view | A backend exposes contiguous, blocks-plus-table, indexed, or opaque state views. The view remains valid for the execution that consumes it. |
@@ -91,6 +91,7 @@ flowchart TD
         LeaseAPI["MemoryGovernor contract<br/>leases, allowances, holder registration"]
         Txn["CapacityTransactionCoordinator<br/>reserve/commit across authorities"]
         Adapters["Governed allocator adapters<br/>bulk leases + local suballocation"]
+        Provider["EP / device provider<br/>creates allocator/backing implementation"]
         Env["OrtEnv<br/>logging, threads, allocator registration"]
         Session["InferenceSession(s)<br/>graph plan, bind, Run"]
         Arenas["ORT / EP arenas<br/>activation + workspace pools"]
@@ -104,6 +105,8 @@ flowchart TD
         Device -->|"implements"| LeaseAPI
         Memory --> Txn
         Txn --> LeaseAPI
+        Provider -->|"register once"| Memory
+        Memory -->|"owns shared handles"| Allocators
         LeaseAPI --> Adapters
         Adapters --> Env
         Env -->|"shared allocator context"| Session
@@ -171,12 +174,13 @@ sequenceDiagram
 | `MemoryGovernor` | Common lease/allowance/reclaim interface; every grant names the exact underlying authority even when one governor exposes several tiers. | C2, C5, C8; I2, I3, I6, I7 |
 | `CapacityTransactionCoordinator` | Reserves all participating authorities before publishing a cross-tier/device state change. | C4; I4, I5, I7, I8, I10 |
 | Governed allocator adapters | Convert bulk grants into fast ORT/EP-local suballocation. | C2, C3; I2, I3, I7 |
+| EP / device provider | Creates the platform allocator/backing implementation and registers it before sessions allocate. | C3, C7; I2, I3, I8, I9 |
 | `OrtEnv` | Provides ORT process context and registers shared allocator adapters; owns no resource policy. | C3, C8; I3, I7 |
 | `InferenceSession` | Plans and executes one graph, binds C6 views, and reports persistent/transient needs. | C4, C6, C8; I5, I8-I10 |
 | Model residency | Chooses hot/warm/cold weights and capture-safe stable slots; releases only safe victims. | C2, C4-C6; I2, I5, I6, I9 |
 | `StateBundle` / `KvPageStore` | Owns KV, recurrent/conv, prefix, fork, checkpoint, and migration semantics. | C2, C4-C6, C9; I2, I4-I6, I9, I10 |
 | ORT/EP arenas | Pool activations/workspace under bulk leases and return reclaimable regions. | C2, C3, C5, C8; I2-I4, I6, I7 |
-| `DeviceAllocator` / `VirtualBacking` | Performs allocation and VA reserve/map/unmap without making policy. | C3; I2, I3, I9 |
+| `DeviceAllocator` / `VirtualBacking` | Process/device-scoped mechanism held by `ProcessMemoryManager` and borrowed by holders to allocate or reserve/map/unmap after admission. | C3; I2, I3, I9 |
 | EP kernels / capture | Consume declared model views; captured work pins compatible addresses/shapes. | C6, C9; I5, I9, I10 |
 
 | Logical boundary | Owns | Does not own |
@@ -225,6 +229,15 @@ Devices sharing physical memory resolve to the host/unified authority instead.
 One process-local `HostGovernor` covers host resources shared by all sessions
 and devices; cross-process enforcement is out of scope.
 
+**Allocator ownership.** ORT owns the allocator ABI, while the active EP,
+host backend, or embedder constructs the implementation. It registers the raw
+allocator/backing with `ProcessMemoryManager`, which owns the shared handle for
+that device and memory class. Sessions may own local arenas, but only as
+suballocators backed by that shared handle; model residency and state holders
+borrow the same handle after receiving a lease. Multiple mechanisms may serve
+one pool (for example device, pinned, and VMM allocators), but C1 gives their
+physical bytes one accounting authority.
+
 **Fast path.** Governance is not a callback on every tensor or kernel.
 Device/ORT arenas bulk-lease regions and suballocate locally; direct host
 allocation may use a cheap header-contained lease or a precharged envelope.
@@ -250,7 +263,8 @@ continue to optimize transient reuse.
 | --- | --- |
 | Process foundation | Add a GenAI-independent `ProcessMemoryManager`, with a default for standalone ORT and injection for hosts such as Foundry Local. |
 | `OrtEnv` | Register shared allocator adapters backed by that manager; keep logging/thread/EP responsibilities separate from resource policy. |
-| Session / EP creation | Inject manager-backed allocators/authority handles before arenas, initializers, or state allocate; late adoption only records accomplished allocations. |
+| EP / device registration | Construct the raw allocator/backing and register its shared handle and capabilities with the manager before any session allocates. |
+| Session creation | Inject manager-backed allocator/authority handles before arenas, initializers, or state allocate; late adoption only records accomplished allocations. |
 | ORT arenas | Bulk-lease regions; report in-use, cached/reclaimable, pinned, and opaque bytes; add soft limits and `release_to(target)`. |
 | Planning | Report persistent and bounded activation/workspace peaks for model and request admission. |
 | Persistent state | Replace KV-specific ownership with C9 `StateBundle`, using external `OrtValue`/I/O Binding or the same EP-private contract. |
