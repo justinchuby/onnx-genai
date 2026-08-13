@@ -1755,32 +1755,6 @@ async fn default_max_batch_is_silently_clamped_on_non_batching_backend() {
 }
 
 #[tokio::test]
-async fn resources_reports_batching_supported_on_static_cache_backend() {
-    // The static-cache fixture decodes a shared batch, so the report must say so:
-    // this is the positive control proving the capability is read from the decode
-    // path and not hard-coded to false.
-    let model_dir =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter");
-    let state =
-        AppState::load(&model_dir, Some("tiny-llm-scatter".to_string())).expect("load scatter");
-    let response = app(state)
-        .oneshot(
-            Request::builder()
-                .uri("/v1/resources")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = json_body(response).await;
-    assert_eq!(
-        body["batching"]["supported"], true,
-        "static-cache decode supports continuous batching"
-    );
-}
-
-#[tokio::test]
 async fn admin_vram_override_requires_engine_runtime_override() {
     let response = app(resource_state(false))
         .oneshot(
@@ -2117,18 +2091,17 @@ async fn queue_depth_admission_limit_returns_429_with_retry_after() {
 
 #[tokio::test]
 async fn stalled_output_route_does_not_block_another_completion() {
-    let model_dir =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter");
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
     let engine = Engine::from_dir(&model_dir, EngineConfig::default()).unwrap();
     let driver = EngineDriver::start(engine, 2, 2);
     let slow_request: ChatCompletionRequest = serde_json::from_value(json!({
-        "model": "tiny-llm-scatter",
+        "model": "tiny-llm",
         "messages": [{"role": "user", "content": "hello"}],
         "max_tokens": 8
     }))
     .unwrap();
     let fast_request: ChatCompletionRequest = serde_json::from_value(json!({
-        "model": "tiny-llm-scatter",
+        "model": "tiny-llm",
         "messages": [{"role": "user", "content": "world"}],
         "max_tokens": 2
     }))

@@ -533,8 +533,7 @@ fn benchmark_case(
          paired_ratio={ratio:.3} samples={samples} workflow_ttft={workflow_ttft:?} \
          native_ttft={native_ttft:?} workflow_cold_start={workflow_cold_start:?} \
          native_cold_start={native_cold_start:?}\n\
-         island={:?}",
-        island
+         island={island:?}"
     );
     assert_eq!(island.components.len(), 3);
     assert_eq!(island.component_boundaries_elided, 2);

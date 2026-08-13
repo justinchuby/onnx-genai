@@ -22,8 +22,10 @@ fn root(name: &str) -> PathBuf {
 fn mobius_decoder_workflow_executes() -> anyhow::Result<()> {
     let root = root("decoder");
     let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
-    let mut options = GenerateOptions::default();
-    options.max_new_tokens = 3;
+    let options = GenerateOptions {
+        max_new_tokens: 3,
+        ..Default::default()
+    };
     let output = engine.run_pipeline(PipelineGenerateRequest::new(GenerateRequest {
         prompt: GeneratePrompt::TokenIds(vec![4, 5]),
         options,
@@ -36,9 +38,11 @@ fn mobius_decoder_workflow_executes() -> anyhow::Result<()> {
 fn mobius_masked_diffusion_workflow_executes() -> anyhow::Result<()> {
     let root = root("masked");
     let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
-    let mut options = GenerateOptions::default();
-    options.max_new_tokens = 3;
-    options.seed = Some(7);
+    let options = GenerateOptions {
+        max_new_tokens: 3,
+        seed: Some(7),
+        ..Default::default()
+    };
     let request = PipelineGenerateRequest::new(GenerateRequest {
         prompt: GeneratePrompt::TokenIds(vec![0, 0]),
         options,
@@ -76,8 +80,10 @@ fn mobius_vlm_workflow_executes() -> anyhow::Result<()> {
         3, 1, 1, 0, 24, 221, 141, 176, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
     ];
     let mut engine = Engine::from_pipeline_dir(&root("vlm"), EngineConfig::default())?;
-    let mut options = GenerateOptions::default();
-    options.max_new_tokens = 2;
+    let options = GenerateOptions {
+        max_new_tokens: 2,
+        ..Default::default()
+    };
     let request = PipelineGenerateRequest::new(GenerateRequest {
         prompt: GeneratePrompt::TokenIds(vec![4, 5]),
         options,
@@ -98,8 +104,10 @@ fn mobius_vlm_workflow_executes() -> anyhow::Result<()> {
 #[test]
 fn mobius_euler_diffusion_workflow_executes() -> anyhow::Result<()> {
     let mut engine = Engine::from_pipeline_dir(&root("diffusion"), EngineConfig::default())?;
-    let mut options = GenerateOptions::default();
-    options.max_new_tokens = 2;
+    let options = GenerateOptions {
+        max_new_tokens: 2,
+        ..Default::default()
+    };
     let request = PipelineGenerateRequest::new(GenerateRequest {
         prompt: GeneratePrompt::TokenIds(vec![4, 5]),
         options,
@@ -116,8 +124,10 @@ fn mobius_euler_diffusion_workflow_executes() -> anyhow::Result<()> {
 #[test]
 fn mobius_tts_workflow_executes() -> anyhow::Result<()> {
     let mut engine = Engine::from_pipeline_dir(&root("tts"), EngineConfig::default())?;
-    let mut options = GenerateOptions::default();
-    options.max_new_tokens = 1;
+    let options = GenerateOptions {
+        max_new_tokens: 1,
+        ..Default::default()
+    };
     let output = engine.run_pipeline(PipelineGenerateRequest::new(GenerateRequest {
         prompt: GeneratePrompt::TokenIds(vec![4, 5]),
         options,
@@ -129,9 +139,11 @@ fn mobius_tts_workflow_executes() -> anyhow::Result<()> {
 #[test]
 fn mobius_speculative_rejection_workflow_executes() -> anyhow::Result<()> {
     let mut engine = Engine::from_pipeline_dir(&root("speculative"), EngineConfig::default())?;
-    let mut options = GenerateOptions::default();
-    options.max_new_tokens = 1;
-    options.seed = Some(7);
+    let options = GenerateOptions {
+        max_new_tokens: 1,
+        seed: Some(7),
+        ..Default::default()
+    };
     let mut transitions = vec![-1_i64; 32];
     transitions[1] = 0;
     let request = PipelineGenerateRequest::new(GenerateRequest {
