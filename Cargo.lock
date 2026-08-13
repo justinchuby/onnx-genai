@@ -2031,6 +2031,7 @@ dependencies = [
  "criterion",
  "onnx-genai-engine",
  "onnx-genai-kv",
+ "onnx-genai-metadata",
  "onnx-genai-ort",
  "onnx-genai-runtime-config",
  "onnx-runtime-ep-cpu",

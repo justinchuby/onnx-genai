@@ -367,6 +367,22 @@ impl NativeDecodeSession {
         Self::from_session_with_cuda_options(session, NativeDecodeCudaOptions::default())
     }
 
+    /// Wrap an already-built native session with an explicit [`ModelIoSpec`],
+    /// used when the graph's ports cannot be disambiguated by shape/dtype alone
+    /// (e.g. the synthetic decoder whose `input_ids`/`attention_mask`/
+    /// `position_ids` are all `[-1, -1]` Int64). The declared spec is
+    /// authoritative.
+    pub fn from_session_with_io(
+        session: InferenceSession,
+        io: &ModelIoSpec,
+    ) -> anyhow::Result<Self> {
+        Self::from_session_with_cuda_options_and_io(
+            session,
+            NativeDecodeCudaOptions::default(),
+            Some(io),
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn from_session_with_cuda_kv_max_len_and_io(
         session: InferenceSession,
