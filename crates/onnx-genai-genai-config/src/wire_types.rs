@@ -80,15 +80,6 @@ pub enum EosTokenId {
     Many(Vec<i64>),
 }
 
-impl EosTokenId {
-    pub(crate) fn to_vec(&self) -> Vec<i64> {
-        match self {
-            EosTokenId::Single(v) => vec![*v],
-            EosTokenId::Many(v) => v.clone(),
-        }
-    }
-}
-
 /// The `model.decoder` section of `genai_config.json`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GenAiDecoder {

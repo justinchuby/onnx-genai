@@ -292,6 +292,13 @@ permitted past/present aliasing. Both cache and length cells are loop-carried; i
 their prior lengths. The workflow carry remains logical decoder dataflow. A separate state-update
 ONNX component is used only for real tensor transforms such as gather or truncation.
 
+The service binding is the only serialized storage-selection contract. Legacy top-level
+`kv_cache`, `model.runtime_configurable.kv_cache`, and `model.io.kv_update` hints are rejected.
+Bare decoder documents use ordinary functional past/present dataflow; metadata attention family,
+dtype strings, or artifact custom-metadata tags never select shared-buffer execution. Explicit
+low-level ORT shared-buffer and static-cache APIs remain available as generic mechanisms, but are
+not selected by inference-metadata loading.
+
 ### Vision-language
 
 ```yaml

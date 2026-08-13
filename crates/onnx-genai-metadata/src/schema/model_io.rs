@@ -15,9 +15,6 @@ pub struct ModelCapabilities {
     #[schemars(range(min = 1))]
     pub vocab_size: Option<usize>,
 
-    /// Built-in draft-head or self-speculative model properties.
-    pub speculative: Option<SpeculativeModelInfo>,
-
     /// Features that a serving runtime may configure at load time.
     pub runtime_configurable: Option<RuntimeConfigurable>,
 
@@ -48,6 +45,7 @@ pub struct ModelCapabilities {
 /// fails with an actionable error naming the key to declare rather than
 /// interpreting a tensor name. A declared port is always authoritative.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ModelIoSpec {
     /// Which declared sequence port drives autoregressive execution.
     ///
@@ -150,18 +148,6 @@ pub struct ModelIoSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(inner(length(min = 1)))]
     pub cross_kv_outputs: Option<Vec<String>>,
-
-    /// How the paired `kv_inputs`/`kv_outputs` cache tensors evolve each step.
-    ///
-    /// This declares GROWING/append versus fixed shared-buffer cache semantics
-    /// explicitly, and is deliberately kept separate from `state_pairs` (which
-    /// describes fixed recurrent tensors that are wholly REPLACED). The KV pair
-    /// lists are the authoritative sparse layer ports: the runtime binds exactly
-    /// the ports named in `kv_inputs`/`kv_outputs` and never expands them from a
-    /// total layer count. Absent means the historical growing-cache default.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "Option<schema_vocabulary::KvUpdateKind>")]
-    pub kv_update: Option<String>,
 
     /// Fixed-shape loop-carried recurrent state ports, distinct from KV cache.
     ///
@@ -554,9 +540,8 @@ impl KvCacheLayout {
 /// on the first step, runs the graph, and copies `output` back into `input` for
 /// the next step (`replace` update). This models any fixed recurrent tensor
 /// (convolution state, linear-attention recurrent state, and so on) without
-/// referencing a model family. It is intentionally distinct from growing or
-/// shared-buffer KV cache, which is declared through `kv_inputs`/`kv_outputs`
-/// and `kv_update`.
+/// referencing a model family. It is intentionally distinct from growing KV
+/// state, whose logical cells and storage service are declared by a workflow.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[schemars(transform = schema_helpers::loop_state_pair)]
 pub struct LoopStatePair {
@@ -644,23 +629,10 @@ pub enum SequenceLengthScalarBroadcast {
     UnitBatch,
 }
 
-/// Build-time support for self-contained speculative decoding.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct SpeculativeModelInfo {
-    /// Whether the exported graph contains Medusa/EAGLE/MTP-style draft heads.
-    pub has_draft_heads: Option<bool>,
-
-    /// Early-exit layer depth usable for self-speculation.
-    #[schemars(range(min = 1))]
-    pub self_speculative_depth: Option<usize>,
-}
-
 /// Features whose concrete settings may be selected by the runtime.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeConfigurable {
-    /// Supported runtime-selectable KV-cache dtypes.
-    pub kv_cache: Option<RuntimeKvConfig>,
-
     /// Whether prefix caching may be enabled.
     pub prefix_cache: Option<bool>,
 
@@ -669,14 +641,6 @@ pub struct RuntimeConfigurable {
 
     /// Chunked-prefill support and preferred chunk size.
     pub chunked_prefill: Option<ChunkedPrefillConfig>,
-}
-
-/// Runtime-selectable KV-cache representations.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct RuntimeKvConfig {
-    /// Non-empty list of supported KV-cache scalar dtypes, in preference order.
-    #[schemars(with = "Vec<schema_vocabulary::DType>", length(min = 1))]
-    pub dtype: Vec<String>,
 }
 
 /// Runtime chunked-prefill preference.

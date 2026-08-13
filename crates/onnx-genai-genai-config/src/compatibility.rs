@@ -105,9 +105,8 @@ impl GenAiConfig {
     /// op. The Microsoft ONNX exporter maps attention onto the GQA op whenever
     /// key/value heads are declared and do not exceed the query heads — this
     /// includes full multi-head attention (`kv == attn`), which is just GQA with
-    /// group size 1. The GQA op supports `past_present_share_buffer` at any head
-    /// ratio, so this (not the strict GQA-vs-MHA ratio) is the correct gate for
-    /// the runtime-owned shared KV buffer path.
+    /// group size 1. This determines the semantic attention description only;
+    /// it does not select a KV storage or execution path.
     pub fn uses_group_query_attention_op(&self) -> bool {
         matches!(
             (
@@ -122,13 +121,6 @@ impl GenAiConfig {
     /// preferring the explicit `context_length` then `search.max_length`.
     pub fn max_sequence_length(&self) -> Option<usize> {
         self.model.context_length.or(self.search.max_length)
-    }
-
-    /// Whether this model advertises the runtime-owned shared KV buffer path.
-    pub fn shared_kv_buffer_supported(&self) -> bool {
-        self.search.past_present_share_buffer == Some(true)
-            && self.uses_group_query_attention_op()
-            && self.max_sequence_length().is_some()
     }
 
     pub(crate) fn shape(&self) -> ModelShape {
@@ -184,12 +176,9 @@ impl GenAiConfig {
 
     /// Convert into native [`InferenceMetadata`].
     ///
-    /// `kv_native_dtype` is the KV cache scalar dtype read from the ONNX graph by
-    /// the caller (e.g. `"float16"` / `"float32"`); it is not present in
-    /// `genai_config.json`. The runtime-owned shared KV buffer path is enabled —
-    /// by emitting `kv_cache.native_dtype` — only when the model declares
-    /// `search.past_present_share_buffer`, uses the GQA op, has a known max
-    /// sequence length, and a share-buffer-compatible KV dtype is provided.
+    /// `kv_native_dtype` is retained for API compatibility with callers that
+    /// inspect decoder graph state. It does not select inference execution or
+    /// emit KV storage metadata.
     ///
     /// NOTE: shapes/tensors the native spec cannot yet represent are intentionally
     /// skipped (loading never fails on them): VAD, Conformer NeMo
@@ -229,7 +218,7 @@ impl GenAiConfig {
 
     fn build_inference_metadata(
         &self,
-        kv_native_dtype: Option<&str>,
+        _kv_native_dtype: Option<&str>,
         decoder_graph: Option<&ModelGraphInfo>,
     ) -> Result<InferenceMetadata, GenAiConfigError> {
         let shape = self.shape();
@@ -260,20 +249,6 @@ impl GenAiConfig {
         let mut root = Map::new();
         root.insert("schema_version".into(), json!(SCHEMA_VERSION));
         root.insert("model".into(), Value::Object(model));
-
-        if let Some(generation) = self.generation_json() {
-            root.insert("generation".into(), generation);
-        }
-        if let Some(tokens) = self.tokens_json() {
-            root.insert("tokens".into(), tokens);
-        }
-
-        if self.shared_kv_buffer_supported()
-            && let Some(dtype) = kv_native_dtype
-            && is_share_buffer_kv_dtype(dtype)
-        {
-            root.insert("kv_cache".into(), json!({ "native_dtype": dtype }));
-        }
 
         Ok(serde_json::from_value(Value::Object(root))?)
     }
@@ -422,45 +397,6 @@ impl GenAiConfig {
         }
 
         io
-    }
-
-    fn generation_json(&self) -> Option<Value> {
-        let s = &self.search;
-        let mut m = Map::new();
-        insert_bool(&mut m, "do_sample", s.do_sample);
-        insert_f32(&mut m, "temperature", s.temperature);
-        insert_usize(&mut m, "top_k", s.top_k);
-        insert_f32(&mut m, "top_p", s.top_p);
-        insert_f32(&mut m, "repetition_penalty", s.repetition_penalty);
-        insert_usize(&mut m, "num_beams", s.num_beams);
-        insert_usize(&mut m, "num_return_sequences", s.num_return_sequences);
-        insert_usize(&mut m, "min_length", s.min_length);
-        insert_usize(&mut m, "max_length", s.max_length);
-        insert_f32(&mut m, "length_penalty", s.length_penalty);
-        insert_usize(&mut m, "no_repeat_ngram_size", s.no_repeat_ngram_size);
-        insert_f32(&mut m, "diversity_penalty", s.diversity_penalty);
-        insert_bool(&mut m, "early_stopping", s.early_stopping);
-        (!m.is_empty()).then_some(Value::Object(m))
-    }
-
-    fn tokens_json(&self) -> Option<Value> {
-        let model = &self.model;
-        let mut m = Map::new();
-        insert_i64(&mut m, "pad_token_id", model.pad_token_id);
-        insert_i64(&mut m, "bos_token_id", model.bos_token_id);
-        if let Some(eos) = &model.eos_token_id {
-            m.insert("eos_token_id".into(), json!(eos.to_vec()));
-        }
-        insert_i64(&mut m, "sep_token_id", model.sep_token_id);
-        insert_i64(
-            &mut m,
-            "decoder_start_token_id",
-            model.decoder_start_token_id,
-        );
-        insert_i64(&mut m, "image_token_id", model.image_token_id);
-        insert_i64(&mut m, "video_token_id", model.video_token_id);
-        insert_i64(&mut m, "vision_start_token_id", model.vision_start_token_id);
-        (!m.is_empty()).then_some(Value::Object(m))
     }
 }
 
@@ -743,8 +679,7 @@ impl GenAiConfig {
             audio_features_input: None,
             cross_kv_inputs: None,
             cross_kv_outputs: None,
-            kv_update: None,
-            state_pairs,
+            state_pairs: Some(state_pairs),
             optional_inputs: std::collections::BTreeMap::new(),
             static_cache: None,
         })

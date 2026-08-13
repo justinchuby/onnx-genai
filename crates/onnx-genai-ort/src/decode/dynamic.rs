@@ -406,9 +406,7 @@ impl<'a> DecodeSession<'a> {
                 "cannot resolve decoder state from tensor shapes (inputs: {unassigned_state_inputs:?}, outputs: {unassigned_state_outputs:?}); declare model.io.kv_inputs and model.io.kv_outputs"
             )));
         }
-        let share_buffer = options
-            .past_present_share_buffer
-            .unwrap_or(session.past_present_share_buffer_supported());
+        let share_buffer = options.past_present_share_buffer.unwrap_or(false);
         let mode = if share_buffer {
             DecodeKvMode::SharedBuffer
         } else {

@@ -372,23 +372,6 @@ pub(crate) fn default_inference_metadata() -> InferenceMetadata {
     InferenceMetadata::default()
 }
 
-/// Optional cap (in tokens) on the runtime-owned fixed-capacity KV buffer,
-/// read from `ONNX_GENAI_KV_MAX_LEN`. Returns `None` when the variable is
-/// unset, empty, or unparseable (in which case the model's full advertised
-/// context length is used, preserving prior behavior).
-pub(crate) fn shared_buffer_cap_from_env() -> Option<usize> {
-    std::env::var("ONNX_GENAI_KV_MAX_LEN")
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|&cap| cap > 0)
-}
-
-/// Apply an optional KV-buffer capacity cap: the effective length is the
-/// smaller of the model's advertised max length and the cap, if any.
-pub(crate) fn cap_kv_len(model_max_len: usize, cap: Option<usize>) -> usize {
-    cap.map_or(model_max_len, |cap| model_max_len.min(cap))
-}
-
 /// Like [`genai_config_compat_metadata`], but derives the decoder graph
 /// inventory by inspecting the ONNX model file directly (used by the native
 /// decoder constructor, which builds metadata before a `Session` exists).

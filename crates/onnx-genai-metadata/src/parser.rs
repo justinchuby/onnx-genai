@@ -259,7 +259,6 @@ fn resolve_shared_kv(model_dir: &Path, config: &SpeculatorConfig) -> SpeculatorP
             audio_features_input: None,
             cross_kv_inputs: None,
             cross_kv_outputs: None,
-            kv_update: None,
             state_pairs: None,
             optional_inputs: std::collections::BTreeMap::new(),
             static_cache: None,

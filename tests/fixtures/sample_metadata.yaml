@@ -11,33 +11,8 @@ model:
     sliding_window: null
   max_sequence_length: 131072
   runtime_configurable:
-    kv_cache:
-      dtype: [fp16, fp8_e5m2]
     prefix_cache: true
     continuous_batching: true
-
-kv_cache:
-  native_dtype: bf16
-  quantization_tolerance:
-    key:
-      default: fp8_e5m2
-      per_layer:
-        - layers: [0, 1]
-          min_precision: fp16
-        - layers: [-1]
-          min_precision: fp16
-      quantization_axis: per_channel
-    value:
-      default: fp8_e4m3
-      per_layer:
-        - layers: [0, 1, -1]
-          min_precision: fp16
-      quantization_axis: per_token
-  sensitive_layers: [0, 1, -1]
-  operations:
-    rewind_safe: true
-    fork_precision_policy: inherit
-    checkpoint_serializable: true
 
 hardware_requirements:
   min_memory_gb: 4.2

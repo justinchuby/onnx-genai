@@ -996,19 +996,6 @@ impl Session {
         result
     }
 
-    /// Detect whether model metadata declares ORT past/present share-buffer KV.
-    pub fn past_present_share_buffer_supported(&self) -> bool {
-        ["past_present_share_buffer", "past.present.share_buffer"]
-            .iter()
-            .filter_map(|key| self.custom_metadata_value(key).ok().flatten())
-            .any(|value| {
-                matches!(
-                    value.to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-    }
-
     pub(crate) fn as_mut_ptr(&self) -> *mut onnx_genai_ort_sys::OrtSession {
         self.ptr.as_ptr()
     }
