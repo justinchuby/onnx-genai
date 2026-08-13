@@ -1,20 +1,4 @@
-use std::path::{Path, PathBuf};
-
-fn metadata_path(path: &Path) -> PathBuf {
-    if path.is_dir() {
-        for name in [
-            "inference_metadata.yaml",
-            "inference_metadata.yml",
-            "inference_metadata.json",
-        ] {
-            let candidate = path.join(name);
-            if candidate.is_file() {
-                return candidate;
-            }
-        }
-    }
-    path.to_path_buf()
-}
+use std::path::PathBuf;
 
 fn main() {
     let paths = std::env::args_os()
@@ -28,12 +12,11 @@ fn main() {
 
     let mut failed = false;
     for input in paths {
-        let path = metadata_path(&input);
-        match onnx_genai_metadata::load_pipeline_spec(&path) {
-            Ok(_) => println!("valid: {}", path.display()),
+        match onnx_genai_metadata::load_metadata_package(&input) {
+            Ok(_) => println!("valid: {}", input.display()),
             Err(error) => {
                 failed = true;
-                eprintln!("invalid: {}: {error}", path.display());
+                eprintln!("invalid: {}: {error}", input.display());
             }
         }
     }

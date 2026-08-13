@@ -1930,7 +1930,7 @@ pipeline:
             proposed_tokens: { dtype: int64, rank: 2, shape: [batch, draft] }
           outputs:
             accepted_tokens: { dtype: int64, rank: 2, shape: [batch, draft] }
-            accepted_count: { dtype: int64, rank: 1, shape: [1] }
+            accepted_count: { dtype: int64, rank: 1, shape: [batch] }
             done: { dtype: bool, rank: 1, shape: [batch] }
         contract:
           id: onnx-genai.speculative-verifier
@@ -1971,8 +1971,8 @@ pipeline:
             .with_input("proposed", Value::from_slice_i64(&[1, 1, 0], &[1, 3])?);
     let outputs = engine.run_pipeline(request)?;
     assert_eq!(outputs["accepted_len"].to_vec_i64()?, [2]);
-    assert_eq!(outputs["accepted_tokens"].shape(), [1, 2]);
-    assert_eq!(outputs["accepted_tokens"].to_vec_i64()?, [1, 1]);
+    assert_eq!(outputs["accepted_tokens.row.0"].shape(), [1, 2]);
+    assert_eq!(outputs["accepted_tokens.row.0"].to_vec_i64()?, [1, 1]);
 
     let batched_request =
         PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
@@ -1987,11 +1987,9 @@ pipeline:
                 "proposed",
                 Value::from_slice_i64(&[1, 1, 0, 1, 1, 0], &[2, 3])?,
             );
-    let error = match engine.run_pipeline(batched_request) {
-        Ok(_) => anyhow::bail!("dense prefix emit accepted more than one runtime length"),
-        Err(error) => format!("{error:#}"),
-    };
-    assert!(error.contains("axis 0 is 2, expected 1"), "{error}");
+    let outputs = engine.run_pipeline(batched_request)?;
+    assert_eq!(outputs["accepted_tokens.row.0"].to_vec_i64()?, [1, 1]);
+    assert_eq!(outputs["accepted_tokens.row.1"].to_vec_i64()?, [1, 1]);
     Ok(())
 }
 
@@ -2515,8 +2513,8 @@ pipeline:
     let output = engine.run_pipeline(request()?)?;
     engine.run_pipeline(request()?)?;
     engine.run_pipeline(request()?)?;
-    assert_eq!(output["tokens"].shape(), [1, 3]);
-    assert_eq!(output["tokens"].to_vec_i64()?, [1, 2, 3]);
+    assert_eq!(output["tokens.row.0"].shape(), [1, 3]);
+    assert_eq!(output["tokens.row.0"].to_vec_i64()?, [1, 2, 3]);
     assert_eq!(output["next_k"].to_vec_i64()?, [3]);
     assert_eq!(output["final_grammar_state"].to_vec_i64()?, [2]);
     let islands = engine.execution_island_diagnostics();

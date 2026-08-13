@@ -1392,6 +1392,10 @@
         "layout": {
           "type": "string"
         },
+        "logical_lengths": {
+          "description": "Semantic state cell containing the current logical sequence length for each row.",
+          "type": "string"
+        },
         "ports": {
           "additionalProperties": {
             "additionalProperties": {
@@ -1414,7 +1418,8 @@
       },
       "required": [
         "sequence_axis",
-        "layout"
+        "layout",
+        "logical_lengths"
       ],
       "type": "object"
     },

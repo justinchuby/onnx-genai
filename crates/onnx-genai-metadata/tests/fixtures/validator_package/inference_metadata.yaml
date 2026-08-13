@@ -1,0 +1,18 @@
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      ir_version: "1.0"
+      onnx_opsets:
+        ai.onnx: 13
+      capabilities:
+        - workflow_ssa
+    components:
+      identity:
+        implementation:
+          kind: onnx
+          artifact: identity.onnx.textproto
+        ports: {}
+    steps:
+      - kind: invoke
+        component: identity

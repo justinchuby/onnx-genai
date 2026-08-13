@@ -178,6 +178,14 @@ pipeline:
         contract: { dtype: int64, rank: 1, shape: [batch] }
         role: { kind: opaque }
         source: { kind: application, name: slot_ids }
+      accepted_len:
+        contract: { dtype: int64, rank: 1, shape: [batch] }
+        role: { kind: opaque }
+        source: { kind: application, name: accepted_len }
+      cache_lengths:
+        contract: { dtype: int64, rank: 1, shape: [batch] }
+        role: { kind: opaque }
+        source: { kind: application, name: cache_lengths }
       empty_cache:
         contract: { dtype: float16, rank: 4, shape: [batch, heads, sequence, head_dim] }
         role: { kind: opaque }
@@ -194,9 +202,16 @@ pipeline:
         initializer: empty_cache
         recurrence: { kind: invariant }
         service_group: decoder_cache
+      cache_lengths:
+        contract: { dtype: int64, rank: 1, shape: [batch] }
+        class: semantic
+        scope: invocation
+        initializer: cache_lengths
+        recurrence: { kind: invariant }
     serving:
       active: active
       done: done
+      accepted_len: accepted_len
       slot_ids: slot_ids
       kv_service:
         paging: paged
@@ -205,6 +220,7 @@ pipeline:
           decoder_cache:
             sequence_axis: 2
             layout: bnsh
+            logical_lengths: cache_lengths
             storage: shared_buffer
             ports:
               decoder:
@@ -216,6 +232,40 @@ pipeline:
     )
     .expect("KV service metadata parses");
     validate_metadata(&metadata).expect("KV service group is executable and bound");
+
+    let mut missing_lengths = metadata.clone();
+    missing_lengths
+        .pipeline
+        .as_mut()
+        .expect("pipeline")
+        .workflow
+        .state
+        .remove("cache_lengths");
+    let errors = validate_metadata(&missing_lengths).expect_err("logical lengths are required");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("unknown logical_lengths state")),
+        "{errors:?}"
+    );
+
+    let mut missing_accepted = metadata;
+    missing_accepted
+        .pipeline
+        .as_mut()
+        .expect("pipeline")
+        .workflow
+        .serving
+        .as_mut()
+        .expect("serving")
+        .accepted_len = None;
+    let errors = validate_metadata(&missing_accepted).expect_err("accepted lengths are required");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("accepted_len is required")),
+        "{errors:?}"
+    );
 }
 
 #[test]

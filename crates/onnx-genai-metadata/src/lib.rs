@@ -43,7 +43,7 @@ pub use lowering::{CompiledWorkflow, compile_workflow};
 pub use parser::{
     MtpProposerSpec, SharedKvProposerSpec, SpeculatorConfigSource, SpeculatorDescriptor,
     SpeculatorProposerKind, SpeculatorProposerStatus, detect_speculator, load_metadata,
-    load_pipeline_spec, resolve_speculator_config,
+    load_metadata_package, load_pipeline_spec, resolve_speculator_config,
 };
 pub use schema::*;
 pub use validation::{

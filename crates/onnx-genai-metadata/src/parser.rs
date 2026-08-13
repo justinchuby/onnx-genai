@@ -347,6 +347,98 @@ pub fn load_metadata(path: &Path) -> Result<InferenceMetadata, crate::MetadataEr
     Ok(metadata)
 }
 
+/// Load and semantically validate a metadata document or package directory.
+///
+/// Package-relative artifact references are checked for existence and may not
+/// escape the package root. ONNX signature admission remains the runtime's
+/// responsibility because it depends on the selected execution provider.
+pub fn load_metadata_package(path: &Path) -> Result<InferenceMetadata, crate::MetadataError> {
+    let metadata_path = if path.is_dir() {
+        [
+            "inference_metadata.yaml",
+            "inference_metadata.yml",
+            "inference_metadata.json",
+        ]
+        .into_iter()
+        .map(|name| path.join(name))
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| {
+            crate::MetadataError::Parse(format!(
+                "package '{}' has no inference_metadata.yaml, .yml, or .json",
+                path.display()
+            ))
+        })?
+    } else {
+        path.to_path_buf()
+    };
+    let metadata = load_metadata(&metadata_path)?;
+    let Some(pipeline) = &metadata.pipeline else {
+        return Err(crate::MetadataError::Parse(
+            "metadata has no pipeline section".to_string(),
+        ));
+    };
+    crate::validation::validate_pipeline_spec(pipeline)
+        .map_err(|error| crate::MetadataError::Parse(error.to_string()))?;
+    validate_package_artifacts(
+        &pipeline.workflow,
+        metadata_path.parent().unwrap_or_else(|| Path::new(".")),
+    )?;
+    Ok(metadata)
+}
+
+fn validate_package_artifacts(
+    workflow: &crate::schema::WorkflowSpec,
+    root: &Path,
+) -> Result<(), crate::MetadataError> {
+    let root = root.canonicalize().map_err(crate::MetadataError::Io)?;
+    let mut artifacts = Vec::new();
+    for (component, declaration) in &workflow.components {
+        match &declaration.implementation {
+            crate::schema::ComponentImplementation::Onnx { artifact } => {
+                artifacts.push((format!("component '{component}'"), artifact.as_str()));
+            }
+            crate::schema::ComponentImplementation::Adapter {
+                artifact: Some(artifact),
+                ..
+            } => {
+                artifacts.push((
+                    format!("adapter component '{component}'"),
+                    artifact.as_str(),
+                ));
+            }
+            crate::schema::ComponentImplementation::Adapter { artifact: None, .. }
+            | crate::schema::ComponentImplementation::Binding => {}
+        }
+    }
+    for (name, input) in &workflow.inputs {
+        if let crate::schema::WorkflowInputSource::Artifact { path } = &input.source {
+            artifacts.push((format!("workflow input '{name}'"), path.as_str()));
+        }
+    }
+    for (owner, artifact) in artifacts {
+        let candidate = root.join(artifact);
+        let resolved = candidate.canonicalize().map_err(|error| {
+            crate::MetadataError::Parse(format!(
+                "{owner} artifact '{}' cannot be opened: {error}",
+                candidate.display()
+            ))
+        })?;
+        if !resolved.starts_with(&root) {
+            return Err(crate::MetadataError::Parse(format!(
+                "{owner} artifact '{artifact}' escapes package root '{}'",
+                root.display()
+            )));
+        }
+        if !resolved.is_file() {
+            return Err(crate::MetadataError::Parse(format!(
+                "{owner} artifact '{}' is not a file",
+                resolved.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Load and validate a metadata file's `pipeline` section.
 pub fn load_pipeline_spec(path: &Path) -> Result<PipelineSpec, crate::MetadataError> {
     let metadata = load_metadata(path)?;

@@ -57,6 +57,9 @@ is ordinary ONNX policy math rather than host control flow.
 `emit.when` optionally suppresses an event. `emit.valid_length` accepts `int[B]` and emits a ragged
 event per active row, slicing each row to its runtime prefix. This defines EOS behavior explicitly:
 a workflow may emit the EOS token, suppress it with `when`, or emit a zero-length row.
+Ragged package values use `output.row.<index>`; event mode adds
+`output.row.<index>.<event-index>`. Once an output becomes ragged, later appends without a length
+are split by row and append to the same row streams.
 
 ONNX port contracts may be omitted when the artifact is authoritative. Declare only semantic
 bindings, bounds/overrides, cross-component constraints, or adapter ports that ONNX cannot describe.
@@ -248,6 +251,12 @@ state:
     initializer: empty_cache
     recurrence: { kind: growing, axis: 2, increment: accepted_len, max: max_context }
     service_group: decoder_cache
+  cache_lengths:
+    contract: { dtype: int64, rank: 1, shape: [batch] }
+    class: semantic
+    scope: invocation
+    initializer: initial_cache_lengths
+    recurrence: { kind: invariant }
 serving:
   active: active
   done: done
@@ -261,15 +270,18 @@ serving:
       decoder_cache:
         sequence_axis: 2
         layout: bnsh
+        logical_lengths: cache_lengths
         storage: shared_buffer
         ports:
           decoder:
             cache: { input: past_key_values, output: present_key_values }
 ```
 
-The service group is the allocation contract: it owns paging, slots, per-row lengths, compaction,
-and permitted past/present aliasing. The workflow carry remains logical decoder dataflow. A separate
-state-update ONNX component is used only for real tensor transforms such as gather or truncation.
+The service group is the allocation contract: `active`, `accepted_len`, and the semantic
+`logical_lengths: int64[B]` cell drive paging, slots, per-row growth/rollback, compaction, and
+permitted past/present aliasing. Both cache and length cells are loop-carried; inactive rows retain
+their prior lengths. The workflow carry remains logical decoder dataflow. A separate state-update
+ONNX component is used only for real tensor transforms such as gather or truncation.
 
 ### Vision-language
 
@@ -352,3 +364,20 @@ A package directory resolves `inference_metadata.yaml`, `.yml`, or `.json`. The 
 multiple paths, reports each invalid document with an actionable error, and exits nonzero if any
 fails. JSON Schema is useful for authoring, but this validator is authoritative for cross-component
 SSA, recurrence, KV service-group, contract-binding, and capability invariants.
+
+## v1 producer migration checklist
+
+1. Replace loop `condition` with pre-test `continue_when`. Initialize it before loop entry; carry
+   the next activity value when the body changes it. A false initial value is a valid zero-trip.
+2. Emit per-row prefixes with `valid_length: int64[B]`; do not reduce across rows. Consume ragged
+   results from `output.row.<index>` (and the event suffix for event mode).
+3. Declare serving `active: bool[B]`, `done: bool[B]`, `accepted_len: int64[B]`, and
+   `slot_ids: int64[B]`. Inactive rows retain prior logical carry values.
+4. Bind each cache tensor state through `service_group`. Each KV group declares
+   `sequence_axis`, `layout`, semantic `logical_lengths: int64[B]`, storage mode, and
+   component/cell past-present port aliases. Use `shared_buffer` to permit physical aliasing.
+5. Keep ONNX ports omitted when artifact inference is sufficient. Request inputs use
+   `source: { kind: request }`; the versioned runtime `role` is the sole request-field identity.
+6. Run `validate_metadata` on every generated package directory. JSON Schema alone is not
+   sufficient; the CLI also checks semantic invariants, package-relative artifact existence, and
+   package-root containment.
