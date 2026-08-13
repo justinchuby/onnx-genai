@@ -49,6 +49,19 @@ fn dynamic_lending_enabled() -> bool {
     )
 }
 
+/// Whether dynamic KV/weight mapped-allowance lending is active for this
+/// process (default on; opt out with `ONNX_GENAI_DYNAMIC_KV_WEIGHT_LENDING=0`).
+///
+/// This is the exact predicate that, together with managed no-spill and an
+/// on-demand-committing arena, decides in [`CudaExecutionProvider::adopt_memory_governor`]
+/// whether the weight-residency cache is registered as a reclaimable mapped
+/// holder. The engine loader queries it to gate elastic weight-budget sizing:
+/// lending the full-context KV reservation to weights is only safe when that
+/// reclaim path exists to give the space back as KV grows (issue #857).
+pub fn dynamic_kv_weight_lending_enabled() -> bool {
+    dynamic_lending_enabled()
+}
+
 fn mapped_attribution_role(
     _role: onnx_runtime_memory_governor::MemoryRole,
 ) -> onnx_runtime_memory_governor::MemoryRole {

@@ -1421,6 +1421,113 @@ fn cuda_offload_resolution_from_plan(
         auto_enabled_from_vram_limit: application.auto_enabled_from_vram_limit,
     })
 }
+/// The device-tier KV bytes to withhold from the elastic weight budget: the
+/// KV context length to keep statically reserved under the elastic weight
+/// budget: the initial KV bucket the engine commits at load, capped at the
+/// declared max context.
+///
+/// This is the KV a sequence can always commit without reclaiming a weight page
+/// (prefill and the first decode step), so it is the safe floor to reserve
+/// while everything above it is lent to weights and reclaimed on demand as the
+/// sequence grows (issue #857).
+#[cfg(all(feature = "cuda", feature = "native-backend"))]
+fn elastic_kv_floor_context(max_context: usize) -> usize {
+    // The engine commits KV in power-of-two buckets whose smallest value is the
+    // configured minimum bucket; `kv_capacity_bucket(1, ..)` is that first
+    // bucket, which is what load commits before any decode step runs.
+    onnx_genai_kv::kv_capacity_bucket(1, max_context).min(max_context)
+}
+
+/// The elastic weight-offload budget: the elastic device availability (resolved
+/// VRAM minus the KV floor and recurrent state) less a headroom margin, but
+/// never below what the static full-context reservation would have granted, so
+/// elastic lending is never a regression versus baseline (issue #857).
+#[cfg(all(feature = "cuda", feature = "native-backend"))]
+fn elastic_weight_budget_bytes(
+    elastic_available_bytes: u64,
+    static_baseline_budget_bytes: u64,
+    headroom_bytes: u64,
+) -> u64 {
+    elastic_available_bytes
+        .saturating_sub(headroom_bytes)
+        .max(static_baseline_budget_bytes)
+}
+
+/// Environment override for the elastic-lending device headroom (issue #857).
+#[cfg(all(feature = "cuda", feature = "native-backend"))]
+const ELASTIC_LENDING_HEADROOM_BYTES_ENV: &str = "ONNX_GENAI_ELASTIC_LENDING_HEADROOM_BYTES";
+
+/// Default device bytes kept *unlent* below the managed no-spill limit under
+/// elastic weight lending (issue #857).
+///
+/// The memory governor's ledger guarantees no oversubscription of the resolved
+/// device budget, but on WDDM a device pushed close to full can have its
+/// physical granules paged out to host RAM by the OS under demand — a spill
+/// that is invisible to our ledger, so `oversubscribed_bytes` would read 0
+/// while the device is in fact spilling. It is not yet established whether our
+/// VMM-mapped granules (`cuMemCreate`/`cuMemMap`) are subject to that eviction
+/// or only ordinary `cuMemAlloc` allocations. Until that is settled, elastic
+/// lending deliberately leaves a headroom margin rather than lending to the
+/// last byte, so the OS has slack before it must evict anything of ours.
+///
+/// This is a conservative default, tunable via
+/// [`ELASTIC_LENDING_HEADROOM_BYTES_ENV`]: once the WDDM question is answered in
+/// our favour it is a cheap follow-up to lower it (or set it to 0) and lend more
+/// aggressively; the reverse mistake — a hidden host-spill regression that only
+/// shows up as wall-clock variance — is not cheap.
+#[cfg(all(feature = "cuda", feature = "native-backend"))]
+const DEFAULT_ELASTIC_LENDING_HEADROOM_BYTES: u64 = 512 * 1024 * 1024;
+
+/// The device headroom to keep unlent below the managed no-spill limit under
+/// elastic weight lending (issue #857), honouring the environment override.
+#[cfg(all(feature = "cuda", feature = "native-backend"))]
+fn elastic_lending_headroom_bytes() -> u64 {
+    std::env::var(ELASTIC_LENDING_HEADROOM_BYTES_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_ELASTIC_LENDING_HEADROOM_BYTES)
+}
+
+/// Whether the weight budget may lend the unused full-context KV reservation to
+/// weights (issue #857).
+///
+/// True only when the dynamic KV/weight reclaim path is guaranteed active: the
+/// same three conditions that register the weight-residency cache as a
+/// reclaimable mapped holder in `CudaExecutionProvider::adopt_memory_governor`.
+/// Without that path the static full-context reservation is the only thing that
+/// guarantees a sequence can reach its declared max context, so lending is
+/// refused.
+#[cfg(all(feature = "cuda", feature = "native-backend"))]
+fn elastic_weight_lending_active(
+    managed_no_spill: bool,
+    commits_on_demand: bool,
+    lending_enabled: bool,
+) -> bool {
+    managed_no_spill && commits_on_demand && lending_enabled
+}
+
+/// The device-tier KV bytes to withhold from the elastic weight budget.
+///
+/// Host-tier KV (a host-accessible EP) contributes nothing to the device weight
+/// budget and returns zero.
+#[cfg(all(feature = "cuda", feature = "native-backend"))]
+fn elastic_kv_floor_device_bytes(
+    native_session: &crate::native_decode::NativeDecodeSession,
+    max_context: Option<usize>,
+) -> anyhow::Result<u64> {
+    let Some(max_context) = max_context else {
+        return Ok(0);
+    };
+    let floor_context = elastic_kv_floor_context(max_context);
+    let (bytes, tier) = native_session
+        .kv_reservation(floor_context)
+        .context("sizing the elastic native CUDA KV floor")?;
+    Ok(if tier == onnx_runtime_memory_governor::Tier::Device {
+        bytes
+    } else {
+        0
+    })
+}
 
 #[cfg(all(feature = "cuda", feature = "native-backend"))]
 fn reconcile_cuda_offload_budget_after_native_load(
@@ -1443,10 +1550,50 @@ fn reconcile_cuda_offload_budget_after_native_load(
             .context("sizing native CUDA KV before deriving the weight-offload budget")?,
         None => (0, onnx_runtime_memory_governor::Tier::Device),
     };
-    let native_kv_device_bytes = if native_kv_tier == onnx_runtime_memory_governor::Tier::Device {
-        native_kv_bytes
+    let native_kv_full_context_device_bytes =
+        if native_kv_tier == onnx_runtime_memory_governor::Tier::Device {
+            native_kv_bytes
+        } else {
+            0
+        };
+    // Elastic weight budget (#857). The weight residency budget was historically
+    // derived by subtracting the *full declared-max-context* KV reservation from
+    // the device budget, once, at load, and never revisited. On a not-fit model
+    // that permanently withholds `kv_bytes_per_token × max_context` from weights
+    // (1.611 GB on qwen14b-zp) even for a short request that commits a fraction
+    // of it, so weights stream bytes that would have fit in the idle reservation.
+    //
+    // When the dynamic KV/weight reclaim path is guaranteed active — managed
+    // no-spill, an on-demand-committing arena, and lending enabled, which is
+    // exactly the condition that registers the weight cache as a reclaimable
+    // mapped holder in `CudaExecutionProvider::adopt_memory_governor` — hold back
+    // only an initial KV *floor* instead. The bytes above the floor are lent to
+    // the weight cache; the registered holder gives them back to KV as the
+    // sequence grows, one bucket at a time, through the transactional
+    // `MappedGrowthAuthority` reclaim (KV growth reclaims from the weight zone).
+    // A sequence can therefore still reach its declared max context: KV reclaims
+    // the lent budget rather than finding it statically reserved.
+    //
+    // Without that reclaim path the static full-context reservation is the only
+    // thing that guarantees max context, so keep it unchanged.
+    let elastic_lending = elastic_weight_lending_active(
+        resolution.policy.managed_no_spill,
+        native_session.commits_on_demand(),
+        onnx_runtime_ep_cuda::dynamic_kv_weight_lending_enabled(),
+    );
+    let native_kv_device_bytes = if elastic_lending {
+        let floor = elastic_kv_floor_device_bytes(native_session, max_context)?
+            .min(native_kv_full_context_device_bytes);
+        tracing::info!(
+            native_kv_full_context_device_bytes,
+            native_kv_floor_device_bytes = floor,
+            lent_to_weights_bytes = native_kv_full_context_device_bytes.saturating_sub(floor),
+            "elastic weight budget: lending the unused full-context KV reservation to weights; \
+             KV reclaims it on demand as the sequence grows (issue #857)"
+        );
+        floor
     } else {
-        0
+        native_kv_full_context_device_bytes
     };
     let (recurrent_state_bytes, recurrent_tier) = native_session
         .recurrent_state_reservation()
@@ -1486,6 +1633,32 @@ fn reconcile_cuda_offload_budget_after_native_load(
 
     let offload_device_budget_bytes = if resolution.device_budget_is_override {
         requested_weight_offload_budget_bytes
+    } else if elastic_lending {
+        // The auto budget in `resolution.policy.device_budget_bytes` was derived
+        // by `build_memory_strategy_plan` by subtracting the *full declared-max-
+        // context* KV reservation from the resolved VRAM. Under elastic lending
+        // we withhold only the KV floor, so that plan-time `requested` value is a
+        // stale, too-low cap: `requested.min(available)` would clamp the budget
+        // straight back to the non-elastic value and lend nothing. The correct
+        // auto budget is the elastic `available` (resolved VRAM minus the floor
+        // and recurrent state); the bytes above the floor are lent to weights and
+        // reclaimed by KV growth on demand (issue #857).
+        //
+        // But do not lend to the last byte: keep a device headroom margin unlent
+        // as a high-water mark below the managed no-spill limit, because on WDDM
+        // a device pushed near full may have physical granules paged to host RAM
+        // by the OS — a spill our ledger cannot see. The margin never drops the
+        // budget below what the static full-context reservation would have
+        // granted, so elastic lending is never a regression versus baseline.
+        let headroom = elastic_lending_headroom_bytes();
+        let static_baseline_budget_bytes = resolved_vram_bytes.saturating_sub(
+            native_kv_full_context_device_bytes.saturating_add(recurrent_device_bytes),
+        );
+        elastic_weight_budget_bytes(
+            available_weight_offload_budget_bytes,
+            static_baseline_budget_bytes,
+            headroom,
+        )
     } else {
         requested_weight_offload_budget_bytes.min(available_weight_offload_budget_bytes)
     };
@@ -1503,6 +1676,12 @@ fn reconcile_cuda_offload_budget_after_native_load(
             native_kv_bytes = native_kv_device_bytes,
             recurrent_state_bytes = recurrent_device_bytes,
             minimum_useful_weight_budget_bytes,
+            elastic_lending,
+            elastic_lending_headroom_bytes = if elastic_lending {
+                elastic_lending_headroom_bytes()
+            } else {
+                0
+            },
             offload_device_budget_bytes = adopted,
             "enabled CUDA weight offload because model weights exceed the resolved device budget"
         );
@@ -2337,6 +2516,87 @@ mod pool_sizing_tests {
 
         assert_eq!(max_len, 131_072);
         assert_eq!(source, "model.max_sequence_length");
+    }
+
+    #[cfg(all(feature = "cuda", feature = "native-backend"))]
+    #[test]
+    fn elastic_lending_requires_reclaim_path_to_be_guaranteed() {
+        // Elastic lending is only safe when the reclaim path exists, which is
+        // exactly managed no-spill + an on-demand-committing arena + lending on.
+        assert!(elastic_weight_lending_active(true, true, true));
+        // Any missing precondition falls back to the static full-context
+        // reservation that guarantees max context on its own.
+        assert!(!elastic_weight_lending_active(false, true, true));
+        assert!(!elastic_weight_lending_active(true, false, true));
+        assert!(!elastic_weight_lending_active(true, true, false));
+    }
+
+    #[cfg(all(feature = "cuda", feature = "native-backend"))]
+    #[test]
+    fn elastic_kv_floor_is_the_first_bucket_and_never_exceeds_max_context() {
+        // The floor is exactly the engine's first KV bucket, capped at the
+        // declared maximum, so the two stay single-sourced.
+        let expected_large = onnx_genai_kv::kv_capacity_bucket(1, 8192).min(8192);
+        assert_eq!(elastic_kv_floor_context(8192), expected_large);
+        assert!(
+            elastic_kv_floor_context(8192) < 8192,
+            "a large context must lend most of its reservation"
+        );
+        // A context at or below the first bucket cannot be lent below itself.
+        assert_eq!(elastic_kv_floor_context(64), 64);
+        // The floor never exceeds the declared maximum.
+        for max in [1usize, 100, 256, 1024, 8192, 131_072] {
+            assert!(elastic_kv_floor_context(max) <= max, "max={max}");
+        }
+    }
+
+    #[cfg(all(feature = "cuda", feature = "native-backend"))]
+    #[test]
+    fn elastic_weight_budget_leaves_headroom_and_never_regresses_below_baseline() {
+        // resolved_vram=100, full-context KV reservation=40, floor=4.
+        // elastic available = 100 - 4 = 96; static baseline = 100 - 40 = 60.
+        let elastic_available = 96u64;
+        let baseline = 60u64;
+
+        // With a 10-byte headroom we lend up to the high-water mark, not the last
+        // byte: 96 - 10 = 86, comfortably above the baseline and below available.
+        let budget = elastic_weight_budget_bytes(elastic_available, baseline, 10);
+        assert_eq!(budget, 86);
+        assert!(budget < elastic_available, "headroom is kept unlent");
+        assert!(
+            budget > baseline,
+            "still lends more than the static reservation"
+        );
+
+        // A headroom so large it would push below the static reservation is
+        // clamped: elastic lending is never a regression versus baseline.
+        let clamped = elastic_weight_budget_bytes(elastic_available, baseline, 90);
+        assert_eq!(clamped, baseline);
+        assert!(clamped >= baseline);
+
+        // Zero headroom lends everything above the floor (opt-in maximal lending).
+        assert_eq!(
+            elastic_weight_budget_bytes(elastic_available, baseline, 0),
+            elastic_available
+        );
+    }
+
+    #[cfg(all(feature = "cuda", feature = "native-backend"))]
+    #[test]
+    fn elastic_lending_headroom_defaults_to_a_conservative_nonzero_margin() {
+        // The default must be non-zero so we never lend to the last byte while
+        // the WDDM granule-eviction question is open.
+        const {
+            assert!(DEFAULT_ELASTIC_LENDING_HEADROOM_BYTES > 0);
+        }
+        // The helper returns the default when the override is absent or
+        // unparseable; in an unset environment that is the conservative default.
+        if std::env::var_os(ELASTIC_LENDING_HEADROOM_BYTES_ENV).is_none() {
+            assert_eq!(
+                elastic_lending_headroom_bytes(),
+                DEFAULT_ELASTIC_LENDING_HEADROOM_BYTES
+            );
+        }
     }
 
     #[test]
