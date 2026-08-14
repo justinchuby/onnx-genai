@@ -7,7 +7,8 @@
 
 use onnx_genai_engine::{
     Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest,
-    PipelineGenerateRequest, pipeline::WorkflowOutputRole,
+    PipelineGenerateRequest,
+    pipeline::{PipelineEngine, WorkflowOutputRole},
 };
 use onnx_genai_ort::{DataType, Value};
 use std::path::PathBuf;
@@ -40,6 +41,11 @@ fn decoder_batch_request(
     let bool_bytes = active.iter().map(|value| u8::from(*value)).collect();
     let zeros = vec![0_i64; usize::try_from(batch)?];
     let ones = vec![1_i64; usize::try_from(batch)?];
+    let float_zeros = vec![0.0_f32; usize::try_from(batch)?];
+    let float_ones = vec![1.0_f32; usize::try_from(batch)?];
+    let seeds = vec![7_i64; usize::try_from(batch)?];
+    let eos_ids = vec![127_i64; usize::try_from(batch)?];
+    let row_max_iterations = vec![i64::try_from(max_new_tokens)?; usize::try_from(batch)?];
     let slot_ids = (0..batch).collect::<Vec<_>>();
     Ok(PipelineGenerateRequest::new(GenerateRequest {
         prompt: GeneratePrompt::TokenIds(vec![0]),
@@ -52,6 +58,44 @@ fn decoder_batch_request(
     .with_input(
         "request.prompt_lengths",
         Value::from_slice_i64(prompt_lengths, &[batch])?,
+    )
+    .with_input(
+        "request.eos_ids",
+        Value::from_slice_i64(&eos_ids, &[batch, 1])?,
+    )
+    .with_input(
+        "request.eos_lengths",
+        Value::from_slice_i64(&ones, &[batch])?,
+    )
+    .with_input(
+        "request.row_max_iterations",
+        Value::from_slice_i64(&row_max_iterations, &[batch])?,
+    )
+    .with_input(
+        "request.temperature",
+        Value::from_slice_f32(&float_ones, &[batch])?,
+    )
+    .with_input("request.top_k", Value::from_slice_i64(&ones, &[batch])?)
+    .with_input(
+        "request.top_p",
+        Value::from_slice_f32(&float_ones, &[batch])?,
+    )
+    .with_input(
+        "request.min_p",
+        Value::from_slice_f32(&float_zeros, &[batch])?,
+    )
+    .with_input("request.seed", Value::from_slice_i64(&seeds, &[batch])?)
+    .with_input(
+        "request.grammar_mask",
+        Value::from_raw_bytes(
+            vec![1; usize::try_from(batch * 128)?],
+            &[batch, 128],
+            DataType::Bool,
+        )?,
+    )
+    .with_input(
+        "request.rng_offset",
+        Value::from_slice_i64(&zeros, &[batch])?,
     )
     .with_input(
         "package.active",
@@ -74,6 +118,20 @@ fn decoder_batch_request(
         "package.zero_batch",
         Value::from_slice_i64(&zeros, &[batch])?,
     ))
+}
+
+#[test]
+fn mobius_v2_policy_components_join_one_execution_island() -> anyhow::Result<()> {
+    for package in ["decoder", "vlm"] {
+        let engine = PipelineEngine::from_dir(&root(package)?)?;
+        let islands = engine.execution_island_diagnostics();
+        assert!(islands.iter().any(|island| {
+            ["token_sampler", "token_state_update", "termination"]
+                .iter()
+                .all(|component| island.components.iter().any(|name| name == component))
+        }));
+    }
+    Ok(())
 }
 
 #[test]
