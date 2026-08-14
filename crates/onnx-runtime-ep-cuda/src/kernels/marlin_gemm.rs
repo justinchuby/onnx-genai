@@ -112,6 +112,22 @@ pub fn marlin_m_gt_1_enabled() -> bool {
     )
 }
 
+/// Opt-in gate for split-K within the Marlin M>1 path. Split-K partitions the
+/// K/group range across `grid.z` to fill idle SMs when M (and thus the base
+/// block count) is small, at the cost of a fixed-order fp32 partial reduction
+/// that is NOT byte-identical to the single-block kernel (it stays within the
+/// f64-oracle tolerance and is deterministic). Default OFF so the byte-identical
+/// direct kernel remains the default greedy-token path; enable with
+/// `ONNX_GENAI_MARLIN_SPLITK=1` (or `true`/`on`). Requires the M>1 Marlin path
+/// to also be enabled.
+#[must_use]
+pub fn marlin_splitk_enabled() -> bool {
+    matches!(
+        std::env::var("ONNX_GENAI_MARLIN_SPLITK").ok().as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
+}
+
 /// Global cache of repacked weights, keyed by the source (packed) device pointer
 /// plus dims and device ordinal. Weights are immutable initializers, so the
 /// device repack runs **once** per weight and every later call — including

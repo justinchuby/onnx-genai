@@ -5118,8 +5118,35 @@ impl MatMulNBitsKernel {
             bias_post_round: self.fold_bias_post_round && bias.is_some(),
             bias_row_stride,
         };
-        marlin_gemm::launch_marlin_gemm(&self.runtime, &args)?;
-        Ok(Some(warm))
+        // Split-K (opt-in): partition K across grid.z to fill idle SMs when the
+        // base block count is small. Partials come from the capture-safe scratch
+        // pool (slot 4) so warm replays stay allocation-free; the reduce applies
+        // the same fold_bias epilogue. Falls back to the byte-identical direct
+        // kernel whenever the heuristic declines to split.
+        let split_warm = self.maybe_launch_marlin_splitk(&args)?;
+        Ok(Some(warm && split_warm))
+    }
+
+    /// Launch `args` through split-K when enabled and the heuristic elects to
+    /// split, otherwise through the direct kernel. Returns whether the launch
+    /// was allocation-free (`true` for the direct kernel; for split-K, whether
+    /// the pooled partials scratch was already warm) so callers can propagate
+    /// capture-safety.
+    fn maybe_launch_marlin_splitk(&self, args: &marlin_gemm::MarlinGemmArgs) -> Result<bool> {
+        if marlin_gemm::marlin_splitk_enabled() {
+            let k_blocks = self.k / self.block_size.max(1);
+            let sm = self.runtime.capabilities().multiprocessor_count();
+            let split_k = marlin_gemm::choose_split_k(args.m, args.n, k_blocks, sm);
+            if split_k > 1 {
+                let bytes = marlin_gemm::splitk_partials_len(split_k, args.m, args.n)
+                    * std::mem::size_of::<f32>();
+                let (partials, warm) = marlin_gemm::ensure_scratch(&self.runtime, 4, bytes)?;
+                marlin_gemm::launch_marlin_gemm_splitk(&self.runtime, args, split_k, partials)?;
+                return Ok(warm);
+            }
+        }
+        marlin_gemm::launch_marlin_gemm(&self.runtime, args)?;
+        Ok(true)
     }
 
     /// Marlin M>1 GEMM with the fused RMS-normalization prologue. Stages the
@@ -5182,8 +5209,8 @@ impl MatMulNBitsKernel {
             bias_post_round: self.fold_bias_post_round && bias.is_some(),
             bias_row_stride,
         };
-        marlin_gemm::launch_marlin_gemm(&self.runtime, &args)?;
-        Ok(Some(weights_warm && scratch_warm))
+        let split_warm = self.maybe_launch_marlin_splitk(&args)?;
+        Ok(Some(weights_warm && scratch_warm && split_warm))
     }
 
     /// Marlin M>1 path for the paired gate/up SwiGLU MLP fusion (optionally with
