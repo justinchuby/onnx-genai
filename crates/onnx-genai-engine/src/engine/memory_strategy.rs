@@ -654,6 +654,11 @@ pub(crate) fn cuda_policy_from_memory_strategy_plan(
         // read straight from the environment like the byte-aware knob above so
         // the eviction-order investigation needs no runtime-application field.
         evict_order_probe: onnx_runtime_ep_cuda::evict_order_probe_from_env(),
+        // Zero-copy hybrid (#864): opt-in A/B knob read straight from the
+        // environment, like the byte-aware and eviction-order knobs above, so it
+        // needs no runtime-application field. Inert unless managed streaming is
+        // active (offload on + VMM stable-VA).
+        zero_copy_hybrid: onnx_runtime_ep_cuda::zero_copy_hybrid_from_env(),
     }
 }
 

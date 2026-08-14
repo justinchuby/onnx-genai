@@ -123,8 +123,8 @@ pub use weight_paging::{
     EvictOrderProbe, GlobalOffloadStats, WEIGHT_OFFLOAD_ASYNC_PAGEIN_ENV,
     WEIGHT_OFFLOAD_BYTE_AWARE_ENV, WEIGHT_OFFLOAD_DEVICE_BYTES_ENV, WEIGHT_OFFLOAD_ENV,
     WEIGHT_OFFLOAD_EVICT_ORDER_ENV, WEIGHT_OFFLOAD_SCAN_RESISTANT_ENV,
-    byte_aware_residency_from_env, evict_order_probe_from_env, global_offload_stats,
-    reset_global_offload_stats,
+    WEIGHT_OFFLOAD_ZERO_COPY_HYBRID_ENV, byte_aware_residency_from_env, evict_order_probe_from_env,
+    global_offload_stats, reset_global_offload_stats, zero_copy_hybrid_from_env,
 };
 
 /// Number of additional u32 words required by the CUDA device argmax result buffer.

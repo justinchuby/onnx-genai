@@ -24,6 +24,10 @@ impl MmapRegionSource for WeightStoreRegionSource<'_> {
                 ))
             })
     }
+
+    fn full_mapping_bytes(&self, mapping_id: usize) -> Option<&[u8]> {
+        self.0.mmap_full_bytes(mapping_id)
+    }
 }
 
 impl Executor {
