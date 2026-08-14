@@ -95,10 +95,26 @@ pub struct PipelineEngine {
     compiled_workflow: CompiledWorkflow,
     movable_emit_values: HashSet<String>,
     execution_islands: Vec<islands::ExecutionIsland>,
+    device_bridge_components: HashSet<String>,
+    component_bindings:
+        RefCell<HashMap<workflow::ComponentBindingKey, workflow::StableComponentBinding>>,
+    component_allocators: RefCell<HashMap<String, Arc<onnx_genai_ort::Allocator>>>,
+    component_outputs: RefCell<HashMap<workflow::ComponentOutputKey, Arc<onnx_genai_ort::Value>>>,
     workflow_performance: RefCell<workflow::WorkflowPerformanceCounters>,
     workflow_execution_generation: Cell<u64>,
     workflow_session_state: RefCell<HashMap<(String, String), Value>>,
     preprocessing: Option<PreprocessingSpec>,
+}
+
+impl Drop for PipelineEngine {
+    fn drop(&mut self) {
+        for island in &mut self.execution_islands {
+            island.clear_bindings();
+        }
+        self.component_bindings.get_mut().clear();
+        self.component_outputs.get_mut().clear();
+        self.component_allocators.get_mut().clear();
+    }
 }
 
 /// Validate an explicit pipeline backend request without touching model files.
@@ -270,6 +286,7 @@ impl PipelineEngine {
             workflow::compile_movable_emit_values(&compiled_workflow.graph, &workflow);
         let aliasable_output_values =
             workflow::compile_aliasable_output_values(&compiled_workflow.graph);
+        let bridge_graph = compiled_workflow.graph.clone();
         let execution_islands = islands::plan_execution_islands(
             &mut compiled_workflow.graph,
             &workflow,
@@ -277,6 +294,12 @@ impl PipelineEngine {
             &aliasable_output_values,
         )
         .map_err(|error| anyhow::anyhow!("Failed to plan workflow execution islands: {error}"))?;
+        let island_components = execution_islands
+            .iter()
+            .flat_map(|island| island.components().iter().cloned())
+            .collect::<HashSet<_>>();
+        let device_bridge_components =
+            workflow::compile_device_bridge_components(&bridge_graph, &island_components);
         Ok(Self {
             models,
             resource_governor,
@@ -286,6 +309,10 @@ impl PipelineEngine {
             compiled_workflow,
             movable_emit_values,
             execution_islands,
+            device_bridge_components,
+            component_bindings: RefCell::new(HashMap::new()),
+            component_allocators: RefCell::new(HashMap::new()),
+            component_outputs: RefCell::new(HashMap::new()),
             workflow_performance: RefCell::new(workflow::WorkflowPerformanceCounters::default()),
             workflow_execution_generation: Cell::new(0),
             workflow_session_state: RefCell::new(HashMap::new()),

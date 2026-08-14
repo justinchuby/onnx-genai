@@ -1,7 +1,11 @@
 //! Universal typed workflow interpreter.
 
+use std::collections::BTreeMap;
+
 use super::*;
 use crate::decode::clone_value;
+use onnx_genai_metadata::KvStorageMode;
+use onnx_genai_ort::{IoBinding, Session};
 
 type ResolvedComponentInvocation<'a> = (
     &'a str,
@@ -9,6 +13,146 @@ type ResolvedComponentInvocation<'a> = (
     std::collections::BTreeMap<String, String>,
     std::collections::BTreeMap<String, String>,
 );
+
+pub(crate) fn compile_device_bridge_components(
+    graph: &WorkflowNode,
+    island_components: &HashSet<String>,
+) -> HashSet<String> {
+    fn collect(
+        node: &WorkflowNode,
+        recurring: bool,
+        producers: &mut HashMap<String, String>,
+        invocations: &mut Vec<(String, Vec<String>, bool)>,
+    ) {
+        match node {
+            WorkflowNode::Sequence { nodes } => {
+                for node in nodes {
+                    collect(node, recurring, producers, invocations);
+                }
+            }
+            WorkflowNode::Invoke {
+                component,
+                inputs,
+                outputs,
+                ..
+            } => {
+                for value in outputs.values() {
+                    producers.insert(value.clone(), component.clone());
+                }
+                invocations.push((
+                    component.clone(),
+                    inputs.values().cloned().collect::<Vec<_>>(),
+                    recurring,
+                ));
+            }
+            WorkflowNode::Loop { setup, body, .. } => {
+                collect(setup, recurring, producers, invocations);
+                collect(body, true, producers, invocations);
+            }
+            WorkflowNode::Branch { cases, default, .. } => {
+                for case in cases.values() {
+                    collect(case, recurring, producers, invocations);
+                }
+                if let Some(default) = default {
+                    collect(default, recurring, producers, invocations);
+                }
+            }
+            WorkflowNode::Emit { .. }
+            | WorkflowNode::Transfer { .. }
+            | WorkflowNode::ExecutionIsland { .. } => {}
+        }
+    }
+
+    let mut producers = HashMap::new();
+    let mut invocations = Vec::new();
+    collect(graph, false, &mut producers, &mut invocations);
+    let recurring_components = invocations
+        .iter()
+        .filter_map(|(component, _, recurring)| recurring.then_some(component.clone()))
+        .collect::<HashSet<_>>();
+    let mut needed = island_components.clone();
+    let mut frontier = island_components.clone();
+    for _ in 0..2 {
+        let mut next = HashSet::new();
+        for (index, (component, inputs, _)) in invocations.iter().enumerate() {
+            if frontier.contains(component) {
+                let mut unresolved = false;
+                for input in inputs {
+                    if let Some(producer) = producers.get(input) {
+                        next.insert(producer.clone());
+                    } else {
+                        unresolved = true;
+                    }
+                }
+                if unresolved
+                    && let Some((previous, _, _)) =
+                        index.checked_sub(1).and_then(|i| invocations.get(i))
+                {
+                    next.insert(previous.clone());
+                }
+            }
+        }
+        next.retain(|component| !needed.contains(component));
+        if next.is_empty() {
+            break;
+        }
+        needed.extend(next.iter().cloned());
+        frontier = next;
+    }
+    needed.retain(|component| !island_components.contains(component));
+    needed.retain(|component| recurring_components.contains(component));
+    needed
+}
+
+pub(crate) type ComponentBindingKey = (String, Vec<(String, Vec<i64>)>);
+pub(crate) type ComponentOutputKey = (String, String, Vec<i64>, String);
+
+pub(crate) struct StableComponentBinding {
+    binding: IoBinding,
+    inputs: Vec<(String, Arc<Value>)>,
+    outputs: Vec<(String, Arc<Value>)>,
+    shared_outputs: Vec<(String, usize)>,
+    output_order: Vec<String>,
+    service_generation: u64,
+    graph_id: i32,
+    captured: bool,
+    _allocator: Arc<onnx_genai_ort::Allocator>,
+}
+
+fn stable_component_outputs(
+    stable: &StableComponentBinding,
+) -> anyhow::Result<Vec<(String, Value)>> {
+    stable
+        .output_order
+        .iter()
+        .filter_map(|name| {
+            let value = if let Some((_, value)) =
+                stable.outputs.iter().find(|(output, _)| output == name)
+            {
+                value
+            } else {
+                let input_index = match stable
+                    .shared_outputs
+                    .iter()
+                    .find(|(output, _)| output == name)
+                {
+                    Some((_, input_index)) => *input_index,
+                    None => {
+                        return Some(Err(anyhow::anyhow!(
+                            "stable component output '{name}' is unavailable"
+                        )));
+                    }
+                };
+                &stable.inputs[input_index].1
+            };
+            Some(
+                Value::alias_from_shared_owner(Arc::clone(value), value.shape())
+                    .map(|value| (name.clone(), value))
+                    .map_err(Into::into),
+            )
+        })
+        .collect()
+}
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct WorkflowPerformanceDiagnostic {
@@ -19,6 +163,8 @@ pub struct WorkflowPerformanceDiagnostic {
     pub last_emit_timestamps_ns: Vec<u128>,
     pub last_loop_iterations: u64,
     pub last_component_invocations: u64,
+    pub last_stage_runs: BTreeMap<String, u64>,
+    pub last_stage_elapsed_ns: BTreeMap<String, u128>,
     pub last_emit_events: u64,
     pub last_emitted_elements: u64,
     pub last_steps_per_second: f64,
@@ -35,6 +181,8 @@ pub(crate) struct WorkflowPerformanceCounters {
     last_emit_timestamps_ns: Vec<u128>,
     last_loop_iterations: u64,
     last_component_invocations: u64,
+    last_stage_runs: BTreeMap<String, u64>,
+    last_stage_elapsed_ns: BTreeMap<String, u128>,
     last_emit_events: u64,
     last_emitted_elements: u64,
 }
@@ -66,6 +214,16 @@ struct WorkflowRunTelemetry {
     component_invocations: u64,
     emit_events: u64,
     emitted_elements: u64,
+    stage_runs: BTreeMap<String, u64>,
+    stage_elapsed_ns: BTreeMap<String, u128>,
+}
+
+impl WorkflowRunTelemetry {
+    fn record_stage(&mut self, name: impl Into<String>, elapsed_ns: u128) {
+        let name = name.into();
+        *self.stage_runs.entry(name.clone()).or_default() += 1;
+        *self.stage_elapsed_ns.entry(name).or_default() += elapsed_ns;
+    }
 }
 
 type WorkflowAdapterExecutor = fn(
@@ -353,6 +511,8 @@ impl PipelineEngine {
             last_emit_timestamps_ns: counters.last_emit_timestamps_ns.clone(),
             last_loop_iterations: counters.last_loop_iterations,
             last_component_invocations: counters.last_component_invocations,
+            last_stage_runs: counters.last_stage_runs.clone(),
+            last_stage_elapsed_ns: counters.last_stage_elapsed_ns.clone(),
             last_emit_events: counters.last_emit_events,
             last_emitted_elements: counters.last_emitted_elements,
             last_steps_per_second: if elapsed_seconds > 0.0 {
@@ -574,6 +734,8 @@ impl<'a> WorkflowExecutionPlan<'a> {
         counters.last_emit_timestamps_ns = telemetry.emit_timestamps_ns;
         counters.last_loop_iterations = telemetry.loop_iterations;
         counters.last_component_invocations = telemetry.component_invocations;
+        counters.last_stage_runs = telemetry.stage_runs;
+        counters.last_stage_elapsed_ns = telemetry.stage_elapsed_ns;
         counters.last_emit_events = telemetry.emit_events;
         counters.last_emitted_elements = telemetry.emitted_elements;
         drop(counters);
@@ -632,6 +794,7 @@ impl PipelineEngine {
                 outputs,
                 ..
             } => {
+                let stage_started = std::time::Instant::now();
                 telemetry.component_invocations += 1;
                 let declaration = workflow
                     .components
@@ -693,12 +856,31 @@ impl PipelineEngine {
                                     })
                             })
                             .collect::<anyhow::Result<Vec<_>>>()?;
-                        let produced = session.run(&resolved)?;
-                        for (port, tensor) in session.output_names().iter().zip(produced) {
-                            let Some(value) = selected_outputs.get(port) else {
+                        let stable_eligible = session.cuda_device_id().is_some()
+                            && self.device_bridge_components.contains(selected_component);
+                        let produced = if stable_eligible {
+                            self.run_stable_component(
+                                workflow,
+                                selected_component,
+                                selected_declaration,
+                                &component_symbols,
+                                session,
+                                &resolved,
+                                &selected_outputs,
+                            )?
+                        } else {
+                            session
+                                .output_names()
+                                .iter()
+                                .cloned()
+                                .zip(session.run(&resolved)?)
+                                .collect()
+                        };
+                        for (port, tensor) in produced {
+                            let Some(value) = selected_outputs.get(&port) else {
                                 continue;
                             };
-                            if let Some(contract) = selected_declaration.ports.outputs.get(port) {
+                            if let Some(contract) = selected_declaration.ports.outputs.get(&port) {
                                 validate_workflow_value(
                                     value,
                                     &tensor,
@@ -707,6 +889,7 @@ impl PipelineEngine {
                                     &component_dynamic_symbols,
                                 )?;
                             }
+
                             values.insert(value.clone(), tensor);
                         }
                     }
@@ -750,6 +933,10 @@ impl PipelineEngine {
                         }
                     }
                 }
+                telemetry.record_stage(
+                    format!("component:{component}"),
+                    stage_started.elapsed().as_nanos(),
+                );
             }
             WorkflowNode::Loop {
                 setup,
@@ -1003,6 +1190,7 @@ impl PipelineEngine {
                 mode,
                 ..
             } => {
+                let emit_started = std::time::Instant::now();
                 self.materialize_workflow_value(values, value)?;
                 if let Some(when) = when {
                     self.materialize_workflow_value(values, when)?;
@@ -1051,12 +1239,14 @@ impl PipelineEngine {
                         emit_counts,
                         telemetry,
                     )?;
+                    telemetry.record_stage("emit", emit_started.elapsed().as_nanos());
                     return Ok(());
                 }
                 if guards
                     .as_ref()
                     .is_some_and(|guards| !guards.first().copied().unwrap_or(false))
                 {
+                    telemetry.record_stage("emit", emit_started.elapsed().as_nanos());
                     return Ok(());
                 }
                 let emitted = if let Some(valid_length) = valid_length {
@@ -1110,6 +1300,7 @@ impl PipelineEngine {
                         values.insert(output.clone(), emitted);
                     }
                 }
+                telemetry.record_stage("emit", emit_started.elapsed().as_nanos());
             }
             WorkflowNode::Transfer {
                 input,
@@ -1127,6 +1318,7 @@ impl PipelineEngine {
                 values.insert(output.clone(), clone_value(tensor)?);
             }
             WorkflowNode::ExecutionIsland { id } => {
+                let stage_started = std::time::Instant::now();
                 let island = self.execution_islands.get(*id).with_context(|| {
                     format!("workflow references unknown execution island {id}")
                 })?;
@@ -1146,12 +1338,258 @@ impl PipelineEngine {
                 }
                 telemetry.component_invocations += island.component_count() as u64;
                 island.run(values, component_overrides)?;
+                telemetry.record_stage(format!("island:{id}"), stage_started.elapsed().as_nanos());
             }
         }
         Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn run_stable_component(
+        &self,
+        workflow: &WorkflowSpec,
+        component: &str,
+        declaration: &onnx_genai_metadata::WorkflowComponent,
+        component_symbols: &HashMap<String, i64>,
+        session: &Session,
+        resolved: &[(&str, &Value)],
+        selected_outputs: &std::collections::BTreeMap<String, String>,
+    ) -> anyhow::Result<Vec<(String, Value)>> {
+        let device_id = session
+            .cuda_device_id()
+            .context("stable component execution requires a CUDA session")?;
+        let key = (
+            component.to_string(),
+            resolved
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), value.shape().to_vec()))
+                .collect(),
+        );
+        let shared = workflow
+            .serving
+            .as_ref()
+            .map(|serving| {
+                serving
+                    .kv_service
+                    .groups
+                    .values()
+                    .filter(|group| group.storage == KvStorageMode::SharedBuffer)
+                    .filter_map(|group| group.ports.get(component))
+                    .flat_map(|aliases| aliases.values())
+                    .map(|alias| (alias.output.clone(), alias.input.clone()))
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
+        let generation = self.workflow_execution_generation.get();
+        let mut bindings = self.component_bindings.borrow_mut();
+        if let Some(stable) = bindings.get_mut(&key) {
+            let reset_services = stable.service_generation != generation;
+            for (name, source) in resolved {
+                let (_, destination) = stable
+                    .inputs
+                    .iter()
+                    .find(|(input, _)| input == name)
+                    .with_context(|| {
+                        format!("stable component '{component}' lost input '{name}'")
+                    })?;
+                let shared_input = shared.values().any(|input| input == name);
+                if shared_input && !reset_services {
+                    continue;
+                }
+                if source.numel() == 0 {
+                    continue;
+                }
+                if source.data_ptr_addr()? == destination.data_ptr_addr()? {
+                    continue;
+                }
+                if !source.is_host_resident()? {
+                    anyhow::ensure!(
+                        source.device_id()? == device_id,
+                        "stable component '{component}' input '{name}' is on CUDA device {}, \
+                         expected {device_id}",
+                        source.device_id()?
+                    );
+                }
+                destination.copy_from_cuda(source, device_id)?;
+            }
+            stable.service_generation = generation;
+            if session.graph_capture() {
+                if !stable.captured {
+                    session.synchronize_device()?;
+                }
+                session.run_with_binding_graph(&stable.binding, stable.graph_id)?;
+                stable.captured = true;
+            } else {
+                session.run_with_binding(&stable.binding)?;
+            }
+            return stable_component_outputs(stable);
+        }
+
+        let allocator =
+            if let Some(allocator) = self.component_allocators.borrow().get(component).cloned() {
+                allocator
+            } else {
+                let allocator = Arc::new(
+                    session
+                        .device_kv_allocator()?
+                        .context("stable component execution requires a CUDA allocator")?,
+                );
+                self.component_allocators
+                    .borrow_mut()
+                    .insert(component.to_string(), Arc::clone(&allocator));
+                allocator
+            };
+        let discovered = if selected_outputs
+            .keys()
+            .any(|output| !declaration.ports.outputs.contains_key(output))
+        {
+            let mut values = session
+                .output_names()
+                .iter()
+                .cloned()
+                .zip(session.run(resolved)?)
+                .collect::<HashMap<_, _>>();
+            if selected_outputs
+                .keys()
+                .any(|output| values.get(output).is_some_and(|value| value.numel() == 0))
+            {
+                return session
+                    .output_names()
+                    .iter()
+                    .filter(|output| selected_outputs.contains_key(*output))
+                    .map(|output| {
+                        values
+                            .remove(output)
+                            .map(|value| (output.clone(), value))
+                            .with_context(|| {
+                                format!(
+                                    "component '{component}' shape discovery did not return \
+                                     selected output '{output}'"
+                                )
+                            })
+                    })
+                    .collect();
+            }
+            Some(values)
+        } else {
+            None
+        };
+        let mut binding = IoBinding::new(session)?;
+        let mut inputs = Vec::with_capacity(resolved.len());
+        for (name, source) in resolved {
+            let stable = if source.numel() == 0 {
+                Arc::new(Value::empty_in(source.shape(), source.dtype(), &allocator)?)
+            } else if !source.is_host_resident()?
+                && source.device_id()? == device_id
+                && let Some(alias) = source.try_alias_clone()
+            {
+                Arc::new(alias?)
+            } else {
+                let stable = Arc::new(Value::empty_in(source.shape(), source.dtype(), &allocator)?);
+                if source.numel() != 0 {
+                    if !source.is_host_resident()? {
+                        anyhow::ensure!(
+                            source.device_id()? == device_id,
+                            "stable component '{component}' input '{name}' is on CUDA device {}, \
+                             expected {device_id}",
+                            source.device_id()?
+                        );
+                    }
+                    stable.copy_from_cuda(source, device_id)?;
+                }
+                stable
+            };
+            binding.bind_input(name, stable.as_ref())?;
+            inputs.push(((*name).to_string(), stable));
+        }
+        let mut shared_outputs = Vec::new();
+        let mut outputs = Vec::new();
+        for output in session
+            .output_names()
+            .iter()
+            .filter(|output| selected_outputs.contains_key(*output))
+        {
+            if let Some(input_name) = shared.get(output) {
+                let (input_index, (_, input)) = inputs
+                    .iter()
+                    .enumerate()
+                    .find(|(_, (name, _))| name == input_name)
+                    .with_context(|| {
+                        format!(
+                            "stable component '{component}' shared output '{output}' has no input \
+                             '{input_name}'"
+                        )
+                    })?;
+                binding.bind_output(output, input.as_ref())?;
+                shared_outputs.push((output.clone(), input_index));
+            } else {
+                let metadata = session
+                    .outputs()
+                    .iter()
+                    .find(|metadata| metadata.name == *output)
+                    .with_context(|| {
+                        format!("stable component '{component}' output '{output}' has no metadata")
+                    })?;
+                let shape = if let Some(contract) = declaration.ports.outputs.get(output) {
+                    resolve_workflow_shape(contract, component_symbols)?
+                } else {
+                    discovered
+                        .as_ref()
+                        .and_then(|values| values.get(output))
+                        .with_context(|| {
+                            format!(
+                                "stable component '{component}' output '{output}' shape discovery \
+                                 did not return that output"
+                            )
+                        })?
+                        .shape()
+                        .to_vec()
+                };
+                let output_key = (
+                    component.to_string(),
+                    output.clone(),
+                    shape.clone(),
+                    format!("{:?}", metadata.dtype),
+                );
+                let stable = if let Some(value) =
+                    self.component_outputs.borrow().get(&output_key).cloned()
+                {
+                    value
+                } else {
+                    let value = Arc::new(Value::empty_in(&shape, metadata.dtype, &allocator)?);
+                    self.component_outputs
+                        .borrow_mut()
+                        .insert(output_key, Arc::clone(&value));
+                    value
+                };
+                binding.bind_output(output, stable.as_ref())?;
+                outputs.push((output.clone(), stable));
+            }
+        }
+        session.run_with_binding(&binding)?;
+        let graph_id =
+            i32::try_from(bindings.len()).context("stable component CUDA graph id exceeds i32")?;
+        let stable = StableComponentBinding {
+            binding,
+            inputs,
+            outputs,
+            shared_outputs,
+            output_order: session
+                .output_names()
+                .iter()
+                .filter(|output| selected_outputs.contains_key(*output))
+                .cloned()
+                .collect(),
+            service_generation: generation,
+            graph_id,
+            captured: false,
+            _allocator: allocator,
+        };
+        let produced = stable_component_outputs(&stable)?;
+        bindings.insert(key, stable);
+        Ok(produced)
+    }
+
     fn run_image_preprocess_adapter(
         &self,
         component: &str,
@@ -2522,7 +2960,7 @@ fn merge_inactive_rows(
 
 fn share_workflow_value(values: &mut PipelineTensors, name: &str) -> anyhow::Result<Value> {
     if let Some(alias) = values.get(name).and_then(Value::try_alias_clone) {
-        return alias.map_err(Into::into);
+        return alias.with_context(|| format!("workflow value '{name}' cannot retain its alias"));
     }
     let owner = values
         .remove(name)

@@ -3118,6 +3118,18 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
             args.decode_skip
         );
         let diagnostic = engine.workflow_performance_diagnostic();
+        for (stage, elapsed_ns) in &diagnostic.last_stage_elapsed_ns {
+            let runs = diagnostic.last_stage_runs.get(stage).copied().unwrap_or(0);
+            println!(
+                "workflow_stage {stage}: runs={runs} elapsed={:.3}ms avg={:.3}ms",
+                *elapsed_ns as f64 / 1_000_000.0,
+                if runs == 0 {
+                    0.0
+                } else {
+                    *elapsed_ns as f64 / runs as f64 / 1_000_000.0
+                }
+            );
+        }
         for island in diagnostic.islands {
             println!(
                 "workflow_island {}: components={:?} runs={} session_runs={} eager={} stable={} \
