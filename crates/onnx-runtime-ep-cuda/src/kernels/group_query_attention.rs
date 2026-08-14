@@ -7,6 +7,7 @@
 //! existing attention baseline. Declared present shapes remain BNSH-compatible
 //! while the native backend may physically store converted paths as BSNH.
 
+use std::borrow::Cow;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
@@ -1184,6 +1185,79 @@ impl KernelFactory for GroupQueryAttentionFactory {
             .with_kv_strides(kv_strides),
         ))
     }
+}
+
+/// Claim-time capability gate for `com.microsoft::GroupQueryAttention`.
+///
+/// Mirrors the attribute-based rejections in
+/// [`GroupQueryAttentionFactory::create`] so the EP declines nodes it cannot
+/// execute *before* ORT commits them to a fused partition. Without this,
+/// `create` would reject an unsupported attribute (e.g. `smooth_softmax`) only
+/// at kernel-construction time, which sinks the entire fused partition instead
+/// of letting ORT route the offending node to another EP. Only
+/// attribute-derivable conditions are checked here; shape- and runtime-derived
+/// conditions remain enforced in `create`.
+pub(crate) fn unsupported_reason(node: &Node) -> Option<Cow<'static, str>> {
+    let required_head = |name: &str| -> core::result::Result<usize, Cow<'static, str>> {
+        let value = node.attr(name).and_then(|a| a.as_int()).ok_or_else(|| {
+            Cow::Owned(format!(
+                "cuda_ep GroupQueryAttention: missing required `{name}` attribute"
+            ))
+        })?;
+        usize::try_from(value)
+            .ok()
+            .filter(|&v| v > 0)
+            .ok_or_else(|| Cow::Owned(format!("cuda_ep GroupQueryAttention: `{name}` must be > 0")))
+    };
+    let num_heads = match required_head("num_heads") {
+        Ok(value) => value,
+        Err(reason) => return Some(reason),
+    };
+    let kv_num_heads = match required_head("kv_num_heads") {
+        Ok(value) => value,
+        Err(reason) => return Some(reason),
+    };
+    if !num_heads.is_multiple_of(kv_num_heads) {
+        return Some(Cow::Owned(format!(
+            "cuda_ep GroupQueryAttention: num_heads {num_heads} must be a multiple of kv_num_heads {kv_num_heads}"
+        )));
+    }
+    for name in ["k_quant_type", "v_quant_type"] {
+        if let Some(value) = node.attr(name)
+            && value.as_str() != Some("NONE")
+        {
+            return Some(Cow::Owned(format!(
+                "cuda_ep GroupQueryAttention: `{name}` other than NONE is not supported"
+            )));
+        }
+    }
+    for (name, message) in [
+        ("kv_cache_bit_width", "quantized KV cache"),
+        ("qk_output", "qk_output"),
+        ("smooth_softmax", "smooth_softmax"),
+    ] {
+        if node.attr(name).and_then(|a| a.as_int()).unwrap_or(0) != 0 {
+            return Some(Cow::Owned(format!(
+                "cuda_ep GroupQueryAttention: {message} is not supported"
+            )));
+        }
+    }
+    let softcap = node
+        .attr("softcap")
+        .and_then(|a| a.as_float())
+        .unwrap_or(0.0);
+    if softcap < 0.0 {
+        return Some(Cow::Borrowed(
+            "cuda_ep GroupQueryAttention: softcap must be non-negative",
+        ));
+    }
+    let kv_layout = node.attr("kv_layout").and_then(|a| a.as_int()).unwrap_or(0);
+    if !matches!(kv_layout, 0 | 1) {
+        return Some(Cow::Owned(format!(
+            "cuda_ep GroupQueryAttention: kv_layout {kv_layout} is not supported (expected 0 or 1)"
+        )));
+    }
+    None
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3114,6 +3188,57 @@ impl Kernel for GroupQueryAttentionKernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use onnx_runtime_ir::{Attribute, NodeId};
+
+    fn gqa_node(attrs: &[(&str, Attribute)]) -> Node {
+        let mut node = Node::new(NodeId(0), "GroupQueryAttention", vec![], vec![]);
+        node.domain = "com.microsoft".to_string();
+        for (name, value) in attrs {
+            node.attributes.insert((*name).into(), value.clone());
+        }
+        node
+    }
+
+    #[test]
+    fn gqa_unsupported_reason_accepts_plain_grouped_attention() {
+        // Qwen2 0.5B head layout: 14 query heads, 2 KV heads, no exotic attrs.
+        let node = gqa_node(&[
+            ("num_heads", Attribute::Int(14)),
+            ("kv_num_heads", Attribute::Int(2)),
+        ]);
+        assert!(unsupported_reason(&node).is_none());
+    }
+
+    #[test]
+    fn gqa_unsupported_reason_declines_smooth_softmax() {
+        let node = gqa_node(&[
+            ("num_heads", Attribute::Int(14)),
+            ("kv_num_heads", Attribute::Int(2)),
+            ("smooth_softmax", Attribute::Int(1)),
+        ]);
+        let reason =
+            unsupported_reason(&node).expect("smooth_softmax must be declined at claim time");
+        assert!(reason.contains("smooth_softmax"), "reason: {reason}");
+    }
+
+    #[test]
+    fn gqa_unsupported_reason_declines_missing_and_misconfigured_heads() {
+        // Missing required num_heads.
+        let missing = gqa_node(&[("kv_num_heads", Attribute::Int(2))]);
+        assert!(
+            unsupported_reason(&missing).is_some_and(|r| r.contains("num_heads")),
+            "missing num_heads must decline"
+        );
+        // num_heads not a multiple of kv_num_heads.
+        let ratio = gqa_node(&[
+            ("num_heads", Attribute::Int(14)),
+            ("kv_num_heads", Attribute::Int(3)),
+        ]);
+        assert!(
+            unsupported_reason(&ratio).is_some_and(|r| r.contains("multiple")),
+            "non-divisible head counts must decline"
+        );
+    }
 
     #[test]
     fn sequence_lengths_shape_accepts_canonical_per_batch_forms() {

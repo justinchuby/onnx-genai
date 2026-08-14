@@ -98,6 +98,16 @@ impl OpRegistry {
         self.by_op.get(domain)?.get(op_type)?.first().copied()
     }
 
+    /// Iterate over every registered key `(op_type, domain, since_version)`.
+    ///
+    /// Domains are already normalized (`"ai.onnx"` collapsed to `""`) at
+    /// registration time, so the returned keys carry the exact domain a plugin
+    /// EP should advertise to ORT. Used to derive kernel-registry entries from
+    /// the real registry rather than a hand-maintained parallel list.
+    pub fn keys(&self) -> impl Iterator<Item = &OpKey> {
+        self.entries.keys()
+    }
+
     /// Number of registered entries.
     pub fn len(&self) -> usize {
         self.entries.len()

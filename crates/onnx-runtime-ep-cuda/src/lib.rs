@@ -113,7 +113,10 @@ pub use kernels::group_query_attention::{
 pub use kernels::index_share::INDEX_SHARE_CAPTURE_ERROR_INDEX;
 pub use kernels::indexing::SCATTER_CAPTURE_ERROR_INDEX;
 pub use kernels::reduce::REDUCE_CAPTURE_ERROR_AXES;
-pub use kernels::{CUDA_COVERED_OPS, build_cuda_registry, build_cuda_registry_with_metrics};
+pub use kernels::{
+    CUDA_COVERED_OPS, CudaOpDescriptor, build_cuda_registry, build_cuda_registry_descriptors,
+    build_cuda_registry_with_metrics, cuda_supported_dtypes_for_op,
+};
 pub use pinned_pool::{PinnedStagingPool, global_pinned_alloc_calls, global_pinned_reuses};
 pub use provider::{
     CudaExecutionProvider, DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES, dynamic_kv_weight_lending_enabled,
