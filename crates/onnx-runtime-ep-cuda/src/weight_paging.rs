@@ -658,29 +658,69 @@ fn zero_copy_max_binds() -> Option<u64> {
     *V.get_or_init(|| parse_numeric_env(NAME).into_option(NAME))
 }
 
-/// Conservative default safety budget for **distinct** zero-copy bytes bound
-/// per residency (256 MiB). This exists because of a measured hardware limit
-/// (#864): on an RTX 4060 Laptop under WDDM, device reads through a
-/// `cuMemHostRegister(READ_ONLY | DEVICEMAP)` mapping are bit-identical up to
+/// Windows/WDDM default safety budget for **distinct** zero-copy bytes bound per
+/// residency (256 MiB). This conservative value exists because of a measured
+/// hardware limit (#864): on an RTX 4060 Laptop under WDDM, device reads through
+/// a `cuMemHostRegister(READ_ONLY | DEVICEMAP)` mapping are bit-identical up to
 /// ~0.44 GB of distinct host-mapped data read per decode step (32 cold weights
 /// verified correct), but **silently corrupt** above that (48 weights / ~0.65 GB
 /// collapsed generation 16 → 3 tokens — the #886 signature, but from stale
 /// host-mapped reads, not eviction). Individual reads are always correct, so
-/// this is an aggregate host-mapped-aperture ceiling, not a per-read fault.
-/// The default is set well under the observed-safe ceiling so the opt-in knob
-/// can never violate the byte-identical gate; override for investigation only.
-const ZERO_COPY_SAFE_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+/// this is an aggregate host-mapped-aperture ceiling, not a per-read fault. It
+/// is a **WDDM/VidMm memory-manager artifact** (same family as #863, where
+/// VidMm silently demoted our own VMM granules to host RAM), so the conservative
+/// value is kept only on Windows.
+const ZERO_COPY_SAFE_BUDGET_BYTES_WDDM: u64 = 256 * 1024 * 1024;
+
+/// Non-Windows (Linux / discrete-GPU) default safety budget: **2 GiB**. #925
+/// re-measured the hybrid on Linux (H200, driver 580.105.08, CUDA 13, kernel
+/// 6.6, native VMM decode path) and found the WDDM aperture ceiling **absent**:
+/// generation stayed byte-identical to the Step-0 baseline with `cuda_graph`
+/// `fallbacks=0` up to **6.795 GB** of distinct host-mapped weights bound and
+/// re-read in place every decode step (704 `cuMemHostRegister` binds; n=3, all
+/// runs byte-identical) — ~15× the WDDM ~0.44 GB onset and ~10× the top of its
+/// 0.44–0.65 GB corruption band. On Linux `cuMemHostRegister(READ_ONLY |
+/// DEVICEMAP)` pins pages in the driver with no VidMm layer above it, so the
+/// ceiling that motivates the Windows value does not apply here; the 256 MiB
+/// default left an ~8× decode win unused in the over-budget regime (67 vs
+/// ~8.5 tok/s median vs managed streaming).
+///
+/// 2 GiB is chosen deliberately **bounded, not unbounded**: it sits >3× below
+/// the #925 measured-safe 6.795 GB (a comfortable margin, since only one GPU
+/// class — Hopper/H200 — was actually tested), yet clears the entire WDDM
+/// corruption band by >3× and covers both the observed ~0.85 GB per-step cold
+/// working set and the deferred fraction of a realistically over-budget model
+/// with headroom — which is what unlocks the win. Keeping it bounded avoids
+/// over-committing pinned host RAM and avoids extrapolating past tested hardware
+/// (portability); operators can raise or lower it per run via
+/// `ONNX_GENAI_ZERO_COPY_HYBRID_BUDGET_BYTES`.
+const ZERO_COPY_SAFE_BUDGET_BYTES_NON_WINDOWS: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Platform-selected default distinct-zero-copy-byte budget. Windows keeps the
+/// conservative WDDM value ([`ZERO_COPY_SAFE_BUDGET_BYTES_WDDM`], #864); every
+/// other platform uses the higher Linux-measured value
+/// ([`ZERO_COPY_SAFE_BUDGET_BYTES_NON_WINDOWS`], #925). The `if cfg!(...)` form
+/// references both named consts unconditionally, so each stays greppable and
+/// unit-testable regardless of the host that compiled this crate. The default
+/// is set under the platform's observed-safe ceiling so the opt-in knob can
+/// never violate the byte-identical gate; override for investigation only.
+const ZERO_COPY_SAFE_BUDGET_BYTES: u64 = if cfg!(target_os = "windows") {
+    ZERO_COPY_SAFE_BUDGET_BYTES_WDDM
+} else {
+    ZERO_COPY_SAFE_BUDGET_BYTES_NON_WINDOWS
+};
 
 /// Per-residency distinct zero-copy byte budget (see
 /// [`ZERO_COPY_SAFE_BUDGET_BYTES`]). Override via
 /// `ONNX_GENAI_ZERO_COPY_HYBRID_BUDGET_BYTES` (e.g. `0` to force copy-only, or a
 /// large value to reproduce the corruption on other hardware).
 ///
-/// The default is a **WDDM-derived figure** (#912) and carries no evidence on
-/// any other platform; whether the ceiling it guards against exists at all on
-/// Linux is unmeasured (#925). Anyone sweeping this on other hardware should
-/// confirm the value took effect by checking that `zero_copy_bytes_per_token`
-/// tracks it, rather than trusting that the environment was read as intended.
+/// The default is **platform-selected** (see [`ZERO_COPY_SAFE_BUDGET_BYTES`]):
+/// 256 MiB on Windows (the WDDM-derived figure, #864/#912) and 2 GiB elsewhere
+/// (Linux/H200 measured byte-identical to 6.795 GB with `fallbacks=0`, #925).
+/// Anyone sweeping this on other hardware should confirm the value took effect
+/// by checking that `zero_copy_bytes_per_token` tracks it, rather than trusting
+/// that the environment was read as intended.
 fn zero_copy_budget_bytes() -> u64 {
     const NAME: &str = "ONNX_GENAI_ZERO_COPY_HYBRID_BUDGET_BYTES";
     static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -3403,17 +3443,46 @@ mod tests {
     }
 
     #[test]
-    fn zero_copy_safe_budget_is_below_measured_corruption_ceiling() {
-        // #864: distinct host-mapped reads were byte-identical at 32 cold
-        // weights (~0.44 GB/step) and corrupted at 48 (~0.65 GB/step). The
-        // default safety budget must sit strictly under the observed-safe
-        // ceiling so the opt-in knob can never violate the byte-identical gate.
-        const OBSERVED_SAFE_BYTES: u64 = 436_633_600; // 32 cold weights, measured
+    fn zero_copy_safe_budget_defaults_are_platform_aware() {
+        // Bind the consts to locals so these stay runtime assertions (comparing
+        // two consts directly trips clippy::assertions_on_constants).
+        let wddm = ZERO_COPY_SAFE_BUDGET_BYTES_WDDM;
+        let non_windows = ZERO_COPY_SAFE_BUDGET_BYTES_NON_WINDOWS;
+        let selected = ZERO_COPY_SAFE_BUDGET_BYTES;
+
+        // Windows/WDDM (#864): distinct host-mapped reads were byte-identical at
+        // 32 cold weights (~0.44 GB/step) and corrupted at 48 (~0.65 GB/step).
+        // The WDDM default must sit strictly under the observed-safe ceiling so
+        // the opt-in knob can never violate the byte-identical gate there.
+        let wddm_observed_safe_bytes: u64 = 436_633_600; // 32 cold weights, measured
+        assert_eq!(wddm, 256 * 1024 * 1024);
         assert!(
-            ZERO_COPY_SAFE_BUDGET_BYTES < OBSERVED_SAFE_BYTES,
-            "default budget {ZERO_COPY_SAFE_BUDGET_BYTES} must be under the measured-safe ceiling"
+            wddm < wddm_observed_safe_bytes,
+            "WDDM default {wddm} must stay under the WDDM ceiling"
         );
-        assert_eq!(ZERO_COPY_SAFE_BUDGET_BYTES, 256 * 1024 * 1024);
+
+        // Non-Windows (#925): Linux/H200 stayed byte-identical to the Step-0
+        // baseline with cuda_graph fallbacks=0 up to 6.795 GB of distinct
+        // host-mapped bytes bound and re-read per step (704 binds, n=3). The
+        // non-Windows default is raised to 2 GiB: bounded and >3x under that
+        // measured-safe figure, yet above the whole WDDM corruption band so the
+        // lever #925 proved available on Linux is actually unlocked.
+        let linux_measured_safe_bytes: u64 = 6_795_458_560; // #925, debug-summed
+        assert_eq!(non_windows, 2 * 1024 * 1024 * 1024);
+        assert!(
+            non_windows < linux_measured_safe_bytes,
+            "non-Windows default {non_windows} must stay under the #925 measured-safe ceiling"
+        );
+        assert!(
+            non_windows > wddm_observed_safe_bytes,
+            "non-Windows default must clear the WDDM corruption band to unlock the lever"
+        );
+
+        // The platform-selected default resolves to the right named const.
+        #[cfg(target_os = "windows")]
+        assert_eq!(selected, wddm);
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(selected, non_windows);
     }
 
     #[test]
