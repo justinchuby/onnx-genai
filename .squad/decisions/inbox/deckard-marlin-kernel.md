@@ -249,3 +249,59 @@ efficiency stays low. **Decision: M=1 remains on the existing dedicated GEMV.**
 **Remaining work:** gate_up SwiGLU still uses the direct kernel at M>1 (its fused
 SiluMul epilogue would need a split-K reduce variant); left as follow-up since the
 plain path covers the bulk of split-K-eligible small-M nodes.
+
+---
+
+## Update 5 — the last two M>1 capture barriers: GQA + SkipSimplifiedLayerNorm
+
+Sebastian's decisive A/B confirmed Marlin is a clean GEMM-level win (capture
+B* 8.76×→4.99×, all 240 MatMulNBits capture seams gone, prefill ~2×,
+byte-identical). The sole remaining blocker to the speculative-capture GO gate
+was the last two ops still declaring `KernelCaptureUnsupported` at M>1:
+**GroupQueryAttention (×40)** and **SkipSimplifiedLayerNormalization (×80)**.
+Both were conservative gates, not real capture hazards. Fixed (commit
+`18d00f90`), both now advertise capture support for a warmed M=K signature.
+
+**SkipSimplifiedLayerNormalization** — *signature relaxation.* The launch is
+already a static grid `(num_groups,1,1)` with no mid-kernel sync / host
+read-back / alloc-free on the hot path, and the shape-keyed
+`SkipBroadcastMetadataCache` already rejects any shape change (including
+`num_groups`) mid-capture (the same pre-warm cold-miss valve as the Marlin
+repack cache). The `num_groups == 1` capture latch was purely conservative →
+relaxed to `true`. bf16 staging path still demotes on arena growth. **What made
+it unsafe at M>1:** nothing — a deliberately conservative latch. **Fix:** latch
+capture-safe for any pre-warmed shape.
+
+**GroupQueryAttention** — *pre-warmed fixed-M flash workspace.* The capture
+signature hard-required `q_seq == 1` (Phase2a split-K decode). At q_seq>1 the op
+fell to the eager path that **host-reads-back** `seqlens_k` /
+`total_sequence_length` (and rotary `position_ids`) — the actual capture killer.
+**Fix:** admit a fp16/bf16 `q_seq>1` **fused-flash** signature. `flash_attention::run`
+is already capture-safe by construction (static grid `batch·heads·q_tiles`,
+device `total_lengths`/`past_lengths`, no host read-back, skips `synchronize`
+during capture). The on-device `gqa_prepare_metadata` kernel + `capture_error_ptr`
+latch replace host validation; the capture-safe branch uses `present_capacity`
+(masking the KV tail on-device) exactly like the M=1 decode path. Backend is
+resolved against the fixed `present_capacity` so warm and captured runs agree
+deterministically. f32 M>1 (reference-scores, host-sized) stays on the eager
+fallback (documented, not a hot decode/verify shape).
+
+**Gates:** greedy tokens byte-identical on glm-4-9b-int4 (heavy
+SkipSimplifiedLayerNorm) M>1 prefill; GQA + normalization lib unit tests pass;
+fmt + lib clippy + native-backend clippy clean. Capture support still declared
+only for a **warmed** signature — the probe must pre-warm the M=K shape before
+the captured attempt (same safety valve as the Marlin repack/scratch pools).
+
+**→ Hands off to Sebastian** for the decisive Increment-0 re-probe with
+`ONNX_GENAI_MARLIN_M_GT_1=1` at M=8: expect `segments → ~1` and `B* ≤ ~2`
+(speculative-capture GO). Validate byte-identical captured M=8 tokens + warm
+replays. One assumption to confirm on the probe: the KV cache tail beyond the
+valid length must not contain NaN (zero-init cache holds; the M=1 capture path
+already relies on the same invariant).
+
+**Per-kernel M>1 capture census (post-fix, by construction):**
+- MatMulNBits ×240 (+ gate_up/rmsnorm): Marlin, capture-safe. ✅ (update 3)
+- SkipSimplifiedLayerNormalization ×80: static-grid, pre-warm valve. ✅
+- GroupQueryAttention ×40: fused-flash, on-device metadata, pre-warm valve. ✅
+- Residual eager seams at M>1 for the hot path: NONE expected — Sebastian's
+  probe is the authoritative segment census.
