@@ -585,16 +585,77 @@ fn zero_copy_no_readonly() -> bool {
     })
 }
 
+/// Outcome of reading a numeric diagnostic knob.
+///
+/// The three states are kept apart deliberately. Collapsing `Invalid` into
+/// `Unset` is what makes the silent-fallback shape dangerous: a sweep that
+/// writes `..._BUDGET_BYTES=2GB` (or leaves a digit separator, or a stray
+/// character) would fall back to the conservative default and then report "no
+/// corruption at 2 GiB" having never tested 2 GiB. A confident wrong answer is
+/// worse than an error. This is the same failure as rendering "not determined"
+/// as "determined to be unsafe" (#931), and the same family as the
+/// `ASYNC_PAGEIN` trap where an unrecognized value silently selected the slow
+/// path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NumericEnv {
+    Unset,
+    Invalid(String),
+    Value(u64),
+}
+
+impl NumericEnv {
+    /// The configured value, warning on stderr when one was supplied but not
+    /// understood, so a measurement taken under it is not mistaken for a
+    /// measurement of the value the operator believed they set.
+    fn or_default(self, name: &str, default: u64) -> u64 {
+        match self {
+            NumericEnv::Value(value) => value,
+            NumericEnv::Unset => default,
+            NumericEnv::Invalid(raw) => {
+                eprintln!(
+                    "cuda_ep: {name}={raw:?} is not a base-10 byte count; using {default} instead. \
+                     Set a plain integer (e.g. 1073741824 for 1 GiB) — this value did NOT take \
+                     effect, so any measurement taken under it describes the default."
+                );
+                default
+            }
+        }
+    }
+
+    fn into_option(self, name: &str) -> Option<u64> {
+        match self {
+            NumericEnv::Value(value) => Some(value),
+            NumericEnv::Unset => None,
+            NumericEnv::Invalid(raw) => {
+                eprintln!(
+                    "cuda_ep: {name}={raw:?} is not a base-10 integer; ignoring it. This value did \
+                     NOT take effect."
+                );
+                None
+            }
+        }
+    }
+}
+
+/// Read a numeric diagnostic knob, keeping "unset" and "set but not understood"
+/// distinct. See [`NumericEnv`] for why that distinction is load-bearing.
+fn parse_numeric_env(name: &str) -> NumericEnv {
+    let Ok(raw) = std::env::var(name) else {
+        return NumericEnv::Unset;
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(value) => NumericEnv::Value(value),
+        Err(_) => NumericEnv::Invalid(raw),
+    }
+}
+
 /// Diagnostic knob (#864): cap how many weights are actually bound zero-copy
 /// (the rest are copied). `Some(1)` isolates a single zero-copy read. Default
 /// `None` (unbounded).
 fn zero_copy_max_binds() -> Option<u64> {
+    const NAME: &str = "ONNX_GENAI_ZERO_COPY_HYBRID_MAX_BINDS";
     static V: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("ONNX_GENAI_ZERO_COPY_HYBRID_MAX_BINDS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-    })
+    *V.get_or_init(|| parse_numeric_env(NAME).into_option(NAME))
 }
 
 /// Conservative default safety budget for **distinct** zero-copy bytes bound
@@ -614,14 +675,16 @@ const ZERO_COPY_SAFE_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 /// [`ZERO_COPY_SAFE_BUDGET_BYTES`]). Override via
 /// `ONNX_GENAI_ZERO_COPY_HYBRID_BUDGET_BYTES` (e.g. `0` to force copy-only, or a
 /// large value to reproduce the corruption on other hardware).
+///
+/// The default is a **WDDM-derived figure** (#912) and carries no evidence on
+/// any other platform; whether the ceiling it guards against exists at all on
+/// Linux is unmeasured (#925). Anyone sweeping this on other hardware should
+/// confirm the value took effect by checking that `zero_copy_bytes_per_token`
+/// tracks it, rather than trusting that the environment was read as intended.
 fn zero_copy_budget_bytes() -> u64 {
+    const NAME: &str = "ONNX_GENAI_ZERO_COPY_HYBRID_BUDGET_BYTES";
     static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("ONNX_GENAI_ZERO_COPY_HYBRID_BUDGET_BYTES")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(ZERO_COPY_SAFE_BUDGET_BYTES)
-    })
+    *V.get_or_init(|| parse_numeric_env(NAME).or_default(NAME, ZERO_COPY_SAFE_BUDGET_BYTES))
 }
 
 ///
@@ -3351,6 +3414,63 @@ mod tests {
             "default budget {ZERO_COPY_SAFE_BUDGET_BYTES} must be under the measured-safe ceiling"
         );
         assert_eq!(ZERO_COPY_SAFE_BUDGET_BYTES, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn numeric_env_keeps_unset_and_unparseable_distinct() {
+        // The hazard is a measurement one. A sweep that writes `2GB`, or leaves
+        // a digit separator or a stray character, would silently fall back to
+        // the conservative default -- and then report "no corruption at 2 GiB"
+        // having never tested 2 GiB. A confident wrong answer is worse than an
+        // error.
+        //
+        // The assertion that matters is that `Invalid` is distinguishable from
+        // `Unset`. The previous implementation was `.parse().ok()`, which
+        // collapsed both to `None`, so a test that only checked "bad input does
+        // not yield a value" would have passed against it unchanged and proved
+        // nothing. Same shape as rendering "not determined" as "determined to
+        // be unsafe" (#931).
+        const NAME: &str = "ONNX_GENAI_TEST_NUMERIC_ENV_PROBE";
+
+        // SAFETY: single-threaded test-local variable with a unique name; it is
+        // set and removed within this test and read by nothing else.
+        unsafe {
+            std::env::remove_var(NAME);
+        }
+        assert_eq!(parse_numeric_env(NAME), NumericEnv::Unset);
+
+        // SAFETY: as above.
+        unsafe {
+            std::env::set_var(NAME, " 1073741824 ");
+        }
+        assert_eq!(
+            parse_numeric_env(NAME),
+            NumericEnv::Value(1_073_741_824),
+            "a plain integer, surrounding whitespace included, must be honoured"
+        );
+
+        for bad in ["2GB", "1_073_741_824", "0x10", "", "1.5", "-1"] {
+            // SAFETY: as above.
+            unsafe {
+                std::env::set_var(NAME, bad);
+            }
+            assert_eq!(
+                parse_numeric_env(NAME),
+                NumericEnv::Invalid(bad.to_string()),
+                "{bad:?} must be reported as supplied-but-unusable, not as absent"
+            );
+        }
+
+        // The default substitution still happens -- the point is that it is
+        // announced rather than silent.
+        assert_eq!(parse_numeric_env(NAME).or_default(NAME, 4096), 4096);
+        assert_eq!(parse_numeric_env(NAME).into_option(NAME), None);
+
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var(NAME);
+        }
+        assert_eq!(parse_numeric_env(NAME).or_default(NAME, 4096), 4096);
     }
 
     #[test]

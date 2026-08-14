@@ -31,6 +31,22 @@ observation. Re-running at the default bucket gave `committed_len = 256` with
 **Check:** for every knob you set, ask what the metric would read if the system
 did nothing at all. If that equals what you measured, you measured the knob.
 
+**The knob is often not a knob.** It can be which constructor, entry point, or
+default you happened to call. #930 concluded "capture and weight-streaming are
+mutually exclusive on this build" from a genuine decline message —
+`weight_offload_enabled && !weight_offload_stable_va`. But the sweep harness
+called `load_with_resolved_io`, which passes `cuda_offload_policy: None`, and
+`stable_va` then falls to its deliberately conservative `unwrap_or(false)`. The
+harness asserted pointer-instability; the runtime was never asked. A run on the
+normal engine path, same box and model, had `captures=2 fallbacks=0` alongside
+`htod_bytes_per_token = 1,714,132,992` — they coexist, which is what #796 built
+and #836 verified at scale. Had it merged, a false negative would have closed
+the most valuable question on the #750 line.
+
+**Check:** when a subsystem declines, print the inputs to the predicate that
+declined it, not just the predicate's name. `!stable_va` and "this hardware
+cannot do it" look identical in a log and mean opposite things.
+
 **Corollary — build a control that could falsify you.** #891 measured `1/N`
 amortization *and* showed it identical at `past_len` 0, 512 and 2048, ruling out
 a KV-pressure artifact. A result that survives a control it could have failed is
