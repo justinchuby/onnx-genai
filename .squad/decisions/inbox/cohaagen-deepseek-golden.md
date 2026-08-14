@@ -1,0 +1,4 @@
+### 2026-08-14: DeepSeek-V2 tiny Attention+QMoE golden lock
+**By:** Cohaagen
+**What:** Added a committed deterministic tiny DeepSeek-V2-style fixture and native golden decode-lock test. The graph uses q/k `ai.onnx::RotaryEmbedding`, standard `ai.onnx::Attention`, and sparse top-k int4 `com.microsoft::QMoE`; prompt `[3]` locks greedy tokens `[11, 11, 11, 11, 11, 11, 11, 11]` on native CPU and native CUDA.
+**Why:** The real DeepSeek-V2-Lite export runs natively through standard ONNX Attention plus QMoE, not a custom MLA op. A tiny committed lock prevents future regressions in that DeepSeek-specific Attention+QMoE path without depending on the full model artifact. CUDA eager passes; with graph capture requested this tiny fixture deterministically declines capture at `attention_mask_consumers_are_capacity_aware` because the int64 metadata mask is cast to bool before Attention, and still matches CPU tokens.

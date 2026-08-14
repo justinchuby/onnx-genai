@@ -101,3 +101,26 @@ adjudicated by — that same phenomenon.
    ORT 315); **extend the fp32 oracle to the status-doc benchmark prompt** so the
    token-16 (374 vs 594) divergence is independently adjudicated rather than
    argued by analogy.
+
+## Golden decode-lock follow-up — 2026-08-14
+
+A committed tiny synthetic DeepSeek-V2-style fixture now locks the native path in
+`deepseek_v2_tiny_qmoe_native_e2e.rs`. The fixture is deterministic and small
+(`tests/fixtures/tiny-deepseek-v2-qmoe-attention`) and contains:
+
+- two standard `ai.onnx::RotaryEmbedding` nodes for q/k RoPE,
+- one standard `ai.onnx::Attention` node, and
+- one sparse top-k integer `com.microsoft::QMoE` block (int4, `activation_type=swiglu`).
+
+Attention-path finding: the real DeepSeek-V2-Lite int4 export does **not** use a
+native custom MLA op. Mobius lowers the MLA-shaped block to standard ONNX
+`RotaryEmbedding` + `Attention`; the native EP executes that standard Attention
+path plus QMoE. The golden fixture intentionally mirrors that emitted path.
+
+Golden stream: prompt token ids `[3]` greedily decode to
+`[11, 11, 11, 11, 11, 11, 11, 11]`. The new lock asserts native CPU produces
+that stream and native CUDA matches CPU. CUDA eager (`ONNX_GENAI_CUDA_GRAPH=0`)
+passes. With graph capture requested (`ONNX_GENAI_CUDA_GRAPH=1`), this tiny
+fixture currently declines capture for the documented capacity-awareness reason
+(`attention_mask_consumers_are_capacity_aware`) because the int64 metadata mask
+is cast to bool before Attention; the token stream still matches CPU exactly.
