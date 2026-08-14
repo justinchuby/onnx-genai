@@ -1706,7 +1706,82 @@ mod tests {
 
         assert_eq!(sequence(0), sequence(0));
         assert_eq!(sequence(1), sequence(1));
-        assert_ne!(sequence(0), sequence(1));
+        assert_eq!(sequence(0), sequence(1));
+    }
+
+    #[test]
+    fn batch_one_sampling_matches_the_independent_sequence() {
+        let options = GenerateOptions {
+            greedy: false,
+            temperature: 0.8,
+            seed: Some(17),
+            ..Default::default()
+        };
+        let mut batched_rng = SamplingRng::for_row(options.seed, 0);
+        let batched = (0..16)
+            .map(|_| sample_categorical(&[0.0, 1.0, 2.0], batched_rng.value_for(&options)))
+            .collect::<Vec<_>>();
+        let mut independent_rng = SamplingRng::for_row(options.seed, 0);
+        let independent = (0..16)
+            .map(|_| sample_categorical(&[0.0, 1.0, 2.0], independent_rng.value_for(&options)))
+            .collect::<Vec<_>>();
+        assert_eq!(batched, independent);
+    }
+
+    #[test]
+    fn heterogeneous_batch_sampling_matches_independent_active_row_runs() {
+        let options = [
+            GenerateOptions {
+                greedy: false,
+                temperature: 0.7,
+                seed: Some(11),
+                ..Default::default()
+            },
+            GenerateOptions {
+                greedy: true,
+                seed: Some(22),
+                ..Default::default()
+            },
+            GenerateOptions {
+                greedy: false,
+                temperature: 1.3,
+                seed: Some(33),
+                ..Default::default()
+            },
+        ];
+        let active_steps = [
+            [true, true, true],
+            [true, false, true],
+            [false, false, true],
+            [true, false, true],
+        ];
+        let logits = [[0.0, 1.0, 2.0], [3.0, 2.0, 1.0], [0.5, 0.5, 0.5]];
+
+        let mut batched_rng = options
+            .iter()
+            .enumerate()
+            .map(|(row, options)| SamplingRng::for_row(options.seed, row))
+            .collect::<Vec<_>>();
+        let mut batched = vec![Vec::new(); options.len()];
+        for active in active_steps {
+            for row in 0..options.len() {
+                if active[row] {
+                    let rng = batched_rng[row].value_for(&options[row]);
+                    batched[row].push(sample_categorical(&logits[row], rng));
+                }
+            }
+        }
+
+        for row in 0..options.len() {
+            let mut rng = SamplingRng::new(options[row].seed);
+            let expected = active_steps
+                .iter()
+                .filter(|active| active[row])
+                .map(|_| sample_categorical(&logits[row], rng.value_for(&options[row])))
+                .collect::<Vec<_>>();
+            assert_eq!(batched[row], expected);
+        }
+        assert_eq!(batched[1], vec![0]);
     }
 
     #[test]
