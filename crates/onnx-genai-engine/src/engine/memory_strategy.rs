@@ -38,7 +38,22 @@ pub(crate) struct MemoryStrategyOverrides {
 
 pub(crate) struct MemoryStrategyPlanInput<'a> {
     pub(crate) config: &'a EngineConfig,
+    /// The resolved *device* (VRAM) capacity limit, or `None` when the device
+    /// capacity could not be measured and the limit was a fraction of it (#947:
+    /// a fraction of unknown capacity is unknown, not a fabricated number). This
+    /// is reported verbatim as `resolved_device_budget_bytes` and drives the
+    /// `fits_resolved_device_budget` verdict; it is never borrowed from the host
+    /// tier.
     pub(crate) resolved_vram_bytes: Option<u64>,
+    /// The physical hot tier the weights will actually occupy, used *only* for
+    /// the residency verdict (`strategy`): the measured VRAM budget when a
+    /// device is queryable, else the measured host-RAM ceiling the weights live
+    /// in on a device-less / ORT-CPU load. This is a different fact from device
+    /// capacity -- "I do not know how big the device is" and "this model fits
+    /// the memory it will really live in" can both be true -- so a fitting model
+    /// reads `FullResident` instead of `Unknown` without fabricating a device
+    /// number. `None` only when even the host tier could not be measured.
+    pub(crate) residency_ceiling_bytes: Option<u64>,
     pub(crate) model_weight_bytes: u64,
     pub(crate) kv_config: ModelKvConfig,
     pub(crate) graph: GraphMemoryEvidence,
@@ -157,12 +172,22 @@ pub(crate) fn combine_graph_memory(
 pub(crate) fn build_memory_strategy_plan(input: MemoryStrategyPlanInput<'_>) -> MemoryStrategyPlan {
     let kv_bytes_per_token = input.kv_config.bytes_per_token();
     let kv_unknown = input.kv_config.page_geometry_required && kv_bytes_per_token.is_none();
-    // `None` when the device (VRAM) capacity could not be measured and the limit
-    // was a fraction: whether the weights "fit" a ceiling that does not exist is
-    // *unknown*, not `false`. Rendering unknown as `false` is exactly the #947
-    // bug (a model that fits the machine reported as not fitting a fictional
-    // device), so it is carried as `Option` all the way to the plan.
+    // The residency verdict (`strategy`) is sized against the tier the weights
+    // physically occupy -- `residency_ceiling_bytes`: measured VRAM on a
+    // queryable device, else the measured host-RAM hot tier. `None` only when
+    // even that tier is unmeasurable; then residency is genuinely unknown. This
+    // is a *different fact* from device capacity: a box with no queryable device
+    // still has its weights demonstrably resident in host RAM, and whether they
+    // fit there is knowable. #947 must stop us fabricating a device size; it
+    // must not stop us stating a residency we can measure.
     let fits = input
+        .residency_ceiling_bytes
+        .map(|budget| input.model_weight_bytes <= budget);
+    // The *reported* device-budget fit is a strictly device-capacity fact and
+    // stays `None` when the device capacity could not be measured -- it never
+    // borrows the host-tier ceiling. Rendering unknown device capacity as
+    // `Some(false)` (or as a fabricated number) is exactly the #947 bug.
+    let device_fits = input
         .resolved_vram_bytes
         .map(|budget| input.model_weight_bytes <= budget);
     let available_weight_budget_bytes = input
@@ -183,7 +208,8 @@ pub(crate) fn build_memory_strategy_plan(input: MemoryStrategyPlanInput<'_>) -> 
     } else {
         match (fits, input.graph.access_pattern) {
             (_, WeightAccessPattern::Unknown) => MemoryStrategy::Unknown,
-            // No measured device budget: residency cannot be chosen honestly.
+            // Even the residency tier could not be measured: residency cannot be
+            // chosen honestly, so it is genuinely unknown (not a false "fit").
             (None, _) => MemoryStrategy::Unknown,
             (Some(true), _) => MemoryStrategy::FullResident,
             (Some(false), WeightAccessPattern::SequentialDense) => {
@@ -368,7 +394,10 @@ pub(crate) fn build_memory_strategy_plan(input: MemoryStrategyPlanInput<'_>) -> 
             input.model_weight_bytes.to_string(),
             DecisionSource::Inference,
             "computed by the shared model-package weight helper",
-            format!("fits_resolved_device_budget={}", opt_bool_or_unknown(fits)),
+            format!(
+                "fits_resolved_device_budget={}",
+                opt_bool_or_unknown(device_fits)
+            ),
         ),
         MemoryStrategyDecision::new(
             "available_weight_budget_bytes",
@@ -409,11 +438,11 @@ pub(crate) fn build_memory_strategy_plan(input: MemoryStrategyPlanInput<'_>) -> 
             } else {
                 DecisionSource::Inference
             },
-            "inferred unconditionally from graph evidence and the resolved budget",
+            "inferred unconditionally from graph evidence and the residency tier",
             format!(
-                "total_weight_bytes={} resolved_vram_bytes={} fits={}",
+                "total_weight_bytes={} residency_ceiling_bytes={} fits={}",
                 input.model_weight_bytes,
-                opt_bytes_or_unknown(input.resolved_vram_bytes),
+                opt_bytes_or_unknown(input.residency_ceiling_bytes),
                 opt_bool_or_unknown(fits)
             ),
         ),
@@ -557,7 +586,7 @@ pub(crate) fn build_memory_strategy_plan(input: MemoryStrategyPlanInput<'_>) -> 
         kv_bytes_per_token,
         per_layer_weight_bytes: input.graph.per_layer_weight_bytes,
         resolved_device_budget_bytes: input.resolved_vram_bytes,
-        fits_resolved_device_budget: fits,
+        fits_resolved_device_budget: device_fits,
         application,
         advisory_only: input.advisory_only,
         decisions,
@@ -918,6 +947,7 @@ mod tests {
         build_memory_strategy_plan(MemoryStrategyPlanInput {
             config,
             resolved_vram_bytes: Some(limit),
+            residency_ceiling_bytes: Some(limit),
             model_weight_bytes: weights,
             kv_config: ModelKvConfig::known(160, 16),
             graph,
@@ -956,6 +986,7 @@ mod tests {
         build_memory_strategy_plan(MemoryStrategyPlanInput {
             config,
             resolved_vram_bytes: None,
+            residency_ceiling_bytes: None,
             model_weight_bytes: weights,
             kv_config: ModelKvConfig::known(160, 16),
             graph,
@@ -969,6 +1000,71 @@ mod tests {
             shared_memory_weight_fallback: true,
             force_managed_weight_streaming: false,
         })
+    }
+
+    /// Build a plan as the real Windows-ARM / no-NVIDIA single-model load does:
+    /// the device (VRAM) capacity is unmeasured (`None`), but host RAM -- the
+    /// tier the weights physically occupy -- IS measured, so the residency
+    /// ceiling is `Some`.
+    fn plan_unknown_device_host_resident(
+        config: &EngineConfig,
+        graph: GraphMemoryEvidence,
+        host_ceiling: u64,
+        weights: u64,
+    ) -> MemoryStrategyPlan {
+        build_memory_strategy_plan(MemoryStrategyPlanInput {
+            config,
+            resolved_vram_bytes: None,
+            residency_ceiling_bytes: Some(host_ceiling),
+            model_weight_bytes: weights,
+            kv_config: ModelKvConfig::known(160, 16),
+            graph,
+            required_device_non_weight_bytes: 0,
+            minimum_useful_weight_budget_bytes: 0,
+            default_dynamic_device_budget_bytes: None,
+            inferred_policy_enabled: false,
+            managed_vmm: false,
+            overrides: MemoryStrategyOverrides::default(),
+            advisory_only: true,
+            shared_memory_weight_fallback: true,
+            force_managed_weight_streaming: false,
+        })
+    }
+
+    #[test]
+    fn unmeasured_device_still_reports_host_resident_fit() {
+        // #947 follow-up: making an unmeasured device *capacity* honest (`None`)
+        // must not swing us to refusing a residency we can measure. On the real
+        // Windows-ARM box the weights (359 MB) plainly fit the measured host RAM
+        // (68 GB) they will live in, so the residency verdict is `FullResident`.
+        // "I do not know the device size" and "this model fits the memory it
+        // will really live in" are different claims: the first keeps
+        // `resolved_device_budget_bytes` at `None` (no fabricated device
+        // number), the second is stated as the strategy.
+        let config = EngineConfig::default();
+        let plan = plan_unknown_device_host_resident(
+            &config,
+            graph_with_boundary("", "MatMul"),
+            68_535_443_456,
+            359_107_027,
+        );
+        assert_eq!(
+            plan.strategy,
+            MemoryStrategy::FullResident,
+            "a model that fits the measured host tier must read as resident, not Unknown"
+        );
+        assert_eq!(
+            plan.resolved_device_budget_bytes, None,
+            "the device capacity is still unmeasured; no device number may be fabricated"
+        );
+        assert_eq!(
+            plan.fits_resolved_device_budget, None,
+            "the device-budget fit stays unknown -- it is a device-capacity fact, not a host one"
+        );
+        assert!(
+            !plan.application.weight_offload_enabled,
+            "a resident model on the advisory-only host path must not page"
+        );
     }
 
     #[test]

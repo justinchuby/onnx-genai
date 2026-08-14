@@ -143,12 +143,15 @@ impl Engine {
         let model_weight_bytes = device_weight_package_bytes(&model_directory.model_path);
         // ORT backend manages its own device memory (advisory-only governor),
         // so it has no native CUDA ordinal to resolve the VRAM fraction against.
-        // The residency verdict is sized against the physical hot tier: the
-        // measured VRAM budget when a device is queryable, else the measured
-        // host-RAM ceiling the ORT/CPU weights actually occupy (#947 addressed
-        // capacity, not placement -- a fitting model must still read as resident,
-        // not `Unknown`).
-        let resolved_vram_bytes = resolve_memory_strategy_hot_tier_bytes(&config.limits, None)?;
+        // The device (VRAM) capacity stays honestly `None` when it cannot be
+        // measured (#947): it is reported verbatim as `resolved_device_budget`
+        // and never borrows the host tier. The residency verdict is a separate
+        // fact, sized against the physical hot tier the weights actually occupy
+        // -- the measured VRAM budget when a device is queryable, else the
+        // measured host-RAM ceiling -- so a fitting model reads `FullResident`
+        // instead of `Unknown` without fabricating a device number.
+        let resolved_vram_bytes = resolve_vram_limit_bytes(&config.limits, None)?;
+        let residency_ceiling_bytes = resolve_memory_strategy_hot_tier_bytes(&config.limits, None)?;
         let graph_memory = analyze_model_memory(&model_directory.model_path);
         let minimum_useful_weight_budget_bytes = graph_memory
             .per_layer_weight_bytes
@@ -159,6 +162,7 @@ impl Engine {
         let memory_strategy_plan = build_memory_strategy_plan(MemoryStrategyPlanInput {
             config: &config,
             resolved_vram_bytes,
+            residency_ceiling_bytes,
             model_weight_bytes,
             kv_config: plan_kv_config,
             graph: graph_memory,
@@ -410,8 +414,21 @@ impl Engine {
             .map(|layer| layer.bytes)
             .max()
             .unwrap_or(0);
+        // The device (VRAM) capacity stays honestly `None` when it cannot be
+        // measured (#947): it is reported verbatim as `resolved_device_budget`
+        // and never borrows the host tier. The residency verdict is a separate,
+        // still-knowable fact, sized against the physical hot tier the weights
+        // will really occupy: the measured VRAM budget when the native load
+        // targets a queryable CUDA device, else the measured host-RAM ceiling
+        // the CPU-native weights actually live in. A model that plainly fits the
+        // host RAM it will occupy must read `FullResident`, not `Unknown`, and no
+        // device number is fabricated to make it so (an explicit `--vram-limit`
+        // still resolves to `Some`; if host RAM itself is unmeasurable, the
+        // residency ceiling stays `None`).
         let resolved_vram_bytes =
             resolve_vram_limit_bytes(&config.limits, native_device.cuda_index())?;
+        let residency_ceiling_bytes =
+            resolve_memory_strategy_hot_tier_bytes(&config.limits, native_device.cuda_index())?;
         #[cfg(feature = "cuda")]
         let required_device_non_weight_bytes = if matches!(
             native_device,
@@ -466,6 +483,7 @@ impl Engine {
         let memory_strategy_plan = build_memory_strategy_plan(MemoryStrategyPlanInput {
             config: &config,
             resolved_vram_bytes,
+            residency_ceiling_bytes,
             model_weight_bytes,
             kv_config: governor_kv_config,
             graph: graph_memory,

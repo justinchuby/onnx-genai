@@ -9,7 +9,7 @@ use crate::engine::{
     Engine, EngineConfig, EngineResourceGovernor, MemoryStrategyPlanInput, analyze_model_memory,
     build_memory_strategy_plan, combine_graph_memory, component_governor, log_memory_strategy_plan,
     model_requires_native_backend, requested_decode_backend,
-    resolve_memory_strategy_hot_tier_bytes,
+    resolve_memory_strategy_hot_tier_bytes, resolve_vram_limit_bytes,
 };
 use crate::kv_bridge::{
     KvModelInfo, attach_pages_to_sequence, infer_kv_model_info, load_materialized_past,
@@ -900,11 +900,15 @@ impl PipelineEngine {
         };
         #[cfg(not(all(feature = "cuda", feature = "native-backend")))]
         let pipeline_cuda_index: Option<u32> = None;
-        // Size the residency verdict against the physical hot tier: the measured
-        // VRAM budget when the pipeline targets a queryable device, else the
-        // measured host-RAM ceiling the weights actually occupy. Unknown device
-        // *capacity* must not turn a resident model into `Unknown` (#947).
-        let resolved_vram_bytes =
+        // The device (VRAM) capacity stays honestly `None` when it cannot be
+        // measured (#947): it is reported verbatim as `resolved_device_budget`
+        // and never borrows the host tier. The residency verdict is a separate,
+        // still-knowable fact, sized against the physical hot tier the weights
+        // will really occupy: the measured VRAM budget when the pipeline targets
+        // a queryable device, else the measured host-RAM ceiling. Unknown device
+        // *capacity* must not turn a resident model into `Unknown`.
+        let resolved_vram_bytes = resolve_vram_limit_bytes(&config.limits, pipeline_cuda_index)?;
+        let residency_ceiling_bytes =
             resolve_memory_strategy_hot_tier_bytes(&config.limits, pipeline_cuda_index)?;
         #[cfg(feature = "cuda")]
         let memory_strategy_overrides = crate::engine::memory_strategy_overrides_from_cuda_env(
@@ -935,6 +939,7 @@ impl PipelineEngine {
         let memory_strategy_plan = build_memory_strategy_plan(MemoryStrategyPlanInput {
             config: &config,
             resolved_vram_bytes,
+            residency_ceiling_bytes,
             model_weight_bytes: model_weights_bytes,
             kv_config: memory_strategy_kv_config,
             graph: graph_memory,
