@@ -332,6 +332,7 @@ The rule generalizes past that one measurement:
 | Data is read once per execution, the working set exceeds capacity, **and the platform offers no such path**. | The runtime, necessarily. Its competitor is failure to run, so the bar is correctness and progress rather than beating anything. |
 | Capacity is sufficient and residency is stable. | Either; prefer the runtime for predictability and to keep accounting honest. |
 | Correctness depends on the bytes being where the ledger says (fences, capture, IPC). | The runtime, unconditionally — this is not a performance decision. |
+| **Host and device are the same physical memory (true UMA).** | **Neither — the question is malformed.** There is no second pool to move bytes into, so "offload" has no referent. See below. |
 
 Rows two and three are the same workload on two operating systems, which is why
 the platform capability belongs in C7 rather than in a policy constant. Windows
@@ -341,6 +342,95 @@ fails outright. A measurement taken on one of these says nothing about the
 other, and this design's own history contains that mistake twice: #783 (a TCC
 conclusion carried onto WDDM) and #912 (a WDDM ceiling that must not be carried
 onto Linux, #925).
+
+### On unified memory the question changes shape
+
+Offload is defined as moving weights from host memory into device memory. When
+those are the same physical memory, that operation is either a no-op or a
+RAM-to-RAM copy that buys nothing. The appendix's topology table already says
+so — device-wired, host-pageable and shared-coherent are **residency classes,
+not additive pools** — and a policy that models UMA as two pools will
+manufacture an over-budget condition that does not exist.
+
+What remains is a different question: *does the working set fit physical memory,
+and if not, can we page better than the OS?* The second half is the same
+argument as everywhere else in this section, with swap in place of PCIe, and it
+resolves the same way for a single-touch access pattern.
+
+### You can hide latency; you cannot hide bandwidth
+
+A natural proposal is to keep layers resident at intervals so that computing on
+a resident layer covers the fetch of the next non-resident one. The arrangement
+is right, but it is worth being precise about what it buys.
+
+If `f` is the resident fraction, `W` the per-step weight bytes and `B_link` the
+bandwidth of whatever the non-resident bytes must cross, then `(1 - f) · W` must
+cross **every step**, and no scheduling changes that:
+
+```
+step_time  >=  (1 - f) · W / B_link
+```
+
+Prefetching decides whether those bytes overlap compute or serialize with it. It
+does not reduce them. For the transfer to stop being the bottleneck at all you
+would need `(1 - f) < B_link / B_fast`, which on an NVMe-versus-unified-memory
+pairing is on the order of 1% — a residency fraction at which offload was never
+needed.
+
+The floor model is corroborated by both arms measured here: managed streaming
+moves the full ~8.33 GB/step at ~5 GB/s and lands at 0.11–0.86 tok/s, while the
+WDDM path keeps ~7.7 GB resident, moves ~0.6 GB/step, and lands at 7.8–8.1 —
+two orders of magnitude explained by streamed bytes alone, with no appeal to
+scheduling quality.
+
+Interval placement still matters for a *fixed* `(1 - f)`: clustered
+non-resident layers stall a bounded prefetch depth, spread ones each get a
+resident layer's compute time to arrive. That is the difference between a
+badly pipelined implementation and a fully pipelined one, not a reduction in
+the floor. Note also that lookahead prefetch over the known layer order is
+already the default here (`ONNX_GENAI_WEIGHT_OFFLOAD_ASYNC_PAGEIN`), and the
+managed path still lost to the OS by 30× — which is itself evidence that
+overlap does not rescue a bandwidth-bound path.
+
+### Dense has nothing to optimize; MoE does
+
+The decision table's first row asks whether data is re-read before eviction.
+For a dense decoder the answer is measured and uniform: **every one of 867
+weight keys has `reads_per_step = 1.000`** (#944). There is no hot subset, so
+no admission or eviction policy can prefer one weight over another on the
+grounds of reuse — which is why #837's residency gap turned out not to be
+recoverable by policy.
+
+Mixture-of-experts is structurally different. Only `k` of `E` experts are read
+per token and routing is data-dependent and skewed, so some experts genuinely
+are re-read across tokens. That is real reuse, and it is the first case in which
+a residency policy has something to be right or wrong about. The per-key trace
+from #944 reports `reads_per_step` directly, so this is measurable rather than
+assumed — and it should be measured before any MoE-specific residency policy is
+designed.
+
+For dense models the only thing that changes the floor is **batching**, because
+it changes `W` per token rather than the bandwidth: `N` sequences sharing one
+fused forward read each weight once for `N` tokens, measured at `1/N` with a
+ceiling of `N_max ~ 19 @ 2048 ctx` (#884/#891). It is not a faster transfer; it
+is the same transfer doing `N` times the work.
+
+**Unmeasured:** every figure above comes from discrete GPUs — WDDM on an
+RTX 4060 and Linux on an H200. True unified memory (Apple Silicon, an APU with
+no discrete pool) has **not** been measured, so this subsection is a prediction
+from the mechanism rather than a result. Given how the same reasoning fared on
+Linux (#925 found the opposite of what the Windows measurement implied, worth
+~8×), it should be measured before it is relied on.
+
+The attempt to measure it (#951) did not produce a result, and the reason is
+itself a finding: on a Windows ARM laptop with unified memory the run reported
+`execution provider: cpu` and **emitted no weight-offload counters at all**.
+The counter block is printed only when some counter is non-zero, so its absence
+means every counter was zero — the offload path never executed. Weight offload
+is a native-CUDA component, and on that machine there is no CUDA. Nothing above
+has been confirmed or refuted on real UMA; the instrument was inert. See
+"An EP either enforces the budget or declares that it cannot" below, which is
+the contract defect that made this invisible until a user went looking.
 
 Two obligations follow, both binding:
 
@@ -385,6 +475,7 @@ names the measurement that established the need.
 | **Aggregate host-mapped read capacity** | Whether zero-copy cold reads are usable, and at what budget (C7) | Silent corruption above ~0.44–0.65 GB/step on one WDDM GPU (#912); unmeasured on Linux (#925) | Absent; assumed unbounded, which corrupted output |
 | **Virtual-memory capability and granule** | Flat VMM vs blocks-plus-table vs static contiguous | 2 MiB CUDA granule; committed/useful ratio drives the choice | Known to the allocator, not reported |
 | **Resident vs host read bandwidth for the access pattern** | How much residency is worth, and therefore hot-set sizing | Sequential proxy 11.41 GB/s vs real strided GEMV ~5.6 GB/s — a 2x error in the sizing input (#877 → #880) | Absent |
+| **Budget enforcement** — does this EP apply a memory limit, or only observe one | Whether `--vram-limit` is a bound or a suggestion, and whether the runtime may report it as binding | ORT accepts a limit and reports weights at 258.6% of it with no action, while native CUDA honours the same request (#955) | Absent; silently `advisory_only` on ORT |
 | **KV layout preference as a stride descriptor** | Which physical KV form to bind | EPs differ; a growing enum imposed by the runtime cannot express it (#783) | A runtime-side enum |
 | **Reclaim capability** | Whether an EP-side holder can answer pressure at all (C5) | — | Absent; no pressure path into the EP |
 
@@ -394,8 +485,8 @@ weights; it cannot express any quantity in the table.
 
 ### Which of these need new API
 
-Rows one to five are **reporting**, and reporting wants one extensible record
-rather than seven entry points — a versioned struct with a `struct_size`
+The reporting rows — everything above the KV layout row — want one extensible
+record rather than six entry points: a versioned struct with a `struct_size`
 prefix, negotiated the way the plugin ABI already negotiates major/minor. Adding
 a capability later then costs a field, not an ABI break, and an EP that predates
 a field is handled by the degradation rule below.
@@ -431,6 +522,82 @@ Two rows are different in kind:
 5. **A capability measured on one platform is a fact about that platform.** Both
    directions of this have already cost us: #783 carried a TCC conclusion onto
    WDDM, and #912 must not be carried onto Linux (#925).
+
+### An EP either enforces the budget or declares that it cannot
+
+Everything above concerns facts an EP reports so the runtime can *choose* a
+policy. This section concerns a different obligation: what an EP owes once the
+runtime has chosen one.
+
+Today the answer differs silently by backend, and that is a defect rather than a
+tradeoff. A user ran the same model at the same `--vram-limit` on the ORT path
+and was shown (#955):
+
+```
+model weights   7.8 GiB   258.6%
+```
+
+The limit was accepted, echoed back, rendered as a percentage of itself, and
+never applied. Nothing streamed, and the KV budget was sized from a weight
+reservation that protected an allocation no one was constraining. On the native
+CUDA path the same request is honoured — offload turns on from the limit and
+`oversubscribed_bytes` stays at zero. Two backends, one flag, opposite meanings,
+no way for the user to tell which they were getting.
+
+The internal name for this is `advisory_only`, and it is *literally* accurate:
+the plan is computed, logged, and consumed by nothing. The problem is that it is
+a **silent property of the code** rather than a **declared property of the EP**.
+
+The obligation, stated so it can be checked:
+
+> An execution provider either **enforces** a memory budget or **declares that
+> it cannot**. The runtime reports which, up front, in the same place it reports
+> the budget — before the run, not after.
+
+Three consequences worth making explicit:
+
+1. **Declining is legitimate; declining silently is not.** This is rule 1 of the
+   governor obligations applied one level down. An EP that cannot constrain its
+   own allocations is a supported configuration. An EP that accepts a limit it
+   will not apply is not.
+2. **The declaration is cheaper than the enforcement, so it must not wait for
+   it.** Making `advisory_only` visible costs a field and a line of output.
+   Implementing enforcement on the ORT path is a much larger change (below).
+   Shipping the first without the second converts a wrong number into an honest
+   "not enforced here", which is the whole of the user-visible harm.
+3. **It belongs in the capability record, not beside it.** `enforces_budget` is
+   another row of the table above, subject to the same degradation rule: an EP
+   that does not report it is assumed *not* to enforce, because that is the
+   conservative reading.
+
+### Why the ORT path cannot enforce today, stated as a feasibility question
+
+It is tempting to read `advisory_only` as a missing conditional. It is not. The
+runtime hands ORT a **path**; ORT opens the model, maps the external-data blob,
+allocates initializers and prepacks them. By the time our plan exists, every
+weight byte is already owned by a component that never saw the budget. There is
+no seam at which the plan could be applied, which is why this is a design gap
+rather than an oversight.
+
+`AddExternalInitializers` and `AddInitializer` appear **nowhere in this
+repository**. The direction they suggest — own initializer loading ourselves and
+hand ORT tensors we allocated, from our ledger, under our budget — would create
+the missing seam and would also be the natural home for offload on non-CUDA EPs.
+
+It is a **direction, not a conclusion**. Three things decide whether it works,
+and none is answered here:
+
+- Does ORT copy again during prepacking? If so, peak memory doubles at load and
+  the no-second-copy property that makes this attractive on UMA is lost.
+- Does a GPU EP always copy initializers to device regardless of how they
+  arrived? If so, this buys accounting but not placement control.
+- Can our loader produce zero-copy `OrtValue`s over an mmap of the external-data
+  blob, with lifetimes that outlive the session?
+
+Each is answerable by a small experiment, and each should be answered before the
+approach is committed to. Recording them as open questions is deliberate: the
+alternative — asserting a root cause and building on it — is the failure mode
+this document has already had to retract twice.
 
 ## Do we still need PagedAttention?
 
