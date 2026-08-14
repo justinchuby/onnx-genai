@@ -1,5 +1,5 @@
 //! Pure metadata data-movement ops: `Flatten`, `Squeeze`, `Size`, and `Trilu`
-//! (`docs/ORT2.md` §4.4).
+//! (`docs/architecture/ORT2.md` §4.4).
 //!
 //! `Flatten` and `Squeeze` only change a tensor's *shape*, never its row-major
 //! element order, and the runtime pre-allocates the output with the target

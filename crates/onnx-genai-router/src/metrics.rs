@@ -1,4 +1,4 @@
-//! Prometheus metrics for the router (see `docs/DESIGN.md` §34.12).
+//! Prometheus metrics for the router (see `docs/architecture/DESIGN.md` §34.12).
 //!
 //! Following the inference server's convention, metrics are a hand-rolled
 //! atomic/`Mutex` registry rendered to Prometheus text exposition — the repo

@@ -1,6 +1,6 @@
 //! GPU regression test for the write-after-read (WAR) safety of the *public*
 //! [`onnx_runtime_session::drive_double_buffer`] driver on a real
-//! [`CudaExecutionProvider`] (issue #87, `docs/WEIGHT_OFFLOAD.md` §4).
+//! [`CudaExecutionProvider`] (issue #87, `docs/memory/WEIGHT_OFFLOAD.md` §4).
 //!
 //! Unlike the hand-rolled fence loop in the ep-cuda runtime tests, this drives
 //! the shipped double-buffer strategy end to end and proves the *driver itself*

@@ -1,7 +1,7 @@
 //! # `onnx-runtime-loader`
 //!
 //! Loads ONNX models from disk into the [`onnx_runtime_ir::Graph`] IR
-//! (see `docs/ORT2.md` §19).
+//! (see `docs/architecture/ORT2.md` §19).
 //!
 //! Pipeline ([`load_model`] / [`load_model_with_weights`]):
 //! 1. [`proto`] — decode the ONNX protobuf (`prost` types generated from the

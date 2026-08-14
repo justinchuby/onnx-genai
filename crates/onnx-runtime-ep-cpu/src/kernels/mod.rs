@@ -1,4 +1,4 @@
-//! CPU kernels for the Phase-1 BERT-on-CPU correctness milestone (`docs/ORT2.md`
+//! CPU kernels for the Phase-1 BERT-on-CPU correctness milestone (`docs/architecture/ORT2.md`
 //! §4.4). One [`Kernel`] per ONNX op, keyed purely by op type — there are **no**
 //! model-specific shapes or names anywhere in this crate; BERT is only the
 //! validation target.
@@ -7,7 +7,7 @@
 //!
 //! These are straightforward, **correct** pure-Rust kernels — the ops other than
 //! the GEMM hot spot use naive loops with no FFI or `cc` build dependency. The
-//! MatMul GEMM went through the Phase-1.5 perf pass (`docs/ORT2.md` §25.2): its
+//! MatMul GEMM went through the Phase-1.5 perf pass (`docs/architecture/ORT2.md` §25.2): its
 //! default backend is a blocked, register-tiled, rayon-parallelized pure-Rust
 //! kernel. Every kernel sits behind the
 //! [`Kernel`] trait, so backends swap in **without touching the EP contract or

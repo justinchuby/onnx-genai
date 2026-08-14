@@ -1,5 +1,5 @@
 //! Background node poller: periodically fetches each node's `GET /v1/status`
-//! and feeds the result into the shared [`Router`] (see `docs/DESIGN.md` §34.8).
+//! and feeds the result into the shared [`Router`] (see `docs/architecture/DESIGN.md` §34.8).
 //!
 //! The [`NodeStatusFetcher`] seam from [`crate::node`] is implemented here by
 //! [`HttpStatusFetcher`] over a `hyper-util` legacy client. The loop itself is

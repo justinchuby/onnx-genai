@@ -384,7 +384,7 @@ The merged generic `every_step` executor is not the remaining blocker: it binds 
 
 ## 0. Problem statement & verified ground truth
 
-Speculation is implemented and **correct** — token-identical to greedy across draft / prompt-lookup / MTP / EAGLE-3 / Gemma4 shared-KV proposers (`docs/PROGRESS.md` L244, L272). But it is trapped on the **ORT** path and **explicitly rejected on native**:
+Speculation is implemented and **correct** — token-identical to greedy across draft / prompt-lookup / MTP / EAGLE-3 / Gemma4 shared-KV proposers (`docs/status/PROGRESS.md` L244, L272). But it is trapped on the **ORT** path and **explicitly rejected on native**:
 
 - `engine.rs:2340 reject_native_request_speculation()` bails for *every* non-`None` `SpeculativeMode` and for any `num_speculative_tokens`.
 - Native engine construction hard-wires all proposers off: `draft/mtp/eagle3/shared_kv_proposer = None`, `speculative_mode = SpeculativeMode::None` (`engine.rs:1004-1011`).
@@ -742,7 +742,7 @@ The checked-out Mobius `src/mobius/integrations/onnx_genai/inference_metadata.py
 
 Mobius's ORT-GenAI exporter is materially ahead: it detects VLM packages, introspects vision/embedding graph ports, selects processor config assets, and emits multimodal mappings (`src/mobius/integrations/ort_genai/auto_export.py:757-804`). That implementation is the best producer-side reference, but its output contract is ORT-GenAI-specific.
 
-`docs/PROGRESS.md:814-818` claims Mobius commit `f313bd1` added native composite emission. That object is absent from every current Mobius ref (`git branch -a --contains f313bd1` reports a malformed/unknown object), and the current source contradicts the note. Treat the progress entry as historical/unverified, not current capability.
+`docs/status/PROGRESS.md:814-818` claims Mobius commit `f313bd1` added native composite emission. That object is absent from every current Mobius ref (`git branch -a --contains f313bd1` reports a malformed/unknown object), and the current source contradicts the note. Treat the progress entry as historical/unverified, not current capability.
 
 # B. Concrete export-to-runtime gap list
 
@@ -1241,7 +1241,7 @@ It does **not** execute CSA/HCA. Compressor/indexer tensors are kept reachable t
 
 `EngineConfig::default()` selects `EngineDecodeBackend::Auto` (`crates/onnx-genai-engine/src/config.rs:453-475,509-525`). Auto uses ORT unless a narrowly detected native-only op is present (`crates/onnx-genai-engine/src/engine.rs:2228-2267`). The detector recognizes only `pkg.nxrt::BlockQuantizedMatMul` (`engine.rs:2329-2367`), so primitive-op DeepSeek V2/V3 and `com.microsoft::QMoE` packages stay on ORT.
 
-The existing DeepSeek-V2 artifact therefore proves the public engine flow and ORT execution, not the native Rust EP. `docs/PROGRESS.md:114-119` accurately calls it a tiny fp32 structural E2E and notes real-weight/native QMoE follow-up.
+The existing DeepSeek-V2 artifact therefore proves the public engine flow and ORT execution, not the native Rust EP. `docs/status/PROGRESS.md:114-119` accurately calls it a tiny fp32 structural E2E and notes real-weight/native QMoE follow-up.
 
 ### 2.2 Native MLA-relevant kernels
 
@@ -1257,7 +1257,7 @@ Native generic kernels already exist:
 - CUDA `com.microsoft::QMoE`: device routing, decode GEMV, grouped prefill GEMM; paging and expert-parallel sharding are deferred (`crates/onnx-runtime-ep-cuda/src/kernels/qmoe.rs:1-7,690-788`).
 - CPU/CUDA registries both register `com.microsoft::QMoE` (`crates/onnx-runtime-ep-cpu/src/kernels/mod.rs:372-373`; `crates/onnx-runtime-ep-cuda/src/kernels/mod.rs:335-336`).
 
-Gap: no DeepSeek engine E2E forces these native kernels. The existing GLM QMoE engine test explicitly exercises ORT contrib QMoE, not native Rust (`crates/onnx-genai-engine/tests/glm_tiny_qmoe_e2e.rs:6-12`; `docs/PROGRESS.md:108-119`).
+Gap: no DeepSeek engine E2E forces these native kernels. The existing GLM QMoE engine test explicitly exercises ORT contrib QMoE, not native Rust (`crates/onnx-genai-engine/tests/glm_tiny_qmoe_e2e.rs:6-12`; `docs/status/PROGRESS.md:108-119`).
 
 ### 2.4 CSA and MTP
 
@@ -1273,7 +1273,7 @@ Generic MTP Phase-1 plumbing also exists:
 - `MtpDecodeSession::step_with_state` binds rank-4 HC state and requires a recurrent state output when `hc_mult > 1` (`crates/onnx-genai-ort/src/mtp.rs:313-457`);
 - `MtpProposer` is constructed once per generation and reused inside the speculative loop (`crates/onnx-genai-engine/src/speculative.rs:1164-1187`).
 
-Gap: the V4-Flash sidecar lacks `mtp_state`, while the official reference does not publish an iterative recurrence/acceptance loop. `docs/DEEPSEEK_CSA_MTP_RUNTIME.md:1485-1515,1585-1625` explicitly marks recurrence, verification, cache lifetime, tie behavior, and exact backend arithmetic as unfrozen.
+Gap: the V4-Flash sidecar lacks `mtp_state`, while the official reference does not publish an iterative recurrence/acceptance loop. `docs/models/DEEPSEEK_CSA_MTP_RUNTIME.md:1485-1515,1585-1625` explicitly marks recurrence, verification, cache lifetime, tie behavior, and exact backend arithmetic as unfrozen.
 
 ## 3. BLOCKED vs ACTIONABLE
 
@@ -1281,7 +1281,7 @@ Gap: the V4-Flash sidecar lacks `mtp_state`, while the official reference does n
 
 1. **Production DeepSeek-V4 onboarding/parity.** Mobius PR #213 is an open draft investigation documenting that no Transformers `configuration_deepseek_v4.py` / `modeling_deepseek_v4.py` exists and the standard AutoConfig/parity workflow cannot run. This blocks a normal verified V4 model onboarding.
 2. **Official iterative V4 MTP.** The reference exposes one MTP block but no recurrent state/acceptance algorithm; the current sidecar lacks `mtp_state`. Do not invent recurrence from `mtp_hidden`.
-3. **V4 portable tie/quant arithmetic claims.** Top-k tie stability, Hadamard implementation version, and several accumulator details remain unpinned (`docs/DEEPSEEK_CSA_MTP_RUNTIME.md:1597-1619`).
+3. **V4 portable tie/quant arithmetic claims.** Top-k tie stability, Hadamard implementation version, and several accumulator details remain unpinned (`docs/models/DEEPSEEK_CSA_MTP_RUNTIME.md:1597-1619`).
 4. **Real V4 E2E in this checkout.** PR #405's manifest entry exists (`tests/e2e/mobius_heads.json:17-27`), but no `deepseek-v4-flash` artifact is present locally.
 
 ### ACTIONABLE NOW
@@ -1416,7 +1416,7 @@ Turn the current one-backend random smoke into a matrix: ORT fp32, native CPU fp
 
 - `crates/onnx-genai-metadata/src/schema.rs`
 - `crates/onnx-genai-metadata/src/validation.rs`
-- `docs/MODEL_METADATA.md`
+- `docs/genai/MODEL_METADATA.md`
 - `crates/onnx-runtime-ep-cpu/src/optimizer.rs` plus a new CPU MLA kernel
 - `crates/onnx-runtime-ep-cuda/src/optimizer.rs` plus a new CUDA MLA kernel
 
@@ -1687,7 +1687,7 @@ Decision archive gate checked at 2026-07-22T21-35-00Z: active ledger was 155203 
 <!-- source: .squad/decisions/inbox/tyrell-wp-b-progress.md -->
 ### Update WP-B progress documentation
 **By:** Tyrell
-**Decision:** `docs/PROGRESS.md` now records WP-B1, WP-B2, and WP-B4 landings and originally marked WP-B3 as still in review; after `3d84b9b`, WP-B is fully landed and future docs should reflect WP-B3 closure.
+**Decision:** `docs/status/PROGRESS.md` now records WP-B1, WP-B2, and WP-B4 landings and originally marked WP-B3 as still in review; after `3d84b9b`, WP-B is fully landed and future docs should reflect WP-B3 closure.
 
 <!-- source: .squad/decisions/inbox/taffey-fmt-fix.md -->
 ### Restore workspace rustfmt gate on main
@@ -2076,7 +2076,7 @@ current EPs (default impl only) these never fire. They are an intentional seam-c
 future EP overrides that might admit unresolved shapes; behavior is unchanged for stock EPs. Fine
 to merge as-is; worth a doc note in the Phase 2 EP-override guidance.
 
-**Why:** The seam matches design intent (docs/design-ep-partial-cuda-graph.md §9 Phase 1 / Open
+**Why:** The seam matches design intent (docs/execution/design-ep-partial-cuda-graph.md §9 Phase 1 / Open
 Question #1 §10): structural policy moved into the EP hook, kernel mechanism (warmth + compiled
 CaptureSupport) stays executor-owned, and segmentation is byte-identical. No precedence reorder,
 no shape-status mismatch, no altered reason string, no model-name branching, all checks green.
@@ -2929,8 +2929,8 @@ The 128-token outputs were identical token-for-token across A and B. Auto-enable
 - `crates/onnx-runtime-session/src/executor.rs`
 - `crates/onnx-runtime-session/src/lib.rs`
 - `crates/onnx-genai-engine/src/native_decode.rs`
-- `docs/design-ep-partial-cuda-graph.md`
-- `docs/CUDA_GRAPH_CAPTURE.md`
+- `docs/execution/design-ep-partial-cuda-graph.md`
+- `docs/execution/CUDA_GRAPH_CAPTURE.md`
 
 **Verification:**
 - `cargo fmt -p onnx-runtime-session` — PASS.
@@ -3450,7 +3450,7 @@ The 128-token outputs were identical token-for-token across A and B. Auto-enable
 
 ### Record the stacked wave-3 performance baseline
 **By:** Kowalski
-**What:** Treat the fresh shared-H200 re-profile as the current wave-3 baseline: median throughput about 691 tok/s at 256 tokens and 712 tok/s at 1024 tokens, with zero CUDA graph fallbacks. Recorded in `docs/PROGRESS.md` by `f42ca3f`.
+**What:** Treat the fresh shared-H200 re-profile as the current wave-3 baseline: median throughput about 691 tok/s at 256 tokens and 712 tok/s at 1024 tokens, with zero CUDA graph fallbacks. Recorded in `docs/status/PROGRESS.md` by `f42ca3f`.
 **Why:** The stacked GQA split and SwiGLU fusion gains reproduce together, remain coherent, and place native CUDA decode above the 657 tok/s ORT GenAI reference at 256 tokens.
 
 ### Gate CUDA EP Clippy warnings in CI

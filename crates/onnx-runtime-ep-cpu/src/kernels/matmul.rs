@@ -1,11 +1,11 @@
 //! `MatMul`: numpy-style matrix multiplication for floating-point tensors,
 //! including batched and broadcast leading dimensions and 1-D vector operands
-//! (`docs/ORT2.md` §4.4).
+//! (`docs/architecture/ORT2.md` §4.4).
 //!
 //! ## Perf seam (Phase-1.5)
 //!
 //! The 2-D tile GEMM ([`gemm`]) dispatches on [`CpuBackend::auto_detect`]
-//! (`docs/ORT2.md` §25.2):
+//! (`docs/architecture/ORT2.md` §25.2):
 //!
 //! * **Generic** (default fallback, always compiled, offline): a blocked,
 //!   register-tiled, rayon-parallelized pure-Rust f32 GEMM ([`gemm_generic`]).
@@ -448,7 +448,7 @@ impl KernelFactory for MatMulFactory {
 /// 2-D tile GEMM dispatch: `c[m,n] = sum_k a[m,k] * b[k,n]` (overwrite).
 ///
 /// `a` is `m*k` row-major, `b` is `k*n` row-major, `c` is `m*n` row-major.
-/// Picks the backend via [`CpuBackend::auto_detect`] (`docs/ORT2.md` §25.2):
+/// Picks the backend via [`CpuBackend::auto_detect`] (`docs/architecture/ORT2.md` §25.2):
 /// `SimdX86` when supported by the host, otherwise the pure-Rust blocked GEMM.
 /// The result is bit-plausible across backends within f32 tolerance.
 pub(crate) fn gemm(

@@ -1,7 +1,7 @@
 //! # `onnx-runtime-session`
 //!
 //! The user-facing session and inference API for the ORT 2.0 runtime
-//! (see `docs/ORT2.md` §20). Design goal: **zero-config by default** — the user
+//! (see `docs/architecture/ORT2.md` §20). Design goal: **zero-config by default** — the user
 //! never has to know what an execution provider is; the runtime auto-detects
 //! hardware and picks a strategy.
 //!
@@ -413,7 +413,7 @@ pub enum DecodePrecision {
 }
 
 /// Graph-optimization level for the session's `optimize` pipeline stage
-/// (`docs/ORT2.md` §18). Selected via the generic `"optimization"` session
+/// (`docs/architecture/ORT2.md` §18). Selected via the generic `"optimization"` session
 /// option (see [`SessionBuilder::option`]).
 ///
 /// The default is [`OptimizationLevel::None`]: with optimization off the graph

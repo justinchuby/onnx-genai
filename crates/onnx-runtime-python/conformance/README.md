@@ -42,7 +42,7 @@ parameter cases produced **158 passed, 1,038 failed, and 2 skipped** across
 least one passing case.
 
 The detailed coverage and failure groups are recorded in
-[`docs/EP_CONFORMANCE.md`](../../../docs/EP_CONFORMANCE.md).
+[`docs/execution/EP_CONFORMANCE.md`](../../../docs/execution/EP_CONFORMANCE.md).
 
 ## Official ONNX backend test
 

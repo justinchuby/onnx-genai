@@ -10,7 +10,7 @@ Not a reviewer of code. A reviewer of **conclusions**.
 ## Why this role exists
 
 This repository has a documented dominant failure mode, recorded in
-`docs/MEMORY_ARCHITECTURE.md` under "How this area fails": **not wrong code, but
+`docs/memory/MEMORY_ARCHITECTURE.md` under "How this area fails": **not wrong code, but
 code that is right, tested, and never reached, plus tests that cannot fail.**
 Confirmed instances include #659, #635, #636, #631, #678, #683, #689, and
 vacuously-passing tests in #671 and #672.

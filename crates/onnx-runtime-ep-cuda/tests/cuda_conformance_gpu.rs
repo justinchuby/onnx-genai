@@ -48,7 +48,7 @@
 //!     --test cuda_conformance_gpu
 //! ```
 //!
-//! See `docs/CUDA_COVERAGE.md` ("Conformance profile & GPU parity sweep").
+//! See `docs/execution/CUDA_COVERAGE.md` ("Conformance profile & GPU parity sweep").
 
 mod common;
 

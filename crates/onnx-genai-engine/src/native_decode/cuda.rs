@@ -1470,7 +1470,7 @@ impl DecodeCudaState {
     /// that lets it grow without moving data — is expressed by the growth/commit
     /// geometry (`kv_growth_byte_layout`, `apply_vmm_growth`,
     /// `build_grown_buffers`), not by permuting this shape. See
-    /// `docs/MEMORY_ARCHITECTURE.md`, "KV layout and residency".
+    /// `docs/memory/MEMORY_ARCHITECTURE.md`, "KV layout and residency".
     pub(crate) fn persistent_state_shapes(
         name: &str,
         dtype: DataType,
@@ -2010,7 +2010,7 @@ impl DecodeCudaState {
     /// `capacity × head_dim × elem ≥ granule`, i.e. ≈8192 tokens at head_dim
     /// 128/fp16, #776); the growing bucket keeps head-major dense, so its dense
     /// ranges equal its bucket ranges and it stays byte-identical (see
-    /// `docs/MEMORY_ARCHITECTURE.md`, "KV layout and residency"). Seq-major
+    /// `docs/memory/MEMORY_ARCHITECTURE.md`, "KV layout and residency"). Seq-major
     /// instead reports a fixed full-context stride and commits its dense prefix
     /// through [`Self::seq_major_kv_commit_requests`].
     ///

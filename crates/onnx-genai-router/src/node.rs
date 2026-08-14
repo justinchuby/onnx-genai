@@ -1,5 +1,5 @@
 //! Node identity, live node state, and the `/v1/status` deserialization
-//! contract (see `docs/DESIGN.md` §34.4 and §34.8).
+//! contract (see `docs/architecture/DESIGN.md` §34.4 and §34.8).
 //!
 //! Everything here is pure and unit-testable. The actual async HTTP polling
 //! loop is deferred to R3; this module only defines the [`NodeStatusFetcher`]
@@ -138,7 +138,7 @@ impl NodeState {
 }
 
 /// Deserialization mirror of the inference server's `GET /v1/status` response
-/// (see `docs/DESIGN.md` §34.8).
+/// (see `docs/architecture/DESIGN.md` §34.8).
 ///
 /// This is intentionally a **copy** of the server's contract rather than a
 /// shared type: the router must not depend on the server/engine crates. If the

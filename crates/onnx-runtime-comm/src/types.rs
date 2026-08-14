@@ -1,4 +1,4 @@
-//! Communicator supporting types (`docs/DISTRIBUTED_RUNTIME.md` §3.1).
+//! Communicator supporting types (`docs/distributed/DISTRIBUTED_RUNTIME.md` §3.1).
 //!
 //! These are the identity, buffer, and result types referenced by the
 //! [`Communicator`](crate::Communicator) trait. For the in-process backend they
@@ -99,7 +99,7 @@ pub struct GlobalDeviceId {
 }
 
 /// Describes what a communicator backend can access directly
-/// (`docs/DISTRIBUTED_RUNTIME.md` §3.3).
+/// (`docs/distributed/DISTRIBUTED_RUNTIME.md` §3.3).
 #[derive(Clone, Debug)]
 pub struct TransportCapability {
     /// Device types this backend can send FROM directly.
@@ -279,7 +279,7 @@ impl CommCompletion for ImmediateCompletion {
 }
 
 /// Wire codec negotiated and frozen at plan compilation
-/// (`docs/DISTRIBUTED_RUNTIME.md` §3.1). Block-quantized reduction semantics are
+/// (`docs/distributed/DISTRIBUTED_RUNTIME.md` §3.1). Block-quantized reduction semantics are
 /// a slice-1c/Phase-3 capability.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WireCodec {

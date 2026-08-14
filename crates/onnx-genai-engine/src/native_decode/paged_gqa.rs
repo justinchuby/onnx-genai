@@ -4,7 +4,7 @@
 //! populated `present_k`/`present_v` (`[B, N_kv, total, D]`) every decode step,
 //! copies the whole past prefix into it, and round-trips it back out as graph
 //! outputs — O(S) traffic per step that compounds to O(S²) over a generation
-//! (see `docs/GQA_KV_MATERIALIZATION_DESIGN.md` §3). Tier A removed the
+//! (see `docs/memory/GQA_KV_MATERIALIZATION_DESIGN.md` §3). Tier A removed the
 //! redundant per-element copies but kept the fresh-present allocation and the
 //! output round-trip, which are "part of the SSA contract". Tier B eliminates
 //! them by making the runtime own a **persistent, append-only KV buffer** the

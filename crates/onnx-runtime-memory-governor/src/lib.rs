@@ -28,7 +28,7 @@
 //!
 //! ## Where this sits
 //!
-//! `docs/MEMORY_ARCHITECTURE.md` is the canonical design. This crate implements
+//! `docs/memory/MEMORY_ARCHITECTURE.md` is the canonical design. This crate implements
 //! a slice of its Layer 3: the vocabulary a lease is expressed in, and a
 //! self-contained ledger for callers that have no governor.
 //!

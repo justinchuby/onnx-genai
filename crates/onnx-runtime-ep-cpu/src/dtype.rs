@@ -1,5 +1,5 @@
 //! Reusable dtype-generic machinery for the arithmetic CPU kernels
-//! (`docs/ORT2.md` §4.4; project preference "不同的dtype，是不是可以用 template").
+//! (`docs/architecture/ORT2.md` §4.4; project preference "不同的dtype，是不是可以用 template").
 //!
 //! The Phase-1 kernels were originally f32-only, which turned every ONNX
 //! `float16` / `bfloat16` / integer conformance case into a spurious failure —

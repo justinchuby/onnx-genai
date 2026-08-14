@@ -10,7 +10,7 @@ use crate::tensor::{DevicePtrMut, TensorMut, TensorView};
 use crate::weight::WeightHandle;
 
 /// A cost estimate for running a kernel, consumed by the placement cost model
-/// (`docs/ORT2.md` §6). All time fields are in **microseconds**; a fuller model
+/// (`docs/architecture/ORT2.md` §6). All time fields are in **microseconds**; a fuller model
 /// (roofline, calibration) lands in `onnx-runtime-cost-model` (Phase 2).
 ///
 /// The struct is `#[non_exhaustive]`: the Phase-2 cost model may add fields
@@ -403,7 +403,7 @@ macro_rules! require {
 
 /// A zero-copy **view output**: a kernel's declaration that one of its outputs
 /// is a strided view aliasing one of its inputs' buffers, rather than freshly
-/// computed bytes (`docs/ORT2.md` §5.4, lazy PyTorch-style views).
+/// computed bytes (`docs/architecture/ORT2.md` §5.4, lazy PyTorch-style views).
 ///
 /// The `shape` / `strides` / `byte_offset` describe the output tensor relative
 /// to the **same base pointer** as the referenced input view (i.e. relative to

@@ -1,5 +1,5 @@
 //! The [`CpuExecutionProvider`]: a host execution provider backed by pure-Rust
-//! reference kernels (`docs/ORT2.md` §4.4).
+//! reference kernels (`docs/architecture/ORT2.md` §4.4).
 //!
 //! # Memory & safety invariants (ep-api safety review)
 //!

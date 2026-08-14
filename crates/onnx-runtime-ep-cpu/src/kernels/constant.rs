@@ -1,5 +1,5 @@
 //! `Constant`: materialize a compile-time constant tensor from an attribute
-//! (`docs/ORT2.md` §4.4).
+//! (`docs/architecture/ORT2.md` §4.4).
 //!
 //! Opset-12 supports several mutually-exclusive value attributes; this kernel
 //! handles the numeric ones the BERT target uses: `value` (a full tensor),

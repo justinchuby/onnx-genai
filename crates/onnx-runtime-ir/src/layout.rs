@@ -1,4 +1,4 @@
-//! Physical strided layout on tensor values (see `docs/ORT2.md` §5).
+//! Physical strided layout on tensor values (see `docs/architecture/ORT2.md` §5).
 //!
 //! Unlike upstream ONNX / `onnx-ir`, every [`crate::Value`] carries a
 //! [`TensorLayout`]. This lets optimization passes track non-contiguous

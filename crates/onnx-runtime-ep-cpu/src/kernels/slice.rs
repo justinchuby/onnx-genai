@@ -1,4 +1,4 @@
-//! `Slice`: extract a strided sub-tensor (`docs/ORT2.md` §4.4).
+//! `Slice`: extract a strided sub-tensor (`docs/architecture/ORT2.md` §4.4).
 //!
 //! Opset-10+ form: `starts`, `ends`, and the optional `axes` / `steps` are
 //! **inputs** (int32/int64 tensors), not attributes. Clamping follows the ONNX

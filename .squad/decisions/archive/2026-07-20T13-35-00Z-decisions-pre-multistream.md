@@ -25,7 +25,7 @@ Suggested different fixer: **Deckard** (Systems Dev), with Pris adding the negat
 
 - Route standard Attention/RoPE through a device SDPA/NVRTC path and add f16/bf16 support; host staging has substantial transfer/performance cost.
 - Broaden GPU parity tests to additive masks, past/present decode, explicit scale, softcap, qk-output modes, and both RoPE layouts without position IDs.
-- `git diff 712b1b1..ea6c61e` also contains an unrelated deletion of `docs/GRAPHVIEW_LENS_DESIGN.md`; restore or separately account for it before integration.
+- `git diff 712b1b1..ea6c61e` also contains an unrelated deletion of `docs/architecture/GRAPHVIEW_LENS_DESIGN.md`; restore or separately account for it before integration.
 
 <!-- Source: apone-custom-shape-handlers.md -->
 ### 2026-07-17: Custom-op shape handlers for GLM/DeepSeek exports
@@ -138,7 +138,7 @@ passed: all reported test suites passed (including 162 shape-inference tests);
 ### 2026-07-17T21-20-01: CI must report test coverage to Codecov; add regression tests for reviewer-found bug classes
 **By:** coordinator
 **What:** CI must report test coverage to Codecov; add regression tests for reviewer-found bug classes
-**References:** scripts/coverage.sh, .github/workflows/ci.yml, docs/GLM_READINESS_GAPS.md
+**References:** scripts/coverage.sh, .github/workflows/ci.yml, docs/models/GLM_READINESS_GAPS.md
 **Why:** User directive (2026-07-17): raise test coverage and ensure defects like the round-8 Squeeze (static non-singleton axis fabrication) and CUDA TopK (non-final-axis layout) bugs are caught by tests. CI currently collects NO coverage — scripts/coverage.sh exists (cargo-llvm-cov, supports --codecov) but ci.yml has no coverage job or Codecov upload, no codecov.yml. Action: add a CI coverage job over the offline-safe crate set that uploads to Codecov, add codecov.yml, and treat regression tests for reviewer-found bug classes as expected going forward. Note the CI portable test job's crate list is narrow (ir/ep-api/ep-cpu/loader/session/tracer) — it omits onnx-rs and shape-inference where the Squeeze bug lived; coverage should surface this.
 
 <!-- merged from dallas-ci-codecov.md -->
@@ -647,7 +647,7 @@ execute with an actionable error).
 ## Phase-B TODO markers (device-resident kernel)
 
 `crates/onnx-runtime-ep-cuda/src/kernels/compressed_sparse_attention.rs` carries a top-of-file
-`// TODO(csa-cuda phase B): ...` referencing `docs/DEEPSEEK_CSA_MTP_RUNTIME.md §4.8`, calling out the
+`// TODO(csa-cuda phase B): ...` referencing `docs/models/DEEPSEEK_CSA_MTP_RUNTIME.md §4.8`, calling out the
 device-resident replacement: device-resident compressed cache/carry, fused
 selection/score/sink-softmax/value-reduction, CUDA-graph capture, and elimination of the host round
 trip. `cuda_graph_compatible()` also documents the Phase-B goal inline.
@@ -802,7 +802,7 @@ Validation: `cargo test -p onnx-genai-engine` passed all 148 non-ignored tests; 
 
 ## Frozen sink formula
 
-Used the exact contract from `docs/DEEPSEEK_CSA_MTP_RUNTIME.md` §4.5 (`:533-543`) and the frozen online formula (`:1360-1388`):
+Used the exact contract from `docs/models/DEEPSEEK_CSA_MTP_RUNTIME.md` §4.5 (`:533-543`) and the frozen online formula (`:1360-1388`):
 
 ```text
 m = max(real_scores)
@@ -834,7 +834,7 @@ The sink is not included in `m`, contributes only the extra denominator term, ha
 
 - **Date:** 2026-07-18T01:20:34Z
 - **Author:** Keaton (CUDA architect)
-- **Artifact:** `docs/CUDA_CSA_PHASE_B_PLAN.md` (branch `docs/cuda-csa-phaseb-plan`, based on origin/main 73629cd)
+- **Artifact:** `docs/execution/CUDA_CSA_PHASE_B_PLAN.md` (branch `docs/cuda-csa-phaseb-plan`, based on origin/main 73629cd)
 
 ## Summary
 
@@ -854,7 +854,7 @@ Phase B (the device-resident fused CUDA `CompressedSparseAttention` kernel repla
 
 ### 2026-07-18: MTP Phase 1 remaining-bullet audit — Phase 1 complete
 **By:** Hudson
-**What:** Audited the remaining MTP Phase 1 bullets in `docs/DEEPSEEK_CSA_MTP_RUNTIME.md` against the engine implementation. Classification:
+**What:** Audited the remaining MTP Phase 1 bullets in `docs/models/DEEPSEEK_CSA_MTP_RUNTIME.md` against the engine implementation. Classification:
 - Metadata resolution — already implemented
 - Package embedding / LM-head references — already implemented
 - Rank-4 Hyper-Connection extraction — already implemented
@@ -939,7 +939,7 @@ For a fixed, valid selected set, the additive-mask standard-Attention result is 
 
 ### 2026-07-18: Refresh GLM readiness and consolidate owner decisions
 **By:** Newt
-**What:** Refreshed `docs/GLM_READINESS_GAPS.md` at `main` `8d9c958` to record GPU-native CUDA Attention, RotaryEmbedding, and SparseKvGather; CUDA CSA Phase A; the optional-input `DataType::Undefined` claim fix; and functionally complete MTP Phase 1. Added `docs/DECISIONS_FOR_JUSTIN.md` with 32 open decision points: CSA 7, BlockQuantizedMoE 8, Kimi K3 5, IndexShare 4, GraphView 5, MLA 1, and Mobius exports 2. Committed as `22841f1`.
+**What:** Refreshed `docs/models/GLM_READINESS_GAPS.md` at `main` `8d9c958` to record GPU-native CUDA Attention, RotaryEmbedding, and SparseKvGather; CUDA CSA Phase A; the optional-input `DataType::Undefined` claim fix; and functionally complete MTP Phase 1. Added `docs/status/DECISIONS_FOR_JUSTIN.md` with 32 open decision points: CSA 7, BlockQuantizedMoE 8, Kimi K3 5, IndexShare 4, GraphView 5, MLA 1, and Mobius exports 2. Committed as `22841f1`.
 **Why:** The previous readiness audit still described landed CUDA paths as missing or host-staged, and owner-blocking roadmap decisions were scattered across team state and design documents. The refresh gives Justin one evidence-linked morning checklist without changing runtime source.
 
 <!-- merged from bishop-csa-cpu-coverage.md -->
@@ -2159,7 +2159,7 @@ reference decomposition graphs rather than the base kernels.
 ### 2026-07-19: Approve conformance refresh to 921 CPU node cases
 **By:** Gaff
 **What:** 🟢 APPROVE commit `cbc049668f21d34c98ef05229e6c04618576bb1e`.
-**Why:** The commit changes only `docs/EP_CONFORMANCE.md` and `crates/onnx-runtime-python/conformance/onnx_backend_node_results.txt`. The results header and all 3,530 rows agree (921 passed, 844 failed, 1,765 skipped; CPU 921/844 and CUDA 1,765 skipped), with no duplicate test names. All requested CumSum, non-expanded CumProd, Bitwise, Hardmax, and non-expanded window CPU cases pass; only the documented expanded window variants remain failed. The documentation reports 921/844, preserves the 360 and 875 historical records, adds the dated +46-case wave, and keeps newly supported operators out of the current representative-failure examples. `git diff --check` passes; the suite was not rerun because the recorded data is internally consistent.
+**Why:** The commit changes only `docs/execution/EP_CONFORMANCE.md` and `crates/onnx-runtime-python/conformance/onnx_backend_node_results.txt`. The results header and all 3,530 rows agree (921 passed, 844 failed, 1,765 skipped; CPU 921/844 and CUDA 1,765 skipped), with no duplicate test names. All requested CumSum, non-expanded CumProd, Bitwise, Hardmax, and non-expanded window CPU cases pass; only the documented expanded window variants remain failed. The documentation reports 921/844, preserves the 360 and 875 historical records, adds the dated +46-case wave, and keeps newly supported operators out of the current representative-failure examples. `git diff --check` passes; the suite was not rerun because the recorded data is internally consistent.
 
 
 <!-- merged from gaff-review-conformance-936.md -->
@@ -2170,7 +2170,7 @@ reference decomposition graphs rather than the base kernels.
 
 Commit `4c05ede` is internally consistent and the data file is intact:
 
-- `docs/EP_CONFORMANCE.md` reports 936 passed, 829 failed, and 1,765 skipped (3,530 collected).
+- `docs/execution/EP_CONFORMANCE.md` reports 936 passed, 829 failed, and 1,765 skipped (3,530 collected).
 - The 360, 875, and 921 historical measurements remain documented, with the new 936 measurement added.
 - The reproduction command still uses `maturin develop --release --no-default-features`.
 - `onnx_backend_node_results.txt` has 3,530 well-formed tab-separated rows: 936 passed + 829 failed + 1,765 skipped = 3,530. CPU and CUDA each have 1,765 entries.
@@ -2335,7 +2335,7 @@ The result file contains 3,530 well-formed tab-separated rows: 1,765 CPU rows
 version, row count, device/test names, ordering, and table format are unchanged;
 exactly 39 CPU rows changed from `failed` to `passed`. The file is neither
 truncated nor reformatted, and its header agrees with both the table contents
-and `docs/EP_CONFORMANCE.md`.
+and `docs/execution/EP_CONFORMANCE.md`.
 
 <!-- merged from luv-review-affinegrid-col2im-crop.md -->
 
@@ -2485,7 +2485,7 @@ Validation passed:
 ### 2026-07-19: Review — Batch-4 conformance documentation refresh (`8c2a264`)
 **By:** Gaff
 **What:** 🟢 APPROVE
-**Why:** Commit scope is exactly the two intended files: `docs/EP_CONFORMANCE.md` and `crates/onnx-runtime-python/conformance/onnx_backend_node_results.txt`; no `.squad/`, kernel, or formatting-only files are part of the commit. The results header reports total/passed/failed/skipped as 3530/1012/753/1765, and tab-separated row counts independently match (1012 passed, 753 failed, 1765 skipped; 3530 total). Arithmetic is consistent. The documentation retains the 360@2026-07-14 and 875/921/936/975 history, adds the dated 2026-07-19 1012/753/1765 entry, and accurately names the Batch-4 Dropout, Split, IsInf, EyeLike, mixed-type Pow, and GridSample coverage.
+**Why:** Commit scope is exactly the two intended files: `docs/execution/EP_CONFORMANCE.md` and `crates/onnx-runtime-python/conformance/onnx_backend_node_results.txt`; no `.squad/`, kernel, or formatting-only files are part of the commit. The results header reports total/passed/failed/skipped as 3530/1012/753/1765, and tab-separated row counts independently match (1012 passed, 753 failed, 1765 skipped; 3530 total). Arithmetic is consistent. The documentation retains the 360@2026-07-14 and 875/921/936/975 history, adds the dated 2026-07-19 1012/753/1765 entry, and accurately names the Batch-4 Dropout, Split, IsInf, EyeLike, mixed-type Pow, and GridSample coverage.
 
 
 ## 2026-07-19 — Scribe inbox merge (18:05Z)
@@ -2868,7 +2868,7 @@ tuned kernel family, and limited 8-thread scaling on the tiny medium shape
 - **Reviewer:** Gaff (REVIEWER authority)
 - **Author:** Deckard (LOCKED OUT of revising per reviewer protocol)
 - **Target:** commit `c1a8071` on `deckard/mlas-gemm`, worktree `/home/justinchu/wt-mlas`
-- **Scope:** `crates/onnx-runtime-ep-cpu/{src/kernels/simd_gemm.rs (NEW), src/backend.rs, src/kernels/matmul.rs}` + `docs/KERNEL_PERF.md`
+- **Scope:** `crates/onnx-runtime-ep-cpu/{src/kernels/simd_gemm.rs (NEW), src/backend.rs, src/kernels/matmul.rs}` + `docs/performance/KERNEL_PERF.md`
 
 ## Verdict: 🟢 APPROVE
 
@@ -2952,7 +2952,7 @@ arm for `SimdX86` is `cfg`-gated out / never selected, falling to `gemm_generic`
 
 - Still ~2–5× slower than ORT (no AVX-512 kernel; single `6×16` kernel vs MLAS's
   shape-specialized family; 8-thread scaling bounded by per-strip B repack on the
-  small medium shape). Documented honestly in `docs/KERNEL_PERF.md`. This is
+  small medium shape). Documented honestly in `docs/performance/KERNEL_PERF.md`. This is
   acceptable progress; ORT parity is a future target, not a gate for this review.
 
 **No fix owner required — approved as-is.**
@@ -3275,14 +3275,14 @@ parity (~32 µs @8t) and best-in-class end-to-end.**
 - `crates/mlas-sys/vendor/mlas/.../lib/threading.cpp`, `mlasi.h` (minimal, marked)
 - `crates/mlas-sys/src/lib.rs` (Rayon backend + registration + probe), `Cargo.toml` (rayon dep)
 - `crates/onnx-runtime-ep-cpu/src/backend.rs`, `kernels/matmul.rs` (doc updates)
-- `docs/KERNEL_PERF.md`, `docs/PROGRESS.md` (multi-thread table + status)
+- `docs/performance/KERNEL_PERF.md`, `docs/status/PROGRESS.md` (multi-thread table + status)
 
 <!-- Source: deckard-mlas-sys-spike.md -->
 ### 2026-07-19 — MLAS-sys vendoring spike: GO
 
 **By:** Deckard (systems/build)
 
-**What:** Time-boxed feasibility spike for the CPU-GEMM parity strategy — vendoring ONNX Runtime's MIT-licensed MLAS source into a standalone `mlas-sys` FFI crate and calling its f32 SGEMM directly. Delivered in worktree `wt-mlas-sys` (branch `deckard/mlas-sys-spike`, not pushed): new crate `crates/mlas-sys` + report `docs/MLAS_SYS_SPIKE.md`.
+**What:** Time-boxed feasibility spike for the CPU-GEMM parity strategy — vendoring ONNX Runtime's MIT-licensed MLAS source into a standalone `mlas-sys` FFI crate and calling its f32 SGEMM directly. Delivered in worktree `wt-mlas-sys` (branch `deckard/mlas-sys-spike`, not pushed): new crate `crates/mlas-sys` + report `docs/performance/MLAS_SYS_SPIKE.md`.
 
 **Outcome: GO ✅.** A `cc`-driven (no cmake) standalone build of a vendored x86-64 MLAS subset compiles cleanly, is numerically correct (7 tests incl. transpose/non-tile/pre-packed, tol 1e-3), and its runtime dispatch selects the **AVX-512F** SGEMM microkernel on this Sapphire Rapids host (verified by a kernel-id probe test).
 
@@ -3354,7 +3354,7 @@ undocumented — it is actively contradicted:**
 Both patched files (`mlasi.h`, `threading.cpp`) live **under that directory**, so
 this provenance claim is now **false**. No committed doc corrects it:
 - `vendor/mlas/README.md` — asserts the opposite of reality; no "local modifications" section.
-- `docs/KERNEL_PERF.md` / `docs/MLAS_SYS_SPIKE.md` — describe the *approach* and
+- `docs/performance/KERNEL_PERF.md` / `docs/performance/MLAS_SYS_SPIKE.md` — describe the *approach* and
   name `vendor/shim.cpp` + `mlas_set_threading`, but **never state that the two
   vendored upstream files were patched**, and never list them for re-sync.
 
@@ -3373,7 +3373,7 @@ a diff-based re-apply, but the authoritative provenance doc must not lie.
    `BUILD_MLAS_NO_ONNXRUNTIME`-only scope, the rationale (route standalone
    parallel-for/thread-count onto the registered backend), and a note that a
    future upstream re-sync MUST re-apply/verify these marked patches.
-3. (Recommended) One line in `docs/MLAS_SYS_SPIKE.md` cross-referencing the same.
+3. (Recommended) One line in `docs/performance/MLAS_SYS_SPIKE.md` cross-referencing the same.
 
 ### Owner of the fix
 **Sapper** (Systems Dev). Deckard is locked out; Gaff (reviewer) must not author.
@@ -3549,7 +3549,7 @@ the `ORT_MINIMAL_BUILD` gotcha is correctly avoided. ✅
 - No other crate depends on `mlas-sys` (grep of all `crates/**/Cargo.toml`).
 - `Cargo.lock` change is only the new `mlas-sys → cc` node.
 - Commit touches only `crates/mlas-sys/`, workspace `Cargo.toml`, `Cargo.lock`,
-  `docs/MLAS_SYS_SPIKE.md`. Nothing staged under `.squad/`. ✅
+  `docs/performance/MLAS_SYS_SPIKE.md`. Nothing staged under `.squad/`. ✅
 - `cargo build -p onnx-runtime-ep-cpu --release` still builds. ✅
 
 > **Environment note (NOT a spike defect):** a bare `cargo build --release` at
@@ -3760,7 +3760,7 @@ MLAS wins across the board; prefill (M=32) is ~8–9.5x faster.
 
 **Author:** Sapper (Backend/CPU-kernel)
 **Branch:** `sapper/direct-f32-output` (worktree `/home/justinchu/wt-direct-output`, based on `origin/main` @ 61dd4b6)
-**Spec:** `docs/OUTPUT_BUFFER_REUSE_DESIGN.md`
+**Spec:** `docs/memory/OUTPUT_BUFFER_REUSE_DESIGN.md`
 
 ## What changed
 
@@ -3892,7 +3892,7 @@ backend) improved consistently.
   strided or non-f32 view, the `numel*4` overlap footprint would need widening.
   Guarded implicitly today; not defended by a compile-time assert.
 - Did not touch `gemm`, `write_dense_f32_narrow`, `write_strided`, or any
-  backend kernel. `docs/PROGRESS.md` left untouched (Scribe owns it).
+  backend kernel. `docs/status/PROGRESS.md` left untouched (Scribe owns it).
 
 <!-- Source: tyrell-mlas-feature-passthrough.md -->
 ### 2026-07-20: MLAS feature passthrough (engine/server/bench/session)

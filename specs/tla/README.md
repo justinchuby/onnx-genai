@@ -185,10 +185,10 @@ constants is useful, but does not replace implementation trace conformance.
 
 ## Design Context
 
-- `docs/MEMORY_ARCHITECTURE.md` section 5.3.1 (pressure protocol)
-- `docs/DISTRIBUTED_RUNTIME.md` sections 3.1 and 3.2.1 (completion and ordering)
-- `docs/DISTRIBUTED_RUNTIME.md` section 8.1 (rank-local DAG scheduling)
-- `docs/MEMORY_ARCHITECTURE.md` KV cache pool sizing and admission
-- `docs/DISTRIBUTED_RUNTIME.md` node failure, abort, and quiescence
-- `docs/MEMORY_ARCHITECTURE.md` model residency and eviction
+- `docs/memory/MEMORY_ARCHITECTURE.md` section 5.3.1 (pressure protocol)
+- `docs/distributed/DISTRIBUTED_RUNTIME.md` sections 3.1 and 3.2.1 (completion and ordering)
+- `docs/distributed/DISTRIBUTED_RUNTIME.md` section 8.1 (rank-local DAG scheduling)
+- `docs/memory/MEMORY_ARCHITECTURE.md` KV cache pool sizing and admission
+- `docs/distributed/DISTRIBUTED_RUNTIME.md` node failure, abort, and quiescence
+- `docs/memory/MEMORY_ARCHITECTURE.md` model residency and eviction
 - `REFINEMENT.md` (implementation linearization and verification gates)

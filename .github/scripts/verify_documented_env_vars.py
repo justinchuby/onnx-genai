@@ -7,7 +7,7 @@ A user who sets a documented environment variable that nothing parses gets **no
 error and no effect**. That is indistinguishable from the variable working and
 having no visible consequence, so the mistake survives indefinitely.
 
-This is the same shape as the failure recorded in `docs/MEMORY_ARCHITECTURE.md`
+This is the same shape as the failure recorded in `docs/memory/MEMORY_ARCHITECTURE.md`
 under "How this area fails" -- not wrong code, but code (or in this case
 configuration) that is documented, plausible, and unreachable. `device_policy` /
 `gpu_layers:N` was documented for months with no parser anywhere in the
@@ -28,7 +28,7 @@ wire one up is not silent.
 
 A match immediately followed by a documentation file extension (`.md`, `.rst`,
 `.toml`) is a **filename**, not an environment variable — e.g. `NXRT_ABI.md` is
-a cross-reference to `docs/NXRT_ABI.md`, not an undeclared knob. A genuine env
+a cross-reference to `docs/architecture/NXRT_ABI.md`, not an undeclared knob. A genuine env
 var is never written with a file extension suffix, so this exclusion cannot mask
 a real gap. Without this rule, any doc named with the `NXRT_*` or
 `ONNX_GENAI_*` prefix would trip the gate the moment another doc links to it —

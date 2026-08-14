@@ -207,7 +207,7 @@ fn is_silu_like_activation(node: &Node) -> bool {
 /// optional bias input (ONNX contrib input index 5). The kernel adds the bias
 /// inside the MLAS GEMV epilogue, so the result is byte-identical to running the
 /// `MatMul` and `Add` separately while eliminating a full-tensor read/write and a
-/// separate kernel launch per decode step (`docs/ORT2.md` §15.1, RULE 2.1).
+/// separate kernel launch per decode step (`docs/architecture/ORT2.md` §15.1, RULE 2.1).
 ///
 /// The match is purely structural — it never inspects model identity, and it
 /// falls back cleanly (no rewrite) whenever the shapes, dtypes, or fan-out do

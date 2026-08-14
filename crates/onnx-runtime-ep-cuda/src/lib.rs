@@ -1,6 +1,6 @@
 //! # `onnx-runtime-ep-cuda`
 //!
-//! The CUDA execution provider for the ORT 2.0 runtime (`docs/ORT2.md` §15 and
+//! The CUDA execution provider for the ORT 2.0 runtime (`docs/architecture/ORT2.md` §15 and
 //! §56 Phase 2). It implements [`onnx_runtime_ep_api::ExecutionProvider`] on top
 //! of [`cudarc`] (driver + cuBLASLt), mirroring the structure of the CPU EP.
 //!
@@ -23,7 +23,7 @@
 //!   tensor-core specialization and retained decode/unsupported-shape baselines.
 //!
 //! The full op → backend mapping matrix, remaining coverage, and the
-//! prioritised custom-kernel candidate list live in `docs/CUDA_COVERAGE.md`.
+//! prioritised custom-kernel candidate list live in `docs/execution/CUDA_COVERAGE.md`.
 //! Roadmap ops not yet wired (cuDNN softmax/norm, cub reductions, data-movement,
 //! FP8 and remaining fusion-node lowering return an actionable
 //! [`onnx_runtime_ep_api::EpError`].

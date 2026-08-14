@@ -1,4 +1,4 @@
-//! `Pad`: enlarge (or crop) a tensor along each axis (`docs/ORT2.md` §4.4).
+//! `Pad`: enlarge (or crop) a tensor along each axis (`docs/architecture/ORT2.md` §4.4).
 //!
 //! The `pads` amounts come from the opset-11+ **input** (`int64`, laid out as
 //! `[begin_0..begin_{k-1}, end_0..end_{k-1}]`) or the legacy opset-2 `pads`

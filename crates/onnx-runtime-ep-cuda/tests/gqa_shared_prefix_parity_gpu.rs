@@ -15,7 +15,7 @@
 //!    physically shared set of granules produce **byte-identical** decode output
 //!    to two independent sequences that each own a private copy of that prefix —
 //!    for both a K cache and a V cache, exactly the `layers × 2` seq-major
-//!    contiguous ranges the layout gives (`docs/MEMORY_ARCHITECTURE.md`, "KV
+//!    contiguous ranges the layout gives (`docs/memory/MEMORY_ARCHITECTURE.md`, "KV
 //!    layout and residency"). An independent CPU oracle guards against the two
 //!    GPU paths being symmetrically wrong.
 //! 2. **Admission is private bytes only.** Admitting the second sharer needs
@@ -70,7 +70,7 @@ const ELEM: usize = std::mem::size_of::<f16>();
 const HOLDER: HolderId = HolderId::new(777);
 
 /// One f16 KV token of a single binding occupies `KV_HEADS × HEAD_DIM × ELEM`
-/// bytes, identical for both layouts (`docs/MEMORY_ARCHITECTURE.md`).
+/// bytes, identical for both layouts (`docs/memory/MEMORY_ARCHITECTURE.md`).
 const BYTES_PER_TOKEN: usize = KV_HEADS * HEAD_DIM * ELEM;
 
 fn typed_bytes<T: Copy>(values: &[T]) -> &[u8] {

@@ -2253,7 +2253,7 @@ impl Kernel for CompressedSparseAttentionKernel {
 /// ratio / cache-layout / sink-mode / arity combination the CPU oracle does not
 /// accept (via a dry-run of the CPU factory), plus explicit dtype gating on the
 /// dtype-fixed inputs, so unsupported combinations never reach `execute`
-/// (docs/DEEPSEEK_CSA_MTP_RUNTIME.md §4.8).
+/// (docs/models/DEEPSEEK_CSA_MTP_RUNTIME.md §4.8).
 pub(crate) fn unsupported_reason(
     node: &Node,
     shapes: &[Shape],

@@ -158,7 +158,7 @@ const SQNBIT_DECODE_MIN_ENV: &str = "NXRT_SQNBIT_DECODE_MIN";
 ///   choice is a wash and the hand path is preferred (no int8 rounding).
 /// * End-to-end Qwen2.5-Coder-7B decode is the same (~8 tok/s) with either M=1
 ///   route; the 2.3x gap vs ORT/foundry is per-op Rayon fork-join and NUMA
-///   locality, not the MatMulNBits kernel (see docs/BENCH_MLAS_INT4_E2E.md).
+///   locality, not the MatMulNBits kernel (see docs/performance/BENCH_MLAS_INT4_E2E.md).
 ///
 /// The default crossover is twice the topology-derived decode worker count.
 /// That preserves `m=16` on the profiled 96-way host while scaling down on

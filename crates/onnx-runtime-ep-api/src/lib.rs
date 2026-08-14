@@ -1,7 +1,7 @@
 //! # `onnx-runtime-ep-api`
 //!
 //! The Execution Provider (EP) interface for the ORT 2.0 runtime
-//! (see `docs/ORT2.md` §4). Every backend — CPU, CUDA, MLX, or a legacy ORT
+//! (see `docs/architecture/ORT2.md` §4). Every backend — CPU, CUDA, MLX, or a legacy ORT
 //! plugin loaded via `dlopen` — implements the same [`ExecutionProvider`]
 //! trait; only the loading mechanism differs.
 //!
@@ -76,7 +76,7 @@ mod error {
     pub type Result<T> = std::result::Result<T, EpError>;
 
     /// Errors produced by execution providers and kernels (subset of the
-    /// runtime top-level `Error`, `docs/ORT2.md` §22).
+    /// runtime top-level `Error`, `docs/architecture/ORT2.md` §22).
     #[derive(Debug, thiserror::Error)]
     pub enum EpError {
         #[error("no EP handler for {domain}::{op_type} at opset {opset} on any available device")]

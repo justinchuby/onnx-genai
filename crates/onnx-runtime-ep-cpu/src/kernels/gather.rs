@@ -1,5 +1,5 @@
 //! `Gather`: index fixed-width `data` along `axis` with an integer `indices` tensor
-//! (`docs/ORT2.md` §4.4). Output shape is
+//! (`docs/architecture/ORT2.md` §4.4). Output shape is
 //! `data.shape[:axis] ++ indices.shape ++ data.shape[axis+1:]`.
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};

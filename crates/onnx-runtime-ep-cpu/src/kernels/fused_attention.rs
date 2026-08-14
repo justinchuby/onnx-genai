@@ -1,5 +1,5 @@
 //! `com.microsoft::FusedAttention`: the optimizer's fusion of the scaled
-//! dot-product-attention (SDPA) core into a single node (`docs/ORT2.md` §18.2).
+//! dot-product-attention (SDPA) core into a single node (`docs/architecture/ORT2.md` §18.2).
 //!
 //! The fused node computes
 //!

@@ -1,7 +1,7 @@
 //! Errors returned by the tracer crate.
 //!
 //! Every variant is written to satisfy the project's flagship rule
-//! ([`RULES.md` #1](../../../RULES.md) / `docs/ORT2.md` §35): a failure must tell
+//! ([`RULES.md` #1](../../../RULES.md) / `docs/architecture/ORT2.md` §35): a failure must tell
 //! humans **and** AI agents *what* failed, *why*, and *how to fix it*, and it
 //! must carry the most useful context (the offending path, the target format,
 //! the underlying cause) so the caller never has to reconstruct what it was

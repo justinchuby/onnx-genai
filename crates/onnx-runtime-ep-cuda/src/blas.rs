@@ -1,4 +1,4 @@
-//! cuBLASLt GEMM plumbing for the CUDA EP (`docs/ORT2.md` §15.3).
+//! cuBLASLt GEMM plumbing for the CUDA EP (`docs/architecture/ORT2.md` §15.3).
 //!
 //! This module owns the single hardest correctness detail in the crate: the
 //! **row-major ONNX ↔ column-major cuBLAS** mapping. Everything about the

@@ -1,4 +1,4 @@
-//! `Concat`: join a list of tensors along one axis (`docs/ORT2.md` §4.4).
+//! `Concat`: join a list of tensors along one axis (`docs/architecture/ORT2.md` §4.4).
 //!
 //! The executor supplies the single, pre-shaped output allocation. Contiguous
 //! inputs are copied directly into disjoint output slabs with bulk memcpy;

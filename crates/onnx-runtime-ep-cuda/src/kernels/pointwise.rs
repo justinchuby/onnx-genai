@@ -1,6 +1,6 @@
 //! Additive pointwise ops — **unary math**, **logical**, and **comparison** —
 //! on the GPU via runtime-compiled (NVRTC) `extern "C"` kernels. This is CUDA
-//! Wave 3 (`docs/CUDA_COVERAGE.md`), extending the [`super::elementwise`] slice
+//! Wave 3 (`docs/execution/CUDA_COVERAGE.md`), extending the [`super::elementwise`] slice
 //! with the remaining CPU-EP pointwise coverage (RULES.md #4 — pointwise chains
 //! have no NVIDIA library op and stay ours so they can later fuse into a GEMM
 //! epilogue or a producer→activation→add chain).
@@ -61,7 +61,7 @@ fn require_dtype(op: &str, name: &str, dt: DataType, want: DataType) -> Result<(
     if dt != want {
         return Err(not_implemented(format!(
             "{op} with {name} dtype {dt:?} (this slice supports {want:?} only; \
-             f16/bf16 pending — see docs/CUDA_COVERAGE.md)"
+             f16/bf16 pending — see docs/execution/CUDA_COVERAGE.md)"
         )));
     }
 

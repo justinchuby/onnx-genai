@@ -1,14 +1,14 @@
 //! Consume and validate `onnx_runtime.*` model metadata hints.
 //!
 //! ONNX models can embed execution hints directly in the graph using the
-//! `onnx_runtime.` metadata namespace (see `docs/MODEL_METADATA.md`). These
+//! `onnx_runtime.` metadata namespace (see `docs/genai/MODEL_METADATA.md`). These
 //! hints are the fourth and lowest-priority source of execution guidance,
 //! written by the model author or export tool into `ModelProto.metadata_props`,
 //! `GraphProto.metadata_props`, and `NodeProto.metadata_props`.
 //!
 //! This module turns those raw `key → value` string pairs into a validated,
 //! typed [`MetadataHints`] structure. The behaviour matches the "Validation"
-//! and "Priority Resolution" sections of `docs/MODEL_METADATA.md`:
+//! and "Priority Resolution" sections of `docs/genai/MODEL_METADATA.md`:
 //!
 //! 1. Scan every `onnx_runtime.*` key at the model, graph, and node levels.
 //! 2. Warn on keys that are not recognised at their level (typo detection).
@@ -40,7 +40,7 @@ pub const NAMESPACE_PREFIX: &str = "onnx_runtime.";
 ///
 /// When more than one source sets the same key, the value from the
 /// highest-priority source wins. Mirrors the "Priority Resolution" table in
-/// `docs/MODEL_METADATA.md`.
+/// `docs/genai/MODEL_METADATA.md`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum HintSource {
     /// Embedded `onnx_runtime.*` metadata on the ONNX model (lowest priority).
@@ -391,7 +391,7 @@ fn lookup(registry: &'static [KnownHint], key: &str) -> Option<HintValueType> {
 
 /// A problem found while scanning `onnx_runtime.*` metadata.
 ///
-/// Field shapes match the enum documented in `docs/MODEL_METADATA.md`. For
+/// Field shapes match the enum documented in `docs/genai/MODEL_METADATA.md`. For
 /// model-level and graph-level entries the `node` field carries the graph name
 /// (empty for the top-level or an unnamed graph) rather than a node name.
 #[derive(Clone, Debug, PartialEq, Eq)]

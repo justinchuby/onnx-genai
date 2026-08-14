@@ -1,4 +1,4 @@
-//! Boolean and comparison kernels (`docs/ORT2.md` §4.4).
+//! Boolean and comparison kernels (`docs/architecture/ORT2.md` §4.4).
 //!
 //! ONNX `Bool` tensors store one byte per element (`0` = false, non-zero =
 //! true). Logical kernels interpret that representation and always emit
