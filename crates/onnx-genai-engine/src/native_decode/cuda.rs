@@ -1628,11 +1628,17 @@ impl DecodeCudaState {
 
     /// KV-only commit requests for the seq-major fixed path: commit the dense
     /// live-prefix ranges [`kv_commit::live_prefix_ranges`] computes for
-    /// [`KvCommitLayout::SeqMajor`] — a single contiguous run
-    /// `0..(committed_len × kv_heads × head_dim × elem)` per KV binding, because
-    /// seq-major bytes are token-contiguous. This is the *same* geometry unit
-    /// the driver-level residency measurement (`vmm_kv_layout_residency_gpu`) and
-    /// the `kv_commit.rs` unit tests exercise, so the live commit path and the
+    /// [`KvCommitLayout::SeqMajor`] — one contiguous run
+    /// `0..(committed_len × kv_heads × head_dim × elem)` **per sequence** (batch
+    /// axis 0), each `capacity × kv_heads × head_dim × elem` apart, because
+    /// seq-major bytes are token-contiguous within a sequence and the per-
+    /// sequence stride is the fixed full-context `capacity`. At `batch == 1`
+    /// (the only value any current caller constructs, stage 2b-impl-2, #750) this
+    /// is exactly one run and byte-identical to the previous single-sequence
+    /// form; the batch axis is outermost, so committing `batch` sequences never
+    /// relocates any sequence's bytes. This is the *same* geometry unit the
+    /// driver-level residency measurement (`vmm_kv_layout_residency_gpu`) and the
+    /// `kv_commit.rs` unit tests exercise, so the live commit path and the
     /// measured floor cannot drift apart. The mask is fully committed at
     /// construction and never grows here, so — unlike [`Self::vmm_growth_requests`]
     /// — no mask range is appended. Re-committing the already-mapped prefix is
@@ -1648,14 +1654,16 @@ impl DecodeCudaState {
             let ranges = kv_commit::live_prefix_ranges(
                 KvCommitLayout::SeqMajor,
                 geometry,
+                self.batch,
                 capacity,
                 committed_len,
             )
             .with_context(|| {
                 format!(
                     "seq-major VMM-backed CUDA KV '{}' dense-prefix commit ranges overflow \
-                     (capacity {capacity}, committed_len {committed_len})",
-                    binding.input_name()
+                     (capacity {capacity}, batch {}, committed_len {committed_len})",
+                    binding.input_name(),
+                    self.batch,
                 )
             })?;
             for range in ranges {
@@ -1699,26 +1707,47 @@ impl DecodeCudaState {
     }
 
     /// Zero the newly committed dense token stripe `[old_committed, new_committed)`
-    /// on every KV binding. Not strictly required for correctness (the kernel
-    /// reads only `[0, total_lengths)`), but it keeps the padding suffix zeroed
-    /// exactly as the growing-bucket path does, guarding against any future
-    /// over-read touching uninitialized physical pages.
+    /// for **every sequence** on every KV binding. Not strictly required for
+    /// correctness (the kernel reads only `[0, total_lengths)`), but it keeps the
+    /// padding suffix zeroed exactly as the growing-bucket path does, guarding
+    /// against any future over-read touching uninitialized physical pages.
+    ///
+    /// Seq-major stores a sequence's tokens token-contiguously, so a sequence's
+    /// committed tail is one contiguous run; the `batch` sequences are a fixed
+    /// full-context `capacity × bytes_per_token` apart (batch axis outermost),
+    /// so this zeroes one run per sequence with no relocation (stage 2b-impl-2,
+    /// #750). At `batch == 1` this is a single memset byte-identical to the
+    /// previous contiguous-tail form.
     fn zero_seq_major_committed_tail(
         &self,
         old_committed: usize,
         new_committed: usize,
     ) -> anyhow::Result<()> {
+        if new_committed <= old_committed {
+            return Ok(());
+        }
         for index in self.kv_binding_range.clone() {
             let binding = &self.bindings[index];
-            let mut shape = binding.physical_shape().to_vec();
-            shape[2] = old_committed;
-            let old_bytes = checked_shape_bytes(&shape, binding.dtype)
-                .context("seq-major committed-tail old size overflow")?;
-            shape[2] = new_committed;
-            let new_bytes = checked_shape_bytes(&shape, binding.dtype)
-                .context("seq-major committed-tail new size overflow")?;
+            let (geometry, capacity) = self.kv_binding_geometry(binding)?;
+            let bytes_per_token = geometry
+                .bytes_per_token()
+                .context("seq-major committed-tail bytes-per-token overflow")?;
+            let per_sequence_stride = capacity
+                .checked_mul(bytes_per_token)
+                .context("seq-major committed-tail per-sequence stride overflow")?;
+            let tail_offset = old_committed
+                .checked_mul(bytes_per_token)
+                .context("seq-major committed-tail offset overflow")?;
+            let tail_bytes = (new_committed - old_committed)
+                .checked_mul(bytes_per_token)
+                .context("seq-major committed-tail byte count overflow")?;
             let ptr = binding.device_ptr() as usize;
-            native_cuda_memset_zero(ptr + old_bytes, new_bytes - old_bytes)?;
+            for sequence in 0..self.batch {
+                let base = sequence
+                    .checked_mul(per_sequence_stride)
+                    .context("seq-major committed-tail sequence base overflow")?;
+                native_cuda_memset_zero(ptr + base + tail_offset, tail_bytes)?;
+            }
         }
         Ok(())
     }
@@ -1984,6 +2013,14 @@ impl DecodeCudaState {
     /// `docs/memory/MEMORY_ARCHITECTURE.md`, "KV layout and residency"). Seq-major
     /// instead reports a fixed full-context stride and commits its dense prefix
     /// through [`Self::seq_major_kv_commit_requests`].
+    ///
+    /// **Batch generality (stage 2b-impl-2, #750).** The per-binding KV range is
+    /// `checked_shape_bytes` of the physical shape whose axis 0 is `batch`, so
+    /// the flat range already spans `batch × kv_heads × new_capacity × head_dim`
+    /// bytes: a head-major packed bucket is dense from offset 0 across all `batch`
+    /// sequences, so one flat `0..bucket_bytes` run is correct at any batch (this
+    /// path only ever runs head-major — seq-major takes the fixed-stride commit).
+    /// The mask island spans `batch` rows. At `batch == 1` this is byte-identical.
     fn vmm_growth_requests(
         &self,
         new_capacity: usize,
@@ -2011,6 +2048,7 @@ impl DecodeCudaState {
         }
         let mask_bytes = new_capacity
             .checked_mul(std::mem::size_of::<i64>())
+            .and_then(|row_bytes| row_bytes.checked_mul(self.batch))
             .with_context(|| {
                 format!("VMM-backed CUDA mask growth overflows for capacity {new_capacity}")
             })?;
@@ -2095,8 +2133,12 @@ impl DecodeCudaState {
         new_capacity: usize,
         valid_len: usize,
     ) -> anyhow::Result<()> {
+        // The mask binding is `[batch, new_capacity]`; the committed byte extent
+        // and the zeroing span all `batch` rows (stage 2b-impl-2, #750). At
+        // `batch == 1` this is byte-identical to the previous single-row memset.
         let bytes = new_capacity
             .checked_mul(std::mem::size_of::<i64>())
+            .and_then(|row_bytes| row_bytes.checked_mul(self.batch))
             .with_context(|| {
                 format!("VMM-backed CUDA mask growth overflows for capacity {new_capacity}")
             })?;
@@ -2225,12 +2267,17 @@ impl DecodeCudaState {
             initial_bucket_len
         };
         let max_len = reported_len;
-        let mask_bytes = max_len
-            .checked_mul(std::mem::size_of::<i64>())
+        // The mask binding is `[batch, len]`, so its committed / reserved byte
+        // extents span `batch` rows (stage 2b-impl-2, #750). Every current
+        // caller constructs at `batch == 1`, so the emitted byte counts are
+        // byte-identical to the previous single-row `len × i64` computation.
+        let mask_bytes = batch
+            .checked_mul(max_len)
+            .and_then(|elements| elements.checked_mul(std::mem::size_of::<i64>()))
             .context("initial CUDA mask size overflow")?;
-        let full_mask_bytes = capacity
-            .max_len
-            .checked_mul(std::mem::size_of::<i64>())
+        let full_mask_bytes = batch
+            .checked_mul(capacity.max_len)
+            .and_then(|elements| elements.checked_mul(std::mem::size_of::<i64>()))
             .context("full CUDA mask reservation size overflow")?;
         // Seq-major fixed stride commits the whole (tiny) mask at construction so
         // the mask island is shape-static at the hard max and never grows; every
@@ -3483,7 +3530,15 @@ impl onnx_genai_kv::KvCapacityGrowthBackend for NativeCudaCapacityBackend<'_> {
             )?;
             native_cuda_memset_zero(
                 new_mask.device_ptr() as usize,
-                new_capacity * std::mem::size_of::<i64>(),
+                self.state
+                    .batch
+                    .checked_mul(new_capacity)
+                    .and_then(|elements| elements.checked_mul(std::mem::size_of::<i64>()))
+                    .with_context(|| {
+                        format!(
+                            "legacy realloc CUDA mask growth overflows for capacity {new_capacity}"
+                        )
+                    })?,
             )?;
             new_mask.set_logical_shape(vec![self.state.batch, valid_len])?;
             Ok(Some(new_mask))
@@ -3585,6 +3640,22 @@ fn native_cuda_memset_zero(_dst: usize, _bytes: usize) -> anyhow::Result<()> {
 ///   the live prefix keeps its byte offsets across growth and no KV data moves.
 ///   This is the fixed-stride property #797 measured at the driver level, here
 ///   realized on the engine growth path.
+///
+/// **Batch-N refusal (stage 2b-impl-2, #750).** This helper feeds the two
+/// *growing-bucket* copy paths ([`DecodeCudaState::apply_vmm_growth`] and the
+/// legacy realloc `build_grown_buffers`), whose per-block stride *is* the
+/// mutable bucket capacity. Head-major keeps the batch axis outermost, so each
+/// `(batch, head)` block re-strides independently and batch-N growth is exact.
+/// Seq-major is different: with `batch > 1` the per-sequence stride is the
+/// growing bucket capacity, so growing the bucket relocates every sequence
+/// `b > 0`'s KV bytes. That relocation would defeat the whole point of the
+/// seq-major fixed-stride design (the "no KV moves / keep the captured graph"
+/// contract) and the `moved_bytes_per_token == 0` growth accounting. Rather than
+/// silently compute a wrong (capacity-dependent) stride, this refuses seq-major
+/// growing-bucket growth at `batch > 1` with a named error. The relocation-free
+/// batch-N seq-major path is the *fixed full-context stride* commit
+/// ([`DecodeCudaState::seq_major_kv_commit_requests`]), which never calls this
+/// helper. Turning batch-N on end-to-end is 2b-impl-4.
 pub(super) fn kv_growth_byte_layout(
     bnsh_shape: &[usize],
     layout: KvCommitLayout,
@@ -3597,6 +3668,19 @@ pub(super) fn kv_growth_byte_layout(
         KvCommitLayout::SeqMajor => {
             let (batch, kv_heads, capacity, head_dim) =
                 (bnsh_shape[0], bnsh_shape[1], bnsh_shape[2], bnsh_shape[3]);
+            if batch > 1 {
+                bail!(
+                    "native CUDA seq-major (BSNH) KV *growing-bucket* growth cannot be made \
+                     batch-general for batch {batch} > 1 without relocating KV: a sequence's \
+                     per-sequence stride is the mutable bucket capacity ({capacity}), so growing \
+                     the bucket moves every sequence b>0's already-written KV bytes. Head-major \
+                     (BNSH) does not have this problem because its batch axis is outermost and \
+                     re-strides per (batch, head) block without moving batch 0. The relocation-free \
+                     batch-N seq-major path is the fixed full-context stride commit-on-demand path, \
+                     not this growing bucket. Refusing rather than computing a capacity-dependent \
+                     stride (stage 2b-impl-2, #750; batch-N is turned on in 2b-impl-4)."
+                );
+            }
             (vec![batch, capacity, kv_heads, head_dim], 1)
         }
     })

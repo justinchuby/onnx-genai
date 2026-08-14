@@ -72,3 +72,5 @@ Older detailed dated entries through 2026-08-04T00:40:00Z — PR #625 native loa
 - Enabled Qwen3.5/3.6-27B hybrid GDN native CUDA: the 27B artifact's thin `inference_metadata.yaml` carries no `io` port contract, so `resolve_kv_layers` returned None ("per-layer KV page geometry unknown").
 - Fix `maybe_fill_hybrid_io_from_graph` in `engine/load.rs` auto-derives the decoder io contract from the ONNX graph port inventory, gated on non-empty `state_pairs`; DRY, no model-name gate — unblocks the whole hybrid GDN family.
 - Byte-exact: native argmax 11751 " Paris" == fp32 oracle, top-1 margin 2.549 nats; locked by `qwen35_27b_hybrid_native_cuda_e2e.rs`. PR #779 (auto-merge, awaiting CI).
+
+- **2026-08-14 (#914, MERGED):** DeepSeek-V2 tiny Attention+QMoE golden decode-lock — committed fixture (RotaryEmbedding + standard ONNX Attention + int4 QMoE), prompt `[3]` locks greedy `[11]×8` on native CPU and CUDA. Standing fact: DeepSeek-V2-Lite native path = standard Attention + QMoE, NOT a custom MLA op.
