@@ -656,7 +656,16 @@ impl EngineDriver {
             snapshot.vram.used = used;
             snapshot.vram.limit = limit;
             snapshot.vram.headroom = limit.saturating_sub(used);
-            snapshot.resolved_limits.vram_bytes = Some(limit);
+            // `resolved_limits.vram_bytes` is the *resolved device (VRAM)
+            // capacity limit*, which stays `None` when the device capacity could
+            // not be measured (#947). The shared authority's ceiling on such a
+            // box is the host-RAM-derived advisory bound, not a measured VRAM
+            // capacity, so it is surfaced through `vram.limit` only and must not
+            // be relabelled here as a resolved VRAM capacity. When the device WAS
+            // measured, refresh it to the shared authority's live ceiling.
+            if snapshot.resolved_limits.vram_bytes.is_some() {
+                snapshot.resolved_limits.vram_bytes = Some(limit);
+            }
         }
         Ok(snapshot)
     }

@@ -143,7 +143,12 @@ impl Engine {
         let model_weight_bytes = device_weight_package_bytes(&model_directory.model_path);
         // ORT backend manages its own device memory (advisory-only governor),
         // so it has no native CUDA ordinal to resolve the VRAM fraction against.
-        let resolved_vram_bytes = resolve_vram_limit_bytes(&config.limits, None)?;
+        // The residency verdict is sized against the physical hot tier: the
+        // measured VRAM budget when a device is queryable, else the measured
+        // host-RAM ceiling the ORT/CPU weights actually occupy (#947 addressed
+        // capacity, not placement -- a fitting model must still read as resident,
+        // not `Unknown`).
+        let resolved_vram_bytes = resolve_memory_strategy_hot_tier_bytes(&config.limits, None)?;
         let graph_memory = analyze_model_memory(&model_directory.model_path);
         let minimum_useful_weight_budget_bytes = graph_memory
             .per_layer_weight_bytes

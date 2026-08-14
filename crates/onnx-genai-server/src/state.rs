@@ -127,16 +127,18 @@ impl ServerMemoryAuthorities {
                     DeviceCompatibilityDomain::Host
                     | DeviceCompatibilityDomain::Accelerator { .. } => None,
                 };
-                onnx_genai_engine::resolve_device_vram_limit_bytes(limit, cuda_device_index)?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "device {} capacity is unavailable, so a fractional limit cannot be \
-                             resolved; set an explicit --vram-limit <bytes> instead",
-                            authority.domain()
-                        )
-                    })
+                // `None` means the limit was a fraction/auto of a device capacity
+                // that could not be measured: it is unknown, not a number (#947).
+                // We do not fabricate a ceiling. Matching the engine governor's
+                // own `set_vram_limit` — which leaves an unmeasured device
+                // authority untouched rather than pushing a fabricated number —
+                // this authority's advisory ceiling is left unchanged (`None`
+                // below) instead of refusing the whole reconfigure. An explicit
+                // byte limit still resolves to `Some` and is enforced on every
+                // device, measurable or not.
+                onnx_genai_engine::resolve_device_vram_limit_bytes(limit, cuda_device_index)
             })
-            .collect::<anyhow::Result<Vec<u64>>>()?;
+            .collect::<anyhow::Result<Vec<Option<u64>>>>()?;
         let _mapped_growth = ordered
             .iter()
             .map(DeviceMemoryAuthority::pause_mapped_growth)
@@ -164,6 +166,12 @@ impl ServerMemoryAuthorities {
             .zip(&guards)
             .zip(resolved_limits.iter().copied())
         {
+            // Unknown fractional limit: no new ceiling to fit under, nothing to
+            // trim — the advisory ceiling stays as it is.
+            let Some(resolved) = resolved else {
+                trim_plan.push(None);
+                continue;
+            };
             let used = guard.used();
             let required = used.saturating_sub(resolved);
             let releasable = authority.releasable_unmapped_bytes();
@@ -174,7 +182,7 @@ impl ServerMemoryAuthorities {
                     authority.domain()
                 );
             }
-            trim_plan.push(required);
+            trim_plan.push(Some(required));
         }
         for (((authority, guard), required), resolved) in ordered
             .iter()
@@ -182,6 +190,9 @@ impl ServerMemoryAuthorities {
             .zip(trim_plan.iter().copied())
             .zip(resolved_limits.iter().copied())
         {
+            let (Some(required), Some(resolved)) = (required, resolved) else {
+                continue;
+            };
             let released = authority.trim_unmapped_bytes(required)?;
             if released < required || guard.used() > resolved {
                 anyhow::bail!(
@@ -194,6 +205,9 @@ impl ServerMemoryAuthorities {
             }
         }
         for (guard, resolved) in guards.iter().zip(resolved_limits.iter().copied()) {
+            let Some(resolved) = resolved else {
+                continue;
+            };
             let result = guard.try_set_limit(resolved);
             debug_assert!(
                 result.is_ok(),

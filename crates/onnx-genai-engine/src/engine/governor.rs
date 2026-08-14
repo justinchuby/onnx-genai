@@ -351,17 +351,20 @@ impl EngineResourceGovernor {
         // a model refuses to start -- and when it was not applied there is
         // nothing to charge.
         //
-        // The reservation is a *device*-tier lease. When the device capacity is
-        // unknown (`vram_bytes == None`) there is no device tier to charge it to
-        // (the device authority is inert with a zero ceiling), and on such a box
-        // the weights live in host RAM under the runtime's own management, not
-        // the device ledger. Charging a device reservation against a zero-ceiling
-        // tier would fail a load that has no device at all (#947), so skip it.
+        // The reservation is a *device*-tier lease of bytes we actually place on
+        // the device (the model weights). It is charged whenever it was applied,
+        // *independently* of whether the device capacity is a measured number or
+        // unknown. Those are separate facts: "I do not know how big this device
+        // is" (`vram_bytes == None`) does not stop us from knowing "I have placed
+        // these bytes on it". The device authority is never inert here -- its
+        // ceiling is the measured VRAM budget when known, and the measured
+        // host-RAM fallback (`device_ceiling_bytes` above) when not -- so the
+        // ledger can always account the allocation. Detaching usage tracking
+        // when capacity became unknown made a loaded model report zero device
+        // usage over /resources and /metrics, which is the #706 regression the
+        // ledger snapshot exists to prevent (#947).
         let mut plan = ModelMemoryPlan::new(memory.clone());
-        if snapshot.resolved_limits.vram_bytes.is_some()
-            && snapshot.derived_budget.reservation_applied
-            && reservation_bytes > 0
-        {
+        if snapshot.derived_budget.reservation_applied && reservation_bytes > 0 {
             plan.reserve(Holder::FixedDeviceReservation, reservation_bytes)
                 .map_err(|error| ResourceError::BudgetArithmeticOverflow {
                     operation: "charging the fixed device reservation to the memory ledger",
@@ -746,6 +749,39 @@ pub(crate) fn resolve_vram_limit_bytes(
     cuda_device_index: Option<u32>,
 ) -> anyhow::Result<Option<u64>> {
     resolve_device_vram_limit_bytes(limits.vram_limit, cuda_device_index)
+}
+
+/// Resolve the hot-tier ceiling the memory-strategy planner sizes weight
+/// residency against: the measured device (VRAM) budget when a device capacity
+/// is available, otherwise the *measured host-RAM* ceiling the weights
+/// physically occupy on a device-less / ORT-CPU load.
+///
+/// #947 made an unmeasured device **capacity** resolve to `None` so nothing
+/// fabricates a VRAM ceiling. But residency is a different fact from capacity:
+/// on a box with no queryable device the weights still demonstrably live in
+/// host RAM, and whether they fit *there* is knowable. Sizing the strategy
+/// against the physical host tier -- exactly as the KV byte budget already is,
+/// via the scheduler's `kv_hot_tier_ceiling` -- lets a fitting model report
+/// `FullResident` instead of `Unknown`, without reintroducing a fabricated
+/// device number. An explicit `--vram-limit <bytes>` still wins (it resolves to
+/// `Some` above), and if host RAM itself could not be measured this stays `None`
+/// (honestly unknown). Nothing here aliases a device lease onto host memory: the
+/// device authority is sized separately, this only picks the ceiling for the
+/// residency verdict.
+pub(crate) fn resolve_memory_strategy_hot_tier_bytes(
+    limits: &ResourceLimits,
+    cuda_device_index: Option<u32>,
+) -> anyhow::Result<Option<u64>> {
+    if let Some(vram_bytes) = resolve_vram_limit_bytes(limits, cuda_device_index)? {
+        return Ok(Some(vram_bytes));
+    }
+    let providers = fallback_capacity_providers(limits);
+    onnx_genai_scheduler::resolve_limit(
+        limits.host_ram_limit,
+        providers.host_ram.as_ref(),
+        "host RAM",
+    )
+    .map_err(anyhow::Error::new)
 }
 
 pub(crate) fn governor_kv_config(
