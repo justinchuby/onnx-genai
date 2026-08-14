@@ -302,39 +302,117 @@ fn leverb_phase0_capture_probe() -> anyhow::Result<()> {
     }
 
     // ------------------------------------------------------------------
+    // PART D — INCREMENT-0: the same REAL M=K forward, now with the three
+    // capture-enablement fixes the Phase-0 (a)-FAIL identified applied as a
+    // test-only overlay (persistent padded [1,K,vocab] logits binding +
+    // pre-capture warm forward to grow the alloc-free scratch arena + inherited
+    // KV-symbol pin). This is THE decisive measurement: does a CAPTURED M=K
+    // replay cost ≈ a CAPTURED M=1 replay (cliff was dispatch → Lever B GO), or
+    // does the ~80ms eager floor persist under capture (cliff is generic
+    // GEMM/arithmetic → Lever B NO-GO, promote Lever A)?
+    // ------------------------------------------------------------------
+    let mut sess = load(&model_dir, true, KV_MAX);
+    sess.decode(&prompt, 0)?;
+    for _ in 0..16 {
+        let past = sess.current_len();
+        sess.decode(&[1], past)?;
+    }
+    let d_mk = sess.leverb_increment0_capture_attempt(K_MAX, REPLAYS)?;
+    drop(sess);
+
+    let mut sess = load(&model_dir, true, KV_MAX);
+    sess.decode(&prompt, 0)?;
+    for _ in 0..16 {
+        let past = sess.current_len();
+        sess.decode(&[1], past)?;
+    }
+    let d_m1 = sess.leverb_increment0_capture_attempt(1, REPLAYS)?;
+    drop(sess);
+
+    let d_mk_med = median(&d_mk.replay_walls_ns);
+    let d_m1_med = median(&d_m1.replay_walls_ns);
+    eprintln!(
+        "[leverb-phase0][D] INC0 M={K_MAX} capture: captured={} segments={} rows={} bucket={} warm_alloc={:?} capture_alloc={:?} decline={:?}",
+        d_mk.captured,
+        d_mk.segments,
+        d_mk.rows,
+        d_mk.bucket,
+        d_mk.warm_alloc_delta,
+        d_mk.alloc_delta,
+        d_mk.decline
+    );
+    eprintln!(
+        "[leverb-phase0][D] INC0 M={K_MAX} seam nodes (root cause of segmented capture): {}",
+        d_mk.seam_summary
+            .as_deref()
+            .unwrap_or("<none: whole-graph>")
+    );
+    eprintln!(
+        "[leverb-phase0][D] INC0 M=1  capture: captured={} segments={} rows={} bucket={} warm_alloc={:?} capture_alloc={:?} decline={:?}",
+        d_m1.captured,
+        d_m1.segments,
+        d_m1.rows,
+        d_m1.bucket,
+        d_m1.warm_alloc_delta,
+        d_m1.alloc_delta,
+        d_m1.decline
+    );
+    let d_captured_ratio = if d_mk.captured && d_m1.captured {
+        let ratio = d_mk_med as f64 / d_m1_med.max(1) as f64;
+        eprintln!(
+            "[leverb-phase0][D] DECISIVE captured replay wall: M={K_MAX} = {:.3} ms | M=1 = {:.3} ms | ratio = {:.2}x",
+            ms(d_mk_med),
+            ms(d_m1_med),
+            ratio
+        );
+        Some(ratio)
+    } else {
+        eprintln!(
+            "[leverb-phase0][D] DECISIVE number UNAVAILABLE: M={K_MAX} captured={} M=1 captured={} (see decline above)",
+            d_mk.captured, d_m1.captured
+        );
+        None
+    };
+
+    // ------------------------------------------------------------------
     // VERDICT
     // ------------------------------------------------------------------
     // (a) capture-safe: real M=K capture instantiated, OR (fallback evidence)
     //     the eager M=K forward performed no device alloc/free in-region and the
     //     identical kernels already capture at M=1.
-    let a_direct = mk.captured;
-    let a_alloc_clean = mk.alloc_delta == Some((0, 0));
+    // (a) capture-safe: the INCREMENT-0 M=K forward instantiated a device graph
+    //     (padded logits binding + alloc-free warm arena); Phase-0's raw M=K
+    //     attempt is retained above only as the pre-fix contrast.
+    let a_direct = d_mk.captured;
+    let a_alloc_clean = d_mk.alloc_delta == Some((0, 0));
     // (b) stable replay across growth: real M=1 machine replayed ~1/step and
     //     invalidated only around bucket growths (NOT the eager 6->280 thrash).
     let b_replays_per_step = g.replays as f64 / DECODE_STEPS as f64;
     let b_no_thrash = g.invalidations <= growths.max(1) * 2 + 2;
     let b_pass = g.enabled && b_replays_per_step >= 0.95 && b_no_thrash;
-    // (c) per-verify wall ≈ M=1: eager M=K/M=1 ratio small (compute is free);
-    //     if the M=K graph captured, its replay wall ≈ M=1 replay wall too.
+    // (c) per-verify wall ≈ M=1: THE DECISIVE test is the INCREMENT-0 CAPTURED
+    //     M=K vs CAPTURED M=1 replay-wall ratio. The eager ratio is retained
+    //     only as the pre-capture upper bound.
+    let c_captured_pass = d_captured_ratio.is_some_and(|ratio| ratio <= 1.5);
     let c_eager_pass = eager_ratio <= 1.5;
-    let c_captured_pass = if mk.captured && m1.captured {
-        (mk_med as f64 / m1_med.max(1) as f64) <= 1.5
-    } else {
-        false
-    };
 
     eprintln!(
-        "[leverb-phase0][VERDICT] (a) capture-safe: direct_capture={a_direct} alloc_clean={a_alloc_clean}"
+        "[leverb-phase0][VERDICT] (a) capture-safe: inc0_capture={a_direct} capture_alloc_clean={a_alloc_clean} (phase0_raw_capture={})",
+        mk.captured
     );
     eprintln!(
         "[leverb-phase0][VERDICT] (b) stable replay: replays/step={b_replays_per_step:.3} invalidations={} growths={growths} pass={b_pass}",
         g.invalidations
     );
     eprintln!(
-        "[leverb-phase0][VERDICT] (c) wall≈M=1: eager_ratio={eager_ratio:.2} eager_pass={c_eager_pass} captured_pass={c_captured_pass}"
+        "[leverb-phase0][VERDICT] (c) wall≈M=1: DECISIVE captured_ratio={d_captured_ratio:?} captured_pass={c_captured_pass} | eager_ratio(upper bound)={eager_ratio:.2} eager_pass={c_eager_pass}"
     );
 
-    let go = (a_direct || a_alloc_clean) && b_pass && c_eager_pass;
+    // GO requires the DECISIVE captured evidence: (a) the M=K graph instantiated
+    // capture-safe, (b) the machine replays ~1/step across growth, and (c) the
+    // CAPTURED M=K replay wall ≈ the CAPTURED M=1 replay wall. A green (a)/(b)
+    // with a captured M=K wall still on the ~80ms eager floor is a NO-GO for B.
+    let go = a_direct && b_pass && c_captured_pass;
     eprintln!(
         "[leverb-phase0][VERDICT] GO/NO-GO = {}",
         if go { "GO" } else { "NO-GO" }

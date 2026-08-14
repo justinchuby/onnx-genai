@@ -130,3 +130,81 @@ Increment-0 is cheap (it is a strict prerequisite of Lever B anyway) and convert
 [leverb-phase0][A] M=8 capture: captured=false ... alloc_delta=Some((724, 722)) decline="... every graph output must use a persistent device binding during capture"
 [leverb-phase0][VERDICT] GO/NO-GO = NO-GO
 ```
+
+---
+
+# Increment-0 — capture-enablement build + the DECISIVE captured number (MEASURED)
+
+**Date:** 2026-08-14 (follow-up, Justin greenlit proceeding from the Phase-0 NO-GO)
+**Branch:** `squad/leverb-increment0-capture` (off `squad/leverb-phase0-capture-probe`)
+**Probe additions:** `NativeDecodeSession::leverb_increment0_capture_attempt` (`native_decode/cuda.rs`, `#[cfg(test)]`) + PART D of `leverb_phase0_probe.rs`. Still `#[ignore]`d and UN-WIRED.
+**HW:** 1× H200, verified idle, pinned. Numbers reproduced 3× (GPU 7 twice, GPU 6 once) — deterministic.
+
+## I0.0 What Increment-0 built (the three Phase-0 (a)-FAIL fixes, as a test-only overlay)
+
+1. **Persistent padded `[1, K_max, vocab]` logits device binding** for the logits output name — so an M=K forward's `[1,K,vocab]` logits land in device memory instead of materializing to the host (the exact reason Phase-0's raw M=K `try_capture` was rejected).
+2. **Alloc-free captured region via a pre-capture warm forward at the M=K shape** — a normal `run_with_device_bindings` at `[1,K]` grows the capture-safe scratch arena *before* `BeginCapture`, so the captured region itself does zero device alloc/free.
+3. **KV-symbol pin** — inherited from the constructor (already pins fixed-capacity KV seq symbols for a graph-enabled session); no new work.
+
+These are applied by swapping padded token/position/logits bindings into the persistent binding vector for the duration of the attempt (then restored), and driving the **real** batched GQA/GEMM M=K kernels through the **real** persistent KV/mask bindings — no toy graph.
+
+## I0.1 Result — criterion (a) now PASSES
+
+```
+INC0 M=8 capture: captured=TRUE  segments=41 warm_alloc=(922,722) capture_alloc=(0,0) decline=None
+INC0 M=1 capture: captured=TRUE  segments=1  warm_alloc=(0,0)     capture_alloc=(0,0) decline=None
+```
+
+The three fixes work: the padded logits binding absorbs the output (`decline=None`), and the warm forward moves **all** arena growth out of the captured region (`capture_alloc=(0,0)`). **The M=K forward now instantiates capture-safe.** The Increment-0 build recipe is validated.
+
+## I0.2 The DECISIVE number — criterion (c): captured M=K replay wall vs captured M=1 replay wall
+
+```
+DECISIVE captured replay wall: M=8 = 87.2 ms | M=1 = 10.2 ms | ratio = 8.58×   (reproduced 8.58–8.59×)
+```
+
+**The ~80 ms floor PERSISTS under capture.** Capture removed the M=1 dispatch overhead (eager M=1 13.4 ms → captured M=1 10.2 ms, ~3 ms) but did essentially **nothing** to the M=K cost: captured M=8 (87.2 ms) ≈ eager M=8 (90.9 ms). Verifying 8 tokens in one "captured" replay costs **8.6× a single-token replay, not ≈1×.** The Phase-0 M=1→M=2 cliff (66.9 ms) was **not** dispatch — capture, which kills dispatch, left it intact. The Lever B premise "K× compute is free because the GPU is idle and weights are read once" is **falsified** at K=8 for this int4 decode-bound model.
+
+## I0.3 Root cause — the M=K forward does NOT whole-graph capture; every hot kernel opts out at query-width > 1
+
+`segments=41` (not 1) at M=8 is the tell. The captured M=8 "graph" is 41 tiny captured glue segments stitched by hundreds of **eager seam nodes**. The seam census (`capture_segmentation()`):
+
+```
+INC0 M=8 seam nodes:
+  GroupQueryAttention[KernelCaptureUnsupported]            × 40   (one per layer)
+  MatMulNBits[KernelCaptureUnsupported]                    × 240  (the int4 GEMV/GEMM — 6 per layer)
+  MatMul[KernelCaptureUnsupported]                         × 1
+  SkipSimplifiedLayerNormalization[KernelCaptureUnsupported] × 80  (two per layer)
+```
+
+**Every hot decode kernel — all 40 GroupQueryAttention, all 240 MatMulNBits, all 80 SkipSimplifiedLayerNormalization — returns `KernelCaptureUnsupported` at M>1.** They advertise capture support **only** at the M=1 decode shape; at query-width K they are each a forced eager seam. So the "captured" M=K forward degrades to ~361 eager per-op relaunches — precisely the dispatch-bound eager regime the entire lever was meant to escape. This is a **structural** result (deterministic, not a timing artifact): it is a property of the CUDA kernels' `capture_support()` at M>1, independent of workspace, logits binding, or KV pin — all of which Increment-0 already solved.
+
+## I0.4 VERDICT — **NO-GO for Lever B. Promote Lever A (Marlin int4 relayout) to primary.**
+
+| Criterion | Phase-0 | Increment-0 | 
+|---|---|---|
+| (a) instantiates capture-safe | FAIL (materialized logits + allocs) | **PASS** (padded logits + alloc-free warm) |
+| (b) replays ~1 dispatch/verify across growth | PASS (994/1000, 3 invalidations, 90 tok/s) | PASS (unchanged) |
+| (c) captured M=K wall ≈ captured M=1 wall | unmeasured | **FAIL — 8.58× (floor persists)** |
+
+Increment-0 did its job: it converted the pivotal unknown into a hard, reproduced number, and the number is a clean NO-GO. Fixing (a) exposed that (c) fails for a **deeper, more expensive** reason than dispatch — the three hottest op families do not support CUDA-graph capture at query-width > 1.
+
+### What a real Lever B would now require (why it is no longer "3–5 eng-weeks reuse existing machinery")
+To make an M=K verify replay actually cost ≈ one M=1 replay, someone must **add M>1 CUDA-graph capture support to three kernel families**: `GroupQueryAttention` (×40), `MatMulNBits` (×240, the int4 GEMV/GEMM), and `SkipSimplifiedLayerNormalization` (×80). Each must guarantee, at query-width K: a static launch grid, no mid-kernel `cudaStreamSynchronize`, no host read-back, and no device alloc/free — the same bar the M=1 variants already meet, re-established for the batched shape. That is a deep, multi-family kernel-capture-support effort, not a "verify sub-graph" build, and it must clear the same numerical near-tie guard (#935) on top. The payoff remains only the **conditional** floor≈1.0×/ceiling~2–3×, and even that is contingent on the K× GEMM/attention arithmetic being genuinely free once captured — which the eager M=2..8 tail (1.76–1.85 ms/row) suggests but this probe could not confirm under capture (no hot kernel captures at M>1 to measure it).
+
+Against that, **Lever A (Marlin int4 relayout) is unconditional ~1.3–1.6× on every token of every workload, at ~4–6 eng-weeks with no capture-support prerequisite.** With Lever B's cost/risk now materially higher and its central premise falsified at the wall-clock level, **Lever A is the primary lever.** Lever B is not dead — it is **gated behind a kernel-capture-support program** (make GQA/MatMulNBits/SkipSimplifiedLayerNorm capture-safe at M>1), after which this exact probe can be re-run to get the true captured-M=K wall. Until then, do not fund the Lever B verify-graph build.
+
+## I0.5 Increment-0 reproducibility
+
+Build/run identical to the Phase-0 command (the probe test is the same `leverb_phase0_capture_probe`, now with PART D). Raw run (GPU 7), verbatim:
+
+```
+[leverb-phase0][D] INC0 M=8 capture: captured=true segments=41 rows=8 bucket=256 warm_alloc=Some((922, 722)) capture_alloc=Some((0, 0)) decline=None
+[leverb-phase0][D] INC0 M=8 seam nodes (root cause of segmented capture): GroupQueryAttention[KernelCaptureUnsupported]×40, MatMulNBits[KernelCaptureUnsupported]×240, MatMul[KernelCaptureUnsupported]×1, SkipSimplifiedLayerNormalization[KernelCaptureUnsupported]×80
+[leverb-phase0][D] INC0 M=1  capture: captured=true segments=1 rows=1 bucket=256 warm_alloc=Some((0, 0)) capture_alloc=Some((0, 0)) decline=None
+[leverb-phase0][D] DECISIVE captured replay wall: M=8 = 87.185 ms | M=1 = 10.164 ms | ratio = 8.58x
+[leverb-phase0][VERDICT] (a) capture-safe: inc0_capture=true capture_alloc_clean=true (phase0_raw_capture=false)
+[leverb-phase0][VERDICT] (b) stable replay: replays/step=0.994 invalidations=3 growths=2 pass=true
+[leverb-phase0][VERDICT] (c) wall≈M=1: DECISIVE captured_ratio=Some(8.578) captured_pass=false | eager_ratio(upper bound)=6.77 eager_pass=false
+[leverb-phase0][VERDICT] GO/NO-GO = NO-GO
+```
