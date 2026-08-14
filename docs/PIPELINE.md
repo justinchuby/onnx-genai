@@ -32,3 +32,8 @@ termination state, and KV/state update decision. Inactive rows consume no RNG,
 preserve semantic state, and produce no compacted emit event. Stable max-batch device
 buffers may contain inactive capacity, but capture and super-island plans must remain
 valid as the active-row set changes without specializing the ONNX graph to batch one.
+
+Ragged emission is explicit: `emit.row_ids` binds physical rows to semantic `int64[B]`
+identities. Guards and valid lengths are zipped with tensors and IDs before compaction.
+Consumers enumerate structured rows by output declaration or semantic role; compatibility
+keys such as `tokens.row.17` are serialization details and are not parsed for behavior.

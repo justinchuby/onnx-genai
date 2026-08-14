@@ -270,6 +270,8 @@ pub enum WorkflowStep {
         when: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         valid_length: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        row_ids: Option<String>,
         output: String,
         mode: WorkflowEmitMode,
     },
@@ -328,6 +330,8 @@ pub enum WorkflowNode {
         /// Optional scalar or rank-one integer SSA value limiting the emitted prefix
         /// on the value's final axis, globally or per batch row.
         valid_length: Option<String>,
+        /// Explicit semantic identity for every physical batch row.
+        row_ids: Option<String>,
         output: String,
         mode: WorkflowEmitMode,
         effect_name: String,

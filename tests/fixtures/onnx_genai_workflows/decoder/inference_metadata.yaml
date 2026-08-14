@@ -11,6 +11,7 @@ pipeline:
       - nested_control_flow
       - typed_emit
       - emit_valid_length
+      - emit_row_identity
       - loop_induction_values
       - serving_service_contract
       - bounded_state_recurrence
@@ -127,6 +128,18 @@ pipeline:
           kind: literal
         required: false
         default: 0
+      request.row_ids:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: row_ids
+        required: true
       package.cache_lengths:
         contract:
           dtype: int64
@@ -308,6 +321,17 @@ pipeline:
         initializer: package.slot_ids
         recurrence:
           kind: invariant
+      row_ids:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+        class: semantic
+        scope: invocation
+        initializer: request.row_ids
+        recurrence:
+          kind: invariant
       cache_lengths:
         contract:
           dtype: int64
@@ -469,6 +493,7 @@ pipeline:
         mode: append
         valid_length: token.emitted_length
         when: active
+        row_ids: row_ids
       - kind: invoke
         component: decoder_step_update
         inputs:
@@ -513,6 +538,8 @@ pipeline:
         next: accepted_len.next
       - cell: slot_ids
         next: slot_ids
+      - cell: row_ids
+        next: row_ids
       - cell: attention_mask
         next: decoder_step.body_attention_mask
       - cell: position_ids

@@ -19,7 +19,7 @@ use onnx_genai_metadata::{
 };
 use onnx_genai_ort::{DataType, PipelineModelDirectory, PipelineModels, SessionOptions, Value};
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -31,6 +31,43 @@ pub use onnx_genai_metadata::WorkflowOutputRole;
 pub use workflow::{WorkflowExecutionPlan, WorkflowPerformanceDiagnostic};
 
 pub type PipelineTensors = HashMap<String, Value>;
+
+/// Structured workflow outputs with explicit semantic row identities.
+pub struct PipelineOutputs {
+    tensors: PipelineTensors,
+    rows: BTreeMap<String, BTreeMap<i64, String>>,
+}
+
+impl PipelineOutputs {
+    pub fn tensors(&self) -> &PipelineTensors {
+        &self.tensors
+    }
+
+    pub fn into_tensors(self) -> PipelineTensors {
+        self.tensors
+    }
+
+    pub fn aggregate(&self, output: &str) -> Option<&Value> {
+        self.tensors.get(output)
+    }
+
+    pub fn rows(&self, output: &str) -> Vec<(i64, &Value)> {
+        self.rows
+            .get(output)
+            .into_iter()
+            .flat_map(|rows| rows.iter())
+            .filter_map(|(identity, name)| self.tensors.get(name).map(|value| (*identity, value)))
+            .collect()
+    }
+}
+
+impl std::ops::Deref for PipelineOutputs {
+    type Target = PipelineTensors;
+
+    fn deref(&self) -> &Self::Target {
+        &self.tensors
+    }
+}
 
 /// Replayable snapshot of semantic session-scoped workflow state.
 pub struct WorkflowSessionCheckpoint {
@@ -355,7 +392,14 @@ impl PipelineEngine {
         self.run_workflow(request)
     }
 
-    /// Return the aggregate output or the first row-wise output for a semantic role.
+    pub fn run_pipeline_outputs(
+        &mut self,
+        request: PipelineGenerateRequest,
+    ) -> anyhow::Result<PipelineOutputs> {
+        self.run_workflow_outputs(request)
+    }
+
+    /// Return an aggregate output for a semantic role.
     pub fn output_for_role<'a>(
         &self,
         outputs: &'a PipelineTensors,
@@ -367,7 +411,22 @@ impl PipelineEngine {
             .iter()
             .find(|(_, output)| output.role == role)
             .map(|(name, _)| name)?;
-        outputs.get(name).or_else(|| {
+        outputs.get(name)
+    }
+
+    /// Return the aggregate output or the first row-wise output for a semantic role.
+    pub fn structured_output_for_role<'a>(
+        &self,
+        outputs: &'a PipelineOutputs,
+        role: WorkflowOutputRole,
+    ) -> Option<&'a Value> {
+        let name = self
+            .workflow
+            .outputs
+            .iter()
+            .find(|(_, output)| output.role == role)
+            .map(|(name, _)| name)?;
+        outputs.aggregate(name).or_else(|| {
             self.output_rows_for_role(outputs, role)
                 .into_iter()
                 .next()
@@ -378,9 +437,9 @@ impl PipelineEngine {
     /// Return explicit row-wise outputs for a semantic role, ordered by row index.
     pub fn output_rows_for_role<'a>(
         &self,
-        outputs: &'a PipelineTensors,
+        outputs: &'a PipelineOutputs,
         role: WorkflowOutputRole,
-    ) -> Vec<(usize, &'a Value)> {
+    ) -> Vec<(i64, &'a Value)> {
         let Some(name) = self
             .workflow
             .outputs
@@ -390,18 +449,7 @@ impl PipelineEngine {
         else {
             return Vec::new();
         };
-        let prefix = format!("{name}.row.");
-        let mut rows = outputs
-            .iter()
-            .filter_map(|(output, value)| {
-                output
-                    .strip_prefix(&prefix)
-                    .and_then(|suffix| suffix.parse::<usize>().ok())
-                    .map(|row| (row, value))
-            })
-            .collect::<Vec<_>>();
-        rows.sort_unstable_by_key(|(row, _)| *row);
-        rows
+        outputs.rows(name)
     }
 
     /// Compile request bindings and reusable interpreter state for repeated execution.
@@ -504,7 +552,7 @@ impl PipelineEngine {
         if let Some(on_admitted) = on_admitted.as_mut() {
             on_admitted();
         }
-        let values = self.run_workflow(request)?;
+        let values = self.run_workflow_outputs(request)?;
         let output = self
             .workflow
             .outputs
@@ -512,16 +560,16 @@ impl PipelineEngine {
             .find(|(_, output)| output.role == WorkflowOutputRole::Tokens)
             .map(|(name, _)| name)
             .context("workflow generate() requires one package output with role: tokens")?;
-        let token_value = values
-            .get(output)
-            .or_else(|| values.get(&format!("{output}.row.0")));
-        if values.contains_key(&format!("{output}.row.1")) {
+        let rows = values.rows(output);
+        if rows.len() > 1 {
             anyhow::bail!(
                 "workflow generate() cannot flatten multi-row ragged output '{output}'; use \
-                 run_pipeline() to consume row streams"
+                 run_pipeline_outputs() to consume semantic row streams"
             );
         }
-        let tokens = token_value
+        let tokens = values
+            .aggregate(output)
+            .or_else(|| rows.first().map(|(_, value)| *value))
             .with_context(|| format!("workflow did not emit tokens output '{output}'"))?
             .to_vec_i64()?
             .into_iter()

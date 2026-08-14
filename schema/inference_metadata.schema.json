@@ -2831,6 +2831,12 @@
             "output": {
               "type": "string"
             },
+            "row_ids": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "valid_length": {
               "type": [
                 "string",

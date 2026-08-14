@@ -86,12 +86,16 @@ roles, whose absence is observable; application-sourced tensors may use it gener
 VLM requests, the absent branch should produce the embedding graph's supported zero-image feature
 tensor; clients do not pass sentinel or fake image bytes.
 
-`emit.when` optionally suppresses an event. `emit.valid_length` accepts `int[B]` and emits a ragged
-event per active row, slicing each row to its runtime prefix. This defines EOS behavior explicitly:
-a workflow may emit the EOS token, suppress it with `when`, or emit a zero-length row.
-Ragged package values use `output.row.<index>`; event mode adds
-`output.row.<index>.<event-index>`. Once an output becomes ragged, later appends without a length
-are split by row and append to the same row streams.
+`emit.row_ids` explicitly selects row emission and binds each physical tensor row to an
+`int64[B]` semantic identity. `emit.when` optionally suppresses a row event, while
+`emit.valid_length` slices that row's final axis. A true guard with length zero emits an empty row;
+a false guard emits nothing. Guards and lengths may be singleton-broadcast or per-row, but row IDs
+must have exactly one unique identity per active physical row.
+
+Aggregate emits omit `row_ids` and retain one tensor under the declared output. Ragged compatibility
+keys use `output.row.<semantic-id>`, but consumers use the structured output API rather than parsing
+those names. Compaction must gather row IDs with every carried state tensor, and slot reassignment
+starts a new request output stream so reusable physical positions never define output identity.
 
 ONNX port contracts may be omitted when the artifact is authoritative. Declare only semantic
 bindings, bounds/overrides, cross-component constraints, or adapter ports that ONNX cannot describe.
