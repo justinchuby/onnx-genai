@@ -353,6 +353,7 @@ fn cuda_request_requires_compile_time_feature() {
         &resolved,
         false,
         &CudaAttentionMode::Auto,
+        None,
         &[],
     )
     .expect_err("CUDA must be rejected without the cargo feature");

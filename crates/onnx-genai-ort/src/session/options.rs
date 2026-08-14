@@ -51,6 +51,14 @@ pub struct SessionOptions {
     /// Generic ORT session configuration entries applied through
     /// `AddSessionConfigEntry` before provider append/session creation.
     pub session_config_entries: Vec<(String, String)>,
+    /// Raw `cudaStream_t` every CUDA session should compute on, as a pointer
+    /// value. `None` leaves each session on the per-session stream ORT creates.
+    ///
+    /// Set this whenever one logical step drives more than one CUDA session:
+    /// see [`crate::cuda_rt::shared_compute_stream`]. Upstream ORT GenAI sets it
+    /// on every CUDA session it builds, so matching it is also what makes this
+    /// runtime's session options comparable to that native baseline.
+    pub cuda_user_compute_stream: Option<usize>,
     /// Whether the non-CPU execution provider was auto-selected for this platform
     /// (e.g. the macOS MLX/Metal default) rather than explicitly requested. An
     /// auto-selected provider must fall back to CPU on load failure, even if the
@@ -63,6 +71,43 @@ pub struct SessionOptions {
 pub const USE_ENV_ALLOCATORS: &str = "session.use_env_allocators";
 
 impl SessionOptions {
+    /// Put every CUDA session built from these options on one shared compute
+    /// stream, so a step that drives several sessions keeps a single ordered
+    /// device timeline instead of ping-ponging between per-session ORT streams.
+    ///
+    /// A no-op without a CUDA execution provider, and a no-op when the CUDA
+    /// runtime cannot be loaded: the stream is a performance property, not a
+    /// correctness one, so failing to create it must not fail session setup.
+    pub fn share_cuda_compute_stream(&mut self) -> &mut Self {
+        #[cfg(feature = "cuda")]
+        {
+            let Some(device_id) = self.cuda_device_id() else {
+                return self;
+            };
+            match crate::cuda_rt::shared_compute_stream(device_id) {
+                Ok(stream) => self.cuda_user_compute_stream = Some(stream),
+                Err(error) => tracing::warn!(
+                    device_id,
+                    "could not create a shared CUDA compute stream; each session keeps its own: \
+                     {error}"
+                ),
+            }
+        }
+        self
+    }
+
+    /// CUDA device this session targets, if a CUDA execution provider is selected.
+    #[must_use]
+    pub fn cuda_device_id(&self) -> Option<i32> {
+        self.execution_providers
+            .iter()
+            .find_map(|provider| match &provider.strategy {
+                #[cfg(feature = "cuda")]
+                super::ep_compat::AppendStrategy::CudaTyped { device_id } => Some(*device_id),
+                _ => None,
+            })
+    }
+
     /// Route this session's allocations through allocators registered on the
     /// environment.
     ///
@@ -145,6 +190,7 @@ impl SessionOptions {
             webgpu_disable_validation: false,
             cuda_attention_mode: cuda_attention_mode_from_runtime_config(),
             session_config_entries: runtime_config().session_config_entries.clone(),
+            cuda_user_compute_stream: None,
             auto_selected: false,
         }
     }

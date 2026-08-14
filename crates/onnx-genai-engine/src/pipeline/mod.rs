@@ -224,6 +224,15 @@ impl PipelineEngine {
         session_options: SessionOptions,
         authority_provider: Option<SharedMemoryAuthorityProvider>,
     ) -> anyhow::Result<Self> {
+        // A workflow step drives several CUDA sessions — the fused decoder
+        // island, the policy island, and the setup components. Put them all on
+        // one compute stream, as upstream ORT GenAI does for every session it
+        // builds: alternating between per-session ORT streams costs far more
+        // than the extra sessions' own work, and matching the native baseline's
+        // session options is a precondition for comparing against it.
+        let mut session_options = session_options;
+        session_options.share_cuda_compute_stream();
+        let session_options = session_options;
         let decode_backend = validate_pipeline_backend_request(config.decode_backend)?;
         let authority_domain = crate::engine::session_device_domain(&session_options)?;
         crate::engine::validate_shared_authority_limit(

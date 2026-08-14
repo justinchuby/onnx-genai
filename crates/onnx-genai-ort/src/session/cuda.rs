@@ -11,6 +11,7 @@ pub(super) fn append_cuda_execution_provider(
     device_id: i32,
     graph_capture: bool,
     attention_mode: &CudaAttentionMode,
+    user_compute_stream: Option<usize>,
     available: &[String],
 ) -> Result<()> {
     const PROVIDER_NAME: &str = "CUDAExecutionProvider";
@@ -74,6 +75,27 @@ pub(super) fn append_cuda_execution_provider(
                 provider_options.len(),
             )
         })?;
+        if let Some(stream) = user_compute_stream {
+            // The stream is a pointer-valued provider option: the typed entry
+            // point is what makes ORT record `has_user_compute_stream` and adopt
+            // the caller's stream, which is how upstream ORT GenAI configures
+            // its CUDA sessions. The string form does not establish that flag,
+            // and a session that half-adopts the stream aborts ORT-managed graph
+            // capture with `operation not permitted when stream is capturing`.
+            let update_value =
+                api.UpdateCUDAProviderOptionsWithValue
+                    .ok_or(OrtError::ApiUnavailable(
+                        "UpdateCUDAProviderOptionsWithValue",
+                    ))?;
+            let key = CString::new("user_compute_stream").map_err(|_| {
+                OrtError::InvalidArgument("CUDA provider option key contains NUL".into())
+            })?;
+            // SAFETY: the options handle and key are valid for the call, and
+            // `stream` is a live `cudaStream_t` that outlives every session.
+            crate::error::check_status(unsafe {
+                update_value(cuda_options, key.as_ptr(), stream as *mut std::ffi::c_void)
+            })?;
+        }
         crate::error::check_status(unsafe { append(session_options, cuda_options) })
     })();
     // SAFETY: `cuda_options` was created above and is released exactly once.
@@ -85,6 +107,7 @@ pub(super) fn append_cuda_execution_provider(
                 device_id,
                 graph_capture,
                 ?attention_mode,
+                shared_compute_stream = user_compute_stream.is_some(),
                 "Enabled ONNX Runtime CUDA execution provider"
             );
             Ok(())

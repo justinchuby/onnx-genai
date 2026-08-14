@@ -20,8 +20,9 @@
 //! resolved symbols are cached in a process-wide `OnceLock` so growth (which
 //! happens only O(log length) times per generation) never reloads it.
 
+use std::collections::BTreeMap;
 use std::os::raw::c_void;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use libloading::Library;
 
@@ -44,6 +45,7 @@ type CudaDeviceSynchronizeFn = unsafe extern "C" fn() -> i32;
 type CudaSetDeviceFn = unsafe extern "C" fn(i32) -> i32;
 type CudaGetDeviceFn = unsafe extern "C" fn(*mut i32) -> i32;
 type CudaMemGetInfoFn = unsafe extern "C" fn(*mut usize, *mut usize) -> i32;
+type CudaStreamCreateFn = unsafe extern "C" fn(*mut *mut c_void) -> i32;
 
 struct CudaRt {
     // Kept alive so the resolved function pointers remain valid; never called
@@ -56,6 +58,7 @@ struct CudaRt {
     set_device: CudaSetDeviceFn,
     get_device: CudaGetDeviceFn,
     mem_get_info: CudaMemGetInfoFn,
+    stream_create: CudaStreamCreateFn,
 }
 
 // SAFETY: the resolved `cudart` entry points are plain C functions that are
@@ -99,6 +102,7 @@ fn load() -> std::result::Result<CudaRt, String> {
         let set_device = unsafe { lib.get::<CudaSetDeviceFn>(b"cudaSetDevice\0") };
         let get_device = unsafe { lib.get::<CudaGetDeviceFn>(b"cudaGetDevice\0") };
         let mem_get_info = unsafe { lib.get::<CudaMemGetInfoFn>(b"cudaMemGetInfo\0") };
+        let stream_create = unsafe { lib.get::<CudaStreamCreateFn>(b"cudaStreamCreate\0") };
         match (
             memcpy,
             memcpy_async,
@@ -107,6 +111,7 @@ fn load() -> std::result::Result<CudaRt, String> {
             set_device,
             get_device,
             mem_get_info,
+            stream_create,
         ) {
             (
                 Ok(memcpy),
@@ -116,6 +121,7 @@ fn load() -> std::result::Result<CudaRt, String> {
                 Ok(set_device),
                 Ok(get_device),
                 Ok(mem_get_info),
+                Ok(stream_create),
             ) => {
                 // Copy the function pointers out before `lib` is moved into the
                 // struct; the borrows on `lib` end here.
@@ -126,6 +132,7 @@ fn load() -> std::result::Result<CudaRt, String> {
                 let set_device = *set_device;
                 let get_device = *get_device;
                 let mem_get_info = *mem_get_info;
+                let stream_create = *stream_create;
                 return Ok(CudaRt {
                     _lib: lib,
                     memcpy,
@@ -135,11 +142,12 @@ fn load() -> std::result::Result<CudaRt, String> {
                     set_device,
                     get_device,
                     mem_get_info,
+                    stream_create,
                 });
             }
             _ => {
                 last_err = format!(
-                    "{name}: missing cudaMemcpy/cudaMemcpyAsync/cudaMemset/cudaDeviceSynchronize/cudaSetDevice/cudaGetDevice/cudaMemGetInfo symbol"
+                    "{name}: missing cudaMemcpy/cudaMemcpyAsync/cudaMemset/cudaDeviceSynchronize/cudaSetDevice/cudaGetDevice/cudaMemGetInfo/cudaStreamCreate symbol"
                 );
             }
         }
@@ -173,6 +181,51 @@ pub fn device_synchronize() -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// One process-lifetime CUDA stream per device, shared by every session that
+/// opts into `user_compute_stream`.
+///
+/// ORT gives each session its own stream by default, and alternating between
+/// per-session streams within one decode step costs far more than the extra
+/// session's work: on an H200 with stock ORT 1.28 a 2499-node captured decoder
+/// island replays in 15.40 ms alone, 16.11 ms with a second single-node session
+/// between replays on its own stream, and 15.44 ms with both on one stream.
+/// Upstream ORT GenAI does exactly this — every CUDA session it builds gets
+/// `user_compute_stream` set to one `cudaStreamCreate` stream — so sharing is
+/// also what makes this runtime's session options match the native baseline it
+/// is measured against.
+///
+/// The stream is created with `cudaStreamCreate`, matching GenAI: a blocking
+/// stream stays ordered against the legacy default stream that the engine's own
+/// helper copies use, so those copies need no extra barrier.
+///
+/// It is created once and deliberately never destroyed: ORT holds it for as
+/// long as any session built with it lives, including through teardown.
+pub fn shared_compute_stream(device_id: i32) -> Result<usize> {
+    static STREAMS: OnceLock<Mutex<BTreeMap<i32, usize>>> = OnceLock::new();
+    let streams = STREAMS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut streams = streams
+        .lock()
+        .map_err(|_| OrtError::InvalidArgument("shared CUDA stream registry is poisoned".into()))?;
+    if let Some(stream) = streams.get(&device_id) {
+        return Ok(*stream);
+    }
+    let _guard = DeviceGuard::set(device_id)?;
+    let rt = runtime()?;
+    let mut stream: *mut c_void = std::ptr::null_mut();
+    // SAFETY: `stream` is a valid out-parameter and the signature matches the
+    // documented `cudart` ABI for `cudaStreamCreate`.
+    let code = unsafe { (rt.stream_create)(&mut stream) };
+    if code != 0 {
+        return Err(OrtError::InvalidArgument(format!(
+            "cudaStreamCreate failed with CUDA error code {code}"
+        )));
+    }
+    let stream = std::ptr::NonNull::new(stream).ok_or(OrtError::NullPointer)?;
+    let stream = stream.as_ptr() as usize;
+    streams.insert(device_id, stream);
+    Ok(stream)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

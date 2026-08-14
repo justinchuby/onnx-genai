@@ -74,6 +74,7 @@ pub(super) fn append_execution_providers(
             provider,
             options.graph_capture,
             &options.cuda_attention_mode,
+            options.cuda_user_compute_stream,
             &available,
         )?;
     }
@@ -86,6 +87,7 @@ pub(super) fn append_execution_provider(
     provider: &ResolvedEp,
     graph_capture: bool,
     cuda_attention_mode: &CudaAttentionMode,
+    cuda_user_compute_stream: Option<usize>,
     available: &[String],
 ) -> Result<()> {
     use ep_compat::AppendStrategy;
@@ -97,6 +99,7 @@ pub(super) fn append_execution_provider(
             *device_id,
             graph_capture,
             cuda_attention_mode,
+            cuda_user_compute_stream,
             available,
         ),
         #[cfg(not(feature = "cuda"))]
@@ -105,6 +108,7 @@ pub(super) fn append_execution_provider(
                 session_options,
                 graph_capture,
                 cuda_attention_mode,
+                cuda_user_compute_stream,
                 available,
             );
             Err(OrtError::InvalidArgument(
