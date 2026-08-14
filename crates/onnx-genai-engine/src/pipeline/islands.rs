@@ -1094,14 +1094,11 @@ fn batching_role_port(
             && tensor.rank == 1
             && matches!(first, Some(onnx_genai_metadata::TensorDimension::Fixed(1)));
     }
-    if role == "token" && first.is_none() {
-        return integer && tensor.rank == 1;
-    }
     if tensor.rank == 0
         || !matches!(
             first,
             Some(onnx_genai_metadata::TensorDimension::Symbol(symbol))
-                if symbol == "batch" || symbol.ends_with(".batch")
+                if symbol == "batch"
         )
     {
         return false;
@@ -2299,6 +2296,46 @@ mod tests {
             );
         }
         assert!(is_fusible_component(&sampler));
+
+        sampler.ports.outputs.get_mut("token").unwrap().shape = None;
+        assert!(!is_fusible_component(&sampler));
+        sampler
+            .ports
+            .outputs
+            .insert("token".into(), batch_tensor("int64", 1));
+        sampler
+            .ports
+            .inputs
+            .get_mut("logits")
+            .unwrap()
+            .shape
+            .as_mut()
+            .unwrap()[0] =
+            onnx_genai_metadata::TensorDimension::Symbol("policy.token_sampler.batch".into());
+        assert!(!is_fusible_component(&sampler));
+        sampler
+            .ports
+            .inputs
+            .insert("logits".into(), batch_tensor("float32", 2));
+        assert!(is_fusible_component(&sampler));
+        sampler
+            .ports
+            .inputs
+            .insert("grammar_mask".into(), batch_tensor("bool", 2));
+        sampler
+            .contract
+            .as_mut()
+            .unwrap()
+            .bindings
+            .insert("grammar_mask".into(), "grammar_mask".into());
+        assert!(!is_fusible_component(&sampler));
+        sampler.ports.inputs.remove("grammar_mask");
+        sampler
+            .contract
+            .as_mut()
+            .unwrap()
+            .bindings
+            .remove("grammar_mask");
 
         sampler
             .contract

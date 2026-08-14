@@ -212,6 +212,10 @@ Inactive rows preserve RNG counters and semantic state and emit no token.
 This ABI permits stable max-batch buffers and CUDA graph replay while the active row set, row
 parameters, logical lengths, and EOS sets change between iterations.
 
+Version 2 admission is exact: the public symbol is literally `batch`, not a component-qualified
+variant, and the 11/9/5 sampler, termination, and state-update binding sets accept no additional
+grammar, RNG-alias, previous-done, length, or iteration-broadcast roles.
+
 ### Termination predicate: `onnx-genai.termination-predicate@1`
 
 Inputs: `tokens: int64[B]`, `eos_ids: int64[E]`, zero-based `iteration: int64[]|[B]`, and
