@@ -68,26 +68,37 @@ use cudarc::driver::CudaContext;
 
 /// Environment switch selecting the VMM arena over `cuMemAlloc`.
 ///
-/// # Currently inert on the native CUDA path
+/// # What enabling it does today
 ///
-/// Enabling this today reserves address space and allocates nothing through
-/// it. The arena installs when the execution provider adopts a memory
-/// governor, and on the native path that happens *after* the session has
-/// built every tensor it will use -- so nothing is left to ask it for memory.
-/// Measured: `committed 0 B of 7732199424 B reserved` after a full generation
-/// (#659).
+/// When set, the CUDA execution provider installs the VMM arena **at
+/// construction** (not at governor adoption) and routes every device
+/// allocation it makes — including the ORT scratch allocations
+/// (`KernelContext_GetScratchBuffer`) the plugin path projects through the
+/// provider's `allocate`/`deallocate` — through it. That is the caller the
+/// arena was always missing on the plugin/standalone path (#659, #956):
+/// repeated same-size scratch requests reuse committed memory from the
+/// retained physical-handle pool instead of calling `cuMemAlloc` per dispatch.
 ///
-/// The allocator itself is correct and tested; what is missing is a caller.
-/// Until #659 is fixed, turning this on costs one address-space reservation
-/// and changes nothing else, so it must not become the default.
+/// The construction-time install predates governor adoption on purpose: on the
+/// native path the session allocates every tensor while loading, before any
+/// governor reaches the provider, so an arena installed at adoption is
+/// installed at the one moment after which nothing will ask it for memory
+/// (#659). The construction-time install closed that gap for the native path;
+/// the standalone (plugin, no-governor) path uses the same install and, from
+/// #956 on, a default retained physical-handle pool so its scratch reuse is
+/// real rather than a per-cycle `cuMemCreate`/`cuMemRelease` churn.
 ///
 /// # Why it is opt-in regardless
 ///
 /// An allocator change is exactly the kind that looks free and is not. The
 /// default should move only after it is measured against `cuMemAlloc` on real
-/// models -- and after there is something to measure.
+/// models.
 pub const CUDA_VMM_ENV: &str = "ONNX_GENAI_CUDA_VMM";
 /// Opt-in retained-byte bound for the production physical-handle pool.
+///
+/// When unset, the standalone (plugin) VMM path falls back to the
+/// `default_pool_bytes` its caller supplies (issue #956), so scratch reuse is
+/// pooled by default whenever the arena is enabled.
 pub const CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV: &str = "ONNX_GENAI_CUDA_PHYSICAL_HANDLE_POOL_BYTES";
 
 /// Whether the VMM arena is enabled. Any of `1`/`true`/`yes`/`on`.
@@ -712,6 +723,7 @@ impl CudaVmmAllocator {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn standalone_with_teardown_synchronizer(
         context: Arc<CudaContext>,
         device: DeviceKey,
@@ -720,6 +732,7 @@ impl CudaVmmAllocator {
         holder: HolderId,
         role: MemoryRole,
         teardown_synchronizer: crate::virtual_memory::TeardownSynchronizer,
+        default_pool_bytes: Option<usize>,
     ) -> Result<Self, MemoryError> {
         let private = onnx_runtime_memory_governor::LedgerGovernor::new(
             onnx_runtime_memory_governor::LeaseLedger::new_for_device(device, u64::MAX, 0, 0),
@@ -732,7 +745,7 @@ impl CudaVmmAllocator {
                 capacity,
                 holder,
                 role,
-                pool_bytes: physical_handle_pool_bytes(),
+                pool_bytes: physical_handle_pool_bytes().or(default_pool_bytes),
                 teardown_synchronizer: Some(teardown_synchronizer),
             },
             &private,

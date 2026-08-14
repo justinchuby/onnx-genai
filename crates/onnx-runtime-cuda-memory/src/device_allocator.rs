@@ -50,6 +50,17 @@ pub struct CudaDeviceAllocator {
     /// and an out-of-memory error much later, with nothing connecting the two.
     leaked_frees: AtomicU64,
     leaked_bytes: AtomicU64,
+    /// Successful `cuMemAlloc` calls this allocator has made.
+    ///
+    /// This is the number the capture-safety story turns on: a `cuMemAlloc`
+    /// per decode dispatch is exactly the residual issue #956 tracks, and it is
+    /// illegal during CUDA-graph capture. Counting it here — rather than
+    /// inferring it from the *absence* of an out-of-memory or a capture error —
+    /// lets a test show directly that this call site scales with decode steps
+    /// on the default path and is bypassed entirely once the VMM arena serves
+    /// the same requests (`measurement-discipline`: measure the thing, do not
+    /// infer it from a missing symptom).
+    cumemalloc_calls: AtomicU64,
 }
 
 impl CudaDeviceAllocator {
@@ -74,7 +85,18 @@ impl CudaDeviceAllocator {
             device: DeviceKey::device(ordinal),
             leaked_frees: AtomicU64::new(0),
             leaked_bytes: AtomicU64::new(0),
+            cumemalloc_calls: AtomicU64::new(0),
         }
+    }
+
+    /// Successful `cuMemAlloc` calls this allocator has made since construction.
+    ///
+    /// Exposed so a test can prove — directly, not by inference — that this
+    /// call site scales one-for-one with allocation requests, which is the
+    /// per-dispatch driver allocation issue #956 removes by routing device
+    /// memory through the VMM arena instead.
+    pub fn cumemalloc_calls(&self) -> u64 {
+        self.cumemalloc_calls.load(Ordering::Relaxed)
     }
 
     /// How many frees this allocator could not perform, and how many bytes they
@@ -147,11 +169,15 @@ impl DeviceAllocator for CudaDeviceAllocator {
                 reason: format!("cuMemAlloc refused {request} bytes: {error}"),
             }
         })?;
-        NonNull::new(dptr as *mut u8).ok_or(MemoryError::AllocationFailed {
-            tier: Tier::Device.name(),
-            requested: bytes as u64,
-            reason: String::from("cuMemAlloc returned a null device pointer"),
-        })
+        NonNull::new(dptr as *mut u8)
+            .ok_or(MemoryError::AllocationFailed {
+                tier: Tier::Device.name(),
+                requested: bytes as u64,
+                reason: String::from("cuMemAlloc returned a null device pointer"),
+            })
+            .inspect(|_| {
+                self.cumemalloc_calls.fetch_add(1, Ordering::Relaxed);
+            })
     }
 
     unsafe fn deallocate(&self, ptr: NonNull<u8>, bytes: usize, _align: usize) {
