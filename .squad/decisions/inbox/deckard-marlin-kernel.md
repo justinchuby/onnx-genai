@@ -64,3 +64,57 @@ op after wiring (Stage 3), coordinating with Sebastian (squad/marlin-bench).
 enabler of capture-stable speculative decoding. Building standalone-validated
 (correctness vs f64 + measured bandwidth) before wiring into the op, per the staging
 plan.
+
+---
+
+### 2026-08-14 (update): Stage 3–4 landed — M>1 wired, capture support advertised
+
+**Status:** Stage 3 (op wiring) + Stage 4 (capture support) COMPLETE and validated on
+H200. M=1 stays on the existing GEMV (precondition still unmet). Head: d722705c.
+
+**What landed:**
+- **Wired Marlin into the `MatMulNBits` M>1 dispatch** (`matmul_nbits.rs`, the
+  `if m > 1` seam only + the `capture_support` doc). Opt-in via
+  `ONNX_GENAI_MARLIN_M_GT_1=1` (default OFF, Rule-11 tier-scoped). Eligibility:
+  SM80+, int4, no fused SwiGLU/RMSNorm epilogue yet, K divisible by 16 and group.
+  Any ineligibility or launch error falls through **byte-compatibly** to the
+  portable tiled GEMM.
+- **Module-level repack cache** (`ensure_repacked` in `marlin_gemm.rs`) keyed by
+  (packed_ptr, ordinal, N, K, group). Immutable initializer weights are repacked
+  on-device **once** during warmup; captured replays hit the warm cache with no
+  allocation. A cold miss during capture is rejected (safety valve → caller falls
+  back). Dispatch stores the cache-warm flag into `last_call_capture_safe`, so
+  **cold call = not-capture-safe, warm replay = capture-safe** — this is what
+  unlocks capture-stable speculative verify at M>1.
+- Op-level test `marlin_m_gt_1_op_parity_and_capture_safety`: real op, flag on,
+  vs f64 oracle (asymmetric zp) — **worst_abs=0.013 ≪ tol=0.67**; asserts
+  cold=not-safe / warm=safe + byte-identical replay. PASSES on GPU.
+
+**Measured — apples-to-apples wall vs tiled through the op**
+(`marlin_m_gt_1_op_wall_vs_tiled`, H200, K=5120 N=13824 block=128, median µs):
+
+| M | tiled µs | marlin µs | speedup |
+|---|---|---|---|
+| 1 | 69.5 | 69.0 | 1.01× (M=1 stays on GEMV) |
+| 2 | 478.0 | 140.0 | **3.41×** |
+| 4 | 494.1 | 138.5 | 3.57× |
+| 8 | 536.4 | 176.9 | 3.03× |
+| 16 | 658.1 | 251.2 | 2.62× |
+| 32 | 1076.7 | 385.0 | 2.80× |
+| 64 | 2010.6 | 821.6 | 2.45× |
+| 128 | 3851.5 | 1357.9 | 2.84× |
+
+**Cliff collapse (the mission payoff):** the tiled path jumps 69.5 µs (M=1 GEMV)
+→ 478 µs (M=2 tiled) = a **6.9× cliff**. Marlin M=2 = 140 µs, collapsing the
+M=1→M=2 cliff to **~2×** (69.5→140 µs). Marlin is **2.4–3.6× faster than the
+tiled GEMM across every M>1**.
+
+**M=1 decision (unchanged, honest):** standalone M=1 5120² is ~3.1% HBM peak and
+through-op M=1 Marlin ties the GEMV (69 vs 69.5 µs) — it does NOT clear the
+feasibility §3 ≥40% precondition, so **M=1 remains on the existing GEMV**. Not
+silently dropped: reported.
+
+**Next:** extend fused epilogues (rmsnorm-prologue first, then swiglu/gate_up/down)
+so those M>1 entry points can also use Marlin; small-M perf levers (split-K /
+cp.async) to push M=1 toward the precondition; Stage 5 e2e on glm-4-9b-int4 +
+qwen2.5-14b (coordinate with Sebastian on squad/marlin-bench).
