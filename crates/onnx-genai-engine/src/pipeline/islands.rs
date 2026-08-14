@@ -7,8 +7,7 @@ use std::time::Instant;
 
 use anyhow::{Context, bail};
 use onnx_genai_metadata::{
-    ComponentImplementation, KvStorageMode, ShapeRecurrence, WorkflowComponent, WorkflowNode,
-    WorkflowSpec,
+    ComponentImplementation, KvStorageMode, WorkflowComponent, WorkflowNode, WorkflowSpec,
 };
 use onnx_genai_ort::{Allocator, IoBinding, Session, Value};
 use onnx_runtime_loader::proto::onnx::{
@@ -69,7 +68,6 @@ pub(crate) struct ExecutionIsland {
     pub outputs: BTreeMap<String, String>,
     aliasable_output_values: HashSet<String>,
     shared_buffer_inputs: HashMap<String, String>,
-    shared_buffer_output_values: HashSet<String>,
     immutable_inputs: HashSet<String>,
     fallback: WorkflowNode,
     session: Session,
@@ -157,24 +155,6 @@ impl ExecutionIsland {
         self.components
             .iter()
             .any(|component| overrides.contains_key(component))
-    }
-
-    pub(crate) fn has_zero_sized_input(&self, values: &PipelineTensors) -> anyhow::Result<bool> {
-        self.inputs.values().try_fold(false, |found, value| {
-            let tensor = values.get(value).with_context(|| {
-                format!(
-                    "execution island {} input value '{value}' is unavailable",
-                    self.id
-                )
-            })?;
-            Ok(found || tensor.numel() == 0)
-        })
-    }
-
-    pub(crate) fn prepare_zero_sized_fallback(&self) {
-        for binding in self.bindings.borrow_mut().values_mut() {
-            binding.service_generation = u64::MAX;
-        }
     }
 
     pub(crate) fn fallback(&self) -> &WorkflowNode {
@@ -308,13 +288,12 @@ impl ExecutionIsland {
                     .map(|tensor| (port.as_str(), tensor))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let signature = resolved
-            .iter()
-            .map(|(_, value)| (format!("{:?}", value.dtype()), value.shape().to_vec()))
-            .collect::<Vec<_>>();
         let source_ptrs = resolved
             .iter()
             .map(|(name, value)| {
+                if value.numel() == 0 {
+                    return Ok(0);
+                }
                 value.data_ptr_addr().with_context(|| {
                     format!(
                         "execution island {} input '{name}' has no tensor data",
@@ -323,6 +302,10 @@ impl ExecutionIsland {
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
+        let signature = resolved
+            .iter()
+            .map(|(_, value)| (format!("{:?}", value.dtype()), value.shape().to_vec()))
+            .collect::<Vec<_>>();
         self.runs.set(self.runs.get() + 1);
 
         let mut bindings = self.bindings.borrow_mut();
@@ -459,7 +442,9 @@ impl ExecutionIsland {
             let mut binding = IoBinding::new(&self.session)?;
             let mut stable_inputs = Vec::new();
             for (name, source) in &resolved {
-                let stable = if !source.is_host_resident()?
+                let stable = if source.numel() == 0 {
+                    Value::empty_in(source.shape(), source.dtype(), allocator)?
+                } else if !source.is_host_resident()?
                     && source.device_id()? == device_id
                     && let Some(alias) = source.try_alias_clone()
                 {
@@ -476,24 +461,6 @@ impl ExecutionIsland {
                 stable_inputs.push(((*name).to_string(), stable));
             }
             for name in self.session.output_names() {
-                if let Some(input_name) = self
-                    .shared_buffer_inputs
-                    .iter()
-                    .find_map(|(input, output)| (output == name).then_some(input))
-                {
-                    let input = stable_inputs
-                        .iter()
-                        .find_map(|(name, value)| (name == input_name).then_some(value))
-                        .with_context(|| {
-                            format!(
-                                "execution island {} shared output '{name}' has no stable input \
-                                 '{input_name}'",
-                                self.id
-                            )
-                        })?;
-                    binding.bind_output(name, input)?;
-                    continue;
-                }
                 if !self
                     .session
                     .bind_output_to_execution_device(&mut binding, name)?
@@ -528,12 +495,31 @@ impl ExecutionIsland {
             }
             let mut stable_outputs = Vec::new();
             for (name, output) in self.session.output_names().iter().zip(produced) {
-                if self
-                    .shared_buffer_inputs
-                    .values()
-                    .any(|shared| shared == name)
+                if self.session.supports_fixed_capacity_present_binding()
+                    && let Some(input_name) = self
+                        .shared_buffer_inputs
+                        .iter()
+                        .find_map(|(input, shared)| (shared == name).then_some(input))
                 {
-                    continue;
+                    let input = stable_inputs
+                        .iter()
+                        .find_map(|(stable_name, value)| {
+                            (stable_name == input_name).then_some(value)
+                        })
+                        .with_context(|| {
+                            format!(
+                                "execution island {} shared output '{name}' has no stable input \
+                                 '{input_name}'",
+                                self.id
+                            )
+                        })?;
+                    // Alias only after warmup proves that present preserves the
+                    // full physical KV capacity. Dynamic Concat outputs remain
+                    // distinct even when metadata requests shared storage.
+                    if input.shape() == output.shape() && input.dtype() == output.dtype() {
+                        binding.bind_output(name, input)?;
+                        continue;
+                    }
                 }
                 let shape = output.shape().to_vec();
                 let output = Value::into_alias_with_shape(output, &shape).with_context(|| {
@@ -544,6 +530,17 @@ impl ExecutionIsland {
                 })?;
                 binding.bind_output(name, &output)?;
                 stable_outputs.push((name.clone(), output));
+            }
+            // The discovery run used distinct present buffers so it could prove
+            // their concrete extents without risking a too-small in-place bind.
+            // Re-run the original inputs with the now-proven aliases: shared-KV
+            // kernels may select a different path when past and present share an
+            // address, so discovery output is not a semantic substitute.
+            self.session_runs.set(self.session_runs.get() + 1);
+            if self.session.graph_capture() {
+                self.session.run_with_binding_graph(&binding, -1)?;
+            } else {
+                self.session.run_with_binding(&binding)?;
             }
             let graph_id = self.next_graph_id.get();
             self.next_graph_id.set(graph_id + 1);
@@ -723,10 +720,6 @@ impl ExecutionIsland {
                     self.id
                 )
             })?;
-            if self.shared_buffer_output_values.contains(value_ref) {
-                values.remove(value_ref);
-                continue;
-            }
             values.insert(value_ref.clone(), tensor);
         }
         Ok(())
@@ -1260,14 +1253,7 @@ fn build_execution_island(
         bail!("file-backed external-data fusion requires ORT-managed CUDA graph capture");
     }
     let mut shared_buffer_inputs = HashMap::new();
-    let mut shared_buffer_output_values = HashSet::new();
-    // Stock ORT 1.28 produces stale recurrent state when a linked file-backed
-    // graph binds every KV graph output to its corresponding graph input. Keep
-    // exact parity by retaining device outputs; the stable binding still avoids
-    // host transfers and captures the complete linked session.
-    if linked.external_files.is_empty()
-        && let Some(serving) = &workflow.serving
-    {
+    if let Some(serving) = &workflow.serving {
         for group in serving
             .kv_service
             .groups
@@ -1278,17 +1264,7 @@ fn build_execution_island(
                 let Some(aliases) = group.ports.get(&invocation.component) else {
                     continue;
                 };
-                for (state_name, alias) in aliases {
-                    // Output-to-input elision is valid only when the physical
-                    // tensor shape is invariant. Growing/bounded KV state needs
-                    // a distinct output allocation even when its logical
-                    // service storage is shared across iterations.
-                    if !matches!(
-                        workflow.state.get(state_name).map(|cell| &cell.recurrence),
-                        Some(ShapeRecurrence::Invariant)
-                    ) {
-                        continue;
-                    }
+                for alias in aliases.values() {
                     let Some(input_value) = invocation.inputs.get(&alias.input) else {
                         continue;
                     };
@@ -1316,7 +1292,6 @@ fn build_execution_island(
                             )
                         })?;
                     shared_buffer_inputs.insert(input_name, output_name);
-                    shared_buffer_output_values.insert(output_value.clone());
                 }
             }
         }
@@ -1383,7 +1358,6 @@ fn build_execution_island(
         outputs: linked.outputs,
         aliasable_output_values: aliasable_output_values.clone(),
         shared_buffer_inputs,
-        shared_buffer_output_values,
         immutable_inputs,
         fallback: WorkflowNode::Sequence {
             nodes: invocations

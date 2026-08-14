@@ -445,6 +445,24 @@ fn session_state_value_name(cell: &str) -> String {
 }
 
 impl PipelineEngine {
+    fn materialize_workflow_value_copy(&self, value: &Value) -> anyhow::Result<Value> {
+        if value.is_host_resident()? {
+            return clone_value(value);
+        }
+        let device_id = value.device_id()?;
+        let island = self
+            .execution_islands
+            .iter()
+            .find(|island| island.cuda_device_id() == Some(device_id))
+            .with_context(|| {
+                format!(
+                    "workflow has a value on CUDA device {device_id} but no execution island for \
+                     that device"
+                )
+            })?;
+        island.materialize_host(value)
+    }
+
     fn materialize_workflow_value(
         &self,
         values: &mut PipelineTensors,
@@ -1144,6 +1162,15 @@ impl PipelineEngine {
                 } else {
                     anyhow::bail!("workflow branch has no case '{key}' and no default");
                 };
+                let mut device_values = Vec::new();
+                for (name, value) in values.iter() {
+                    if !value.is_host_resident()? {
+                        device_values.push(name.clone());
+                    }
+                }
+                for name in device_values {
+                    self.materialize_workflow_value(values, &name)?;
+                }
                 let mut branch_values = clone_pipeline_tensors(values)?;
                 let mut branch_state_refs = final_state_refs.clone();
                 let emit_counts_before = emit_counts.clone();
@@ -1229,7 +1256,6 @@ impl PipelineEngine {
                 ..
             } => {
                 let emit_started = std::time::Instant::now();
-                self.materialize_workflow_value(values, value)?;
                 if let Some(when) = when {
                     self.materialize_workflow_value(values, when)?;
                 }
@@ -1239,14 +1265,17 @@ impl PipelineEngine {
                 if let Some(row_ids) = row_ids {
                     self.materialize_workflow_value(values, row_ids)?;
                 }
-                let tensor = if self.movable_emit_values.contains(value) {
-                    values
-                        .remove(value)
-                        .with_context(|| format!("workflow emit value '{value}' is unavailable"))?
-                } else {
-                    clone_value(values.get(value).with_context(|| {
-                        format!("workflow emit value '{value}' is unavailable")
-                    })?)?
+                let tensor = {
+                    let source = values
+                        .get(value)
+                        .with_context(|| format!("workflow emit value '{value}' is unavailable"))?;
+                    if source.is_host_resident()? && self.movable_emit_values.contains(value) {
+                        values.remove(value).with_context(|| {
+                            format!("workflow emit value '{value}' is unavailable")
+                        })?
+                    } else {
+                        self.materialize_workflow_value_copy(source)?
+                    }
                 };
                 let output_contract = workflow.outputs.get(output).with_context(|| {
                     format!("workflow emit references undeclared output '{output}'")
@@ -1362,11 +1391,7 @@ impl PipelineEngine {
                 let island = self.execution_islands.get(*id).with_context(|| {
                     format!("workflow references unknown execution island {id}")
                 })?;
-                let zero_sized_fallback = island.has_zero_sized_input(values)?;
-                if island.uses_override(component_overrides) || zero_sized_fallback {
-                    if zero_sized_fallback {
-                        island.prepare_zero_sized_fallback();
-                    }
+                if island.uses_override(component_overrides) {
                     self.run_workflow_node(
                         island.fallback(),
                         workflow,
