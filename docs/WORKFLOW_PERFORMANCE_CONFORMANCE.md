@@ -91,12 +91,16 @@ acceptance results use the defaults.
 
 The first workflow invocation discovers artifact-inferred output extents before allocating stable
 bindings, so its cold-start latency is higher than a baseline whose output shapes were supplied
-directly. Subsequent invocations use stable bindings and CUDA graph replay. Production sessions
-should prewarm; eliminating discovery through planner-provided inferred output extents remains a
-startup optimization rather than a reason to relax steady-state or warm-TTFT acceptance.
+directly. CUDA sessions warm each final fixed-address binding with `gpu_graph_id=-1`; the next
+equal-shape invocation captures it. Each input-shape signature, including B=1/2/4, owns a distinct
+binding and graph ID. Production sessions should warm the largest supported batch first so ORT
+allocates non-arena constants before any smaller graph is captured.
 
 Prepared plans track the backing pointer of each stable input slot. Unchanged values are not copied
 again; `set_input` replaces the slot and triggers exactly one refresh. Single-run island outputs
 are exposed as no-copy aliases until package-output materialization, while repeated loop-island
 outputs retain independent storage. Shared-buffer KV aliases bind declared past/present ports to
-the same device allocation and refresh only at the start of a prepared execution.
+the same device allocation only for physically invariant state; growing or bounded KV outputs keep
+separate device allocations and use logical lengths for inactive rows. Linked models retain
+external-data references and automatically form an ORT-managed CUDA Graph island when capture is
+enabled; no file-backed opt-in gate is required.

@@ -7,7 +7,8 @@ use std::time::Instant;
 
 use anyhow::{Context, bail};
 use onnx_genai_metadata::{
-    ComponentImplementation, KvStorageMode, WorkflowComponent, WorkflowNode, WorkflowSpec,
+    ComponentImplementation, KvStorageMode, ShapeRecurrence, WorkflowComponent, WorkflowNode,
+    WorkflowSpec,
 };
 use onnx_genai_ort::{Allocator, IoBinding, Session, Value};
 use onnx_runtime_loader::proto::onnx::{
@@ -507,7 +508,14 @@ impl ExecutionIsland {
             self.session.synchronize_device()?;
             self.eager_runs.set(self.eager_runs.get() + 1);
             self.session_runs.set(self.session_runs.get() + 1);
-            self.session.run_with_binding(&binding)?;
+            if self.session.graph_capture() {
+                // Populate ORT's non-arena constants and discover output extents
+                // without consuming a graph id. The stable binding is captured
+                // only on its next run, after every OrtValue address is fixed.
+                self.session.run_with_binding_graph(&binding, -1)?;
+            } else {
+                self.session.run_with_binding(&binding)?;
+            }
             let produced = binding.output_values().with_context(|| {
                 format!(
                     "execution island {} could not extract warmup outputs",
@@ -1246,13 +1254,10 @@ fn build_execution_island(
         .cloned()
         .collect::<HashSet<_>>();
     let linked = link_models(id, &invocations, models, &boundary_outputs)?;
-    if !linked.external_files.is_empty()
-        && std::env::var("ONNX_GENAI_FILE_BACKED_SUPER_ISLAND").as_deref() != Ok("1")
-    {
-        bail!(
-            "file-backed external-data fusion is disabled; set \
-             ONNX_GENAI_FILE_BACKED_SUPER_ISLAND=1 to enable it"
-        );
+    let mut options = models.session_options();
+    let capture_requested = options.graph_capture;
+    if !linked.external_files.is_empty() && !(device.starts_with("cuda:") && capture_requested) {
+        bail!("file-backed external-data fusion requires ORT-managed CUDA graph capture");
     }
     let mut shared_buffer_inputs = HashMap::new();
     let mut shared_buffer_output_values = HashSet::new();
@@ -1273,7 +1278,17 @@ fn build_execution_island(
                 let Some(aliases) = group.ports.get(&invocation.component) else {
                     continue;
                 };
-                for alias in aliases.values() {
+                for (state_name, alias) in aliases {
+                    // Output-to-input elision is valid only when the physical
+                    // tensor shape is invariant. Growing/bounded KV state needs
+                    // a distinct output allocation even when its logical
+                    // service storage is shared across iterations.
+                    if !matches!(
+                        workflow.state.get(state_name).map(|cell| &cell.recurrence),
+                        Some(ShapeRecurrence::Invariant)
+                    ) {
+                        continue;
+                    }
                     let Some(input_value) = invocation.inputs.get(&alias.input) else {
                         continue;
                     };
@@ -1306,8 +1321,6 @@ fn build_execution_island(
             }
         }
     }
-    let mut options = models.session_options();
-    let capture_requested = options.graph_capture;
     let structurally_capture_eligible =
         device.starts_with("cuda:") && capture_requested && linked.capture_declines.is_empty();
     let linked_path = (!linked.external_files.is_empty())

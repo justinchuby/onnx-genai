@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use onnx_genai_engine::{
     Engine, EngineConfig, GeneratePrompt, GenerateRequest, PipelineGenerateRequest,
 };
-use onnx_genai_ort::{DataType, Value};
+use onnx_genai_ort::{DataType, SessionOptions, Value};
 
 fn package(name: &str, metadata: &str, models: &[(&str, &str)]) -> anyhow::Result<PathBuf> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1353,18 +1353,35 @@ pipeline:
     )?;
 
     let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
-    let output = engine.run_pipeline(
-        PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
-            .with_input(
-                "logits",
-                Value::from_slice_f32(&[4.0, 3.0, 1.0, 0.0], &[1, 4])?,
-            ),
-    )?;
-    assert_eq!(output["token"].to_vec_i64()?, [2]);
+    // Warm the largest bucket first, then interleave B=1/2/4. Each shape keeps
+    // a distinct fixed-address binding and graph id.
+    for batch in [4_i64, 1, 2, 4, 1, 2, 4, 1, 2] {
+        let mut logits = Vec::with_capacity(usize::try_from(batch * 4)?);
+        for _ in 0..batch {
+            logits.extend_from_slice(&[4.0, 3.0, 1.0, 0.0]);
+        }
+        let output = engine.run_pipeline(
+            PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
+                .with_input("logits", Value::from_slice_f32(&logits, &[batch, 4])?),
+        )?;
+        assert_eq!(
+            output["token"].to_vec_i64()?,
+            vec![2; usize::try_from(batch)?]
+        );
+    }
+    let options = SessionOptions::default();
+    let capture_expected = options.selects_cuda() && options.graph_capture;
     assert_eq!(
         engine.execution_island_diagnostics().len(),
-        usize::from(std::env::var("ONNX_GENAI_FILE_BACKED_SUPER_ISLAND").as_deref() == Ok("1"))
+        usize::from(capture_expected)
     );
+    if capture_expected {
+        let diagnostics = &engine.execution_island_diagnostics()[0];
+        assert!(diagnostics.device.starts_with("cuda:"));
+        assert!(diagnostics.capture_eligible);
+        assert_eq!(diagnostics.captures, 3);
+        assert_eq!(diagnostics.replays, 3);
+    }
     Ok(())
 }
 
