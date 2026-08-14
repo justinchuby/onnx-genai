@@ -54,3 +54,23 @@ deep kernel-capture-support program, not "reuse existing machinery"); **Lever A 
 unconditional ~1.3–1.6×) promoted to the primary decode lever.** Supersedes #938's Lever-B-first call.
 
 - 2026-08-14 (#957, MERGED 2f0b62b3): Spec-capture feasibility (design-only) → **CONDITIONAL-GO gated behind Marlin** — refines (not overturns) the Lever B NO-GO. Break-even B\*=8.5 today → ~1.2–2.0 post-Marlin; ~80 ms M=8 floor is the 240 MatMulNBits generic GEMMs (Marlin fixes it) + two cheap GQA/norm M>1 capture fixes. Do NOT fund the speculative build ahead of Marlin.
+
+## 2026-08-14 — Marlin fp16×int4 tensor-core GEMM (Lever A) LANDED & MERGED (#960, 7774ec5b)
+Built + shipped the from-scratch SM80 `mma.sync.m16n8k16` fused fp16×int4 tensor-core GEMM
+(`crates/onnx-runtime-ep-cuda/src/kernels/marlin_gemm.rs`) — adapt-not-vendor (ONNX N-major nibble
+packing, asymmetric nibble zero-points, groups 16/32/64/128; per-group scale applied AFTER the
+tensor-core accumulate; raw inline `mma.sync` PTX; no upstream source ⇒ no LICENSE vendoring). Wired into
+`MatMulNBits` M>1 (plain + rmsnorm-prologue + gate_up SwiGLU fused) + split-K + the GQA/SkipLN M>1
+capture-safety valves + lm_head cached dense-GEMM capture plan. Opt-in `ONNX_GENAI_MARLIN_M_GT_1` (default
+OFF, SM80 guard, byte-identical tiled fallback — Rule 11); split-K default-ON (`ONNX_GENAI_MARLIN_SPLITK=0`
+opts out). **Result (glm-4-9b canonical gate):** M=8 verify graph **41 fragmented segments / B\*=8.76×
+(hard NO-GO) → SINGLE whole-graph capture, ZERO unsupported nodes, B\*=2.16×** (arc 8.76→4.99→2.71→2.63→
+2.16×), byte-identical greedy tokens, prefill ~2×. B\*≈2.16 is the intrinsic small-M `mma.m16n8k16` floor,
+not a tuning gap. **Attribution correction (my update-10 fixes update-8):** fused gate_up split-K needs
+`block_size==32`; glm is block-128 so its fused gate_up node never forms — glm's 2.63→2.16× was ENTIRELY
+the `4abe4e57` general small-M split-K retune, NOT gate_up fusion. qwen (block-32) forms/fires the fused
+node; its capture is fully solved (segments=1, zero unsupported) but B\*≈4.7× is a denominator effect (fast
+tuned block-32 M=1), a drafting-depth follow-up not a kernel bug. Gates the #957 spec-capture
+CONDITIONAL-GO — Lever A delivered. Reviews: Chew 🟡 APPROVE-WITH-NOTES, Gaff 🟢 APPROVE. Lesson: keep the
+flag opt-in until broader prompt/model parity coverage; add a fallback logging/counter (Chew N2) before any
+default flip.

@@ -87,3 +87,21 @@ fusion pursued: the fusion arc concluded that **native int4 decode of Muse-Glimm
 weight-bandwidth/compute-floor bound at ~47.25 tok/s (H200)** (the architectural ceiling), so
 node/launch fusion — cheap or expensive — cannot help. Rule reinforced: bf16 accumulate in fp32,
 oracle-gate against f64.
+
+## 2026-08-14 — PR #960 Marlin int4 M>1 GEMM numerics review 🟡 APPROVE-WITH-NOTES
+Reviewed Deckard's Marlin fp16×int4 tensor-core GEMM (numerics only; Gaff owns quality). Verified by close
+read of the mma B-fragment lane mapping + repack (host `repack_int4_weights` == device repack, byte-identical,
+all group sizes), the **scale-after-accumulate** factoring (exact: scale/zp constant across K within a group),
+asymmetric nibble zp indexing, padding-column guard, split-K disjoint fp32 partials (deterministic fixed-order
+reduce ⇒ capture-stable), and the lm_head cached dense-GEMM plan (cuBLASLt heuristic deterministic for fixed
+shape ⇒ cached algo == dynamic algo). Ran the in-crate GPU parity suite on H200: **11/11 pass** incl.
+`marlin_parity_vs_f64_oracle`, `marlin_splitk_parity_vs_f64_oracle`, `marlin_splitk_is_deterministic`,
+`repack_roundtrip_all_group_sizes`. Confirmed Pris's #961 f64 tolerance is engineering-justified (~8× fp16-ULP
+headroom), not a rubber stamp. **No correctness bug — ship.** Three non-blocking notes: (N1) "byte-identical
+greedy tokens" is a soft argmax-stability guarantee (empirical over 2 models × 24 tokens), NOT a numeric
+invariant — a near-tie on an untested prompt could flip; keep the flag opt-in. (N2) hard Marlin launch errors
+are silently swallowed into the tiled fallback (`Err(_) => fall through`) — numerically safe but log/count it
+so a real kernel fault can't hide behind the slow path. (N3) Marlin assumes nibble-packed int zero-points
+(matches every existing int4 tiled kernel — not a regression; guard dispatch if float-zp int4 is ever added).
+Rule reinforced: a relayout that reorders partial sums cannot be diffed bit-for-bit; the only defensible
+reference is a high-precision f64 oracle with a justified tolerance.

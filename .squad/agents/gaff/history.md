@@ -70,3 +70,20 @@ Reviewed HEAD `fbf322f76b` — the evidence-accuracy fix commit. Built from clea
 ## 2026-08-12 — PR #31973 evidence-accuracy review (focused delta)
 
 Focused evidence review of Mariette's B1+B2 fixes (HEAD `fbf322f76b`). Reproduced all four accuracy figures to 4 significant figures. Confirmed `nullptr` MeanOut matches production. Dispatch assertion fires. No stale claims found. Test counts 41/2/43 confirmed on fresh build. One nit: RMSNorm ~3.3x at NormSize 256 is ~14% above measured ~2.84x; body says ~0.83x at NormSize 15, measured 1.00x (body is conservative). Coordinator widened variance disclosure to ~15%. Verdict: ready to leave draft, no blockers.
+
+## 2026-08-14 — PR #960 Marlin int4 M>1 GEMM quality/portability review 🟢 APPROVE
+Reviewed Deckard's Marlin M>1 GEMM for quality / Rule 11 portability / capture-safety / build hygiene (numerics
+= Chew; the B\*=2.16 plateau is an accepted honest plateau, not a defect). Frozen head `a11facbc` (code
+`3735d57e`). **Zero blocking defects.** Rule 11 PASS: genuinely opt-in (`ONNX_GENAI_MARLIN_M_GT_1` default OFF,
+checked first at all three M>1 dispatch seams), SM80 guard correct (`device_supports_marlin` ANDed at every call
+site — even a force-set env var on <SM80 falls through to the portable tiled GEMM), and Marlin-OFF is provably
+byte-identical to the prior tiled path; any runtime ineligibility/launch error also falls through. Env-var honesty
+PASS: both knobs read & wired (`verify_documented_env_vars.py` EXIT 0). Capture-safety valve family sound: four
+caches share one contract — cache-hit → warm (no alloc/sync ⇒ capture-safe); cold miss while `is_capturing()` →
+return Err so caller falls back, never alloc inside capture; pre-warm forward populates them. GQA M>1 Fused flash
+path + SkipLN latch relaxation both verified capture-safe (on-device totals, no host read-back, shape-keyed cache
+rejects mid-capture shape change). `cargo fmt` + the exact CUDA and engine `-D warnings` clippy gates clean; all
+`unsafe` blocks carry SAFETY justifications. One trivial `cfg(test)`-only `clippy::unusual_byte_groupings` note
+(`0xcafef00d_1234_5678u64`) — outside the CUDA CI gate (no `--all-targets`), does not break CI, trivially fixable.
+Rule reinforced: env-var honesty + a byte-identical default-OFF fallback are the portability contract for any
+tier-scoped kernel.
