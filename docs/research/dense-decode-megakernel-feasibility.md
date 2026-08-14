@@ -605,6 +605,70 @@ trade may flip. **No production regression: the default binary is unchanged (47.
 
 ---
 
+### 8.7 PROTOTYPED — bf16 norm-into-GEMV-prologue fusion (measured **NO-GO**, this H200)
+
+> **Finding-only record.** The prototype pass measured below was a throwaway probe; because the result
+> is a regression **and** numerically divergent (not byte-exact), the code was **NOT landed** — no
+> production `src/` change, no opt-in flag, no kernel change ships from this work. Only this NO-GO
+> finding and its mechanism are retained. Reproduce from the design notes here if a future device or a
+> new cooperative-reduction prologue kernel (see the mechanism below) revisits it.
+
+§8.6 closed by naming the *only* bf16 path that could still win: fold the standalone bf16 RMSNorm
+into the **prologue of the following multi-CTA int4 GEMV** — the bf16 analogue of the fp16
+`CudaSkipRmsNormMatMulFusion` — so the RMS reduction rides the GEMV's full-device (132-SM) occupancy
+instead of a standalone single-CTA launch. Pattern: `x → SimplifiedLayerNormalization(x, γ) → MatMulNBits`
+collapses to one fused GEMV that reads `x`, computes RMS(x) in its prologue, normalizes, then does the
+int4 GEMV. This is the distributed-reduction fix that §8.6's standalone fold (−1.5%, #903) lacked.
+The prototype was a dedicated bf16-only optimizer pass (redirect the follower GEMV's activation to the
+norm input `x`, bind γ at slot 6/5, set the prologue attr+epsilon, delete the norm) — measured, then
+discarded per the finding-only note above.
+
+**Structure (Gemma3 sandwich-norm, from the real graph — 312 `SimplifiedLayerNormalization`,
+417 `MatMulNBits`):** only the two **pre-norms** per layer (`input_layernorm` → Q/K/V/gate GEMVs;
+`pre_feedforward_layernorm` → gate/up GEMVs) are `norm → GEMV` seams (`x` is the residual stream, not a
+GEMV output → no residual/preceding-GEMV fold). 2 foldable pre-norms/layer × 52 = **104 foldable**.
+The qk-norms (→ Mul/Reshape), post-attention and post-feedforward norms (→ Add) do not feed a GEMV and
+are left standalone.
+
+**Kernel:** no changes needed. The bf16 GEMV stages through fp16 in `MatMulNBitsKernel::run_bf16`
+(casts bf16→fp16 — mantissa-lossless — runs the tuned fp16 int4 GEMV that honors the prologue attr,
+casts fp16→bf16), so a bf16 GEMV carrying the prologue attr reuses the existing fp16 prologue kernel.
+
+**Measured (H200, `ONNX_GENAI_CUDA_GRAPH=1`, interleaved A/B, `--pipeline`):**
+
+| Configuration | tok/s | Δ |
+|---|---|---|
+| Baseline (default, pass OFF) | **47.9** | — |
+| Norm→GEMV-prologue fused ON | **45.7** | **−4.6 % REGRESSION** |
+
+Greedy 128-token stream **DIVERGES at ≈token 38** (`…2963, 38, 9520…` → `…2963, 38, 8323, 2481, 9520…`)
+→ **not byte-exact** (would need Chew even if perf were neutral).
+
+**Mechanism (op timer, eager decomposition):** folding removed only **~1.8 ms** of standalone norm
+(106.55 → 104.78 ms — the bf16 standalone norm `rmsnorm_bf16` is a block-tree parallel reduction and is
+*already cheap*), but added **+180 ms** to the GEMVs (368.91 → 548.81 ms, **+48 %**). The fp16 prologue
+reduction is `skip_rmsnorm_f16_warp_half4` — a **single-warp serial** sweep of the whole H=6656 row while
+the block's other warps idle at `__syncthreads`, re-executed **once per following GEMV** (input_layernorm
+fans out to ≤4 GEMVs). So the fold trades ~1.8 ms of a cheap parallel reduction for ~180 ms of serial
+warp reduction placed **on the critical GEMV path, redundantly per fan-out follower**.
+
+This is the **exact inverse** of the fp16 skip case that motivated `CudaSkipRmsNormMatMulFusion`: there
+the standalone `skip_rmsnorm` was ~24 % of decode and the prologue absorbed it for free; the
+`fusion_benefit_is_positive` gate was calibrated on that fp16 assumption, which is **FALSE for bf16**
+because the bf16 block-tree norm is already efficient. The kernel-level *distributed-reduction* idea is
+sound in principle, but the prologue reduction that actually exists is **single-warp-serial**, not a
+genuine multi-CTA cooperative reduction across the GEMV grid — a real win would require a **new
+cooperative-reduction prologue kernel**, out of scope for this bounded gate.
+
+**Verdict — NO-GO / NO-SHIP.** The prototype pass was **not landed** (finding-only; no `src/` change,
+no opt-in flag, no dead code) — the default binary is unchanged (**48.15 tok/s == baseline,
+byte-identical stream**). Kill-gate CLOSED: **decode remains at its launch-amortized latency floor
+(~47.6–48 tok/s)**; do not pursue norm→GEMV-prologue on H200 without first writing a true multi-CTA
+cooperative-reduction prologue. This is the **fourth** independent confirmation of the launch-amortized
+latency floor (megakernel §7, glue-under-replay §8, standalone skip-fold §8.6, and now this).
+
+---
+
 - Env: `source /home/justinchu/onnx-genai/.cudaenv.sh`; `CUDA_VISIBLE_DEVICES=0 ONNX_GENAI_CUDA_DEVICE=0`.
 - Baseline/eager/op-mix: `profile_native` as in §1 (`ONNX_GENAI_CUDA_GRAPH=0/1`, `ONNX_GENAI_PROFILE_OPS=1`).
 - Phase B / P1.5 / P2-prototype micro-bench (throwaway, `#[ignore]`, never shipped):
