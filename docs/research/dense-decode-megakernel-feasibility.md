@@ -772,6 +772,31 @@ relative check fails). Plain split-K passes that guard.
   lever. Beyond the kernel, the ~39% non-GEMV tail Amdahl-caps decode; the large multipliers
   (speculative decoding, tensor-parallel) stack on top and are the higher-leverage next steps.
 
+### 9.4 Kernel↔token reconciliation (the honesty check — is the token number Amdahl-diluted or hiding a flat token?)
+
+A pretty per-kernel number can hide a flat token number (cf. the byte-fold probe in
+`lowbit-quant-feasibility.md`: −75% weight DRAM bytes → only **+2.8%** end-to-end, because bytes were
+not the binding). So reconcile the two levels explicitly for fold-scale:
+
+- **Kernel level (ncu):** dominant GEMV **56 → 53.4 µs = −4.6%** per-kernel time; DRAM 29.4 → 30.9%.
+- **Token level (steady, medians, GPU-idle-pinned):** **47.7 → 49.0 tok/s = +2.7%** end-to-end.
+- **Non-GEMV fraction:** ~39% ⇒ GEMV ≈ 61% of decode.
+
+Amdahl prediction: `1 / (0.39 + 0.61 × (1 − 0.046)) = +2.9%`. **Measured +2.7%.** The token gain is
+**fully explained by Amdahl** — there is **no extra dilution beyond the 39% non-GEMV tail**, i.e. no
+hidden serial node-launch floor stealing the kernel win (consistent with graph replay already having
+amortized launches, which is exactly why the four §7–§8.7 launch-collapse levers were NO-GOs). This is
+the **benign inverse** of the byte-fold caution: there the kernel didn't improve (bytes weren't the
+binding); here the kernel *did* improve (−4.6%) and the token moved by precisely the Amdahl-predicted
+amount — the win is real and un-hidden, just **small**.
+
+The uncomfortable part, stated plainly: the hope that "cp.async attacks the actual 40% Long-Scoreboard
+binding, so we should beat +2.8%" **did not hold** — cp.async **regressed −13%** (4 B/lane granularity
+too small to amortize) and split-K was flat/negative. The levers that *should* attack the named bindings
+don't, given the current weight layout, so the only realized lever is the ALU-relief fold-scale (+2.7%),
+which lands at the byte-fold caution level for a *different, benign* reason (Amdahl on a modest real
+kernel win), not a flat-token / serial-dispatch pathology.
+
 Repro: `matmul_nbits.rs` fold-scale entries `..._foldscale_splitk` / `..._foldscale_zp_splitk`, gated by
 `gemv_foldscale_enabled()`; A/B with `ONNX_GENAI_GEMV_FOLDSCALE=1` vs unset on
 `profile_native --model <dir> --pipeline --ep cuda --backend native --steady --warmups 2 --runs 5 --tokens 128`.

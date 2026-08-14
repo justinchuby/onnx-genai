@@ -32,6 +32,14 @@ fold-scale K=2 **48.9–49.0 (+2.7%)**; split-K K4=47.8 / K8=45.4; cp.async K2=4
 fold-scale: dominant kernel 56→53.4 µs (−5%), DRAM 29.4→30.9%, Long-Scoreboard relatively rose (ALU
 relief shifts balance back to loads — confirms the mechanism).
 
+**Kernel↔token reconciliation (Roper's honesty check):** kernel −4.6% (56→53.4 µs) over the ~61%
+GEMV fraction predicts `1/(0.39+0.61×0.954)=+2.9%` end-to-end; **measured +2.7%** — the token gain is
+**fully Amdahl-explained, no hidden serial-dispatch floor** (graph replay already amortized launches).
+This is the *benign inverse* of the `lowbit-quant-feasibility.md` byte-fold probe (−75% bytes → +2.8%,
+because bytes weren't the binding): here the kernel genuinely improved and the token moved by exactly the
+predicted amount — real but small. The hope that cp.async would beat +2.8% by hiding the 40%
+Long-Scoreboard did NOT hold (cp.async −13%, split-K flat); the current weight layout defeats those levers.
+
 **Why:** The GEMV is **co-bound** (40.7% Long-Scoreboard load-latency AND 64.8% dequant-ALU), not purely
 latency-bound, so the textbook latency-hiding levers (split-K, small-granularity cp.async) can't raise
 achieved DRAM. The hoped 1.3–1.6× (60–75 tok/s) did **not** materialize — the existing GEMV is already
