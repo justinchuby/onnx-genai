@@ -121,6 +121,9 @@ struct Args {
     /// tokens so prefill, eager warmup, and graph capture are outside the window.
     #[arg(long)]
     steady: bool,
+    /// Must be at least 1: the steady window is timed from the token
+    /// immediately before the first measured token, so index `decode_skip - 1`
+    /// has to exist.
     #[arg(long, default_value_t = 8)]
     decode_skip: usize,
     #[arg(long, value_enum, default_value_t = ExecutionProvider::Cpu)]
@@ -1392,6 +1395,12 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
     if args.synthetic {
         bail!("--steady requires a real model directory");
     }
+    if args.decode_skip == 0 {
+        bail!(
+            "--decode-skip must be at least 1: the steady window is timed from the token \
+             immediately before the first measured token"
+        );
+    }
     if args.tokens <= args.decode_skip {
         bail!("--tokens must be greater than --decode-skip");
     }
@@ -1549,6 +1558,12 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
              has no k-token verify/rewind hook. Native prompt-lookup speculation is wired only \
              into the single-model Engine path (use --steady without --pipeline). Requesting \
              speculation here would be silently ignored and report misleading (greedy) numbers."
+        );
+    }
+    if args.steady && args.decode_skip == 0 {
+        bail!(
+            "--decode-skip must be at least 1: the steady window is timed from the token \
+             immediately before the first measured token"
         );
     }
     if args.steady && args.tokens <= args.decode_skip {
