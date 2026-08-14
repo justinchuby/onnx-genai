@@ -392,13 +392,12 @@ impl Value {
     /// device tensor that address is not dereferenceable from the CPU, so the
     /// alternative to this check is a wild read or store rather than a fault.
     fn ensure_host_accessible(&self, operation: &str) -> Result<()> {
-        if self.is_host_accessible() {
+        if self.is_host_accessible() && self.is_host_resident()? {
             return Ok(());
         }
         Err(OrtError::InvalidArgument(format!(
             "{operation} needs to reach this tensor's bytes through a host pointer, but it \
-             wraps external memory that was declared as living on a device; copy it to the \
-             host first, or use the device-side helpers"
+             lives on a device; copy it to the host first, or use the device-side helpers"
         )))
     }
 
@@ -539,6 +538,9 @@ impl Value {
         let get_device_type = api
             .MemoryInfoGetDeviceType
             .ok_or(OrtError::ApiUnavailable("MemoryInfoGetDeviceType"))?;
+        let get_name = api
+            .MemoryInfoGetName
+            .ok_or(OrtError::ApiUnavailable("MemoryInfoGetName"))?;
         let mut memory_info = std::ptr::null();
         // SAFETY: `self.ptr` is a valid tensor OrtValue. ORT owns the returned
         // OrtMemoryInfo for the lifetime of the value, so it must not be freed.
@@ -552,7 +554,20 @@ impl Value {
         // SAFETY: `memory_info` is the non-null table ORT just returned, and
         // `device_type` is a valid out-parameter for the duration of the call.
         unsafe { get_device_type(memory_info, &mut device_type) };
-        Ok(device_type == onnx_genai_ort_sys::OrtMemoryInfoDeviceType_CPU)
+        if device_type != onnx_genai_ort_sys::OrtMemoryInfoDeviceType_CPU {
+            return Ok(false);
+        }
+        let mut name = std::ptr::null();
+        // SAFETY: `memory_info` is valid and `name` is a live out-parameter.
+        crate::error::check_status(unsafe { get_name(memory_info, &mut name) })?;
+        if name.is_null() {
+            return Err(OrtError::NullPointer);
+        }
+        // `CreateMemoryInfo`, used by the built-in CUDA allocator, does not
+        // encode an OrtDevice type and ORT reports CPU here despite returning
+        // a device pointer. The allocator name remains authoritative.
+        let name = unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy();
+        Ok(!matches!(name.as_ref(), "Cuda" | "DML" | "WebGPU_Buffer"))
     }
 
     /// Return the allocator device ID recorded on this tensor.
@@ -1267,6 +1282,11 @@ impl Value {
     #[allow(clippy::arc_with_non_send_sync)]
     pub fn into_alias_with_shape(owner: Value, shape: &[i64]) -> Result<Self> {
         Self::alias_with_shape(Arc::new(owner), shape)
+    }
+
+    /// Create a no-copy tensor view while retaining a shared allocation owner.
+    pub fn alias_from_shared_owner(owner: Arc<Value>, shape: &[i64]) -> Result<Self> {
+        Self::alias_with_shape(owner, shape)
     }
 
     /// If this value is a no-copy alias over a shared owner, produce another
@@ -2069,6 +2089,15 @@ mod cuda_device_write_tests {
             return;
         };
         let owner = Value::empty_in(&[4], DataType::Int64, &allocator).expect("device allocation");
+        assert!(!owner.is_host_resident().expect("device residency"));
+        let host = Value::from_slice_i64(&[9, 8, 7, 6], &[4]).expect("host tensor");
+        let error = owner
+            .copy_from_host(&host)
+            .expect_err("CUDA allocation must not be host-accessible");
+        assert!(
+            error.to_string().contains("lives on a device"),
+            "unexpected error: {error}"
+        );
         let bytes = [1_i64, 2, 3, 4]
             .into_iter()
             .flat_map(i64::to_ne_bytes)
