@@ -8,22 +8,36 @@ Foundry-managed multi-process and multi-node coordination
 
 ## Motivation
 
-Memory is currently retained independently by ORT/EP arenas, model weights,
-generation state, and backend caches. The pools cannot safely lend or reclaim
-capacity across components, so memory is stranded and configured limits do not
-describe actual process pressure.
+The goal is to make ORT and ORT GenAI execute one or more models efficiently on
+a local machine across heterogeneous CPUs, GPUs, and NPUs. A model should still
+run when its weights and generation state do not fit in VRAM; a small workload
+should consume only what it needs; multiple models and requests should share
+available capacity; and operators should be able to preserve enough headroom
+for the desktop and other applications.
 
-To address this, the proposal introduces:
+This requires the runtime to:
 
-1. A GenAI-independent `ProcessMemoryManager` in each ORT process.
-2. An optional Foundry Local `ServingMemoryCoordinator` that delegates
-   coarse quotas only to participating Foundry workers.
-3. The OS/driver as the ultimate machine-wide arbiter; unrelated programs
-   are external pressure, not reclaimable holders.
-4. ORT GenAI responsible for generation/state policy and ORT responsible
-   for graph execution, allocator contracts, EPs, and kernels.
-5. One memory control plane with multiple model-view/data-plane mechanisms:
-   flat VMM, blocks-plus-table, static buffers, and fixed/indexed state.
+- use weight offload, tiered state, and demand commitment when a model exceeds
+  one device's memory;
+- avoid maximum-context and per-model worst-case reservations when actual demand
+  is smaller;
+- coordinate weights, KV/recurrent state, activations, workspaces, prefix
+  caches, and runtime overhead under one resource envelope;
+- support prompt reuse, continuous batching, and fast local model switching
+  without each subsystem hoarding an isolated pool; and
+- adapt placement and accounting to discrete, unified, multi-device,
+  multi-process, and multi-node topologies.
+
+Today these bytes are retained independently by ORT/EP arenas, model residency,
+generation state, and backend caches. Each component can optimize its own pool
+but cannot safely lend unused capacity or reclaim it from another holder. The
+result is stranded memory, avoidable offload or allocation failure, poor
+multi-model utilization, and limits that do not describe the runtime's true
+pressure on the machine.
+
+This proposal defines the contracts that let those specialized components share
+one coordinated control plane without replacing their allocators, kernels, or
+state-specific policies.
 
 ## Contracts
 
@@ -76,66 +90,54 @@ I12 is the design obligation represented by
 
 ## Architecture
 
-Arrows below are control, request, quota, or budget-signal flow. Containment denotes ownership;
-responses, metrics, and pressure callbacks are omitted.
+The diagram separates ownership from runtime interaction. Every numbered path is
+described immediately below it.
 
-```mermaid
-flowchart TD
-    OS["OS / driver<br/>ultimate machine arbiter"]
-    Cluster["ClusterCoordinator<br/>node placement + coarse node quota"]
-    Client["Local API clients"] --> Foundry
-    Standalone["Standalone ORT application"]
+```text
+ COORDINATION
 
-    subgraph Product["Foundry Local"]
-        Foundry["Product APIs, packages, routing, policy"]
-        Serving["ServingMemoryCoordinator<br/>cooperative Foundry worker quotas"]
-        Foundry --> Serving
-    end
+ OS / driver -------- budget signals --------> ServingMemoryCoordinator
+ ClusterCoordinator -- node placement/quota --> ServingMemoryCoordinator
+ Foundry Local ------- product policy --------> ServingMemoryCoordinator
+ ServingMemoryCoordinator -- (1) delegated quota --> ProcessMemoryManager
 
-    subgraph Worker["One participating ORT worker process (1..N)"]
-        subgraph Generation["ORT GenAI (may merge into ORT)"]
-            Gen["Generation API / engine / scheduler"]
-            Weights["Model residency holder"]
-            State["StateBundle / KvPageStore"]
-            Gen --> Weights
-            Gen --> State
-        end
+ Standalone ORT ---------------- local budget -----> ProcessMemoryManager
 
-        subgraph ORT["ORT foundation / graph execution"]
-            Session["InferenceSession / EP"]
-            Arena["ORT/EP arena + communication holders"]
-            subgraph PMM["ProcessMemoryManager"]
-                Txn["CapacityTransactionCoordinator"]
-                Gov["MemoryGovernor API<br/>fronts HostGovernor + DeviceMemoryAuthority"]
-                Topology["TopologyProvider + authority/provider registries"]
-                Host["Process HostGovernor"]
-                Device["Process DeviceMemoryAuthority(s)"]
-                Txn -->|"ordered try-reserve"| Gov
-            end
-            Alloc["Provider-supplied DeviceAllocator / VirtualBacking"]
-            Session --> Arena
-            Arena --> Gov
-            Arena --> Alloc
-        end
 
-        Gen --> Txn
-        Weights --> Gov
-        State --> Gov
-        Weights --> Alloc
-        State --> Alloc
-        Weights --> Session
-        State --> Session
-        Gen --> Session
-    end
+ INSIDE ONE ORT WORKER
 
-    OS --> Serving
-    OS --> PMM
-    Cluster --> Serving
-    Foundry --> Gen
-    Serving -->|"delegated quotas"| PMM
-    Standalone --> PMM
-    Standalone --> Session
+ ORT GenAI ---------------- (3) bind views / Run ------------> InferenceSession / EP
+    |                                                            |
+    +--> ModelResidency holder                                   +--> Arena/communication holder
+    +--> StateBundle / KvPageStore holder
+
+ ORT GenAI ---------------- (2) plan transaction -------------> ProcessMemoryManager
+
+ Lease-owning holders:
+ [ModelResidency | StateBundle/KvPageStore | Arena/communication]
+              <---- (4) reserve, grant, and pressure ----> ProcessMemoryManager
+                                                            topology + registries
+                                                            transaction coordinator
+                                                            HostGovernor
+                                                            DeviceMemoryAuthority(s)
+
+ All holders --------------- (5) allocate/map after grant ---> DeviceAllocator / VirtualBacking
+ All holders -------------------- publish model views --------> InferenceSession / EP
+ InferenceSession / EP ---------------- dispatch -------------> EP kernels / capture
 ```
+
+1. Foundry delegates only a cooperative quota; the OS remains the final
+   machine-wide arbiter.
+2. ORT GenAI asks `CapacityTransactionCoordinator` to reserve all required
+   authorities before exposing state.
+3. ORT GenAI binds model/state views and invokes `InferenceSession::Run`.
+4. The component retaining bytes owns the lease. `MemoryGovernor` grants,
+   accounts, and sends pressure; the holder chooses what can be released.
+5. After a grant, the holder borrows the provider allocator/backing to allocate
+   or map physical memory. The allocator implements mechanism, not policy.
+
+Standalone ORT enters at `ProcessMemoryManager` and `InferenceSession`, bypassing
+Foundry and ORT GenAI.
 
 ### Responsibility boundaries
 
