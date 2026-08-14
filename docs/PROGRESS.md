@@ -422,16 +422,33 @@ short spine (full day-by-day is archived).
 ### DeepSeek native support
 See [`deepseek-native-status-2026-07-25.md`](deepseek-native-status-2026-07-25.md).
 
-- [ ] **The #864 hybrid — resident hot set + zero-copy cold reads.** The only route to
-  *beating* the OS on over-budget models rather than merely no longer losing to it (#874
-  buys the ~100× by not choosing the slow path; it does not make us faster than WDDM).
-  **Both halves are now measured and sound (#880):** a real strided GEMV reads host-mapped
-  weights at ~5.6 GB/s with bit-identical outputs, and capture works with a host-mapped
-  pointer — the two risks that could have killed it. Size the cold path at **5.6 GB/s**
-  (not #877's 11.4 proxy) and treat the resident hot set as the dominant lever. Remaining
-  unknowns are policy rather than feasibility: registering all 8.33 GB page-locks that much
-  host RAM, which needs a rule on smaller hosts, and which weights belong in the hot set is
-  #837 item 3's question.
+- [x] **The #864 hybrid — resident hot set + zero-copy cold reads. Built, measured,
+  and closed NEGATIVE (#912).** It was the presumed route to *beating* the OS on
+  over-budget models rather than merely no longer losing to it. It does not beat the OS
+  on this hardware, for two independent reasons, and both are capacity limits rather than
+  integration problems:
+  - **Correctness ceiling.** Aggregate *distinct* host-mapped bytes read per decode step
+    above **~0.44–0.65 GB** silently return stale data — 48 cold weights collapsed
+    generation 16 → 3 tokens with no error raised. A *single* host-mapped read is
+    bit-identical at 1/8/16/32 cold weights, and a copy-instead A/B isolates the fault to
+    the host-mapped **read**, not the deferral flow. So it is an aggregate aperture
+    ceiling, not a per-read bug — and it is invisible, which is why the byte-identical
+    token gate is the only thing that catches it.
+  - **Throughput.** Capped at a provably safe 256 MiB budget the arm ran **0.73 tok/s
+    against WDDM's 7.84** (coordinator's independent re-measurement; the PR reported 0.04,
+    and the 18× spread between two runs of the same configuration is this box's known
+    wall-clock instability, not a disagreement about the verdict). The safe aperture
+    (0.26 GB/step) is structurally smaller than the traffic it must displace
+    (~0.6 GB/step) — too short **by construction**, not by tuning.
+
+  **What survived and is worth keeping:** #880's ~5.6 GB/s real strided GEMV and
+  bit-identical capture with host-mapped pointers both held up end-to-end. The *mechanism*
+  works; the *capacity* on this class of GPU does not. The path ships default-OFF behind
+  `ONNX_GENAI_ZERO_COPY_HYBRID` with the conservative budget, as instrumentation for parts
+  with larger host apertures — which must be **re-measured**, not assumed to inherit this
+  result in either direction. Recorded as a design constraint in
+  [`MEMORY_MANAGEMENT_MODEL_DESIGN.md`](./MEMORY_MANAGEMENT_MODEL_DESIGN.md) C7: a platform
+  that cannot report its host-mapped read capacity is treated as **zero**, not unbounded.
 - [ ] **#837 item 3 — residency policy gap.** Post-#866 the policy sits **1.97× above its
   own streaming floor** (2.349 vs 1.191 GB/step), i.e. **1.158 GB/step recoverable**, worth
   ~91 ms/step at measured bandwidths. `byte_hit_rate` 71.8% against an achievable 85.7%
@@ -442,10 +459,17 @@ See [`deepseek-native-status-2026-07-25.md`](deepseek-native-status-2026-07-25.m
   collapsing to 3 tokens — whenever offload actually engages on the managed streaming path,
   with and without CUDA graph; the default-off path is unaffected. The byte-identical token
   constraint is what caught it, which is the reason that constraint is non-negotiable on
-  every change in this area. Governs Linux, forced-managed Windows, and — the
-  reason it still matters after #874 — the hybrid, whose entire thesis is that we choose
-  residency better than the driver does blind, and whose payoff #880 sizes at ~9.7×
-  realistic / ~15–24× at large N against ~5.6 GB/s host-mapped reads.
+  every change in this area. Governs Linux, forced-managed Windows, and datacenter
+  parts — but **no longer the #864 hybrid**, which is closed negative (above), so the
+  residency policy can no longer borrow that justification. **Two later results narrowed
+  where the remaining fix can possibly live:** #892 showed decode correctness does *not*
+  depend on eviction order (default, MRU and smallest-first all byte-identical, the last
+  driven to 10,816 page-ins), and #901 swept MRU vs LRU across two models and four budgets,
+  found MRU directionally better, **kept LRU anyway**, and bounded eviction-order tuning at
+  **~0.116 GB/step — about 10% of the gap**. Eviction cannot admit a tensor that admission
+  already refused, so ~90% of the recoverable gap is the **admission** decision at
+  `weight_paging.rs`'s `!can_fit(bytes)` arrival-order first fit. Anyone picking this up
+  should not spend it on eviction policy.
 - [ ] **#750 native multi-request batching.** Structurally batch-1 today; `--max-batch` is
   honestly reported as ineffective (#758). Stage 1 (#844) confirmed the premise **and its
   condition**: batching amortizes the weight stream only if implemented as **one fused
@@ -459,9 +483,18 @@ See [`deepseek-native-status-2026-07-25.md`](deepseek-native-status-2026-07-25.m
   assumptions #1 (input binding) and #2 (KV batch) are inseparable for an attention decoder
   (`persistent_state_shapes` pins KV batch axis 0 = 1, the mask is `[1, max_len]`, ONNX
   attention couples the batch dim across QKV/mask/past/present), so 2a used the stateless
-  escape hatch #844 anticipated and left `cuda.rs` untouched. Remaining: **2b** batched KV
-  + recapture accounting (batch-N *decode* capture must be quantified, not assumed), **2c**
-  wire `continuous_batch_manager`.
+  escape hatch #844 anticipated and left `cuda.rs` untouched. **Stage 2b landed and
+  measured (#891):** a batched-KV fused forward, with a control that could have falsified
+  it — totals identical at `past_len` 0/512/2048, ruling out a KV-pressure artifact — plus
+  the honest ceiling, `N_max ≈ 19 @ 2048 ctx`. **Implementation is split four ways (#905)
+  and increment 1 landed (#913):** `batch` is now threaded through the CUDA decode
+  shape/IO-binding layer and constructor-fixed to `1`, byte-identical on hardware
+  (7.60 tok/s vs 7.84 on `main`, reference token IDs exact, `fallbacks=0`), with the
+  geometry unit-tested at `batch = 3` where a transposed axis would actually show up.
+  Remaining: **2b-impl-2** KV growth/commit geometry, **2b-impl-3** device argmax,
+  **2b-impl-4** pin the batch symbol and flip batch-N on (the only increment that changes
+  behaviour, and the one that must report measured recapture-per-shape), then **2c** wire
+  `continuous_batch_manager`.
 - [ ] **#851 — intermittent `ILLEGAL_ADDRESS` in the mobius gate.** Parked, not solved.
   Three hypotheses eliminated (not gate flakiness — 8/8 strict solo; not kept-graph replay —
   25/25 isolated; not a relocated weight mapping — the fault targets a freshly allocated
