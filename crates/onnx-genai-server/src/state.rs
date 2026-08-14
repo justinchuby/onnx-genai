@@ -28,7 +28,6 @@ const DEFAULT_MAX_OUTPUT_TOKENS: usize = 4096;
 const DEFAULT_MAX_SESSIONS: usize = 256;
 const DEFAULT_MAX_QUEUE_DEPTH: usize = 256;
 const DEFAULT_MAX_BATCH: usize = 4;
-const PROVISIONAL_VRAM_CAPACITY_BYTES: u64 = 8 << 30;
 
 #[derive(Debug)]
 pub(crate) struct ServerMemoryAuthorities {
@@ -113,20 +112,31 @@ impl ServerMemoryAuthorities {
             .authorities
             .lock()
             .map_err(|_| anyhow::anyhow!("server device-authority registry lock poisoned"))?;
-        let capacity = onnx_genai_engine::FixedCapacity::new(
-            PROVISIONAL_VRAM_CAPACITY_BYTES,
-            PROVISIONAL_VRAM_CAPACITY_BYTES,
-        );
-        let resolved = onnx_genai_engine::resolve_limit(limit, &capacity, "vram")
-            .map_err(anyhow::Error::new)?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "device capacity is unavailable, so a fractional limit cannot be resolved; \
-                     set an explicit byte limit instead"
-                )
-            })?;
         let mut ordered = authorities.values().cloned().collect::<Vec<_>>();
         ordered.sort_by_key(|authority| authority.domain().to_string());
+        // Resolve the policy against each device's REAL capacity (or an honest
+        // "unknown") through the same engine machinery the decode governor uses
+        // — never a fabricated 8 GiB constant (#947). A fraction of an unmeasured
+        // device is unknown and cannot be resolved; an explicit byte limit is
+        // honoured on every device regardless.
+        let resolved_limits = ordered
+            .iter()
+            .map(|authority| {
+                let cuda_device_index = match authority.domain() {
+                    DeviceCompatibilityDomain::Cuda(index) => Some(*index),
+                    DeviceCompatibilityDomain::Host
+                    | DeviceCompatibilityDomain::Accelerator { .. } => None,
+                };
+                onnx_genai_engine::resolve_device_vram_limit_bytes(limit, cuda_device_index)?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "device {} capacity is unavailable, so a fractional limit cannot be \
+                             resolved; set an explicit --vram-limit <bytes> instead",
+                            authority.domain()
+                        )
+                    })
+            })
+            .collect::<anyhow::Result<Vec<u64>>>()?;
         let _mapped_growth = ordered
             .iter()
             .map(DeviceMemoryAuthority::pause_mapped_growth)
@@ -149,7 +159,11 @@ impl ServerMemoryAuthorities {
             })
             .collect::<Vec<_>>();
         let mut trim_plan = Vec::with_capacity(ordered.len());
-        for (authority, guard) in ordered.iter().zip(&guards) {
+        for ((authority, guard), resolved) in ordered
+            .iter()
+            .zip(&guards)
+            .zip(resolved_limits.iter().copied())
+        {
             let used = guard.used();
             let required = used.saturating_sub(resolved);
             let releasable = authority.releasable_unmapped_bytes();
@@ -162,8 +176,11 @@ impl ServerMemoryAuthorities {
             }
             trim_plan.push(required);
         }
-        for ((authority, guard), required) in
-            ordered.iter().zip(&guards).zip(trim_plan.iter().copied())
+        for (((authority, guard), required), resolved) in ordered
+            .iter()
+            .zip(&guards)
+            .zip(trim_plan.iter().copied())
+            .zip(resolved_limits.iter().copied())
         {
             let released = authority.trim_unmapped_bytes(required)?;
             if released < required || guard.used() > resolved {
@@ -176,7 +193,7 @@ impl ServerMemoryAuthorities {
                 );
             }
         }
-        for guard in &guards {
+        for (guard, resolved) in guards.iter().zip(resolved_limits.iter().copied()) {
             let result = guard.try_set_limit(resolved);
             debug_assert!(
                 result.is_ok(),

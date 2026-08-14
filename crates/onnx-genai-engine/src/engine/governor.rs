@@ -697,17 +697,44 @@ pub(crate) fn capacity_providers_for_device(
     limits: &ResourceLimits,
     cuda_device_index: Option<u32>,
 ) -> CapacityProviders {
-    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
     let mut providers = fallback_capacity_providers(limits);
+    providers.vram = device_vram_capacity(cuda_device_index);
+    providers
+}
+
+/// The VRAM capacity tier for a device: the real `cudaMemGetInfo` query when the
+/// decode targets a known CUDA index, and [`UnknownCapacity`] otherwise.
+///
+/// This is the single point where the engine decides whether a device capacity
+/// is *measured* or *unknown*, so every consumer — the decode governor and the
+/// server's device-limit resolution alike — shares one honest answer (#947).
+pub(crate) fn device_vram_capacity(cuda_device_index: Option<u32>) -> Arc<dyn CapacityProvider> {
     #[cfg(feature = "cuda")]
     if let Some(index) = cuda_device_index
         && let Some((total, free)) = real_cuda_vram_capacity(index)
     {
-        providers.vram = Arc::new(FixedCapacity::new(total, free));
+        return Arc::new(FixedCapacity::new(total, free));
     }
     #[cfg(not(feature = "cuda"))]
     let _ = cuda_device_index;
-    providers
+    Arc::new(onnx_genai_scheduler::UnknownCapacity)
+}
+
+/// Resolve a device VRAM limit to a concrete byte budget using the same capacity
+/// resolution the decode governor uses: the real device query when the device is
+/// a known CUDA index, and *unknown* otherwise. A fraction of unknown capacity
+/// resolves to `None` ("a fraction of an unknown is unknown, not a number"); an
+/// explicit `--vram-limit <bytes>` is always honoured, measurable device or not.
+///
+/// Exposed at the crate root so the server's multi-device limit path resolves
+/// through the real query / unknown machinery instead of fabricating an 8 GiB
+/// `FixedCapacity` — the second copy of the #947 constant.
+pub fn resolve_device_vram_limit_bytes(
+    limit: ResourceLimit,
+    cuda_device_index: Option<u32>,
+) -> anyhow::Result<Option<u64>> {
+    let vram = device_vram_capacity(cuda_device_index);
+    onnx_genai_scheduler::resolve_limit(limit, vram.as_ref(), "vram").map_err(anyhow::Error::new)
 }
 
 /// Resolve the configured VRAM limit to a concrete byte budget, or `None` when
@@ -718,9 +745,7 @@ pub(crate) fn resolve_vram_limit_bytes(
     limits: &ResourceLimits,
     cuda_device_index: Option<u32>,
 ) -> anyhow::Result<Option<u64>> {
-    let capacities = capacity_providers_for_device(limits, cuda_device_index);
-    onnx_genai_scheduler::resolve_limit(limits.vram_limit, capacities.vram.as_ref(), "vram")
-        .map_err(anyhow::Error::new)
+    resolve_device_vram_limit_bytes(limits.vram_limit, cuda_device_index)
 }
 
 pub(crate) fn governor_kv_config(

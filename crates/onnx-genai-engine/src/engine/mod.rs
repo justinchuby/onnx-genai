@@ -78,7 +78,7 @@ mod speculative_load;
 
 pub(crate) use decode_backend::*;
 pub(crate) use governor::*;
-pub use governor::{EngineGovernorError, EngineResourceGovernor};
+pub use governor::{EngineGovernorError, EngineResourceGovernor, resolve_device_vram_limit_bytes};
 #[cfg(all(feature = "cuda", feature = "native-backend"))]
 pub(crate) use load::managed_vmm_default_enabled;
 pub(crate) use load::{

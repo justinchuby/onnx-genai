@@ -56,6 +56,7 @@ pub use engine::{
     ScheduledGenerateArrival, SessionCheckpoint, SessionForkCapability, SessionId, SessionPosition,
     SharedKvBinding, SharedKvProposerConfig, SpeculativeMode, TokenLogprob, WeightAccessPattern,
     WeightPlacementReport, XtcConfig, parse_device_policy, parse_resource_limit,
+    resolve_device_vram_limit_bytes,
 };
 pub use fim::{FimConfig, FimFormat};
 pub use logits::{
