@@ -12,7 +12,7 @@ use onnx_genai_engine::logits::{
 use onnx_genai_engine::{
     DecodePrecision, Engine, EngineConfig, EngineDecodeBackend, GenerateOptions, GenerateRequest,
     NativeDecodeDevice, NativeDecodeSession, PipelineEngine, PipelineGenerateRequest,
-    ProcessorChain, parse_resource_limit,
+    ProcessorChain, SpeculativeMode, SpeculativeStats, parse_resource_limit,
 };
 use onnx_genai_ort::{Tokenizer, available_execution_providers, profile};
 use onnx_runtime_session::InferenceSession;
@@ -82,6 +82,18 @@ impl From<DecodePrecisionArg> for DecodePrecision {
             DecodePrecisionArg::Fp16 => Self::Fp16,
         }
     }
+}
+
+/// Speculative decoding mode selected on the command line. Only the native
+/// single-model engine path (`--steady` without `--pipeline`) wires speculation
+/// today; see the guard in `run_pipeline`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum SpeculativeArg {
+    /// Plain M=1 greedy decode (default).
+    None,
+    /// Prompt-lookup (n-gram) speculation: copy continuations from the most
+    /// recent matching context n-gram, then exact-verify against the target.
+    PromptLookup,
 }
 
 #[derive(Debug, Parser)]
@@ -185,6 +197,19 @@ struct Args {
     /// empty-past probe could not surface.
     #[arg(long, value_delimiter = ',')]
     fused_forward_kv_sweep: Option<Vec<String>>,
+    /// Speculative decoding mode. `prompt-lookup` enables native n-gram
+    /// speculation (exact verification; lossless vs greedy). Only supported on
+    /// the single-model native `--steady` path; rejected with `--pipeline`.
+    #[arg(long, value_enum, default_value_t = SpeculativeArg::None)]
+    speculative: SpeculativeArg,
+    /// Prompt-lookup n-gram key length (trailing context tokens matched to find
+    /// a continuation). Only used when `--speculative prompt-lookup`.
+    #[arg(long, default_value_t = 3)]
+    spec_ngram: usize,
+    /// Prompt-lookup draft width K: max continuation tokens proposed and
+    /// verified per step. Only used when `--speculative prompt-lookup`.
+    #[arg(long, default_value_t = 4)]
+    spec_tokens: usize,
 }
 
 fn categorical_sampling_enabled(args: &Args) -> bool {
@@ -287,7 +312,33 @@ fn request(args: &Args, tokens: usize) -> GenerateRequest {
     request.options.max_new_tokens = tokens;
     request.options.stop_on_eos = false;
     apply_sampling_options(&mut request.options, args);
+    apply_speculative_options(&mut request.options, args);
     request
+}
+
+/// Wire the prompt-lookup speculative mode into the request options. A no-op for
+/// `--speculative none`, so the default greedy fast path is untouched.
+fn apply_speculative_options(options: &mut GenerateOptions, args: &Args) {
+    match args.speculative {
+        SpeculativeArg::None => {}
+        SpeculativeArg::PromptLookup => {
+            options.speculative_mode = Some(SpeculativeMode::PromptLookup {
+                ngram: args.spec_ngram,
+                max_tokens: args.spec_tokens,
+            });
+            options.num_speculative_tokens = Some(args.spec_tokens);
+        }
+    }
+}
+
+fn describe_speculative(args: &Args) -> String {
+    match args.speculative {
+        SpeculativeArg::None => "speculative: OFF (plain M=1 greedy)".to_string(),
+        SpeculativeArg::PromptLookup => format!(
+            "speculative: prompt-lookup ngram={} K={}",
+            args.spec_ngram, args.spec_tokens
+        ),
+    }
 }
 
 fn pipeline_request(args: &Args, tokens: usize) -> PipelineGenerateRequest {
@@ -374,6 +425,31 @@ fn print_memory_observability(engine: &Engine) {
         resources.vram.limit,
         resources.vram.headroom,
         engine.device_oversubscribed_bytes()
+    );
+}
+
+/// Report prompt-lookup speculation diagnostics: proposals, exact-verify
+/// acceptance rate, and the mean accepted-run length per verify step.
+fn print_speculative_observability(stats: &SpeculativeStats) {
+    let acceptance = if stats.proposed_tokens > 0 {
+        stats.accepted_tokens as f64 / stats.proposed_tokens as f64 * 100.0
+    } else {
+        0.0
+    };
+    // Each verify step commits `accepted` draft tokens plus one free bonus
+    // token, so mean tokens committed per verify = (accepted + steps) / steps.
+    let tokens_per_step = if stats.verification_steps > 0 {
+        (stats.accepted_tokens + stats.verification_steps) as f64 / stats.verification_steps as f64
+    } else {
+        0.0
+    };
+    println!(
+        "speculative_stats: verify_steps={} proposed={} accepted={} acceptance={acceptance:.1}% \
+         multi_token_accepts={} tokens_per_verify_step={tokens_per_step:.2}",
+        stats.verification_steps,
+        stats.proposed_tokens,
+        stats.accepted_tokens,
+        stats.multi_token_accepts,
     );
 }
 
@@ -749,6 +825,7 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
     }
     print_backend_label(args.backend);
     println!("profile_native: {}", describe_sampling(args));
+    println!("profile_native: {}", describe_speculative(args));
     if matches!(args.backend, DecodeBackend::Ort | DecodeBackend::Auto) {
         configure_ort_provider(args)?;
     }
@@ -873,6 +950,9 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
     if let Some(tokens) = reference_tokens {
         println!("generated_token_ids: {tokens:?}");
     }
+    if args.speculative != SpeculativeArg::None {
+        print_speculative_observability(&engine.last_speculative_stats());
+    }
     print_cuda_observability(&engine, cuda_before.as_ref());
     print_weight_offload_observability(generated as u64);
     print_vmm_observability(&engine);
@@ -889,6 +969,15 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
     }
     if !model_dir.is_dir() {
         bail!("--pipeline requires --model to name a pipeline directory");
+    }
+    if args.speculative != SpeculativeArg::None {
+        bail!(
+            "--speculative is not supported on the --pipeline path: PipelineEngine drives its \
+             autoregressive decode through the strict one-token-per-step run_decode_loop, which \
+             has no k-token verify/rewind hook. Native prompt-lookup speculation is wired only \
+             into the single-model Engine path (use --steady without --pipeline). Requesting \
+             speculation here would be silently ignored and report misleading (greedy) numbers."
+        );
     }
     if args.steady && args.tokens <= args.decode_skip {
         bail!("--tokens must be greater than --decode-skip");
