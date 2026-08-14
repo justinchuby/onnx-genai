@@ -30,6 +30,37 @@ fn options(max_new_tokens: usize) -> GenerateOptions {
     options
 }
 
+fn assert_batched_policy_super_island(engine: &PipelineEngine) {
+    let diagnostics = engine.execution_island_diagnostics();
+    let island = diagnostics
+        .iter()
+        .find(|island| {
+            ["token_sampler", "termination", "token_state_update"]
+                .iter()
+                .all(|component| island.components.iter().any(|item| item == component))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "sampler, termination, and state update must share one execution island: \
+                 {diagnostics:#?}"
+            )
+        });
+    assert!(island.runs > 0, "batched policy island must execute");
+    assert_eq!(island.session_runs, island.runs);
+    assert!(
+        island.component_boundaries_elided >= 2,
+        "the three policy components must execute as a fused island"
+    );
+    if island.device.starts_with("cuda:") {
+        assert_eq!(island.fallback_reason, None);
+    } else {
+        assert_eq!(
+            island.fallback_reason.as_deref(),
+            Some("island is not placed on CUDA")
+        );
+    }
+}
+
 fn decoder_batch_request(
     input_ids: &[i64],
     batch: i64,
@@ -258,6 +289,7 @@ fn mobius_decoder_rows_match_independent_runs_and_dynamic_batch_replay() -> anyh
         engine.output_rows_for_role(&batch_two_replay_output, WorkflowOutputRole::Tokens);
     assert_eq!(batch_two_replay_rows[0].1.to_vec_i64()?, first_tokens);
     assert_eq!(batch_two_replay_rows[1].1.to_vec_i64()?, second_tokens);
+    assert_batched_policy_super_island(&engine);
     Ok(())
 }
 
@@ -287,6 +319,7 @@ fn mobius_vlm_workflow_executes_complete_image_path() -> anyhow::Result<()> {
             .shape(),
         [1, 2]
     );
+    assert_batched_policy_super_island(&engine);
     Ok(())
 }
 
