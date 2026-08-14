@@ -282,8 +282,25 @@ The claim that survives is narrower: **prefer a resident hot set, and let the
 platform move the cold remainder** unless C7 reports a host-mapped read capacity
 large enough to cover the per-step cold traffic. The mechanism itself is sound —
 capture survives host-mapped pointers with bit-identical replay — so this stands
-as a capacity verdict about one class of GPU. Datacenter parts with larger host
-apertures should be re-measured before inheriting either conclusion.
+as a capacity verdict about one class of GPU.
+
+**And the re-measurement has since happened, with the opposite result (#925).**
+On an H200 under Linux (driver 580.105.08, CUDA 13, kernel 6.6) the aperture
+ceiling is **absent**: generation stayed byte-identical to baseline with
+`fallbacks=0` up to **6.795 GB** of distinct host-mapped weights bound and
+re-read in place every decode step — 704 `cuMemHostRegister` binds, n=3, all
+runs byte-identical, ~15× the WDDM ~0.44 GB onset and ~10× the top of its
+corruption band. There the hybrid is worth **~8× (67 tok/s against ~8.5 median
+for managed streaming)**, because Linux has no OS fallback and the competitor is
+managed streaming or failure rather than a fast demand-paging path. The default
+budget is now platform-conditional — 256 MiB on Windows, 2 GiB elsewhere,
+bounded at >3× under the measured-safe figure since only one GPU class was
+tested (#936).
+
+This pair is the clearest case for putting the capacity in C7 rather than in a
+constant: the same capability differs by more than an order of magnitude across
+two platforms, and getting it wrong costs silently corrupted output in one
+direction and ~8× of throughput in the other.
 
 Managed no-spill CUDA VMM is a hard bound on *our own admission* — the ledger
 refuses to hand out more than `managed_limit`, and a request past it fails

@@ -1,16 +1,54 @@
 # Native batch-N decode step — stage 2b-impl scoping (#750)
 
-**Status:** scoping + on-hardware batch-1 baseline. **Verdict: the smallest
-*correct* (token-producing) batch-N persistent-binding decode step does not fit
-in one reviewable PR.** This document proposes the split, with file/line
-evidence for every coupled site, and records the measured batch-1 baseline that
-every increment must hold byte-identical.
+**Status: COMPLETE — all four increments landed (#913, #920, #924, #930).**
+This document is kept as the record of the split and the batch-1 baseline every
+increment held byte-identical. Where an increment corrected the plan below, the
+correction is noted inline; **the corrections are the more useful part of this
+document now**, because three of the four returned one.
+
+Outcome, reproduced independently by the coordinator rather than taken from the
+PRs: **CUDA graph capture survives batch-N while weights stream** — at N=2 and
+N=4, `enabled=true captures=1 invalidations=0 fallbacks=0` with
+`htod_bytes_per_token` 1,234,271,232 and 547,528,704, `byte_hit_rate` 68.64% →
+72.17% (solo, managed streaming forced, `qwen14b-zp`, context 64). That was the
+open risk #891 flagged, and it is now closed positively. The `1/N` weight-stream
+amortization holds on the real decode path, with the #866 offset measurable
+within the sweep: `byte_hit_rate` flat ~62% at N=1,2,4, then −5.12 points at N=8
+as evictions go 1273 → 1678, which is exactly why N=8 sits +13.5% above the
+ideal line.
+
+**One near-miss worth carrying forward.** #930's first version reported capture
+and weight streaming as *mutually exclusive on this build*, from a real decline
+message naming a real predicate. Its sweep harness called
+`load_with_resolved_io`, which passes `cuda_offload_policy: None`, so
+`weight_offload_stable_va` fell to its deliberately conservative
+`unwrap_or(false)` and capture declined **by construction** — the harness
+asserted pointer-instability and the runtime was never asked. Rewiring the sweep
+onto the governed `Engine::from_dir` path produced the result above. See
+`.github/skills/measurement-discipline/SKILL.md` failure mode 1; #930 now prints
+the predicate's *inputs* and their source, so `!stable_va` can no longer be
+mistaken for "this hardware cannot do it".
+
+**Original verdict, which held:** the smallest *correct* (token-producing)
+batch-N persistent-binding decode step does not fit in one reviewable PR. This
+document proposes the split, with file/line evidence for every coupled site, and
+records the measured batch-1 baseline that every increment must hold
+byte-identical.
 
 This is deliberately the same shape of deliverable the owner accepted for stage 1
 (#844, a staging plan) and stage 2b (#891, which landed a guard and *proposed*
 this rewrite as a separate change): "a landed increment with a guard beats a
 large one that stalls." Here the landed artifact is the baseline + the
 decomposition that makes each following increment safe to attempt.
+
+## 0. What each increment corrected in this plan
+
+| Increment | Correction returned |
+|---|---|
+| **#913** (2b-impl-1) | None — the inventory in §3/§4 held for the shape/IO-binding layer. Added the control this document did not ask for: the geometry is unit-tested at `batch = 3`, where a transposed axis actually shows up, rather than only at 1 where it cannot. |
+| **#920** (2b-impl-2) | Two. §3/§4 place `live_prefix_ranges` in another crate; it is in this one (`native_decode/kv_commit.rs:122`). And "KV growth stride math already batch-general" holds **only for head-major**: a *fixed full-context stride* commit is batch-general in both layouts because the batch axis is outermost and sequences sit a constant `capacity × bytes_per_token` apart, but a *growing bucket* is not, because seq-major's per-sequence stride **is** the mutable capacity, so growth would relocate every sequence `b > 0`. That case is now a named `bail!` rather than a silently capacity-dependent stride — which would have passed every batch-1 test and corrupted the first batch-N run. |
+| **#924** (2b-impl-3) | None to the split. Confirmed §5's `write_decode_inputs` placement: writing N selected tokens is inseparable from the batch-N caller, so it correctly stayed in 2b-impl-4. |
+| **#930** (2b-impl-4) | The harness artifact above. Also confirmed that pinning the batch symbol at session construction is required for capture, as §2.1 assumed. |
 
 ## 1. Batch-1 baseline — measured solo on hardware (the "before")
 
@@ -88,6 +126,16 @@ Grouped by how much work each is. The pleasant surprise: the **KV growth *stride
 math is already batch-general**; the blockers are shape allocation, the mask, the
 IO bindings, the device argmax, and capture-symbol pinning.
 
+> **Corrected by #920.** That surprise holds only for **head-major**. A *fixed
+> full-context stride* commit is batch-general in both layouts — the batch axis
+> is outermost, so sequences sit a constant `capacity × bytes_per_token` apart
+> and nothing relocates. A *growing bucket* is different: seq-major's
+> per-sequence stride **is** the mutable bucket capacity, so growing it would
+> relocate every sequence `b > 0`'s already-written KV. `kv_growth_byte_layout`
+> now `bail!`s on that case rather than computing a capacity-dependent stride,
+> which would have passed every batch-1 test and corrupted the first batch-N
+> run. Read the two paths as separate; this section conflated them.
+
 ### Already batch-general (block-count based, no change or trivial)
 
 - `kv_growth_byte_layout` (`cuda.rs:3543`) and
@@ -124,6 +172,14 @@ IO bindings, the device argmax, and capture-symbol pinning.
    `kv_commit::live_prefix_ranges` in `onnx-genai-kv`) produce **one dense prefix
    per batch row**; at N>1 seq-major yields N scattered fragments per binding.
    `live_prefix_ranges` must be proven batch-correct (another crate).
+
+   > **Corrected by #920.** `live_prefix_ranges` is in *this* crate —
+   > `crates/onnx-genai-engine/src/native_decode/kv_commit.rs:122` — not
+   > `onnx-genai-kv`, so no cross-crate coordination was needed. It now takes
+   > `batch` and emits one dense run per sequence at a fixed full-context
+   > stride, which is relocation-free; see the correction on §3 for why the
+   > growing-bucket path is the one that cannot be made batch-general in
+   > seq-major.
 7. **Capture-symbol semantics.** `collect_unit_symbols` (`cuda.rs:2102`) treats
    batch (axis 0) as a *unit* symbol collapsed to `1`; under batch-N it must be
    *pinned to N*, not collapsed, or every auxiliary output and the attention grid
