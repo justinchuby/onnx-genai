@@ -906,6 +906,30 @@ impl NativeDecodeSession {
         self.decode_cuda_greedy_batch(token_ids, past_len)
     }
 
+    /// Ragged batch-N greedy decode step (stage 3a, #750). Steps the pinned
+    /// `batch` sequences together where row `r` sits at its own logical length
+    /// `past_lens[r]` and advances only if `advances[r]`. Returns the `batch`
+    /// selected token ids. This is the ragged generalization of
+    /// [`Self::decode_greedy_batch`]: per-row attention-mask window, per-row
+    /// `position_ids`, and a per-row logical length, so genuinely
+    /// different-length requests can share one fused forward (the geometry a
+    /// continuous batcher needs). Like the uniform entry point it requires a CUDA
+    /// decode session pinned at the same batch extent whose logits binding
+    /// supports the device-argmax fast path. The single-sequence generation
+    /// driver is unchanged and stays the batch-1 byte-identity reference; this is
+    /// exercised by `profile_native --ragged-solo-equivalence-prompts`.
+    pub fn decode_greedy_batch_ragged(
+        &mut self,
+        token_ids: &[TokenId],
+        past_lens: &[usize],
+        advances: &[bool],
+    ) -> anyhow::Result<Vec<TokenId>> {
+        if self.cuda.is_none() {
+            bail!("native ragged batch greedy decode requires a CUDA decode session");
+        }
+        self.decode_cuda_greedy_batch_ragged(token_ids, past_lens, advances)
+    }
+
     /// The pinned persistent-decode batch extent (1 unless
     /// `ONNX_GENAI_NATIVE_DECODE_BATCH` requested batch-N and a CUDA session was
     /// built). Lets a harness confirm the session actually bound the batch grid.
