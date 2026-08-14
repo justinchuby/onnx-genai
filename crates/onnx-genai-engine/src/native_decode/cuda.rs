@@ -370,7 +370,7 @@ fn ns_to_ms(ns: u64) -> f64 {
 /// Result of one [`NativeDecodeSession::leverb_phase0_capture_attempt`] call —
 /// a THROWAWAY Lever-B Phase-0 probe (leverb-phase0), not part of any shipping
 /// contract.
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 #[derive(Clone, Debug, Default)]
 pub(crate) struct LeverBPhase0CaptureAttempt {
     /// Query rows in the attempted forward (`k_max` for M=K, `1` for M=1).
@@ -901,7 +901,7 @@ impl NativeDecodeSession {
     /// commit KV or advance the logical length: the captured/replayed forward
     /// dirties device KV, and KV-commit correctness is explicitly out of Phase-0
     /// scope, so the caller MUST discard the session afterwards.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "cuda"))]
     pub(crate) fn leverb_phase0_capture_attempt(
         &mut self,
         m: usize,
