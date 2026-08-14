@@ -907,6 +907,7 @@ fn batching_safe_policy_contract(component: &WorkflowComponent) -> bool {
             &[
                 "logits",
                 "active",
+                "done",
                 "temperature",
                 "top_k",
                 "top_p",
@@ -927,7 +928,7 @@ fn batching_safe_policy_contract(component: &WorkflowComponent) -> bool {
             ],
             &["done", "continue"],
         ),
-        "onnx-genai.state-update" => (&["current", "update", "active"], &["next"]),
+        "onnx-genai.state-update" => (&["current", "update", "active", "done"], &["next"]),
         _ => return true,
     };
     let mut bound_ports = HashSet::new();
@@ -2158,6 +2159,7 @@ mod tests {
         for (role, dtype, rank) in [
             ("logits", "float32", 2),
             ("active", "bool", 1),
+            ("done", "bool", 1),
             ("temperature", "float32", 1),
             ("top_k", "int64", 1),
             ("top_p", "float32", 1),
@@ -2182,6 +2184,7 @@ mod tests {
             for role in [
                 "logits",
                 "active",
+                "done",
                 "temperature",
                 "top_k",
                 "top_p",
@@ -2313,12 +2316,16 @@ mod tests {
             .insert("active".into(), batch_tensor("bool", 1));
         state
             .ports
+            .inputs
+            .insert("done".into(), batch_tensor("bool", 1));
+        state
+            .ports
             .outputs
             .insert("next".into(), batch_tensor("float32", 2));
         state.contract = Some(onnx_genai_metadata::ComponentContract {
             id: "onnx-genai.state-update".into(),
             version: "2".into(),
-            bindings: ["current", "update", "active", "next"]
+            bindings: ["current", "update", "active", "done", "next"]
                 .into_iter()
                 .map(|role| (role.into(), role.into()))
                 .collect(),

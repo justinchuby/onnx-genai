@@ -22,9 +22,9 @@ are driven by typed workflow values rather than model-family dispatch.
 
 Sampler and termination components may enter an execution island only through their
 version 2 per-row ABI. A sampler must bind `logits`, `active`, `temperature`, `top_k`,
-`top_p`, `min_p`, `seed`, `counter`, `token`, and `next_counter`, with contract
+`done`, `top_p`, `min_p`, `seed`, `counter`, `token`, and `next_counter`, with contract
 parameters `batching: per_row` and `inactive_rows: preserve`. Termination additionally
-binds per-row EOS lengths and iteration limits; state updates bind an `active` mask.
+binds per-row EOS lengths and iteration limits; state updates bind `active` and `done` masks.
 
 These are semantic requirements, not scalar-broadcast conveniences. Every row owns
 its sampling parameters, ragged logical lengths, deterministic RNG seed/counter,

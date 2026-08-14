@@ -188,11 +188,12 @@ Policy components may join a fused execution island only through version 2 contr
 `batching: per_row` and `inactive_rows: preserve`. Version 1 artifacts remain valid unfused
 components, but their scalar-compatible ABI cannot establish continuous-batching safety.
 
-The version 2 token sampler binds per-row `active`, `temperature`, `top_k`, `top_p`, `min_p`,
-`seed`, and `counter` inputs in addition to `logits`, and returns `token` plus `next_counter`.
+The version 2 token sampler binds per-row `active`, `done`, `temperature`, `top_k`, `top_p`,
+`min_p`, `seed`, and `counter` inputs in addition to `logits`, and returns `token` plus
+`next_counter`.
 The termination predicate binds `tokens`, `active`, ragged `eos_ids` with `eos_lengths`,
 `iteration`, and `max_iterations`, and returns both `done` and `continue`. State update binds
-`current`, `update`, and `active`, returning a shape- and dtype-identical `next`.
+`current`, `update`, `active`, and `done`, returning a shape- and dtype-identical `next`.
 
 All ports have a symbolic leading `batch` axis. Inactive rows preserve RNG counters and semantic
 state and emit no token. This ABI permits stable max-batch buffers and CUDA graph replay while the
