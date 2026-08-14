@@ -723,7 +723,7 @@ impl Session {
     /// allocator. If a device EP is selected but ORT cannot produce a matching
     /// allocator (e.g. the EP silently fell back to CPU), the error is logged
     /// and `Ok(None)` is returned so decode still works via CPU buffers.
-    pub(crate) fn device_kv_allocator(&self) -> Result<Option<Allocator>> {
+    pub fn device_kv_allocator(&self) -> Result<Option<Allocator>> {
         if !self
             .execution_providers
             .iter()

@@ -37,6 +37,8 @@ const CUDA_MEMCPY_DEVICE_TO_HOST: i32 = 2;
 const CUDA_MEMCPY_DEVICE_TO_DEVICE: i32 = 3;
 
 type CudaMemcpyFn = unsafe extern "C" fn(*mut c_void, *const c_void, usize, i32) -> i32;
+type CudaMemcpyAsyncFn =
+    unsafe extern "C" fn(*mut c_void, *const c_void, usize, i32, *mut c_void) -> i32;
 type CudaMemsetFn = unsafe extern "C" fn(*mut c_void, i32, usize) -> i32;
 type CudaDeviceSynchronizeFn = unsafe extern "C" fn() -> i32;
 type CudaSetDeviceFn = unsafe extern "C" fn(i32) -> i32;
@@ -48,6 +50,7 @@ struct CudaRt {
     // directly after construction.
     _lib: Library,
     memcpy: CudaMemcpyFn,
+    memcpy_async: CudaMemcpyAsyncFn,
     memset: CudaMemsetFn,
     device_synchronize: CudaDeviceSynchronizeFn,
     set_device: CudaSetDeviceFn,
@@ -89,6 +92,7 @@ fn load() -> std::result::Result<CudaRt, String> {
         };
         // SAFETY: the symbol signatures match the documented `cudart` ABI.
         let memcpy = unsafe { lib.get::<CudaMemcpyFn>(b"cudaMemcpy\0") };
+        let memcpy_async = unsafe { lib.get::<CudaMemcpyAsyncFn>(b"cudaMemcpyAsync\0") };
         let memset = unsafe { lib.get::<CudaMemsetFn>(b"cudaMemset\0") };
         let device_synchronize =
             unsafe { lib.get::<CudaDeviceSynchronizeFn>(b"cudaDeviceSynchronize\0") };
@@ -97,6 +101,7 @@ fn load() -> std::result::Result<CudaRt, String> {
         let mem_get_info = unsafe { lib.get::<CudaMemGetInfoFn>(b"cudaMemGetInfo\0") };
         match (
             memcpy,
+            memcpy_async,
             memset,
             device_synchronize,
             set_device,
@@ -105,6 +110,7 @@ fn load() -> std::result::Result<CudaRt, String> {
         ) {
             (
                 Ok(memcpy),
+                Ok(memcpy_async),
                 Ok(memset),
                 Ok(device_synchronize),
                 Ok(set_device),
@@ -114,6 +120,7 @@ fn load() -> std::result::Result<CudaRt, String> {
                 // Copy the function pointers out before `lib` is moved into the
                 // struct; the borrows on `lib` end here.
                 let memcpy = *memcpy;
+                let memcpy_async = *memcpy_async;
                 let memset = *memset;
                 let device_synchronize = *device_synchronize;
                 let set_device = *set_device;
@@ -122,6 +129,7 @@ fn load() -> std::result::Result<CudaRt, String> {
                 return Ok(CudaRt {
                     _lib: lib,
                     memcpy,
+                    memcpy_async,
                     memset,
                     device_synchronize,
                     set_device,
@@ -131,7 +139,7 @@ fn load() -> std::result::Result<CudaRt, String> {
             }
             _ => {
                 last_err = format!(
-                    "{name}: missing cudaMemcpy/cudaMemset/cudaDeviceSynchronize/cudaSetDevice/cudaGetDevice/cudaMemGetInfo symbol"
+                    "{name}: missing cudaMemcpy/cudaMemcpyAsync/cudaMemset/cudaDeviceSynchronize/cudaSetDevice/cudaGetDevice/cudaMemGetInfo symbol"
                 );
             }
         }
@@ -375,6 +383,34 @@ pub fn memcpy_device_to_device(dst: usize, src: usize, bytes: usize) -> Result<(
     if code != 0 {
         return Err(OrtError::InvalidArgument(format!(
             "cudaMemcpy (device-to-device) failed with CUDA error code {code}"
+        )));
+    }
+    Ok(())
+}
+
+/// Enqueue a device-to-device copy on CUDA's default stream.
+///
+/// Callers must synchronize once after enqueueing their complete copy batch
+/// and before another session consumes the destination buffers.
+pub fn memcpy_device_to_device_async(dst: usize, src: usize, bytes: usize) -> Result<()> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    let rt = runtime()?;
+    // SAFETY: `src` and `dst` cover `bytes`; a null stream selects CUDA's
+    // default stream; the function pointer matches the documented cudart ABI.
+    let code = unsafe {
+        (rt.memcpy_async)(
+            dst as *mut c_void,
+            src as *const c_void,
+            bytes,
+            CUDA_MEMCPY_DEVICE_TO_DEVICE,
+            std::ptr::null_mut(),
+        )
+    };
+    if code != 0 {
+        return Err(OrtError::InvalidArgument(format!(
+            "cudaMemcpyAsync (device-to-device) failed with CUDA error code {code}"
         )));
     }
     Ok(())

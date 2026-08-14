@@ -840,6 +840,7 @@ impl Value {
                 self.dtype, self.shape, source.dtype, source.shape
             )));
         }
+
         let destination_host = self.is_host_resident()?;
         let source_host = source.is_host_resident()?;
         if destination_host && source_host {
@@ -879,6 +880,43 @@ impl Value {
             let _ = device_id;
             Err(OrtError::InvalidArgument(
                 "tensor copy involves CUDA memory but this build has no CUDA support".into(),
+            ))
+        }
+    }
+
+    /// Enqueue a same-device CUDA copy without synchronizing the device.
+    pub fn copy_from_cuda_async(&self, source: &Value, device_id: i32) -> Result<()> {
+        if self.shape != source.shape || self.dtype != source.dtype {
+            return Err(OrtError::InvalidArgument(format!(
+                "asynchronous CUDA tensor copy requires identical tensors, destination {:?} {:?}, source {:?} {:?}",
+                self.dtype, self.shape, source.dtype, source.shape
+            )));
+        }
+        if self.is_host_resident()? || source.is_host_resident()? {
+            return Err(OrtError::InvalidArgument(
+                "asynchronous CUDA tensor copy requires device-resident tensors".into(),
+            ));
+        }
+        #[cfg(feature = "cuda")]
+        {
+            let bytes = self
+                .numel()
+                .checked_mul(self.dtype.size_of())
+                .ok_or_else(|| {
+                    OrtError::InvalidArgument("CUDA tensor copy byte size overflows".into())
+                })?;
+            let _guard = crate::cuda_rt::DeviceGuard::set(device_id)?;
+            return crate::cuda_rt::memcpy_device_to_device_async(
+                self.data_ptr_addr()?,
+                source.data_ptr_addr()?,
+                bytes,
+            );
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = device_id;
+            Err(OrtError::InvalidArgument(
+                "asynchronous CUDA copy requires the cuda feature".into(),
             ))
         }
     }

@@ -116,8 +116,16 @@ impl ExecutionIsland {
         self.execution_generation.set(generation);
     }
 
+    pub(crate) fn clear_bindings(&mut self) {
+        self.bindings.get_mut().clear();
+    }
+
     pub(crate) fn component_count(&self) -> usize {
         self.components.len()
+    }
+
+    pub(crate) fn components(&self) -> &[String] {
+        &self.components
     }
 
     pub(crate) fn cuda_device_id(&self) -> Option<i32> {
@@ -182,6 +190,32 @@ impl ExecutionIsland {
         self.record_copy(output, &stored)?;
         stored.copy_from_cuda(output, device_id)?;
         Ok(stored)
+    }
+
+    fn clone_output_for_store_async(
+        &self,
+        value_ref: &str,
+        output: &Value,
+    ) -> anyhow::Result<(Value, bool)> {
+        if self.session.cuda_device_id().is_none()
+            || self.aliasable_output_values.contains(value_ref)
+        {
+            return Ok((self.clone_output_for_store(value_ref, output)?, false));
+        }
+        let device_id = self
+            .session
+            .cuda_device_id()
+            .context("CUDA island output has no CUDA device")?;
+        let allocator = self.device_allocator.as_ref().with_context(|| {
+            format!(
+                "execution island {} has a CUDA output but no device allocator",
+                self.id
+            )
+        })?;
+        let stored = Value::empty_in(output.shape(), output.dtype(), allocator)?;
+        self.record_copy(output, &stored)?;
+        stored.copy_from_cuda_async(output, device_id)?;
+        Ok((stored, true))
     }
 
     fn diagnostic(&self) -> ExecutionIslandDiagnostic {
@@ -271,9 +305,12 @@ impl ExecutionIsland {
                 resolved.iter().zip(&stable.inputs).enumerate()
             {
                 let source_ptr = source_ptrs[index];
-                let source_changed = stable.source_ptrs[index] != source_ptr;
                 let shared_service = self.shared_buffer_inputs.contains_key(*name);
-                if (shared_service && !reset_services) || (!shared_service && !source_changed) {
+                let aliases_destination = source_ptr == destination.data_ptr_addr()?;
+                let unchanged_source = !reset_services && source_ptr == stable.source_ptrs[index];
+                if (shared_service && !reset_services)
+                    || (!shared_service && (aliases_destination || unchanged_source))
+                {
                     continue;
                 }
                 self.record_copy(source, destination)?;
@@ -292,8 +329,10 @@ impl ExecutionIsland {
                 && self.session.graph_capture()
                 && !self.capture_disabled.get();
             let mut result = if capture_enabled {
-                self.record_device_synchronization();
-                self.session.synchronize_device()?;
+                if !replay {
+                    self.record_device_synchronization();
+                    self.session.synchronize_device()?;
+                }
                 self.session_runs.set(self.session_runs.get() + 1);
                 self.session
                     .run_with_binding_graph(&stable.binding, stable.graph_id)
@@ -330,12 +369,16 @@ impl ExecutionIsland {
                     stable.captured = true;
                 }
             }
+            let mut pending_copies = false;
             for (port, output) in &stable.outputs {
                 let value_ref = &self.outputs[port];
-                values.insert(
-                    value_ref.clone(),
-                    self.clone_output_for_store(value_ref, output)?,
-                );
+                let (stored, pending) = self.clone_output_for_store_async(value_ref, output)?;
+                pending_copies |= pending;
+                values.insert(value_ref.clone(), stored);
+            }
+            if pending_copies {
+                self.record_device_synchronization();
+                self.session.synchronize_device()?;
             }
             self.record_elapsed(started);
             return Ok(());
@@ -359,11 +402,19 @@ impl ExecutionIsland {
             let mut binding = IoBinding::new(&self.session)?;
             let mut stable_inputs = Vec::new();
             for (name, source) in &resolved {
-                let stable = Value::empty_in(source.shape(), source.dtype(), allocator)?;
-                self.record_copy(source, &stable)?;
-                if source.numel() != 0 {
-                    stable.copy_from_cuda(source, device_id)?;
-                }
+                let stable = if !source.is_host_resident()?
+                    && source.device_id()? == device_id
+                    && let Some(alias) = source.try_alias_clone()
+                {
+                    alias?
+                } else {
+                    let stable = Value::empty_in(source.shape(), source.dtype(), allocator)?;
+                    self.record_copy(source, &stable)?;
+                    if source.numel() != 0 {
+                        stable.copy_from_cuda(source, device_id)?;
+                    }
+                    stable
+                };
                 binding.bind_input(name, &stable)?;
                 stable_inputs.push(((*name).to_string(), stable));
             }
@@ -422,12 +473,16 @@ impl ExecutionIsland {
             }
             let graph_id = self.next_graph_id.get();
             self.next_graph_id.set(graph_id + 1);
+            let mut pending_copies = false;
             for (port, output) in &stable_outputs {
                 let value_ref = &self.outputs[port];
-                values.insert(
-                    value_ref.clone(),
-                    self.clone_output_for_store(value_ref, output)?,
-                );
+                let (stored, pending) = self.clone_output_for_store_async(value_ref, output)?;
+                pending_copies |= pending;
+                values.insert(value_ref.clone(), stored);
+            }
+            if pending_copies {
+                self.record_device_synchronization();
+                self.session.synchronize_device()?;
             }
             self.record_stable_binding_bytes(&stable_inputs, &stable_outputs);
             bindings.insert(
@@ -600,6 +655,12 @@ impl ExecutionIsland {
             values.insert(value_ref.clone(), tensor);
         }
         Ok(())
+    }
+}
+
+impl Drop for ExecutionIsland {
+    fn drop(&mut self) {
+        self.bindings.get_mut().clear();
     }
 }
 
