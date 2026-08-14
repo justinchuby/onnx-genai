@@ -643,6 +643,13 @@ fn print_weight_offload_observability(emitted_tokens: u64) {
         stats.pinned_alloc_calls, stats.pinned_reuses, htod_gbps
     );
     print_weight_paging_key_trace(emitted_tokens);
+    let (pinned_keys, pinned_bytes) = onnx_runtime_ep_cuda::pinned_hot_set();
+    if pinned_keys > 0 {
+        println!(
+            "weight_offload_pin: pinned_keys={pinned_keys} pinned_bytes={pinned_bytes} \
+             pinned_bytes_saved_per_step={pinned_bytes}"
+        );
+    }
 }
 
 /// Dump the per-key weight-paging trace (#837 item 3 characterisation). Empty
