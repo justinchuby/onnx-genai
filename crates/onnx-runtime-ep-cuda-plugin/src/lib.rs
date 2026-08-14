@@ -301,6 +301,48 @@ pub fn fail_closed_diagnostic() -> Option<String> {
     }
 }
 
+// ─── Hardware-validation observability ───────────────────────────────────────
+//
+// ORT loads this cdylib with `dlopen`, so the only way a validation harness
+// running in the ORT process can read the executor's counters is through
+// exported C symbols. The CPU plugin already exports the compiled-node counter
+// for exactly this reason; issue #768's residual scope needs the workspace
+// counter too, on the library ORT actually loads on the GPU host.
+
+/// Number of nodes this EP has compiled since the last reset.
+///
+/// Proves the node under test was **assigned to this plugin EP** rather than
+/// silently falling back: ORT reporting `cuda_ep` in the session providers only
+/// says the EP was registered, not that it claimed anything.
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_compiled_node_count() -> usize {
+    onnx_runtime_ep_plugin::ep::compiled_node_count()
+}
+
+/// Reset the compiled-node counter.
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_reset_compiled_node_count() {
+    onnx_runtime_ep_plugin::ep::reset_compiled_node_count()
+}
+
+/// Number of workspace **placement resolutions** since the last reset.
+///
+/// One resolution happens per served `StepScoped` workspace and nowhere else: a
+/// zero-byte requirement and a declined `SessionPersistent` request both return
+/// before placement is resolved. A non-zero delta across a `Run` is therefore
+/// evidence that the governed-workspace path actually served this node — the
+/// property issue #768 asks hardware to confirm.
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_workspace_placement_queries() -> usize {
+    onnx_runtime_ep_plugin::compute::workspace_placement_queries()
+}
+
+/// Reset the workspace placement-resolution counter.
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_reset_workspace_placement_queries() {
+    onnx_runtime_ep_plugin::compute::reset_workspace_placement_queries()
+}
+
 #[cfg(test)]
 mod tests {
     use std::panic::AssertUnwindSafe;

@@ -485,9 +485,9 @@ sync; the ORT ABI evolves toward nxrt; fail closed on unsupported capabilities.
 5. ~~**Leon (pre-M2-merge):** Fix M2-1 EP leak in `stream_release`~~ — **DONE** (`3ab0ded68`).
 6. ~~**Leon (pre-M2-merge):** Fix M2-2 misleading doc on `DeviceAllocator::memory_info:86`~~ — **DONE** (`3ab0ded68`).
 7. ~~**Any M2 committer (pre-M2-merge):** Fix clippy regression in `ep.rs:1041,1047`~~ — **DONE** by Deckard (`3ab0ded68`).
-8. **CUDA EP work (post-both-PRs):** `onnx-runtime-ep-cuda-plugin` is implementation-blocked on four defects (see `docs/execution/CUDA_EP_STATUS.md` §1). Fix order: resolve shared CUcontext/stream architecture → wire CreateDataTransfer with OrtApi → track allocation sizes → expose real cudaStream_t handle. Then resolve the five ORT integration design gaps (§4 of CUDA_EP_STATUS). Only then does GPU hardware validation (#768) become meaningful.
+8. **CUDA EP work — done in #832.** The four defects are fixed and the plugin was validated on an NVIDIA H200: ORT discovers 8× `cuda_ep` devices and executes single- and multi-node graphs on-device. See `docs/execution/CUDA_EP_STATUS.md` §1; #768 now tracks only the residual items in §7.
 9. ~~**Native nxrt dynamic ABI — fixture isolation fix needed (Pris):**~~ **DONE.** Pris added `ENV_MUTEX` to serialize tests that set `NXRT_TEST_PANIC` / `NXRT_TEST_FACTORY_ERROR`. Full round-trip suite is now 10/10 green.
-10. **CUDA hardware conformance runner:** `scripts/cuda_conformance_runner.sh` is committed. It exits **2 (UNVALIDATED)** on this host (no GPU). A self-hosted GPU workflow does not exist in this repo — hardware validation requires a GPU host that is not currently configured. See `docs/execution/CUDA_EP_STATUS.md`.
+10. **CUDA hardware conformance runner:** `scripts/cuda_conformance_runner.sh` is committed and exits **2 (UNVALIDATED)** on any host without a GPU, including CI. Hardware validation was performed manually on an H200 in #832 (`scripts/validate_plugin_ep_ort.py`); no self-hosted GPU workflow exists in this repo. See `docs/execution/CUDA_EP_STATUS.md`.
 
 ---
 

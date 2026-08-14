@@ -352,20 +352,180 @@ pub unsafe fn create_ep_factories_for_shared_ep(
     ok_status()
 }
 
+/// Outcome of the explicit shared-EP teardown attempted by
+/// [`release_ep_factory_with_teardown`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SharedEpTeardown {
+    /// There was no shared EP (the owned/CPU path).
+    NotShared,
+    /// The factory held the last reference and `shutdown()` was called here.
+    ShutdownCalled,
+    /// `shutdown()` failed; the EP is still dropped.
+    ShutdownFailed,
+    /// Other surfaces (allocators, sync streams, data transfer, `OrtEp`s) were
+    /// still alive, or a `Weak` handle to the shared EP was outstanding, so
+    /// `shutdown()` could not run. The EP's `Drop` releases its resources once
+    /// the last strong reference goes away.
+    ///
+    /// Both counts are reported because they are separately sufficient to block
+    /// teardown: `Arc::get_mut` refuses when `strong_count > 1` **or** when any
+    /// `Weak` exists, and reporting only `strong_count` produced the nonsense
+    /// diagnostic "0 other reference(s) are still alive" in the weak-only case.
+    ///
+    /// `strong_count == 1 && weak_count == 0` is reachable only when references
+    /// are being manipulated concurrently with `ReleaseEpFactory`: exclusive
+    /// access is retried once before this is reported, and the diagnostic then
+    /// names the race rather than a blocker that the counts do not support.
+    StillReferenced {
+        strong_count: usize,
+        weak_count: usize,
+    },
+}
+
+/// Explicitly tear down a factory's shared EP, then drop the factory.
+///
+/// # Shutdown semantics for shared EPs
+///
+/// A shared EP is reachable from four kinds of ORT-owned surface: the
+/// `OrtAllocator`, the `OrtSyncStreamImpl`, the `OrtDataTransferImpl`, and one
+/// `OrtEp` per session — the last through [`crate::ep::EpHandle::Shared`]. Each
+/// holds an `Arc` clone, so **no single `Release*` callback may call
+/// `shutdown()`**: doing so would tear down the CUDA runtime/context another
+/// live session still needs. That is exactly why
+/// [`crate::ep::EpHandle::shutdown_if_owned`] is a no-op for the shared variant.
+///
+/// `ReleaseEpFactory` is the one point in the ORT lifecycle that happens after
+/// every other surface has been released, so it is where explicit shutdown
+/// belongs. When the factory holds the last reference we call `shutdown()`
+/// here — the explicit, documented cleanup path for normal teardown. Because
+/// `EpHandle::Shared` never shuts down, this is also the only place a shared
+/// EP's `shutdown()` can run at all, so it cannot double-shut-down.
+///
+/// # Inverted teardown
+///
+/// When surfaces are somehow still alive (an ORT contract violation, or an
+/// embedder that leaked a handle) we do **not** shut down out from under them.
+/// The invariant then in force is **Drop-only**: `Arc` drops the EP when the
+/// last surface releases it, and the EP's own `Drop` frees its device
+/// resources. `Arc::get_mut` is also refused while any `Weak` handle exists
+/// even if this factory holds the only strong reference, so the diagnostic
+/// reports `weak_count` alongside `strong_count` and names whichever of the two
+/// actually blocked exclusive access.
+///
+/// A poisoned EP mutex is recovered rather than propagated, matching
+/// [`crate::ep::EpHandle::with`] and `EpRef::with_ep`: refusing to shut down
+/// because some unrelated callback panicked would leak the device context.
+///
+/// # Audit: what else can keep EP-derived state alive
+///
+/// `ExportedComputeInfo` (the `OrtNodeComputeInfo` ORT holds per compiled
+/// subgraph) deliberately holds **no** reference to the EP: workspaces and
+/// fused-subgraph intermediates come from ORT scratch
+/// (`KernelContext_GetScratchBuffer`), not from the EP allocator, so a live
+/// compute info can never keep the EP alive or block this teardown. What a
+/// compiled kernel *does* capture is its own backend runtime handle (the CUDA
+/// EP's kernels hold `Arc<CudaRuntime>`), so the CUDA context outlives
+/// `ReleaseEpFactory` until ORT releases the compute infos — which is correct,
+/// since those kernels may still be executing. `ExecutionProvider::shutdown()`
+/// on the CUDA EP clears a flag and does not destroy the runtime, so ordering
+/// between this call and compute-info release is not a use-after-free hazard in
+/// either direction.
+///
+/// # Safety
+///
+/// `factory` must be a pointer returned by `create_ep_factories*`.
+pub unsafe fn release_ep_factory_with_teardown(
+    factory: *mut ort::OrtEpFactory,
+) -> (SharedEpTeardown, *mut ort::OrtStatus) {
+    if factory.is_null() {
+        return (SharedEpTeardown::NotShared, ok_status());
+    }
+    // SAFETY: The pointer was created by Box::into_raw in create_ep_factories.
+    let mut exported = unsafe { Box::from_raw(factory.cast::<ExportedFactory>()) };
+
+    let outcome = match exported.shared_ep.take() {
+        None => SharedEpTeardown::NotShared,
+        Some(mut shared) => {
+            // `Arc::get_mut` and the count reads below are three separate
+            // atomic operations, so a concurrent owner can release *between*
+            // them. Retry once when the counts read back as exclusive rather
+            // than printing "1 strong, 0 weak blocked exclusive access", which
+            // is self-contradictory, and would also give up a shutdown() that
+            // is now legal.
+            let mut retried = false;
+            loop {
+                if let Some(mutex) = Arc::get_mut(&mut shared) {
+                    let ep = mutex
+                        .get_mut()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    break match ep.shutdown() {
+                        Ok(()) => SharedEpTeardown::ShutdownCalled,
+                        Err(e) => {
+                            eprintln!(
+                                "nxrt ep plugin: shared EP shutdown() failed during \
+                                 ReleaseEpFactory: {e}"
+                            );
+                            SharedEpTeardown::ShutdownFailed
+                        }
+                    };
+                }
+                let strong_count = Arc::strong_count(&shared);
+                let weak_count = Arc::weak_count(&shared);
+                if strong_count == 1 && weak_count == 0 && !retried {
+                    retried = true;
+                    continue;
+                }
+                // `Arc::get_mut` returns `None` for either reason, and the two
+                // call for different follow-up, so name the one that applies.
+                let blocker = if strong_count > 1 {
+                    format!(
+                        "{} other strong reference(s) to the shared EP are still alive \
+                         (allocator / sync stream / data transfer / OrtEp)",
+                        strong_count - 1
+                    )
+                } else if weak_count > 0 {
+                    format!(
+                        "the factory holds the only strong reference, but {weak_count} Weak \
+                         handle(s) to the shared EP are outstanding, which is also enough to \
+                         block exclusive access"
+                    )
+                } else {
+                    // Exclusive by the counts, yet still not exclusive when
+                    // asked. Another thread is manipulating references
+                    // concurrently; say that, and do not invent a blocker.
+                    "exclusive access was refused twice even though the counts now read \
+                     strong=1 weak=0, so references are being created or released \
+                     concurrently with ReleaseEpFactory"
+                        .to_string()
+                };
+                eprintln!(
+                    "nxrt ep plugin: ReleaseEpFactory called while {blocker}. ORT should release \
+                     those before releasing the factory. Skipping explicit shutdown() and falling \
+                     back to the Drop-only invariant: the EP is released when the last strong \
+                     reference goes away. (strong_count={strong_count}, weak_count={weak_count})"
+                );
+                break SharedEpTeardown::StillReferenced {
+                    strong_count,
+                    weak_count,
+                };
+            }
+        }
+    };
+
+    drop(exported);
+    (outcome, ok_status())
+}
+
 /// Implementation of `ReleaseEpFactory`.
+///
+/// Thin wrapper over [`release_ep_factory_with_teardown`] that discards the
+/// teardown outcome (which exists so tests can assert on it).
 ///
 /// # Safety
 ///
 /// `factory` must be a pointer returned by `create_ep_factories`.
 pub unsafe fn release_ep_factory(factory: *mut ort::OrtEpFactory) -> *mut ort::OrtStatus {
-    if factory.is_null() {
-        return ok_status();
-    }
-    // SAFETY: The pointer was created by Box::into_raw in create_ep_factories.
-    unsafe {
-        drop(Box::from_raw(factory.cast::<ExportedFactory>()));
-    }
-    ok_status()
+    unsafe { release_ep_factory_with_teardown(factory) }.1
 }
 
 // ─── OrtEpFactory callbacks ─────────────────────────────────────────────────
@@ -652,7 +812,9 @@ unsafe extern "C" fn factory_release_ep(_factory: *mut ort::OrtEpFactory, ep: *m
         unsafe {
             let mut exported_ep = Box::from_raw(ep.cast::<ExportedEp>());
             // Best-effort shutdown — only for owned EPs. A shared EP belongs to
-            // the factory and is shut down when the factory is released.
+            // the factory and is shut down when the factory is released; see
+            // `release_ep_factory_with_teardown` for the full contract and for
+            // why exactly one site may call `shutdown()` on a shared EP.
             exported_ep.ep.shutdown_if_owned();
         }
     }));
@@ -965,4 +1127,349 @@ unsafe extern "C" fn factory_deinit_graphics_interop(
     _ep_device: *const ort::OrtEpDevice,
 ) -> *mut ort::OrtStatus {
     ok_status()
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use onnx_runtime_ep_api::provider::{DeviceBuffer, EpConfig, Fence};
+    use onnx_runtime_ep_api::{EpError, Kernel, KernelMatch, Result as EpResult};
+    use onnx_runtime_ir::{DataType, DeviceId, DeviceType, Node, Shape, TensorLayout};
+
+    use super::*;
+
+    /// Counts `shutdown()` and `Drop` so a test can tell the explicit teardown
+    /// path apart from the Drop-only fallback, and can catch a double shutdown.
+    struct CountingEp {
+        shutdowns: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+        shutdown_result: Result<(), &'static str>,
+    }
+
+    impl Drop for CountingEp {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl ExecutionProvider for CountingEp {
+        fn name(&self) -> &str {
+            "counting_ep"
+        }
+        fn device_type(&self) -> DeviceType {
+            DeviceType::Cuda
+        }
+        fn device_id(&self) -> DeviceId {
+            DeviceId::cuda(0)
+        }
+        fn initialize(&mut self, _config: &EpConfig) -> EpResult<()> {
+            Ok(())
+        }
+        fn shutdown(&mut self) -> EpResult<()> {
+            self.shutdowns.fetch_add(1, Ordering::SeqCst);
+            match self.shutdown_result {
+                Ok(()) => Ok(()),
+                Err(msg) => Err(EpError::KernelFailed(msg.into())),
+            }
+        }
+        fn supports_op(
+            &self,
+            _op: &Node,
+            _opset: u64,
+            _shapes: &[Shape],
+            _input_dtypes: &[DataType],
+            _layouts: &[TensorLayout],
+        ) -> KernelMatch {
+            KernelMatch::unsupported("mock")
+        }
+        fn get_kernel(
+            &self,
+            _op: &Node,
+            _shapes: &[Vec<usize>],
+            _opset: u64,
+        ) -> EpResult<Box<dyn Kernel>> {
+            Err(EpError::KernelFailed("mock".into()))
+        }
+        fn allocate(&self, _size: usize, _alignment: usize) -> EpResult<DeviceBuffer> {
+            Err(EpError::OutOfMemory {
+                requested: 0,
+                available: 0,
+            })
+        }
+        fn deallocate(&self, _buffer: DeviceBuffer) -> EpResult<()> {
+            Ok(())
+        }
+        fn copy(&self, _s: &DeviceBuffer, _d: &mut DeviceBuffer, _n: usize) -> EpResult<()> {
+            Ok(())
+        }
+        fn copy_async(
+            &self,
+            _s: &DeviceBuffer,
+            _d: &mut DeviceBuffer,
+            _n: usize,
+        ) -> EpResult<Fence> {
+            Ok(Fence::signalled())
+        }
+        fn sync(&self) -> EpResult<()> {
+            Ok(())
+        }
+    }
+
+    type SharedEp = Arc<Mutex<Box<dyn ExecutionProvider + Send>>>;
+
+    fn counting_ep(
+        shutdowns: &Arc<AtomicUsize>,
+        drops: &Arc<AtomicUsize>,
+        shutdown_result: Result<(), &'static str>,
+    ) -> SharedEp {
+        let ep: Box<dyn ExecutionProvider + Send> = Box::new(CountingEp {
+            shutdowns: Arc::clone(shutdowns),
+            drops: Arc::clone(drops),
+            shutdown_result,
+        });
+        Arc::new(Mutex::new(ep))
+    }
+
+    /// Build a bare factory carrying `shared_ep`, bypassing `init_host_api`
+    /// (which needs a live ORT). Returns the raw pointer
+    /// `release_ep_factory_with_teardown` expects.
+    fn raw_shared_factory(shared: Option<SharedEp>) -> *mut ort::OrtEpFactory {
+        let mut factory = build_factory(
+            CString::new("test_factory").unwrap(),
+            Box::new(|| unreachable!("shared EP factories never call the constructor")),
+        );
+        factory.shared_ep = shared;
+        Box::into_raw(factory).cast::<ort::OrtEpFactory>()
+    }
+
+    /// Normal teardown: ORT releases every other surface first, so the factory
+    /// is the last owner and must run the explicit `shutdown()` exactly once.
+    #[test]
+    fn releasing_the_factory_shuts_down_a_solely_owned_shared_ep() {
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let raw = raw_shared_factory(Some(counting_ep(&shutdowns, &drops, Ok(()))));
+
+        // SAFETY: `raw` came from `raw_shared_factory`.
+        let (outcome, status) = unsafe { release_ep_factory_with_teardown(raw) };
+        assert_eq!(
+            outcome,
+            SharedEpTeardown::ShutdownCalled,
+            "normal teardown must take the explicit shutdown path, not Drop-only"
+        );
+        assert!(status.is_null(), "release must report success");
+        assert_eq!(
+            shutdowns.load(Ordering::SeqCst),
+            1,
+            "shutdown() must run exactly once — not zero (leak) and not twice"
+        );
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "the EP must also be dropped"
+        );
+    }
+
+    /// Inverted teardown: a surface that outlives the factory (ORT contract
+    /// violation or a leaked handle) must NOT be shut down out from under; the
+    /// documented fallback is the Drop-only invariant.
+    #[test]
+    fn releasing_the_factory_defers_to_drop_when_surfaces_are_still_alive() {
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let shared = counting_ep(&shutdowns, &drops, Ok(()));
+        // Stand-in for a still-live allocator / sync stream / OrtEp.
+        let surface = Arc::clone(&shared);
+        let raw = raw_shared_factory(Some(shared));
+
+        // SAFETY: `raw` came from `raw_shared_factory`.
+        let (outcome, status) = unsafe { release_ep_factory_with_teardown(raw) };
+        assert_eq!(
+            outcome,
+            SharedEpTeardown::StillReferenced {
+                strong_count: 2,
+                weak_count: 0
+            },
+            "a shared EP with a live surface must not be shut down"
+        );
+        assert!(status.is_null());
+        assert_eq!(
+            shutdowns.load(Ordering::SeqCst),
+            0,
+            "shutting down here would tear down a runtime the surviving surface still uses"
+        );
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "the EP must still be alive"
+        );
+
+        drop(surface);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "Drop-only invariant: releasing the last surface must release the EP"
+        );
+        assert_eq!(
+            shutdowns.load(Ordering::SeqCst),
+            0,
+            "the Drop-only path must not retroactively call shutdown()"
+        );
+    }
+
+    /// A `Weak` handle alone blocks `Arc::get_mut`, so teardown must report
+    /// `weak_count` and must not describe the situation as "0 other
+    /// reference(s) are still alive".
+    ///
+    /// Falsifier for the previous diagnostic: with only `strong_count`
+    /// reported, this case yielded `StillReferenced { strong_count: 1 }` and
+    /// printed `strong_count - 1 == 0` — a message that names no blocker at
+    /// all. Deleting `weak_count` from the outcome, or computing it as
+    /// `strong_count - 1`, turns this test red.
+    #[test]
+    fn releasing_the_factory_reports_weak_handles_as_the_blocker() {
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let shared = counting_ep(&shutdowns, &drops, Ok(()));
+        // An embedder that kept a Weak (no strong reference at all).
+        let weak = Arc::downgrade(&shared);
+        let raw = raw_shared_factory(Some(shared));
+
+        // SAFETY: `raw` came from `raw_shared_factory`.
+        let (outcome, status) = unsafe { release_ep_factory_with_teardown(raw) };
+        assert!(status.is_null());
+        assert_eq!(
+            outcome,
+            SharedEpTeardown::StillReferenced {
+                strong_count: 1,
+                weak_count: 1
+            },
+            "a live Weak handle blocks Arc::get_mut even though the factory holds the only \
+             strong reference; the outcome must say so instead of reporting one strong owner \
+             and no blocker"
+        );
+        assert_eq!(
+            shutdowns.load(Ordering::SeqCst),
+            0,
+            "shutdown() must not run while exclusive access is refused"
+        );
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            1,
+            "the last strong reference went away with the factory, so Drop still ran"
+        );
+        assert!(
+            weak.upgrade().is_none(),
+            "the Weak must not be upgradable after the EP was dropped"
+        );
+    }
+
+    /// `ReleaseEp` for a shared `OrtEp` must not shut the EP down; only
+    /// `ReleaseEpFactory` may. Together with the test above this proves no
+    /// double shutdown across the two release callbacks.
+    #[test]
+    fn releasing_a_shared_ort_ep_then_the_factory_shuts_down_exactly_once() {
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let shared = counting_ep(&shutdowns, &drops, Ok(()));
+
+        // What `factory_create_ep` builds for the shared path.
+        let exported_ep = Box::new(crate::ep::ExportedEp::new_shared(
+            Arc::clone(&shared),
+            "counting_ep",
+            None,
+            Vec::new(),
+        ));
+        let ep_ptr = Box::into_raw(exported_ep).cast::<ort::OrtEp>();
+        let raw = raw_shared_factory(Some(shared));
+
+        // ORT's release ordering: every `OrtEp` first, then the factory.
+        // SAFETY: `ep_ptr` came from `Box::into_raw` above.
+        unsafe { factory_release_ep(raw, ep_ptr) };
+        assert_eq!(
+            shutdowns.load(Ordering::SeqCst),
+            0,
+            "releasing one session's OrtEp must never shut down the shared EP"
+        );
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            0,
+            "the EP must still be alive"
+        );
+
+        // SAFETY: `raw` came from `raw_shared_factory`.
+        let (outcome, _status) = unsafe { release_ep_factory_with_teardown(raw) };
+        assert_eq!(outcome, SharedEpTeardown::ShutdownCalled);
+        assert_eq!(
+            shutdowns.load(Ordering::SeqCst),
+            1,
+            "exactly one shutdown() across both release callbacks"
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    /// A failing `shutdown()` must be reported, not swallowed — and must not
+    /// prevent the EP from being dropped.
+    #[test]
+    fn failing_shutdown_is_reported_and_the_ep_is_still_dropped() {
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let raw = raw_shared_factory(Some(counting_ep(
+            &shutdowns,
+            &drops,
+            Err("shutdown refused"),
+        )));
+
+        // SAFETY: `raw` came from `raw_shared_factory`.
+        let (outcome, status) = unsafe { release_ep_factory_with_teardown(raw) };
+        assert_eq!(outcome, SharedEpTeardown::ShutdownFailed);
+        assert!(status.is_null());
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    /// A poisoned EP mutex must not block teardown — that would leak the
+    /// device context.
+    #[test]
+    fn poisoned_ep_mutex_still_shuts_down() {
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let shared = counting_ep(&shutdowns, &drops, Ok(()));
+        let poisoner = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _guard = shared.lock().unwrap();
+            panic!("poison the shared EP mutex");
+        }));
+        assert!(poisoner.is_err(), "the poisoning panic must be observed");
+        assert!(shared.is_poisoned(), "mutex must now be poisoned");
+
+        let raw = raw_shared_factory(Some(shared));
+        // SAFETY: `raw` came from `raw_shared_factory`.
+        let (outcome, _status) = unsafe { release_ep_factory_with_teardown(raw) };
+        assert_eq!(outcome, SharedEpTeardown::ShutdownCalled);
+        assert_eq!(shutdowns.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    /// The owned (non-shared, e.g. CPU) path is unchanged.
+    #[test]
+    fn releasing_a_non_shared_factory_reports_not_shared() {
+        let raw = raw_shared_factory(None);
+        // SAFETY: `raw` came from `raw_shared_factory`.
+        let (outcome, status) = unsafe { release_ep_factory_with_teardown(raw) };
+        assert_eq!(outcome, SharedEpTeardown::NotShared);
+        assert!(status.is_null());
+    }
+
+    /// A null factory pointer must be tolerated (ORT may call release twice on
+    /// a failed registration).
+    #[test]
+    fn releasing_a_null_factory_is_a_no_op() {
+        // SAFETY: a null factory is explicitly allowed.
+        let (outcome, status) = unsafe { release_ep_factory_with_teardown(ptr::null_mut()) };
+        assert_eq!(outcome, SharedEpTeardown::NotShared);
+        assert!(status.is_null());
+    }
 }

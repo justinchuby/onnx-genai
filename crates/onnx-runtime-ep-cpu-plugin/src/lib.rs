@@ -161,3 +161,19 @@ pub extern "C" fn nxrt_ep_compiled_node_count() -> usize {
 pub extern "C" fn nxrt_ep_reset_compiled_node_count() {
     onnx_runtime_ep_plugin::ep::reset_compiled_node_count()
 }
+
+/// Number of workspace **placement resolutions** since the last reset.
+///
+/// Mirrors the CUDA plugin's accessor so the same validation harness runs
+/// against either cdylib: on a GPU-less host it can be pointed at this library
+/// to exercise its own plumbing before the GPU host runs it for real.
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_workspace_placement_queries() -> usize {
+    onnx_runtime_ep_plugin::compute::workspace_placement_queries()
+}
+
+/// Resets the workspace placement-resolution counter to zero.
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_reset_workspace_placement_queries() {
+    onnx_runtime_ep_plugin::compute::reset_workspace_placement_queries()
+}

@@ -65,7 +65,7 @@ Results (non-test, non-mock):
 | **Op coverage** | **109 entries** registered in `src/kernels/mod.rs` (verified with `grep -c "reg.register"` → 109). Covers MatMul, GEMM, custom attention, fused ops, quantized matmul, MoE, activation, norm, element-wise, rotary embedding, etc. — subset of CPU EP coverage. |
 | **Device / memory model** | Device buffers (CUDA device-virtual pointers, not host-dereferenceable). Separate compute stream + transfer stream for async weight paging. CUDA events as `Fence`. Optional VMM arena (physical granule mapping). Memory governor integration. cuBLASLt for GEMM. cuDNN for attention. |
 | **Build deps** | CUDA toolkit ≥ 12.6, cuBLAS, cuDNN, `cudarc`. Does **not** build without CUDA toolkit. Cannot use `--no-default-features` and still compile this crate. |
-| **Readiness for outbound ORT plugin export** | **HARDWARE-BLOCKED** — `onnx-runtime-ep-cuda-plugin` exists and fails closed by design (zero factories when no GPU is available). The four implementation defects (B1–B4) are resolved in code but **unvalidated on hardware** — no self-hosted GPU runner exists. Issue #768 tracks GPU validation. See `docs/execution/CUDA_EP_STATUS.md`. |
+| **Readiness for outbound ORT plugin export** | **HARDWARE-VALIDATED (core path)** — PR #832 registered `onnx-runtime-ep-cuda-plugin` with ORT on an NVIDIA H200, discovered 8× `cuda_ep` devices, and executed single- and multi-node graphs on-device with correct results. The four implementation defects (B1–B4) are resolved. It still fails closed by design (zero factories when no GPU is available). Issue #768 now tracks only the residual items in `docs/execution/CUDA_EP_STATUS.md` §7. |
 
 ---
 
@@ -132,7 +132,7 @@ Evidence:
 | `KernelMatch` → Rust enum, cannot cross FFI | `provider.rs` returns `KernelMatch::Supported { cost, … }` | **ABI-safety** | ✅ Resolved in `ep.rs` — mapped to `OrtNodeComputeInfo`. |
 | `EpError` / `Result<T, EpError>` → Rust enum, cannot cross FFI | Every required method returns `Result<_, EpError>` | **ABI-safety** | ✅ Resolved in `status.rs` — `fail_status(msg)` converts to `*mut OrtStatus`. |
 | `Kernel` trait (returned by `get_kernel`) → Rust vtable, cannot cross FFI | `Box<dyn Kernel>` at `provider.rs` / kernel.rs | **ABI-safety** | ✅ Resolved in `compute.rs` — `ComputeState` wraps kernels; `CreateState`/`Compute`/`ReleaseState` expose `OrtNodeComputeInfo`. |
-| `DeviceBuffer` struct itself cannot cross FFI | Contains `NonNull<c_void>`, `usize`, `usize`, `BufferOwner` (private enum) | **ABI-safety** | ✅ Resolved for CPU. CUDA path (device pointers) still blocked — see `docs/execution/CUDA_EP_STATUS.md`. |
+| `DeviceBuffer` struct itself cannot cross FFI | Contains `NonNull<c_void>`, `usize`, `usize`, `BufferOwner` (private enum) | **ABI-safety** | ✅ Resolved for CPU. CUDA path (device pointers) exercised on an H200 in #832 — see `docs/execution/CUDA_EP_STATUS.md`. |
 | Lifetimes in `supports_op`/`get_kernel` (`&Node`, `&[Shape]`, etc.) | These are Rust-lifetime-bearing references that would need to be projected to C structs with explicit ownership | **ABI-shape** | ✅ Resolved — graph is constructed in `ep.rs` from ORT's `OrtGraph` callbacks; lifetimes stay within the callback frame. |
 
 **Not missing, will work as-is:**
@@ -160,7 +160,7 @@ Evidence:
 | EP | Crate | `impl EP`? | `todo!`/stubs | Op registrations | Memory model | Build deps | ORT export readiness |
 |---|---|---|---|---|---|---|---|
 | **CpuExecutionProvider** | `onnx-runtime-ep-cpu` | Yes (`provider.rs:118`) | None | **166** | Host-only, `malloc`/`free` | Pure Rust (mlas optional) | ✅ **DONE (M1+M2)** — `onnx-runtime-ep-cpu-plugin` is a working ORT plugin EP; 23 conformance tests pass including f16/bf16; dtype-aware capability claiming via `GetKernelRegistry` |
-| **CudaExecutionProvider** | `onnx-runtime-ep-cuda` | Yes (`provider.rs:513`) | `prefetch_lazy_weight` stub | **109** | Device pointers, streams, VMM | CUDA ≥ 12.6 at runtime (dynamic-loading build, no build-time dep) | 🟡 **HARDWARE-BLOCKED** — `onnx-runtime-ep-cuda-plugin` compiles and fails closed by design (zero factories without a GPU). All four implementation defects (B1–B4) are resolved. Unvalidated on hardware; #768 tracks GPU validation. See `docs/execution/CUDA_EP_STATUS.md`. |
+| **CudaExecutionProvider** | `onnx-runtime-ep-cuda` | Yes (`provider.rs:513`) | `prefetch_lazy_weight` stub | **109** | Device pointers, streams, VMM | CUDA ≥ 12.6 at runtime (dynamic-loading build, no build-time dep) | 🟢 **H200-VALIDATED (#832)** — `onnx-runtime-ep-cuda-plugin` loads in ORT on an H200 and executes graphs on-device; it still fails closed (zero factories) without a GPU. All four implementation defects (B1–B4) are resolved. #768 tracks the residual items in `docs/execution/CUDA_EP_STATUS.md` §7. |
 | LegacyOrtEp | `onnx-runtime-ep-api` | Yes (inbound only) | — | — | Inbound adapter | — | Not a candidate |
 | PluginExecutionProvider | `onnx-runtime-session` | Yes (inbound bridge) | — | — | Inbound bridge | — | Not a candidate |
 | onnx-runtime-eager | `onnx-runtime-eager` | No (orchestrator) | — | — | — | — | Not a candidate |
