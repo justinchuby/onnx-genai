@@ -730,7 +730,12 @@ impl DeviceIoBinding {
         self.allocator.device_argmax_supported()
     }
 
-    pub fn device_argmax(&self, elements: usize, result: &mut DeviceIoBinding) -> Result<()> {
+    pub fn device_argmax(
+        &self,
+        elements: usize,
+        batch: usize,
+        result: &mut DeviceIoBinding,
+    ) -> Result<()> {
         if !matches!(self.dtype, DataType::Float32 | DataType::Float16)
             || result.dtype != DataType::Uint32
         {
@@ -747,6 +752,7 @@ impl DeviceIoBinding {
         Ok(self.allocator.device_argmax(
             self.buffer(),
             elements,
+            batch,
             self.dtype,
             result.buffer_mut(),
         )?)

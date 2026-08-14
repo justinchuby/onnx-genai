@@ -18,8 +18,16 @@ pub(crate) fn partial_count(elements: usize) -> usize {
         .clamp(1, MAX_PARTIALS)
 }
 
-pub(crate) fn scratch_words(elements: usize) -> usize {
-    2 * partial_count(elements)
+/// Scratch u32 words the device argmax result buffer needs *beyond* its
+/// `2 × batch` header words, for `batch` sequences of `elements` logits each.
+///
+/// The scratch holds, per sequence, `partial_count(elements)` partial values
+/// (f32, one u32 word each) followed by `partial_count(elements)` partial
+/// indices (u32), i.e. `2 × partial_count` words per sequence. At `batch == 1`
+/// this is byte-identical to the previous single-sequence `2 × partial_count`
+/// scratch (stage 2b-impl-3, #750).
+pub(crate) fn scratch_words(elements: usize, batch: usize) -> usize {
+    2 * partial_count(elements) * batch
 }
 
 const SOURCE: &str = r#"
@@ -67,6 +75,16 @@ __device__ __forceinline__ void greedy_argmax_partials_impl(
     unsigned long long elements,
     float* partial_values,
     unsigned int* partial_indices) {
+  // One sequence per grid row (blockIdx.y); `gridDim.x` blocks cooperatively
+  // reduce that sequence's `elements` contiguous logits. Sequence `s` reads
+  // `logits[s*elements + ..]` and writes its `gridDim.x` partials at
+  // `partial_{values,indices}[s*gridDim.x + ..]`. At batch 1 (gridDim.y == 1)
+  // the sequence offset is 0 and the launch is byte-identical to the previous
+  // single-sequence kernel (stage 2b-impl-3, #750).
+  unsigned long long sequence = blockIdx.y;
+  const T* seq_logits = logits + sequence * elements;
+  float* seq_values = partial_values + sequence * gridDim.x;
+  unsigned int* seq_indices = partial_indices + sequence * gridDim.x;
   float best = -1.0f / 0.0f;
   unsigned int best_index = 0;
   unsigned long long i =
@@ -74,7 +92,7 @@ __device__ __forceinline__ void greedy_argmax_partials_impl(
   unsigned long long stride =
       static_cast<unsigned long long>(blockDim.x) * gridDim.x;
   for (; i < elements; i += stride) {
-    float value = argmax_load<T>(logits[i]);
+    float value = argmax_load<T>(seq_logits[i]);
     if (isnan(value)) continue;
     unsigned int index = static_cast<unsigned int>(i);
     argmax_update(value, index, best, best_index);
@@ -97,8 +115,8 @@ __device__ __forceinline__ void greedy_argmax_partials_impl(
     best_index = lane < warp_count ? warp_indices[lane] : 0;
     warp_argmax(best, best_index);
     if (lane == 0) {
-      partial_values[blockIdx.x] = best;
-      partial_indices[blockIdx.x] = best_index;
+      seq_values[blockIdx.x] = best;
+      seq_indices[blockIdx.x] = best_index;
     }
   }
 }
@@ -127,10 +145,19 @@ extern "C" __global__ void greedy_argmax_finalize(
     unsigned int partial_count,
     const unsigned int* capture_error,
     unsigned int* result) {
+  // One block per sequence (blockIdx.x). Sequence `s` reduces its own
+  // `partial_count` partials at `partial_{values,indices}[s*partial_count + ..]`
+  // and writes its token id / capture-error pair at `result[2*s .. 2*s+2]`. At
+  // batch 1 (gridDim.x == 1) this writes result[0]/result[1] from the base
+  // partial region, byte-identical to the previous single-sequence finalize
+  // (stage 2b-impl-3, #750).
+  unsigned int sequence = blockIdx.x;
+  const float* seq_values = partial_values + sequence * partial_count;
+  const unsigned int* seq_indices = partial_indices + sequence * partial_count;
   float best = -1.0f / 0.0f;
   unsigned int best_index = 0;
   for (unsigned int i = threadIdx.x; i < partial_count; i += blockDim.x) {
-    argmax_update(partial_values[i], partial_indices[i], best, best_index);
+    argmax_update(seq_values[i], seq_indices[i], best, best_index);
   }
   warp_argmax(best, best_index);
   __shared__ float warp_values[32];
@@ -148,8 +175,8 @@ extern "C" __global__ void greedy_argmax_finalize(
     best_index = lane < warp_count ? warp_indices[lane] : 0;
     warp_argmax(best, best_index);
     if (lane == 0) {
-      result[0] = best_index;
-      result[1] = *capture_error;
+      result[2 * sequence] = best_index;
+      result[2 * sequence + 1] = *capture_error;
     }
   }
 }
@@ -159,6 +186,7 @@ pub(crate) fn launch(
     runtime: &CudaRuntime,
     logits: &DeviceBuffer,
     elements: usize,
+    batch: usize,
     dtype: DataType,
     result: &mut DeviceBuffer,
 ) -> Result<()> {
@@ -167,9 +195,23 @@ pub(crate) fn launch(
             "cuda_ep device argmax: logits must not be empty".into(),
         ));
     }
+    if batch == 0 {
+        return Err(EpError::KernelFailed(
+            "cuda_ep device argmax: batch must not be zero".into(),
+        ));
+    }
     if elements > u32::MAX as usize {
         return Err(EpError::KernelFailed(format!(
             "cuda_ep device argmax: {elements} elements exceed the u32 token-id range"
+        )));
+    }
+    // The grid dedicates one row (blockIdx.y for partials, blockIdx.x for
+    // finalize) to each of the `batch` sequences, so the batch count must fit
+    // the u32 grid dimension. At batch 1 the grid is 1-deep and byte-identical
+    // to the previous single-sequence launch (stage 2b-impl-3, #750).
+    if batch > u32::MAX as usize {
+        return Err(EpError::KernelFailed(format!(
+            "cuda_ep device argmax: batch {batch} exceeds the u32 grid range"
         )));
     }
     let (entry, elem_size) = match dtype {
@@ -181,18 +223,28 @@ pub(crate) fn launch(
             )));
         }
     };
-    let logits_bytes = elements.checked_mul(elem_size).ok_or_else(|| {
-        EpError::KernelFailed("cuda_ep device argmax: logits byte size overflows".into())
-    })?;
+    let logits_bytes = elements
+        .checked_mul(elem_size)
+        .and_then(|per_seq| per_seq.checked_mul(batch))
+        .ok_or_else(|| {
+            EpError::KernelFailed("cuda_ep device argmax: logits byte size overflows".into())
+        })?;
     if logits_bytes > logits.len() {
         return Err(EpError::KernelFailed(format!(
-            "cuda_ep device argmax: {elements} values require {logits_bytes} bytes, buffer has {}",
+            "cuda_ep device argmax: {batch}×{elements} values require {logits_bytes} bytes, buffer has {}",
             logits.len()
         )));
     }
     let partial_count = partial_count(elements);
-    let required_result_bytes = RESULT_BYTES
-        + scratch_words(elements)
+    // Header is `2 × batch` u32 words (a token id + capture-error pair per
+    // sequence, laid out contiguously so sequence `s` owns `result[2*s..2*s+2]`),
+    // followed by `batch × 2 × partial_count` scratch words. At batch 1 this is
+    // `RESULT_BYTES` header + the previous single-sequence scratch — byte-identical.
+    let header_bytes = batch.checked_mul(RESULT_BYTES).ok_or_else(|| {
+        EpError::KernelFailed("cuda_ep device argmax: result header size overflows".into())
+    })?;
+    let required_result_bytes = header_bytes
+        + scratch_words(elements, batch)
             .checked_mul(std::mem::size_of::<u32>())
             .ok_or_else(|| {
                 EpError::KernelFailed("cuda_ep device argmax: scratch byte size overflows".into())
@@ -217,10 +269,12 @@ pub(crate) fn launch(
         runtime.nvrtc_function("native_device_argmax", SOURCE, "greedy_argmax_finalize")?;
     let logits_ptr = cuptr(logits.as_ptr());
     let elements = elements as u64;
-    let scratch_ptr = unsafe { result.as_mut_ptr().add(RESULT_BYTES) };
+    // Scratch begins after the `batch`-wide header. Per-sequence partials are
+    // laid out values-then-indices, `batch × partial_count` of each.
+    let scratch_ptr = unsafe { result.as_mut_ptr().add(header_bytes) };
     let partial_values_ptr = cuptr(scratch_ptr);
     let partial_indices_ptr =
-        cuptr(unsafe { scratch_ptr.add(partial_count * std::mem::size_of::<f32>()) });
+        cuptr(unsafe { scratch_ptr.add(batch * partial_count * std::mem::size_of::<f32>()) });
     let capture_error_ptr = runtime.capture_error_ptr();
     let result_ptr = cuptr(result.as_mut_ptr());
     let mut builder = runtime.stream().launch_builder(&partial_function);
@@ -231,7 +285,7 @@ pub(crate) fn launch(
         .arg(&partial_indices_ptr);
     unsafe {
         builder.launch(LaunchConfig {
-            grid_dim: (partial_count as u32, 1, 1),
+            grid_dim: (partial_count as u32, batch as u32, 1),
             block_dim: (BLOCK, 1, 1),
             shared_mem_bytes: 0,
         })
@@ -248,7 +302,7 @@ pub(crate) fn launch(
         .arg(&result_ptr);
     unsafe {
         builder.launch(LaunchConfig {
-            grid_dim: (1, 1, 1),
+            grid_dim: (batch as u32, 1, 1),
             block_dim: (BLOCK, 1, 1),
             shared_mem_bytes: 0,
         })
@@ -281,8 +335,8 @@ mod tests {
             .unwrap_or(0) as u32
     }
 
-    fn result_bytes(elements: usize) -> usize {
-        RESULT_BYTES + scratch_words(elements) * std::mem::size_of::<u32>()
+    fn result_bytes(elements: usize, batch: usize) -> usize {
+        (batch * RESULT_BYTES) + scratch_words(elements, batch) * std::mem::size_of::<u32>()
     }
 
     fn run_case(ep: &CudaExecutionProvider, logits: &[f32]) -> [u32; 2] {
@@ -291,9 +345,9 @@ mod tests {
             .flat_map(|value| value.to_ne_bytes())
             .collect::<Vec<_>>();
         let mut input = ep.allocate(bytes.len(), 256).unwrap();
-        let mut output = ep.allocate(result_bytes(logits.len()), 256).unwrap();
+        let mut output = ep.allocate(result_bytes(logits.len(), 1), 256).unwrap();
         ep.copy_from_host(&bytes, &mut input).unwrap();
-        ep.device_argmax(&input, logits.len(), DataType::Float32, &mut output)
+        ep.device_argmax(&input, logits.len(), 1, DataType::Float32, &mut output)
             .unwrap();
         let mut result = [0_u8; RESULT_BYTES];
         ep.copy_to_host(&output, &mut result).unwrap();
@@ -306,15 +360,48 @@ mod tests {
         values
     }
 
+    /// Run the argmax over `batch` sequences of `vocab` f32 logits laid out
+    /// row-major (`rows.concat()`), returning the `(token_id, capture_error)`
+    /// pair per sequence read back from the `2 × batch`-word header.
+    fn run_batch_case(ep: &CudaExecutionProvider, rows: &[Vec<f32>]) -> Vec<[u32; 2]> {
+        let batch = rows.len();
+        let vocab = rows[0].len();
+        assert!(rows.iter().all(|row| row.len() == vocab));
+        let flat = rows.iter().flatten().copied().collect::<Vec<_>>();
+        let bytes = flat
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect::<Vec<_>>();
+        let mut input = ep.allocate(bytes.len(), 256).unwrap();
+        let mut output = ep.allocate(result_bytes(vocab, batch), 256).unwrap();
+        ep.copy_from_host(&bytes, &mut input).unwrap();
+        ep.device_argmax(&input, vocab, batch, DataType::Float32, &mut output)
+            .unwrap();
+        let mut header = vec![0_u8; batch * RESULT_BYTES];
+        ep.copy_to_host(&output, &mut header).unwrap();
+        let out = (0..batch)
+            .map(|s| {
+                let base = s * RESULT_BYTES;
+                [
+                    u32::from_ne_bytes(header[base..base + 4].try_into().unwrap()),
+                    u32::from_ne_bytes(header[base + 4..base + 8].try_into().unwrap()),
+                ]
+            })
+            .collect();
+        ep.deallocate(input).unwrap();
+        ep.deallocate(output).unwrap();
+        out
+    }
+
     fn run_case_f16(ep: &CudaExecutionProvider, logits: &[f32]) -> [u32; 2] {
         let bytes = logits
             .iter()
             .flat_map(|&value| half::f16::from_f32(value).to_bits().to_ne_bytes())
             .collect::<Vec<_>>();
         let mut input = ep.allocate(bytes.len(), 256).unwrap();
-        let mut output = ep.allocate(result_bytes(logits.len()), 256).unwrap();
+        let mut output = ep.allocate(result_bytes(logits.len(), 1), 256).unwrap();
         ep.copy_from_host(&bytes, &mut input).unwrap();
-        ep.device_argmax(&input, logits.len(), DataType::Float16, &mut output)
+        ep.device_argmax(&input, logits.len(), 1, DataType::Float16, &mut output)
             .unwrap();
         let mut result = [0_u8; RESULT_BYTES];
         ep.copy_to_host(&output, &mut result).unwrap();
@@ -381,5 +468,52 @@ mod tests {
         let all_non_finite = [f32::NAN, f32::NEG_INFINITY, f32::NAN];
         let result = run_case_f16(&ep, &all_non_finite);
         assert_eq!(result, [host_argmax(&all_non_finite), 0]);
+    }
+
+    #[test]
+    fn device_argmax_batch_selects_per_row_max_with_deliberate_ties() {
+        let Some(ep) = gpu() else { return };
+        // A control that would falsify a shared reduction buffer or a wrong
+        // per-sequence stride: the maximum sits at a *different* position in
+        // every row, each row is larger than one block's grid-stride reach so
+        // multiple partials are reduced, and two rows carry a deliberate tie so
+        // the lowest-index tie-break is exercised per sequence rather than
+        // globally (stage 2b-impl-3, #750).
+        let vocab = 4096;
+        let peaks = [17_usize, 4000, 128, 2049];
+        let mut rows: Vec<Vec<f32>> = peaks
+            .iter()
+            .enumerate()
+            .map(|(row, &peak)| {
+                let mut logits = (0..vocab)
+                    .map(|i| ((i + row) % 13) as f32 * 0.1)
+                    .collect::<Vec<_>>();
+                logits[peak] = 9.0;
+                logits
+            })
+            .collect();
+        // Row 1 gets a tie at an *earlier* index than its peak; the lower index
+        // must win, proving each sequence tie-breaks against its own partials.
+        rows[1][2500] = 9.0; // peak was 4000 → lower index 2500 must win
+        rows[3][900] = 9.0; // peak was 2049 → lower index 900 must win
+        let expected = [17_u32, 2500, 128, 900];
+
+        let batched = run_batch_case(&ep, &rows);
+        assert_eq!(batched.len(), rows.len());
+        for (row, (result, &want)) in batched.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(
+                result[0], want,
+                "batched argmax row {row} selected token {} not {want}",
+                result[0]
+            );
+            assert_eq!(result[1], 0, "row {row} unexpected capture-error flag");
+            // Each batched row must equal a standalone single-sequence argmax of
+            // the same logits — the byte-identity contract, row by row.
+            let solo = run_case(&ep, &rows[row]);
+            assert_eq!(
+                *result, solo,
+                "batched row {row} diverged from the single-sequence argmax"
+            );
+        }
     }
 }
