@@ -40,3 +40,15 @@ KV; FP non-associativity). A cheap near-tie guard restores exact greedy identity
 capture** (replays 1267→25, invalidations 6→280). Native decode is DISPATCH-bound; acceptance is not the
 bottleneck. Do NOT wire speculative into the pipeline; same gate blocks EAGLE-3/MTP. Single-stream wins
 must come from Marlin relayout / capture-preserving changes.
+
+## 2026-08-14 — Lever B (capture-stable M=K verify) CLOSED as NO-GO; Marlin (Lever A) promoted primary (#948/#949)
+Followed the speculative KILL into the #938 "big build" levers. **Phase-0 (#948):** capture machinery is
+stable (994/1000 replays, 90.3 tok/s captured M=1) but the raw M=K forward is `NotCapturable`; eager proxy
+= 6.77× step function (~80 ms floor, composition unknown) → NO-GO to an unconditional commit, re-test gated
+on Increment-0. **Increment-0 (#949) — DECISIVE:** built the capture-enablement overlay (persistent
+`[1,K_max,vocab]` logits binding + alloc-free M=K workspace + KV-symbol pin); M=8 now captures but
+**captured M=8 = 87.2 ms = 8.58× captured M=1 (10.2 ms)** — the ~80 ms floor PERSISTS. Root cause:
+`segments=41` at M=8 because GroupQueryAttention/MatMulNBits/SkipSimplifiedLayerNormalization declare
+`KernelCaptureUnsupported` at M>1 → ~361 eager relaunches. **Verdict: NO-GO for Lever B** (gated behind a
+deep kernel-capture-support program, not "reuse existing machinery"); **Lever A (Marlin int4 relayout,
+unconditional ~1.3–1.6×) promoted to the primary decode lever.** Supersedes #938's Lever-B-first call.
