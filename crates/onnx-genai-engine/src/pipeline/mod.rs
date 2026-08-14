@@ -27,6 +27,12 @@ mod arg_reduce;
 mod islands;
 mod workflow;
 
+/// Domain of the optional fused CUDA argmax kernel, exposed so benchmarks and
+/// tools can build a model that uses it without duplicating the name.
+pub use arg_reduce::FUSED_DOMAIN as FUSED_ARGMAX_DOMAIN;
+pub use arg_reduce::{
+    ArgReduceRewrites, tile_degenerate_arg_reductions as lower_degenerate_arg_reductions,
+};
 pub use islands::ExecutionIslandDiagnostic;
 pub use onnx_genai_metadata::WorkflowOutputRole;
 pub use workflow::{WorkflowExecutionPlan, WorkflowPerformanceDiagnostic};

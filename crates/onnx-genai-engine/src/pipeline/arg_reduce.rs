@@ -50,24 +50,95 @@ const MINIMUM_TILED_EXTENT: i64 = 4_096;
 /// Require the tiled scan length to be a small fraction of the flat scan it replaces.
 const MINIMUM_SCAN_REDUCTION: i64 = 8;
 
-/// Rewrite every degenerate last-axis arg-reduction in `graph`, returning how many
-/// nodes were replaced.
-pub(crate) fn tile_degenerate_arg_reductions(graph: &mut GraphProto) -> usize {
+/// Domain of the optional fused CUDA kernel, mirrored from
+/// `onnx_genai_ort::fused_argmax::DOMAIN` so this pass does not depend on the
+/// CUDA feature being enabled to know the name it would emit.
+pub const FUSED_DOMAIN: &str = "com.github.onnx_genai";
+
+/// Op name of the optional fused CUDA kernel.
+pub const FUSED_OP: &str = "ArgMaxLastAxis";
+
+/// What each rewritten node was replaced with.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArgReduceRewrites {
+    /// Nodes replaced by the portable `rows x tile` ONNX expansion.
+    pub tiled: usize,
+    /// Nodes replaced by the single fused custom-op node.
+    pub fused: usize,
+}
+
+impl ArgReduceRewrites {
+    pub fn total(self) -> usize {
+        self.tiled + self.fused
+    }
+}
+
+/// Rewrite every degenerate last-axis arg-reduction in `graph`.
+///
+/// When `fused` is set, a node the fused CUDA kernel can serve exactly becomes a
+/// single [`FUSED_OP`] node; everything else — `ArgMin`, `select_last_index=1`,
+/// or any graph running without the kernel — falls back to the portable tiling,
+/// which computes the same result using only standard ONNX ops.
+pub fn tile_degenerate_arg_reductions(graph: &mut GraphProto, fused: bool) -> ArgReduceRewrites {
     let shapes = static_shapes(graph);
-    let mut rewritten = 0;
+    let mut rewritten = ArgReduceRewrites::default();
     let mut index = 0;
     while index < graph.node.len() {
         let Some(plan) = plan_rewrite(&graph.node[index], &shapes) else {
             index += 1;
             continue;
         };
-        let replacement = expand(&graph.node[index], &plan, &mut graph.initializer);
+        let replacement = if fused && fusable(&graph.node[index]) {
+            rewritten.fused += 1;
+            fuse(&graph.node[index], &plan, &mut graph.initializer)
+        } else {
+            rewritten.tiled += 1;
+            expand(&graph.node[index], &plan, &mut graph.initializer)
+        };
         let inserted = replacement.len();
         graph.node.splice(index..=index, replacement);
         index += inserted;
-        rewritten += 1;
     }
     rewritten
+}
+
+/// Whether the fused kernel reproduces this node exactly.
+///
+/// The kernel is a maximum reduction that keeps the lowest index on ties, so
+/// `ArgMin` and `select_last_index=1` stay on the portable expansion rather than
+/// being served by something that would answer a different question.
+fn fusable(node: &NodeProto) -> bool {
+    node.op_type == "ArgMax" && attribute_int(node, "select_last_index").unwrap_or(0) == 0
+}
+
+/// Replace a degenerate `ArgMax` with the fused custom op.
+///
+/// The kernel always drops the reduced axis, so `keepdims=1` keeps its original
+/// shape through a trailing `Reshape` rather than changing the kernel contract.
+fn fuse(node: &NodeProto, plan: &TilePlan, initializers: &mut Vec<TensorProto>) -> Vec<NodeProto> {
+    let base = if node.name.is_empty() {
+        format!("fused_{}_{}", node.op_type, node.output[0])
+    } else {
+        format!("fused_{}", node.name)
+    };
+    let result = node.output[0].clone();
+    if !plan.keepdims {
+        return vec![
+            make_node(FUSED_OP, &[&node.input[0]], &[&result], &base).with_domain(FUSED_DOMAIN),
+        ];
+    }
+    let flat = format!("{base}__flat");
+    let keep_shape = format!("{base}__keep_shape");
+    initializers.push(int64_initializer(&keep_shape, &[0, 1]));
+    vec![
+        make_node(FUSED_OP, &[&node.input[0]], &[&flat], &base).with_domain(FUSED_DOMAIN),
+        make_node(
+            "Reshape",
+            &[&flat, &keep_shape],
+            &[&result],
+            &format!("{base}_keepdims"),
+        ),
+    ]
 }
 
 struct TilePlan {
@@ -349,6 +420,8 @@ fn arg_node(
 
 trait WithIntAttribute {
     fn with_int_attribute(self, name: &str, value: i64) -> Self;
+    /// Place the node in a non-default operator domain.
+    fn with_domain(self, domain: &str) -> Self;
 }
 
 impl WithIntAttribute for NodeProto {
@@ -363,6 +436,11 @@ impl WithIntAttribute for NodeProto {
             });
         self
     }
+
+    fn with_domain(mut self, domain: &str) -> Self {
+        self.domain = domain.to_string();
+        self
+    }
 }
 
 #[cfg(test)]
@@ -370,7 +448,7 @@ mod tests {
     use super::*;
     use onnx_runtime_loader::proto::onnx::{TensorShapeProto, TypeProto, ValueInfoProto};
 
-    fn tensor_input(name: &str, dims: &[Option<i64>]) -> ValueInfoProto {
+    pub(super) fn tensor_input(name: &str, dims: &[Option<i64>]) -> ValueInfoProto {
         ValueInfoProto {
             name: name.to_string(),
             r#type: Some(TypeProto {
@@ -399,7 +477,7 @@ mod tests {
         }
     }
 
-    fn sampler_graph(dims: &[Option<i64>], keepdims: i64) -> GraphProto {
+    pub(super) fn sampler_graph(dims: &[Option<i64>], keepdims: i64) -> GraphProto {
         GraphProto {
             name: "sampler".to_string(),
             input: vec![tensor_input("logits", dims)],
@@ -429,7 +507,7 @@ mod tests {
     #[test]
     fn degenerate_sampler_argmax_is_tiled_into_two_stages() {
         let mut graph = sampler_graph(&[None, Some(202_048)], 0);
-        assert_eq!(tile_degenerate_arg_reductions(&mut graph), 1);
+        assert_eq!(tile_degenerate_arg_reductions(&mut graph, false).tiled, 1);
         let ops = graph
             .node
             .iter()
@@ -462,7 +540,7 @@ mod tests {
     #[test]
     fn keepdims_output_skips_the_trailing_reshape() {
         let mut graph = sampler_graph(&[None, Some(202_048)], 1);
-        assert_eq!(tile_degenerate_arg_reductions(&mut graph), 1);
+        assert_eq!(tile_degenerate_arg_reductions(&mut graph, false).tiled, 1);
         assert_eq!(graph.node.last().expect("output node").op_type, "Add");
         assert_eq!(graph.node.last().expect("output node").output, ["token"]);
     }
@@ -470,9 +548,12 @@ mod tests {
     #[test]
     fn symbolic_or_small_reductions_are_not_rewritten() {
         let mut symbolic = sampler_graph(&[None, None], 0);
-        assert_eq!(tile_degenerate_arg_reductions(&mut symbolic), 0);
+        assert_eq!(
+            tile_degenerate_arg_reductions(&mut symbolic, false).tiled,
+            0
+        );
         let mut small = sampler_graph(&[None, Some(1_024)], 0);
-        assert_eq!(tile_degenerate_arg_reductions(&mut small), 0);
+        assert_eq!(tile_degenerate_arg_reductions(&mut small, false).tiled, 0);
     }
 
     #[test]
@@ -488,6 +569,95 @@ mod tests {
             ],
             ..Default::default()
         };
-        assert_eq!(tile_degenerate_arg_reductions(&mut graph), 1);
+        assert_eq!(tile_degenerate_arg_reductions(&mut graph, false).tiled, 1);
+    }
+}
+
+/// Behaviour of the optional fused-kernel substitution.
+#[cfg(test)]
+mod fused {
+    use super::tests::{sampler_graph, tensor_input};
+    use super::*;
+
+    #[test]
+    fn degenerate_argmax_becomes_a_single_custom_node() {
+        let mut graph = sampler_graph(&[None, Some(202_048)], 0);
+        let rewrites = tile_degenerate_arg_reductions(&mut graph, true);
+        assert_eq!(rewrites, ArgReduceRewrites { tiled: 0, fused: 1 });
+        assert_eq!(graph.node.len(), 1, "the fused form is one node, not nine");
+        assert_eq!(graph.node[0].op_type, FUSED_OP);
+        assert_eq!(graph.node[0].domain, FUSED_DOMAIN);
+        assert_eq!(graph.node[0].input, vec!["logits".to_string()]);
+        assert_eq!(graph.node[0].output, vec!["token".to_string()]);
+        // The output keeps the original name, so the rest of the island is
+        // untouched by the substitution.
+        assert!(graph.initializer.is_empty());
+    }
+
+    #[test]
+    fn keepdims_is_restored_by_a_reshape() {
+        let mut graph = sampler_graph(&[None, Some(202_048)], 1);
+        assert_eq!(tile_degenerate_arg_reductions(&mut graph, true).fused, 1);
+        let ops = graph
+            .node
+            .iter()
+            .map(|node| node.op_type.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ops, vec![FUSED_OP, "Reshape"]);
+        assert_eq!(graph.node[1].output, vec!["token".to_string()]);
+        let shape = graph
+            .initializer
+            .iter()
+            .find(|init| init.name.ends_with("__keep_shape"))
+            .expect("keepdims reshape target");
+        assert_eq!(shape.int64_data, vec![0, 1]);
+    }
+
+    #[test]
+    fn argmin_stays_on_the_portable_expansion() {
+        // The kernel is a maximum reduction, so a minimum must not be fused.
+        let mut graph = GraphProto {
+            name: "sampler".to_string(),
+            input: vec![tensor_input("logits", &[None, Some(202_048)])],
+            node: vec![
+                make_node("ArgMin", &["logits"], &["token"], "argmin")
+                    .with_int_attribute("axis", -1)
+                    .with_int_attribute("keepdims", 0),
+            ],
+            ..Default::default()
+        };
+        let rewrites = tile_degenerate_arg_reductions(&mut graph, true);
+        assert_eq!(rewrites, ArgReduceRewrites { tiled: 1, fused: 0 });
+        assert!(graph.node.iter().all(|node| node.domain.is_empty()));
+    }
+
+    #[test]
+    fn last_index_tie_breaking_stays_on_the_portable_expansion() {
+        // The kernel keeps the lowest index on ties.
+        let mut graph = GraphProto {
+            name: "sampler".to_string(),
+            input: vec![tensor_input("logits", &[None, Some(202_048)])],
+            node: vec![
+                make_node("ArgMax", &["logits"], &["token"], "argmax")
+                    .with_int_attribute("axis", -1)
+                    .with_int_attribute("keepdims", 0)
+                    .with_int_attribute("select_last_index", 1),
+            ],
+            ..Default::default()
+        };
+        let rewrites = tile_degenerate_arg_reductions(&mut graph, true);
+        assert_eq!(rewrites, ArgReduceRewrites { tiled: 1, fused: 0 });
+    }
+
+    #[test]
+    fn narrow_reductions_are_left_alone_either_way() {
+        // Below the tiling threshold ORT's own kernel is not degenerate, so
+        // neither rewrite applies and the graph is untouched.
+        let mut graph = sampler_graph(&[None, Some(1_024)], 0);
+        assert_eq!(
+            tile_degenerate_arg_reductions(&mut graph, true),
+            ArgReduceRewrites::default()
+        );
+        assert_eq!(graph.node[0].op_type, "ArgMax");
     }
 }

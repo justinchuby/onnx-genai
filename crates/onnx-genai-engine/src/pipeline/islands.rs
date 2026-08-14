@@ -1512,7 +1512,14 @@ fn build_execution_island(
         })
         .cloned()
         .collect::<HashSet<_>>();
-    let linked = link_models(id, &invocations, models, &boundary_outputs, workflow)?;
+    let linked = link_models(
+        id,
+        &invocations,
+        models,
+        &boundary_outputs,
+        workflow,
+        device.starts_with("cuda:"),
+    )?;
     let mut options = models.session_options();
     let capture_requested = options.graph_capture;
     if !linked.external_files.is_empty() && !(device.starts_with("cuda:") && capture_requested) {
@@ -1825,12 +1832,27 @@ fn hash_file_identity(path: &Path, hasher: &mut impl Hasher) -> anyhow::Result<(
     Ok(())
 }
 
+/// Whether this build can serve a fused last-axis argmax on the CUDA EP.
+///
+/// Compiled out entirely without the `cuda` feature, so a CPU-only build never
+/// emits a node it has no kernel for.
+#[cfg(feature = "cuda")]
+fn fused_argmax_is_available() -> bool {
+    onnx_genai_ort::fused_argmax::available()
+}
+
+#[cfg(not(feature = "cuda"))]
+fn fused_argmax_is_available() -> bool {
+    false
+}
+
 fn link_models(
     id: usize,
     invocations: &[IslandInvocation],
     models: &onnx_genai_ort::PipelineModels,
     boundary_outputs: &HashSet<String>,
     workflow: &WorkflowSpec,
+    cuda: bool,
 ) -> anyhow::Result<LinkedModel> {
     let mut model = ModelProto {
         ir_version: 8,
@@ -2045,13 +2067,21 @@ fn link_models(
         graph.value_info.extend(source_graph.value_info);
     }
     graph.input.extend(graph_inputs.into_values());
-    let tiled_arg_reductions = super::arg_reduce::tile_degenerate_arg_reductions(graph);
-    if tiled_arg_reductions > 0 {
+    let fused_argmax_available = cuda && fused_argmax_is_available();
+    let arg_reductions =
+        super::arg_reduce::tile_degenerate_arg_reductions(graph, fused_argmax_available);
+    if arg_reductions.total() > 0 {
         tracing::debug!(
             island = id,
-            tiled_arg_reductions,
-            "tiled degenerate last-axis arg-reductions inside execution island"
+            tiled = arg_reductions.tiled,
+            fused = arg_reductions.fused,
+            "rewrote degenerate last-axis arg-reductions inside execution island"
         );
+    }
+    if arg_reductions.fused > 0 {
+        // A custom-domain node needs its own opset import or ORT rejects the
+        // model before it ever looks for the kernel.
+        opsets.insert(super::arg_reduce::FUSED_DOMAIN.to_string(), 1);
     }
     model.opset_import = opsets
         .into_iter()

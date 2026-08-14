@@ -925,6 +925,15 @@ impl RawSessionOptions {
             add_session_config_entry(this.ptr.as_ptr(), key, value)?;
         }
 
+        // The fused last-axis argmax is a CUDA-only kernel, and registering a
+        // domain a session never uses would only add a schema. Sessions that do
+        // not get it fall back to the portable graph tiling, which computes the
+        // same result.
+        #[cfg(feature = "cuda")]
+        if options.selects_cuda() {
+            crate::fused_argmax::register(this.ptr.as_ptr());
+        }
+
         append_execution_providers(env, this.ptr.as_ptr(), options)?;
         apply_webgpu_provider_options(this.ptr.as_ptr(), options)?;
 
