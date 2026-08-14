@@ -2,18 +2,63 @@
 
 **Status:** Design proposal  
 **Date:** 2026-08-13  
-**Scope:** Local inference memory: one ORT process through optional
-Foundry-managed multi-process and multi-node coordination
+**Scope:** Local inference memory for a machine running several models at once —
+one ORT process through optional Foundry-managed multi-process and multi-node
+coordination
 **Supporting detail:** [design appendix](./MEMORY_MANAGEMENT_MODEL_DESIGN_APPENDIX.md)
 
 ## Motivation
 
-The goal is to make ORT and ORT GenAI execute one or more models efficiently on
-a local machine across heterogeneous CPUs, GPUs, and NPUs. A model should still
-run when its weights and generation state do not fit in VRAM; a small workload
-should consume only what it needs; multiple models and requests should share
-available capacity; and operators should be able to preserve enough headroom
-for the desktop and other applications.
+### The workload we are actually building for
+
+The target is not a benchmark harness with one model and the machine to itself.
+It is a developer laptop or workstation running an assistant that stays resident
+all day, alongside whatever else the user is doing.
+
+**A local coding agent.** A large decoder is loaded once and lives for hours. It
+is idle most of that time and bursty when used, its context grows across a long
+session, and it must stay responsive while the user is also running a compiler,
+a browser, and an IDE on the same GPU and the same RAM. Two consequences follow
+immediately. Memory it reserved for a context length it has not reached yet is
+memory the rest of the machine cannot use — and today it is charged from the
+first token. Memory it is holding while idle is memory nothing else can borrow,
+because there is no mechanism to lend it and no mechanism to ask for it back.
+
+**Speech-to-text at the same time.** The user talks to the agent, so a Whisper-
+class model has to run *while the coding model is resident*. It is small,
+latency-critical, and invoked intermittently — exactly the shape that loses
+under first-come-first-served allocation. It does not need much; it needs to be
+able to get it *now*, from a process that is holding more than it is using. A
+design that can only answer "the arena is already at its high-water mark" fails
+this case even though the bytes are physically there.
+
+**Image generation occasionally.** A diffusion model has an entirely different
+memory shape from LLM decode: large transient activation peaks, short-lived,
+compute-bound, run once in a while rather than continuously. Sizing a pool for
+its peak and keeping that pool is wrong the other 99% of the time; refusing to
+run it because a resident LLM has the VRAM is also wrong. This is the case that
+makes transient-peak accounting load-bearing rather than a nicety — the peak is
+a property of the graph, and only the session's plan knows it.
+
+**Several models serving several applications.** Locally, this is usually
+several *processes*: an editor extension, a shell tool, a background indexer,
+each with its own ORT. No process can see the others, so each must size for its
+own worst case, and their sum can exceed the device with every individual
+process behaving correctly. Nothing here is a bug in any one of them.
+
+None of these are unusual. They are the normal state of a machine running local
+AI, and they share one property: **the bytes are usually there, but they are in
+the wrong holder's pool at the wrong time.**
+
+| Use case | What breaks today | Contracts it drives |
+|---|---|---|
+| Long-lived coding agent, growing context | Reservation sized at load from the declared max context is charged from the first token | I8c elastic reservation, C5 reclaimable holder |
+| Idle-but-resident large model | No holder can lend, no authority can ask | C2 lease, C5 pressure, C8 observability |
+| Concurrent latency-critical STT | Small urgent request loses to a large incumbent that is over-provisioned right now | I12 completion-feasible admission, I13 starvation-free arbitration |
+| Occasional image generation | Transient activation peak is unknown to admission; pool sized for a peak that is rare | I8 exact bytes incl. transient peaks, session reporting edge |
+| Several apps, several processes | Each sizes for its own worst case; the sum exceeds the device | C10 cooperative hierarchy, delegated quota |
+| Model does not fit VRAM at all | All-or-nothing load | Weight offload, tiered state, demand commitment |
+| User still wants to use the machine | Runtime cannot describe or bound its own pressure | I11 honest enforcement scope, OS safety budget |
 
 ### Why this is not an arena-tuning problem
 
@@ -25,8 +70,9 @@ sizing.
 
 ORT today gives each pool a *bound*. What it does not give is a way for one
 holder to *lend* capacity to another, or for the runtime to *reclaim* capacity
-from a holder that is currently holding more than it needs. Concretely, in a
-process running one generative model:
+from a holder that is currently holding more than it needs. The multi-model
+cases above make this obvious, but it is worth showing that the **simplest**
+case already fails — one process, one generative model:
 
 - the device BFC arena grows to its high-water mark and, absent an explicit
   end-of-`Run` shrinkage request, keeps that memory for the rest of the run;
