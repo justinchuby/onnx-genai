@@ -154,7 +154,7 @@ a grant and can be asked to give some back.
 | **C4 Capacity transaction** | State-visible or cross-holder/tier/device change uses `plan -> reserve -> provisional view -> execute -> commit`. Delegated-quota negotiation and waiting happen before open. Open transactions acquire authorities in stable order with try-only reservation and release all on failure; a retry retains its original arbitration identity without holding capacity. |
 | **C5 Reclaimable holder** | Pressure is a cancellable ticket with bytes, priority, deadline, and generation. The holder chooses safe victims and may release zero. |
 | **C6 Model memory view** | A backend exposes contiguous, blocks-plus-table, indexed, or opaque views valid for the consuming execution. |
-| **C7 Topology and capability** | The platform reports physical/aliased pools, capacity, granularity, links, allocator capabilities, and supported model views. It must also report the two quantities a tiering decision needs but cannot infer: **resident-vs-host read bandwidth** for the access pattern in question, and the **aggregate host-mapped read capacity** — the total distinct host-mapped bytes a device may read per execution before results stop being trustworthy. That second figure was measured at ~0.44–0.65 GB/step on one consumer WDDM GPU, above which reads silently returned stale data (#912). A platform that cannot report it must be treated as having a capacity of zero. |
+| **C7 Topology and capability** | The platform reports physical/aliased pools, capacity, granularity, links, allocator capabilities, and supported model views. It must also report the two quantities a tiering decision needs but cannot infer: **resident-vs-host read bandwidth** for the access pattern in question, and the **aggregate host-mapped read capacity** — the total distinct host-mapped bytes a device may read per execution before results stop being trustworthy. That second figure was measured at ~0.44–0.65 GB/step on one consumer WDDM GPU, above which reads silently returned stale data (#912); whether it binds on a platform without a paging display driver is unmeasured. A platform that cannot report it must be treated as having a capacity of zero, and the figure must be obtained per platform rather than carried across. |
 | **C8 Reconfiguration and observability** | Authorities report used, available, oversubscribed, role, reclaimable, and unattributed bytes. Every one of these is a statement about **charge**, not physical residency (I8b); a report that conflates them is worse than no report, because it will be believed. Rates reported for policy decisions must be byte-weighted — a count-based hit rate over a population whose members differ by orders of magnitude in size can rise while the byte gap widens, which is exactly what happened here (57.09% -> 81.31% while the gap grew 1.78x -> 2.30x, #869). Lowering uses prepare/reclaim/commit; failure preserves the old limit and reports completed actions. |
 | **C9 Persistent state bundle** | Managed mode requires declarations for all loop-carried state and its lifetime, growth/update pattern, view, and checkpoint/fork/migrate/recompute capabilities. Missing declarations are rejected or enter reported conservative compatibility: inferred/enveloped bytes are unattributed and prefix reuse/migration is disabled. |
 | **C10 Cooperative hierarchy** | Foundry delegates quotas only to authenticated workers it spawned/authorized. Workers never hold local reservations while awaiting quota and return uncommitted delegated capacity on defer. The coordinator retains submit identity, priority, and bounded aging as a non-owning retry intent. Heartbeat failure fences/terminates the worker; quota stays charged until exit. |
@@ -328,9 +328,19 @@ The rule generalizes past that one measurement:
 | Condition | Who should move the bytes |
 |---|---|
 | Data is re-read from device memory before eviction (weights under batching, hot experts, prefix-shared KV). | The runtime. Reuse amortizes the transfer, and only the runtime knows the reuse pattern. |
-| Data is read once per execution and the working set exceeds capacity. | The platform. Managing it adds cost to the identical transfer and buys no reuse. |
+| Data is read once per execution, the working set exceeds capacity, **and the platform offers a demand-paging path**. | The platform. Managing it adds cost to the identical transfer and buys no reuse. |
+| Data is read once per execution, the working set exceeds capacity, **and the platform offers no such path**. | The runtime, necessarily. Its competitor is failure to run, so the bar is correctness and progress rather than beating anything. |
 | Capacity is sufficient and residency is stable. | Either; prefer the runtime for predictability and to keep accounting honest. |
 | Correctness depends on the bytes being where the ledger says (fences, capture, IPC). | The runtime, unconditionally — this is not a performance decision. |
+
+Rows two and three are the same workload on two operating systems, which is why
+the platform capability belongs in C7 rather than in a policy constant. Windows
+under WDDM demand-pages device-visible allocations from host RAM; Linux with a
+discrete GPU has no equivalent, so an over-budget model that does not stream
+fails outright. A measurement taken on one of these says nothing about the
+other, and this design's own history contains that mistake twice: #783 (a TCC
+conclusion carried onto WDDM) and #912 (a WDDM ceiling that must not be carried
+onto Linux, #925).
 
 Two obligations follow, both binding:
 
@@ -349,6 +359,78 @@ fused forward read each weight once for `N` tokens instead of once per token,
 which makes multi-request batching and weight offload one lever with two names.
 That amortization is measured at `1/N` with a ceiling of roughly `N_max ~ 19` at
 2048 context on this hardware (#884/#891).
+
+## Platform and EP capability negotiation
+
+Rows two and three of the table above are the same workload on two operating
+systems with opposite correct answers. The runtime has to choose between them,
+and today it chooses with `cfg!(windows)` — a compile-time proxy for "is this
+WDDM", which is wrong for TCC-mode Windows and says nothing about a third EP.
+That proxy is serviceable as an interim and indefensible as a design.
+
+The general form of the problem: **policy needs facts about the platform that
+only the EP knows, and those facts are quantities rather than flags.** A boolean
+"supports host mapping" would not have prevented #912, because the finding was
+about *how much* host-mapped data may be read before results stop being true.
+
+### What the EP must report
+
+Each row below exists because a policy decision measurably needed it, and each
+names the measurement that established the need.
+
+| Reported fact | Decides | Evidence | Status today |
+|---|---|---|---|
+| **Oversubscription behaviour** — demand-page / fail / unified | Whether "defer to the platform" is an option at all | WDDM demand-pages, 30x faster than managing it (#864/#874); TCC and Linux discrete fail at the physical limit (#783) | Inferred from `cfg!(windows)` |
+| **Ledger truthfulness** — do charged bytes imply residency | Whether C8's numbers may be reported as physical, and whether no-spill is a guarantee (I8b) | WDDM demotes our own VMM granules invisibly (#863) | Absent; assumed true |
+| **Aggregate host-mapped read capacity** | Whether zero-copy cold reads are usable, and at what budget (C7) | Silent corruption above ~0.44–0.65 GB/step on one WDDM GPU (#912); unmeasured on Linux (#925) | Absent; assumed unbounded, which corrupted output |
+| **Virtual-memory capability and granule** | Flat VMM vs blocks-plus-table vs static contiguous | 2 MiB CUDA granule; committed/useful ratio drives the choice | Known to the allocator, not reported |
+| **Resident vs host read bandwidth for the access pattern** | How much residency is worth, and therefore hot-set sizing | Sequential proxy 11.41 GB/s vs real strided GEMV ~5.6 GB/s — a 2x error in the sizing input (#877 → #880) | Absent |
+| **KV layout preference as a stride descriptor** | Which physical KV form to bind | EPs differ; a growing enum imposed by the runtime cannot express it (#783) | A runtime-side enum |
+| **Reclaim capability** | Whether an EP-side holder can answer pressure at all (C5) | — | Absent; no pressure path into the EP |
+
+Today's channel is `ExecutionProviderCapabilities`, a set of opaque string
+flags carrying exactly one entry (`"nxrt"`). It can express *that* an EP pages
+weights; it cannot express any quantity in the table.
+
+### Which of these need new API
+
+Rows one to five are **reporting**, and reporting wants one extensible record
+rather than seven entry points — a versioned struct with a `struct_size`
+prefix, negotiated the way the plugin ABI already negotiates major/minor. Adding
+a capability later then costs a field, not an ABI break, and an EP that predates
+a field is handled by the degradation rule below.
+
+Two rows are different in kind:
+
+- **KV layout is a negotiation, not a report.** The runtime must end up binding
+  exactly one physical form per KV binding, so an EP that merely announces a
+  preference leaves the runtime no way to resolve a disagreement. The shape that
+  works is propose/accept/counter over a stride descriptor (#783), with the
+  runtime holding the final choice and the EP free to decline to be fast.
+- **Reclaim is behavioural.** C5's pressure ticket has to reach an EP-side
+  holder, which means a callback rather than a field: `reclaim(target_bytes) ->
+  released_bytes`, with the holder choosing victims (I6) and permitted to
+  release zero.
+
+### Rules that keep this from fragmenting
+
+1. **EPs report facts; the runtime owns policy.** If each EP decides for itself
+   when to offload, the policies diverge, and no single authority can account
+   for the result — which defeats the reason for having one ledger.
+2. **An unreported capability degrades to its most conservative reading, never
+   its most convenient one.** Unknown host-mapped capacity is zero, not
+   unbounded. Unknown oversubscription behaviour is "fails", not "demand-pages".
+   #912 is the cautionary case: the optimistic default produced silently wrong
+   tokens rather than an error.
+3. **Report quantities where policy needs quantities.** Flags collapse exactly
+   the information the decision turns on.
+4. **A compile-time proxy is an interim, and must be labelled as one.** It is
+   acceptable to ship `cfg!(windows)` while the report does not exist. It is not
+   acceptable to build policy that cannot be rewired to a report without being
+   rewritten.
+5. **A capability measured on one platform is a fact about that platform.** Both
+   directions of this have already cost us: #783 carried a TCC conclusion onto
+   WDDM, and #912 must not be carried onto Linux (#925).
 
 ## Do we still need PagedAttention?
 
@@ -438,11 +520,23 @@ safe victims.
    peaks and EP mapping granularity, so admission can satisfy I8 with measured
    graph geometry instead of an envelope. This is the smallest ORT-side change
    in the list and the one the rest of admission depends on.
-9. Implement completion-feasible request admission in the GenAI scheduler and
-   eviction-progress protection in model residency.
-10. Extend formal/refinement coverage from one HostGovernor to ordered,
-   starvation-free multi-authority transactions and completion-feasible
-   admission.
+9. Replace the opaque capability flag set with a **versioned EP capability
+   record** carrying the quantities in
+   [Platform and EP capability negotiation](#platform-and-ep-capability-negotiation):
+   oversubscription behaviour, ledger truthfulness, host-mapped read capacity,
+   VMM capability and granule, and the resident-vs-host bandwidth pair. One
+   `struct_size`-prefixed record, so a later capability costs a field rather
+   than an ABI break. This retires the `cfg!(windows)` proxy currently standing
+   in for WDDM detection.
+10. Add a KV **stride-descriptor negotiation** (propose/accept/counter) so an EP
+    can state a layout preference and the runtime can still bind exactly one
+    physical form (#783), and an optional `reclaim(target_bytes) ->
+    released_bytes` callback so C5 pressure can reach an EP-side holder.
+11. Implement completion-feasible request admission in the GenAI scheduler and
+    eviction-progress protection in model residency.
+12. Extend formal/refinement coverage from one HostGovernor to ordered,
+    starvation-free multi-authority transactions and completion-feasible
+    admission.
 
 ## Major risks and mitigations
 
