@@ -23,6 +23,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
+mod arg_reduce;
 mod islands;
 mod workflow;
 

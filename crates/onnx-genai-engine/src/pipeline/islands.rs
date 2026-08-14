@@ -979,6 +979,9 @@ fn batching_safe_policy_contract(component: &WorkflowComponent) -> bool {
     let Some(contract) = &component.contract else {
         return true;
     };
+    if contract.version == "1" {
+        return v1_policy_contract_is_batching_safe(component, contract);
+    }
     let (input_roles, output_roles): (&[&str], &[&str]) = match contract.id.as_str() {
         "onnx-genai.token-sampler" => (
             &[
@@ -1026,6 +1029,143 @@ fn batching_safe_policy_contract(component: &WorkflowComponent) -> bool {
             Some(onnx_genai_metadata::ScalarValue::String(value)) if value == "preserve"
         )
         && state_update_contracts_match(component, contract)
+}
+
+/// Admit the canonical version-1 policy ABI into execution-island fusion.
+///
+/// A version-1 sampler, termination predicate, or state update declares no
+/// per-row activity ports at all, so its ONNX graph computes over the whole
+/// bound batch whether it is invoked on its own or linked into an island. Fusion
+/// therefore elides intermediate materialization without changing a single row's
+/// result: the same graphs run in the same order over the same tensors. Row
+/// activity for a version-1 package is expressed by the workflow's guarded emit
+/// and carried state, not by the policy graph, and that is unchanged by fusion.
+///
+/// The port shapes are still checked structurally so a mislabelled artifact
+/// cannot enter an island: every fused row axis must be the shared `batch`
+/// symbol, which is what keeps the stable binding and its graph bucket keyed by
+/// one batch extent.
+fn v1_policy_contract_is_batching_safe(
+    component: &WorkflowComponent,
+    contract: &onnx_genai_metadata::ComponentContract,
+) -> bool {
+    let tensor = |role: &str, input: bool| {
+        contract.bindings.get(role).and_then(|port| {
+            if input {
+                component.ports.inputs.get(port)
+            } else {
+                component.ports.outputs.get(port)
+            }
+        })
+    };
+    let dimension = |tensor: &onnx_genai_metadata::TensorContract, axis: usize| {
+        tensor.shape.as_deref().and_then(|shape| shape.get(axis)).cloned()
+    };
+    let row_axis = |tensor: &onnx_genai_metadata::TensorContract| {
+        matches!(
+            dimension(tensor, 0),
+            Some(onnx_genai_metadata::TensorDimension::Symbol(symbol)) if symbol == "batch"
+        )
+    };
+    let integer = |tensor: &onnx_genai_metadata::TensorContract| {
+        tensor.dtype.starts_with("int") || tensor.dtype.starts_with("uint")
+    };
+    let float = |tensor: &onnx_genai_metadata::TensorContract| {
+        matches!(tensor.dtype.as_str(), "float32" | "float16" | "bfloat16")
+    };
+    let bound_roles = |roles: &[&str]| -> bool {
+        contract.bindings.len() == roles.len()
+            && roles.iter().all(|role| contract.bindings.contains_key(*role))
+    };
+    match contract.id.as_str() {
+        "onnx-genai.token-sampler" => {
+            // Only greedy selection is admitted: a sampled version-1 policy has
+            // no counter/seed ports, so its RNG could not stay deterministic
+            // across a captured replay.
+            if !matches!(
+                contract.parameters.get("mode"),
+                Some(onnx_genai_metadata::ScalarValue::String(mode)) if mode == "greedy"
+            ) {
+                return false;
+            }
+            let (Some(logits), Some(token)) = (tensor("logits", true), tensor("token", false))
+            else {
+                return false;
+            };
+            bound_roles(&["logits", "token"])
+                && float(logits)
+                && matches!(logits.rank, 2 | 3)
+                && row_axis(logits)
+                && integer(token)
+                && token.rank == 1
+                && row_axis(token)
+        }
+        "onnx-genai.termination-predicate" => {
+            let (
+                Some(tokens),
+                Some(eos_ids),
+                Some(iteration),
+                Some(max_iterations),
+                Some(done),
+                Some(next),
+            ) = (
+                tensor("tokens", true),
+                tensor("eos_ids", true),
+                tensor("iteration", true),
+                tensor("max_iterations", true),
+                tensor("done", false),
+                tensor("continue", false),
+            )
+            else {
+                return false;
+            };
+            bound_roles(&[
+                "tokens",
+                "eos_ids",
+                "iteration",
+                "max_iterations",
+                "done",
+                "continue",
+            ]) && integer(tokens)
+                && tokens.rank == 1
+                && row_axis(tokens)
+                && integer(eos_ids)
+                && eos_ids.rank == 1
+                && integer(iteration)
+                && iteration.rank == 1
+                && integer(max_iterations)
+                && max_iterations.rank == 1
+                && done.dtype == "bool"
+                && done.rank == 1
+                && row_axis(done)
+                && next.dtype == "bool"
+                && next.rank == 1
+                && matches!(
+                    dimension(next, 0),
+                    Some(onnx_genai_metadata::TensorDimension::Fixed(1))
+                )
+        }
+        "onnx-genai.state-update" => {
+            let (Some(current), Some(update), Some(next)) = (
+                tensor("current", true),
+                tensor("update", true),
+                tensor("next", false),
+            ) else {
+                return false;
+            };
+            bound_roles(&["current", "update", "next"])
+                && current.dtype == "int64"
+                && update.dtype == "int64"
+                && next.dtype == "int64"
+                && current.rank == 2
+                && update.rank == 1
+                && next.rank == 2
+                && row_axis(current)
+                && row_axis(update)
+                && current.shape == next.shape
+        }
+        _ => true,
+    }
 }
 
 fn state_update_contracts_match(
@@ -1243,7 +1383,7 @@ fn build_execution_island(
         })
         .cloned()
         .collect::<HashSet<_>>();
-    let linked = link_models(id, &invocations, models, &boundary_outputs)?;
+    let linked = link_models(id, &invocations, models, &boundary_outputs, workflow)?;
     let mut options = models.session_options();
     let capture_requested = options.graph_capture;
     if !linked.external_files.is_empty() && !(device.starts_with("cuda:") && capture_requested) {
@@ -1557,6 +1697,7 @@ fn link_models(
     invocations: &[IslandInvocation],
     models: &onnx_genai_ort::PipelineModels,
     boundary_outputs: &HashSet<String>,
+    workflow: &WorkflowSpec,
 ) -> anyhow::Result<LinkedModel> {
     let mut model = ModelProto {
         ir_version: 8,
@@ -1649,6 +1790,7 @@ fn link_models(
                         .clone();
                     let mut info = input.clone();
                     info.name = name.clone();
+                    refine_boundary_input_extents(&mut info, workflow, value_ref);
                     graph_inputs.entry(name.clone()).or_insert(info);
                     fused_inputs.insert(name.clone(), value_ref.clone());
                     name
@@ -1770,6 +1912,14 @@ fn link_models(
         graph.value_info.extend(source_graph.value_info);
     }
     graph.input.extend(graph_inputs.into_values());
+    let tiled_arg_reductions = super::arg_reduce::tile_degenerate_arg_reductions(graph);
+    if tiled_arg_reductions > 0 {
+        tracing::debug!(
+            island = id,
+            tiled_arg_reductions,
+            "tiled degenerate last-axis arg-reductions inside execution island"
+        );
+    }
     model.opset_import = opsets
         .into_iter()
         .map(
@@ -1791,6 +1941,61 @@ fn link_models(
         external_files: external_files.into_values().collect(),
         node_count,
     })
+}
+
+/// Stamp workflow-declared fixed extents onto an island's boundary input type.
+///
+/// A component artifact spells its own ports symbolically (`policy.x.vocabulary`)
+/// because it is authored independently of the package that binds it. The
+/// workflow, however, declares the concrete contract of the value flowing into
+/// that port — a vocabulary-width logits cell is `[batch, 202048]`. Copying those
+/// fixed extents into the linked graph lets ORT shape-specialize the island and
+/// lets later passes see a static reduced extent, while every symbolic axis (the
+/// serving row axis in particular) stays symbolic so one island still serves
+/// every batch shape.
+///
+/// Only an axis the artifact left symbolic is refined, and only from a contract
+/// the workflow already enforces on that value, so this narrows declared types
+/// without inventing any.
+fn refine_boundary_input_extents(
+    info: &mut ValueInfoProto,
+    workflow: &WorkflowSpec,
+    value_ref: &str,
+) {
+    let Some(contract) = workflow
+        .state
+        .get(value_ref)
+        .map(|cell| &cell.contract)
+        .or_else(|| workflow.inputs.get(value_ref).map(|input| &input.contract))
+    else {
+        return;
+    };
+    let Some(declared) = contract.shape.as_deref() else {
+        return;
+    };
+    let Some(type_proto::Value::TensorType(tensor)) =
+        info.r#type.as_mut().and_then(|kind| kind.value.as_mut())
+    else {
+        return;
+    };
+    let Some(shape) = tensor.shape.as_mut() else {
+        return;
+    };
+    if shape.dim.len() != declared.len() {
+        return;
+    }
+    for (dimension, declared) in shape.dim.iter_mut().zip(declared) {
+        let onnx_genai_metadata::TensorDimension::Fixed(extent) = declared else {
+            continue;
+        };
+        if matches!(
+            dimension.value,
+            Some(tensor_shape_proto::dimension::Value::DimValue(existing)) if existing > 0
+        ) {
+            continue;
+        }
+        dimension.value = Some(tensor_shape_proto::dimension::Value::DimValue(*extent));
+    }
 }
 
 /// Namespace artifact-local symbolic dimensions before models share one graph.

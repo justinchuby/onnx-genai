@@ -129,3 +129,6 @@ PR*.md
 # seq-major microbenchmark scratch crate
 /bench-seqmajor/target/
 bench-bins/
+
+# Local Muse stock-ORT performance scratch (probes, nsys reports, run logs).
+/scratch/
