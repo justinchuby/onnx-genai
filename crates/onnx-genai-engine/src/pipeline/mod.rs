@@ -1194,7 +1194,7 @@ impl PipelineEngine {
                 snapshot.vram.used = authority.used_bytes();
                 snapshot.vram.limit = authority.limit_bytes();
                 snapshot.vram.headroom = authority.headroom_bytes();
-                snapshot.resolved_limits.vram_bytes = authority.limit_bytes();
+                snapshot.resolved_limits.vram_bytes = Some(authority.limit_bytes());
             }
             snapshot
         }

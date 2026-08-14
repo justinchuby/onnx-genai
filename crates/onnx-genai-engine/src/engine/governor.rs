@@ -87,12 +87,22 @@ pub(crate) fn validate_native_decode_device(
     }
 }
 
-// Provisional vendor-neutral capacities used until the active EP, OS, and
-// filesystem supply real providers. Configured limits are resolved against
-// these conservative constants; they never manufacture additional capacity.
-pub(crate) const PROVISIONAL_VRAM_CAPACITY_BYTES: u64 = 8 << 30;
-pub(crate) const PROVISIONAL_HOST_RAM_CAPACITY_BYTES: u64 = 16 << 30;
-pub(crate) const PROVISIONAL_DISK_CAPACITY_BYTES: u64 = 16 << 30;
+// Real, platform-measured capacities replace the fabricated constants that
+// #947 removed. VRAM has no vendor-neutral capacity query yet, so when no
+// execution provider can report it the device tier is *unknown* (see
+// `capacity_providers_for_device`), never a manufactured number. Host RAM and
+// disk are measured from the OS by `crate::platform_capacity`.
+
+/// The filesystem path whose free/total is used to size the disk-spill tier.
+///
+/// #947 asked for "free/total on the path that would actually be used for
+/// spill, not an arbitrary drive." There is no separately configured spill
+/// directory today, so the working directory (the process's default write
+/// location) is the honest stand-in; falling back to the temp dir keeps the
+/// query robust when the cwd is unavailable.
+fn disk_spill_measurement_path() -> std::path::PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir())
+}
 
 /// Engine-owned Resource Governor handle.
 pub struct EngineResourceGovernor {
@@ -281,22 +291,35 @@ impl EngineResourceGovernor {
         // what remains after a claim the ledger can see, rather than after
         // arithmetic it cannot.
         let snapshot = inner.snapshot();
+        // Device (VRAM) ceiling for the authority. `None` means the device
+        // capacity could not be measured (no CUDA query, no vendor-neutral
+        // probe): the KV cache and weights on this box live in host RAM, so the
+        // advisory device authority is bounded by the *measured* host-RAM ceiling
+        // rather than a fabricated device constant (the #947 bug) or an unusable
+        // zero that would collapse admission on a device-less machine. This is
+        // the pragmatic hot-tier bound, not the deferred UMA authority
+        // unification: no device lease is aliased onto host memory, and the plan
+        // still reports the device budget as unknown.
+        let device_ceiling_bytes = snapshot
+            .resolved_limits
+            .vram_bytes
+            .unwrap_or(snapshot.resolved_limits.host_ram_bytes);
         let device = match (provider, domain) {
             (Some(provider), Some(domain)) => provider
-                .authority(domain, snapshot.resolved_limits.vram_bytes)
+                .authority(domain, device_ceiling_bytes)
                 .map_err(|error| ResourceError::BudgetArithmeticOverflow {
                     operation: "acquiring the shared device memory authority",
                     reason: error.to_string(),
                 })?,
             (None, Some(domain)) => {
-                DeviceMemoryAuthority::new(domain.clone(), snapshot.resolved_limits.vram_bytes)
+                DeviceMemoryAuthority::new(domain.clone(), device_ceiling_bytes)
             }
             _ => DeviceMemoryAuthority::new(
                 DeviceCompatibilityDomain::Accelerator {
                     backend: "standalone".to_string(),
                     index: 0,
                 },
-                snapshot.resolved_limits.vram_bytes,
+                device_ceiling_bytes,
             ),
         };
         let memory = EngineMemoryGovernor::new(
@@ -304,7 +327,13 @@ impl EngineResourceGovernor {
             snapshot.resolved_limits.host_ram_bytes,
             snapshot.disk_spill.as_ref().map_or(0, |tier| tier.limit),
         );
-        if provider.is_some()
+        // A reservation that "does not fit under the resolved ceiling" is only a
+        // real failure when there *is* a resolved ceiling. When the device
+        // capacity is unknown (`vram_bytes == None`) there is nothing to fit
+        // under, so this must not refuse the load — it stays advisory, exactly as
+        // it did before #947 stopped fabricating an 8 GiB ceiling here.
+        if let Some(resolved_vram_bytes) = snapshot.resolved_limits.vram_bytes
+            && provider.is_some()
             && reservation_bytes > 0
             && !snapshot.derived_budget.reservation_applied
         {
@@ -312,8 +341,7 @@ impl EngineResourceGovernor {
                 operation: "reserving production model weights before session load",
                 reason: format!(
                     "{reservation_bytes} bytes of model weights do not fit under the resolved \
-                     {} byte device-authority limit",
-                    snapshot.resolved_limits.vram_bytes
+                     {resolved_vram_bytes} byte device-authority limit"
                 ),
             });
         }
@@ -322,8 +350,18 @@ impl EngineResourceGovernor {
         // ceiling that may itself be provisional, so it must never be the reason
         // a model refuses to start -- and when it was not applied there is
         // nothing to charge.
+        //
+        // The reservation is a *device*-tier lease. When the device capacity is
+        // unknown (`vram_bytes == None`) there is no device tier to charge it to
+        // (the device authority is inert with a zero ceiling), and on such a box
+        // the weights live in host RAM under the runtime's own management, not
+        // the device ledger. Charging a device reservation against a zero-ceiling
+        // tier would fail a load that has no device at all (#947), so skip it.
         let mut plan = ModelMemoryPlan::new(memory.clone());
-        if snapshot.derived_budget.reservation_applied && reservation_bytes > 0 {
+        if snapshot.resolved_limits.vram_bytes.is_some()
+            && snapshot.derived_budget.reservation_applied
+            && reservation_bytes > 0
+        {
             plan.reserve(Holder::FixedDeviceReservation, reservation_bytes)
                 .map_err(|error| ResourceError::BudgetArithmeticOverflow {
                     operation: "charging the fixed device reservation to the memory ledger",
@@ -454,13 +492,18 @@ impl EngineResourceGovernor {
         // across live engine sessions when the outcome reports an overage.
         let outcome = self.inner.set_vram_limit(limit)?;
         let authority = self.memory.device_authority();
-        if let Err(error) = authority.try_set_limit_bytes(outcome.new_limits.vram_bytes) {
-            let _ = self
-                .inner
-                .set_vram_limit(ResourceLimit::Bytes(outcome.old_limits.vram_bytes));
+        // When the device capacity is unknown the resolved ceiling is `None` and
+        // the authority is inert — there is no number to push, so leave it
+        // untouched rather than fabricating one.
+        if let Some(new_vram) = outcome.new_limits.vram_bytes
+            && let Err(error) = authority.try_set_limit_bytes(new_vram)
+        {
+            if let Some(old_vram) = outcome.old_limits.vram_bytes {
+                let _ = self.inner.set_vram_limit(ResourceLimit::Bytes(old_vram));
+            }
             return Err(EngineGovernorError::Resource(
                 ResourceError::CannotSatisfyLoweredLimit {
-                    requested_bytes: outcome.new_limits.vram_bytes,
+                    requested_bytes: new_vram,
                     minimum_bytes: authority.used_bytes(),
                     reason: error.to_string(),
                 },
@@ -576,22 +619,37 @@ pub enum EngineGovernorError {
     Resource(#[from] ResourceError),
 }
 
+/// A capacity provider built from a real OS/EP measurement, or
+/// [`UnknownCapacity`] when the platform could not report it. A fraction/auto
+/// limit resolved against the unknown provider is itself unknown — never a
+/// fabricated number.
+fn measured_or_unknown(measured: Option<(u64, u64)>) -> Arc<dyn CapacityProvider> {
+    match measured {
+        Some((total, free)) => Arc::new(FixedCapacity::new(total, free)),
+        None => Arc::new(onnx_genai_scheduler::UnknownCapacity),
+    }
+}
+
+/// Capacity providers with **no** device query available: VRAM is reported as
+/// *unknown* (there is no vendor-neutral capacity probe yet, and #947 forbids
+/// fabricating one), while host RAM and disk are measured from the OS.
 pub(crate) fn fallback_capacity_providers(limits: &ResourceLimits) -> CapacityProviders {
+    let host_ram = measured_or_unknown(crate::platform_capacity::host_ram_total_bytes().map(
+        |total| {
+            let available = crate::platform_capacity::host_ram_available_bytes().unwrap_or(total);
+            (total, available)
+        },
+    ));
     let disk_spill = limits.disk_spill_limit.map(|_| {
-        Arc::new(FixedCapacity::new(
-            PROVISIONAL_DISK_CAPACITY_BYTES,
-            PROVISIONAL_DISK_CAPACITY_BYTES,
-        )) as Arc<dyn CapacityProvider>
+        measured_or_unknown(crate::platform_capacity::disk_capacity_bytes(
+            &disk_spill_measurement_path(),
+        ))
     });
     CapacityProviders {
-        vram: Arc::new(FixedCapacity::new(
-            PROVISIONAL_VRAM_CAPACITY_BYTES,
-            PROVISIONAL_VRAM_CAPACITY_BYTES,
-        )),
-        host_ram: Arc::new(FixedCapacity::new(
-            PROVISIONAL_HOST_RAM_CAPACITY_BYTES,
-            PROVISIONAL_HOST_RAM_CAPACITY_BYTES,
-        )),
+        // Unknown, not a manufactured 8 GiB: a fraction of this stays unknown,
+        // which is the whole point of #947.
+        vram: Arc::new(onnx_genai_scheduler::UnknownCapacity),
+        host_ram,
         disk_spill,
     }
 }
@@ -600,7 +658,8 @@ pub(crate) fn fallback_capacity_providers(limits: &ResourceLimits) -> CapacityPr
 ///
 /// Returns `(total_bytes, free_bytes)` on success. Returns `None` when the
 /// query is unavailable (no driver, query failure, or a nonsense zero total)
-/// so the caller falls back to the provisional capacity constant.
+/// so the caller reports the device tier as *unknown* rather than fabricating a
+/// capacity.
 #[cfg(feature = "cuda")]
 pub(crate) fn real_cuda_vram_capacity(device_index: u32) -> Option<(u64, u64)> {
     let device_id = i32::try_from(device_index).ok()?;
@@ -609,7 +668,7 @@ pub(crate) fn real_cuda_vram_capacity(device_index: u32) -> Option<(u64, u64)> {
         Ok(_) => {
             tracing::warn!(
                 device_index,
-                "cudaMemGetInfo reported zero total VRAM; falling back to provisional capacity"
+                "cudaMemGetInfo reported zero total VRAM; reporting the device tier as unknown"
             );
             None
         }
@@ -617,7 +676,7 @@ pub(crate) fn real_cuda_vram_capacity(device_index: u32) -> Option<(u64, u64)> {
             tracing::warn!(
                 device_index,
                 error = %err,
-                "could not query real CUDA device memory; falling back to provisional VRAM capacity"
+                "could not query real CUDA device memory; reporting the device tier as unknown"
             );
             None
         }
@@ -627,13 +686,13 @@ pub(crate) fn real_cuda_vram_capacity(device_index: u32) -> Option<(u64, u64)> {
 /// Capacity providers with the VRAM tier resolved against the *real* device
 /// total when the decode targets a CUDA device.
 ///
-/// The provisional `PROVISIONAL_VRAM_CAPACITY_BYTES` (8 GiB) is a portability
-/// hazard: a `Fraction(0.90)` limit resolved against it caps device leases at
-/// ~7.2 GiB on *every* machine, so any model larger than that fails to load
-/// resident even on a 143 GiB H200. When the native device is CUDA we query
-/// the driver for the true capacity so the default fraction "just works"; the
-/// 8 GiB constant survives only as a last-resort fallback for CPU-only builds
-/// or a failed query.
+/// Without a real device query the VRAM tier is [`UnknownCapacity`]: a
+/// `Fraction(0.90)` limit against an *8 GiB constant* used to cap device leases
+/// at ~7.2 GiB on every machine (a portability hazard that also fabricated a
+/// ceiling on machines with no such device at all — #947). When the native
+/// device is CUDA we query the driver for the true capacity so the default
+/// fraction "just works"; otherwise the tier stays honestly unknown and a
+/// fraction of it resolves to `None`, not a manufactured number.
 pub(crate) fn capacity_providers_for_device(
     limits: &ResourceLimits,
     cuda_device_index: Option<u32>,
@@ -651,10 +710,14 @@ pub(crate) fn capacity_providers_for_device(
     providers
 }
 
+/// Resolve the configured VRAM limit to a concrete byte budget, or `None` when
+/// the device capacity could not be measured and the limit was a fraction —
+/// "a fraction of an unknown is unknown, not a number" (#947). An explicit
+/// `--vram-limit <bytes>` is always honoured, measurable device or not.
 pub(crate) fn resolve_vram_limit_bytes(
     limits: &ResourceLimits,
     cuda_device_index: Option<u32>,
-) -> anyhow::Result<u64> {
+) -> anyhow::Result<Option<u64>> {
     let capacities = capacity_providers_for_device(limits, cuda_device_index);
     onnx_genai_scheduler::resolve_limit(limits.vram_limit, capacities.vram.as_ref(), "vram")
         .map_err(anyhow::Error::new)
@@ -794,49 +857,83 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fallback_vram_fraction_resolves_against_provisional_capacity() {
-        // CPU-only / no-CUDA path: `cuda_device_index = None` must resolve a
-        // `Fraction` against the provisional 8 GiB tier (documented last-resort
-        // fallback), never a zero or a panic.
+    fn fraction_over_unmeasured_vram_is_unknown_not_a_number() {
+        // #947 regression: on the reported machine (no NVIDIA GPU) the no-CUDA
+        // path resolved `Fraction(0.90)` against a fabricated 8 GiB constant,
+        // yielding a specific-looking 7,730,940,928 that a real user mistook for
+        // a device that did not exist. It must now resolve to `None` (unknown).
+        //
+        // This test *fails on `main`* — there `resolve_vram_limit_bytes` returns
+        // `Ok(7_730_940_928)` — which is the whole point: it pins the fix, not a
+        // tautology that both versions pass.
         let limits = ResourceLimits {
             vram_limit: ResourceLimit::Fraction(0.90),
             host_ram_limit: ResourceLimit::Fraction(0.90),
             disk_spill_limit: None,
         };
-        let resolved = resolve_vram_limit_bytes(&limits, None).unwrap();
-        let expected = (PROVISIONAL_VRAM_CAPACITY_BYTES as f64 * 0.90) as u64;
-        // The resolver applies the fraction in f32, so allow a few ULP of slack.
-        assert!(
-            resolved.abs_diff(expected) <= 4096,
-            "resolved {resolved} should be ~0.9 * 8 GiB ({expected})"
+        assert_eq!(
+            resolve_vram_limit_bytes(&limits, None).unwrap(),
+            None,
+            "a fraction of an unmeasured device capacity must be unknown, not a number"
         );
     }
 
     #[test]
-    fn no_cuda_device_uses_provisional_vram_provider() {
+    fn explicit_vram_byte_limit_is_honoured_without_a_device_query() {
+        // An explicit limit is the caller's own assertion and must survive even
+        // when no device capacity can be measured.
+        let limits = ResourceLimits {
+            vram_limit: ResourceLimit::Bytes(12_345_678),
+            host_ram_limit: ResourceLimit::Fraction(0.90),
+            disk_spill_limit: None,
+        };
+        assert_eq!(
+            resolve_vram_limit_bytes(&limits, None).unwrap(),
+            Some(12_345_678)
+        );
+    }
+
+    #[test]
+    fn no_cuda_device_reports_unknown_vram_capacity() {
+        // The device tier must report *unknown*, not a manufactured 8 GiB total,
+        // when there is no execution provider to query.
         let limits = ResourceLimits::default();
         let providers = capacity_providers_for_device(&limits, None);
-        assert_eq!(
-            providers.vram.total_bytes(),
-            PROVISIONAL_VRAM_CAPACITY_BYTES
-        );
+        assert_eq!(providers.vram.total_bytes(), None);
+        assert_eq!(providers.vram.free_bytes(), None);
+    }
+
+    #[test]
+    fn host_ram_capacity_is_measured_not_fabricated() {
+        // Host RAM is queryable on every supported platform, so the tier must
+        // carry a real number — not the old fabricated 16 GiB constant.
+        let limits = ResourceLimits::default();
+        let providers = capacity_providers_for_device(&limits, None);
+        let total = providers
+            .host_ram
+            .total_bytes()
+            .expect("host RAM must be measurable on this platform");
+        assert!(total > (1u64 << 30), "implausibly small host RAM: {total}");
+        assert_ne!(total, 16u64 << 30, "looks like the old fabricated constant");
     }
 
     // The real-capacity path is what fixes the portability bug: on a CUDA build
     // with a visible device, a `Fraction(0.90)` must resolve against the true
-    // device total, not the 8 GiB provisional cap — otherwise any model larger
-    // than ~7.2 GiB fails to load resident even on a 143 GiB H200.
+    // device total, not a provisional cap — otherwise any model larger than
+    // ~7.2 GiB fails to load resident even on a 143 GiB H200.
     #[cfg(feature = "cuda")]
     #[test]
     fn real_cuda_capacity_lifts_fraction_above_provisional_cap() {
+        // Historic 8 GiB provisional cap this test guards against regressing to.
+        const LEGACY_PROVISIONAL_VRAM_CAP: u64 = 8 << 30;
         let Some((total, _free)) = real_cuda_vram_capacity(0) else {
             eprintln!("no CUDA device 0 visible; skipping real-capacity assertion");
             return;
         };
-        // Only meaningful when the device is larger than the provisional tier
+        // Only meaningful when the device is larger than the historic cap
         // (true for every modern datacenter GPU, e.g. H200 = 143 GiB).
-        if total <= PROVISIONAL_VRAM_CAPACITY_BYTES {
-            eprintln!("device 0 total {total} <= provisional cap; skipping");
+        if total <= LEGACY_PROVISIONAL_VRAM_CAP {
+            eprintln!("device 0 total {total} <= legacy provisional cap; skipping");
             return;
         }
         let limits = ResourceLimits {
@@ -844,8 +941,10 @@ mod tests {
             host_ram_limit: ResourceLimit::Fraction(0.90),
             disk_spill_limit: None,
         };
-        let resolved = resolve_vram_limit_bytes(&limits, Some(0)).unwrap();
-        let provisional_cap = (PROVISIONAL_VRAM_CAPACITY_BYTES as f64 * 0.90) as u64;
+        let resolved = resolve_vram_limit_bytes(&limits, Some(0))
+            .unwrap()
+            .expect("a visible CUDA device has a measured capacity");
+        let provisional_cap = (LEGACY_PROVISIONAL_VRAM_CAP as f64 * 0.90) as u64;
         assert!(
             resolved > provisional_cap,
             "resolved {resolved} must exceed provisional cap {provisional_cap}"

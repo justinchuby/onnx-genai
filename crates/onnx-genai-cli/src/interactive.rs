@@ -700,7 +700,7 @@ impl Backend {
                     kv_max_tokens: Some(budget.max_total_tokens),
                     host_ram_used_bytes: Some(snapshot.host_ram.used),
                     device_used_bytes: Some(snapshot.vram.used),
-                    device_limit_bytes: Some(snapshot.resolved_limits.vram_bytes),
+                    device_limit_bytes: snapshot.resolved_limits.vram_bytes,
                     device_oversubscribed_bytes: Some(engine.device_oversubscribed_bytes()),
                     peak_resident_bytes: None,
                     composition: Some(profile::DeviceComposition {

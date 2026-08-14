@@ -42,9 +42,16 @@ impl Default for ResourceLimits {
 }
 
 /// Vendor-neutral capacity query supplied by the active execution environment.
+///
+/// Both queries return `Option`: `None` means the capacity **could not be
+/// measured** on this platform, which is a different fact from a small number
+/// and must never render as one. A fraction/auto limit resolved against an
+/// unmeasured capacity is itself unknown (see [`resolve_limit`]), not a guess.
 pub trait CapacityProvider: Send + Sync {
-    fn total_bytes(&self) -> u64;
-    fn free_bytes(&self) -> u64;
+    /// Total capacity in bytes, or `None` when the platform cannot report it.
+    fn total_bytes(&self) -> Option<u64>;
+    /// Free capacity in bytes, or `None` when the platform cannot report it.
+    fn free_bytes(&self) -> Option<u64>;
 }
 
 /// Fixed capacity provider useful for tests and statically known tiers.
@@ -61,12 +68,30 @@ impl FixedCapacity {
 }
 
 impl CapacityProvider for FixedCapacity {
-    fn total_bytes(&self) -> u64 {
-        self.total
+    fn total_bytes(&self) -> Option<u64> {
+        Some(self.total)
     }
 
-    fn free_bytes(&self) -> u64 {
-        self.free
+    fn free_bytes(&self) -> Option<u64> {
+        Some(self.free)
+    }
+}
+
+/// A capacity the platform cannot report. Every query returns `None`, so a
+/// fraction/auto limit resolved against it is *unknown* rather than a fabricated
+/// number. This is what a tier reports when no execution provider, OS call, or
+/// filesystem query can supply a real figure — the honest opposite of a
+/// specific-looking constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UnknownCapacity;
+
+impl CapacityProvider for UnknownCapacity {
+    fn total_bytes(&self) -> Option<u64> {
+        None
+    }
+
+    fn free_bytes(&self) -> Option<u64> {
+        None
     }
 }
 
@@ -196,7 +221,11 @@ pub struct DerivedBudget {
 /// Concrete per-tier ceilings after capacity resolution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolvedLimits {
-    pub vram_bytes: u64,
+    /// Resolved device (VRAM) ceiling, or `None` when the device capacity could
+    /// not be measured and the limit was a fraction/auto. `None` is *unknown*,
+    /// not zero and not a provisional constant: nothing downstream may resolve a
+    /// device budget from a fraction of an unmeasured capacity.
+    pub vram_bytes: Option<u64>,
     pub host_ram_bytes: u64,
     pub disk_spill_bytes: Option<u64>,
 }
@@ -294,6 +323,13 @@ pub enum ResourceError {
     MissingDiskCapacityProvider,
 
     #[error(
+        "cannot resolve the {tier} budget: it was requested as a fraction of capacity but the \
+         {tier} capacity could not be measured on this platform; set an explicit byte limit so \
+         the runtime is sized against a real number instead of a fabricated one"
+    )]
+    UnmeasuredCapacity { tier: &'static str },
+
+    #[error(
         "cannot derive the KV memory budget because per-layer KV page geometry is unknown \
          ({tokens_per_page} token(s) per page but no byte size); fix by declaring model.io.kv_inputs \
          and model.io.kv_outputs so the runtime can inspect the model's real KV head geometry"
@@ -356,11 +392,17 @@ pub enum ResourceError {
 }
 
 /// Resolve a limit against a tier's detected total capacity.
+///
+/// Returns `Ok(None)` when the limit is a fraction (or `auto`) and the tier's
+/// capacity could not be measured: a fraction of an unknown is unknown, not a
+/// number. An explicit [`ResourceLimit::Bytes`] is always `Ok(Some(bytes))` —
+/// it is the caller's authoritative statement about the device and is honoured
+/// with or without a measured capacity.
 pub fn resolve_limit(
     limit: ResourceLimit,
     capacity: &dyn CapacityProvider,
     tier: &'static str,
-) -> Result<u64, ResourceError> {
+) -> Result<Option<u64>, ResourceError> {
     let default_fraction = match tier {
         "vram" => DEFAULT_VRAM_FRACTION,
         "host RAM" => DEFAULT_HOST_RAM_FRACTION,
@@ -371,15 +413,20 @@ pub fn resolve_limit(
     match limit {
         // An explicit byte limit is the caller's assertion about the device and
         // is taken at face value. Clamping it to the reported capacity would be
-        // right only if that capacity were measured; while it is a provisional
-        // constant, clamping silently discards the one knob a user has for
-        // telling the runtime how much memory it may actually use.
-        ResourceLimit::Bytes(bytes) => Ok(bytes),
-        ResourceLimit::Auto => Ok(resolve_fraction(default_fraction, capacity.total_bytes())),
+        // right only if that capacity were measured; while it may be unknown,
+        // clamping silently discards the one knob a user has for telling the
+        // runtime how much memory it may actually use.
+        ResourceLimit::Bytes(bytes) => Ok(Some(bytes)),
+        // A fraction/auto of an unmeasured capacity is unknown, not a guess.
+        ResourceLimit::Auto => Ok(capacity
+            .total_bytes()
+            .map(|total| resolve_fraction(default_fraction, total))),
         ResourceLimit::Fraction(fraction)
             if fraction.is_finite() && (0.0..=1.0).contains(&fraction) =>
         {
-            Ok(resolve_fraction(fraction, capacity.total_bytes()))
+            Ok(capacity
+                .total_bytes()
+                .map(|total| resolve_fraction(fraction, total)))
         }
         ResourceLimit::Fraction(fraction) => Err(ResourceError::InvalidFraction {
             tier,
@@ -393,8 +440,16 @@ fn resolve_fraction(fraction: f32, total_bytes: u64) -> u64 {
 }
 
 /// Derive the page/token budget after reserving fixed hot-tier consumers.
+///
+/// `resolved_vram_bytes` is `None` when the device (VRAM) capacity could not be
+/// measured and the limit was a fraction. In that case there is **no device
+/// ceiling** to size a device KV budget against, so the device KV budget is
+/// reported as zero with `reservation_applied = false` — and, crucially, the
+/// "raise the VRAM limit" advice is suppressed: telling a user to raise a
+/// ceiling that does not exist is worse than saying nothing. Host-tier KV is
+/// sized separately and is unaffected.
 pub fn derive_kv_budget(
-    resolved_vram_bytes: u64,
+    resolved_vram_bytes: Option<u64>,
     breakdown: &VramBreakdown,
     kv_config: &ModelKvConfig,
 ) -> Result<DerivedBudget, ResourceError> {
@@ -405,6 +460,24 @@ pub fn derive_kv_budget(
                 operation: "summing model weights, activations, and runtime overhead",
                 reason: "the fixed VRAM reservations exceed the representable byte range".into(),
             })?;
+    let Some(resolved_vram_bytes) = resolved_vram_bytes else {
+        // Device capacity is unknown: no ceiling exists to fit the reservation
+        // under, so there is no honest device KV budget and no actionable "raise
+        // the limit" advice. Report unknown as zero device KV, not a fabricated
+        // number derived from a provisional constant.
+        if kv_config.page_geometry_required && kv_config.page_size_bytes.is_none() {
+            return Err(ResourceError::UnknownKvGeometry {
+                tokens_per_page: kv_config.tokens_per_page,
+            });
+        }
+        return Ok(DerivedBudget {
+            kv_bytes: 0,
+            total_pages: 0,
+            max_total_tokens: 0,
+            reserved_bytes,
+            reservation_applied: false,
+        });
+    };
     let Some(page_size_bytes) = kv_config.page_size_bytes else {
         if kv_config.page_geometry_required {
             return Err(ResourceError::UnknownKvGeometry {
@@ -541,6 +614,24 @@ struct GovernorState {
     derived_budget: DerivedBudget,
 }
 
+/// The hot tier the KV byte budget is sized against.
+///
+/// When a device capacity was measured (`vram_bytes == Some`), the device
+/// (VRAM) ceiling bounds the hot-tier KV budget, exactly as before. When no
+/// device could be measured (`vram_bytes == None`, e.g. an ORT/CPU load or a
+/// machine with no NVIDIA GPU), the KV cache physically lives in host RAM, so
+/// the *measured* host-RAM ceiling bounds it instead of the fabricated 8 GiB
+/// device constant that #947 removed.
+///
+/// This is deliberately **not** device/host authority aliasing (the deferred
+/// UMA work): the device authority stays separately unknown and inert, and no
+/// device lease is charged against host memory. This only picks the physically
+/// correct ceiling for the KV byte budget so a device-less machine can still
+/// size a working KV cache from a real number rather than a manufactured one.
+fn kv_hot_tier_ceiling(resolved: &ResolvedLimits) -> Option<u64> {
+    resolved.vram_bytes.or(Some(resolved.host_ram_bytes))
+}
+
 /// Per-device resource governor driving the shared hot-tier [`ByteBudget`].
 pub struct ResourceGovernor {
     capacities: CapacityProviders,
@@ -558,7 +649,11 @@ impl ResourceGovernor {
         kv_config: ModelKvConfig,
     ) -> Result<Self, ResourceError> {
         let resolved_limits = resolve_limits(&limits, &capacities)?;
-        let derived_budget = derive_kv_budget(resolved_limits.vram_bytes, &breakdown, &kv_config)?;
+        let derived_budget = derive_kv_budget(
+            kv_hot_tier_ceiling(&resolved_limits),
+            &breakdown,
+            &kv_config,
+        )?;
         Ok(Self {
             capacities,
             breakdown,
@@ -592,8 +687,11 @@ impl ResourceGovernor {
         limits: ResourceLimits,
     ) -> Result<GovernorReconfigureOutcome, ResourceError> {
         let new_limits = resolve_limits(&limits, &self.capacities)?;
-        let derived_budget =
-            derive_kv_budget(new_limits.vram_bytes, &self.breakdown, &self.kv_config)?;
+        let derived_budget = derive_kv_budget(
+            kv_hot_tier_ceiling(&new_limits),
+            &self.breakdown,
+            &self.kv_config,
+        )?;
 
         // All fallible validation precedes mutation, so an impossible target leaves
         // both governor state and ByteBudget unchanged.
@@ -677,8 +775,12 @@ impl ResourceGovernor {
 }
 
 fn capacity_snapshot(capacity: &dyn CapacityProvider, limit: u64) -> TierSnapshot {
-    let total = capacity.total_bytes();
-    let used = total.saturating_sub(capacity.free_bytes().min(total));
+    let used = match (capacity.total_bytes(), capacity.free_bytes()) {
+        (Some(total), Some(free)) => total.saturating_sub(free.min(total)),
+        // Usage is unknown when the tier capacity cannot be measured; report
+        // zero used rather than inventing a figure from a missing total.
+        _ => 0,
+    };
     TierSnapshot::new(used, limit)
 }
 
@@ -693,17 +795,25 @@ fn resolve_limits(
                 .disk_spill
                 .as_deref()
                 .ok_or(ResourceError::MissingDiskCapacityProvider)?;
-            Some(resolve_limit(limit, capacity, "disk spill")?)
+            // Disk spill is opt-in; a fraction of an unmeasured filesystem is
+            // still unmeasurable, so refuse rather than fabricate.
+            Some(
+                resolve_limit(limit, capacity, "disk spill")?
+                    .ok_or(ResourceError::UnmeasuredCapacity { tier: "disk spill" })?,
+            )
         }
     };
 
     Ok(ResolvedLimits {
+        // VRAM may legitimately be unknown (no device to query); the device KV
+        // budget derivation treats `None` as "no device ceiling".
         vram_bytes: resolve_limit(limits.vram_limit, capacities.vram.as_ref(), "vram")?,
         host_ram_bytes: resolve_limit(
             limits.host_ram_limit,
             capacities.host_ram.as_ref(),
             "host RAM",
-        )?,
+        )?
+        .ok_or(ResourceError::UnmeasuredCapacity { tier: "host RAM" })?,
         disk_spill_bytes,
     })
 }
@@ -762,24 +872,58 @@ mod tests {
     fn resolves_bytes_fraction_and_auto_against_total_capacity() {
         let capacity = FixedCapacity::new(1_000, 100);
         // An explicit byte limit is authoritative, not clamped to the reported
-        // capacity: that capacity is still a provisional constant, so clamping
-        // would silently discard the caller's only way to state the real budget.
+        // capacity: clamping would silently discard the caller's only way to
+        // state the real budget.
         assert_eq!(
             resolve_limit(ResourceLimit::Bytes(2_000), &capacity, "vram").unwrap(),
-            2_000
+            Some(2_000)
         );
         assert_eq!(
             resolve_limit(ResourceLimit::Fraction(0.5), &capacity, "vram").unwrap(),
-            500
+            Some(500)
         );
         assert_eq!(
             resolve_limit(ResourceLimit::Auto, &capacity, "vram").unwrap(),
-            900
+            Some(900)
         );
         assert_eq!(
             resolve_limit(ResourceLimit::Auto, &capacity, "host RAM").unwrap(),
-            250
+            Some(250)
         );
+    }
+
+    #[test]
+    fn a_fraction_of_unmeasured_capacity_is_unknown_not_a_number() {
+        // The whole point of #947: a fraction/auto of a capacity that could not
+        // be measured must resolve to `None` (unknown), never to a specific
+        // number derived from a fabricated constant. An explicit byte limit is
+        // still honoured because it is the caller's own assertion.
+        let capacity = UnknownCapacity;
+        assert_eq!(
+            resolve_limit(ResourceLimit::Fraction(0.90), &capacity, "vram").unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_limit(ResourceLimit::Auto, &capacity, "vram").unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_limit(ResourceLimit::Bytes(1_234), &capacity, "vram").unwrap(),
+            Some(1_234)
+        );
+    }
+
+    #[test]
+    fn unknown_device_capacity_yields_no_device_kv_budget_without_advice() {
+        // `None` VRAM means there is no device ceiling to fit the reservation
+        // under, so the device KV budget is zero and nothing is "applied" —
+        // there is no fabricated ceiling and no unactionable raise-the-limit path.
+        let derived = derive_kv_budget(None, &breakdown(), &kv_config()).unwrap();
+        assert_eq!(derived.kv_bytes, 0);
+        assert_eq!(derived.total_pages, 0);
+        assert_eq!(derived.max_total_tokens, 0);
+        assert!(!derived.reservation_applied);
+        assert_eq!(derived.reserved_bytes, 200);
     }
 
     #[test]
@@ -797,7 +941,7 @@ mod tests {
 
     #[test]
     fn derives_kv_pages_and_tokens_after_fixed_reservations() {
-        let derived = derive_kv_budget(1_000, &breakdown(), &kv_config()).unwrap();
+        let derived = derive_kv_budget(Some(1_000), &breakdown(), &kv_config()).unwrap();
         assert_eq!(
             derived,
             DerivedBudget {
@@ -817,7 +961,7 @@ mod tests {
         assert_eq!(kv_config.bytes_per_token(), None);
         assert_eq!(kv_config.pages_for_bytes(256), None);
 
-        let error = derive_kv_budget(1_000, &breakdown(), &kv_config).unwrap_err();
+        let error = derive_kv_budget(Some(1_000), &breakdown(), &kv_config).unwrap_err();
         assert!(matches!(
             error,
             ResourceError::UnknownKvGeometry {
@@ -835,7 +979,7 @@ mod tests {
         // The reservation is an estimate carved from a ceiling that may itself
         // be provisional, so it must never be the reason a model cannot start:
         // the previous behaviour reserved nothing at all.
-        let derived = derive_kv_budget(150, &breakdown(), &kv_config()).unwrap();
+        let derived = derive_kv_budget(Some(150), &breakdown(), &kv_config()).unwrap();
 
         assert!(!derived.reservation_applied);
         assert_eq!(derived.reserved_bytes, 0);
@@ -853,7 +997,7 @@ mod tests {
             ort_overhead_bytes: Some(0),
         };
 
-        let error = derive_kv_budget(5, &no_reservation, &kv_config()).unwrap_err();
+        let error = derive_kv_budget(Some(5), &no_reservation, &kv_config()).unwrap_err();
 
         assert!(matches!(
             error,
@@ -866,7 +1010,7 @@ mod tests {
 
     #[test]
     fn derive_accepts_ceiling_exactly_large_enough_for_one_page() {
-        let derived = derive_kv_budget(210, &breakdown(), &kv_config()).unwrap();
+        let derived = derive_kv_budget(Some(210), &breakdown(), &kv_config()).unwrap();
         assert_eq!(
             derived,
             DerivedBudget {
@@ -887,7 +1031,7 @@ mod tests {
             ort_overhead_bytes: Some(0),
         };
 
-        let error = derive_kv_budget(u64::MAX, &breakdown, &kv_config()).unwrap_err();
+        let error = derive_kv_budget(Some(u64::MAX), &breakdown, &kv_config()).unwrap_err();
         assert!(matches!(
             error,
             ResourceError::BudgetArithmeticOverflow { .. }

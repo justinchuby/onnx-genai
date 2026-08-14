@@ -118,7 +118,13 @@ impl ServerMemoryAuthorities {
             PROVISIONAL_VRAM_CAPACITY_BYTES,
         );
         let resolved = onnx_genai_engine::resolve_limit(limit, &capacity, "vram")
-            .map_err(anyhow::Error::new)?;
+            .map_err(anyhow::Error::new)?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "device capacity is unavailable, so a fractional limit cannot be resolved; \
+                     set an explicit byte limit instead"
+                )
+            })?;
         let mut ordered = authorities.values().cloned().collect::<Vec<_>>();
         ordered.sort_by_key(|authority| authority.domain().to_string());
         let _mapped_growth = ordered

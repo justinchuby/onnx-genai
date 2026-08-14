@@ -28,6 +28,7 @@ pub mod native_decode_device;
 pub(crate) mod native_speculative;
 pub mod pipeline;
 pub mod pipeline_cache;
+pub(crate) mod platform_capacity;
 pub(crate) mod processors;
 #[cfg(feature = "native-backend")]
 pub mod runtime_trace;

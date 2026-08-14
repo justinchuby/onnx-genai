@@ -579,7 +579,10 @@ impl Engine {
                 .model
                 .as_ref()
                 .and_then(|model| model.max_sequence_length),
-            governor.snapshot().resolved_limits.vram_bytes,
+            // Native CUDA load always has a measured device capacity, so the
+            // resolved VRAM budget is `Some`. `unwrap_or(0)` only guards the
+            // impossible unknown-device-on-CUDA case.
+            governor.snapshot().resolved_limits.vram_bytes.unwrap_or(0),
             model_weight_bytes,
             cuda_offload_resolution,
         )?;

@@ -2,6 +2,25 @@ use super::*;
 use onnx_runtime_ep_api::{LazyWeightBoundary, lazy_weight_candidates};
 use onnx_runtime_ir::{Graph, WeightRef};
 
+/// Render an optional byte capacity/budget for a plan decision. `None` means the
+/// value could not be measured and is reported as `Unknown` — never as a
+/// concrete-looking number the reader would have to reverse-engineer (#947).
+fn opt_bytes_or_unknown(value: Option<u64>) -> String {
+    match value {
+        Some(bytes) => bytes.to_string(),
+        None => "Unknown".to_string(),
+    }
+}
+
+/// Render an optional fit result. `None` (unknown device capacity) is reported
+/// as `Unknown`, distinct from a measured `false`.
+fn opt_bool_or_unknown(value: Option<bool>) -> String {
+    match value {
+        Some(flag) => flag.to_string(),
+        None => "Unknown".to_string(),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct GraphMemoryEvidence {
     pub(crate) access_pattern: WeightAccessPattern,
@@ -19,7 +38,7 @@ pub(crate) struct MemoryStrategyOverrides {
 
 pub(crate) struct MemoryStrategyPlanInput<'a> {
     pub(crate) config: &'a EngineConfig,
-    pub(crate) resolved_vram_bytes: u64,
+    pub(crate) resolved_vram_bytes: Option<u64>,
     pub(crate) model_weight_bytes: u64,
     pub(crate) kv_config: ModelKvConfig,
     pub(crate) graph: GraphMemoryEvidence,
@@ -138,25 +157,40 @@ pub(crate) fn combine_graph_memory(
 pub(crate) fn build_memory_strategy_plan(input: MemoryStrategyPlanInput<'_>) -> MemoryStrategyPlan {
     let kv_bytes_per_token = input.kv_config.bytes_per_token();
     let kv_unknown = input.kv_config.page_geometry_required && kv_bytes_per_token.is_none();
-    let fits = input.model_weight_bytes <= input.resolved_vram_bytes;
+    // `None` when the device (VRAM) capacity could not be measured and the limit
+    // was a fraction: whether the weights "fit" a ceiling that does not exist is
+    // *unknown*, not `false`. Rendering unknown as `false` is exactly the #947
+    // bug (a model that fits the machine reported as not fitting a fictional
+    // device), so it is carried as `Option` all the way to the plan.
+    let fits = input
+        .resolved_vram_bytes
+        .map(|budget| input.model_weight_bytes <= budget);
     let available_weight_budget_bytes = input
         .resolved_vram_bytes
-        .saturating_sub(input.required_device_non_weight_bytes);
+        .map(|budget| budget.saturating_sub(input.required_device_non_weight_bytes));
     // Since #755 the managed no-spill VMM path is the default: it owns the
     // authority-scoped physical-handle pool and caps at the resolved budget
     // instead of relying on WDDM shared-memory spill. Reported in the plan so
     // the new default is observable rather than implicit.
     let managed_no_spill = input.managed_vmm;
-    let managed_limit_bytes = managed_no_spill.then_some(input.resolved_vram_bytes);
+    let managed_limit_bytes = if managed_no_spill {
+        input.resolved_vram_bytes
+    } else {
+        None
+    };
     let inferred_strategy = if kv_unknown {
         MemoryStrategy::Unknown
     } else {
         match (fits, input.graph.access_pattern) {
             (_, WeightAccessPattern::Unknown) => MemoryStrategy::Unknown,
-            (true, _) => MemoryStrategy::FullResident,
-            (false, WeightAccessPattern::SequentialDense) => MemoryStrategy::DynamicWeightResidency,
-            (false, WeightAccessPattern::MoeRouted) => MemoryStrategy::MoeRoutingAware,
-            (false, WeightAccessPattern::Iterative) => MemoryStrategy::Unknown,
+            // No measured device budget: residency cannot be chosen honestly.
+            (None, _) => MemoryStrategy::Unknown,
+            (Some(true), _) => MemoryStrategy::FullResident,
+            (Some(false), WeightAccessPattern::SequentialDense) => {
+                MemoryStrategy::DynamicWeightResidency
+            }
+            (Some(false), WeightAccessPattern::MoeRouted) => MemoryStrategy::MoeRoutingAware,
+            (Some(false), WeightAccessPattern::Iterative) => MemoryStrategy::Unknown,
         }
     };
 
@@ -276,7 +310,7 @@ pub(crate) fn build_memory_strategy_plan(input: MemoryStrategyPlanInput<'_>) -> 
                         {
                             input.default_dynamic_device_budget_bytes
                         } else {
-                            Some(available_weight_budget_bytes)
+                            available_weight_budget_bytes
                         }
                     }),
                     scan_resistant_dense: input.overrides.scan_resistant_dense.unwrap_or(true),
@@ -295,12 +329,21 @@ pub(crate) fn build_memory_strategy_plan(input: MemoryStrategyPlanInput<'_>) -> 
     let mut decisions = vec![
         MemoryStrategyDecision::new(
             "resolved_device_budget_bytes",
-            input.resolved_vram_bytes.to_string(),
-            match input.config.limits.vram_limit {
-                ResourceLimit::Bytes(_) => DecisionSource::ExplicitOverride,
-                _ => DecisionSource::Inference,
+            opt_bytes_or_unknown(input.resolved_vram_bytes),
+            match (input.resolved_vram_bytes, input.config.limits.vram_limit) {
+                // No capacity could be measured and no explicit byte limit was
+                // set: the budget is genuinely unavailable, not inferred.
+                (None, _) => DecisionSource::Unavailable,
+                (Some(_), ResourceLimit::Bytes(_)) => DecisionSource::ExplicitOverride,
+                (Some(_), _) => DecisionSource::Inference,
             },
-            "resolved once through the same capacity helper used by the governor",
+            match input.resolved_vram_bytes {
+                Some(_) => "resolved once through the same capacity helper used by the governor",
+                None => {
+                    "device capacity could not be measured; a fraction of unknown capacity is \
+                     unknown, so no device budget is resolved"
+                }
+            },
             format!(
                 "configured_vram_limit={}",
                 format_resource_limit_for_plan(input.config.limits.vram_limit)
@@ -325,16 +368,19 @@ pub(crate) fn build_memory_strategy_plan(input: MemoryStrategyPlanInput<'_>) -> 
             input.model_weight_bytes.to_string(),
             DecisionSource::Inference,
             "computed by the shared model-package weight helper",
-            format!("fits_resolved_device_budget={fits}"),
+            format!("fits_resolved_device_budget={}", opt_bool_or_unknown(fits)),
         ),
         MemoryStrategyDecision::new(
             "available_weight_budget_bytes",
-            available_weight_budget_bytes.to_string(),
-            DecisionSource::Inference,
+            opt_bytes_or_unknown(available_weight_budget_bytes),
+            match available_weight_budget_bytes {
+                Some(_) => DecisionSource::Inference,
+                None => DecisionSource::Unavailable,
+            },
             "derived before provider construction from runtime-owned non-weight geometry",
             format!(
                 "resolved_device_budget_bytes={} required_device_non_weight_bytes={} minimum_useful_weight_budget_bytes={}",
-                input.resolved_vram_bytes,
+                opt_bytes_or_unknown(input.resolved_vram_bytes),
                 input.required_device_non_weight_bytes,
                 input.minimum_useful_weight_budget_bytes
             ),
@@ -365,8 +411,10 @@ pub(crate) fn build_memory_strategy_plan(input: MemoryStrategyPlanInput<'_>) -> 
             },
             "inferred unconditionally from graph evidence and the resolved budget",
             format!(
-                "total_weight_bytes={} resolved_vram_bytes={} fits={fits}",
-                input.model_weight_bytes, input.resolved_vram_bytes
+                "total_weight_bytes={} resolved_vram_bytes={} fits={}",
+                input.model_weight_bytes,
+                opt_bytes_or_unknown(input.resolved_vram_bytes),
+                opt_bool_or_unknown(fits)
             ),
         ),
     ];
@@ -416,7 +464,7 @@ pub(crate) fn build_memory_strategy_plan(input: MemoryStrategyPlanInput<'_>) -> 
                 input.shared_memory_weight_fallback,
                 input.force_managed_weight_streaming,
                 input.model_weight_bytes,
-                input.resolved_vram_bytes
+                opt_bytes_or_unknown(input.resolved_vram_bytes)
             ),
         ));
     }
@@ -508,8 +556,8 @@ pub(crate) fn build_memory_strategy_plan(input: MemoryStrategyPlanInput<'_>) -> 
         total_weight_bytes: input.model_weight_bytes,
         kv_bytes_per_token,
         per_layer_weight_bytes: input.graph.per_layer_weight_bytes,
-        resolved_device_budget_bytes: Some(input.resolved_vram_bytes),
-        fits_resolved_device_budget: Some(fits),
+        resolved_device_budget_bytes: input.resolved_vram_bytes,
+        fits_resolved_device_budget: fits,
         application,
         advisory_only: input.advisory_only,
         decisions,
@@ -536,15 +584,16 @@ fn wddm_shared_memory_application(input: &MemoryStrategyPlanInput<'_>) -> Memory
 
 fn compatibility_application(
     input: &MemoryStrategyPlanInput<'_>,
-    fits: bool,
+    fits: Option<bool>,
 ) -> MemoryPolicyApplication {
     let explicit_bytes = matches!(input.config.limits.vram_limit, ResourceLimit::Bytes(_));
     let forced = input.overrides.weight_offload == Some(true);
     // The compatibility/Unknown application cannot page safely (no known weight
     // access boundary), so automatic offload stays keyed on an explicit byte
-    // limit even under the managed default. The managed no-spill cap is still
-    // reported so the physical-handle pool bounds the load instead of spilling.
-    let auto_enabled = explicit_bytes && !fits && !forced;
+    // limit under which the weights demonstrably do not fit. When the device
+    // capacity is unknown, `fits` is `None` and auto-offload stays off — the
+    // whole point of #947 is that unknown must not be read as "does not fit".
+    let auto_enabled = explicit_bytes && fits == Some(false) && !forced;
     let enabled = forced || auto_enabled;
     MemoryPolicyApplication {
         weight_offload_enabled: enabled,
@@ -553,11 +602,13 @@ fn compatibility_application(
                 .overrides
                 .device_budget_bytes
                 .or_else(|| {
-                    auto_enabled.then_some(
-                        input
-                            .resolved_vram_bytes
-                            .saturating_sub(input.required_device_non_weight_bytes),
-                    )
+                    auto_enabled
+                        .then(|| {
+                            input.resolved_vram_bytes.map(|budget| {
+                                budget.saturating_sub(input.required_device_non_weight_bytes)
+                            })
+                        })
+                        .flatten()
                 })
                 .or(input.default_dynamic_device_budget_bytes)
         } else {
@@ -565,7 +616,11 @@ fn compatibility_application(
         },
         scan_resistant_dense: input.overrides.scan_resistant_dense.unwrap_or(true),
         managed_no_spill: input.managed_vmm,
-        managed_limit_bytes: input.managed_vmm.then_some(input.resolved_vram_bytes),
+        managed_limit_bytes: if input.managed_vmm {
+            input.resolved_vram_bytes
+        } else {
+            None
+        },
         device_budget_is_override: input.overrides.device_budget_bytes.is_some(),
         auto_enabled_from_vram_limit: auto_enabled,
     }
@@ -862,7 +917,7 @@ mod tests {
         let managed_vmm = managed_default || explicit_bytes;
         build_memory_strategy_plan(MemoryStrategyPlanInput {
             config,
-            resolved_vram_bytes: limit,
+            resolved_vram_bytes: Some(limit),
             model_weight_bytes: weights,
             kv_config: ModelKvConfig::known(160, 16),
             graph,
@@ -886,6 +941,67 @@ mod tests {
             },
             ..EngineConfig::default()
         }
+    }
+
+    /// Build a plan with an *unmeasured* device capacity, as the reported
+    /// Windows-ARM / no-NVIDIA machine does: the default fractional VRAM limit
+    /// resolves to `None` because a fraction of unknown capacity is unknown.
+    fn plan_unknown_device(
+        config: &EngineConfig,
+        graph: GraphMemoryEvidence,
+        weights: u64,
+        overrides: MemoryStrategyOverrides,
+    ) -> MemoryStrategyPlan {
+        let explicit_bytes = matches!(config.limits.vram_limit, ResourceLimit::Bytes(_));
+        build_memory_strategy_plan(MemoryStrategyPlanInput {
+            config,
+            resolved_vram_bytes: None,
+            model_weight_bytes: weights,
+            kv_config: ModelKvConfig::known(160, 16),
+            graph,
+            required_device_non_weight_bytes: 0,
+            minimum_useful_weight_budget_bytes: 0,
+            default_dynamic_device_budget_bytes: None,
+            inferred_policy_enabled: explicit_bytes,
+            managed_vmm: explicit_bytes,
+            overrides,
+            advisory_only: true,
+            shared_memory_weight_fallback: true,
+            force_managed_weight_streaming: false,
+        })
+    }
+
+    #[test]
+    fn unknown_device_capacity_is_reported_as_unknown_not_a_false_fit() {
+        // #947 regression guard. On `main` an unmeasured device capacity is
+        // fabricated to 8 GiB and a model larger than 7.73 GiB is reported as
+        // `fits=Some(false)` against a device that does not exist. The honest
+        // answer is "unknown": no resolved device budget, no fit verdict.
+        let config = EngineConfig::default();
+        let plan = plan_unknown_device(
+            &config,
+            graph_with_boundary("", "MatMul"),
+            8_330_595_020,
+            MemoryStrategyOverrides::default(),
+        );
+        assert_eq!(
+            plan.resolved_device_budget_bytes, None,
+            "an unmeasured device capacity must not resolve to a fabricated budget"
+        );
+        assert_eq!(
+            plan.fits_resolved_device_budget, None,
+            "unknown capacity must render as unknown fit, never Some(false)"
+        );
+        // The unactionable "raise the VRAM limit" pressure must not appear: with
+        // no device ceiling there is nothing to raise. Auto-offload stays off.
+        assert!(!plan.application.weight_offload_enabled);
+        let budget_decision = plan
+            .decisions
+            .iter()
+            .find(|decision| decision.field == "resolved_device_budget_bytes")
+            .expect("plan reports the resolved device budget decision");
+        assert_eq!(budget_decision.value, "Unknown");
+        assert_eq!(budget_decision.source, DecisionSource::Unavailable);
     }
 
     #[test]

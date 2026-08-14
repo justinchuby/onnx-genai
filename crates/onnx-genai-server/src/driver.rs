@@ -656,7 +656,7 @@ impl EngineDriver {
             snapshot.vram.used = used;
             snapshot.vram.limit = limit;
             snapshot.vram.headroom = limit.saturating_sub(used);
-            snapshot.resolved_limits.vram_bytes = limit;
+            snapshot.resolved_limits.vram_bytes = Some(limit);
         }
         Ok(snapshot)
     }

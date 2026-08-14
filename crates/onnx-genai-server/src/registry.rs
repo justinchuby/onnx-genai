@@ -330,7 +330,7 @@ impl ModelRegistry {
             snapshot.vram.used = used;
             snapshot.vram.limit = limit;
             snapshot.vram.headroom = headroom;
-            snapshot.resolved_limits.vram_bytes = limit;
+            snapshot.resolved_limits.vram_bytes = Some(limit);
         }
         Ok(Some(snapshot))
     }
