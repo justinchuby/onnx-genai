@@ -69,6 +69,7 @@ pub(crate) struct ExecutionIsland {
     aliasable_output_values: HashSet<String>,
     shared_buffer_inputs: HashMap<String, String>,
     shared_buffer_output_values: HashSet<String>,
+    immutable_inputs: HashSet<String>,
     fallback: WorkflowNode,
     session: Session,
     capture_eligible: bool,
@@ -325,9 +326,11 @@ impl ExecutionIsland {
                             self.id
                         )
                     })?;
-                let unchanged_source = !reset_services && source_ptr == stable.source_ptrs[index];
+                let unchanged_immutable = !reset_services
+                    && self.immutable_inputs.contains(*name)
+                    && source_ptr == stable.source_ptrs[index];
                 if (shared_service && !reset_services)
-                    || (!shared_service && (aliases_destination || unchanged_source))
+                    || (!shared_service && (aliases_destination || unchanged_immutable))
                 {
                     continue;
                 }
@@ -1021,7 +1024,13 @@ fn build_execution_island(
     }
     let mut shared_buffer_inputs = HashMap::new();
     let mut shared_buffer_output_values = HashSet::new();
-    if let Some(serving) = &workflow.serving {
+    // Stock ORT 1.28 produces stale recurrent state when a linked file-backed
+    // graph binds every KV graph output to its corresponding graph input. Keep
+    // exact parity by retaining device outputs; the stable binding still avoids
+    // host transfers and captures the complete linked session.
+    if linked.external_files.is_empty()
+        && let Some(serving) = &workflow.serving
+    {
         for group in serving
             .kv_service
             .groups
@@ -1067,13 +1076,8 @@ fn build_execution_island(
     }
     let mut options = models.session_options();
     let capture_requested = options.graph_capture;
-    let structurally_capture_eligible = device.starts_with("cuda:")
-        && capture_requested
-        && linked.capture_declines.is_empty()
-        && linked.external_files.is_empty();
-    if !linked.external_files.is_empty() {
-        options.graph_capture = false;
-    }
+    let structurally_capture_eligible =
+        device.starts_with("cuda:") && capture_requested && linked.capture_declines.is_empty();
     let linked_path = (!linked.external_files.is_empty())
         .then(|| materialize_linked_model(&linked))
         .transpose()?;
@@ -1116,6 +1120,16 @@ fn build_execution_island(
         .iter()
         .map(|invoke| invoke.component.clone())
         .collect();
+    let immutable_inputs = linked
+        .inputs
+        .iter()
+        .filter_map(|(name, value)| {
+            (value.starts_with("package.")
+                || value.starts_with("request.")
+                || value.starts_with("vision."))
+            .then_some(name.clone())
+        })
+        .collect();
     let _ = workflow;
     Ok(ExecutionIsland {
         id,
@@ -1125,6 +1139,7 @@ fn build_execution_island(
         aliasable_output_values: aliasable_output_values.clone(),
         shared_buffer_inputs,
         shared_buffer_output_values,
+        immutable_inputs,
         fallback: WorkflowNode::Sequence {
             nodes: invocations
                 .iter()
@@ -1171,8 +1186,6 @@ fn build_execution_island(
             Some("island is not placed on CUDA".to_string())
         } else if !linked.capture_declines.is_empty() {
             Some(linked.capture_declines.join("; "))
-        } else if !linked.external_files.is_empty() {
-            Some("file-backed external-data island awaits coordinated capture support".to_string())
         } else if !capture_requested {
             Some("CUDA graph capture is disabled by session options".to_string())
         } else if !capture_eligible {
@@ -1508,26 +1521,27 @@ fn link_models(
                 }
             }
         }
-        for (port, value_ref) in &invocation.outputs {
-            let internal = names.get(port).with_context(|| {
-                format!(
-                    "component '{}' workflow output port '{port}' is not a graph output",
-                    invocation.component
-                )
-            })?;
+        let graph_output_names = source_graph
+            .output
+            .iter()
+            .map(|output| output.name.as_str())
+            .collect::<HashSet<_>>();
+        for port in invocation.outputs.keys() {
+            anyhow::ensure!(
+                graph_output_names.contains(port.as_str()),
+                "component '{}' workflow output port '{port}' is not a graph output",
+                invocation.component
+            );
+        }
+        for output in &source_graph.output {
+            let port = &output.name;
+            let Some(value_ref) = invocation.outputs.get(port) else {
+                continue;
+            };
+            let internal = &names[port];
             ssa_values.insert(value_ref.clone(), internal.clone());
             if boundary_outputs.contains(value_ref) {
-                let mut info = source_graph
-                    .output
-                    .iter()
-                    .find(|output| output.name == *port)
-                    .cloned()
-                    .with_context(|| {
-                        format!(
-                            "component '{}' has no output metadata for '{port}'",
-                            invocation.component
-                        )
-                    })?;
+                let mut info = output.clone();
                 // Component-local values are already uniquely prefixed. Export the producer
                 // value directly so a logical component boundary adds no executable ONNX node.
                 info.name = internal.clone();
