@@ -179,8 +179,6 @@ pub enum PreemptionPolicy {
     Disabled,
     /// Preserve decode/KV state in place and resume later.
     Swap,
-    /// Future policy: drop active KV and recompute when resumed.
-    Recompute,
 }
 
 impl Default for SchedulerConfig {
@@ -466,11 +464,19 @@ impl Scheduler {
             .map(|sequence| sequence.seq_id)
             .collect::<Vec<_>>();
 
-        self.apply_preemption(&mut decision);
+        let mut retained_candidate = None;
+        if self.should_retain_fair_share_preemption_candidate() {
+            retained_candidate = self.retain_fair_share_preemption_candidate(&mut decision);
+        } else {
+            self.apply_preemption(&mut decision);
+        }
 
         // Admit new sequences if budget allows
         while self.has_capacity_for_candidate() {
-            let Some(candidate) = self.pop_next_candidate() else {
+            let Some(candidate) = retained_candidate
+                .take()
+                .or_else(|| self.pop_next_candidate_excluding(&decision.preempt))
+            else {
                 break;
             };
             match candidate {
@@ -578,7 +584,6 @@ impl Scheduler {
 
     fn apply_preemption(&mut self, decision: &mut ScheduleDecision) {
         if matches!(self.config.preemption_policy, PreemptionPolicy::Disabled)
-            || matches!(self.config.priority_policy, PriorityPolicy::FairShare)
             || self.running.is_empty()
             || self.waiting.is_empty()
         {
@@ -586,7 +591,7 @@ impl Scheduler {
         }
 
         while !self.has_capacity_for_candidate() {
-            let Some(best_waiting_idx) = self.best_waiting_index() else {
+            let Some(best_waiting_idx) = self.highest_priority_waiting_index() else {
                 break;
             };
             let Some(victim_idx) = self.lowest_priority_running_index() else {
@@ -602,6 +607,113 @@ impl Scheduler {
             decision.preempt.push(victim.seq_id);
             self.swapped.push(victim);
         }
+    }
+
+    fn apply_preemption_for_priority(
+        &mut self,
+        candidate_priority: Priority,
+        decision: &mut ScheduleDecision,
+    ) {
+        if matches!(self.config.preemption_policy, PreemptionPolicy::Disabled)
+            || self.running.is_empty()
+        {
+            return;
+        }
+
+        while !self.has_capacity_for_candidate() {
+            let Some(victim_idx) = self.lowest_priority_running_index() else {
+                break;
+            };
+            if candidate_priority <= self.running[victim_idx].priority {
+                break;
+            }
+
+            let mut victim = self.running.remove(victim_idx);
+            self.release_bytes(victim.reserved_bytes);
+            victim.reserved_bytes = 0;
+            decision.preempt.push(victim.seq_id);
+            self.swapped.push(victim);
+        }
+    }
+
+    fn retain_fair_share_preemption_candidate(
+        &mut self,
+        decision: &mut ScheduleDecision,
+    ) -> Option<Candidate> {
+        let candidate_count = self.waiting.len().saturating_add(self.swapped.len());
+        let mut skipped = Vec::new();
+
+        for _ in 0..candidate_count {
+            let Some(candidate) = self.pop_next_fair_share_candidate() else {
+                break;
+            };
+            if self.can_make_capacity_by_preempting(candidate.priority()) {
+                self.apply_preemption_for_priority(candidate.priority(), decision);
+                for skipped_candidate in skipped {
+                    self.restore_candidate(skipped_candidate);
+                }
+                return Some(candidate);
+            }
+            skipped.push(candidate);
+        }
+
+        for skipped_candidate in skipped {
+            self.restore_candidate(skipped_candidate);
+        }
+        None
+    }
+
+    fn can_make_capacity_by_preempting(&self, candidate_priority: Priority) -> bool {
+        let mut running_len = self.running.len();
+        let mut token_budget = self.running_token_budget();
+        if running_len < self.config.max_batch_size && token_budget < self.config.max_total_tokens {
+            return true;
+        }
+
+        for sequence in self
+            .running
+            .iter()
+            .filter(|sequence| candidate_priority > sequence.priority)
+        {
+            running_len = running_len.saturating_sub(1);
+            token_budget =
+                token_budget.saturating_sub(sequence.prompt_tokens + sequence.generated_tokens);
+            if running_len < self.config.max_batch_size
+                && token_budget < self.config.max_total_tokens
+            {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn should_retain_fair_share_preemption_candidate(&self) -> bool {
+        matches!(self.config.priority_policy, PriorityPolicy::FairShare)
+            && !matches!(self.config.preemption_policy, PreemptionPolicy::Disabled)
+            && !self.has_capacity_for_candidate()
+            && !self.running.is_empty()
+            && (!self.waiting.is_empty() || !self.swapped.is_empty())
+    }
+
+    fn restore_candidate(&mut self, candidate: Candidate) {
+        match candidate {
+            Candidate::Waiting(request) => self.waiting.push(request),
+            Candidate::Swapped(sequence) => self.swapped.push(sequence),
+        }
+    }
+
+    fn highest_priority_waiting_index(&self) -> Option<usize> {
+        self.waiting
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| {
+                a.priority
+                    .cmp(&b.priority)
+                    .then_with(|| b.arrived_at.cmp(&a.arrived_at))
+                    .then_with(|| b.id.cmp(&a.id))
+            })
+            .map(|(idx, _)| idx)
     }
 
     /// Estimated hot-tier KV bytes for a sequence's worst-case footprint.
@@ -647,14 +759,6 @@ impl Scheduler {
             .sum()
     }
 
-    fn best_waiting_index(&self) -> Option<usize> {
-        self.waiting
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| self.cmp_request(a, b))
-            .map(|(idx, _)| idx)
-    }
-
     fn lowest_priority_running_index(&self) -> Option<usize> {
         self.running
             .iter()
@@ -668,13 +772,13 @@ impl Scheduler {
             .map(|(idx, _)| idx)
     }
 
-    fn pop_next_candidate(&mut self) -> Option<Candidate> {
+    fn pop_next_candidate_excluding(&mut self, unavailable: &[SequenceId]) -> Option<Candidate> {
         if matches!(self.config.priority_policy, PriorityPolicy::FairShare) {
-            return self.pop_next_fair_share_candidate();
+            return self.pop_next_fair_share_candidate_excluding(unavailable);
         }
 
-        let waiting = self.best_waiting_index();
-        let swapped = self.best_swapped_index();
+        let waiting = self.best_waiting_index_excluding(unavailable);
+        let swapped = self.best_swapped_index_excluding(unavailable);
         match (waiting, swapped) {
             (None, None) => None,
             (Some(idx), None) => Some(Candidate::Waiting(self.waiting.remove(idx))),
@@ -692,25 +796,54 @@ impl Scheduler {
     }
 
     fn pop_next_fair_share_candidate(&mut self) -> Option<Candidate> {
+        self.pop_next_fair_share_candidate_excluding(&[])
+    }
+
+    fn pop_next_fair_share_candidate_excluding(
+        &mut self,
+        unavailable: &[SequenceId],
+    ) -> Option<Candidate> {
+        if self
+            .waiting
+            .iter()
+            .all(|request| unavailable.contains(&request.seq_id))
+            && self
+                .swapped
+                .iter()
+                .all(|sequence| unavailable.contains(&sequence.seq_id))
+        {
+            return None;
+        }
+
         let selected_priority = self.fair_share.select(
             self.waiting
                 .iter()
+                .filter(|request| !unavailable.contains(&request.seq_id))
                 .map(|request| request.priority)
-                .chain(self.swapped.iter().map(|sequence| sequence.priority)),
+                .chain(
+                    self.swapped
+                        .iter()
+                        .filter(|sequence| !unavailable.contains(&sequence.seq_id))
+                        .map(|sequence| sequence.priority),
+                ),
         )?;
 
         let waiting = self
             .waiting
             .iter()
             .enumerate()
-            .filter(|(_, request)| request.priority == selected_priority)
+            .filter(|(_, request)| {
+                request.priority == selected_priority && !unavailable.contains(&request.seq_id)
+            })
             .min_by_key(|(_, request)| (request.arrived_at, request.id))
             .map(|(index, request)| (index, request.arrived_at, request.id));
         let swapped = self
             .swapped
             .iter()
             .enumerate()
-            .filter(|(_, sequence)| sequence.priority == selected_priority)
+            .filter(|(_, sequence)| {
+                sequence.priority == selected_priority && !unavailable.contains(&sequence.seq_id)
+            })
             .min_by_key(|(_, sequence)| (sequence.arrived_at, sequence.request_id))
             .map(|(index, sequence)| (index, sequence.arrived_at, sequence.request_id));
 
@@ -731,10 +864,20 @@ impl Scheduler {
         }
     }
 
-    fn best_swapped_index(&self) -> Option<usize> {
+    fn best_waiting_index_excluding(&self, unavailable: &[SequenceId]) -> Option<usize> {
+        self.waiting
+            .iter()
+            .enumerate()
+            .filter(|(_, request)| !unavailable.contains(&request.seq_id))
+            .min_by(|(_, a), (_, b)| self.cmp_request(a, b))
+            .map(|(idx, _)| idx)
+    }
+
+    fn best_swapped_index_excluding(&self, unavailable: &[SequenceId]) -> Option<usize> {
         self.swapped
             .iter()
             .enumerate()
+            .filter(|(_, sequence)| !unavailable.contains(&sequence.seq_id))
             .min_by(|(_, a), (_, b)| {
                 self.cmp_candidate_key(CandidateKey::from_running(a), CandidateKey::from_running(b))
             })
@@ -761,6 +904,15 @@ impl Scheduler {
 enum Candidate {
     Waiting(Request),
     Swapped(RunningSequence),
+}
+
+impl Candidate {
+    fn priority(&self) -> Priority {
+        match self {
+            Self::Waiting(request) => request.priority,
+            Self::Swapped(sequence) => sequence.priority,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -867,6 +1019,147 @@ mod tests {
         }
 
         assert_eq!((low, high), (10, 30));
+    }
+
+    #[test]
+    fn fair_share_respects_enabled_preemption_policy() {
+        let mut fair_config = config();
+        fair_config.priority_policy = PriorityPolicy::FairShare;
+        fair_config.preemption_policy = PreemptionPolicy::Swap;
+        let mut scheduler = Scheduler::new(fair_config);
+
+        scheduler.enqueue_generate_request(10, 3, 4, Priority::Low);
+        let first = scheduler.schedule();
+        assert_eq!(first.prefill, vec![10]);
+        scheduler.advance(10);
+
+        scheduler.enqueue_generate_request(20, 3, 2, Priority::High);
+        let preempt = scheduler.schedule();
+
+        assert_eq!(preempt.preempt, vec![10]);
+        assert_eq!(preempt.prefill, vec![20]);
+        assert!(preempt.decode.is_empty());
+        assert_eq!(scheduler.running_count(), 1);
+        assert_eq!(scheduler.swapped_count(), 1);
+    }
+
+    #[test]
+    fn fair_share_preemption_admits_the_retained_candidate_without_conflicts() {
+        let mut fair_config = config();
+        fair_config.max_batch_size = 2;
+        fair_config.priority_policy = PriorityPolicy::FairShare;
+        fair_config.preemption_policy = PreemptionPolicy::Swap;
+        let mut scheduler = Scheduler::new(fair_config);
+
+        scheduler.enqueue_generate_request(10, 3, 4, Priority::Low);
+        scheduler.enqueue_generate_request(20, 3, 4, Priority::High);
+        let initial = scheduler.schedule();
+        assert_eq!(initial.prefill, vec![10, 20]);
+        scheduler.advance(10);
+        scheduler.advance(20);
+
+        scheduler.enqueue_generate_request(30, 3, 2, Priority::Normal);
+        let decision = scheduler.schedule();
+
+        assert_eq!(decision.preempt, vec![10]);
+        assert_eq!(decision.prefill, vec![30]);
+        assert!(decision.swap_in.is_empty());
+        assert_eq!(decision.decode, vec![20]);
+        for preempted in &decision.preempt {
+            assert!(!decision.swap_in.contains(preempted));
+            assert!(!decision.decode.contains(preempted));
+        }
+        assert_eq!(scheduler.waiting_count(), 0);
+        assert_eq!(scheduler.running_count(), 2);
+        assert_eq!(scheduler.swapped_count(), 1);
+    }
+
+    #[test]
+    fn fair_share_skips_ineligible_preemption_candidate_so_high_does_not_starve() {
+        let mut fair_config = config();
+        fair_config.max_batch_size = 2;
+        fair_config.priority_policy = PriorityPolicy::FairShare;
+        fair_config.preemption_policy = PreemptionPolicy::Swap;
+        let mut scheduler = Scheduler::new(fair_config).with_fair_share_weights(3, 1, 1);
+
+        scheduler.enqueue_generate_request(10, 3, 4, Priority::Low);
+        scheduler.enqueue_generate_request(20, 3, 4, Priority::Normal);
+        let initial = scheduler.schedule();
+        assert_eq!(initial.prefill, vec![10, 20]);
+        scheduler.advance(10);
+        scheduler.advance(20);
+
+        scheduler.enqueue_generate_request(30, 3, 2, Priority::Low);
+        scheduler.enqueue_generate_request(40, 3, 2, Priority::High);
+        let decision = scheduler.schedule();
+
+        assert_eq!(decision.preempt, vec![10]);
+        assert_eq!(decision.prefill, vec![40]);
+        assert!(decision.swap_in.is_empty());
+        assert_eq!(decision.decode, vec![20]);
+        for preempted in &decision.preempt {
+            assert!(!decision.prefill.contains(preempted));
+            assert!(!decision.swap_in.contains(preempted));
+            assert!(!decision.decode.contains(preempted));
+        }
+        assert_eq!(scheduler.waiting_count(), 1);
+        assert_eq!(scheduler.running_count(), 2);
+        assert_eq!(scheduler.swapped_count(), 1);
+    }
+
+    #[test]
+    fn token_budget_preemption_does_not_re_admit_same_step_victim() {
+        let mut fair_config = config();
+        fair_config.max_batch_size = 3;
+        fair_config.max_total_tokens = 8;
+        fair_config.priority_policy = PriorityPolicy::FairShare;
+        fair_config.preemption_policy = PreemptionPolicy::Swap;
+        let mut scheduler = Scheduler::new(fair_config);
+
+        scheduler.enqueue_generate_request(10, 3, 4, Priority::Low);
+        scheduler.enqueue_generate_request(20, 3, 4, Priority::Normal);
+        let initial = scheduler.schedule();
+        assert_eq!(initial.prefill, vec![10, 20]);
+        scheduler.advance(10);
+        scheduler.advance(20);
+
+        scheduler.enqueue_generate_request(30, 3, 2, Priority::High);
+        let decision = scheduler.schedule();
+
+        assert_eq!(decision.preempt, vec![10]);
+        assert_eq!(decision.prefill, vec![30]);
+        assert!(decision.swap_in.is_empty());
+        assert_eq!(decision.decode, vec![20]);
+        for preempted in &decision.preempt {
+            assert!(!decision.prefill.contains(preempted));
+            assert!(!decision.swap_in.contains(preempted));
+            assert!(!decision.decode.contains(preempted));
+        }
+        assert_eq!(scheduler.waiting_count(), 0);
+        assert_eq!(scheduler.running_count(), 2);
+        assert_eq!(scheduler.swapped_count(), 1);
+    }
+
+    #[test]
+    fn fair_share_respects_disabled_preemption_policy() {
+        let mut fair_config = config();
+        fair_config.priority_policy = PriorityPolicy::FairShare;
+        fair_config.preemption_policy = PreemptionPolicy::Disabled;
+        let mut scheduler = Scheduler::new(fair_config);
+
+        scheduler.enqueue_generate_request(10, 3, 4, Priority::Low);
+        scheduler.schedule();
+        scheduler.advance(10);
+
+        scheduler.enqueue_generate_request(20, 3, 2, Priority::High);
+        let decision = scheduler.schedule();
+
+        assert!(decision.preempt.is_empty());
+        assert!(decision.prefill.is_empty());
+        assert_eq!(decision.decode, vec![10]);
+        assert_eq!(scheduler.running_count(), 1);
+        assert_eq!(scheduler.swapped_count(), 0);
+        assert_eq!(scheduler.waiting_count(), 1);
     }
 
     fn byte_budget_config(bytes_per_token: u64) -> SchedulerConfig {

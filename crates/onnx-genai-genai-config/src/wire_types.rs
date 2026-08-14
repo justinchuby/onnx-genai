@@ -17,9 +17,6 @@ pub struct GenAiConfig {
 /// The `model` section of `genai_config.json`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GenAiModel {
-    /// Architecture identifier (e.g. `"qwen2"`, `"whisper"`, `"decoder-pipeline"`).
-    #[serde(rename = "type", default)]
-    pub model_type: Option<String>,
     /// Maximum total context length in tokens.
     #[serde(default)]
     pub context_length: Option<usize>,
@@ -64,10 +61,6 @@ pub struct GenAiModel {
     /// which is NOT an encoder-decoder (cross-attention) model.
     #[serde(default)]
     pub joiner: Option<GenAiJoiner>,
-    /// Optional voice-activity-detection graph (e.g. Silero VAD) used by
-    /// streaming transducer packages for segmentation.
-    #[serde(default)]
-    pub vad: Option<GenAiVad>,
 }
 
 /// `eos_token_id` accepts either a scalar or an array; both normalize to a list.
@@ -192,42 +185,11 @@ pub struct EncoderOutputs {
 /// The joint network combines the encoder output and the prediction-network
 /// (decoder) output into per-step logits over the vocabulary plus a blank
 /// symbol. It has no analog in a cross-attention encoder-decoder model, so its
-/// mere presence identifies a transducer package. Only the fields needed to
-/// DETECT and describe the family are parsed; the joint is not yet executable.
+/// mere presence identifies a transducer package. The section is intentionally
+/// only a marker while transducer execution is unsupported; graph filenames and
+/// ports are ignored rather than exposed as usable bindings.
 #[derive(Debug, Clone, Default, Deserialize)]
-pub struct GenAiJoiner {
-    #[serde(default)]
-    pub filename: Option<String>,
-    #[serde(default)]
-    pub inputs: JoinerInputs,
-    #[serde(default)]
-    pub outputs: JoinerOutputs,
-}
-
-/// Joint-network graph input port names.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
-pub struct JoinerInputs {
-    pub encoder_outputs: Option<String>,
-    pub decoder_outputs: Option<String>,
-}
-
-/// Joint-network graph output port names.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
-pub struct JoinerOutputs {
-    pub logits: Option<String>,
-}
-
-/// The `model.vad` section (voice-activity-detection front-end, e.g. Silero).
-///
-/// Only parsed so streaming transducer packages describe cleanly; VAD
-/// segmentation is not part of the current inference-metadata contract.
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct GenAiVad {
-    #[serde(default)]
-    pub filename: Option<String>,
-}
+pub struct GenAiJoiner {}
 
 /// The `model.embedding` section (multimodal token embedder).
 #[derive(Debug, Clone, Deserialize)]

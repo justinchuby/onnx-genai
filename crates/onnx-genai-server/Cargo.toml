@@ -12,8 +12,6 @@ categories = ["web-programming::http-server", "science"]
 default = ["metrics", "cuda-13000"]
 # Exposes the allocation-free atomic registry at GET /metrics in Prometheus format.
 metrics = []
-# Enables profiling integration hooks. Perfetto and OTLP exporters remain deferred.
-profiling = []
 # Enables the ORT and native-runtime CUDA execution providers (build on a CUDA host, e.g. H200).
 cuda = [
     "onnx-genai-ort/cuda",
