@@ -231,7 +231,8 @@ impl CudaExecutionProvider {
                     .with_async_pagein(offload_policy.async_pagein)
                     .with_scan_resistant_dense(offload_policy.scan_resistant_dense)
                     .with_byte_aware_residency(offload_policy.byte_aware_residency)
-                    .with_evict_order_probe(offload_policy.evict_order_probe),
+                    .with_evict_order_probe(offload_policy.evict_order_probe)
+                    .with_zero_copy_hybrid(offload_policy.zero_copy_hybrid),
             )
         });
         let provider = Self {

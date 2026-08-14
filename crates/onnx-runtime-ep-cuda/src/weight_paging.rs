@@ -22,9 +22,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use cudarc::driver::sys;
 use cudarc::driver::sys::CUdeviceptr;
 use onnx_runtime_ep_api::{
-    LazyDeviceWeightBinder, LazyWeight, LazyWeightBoundary, MmapRegionSource, WeightHandleError,
+    ExternalMmapRegion, LazyDeviceWeightBinder, LazyWeight, LazyWeightBoundary, MmapRegionSource,
+    WeightHandleError,
 };
 use onnx_runtime_ir::DataType;
 use onnx_runtime_memory_governor::{DeviceAllocator, Tier};
@@ -87,6 +89,23 @@ static GLOBAL_PEAK_RESIDENT_BYTES: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_BUDGET_BYTES: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_CONTENT_RESIDENT_BYTES: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_WEIGHT_MAPPED_BYTES: AtomicU64 = AtomicU64::new(0);
+// Zero-copy hybrid counters (#864). A cold weight the hybrid declines to copy
+// into VRAM is read in place from a `cuMemHostRegister(READ_ONLY|DEVICEMAP)`
+// host mapping. `GLOBAL_ZERO_COPY_BINDS` counts the distinct cold weights bound
+// this way (each registered once, never re-copied); `GLOBAL_ZERO_COPY_READS`
+// and `GLOBAL_ZERO_COPY_BYTES` count every dispatch that reads such a weight,
+// so `zero_copy_bytes / emitted_tokens` is the per-step PCIe traffic the cold
+// fraction moves — the honest analogue of `htod_bytes_per_token` for the arm
+// that never copies. `GLOBAL_HOST_REGISTERED_BYTES` is the page-locked host RAM
+// the registrations claim (a live gauge, preserved across window resets).
+static GLOBAL_ZERO_COPY_BINDS: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_ZERO_COPY_READS: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_ZERO_COPY_BYTES: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_HOST_REGISTERED_BYTES: AtomicU64 = AtomicU64::new(0);
+// Distinct bytes actually bound zero-copy (each cold weight counted once at
+// bind, not per read). This is the per-step host-mapped read footprint, which
+// the safety budget caps — see `ZERO_COPY_SAFE_BUDGET_BYTES`.
+static GLOBAL_ZERO_COPY_BOUND_BYTES: AtomicU64 = AtomicU64::new(0);
 
 fn add_duration(counter: &AtomicU64, elapsed: Duration) {
     let nanos = elapsed.as_nanos().min(u128::from(u64::MAX)) as u64;
@@ -163,6 +182,20 @@ pub struct GlobalOffloadStats {
     pub pinned_alloc_calls: u64,
     /// Page-ins whose pinned staging buffer was served from the pool free-list.
     pub pinned_reuses: u64,
+    /// Distinct cold weights bound zero-copy from host-mapped memory (#864).
+    /// Each is `cuMemHostRegister`ed once and never copied into VRAM; a nonzero
+    /// value means the zero-copy hybrid is engaged.
+    pub zero_copy_binds: u64,
+    /// Dispatch reads served from a host-mapped (zero-copy) weight page. Every
+    /// decode step re-reads each cold weight over PCIe in place, so this grows
+    /// once per cold-weight lookup per step.
+    pub zero_copy_reads: u64,
+    /// Weight **bytes** read in place from host-mapped memory. This is *not* part
+    /// of [`Self::htod_bytes`] (no copy happened); it is the honest per-step PCIe
+    /// traffic of the cold fraction. See [`Self::zero_copy_byte_hit_rate`].
+    pub zero_copy_bytes: u64,
+    /// Page-locked host RAM claimed by zero-copy registrations (a live gauge).
+    pub host_registered_bytes: u64,
 }
 
 impl GlobalOffloadStats {
@@ -195,6 +228,25 @@ impl GlobalOffloadStats {
     pub fn bypassed_byte_share(&self) -> Option<f64> {
         (self.htod_bytes > 0).then(|| self.bypassed_page_in_bytes as f64 / self.htod_bytes as f64)
     }
+
+    /// Byte-weighted fraction of requested weight bytes served from **VRAM
+    /// residency**, counting host-mapped zero-copy reads as *not* resident
+    /// (#864). [`Self::byte_hit_rate`] divides only by copied bytes, so on the
+    /// zero-copy hybrid — where the cold fraction is read in place and never
+    /// copied — it would report ~100% and hide that the cold bytes still cross
+    /// PCIe every step. This denominator adds `zero_copy_bytes` so the number
+    /// reflects the true resident share: `hit_bytes / (hit_bytes + htod_bytes +
+    /// zero_copy_bytes)`.
+    ///
+    /// `None` when no weight bytes were requested in the window.
+    #[must_use]
+    pub fn zero_copy_byte_hit_rate(&self) -> Option<f64> {
+        let requested = self
+            .hit_bytes
+            .checked_add(self.htod_bytes)?
+            .checked_add(self.zero_copy_bytes)?;
+        (requested > 0).then(|| self.hit_bytes as f64 / requested as f64)
+    }
 }
 
 /// Read the process-global weight-offload counters.
@@ -223,6 +275,10 @@ pub fn global_offload_stats() -> GlobalOffloadStats {
         mapped_physical_bytes: GLOBAL_WEIGHT_MAPPED_BYTES.load(Ordering::Relaxed),
         pinned_alloc_calls: crate::pinned_pool::global_pinned_alloc_calls(),
         pinned_reuses: crate::pinned_pool::global_pinned_reuses(),
+        zero_copy_binds: GLOBAL_ZERO_COPY_BINDS.load(Ordering::Relaxed),
+        zero_copy_reads: GLOBAL_ZERO_COPY_READS.load(Ordering::Relaxed),
+        zero_copy_bytes: GLOBAL_ZERO_COPY_BYTES.load(Ordering::Relaxed),
+        host_registered_bytes: GLOBAL_HOST_REGISTERED_BYTES.load(Ordering::Relaxed),
     }
 }
 
@@ -250,6 +306,11 @@ pub fn reset_global_offload_stats() {
     GLOBAL_HTOD_BYTES.store(0, Ordering::Relaxed);
     GLOBAL_VRAM_ALLOC_NS.store(0, Ordering::Relaxed);
     GLOBAL_VRAM_FREE_NS.store(0, Ordering::Relaxed);
+    // Per-window activity: cold zero-copy reads/bytes. `zero_copy_binds` and
+    // `host_registered_bytes` are live gauges (the registrations survive a
+    // window reset), so they are preserved exactly like the residency gauges.
+    GLOBAL_ZERO_COPY_READS.store(0, Ordering::Relaxed);
+    GLOBAL_ZERO_COPY_BYTES.store(0, Ordering::Relaxed);
     crate::pinned_pool::reset_pinned_pool_counters();
 }
 
@@ -419,9 +480,150 @@ pub fn byte_aware_residency_from_env() -> bool {
     byte_aware_from_env_value(std::env::var(WEIGHT_OFFLOAD_BYTE_AWARE_ENV).ok().as_deref())
 }
 
-/// Sub-knob (default `lru` = shipped behaviour) selecting the **eviction victim
-/// order** used on the size-blind `StableResident`/`Lru` admission path, without
-/// changing the retain-vs-bypass decision at all (#888).
+/// Sub-knob (default OFF / opt-IN) selecting the **zero-copy hybrid** (#864). On
+/// top of the size-blind `StableResident` residency, the cold remainder that
+/// would otherwise be streamed transiently (copied into VRAM and evicted every
+/// decode step) is instead read *in place* from a
+/// `cuMemHostRegister(READ_ONLY|DEVICEMAP)` host mapping — the exact zero-copy
+/// path #877/#880 measured at ~5.6 GB/s with bit-identical outputs and CUDA
+/// graph capture support.
+///
+/// The hot resident set is unchanged from `StableResident` (arrival-order
+/// first-fit up to the weight budget, retained and never evicted), so the
+/// hybrid is a clean A/B against managed streaming: **same resident set, cold
+/// reads zero-copy in place instead of copied**. It removes the per-step CPU
+/// memcpy into pinned staging, the VRAM commit, the eviction and the
+/// synchronize for every cold weight, and pins nothing dynamically — so it
+/// never exercises the retain-then-churn path #886/#892 localised as unsafe.
+///
+/// Only takes effect when weight offload is enabled on the VMM stable-VA path
+/// (`ONNX_GENAI_MANAGED_WEIGHT_STREAMING=1`); with offload off, or on the
+/// non-VMM path, it is inert and byte-identical. Set to `1`/`true`/`yes`/`on`
+/// to enable.
+///
+/// Host-RAM policy: only the **cold** weights actually read zero-copy are
+/// page-locked, at page granularity, bounded to the over-budget fraction
+/// (~`W - B`, e.g. ~1.2 GiB on qwen14b-zp), not the whole 16.65 GiB data file.
+/// Registration happens once per weight and is never repeated per page-in.
+pub const WEIGHT_OFFLOAD_ZERO_COPY_HYBRID_ENV: &str = "ONNX_GENAI_ZERO_COPY_HYBRID";
+
+/// Parse [`WEIGHT_OFFLOAD_ZERO_COPY_HYBRID_ENV`]. Defaults **OFF** (opt-in):
+/// only `1`/`true`/`yes`/`on` (case/whitespace-insensitive) enable it.
+pub(crate) fn zero_copy_hybrid_from_env_value(value: Option<&str>) -> bool {
+    match value {
+        Some(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        None => false,
+    }
+}
+
+/// Read [`WEIGHT_OFFLOAD_ZERO_COPY_HYBRID_ENV`] from the process environment.
+/// Exposed so the engine's memory-strategy policy can opt this knob in without
+/// threading a new field through the whole runtime-application config, exactly
+/// like [`byte_aware_residency_from_env`].
+#[must_use]
+pub fn zero_copy_hybrid_from_env() -> bool {
+    zero_copy_hybrid_from_env_value(
+        std::env::var(WEIGHT_OFFLOAD_ZERO_COPY_HYBRID_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Diagnostic knob (#864): perform the deferred weight's real streaming copy
+/// instead of binding its host-mapped device pointer. Isolates the deferral/
+/// admission flow from the host-mapped READ. Default OFF.
+fn zero_copy_copy_instead() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        zero_copy_hybrid_from_env_value(
+            std::env::var("ONNX_GENAI_ZERO_COPY_HYBRID_COPY_INSTEAD")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// Diagnostic knob (#864): print per-bind zero-copy diagnostics. Default OFF.
+fn zero_copy_debug() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        zero_copy_hybrid_from_env_value(
+            std::env::var("ONNX_GENAI_ZERO_COPY_HYBRID_DEBUG")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// Diagnostic knob (#864): pre-fault every page of the mapping on the CPU before
+/// `cuMemHostRegister`, so pinning sees populated pages rather than racing the
+/// lazy mmap's demand paging. Default OFF.
+fn zero_copy_prefault() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        zero_copy_hybrid_from_env_value(
+            std::env::var("ONNX_GENAI_ZERO_COPY_HYBRID_PREFAULT")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// Diagnostic knob (#864): register the mapping with DEVICEMAP only (drop
+/// READ_ONLY), to isolate a READ_ONLY-flag correctness problem. Default OFF.
+fn zero_copy_no_readonly() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        zero_copy_hybrid_from_env_value(
+            std::env::var("ONNX_GENAI_ZERO_COPY_HYBRID_NO_READONLY")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// Diagnostic knob (#864): cap how many weights are actually bound zero-copy
+/// (the rest are copied). `Some(1)` isolates a single zero-copy read. Default
+/// `None` (unbounded).
+fn zero_copy_max_binds() -> Option<u64> {
+    static V: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("ONNX_GENAI_ZERO_COPY_HYBRID_MAX_BINDS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    })
+}
+
+/// Conservative default safety budget for **distinct** zero-copy bytes bound
+/// per residency (256 MiB). This exists because of a measured hardware limit
+/// (#864): on an RTX 4060 Laptop under WDDM, device reads through a
+/// `cuMemHostRegister(READ_ONLY | DEVICEMAP)` mapping are bit-identical up to
+/// ~0.44 GB of distinct host-mapped data read per decode step (32 cold weights
+/// verified correct), but **silently corrupt** above that (48 weights / ~0.65 GB
+/// collapsed generation 16 → 3 tokens — the #886 signature, but from stale
+/// host-mapped reads, not eviction). Individual reads are always correct, so
+/// this is an aggregate host-mapped-aperture ceiling, not a per-read fault.
+/// The default is set well under the observed-safe ceiling so the opt-in knob
+/// can never violate the byte-identical gate; override for investigation only.
+const ZERO_COPY_SAFE_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Per-residency distinct zero-copy byte budget (see
+/// [`ZERO_COPY_SAFE_BUDGET_BYTES`]). Override via
+/// `ONNX_GENAI_ZERO_COPY_HYBRID_BUDGET_BYTES` (e.g. `0` to force copy-only, or a
+/// large value to reproduce the corruption on other hardware).
+fn zero_copy_budget_bytes() -> u64 {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("ONNX_GENAI_ZERO_COPY_HYBRID_BUDGET_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(ZERO_COPY_SAFE_BUDGET_BYTES)
+    })
+}
+
 ///
 /// This exists purely to answer the #888 discriminating question: byte-aware
 /// residency (#886) changed *two* independent things at once — it started
@@ -557,6 +759,12 @@ pub struct DeviceOffloadPolicy {
     /// evicted for physical room, isolating whether decode correctness depends
     /// on eviction order independently of byte-aware's retain change.
     pub evict_order_probe: EvictOrderProbe,
+    /// Enable the zero-copy hybrid (#864): read the cold, over-budget weight
+    /// remainder in place from a `cuMemHostRegister(READ_ONLY|DEVICEMAP)` host
+    /// mapping instead of copying it into VRAM every decode step. Default off;
+    /// see [`WEIGHT_OFFLOAD_ZERO_COPY_HYBRID_ENV`]. Only effective on the VMM
+    /// stable-VA managed-streaming path.
+    pub zero_copy_hybrid: bool,
 }
 
 impl Default for DeviceOffloadPolicy {
@@ -570,6 +778,7 @@ impl Default for DeviceOffloadPolicy {
             scan_resistant_dense: true,
             byte_aware_residency: false,
             evict_order_probe: EvictOrderProbe::Lru,
+            zero_copy_hybrid: false,
         }
     }
 }
@@ -602,6 +811,11 @@ impl DeviceOffloadPolicy {
                 .ok()
                 .as_deref(),
         );
+        let zero_copy_hybrid = zero_copy_hybrid_from_env_value(
+            std::env::var(WEIGHT_OFFLOAD_ZERO_COPY_HYBRID_ENV)
+                .ok()
+                .as_deref(),
+        );
         Self {
             enabled,
             managed_no_spill: false,
@@ -611,6 +825,7 @@ impl DeviceOffloadPolicy {
             scan_resistant_dense,
             byte_aware_residency,
             evict_order_probe,
+            zero_copy_hybrid,
         }
     }
 }
@@ -675,6 +890,12 @@ pub struct CudaWeightPage {
 enum WeightAllocation {
     Runtime,
     Retired,
+    /// A cold weight read in place from host-mapped memory (#864 zero-copy
+    /// hybrid). `ptr` is a `cuMemHostGetDevicePointer` over a
+    /// `cuMemHostRegister(READ_ONLY|DEVICEMAP)` region of the weight mmap; no
+    /// VRAM is owned, so Drop frees nothing. Unregistration is owned by the
+    /// residency's [`HostMapRegistry`], which outlives every page it hands out.
+    HostMapped,
     Vmm {
         allocator: Arc<crate::vmm_allocator::CudaVmmAllocator>,
         allowance: onnx_runtime_memory_governor::MappedAllowance,
@@ -709,6 +930,11 @@ impl CudaWeightPage {
                 let _ = unsafe { self.runtime.free_raw(self.ptr) };
             }
             WeightAllocation::Retired => {}
+            WeightAllocation::HostMapped => {
+                // The device pointer aliases host-mapped memory owned and
+                // unregistered by the residency's `HostMapRegistry`. Nothing to
+                // free here; never assert (reachable from Drop).
+            }
             WeightAllocation::Vmm {
                 allocator,
                 allowance,
@@ -1052,6 +1278,154 @@ impl<S: MmapRegionSource + ?Sized> LazyDeviceWeightBinder for CudaWeightPager<'_
     }
 }
 
+/// Host page size assertion helper for `cuMemHostRegister` (#864). x86-64 mmap
+/// bases are 4 KiB page-aligned, which `cuMemHostRegister` requires.
+const HOST_REGISTER_PAGE: usize = 4096;
+const CU_MEMHOSTREGISTER_DEVICEMAP: u32 = 0x02;
+const CU_MEMHOSTREGISTER_READ_ONLY: u32 = 0x08;
+
+/// Owns the `cuMemHostRegister(READ_ONLY|DEVICEMAP)` registrations backing the
+/// zero-copy hybrid (#864) and derives per-weight device pointers from them.
+///
+/// An **entire mapping** is registered in a single call the first time any cold
+/// weight from it is bound. This is the critical correctness property:
+/// `cuMemHostGetDevicePointer` only guarantees a device address that is
+/// contiguous over the extent of **one** registration, so a weight spanning two
+/// separate registrations would map to discontiguous device VAs and a kernel
+/// reading it linearly would run off the end (observed as
+/// `CUDA_ERROR_ILLEGAL_ADDRESS`). One registration per mapping guarantees every
+/// weight in that mapping is fully covered and contiguous.
+///
+/// Policy / cost: registering a whole mapping page-locks its full host size
+/// (the model data file). On this qwen14b-zp box that is ~16.6 GiB of a 63.8
+/// GiB host with ~34 GiB free — comfortable here, but a real claim on smaller
+/// hosts, which is why the hybrid is gated behind a default-OFF knob. The lock
+/// is paid once at first cold touch, never per page-in.
+struct HostMapRegistry {
+    /// mapping_id → (registered host base address, registered length).
+    registered: HashMap<usize, (usize, usize)>,
+}
+
+impl HostMapRegistry {
+    fn new() -> Self {
+        Self {
+            registered: HashMap::new(),
+        }
+    }
+
+    /// Ensure the whole `mapping` is registered `READ_ONLY | DEVICEMAP` (once),
+    /// then return the device pointer for `host_ptr`, which must lie inside it.
+    /// Registration happens once per mapping and is never repeated, so repeated
+    /// page-ins of any weight in the mapping pay nothing.
+    fn device_ptr_for(
+        &mut self,
+        mapping_id: usize,
+        mapping: &[u8],
+        host_ptr: *const u8,
+    ) -> Result<CUdeviceptr, WeightHandleError> {
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.registered.entry(mapping_id)
+        {
+            let base = mapping.as_ptr();
+            if (base as usize) & (HOST_REGISTER_PAGE - 1) != 0 {
+                return Err(WeightHandleError::DeviceBinding(format!(
+                    "mmap base {base:p} is not {HOST_REGISTER_PAGE}-byte page aligned; \
+                     cannot host-register for zero-copy"
+                )));
+            }
+            let len = mapping.len();
+            // Optional pre-fault (#864 diagnostic): the weight file is mmap'd
+            // lazily, so a cold page may not be resident when we register it.
+            // Touch every page on the CPU first so `cuMemHostRegister` pins the
+            // real, populated physical pages rather than racing demand paging.
+            if zero_copy_prefault() {
+                let mut acc: u64 = 0;
+                let mut off = 0usize;
+                while off < len {
+                    // SAFETY: `off < len` and `mapping` is a live slice.
+                    acc = acc.wrapping_add(unsafe { *mapping.get_unchecked(off) } as u64);
+                    off += HOST_REGISTER_PAGE;
+                }
+                // Prevent the loop from being optimized away.
+                std::hint::black_box(acc);
+            }
+            let flags = if zero_copy_no_readonly() {
+                CU_MEMHOSTREGISTER_DEVICEMAP
+            } else {
+                CU_MEMHOSTREGISTER_DEVICEMAP | CU_MEMHOSTREGISTER_READ_ONLY
+            };
+            // SAFETY: `mapping` is a live, page-aligned, read-only weight file
+            // mapping owned by the executor's weight store, which outlives this
+            // registry. READ_ONLY is sound because weights are immutable;
+            // DEVICEMAP makes the device pointer valid. It is registered exactly
+            // once per mapping_id (guarded above), so never double-registers.
+            unsafe { sys::cuMemHostRegister_v2(base as *mut std::ffi::c_void, len, flags) }
+                .result()
+                .map_err(|error| {
+                    WeightHandleError::DeviceBinding(format!(
+                        "cuMemHostRegister(DEVICEMAP) of {len} bytes failed: {error}"
+                    ))
+                })?;
+            entry.insert((base as usize, len));
+            GLOBAL_HOST_REGISTERED_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+        }
+        let mut device_ptr: CUdeviceptr = 0;
+        // SAFETY: `host_ptr` lies inside the mapping registered with DEVICEMAP
+        // above, so a device pointer for it exists and is contiguous over the
+        // whole mapping.
+        unsafe {
+            sys::cuMemHostGetDevicePointer_v2(&mut device_ptr, host_ptr as *mut std::ffi::c_void, 0)
+        }
+        .result()
+        .map_err(|error| {
+            WeightHandleError::DeviceBinding(format!("cuMemHostGetDevicePointer failed: {error}"))
+        })?;
+        Ok(device_ptr)
+    }
+}
+
+impl Drop for HostMapRegistry {
+    fn drop(&mut self) {
+        for &(base, _len) in self.registered.values() {
+            // Best-effort teardown; never assert in Drop. If the mapping was
+            // already torn down, unregistration failing is harmless.
+            let _ = unsafe { sys::cuMemHostUnregister(base as *mut std::ffi::c_void) };
+        }
+    }
+}
+
+/// Outcome of a single VMM `admit_committed_span` attempt.
+enum SpanAdmit {
+    /// The span was filled into VRAM. `bypass` is `true` when the page was
+    /// streamed transiently (not retained in the resident set).
+    Filled { bypass: bool },
+    /// Zero-copy hybrid (#864) only: admission would have bypassed (transiently
+    /// streamed) this span, so the caller must bind it zero-copy instead. No
+    /// eviction, reservation-map, or fill happened — the reserved VA is clean.
+    DeferToZeroCopy,
+}
+
+/// Outcome of a VMM live page-in attempt (`resident_vmm_with`) under the
+/// zero-copy hybrid. Non-hybrid callers only ever observe [`VmmAdmit::Page`].
+#[derive(Debug)]
+enum VmmAdmit {
+    Page(Arc<CudaWeightPage>),
+    /// The weight would be bypassed; the hybrid must bind it zero-copy in place
+    /// rather than streaming it transiently through VRAM.
+    DeferToZeroCopy,
+}
+
+impl VmmAdmit {
+    /// Unwrap a page from a non-hybrid admission, which can never defer.
+    fn expect_page(self) -> Arc<CudaWeightPage> {
+        match self {
+            VmmAdmit::Page(page) => page,
+            VmmAdmit::DeferToZeroCopy => {
+                unreachable!("non-hybrid VMM admission never defers to zero-copy")
+            }
+        }
+    }
+}
+
 /// A bounded-VRAM LRU cache of live device weight pages (WEIGHT_OFFLOAD Phase 3b
 /// "page-in + eviction").
 ///
@@ -1092,6 +1466,14 @@ pub struct CudaWeightResidency {
     /// always-bypass decision is unchanged. Default [`EvictOrderProbe::Lru`] is
     /// byte-identical to the shipped path.
     evict_order_probe: EvictOrderProbe,
+    /// Enable the zero-copy hybrid (#864): read the cold, over-budget remainder
+    /// in place from host-mapped memory instead of copying it into VRAM every
+    /// step. Only effective with `physical` (VMM stable-VA) installed.
+    zero_copy_hybrid: bool,
+    /// Owns the host registrations and derives device pointers for cold weights
+    /// bound zero-copy. A separate lock from `inner` so the cold path never
+    /// contends the residency mutex for its (idempotent) registration bookkeeping.
+    host_registry: Mutex<HostMapRegistry>,
     physical: OnceLock<PhysicalAdmission>,
     /// Reused pinned host staging buffers for weight page-ins. Shared so every
     /// page-in draws from the same bounded free-list instead of page-locking a
@@ -1135,6 +1517,13 @@ struct ResidencyInner {
     /// cycles. Only retained (resident-set) keys get a slot; transient bypass
     /// page-ins keep their own throwaway VA and never appear here.
     slots: HashMap<u64, StableWeightSlot>,
+    /// Cold weights bound zero-copy from host-mapped memory (#864 hybrid). Kept
+    /// separate from `pages` because these own no VRAM and must never be counted
+    /// as resident, evicted, or reported in the residency byte ledger. Each is
+    /// bound once and its `Arc` reused for every subsequent decode step (the
+    /// device pointer is stable for the residency's lifetime), so steady-state
+    /// cold lookups allocate nothing.
+    cold_pages: HashMap<u64, Arc<CudaWeightPage>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1384,6 +1773,8 @@ impl CudaWeightResidency {
             scan_resistant_dense: false,
             byte_aware: false,
             evict_order_probe: EvictOrderProbe::Lru,
+            zero_copy_hybrid: false,
+            host_registry: Mutex::new(HostMapRegistry::new()),
             physical: OnceLock::new(),
             staging_pool: PinnedStagingPool::new(Arc::clone(&runtime)),
             inner: Mutex::new(ResidencyInner {
@@ -1393,6 +1784,7 @@ impl CudaWeightResidency {
                 mapped_allowance: None,
                 admission_no_progress: 0,
                 slots: HashMap::new(),
+                cold_pages: HashMap::new(),
             }),
         }
     }
@@ -1436,6 +1828,8 @@ impl CudaWeightResidency {
             scan_resistant_dense: false,
             byte_aware: false,
             evict_order_probe: EvictOrderProbe::Lru,
+            zero_copy_hybrid: false,
+            host_registry: Mutex::new(HostMapRegistry::new()),
             physical: OnceLock::new(),
             staging_pool: PinnedStagingPool::new(Arc::clone(&runtime)),
             inner: Mutex::new(ResidencyInner {
@@ -1445,6 +1839,7 @@ impl CudaWeightResidency {
                 mapped_allowance: None,
                 admission_no_progress: 0,
                 slots: HashMap::new(),
+                cold_pages: HashMap::new(),
             }),
         })
     }
@@ -1575,6 +1970,15 @@ impl CudaWeightResidency {
         self
     }
 
+    /// Select the zero-copy hybrid (#864): read the cold, over-budget weight
+    /// remainder in place from host-mapped memory instead of copying it into
+    /// VRAM every decode step. Only effective once VMM stable-VA admission is
+    /// installed; inert (byte-identical) otherwise.
+    pub fn with_zero_copy_hybrid(mut self, zero_copy_hybrid: bool) -> Self {
+        self.zero_copy_hybrid = zero_copy_hybrid;
+        self
+    }
+
     /// Use the production VMM arena and its existing physical-memory authority
     /// for weight pages. The configured cache budget remains an observability
     /// value; admission is governed by incremental authority-owned bytes, not
@@ -1650,18 +2054,21 @@ impl CudaWeightResidency {
             let resident = weight.materialize()?;
             GLOBAL_MATERIALIZE_FALLBACK_CALLS.fetch_add(1, Ordering::Relaxed);
             let bytes = resident.bytes().to_vec();
-            return self.resident_vmm_with(
-                key,
-                resident.dtype,
-                resident.shape.clone(),
-                bytes.len(),
-                self.eviction_for(weight.boundary),
-                move |runtime, ptr| {
-                    unsafe { runtime.htod(&bytes, ptr) }.map_err(|error| {
-                        WeightHandleError::DeviceBinding(format!("H2D copy: {error}"))
-                    })
-                },
-            );
+            return self
+                .resident_vmm_with(
+                    key,
+                    resident.dtype,
+                    resident.shape.clone(),
+                    bytes.len(),
+                    self.eviction_for(weight.boundary),
+                    false,
+                    move |runtime, ptr| {
+                        unsafe { runtime.htod(&bytes, ptr) }.map_err(|error| {
+                            WeightHandleError::DeviceBinding(format!("H2D copy: {error}"))
+                        })
+                    },
+                )
+                .map(VmmAdmit::expect_page);
         }
         // Copy region bytes host→device before re-locking so a failed bind never
         // mutates cache accounting.
@@ -1676,14 +2083,40 @@ impl CudaWeightResidency {
     /// not-fit model the same layer weights are paged every token; rebuilding an
     /// owned host tensor for each miss made CPU materialization dominate decode
     /// time.
+    ///
+    /// When the zero-copy hybrid (#864) is enabled and VMM stable-VA admission
+    /// is installed, dispatches to [`Self::resident_mapped_hybrid`]; otherwise
+    /// runs the copy-into-VRAM path unchanged.
     pub fn resident_mapped(
         &self,
         key: u64,
         weight: &LazyWeight,
         source: &dyn MmapRegionSource,
     ) -> Result<Arc<CudaWeightPage>, WeightHandleError> {
+        if self.zero_copy_hybrid && self.physical.get().is_some() {
+            return self.resident_mapped_hybrid(key, weight, source);
+        }
+        self.resident_mapped_inner(key, weight, source, false)
+            .map(VmmAdmit::expect_page)
+    }
+
+    /// Copy-into-VRAM live page-in path (the managed-streaming behaviour). The
+    /// hybrid reuses this verbatim to pin its static hot set.
+    ///
+    /// When `hybrid_zero_copy` is set, a weight the VMM admission would bypass
+    /// (transiently stream) is not evicted-for and not filled — instead the
+    /// call returns [`VmmAdmit::DeferToZeroCopy`] so the caller binds it
+    /// zero-copy in place. Non-hybrid callers pass `false` and always receive a
+    /// [`VmmAdmit::Page`].
+    fn resident_mapped_inner(
+        &self,
+        key: u64,
+        weight: &LazyWeight,
+        source: &dyn MmapRegionSource,
+        hybrid_zero_copy: bool,
+    ) -> Result<VmmAdmit, WeightHandleError> {
         if let Some(hit) = self.get_hit(key) {
-            return Ok(hit);
+            return Ok(VmmAdmit::Page(hit));
         }
         let len = weight.region_bytes_len();
         // Draw a reusable pinned staging buffer from the bounded pool instead of
@@ -1704,6 +2137,7 @@ impl CudaWeightResidency {
                 weight.shape.clone(),
                 len,
                 self.eviction_for(weight.boundary),
+                hybrid_zero_copy,
                 // `staging` (a `PooledStaging`) is moved into the fill closure.
                 // `htod_async_elapsed_ms` host-synchronizes the copy before it
                 // returns and yields a `CopyCompleted` witness; `retire` consumes
@@ -1735,13 +2169,212 @@ impl CudaWeightResidency {
         )?;
         self.staging_pool.release(raw_staging, completed);
         self.admit(key, Arc::new(page), self.eviction_for(weight.boundary))
+            .map(VmmAdmit::Page)
     }
 
-    /// Live-dispatch entry point: return the device page for `key`, paging it in
-    /// on a miss by materializing the weight's canonical (compressed) bytes and
-    /// streaming them host→device, with LRU eviction under the VRAM budget. The
-    /// materialized bytes are the exact resident backing, so the page is
-    /// byte-identical to a stock upload.
+    /// Zero-copy hybrid live-dispatch path (#864).
+    ///
+    /// The hot resident set is **exactly** what size-blind `StableResident`
+    /// admission retains: a weight is copied into VRAM once and pinned only when
+    /// it fits *without evicting* anything. The moment admission would bypass a
+    /// weight — i.e. transiently stream it because it does not fit — the hybrid
+    /// binds it **zero-copy in place** from a `cuMemHostRegister(READ_ONLY |
+    /// DEVICEMAP)` host mapping instead of copying it, and no eviction ever
+    /// runs. This is the critical safety property (#886/#892): because the hot
+    /// set never evicts and the cold set never enters VRAM, no large weight ever
+    /// occupies a stable slot that could later be evicted and re-admitted — the
+    /// exact pattern that silently corrupted decode in #886. It is also a clean
+    /// A/B against managed streaming: identical hot set, cold remainder read
+    /// zero-copy in place rather than copied-and-bypassed every step.
+    ///
+    /// Cold pages own no VRAM and their device pointer is stable for the
+    /// residency's lifetime, so after the first touch every lookup is a cache
+    /// hit that allocates nothing.
+    fn resident_mapped_hybrid(
+        &self,
+        key: u64,
+        weight: &LazyWeight,
+        source: &dyn MmapRegionSource,
+    ) -> Result<Arc<CudaWeightPage>, WeightHandleError> {
+        // Hot (VRAM-resident) hit.
+        if let Some(hit) = self.get_hit(key) {
+            return Ok(hit);
+        }
+        // Cold (host-mapped) hit: already bound zero-copy on an earlier step.
+        {
+            let inner = self.lock();
+            if let Some(cold) = inner.cold_pages.get(&key).cloned() {
+                let len = cold.len();
+                drop(inner);
+                self.record_zero_copy_read(len);
+                return Ok(cold);
+            }
+        }
+        let len = weight.region_bytes_len();
+        // Attempt a normal VMM page-in. In hybrid mode the admission short-
+        // circuits to `DeferToZeroCopy` the instant it would bypass (transiently
+        // stream) this weight — before any eviction — so a retained hot weight
+        // is only ever one that fit without displacing another. Everything else
+        // is bound zero-copy in place below.
+        match self.resident_mapped_inner(key, weight, source, true)? {
+            VmmAdmit::Page(page) => Ok(page),
+            VmmAdmit::DeferToZeroCopy => self.bind_zero_copy(key, weight, source, len),
+        }
+    }
+
+    /// Bind `key`'s cold weight zero-copy from host-mapped memory, caching the
+    /// resulting page so subsequent steps reuse the identical device pointer.
+    ///
+    /// Falls back to a transient copy-into-VRAM stream (the managed-streaming
+    /// bypass, which is byte-identical and never retains a large stable slot)
+    /// when the weight's regions are not a single contiguous span — a single
+    /// device pointer cannot address a gapped weight; in practice the packed
+    /// `MatMulNBits`/`QMoE` blobs are one region.
+    fn bind_zero_copy(
+        &self,
+        key: u64,
+        weight: &LazyWeight,
+        source: &dyn MmapRegionSource,
+        len: usize,
+    ) -> Result<Arc<CudaWeightPage>, WeightHandleError> {
+        // Safety budget (#864): keep distinct zero-copy bytes below the measured
+        // host-mapped corruption ceiling on this class of hardware. Over budget,
+        // copy the weight (byte-identical managed-streaming bypass) rather than
+        // bind it host-mapped — this is what keeps the opt-in knob from ever
+        // violating the byte-identical gate. See `ZERO_COPY_SAFE_BUDGET_BYTES`.
+        if GLOBAL_ZERO_COPY_BOUND_BYTES
+            .load(Ordering::Relaxed)
+            .saturating_add(len as u64)
+            > zero_copy_budget_bytes()
+        {
+            return self
+                .resident_mapped_inner(key, weight, source, false)
+                .map(VmmAdmit::expect_page);
+        }
+        let device_ptr = match self.zero_copy_device_ptr(weight, source)? {
+            Some(ptr) => ptr,
+            None => {
+                // Non-contiguous weight: fall back to the plain streaming path
+                // (hybrid flag off) so it transiently bypasses like managed
+                // streaming rather than looping back here.
+                return self
+                    .resident_mapped_inner(key, weight, source, false)
+                    .map(VmmAdmit::expect_page);
+            }
+        };
+        // Diagnostic isolation knob (#864): cap the number of weights actually
+        // bound zero-copy; copy the rest. `max=1` tests whether a *single*
+        // zero-copy read is correct in the real decode integration (bisecting a
+        // scale/aperture fault from a per-read fault). The whole mapping is still
+        // registered above, so the device pointer is real either way.
+        if zero_copy_max_binds()
+            .is_some_and(|max| GLOBAL_ZERO_COPY_BINDS.load(Ordering::Relaxed) >= max)
+        {
+            return self
+                .resident_mapped_inner(key, weight, source, false)
+                .map(VmmAdmit::expect_page);
+        } // end MAX_BINDS diagnostic cap
+        // Diagnostic isolation knob (#864): when set, take the deferral decision
+        // exactly as the zero-copy path would, but perform the real streaming
+        // copy instead of binding the host-mapped pointer. If output is correct
+        // under this knob but wrong without it, the fault is the host-mapped
+        // READ (alignment/hardware), not the deferral/admission flow.
+        if zero_copy_copy_instead() {
+            return self
+                .resident_mapped_inner(key, weight, source, false)
+                .map(VmmAdmit::expect_page);
+        }
+        if zero_copy_debug() {
+            let host_align = (device_ptr as usize) & 0xff;
+            eprintln!(
+                "zero_copy_bind: key={key} len={len} dptr=0x{device_ptr:x} dptr_align256={host_align} \
+                 regions={} first_off={}",
+                weight.regions.len(),
+                weight.regions.first().map(|r| r.offset).unwrap_or(0)
+            );
+        }
+        let page = Arc::new(CudaWeightPage {
+            runtime: Arc::clone(&self.runtime),
+            allocation: WeightAllocation::HostMapped,
+            ptr: device_ptr,
+            len,
+            dtype: weight.dtype,
+            shape: weight.shape.clone(),
+        });
+        {
+            let mut inner = self.lock();
+            // A concurrent dispatch may have bound the same key; prefer the
+            // existing page and drop ours (Drop frees nothing for HostMapped).
+            if let Some(existing) = inner.cold_pages.get(&key).cloned() {
+                let existing_len = existing.len();
+                drop(inner);
+                self.record_zero_copy_read(existing_len);
+                return Ok(existing);
+            }
+            inner.cold_pages.insert(key, Arc::clone(&page));
+        }
+        GLOBAL_ZERO_COPY_BINDS.fetch_add(1, Ordering::Relaxed);
+        GLOBAL_ZERO_COPY_BOUND_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+        self.record_zero_copy_read(len);
+        Ok(page)
+    }
+
+    /// Resolve a device pointer for `weight`'s contiguous host-mapped span, or
+    /// `Ok(None)` when the weight is not a single contiguous region and cannot
+    /// be addressed by one pointer.
+    fn zero_copy_device_ptr(
+        &self,
+        weight: &LazyWeight,
+        source: &dyn MmapRegionSource,
+    ) -> Result<Option<CUdeviceptr>, WeightHandleError> {
+        let Some(first) = weight.regions.first() else {
+            return Ok(None);
+        };
+        let mapping_id = first.mapping_id;
+        let mut expected = first.offset;
+        for region in &weight.regions {
+            if region.mapping_id != mapping_id || region.offset != expected {
+                return Ok(None);
+            }
+            expected = match expected.checked_add(region.len) {
+                Some(next) => next,
+                None => return Ok(None),
+            };
+        }
+        let span = ExternalMmapRegion {
+            mapping_id,
+            offset: first.offset,
+            len: weight.region_bytes_len(),
+        };
+        let bytes = source.region_bytes(&span)?;
+        let host_ptr = bytes.as_ptr();
+        // The whole mapping must be registered in one call so the weight's
+        // device pointer is contiguous over its full length (a per-weight
+        // registration is only contiguous within itself, so a weight spanning
+        // two registrations would read off the end — `CUDA_ERROR_ILLEGAL_ADDRESS`).
+        let Some(mapping) = source.full_mapping_bytes(mapping_id) else {
+            return Ok(None);
+        };
+        let device_ptr = self
+            .host_registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .device_ptr_for(mapping_id, mapping, host_ptr)?;
+        Ok(Some(device_ptr))
+    }
+
+    /// Account one dispatch read of a cold host-mapped weight: the bytes cross
+    /// PCIe in place this step, so they are the honest per-step cold traffic —
+    /// tracked separately from `htod_bytes` (no copy happened).
+    fn record_zero_copy_read(&self, len: usize) {
+        GLOBAL_ZERO_COPY_READS.fetch_add(1, Ordering::Relaxed);
+        GLOBAL_ZERO_COPY_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+    }
+
+    /// Resolve a weight on a miss by materializing the weight's canonical
+    /// (compressed) bytes and streaming them host→device, with LRU eviction
+    /// under the VRAM budget. The materialized bytes are the exact resident
+    /// backing, so the page is byte-identical to a stock upload.
     pub fn resident_materialized(
         &self,
         key: u64,
@@ -1756,18 +2389,21 @@ impl CudaWeightResidency {
         add_duration(&GLOBAL_MATERIALIZE_NS, materialize_start.elapsed());
         if self.physical.get().is_some() {
             let bytes = resident.bytes().to_vec();
-            return self.resident_vmm_with(
-                key,
-                resident.dtype,
-                resident.shape.clone(),
-                bytes.len(),
-                self.eviction_for(weight.boundary),
-                move |runtime, ptr| {
-                    unsafe { runtime.htod(&bytes, ptr) }.map_err(|error| {
-                        WeightHandleError::DeviceBinding(format!("H2D copy: {error}"))
-                    })
-                },
-            );
+            return self
+                .resident_vmm_with(
+                    key,
+                    resident.dtype,
+                    resident.shape.clone(),
+                    bytes.len(),
+                    self.eviction_for(weight.boundary),
+                    false,
+                    move |runtime, ptr| {
+                        unsafe { runtime.htod(&bytes, ptr) }.map_err(|error| {
+                            WeightHandleError::DeviceBinding(format!("H2D copy: {error}"))
+                        })
+                    },
+                )
+                .map(VmmAdmit::expect_page);
         }
         let page = Arc::new(CudaWeightPage::upload(
             &self.runtime,
@@ -1778,6 +2414,7 @@ impl CudaWeightResidency {
         self.admit(key, page, self.eviction_for(weight.boundary))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn resident_vmm_with<F>(
         &self,
         key: u64,
@@ -1785,8 +2422,9 @@ impl CudaWeightResidency {
         shape: Vec<usize>,
         len: usize,
         eviction: WeightEvictionPolicy,
+        hybrid_zero_copy: bool,
         fill: F,
-    ) -> Result<Arc<CudaWeightPage>, WeightHandleError>
+    ) -> Result<VmmAdmit, WeightHandleError>
     where
         F: FnOnce(&CudaRuntime, CUdeviceptr) -> Result<(), WeightHandleError>,
     {
@@ -1797,7 +2435,7 @@ impl CudaWeightResidency {
         let mut inner = self.lock();
         if let Some(existing) = inner.pages.get(&key).cloned() {
             inner.record_hit(key);
-            return Ok(existing);
+            return Ok(VmmAdmit::Page(existing));
         }
         let allowance = inner.mapped_allowance.clone().ok_or_else(|| {
             WeightHandleError::DeviceBinding(
@@ -1847,9 +2485,21 @@ impl CudaWeightResidency {
             len,
             eviction,
             reused_slot.is_some(),
+            hybrid_zero_copy,
             fill,
         ) {
-            Ok(bypass) => bypass,
+            Ok(SpanAdmit::Filled { bypass }) => bypass,
+            Ok(SpanAdmit::DeferToZeroCopy) => {
+                // Hybrid mode short-circuited before any eviction or fill: this
+                // weight would be transiently streamed, so the caller binds it
+                // zero-copy instead. A deferred weight never had a stable slot
+                // (bypass keys never do), so `reused_slot` is always None here;
+                // release the fresh throwaway VA and report the deferral.
+                if reused_slot.is_none() {
+                    let _ = physical.allocator.deallocate_span(ptr);
+                }
+                return Ok(VmmAdmit::DeferToZeroCopy);
+            }
             Err(error) => {
                 // A reused slot's VA is persistent (its physical is already
                 // decommitted); a fresh throwaway reservation must be released
@@ -1911,14 +2561,22 @@ impl CudaWeightResidency {
         } else {
             inner.insert_page(key, Arc::clone(&page), len as u64);
         }
-        Ok(page)
+        Ok(VmmAdmit::Page(page))
     }
 
     /// Commit `len` physical bytes under the reserved VA `ptr`, evicting other
     /// resident pages as `eviction` permits, then run `fill` to copy the weight
-    /// bytes into the freshly mapped granules. Returns `true` when the page
-    /// could not be admitted to the resident set and is handed back transiently
-    /// (a "bypass" under scan-resistant admission), `false` when it is retained.
+    /// bytes into the freshly mapped granules. Returns
+    /// [`SpanAdmit::Filled`] with `bypass = true` when the page could not be
+    /// admitted to the resident set and is handed back transiently (a "bypass"
+    /// under scan-resistant admission), `bypass = false` when it is retained.
+    ///
+    /// When `hybrid_zero_copy` is set (#864), the first time admission would
+    /// bypass this span the method returns [`SpanAdmit::DeferToZeroCopy`]
+    /// **before** evicting or filling, so the caller can bind the weight
+    /// zero-copy in place. This is what keeps the hybrid's hot set static: no
+    /// eviction ever runs on behalf of a cold weight, so no retained weight is
+    /// evicted and re-admitted (the #886 corruption pattern).
     ///
     /// This runs entirely under the residency lock (`inner`), so page-ins —
     /// and therefore the eviction-driven `decommit` of any stable slot — are
@@ -1937,8 +2595,9 @@ impl CudaWeightResidency {
         len: usize,
         eviction: WeightEvictionPolicy,
         has_stable_slot: bool,
+        hybrid_zero_copy: bool,
         fill: F,
-    ) -> Result<bool, WeightHandleError>
+    ) -> Result<SpanAdmit, WeightHandleError>
     where
         F: FnOnce(&CudaRuntime, CUdeviceptr) -> Result<(), WeightHandleError>,
     {
@@ -2011,7 +2670,7 @@ impl CudaWeightResidency {
                             &self.runtime,
                             ptr.as_ptr() as CUdeviceptr,
                         )?;
-                        return Ok(bypass);
+                        return Ok(SpanAdmit::Filled { bypass });
                     }
                     Err(error) => {
                         allowance.unmap(required_mapped);
@@ -2048,6 +2707,18 @@ impl CudaWeightResidency {
                         || inner
                             .smallest_evictable()
                             .is_some_and(|(_, smallest)| (len as u64) > smallest)));
+            }
+
+            // Zero-copy hybrid (#864): the instant admission would need to evict
+            // to place this weight, hand it back to be bound zero-copy in place —
+            // *before* any eviction runs, for every eviction policy. This is the
+            // safety hinge: no cold weight ever evicts a retained hot page, so no
+            // large weight occupies a stable slot that is later evicted and
+            // re-admitted (the #886 corruption). It also means a hybrid hot page
+            // is only ever one that fit without eviction. `evictions` is always 0
+            // here under the hybrid because the first non-fit defers immediately.
+            if hybrid_zero_copy {
+                return Ok(SpanAdmit::DeferToZeroCopy);
             }
 
             if evictions >= max_evictions {
@@ -2652,6 +3323,37 @@ mod tests {
     }
 
     #[test]
+    fn zero_copy_hybrid_env_defaults_off_and_opts_in() {
+        // Opt-in, default OFF: the hybrid is byte-identical to the shipped path
+        // until an operator explicitly enables it (#864). Unset and every
+        // non-truthy spelling stay OFF.
+        assert!(!zero_copy_hybrid_from_env_value(None));
+        assert!(!zero_copy_hybrid_from_env_value(Some("0")));
+        assert!(!zero_copy_hybrid_from_env_value(Some("false")));
+        assert!(!zero_copy_hybrid_from_env_value(Some("")));
+        assert!(!zero_copy_hybrid_from_env_value(Some("maybe")));
+        // Only the canonical truthy spellings enable it.
+        assert!(zero_copy_hybrid_from_env_value(Some("1")));
+        assert!(zero_copy_hybrid_from_env_value(Some("true")));
+        assert!(zero_copy_hybrid_from_env_value(Some("YES")));
+        assert!(zero_copy_hybrid_from_env_value(Some("  On ")));
+    }
+
+    #[test]
+    fn zero_copy_safe_budget_is_below_measured_corruption_ceiling() {
+        // #864: distinct host-mapped reads were byte-identical at 32 cold
+        // weights (~0.44 GB/step) and corrupted at 48 (~0.65 GB/step). The
+        // default safety budget must sit strictly under the observed-safe
+        // ceiling so the opt-in knob can never violate the byte-identical gate.
+        const OBSERVED_SAFE_BYTES: u64 = 436_633_600; // 32 cold weights, measured
+        assert!(
+            ZERO_COPY_SAFE_BUDGET_BYTES < OBSERVED_SAFE_BYTES,
+            "default budget {ZERO_COPY_SAFE_BUDGET_BYTES} must be under the measured-safe ceiling"
+        );
+        assert_eq!(ZERO_COPY_SAFE_BUDGET_BYTES, 256 * 1024 * 1024);
+    }
+
+    #[test]
     fn evict_order_env_defaults_lru_and_parses_variants() {
         // Unset and unrecognised keep the shipped front-of-order LRU victim, so
         // the default path is byte-identical (#888).
@@ -2777,11 +3479,13 @@ mod tests {
                 vec![granule],
                 granule,
                 WeightEvictionPolicy::Lru,
+                false,
                 move |runtime, ptr| {
                     unsafe { runtime.htod(&first_bytes, ptr) }
                         .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))
                 },
             )
+            .map(VmmAdmit::expect_page)
             .expect("first physical page");
 
         let zone_error = residency
@@ -2791,6 +3495,7 @@ mod tests {
                 vec![granule],
                 granule,
                 WeightEvictionPolicy::StableResident,
+                false,
                 |_, _| panic!("zone refusal must happen before copy"),
             )
             .expect_err("global room cannot bypass a full mapped weight allowance");
@@ -2805,11 +3510,13 @@ mod tests {
                 vec![granule],
                 granule,
                 WeightEvictionPolicy::Lru,
+                false,
                 move |runtime, ptr| {
                     unsafe { runtime.htod(&second_bytes, ptr) }
                         .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))
                 },
             )
+            .map(VmmAdmit::expect_page)
             .expect("second page reuses the owned handle");
         drop(second);
 
@@ -2893,6 +3600,7 @@ mod tests {
                 vec![granule],
                 granule,
                 WeightEvictionPolicy::Lru,
+                false,
                 |_, _| panic!("global refusal must happen before copy"),
             )
             .expect_err("zone room cannot bypass missing global physical headroom");
@@ -2989,11 +3697,13 @@ mod tests {
                     vec![granule],
                     granule,
                     WeightEvictionPolicy::Lru,
+                    false,
                     move |runtime, ptr| {
                         unsafe { runtime.htod(&bytes, ptr) }
                             .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))
                     },
                 )
+                .map(VmmAdmit::expect_page)
                 .expect("page key 1")
         };
 
@@ -3012,11 +3722,13 @@ mod tests {
                 vec![granule],
                 granule,
                 WeightEvictionPolicy::Lru,
+                false,
                 move |runtime, ptr| {
                     unsafe { runtime.htod(&second_bytes, ptr) }
                         .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))
                 },
             )
+            .map(VmmAdmit::expect_page)
             .expect("page key 2 evicts key 1");
         assert_ne!(
             second.device_ptr(),

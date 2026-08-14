@@ -442,10 +442,15 @@ fn print_weight_offload_amortization(
     };
     println!(
         "weight_offload_amortization: emitted_tokens={} htod_bytes_per_token={} \
-         page_ins_per_token={}",
+         page_ins_per_token={} zero_copy_bytes_per_token={} zero_copy_reads_per_token={} \
+         zero_copy_binds={} host_registered_bytes={}",
         emitted_tokens,
         fmt(per_emitted_token(stats.htod_bytes, emitted_tokens)),
-        fmt(per_emitted_token(stats.page_ins, emitted_tokens))
+        fmt(per_emitted_token(stats.page_ins, emitted_tokens)),
+        fmt(per_emitted_token(stats.zero_copy_bytes, emitted_tokens)),
+        fmt(per_emitted_token(stats.zero_copy_reads, emitted_tokens)),
+        stats.zero_copy_binds,
+        stats.host_registered_bytes,
     );
 }
 
@@ -461,6 +466,13 @@ fn print_weight_offload_observability(emitted_tokens: u64) {
         .byte_hit_rate()
         .map(|rate| format!("{:.2}%", rate * 100.0))
         .unwrap_or_else(|| "n/a".to_string());
+    // When the hybrid reads cold weights zero-copy in place, those bytes never
+    // appear in htod traffic, so byte_hit_rate() falsely reads ~100%. Include
+    // zero-copy PCIe traffic in the denominator for an honest residency figure.
+    let zero_copy_byte_hit_rate = stats
+        .zero_copy_byte_hit_rate()
+        .map(|rate| format!("{:.2}%", rate * 100.0))
+        .unwrap_or_else(|| "n/a".to_string());
     // Byte-weighted attribution of the bypass count: what share of streamed
     // bytes is bypass traffic that residency policy keeps no benefit from and
     // re-streams every step (#837 item 3).
@@ -470,12 +482,13 @@ fn print_weight_offload_observability(emitted_tokens: u64) {
         .unwrap_or_else(|| "n/a".to_string());
     println!(
         "weight_offload_cache: page_ins={} hits={} hit_rate={} byte_hit_rate={} \
-         hit_bytes={} evictions={} bypassed_page_ins={} bypassed_page_in_bytes={} \
-         bypassed_byte_share={}",
+         zero_copy_byte_hit_rate={} hit_bytes={} evictions={} bypassed_page_ins={} \
+         bypassed_page_in_bytes={} bypassed_byte_share={}",
         stats.page_ins,
         stats.hits,
         hit_rate,
         byte_hit_rate,
+        zero_copy_byte_hit_rate,
         stats.hit_bytes,
         stats.evictions,
         stats.bypassed_page_ins,
