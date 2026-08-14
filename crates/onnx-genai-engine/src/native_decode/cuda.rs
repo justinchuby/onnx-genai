@@ -426,6 +426,16 @@ enum DecodeCudaGraphPhase {
 }
 
 pub(crate) struct DecodeCudaState {
+    /// Number of sequences the persistent decode bindings are shaped for (KV /
+    /// mask / input / position / logits batch axis). **Constructor-fixed to `1`
+    /// today** (stage 2b-impl-1, #750): the value is threaded through the shape
+    /// and IO-binding layer so the batch extent is no longer a hard-coded `1`
+    /// literal at those sites, but every current entry point still constructs
+    /// the state at batch 1, so decode remains byte-identical. The token-writer,
+    /// KV growth/commit geometry, device argmax and batch-symbol capture pinning
+    /// that a real batch-N step also needs are owned by later increments
+    /// (2b-impl-2..4) and are *not* generalized here.
+    batch: usize,
     logical_len: usize,
     /// Current physical KV bucket for the native CUDA decode session. The hard
     /// maximum lives in `capacity.max_len`; this bucket grows on demand via the
@@ -1444,9 +1454,14 @@ impl DecodeCudaState {
     /// Build the padded physical and initial logical shapes for a persistent KV
     /// (`fixed == false`) or recurrent-state (`fixed == true`) binding.
     ///
-    /// The KV shape is always **BNSH** `[1, kv_heads, max_len, head_dim]`,
-    /// growing on axis 2, for *both* the head-major and seq-major layouts. This
-    /// is deliberate and is the KV binding contract: the CUDA GQA node validates
+    /// The KV shape is always **BNSH** `[batch, kv_heads, max_len, head_dim]`,
+    /// growing on axis 2, for *both* the head-major and seq-major layouts. The
+    /// `batch` axis-0 extent is threaded from the caller (stage 2b-impl-1, #750)
+    /// rather than hard-coded to `1`; every current caller passes `1`, so the
+    /// emitted shape is unchanged. Threading `batch` must **not** disturb the
+    /// axis order: the CUDA GQA node reads `present_capacity` from BNSH axis 2
+    /// regardless of `kv_layout`, so axis 0 stays batch and axis 2 stays seq.
+    /// This is deliberate and is the KV binding contract: the CUDA GQA node validates
     /// `past_key`/`past_value` as `[batch, kv_heads, seq, head_dim]` and reads
     /// `present_capacity` from axis 2 **regardless** of the `kv_layout`
     /// attribute (which only re-specializes the kernel's stride arithmetic). A
@@ -1460,6 +1475,7 @@ impl DecodeCudaState {
         name: &str,
         dtype: DataType,
         shape: &[Dim],
+        batch: usize,
         max_len: usize,
         fixed: bool,
     ) -> anyhow::Result<(Vec<usize>, Vec<usize>)> {
@@ -1480,7 +1496,7 @@ impl DecodeCudaState {
             let mut physical_shape = Vec::with_capacity(4);
             for (axis, dim) in shape.iter().copied().enumerate() {
                 let value = if axis == 0 {
-                    1
+                    batch
                 } else if axis == 2 {
                     max_len
                 } else if let Dim::Static(value) = dim {
@@ -1501,7 +1517,7 @@ impl DecodeCudaState {
             .enumerate()
             .map(|(axis, dim)| {
                 if axis == 0 {
-                    Ok(1)
+                    Ok(batch)
                 } else if let Dim::Static(value) = dim {
                     Ok(value)
                 } else {
@@ -2085,8 +2101,10 @@ impl DecodeCudaState {
                 format!("VMM-backed CUDA mask growth overflows for capacity {new_capacity}")
             })?;
         native_cuda_memset_zero(self.bindings[0].device_ptr() as usize, bytes)?;
-        self.bindings[0]
-            .set_physical_and_logical_shapes(vec![1, new_capacity], vec![1, valid_len])?;
+        self.bindings[0].set_physical_and_logical_shapes(
+            vec![self.batch, new_capacity],
+            vec![self.batch, valid_len],
+        )?;
         Ok(())
     }
 
@@ -2131,16 +2149,23 @@ impl DecodeCudaState {
         name: &str,
         dtype: DataType,
         shape: &[Dim],
+        batch: usize,
     ) -> anyhow::Result<Vec<usize>> {
         if matches!(dtype, DataType::Undefined | DataType::String) {
             bail!(
                 "cannot bind auxiliary CUDA graph output '{name}' persistently: dtype {dtype:?} does not have fixed-size device tensor storage, but CUDA graph capture requires every declared graph output to use stable device storage; export this output as a numeric tensor or remove the unused graph output"
             );
         }
+        // The batch axis (0) collapses to the threaded `batch` extent; every
+        // other symbolic axis is a decode-unit (query-seq) that stays `1`. At
+        // batch 1 (the only value any current caller passes) this is byte-
+        // identical to the historical "collapse every symbolic dim to 1".
         let shape = shape
             .iter()
-            .map(|dim| match dim {
+            .enumerate()
+            .map(|(axis, dim)| match dim {
                 Dim::Static(value) => *value,
+                Dim::Symbolic(_) if axis == 0 => batch,
                 Dim::Symbolic(_) => 1,
             })
             .collect::<Vec<_>>();
@@ -2171,6 +2196,14 @@ impl DecodeCudaState {
         kv_layout: KvCommitLayout,
     ) -> anyhow::Result<Self> {
         let kv_commits_on_demand = session.commits_on_demand();
+        // Stage 2b-impl-1 (#750): the persistent decode bindings are shaped for
+        // `batch` sequences. Constructor-fixed to `1` — every current entry
+        // point decodes a single sequence, so the emitted shapes and all decode
+        // behaviour are byte-identical to the previous hard-coded `1`. Threading
+        // the value (rather than turning batch-N on) is the whole of this
+        // increment; KV growth/commit geometry, the token writer, the device
+        // argmax and batch-symbol capture pinning stay batch-1 (2b-impl-2..4).
+        let batch = 1usize;
         // Seq-major KV addressing is capacity-independent at batch index 0 (the
         // only index native decode uses): token `t` always lands at
         // `t * kv_heads * head_dim`, and the baked `cache_capacity` scalar only
@@ -2213,8 +2246,8 @@ impl DecodeCudaState {
                 io.attention_mask,
                 None::<String>,
                 DataType::Int64,
-                vec![1, max_len],
-                vec![1, max_len],
+                vec![batch, max_len],
+                vec![batch, max_len],
                 full_mask_bytes,
                 committed,
             )?
@@ -2223,8 +2256,8 @@ impl DecodeCudaState {
                 io.attention_mask,
                 None::<String>,
                 DataType::Int64,
-                vec![1, max_len],
-                vec![1, max_len],
+                vec![batch, max_len],
+                vec![batch, max_len],
             )?
         };
         native_cuda_memset_zero(mask.device_ptr() as usize, mask_committed_bytes)?;
@@ -2247,8 +2280,14 @@ impl DecodeCudaState {
                 .iter()
                 .find(|meta| meta.name == *past)
                 .with_context(|| format!("missing CUDA KV input metadata for '{past}'"))?;
-            let (physical_shape, logical_shape) =
-                Self::persistent_state_shapes(past, meta.dtype, &meta.shape, max_len, false)?;
+            let (physical_shape, logical_shape) = Self::persistent_state_shapes(
+                past,
+                meta.dtype,
+                &meta.shape,
+                batch,
+                max_len,
+                false,
+            )?;
             let binding = if kv_commits_on_demand {
                 let allocation_bytes = Self::full_vmm_kv_allocation_bytes(
                     &physical_shape,
@@ -2324,7 +2363,7 @@ impl DecodeCudaState {
                 .find(|meta| meta.name == *past)
                 .with_context(|| format!("missing fixed CUDA state input metadata for '{past}'"))?;
             let (physical_shape, logical_shape) =
-                Self::persistent_state_shapes(past, meta.dtype, &meta.shape, max_len, true)?;
+                Self::persistent_state_shapes(past, meta.dtype, &meta.shape, batch, max_len, true)?;
             let binding = session.allocate_device_binding(
                 past.clone(),
                 Some(present.clone()),
@@ -2363,7 +2402,7 @@ impl DecodeCudaState {
         }
         let logits_dtype = logits_meta.dtype;
         let logits_shape =
-            Self::persistent_output_shape(io.logits, logits_dtype, &logits_meta.shape)?;
+            Self::persistent_output_shape(io.logits, logits_dtype, &logits_meta.shape, batch)?;
         let logits_device_binding = session.allocate_device_output_binding(
             io.logits,
             logits_dtype,
@@ -2446,7 +2485,11 @@ impl DecodeCudaState {
                 ));
                 continue;
             }
-            let shape = Self::persistent_output_shape(&meta.name, meta.dtype, &meta.shape)?;
+            // Auxiliary outputs keep the historical batch-1 collapse: their
+            // batch-axis symbol pinning is owned by 2b-impl-4 (the
+            // `collect_unit_symbols` / capture-symbol work), not this increment,
+            // so pass `1` explicitly rather than the threaded `batch`.
+            let shape = Self::persistent_output_shape(&meta.name, meta.dtype, &meta.shape, 1)?;
             bindings.push(
                 session
                     .allocate_device_output_binding(
@@ -2500,27 +2543,28 @@ impl DecodeCudaState {
                 embeds.name,
                 None::<String>,
                 embeds.dtype,
-                vec![1, 1, embeds.hidden],
-                vec![1, 1, embeds.hidden],
+                vec![batch, 1, embeds.hidden],
+                vec![batch, 1, embeds.hidden],
             )?);
         } else {
             bindings.push(session.allocate_device_binding(
                 io.input_ids,
                 None::<String>,
                 DataType::Int64,
-                vec![1, 1],
-                vec![1, 1],
+                vec![batch, 1],
+                vec![batch, 1],
             )?);
         }
         let position_ids_binding = if let Some(position_ids) = io.position_ids {
             let index = bindings.len();
             // A rank-N mrope decoder declares `position_ids [N, B, S]`; the single
-            // decode step collapses batch/sequence to 1 → `[N, 1, 1]`. Rank 1 is
-            // the conventional `[1, 1]`, byte-identical to before.
+            // decode step collapses sequence to 1 → `[N, batch, 1]`. Rank 1 is
+            // the conventional `[batch, 1]`. At `batch == 1` this is byte-
+            // identical to the historical `[1, 1]` / `[N, 1, 1]`.
             let shape = if position_rank == 1 {
-                vec![1, 1]
+                vec![batch, 1]
             } else {
-                vec![position_rank, 1, 1]
+                vec![position_rank, batch, 1]
             };
             bindings.push(session.allocate_device_binding(
                 position_ids,
@@ -2674,6 +2718,7 @@ impl DecodeCudaState {
         }
 
         Ok(Self {
+            batch,
             logical_len: 0,
             max_len,
             bindings,
@@ -2760,7 +2805,7 @@ impl DecodeCudaState {
             .flat_map(|_| 1i64.to_le_bytes())
             .collect::<Vec<_>>();
         self.bindings[0].write_bytes(start * std::mem::size_of::<i64>(), &ones)?;
-        self.bindings[0].set_logical_shape(vec![1, expose_len])?;
+        self.bindings[0].set_logical_shape(vec![self.batch, expose_len])?;
         Ok(())
     }
 
@@ -2975,7 +3020,7 @@ impl DecodeCudaState {
             let zeros = vec![0u8; (self.logical_len - target_len) * std::mem::size_of::<i64>()];
             self.bindings[0].write_bytes(target_len * std::mem::size_of::<i64>(), &zeros)?;
         }
-        self.bindings[0].set_logical_shape(vec![1, target_len])?;
+        self.bindings[0].set_logical_shape(vec![self.batch, target_len])?;
         if target_len == 0 {
             // Fixed-size recurrent/conv states are unmasked rolling caches: a
             // reused session would otherwise inherit the previous generation's
@@ -3433,14 +3478,14 @@ impl onnx_genai_kv::KvCapacityGrowthBackend for NativeCudaCapacityBackend<'_> {
                 self.state.bindings[0].input_name().to_owned(),
                 self.state.bindings[0].output_name().map(str::to_owned),
                 DataType::Int64,
-                vec![1, new_capacity],
-                vec![1, valid_len],
+                vec![self.state.batch, new_capacity],
+                vec![self.state.batch, valid_len],
             )?;
             native_cuda_memset_zero(
                 new_mask.device_ptr() as usize,
                 new_capacity * std::mem::size_of::<i64>(),
             )?;
-            new_mask.set_logical_shape(vec![1, valid_len])?;
+            new_mask.set_logical_shape(vec![self.state.batch, valid_len])?;
             Ok(Some(new_mask))
         })()
         .map_err(|error| {

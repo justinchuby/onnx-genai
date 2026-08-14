@@ -1942,6 +1942,7 @@ fn persistent_auxiliary_output_shape_is_fixed_and_rejects_strings() {
         "auxiliary_state",
         DataType::Float16,
         &[Dim::Symbolic(SymbolId(0)), Dim::Static(1536)],
+        1,
     )
     .expect("numeric auxiliary output must be bindable");
     assert_eq!(shape, [1, 1536]);
@@ -1950,6 +1951,7 @@ fn persistent_auxiliary_output_shape_is_fixed_and_rejects_strings() {
         "auxiliary_text",
         DataType::String,
         &[Dim::Static(1)],
+        1,
     )
     .expect_err("variable-width auxiliary output must fail explicitly");
     let message = error.to_string();
@@ -1971,6 +1973,7 @@ fn cuda_persistent_state_shapes_preserve_growing_kv_and_fixed_recurrent_geometry
             Dim::Symbolic(past),
             Dim::Static(256),
         ],
+        1,
         512,
         false,
     )
@@ -1982,6 +1985,7 @@ fn cuda_persistent_state_shapes_preserve_growing_kv_and_fixed_recurrent_geometry
         "past_key_values.0.conv_state",
         DataType::Float16,
         &[Dim::Symbolic(batch), Dim::Static(10_240), Dim::Static(3)],
+        1,
         512,
         true,
     )
@@ -1998,12 +2002,91 @@ fn cuda_persistent_state_shapes_preserve_growing_kv_and_fixed_recurrent_geometry
             Dim::Static(128),
             Dim::Static(128),
         ],
+        1,
         512,
         true,
     )
     .expect("rank-4 fixed recurrent state");
     assert_eq!(recurrent_physical, [1, 48, 128, 128]);
     assert_eq!(recurrent_logical, recurrent_physical);
+}
+
+#[test]
+fn cuda_persistent_state_shapes_thread_batch_axis_0() {
+    // Stage 2b-impl-1 (#750): the batch extent is threaded to axis 0 rather than
+    // hard-coded to 1. The BNSH axis order must not move: axis 0 is batch, axis
+    // 2 is the grown seq capacity, regardless of `batch`.
+    let batch_sym = SymbolId(0);
+    let past = SymbolId(1);
+    let (kv_physical, kv_logical) = DecodeCudaState::persistent_state_shapes(
+        "past_key_values.0.key",
+        DataType::Float16,
+        &[
+            Dim::Symbolic(batch_sym),
+            Dim::Static(4),
+            Dim::Symbolic(past),
+            Dim::Static(256),
+        ],
+        3,
+        512,
+        false,
+    )
+    .expect("rank-4 growing KV threads batch");
+    assert_eq!(kv_physical, [3, 4, 512, 256]);
+    assert_eq!(kv_logical, [3, 4, 0, 256]);
+
+    // Fixed recurrent state threads batch on axis 0 too.
+    let (recurrent_physical, recurrent_logical) = DecodeCudaState::persistent_state_shapes(
+        "past_key_values.0.recurrent_state",
+        DataType::Float16,
+        &[
+            Dim::Symbolic(batch_sym),
+            Dim::Static(48),
+            Dim::Static(128),
+            Dim::Static(128),
+        ],
+        3,
+        512,
+        true,
+    )
+    .expect("rank-4 fixed recurrent state threads batch");
+    assert_eq!(recurrent_physical, [3, 48, 128, 128]);
+    assert_eq!(recurrent_logical, recurrent_physical);
+}
+
+#[test]
+fn persistent_output_shape_threads_batch_only_on_axis_0() {
+    // The batch axis (0) takes the threaded extent; every other symbolic axis is
+    // a query-seq unit collapsed to 1. Static axes (e.g. vocab) are preserved.
+    let batch = SymbolId(0);
+    let seq = SymbolId(1);
+    let shape = DecodeCudaState::persistent_output_shape(
+        "logits",
+        DataType::Float32,
+        &[
+            Dim::Symbolic(batch),
+            Dim::Symbolic(seq),
+            Dim::Static(151_936),
+        ],
+        3,
+    )
+    .expect("logits shape threads batch");
+    assert_eq!(shape, [3, 1, 151_936]);
+
+    // At batch 1 (every current caller) it is byte-identical to the historical
+    // collapse-every-symbolic-to-1 behavior.
+    let shape_batch_1 = DecodeCudaState::persistent_output_shape(
+        "logits",
+        DataType::Float32,
+        &[
+            Dim::Symbolic(batch),
+            Dim::Symbolic(seq),
+            Dim::Static(151_936),
+        ],
+        1,
+    )
+    .expect("logits shape at batch 1");
+    assert_eq!(shape_batch_1, [1, 1, 151_936]);
 }
 
 #[test]
@@ -2088,6 +2171,7 @@ fn cuda_fixed_state_shapes_reject_unbounded_non_batch_dimensions() {
         "state",
         DataType::Float16,
         &[Dim::Symbolic(SymbolId(0)), Dim::Symbolic(SymbolId(1))],
+        1,
         128,
         true,
     )
