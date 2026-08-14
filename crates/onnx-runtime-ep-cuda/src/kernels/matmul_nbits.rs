@@ -7189,6 +7189,209 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         }
     }
 
+    /// Apples-to-apples wall-clock comparison of the Marlin M>1 tensor-core GEMM
+    /// against the portable tiled CUDA-core GEMM through the real op, across a
+    /// sweep of M at a production projection shape. Prints median kernel wall per
+    /// path; this is the measurement that quantifies the M=1→M=2 cliff collapse.
+    /// Ignored (perf, needs a dedicated idle SM80+ GPU).
+    #[test]
+    #[ignore = "perf microbench; requires a dedicated idle SM80+ CUDA device"]
+    fn marlin_m_gt_1_op_wall_vs_tiled() {
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping Marlin M>1 wall bench: CUDA runtime unavailable");
+            return;
+        };
+        if runtime
+            .require_nvrtc_half_headers("marlin_m_gt_1_wall")
+            .is_err()
+            || !marlin_gemm::device_supports_marlin(runtime.capabilities().compute_capability())
+        {
+            eprintln!("skipping Marlin M>1 wall bench: headers unavailable or pre-SM80");
+            return;
+        }
+
+        let k = 5120usize;
+        let n = 13824usize;
+        let block_size = 128usize;
+        let k_blocks = k / block_size;
+        let blob_size = block_size / 2;
+        let zp_row_bytes = k_blocks.div_ceil(2);
+
+        let mut state = 0xcafef00d_1234_5678u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+
+        let max_m = 128usize;
+        let mut activation_f16 = vec![f16::ZERO; max_m * k];
+        for h in activation_f16.iter_mut() {
+            *h = f16::from_f32(next());
+        }
+        let mut quant = vec![0u8; n * k];
+        for value in quant.iter_mut() {
+            *value = ((next() * 0.5 + 0.5) * 15.0).round().clamp(0.0, 15.0) as u8;
+        }
+        let mut packed = vec![0u8; n * k_blocks * blob_size];
+        for col in 0..n {
+            for block in 0..k_blocks {
+                for pair in 0..blob_size {
+                    let low = quant[col * k + block * block_size + pair * 2] & 15;
+                    let high = quant[col * k + block * block_size + pair * 2 + 1] & 15;
+                    packed[(col * k_blocks + block) * blob_size + pair] = low | (high << 4);
+                }
+            }
+        }
+        let mut zp_packed = vec![0u8; n * zp_row_bytes];
+        for byte in zp_packed.iter_mut() {
+            *byte = ((next() * 0.5 + 0.5) * 255.0) as u8;
+        }
+        let mut scale_f16 = vec![f16::ZERO; n * k_blocks];
+        for h in scale_f16.iter_mut() {
+            *h = f16::from_f32(0.015 + 0.01 * (next() * 0.5 + 0.5));
+        }
+
+        let activation_dev = runtime.alloc_raw(activation_f16.len() * 2).unwrap();
+        let packed_dev = runtime.alloc_raw(packed.len()).unwrap();
+        let scales_dev = runtime.alloc_raw(scale_f16.len() * 2).unwrap();
+        let zp_dev = runtime.alloc_raw(zp_packed.len()).unwrap();
+        let output_dev = runtime.alloc_raw(max_m * n * 2).unwrap();
+        // SAFETY: buffers sized to their sources.
+        unsafe {
+            runtime
+                .htod(as_bytes(&activation_f16), activation_dev)
+                .unwrap();
+            runtime.htod(&packed, packed_dev).unwrap();
+            runtime.htod(as_bytes(&scale_f16), scales_dev).unwrap();
+            runtime.htod(&zp_packed, zp_dev).unwrap();
+        }
+
+        let device = DeviceId::cuda(0);
+        let b_shape = [n, k_blocks, blob_size];
+        let b_strides = [(k_blocks * blob_size) as i64, blob_size as i64, 1];
+        let scales_shape = [n, k_blocks];
+        let scales_strides = [k_blocks as i64, 1];
+        let zp_shape = [n, zp_row_bytes];
+        let zp_strides = [zp_row_bytes as i64, 1];
+
+        let kernel = MatMulNBitsKernel {
+            runtime: runtime.clone(),
+            k,
+            n,
+            bits: 4,
+            block_size,
+            accuracy_level: 4,
+            accuracy4_workspace: None,
+            fold_bias_post_round: false,
+            gate_up_swiglu: false,
+            decomposed_silu: false,
+            rmsnorm_prologue: false,
+            rmsnorm_epsilon: 1e-5,
+            last_call_capture_safe: AtomicBool::new(false),
+            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+        };
+
+        let time_path = |kernel: &MatMulNBitsKernel, m: usize| -> f64 {
+            let a_shape = [m, k];
+            let a_strides = [k as i64, 1];
+            let y_shape = [m, n];
+            let y_strides = [n as i64, 1];
+            let inputs = vec![
+                TensorView::new(
+                    device_ptr(activation_dev),
+                    DataType::Float16,
+                    &a_shape,
+                    &a_strides,
+                    device,
+                ),
+                TensorView::new(
+                    device_ptr(packed_dev),
+                    DataType::Uint8,
+                    &b_shape,
+                    &b_strides,
+                    device,
+                ),
+                TensorView::new(
+                    device_ptr(scales_dev),
+                    DataType::Float16,
+                    &scales_shape,
+                    &scales_strides,
+                    device,
+                ),
+                TensorView::new(
+                    device_ptr(zp_dev),
+                    DataType::Uint8,
+                    &zp_shape,
+                    &zp_strides,
+                    device,
+                ),
+            ];
+            let run = || {
+                let mut outputs = [TensorMut::new(
+                    device_ptr_mut(output_dev),
+                    DataType::Float16,
+                    &y_shape,
+                    &y_strides,
+                    device,
+                )];
+                kernel.run(&inputs, &mut outputs, None).unwrap();
+            };
+            // Warm up (NVRTC compile, repack cache fill).
+            run();
+            runtime.synchronize().unwrap();
+            let iters = 30;
+            let mut samples = Vec::with_capacity(iters);
+            for _ in 0..iters {
+                let start = std::time::Instant::now();
+                run();
+                runtime.synchronize().unwrap();
+                samples.push(start.elapsed().as_secs_f64() * 1e6);
+            }
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            samples[samples.len() / 2]
+        };
+
+        eprintln!("Marlin M>1 wall vs tiled @ K={k} N={n} block={block_size} (median us):");
+        eprintln!("  M     tiled_us   marlin_us   speedup");
+        for &m in &[1usize, 2, 4, 8, 16, 32, 64, 128] {
+            // SAFETY: serial ignored bench; flag toggling is race-free here.
+            unsafe {
+                std::env::remove_var("ONNX_GENAI_MARLIN_M_GT_1");
+            }
+            let tiled = time_path(&kernel, m);
+            unsafe {
+                std::env::set_var("ONNX_GENAI_MARLIN_M_GT_1", "1");
+            }
+            let marlin = time_path(&kernel, m);
+            let marlin_used = m > 1;
+            eprintln!(
+                "  {m:<5} {tiled:>8.1}   {marlin:>8.1}   {:>6.2}x{}",
+                tiled / marlin,
+                if marlin_used {
+                    ""
+                } else {
+                    " (M=1 stays on GEMV)"
+                }
+            );
+        }
+        // SAFETY: clear the flag so it cannot leak into other tests.
+        unsafe {
+            std::env::remove_var("ONNX_GENAI_MARLIN_M_GT_1");
+        }
+
+        // SAFETY: every pointer came from this runtime's alloc_raw, freed once.
+        unsafe {
+            runtime.free_raw(activation_dev).unwrap();
+            runtime.free_raw(packed_dev).unwrap();
+            runtime.free_raw(scales_dev).unwrap();
+            runtime.free_raw(zp_dev).unwrap();
+            runtime.free_raw(output_dev).unwrap();
+        }
+    }
+
     fn device_ptr(raw: CUdeviceptr) -> DevicePtr {
         DevicePtr(raw as usize as *const c_void)
     }
