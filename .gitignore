@@ -132,3 +132,9 @@ PR*.md
 # seq-major microbenchmark scratch crate
 /bench-seqmajor/target/
 bench-bins/
+
+# Sebastian marlin-bench scratch: re-exported ORT-genai glm package + staging (large, reproducible)
+/ort-glm-build/
+/ort-glm-stage/
+/ort-glm-cache/
+/bench-logs/
