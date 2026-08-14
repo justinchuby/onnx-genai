@@ -552,6 +552,53 @@ See [`deepseek-native-status-2026-07-25.md`](../models/deepseek-native-status-20
   Remaining: **2c** — wire `continuous_batch_manager` to a native uniform-batch manager, and
   real per-sequence prompt seeding, which is what makes token *values* at N>1 meaningful
   rather than content-arbitrary (the counters are already content-invariant, #884).
+
+  **Stage 2c landed and measured (this PR).** Real per-sequence state, and the correctness
+  bar that replaces identical-token row-identity with genuine content: **each batch row's
+  output is byte-identical to that same prompt run alone at batch 1.** No `cuda.rs` change
+  was needed — `decode_greedy_batch` already accepts per-row token ids (2b-impl-4), so K
+  genuinely different prompts are seeded by lockstep single-token stepping (row `b` gets its
+  own prompt token at the shared position each step; per-row KV lives on batch axis 0, so
+  rows are independent). New harness mode `profile_native --solo-equivalence-prompts`
+  (`||`-separated prompts) runs each prompt solo at batch 1, then all K in one batch-K
+  session, and asserts every row reproduces its solo stream. Coordinator run, `nvidia-smi`
+  verified clear, **`qwen14b-zp`**, 3 prompts (`"The capital of France is"`,
+  `"Once upon a time there"`, `"Water boils at a very"`), 16 generated tokens: three
+  genuinely different streams (row 0 `[264,1985,315,279,8585,3033,...]`, row 1
+  `[572,264,3364,315,264,11618,...]`, row 2 `[1550,9315,11,323,279,2701,...]`) and
+  **`all_rows_match_solo=true`** — cross-row KV bleed, a shared mask, a wrong stride, or a
+  position error would all diverge here and none did. Reproduced on
+  `qwen2.5-0.5b-q4_0-mobius` (also `all_rows_match_solo=true`). Batch-1 byte-identity held
+  in the same session (`qwen14b-zp`, prompt `"Hello"`, 16 tokens =
+  `[96347,3375,724,11,358,2776,14589,311,6723,429,498,3003,2581,6617,315,752]`), and the
+  mobius seq-major parity gate reported **`2 passed`**.
+
+  **The uniform-batch constraint is real and named:** the native persistent decode path has
+  **one** shared mask window and **one** shared position per step
+  (`DecodeCudaState::extend_mask` writes an identical `1`s window to every row and sets a
+  single `[batch, expose_len]` logical mask; `decode_cuda_greedy_batch` uses
+  `vec![past_len; batch]`). So all K prompts must share a length — the harness truncates to
+  the shortest common token length and says so. A ragged batch is not representable without
+  per-row masks/positions.
+
+  **`continuous_batch_manager` wiring is a *named refusal*, not a silent gap.** The manager
+  drives a **ragged** `BatchedDecodeSession` (`onnx-genai-ort/src/decode/mod.rs`): per-row
+  `row_len`, `assign_row`/`deactivate_row`, `step_select(.., advance_rows)` advancing a
+  *subset* of rows at per-row `position_ids`, and it returns host `[B,1,vocab]` **logits**
+  for the host sampler (`ContinuousBatchManager::advance_row` → `select_next_token_with_rng`).
+  It also backfills finished rows mid-flight, so lengths within one batch go ragged. The
+  native uniform path cannot express any of that: no per-row length, no ragged advance, and
+  a device-argmax that returns **tokens not logits**. `continuous_batch_manager` now bails on
+  the native backend with that structural reason (`batched.rs`), replacing the misleading
+  "ORT decoder session is unavailable" — parallel to `batching_capability`'s existing
+  native `Some(1)`. Wiring it for real needs per-row mask/position/length generalization in
+  `native_decode/cuda.rs` (a genuinely different, ragged path), or a *new* uniform-only
+  manager that admits equal-length requests and never backfills — which is not
+  `continuous_batch_manager`. **`--max-batch` therefore stays honestly ineffective on native
+  (#758):** `batching_capability` still reports `Some(1)` and the manager still refuses N>1.
+  This is the corrected split: 2c's "real per-sequence state + solo-equivalence" landed and
+  is measured; "wire `continuous_batch_manager`" is blocked on the uniform↔ragged mismatch,
+  with the file/line evidence above rather than a quiet flip.
 - [ ] **#851 — intermittent `ILLEGAL_ADDRESS` in the mobius gate.** Parked, not solved.
   Three hypotheses eliminated (not gate flakiness — 8/8 strict solo; not kept-graph replay —
   25/25 isolated; not a relocated weight mapping — the fault targets a freshly allocated

@@ -777,6 +777,35 @@ impl Engine {
         if max_batch == 0 {
             anyhow::bail!("continuous batch max_batch must be greater than zero");
         }
+        // Native backend: refuse structurally with the honest reason, not the
+        // misleading "session unavailable" (there is deliberately no ORT decoder
+        // session on the native path). `ContinuousBatchManager` drives a *ragged*
+        // `BatchedDecodeSession`: per-row `row_len`, `assign_row`/`deactivate_row`,
+        // `step_select` with a per-row `advance_rows` mask and per-row
+        // `position_ids`, and host `[B, 1, vocab]` logits fed to the host sampler
+        // (`advance_row` -> `select_next_token_with_rng`). The native CUDA
+        // persistent batch path is *uniform*: `DecodeCudaState::extend_mask`
+        // writes one identical mask window to every row and sets a single shared
+        // logical length, `decode_cuda_greedy_batch` steps every row at one shared
+        // position (`vec![past_len; batch]`), there is no per-row length, and the
+        // device-argmax fast path returns tokens, not logits. Genuinely different
+        // requests can be batched only when they share a length and step in
+        // lockstep (see `profile_native --solo-equivalence-prompts`, stage 2c);
+        // mid-flight backfill of finished rows would make the batch ragged, which
+        // the uniform path cannot represent. Wiring the manager onto native
+        // requires per-row mask/position/length generalization in
+        // native_decode/cuda.rs, tracked under #750 stage 2c.
+        if self.decode_backend == EngineDecodeBackend::Native {
+            anyhow::bail!(
+                "continuous batching is unavailable on the native decode backend: the \
+                 ContinuousBatchManager needs a ragged BatchedDecodeSession (per-row length, \
+                 per-row advance/position, host logits for the sampler), but the native CUDA \
+                 batch path is uniform (one shared mask window and one shared position per step, \
+                 no per-row length, device-argmax tokens not logits). Same-length lockstep \
+                 batching is exercised by `profile_native --solo-equivalence-prompts` (#750 \
+                 stage 2c); ragged continuous batching needs per-row cuda.rs generalization."
+            );
+        }
         let session = self
             .session
             .as_deref()

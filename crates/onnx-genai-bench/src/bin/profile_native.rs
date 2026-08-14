@@ -221,6 +221,25 @@ struct Args {
     /// (weights stay fully resident, `htod_bytes_per_token = 0`).
     #[arg(long, default_value_t = 0)]
     native_decode_batch_context: usize,
+    /// Stage 2c (#750): the batch-N **solo-equivalence** correctness gate. Give a
+    /// `||`-separated list of K distinct text prompts (e.g.
+    /// `"The capital of France is||Once upon a time,||2 + 2 ="`). Each prompt is
+    /// tokenized and — because the native persistent decode path is a *uniform*
+    /// batch (one shared mask window and one shared position per step, see
+    /// `DecodeCudaState::extend_mask`) — every prompt is truncated to the shortest
+    /// common token length `L` so all K rows step in lockstep. The tool then
+    /// (1) runs each prompt **alone** at batch 1 (fresh
+    /// `ONNX_GENAI_NATIVE_DECODE_BATCH=1` session, reset between prompts),
+    /// recording its `--tokens` greedy token stream, then (2) seeds all K
+    /// genuinely-different prompts into one batch-K session (row `b` carries
+    /// prompt `b`'s own tokens, position, and KV row) and runs the same
+    /// `--tokens` steps, and asserts every batch row is **byte-identical** to
+    /// that prompt's solo stream. Unlike the identical-token
+    /// `--native-decode-batch-sweep`, the rows here carry different content, so
+    /// cross-row KV bleed, a shared mask, a wrong stride, or a position error
+    /// would all diverge — the real test that rows do not observe each other.
+    #[arg(long)]
+    solo_equivalence_prompts: Option<String>,
     /// Speculative decoding mode. `prompt-lookup` enables native n-gram
     /// speculation (exact verification; lossless vs greedy). Only supported on
     /// the single-model native `--steady` path; rejected with `--pipeline`.
@@ -1069,6 +1088,249 @@ fn report_foreign_compute_apps(own_pid: u32) {
     }
 }
 
+/// Build a fully governed native engine pinned to `batch` decode rows and hand
+/// back its native decode session mutably. Mirrors the construction in
+/// [`run_native_decode_batch_sweep`] so the weight-offload policy and stable-VA
+/// authority are the governed ones (trap #1: ask the runtime, do not tell it).
+/// The batch extent is read from `ONNX_GENAI_NATIVE_DECODE_BATCH`, which the
+/// caller sets before invoking.
+fn build_governed_batch_engine(
+    model_dir: &Path,
+    device: &NativeDecodeDevice,
+    decode_precision: DecodePrecision,
+    batch: usize,
+) -> Result<Engine> {
+    let mut config = EngineConfig {
+        decode_backend: EngineDecodeBackend::Native,
+        decode_precision,
+        ..EngineConfig::default()
+    };
+    config.native_device = Some(device.clone());
+    apply_vram_limit_env(&mut config)?;
+    let mut engine = Engine::from_dir(model_dir, config).with_context(|| {
+        format!(
+            "load governed engine {} at batch {batch}",
+            model_dir.display()
+        )
+    })?;
+    let bound = engine
+        .native_decode_session_mut()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "engine did not build a native decode session at batch {batch}; the model likely \
+                 resolved to the ORT backend (batch-N needs the native CUDA persistent path)"
+            )
+        })?
+        .native_decode_batch();
+    if bound != batch {
+        bail!(
+            "requested batch {batch} but the session bound batch {bound}; the model likely declined \
+             a CUDA persistent decode session (batch-N needs the captured CUDA path)"
+        );
+    }
+    Ok(engine)
+}
+
+/// Seed `prompts` (row `b` = prompt `b`) into `session`'s `batch` decode rows by
+/// lockstep single-token stepping, then greedily generate `gen_tokens` more per
+/// row. Returns one `gen_tokens`-long token stream per row. All prompts must be
+/// the same length `L` (uniform batch): every step feeds one token per row at
+/// the shared position and the shared mask window advances by one, so ragged
+/// lengths are not representable — the caller truncates to a common `L`.
+///
+/// The greedy token returned by the final prefill step (consuming each row's
+/// last prompt token) is that row's first generated token; each subsequent step
+/// feeds the row its own previous token, so rows never share input.
+fn drive_uniform_batch(
+    session: &mut NativeDecodeSession,
+    prompts: &[Vec<u32>],
+    gen_tokens: usize,
+) -> Result<Vec<Vec<u32>>> {
+    let batch = prompts.len();
+    if batch == 0 {
+        bail!("drive_uniform_batch requires at least one prompt");
+    }
+    let prompt_len = prompts[0].len();
+    if prompt_len == 0 {
+        bail!("drive_uniform_batch requires a non-empty prompt");
+    }
+    if prompts.iter().any(|prompt| prompt.len() != prompt_len) {
+        bail!("drive_uniform_batch requires every prompt to share the uniform length {prompt_len}");
+    }
+    session.reset()?;
+
+    // Prefill lockstep: at position `p` every row is fed its own prompt token.
+    let mut row_tokens = vec![0u32; batch];
+    for position in 0..prompt_len {
+        let inputs: Vec<u32> = prompts.iter().map(|prompt| prompt[position]).collect();
+        let rows = session
+            .decode_greedy_batch(&inputs, position)
+            .with_context(|| format!("uniform batch prefill step at position {position}"))?;
+        if rows.len() != batch {
+            bail!(
+                "prefill step {position} returned {} rows, expected {batch}",
+                rows.len()
+            );
+        }
+        row_tokens = rows;
+    }
+
+    // The final prefill step's greedy result is each row's first generated token.
+    let mut streams: Vec<Vec<u32>> = row_tokens.iter().map(|&token| vec![token]).collect();
+    for step in 0..gen_tokens.saturating_sub(1) {
+        let inputs: Vec<u32> = streams
+            .iter()
+            .map(|stream| *stream.last().expect("stream seeded with the first token"))
+            .collect();
+        let past_len = prompt_len + step;
+        let rows = session
+            .decode_greedy_batch(&inputs, past_len)
+            .with_context(|| format!("uniform batch decode step {step} at past_len {past_len}"))?;
+        if rows.len() != batch {
+            bail!(
+                "decode step {step} returned {} rows, expected {batch}",
+                rows.len()
+            );
+        }
+        for (row, &token) in rows.iter().enumerate() {
+            streams[row].push(token);
+        }
+    }
+    Ok(streams)
+}
+
+/// Stage 2c (#750) batch-N solo-equivalence gate: seed K genuinely different
+/// prompts into one batch-K decode session and assert every row reproduces the
+/// exact token stream that prompt produces when run alone at batch 1. This is a
+/// strictly stronger correctness bar than the identical-token sweep's row
+/// identity: the rows carry different content, so cross-row KV bleed, a shared
+/// mask, a wrong stride, or a position error all diverge here.
+fn run_native_decode_solo_equivalence(
+    model_dir: &Path,
+    device: NativeDecodeDevice,
+    decode_precision: DecodePrecision,
+    tokenizer: &Tokenizer,
+    prompt_spec: &str,
+    gen_tokens: usize,
+) -> Result<()> {
+    let own_pid = std::process::id();
+    report_foreign_compute_apps(own_pid);
+
+    let prompt_texts: Vec<&str> = prompt_spec
+        .split("||")
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .collect();
+    if prompt_texts.len() < 2 {
+        bail!(
+            "--solo-equivalence-prompts needs at least 2 distinct prompts separated by '||' (got {})",
+            prompt_texts.len()
+        );
+    }
+    let mut prompts: Vec<Vec<u32>> = Vec::with_capacity(prompt_texts.len());
+    for text in &prompt_texts {
+        let tokens = tokenizer
+            .encode(text)
+            .with_context(|| format!("tokenize solo-equivalence prompt {text:?}"))?;
+        if tokens.is_empty() {
+            bail!("solo-equivalence prompt {text:?} tokenized to an empty sequence");
+        }
+        prompts.push(tokens);
+    }
+    // Uniform batch requires equal lengths, so truncate every prompt to the
+    // shortest common token length. This is a real, named constraint of the
+    // native uniform-batch path (one shared mask window / shared position per
+    // step); a ragged batch is not representable without per-row masks.
+    let uniform_len = prompts
+        .iter()
+        .map(Vec::len)
+        .min()
+        .expect("non-empty prompt set");
+    if uniform_len == 0 {
+        bail!("solo-equivalence prompts share no common non-empty prefix");
+    }
+    for prompt in &mut prompts {
+        prompt.truncate(uniform_len);
+    }
+    let batch = prompts.len();
+    println!(
+        "native_decode_batch_solo_equivalence: own_pid={own_pid} prompts={batch} uniform_len={uniform_len} \
+         gen_tokens={gen_tokens} (uniform-batch constraint: every prompt truncated to the shortest \
+         common token length; rows carry genuinely different content)"
+    );
+    for (row, (text, prompt)) in prompt_texts.iter().zip(prompts.iter()).enumerate() {
+        println!(
+            "native_decode_batch_solo_equivalence_prompt: row={row} text={text:?} tokens={prompt:?}"
+        );
+    }
+
+    // 1) Solo reference: each prompt alone at batch 1 (reset between prompts).
+    // SAFETY: single-threaded benchmark setup.
+    unsafe {
+        std::env::set_var("ONNX_GENAI_NATIVE_DECODE_BATCH", "1");
+    }
+    let mut solo_engine = build_governed_batch_engine(model_dir, &device, decode_precision, 1)?;
+    let solo_session = solo_engine
+        .native_decode_session_mut()
+        .expect("batch-1 native session");
+    let mut solo_streams: Vec<Vec<u32>> = Vec::with_capacity(batch);
+    for (row, prompt) in prompts.iter().enumerate() {
+        let stream = drive_uniform_batch(solo_session, std::slice::from_ref(prompt), gen_tokens)?;
+        println!(
+            "native_decode_batch_solo_equivalence_solo: row={row} stream={:?}",
+            stream[0]
+        );
+        solo_streams.push(stream.into_iter().next().expect("one solo row"));
+    }
+    drop(solo_engine);
+
+    // 2) Batch-K: all K prompts seeded into one session, stepping together.
+    // SAFETY: single-threaded benchmark setup.
+    unsafe {
+        std::env::set_var("ONNX_GENAI_NATIVE_DECODE_BATCH", batch.to_string());
+    }
+    let mut batch_engine =
+        build_governed_batch_engine(model_dir, &device, decode_precision, batch)?;
+    let batch_session = batch_engine
+        .native_decode_session_mut()
+        .expect("batch-K native session");
+    let batch_streams = drive_uniform_batch(batch_session, &prompts, gen_tokens)?;
+    drop(batch_engine);
+
+    // SAFETY: single-threaded teardown.
+    unsafe {
+        std::env::remove_var("ONNX_GENAI_NATIVE_DECODE_BATCH");
+    }
+
+    // 3) Assert each batch row reproduces its solo stream byte-for-byte.
+    let mut all_match = true;
+    for (row, (solo, batched)) in solo_streams.iter().zip(batch_streams.iter()).enumerate() {
+        let matches = solo == batched;
+        all_match &= matches;
+        println!(
+            "native_decode_batch_solo_equivalence_row: row={row} matches_solo={matches} \
+             batch_stream={batched:?}"
+        );
+        if !matches {
+            println!(
+                "native_decode_batch_solo_equivalence_detail: row={row} solo={solo:?} batch={batched:?}"
+            );
+        }
+    }
+    println!(
+        "native_decode_batch_solo_equivalence_result: prompts={batch} uniform_len={uniform_len} \
+         gen_tokens={gen_tokens} all_rows_match_solo={all_match}"
+    );
+    if !all_match {
+        bail!(
+            "solo-equivalence FAILED: at least one batch row diverged from its solo batch-1 stream \
+             — rows are observing each other (cross-row KV bleed, shared mask, wrong stride, or \
+             position error)"
+        );
+    }
+    Ok(())
+}
+
 fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Result<()> {
     if args.synthetic {
         bail!("--steady requires a real model directory");
@@ -1480,6 +1742,22 @@ fn main() -> Result<()> {
             &batch_sizes,
             args.tokens,
             args.native_decode_batch_context,
+        );
+    }
+    if let Some(prompt_spec) = args.solo_equivalence_prompts.clone() {
+        drop(session);
+        let model_dir = args
+            .model
+            .as_deref()
+            .expect("validated model argument")
+            .to_path_buf();
+        return run_native_decode_solo_equivalence(
+            &model_dir,
+            device.clone(),
+            args.decode_precision.into(),
+            &tokenizer,
+            &prompt_spec,
+            args.tokens,
         );
     }
     if let Some(dump_path) = args.dump_logprobs.as_ref() {
