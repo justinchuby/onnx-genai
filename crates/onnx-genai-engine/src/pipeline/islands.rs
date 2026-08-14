@@ -1,6 +1,8 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use anyhow::{Context, bail};
@@ -292,8 +294,15 @@ impl ExecutionIsland {
             .collect::<Vec<_>>();
         let source_ptrs = resolved
             .iter()
-            .map(|(_, value)| value.data_ptr_addr())
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|(name, value)| {
+                value.data_ptr_addr().with_context(|| {
+                    format!(
+                        "execution island {} input '{name}' has no tensor data",
+                        self.id
+                    )
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
         self.runs.set(self.runs.get() + 1);
 
         let mut bindings = self.bindings.borrow_mut();
@@ -305,19 +314,38 @@ impl ExecutionIsland {
                 resolved.iter().zip(&stable.inputs).enumerate()
             {
                 let source_ptr = source_ptrs[index];
+                if source.numel() == 0 {
+                    continue;
+                }
                 let shared_service = self.shared_buffer_inputs.contains_key(*name);
-                let aliases_destination = source_ptr == destination.data_ptr_addr()?;
+                let aliases_destination = source_ptr
+                    == destination.data_ptr_addr().with_context(|| {
+                        format!(
+                            "execution island {} stable input '{name}' lost its tensor data",
+                            self.id
+                        )
+                    })?;
                 let unchanged_source = !reset_services && source_ptr == stable.source_ptrs[index];
                 if (shared_service && !reset_services)
                     || (!shared_service && (aliases_destination || unchanged_source))
                 {
                     continue;
                 }
-                self.record_copy(source, destination)?;
-                if source.numel() == 0 {
-                    continue;
-                } else if let Some(device_id) = self.session.cuda_device_id() {
-                    destination.copy_from_cuda(source, device_id)?;
+                self.record_copy(source, destination).with_context(|| {
+                    format!(
+                        "execution island {} could not classify input '{name}'",
+                        self.id
+                    )
+                })?;
+                if let Some(device_id) = self.session.cuda_device_id() {
+                    destination
+                        .copy_from_cuda(source, device_id)
+                        .with_context(|| {
+                            format!(
+                                "execution island {} could not refresh input '{name}'",
+                                self.id
+                            )
+                        })?;
                 } else {
                     destination.copy_from_host(source)?;
                 }
@@ -372,7 +400,14 @@ impl ExecutionIsland {
             let mut pending_copies = false;
             for (port, output) in &stable.outputs {
                 let value_ref = &self.outputs[port];
-                let (stored, pending) = self.clone_output_for_store_async(value_ref, output)?;
+                let (stored, pending) = self
+                    .clone_output_for_store_async(value_ref, output)
+                    .with_context(|| {
+                        format!(
+                            "execution island {} could not retain output '{port}'",
+                            self.id
+                        )
+                    })?;
                 pending_copies |= pending;
                 values.insert(value_ref.clone(), stored);
             }
@@ -452,7 +487,12 @@ impl ExecutionIsland {
             self.eager_runs.set(self.eager_runs.get() + 1);
             self.session_runs.set(self.session_runs.get() + 1);
             self.session.run_with_binding(&binding)?;
-            let produced = binding.output_values()?;
+            let produced = binding.output_values().with_context(|| {
+                format!(
+                    "execution island {} could not extract warmup outputs",
+                    self.id
+                )
+            })?;
             binding.clear()?;
             for (name, input) in &stable_inputs {
                 binding.bind_input(name, input)?;
@@ -467,7 +507,12 @@ impl ExecutionIsland {
                     continue;
                 }
                 let shape = output.shape().to_vec();
-                let output = Value::into_alias_with_shape(output, &shape)?;
+                let output = Value::into_alias_with_shape(output, &shape).with_context(|| {
+                    format!(
+                        "execution island {} output '{name}' could not retain its warmup buffer",
+                        self.id
+                    )
+                })?;
                 binding.bind_output(name, &output)?;
                 stable_outputs.push((name.clone(), output));
             }
@@ -966,6 +1011,14 @@ fn build_execution_island(
         .cloned()
         .collect::<HashSet<_>>();
     let linked = link_models(id, &invocations, models, &boundary_outputs)?;
+    if !linked.external_files.is_empty()
+        && std::env::var("ONNX_GENAI_FILE_BACKED_SUPER_ISLAND").as_deref() != Ok("1")
+    {
+        bail!(
+            "file-backed external-data fusion is disabled; set \
+             ONNX_GENAI_FILE_BACKED_SUPER_ISLAND=1 to enable it"
+        );
+    }
     let mut shared_buffer_inputs = HashMap::new();
     let mut shared_buffer_output_values = HashSet::new();
     if let Some(serving) = &workflow.serving {
@@ -1014,46 +1067,51 @@ fn build_execution_island(
     }
     let mut options = models.session_options();
     let capture_requested = options.graph_capture;
-    let structurally_capture_eligible =
-        device.starts_with("cuda:") && capture_requested && linked.capture_declines.is_empty();
-    let session_name = format!("workflow-island-{id}");
-    let (session, capture_session_failure) = match Session::from_model_bytes_with_external_files(
-        models.environment(),
-        &session_name,
-        &linked.bytes,
-        &linked.external_files,
-        options.clone(),
-    ) {
+    let structurally_capture_eligible = device.starts_with("cuda:")
+        && capture_requested
+        && linked.capture_declines.is_empty()
+        && linked.external_files.is_empty();
+    if !linked.external_files.is_empty() {
+        options.graph_capture = false;
+    }
+    let linked_path = (!linked.external_files.is_empty())
+        .then(|| materialize_linked_model(&linked))
+        .transpose()?;
+    let create_session = |options| {
+        if let Some(path) = &linked_path {
+            Session::new(models.environment(), path, options)
+        } else {
+            Session::from_model_bytes(
+                models.environment(),
+                format!("workflow-island-{id}"),
+                &linked.bytes,
+                options,
+            )
+        }
+    };
+    let (session, capture_session_failure) = match create_session(options.clone()) {
         Ok(session) => (session, None),
         Err(error) if capture_requested => {
             options.graph_capture = false;
             let reason = format!(
                 "ORT rejected CUDA graph capture for this island; using stable binding: {error}"
             );
-            let session = Session::from_model_bytes_with_external_files(
-                models.environment(),
-                session_name,
-                &linked.bytes,
-                &linked.external_files,
-                options,
-            )?;
+            let session = create_session(options)?;
             (session, Some(reason))
         }
         Err(error) => return Err(error.into()),
     };
     let device_allocator = if device.starts_with("cuda:") {
-        session.device_allocator()?
+        session
+            .device_allocator()
+            .with_context(|| format!("execution island {id} could not acquire CUDA allocator"))?
     } else {
         None
     };
     let capture_eligible = structurally_capture_eligible
         && capture_session_failure.is_none()
         && device_allocator.is_some();
-    let external_initializer_bytes = linked
-        .external_files
-        .iter()
-        .map(|(_, bytes)| bytes.len() as u64)
-        .sum();
+    let external_initializer_bytes = linked.external_files.iter().map(|file| file.len).sum();
     let components = invocations
         .iter()
         .map(|invoke| invoke.component.clone())
@@ -1113,6 +1171,8 @@ fn build_execution_island(
             Some("island is not placed on CUDA".to_string())
         } else if !linked.capture_declines.is_empty() {
             Some(linked.capture_declines.join("; "))
+        } else if !linked.external_files.is_empty() {
+            Some("file-backed external-data island awaits coordinated capture support".to_string())
         } else if !capture_requested {
             Some("CUDA graph capture is disabled by session options".to_string())
         } else if !capture_eligible {
@@ -1129,8 +1189,138 @@ struct LinkedModel {
     inputs: BTreeMap<String, String>,
     outputs: BTreeMap<String, String>,
     capture_declines: Vec<String>,
-    external_files: Vec<(String, Vec<u8>)>,
+    external_files: Vec<LinkedExternalFile>,
     node_count: usize,
+}
+
+struct LinkedExternalFile {
+    virtual_name: String,
+    source_path: std::path::PathBuf,
+    len: u64,
+}
+
+static LINKED_MODEL_STAGING_ID: AtomicU64 = AtomicU64::new(0);
+
+fn materialize_linked_model(linked: &LinkedModel) -> anyhow::Result<std::path::PathBuf> {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    linked.bytes.hash(&mut hasher);
+    for file in &linked.external_files {
+        file.virtual_name.hash(&mut hasher);
+        file.source_path.hash(&mut hasher);
+        file.len.hash(&mut hasher);
+        hash_file_identity(&file.source_path, &mut hasher)?;
+    }
+    let cache_root = std::env::var_os("ONNX_GENAI_LINKED_MODEL_CACHE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or(std::env::current_dir()?.join("target/onnx-genai-linked"));
+    let directory = cache_root.join(format!("{:016x}", hasher.finish()));
+    if directory.exists() {
+        validate_linked_model_directory(linked, &directory)?;
+        return Ok(directory.join("model.onnx"));
+    }
+    std::fs::create_dir_all(&cache_root)?;
+    let staging = create_linked_model_staging_directory(&cache_root)?;
+    let materialize_result = materialize_linked_model_directory(linked, &staging);
+    if let Err(error) = materialize_result {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+    match std::fs::rename(&staging, &directory) {
+        Ok(()) => {}
+        Err(_) if directory.exists() => {
+            std::fs::remove_dir_all(&staging)?;
+            validate_linked_model_directory(linked, &directory)?;
+        }
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(error.into());
+        }
+    }
+    Ok(directory.join("model.onnx"))
+}
+
+fn create_linked_model_staging_directory(cache_root: &Path) -> anyhow::Result<std::path::PathBuf> {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    for _ in 0..1024 {
+        let staging = cache_root.join(format!(
+            ".staging-{}-{timestamp}-{}",
+            std::process::id(),
+            LINKED_MODEL_STAGING_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::create_dir(&staging) {
+            Ok(()) => return Ok(staging),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    bail!(
+        "could not allocate a linked-model staging directory under {}",
+        cache_root.display()
+    )
+}
+
+fn materialize_linked_model_directory(
+    linked: &LinkedModel,
+    directory: &Path,
+) -> anyhow::Result<()> {
+    for file in &linked.external_files {
+        let destination = directory.join(&file.virtual_name);
+        link_external_file(&file.source_path, &destination)?;
+    }
+    std::fs::write(directory.join("model.onnx"), &linked.bytes)?;
+    Ok(())
+}
+
+fn validate_linked_model_directory(linked: &LinkedModel, directory: &Path) -> anyhow::Result<()> {
+    for file in &linked.external_files {
+        let destination = directory.join(&file.virtual_name);
+        anyhow::ensure!(
+            destination.metadata()?.len() == file.len,
+            "linked external initializer '{}' changed size",
+            file.source_path.display()
+        );
+    }
+    let model_path = directory.join("model.onnx");
+    anyhow::ensure!(
+        std::fs::read(&model_path)? == linked.bytes,
+        "linked model cache collision at {}",
+        model_path.display()
+    );
+    Ok(())
+}
+
+fn link_external_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::hard_link(source, destination).or_else(|_| {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(source, destination)
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(source, destination)
+        }
+    })
+}
+
+fn hash_file_identity(path: &Path, hasher: &mut impl Hasher) -> anyhow::Result<()> {
+    let metadata = path.metadata()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        metadata.dev().hash(hasher);
+        metadata.ino().hash(hasher);
+        metadata.mtime().hash(hasher);
+        metadata.mtime_nsec().hash(hasher);
+    }
+    #[cfg(not(unix))]
+    {
+        let modified = metadata.modified()?.duration_since(std::time::UNIX_EPOCH)?;
+        modified.as_secs().hash(hasher);
+        modified.subsec_nanos().hash(hasher);
+    }
+    Ok(())
 }
 
 fn link_models(
@@ -1156,7 +1346,7 @@ fn link_models(
     let mut graph_inputs = BTreeMap::<String, ValueInfoProto>::new();
     let mut boundary_input_names = HashMap::<String, String>::new();
     let mut capture_declines = Vec::new();
-    let mut external_files = BTreeMap::<String, Vec<u8>>::new();
+    let mut external_files = BTreeMap::<String, LinkedExternalFile>::new();
     let mut external_names = BTreeMap::<std::path::PathBuf, String>::new();
 
     for (index, invocation) in invocations.iter().enumerate() {
@@ -1368,7 +1558,7 @@ fn link_models(
         inputs: fused_inputs,
         outputs: fused_outputs,
         capture_declines,
-        external_files: external_files.into_iter().collect(),
+        external_files: external_files.into_values().collect(),
         node_count,
     })
 }
@@ -1520,7 +1710,7 @@ fn collect_external_initializers(
     initializers: &mut [TensorProto],
     model_path: &Path,
     prefix: &str,
-    external_files: &mut BTreeMap<String, Vec<u8>>,
+    external_files: &mut BTreeMap<String, LinkedExternalFile>,
     external_names: &mut BTreeMap<std::path::PathBuf, String>,
 ) -> anyhow::Result<()> {
     for (initializer_index, initializer) in initializers.iter_mut().enumerate() {
@@ -1549,11 +1739,14 @@ fn collect_external_initializers(
             name.clone()
         } else {
             let name = format!("{prefix}external_{initializer_index}");
+            let len = path.metadata()?.len();
             external_files.insert(
                 name.clone(),
-                std::fs::read(&path).with_context(|| {
-                    format!("failed to read external weights {}", path.display())
-                })?,
+                LinkedExternalFile {
+                    virtual_name: name.clone(),
+                    source_path: path.clone(),
+                    len,
+                },
             );
             external_names.insert(path, name.clone());
             name
@@ -1639,6 +1832,124 @@ mod tests {
             application_overridable: false,
             effects: Vec::new(),
         }
+    }
+
+    #[test]
+    fn external_initializers_are_linked_by_path_without_copying_bytes() {
+        let test_root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("island-external-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&test_root);
+        std::fs::create_dir_all(&test_root).unwrap();
+        let model_path = test_root.join("source.onnx");
+        std::fs::write(&model_path, []).unwrap();
+        let weights_path = test_root.join("weights.bin");
+        std::fs::write(&weights_path, b"0123456789abcdef").unwrap();
+        let mut initializer = TensorProto {
+            name: "weight".to_string(),
+            data_location: tensor_proto::DataLocation::External as i32,
+            external_data: vec![
+                onnx_runtime_loader::proto::onnx::StringStringEntryProto {
+                    key: "location".to_string(),
+                    value: "weights.bin".to_string(),
+                },
+                onnx_runtime_loader::proto::onnx::StringStringEntryProto {
+                    key: "offset".to_string(),
+                    value: "4".to_string(),
+                },
+                onnx_runtime_loader::proto::onnx::StringStringEntryProto {
+                    key: "length".to_string(),
+                    value: "8".to_string(),
+                },
+                onnx_runtime_loader::proto::onnx::StringStringEntryProto {
+                    key: "checksum".to_string(),
+                    value: "unchanged".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut files = BTreeMap::new();
+        let mut names = BTreeMap::new();
+        collect_external_initializers(
+            std::slice::from_mut(&mut initializer),
+            &model_path,
+            "island0_c0_",
+            &mut files,
+            &mut names,
+        )
+        .unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files.values().next().unwrap().len, 16);
+        assert_eq!(
+            initializer
+                .external_data
+                .iter()
+                .find(|entry| entry.key == "offset")
+                .unwrap()
+                .value,
+            "4"
+        );
+        assert_eq!(
+            initializer
+                .external_data
+                .iter()
+                .find(|entry| entry.key == "length")
+                .unwrap()
+                .value,
+            "8"
+        );
+        assert_eq!(
+            initializer
+                .external_data
+                .iter()
+                .find(|entry| entry.key == "checksum")
+                .unwrap()
+                .value,
+            "unchanged"
+        );
+
+        let linked = std::sync::Arc::new(LinkedModel {
+            bytes: b"linked-model".to_vec(),
+            inputs: BTreeMap::new(),
+            outputs: BTreeMap::new(),
+            capture_declines: Vec::new(),
+            external_files: files.into_values().collect(),
+            node_count: 0,
+        });
+        let linked_paths = (0..4)
+            .map(|_| {
+                let linked = std::sync::Arc::clone(&linked);
+                std::thread::spawn(move || materialize_linked_model(&linked).unwrap())
+            })
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        assert!(linked_paths.windows(2).all(|paths| paths[0] == paths[1]));
+        let linked_path = linked_paths[0].clone();
+        let linked_weights = linked_path.parent().unwrap().join("island0_c0_external_0");
+        assert_eq!(std::fs::read(&linked_weights).unwrap(), b"0123456789abcdef");
+        assert_eq!(std::fs::read(&linked_path).unwrap(), b"linked-model");
+        let linked_directory = linked_path.parent().unwrap().to_path_buf();
+
+        let replacement = test_root.join("replacement.bin");
+        std::fs::write(&replacement, b"fedcba9876543210").unwrap();
+        std::fs::rename(replacement, &weights_path).unwrap();
+        let replacement_linked_path = materialize_linked_model(&linked).unwrap();
+        assert_ne!(replacement_linked_path, linked_path);
+        assert_eq!(
+            std::fs::read(
+                replacement_linked_path
+                    .parent()
+                    .unwrap()
+                    .join("island0_c0_external_0")
+            )
+            .unwrap(),
+            b"fedcba9876543210"
+        );
+        let replacement_linked_directory = replacement_linked_path.parent().unwrap().to_path_buf();
+        std::fs::remove_dir_all(test_root).unwrap();
+        std::fs::remove_dir_all(linked_directory).unwrap();
+        std::fs::remove_dir_all(replacement_linked_directory).unwrap();
     }
 
     #[test]
