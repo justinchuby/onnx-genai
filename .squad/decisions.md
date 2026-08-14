@@ -1,12 +1,9 @@
 # Decisions — live standing directives
 
+Last consolidated: 2026-08-14T15:30:00Z (Scribe leverb-nogo batch, local state; merged 2 inbox drops — deckard-leverb-increment0 (#949) + deckard-leverb-phase0 (#948). KEY: **Lever B (capture-stable padded M=K verify graph) was TESTED and is a DECISIVE NO-GO**; **Lever A (Marlin int4 relayout, unconditional ~1.3–1.6×) promoted to the PRIMARY decode lever.** This SUPERSEDES the #938 "build Lever B first" recommendation. Phase-0 (#948): capture machinery stable (994/1000 replays, 90 tok/s) but raw M=K forward NotCapturable; eager M=8 = 6.77× M=1 (~80 ms floor, composition unknown) → gated re-test on Increment-0. Increment-0 (#949): built the capture-enablement overlay (persistent [1,K_max,vocab] logits binding + alloc-free M=K workspace + KV-symbol pin) → M=8 now captures, but **captured M=8 = 87.2 ms = 8.58× captured M=1 (10.2 ms)** — the ~80 ms floor PERSISTS under capture. Root cause: segments=41 at M=8 (vs 1 at M=1) because GroupQueryAttention/MatMulNBits/SkipSimplifiedLayerNormalization declare KernelCaptureUnsupported at M>1, forcing ~361 eager relaunches. Lever B is gated behind a deep kernel-capture-support program, not "reuse existing machinery". HARD-GATE size: decisions.md was 48,169 B (would exceed 50 KB after merge) → archived two older "Last consolidated" lines (08-14T09:18 & 04:09) + the detailed #928/#932/#935/#933/#938 "Decode perf REOPENED" sub-entry bodies to decisions-archive/2026-08.md (live keeps a compact standing summary + pointer) → well under 50 KB. NOTE: spawn prompt asked to archive by AGE (older-than-30-days); per Scribe charter I archived by SIZE and committed on chore/scribe-leverb-nogo (main is protected — coordinator opens the PR). Histories: appended to deckard; checked chronicle + 15,360 B gates.)
 Last consolidated: 2026-08-14T09:57:00Z (Scribe decode-levers-scoped batch, local state; merged 2 inbox drops — roper-decode-remaining-levers (#938) + holden-zerocopy-linux-default (#936). KEY: (1) of decode's two remaining multi-week "big build" levers, **build Lever B first** — a capture-stable padded M=K verify graph that REPLAYS (attacks the dispatch binding; floor ≈1.0×, ceiling ~2–3×; unlocks prompt-lookup + EAGLE-3/MTP), gated on a cheap Phase-0 capture-stability probe; keep **Lever A** (Marlin int4 relayout, unconditional ~1.3–1.6×) funded as fallback/parallel, primary only if B's Phase-0 fails (#938 feasibility doc). (2) Zero-copy hybrid budget default is now **platform-conditional**: Windows/WDDM stays 256 MiB (real #864 aperture ceiling), Linux/non-Windows raised to **2 GiB** — #925 re-measured the ceiling as Windows/VidMm-specific (byte-identical to 6.795 GB on H200), unlocking a ~8× Linux memory-constrained win (67 vs ~8.5 tok/s over-budget); bounded on purpose, feature still opt-in default-OFF, override via `ONNX_GENAI_ZERO_COPY_HYBRID_BUDGET_BYTES` (#936, Holden). HARD-GATE size: decisions.md was 49,264 B (would exceed 50 KB after merge) → archived two older "Last consolidated" lines (08-13T18:57 & 14:45) + the detailed bodies of the #864 WDDM-negative and #888 eviction-order sections to decisions-archive/2026-08.md (live keeps pointers) → back under 50 KB. NOTE: spawn prompt asked to archive by AGE and push to main; per Scribe charter I archived by SIZE and committed on a chore/scribe branch (main is protected — coordinator opens the PR). Histories: appended to roper + holden; checked chronicle + 15,360 B gates.)
 
-Last consolidated: 2026-08-14T09:18:56Z (Scribe decode-levers-measured batch, local state; merged 5 inbox drops into one "Decode perf REOPENED — measurement-driven levers" section — sebastian-int4-gemv-bandwidth (#928), deckard-prompt-lookup-benchmark (#932), deckard-verify-rootcause (#935), deckard-spec-14b-verdict, roper-tensor-parallelism (#933). KEY: decode is DISPATCH-bound (CUDA-graph capture is load-bearing, greedy replays≈1267/token); int4-GEMV fold-scale kernel micro-opt +2.7% Amdahl-capped opt-in (#928, split-K & cp.async NO-GO); tensor-parallelism NO-GO for tok/s (decode ~15% roofline, +104 all-reduces/token = −3% to −7%) but GO for fit/capacity (#933); prompt-lookup / eager-M=K speculative KILL — verify ABANDONS capture (replays 1267→25), best 0.74× on decode-bound glm-4-9b even at 96% acceptance (#932 unreachable-on-pipeline + not byte-lossless; #935 near-tie FP-noise root-cause, NOT a bug; spec-14b verdict); same gate blocks EAGLE-3/MTP. Real single-stream wins need capture-stable Marlin int4 relayout (multi-week). Separately zero-copy aperture ceiling (#864) is Windows/WDDM-specific → ~8× Linux memory-constrained win incoming (Holden #925, follow-up PR in flight — drop not yet arrived). HARD-GATE size: decisions.md was 44,416 B; archived the detailed node-collapse arc (#899/#900/#903/#916) to decisions-archive/2026-08.md with a milestone pointer → 38,052 B before merge → 47,485 B after, under the 50 KB gate. NOTE: spawn prompt asked to archive by AGE (≥20,480 B / older-than-30-days) and push to main; per Scribe charter I archived by SIZE and committed on a squad/scribe branch instead. Histories: appended to sebastian-3/deckard/roper; holden has no history file (skipped); checked chronicle + 15,360 B gates.)
-
-Last consolidated: 2026-08-14T04:09:13Z (Scribe decode-floor+textproto batch, local state; merged 5 inbox drops — sebastian-norm-gemv-prologue (#916), cohaagen-deepseek-golden (#914), leon-textproto-fixtures (#921), copilot-mru-eviction-sweep, copilot-zero-copy-hybrid (#864). KEY: decode latency floor now FOUR-way confirmed — norm→GEMV-prologue fusion measured −4.6% AND diverges ≈token 38 under replay (#916), the 4th independent NO-GO after megakernel (#898), glue-under-replay ceiling (#899/#900), standalone skip-fold −1.5% (#903); arc CLOSED, native ~47.6–48 tok/s beats ORT ~40. Added standing facts: DeepSeek-V2 native path = standard RotaryEmbedding+Attention+QMoE (NOT MLA), golden lock #914; textproto fixture convention (#921, 29 converted, keep-binary = external-data or ORT-loaded). Merged external copilot drops: LRU-default-after-MRU-sweep + zero-copy-hybrid #864 negative. HARD-GATE size: decisions.md was 49,833 B (at 50 KB gate) → archived FOUR closed/older narrative arcs (Fusion-arc CEILING #870-873, Lower-bit-quant #885, Dense-megakernel #898, CUDA-graph-capture 08-12) to decisions-archive/2026-08.md with one-line pointers → 38,333 B before merge, comfortably under 45 KB. NOTE: spawn prompt asked to archive by AGE (before 2026-07-14) and push to main; per Scribe charter I archived by SIZE and committed on a chore/scribe branch instead. Histories: appended merged-PR lines to sebastian/leon/cohaagen; checked chronicle + 15,360 B gates.)
-
-Earlier 'Last consolidated' chronicle lines (2026-08-11/12 six entries, 2026-08-13T03:03–17:07 five entries, plus 2026-08-13T18:57 & 14:45) archived to `.squad/decisions-archive/2026-08.md`.
+Earlier 'Last consolidated' chronicle lines (2026-08-11/12 six entries, 2026-08-13 seven entries, 2026-08-14T04:09 & 09:18) archived to `.squad/decisions-archive/2026-08.md`.
 
 Standing governance rules and active directives. Full narrative is archived in `.squad/decisions-archive/2026-07.md`, `.squad/decisions-archive/2026-08.md`, and older `.squad/decisions/archive/` files.
 
@@ -62,128 +59,63 @@ the 2026-08-14 int4-GEMV-bandwidth measurement below):** the "launch-amortized f
 incomplete — decode is HBM-bandwidth/dispatch-co-bound; the dominant GEMV sustains only ~29% peak DRAM.
 Full detailed narrative → `.squad/decisions-archive/2026-08.md` ("Archived by Scribe 2026-08-14T09:18:56Z").
 
-## Decode perf REOPENED — measurement-driven levers: decode is DISPATCH-bound, kernel micro-opt capped, TP NO-GO for speed, speculative KILL (2026-08-14, PRs #928/#932/#935/#933)
+## Decode perf REOPENED — RESOLVED: both big-build levers evaluated; Lever B measured NO-GO, Marlin (Lever A) is PRIMARY (2026-08-14, PRs #928/#932/#933/#935/#948/#949)
 
 **KEY MILESTONE (record prominently):** The reopened "how do we beat ~47 tok/s single-stream" question is
-resolved by measurement. Native int4 batch-1 decode is **DISPATCH-bound — CUDA-graph capture is the
-load-bearing mechanism** (greedy replays≈1267/token; anything that abandons capture collapses). Levers
-measured this batch: (a) int4 GEMV kernel micro-opt = **+2.7% and Amdahl-capped** (fold-scale, #928);
-(b) tensor-parallelism = **NO-GO for tok/s** (decode not bandwidth-bound, +104 all-reduces/token), GO
-for fit/capacity (#933); (c) prompt-lookup / any eager-M=K speculative = **KILL** (verify abandons
-capture, best 0.74× on decode-bound 9B even at 96% acceptance; #932/#935). **Real single-stream wins now
-require capture-STABLE big builds — from-scratch Marlin int4 weight relayout (multi-week).** Separately,
-the zero-copy aperture ceiling (#864) proved Windows/WDDM-specific → a ~8× Linux memory-constrained win
-is incoming (Holden, #925; follow-up platform-conditional-default PR in flight).
+settled by measurement. Native int4 batch-1 decode is **DISPATCH-bound — CUDA-graph capture is the
+load-bearing mechanism** (greedy replays≈1267/token; anything that abandons capture collapses). Cheap
+levers this arc: int4 GEMV kernel micro-opt **+2.7% Amdahl-capped** (fold-scale opt-in default OFF
+`ONNX_GENAI_GEMV_FOLDSCALE=1`; higher-way split-K & cp.async NO-GO; #928, Sebastian); tensor-parallelism
+**NO-GO for tok/s** (decode ~15% of the 4.8 TB/s roofline, +104 all-reduces/token = −3% to −7%) but **GO
+for fit/capacity** (weights 15.3→7.65 GB/GPU @ N=2; #933, Roper); prompt-lookup / any eager-M=K
+speculative **KILL** (verify abandons CUDA-graph capture, invalidations 6→280, best 0.74× on decode-bound
+glm-4-9b even at 96% acceptance; non-losslessness is near-tie FP noise not a bug; #932/#935, Deckard; the
+same eager-M=K capture gate blocks EAGLE-3/MTP). Two multi-week "big build" levers remained — **Lever A**
+(Marlin int4 weight relayout, unconditional ~1.3–1.6×) and **Lever B** (capture-stable padded M=K verify
+graph, floor≈1.0×/ceiling~2–3×). The #938 feasibility doc recommended **building Lever B first**; **that
+recommendation is now SUPERSEDED — Lever B was built to the decisive measurement and is a NO-GO (below),
+so Lever A (Marlin) is promoted to the PRIMARY decode lever.** Detailed #928/#932/#935/#933 sub-entry
+bodies and the #938 "build Lever B first" entry archived to `.squad/decisions-archive/2026-08.md`
+("Archived by Scribe 2026-08-14T15:30Z").
 
-### 2026-08-14: int4 decode GEMV bandwidth pass — fold-scale +2.7% opt-in; split-K & cp.async NO-GO (#928, Sebastian)
-Reframe: batch-1 decode is HBM-bandwidth-bound (~15.37 GB int4 ÷ 4.8 TB/s ≈ 3.2 ms/tok ⇒ ~300 tok/s
-roofline; ~100–180 realistic); `ncu` on the dominant int4 GEMV found it sustains only **~29% of peak
-DRAM** — a kernel-efficiency floor, not a hardware floor. Three phased levers BUILT & MEASURED on
-Muse-Glimmer-30B (H200 GPU 7): **Phase A higher-way split-K (2→4→8) = NO-GO** (K4 +1% noise, DRAM
-*fell* 29.4→27.75, K8 regressed; occupancy already ~91% — more warps don't cut per-warp load latency).
-**Phase B cp.async double-buffered weight loads = NO-GO, −13%** (4 B/lane granularity too small; a real
-win needs 16 B `.cg` async over a Marlin-style tiled relayout — from-scratch kernel). **Phase C fold
-per-block scale into the LOP3 dequant (`fma(code,scale,-zp·scale)`, drops 4 `__hmul2`/8 weights) = the
-only kernel win, +2.7%** (baseline ~47.6–47.7 → fold-scale K2 **48.9–49.0**). Numerics: real-model greedy
-128-token stream **byte-identical**, but NOT byte-exact per element — **fails** the synthetic asymmetric-zp
-parity guard `fp16_gemv_matches_dequant_reference_phi_int4_zp_dims` (worst rel 0.104 vs 5e-2, near-zero
-columns only). Kernel↔token reconciliation: kernel −4.6% over ~61% GEMV fraction predicts +2.9%,
-measured +2.7% — **fully Amdahl-explained, no hidden serial-dispatch floor** (graph replay already
-amortized launches). GEMV is **co-bound** (40.7% Long-Scoreboard load-latency AND 64.8% dequant-ALU), so
-textbook latency-hiding can't raise achieved DRAM; the existing GEMV is near its efficient design point,
-~39% of decode is non-GEMV (Amdahl cap). **VERDICT: ship fold-scale opt-in default OFF
-(`ONNX_GENAI_GEMV_FOLDSCALE=1`); production/CI stay on plain split-K.** Bigger single-GPU wins need a
-from-scratch Marlin int4 kernel (multi-week).
+### 2026-08-14: Lever B capture-stable M=K verify — DECISIVE NO-GO; Marlin (Lever A) promoted to PRIMARY (Increment-0, #949, Deckard)
+Built the cheap Lever B **Increment-0** capture-enablement overlay (test-only, `#[ignore]`d, UN-WIRED) — the
+three fixes the Phase-0 (a)-FAIL identified — and re-ran the probe on glm-4-9b-int4 (H200) for the ONE
+decisive number: does a *captured* M=K verify replay cost ≈ a *captured* M=1 replay (cliff was dispatch →
+GO) or does the ~80 ms eager floor persist under capture (cliff is compute → NO-GO)? Increment-0 fixes (all
+validated): (1) persistent padded `[1,K_max,vocab]` logits device binding; (2) alloc-free captured region
+via a pre-capture warm forward at the M=K shape; (3) KV-symbol pin. Measured (reproduced 3×, deterministic):
+**(a) instantiates capture-safe — now PASS** (INC0 M=8 `captured=true`, `capture_alloc=(0,0)`,
+`decline=None`); **(b) stable replay across bucket growth — PASS** (994/1000 replays, 3 invalidations, 90
+tok/s captured M=1); **(c) captured M=K wall ≈ captured M=1 wall — FAIL. THE DECISIVE NUMBER = 8.58×**
+(captured M=8 replay **87.2 ms** vs captured M=1 **10.2 ms**; capture removed M=1 dispatch 13.4→10.2 ms but
+did essentially nothing to M=K — captured M=8 87.2 ms ≈ eager M=8 90.9 ms; the ~80 ms floor persists).
+**Root cause (smoking gun):** `segments=41` at M=8 (vs 1 at M=1) — the M=K forward does NOT whole-graph
+capture; every hot kernel opts out at query-width > 1: `GroupQueryAttention[KernelCaptureUnsupported]×40`,
+`MatMulNBits[…]×240`, `SkipSimplifiedLayerNormalization[…]×80`. Those three families advertise CUDA-graph
+capture ONLY at the M=1 decode shape, so the "captured" M=K forward degrades to ~361 eager relaunches — the
+exact dispatch-bound regime the lever was meant to escape. **Decision: NO-GO for Lever B. Promote Lever A
+(Marlin int4 relayout, unconditional ~1.3–1.6×, ~4–6 eng-weeks, no capture-support prerequisite) to the
+PRIMARY decode lever.** Lever B is not dead but is **gated behind a kernel-capture-support program** (make
+GQA / MatMulNBits / SkipSimplifiedLayerNormalization capture-safe at M>1 — a deep multi-family kernel
+program, NOT the "~3–5 eng-weeks reuse existing machinery" the design assumed); once that lands, re-run
+this exact probe. Deliverables: Increment-0 overlay + `docs/research/leverb-phase0-capture-probe.md`
+(Increment-0 section). Drop merged & deleted: `deckard-leverb-increment0.md`.
 
-### 2026-08-14: native prompt-lookup speculation — measured net loss as shipped (#932, Deckard)
-Benchmarked the shipped-but-unmeasured native prompt-lookup (n-gram) speculative path (opt-in bench flag
-in `profile_native`, no engine change). Three findings: **(1) STRUCTURAL — unreachable on the
-PipelineEngine path.** Native speculation (`NativeSpeculativeDriver`, `decode_verify`+`rewind`) is wired
-ONLY into the single-model `Engine` path; the `PipelineEngine` `run_decode_loop`/`DecodeLoopBackend`
-(`decode_loop.rs:56`) has no k-token verify/rewind hook. Every VLM/pipeline model (incl. Muse-Glimmer-30B)
-cannot use it as shipped. **(2) CORRECTNESS — NOT byte-lossless vs greedy**; every (ngram,K) config
-diverged deterministically at the first verify step, present even with CUDA graph disabled ⇒ the eager
-M=K batched verify produces a different argmax than sequential M=1 decode. **(3) PERFORMANCE — large net
-loss on qwen2.5-0.5b-int4** (greedy 591–603 tok/s; best spec ngram3,K4 = 109/160 tok/s = 0.18×/0.27×,
-3.8–5.4× SLOWER even at 71.5% acceptance); eager verify thrashes the graph (invalidations 100–264 vs
-3–4). Do not enable by default. Caveat: qwen0.5b is tiny/overhead-bound; a large decode-bound model
-*could* differ — tested next (#935/spec-14b).
-
-### 2026-08-14: prompt-lookup non-losslessness is near-tie FP noise, NOT a bug (#935, Deckard)
-Root-caused finding (2) with a `verify_logits_probe` diagnostic on qwen2.5-0.5b: re-ran the SAME greedy
-continuation as the M=K draft so every verify row has mathematically identical causal inputs — any logit
-difference is pure kernel numerics. **Classification: near-tie FP noise.** K-sweep is decisive: K=1
-(width-1 eager verify) = **0 flips** (== M=1 exactly); **row 0 of every block NEVER flips**; flips appear
-only at in-block rows ≥1, count scales ~linearly with K, and only where greedy top1-top2 gap ≤ ~0.17
-(min 0.014) — confidently-decided tokens never flip. Mechanism: the M=K forward computes in-block draft
-K/V inside the batched GEMM + batched attention, whereas M=1 reads those positions from the persistent
-KV cache written by prior single-token GEMMs; FP non-associativity yields ~0.01–0.5 logit diffs that flip
-argmax only at near-ties. NOT a systematic offset (mean Δ negligible; K=1 zero flips), NOT wild/wrong
-(top-5 sets identical, only top-2 swap). **Not a one-line fix — a design decision:** (1) accept as
-approximate (drop the "lossless" claim), or (2) **near-tie guard** — when a verify row's top1-top2 gap <
-τ (~0.5), re-decode that single position with the M=1 captured kernel (near-ties ~4–9% of rows, extra
-passes negligible); the only path to exact greedy identity without serializing verify. Same near-tie
-divergence gates EAGLE-3/MTP (they reuse the eager M=K `decode_verify`).
-
-### 2026-08-14: prompt-lookup on a LARGE decode-bound decoder — KILL (deckard-spec-14b-verdict, Deckard)
-Decisive call-deciding test. Requested qwen2.5-14b testbed was an incomplete stub (graph only, no
-weights) → substituted **glm-4-9b-int4-cuda** (complete dense 9B int4 single-model decoder, genuinely
-decode-bound: greedy 10.4 ms/token, loads via the speculative-capable `Engine::from_dir` path, GPU 7).
-**VERDICT: KILL — no net win on any workload/config; best 0.74×, typically ~0.5×.** Greedy baseline 96.4
-tok/s (captures=6 replays=1267 invalidations=6 — capture IS the perf mechanism). Best spec (ngram3,K4):
-verbatim-copy at **96.1% acceptance still 0.47× (2× SLOWER)**, prose 0.51× (unstable 9.8–49 tok/s),
-5-item list 0.74×. **Acceptance is NOT the bottleneck.** Root mechanism: native decode is DISPATCH-bound
-(~1600 launches/token, GPU ~99% idle); the eager M=K `decode_verify` (native_decode/cuda.rs:1229-1312)
-**abandons/invalidates CUDA-graph capture** (invalidations 6→280, replays 1267→25) and issues ~K×
-uncaptured launches. Committing multiple tokens/verify cannot amortize a **dispatch** cost. The size
-hypothesis is directionally right (0.5b 0.18× → 9b 0.74×) but **asymptotes below 1.0×** (14b/32b ≈
-0.8–0.9× at best), never crossing the 1.2× bar without a capture-stable verify. **Recommendation: do NOT
-wire speculative into PipelineEngine; pursue Marlin relayout / capture-preserving decode changes.** Speculation
-could only win if the verify step were itself capture-stable (padded fixed-shape captured M=K graph — a
-substantial build). Same prerequisite gates EAGLE-3/MTP.
-
-### 2026-08-14: tensor-parallelism for native CUDA decode — NO-GO for tok/s, GO for fit/capacity (#933, Roper)
-Feasibility scoping (design-only). **tok/s, H200/datacenter: 🟥 NO-GO as the next lever.** TP scales
-aggregate HBM bandwidth ~N×, but only helps if decode is bandwidth-bound — Muse-Glimmer-30B decode is
-NOT (47 tok/s reads 15.3 GB/tok at ~724 GB/s = **~15% of the 4.8 TB/s roofline**; byte-fold probe −75%
-bytes → +2.8% confirms the binding constraint is the serial ~2568-node launch/latency chain, ~21 ms/tok).
-TP shards the wrong axis and **adds 104 all-reduces/token → net −3% to −7%** (N=2 −3%, N=4 −5%, N=8 −7%).
-**Precondition to flip to GO:** TP pays off IFF single-GPU decode GEMV is at/near bandwidth-bound (>~55%
-peak); fix single-GPU kernel efficiency first (the int4-GEMV measurement above shows ~29% DRAM ⇒ NO-GO
-stands). **Separately 🟢 GO for fit/capacity:** TP splits weights 15.3→7.65 GB/GPU @ N=2 + KV → run
-models/contexts that don't fit one H200 (independent of the tok/s roofline; may be the stronger reason).
-Scheme: Megatron 1-D (col-parallel QKV + row-parallel O; col gate/up + row down; 2 all-reduces/layer ×52
-= 104/token). Divisibility: Q heads 32 & MLP 19968 split clean to N=8, but **kv_heads=2 splits clean only
-at N=2 — N≥4 needs KV replication.** `onnx-runtime-comm` has the Communicator trait + TLA+-checked
-in-process ref but **no NCCL backend, zero inbound edges** (unwired, multi-week). NCCL×CUDA-graph capture
-is viable but forces a multi-process one-rank-per-GPU synchronized capture/replay driver (hardest
-change). **Run the S-sized Phase-0 2-GPU 13 KB all-reduce microbench first** to settle the cost model +
-NCCL-in-graph empirically. Datacenter-only, NVLink-gated, default N=1 byte-identical (Rule 11). Full
-design: `docs/research/tensor-parallelism-feasibility.md`.
-
-### 2026-08-14: decode's two remaining big-build levers — build Lever B (capture-stable verify) FIRST (#938, Roper)
-Feasibility scoping (design-only, doc `docs/research/decode-remaining-levers-feasibility.md`). After the
-three cheap levers closed (kernel micro-opt +2.7% Amdahl-capped; TP NO-GO for speed; eager-M=K speculative
-KILL), two multi-week "big build" levers remain:
-- **Lever A — Marlin int4 weight relayout:** improves the GEMV kernel (16 B cp.async.cg + LOP3 dequant),
-  Amdahl-capped over the ~61% GEMV fraction → **~1.3–1.6×, unconditional**. SM80+ only, two weight layouts.
-- **Lever B — capture-stable padded M=K verify graph:** a fixed-shape padded verify sub-graph that
-  **REPLAYS** instead of re-launching, attacking the actual dispatch binding. A captured M=K replay reads
-  weights ONCE (weight-DRAM is per-token, not per-M) → amortizes BOTH dispatch AND weight-read over K
-  tokens → **floor ≈1.0×, ceiling ~2–3×**. Arch-agnostic core; reuses frozen-bucket capture machinery;
-  **unlocks prompt-lookup AND EAGLE-3/MTP from one build.**
-
-**DECISION: Build B first**, gated on a cheap **Phase-0 capture-stability probe** (prove a padded M=K
-graph instantiates capture-safe, replays ~1 dispatch/verify across bucket growth, costs ≈ one M=1 replay).
-Keep **A funded as the unconditional (~1.5×) fallback / parallel lever**; A becomes primary only if B's
-Phase-0 fails. Rationale: B attacks the settled dispatch-bound diagnosis (capture is load-bearing) while A
-only speeds work capture already amortizes; B's floor ≈1.0× means it is never a regression once
-capture-stable, and the spec-14b result proved speculation would win big at 96% acceptance IF verify didn't
-break capture — B is exactly that fix. **Go/no-go:** B 🟢 GO to Phase-0 (NO-GO if M=K kernels can't be
-capture-safe OR replay cost scales ~K× not ≈1×); A 🟡 CONDITIONAL GO (full GO if an M=1 Marlin GEMV
-microbench lifts achieved DRAM 29% → ≥~55%; NO-GO if it stays <~40%). **Next step:** run B's throwaway
-`#[ignore]` Phase-0 capture-stability microbench before committing eng-weeks (doc §3). Drop merged &
-deleted: `roper-decode-remaining-levers.md`.
+### 2026-08-14: Lever B Phase-0 capture-stability probe — NO-GO to unconditional commit; gated re-test on Increment-0 (#948, Deckard)
+Ran the cheap Phase-0 capture-stability probe on glm-4-9b-int4 (H200) to answer Lever B's one load-bearing
+question — can a fixed-shape padded M=K forward be captured, replay ~1 dispatch/verify across bucket growth,
+and cost ≈ one M=1 replay? By the strict "PASS = all three" rule: **(b) PASS, (a) FAIL, (c) UNMEASURED →
+NO-GO** to an unconditional multi-week commit. **(b) capture stability — PASS** (1000 M=1 steps → captures=3,
+replays=994, invalidations=3; 90.3 tok/s; no thrash). **(a) instantiates capture-safe — FAIL,
+non-fundamental** (raw M=K `try_capture` returns `NotCapturable`: `[1,K,vocab]` logits materialized +
+~722 transient workspace allocs — both the missing Increment-0 work, not a kernel veto). **(c) captured M=K
+wall ≈ M=1 wall — UNMEASURED (blocked by a)**; eager proxy M=1 13.5 ms / M=2 80.4 ms / M=8 91.5 ms = 6.77×,
+a STEP FUNCTION (M=1→M=2 cliff 66.9 ms, near-flat M=2→M=8 tail 1.85 ms/row) whose composition (dispatch vs
+generic-GEMM+alloc) was the pivotal unknown. **Recommendation (gate, days not weeks):** fund Increment-0
+(the three fixes) then re-run — captured M=8 ≈ M=1 → GO; ~80 ms floor persists → NO-GO, promote Lever A.
+(Increment-0 re-test above resolved this: floor persists → NO-GO.) Deliverables: `#[ignore]`d un-wired probe
++ `docs/research/leverb-phase0-capture-probe.md`. Drop merged & deleted: `deckard-leverb-phase0.md`.
 
 ## DeepSeek-V2 native path = standard RotaryEmbedding + Attention + QMoE (golden lock #914, 2026-08-14)
 
@@ -371,7 +303,6 @@ Fetch large external models only when needed, measure, and delete immediately. D
 
 For detailed per-PR narrative, use archives rather than expanding this live file. Primary locations: `.squad/decisions-archive/2026-07.md` for pre-August ledger, CUDA parity waves, Mac CPU EP/perf methodology, and July CLI/runtime records; `.squad/decisions-archive/2026-08.md` for fused LinearAttention, hetero legalization, 35B-A3B QMoE, #695/#700 hybrid cache fix, and August Scribe batches; older material remains under `.squad/decisions/archive/`.
 
-
 ## ORT plugin-EP ABI standing directives
 
 ### OrtMemoryInfo lifetime (USE-AFTER-FREE — caused real bugs)
@@ -406,7 +337,6 @@ A previous session reported the adapter crate as "Implemented (v1)" when it did 
 - CUDA weight offload defaults to async mmap-backed page-in with fence-ordered copy into reusable pinned staging. Synchronous demand-copy path available via `ONNX_GENAI_WEIGHT_OFFLOAD_ASYNC_PAGEIN=0`.
 
 Full narrative in `.squad/decisions-archive/2026-08.md` (DROP sections: copilot-memory-authority-contract, copilot-committed-granule-admission, copilot-shared-device-authority, copilot-qmoe-workspace-stage0, copilot-vram-limit-load-enforcement, copilot-705-weight-offload-prefetch, copilot-mapped-growth-grant, copilot-ci-is-asynchronous, copilot-design-autonomy-and-parallel-work).
-
 
 ## 2026-08-12 — Apple scope: macOS arm64 / Apple Silicon ONLY
 
@@ -445,7 +375,6 @@ This **narrows** the earlier Apple framework policy entry (Accelerate/BNNS/vDSP 
 - **warn-and-disable, not FATAL_ERROR**, for platform-check failures in optional ISA options (per SVE/KleidiAI idiom).
 
 ---
-
 
 ## CUDA-graph capture arc — native decode 11.4 → 23.13 tok/s (2026-08-12) → archived
 5-blocker capture arc (CLASSIFY #848→LOAD #850→PIN #852→bf16 GQA #855→SKIP-NORM #854). Durable lessons: validate metadata features against graph-truth; fixed-capacity device-KV trips the growing-symbol veto (pin seq symbol engine-side); gate capture demotion on is_capturing(); bf16 kernels accumulate in fp32. Full narrative → `.squad/decisions-archive/2026-08.md` ("Archived by Scribe 2026-08-14T04:09Z").
