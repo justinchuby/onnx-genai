@@ -127,3 +127,5 @@ NO-GO and #899/#900 glue-collapse +0.9% ceiling). **Next lever (NOT funded):** f
 into the neighbouring multi-CTA int4 GEMV prologue/epilogue (bf16 analogue of
 `CudaSkipRmsNormMatMulFusion`) — keeps the reduction distributed. Do NOT self-merge (Chew gates
 numerics). Doc §8.6.
+
+- **2026-08-14 (#916, MERGED):** bf16 norm-into-GEMV-prologue fusion measured NO-GO — −4.6% regression AND numeric divergence (≈token 38) under CUDA-graph replay; fp16 prologue reduction is single-warp-serial on the critical GEMV path. Finding-only (docs §8.7), nothing landed. **Fourth** independent confirmation of the batch-1 decode latency floor; norm→GEMV-prologue kill-gate CLOSED.
