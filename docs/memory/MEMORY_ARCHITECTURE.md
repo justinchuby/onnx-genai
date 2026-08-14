@@ -2126,10 +2126,48 @@ into page-aligned transfer tiles.
 > *evicting and re-admitting* large stable-slot residents) is **incomplete** — it may be
 > *a* corrupting path, it is not the only one. #912's hybrid safety argument invoked the
 > static-hot-set claim; the hybrid's own measurements remain valid, but that particular
-> justification for them does not. Leading hypothesis is retained-page staleness (filled
-> once, served as a hit every step, never re-filled) — stated as a hypothesis, not a
-> cause; #945 lists the four experiments that would settle it, two of which need no CUDA
-> toolkit.
+> justification for them does not.
+>
+> **Retained-page staleness — FALSIFIED 2026-08-14 (#945).** The leading hypothesis was
+> that key 919's retained page is filled once and then goes stale (an incomplete fill, or
+> a device copy silently invalidated) while the residency cache reports a hit. Three
+> hardware experiments on `qwen14b-zp`, all env-gated and off on the shipped path, kill it:
+>
+> 1. **Granule checksums (experiment 2/3).** 919's 371 MiB device copy is hashed per
+>    2 MiB granule on admission and re-hashed on every decode step. All **186/186 granules
+>    are byte-identical to admission on every step of a run that still collapses to 3
+>    tokens** — the probe's per-step full-device sync did *not* mask the bug. Since nothing
+>    diverges, there is no offset to bisect (experiment 3 is subsumed: no within-tensor
+>    divergence exists).
+> 2. **Forced re-fill (experiment 1, the decisive one).** Re-copying the correct host
+>    source into the *same* resident VA every single step (never evicting or re-admitting)
+>    **does not prevent the collapse** — still 3 tokens. The fault is not in the retained
+>    page's content.
+> 3. **Cross-generation isolation — the actual reframe.** With `--warmups 0`, pinning 919
+>    yields the **full byte-identical 16-token reference stream**. The first generation
+>    with 919 retained is correct; a *subsequent* generation collapses (reproduced on the
+>    measured path too: `--warmups 0 --runs 2` gives run 1 = 16 tokens, run 2 = 3). The
+>    #944/#945 reproduction runs an implicit warmup, so the observed collapse is the
+>    **second** generation — not a page that "goes stale as the run proceeds".
+>
+> **Mass/size is not the trigger (experiment 4).** 919 (389,283,840 B) is a unique ~8×
+> size outlier — the next-largest tensor is 35 MiB, so no single ~371 MiB non-projection
+> tensor exists to use as the control. Pinning **eleven** 35 MiB non-projection tensors
+> totalling **exactly 389,283,840 B** (identical to 919) across two generations is
+> **byte-identical**, as is #944's 2.4 GB threshold arm. Retaining ≈371 MiB — or 2.4 GB —
+> of non-projection weight across generations is safe; retaining the lm_head projection
+> specifically is not.
+>
+> **What the evidence supports now.** The trigger is retaining key 919 across generations,
+> and the fault manifests while 919's own bytes stay perfectly correct. So the mechanism
+> is a **cross-generation interaction of the retained stable-slot VA** (the #716 stable-slot
+> machinery engages only for retained keys) with per-generation setup (re-prefill / KV
+> reallocation under "dynamic KV/weight lending"), **not** the page content. Remaining
+> candidates: (a) 919's stable-slot reservation aliases a gen-2 KV/activation buffer, so
+> *that* buffer is corrupted (919 stays MATCH because a read-only weight is never written);
+> (b) a consumer-side stream/pointer assumption that holds when 919 streams fresh each step
+> but is violated once it is a persistent slot, exposed only after the first generation's
+> teardown. Not yet pinpointed to a line; `compute-sanitizer` is unavailable on this box.
 >
 > What survives unchanged: any **dynamic** scheme that churns large weight pages (#866's
 > elastic reclaim, #750 admission, any future byte-aware policy) **must assert token

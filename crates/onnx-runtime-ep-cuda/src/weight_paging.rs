@@ -981,6 +981,104 @@ fn static_pin_keys() -> Option<&'static HashSet<u64>> {
         .as_ref()
 }
 
+/// Physical VMM granule size on this build (2 MiB). The staleness probes below
+/// hash and report the retained device copy at this granularity so a divergence
+/// can be pinned to a specific granule / byte offset within the tensor (#945
+/// experiment 3, the within-tensor bisection).
+const PIN_PROBE_GRANULE_BYTES: usize = 2 * 1024 * 1024;
+
+/// #945 experiment 2/3 — granule-level checksums of a pinned page. Comma-separated
+/// `u64` weight keys whose retained device copy is hashed on admission and
+/// re-hashed on every subsequent hit, reporting the first step at which the bytes
+/// diverge from the admission snapshot and the first granule that changed. This is
+/// a pure read-back (device→host memcpy + FNV-1a); it needs no CUDA toolkit, which
+/// is what blocked settling #886. Unset on the shipped path, so the size-blind
+/// residency path is byte-identical with it off.
+const WEIGHT_PIN_CHECKSUM_ENV: &str = "ONNX_GENAI_WEIGHT_PIN_CHECKSUM";
+
+/// #945 experiment 1 — force a re-fill of a pinned page every `N` hits. When set to
+/// a positive integer `N`, every `N`-th time a *pinned* key is served as a hit its
+/// device copy is re-filled from the original host source (the same closure that
+/// filled it on admission). If corruption disappears under this and the host bytes
+/// are unchanged, the retained device copy was going stale — the decisive control
+/// for the retained-page-staleness hypothesis. A **null (unset) value performs no
+/// re-fill and reproduces the baseline byte-for-byte**, so a positive reading here
+/// cannot be an artifact of the knob's mere presence (measurement discipline #1).
+const WEIGHT_PIN_REFILL_EVERY_ENV: &str = "ONNX_GENAI_WEIGHT_PIN_REFILL_EVERY";
+
+/// Parsed checksum-probe key allow-list, cached once per process. `None` when the
+/// variable is unset/empty (the shipped path).
+fn pin_checksum_keys() -> Option<&'static HashSet<u64>> {
+    static CACHE: OnceLock<Option<HashSet<u64>>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let raw = std::env::var(WEIGHT_PIN_CHECKSUM_ENV).ok()?;
+            let keys: HashSet<u64> = raw
+                .split(',')
+                .filter_map(|token| token.trim().parse::<u64>().ok())
+                .collect();
+            (!keys.is_empty()).then_some(keys)
+        })
+        .as_ref()
+}
+
+/// Parsed force-re-fill cadence, cached once per process. `None`/`Some(0)` on the
+/// shipped path means never re-fill.
+fn pin_refill_every() -> Option<u64> {
+    static CACHE: OnceLock<Option<u64>> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var(WEIGHT_PIN_REFILL_EVERY_ENV)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .filter(|n| *n > 0)
+    })
+}
+
+/// FNV-1a hash of a byte slice, used only by the #945 granule-checksum probe.
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Compare a fresh per-granule hash of a pinned page against its admission
+/// snapshot and report the first divergence (#945 experiments 2/3). Emits one
+/// line per step so a run's whole trace is legible: `MATCH` while the retained
+/// device copy still equals what was filled on admission, `CHANGED` with the
+/// first differing granule (and its byte offset within the tensor) once it does
+/// not. Reporting the divergence *step* is meaningful here — the snapshot is the
+/// admission content, so a change is where the device bytes actually diverged,
+/// not a deferred detection of an earlier fault.
+fn report_pin_granule_diff(key: u64, step: u64, baseline: &[u64], current: &[u64]) {
+    if baseline == current {
+        eprintln!(
+            "weight_pin_checksum[#945]: key={key} step={step} MATCH granules={}",
+            baseline.len()
+        );
+        return;
+    }
+    let mut first_changed: Option<usize> = None;
+    let mut changed = 0usize;
+    for (index, (want, got)) in baseline.iter().zip(current.iter()).enumerate() {
+        if want != got {
+            first_changed.get_or_insert(index);
+            changed += 1;
+        }
+    }
+    let first = first_changed.unwrap_or(0);
+    eprintln!(
+        "weight_pin_checksum[#945]: key={key} step={step} CHANGED first_granule={first} \
+         byte_offset={} changed_granules={} of {} (len_delta={})",
+        first * PIN_PROBE_GRANULE_BYTES,
+        changed,
+        baseline.len(),
+        current.len() as isize - baseline.len() as isize,
+    );
+}
+
 /// Distinct weight keys currently held in the static pin set (a live gauge).
 static GLOBAL_PINNED_KEYS: AtomicU64 = AtomicU64::new(0);
 /// Distinct weight bytes held in the static pin set (a live gauge).
@@ -1802,6 +1900,14 @@ struct ResidencyInner {
     pinned: HashSet<u64>,
     /// Distinct bytes held by [`Self::pinned`], for the pin-budget cap.
     pinned_bytes: u64,
+    /// #945 diagnostics only (off unless a probe env is set). Per-key count of
+    /// hits served for a pinned key, i.e. the decode step index at which the
+    /// retained page was read without a re-fill.
+    pin_hit_step: HashMap<u64, u64>,
+    /// #945 diagnostics only. Per-granule FNV-1a hash of a pinned probe key's
+    /// device copy captured on admission, compared against on every later hit to
+    /// detect retained-page staleness.
+    pin_granule_hashes: HashMap<u64, Vec<u64>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2065,6 +2171,8 @@ impl CudaWeightResidency {
                 cold_pages: HashMap::new(),
                 pinned: HashSet::new(),
                 pinned_bytes: 0,
+                pin_hit_step: HashMap::new(),
+                pin_granule_hashes: HashMap::new(),
             }),
         }
     }
@@ -2122,6 +2230,8 @@ impl CudaWeightResidency {
                 cold_pages: HashMap::new(),
                 pinned: HashSet::new(),
                 pinned_bytes: 0,
+                pin_hit_step: HashMap::new(),
+                pin_granule_hashes: HashMap::new(),
             }),
         })
     }
@@ -2717,6 +2827,48 @@ impl CudaWeightResidency {
         let mut inner = self.lock();
         if let Some(existing) = inner.pages.get(&key).cloned() {
             inner.record_hit(key);
+            // #945 retained-page-staleness probes. Reached only when a probe env
+            // is set; the shipped path takes the early return above unchanged.
+            let is_pinned = inner.pinned.contains(&key);
+            let probe_checksum =
+                is_pinned && pin_checksum_keys().is_some_and(|keys| keys.contains(&key));
+            let refill_every = if is_pinned { pin_refill_every() } else { None };
+            if is_pinned && (probe_checksum || refill_every.is_some()) {
+                let step = {
+                    let counter = inner.pin_hit_step.entry(key).or_insert(0);
+                    *counter += 1;
+                    *counter
+                };
+                let baseline = if probe_checksum {
+                    inner.pin_granule_hashes.get(&key).cloned()
+                } else {
+                    None
+                };
+                drop(inner);
+                if let Some(baseline) = baseline {
+                    let current = self.hash_page_granules(existing.ptr, existing.len)?;
+                    report_pin_granule_diff(key, step, &baseline, &current);
+                }
+                if let Some(every) = refill_every
+                    && step % every == 0
+                {
+                    // Re-run the admission fill against the *same* device VA,
+                    // re-copying the original host source. If corruption
+                    // vanishes under this, the retained device copy had gone
+                    // stale (host bytes are unchanged) — the decisive control.
+                    self.runtime.synchronize().map_err(|error| {
+                        WeightHandleError::DeviceBinding(format!(
+                            "pin-refill compute drain: {error}"
+                        ))
+                    })?;
+                    fill(&self.runtime, existing.ptr)?;
+                    eprintln!(
+                        "weight_pin_refill[#945]: key={key} step={step} re-filled \
+                         pinned page from host source"
+                    );
+                }
+                return Ok(VmmAdmit::Page(existing));
+            }
             return Ok(VmmAdmit::Page(existing));
         }
         let allowance = inner.mapped_allowance.clone().ok_or_else(|| {
@@ -2843,6 +2995,23 @@ impl CudaWeightResidency {
             inner.record_bypassed_page_in(key, len as u64);
         } else {
             inner.insert_page(key, Arc::clone(&page), len as u64);
+        }
+        // #945 experiment 2/3: snapshot the pinned probe key's device copy right
+        // after its (one and only) admission fill, so every later hit can be
+        // compared against the bytes that were actually written here.
+        let want_baseline = !bypass
+            && inner.pinned.contains(&key)
+            && pin_checksum_keys().is_some_and(|keys| keys.contains(&key));
+        drop(inner);
+        if want_baseline {
+            let hashes = self.hash_page_granules(page.ptr, page.len)?;
+            eprintln!(
+                "weight_pin_checksum[#945]: key={key} admitted len={} granules={} \
+                 (baseline snapshot)",
+                page.len,
+                hashes.len()
+            );
+            self.lock().pin_granule_hashes.insert(key, hashes);
         }
         Ok(VmmAdmit::Page(page))
     }
@@ -3116,7 +3285,39 @@ impl CudaWeightResidency {
     fn get_hit(&self, key: u64) -> Option<Arc<CudaWeightPage>> {
         let mut inner = self.lock();
         if let Some(page) = inner.pages.get(&key).cloned() {
+            let is_pinned = inner.pinned.contains(&key);
+            // #945 experiment 1: when forcing a periodic re-fill of a pinned key,
+            // decline the fast-path hit here so the caller falls through to the
+            // fill path (`resident_vmm_with`), which re-copies the host source
+            // into the *same* resident device VA. The page is never evicted or
+            // re-admitted; only its bytes are rewritten. With the env unset this
+            // is skipped and the shipped hit path is byte-for-byte unchanged.
+            if is_pinned && pin_refill_every().is_some() {
+                return None;
+            }
             inner.record_hit(key);
+            // #945 experiment 2/3: the retained lm_head is read once per decode
+            // step through this fast path (its device pointer is not re-resolved
+            // elsewhere), so this is where a stale device copy would be observed.
+            if is_pinned && pin_checksum_keys().is_some_and(|keys| keys.contains(&key)) {
+                let step = {
+                    let counter = inner.pin_hit_step.entry(key).or_insert(0);
+                    *counter += 1;
+                    *counter
+                };
+                let baseline = inner.pin_granule_hashes.get(&key).cloned();
+                let (ptr, len) = (page.ptr, page.len);
+                drop(inner);
+                if let Some(baseline) = baseline {
+                    match self.hash_page_granules(ptr, len) {
+                        Ok(current) => report_pin_granule_diff(key, step, &baseline, &current),
+                        Err(error) => eprintln!(
+                            "weight_pin_checksum[#945]: key={key} step={step} readback failed: {error}"
+                        ),
+                    }
+                }
+                return Some(page);
+            }
             Some(page)
         } else {
             None
@@ -3130,6 +3331,31 @@ impl CudaWeightResidency {
         self.runtime.sync_copy_stream().map_err(|error| {
             WeightHandleError::DeviceBinding(format!("transfer stream sync: {error}"))
         })
+    }
+
+    /// #945 staleness probe: read the current device copy at `ptr..ptr+len` back
+    /// to the host and return a per-granule FNV-1a hash vector. Both streams are
+    /// drained first so the read-back observes every fill and kernel enqueued for
+    /// prior steps, not an in-flight snapshot. Diagnostic-only: reached only when
+    /// a `ONNX_GENAI_WEIGHT_PIN_CHECKSUM` key is set, never on the shipped path.
+    fn hash_page_granules(
+        &self,
+        ptr: CUdeviceptr,
+        len: usize,
+    ) -> Result<Vec<u64>, WeightHandleError> {
+        self.runtime.synchronize().map_err(|error| {
+            WeightHandleError::DeviceBinding(format!("pin-checksum compute drain: {error}"))
+        })?;
+        self.runtime.copy_stream().synchronize().map_err(|error| {
+            WeightHandleError::DeviceBinding(format!("pin-checksum copy drain: {error}"))
+        })?;
+        let mut host = vec![0u8; len];
+        // SAFETY: `ptr` owns `len` device bytes (it is a live resident page's VA);
+        // `dtoh` copies exactly `len` bytes and synchronizes before returning.
+        unsafe { self.runtime.dtoh(&mut host, ptr) }.map_err(|error| {
+            WeightHandleError::DeviceBinding(format!("pin-checksum dtoh: {error}"))
+        })?;
+        Ok(host.chunks(PIN_PROBE_GRANULE_BYTES).map(fnv1a_64).collect())
     }
 
     /// Insert a freshly paged-in `page` under `key`, evicting LRU pages to fit the
