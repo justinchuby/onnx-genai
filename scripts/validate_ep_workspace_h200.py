@@ -339,6 +339,53 @@ def select_ep_devices(ort, ep_name: str, device_index: int):
     return [devices[min(device_index, len(devices) - 1)]]
 
 
+def iobinding_device(args) -> tuple[str, int]:
+    """Where inputs and outputs are made resident.
+
+    The `attention` model runs on the CUDA plugin, so its I/O is pinned on the
+    device; the `addmul` self-test runs on the CPU shared-mock EP, so its I/O
+    stays on the host. Device-resident I/O is the whole point of this path: it
+    removes the per-`Run` host->device staging (and its transient `cuMemAlloc`s)
+    that ORT does when a session is fed host NumPy arrays every step, so the
+    only device allocation the `nsys` capture can then see is the executor's own
+    served-workspace scratch — which is what requirement 3 is actually about.
+    """
+    if args.model == "attention":
+        return "cuda", args.device_index
+    return "cpu", 0
+
+
+def bind_device_io(ort, sess, feeds, geom, model_kind, device_type, device_id):
+    """Bind every input to a device-resident `OrtValue` and bind the output to a
+    single reused device `OrtValue`, so repeated `run_with_iobinding` calls do
+    no per-`Run` input feeding and no per-`Run` output allocation.
+
+    Returns `(io_binding, output_ortvalue)`; the caller reads the output back to
+    the host once (outside any capture) via `output_ortvalue.numpy()`.
+    """
+    import numpy as np
+
+    io_binding = sess.io_binding()
+    # Kept alive by binding into `io_binding`; ORT holds no strong reference to
+    # the Python OrtValue, so returning the output value keeps the whole set
+    # reachable for the lifetime of the binding's use.
+    io_binding._nxrt_inputs = [
+        ort.OrtValue.ortvalue_from_numpy(np.ascontiguousarray(arr), device_type, device_id)
+        for arr in feeds.values()
+    ]
+    for name, value in zip(feeds.keys(), io_binding._nxrt_inputs):
+        io_binding.bind_ortvalue_input(name, value)
+
+    out_meta = sess.get_outputs()[0]
+    if model_kind == "attention":
+        out_shape = [geom.batch, geom.q_heads, geom.q_seq, geom.head_size]
+    else:
+        out_shape = list(feeds["x"].shape)
+    output_value = ort.OrtValue.ortvalue_from_shape_and_type(out_shape, np.float32, device_type, device_id)
+    io_binding.bind_ortvalue_output(out_meta.name, output_value)
+    return io_binding, output_value
+
+
 def run_phase(args) -> tuple[int, dict]:
     """Child phase: registers, runs and reports. Trace output goes to stderr,
     the JSON record to stdout, so the parent can read both."""
@@ -413,7 +460,18 @@ def run_phase(args) -> tuple[int, dict]:
             f"session providers = {providers}",
         )
 
-        actual = sess.run(None, feeds)[0]
+        # Feed via IOBinding with device-resident inputs and a reused device
+        # output, so ORT does not stage host arrays to the device every Run. The
+        # only per-step device allocation left for `nsys` to see is then the
+        # executor's served-workspace scratch, not a harness input-feed artifact.
+        io_device_type, io_device_id = iobinding_device(args)
+        result.data["io_binding"] = {"device_type": io_device_type, "device_id": io_device_id}
+        io_binding, output_value = bind_device_io(
+            ort, sess, feeds, geom, args.model, io_device_type, io_device_id
+        )
+
+        sess.run_with_iobinding(io_binding)
+        actual = output_value.numpy()
         compiled_after, placement_after = counters.compiled(), counters.placement()
         result.data["compiled_nodes_delta"] = compiled_after - compiled_before
         result.data["placement_first_run"] = placement_after - placement_before
@@ -449,13 +507,15 @@ def run_phase(args) -> tuple[int, dict]:
             f"max|out - ORT CPU| = {diff_cpu:.3e}",
         )
 
-        # Steady state: the region an nsys capture is expected to cover.
+        # Steady state: the region an nsys capture is expected to cover. The
+        # same IOBinding (device-resident inputs, reused device output) is
+        # replayed, so no per-step host->device feed happens inside the capture.
         for _ in range(args.warmup):
-            sess.run(None, feeds)
+            sess.run_with_iobinding(io_binding)
         steady_before = counters.placement()
         profiler = start_cuda_profiler() if args.cuda_profiler_range else None
         for _ in range(args.steps):
-            sess.run(None, feeds)
+            sess.run_with_iobinding(io_binding)
         if profiler is not None:
             profiler.stop()
         steady_delta = counters.placement() - steady_before
