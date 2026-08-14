@@ -2099,15 +2099,42 @@ into page-aligned transfer tiles.
 > isolated; settling it needs granule-level checksums across steps, and
 > `compute-sanitizer` is unavailable on this box.
 >
-> **Design consequence:** a **static** hot set — retain once, never evict, never
-> re-admit — provably does not exercise the corrupting path. #864's hybrid was built in
-> exactly that shape and confirmed it: 462 tool-calls of implementation, zero churn
-> needed, and the corruption it eventually hit came from a different mechanism entirely
-> (host-mapped read aperture, #912), never from evict-and-re-admit. Any **dynamic**
-> scheme that churns large weight pages (#866's elastic reclaim, #750 admission, any
-> future byte-aware policy) **must assert token identity rather than assume it.** The
-> default size-blind path is safe because it never retains large tensors, so the buggy
-> path is unreachable.
+> **Design consequence — FALSIFIED 2026-08-14 (#944/#945).** This entry previously
+> said a **static** hot set — retain once, never evict, never re-admit — *provably does
+> not exercise the corrupting path*. That is **false**. #944 pinned a single weight,
+> never evicted and never re-admitted it, and decode corrupted with the identical #886
+> signature: three correct tokens, then generation stops. Pinning is not a safety
+> property.
+>
+> What #944 established instead, and it is a far better lead than the claim it replaces:
+> the trigger is **one specific tensor** — key 919, 389,283,840 B = `152064 × 5120 × 0.5`,
+> the **int4-quantized lm_head / vocabulary projection**. Its own int4 scales (key 920,
+> ~1/8 the size, same layer, adjacent key) pinned alone are **safe**, as is a 35 MiB block
+> weight, as is pinning 67 tensors totalling 2.371 GB chosen by size threshold — the last
+> of which forces *strictly more* evict-and-re-admit (`htod` +11.8%, `page_ins_per_token`
+> 321 → 375) and stays byte-identical. **Churn mass is not the trigger; tensor selection
+> is.** The threshold rule is safe only because it structurally never reaches 919, which
+> is the last large tensor touched each step. CUDA graph is ruled out (corrupts with
+> `ONNX_GENAI_CUDA_GRAPH=0`).
+>
+> That lm_head is the tensor also explains the *shape* of the failure, which no previous
+> hypothesis did: it is the only weight that computes token identity, so everything
+> upstream can be exactly right and the tokens still wrong — and a stale logits projection
+> selecting EOS produces "three correct tokens then stop" rather than degenerating output.
+>
+> **Consequences for what rests on this.** #892's localisation (the corruption is
+> *evicting and re-admitting* large stable-slot residents) is **incomplete** — it may be
+> *a* corrupting path, it is not the only one. #912's hybrid safety argument invoked the
+> static-hot-set claim; the hybrid's own measurements remain valid, but that particular
+> justification for them does not. Leading hypothesis is retained-page staleness (filled
+> once, served as a hit every step, never re-filled) — stated as a hypothesis, not a
+> cause; #945 lists the four experiments that would settle it, two of which need no CUDA
+> toolkit.
+>
+> What survives unchanged: any **dynamic** scheme that churns large weight pages (#866's
+> elastic reclaim, #750 admission, any future byte-aware policy) **must assert token
+> identity rather than assume it** — and so must any static one. The default size-blind
+> path is safe because it never retains large tensors, so the buggy path is unreachable.
 >
 > **3. The residency gap is an *admission* problem, not an eviction problem
 > (#837/#886).** ~90% of the recoverable 1.158 GB/step is bypass traffic: 11% of
