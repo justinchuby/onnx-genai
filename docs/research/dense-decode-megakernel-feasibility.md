@@ -669,6 +669,115 @@ latency floor (megakernel §7, glue-under-replay §8, standalone skip-fold §8.6
 
 ---
 
+## 9. The "47 = launch-amortized floor" framing was INCOMPLETE — the int4 GEMV was a KERNEL-EFFICIENCY floor at 29% peak DRAM (measured, H200, `ncu`)
+
+§7–§8.7 concluded four times that decode is at a **launch-amortized latency floor** (~47.6 tok/s).
+That conclusion is correct about *launch/dispatch* overhead — graph replay already amortizes it, so
+every launch-collapse lever (megakernel, glue node-collapse, norm-into-GEMV) recovers ≈0. **But
+launch overhead is not the hardware limit.** The batch-1 decode roofline is HBM **bandwidth**:
+~15.37 GB of int4 weights ÷ 4.8 TB/s (H200 HBM3e) ≈ 3.2 ms/token ⇒ ~300 tok/s roofline; a well-tuned
+single-stream engine reaches ~100–180 tok/s. At 47 we are ~6× off roofline. That gap lives inside the
+int4 GEMV **kernel efficiency (achieved HBM bandwidth)** — a number we had *never* measured; every
+prior §7–§8.7 number was a *relative* timing between fusion variants.
+
+### 9.1 The money measurement (ncu, `--graph-profiling node`, dominant decode kernel)
+
+Dominant decode kernel = `matmul_nbits_gemv_f16_scales_f16_zp_splitk` (the per-layer Q/K/V/O/gate/up/down
+int4 GEMVs + the vocab-202048 lm_head). ncu on the H200 (GPU pinned idle, `CUDA_VISIBLE_DEVICES`):
+
+| Metric | Measured | Reading |
+| --- | --- | --- |
+| `dram__throughput.avg.pct_of_peak_sustained_elapsed` | **~29%** | **NOT bandwidth-saturated** — headroom exists |
+| `sm__throughput.avg.pct_of_peak_sustained_elapsed` | ~73% | SM pipes are the co-bottleneck |
+| achieved occupancy | ~91% | occupancy is NOT the problem |
+| stall: **Long Scoreboard** (global-load latency) | **~40.7%** (#1 stall) | classic latency-bound signature |
+| dequant-ALU pipe utilization | ~64.8% | **ALU co-bound** — dequant math competes with loads |
+| non-GEMV fraction of decode | ~39% | **Amdahl ceiling**: even a perfect GEMV caps end-to-end gain |
+
+**Interpretation:** the GEMV is **co-bound** — 40% Long-Scoreboard (load latency) AND 65% dequant-ALU.
+It is *not* purely latency-bound, so the textbook latency-hiding levers (more warps, deeper pipelines)
+were expected to help only partially, and the 39% non-GEMV tail Amdahl-caps end-to-end wins. Naïve
+roofline (close to 60–70% peak BW ⇒ ~1.3–1.6× ⇒ 60–75 tok/s) is an **upper** bound that ignores the
+ALU co-bound and the Amdahl tail.
+
+### 9.2 Three phased levers — BUILT & MEASURED (H200, steady, GPU-idle-pinned, `ONNX_GENAI_CUDA_GRAPH=1`)
+
+Baseline this pass: **~47.6–47.7 tok/s** (plain `..._zp_splitk`, K_SPLIT=2).
+
+**Phase A — higher-way split-K (2→4→8).** More cooperating warps per output column ⇒ more concurrent
+global loads to hide Long Scoreboard. Env-parametrized `ONNX_GENAI_GEMV_KSPLIT`.
+
+| K_SPLIT | tok/s | DRAM% (ncu) | dominant-kernel µs |
+| --- | --- | --- | --- |
+| 2 (baseline) | 47.3 | 29.4 | 56.0 |
+| 4 | 47.8 (+1%, noise) | 27.75 | 59.4 (slower) |
+| 8 | 45.4 (regression) | — | — |
+
+**Phase A = NO-GO.** Occupancy is already ~91% and the scheduler already has eligible warps
+(Not-Selected 18.6%), so adding warps does not reduce per-warp load latency; K=4 did *not* raise DRAM
+(it fell) and made the dominant kernel *slower*; K=8 regresses (too little K-work/warp ⇒ reduction+sync
+dominate).
+
+**Phase B — cp.async double-buffered weight loads (attacks the 40% Long Scoreboard directly).** Separate
+2-stage `cp.async.ca.shared.global` (4 B/lane) template, arch-guarded `#if __CUDA_ARCH__>=800` with a
+synchronous fallback, env `ONNX_GENAI_GEMV_CPASYNC`.
+
+| variant | tok/s |
+| --- | --- |
+| baseline (sync) K=2 | 47.6 |
+| cp.async K=2 | **41.2 (−13%)** |
+| cp.async K=4 | 41.0 |
+
+**Phase B = NO-GO.** The 4-byte-per-lane cp.async granularity is too small: per-group commit/wait +
+the extra shared round-trip cost more than the load latency they hide. A profitable cp.async needs a
+16 B/`.cg` async copy over a **Marlin-style tiled weight relayout** so each async transaction moves a
+full 128-bit sector — that is a from-scratch kernel, out of scope for this bounded pass.
+
+**Phase C — dequant-ALU relief.** The dequant (`int4x8_to_half2x4_sub`) **already** uses Marlin-style
+LOP3 (4×`lop3.b32` + debias) — that is *why* the ALU pipe is at 65%. The one remaining ALU lever is to
+**fold the per-block scale into the dequant's zp-subtract**: replace the plain `q=(code-zp)` then a
+separate `__hmul2(q, scale)` with a single `fma(code, scale, -zp*scale)`, dropping **4 `__hmul2` per 8
+weights** (~20% fewer fp16 ALU ops in the MAC). Env `ONNX_GENAI_GEMV_FOLDSCALE`.
+
+| variant | tok/s | Δ | dominant-kernel µs | DRAM% |
+| --- | --- | --- | --- | --- |
+| baseline | 47.7 | — | 56.0 | 29.4 |
+| **fold-scale K=2** | **48.9–49.0** | **+2.7%** | 53.4 (−5%) | 30.9 |
+| fold-scale K=4 | 48.7 | (no stacking) | — | — |
+
+**Phase C fold-scale = the only kernel-level win (+2.7%), but NOT byte-exact.** ncu confirms the
+mechanism: dominant kernel 56→53.4 µs, DRAM 29.4→30.9%, Long-Scoreboard *relatively* rose (the ALU
+relief shifts the balance back toward loads) — i.e. genuine ALU relief. On the **real** Muse-Glimmer-30B
+the greedy 128-token stream is **byte-identical** to baseline. **However** the fused `fma(code,scale,
+-zp·scale)` sums two fp16-rounded terms (`code·scale` + a pre-rounded `-zp·scale`) versus the plain
+path's exact integer `(code-zp)` then a single rounded multiply — so it is strictly less accurate per
+element. It **fails** the existing synthetic parity guard
+`fp16_gemv_matches_dequant_reference_phi_int4_zp_dims` (K=3072 N=3072, asymmetric zp): **worst rel
+0.104 vs the 5e-2 bound** (max-abs 1.19e-2 was *within* the 2.55e-2 abs bound — only the near-zero-column
+relative check fails). Plain split-K passes that guard.
+
+### 9.3 Verdict — the hoped 1.3–1.6× did NOT materialize; the GEMV is near its efficient design point
+
+- The "47 = launch floor" framing was **incomplete**: the real limit at 47 was a **kernel-efficiency
+  floor within the existing GEMV design** (29% peak DRAM), NOT hardware and NOT (only) launch overhead.
+- BUT the optimistic roofline (60–75 tok/s via split-K + cp.async) **over-estimated**: the kernel is
+  **ALU-co-bound** (65% dequant pipe), not purely latency-bound, so split-K (NO-GO) and small-granularity
+  cp.async (NO-GO, −13%) do not raise achieved DRAM. The dequant is **already** LOP3/Marlin-style.
+- **The only realized kernel-level lever is fold-scale (+2.7%)**, and it carries a per-element accuracy
+  cost (fails the asymmetric-zp parity guard at rel 0.104). It is shipped **opt-in, default OFF**
+  (`ONNX_GENAI_GEMV_FOLDSCALE=1`); production + CI stay on the exact plain split-K path. **Chew gates**
+  whether the +2.7% is worth flipping the default given the accuracy trade.
+- **Bigger single-GPU wins require a from-scratch Marlin-style int4 kernel** (16 B/`.cg` cp.async over a
+  tiled weight relayout, so the async pipeline actually amortizes) — a multi-week rewrite, not a bounded
+  lever. Beyond the kernel, the ~39% non-GEMV tail Amdahl-caps decode; the large multipliers
+  (speculative decoding, tensor-parallel) stack on top and are the higher-leverage next steps.
+
+Repro: `matmul_nbits.rs` fold-scale entries `..._foldscale_splitk` / `..._foldscale_zp_splitk`, gated by
+`gemv_foldscale_enabled()`; A/B with `ONNX_GENAI_GEMV_FOLDSCALE=1` vs unset on
+`profile_native --model <dir> --pipeline --ep cuda --backend native --steady --warmups 2 --runs 5 --tokens 128`.
+
+---
+
 - Env: `source /home/justinchu/onnx-genai/.cudaenv.sh`; `CUDA_VISIBLE_DEVICES=0 ONNX_GENAI_CUDA_DEVICE=0`.
 - Baseline/eager/op-mix: `profile_native` as in §1 (`ONNX_GENAI_CUDA_GRAPH=0/1`, `ONNX_GENAI_PROFILE_OPS=1`).
 - Phase B / P1.5 / P2-prototype micro-bench (throwaway, `#[ignore]`, never shipped):
