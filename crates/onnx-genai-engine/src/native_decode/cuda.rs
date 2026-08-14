@@ -367,6 +367,40 @@ fn ns_to_ms(ns: u64) -> f64 {
     ns as f64 / 1_000_000.0
 }
 
+/// Result of one [`NativeDecodeSession::leverb_phase0_capture_attempt`] call —
+/// a THROWAWAY Lever-B Phase-0 probe (leverb-phase0), not part of any shipping
+/// contract.
+#[cfg(all(test, feature = "cuda"))]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LeverBPhase0CaptureAttempt {
+    /// Query rows in the attempted forward (`k_max` for M=K, `1` for M=1).
+    pub rows: usize,
+    /// Committed past length the forward attended.
+    pub past_len: usize,
+    /// Physical KV bucket (`max_len`) the capture was frozen to.
+    pub bucket: usize,
+    /// Whether `try_capture_with_device_bindings` instantiated a device graph.
+    pub captured: bool,
+    /// Installed captured segment count (`1` = whole-subgraph, `>=2` = seamed).
+    pub segments: usize,
+    /// Decline reason when not captured, or a note when captured-with-caveat.
+    pub decline: Option<String>,
+    /// Device (allocations, frees) observed across the capture run — Phase-0
+    /// pass criterion (a) requires zero alloc/free inside the captured region.
+    pub alloc_delta: Option<(u64, u64)>,
+    /// Device (allocations, frees) observed across the Increment-0 pre-capture
+    /// warm forward at the M=K shape (grows the capture-safe scratch arena so
+    /// the captured region itself stays alloc-free). `None` for the raw Phase-0
+    /// probe, which performs no warm pass.
+    pub warm_alloc_delta: Option<(u64, u64)>,
+    /// Per-replay wall (ns), GPU-inclusive (synchronized by a logits read).
+    pub replay_walls_ns: Vec<u64>,
+    /// Increment-0 only: a compact summary of the eager seam nodes that split a
+    /// segmented M=K capture (`op_type[seam_reason] × count`), the root cause of
+    /// a >1-segment capture that never reaches the whole-graph replay fast path.
+    pub seam_summary: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CudaKvDebugStats {
     pub logical_len: usize,
@@ -859,6 +893,392 @@ impl NativeDecodeSession {
         state.set_logical_len(total_len)?;
         self.current_len = total_len;
         Ok(logits)
+    }
+
+    /// THROWAWAY Lever-B Phase-0 capture-stability probe (leverb-phase0).
+    ///
+    /// NOT wired into any decode path — invoked only by the `#[ignore]`d
+    /// `leverb_phase0_probe` test. It attempts to CUDA-graph capture a single
+    /// fixed-shape `[1, m]` (padded M=K) forward against the existing persistent
+    /// KV/mask/logits bindings and, if the capture instantiates, replays it
+    /// `replays` times, timing each replay wall (the replay is synchronized by a
+    /// D2H read of the logits binding, mirroring the real per-step logits sync).
+    ///
+    /// This measures Phase-0 pass criteria (a) "instantiates capture-safe" and
+    /// (c) "per-verify replay wall" on the REAL batched GQA/GEMM (`MatMulNBits`)
+    /// kernels — it does not hand-roll a toy graph. It deliberately does NOT
+    /// commit KV or advance the logical length: the captured/replayed forward
+    /// dirties device KV, and KV-commit correctness is explicitly out of Phase-0
+    /// scope, so the caller MUST discard the session afterwards.
+    #[cfg(all(test, feature = "cuda"))]
+    pub(crate) fn leverb_phase0_capture_attempt(
+        &mut self,
+        m: usize,
+        replays: usize,
+    ) -> anyhow::Result<LeverBPhase0CaptureAttempt> {
+        let past_len = self.current_len;
+        let total_len = past_len
+            .checked_add(m)
+            .context("leverb phase0 probe length overflow")?;
+        let token_input = self
+            .step_input_name(NativeStepInputSource::TokenIds)
+            .context("native CUDA decoder has no token input binding")?
+            .to_owned();
+        let position_input = self
+            .step_input_name(NativeStepInputSource::PositionIds)
+            .map(str::to_owned);
+
+        // Build the fixed padded `[1, m]` token/position inputs. Token *values*
+        // are irrelevant to Phase-0 (acceptance/KV correctness is out of scope);
+        // a constant id keeps the shape fixed so a captured graph can replay
+        // without re-instantiation.
+        let ids = vec![1_i64; m];
+        let input_ids = Tensor::from_i64(&[1, m], &ids)?;
+        let mut owned: Vec<(String, Tensor)> = Vec::with_capacity(2);
+        owned.push((token_input, input_ids));
+        if let Some(position_ids_name) = position_input {
+            owned.push((
+                position_ids_name,
+                self.build_step_positions(past_len, total_len)?,
+            ));
+        }
+
+        let state = self
+            .cuda
+            .as_mut()
+            .context("CUDA decode state is not initialized")?;
+        if total_len > state.capacity.max_len {
+            bail!("{}", state.capacity_exceeded_error(total_len));
+        }
+        // Keep the whole probe inside one physical bucket: growth is a capture
+        // boundary and is exercised separately by the M=1 stability loop.
+        let grew = state.ensure_capacity(&mut self.session, total_len)?;
+        state.extend_mask(if grew { 0 } else { past_len }, total_len, total_len)?;
+        // Start from a clean graph slot so the capture attempt is unambiguous.
+        state.invalidate_graph(&mut self.session)?;
+
+        let borrowed = owned
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+            .collect::<Vec<_>>();
+        let base = state.base_binding_count;
+
+        let alloc_before = self.session.device_allocation_counts();
+        let capture = self
+            .session
+            .try_capture_with_device_bindings(&borrowed, &mut state.bindings[..base])?;
+        let alloc_after = self.session.device_allocation_counts();
+        let alloc_delta = match (alloc_before, alloc_after) {
+            (Some(before), Some(after)) => Some((
+                after.allocations.saturating_sub(before.allocations),
+                after.frees.saturating_sub(before.frees),
+            )),
+            _ => None,
+        };
+        let segments = self.session.captured_graph_segment_count();
+
+        let mut attempt = LeverBPhase0CaptureAttempt {
+            rows: m,
+            past_len,
+            bucket: state.max_len,
+            captured: false,
+            segments,
+            decline: None,
+            alloc_delta,
+            warm_alloc_delta: None,
+            replay_walls_ns: Vec::new(),
+            seam_summary: None,
+        };
+
+        match capture {
+            DeviceGraphCaptureResult::Captured(outputs) => {
+                attempt.captured = true;
+                if outputs.iter().any(Option::is_some) {
+                    // A materialized (host-returned) output means the padded M=K
+                    // logits do not fit the single-token logits binding; still a
+                    // capture, but record it as a decline note for the findings.
+                    attempt.decline = Some(
+                        "captured, but the forward materialized a host output (padded logits do not fit the single-token logits binding)".to_string(),
+                    );
+                }
+                for _ in 0..replays {
+                    let start = std::time::Instant::now();
+                    let still_valid = self
+                        .session
+                        .replay_device_graph(&mut state.bindings[..base])?;
+                    // Force stream completion with a D2H read of the logits
+                    // binding (the real hot path syncs on the per-step logits
+                    // read); this makes the wall the GPU-inclusive replay time.
+                    let _ = state.bindings[state.logits_binding].read_bytes()?;
+                    attempt
+                        .replay_walls_ns
+                        .push(start.elapsed().as_nanos() as u64);
+                    if !still_valid {
+                        break;
+                    }
+                }
+            }
+            DeviceGraphCaptureResult::NotCapturable(report) => {
+                attempt.decline = Some(report.to_string());
+            }
+        }
+        // Leave the graph slot clean; state is intentionally left dirty.
+        state.invalidate_graph(&mut self.session)?;
+        Ok(attempt)
+    }
+
+    /// THROWAWAY Lever-B **Increment-0** capture attempt (leverb-increment0):
+    /// the same real M=K forward as [`Self::leverb_phase0_capture_attempt`], but
+    /// with the three capture-enablement fixes the Phase-0 (a)-FAIL identified,
+    /// applied as a test-only overlay (NOT wired into the decode path):
+    ///
+    ///   1. **Persistent padded `[1, m, vocab]` logits binding.** The production
+    ///      logits binding is single-token `[1, 1, vocab]`, so an M=K forward's
+    ///      `[1, m, vocab]` logits do not fit and materialize to the host — which
+    ///      makes capture reject ("every graph output must use a persistent
+    ///      device binding"). A fresh padded output binding for the same logits
+    ///      output name lands them in device memory instead.
+    ///   2. **Alloc-free captured region via a pre-capture warm forward at the
+    ///      M=K shape.** The capture-safe scratch arena is grown by a normal
+    ///      `run_with_device_bindings` at `[1, m]` *before* `BeginCapture`, so the
+    ///      captured region itself performs no device alloc/free (#854/#867).
+    ///   3. **KV-symbol pin** — inherited: the constructor already pins the
+    ///      fixed-capacity KV seq symbols for a graph-enabled session, so the
+    ///      batched GQA attention nodes admit capture at any query width `m`.
+    ///
+    /// Like the Phase-0 probe this dirties device KV (KV-commit correctness is
+    /// out of scope) and does NOT advance the logical length, so the caller MUST
+    /// discard the session afterwards. It drives the real batched GQA/GEMM M=K
+    /// kernels through the real persistent KV/mask bindings — it does not
+    /// hand-roll a toy graph. The padded token/position/logits bindings are
+    /// swapped into the persistent binding vector for the duration of the
+    /// attempt and restored before returning.
+    #[cfg(all(test, feature = "cuda"))]
+    pub(crate) fn leverb_increment0_capture_attempt(
+        &mut self,
+        m: usize,
+        replays: usize,
+    ) -> anyhow::Result<LeverBPhase0CaptureAttempt> {
+        let past_len = self.current_len;
+        let total_len = past_len
+            .checked_add(m)
+            .context("leverb increment0 probe length overflow")?;
+        let token_input = self
+            .step_input_name(NativeStepInputSource::TokenIds)
+            .context("native CUDA decoder has no token input binding")?
+            .to_owned();
+        let position_input = self
+            .step_input_name(NativeStepInputSource::PositionIds)
+            .map(str::to_owned);
+
+        // Resolve the immutable facts we need from state before allocating the
+        // padded bindings (which borrows `self.session`); the two live on
+        // disjoint fields so both borrows coexist.
+        let state = self
+            .cuda
+            .as_mut()
+            .context("CUDA decode state is not initialized")?;
+        if total_len > state.capacity.max_len {
+            bail!("{}", state.capacity_exceeded_error(total_len));
+        }
+        let grew = state.ensure_capacity(&mut self.session, total_len)?;
+        state.extend_mask(if grew { 0 } else { past_len }, total_len, total_len)?;
+        state.invalidate_graph(&mut self.session)?;
+
+        let bucket = state.max_len;
+        let vocab = *state
+            .logits_shape
+            .last()
+            .context("CUDA logits shape has no vocabulary dimension")?;
+        let logits_dtype = state.logits_dtype;
+        let logits_index = state.logits_binding;
+        let input_ids_index = state.input_ids_binding;
+        let position_ids_index = state.position_ids_binding;
+        let logits_name = state.bindings[logits_index]
+            .output_name()
+            .context("logits binding has no output name")?
+            .to_owned();
+
+        // ---- FIX 1: persistent padded [1, m, vocab] logits device binding ----
+        let padded_logits = self.session.allocate_device_output_binding(
+            logits_name,
+            logits_dtype,
+            vec![1, m, vocab],
+            vec![1, m, vocab],
+        )?;
+        // ---- padded [1, m] token binding (device-resident, like run_one_token,
+        // so the capture takes no owned host inputs) ----
+        let mut padded_ids = self.session.allocate_device_binding(
+            token_input,
+            None::<String>,
+            DataType::Int64,
+            vec![1, m],
+            vec![1, m],
+        )?;
+        let mut token_bytes = Vec::with_capacity(m * 8);
+        for _ in 0..m {
+            // Token value is irrelevant to capture/timing (KV correctness is out
+            // of scope); a constant keeps the device buffer fixed for replay.
+            token_bytes.extend_from_slice(&1_i64.to_ne_bytes());
+        }
+        padded_ids.write_bytes(0, &token_bytes)?;
+
+        let padded_positions = if let Some(position_input) = position_input.as_deref() {
+            let mut binding = self.session.allocate_device_binding(
+                position_input,
+                None::<String>,
+                DataType::Int64,
+                vec![1, m],
+                vec![1, m],
+            )?;
+            let mut pos_bytes = Vec::with_capacity(m * 8);
+            for pos in past_len..total_len {
+                pos_bytes.extend_from_slice(&(pos as i64).to_ne_bytes());
+            }
+            binding.write_bytes(0, &pos_bytes)?;
+            Some(binding)
+        } else {
+            None
+        };
+
+        // Swap the padded bindings into the persistent vector. The originals are
+        // parked and restored before returning.
+        let orig_ids = std::mem::replace(&mut state.bindings[input_ids_index], padded_ids);
+        let orig_logits = std::mem::replace(&mut state.bindings[logits_index], padded_logits);
+        let orig_positions = position_ids_index
+            .zip(padded_positions)
+            .map(|(index, binding)| {
+                (
+                    index,
+                    std::mem::replace(&mut state.bindings[index], binding),
+                )
+            });
+
+        // ---- FIX 2: warm the capture-safe scratch arena at the M=K shape so the
+        // captured region below performs no device alloc/free ----
+        let warm_before = self.session.device_allocation_counts();
+        let warm = self
+            .session
+            .run_with_device_bindings(&[], &mut state.bindings[..]);
+        let warm_after = self.session.device_allocation_counts();
+        if let Err(error) = warm {
+            // Restore before surfacing the error.
+            let restored_ids = std::mem::replace(&mut state.bindings[input_ids_index], orig_ids);
+            let restored_logits = std::mem::replace(&mut state.bindings[logits_index], orig_logits);
+            drop(restored_ids);
+            drop(restored_logits);
+            if let Some((index, binding)) = orig_positions {
+                drop(std::mem::replace(&mut state.bindings[index], binding));
+            }
+            state.invalidate_graph(&mut self.session)?;
+            return Err(error).context("leverb increment0 warm forward at M=K");
+        }
+        let warm_alloc_delta = match (warm_before, warm_after) {
+            (Some(before), Some(after)) => Some((
+                after.allocations.saturating_sub(before.allocations),
+                after.frees.saturating_sub(before.frees),
+            )),
+            _ => None,
+        };
+
+        // ---- Capture the real M=K forward against the full device binding set
+        // (KV + mask + token + position + padded logits), no owned host inputs. ----
+        let alloc_before = self.session.device_allocation_counts();
+        let capture = self
+            .session
+            .try_capture_with_device_bindings(&[], &mut state.bindings[..]);
+        let alloc_after = self.session.device_allocation_counts();
+        let alloc_delta = match (alloc_before, alloc_after) {
+            (Some(before), Some(after)) => Some((
+                after.allocations.saturating_sub(before.allocations),
+                after.frees.saturating_sub(before.frees),
+            )),
+            _ => None,
+        };
+
+        let segments = self.session.captured_graph_segment_count();
+        // Summarize the eager seam nodes that split a segmented capture: the
+        // root cause of a >1-segment M=K graph that never reaches the whole-
+        // subgraph replay fast path. Fold to `op_type[seam] × count`.
+        let seam_summary = {
+            let mut counts: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            for decline in self.session.capture_segmentation() {
+                let seam = decline
+                    .seam_reason
+                    .map(|reason| format!("{reason:?}"))
+                    .unwrap_or_else(|| "graph".to_string());
+                *counts
+                    .entry(format!("{}[{}]", decline.op_type, seam))
+                    .or_default() += 1;
+            }
+            if counts.is_empty() {
+                None
+            } else {
+                Some(
+                    counts
+                        .into_iter()
+                        .map(|(key, count)| format!("{key}×{count}"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                )
+            }
+        };
+
+        let mut attempt = LeverBPhase0CaptureAttempt {
+            rows: m,
+            past_len,
+            bucket,
+            captured: false,
+            segments,
+            decline: None,
+            alloc_delta,
+            warm_alloc_delta,
+            replay_walls_ns: Vec::new(),
+            seam_summary,
+        };
+
+        match capture {
+            Ok(DeviceGraphCaptureResult::Captured(outputs)) => {
+                attempt.captured = true;
+                if outputs.iter().any(Option::is_some) {
+                    attempt.decline = Some(
+                        "captured, but still materialized a host output (padded logits binding did not absorb every output)".to_string(),
+                    );
+                }
+                for _ in 0..replays {
+                    let start = std::time::Instant::now();
+                    let still_valid = self.session.replay_device_graph(&mut state.bindings[..])?;
+                    // Sync on the padded logits D2H read (the real hot path syncs
+                    // on the per-step logits read), making the wall GPU-inclusive.
+                    let _ = state.bindings[logits_index].read_bytes()?;
+                    attempt
+                        .replay_walls_ns
+                        .push(start.elapsed().as_nanos() as u64);
+                    if !still_valid {
+                        break;
+                    }
+                }
+            }
+            Ok(DeviceGraphCaptureResult::NotCapturable(report)) => {
+                attempt.decline = Some(report.to_string());
+            }
+            Err(error) => {
+                attempt.decline = Some(format!("capture attempt errored: {error}"));
+            }
+        }
+
+        // Restore the persistent bindings and leave the graph slot clean; the KV
+        // state is intentionally left dirty (caller discards the session).
+        let restored_ids = std::mem::replace(&mut state.bindings[input_ids_index], orig_ids);
+        let restored_logits = std::mem::replace(&mut state.bindings[logits_index], orig_logits);
+        drop(restored_ids);
+        drop(restored_logits);
+        if let Some((index, binding)) = orig_positions {
+            drop(std::mem::replace(&mut state.bindings[index], binding));
+        }
+        state.invalidate_graph(&mut self.session)?;
+        Ok(attempt)
     }
 
     pub(crate) fn decode_cuda(

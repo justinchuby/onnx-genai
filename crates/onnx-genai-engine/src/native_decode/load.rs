@@ -299,6 +299,21 @@ impl NativeDecodeSession {
         )
     }
 
+    /// Test-support (leverb-phase0): load with an explicit [`ModelIoSpec`] and
+    /// custom CUDA options but no offload governor. Lets the `#[ignore]`d Lever-B
+    /// probe drive a real metadata-declared decoder (e.g. glm-4-9b, whose two
+    /// rank-2 int64 inputs are ambiguous under shape-only autoderive) directly at
+    /// the `NativeDecodeSession` layer, without standing up a full pipeline.
+    #[cfg(all(test, feature = "cuda"))]
+    pub(crate) fn load_with_cuda_options_and_io_spec(
+        path: impl AsRef<Path>,
+        device: NativeDecodeDevice,
+        options: NativeDecodeCudaOptions,
+        io: Option<&ModelIoSpec>,
+    ) -> anyhow::Result<Self> {
+        Self::load_with_cuda_options_and_io(path, device, options, io, None, None)
+    }
+
     fn load_with_cuda_options_and_io(
         path: impl AsRef<Path>,
         device: NativeDecodeDevice,
