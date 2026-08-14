@@ -46,16 +46,19 @@
 //! The tensor-core kernel uses `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32`.
 //! For the B (weight) operand, a warp lane `l` (with `groupID = l>>2`,
 //! `tid = l&3`) owns column `n = ncol0 + groupID` and the four K values
-//! `{2·tid, 2·tid+1, 2·tid+8, 2·tid+9}` of each 16-wide K slice. We repack so
-//! each lane reads its four nibbles as two contiguous bytes:
+//! `{2·tid, 2·tid+1, 2·tid+8, 2·tid+9}` of each 16-wide K slice. We repack in
+//! **8-column n-tiles** so the 32 lanes of a warp read one contiguous 64-byte
+//! chunk per K slice — lane `l` reads exactly bytes `[2·l, 2·l+1]`:
 //!
-//! `repacked[(n * (K/16) + slice) * 8 + tid*2 + {0,1}]`
+//! `repacked[(n_tile * (K/16) + slice) * 64 + groupID*8 + tid*2 + {0,1}]`
 //!   byte+0 = code(k=2·tid) | code(k=2·tid+1) << 4
 //!   byte+1 = code(k=2·tid+8) | code(k=2·tid+9) << 4
 //!
-//! where `slice = k/16` runs `0..K/16`. Total size is `N*K/2` bytes — identical
-//! to the source `packed`, it is a *reordering*, not an expansion. `scales` and
-//! `zero_points` keep their original `[N, k_blocks]` indexing.
+//! for column `n = n_tile*8 + groupID`, where `slice = k/16` runs `0..K/16` and
+//! `n_tile = 0..ceil(N/8)`. N is padded up to a multiple of 8 (tail columns hold
+//! zero codes and are never stored to the output). Total size is
+//! `ceil(N/8)*8 * (K/16) * 8` bytes ≈ `N*K/2` — a *reordering*, not an expansion.
+//! `scales` and `zero_points` keep their original `[N, k_blocks]` indexing.
 
 use std::ffi::c_void;
 
@@ -102,8 +105,12 @@ pub fn repack_int4_weights(packed: &[u8], n: usize, k: usize, group_size: usize)
     let k_blocks = k / group_size;
     let blob = group_size / 2;
     let slices = k / 16;
-    let mut out = vec![0u8; n * slices * 8];
+    let n_tiles = n.div_ceil(8);
+    let mut out = vec![0u8; n_tiles * slices * 64];
     let code_at = |col: usize, kk: usize| -> u8 {
+        if col >= n {
+            return 0;
+        }
         let block = kk / group_size;
         let within = kk % group_size;
         let byte = packed[(col * k_blocks + block) * blob + within / 2];
@@ -113,16 +120,21 @@ pub fn repack_int4_weights(packed: &[u8], n: usize, k: usize, group_size: usize)
             byte >> 4
         }
     };
-    for col in 0..n {
+    for n_tile in 0..n_tiles {
         for slice in 0..slices {
             let kbase = slice * 16;
-            let dst = (col * slices + slice) * 8;
-            for tid in 0..4usize {
-                let lo = code_at(col, kbase + tid * 2) | (code_at(col, kbase + tid * 2 + 1) << 4);
-                let hi =
-                    code_at(col, kbase + tid * 2 + 8) | (code_at(col, kbase + tid * 2 + 9) << 4);
-                out[dst + tid * 2] = lo;
-                out[dst + tid * 2 + 1] = hi;
+            let tile_base = (n_tile * slices + slice) * 64;
+            for group_id in 0..8usize {
+                let col = n_tile * 8 + group_id;
+                for tid in 0..4usize {
+                    let lo =
+                        code_at(col, kbase + tid * 2) | (code_at(col, kbase + tid * 2 + 1) << 4);
+                    let hi = code_at(col, kbase + tid * 2 + 8)
+                        | (code_at(col, kbase + tid * 2 + 9) << 4);
+                    let dst = tile_base + group_id * 8 + tid * 2;
+                    out[dst] = lo;
+                    out[dst + 1] = hi;
+                }
             }
         }
     }
@@ -238,10 +250,14 @@ extern "C" __global__ void matmul_nbits_marlin_gemm_f16(
             const unsigned ra2 = pack_half2(a4, a5);
             const unsigned ra3 = pack_half2(a6, a7);
 
-            // B fragment (16x8), col-major. Weights centered (code - zp), unscaled.
+            // B fragment (16x8), col-major. Weights centered (code - zp),
+            // unscaled. Coalesced: lane l reads bytes [2l, 2l+1] of the warp's
+            // 64-byte n-tile chunk for this slice.
+            const int n_tile_idx = (int)blockIdx.x * ((int)blockDim.x / 32) + warp;
             unsigned char blo = 0, bhi = 0;
-            if (nb_col < n) {
-                const long base = ((long)nb_col * slices + slice) * 8 + tid * 2;
+            {
+                const long base = ((long)n_tile_idx * slices + slice) * 64
+                    + group_id * 8 + tid * 2;
                 blo = weights[base];
                 bhi = weights[base + 1];
             }
@@ -422,20 +438,27 @@ mod tests {
             }
 
             let repacked = repack_int4_weights(&packed, n, k, group);
-            assert_eq!(repacked.len(), n * (k / 16) * 8);
-
             let slices = k / 16;
-            for col in 0..n {
+            let n_tiles = n.div_ceil(8);
+            assert_eq!(repacked.len(), n_tiles * slices * 64);
+
+            for n_tile in 0..n_tiles {
                 for slice in 0..slices {
-                    let dst = (col * slices + slice) * 8;
-                    for tid in 0..4usize {
-                        let kbase = slice * 16;
-                        let lo = repacked[dst + tid * 2];
-                        let hi = repacked[dst + tid * 2 + 1];
-                        assert_eq!(lo & 15, codes[col * k + kbase + tid * 2] & 15);
-                        assert_eq!(lo >> 4, codes[col * k + kbase + tid * 2 + 1] & 15);
-                        assert_eq!(hi & 15, codes[col * k + kbase + tid * 2 + 8] & 15);
-                        assert_eq!(hi >> 4, codes[col * k + kbase + tid * 2 + 9] & 15);
+                    let tile_base = (n_tile * slices + slice) * 64;
+                    let kbase = slice * 16;
+                    for group_id in 0..8usize {
+                        let col = n_tile * 8 + group_id;
+                        for tid in 0..4usize {
+                            let lo = repacked[tile_base + group_id * 8 + tid * 2];
+                            let hi = repacked[tile_base + group_id * 8 + tid * 2 + 1];
+                            let expect = |kk: usize| -> u8 {
+                                if col < n { codes[col * k + kk] & 15 } else { 0 }
+                            };
+                            assert_eq!(lo & 15, expect(kbase + tid * 2));
+                            assert_eq!(lo >> 4, expect(kbase + tid * 2 + 1));
+                            assert_eq!(hi & 15, expect(kbase + tid * 2 + 8));
+                            assert_eq!(hi >> 4, expect(kbase + tid * 2 + 9));
+                        }
                     }
                 }
             }
@@ -448,5 +471,399 @@ mod tests {
         assert!(device_supports_marlin((9, 0)));
         assert!(!device_supports_marlin((7, 5)));
         assert!(!device_supports_marlin((7, 0)));
+    }
+
+    // ---- GPU parity + microbench (require a live CUDA device; #[ignore]) ----
+
+    use std::sync::Arc;
+
+    use crate::runtime::CudaRuntime;
+
+    fn runtime() -> Option<Arc<CudaRuntime>> {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let rt = std::panic::catch_unwind(|| CudaRuntime::new(0).ok().map(Arc::new))
+            .ok()
+            .flatten();
+        std::panic::set_hook(previous);
+        rt
+    }
+
+    fn as_bytes<T: Copy>(values: &[T]) -> &[u8] {
+        // SAFETY: reinterpreting a POD slice as raw bytes for a host->device copy.
+        unsafe {
+            std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+        }
+    }
+
+    fn as_bytes_mut<T: Copy>(values: &mut [T]) -> &mut [u8] {
+        // SAFETY: reinterpreting a POD slice as raw bytes for a device->host copy.
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                values.as_mut_ptr().cast::<u8>(),
+                std::mem::size_of_val(values),
+            )
+        }
+    }
+
+    /// Result of a parity run: worst absolute error, worst relative error, and
+    /// the max magnitude of the oracle output (for scaling the tolerance).
+    struct Parity {
+        worst_abs: f32,
+        worst_rel: f32,
+        max_out: f32,
+        all_finite: bool,
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_marlin_parity(
+        rt: &Arc<CudaRuntime>,
+        m: usize,
+        k: usize,
+        n: usize,
+        group_size: usize,
+        scales_fp16: bool,
+        explicit_zp: bool,
+        seed: u64,
+    ) -> Parity {
+        use half::f16;
+
+        let k_blocks = k / group_size;
+        let blob = group_size / 2;
+        let zp_row_bytes = k_blocks.div_ceil(2);
+
+        let mut state = seed;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+
+        // fp16 activations + their fp16-as-f32 twin for the shared-input oracle.
+        let mut activation_f16 = vec![f16::ZERO; m * k];
+        let mut activation_ref = vec![0.0f32; m * k];
+        for (h, f) in activation_f16.iter_mut().zip(activation_ref.iter_mut()) {
+            let v = f16::from_f32(next());
+            *h = v;
+            *f = v.to_f32();
+        }
+
+        // int4 codes 0..15, packed in the ONNX N-major layout.
+        let mut codes = vec![0u8; n * k];
+        for c in codes.iter_mut() {
+            *c = ((next() * 0.5 + 0.5) * 15.0).round().clamp(0.0, 15.0) as u8;
+        }
+        let mut packed = vec![0u8; n * k_blocks * blob];
+        for col in 0..n {
+            for block in 0..k_blocks {
+                for pair in 0..blob {
+                    let lo = codes[col * k + block * group_size + pair * 2] & 15;
+                    let hi = codes[col * k + block * group_size + pair * 2 + 1] & 15;
+                    packed[(col * k_blocks + block) * blob + pair] = lo | (hi << 4);
+                }
+            }
+        }
+        let repacked = repack_int4_weights(&packed, n, k, group_size);
+
+        // Asymmetric zero points (nibble-packed) or symmetric default 8.
+        let mut zp_codes = vec![8i32; n * k_blocks];
+        let mut zp_packed = vec![0u8; n * zp_row_bytes];
+        if explicit_zp {
+            for c in zp_codes.iter_mut() {
+                *c = ((next() * 0.5 + 0.5) * 15.0).round().clamp(0.0, 15.0) as i32;
+            }
+            for col in 0..n {
+                for block in 0..k_blocks {
+                    let code = (zp_codes[col * k_blocks + block] & 15) as u8;
+                    let byte = &mut zp_packed[col * zp_row_bytes + block / 2];
+                    if block & 1 == 0 {
+                        *byte = (*byte & 0xf0) | code;
+                    } else {
+                        *byte = (*byte & 0x0f) | (code << 4);
+                    }
+                }
+            }
+        }
+
+        // Per (col, block) scales, rounded to storage dtype (shared by oracle).
+        let mut scale_ref = vec![0.0f32; n * k_blocks];
+        let mut scale_f16 = vec![f16::ZERO; n * k_blocks];
+        let mut scale_f32 = vec![0.0f32; n * k_blocks];
+        for i in 0..n * k_blocks {
+            let raw = 0.015 + 0.01 * (next() * 0.5 + 0.5);
+            if scales_fp16 {
+                let h = f16::from_f32(raw);
+                scale_f16[i] = h;
+                scale_ref[i] = h.to_f32();
+            } else {
+                scale_f32[i] = raw;
+                scale_ref[i] = raw;
+            }
+        }
+
+        // f64 dequant-and-matmul oracle: Y[r,c] = sum_k A[r,k]*(code-zp)*scale.
+        let mut expected = vec![0.0f32; m * n];
+        for r in 0..m {
+            for c in 0..n {
+                let mut acc = 0.0f64;
+                for block in 0..k_blocks {
+                    let scale = scale_ref[c * k_blocks + block] as f64;
+                    let zero = zp_codes[c * k_blocks + block];
+                    for within in 0..group_size {
+                        let depth = block * group_size + within;
+                        let q = codes[c * k + depth] as i32 - zero;
+                        acc += activation_ref[r * k + depth] as f64 * q as f64 * scale;
+                    }
+                }
+                expected[r * n + c] = acc as f32;
+            }
+        }
+
+        let activation_dev = rt.alloc_raw(activation_f16.len() * 2).unwrap();
+        let weights_dev = rt.alloc_raw(repacked.len()).unwrap();
+        let scales_dev = rt
+            .alloc_raw(n * k_blocks * if scales_fp16 { 2 } else { 4 })
+            .unwrap();
+        let zp_dev = rt.alloc_raw(zp_packed.len().max(1)).unwrap();
+        let output_dev = rt.alloc_raw(m * n * 2).unwrap();
+
+        // SAFETY: each device buffer was sized for its source slice.
+        unsafe {
+            rt.htod(as_bytes(&activation_f16), activation_dev).unwrap();
+            rt.htod(&repacked, weights_dev).unwrap();
+            if scales_fp16 {
+                rt.htod(as_bytes(&scale_f16), scales_dev).unwrap();
+            } else {
+                rt.htod(as_bytes(&scale_f32), scales_dev).unwrap();
+            }
+            if explicit_zp {
+                rt.htod(&zp_packed, zp_dev).unwrap();
+            }
+        }
+
+        let args = MarlinGemmArgs {
+            activation: activation_dev,
+            weights: weights_dev,
+            scales: scales_dev,
+            zero_points: explicit_zp.then_some(zp_dev),
+            bias: None,
+            output: output_dev,
+            m,
+            k,
+            n,
+            group_size,
+            scales_fp16,
+            bias_post_round: false,
+            bias_row_stride: 0,
+        };
+        launch_marlin_gemm(rt, &args).unwrap();
+        rt.synchronize().unwrap();
+
+        let mut got = vec![f16::ZERO; m * n];
+        // SAFETY: output_dev holds m*n fp16 values.
+        unsafe {
+            rt.dtoh(as_bytes_mut(&mut got), output_dev).unwrap();
+        }
+
+        // SAFETY: each pointer came from alloc_raw above and is freed once.
+        unsafe {
+            rt.free_raw(activation_dev).unwrap();
+            rt.free_raw(weights_dev).unwrap();
+            rt.free_raw(scales_dev).unwrap();
+            rt.free_raw(zp_dev).unwrap();
+            rt.free_raw(output_dev).unwrap();
+        }
+
+        let mut p = Parity {
+            worst_abs: 0.0,
+            worst_rel: 0.0,
+            max_out: 0.0,
+            all_finite: true,
+        };
+        for (g, e) in got.iter().zip(expected.iter()) {
+            let g = g.to_f32();
+            if !g.is_finite() {
+                p.all_finite = false;
+            }
+            let abs = (g - e).abs();
+            let rel = abs / e.abs().max(1e-1);
+            p.worst_abs = p.worst_abs.max(abs);
+            p.worst_rel = p.worst_rel.max(rel);
+            p.max_out = p.max_out.max(e.abs());
+        }
+        p
+    }
+
+    /// GPU parity vs an f64 dequant→GEMM oracle across M, group sizes, scale
+    /// dtype, and symmetric/asymmetric zero points. The relayout reorders partial
+    /// sums, so the contract is tolerance-based (not byte-exact): fp16 activation
+    /// × fp16-centered weight with fp32 tensor-core accumulation and per-group
+    /// scale-after-accumulate. Relative tolerance is generous because the oracle
+    /// runs in f64; the residual reflects only fp16 input rounding + accumulation
+    /// order, which is exactly what Chew's numerics gate assesses.
+    #[test]
+    #[ignore = "requires a live CUDA device (SM80+)"]
+    fn marlin_parity_vs_f64_oracle() {
+        let Some(rt) = runtime() else {
+            eprintln!("skipping: CUDA runtime unavailable");
+            return;
+        };
+        if rt.require_nvrtc_half_headers("marlin").is_err() {
+            eprintln!("skipping: fp16 NVRTC headers unavailable");
+            return;
+        }
+        if !device_supports_marlin(rt.capabilities().compute_capability()) {
+            eprintln!("skipping: device is not SM80+");
+            return;
+        }
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        // (M, K, N) picks: M sweeps the 1->cliff region; K/N cover ragged tails.
+        for &(m, k, n) in &[
+            (1usize, 4096usize, 128usize),
+            (2, 4096, 96),
+            (7, 2048, 130),
+            (16, 4096, 256),
+            (33, 1024, 64),
+            (64, 1536, 200),
+        ] {
+            for &group in &[32usize, 128, 64, 16] {
+                if k % group != 0 {
+                    continue;
+                }
+                for &scales_fp16 in &[true, false] {
+                    for &zp in &[false, true] {
+                        seed = seed.wrapping_add(0x1000);
+                        let p = run_marlin_parity(&rt, m, k, n, group, scales_fp16, zp, seed);
+                        assert!(
+                            p.all_finite,
+                            "non-finite output for M={m} K={k} N={n} group={group} zp={zp}"
+                        );
+                        // Tolerance: abs scaled by output magnitude. fp16 mantissa
+                        // is ~2^-11; with K up to 4096 accumulation the relative
+                        // error stays well under 2%.
+                        let tol = 2e-2 * p.max_out.max(1.0);
+                        assert!(
+                            p.worst_abs <= tol,
+                            "M={m} K={k} N={n} group={group} scales_fp16={scales_fp16} zp={zp}: \
+                             worst_abs={:.4} > tol={:.4} (worst_rel={:.4}, max_out={:.2})",
+                            p.worst_abs,
+                            tol,
+                            p.worst_rel,
+                            p.max_out
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Microbench: report achieved weight-DRAM bandwidth and % of a configurable
+    /// HBM peak for representative decode/prefill shapes. Peak defaults to the
+    /// H200 HBM3e figure (~4.8 TB/s); override with `MARLIN_PEAK_GBPS`. This is
+    /// the honest measurement gating the M=1 lever (feasibility §3: M=1 must clear
+    /// >=~55% weight-DRAM to win over the existing GEMV; >=40% to land at all).
+    #[test]
+    #[ignore = "requires a live CUDA device (SM80+); prints timing"]
+    fn marlin_bandwidth_microbench() {
+        use half::f16;
+
+        let Some(rt) = runtime() else {
+            eprintln!("skipping: CUDA runtime unavailable");
+            return;
+        };
+        if rt.require_nvrtc_half_headers("marlin").is_err()
+            || !device_supports_marlin(rt.capabilities().compute_capability())
+        {
+            eprintln!("skipping: no SM80+ device / headers");
+            return;
+        }
+        let peak_gbps: f64 = std::env::var("MARLIN_PEAK_GBPS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(4800.0);
+        let iters: usize = 100;
+
+        // Qwen2.5-14B-ish projections: gate/up (K=5120,N=13824) and a square-ish
+        // attention proj (K=5120,N=5120). Sweep M across the decode->prefill range.
+        for &(k, n) in &[(5120usize, 5120usize), (5120, 13824)] {
+            let group = 128usize;
+            let k_blocks = k / group;
+            let blob = group / 2;
+            // Random weights (repacked) + fp16 scales; content is irrelevant to timing.
+            let packed = vec![0x42u8; n * k_blocks * blob];
+            let repacked = repack_int4_weights(&packed, n, k, group);
+            let scales = vec![f16::from_f32(0.02); n * k_blocks];
+            let weights_dev = rt.alloc_raw(repacked.len()).unwrap();
+            let scales_dev = rt.alloc_raw(scales.len() * 2).unwrap();
+            // SAFETY: buffers sized for their slices.
+            unsafe {
+                rt.htod(&repacked, weights_dev).unwrap();
+                rt.htod(as_bytes(&scales), scales_dev).unwrap();
+            }
+            for &m in &[1usize, 2, 8, 32, 128] {
+                let activation = vec![f16::from_f32(0.01); m * k];
+                let activation_dev = rt.alloc_raw(activation.len() * 2).unwrap();
+                let output_dev = rt.alloc_raw(m * n * 2).unwrap();
+                // SAFETY: buffers sized for their slices.
+                unsafe {
+                    rt.htod(as_bytes(&activation), activation_dev).unwrap();
+                }
+                let args = MarlinGemmArgs {
+                    activation: activation_dev,
+                    weights: weights_dev,
+                    scales: scales_dev,
+                    zero_points: None,
+                    bias: None,
+                    output: output_dev,
+                    m,
+                    k,
+                    n,
+                    group_size: group,
+                    scales_fp16: true,
+                    bias_post_round: false,
+                    bias_row_stride: 0,
+                };
+                // Warmup.
+                for _ in 0..5 {
+                    launch_marlin_gemm(&rt, &args).unwrap();
+                }
+                rt.synchronize().unwrap();
+                let start = std::time::Instant::now();
+                for _ in 0..iters {
+                    launch_marlin_gemm(&rt, &args).unwrap();
+                }
+                rt.synchronize().unwrap();
+                let secs = start.elapsed().as_secs_f64() / iters as f64;
+
+                let weight_bytes = (n * k / 2) as f64;
+                let act_bytes = (m * k * 2) as f64;
+                let out_bytes = (m * n * 2) as f64;
+                let scale_bytes = (n * k_blocks * 2) as f64;
+                let total_bytes = weight_bytes + act_bytes + out_bytes + scale_bytes;
+                let gbps = total_bytes / secs / 1e9;
+                let weight_gbps = weight_bytes / secs / 1e9;
+                let gflops = (2 * m * n * k) as f64 / secs / 1e9;
+                eprintln!(
+                    "marlin K={k} N={n} M={m}: {us:.1} us | total {gbps:.0} GB/s ({pct:.1}% peak) \
+                     | weight {wgbps:.0} GB/s ({wpct:.1}% peak) | {gflops:.0} GFLOP/s",
+                    us = secs * 1e6,
+                    pct = gbps / peak_gbps * 100.0,
+                    wgbps = weight_gbps,
+                    wpct = weight_gbps / peak_gbps * 100.0,
+                );
+
+                // SAFETY: freed once each.
+                unsafe {
+                    rt.free_raw(activation_dev).unwrap();
+                    rt.free_raw(output_dev).unwrap();
+                }
+            }
+            // SAFETY: freed once each.
+            unsafe {
+                rt.free_raw(weights_dev).unwrap();
+                rt.free_raw(scales_dev).unwrap();
+            }
+        }
     }
 }
