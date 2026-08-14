@@ -398,6 +398,22 @@ impl Engine {
             .and_then(crate::native_decode::NativeDecodeSession::cuda_kv_debug_stats)
     }
 
+    /// Mutable access to the engine-owned native decode session, if any.
+    ///
+    /// Exposed so measurement harnesses can drive the batch-N decode entry
+    /// points (`decode_greedy_batch`) against the *fully governed* session —
+    /// the one whose weight-offload policy carries the managed no-spill
+    /// stable-VA authority. A bare `load_with_resolved_io` session takes the
+    /// conservative pointer-unstable default and would decline capture by
+    /// construction, so a harness that wants to observe the real
+    /// capture-plus-streaming behaviour must go through the engine.
+    #[cfg(feature = "native-backend")]
+    pub fn native_decode_session_mut(
+        &mut self,
+    ) -> Option<&mut crate::native_decode::NativeDecodeSession> {
+        self.native_session.as_mut()
+    }
+
     /// Access the engine-owned Resource Governor handle.
     pub fn governor(&self) -> &EngineResourceGovernor {
         &self.governor

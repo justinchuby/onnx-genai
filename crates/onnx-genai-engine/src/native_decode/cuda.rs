@@ -119,12 +119,27 @@ pub(crate) fn resolve_graph_capture_decision(
     env_value: bool,
     structural: GraphCaptureStructuralSafety,
     weight_offload_enabled: bool,
-    weight_offload_stable_va: bool,
+    weight_offload_stable_va: Option<bool>,
 ) -> GraphCaptureDecision {
-    if weight_offload_enabled && !weight_offload_stable_va {
+    // `weight_offload_stable_va` is three-state on purpose: `Some(true)` proved
+    // stable (capture-safe), `Some(false)` proved unstable by the effective
+    // offload policy, and `None` means no policy was supplied so the caller took
+    // the conservative default. The first two are runtime facts; the third is a
+    // harness/plumbing gap that must not masquerade as a runtime fact — print the
+    // predicate inputs and their source so a declined capture is diagnosable.
+    let stable_va_safe = weight_offload_stable_va == Some(true);
+    if weight_offload_enabled && !stable_va_safe {
+        let source = match weight_offload_stable_va {
+            Some(false) => "effective offload policy: pointer-unstable paging path",
+            None => "caller default, cuda_offload_policy not supplied (unwrap_or false)",
+            Some(true) => unreachable!("stable_va_safe would be true"),
+        };
         return GraphCaptureDecision::declined(
             "weight_offload_enabled && !weight_offload_stable_va",
-            "weight offload is using the pointer-unstable paging path",
+            format_args!(
+                "weight_offload_enabled={weight_offload_enabled} \
+                 weight_offload_stable_va={stable_va_safe} (source: {source})"
+            ),
         );
     }
     if let Some(explicit) = programmatic {
@@ -172,7 +187,7 @@ pub(crate) fn resolve_graph_capture_enabled(
     env_value: bool,
     structural: GraphCaptureStructuralSafety,
     weight_offload_enabled: bool,
-    weight_offload_stable_va: bool,
+    weight_offload_stable_va: Option<bool>,
 ) -> bool {
     resolve_graph_capture_decision(
         programmatic,
@@ -1382,6 +1397,79 @@ impl NativeDecodeSession {
         self.current_len = total_len;
         Ok(token_id)
     }
+
+    /// Batch-N greedy decode step (stage 2b-impl-4, #750): step `batch`
+    /// sequences together, one token each, and return the `batch` selected token
+    /// ids (row `i` = the greedy token of sequence `i`). Every sequence shares
+    /// the uniform decode length `past_len → past_len + 1`, so a single mask
+    /// window and one `run_one_token` forward drive all rows; the batched device
+    /// argmax reads N rows back.
+    ///
+    /// This is the reachable batch-N entry point: `tokens.len()` must equal the
+    /// pinned session batch. It is NOT wired into the single-sequence generation
+    /// driver — presenting N real sequences with N independently seeded KV states
+    /// is the stage 2c caller — so this is exercised directly by the batch
+    /// measurement harness (`profile_native --native-decode-batch-sweep`) and by
+    /// row-identity assertions there. The greedy device argmax already returns N
+    /// rows (2b-impl-3), so no logits round-trip is needed.
+    pub(crate) fn decode_cuda_greedy_batch(
+        &mut self,
+        tokens: &[TokenId],
+        past_len: usize,
+    ) -> anyhow::Result<Vec<TokenId>> {
+        let state = self
+            .cuda
+            .as_mut()
+            .context("CUDA decode state is not initialized")?;
+        if tokens.len() != state.batch {
+            bail!(
+                "native CUDA batch greedy decode expects {} tokens (pinned batch), got {}",
+                state.batch,
+                tokens.len()
+            );
+        }
+        if !state.greedy_fastpath_supported() {
+            bail!(
+                "native CUDA batch greedy decode requires the device-argmax fast path; this \
+                 decoder's logits binding does not support it"
+            );
+        }
+        let total_len = past_len
+            .checked_add(1)
+            .context("native decode context length overflow")?;
+        if total_len > state.capacity.max_len {
+            bail!("{}", state.capacity_exceeded_error(total_len));
+        }
+        let grew = state.ensure_capacity(&mut self.session, total_len)?;
+        state.extend_mask(
+            if grew { 0 } else { past_len },
+            total_len,
+            state.decode_mask_expose_len(total_len),
+        )?;
+        let positions = vec![past_len; state.batch];
+        state.write_decode_inputs_batch(tokens, &positions)?;
+        if let Err(error) = state.run_one_token(&mut self.session, &self.trace) {
+            let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
+            return Err(error.context(format!(
+                "native CUDA batch decoder forward pass failed{diagnosis}"
+            )));
+        }
+        let rows = state.read_greedy_result_batch()?;
+        for (sequence, (_, capture_error)) in rows.iter().enumerate() {
+            if *capture_error != 0 {
+                let _ = state.invalidate_graph(&mut self.session);
+                bail!(
+                    "native CUDA batch decoder aborted: device capture validation violation \
+                     (flags=0x{capture_error:x}) on sequence {sequence} during captured graph \
+                     replay; the produced tokens were rejected before consumption and the decode \
+                     graph was invalidated"
+                );
+            }
+        }
+        state.set_logical_len(total_len)?;
+        self.current_len = total_len;
+        Ok(rows.into_iter().map(|(token, _)| token).collect())
+    }
 }
 
 impl DecodeCudaState {
@@ -2238,14 +2326,19 @@ impl DecodeCudaState {
         kv_layout: KvCommitLayout,
     ) -> anyhow::Result<Self> {
         let kv_commits_on_demand = session.commits_on_demand();
-        // Stage 2b-impl-1 (#750): the persistent decode bindings are shaped for
-        // `batch` sequences. Constructor-fixed to `1` — every current entry
-        // point decodes a single sequence, so the emitted shapes and all decode
-        // behaviour are byte-identical to the previous hard-coded `1`. Threading
-        // the value (rather than turning batch-N on) is the whole of this
-        // increment; KV growth/commit geometry, the token writer, the device
-        // argmax and batch-symbol capture pinning stay batch-1 (2b-impl-2..4).
-        let batch = 1usize;
+        // Stage 2b-impl-4 (#750): the persistent decode bindings are shaped for
+        // `batch` sequences and batch-N is now turned ON. The batch extent is
+        // resolved from `ONNX_GENAI_NATIVE_DECODE_BATCH` (default `1`) and is
+        // pinned for the whole session so CUDA-graph capture binds a stable batch
+        // shape (capture requires stable shapes). At the default `batch == 1`
+        // every emitted shape, IO binding, mask/token/position write, KV commit
+        // geometry and device-argmax read-back is byte-identical to the previous
+        // hard-coded `1`, so decode stays the #750 byte-identity reference. Only
+        // an explicit `> 1` value binds a batch-N grid; the batch-N *caller* (a
+        // driver presenting N real sequences with N seeded KV states) is stage 2c
+        // — the reachable batch-N exercise here is the `decode_cuda_greedy_batch`
+        // entry point, driven by `profile_native --native-decode-batch-sweep`.
+        let batch = resolve_native_decode_batch()?;
         // Seq-major KV addressing is capacity-independent at batch index 0 (the
         // only index native decode uses): token `t` always lands at
         // `t * kv_heads * head_dim`, and the baked `cache_capacity` scalar only
@@ -2532,11 +2625,16 @@ impl DecodeCudaState {
                 ));
                 continue;
             }
-            // Auxiliary outputs keep the historical batch-1 collapse: their
-            // batch-axis symbol pinning is owned by 2b-impl-4 (the
-            // `collect_unit_symbols` / capture-symbol work), not this increment,
-            // so pass `1` explicitly rather than the threaded `batch`.
-            let shape = Self::persistent_output_shape(&meta.name, meta.dtype, &meta.shape, 1)?;
+            // Batch-symbol pinning (stage 2b-impl-4, #750): auxiliary outputs
+            // whose axis 0 is the batch symbol are bound at the pinned `batch`
+            // extent, exactly like the logits binding, so CUDA-graph capture
+            // admits a batch-N grid for every declared output rather than sizing
+            // one output to `1` and mis-shaping the replay. `persistent_output_shape`
+            // maps a symbolic axis 0 → `batch` and every other symbolic (decode-
+            // unit) axis → `1`; the `unresolved_symbolic_axis` gate above has
+            // already declined any output with a non-unit symbolic axis. At
+            // `batch == 1` this is byte-identical to the historical collapse.
+            let shape = Self::persistent_output_shape(&meta.name, meta.dtype, &meta.shape, batch)?;
             bindings.push(
                 session
                     .allocate_device_output_binding(
@@ -2852,10 +2950,19 @@ impl DecodeCudaState {
                 self.max_len
             );
         }
+        // The mask binding is physically `[batch, max_len]`, so row `r`'s
+        // `[start, end)` valid span sits `r × max_len` i64s from the base. Batch
+        // decode is uniform-length (all sequences step together), so every row
+        // gets the identical `1`s window (stage 2b-impl-4, #750). At `batch == 1`
+        // this is a single write at `start × i64` — byte-identical to before.
         let ones = (start..end)
             .flat_map(|_| 1i64.to_le_bytes())
             .collect::<Vec<_>>();
-        self.bindings[0].write_bytes(start * std::mem::size_of::<i64>(), &ones)?;
+        let row_stride = self.max_len * std::mem::size_of::<i64>();
+        for sequence in 0..self.batch {
+            let offset = sequence * row_stride + start * std::mem::size_of::<i64>();
+            self.bindings[0].write_bytes(offset, &ones)?;
+        }
         self.bindings[0].set_logical_shape(vec![self.batch, expose_len])?;
         Ok(())
     }
@@ -3095,8 +3202,39 @@ impl DecodeCudaState {
     }
 
     fn write_decode_inputs(&mut self, token_id: TokenId, position: usize) -> anyhow::Result<()> {
-        self.bindings[self.input_ids_binding].write_bytes(0, &i64::from(token_id).to_le_bytes())?;
-        self.write_position_binding(position)
+        // Single-token decode replicates the token/position across all `batch`
+        // rows so the persistent batch grid stays coherent when a single-sequence
+        // caller drives a batch-N binding (stage 2b-impl-4, #750). At `batch == 1`
+        // this is a single i64 write at offset 0 — byte-identical to before.
+        self.write_decode_inputs_batch(&vec![token_id; self.batch], &vec![position; self.batch])
+    }
+
+    /// Write N selected token ids into the N `input_ids` slots and N positions
+    /// into the `position_ids` binding, one per sequence (stage 2b-impl-4, #750).
+    /// The `input_ids` binding is physically `[batch, 1]`, so sequence `s`'s
+    /// token is one i64 at offset `s × 8`; positions fan out per
+    /// [`Self::write_position_binding_batch`]. `tokens.len()` and
+    /// `positions.len()` must both equal the pinned `batch`.
+    fn write_decode_inputs_batch(
+        &mut self,
+        tokens: &[TokenId],
+        positions: &[usize],
+    ) -> anyhow::Result<()> {
+        if tokens.len() != self.batch || positions.len() != self.batch {
+            bail!(
+                "native CUDA batch decode expects {} tokens and {} positions, got {} / {}",
+                self.batch,
+                self.batch,
+                tokens.len(),
+                positions.len()
+            );
+        }
+        let word = std::mem::size_of::<i64>();
+        for (sequence, token) in tokens.iter().enumerate() {
+            self.bindings[self.input_ids_binding]
+                .write_bytes(sequence * word, &i64::from(*token).to_le_bytes())?;
+        }
+        self.write_position_binding_batch(positions)
     }
 
     /// Write the current position into the persistent `position_ids` device
@@ -3105,12 +3243,33 @@ impl DecodeCudaState {
     /// to before; a rank-N mrope decoder gets `[position; N]` — the one-token
     /// `linear_increment` coordinate for all axes.
     fn write_position_binding(&mut self, position: usize) -> anyhow::Result<()> {
+        self.write_position_binding_batch(&vec![position; self.batch])
+    }
+
+    /// Write N per-sequence positions into the persistent `position_ids` binding
+    /// (stage 2b-impl-4, #750). A rank-1 decoder binds `position_ids [batch, 1]`,
+    /// so sequence `s`'s position is one i64 at offset `s × 8`. A rank-R mrope
+    /// decoder binds `[R, batch, 1]`; element `(r, s)` sits at `(r × batch + s) × 8`
+    /// and every coordinate axis gets the same per-sequence position (the
+    /// one-token `linear_increment`). At `batch == 1, rank == 1` this is a single
+    /// i64 at offset 0 — byte-identical to before.
+    fn write_position_binding_batch(&mut self, positions: &[usize]) -> anyhow::Result<()> {
+        if positions.len() != self.batch {
+            bail!(
+                "native CUDA batch decode expects {} positions, got {}",
+                self.batch,
+                positions.len()
+            );
+        }
         if let Some(index) = self.position_ids_binding {
-            let position = i64::try_from(position).context("position id exceeds i64 range")?;
-            let bytes = position.to_le_bytes();
             let axis_bytes = std::mem::size_of::<i64>();
             for axis in 0..self.position_rank {
-                self.bindings[index].write_bytes(axis * axis_bytes, &bytes)?;
+                for (sequence, position) in positions.iter().enumerate() {
+                    let position =
+                        i64::try_from(*position).context("position id exceeds i64 range")?;
+                    let offset = (axis * self.batch + sequence) * axis_bytes;
+                    self.bindings[index].write_bytes(offset, &position.to_le_bytes())?;
+                }
             }
         }
         Ok(())
@@ -3314,6 +3473,11 @@ impl DecodeCudaState {
 
     pub(crate) fn greedy_fastpath_supported(&self) -> bool {
         self.bindings[self.logits_binding].device_argmax_supported()
+    }
+
+    /// The pinned persistent-decode batch extent (stage 2b-impl-4, #750).
+    pub(crate) fn batch(&self) -> usize {
+        self.batch
     }
 
     /// Run the batched device argmax over the `[batch, 1, vocab]` logits binding
@@ -3644,6 +3808,29 @@ fn native_cuda_memset_zero(dst: usize, bytes: usize) -> anyhow::Result<()> {
 #[cfg(not(feature = "cuda"))]
 fn native_cuda_memset_zero(_dst: usize, _bytes: usize) -> anyhow::Result<()> {
     bail!("native CUDA KV growth requires the onnx-genai-engine `cuda` feature")
+}
+
+/// Resolve the persistent decode batch extent from `ONNX_GENAI_NATIVE_DECODE_BATCH`
+/// (stage 2b-impl-4, #750). Unset or empty resolves to `1` — the byte-identity
+/// default that keeps every current single-sequence entry point unchanged. A
+/// value `> 1` turns batch-N on: the KV / mask / input / position / logits
+/// bindings are shaped `[N, …]`, the token writer fans N selected tokens into N
+/// slots, and the device argmax reads N rows. The value is pinned for the whole
+/// session (capture requires a stable batch shape), so it is read exactly once
+/// at construction. `0` is rejected — a zero-width decode has no meaning.
+fn resolve_native_decode_batch() -> anyhow::Result<usize> {
+    match std::env::var("ONNX_GENAI_NATIVE_DECODE_BATCH") {
+        Ok(raw) if !raw.trim().is_empty() => {
+            let batch: usize = raw.trim().parse().with_context(|| {
+                format!("ONNX_GENAI_NATIVE_DECODE_BATCH must be a positive integer, got '{raw}'")
+            })?;
+            if batch == 0 {
+                bail!("ONNX_GENAI_NATIVE_DECODE_BATCH must be > 0, got 0");
+            }
+            Ok(batch)
+        }
+        _ => Ok(1),
+    }
 }
 
 /// Map a BNSH-declared KV binding shape `[batch, kv_heads, capacity, head_dim]`

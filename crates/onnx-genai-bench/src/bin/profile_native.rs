@@ -197,6 +197,30 @@ struct Args {
     /// empty-past probe could not surface.
     #[arg(long, value_delimiter = ',')]
     fused_forward_kv_sweep: Option<Vec<String>>,
+    /// Stage 2b-impl-4 (#750): sweep the **persistent batch-N decode path**
+    /// ([`NativeDecodeSession::decode_greedy_batch`], the real captured decode
+    /// step — not the stateless fused forward) across the comma-separated batch
+    /// sizes in this list (e.g. `1,2,4,8`). For each `N` a fresh session is built
+    /// pinned to batch `N` (`ONNX_GENAI_NATIVE_DECODE_BATCH`), `--tokens` batch-N
+    /// greedy steps are run from an empty past feeding an identical token to all
+    /// `N` rows, and the weight-offload counters + CUDA-graph recapture counters
+    /// are reported per shape. Because every row sees identical inputs from an
+    /// identical (empty) initial state, all `N` output rows must be byte-identical
+    /// each step (a cross-row corruption guard), and row 0 must match the batch-1
+    /// stream (the batch-N row-identity guard). Token *values* are content-
+    /// arbitrary (no real prompt is seeded — that needs the stage 2c caller), but
+    /// the weight/page/capture counters are content-invariant (#884) and are the
+    /// measurement the whole batch-N line was after.
+    #[arg(long, value_delimiter = ',')]
+    native_decode_batch_sweep: Option<Vec<usize>>,
+    /// Unmeasured context length to seed before the measured `--native-decode-batch-sweep`
+    /// window (default 0). Each batch runs this many decode steps first so the
+    /// committed KV occupancy grows to `N × context × kv_bytes_per_token`,
+    /// shrinking the elastic weight budget (#866) enough that an over-budget model
+    /// actually streams weights during the measured steps. 0 leaves the KV empty
+    /// (weights stay fully resident, `htod_bytes_per_token = 0`).
+    #[arg(long, default_value_t = 0)]
+    native_decode_batch_context: usize,
     /// Speculative decoding mode. `prompt-lookup` enables native n-gram
     /// speculation (exact verification; lossless vs greedy). Only supported on
     /// the single-model native `--steady` path; rejected with `--pipeline`.
@@ -775,6 +799,235 @@ fn fused_tokens(prompt_tokens: &[u32], batch: usize) -> Vec<u32> {
         .collect()
 }
 
+/// Stage 2b-impl-4 (#750): sweep the **persistent batch-N decode path** — the
+/// real captured decode step [`NativeDecodeSession::decode_greedy_batch`], not
+/// the stateless fused forward the stage 2a/2b sweeps measure. For each batch
+/// size `N` this rebuilds a fresh session pinned to batch `N`
+/// (`ONNX_GENAI_NATIVE_DECODE_BATCH`), runs `tokens` batch-N greedy decode steps
+/// from an empty past feeding an identical token to all `N` rows, and reports
+/// the weight-offload counters and the CUDA-graph recapture counters per shape.
+///
+/// Because every row sees identical inputs from an identical (empty) initial KV
+/// state, all `N` output rows must be byte-identical every step (a cross-row
+/// corruption guard, the #892 detector) and row 0 must equal the batch-1 stream
+/// (the batch-N row-identity guard the scoping doc §3.8 asks for). Token *values*
+/// are content-arbitrary (a real per-sequence prompt needs the stage 2c seeding
+/// caller), but the weight/page/capture counters are content-invariant (#884),
+/// so they are the trustworthy batch-N measurement.
+fn run_native_decode_batch_sweep(
+    model_dir: &Path,
+    device: NativeDecodeDevice,
+    decode_precision: DecodePrecision,
+    prompt_tokens: &[u32],
+    batch_sizes: &[usize],
+    tokens: usize,
+    context: usize,
+) -> Result<()> {
+    if batch_sizes.is_empty() {
+        bail!("--native-decode-batch-sweep requires at least one batch size");
+    }
+    let own_pid = std::process::id();
+    println!(
+        "native_decode_batch_sweep: own_pid={own_pid} batch_sizes={batch_sizes:?} tokens={tokens} \
+         context={context} (persistent captured decode path; identical token fanned to all N rows; \
+         `context` unmeasured decode steps build a length-N×context KV occupancy to create weight \
+         pressure, then the weight-offload counters are reset and `tokens` steps are measured; token \
+         values are content-arbitrary, weight/page/capture counters are content-invariant #884)"
+    );
+
+    // Row-0 token stream of the batch-1 pass, used as the cross-batch identity
+    // reference for every N > 1 pass.
+    let mut batch1_reference: Option<Vec<u32>> = None;
+
+    for &batch in batch_sizes {
+        if batch == 0 {
+            bail!("--native-decode-batch-sweep batch sizes must be > 0");
+        }
+        report_foreign_compute_apps(own_pid);
+
+        // SAFETY: single-threaded benchmark setup; the batch extent is read once
+        // at session construction below.
+        unsafe {
+            std::env::set_var("ONNX_GENAI_NATIVE_DECODE_BATCH", batch.to_string());
+        }
+        // Build the *fully governed* engine so the native decode session carries
+        // the effective weight-offload policy (managed no-spill + stable-VA
+        // authority) instead of the conservative pointer-unstable default that
+        // `load_with_resolved_io` hardcodes. Only through this path can whole-step
+        // CUDA-graph capture stay ON while weights stream: the earlier bare-load
+        // sweep reported a capture decline that was a harness artifact of the
+        // default, not a runtime property. The batch extent is read from
+        // ONNX_GENAI_NATIVE_DECODE_BATCH during the native session load below.
+        let mut config = EngineConfig {
+            decode_backend: EngineDecodeBackend::Native,
+            decode_precision,
+            ..EngineConfig::default()
+        };
+        config.native_device = Some(device.clone());
+        apply_vram_limit_env(&mut config)?;
+        let mut engine = Engine::from_dir(model_dir, config).with_context(|| {
+            format!(
+                "load governed engine {} at batch {batch}",
+                model_dir.display()
+            )
+        })?;
+        let session = engine.native_decode_session_mut().ok_or_else(|| {
+            anyhow::anyhow!(
+                "engine did not build a native decode session at batch {batch}; the model likely \
+                 resolved to the ORT backend (batch-N needs the native CUDA persistent path)"
+            )
+        })?;
+        let bound = session.native_decode_batch();
+        if bound != batch {
+            bail!(
+                "requested batch {batch} but the session bound batch {bound}; the model likely \
+                 declined a CUDA persistent decode session (batch-N needs the captured CUDA path)"
+            );
+        }
+
+        onnx_runtime_ep_cuda::reset_global_offload_stats();
+        let before = session.cuda_kv_debug_stats();
+
+        let step_token = prompt_tokens[0];
+
+        // Context warmup (unmeasured): grow the KV to `context` tokens per row so
+        // the committed KV occupancy is `N × context × kv_bytes_per_token`. This
+        // shrinks the elastic weight budget (#866) and forces the over-budget
+        // model to stream weights during the *measured* steps below. All rows see
+        // the identical token, so row identity is preserved into the measured
+        // window. Stats are reset AFTER this warmup so first-touch admission is
+        // not attributed to the measurement.
+        for step in 0..context {
+            let inputs = vec![step_token; batch];
+            let rows = session
+                .decode_greedy_batch(&inputs, step)
+                .with_context(|| format!("batch {batch} context step {step}"))?;
+            debug_assert_eq!(rows.len(), batch);
+        }
+
+        onnx_runtime_ep_cuda::reset_global_offload_stats();
+        let before_measured = session.cuda_kv_debug_stats();
+
+        let mut row0_stream = Vec::with_capacity(tokens);
+        for step in 0..tokens {
+            let inputs = vec![step_token; batch];
+            let past_len = context + step;
+            let rows = session
+                .decode_greedy_batch(&inputs, past_len)
+                .with_context(|| format!("batch {batch} decode step {step}"))?;
+            if rows.len() != batch {
+                bail!(
+                    "batch {batch} decode step {step} returned {} rows, expected {batch}",
+                    rows.len()
+                );
+            }
+            for (row, &token) in rows.iter().enumerate() {
+                if token != rows[0] {
+                    bail!(
+                        "batch {batch} row-identity VIOLATION at step {step}: row {row} produced \
+                         token {token} but row 0 produced {} — the batch grid corrupted a row \
+                         (the #892 failure class)",
+                        rows[0]
+                    );
+                }
+            }
+            row0_stream.push(rows[0]);
+        }
+
+        println!("--- native_decode batch={batch} ---");
+        println!(
+            "native_decode_batch_row_identity: batch={batch} all_rows_equal_row0=true steps={tokens}"
+        );
+        println!("native_decode_batch_row0_stream: batch={batch} {row0_stream:?}");
+        match &batch1_reference {
+            None if batch == 1 => batch1_reference = Some(row0_stream.clone()),
+            Some(reference) => {
+                let matches = *reference == row0_stream;
+                println!(
+                    "native_decode_batch_cross_identity: batch={batch} row0_matches_batch1={matches}"
+                );
+                if !matches {
+                    println!(
+                        "native_decode_batch_cross_identity_detail: batch1={reference:?} \
+                         batch{batch}_row0={row0_stream:?}"
+                    );
+                }
+            }
+            None => {
+                println!(
+                    "native_decode_batch_cross_identity: batch={batch} row0_matches_batch1=unknown \
+                     (batch 1 not in this sweep; include 1 to anchor the reference)"
+                );
+            }
+        }
+
+        // Recapture-per-shape: the CUDA-graph counters. The *measured-window*
+        // delta (post-warmup) answers whether capture survives steady batch-N
+        // decode at the seeded context; the *total* delta (from load) also folds
+        // in the warmup's bucket-growth recaptures. `invalidations`/`captures` > 1
+        // in the measured window means capture did not survive the batch shape as
+        // implemented (a first-class result).
+        if let Some(stats) = session.cuda_kv_debug_stats() {
+            let graph_delta =
+                |base: &Option<onnx_genai_engine::native_decode::CudaKvDebugStats>| {
+                    base.as_ref()
+                        .map(|b| {
+                            (
+                                b.graph.captures,
+                                b.graph.replays,
+                                b.graph.fallbacks,
+                                b.graph.invalidations,
+                            )
+                        })
+                        .unwrap_or((0, 0, 0, 0))
+                };
+            let (mc, mr, mf, mi) = graph_delta(&before_measured);
+            println!(
+                "native_decode_batch_cuda_graph_measured: batch={batch} enabled={} captures={} \
+                 replays={} fallbacks={} invalidations={}",
+                stats.graph.enabled,
+                stats.graph.captures.saturating_sub(mc),
+                stats.graph.replays.saturating_sub(mr),
+                stats.graph.fallbacks.saturating_sub(mf),
+                stats.graph.invalidations.saturating_sub(mi),
+            );
+            let (tc, tr, tf, ti) = graph_delta(&before);
+            println!(
+                "native_decode_batch_cuda_graph_total: batch={batch} captures={} replays={} \
+                 fallbacks={} invalidations={}",
+                stats.graph.captures.saturating_sub(tc),
+                stats.graph.replays.saturating_sub(tr),
+                stats.graph.fallbacks.saturating_sub(tf),
+                stats.graph.invalidations.saturating_sub(ti),
+            );
+            if let Some(reason) = &stats.graph.decline_reason {
+                println!("native_decode_batch_cuda_graph_decline: batch={batch} {reason}");
+            }
+            if let Some(decision) = &stats.graph.growth_decision {
+                println!("native_decode_batch_cuda_graph_growth: batch={batch} {decision}");
+            }
+        }
+
+        // Weight-streaming amortization: emitted tokens = steps × rows, so
+        // `htod_bytes_per_token` is per produced token and should fall ~1/N,
+        // partly offset upward as N× KV occupancy shrinks the elastic weight
+        // budget (#866). `byte_hit_rate` carries that #866 offset.
+        let emitted = (tokens as u64).saturating_mul(batch as u64);
+        print_weight_offload_observability(emitted);
+
+        // `session` borrows `engine`; drop the engine to release the native
+        // session (and its VRAM) before the next batch shape reloads.
+        let _ = session;
+        drop(engine);
+    }
+
+    // SAFETY: single-threaded teardown.
+    unsafe {
+        std::env::remove_var("ONNX_GENAI_NATIVE_DECODE_BATCH");
+    }
+    Ok(())
+}
+
 /// Print any CUDA compute processes that are NOT this profiler, so a contended
 /// run is labeled as such in its own log (per #851). Our own PID is expected
 /// and filtered out; a non-empty foreign list is flagged loudly.
@@ -1191,7 +1444,7 @@ fn main() -> Result<()> {
             .context("build synthetic native session")?;
         NativeDecodeSession::from_session(native).context("wrap synthetic native decoder")?
     } else {
-        NativeDecodeSession::load_with_resolved_io(&model, device)
+        NativeDecodeSession::load_with_resolved_io(&model, device.clone())
             .with_context(|| format!("load native decoder {}", model.display()))?
     };
 
@@ -1211,6 +1464,23 @@ fn main() -> Result<()> {
     }
     if let Some(pairs) = args.fused_forward_kv_sweep.clone() {
         return run_fused_forward_kv_sweep(&mut session, &prompt_tokens, &pairs);
+    }
+    if let Some(batch_sizes) = args.native_decode_batch_sweep.clone() {
+        drop(session);
+        let model_dir = args
+            .model
+            .as_deref()
+            .expect("validated model argument")
+            .to_path_buf();
+        return run_native_decode_batch_sweep(
+            &model_dir,
+            device.clone(),
+            args.decode_precision.into(),
+            &prompt_tokens,
+            &batch_sizes,
+            args.tokens,
+            args.native_decode_batch_context,
+        );
     }
     if let Some(dump_path) = args.dump_logprobs.as_ref() {
         let dump_prompt_tokens = if let Some(ids_path) = args.prompt_ids.as_ref() {

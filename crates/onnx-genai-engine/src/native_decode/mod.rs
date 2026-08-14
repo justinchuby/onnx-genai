@@ -878,6 +878,38 @@ impl NativeDecodeSession {
         <Self as DecodeBackend>::decode(self, token_ids, past_len)
     }
 
+    /// Batch-N greedy decode step (stage 2b-impl-4, #750). Steps the pinned
+    /// `batch` sequences together — one token per sequence — and returns the
+    /// `batch` selected token ids. Requires a CUDA decode session pinned at the
+    /// same batch extent (via `ONNX_GENAI_NATIVE_DECODE_BATCH`) whose logits
+    /// binding supports the device-argmax fast path; otherwise it errors. This is
+    /// the reachable batch-N exercise seam (the single-sequence generation driver
+    /// is unchanged and stays the batch-1 byte-identity reference); it is used by
+    /// the batch measurement harness in `profile_native`.
+    pub fn decode_greedy_batch(
+        &mut self,
+        token_ids: &[TokenId],
+        past_len: usize,
+    ) -> anyhow::Result<Vec<TokenId>> {
+        if past_len != self.current_len {
+            bail!(
+                "native batch decode past length mismatch: caller supplied {past_len}, adapter holds {}",
+                self.current_len
+            );
+        }
+        if self.cuda.is_none() {
+            bail!("native batch greedy decode requires a CUDA decode session");
+        }
+        self.decode_cuda_greedy_batch(token_ids, past_len)
+    }
+
+    /// The pinned persistent-decode batch extent (1 unless
+    /// `ONNX_GENAI_NATIVE_DECODE_BATCH` requested batch-N and a CUDA session was
+    /// built). Lets a harness confirm the session actually bound the batch grid.
+    pub fn native_decode_batch(&self) -> usize {
+        self.cuda.as_ref().map(DecodeCudaState::batch).unwrap_or(1)
+    }
+
     /// Run one target step with arbitrary named tensors supplied by pipeline
     /// routing. Generated roles (token ids, attention mask, and position ids)
     /// come from `ModelIoSpec`; every other non-KV graph input is resolved by its
