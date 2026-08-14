@@ -108,6 +108,20 @@ pub enum ShapeInference {
     },
     /// RotaryEmbedding — output same shape as input[0].
     RotaryEmbedding,
+    /// Standard `ai.onnx::Attention` (opset 23+): scaled dot-product attention.
+    ///
+    /// Q/K/V are rank-3 `(batch, seq, hidden)` or rank-4
+    /// `(batch, heads, seq, head_size)`. `Y` follows Q's layout with the value
+    /// head size (which may differ from the Q/K head size), and the optional
+    /// `present_key`/`present_value`/`qk_matmul_output` slots are shaped from
+    /// the K/V geometry and the (optional) `past_key` length. `q_num_heads`/
+    /// `kv_num_heads` are required only for the rank-3 layout, where they split
+    /// the hidden dimension into heads.
+    AttentionStd {
+        q_num_heads: usize,
+        kv_num_heads: usize,
+        num_outputs: usize,
+    },
     /// LayerNormalization family: output 0 = input[0] shape,
     /// outputs 1+ (Mean, InvStdDev) = input[0] shape with dims from `axis`
     /// onward replaced by 1 (keepdims reduction).
@@ -462,6 +476,19 @@ impl ShapeInference {
                 }
             }
             "RotaryEmbedding" => Self::RotaryEmbedding,
+
+            // ── Standard attention (ai.onnx::Attention, opset 23+) ─────────
+            "Attention" if domain.is_empty() || domain == "ai.onnx" => {
+                let q_num_heads = int_attr("q_num_heads").unwrap_or(0).max(0) as usize;
+                let kv_num_heads = int_attr("kv_num_heads")
+                    .unwrap_or(q_num_heads as i64)
+                    .max(0) as usize;
+                Self::AttentionStd {
+                    q_num_heads,
+                    kv_num_heads,
+                    num_outputs,
+                }
+            }
 
             _ => Self::Declined {
                 op_type: op.to_string(),
@@ -2559,6 +2586,96 @@ fn infer_shapes(
             Ok(vec![inputs[0].shape.to_vec()])
         }
 
+        ShapeInference::AttentionStd {
+            q_num_heads,
+            kv_num_heads,
+            num_outputs,
+        } => {
+            // Inputs: Q(0), K(1), V(2), attn_mask(3), past_key(4),
+            // past_value(5), nonpad_kv_seqlen(6). Q/K/V are rank-3
+            // (batch, seq, hidden) or rank-4 (batch, heads, seq, head_size).
+            if inputs.len() < 3 {
+                return Err("Attention: expected at least Q, K, V inputs".into());
+            }
+            let q = inputs[0].shape;
+            let v = inputs[2].shape;
+            if q.len() < 2 {
+                return Err("Attention: query rank must be ≥3 or 4".into());
+            }
+
+            // Resolve (batch, q_heads, q_seq, qk_head_size) from Q and
+            // (kv_heads, kv_seq, v_head_size) from V, for both layouts.
+            let (batch, q_heads, q_seq, qk_head_size, is_3d) = match q.len() {
+                4 => (q[0], q[1], q[2], q[3], false),
+                3 => {
+                    if *q_num_heads == 0 {
+                        return Err("Attention: rank-3 query requires q_num_heads".into());
+                    }
+                    let hidden = q[2];
+                    (
+                        q[0],
+                        *q_num_heads,
+                        q[1],
+                        hidden / (*q_num_heads).max(1),
+                        true,
+                    )
+                }
+                other => {
+                    return Err(format!("Attention: query must be rank 3 or 4, got {other}"));
+                }
+            };
+            let (kv_heads, kv_seq, v_head_size) = match v.len() {
+                4 => (v[1], v[2], v[3]),
+                3 => {
+                    let kvh = if *kv_num_heads > 0 {
+                        *kv_num_heads
+                    } else {
+                        *q_num_heads
+                    };
+                    if kvh == 0 {
+                        return Err("Attention: rank-3 value requires kv_num_heads".into());
+                    }
+                    (kvh, v[1], v[2] / kvh.max(1))
+                }
+                other => {
+                    return Err(format!("Attention: value must be rank 3 or 4, got {other}"));
+                }
+            };
+
+            // Y follows Q's layout, carrying the value head size.
+            let y = if is_3d {
+                vec![batch, q_seq, q_heads.saturating_mul(v_head_size)]
+            } else {
+                vec![batch, q_heads, q_seq, v_head_size]
+            };
+
+            let mut outputs = vec![y];
+            if *num_outputs > 1 {
+                // present_key/present_value are always rank-4
+                // (batch, kv_heads, total_seq, head_size). total_seq folds in
+                // any past_key length (input 4).
+                let past_seq = inputs
+                    .get(4)
+                    .map(|p| if p.shape.len() >= 3 { p.shape[2] } else { 0 })
+                    .unwrap_or(0);
+                let total_seq = past_seq.saturating_add(kv_seq);
+                let present_key = vec![batch, kv_heads, total_seq, qk_head_size];
+                let present_value = vec![batch, kv_heads, total_seq, v_head_size];
+                // Slot order: Y, present_key, present_value, qk_matmul_output.
+                if *num_outputs > 1 {
+                    outputs.push(present_key);
+                }
+                if *num_outputs > 2 {
+                    outputs.push(present_value);
+                }
+                if *num_outputs > 3 {
+                    // qk_matmul_output: (batch, q_heads, q_seq, total_seq).
+                    outputs.push(vec![batch, q_heads, q_seq, total_seq]);
+                }
+            }
+            Ok(outputs)
+        }
+
         ShapeInference::Declined { op_type, domain } => Err(format!(
             "Op '{op_type}' (domain '{domain}') has no shape-inference rule. \
              Call ShapeInference::for_node(node, input_shapes, num_outputs) instead \
@@ -2800,6 +2917,88 @@ mod tests {
         inputs: &[TensorView<'_>],
     ) -> Result<Vec<Vec<usize>>, String> {
         infer_shapes(strategy, inputs)
+    }
+
+    // ── AttentionStd (ai.onnx::Attention, opset 23+) ──────────────────────────
+
+    #[test]
+    fn attention_std_rank4_single_output_uses_value_head_size() {
+        // Q/K:[B,Hq,Sq,Dqk], V:[B,Hkv,Skv,Dv] with Dv != Dqk. Y carries Dv.
+        let q = [2usize, 4, 8, 32];
+        let v = [2usize, 4, 8, 16];
+        let st4 = [0i64, 0, 0, 0];
+        let s = ShapeInference::AttentionStd {
+            q_num_heads: 0,
+            kv_num_heads: 0,
+            num_outputs: 1,
+        };
+        let res = infer(&s, &[view(&q, &st4), view(&q, &st4), view(&v, &st4)]).unwrap();
+        assert_eq!(res, vec![vec![2, 4, 8, 16]]);
+    }
+
+    #[test]
+    fn attention_std_rank4_present_outputs_fold_in_past() {
+        // Three outputs: Y, present_key, present_value. past_key seq=5 → total 13.
+        let q = [1usize, 8, 3, 64];
+        let v = [1usize, 2, 8, 64];
+        let past = [1usize, 2, 5, 64];
+        let st4 = [0i64, 0, 0, 0];
+        let s = ShapeInference::AttentionStd {
+            q_num_heads: 0,
+            kv_num_heads: 0,
+            num_outputs: 3,
+        };
+        let inputs = [
+            view(&q, &st4),    // Q
+            view(&q, &st4),    // K
+            view(&v, &st4),    // V
+            view(&q, &st4),    // attn_mask (shape unused here)
+            view(&past, &st4), // past_key
+        ];
+        let res = infer(&s, &inputs).unwrap();
+        assert_eq!(
+            res,
+            vec![
+                vec![1, 8, 3, 64],  // Y
+                vec![1, 2, 13, 64], // present_key: kv_heads=2, total_seq=13
+                vec![1, 2, 13, 64], // present_value
+            ]
+        );
+    }
+
+    #[test]
+    fn attention_std_rank3_splits_hidden_by_heads() {
+        // Q:[B,Sq,Hq*Dqk]=[2,8,128] (q_num_heads=4 → Dqk=32),
+        // V:[B,Skv,Hkv*Dv]=[2,8,64] (kv_num_heads=4 → Dv=16).
+        // Y:[B,Sq,Hq*Dv] = [2,8,64].
+        let q = [2usize, 8, 128];
+        let v = [2usize, 8, 64];
+        let st3 = [0i64, 0, 0];
+        let s = ShapeInference::AttentionStd {
+            q_num_heads: 4,
+            kv_num_heads: 4,
+            num_outputs: 1,
+        };
+        let res = infer(&s, &[view(&q, &st3), view(&q, &st3), view(&v, &st3)]).unwrap();
+        assert_eq!(res, vec![vec![2, 8, 64]]);
+    }
+
+    #[test]
+    fn attention_std_for_node_reads_heads_and_declines_other_domains() {
+        use onnx_runtime_ir::{Node, NodeId};
+        // Default-domain Attention is modelled.
+        let node = Node::new(NodeId(0), "Attention", Vec::new(), Vec::new());
+        assert!(matches!(
+            ShapeInference::for_node(&node, &[], 1),
+            ShapeInference::AttentionStd { .. }
+        ));
+        // A foreign domain is not claimed by this arm.
+        let mut contrib = Node::new(NodeId(0), "Attention", Vec::new(), Vec::new());
+        contrib.domain = "com.microsoft".into();
+        assert!(matches!(
+            ShapeInference::for_node(&contrib, &[], 1),
+            ShapeInference::Declined { .. }
+        ));
     }
 
     // ── for_op: fail-closed fallback ──────────────────────────────────────────
