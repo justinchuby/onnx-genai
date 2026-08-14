@@ -45,6 +45,8 @@ pub(crate) mod device_sampler;
 pub mod eagle3;
 pub mod env;
 pub mod error;
+#[cfg(feature = "cuda")]
+pub mod fused_argmax;
 pub mod governed_allocator;
 pub mod io_roles;
 pub mod loader;

@@ -1506,6 +1506,89 @@ fn cubin_supported(nvrtc: (i32, i32), driver: (i32, i32)) -> bool {
     nvrtc >= FIRST_NVRTC_WITH_CUBIN && nvrtc.0 <= driver.0
 }
 
+/// Build the kernels in `source` and return the raw module image, for callers
+/// that load it themselves.
+///
+/// Applies the same two gates as [`load_kernels_for_device`] — SASS only when
+/// this NVRTC can emit it and the driver's CUDA major will load it, PTX only
+/// when this NVRTC is not newer than the driver's toolkit — but cannot retry
+/// after a load failure, because it does not do the loading. Callers that can
+/// load through a `CudaContext` should prefer `load_kernels_for_device`, which
+/// falls back when the driver rejects an image.
+///
+/// PTX images are NUL terminated because `cuModuleLoadData` reads them as C
+/// strings; cubin images are ELF and need no terminator.
+pub(crate) fn compile_image_for_device(
+    source: &str,
+    name: &str,
+    (major, minor): (i32, i32),
+) -> Result<Vec<u8>> {
+    let nvrtc = nvrtc_version()?;
+    let driver = driver_toolkit_version()?;
+    let mut rejected: Vec<String> = Vec::new();
+
+    if cubin_supported(nvrtc, driver) {
+        match compile_cubin(source, arch_flag(DeviceCode::Cubin, major, minor)) {
+            Ok(cubin) => {
+                tracing::debug!(
+                    kernel = name,
+                    arch = format!("sm_{major}{minor}"),
+                    bytes = cubin.len(),
+                    "compiled kernels to real-architecture SASS"
+                );
+                return Ok(cubin);
+            }
+            Err(error) => {
+                rejected.push(format!(
+                    "NVRTC could not emit sm_{major}{minor} SASS ({error})"
+                ));
+            }
+        }
+    } else if nvrtc < FIRST_NVRTC_WITH_CUBIN {
+        rejected.push(format!(
+            "NVRTC {}.{} predates nvrtcGetCUBIN (CUDA {}.{}) and cannot emit SASS",
+            nvrtc.0, nvrtc.1, FIRST_NVRTC_WITH_CUBIN.0, FIRST_NVRTC_WITH_CUBIN.1
+        ));
+    } else {
+        rejected.push(format!(
+            "NVRTC {}.{} is a newer CUDA major than the CUDA {}.{} this driver supports, so its SASS would be rejected at load",
+            nvrtc.0, nvrtc.1, driver.0, driver.1
+        ));
+    }
+
+    if !ptx_jit_supported(nvrtc, driver) {
+        return Err(OrtError::Cuda(format!(
+            "device kernels cannot be built for this machine (kernel {name}, device sm_{major}{minor}, NVRTC {}.{}, driver supports CUDA {}.{}): {}; and PTX cannot be used either, because this NVRTC is newer than the CUDA the driver supports. Point the process at an NVRTC no newer than CUDA {}.{}, install a newer driver, or use a toolkit whose NVRTC emits SASS for sm_{major}{minor}.",
+            nvrtc.0,
+            nvrtc.1,
+            driver.0,
+            driver.1,
+            rejected.join("; "),
+            driver.0,
+            driver.1,
+        )));
+    }
+
+    let opts = cudarc::nvrtc::CompileOptions {
+        options: vec![arch_flag(DeviceCode::Ptx, major, minor)],
+        ..Default::default()
+    };
+    let ptx = cudarc::nvrtc::compile_ptx_with_opts(source, opts).map_err(|e| {
+        OrtError::Cuda(format!(
+            "NVRTC could not emit PTX for compute_{major}{minor} with NVRTC {}.{} (driver supports CUDA {}.{}); SASS was unavailable first: {}. Original error: {e:?}",
+            nvrtc.0, nvrtc.1, driver.0, driver.1, rejected.join("; "),
+        ))
+    })?;
+    tracing::debug!(
+        kernel = name,
+        arch = format!("compute_{major}{minor}"),
+        "compiled kernels to PTX; the driver will JIT them"
+    );
+    let mut image = ptx.to_src().into_bytes();
+    image.push(0);
+    Ok(image)
+}
+
 /// Compile to real-architecture SASS, returning the cubin image.
 ///
 /// Returns a description of why SASS was unavailable rather than an
