@@ -885,6 +885,55 @@ impl Value {
     }
 
     /// Enqueue a same-device CUDA copy without synchronizing the device.
+    /// Copy from another device tensor, ordered on `stream`.
+    ///
+    /// The copy is only ordered against work issued to the same stream, so this
+    /// is for buffers a shared compute stream already owns: it replaces a
+    /// synchronous `cudaMemcpy` plus a device barrier with one stream-ordered
+    /// node, which is what keeps a multi-session step from draining the device
+    /// between runs.
+    pub fn copy_from_cuda_on_stream(
+        &self,
+        source: &Value,
+        device_id: i32,
+        stream: usize,
+    ) -> Result<()> {
+        if self.shape != source.shape || self.dtype != source.dtype {
+            return Err(OrtError::InvalidArgument(format!(
+                "stream-ordered CUDA tensor copy requires identical tensors, destination {:?} {:?}, source {:?} {:?}",
+                self.dtype, self.shape, source.dtype, source.shape
+            )));
+        }
+        if self.is_host_resident()? || source.is_host_resident()? {
+            return Err(OrtError::InvalidArgument(
+                "stream-ordered CUDA tensor copy requires device-resident tensors".into(),
+            ));
+        }
+        #[cfg(feature = "cuda")]
+        {
+            let bytes = self
+                .numel()
+                .checked_mul(self.dtype.size_of())
+                .ok_or_else(|| {
+                    OrtError::InvalidArgument("CUDA tensor copy byte size overflows".into())
+                })?;
+            let _guard = crate::cuda_rt::DeviceGuard::set(device_id)?;
+            return crate::cuda_rt::memcpy_device_to_device_on_stream(
+                self.data_ptr_addr()?,
+                source.data_ptr_addr()?,
+                bytes,
+                stream,
+            );
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (device_id, stream);
+            Err(OrtError::InvalidArgument(
+                "stream-ordered CUDA tensor copy requires a build with CUDA support".into(),
+            ))
+        }
+    }
+
     pub fn copy_from_cuda_async(&self, source: &Value, device_id: i32) -> Result<()> {
         if self.shape != source.shape || self.dtype != source.dtype {
             return Err(OrtError::InvalidArgument(format!(

@@ -20,7 +20,6 @@
 //! resolved symbols are cached in a process-wide `OnceLock` so growth (which
 //! happens only O(log length) times per generation) never reloads it.
 
-use std::collections::BTreeMap;
 use std::os::raw::c_void;
 use std::sync::{Mutex, OnceLock};
 
@@ -183,34 +182,33 @@ pub fn device_synchronize() -> Result<()> {
     Ok(())
 }
 
-/// One process-lifetime CUDA stream per device, shared by every session that
-/// opts into `user_compute_stream`.
+/// Create a CUDA compute stream for one pipeline to share across its sessions.
 ///
 /// ORT gives each session its own stream by default, and alternating between
-/// per-session streams within one decode step costs far more than the extra
-/// session's work: on an H200 with stock ORT 1.28 a 2499-node captured decoder
-/// island replays in 15.40 ms alone, 16.11 ms with a second single-node session
-/// between replays on its own stream, and 15.44 ms with both on one stream.
-/// Upstream ORT GenAI does exactly this — every CUDA session it builds gets
-/// `user_compute_stream` set to one `cudaStreamCreate` stream — so sharing is
-/// also what makes this runtime's session options match the native baseline it
-/// is measured against.
+/// per-session streams within one step costs far more than the extra sessions'
+/// work: on an H200 with stock ORT 1.28 a 2499-node captured decoder island
+/// replays in 15.40 ms alone and 16.11 ms with a second single-node session
+/// between replays on its own stream. Sharing one stream also gives the
+/// pipeline a single ordered timeline, which is what lets stream-ordered copies
+/// between sessions replace device-wide barriers. Upstream ORT GenAI configures
+/// its CUDA sessions the same way.
+///
+/// Each call returns a *distinct* stream, and callers are expected to create one
+/// per pipeline rather than one per device. Stream capture is a property of the
+/// stream, not the thread: ORT captures with `cudaStreamCaptureModeGlobal`, so
+/// if two independently driven pipelines shared a stream, work one of them
+/// enqueued could be silently recorded into the other's graph instead of
+/// executing. A stream per pipeline keeps that impossible.
 ///
 /// The stream is created with `cudaStreamCreate`, matching GenAI: a blocking
 /// stream stays ordered against the legacy default stream that the engine's own
-/// helper copies use, so those copies need no extra barrier.
+/// host-visible copies use, so those copies need no extra barrier.
 ///
-/// It is created once and deliberately never destroyed: ORT holds it for as
-/// long as any session built with it lives, including through teardown.
-pub fn shared_compute_stream(device_id: i32) -> Result<usize> {
-    static STREAMS: OnceLock<Mutex<BTreeMap<i32, usize>>> = OnceLock::new();
-    let streams = STREAMS.get_or_init(|| Mutex::new(BTreeMap::new()));
-    let mut streams = streams
-        .lock()
-        .map_err(|_| OrtError::InvalidArgument("shared CUDA stream registry is poisoned".into()))?;
-    if let Some(stream) = streams.get(&device_id) {
-        return Ok(*stream);
-    }
+/// Streams are retained for the process lifetime and never destroyed: ORT holds
+/// one for as long as any session built with it lives, including through
+/// teardown, and the count is bounded by the number of loaded pipelines.
+pub fn create_compute_stream(device_id: i32) -> Result<usize> {
+    static STREAMS: OnceLock<Mutex<Vec<usize>>> = OnceLock::new();
     let _guard = DeviceGuard::set(device_id)?;
     let rt = runtime()?;
     let mut stream: *mut c_void = std::ptr::null_mut();
@@ -224,8 +222,46 @@ pub fn shared_compute_stream(device_id: i32) -> Result<usize> {
     }
     let stream = std::ptr::NonNull::new(stream).ok_or(OrtError::NullPointer)?;
     let stream = stream.as_ptr() as usize;
-    streams.insert(device_id, stream);
+    STREAMS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .map_err(|_| OrtError::InvalidArgument("CUDA stream registry is poisoned".into()))?
+        .push(stream);
     Ok(stream)
+}
+
+/// Enqueue a device-to-device copy on `stream`.
+///
+/// Stream-ordered against every other operation issued to the same stream, so a
+/// pipeline whose sessions share one compute stream needs no device barrier
+/// between a copy and the session runs on either side of it.
+pub fn memcpy_device_to_device_on_stream(
+    dst: usize,
+    src: usize,
+    bytes: usize,
+    stream: usize,
+) -> Result<()> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    let rt = runtime()?;
+    // SAFETY: `src` and `dst` cover `bytes` on the current device, and `stream`
+    // is a live `cudaStream_t`; the signature matches the documented cudart ABI.
+    let code = unsafe {
+        (rt.memcpy_async)(
+            dst as *mut c_void,
+            src as *const c_void,
+            bytes,
+            CUDA_MEMCPY_DEVICE_TO_DEVICE,
+            stream as *mut c_void,
+        )
+    };
+    if code != 0 {
+        return Err(OrtError::InvalidArgument(format!(
+            "cudaMemcpyAsync (device-to-device, stream-ordered) failed with CUDA error code {code}"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

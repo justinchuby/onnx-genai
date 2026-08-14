@@ -55,7 +55,7 @@ pub struct SessionOptions {
     /// value. `None` leaves each session on the per-session stream ORT creates.
     ///
     /// Set this whenever one logical step drives more than one CUDA session:
-    /// see [`crate::cuda_rt::shared_compute_stream`]. Upstream ORT GenAI sets it
+    /// see [`crate::cuda_rt::create_compute_stream`]. Upstream ORT GenAI sets it
     /// on every CUDA session it builds, so matching it is also what makes this
     /// runtime's session options comparable to that native baseline.
     pub cuda_user_compute_stream: Option<usize>,
@@ -75,6 +75,11 @@ impl SessionOptions {
     /// stream, so a step that drives several sessions keeps a single ordered
     /// device timeline instead of ping-ponging between per-session ORT streams.
     ///
+    /// Call this once per pipeline and derive that pipeline's session options
+    /// from the result. Each call creates a distinct stream on purpose: ORT
+    /// captures graphs with `cudaStreamCaptureModeGlobal`, so two independently
+    /// driven pipelines must never share one stream.
+    ///
     /// A no-op without a CUDA execution provider, and a no-op when the CUDA
     /// runtime cannot be loaded: the stream is a performance property, not a
     /// correctness one, so failing to create it must not fail session setup.
@@ -84,7 +89,7 @@ impl SessionOptions {
             let Some(device_id) = self.cuda_device_id() else {
                 return self;
             };
-            match crate::cuda_rt::shared_compute_stream(device_id) {
+            match crate::cuda_rt::create_compute_stream(device_id) {
                 Ok(stream) => self.cuda_user_compute_stream = Some(stream),
                 Err(error) => tracing::warn!(
                     device_id,

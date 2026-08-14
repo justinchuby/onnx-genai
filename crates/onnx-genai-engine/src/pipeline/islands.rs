@@ -265,6 +265,13 @@ impl ExecutionIsland {
         })?;
         let stored = Value::empty_in(output.shape(), output.dtype(), allocator)?;
         self.record_copy(output, &stored)?;
+        if let Some(stream) = self.session.user_compute_stream() {
+            // Ordered on the shared stream: the next session run reads it in
+            // order, and a host read goes through the default stream, which a
+            // blocking shared stream already serializes against. No barrier.
+            stored.copy_from_cuda_on_stream(output, device_id, stream)?;
+            return Ok((stored, false));
+        }
         stored.copy_from_cuda_async(output, device_id)?;
         Ok((stored, true))
     }
@@ -391,8 +398,7 @@ impl ExecutionIsland {
                     )
                 })?;
                 if let Some(device_id) = self.session.cuda_device_id() {
-                    destination
-                        .copy_from_cuda(source, device_id)
+                    self.refresh_input(destination, source, device_id)
                         .with_context(|| {
                             format!(
                                 "execution island {} could not refresh input '{name}'",
@@ -679,6 +685,36 @@ impl ExecutionIsland {
         self.record_device_memory_if_due();
         self.total_run_ns
             .set(self.total_run_ns.get() + started.elapsed().as_nanos());
+    }
+
+    /// Refresh one stable input from its producer.
+    ///
+    /// When the session shares a compute stream, the copy is issued to that
+    /// stream: it is then ordered against the session runs on either side of it
+    /// without a device barrier, and the host never waits.
+    ///
+    /// Otherwise it falls back to the legacy-default-stream copy this path has
+    /// always used. That fallback is only sound because ORT then synchronizes
+    /// its own stream at the end of every run, not because the copy itself
+    /// orders against it — a device-to-device `cudaMemcpy` is neither host-
+    /// blocking nor ordered against a non-blocking stream.
+    fn refresh_input(
+        &self,
+        destination: &Value,
+        source: &Value,
+        device_id: i32,
+    ) -> anyhow::Result<()> {
+        if let Some(stream) = self.session.user_compute_stream()
+            && !source.is_host_resident()?
+            && !destination.is_host_resident()?
+        {
+            return destination
+                .copy_from_cuda_on_stream(source, device_id, stream)
+                .map_err(Into::into);
+        }
+        destination
+            .copy_from_cuda(source, device_id)
+            .map_err(Into::into)
     }
 
     /// Resolve every input's dispatch decision once, when its binding is built.

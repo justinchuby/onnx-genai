@@ -169,6 +169,7 @@ pub struct Session {
     /// (CUDA `enable_cuda_graph=1`). Decode runners use this to drive the
     /// static-shape captured-graph replay path.
     graph_capture: bool,
+    user_compute_stream: Option<usize>,
 }
 
 impl Session {
@@ -301,6 +302,7 @@ impl Session {
             outputs,
             execution_providers: effective_providers,
             graph_capture: options.graph_capture,
+            user_compute_stream: options.cuda_user_compute_stream,
         })
     }
 
@@ -424,6 +426,7 @@ impl Session {
             outputs,
             execution_providers: effective_providers,
             graph_capture: options.graph_capture,
+            user_compute_stream: options.cuda_user_compute_stream,
         })
     }
 
@@ -499,6 +502,14 @@ impl Session {
     /// Whether this session was created with EP graph capture enabled.
     pub fn graph_capture(&self) -> bool {
         self.graph_capture
+    }
+
+    /// The caller-owned CUDA stream this session computes on, when one was
+    /// shared with it. Work issued to the same stream needs no device barrier
+    /// to be ordered against this session's runs.
+    #[must_use]
+    pub fn user_compute_stream(&self) -> Option<usize> {
+        self.user_compute_stream
     }
 
     /// The CUDA device id this session runs on, if a CUDA EP was requested.
