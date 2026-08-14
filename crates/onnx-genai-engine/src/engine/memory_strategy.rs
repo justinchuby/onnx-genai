@@ -695,6 +695,57 @@ pub(crate) fn log_memory_strategy_plan(plan: &MemoryStrategyPlan, scope: &'stati
             decision.reason
         );
     }
+    warn_if_budget_is_not_enforced(scope, plan);
+}
+
+/// Say, before the run rather than after it, that the memory budget this backend
+/// just reported is one it will not apply.
+///
+/// `advisory_only` is literally accurate — the plan is computed, logged, and
+/// consumed by nothing — but it has been a silent property of the code rather
+/// than a declared property of the backend. A user who passed a limit was shown
+/// the limit, shown their weights as a percentage of it, and never told that the
+/// percentage could exceed 100 without anything happening (#955). Reporting a
+/// bound we have handed away is the whole of the user-visible harm, and saying so
+/// costs a line.
+fn warn_if_budget_is_not_enforced(scope: &str, plan: &MemoryStrategyPlan) {
+    let Some((budget, percent)) = unenforced_budget_overrun(plan) else {
+        return;
+    };
+    tracing::warn!(
+        scope,
+        total_weight_bytes = plan.total_weight_bytes,
+        resolved_device_budget_bytes = budget,
+        weight_percent_of_budget = format!("{percent:.1}%"),
+        "this backend does not enforce the memory budget: model weights are \
+         {percent:.1}% of the resolved budget and nothing will constrain them. \
+         The plan below is advisory. Weight streaming is implemented on the \
+         native CUDA path; on this backend the limit is reported but not applied, \
+         so the KV cache is sized against a weight reservation that is never \
+         honoured (#955)."
+    );
+}
+
+/// `Some((budget, percent))` when the plan reports a budget the backend will not
+/// apply *and* the weights exceed it.
+///
+/// Deliberately silent when the budget is merely unenforced without being
+/// exceeded: that costs the user nothing, and warning on every run would train
+/// people to ignore the message that matters.
+fn unenforced_budget_overrun(plan: &MemoryStrategyPlan) -> Option<(u64, f64)> {
+    if !plan.advisory_only {
+        return None;
+    }
+    let budget = plan.resolved_device_budget_bytes?;
+    if plan.fits_resolved_device_budget != Some(false) {
+        return None;
+    }
+    let percent = if budget > 0 {
+        (plan.total_weight_bytes as f64 / budget as f64) * 100.0
+    } else {
+        f64::INFINITY
+    };
+    Some((budget, percent))
 }
 
 #[cfg(feature = "cuda")]
@@ -851,6 +902,58 @@ fn format_resource_limit_for_plan(limit: ResourceLimit) -> String {
 mod tests {
     use super::*;
     use onnx_runtime_ir::{DataType, Node, NodeId, TensorData};
+
+    /// A plan shaped like the one a user gets on the ORT path: the budget is
+    /// resolved and reported, and `advisory_only` means nothing will apply it.
+    fn advisory_plan(weights: u64, budget: Option<u64>, fits: Option<bool>) -> MemoryStrategyPlan {
+        let mut plan = MemoryStrategyPlan::unknown(weights, Some(196_608), "test");
+        assert!(
+            plan.advisory_only,
+            "unknown() is expected to be advisory; this test depends on it"
+        );
+        plan.resolved_device_budget_bytes = budget;
+        plan.fits_resolved_device_budget = fits;
+        plan
+    }
+
+    /// The exact case reported in #955: a 3 GiB limit, 8,330,595,870 bytes of
+    /// weights, and the runtime cheerfully printing 258.6% while doing nothing.
+    #[test]
+    fn unenforced_budget_overrun_reports_the_reported_percentage() {
+        let plan = advisory_plan(8_330_595_870, Some(3 << 30), Some(false));
+        let (budget, percent) = unenforced_budget_overrun(&plan)
+            .expect("an advisory budget that the weights exceed must be reported");
+        assert_eq!(budget, 3 << 30);
+        assert!(
+            (percent - 258.6).abs() < 0.1,
+            "expected the 258.6% from #955, got {percent}"
+        );
+    }
+
+    #[test]
+    fn an_unenforced_budget_that_is_not_exceeded_stays_quiet() {
+        // Warning on every advisory run would train users to ignore the one
+        // message that matters.
+        let plan = advisory_plan(1 << 30, Some(3 << 30), Some(true));
+        assert!(unenforced_budget_overrun(&plan).is_none());
+    }
+
+    #[test]
+    fn an_enforcing_backend_does_not_warn_even_when_over_budget() {
+        // Native CUDA streams the overflow; being over budget is the normal,
+        // handled case there, not a defect to report.
+        let mut plan = advisory_plan(8_330_595_870, Some(3 << 30), Some(false));
+        plan.advisory_only = false;
+        assert!(unenforced_budget_overrun(&plan).is_none());
+    }
+
+    #[test]
+    fn an_unmeasured_device_budget_does_not_warn() {
+        // After #947 an unknown capacity resolves to None. There is no budget to
+        // have violated, so there is nothing to say.
+        let plan = advisory_plan(8_330_595_870, None, None);
+        assert!(unenforced_budget_overrun(&plan).is_none());
+    }
 
     fn graph_with_boundary(domain: &str, op_type: &str) -> GraphMemoryEvidence {
         let mut graph = Graph::new();
