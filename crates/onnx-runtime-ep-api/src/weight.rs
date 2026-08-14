@@ -359,6 +359,17 @@ pub trait LazyDeviceWeightBinder {
 /// this; the returned slice must stay valid for the duration of the copy.
 pub trait MmapRegionSource {
     fn region_bytes(&self, region: &ExternalMmapRegion) -> Result<&[u8], WeightHandleError>;
+
+    /// Return the whole live mapping identified by `mapping_id`, if available.
+    ///
+    /// Used by the zero-copy hybrid weight path to page-lock and device-map an
+    /// entire mapping in a single `cuMemHostRegister`, guaranteeing that every
+    /// weight's device pointer is contiguous over its full length. Returning
+    /// `None` disables zero-copy for that mapping (the caller falls back to a
+    /// copy). The returned slice must stay valid for the mapping's lifetime.
+    fn full_mapping_bytes(&self, _mapping_id: usize) -> Option<&[u8]> {
+        None
+    }
 }
 
 /// A lazy weight paged into device memory by an EP, ready for a kernel to read.

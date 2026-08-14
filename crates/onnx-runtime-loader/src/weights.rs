@@ -600,6 +600,19 @@ impl WeightStore {
         mmap.mmap.get(offset..offset.checked_add(len)?)
     }
 
+    /// Return the whole live mmap backing `mapping_id`.
+    ///
+    /// The zero-copy hybrid (#864) registers an entire mapping once with
+    /// `cuMemHostRegister(READ_ONLY | DEVICEMAP)` so that every weight's device
+    /// pointer (from `cuMemHostGetDevicePointer`) is contiguous for its full
+    /// length — a per-weight registration would only be contiguous up to the
+    /// registration boundary, so a weight spanning two registrations would read
+    /// past valid device addresses.
+    pub fn mmap_full_bytes(&self, mapping_id: usize) -> Option<&[u8]> {
+        let mmap = self.mmaps.values().find(|mapped| mapped.id == mapping_id)?;
+        Some(&mmap.mmap[..])
+    }
+
     fn external_bytes(&self, path: &Path, offset: usize, length: usize) -> Option<&[u8]> {
         let mmap = self.mmaps.get(path)?;
         mmap.mmap.get(offset..offset.checked_add(length)?)
