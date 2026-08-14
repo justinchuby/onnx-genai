@@ -1095,7 +1095,13 @@ impl PipelineEngine {
                             })?;
                             validate_state_recurrence(&carry.cell, current, next, state, values)?;
                         }
-                        let next_value = if active_rows.iter().all(|active| *active) {
+                        let next_value = if active_rows.iter().all(|active| *active)
+                            || state.service_group.is_some()
+                        {
+                            // Service-managed state preserves inactive rows
+                            // through its logical lengths. Retain the device
+                            // value directly instead of materializing it on the
+                            // host merely to clone the same tensor.
                             share_workflow_value(values, &carry.body_output)?
                         } else {
                             let current = values.get(&carry.next).with_context(|| {
@@ -1107,13 +1113,7 @@ impl PipelineEngine {
                                     carry.body_output
                                 )
                             })?;
-                            merge_inactive_rows(
-                                current,
-                                next,
-                                &active_rows,
-                                state.service_group.is_some(),
-                            )
-                            .with_context(|| {
+                            merge_inactive_rows(current, next, &active_rows).with_context(|| {
                                 format!(
                                     "workflow loop carry '{}' cannot preserve inactive rows",
                                     carry.cell
@@ -1610,7 +1610,13 @@ impl PipelineEngine {
                 outputs.push((output.clone(), stable));
             }
         }
-        session.run_with_binding(&binding)?;
+        if session.graph_capture() {
+            // Warm the final fixed-address binding without capturing. The next
+            // equal-shape invocation owns the non-negative graph id.
+            session.run_with_binding_graph(&binding, -1)?;
+        } else {
+            session.run_with_binding(&binding)?;
+        }
         let graph_id =
             i32::try_from(bindings.len()).context("stable component CUDA graph id exceeds i32")?;
         let stable = StableComponentBinding {
@@ -3006,22 +3012,13 @@ fn slice_workflow_row(
     }
 }
 
-fn merge_inactive_rows(
-    current: &Value,
-    next: &Value,
-    active: &[bool],
-    service_managed: bool,
-) -> anyhow::Result<Value> {
+fn merge_inactive_rows(current: &Value, next: &Value, active: &[bool]) -> anyhow::Result<Value> {
     if active.len() == 1 || active.iter().all(|active| *active) {
-        return clone_value(next);
-    }
-    if service_managed {
-        // Per-row logical lengths and inactive-row storage are owned by the bound service.
         return clone_value(next);
     }
     anyhow::ensure!(current.dtype() == next.dtype());
     anyhow::ensure!(
-        current.shape() == next.shape() || service_managed,
+        current.shape() == next.shape(),
         "mixed active rows require equal current/next dense shapes; use per-row lengths and a \
          KV service group for growing state"
     );
@@ -3249,7 +3246,7 @@ mod workflow_scalar_tests {
         let current = Value::from_slice_i64(&[1, 2, 3, 4], &[2, 2]).expect("current");
         let next = Value::from_slice_i64(&[10, 20, 30, 40], &[2, 2]).expect("next");
         let merged =
-            merge_inactive_rows(&current, &next, &[true, false], false).expect("merge active rows");
+            merge_inactive_rows(&current, &next, &[true, false]).expect("merge active rows");
         assert_eq!(merged.to_vec_i64().expect("merged values"), [10, 20, 3, 4]);
     }
 

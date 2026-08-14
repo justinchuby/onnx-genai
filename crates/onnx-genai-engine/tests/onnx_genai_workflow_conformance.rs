@@ -222,6 +222,26 @@ fn mobius_decoder_rows_match_independent_runs_and_dynamic_batch_replay() -> anyh
         second_tokens
     );
 
+    let batch_four = decoder_batch_request(
+        &[4, 5, 6, 0, 4, 5, 6, 0],
+        4,
+        2,
+        &[2, 1, 2, 1],
+        &[true, true, true, true],
+        3,
+    )?;
+    let batch_four_output = engine.run_pipeline_outputs(batch_four)?;
+    let batch_four_rows =
+        engine.output_rows_for_role(&batch_four_output, WorkflowOutputRole::Tokens);
+    assert_eq!(batch_four_rows.len(), 4);
+    for (row, expected) in
+        batch_four_rows
+            .iter()
+            .zip([&first_tokens, &second_tokens, &first_tokens, &second_tokens])
+    {
+        assert_eq!(row.1.to_vec_i64()?, expected.as_slice());
+    }
+
     let replay = decoder_batch_request(&[4, 5], 1, 2, &[2], &[true], 3)?;
     let replay_output = engine.run_pipeline_outputs(replay)?;
     assert_eq!(
@@ -231,6 +251,13 @@ fn mobius_decoder_rows_match_independent_runs_and_dynamic_batch_replay() -> anyh
             .to_vec_i64()?,
         first_tokens
     );
+
+    let batch_two_replay = decoder_batch_request(&[4, 5, 6, 0], 2, 2, &[2, 1], &[true, true], 3)?;
+    let batch_two_replay_output = engine.run_pipeline_outputs(batch_two_replay)?;
+    let batch_two_replay_rows =
+        engine.output_rows_for_role(&batch_two_replay_output, WorkflowOutputRole::Tokens);
+    assert_eq!(batch_two_replay_rows[0].1.to_vec_i64()?, first_tokens);
+    assert_eq!(batch_two_replay_rows[1].1.to_vec_i64()?, second_tokens);
     Ok(())
 }
 
