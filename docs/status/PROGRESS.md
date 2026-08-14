@@ -447,8 +447,26 @@ See [`deepseek-native-status-2026-07-25.md`](../models/deepseek-native-status-20
   `ONNX_GENAI_ZERO_COPY_HYBRID` with the conservative budget, as instrumentation for parts
   with larger host apertures — which must be **re-measured**, not assumed to inherit this
   result in either direction. Recorded as a design constraint in
-  [`MEMORY_MANAGEMENT_MODEL_DESIGN.md`](../memory/MEMORY_MANAGEMENT_MODEL_DESIGN.md) C7: a platform
-  that cannot report its host-mapped read capacity is treated as **zero**, not unbounded.
+  [`MEMORY_MANAGEMENT_MODEL_DESIGN.md`](../memory/MEMORY_MANAGEMENT_MODEL_DESIGN.md) C7: a
+  platform that cannot report its host-mapped read capacity is treated as **zero**, not
+  unbounded.
+
+  **Scope: this closure is WDDM-only. On Linux the hybrid is OPEN and untested (#925),**
+  and the reasoning that closed it does not carry over:
+  - **The comparison arm does not exist there.** Linux has no OS shared-memory fallback,
+    so an over-budget model that does not stream simply fails. The hybrid's competitor on
+    Linux is managed streaming (0.11–0.86 tok/s on this box) or "does not run" — not
+    WDDM's 7.84. A result that loses badly to WDDM can still be the largest available win
+    on Linux.
+  - **The ceiling that killed it is plausibly WDDM's.** #863 already measured VidMm
+    demoting our own VMM granules behind our back; a host registration being silently
+    remapped is the same family of behaviour. On Linux `cuMemHostRegister` pins pages in
+    the driver with no VidMm layer above it. That is a hypothesis, not a measurement —
+    which is exactly why it needs measuring rather than assuming.
+  This is #783's lesson applied to our own result: do not inherit a platform-specific
+  conclusion. The code already keeps the platforms separate — `shared_memory_weight_fallback`
+  is `cfg!(windows)` and Linux still auto-enables managed streaming, unit-locked by
+  `managed_default_no_flag_over_budget_model_auto_streams`.
 - [ ] **#837 item 3 — residency policy gap.** Post-#866 the policy sits **1.97× above its
   own streaming floor** (2.349 vs 1.191 GB/step), i.e. **1.158 GB/step recoverable**, worth
   ~91 ms/step at measured bandwidths. `byte_hit_rate` 71.8% against an achievable 85.7%
