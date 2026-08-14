@@ -90,3 +90,14 @@ Focused delta re-review of three new BF16 tests and comment hygiene. All three t
 - **Verdict: READY to leave draft.**
 
 **Output:** `.squad/decisions/inbox/holden-final-two.md`
+
+## 2026-08-14 — Zero-copy hybrid Linux default raised to 2 GiB (#936, merged)
+Measured (#925, H200, driver 580.105.08, CUDA 13, native VMM) that the #864 zero-copy aperture ceiling
+is **Windows/WDDM/VidMm-specific and absent on Linux** — generation byte-identical up to 6.795 GB
+host-mapped weights (704 binds, n=3), ~15× the WDDM ~0.44 GB corruption onset. Made
+`ZERO_COPY_SAFE_BUDGET_BYTES` platform-conditional in `crates/onnx-runtime-ep-cuda/src/weight_paging.rs`:
+Windows stays 256 MiB, Linux/non-Windows raised to **2 GiB** (both consts referenced every build via
+`cfg!(target_os="windows")`). Unlocks a ~8× memory-constrained decode win (67.04 vs ~8.5 tok/s over-budget,
+byte-identical). 2 GiB bounded on purpose (>3× below measured-safe 6.795 GB, only Hopper tested); operator
+override via `ONNX_GENAI_ZERO_COPY_HYBRID_BUDGET_BYTES`. Feature stays opt-in default-OFF; Windows unchanged
+(do NOT inherit the Linux conclusion there — inverse of #783).

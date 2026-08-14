@@ -17,3 +17,12 @@ is not bandwidth-bound (47 tok/s = ~15% of the 4.8 TB/s roofline; byte-fold −7
 KV sharding runs models that don't fit one H200 (may be the stronger reason to build TP). kv_heads=2 splits
 clean only at N=2 (N≥4 needs KV replication); `onnx-runtime-comm` has the trait but no NCCL backend
 (multi-week to wire). Recommend the S-sized Phase-0 2-GPU all-reduce microbench first.
+
+## 2026-08-14 — Decode remaining big-build levers: build B first (#938, doc on main)
+Feasibility scoping of the two multi-week levers left after the cheap ones closed. **Recommend Lever B
+first** — a capture-stable padded M=K verify graph that REPLAYS (attacks the dispatch binding; floor
+≈1.0×, ceiling ~2–3×; one build unlocks prompt-lookup + EAGLE-3/MTP), gated on a cheap Phase-0
+capture-stability probe. Keep **Lever A** (Marlin int4 weight relayout, unconditional ~1.3–1.6×) funded
+as fallback/parallel; A becomes primary only if B's Phase-0 fails. B 🟢 GO to Phase-0; A 🟡 CONDITIONAL
+(full GO iff an M=1 Marlin GEMV microbench lifts achieved DRAM 29% → ≥~55%). Next step = throwaway
+`#[ignore]` Phase-0 microbench before committing eng-weeks. Doc `docs/research/decode-remaining-levers-feasibility.md`.
