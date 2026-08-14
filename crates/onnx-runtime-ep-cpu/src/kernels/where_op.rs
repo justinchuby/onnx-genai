@@ -1,5 +1,5 @@
 //! `Where(cond, x, y)`: elementwise select with numpy-style broadcasting
-//! (`docs/ORT2.md` §4.4).
+//! (`docs/architecture/ORT2.md` §4.4).
 //!
 //! `cond` is a `Bool` tensor; `x` and `y` share the output dtype. The three
 //! operands broadcast together to the output shape. Selection copies raw

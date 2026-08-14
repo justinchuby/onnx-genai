@@ -1,5 +1,5 @@
 //! Phase-2b scaled-dot-product / grouped-query **attention** on the GPU
-//! (`docs/ORT2.md` §13 + §15.5).
+//! (`docs/architecture/ORT2.md` §13 + §15.5).
 //!
 //! Multi-token prefill uses an NVRTC-compiled tiled online-softmax kernel that
 //! keeps score tiles and softmax state in SRAM/registers. It does not allocate

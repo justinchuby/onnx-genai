@@ -110,6 +110,17 @@ const GEMV_F16_SCALES_F16_ZP_SPLITK_ENTRY: &str = "matmul_nbits_gemv_f16_scales_
 /// its `blockDim.x / 32` warps but now covers `warps / K_SPLIT` columns, so the
 /// launch grid grows by this factor.
 const GEMV_F16_SCALES_F16_ZP_SPLITK: usize = 2;
+/// Fold-scale split-K entry names. The per-block scale is folded into the int4
+/// dequant so the MAC drops 4 fp16x2 multiplies per 8 weights, relieving the
+/// dequant-ALU pipe that co-bounds the decode GEMV (measured +2.7% end-to-end,
+/// byte-identical greedy stream on Muse-Glimmer-30B). Opt-in via
+/// `ONNX_GENAI_GEMV_FOLDSCALE=1` (default OFF; the fused `(code-zp)*scale` is
+/// slightly less accurate per element than the plain split-K path, so it stays
+/// gated pending a numerics review). Results are near-equal (tolerance).
+const GEMV_F16_SCALES_F16_FOLDSCALE_SPLITK_ENTRY: &str =
+    "matmul_nbits_gemv_f16_scales_f16_foldscale_splitk";
+const GEMV_F16_SCALES_F16_ZP_FOLDSCALE_SPLITK_ENTRY: &str =
+    "matmul_nbits_gemv_f16_scales_f16_foldscale_zp_splitk";
 /// General fp16/fp16-scales GEMV with a fused RMS-normalization prologue (see
 /// [`crate::optimizer::CudaSkipRmsNormMatMulFusion`]). It normalizes the input
 /// activation in-kernel — byte-identically to `skip_rmsnorm_f16_warp_half4` —
@@ -1488,7 +1499,81 @@ __device__ __forceinline__ void accumulate_int4x8_f16_zp(
                    *reinterpret_cast<const __half2*>(&permuted.w), sum3);
 }
 
-// One warp per output column; `columns_per_block` (== blockDim.x / 32) columns
+// Debias-then-scale int4 dequant (fold-scale). Recovers the exact integer code
+// in fp16 (the same 1024/64 lop3-bias removal as `int4x8_to_half2x4_sub`, which
+// is fp16-exact for codes 0..15 so there is no catastrophic cancellation), then
+// folds the per-block scale AND zero point into ONE `fma` per pair:
+// `(code - zp) * scale = fma(code, scale2, neg_zp_scale2)`. This lets the MAC
+// drop its separate `__hmul2(q, scale)`, removing 4 fp16x2 multiplies per 8
+// weights on the ALU-co-bound (measured 65% pipe) M=1 decode GEMV.
+__device__ __forceinline__ void int4x8_to_half2x4_scaledsub(
+    const unsigned int packed,
+    __half2* values,
+    const unsigned int scale2,
+    const unsigned int neg_zp_scale2)
+{
+    unsigned int* h = reinterpret_cast<unsigned int*>(values);
+    constexpr unsigned int bottom_mask = 0x000f000f;
+    constexpr unsigned int top_mask = 0x00f000f0;
+    constexpr unsigned int fp16_magic = 0x64006400;
+    constexpr unsigned int lop3_lut = (0xf0 & 0xcc) | 0xaa;
+    const unsigned int top = packed >> 8;
+    asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+                 : "=r"(h[0])
+                 : "r"(packed), "n"(bottom_mask), "n"(fp16_magic), "n"(lop3_lut));
+    asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+                 : "=r"(h[1])
+                 : "r"(packed), "n"(top_mask), "n"(fp16_magic), "n"(lop3_lut));
+    asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+                 : "=r"(h[2])
+                 : "r"(top), "n"(bottom_mask), "n"(fp16_magic), "n"(lop3_lut));
+    asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+                 : "=r"(h[3])
+                 : "r"(top), "n"(top_mask), "n"(fp16_magic), "n"(lop3_lut));
+    constexpr unsigned int fp16_1024 = 0x64006400;
+    constexpr unsigned int fp16_one_sixteenth = 0x2c002c00;
+    constexpr unsigned int fp16_neg64 = 0xd400d400;
+    // Debias to the exact integer code first (fp16-exact for 0..15).
+    asm volatile("sub.f16x2 %0, %1, %2;\n"
+                 : "=r"(h[0]) : "r"(h[0]), "r"(fp16_1024));
+    asm volatile("fma.rn.f16x2 %0, %1, %2, %3;\n"
+                 : "=r"(h[1])
+                 : "r"(h[1]), "r"(fp16_one_sixteenth), "r"(fp16_neg64));
+    asm volatile("sub.f16x2 %0, %1, %2;\n"
+                 : "=r"(h[2]) : "r"(h[2]), "r"(fp16_1024));
+    asm volatile("fma.rn.f16x2 %0, %1, %2, %3;\n"
+                 : "=r"(h[3])
+                 : "r"(h[3]), "r"(fp16_one_sixteenth), "r"(fp16_neg64));
+    // Fold `(code - zp) * scale` into one fma per pair (replaces the standalone
+    // zp-subtract here and the `__hmul2(q, scale)` in the MAC).
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        asm volatile("fma.rn.f16x2 %0, %1, %2, %3;\n"
+                     : "=r"(h[i]) : "r"(h[i]), "r"(scale2), "r"(neg_zp_scale2));
+    }
+}
+
+// Fold-scale MAC: dequant `(code - zp) * scale` via `int4x8_to_half2x4_scaledsub`
+// then a plain `__hfma2` per pair against the pre-permuted activation — no
+// separate scale multiply. `scale2` is the packed fp16x2 block scale and
+// `neg_zp_scale2` the packed fp16x2 `-(zp * scale)`.
+__device__ __forceinline__ void accumulate_int4x8_f16_foldscale(
+    const unsigned int packed,
+    const uint4& activation,
+    const unsigned int scale2,
+    const unsigned int neg_zp_scale2,
+    __half2& sum0,
+    __half2& sum1,
+    __half2& sum2,
+    __half2& sum3)
+{
+    __half2 q[4];
+    int4x8_to_half2x4_scaledsub(packed, q, scale2, neg_zp_scale2);
+    sum0 = __hfma2(q[0], *reinterpret_cast<const __half2*>(&activation.x), sum0);
+    sum1 = __hfma2(q[1], *reinterpret_cast<const __half2*>(&activation.y), sum1);
+    sum2 = __hfma2(q[2], *reinterpret_cast<const __half2*>(&activation.z), sum2);
+    sum3 = __hfma2(q[3], *reinterpret_cast<const __half2*>(&activation.w), sum3);
+}
 // per CTA. Four adjacent lanes split each block-32 weight blob into aligned
 // uint32 loads, so every warp issues contiguous 128-byte packed-weight
 // transactions. Each lane also reads eight activations with one uint4 load.
@@ -1871,6 +1956,175 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_zp_splitk(
     const int bias_post_round)
 {
     matmul_nbits_gemv_f16_scales_f16_splitk_tpl<true>(
+        activation, packed, scales_raw, zero_points, bias, output, k, n,
+        block_size, k_blocks, blob_size, zp_row_bytes, scales_fp16,
+        bias_post_round);
+}
+
+// Fold-scale split-K int4 GEMV. Identical structure/reduction to
+// `matmul_nbits_gemv_f16_scales_f16_splitk_tpl`, but the per-block scale is
+// folded into the dequant (`accumulate_int4x8_f16_foldscale`) so the MAC drops
+// 4 fp16x2 multiplies per 8 weights — relieving the ~65% dequant-ALU pipe that
+// co-bounds the M=1 decode GEMV (measured: dominant gate/up GEMV ~56us -> ~53us,
+// +2.7% end-to-end decode). Numerics differ from the plain split-K only by fp16
+// rounding of `(code-zp)*scale` (a fused fma vs a separate multiply); the greedy
+// token stream on Muse-Glimmer-30B is byte-identical to the plain split-K path,
+// so it is tolerance-clean (this path is already a new fp32 block-sum
+// association vs the single-warp kernel).
+template <bool HasZp>
+__device__ __forceinline__ void matmul_nbits_gemv_f16_scales_f16_splitk_foldscale_tpl(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales_raw,
+    const unsigned char* __restrict__ zero_points,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int scales_fp16,
+    const int bias_post_round)
+{
+    (void)block_size;
+    (void)scales_fp16;
+    constexpr int K_SPLIT = 2;
+    const __half* __restrict__ scales =
+        reinterpret_cast<const __half*>(scales_raw);
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const int cols_per_block = warps_per_block / K_SPLIT;
+    const int col_local = warp / K_SPLIT;
+    const int ks = warp % K_SPLIT;
+    const int column = (int)blockIdx.x * cols_per_block + col_local;
+
+    __shared__ float partials[8][K_SPLIT];
+
+    __half2 sum0 = __float2half2_rn(0.0f);
+    __half2 sum1 = __float2half2_rn(0.0f);
+    __half2 sum2 = __float2half2_rn(0.0f);
+    __half2 sum3 = __float2half2_rn(0.0f);
+    float tail = 0.0f;
+    if (column < n) {
+        const int lane_depth = lane * 8;
+        int depth_base = ks * 256;
+        const __half* activation_ptr = activation + depth_base + lane_depth;
+        const unsigned char* packed_ptr =
+            packed + (long)column * k_blocks * blob_size +
+            (long)(depth_base >> 5) * blob_size + lane * 4;
+        const __half* scale_ptr =
+            scales + (long)column * k_blocks + (depth_base >> 5) + (lane >> 2);
+        for (; depth_base < k; depth_base += K_SPLIT * 256) {
+            const int depth = depth_base + lane_depth;
+            if (depth >= k) {
+                activation_ptr += K_SPLIT * 256;
+                packed_ptr += K_SPLIT * 128;
+                scale_ptr += K_SPLIT * 8;
+                continue;
+            }
+            const unsigned int packed_word =
+                *reinterpret_cast<const unsigned int*>(packed_ptr);
+            const int block = (depth_base >> 5) + (lane >> 2);
+            const __half sc = *scale_ptr;
+            const float scf = __half2float(sc);
+            const int zero_point =
+                block_zp<HasZp>(zero_points, column, block, zp_row_bytes);
+            if (depth + 8 <= k) {
+                const __half2 scale2h = __halves2half2(sc, sc);
+                const __half nzs = __float2half(-(float)zero_point * scf);
+                const __half2 nzs2 = __halves2half2(nzs, nzs);
+                const uint4 permuted = permute_activation_f16x8(activation_ptr);
+                accumulate_int4x8_f16_foldscale(
+                    packed_word, permuted,
+                    *reinterpret_cast<const unsigned int*>(&scale2h),
+                    *reinterpret_cast<const unsigned int*>(&nzs2),
+                    sum0, sum1, sum2, sum3);
+            } else {
+                const int valid = k - depth;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    if (i < valid) {
+                        const int q =
+                            (int)((packed_word >> (i * 4)) & 15u) - zero_point;
+                        tail += (float)q * __half2float(activation_ptr[i]) * scf;
+                    }
+                }
+            }
+            activation_ptr += K_SPLIT * 256;
+            packed_ptr += K_SPLIT * 128;
+            scale_ptr += K_SPLIT * 8;
+        }
+    }
+    const float2 value04 = __half22float2(sum0);
+    const float2 value15 = __half22float2(sum1);
+    const float2 value26 = __half22float2(sum2);
+    const float2 value37 = __half22float2(sum3);
+    float value = tail + value04.x;
+    value += value15.x;
+    value += value26.x;
+    value += value37.x;
+    value += value04.y;
+    value += value15.y;
+    value += value26.y;
+    value += value37.y;
+    value = warp_sum(value);
+    if (lane == 0) {
+        partials[col_local][ks] = (column < n) ? value : 0.0f;
+    }
+    __syncthreads();
+    if (ks == 0 && lane == 0 && column < n) {
+        float acc = 0.0f;
+#pragma unroll
+        for (int s = 0; s < K_SPLIT; ++s) {
+            acc += partials[col_local][s];
+        }
+        output[column] = fold_bias_f16(acc, bias, column, bias_post_round);
+    }
+}
+
+extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_foldscale_splitk(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales_raw,
+    const unsigned char* __restrict__ zero_points,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int scales_fp16,
+    const int bias_post_round)
+{
+    matmul_nbits_gemv_f16_scales_f16_splitk_foldscale_tpl<false>(
+        activation, packed, scales_raw, zero_points, bias, output, k, n,
+        block_size, k_blocks, blob_size, zp_row_bytes, scales_fp16,
+        bias_post_round);
+}
+
+extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_foldscale_zp_splitk(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales_raw,
+    const unsigned char* __restrict__ zero_points,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int scales_fp16,
+    const int bias_post_round)
+{
+    matmul_nbits_gemv_f16_scales_f16_splitk_foldscale_tpl<true>(
         activation, packed, scales_raw, zero_points, bias, output, k, n,
         block_size, k_blocks, blob_size, zp_row_bytes, scales_fp16,
         bias_post_round);
@@ -3502,6 +3756,21 @@ fn down_columns_override() -> Option<(usize, &'static str)> {
         "2" => Some((2, GEMV_F16_DOWN_C2_ENTRY)),
         _ => None,
     }
+}
+
+/// Fold-scale toggle for the dominant int4 decode GEMV. Default OFF: folding the
+/// per-block scale into the dequant drops 4 fp16x2 multiplies per 8 weights
+/// (measured +2.7% decode, greedy stream byte-identical on Muse-Glimmer-30B),
+/// but the fused `(code-zp)*scale` sums two fp16-rounded terms and so is
+/// slightly less accurate per element than the plain split-K path (exceeds the
+/// synthetic asymmetric-zp parity guard's 5e-2 rel bound at ~1e-1). Opt in with
+/// `ONNX_GENAI_GEMV_FOLDSCALE=1` (or `true`/`on`); production stays on the plain
+/// split-K entries until the accuracy trade is gated.
+fn gemv_foldscale_enabled() -> bool {
+    matches!(
+        std::env::var("ONNX_GENAI_GEMV_FOLDSCALE").ok().as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
 }
 
 pub struct MatMulNBitsFactory {
@@ -5713,6 +5982,11 @@ impl MatMulNBitsKernel {
                 capabilities.max_threads_per_block(),
             );
         let use_scales_f16_splitk = use_scales_f16_zp_splitk || use_scales_f16_symmetric_splitk;
+        // Fold-scale routing for the split-K decode GEMV: opt-in (default off)
+        // via `ONNX_GENAI_GEMV_FOLDSCALE`. Folds the per-block scale into the
+        // dequant, dropping the MAC's __hmul2. Only matters when the split-K
+        // path is actually taken.
+        let use_gemv_foldscale = use_scales_f16_splitk && gemv_foldscale_enabled();
         // Down projection grid-fill: choose columns-per-CTA (8/4/2) from the
         // device SM count so a small-N (grid-starved) down launch splits enough
         // to fill the multiprocessors, bit-identically. A developer env override
@@ -5747,13 +6021,21 @@ impl MatMulNBitsKernel {
                         // SMs; otherwise the plain single-warp `_zp` entry (which
                         // handles the divergent K tail).
                         if use_scales_f16_zp_splitk {
-                            GEMV_F16_SCALES_F16_ZP_SPLITK_ENTRY
+                            if use_gemv_foldscale {
+                                GEMV_F16_SCALES_F16_ZP_FOLDSCALE_SPLITK_ENTRY
+                            } else {
+                                GEMV_F16_SCALES_F16_ZP_SPLITK_ENTRY
+                            }
                         } else {
                             GEMV_F16_SCALES_F16_ZP_ENTRY
                         }
                     } else {
                         if use_scales_f16_symmetric_splitk {
-                            GEMV_F16_SCALES_F16_SPLITK_ENTRY
+                            if use_gemv_foldscale {
+                                GEMV_F16_SCALES_F16_FOLDSCALE_SPLITK_ENTRY
+                            } else {
+                                GEMV_F16_SCALES_F16_SPLITK_ENTRY
+                            }
                         } else {
                             GEMV_F16_SCALES_F16_ENTRY
                         }

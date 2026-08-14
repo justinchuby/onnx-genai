@@ -2,7 +2,7 @@
 //!
 //! A pure-Rust ONNX **standard library** — model I/O, textual format, and an
 //! extensible validator — built on the shared runtime IR. This is the first
-//! wave of the design captured in `docs/ONNX_RS.md`.
+//! wave of the design captured in `docs/architecture/ONNX_RS.md`.
 //!
 //! ## Relationship to the rest of the workspace
 //!

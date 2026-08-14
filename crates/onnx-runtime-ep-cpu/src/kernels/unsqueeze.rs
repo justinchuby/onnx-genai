@@ -1,5 +1,5 @@
 //! `Unsqueeze`: insert size-1 dimensions at the positions named by `axes`
-//! (`docs/ORT2.md` §4.4).
+//! (`docs/architecture/ORT2.md` §4.4).
 //!
 //! Two axis-signature forms are supported:
 //! * **Legacy (opset ≤ 12):** `axes` is an **attribute**.

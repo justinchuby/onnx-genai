@@ -4,7 +4,7 @@
 //! under captured-graph replay — the decode hot path?) and question **Q5** (what
 //! does copy-on-write at the granule boundary cost when a sequence diverges?).
 //!
-//! # Background (measured, merged — see docs/MEMORY_ARCHITECTURE.md)
+//! # Background (measured, merged — see docs/memory/MEMORY_ARCHITECTURE.md)
 //!
 //! Concurrent serving requests overwhelmingly share a prefix — a system prompt,
 //! a tool schema, a few-shot preamble, a RAG document. Today each concurrent

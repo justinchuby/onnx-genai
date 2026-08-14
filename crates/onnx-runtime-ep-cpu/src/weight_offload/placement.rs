@@ -278,7 +278,7 @@ fn catalog_tensor_bytes(catalog: &WeightRegionCatalog) -> Result<u64, PlacementE
 //
 // The *placement* planner above stays. Deciding which layers live on the device
 // is a different question, nothing else answers it, and Phase 3b is waiting on
-// it (docs/WEIGHT_OFFLOAD.md). What it must not do is carry its own budget:
+// it (docs/memory/WEIGHT_OFFLOAD.md). What it must not do is carry its own budget:
 // when it is wired, it should ask the governor how much room there is rather
 // than arbitrating for itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

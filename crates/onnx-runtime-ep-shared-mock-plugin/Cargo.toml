@@ -20,6 +20,7 @@ onnx-runtime-memory-governor = { workspace = true }
 libloading = { workspace = true }
 onnx-genai-ort-sys = { workspace = true }
 onnx-runtime-ort-testkit = { workspace = true }
+onnx-std = { workspace = true }
 
 [lints]
 workspace = true

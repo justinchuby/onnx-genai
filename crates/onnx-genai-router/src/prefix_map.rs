@@ -1,4 +1,4 @@
-//! Prefix-hash → node co-location map (see `docs/DESIGN.md` §34.4/§34.5).
+//! Prefix-hash → node co-location map (see `docs/architecture/DESIGN.md` §34.4/§34.5).
 //!
 //! Sessions that share a system-prompt prefix are placed on the same node so
 //! they can share KV pages. The router keys this on a `u64` prefix hash. The

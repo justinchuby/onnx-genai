@@ -1,5 +1,5 @@
 //! `Gemm`: general matrix multiply `Y = alpha * A' * B' + beta * C` for floating
-//! point tensors (`docs/ORT2.md` §4.4).
+//! point tensors (`docs/architecture/ORT2.md` §4.4).
 //!
 //! `A'`/`B'` are `A`/`B` optionally transposed per `transA`/`transB`. `A` is
 //! 2-D `[M,K]` (or `[K,M]` when transposed), `B` is `[K,N]` (or `[N,K]`). The

@@ -1,6 +1,6 @@
 //! # `onnx-runtime-ep-cuda`
 //!
-//! The CUDA execution provider for the ORT 2.0 runtime (`docs/ORT2.md` §15 and
+//! The CUDA execution provider for the ORT 2.0 runtime (`docs/architecture/ORT2.md` §15 and
 //! §56 Phase 2). It implements [`onnx_runtime_ep_api::ExecutionProvider`] on top
 //! of [`cudarc`] (driver + cuBLASLt), mirroring the structure of the CPU EP.
 //!
@@ -23,7 +23,7 @@
 //!   tensor-core specialization and retained decode/unsupported-shape baselines.
 //!
 //! The full op → backend mapping matrix, remaining coverage, and the
-//! prioritised custom-kernel candidate list live in `docs/CUDA_COVERAGE.md`.
+//! prioritised custom-kernel candidate list live in `docs/execution/CUDA_COVERAGE.md`.
 //! Roadmap ops not yet wired (cuDNN softmax/norm, cub reductions, data-movement,
 //! FP8 and remaining fusion-node lowering return an actionable
 //! [`onnx_runtime_ep_api::EpError`].
@@ -123,12 +123,14 @@ pub use weight_paging::{
     EvictOrderProbe, GlobalOffloadStats, WEIGHT_OFFLOAD_ASYNC_PAGEIN_ENV,
     WEIGHT_OFFLOAD_BYTE_AWARE_ENV, WEIGHT_OFFLOAD_DEVICE_BYTES_ENV, WEIGHT_OFFLOAD_ENV,
     WEIGHT_OFFLOAD_EVICT_ORDER_ENV, WEIGHT_OFFLOAD_SCAN_RESISTANT_ENV,
-    byte_aware_residency_from_env, evict_order_probe_from_env, global_offload_stats,
-    reset_global_offload_stats,
+    WEIGHT_OFFLOAD_ZERO_COPY_HYBRID_ENV, byte_aware_residency_from_env, evict_order_probe_from_env,
+    global_offload_stats, reset_global_offload_stats, zero_copy_hybrid_from_env,
 };
 
-/// Number of additional u32 words required by the CUDA device argmax result buffer.
-pub fn device_argmax_scratch_words(elements: usize) -> usize {
-    kernels::device_argmax::scratch_words(elements)
+/// Number of additional u32 words the CUDA device argmax result buffer needs
+/// beyond its `2 × batch` header words, for `batch` sequences of `elements`
+/// logits each.
+pub fn device_argmax_scratch_words(elements: usize, batch: usize) -> usize {
+    kernels::device_argmax::scratch_words(elements, batch)
 }
 pub use runtime::{CudaAllocationCounts, CudaRuntime};

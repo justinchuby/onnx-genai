@@ -9,7 +9,7 @@ Requested by @justinchuby to challenge non-intuitive claims and direction-settin
 - Nabil's `CreateEpFactories` export symbol: SOUND.
 - Pris's `CreateEpApiFactories` export symbol: CONTRADICTED (typedef name vs dlsym name).
 - Pris's "e2e test impossible, nm -D shows 2 symbols": CONTRADICTED (ORT C API delivered via function-pointer struct, invisible to nm -D).
-Written `docs/EP_PLUGIN_EXPORT_ABI_TRUTH.md`. Implementation unblocked for e2e testing.
+Written `docs/ep-plugin/EP_PLUGIN_EXPORT_ABI_TRUTH.md`. Implementation unblocked for e2e testing.
 
 ### 2026-08-11 — PR #762 fourth review (fbd565160..4757e25b6)
 Two BLOCKERS: B1 `__absent_output_*` string sentinel forgeable from model content; B2 `filter_map(|d| d.as_static())` destroys rank (`[batch, seq, 768]` → `[768]`). Coco fixed both.

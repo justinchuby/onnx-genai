@@ -7,7 +7,7 @@
 //! builds against. It is intentionally pure, safe Rust with no FFI and no
 //! device dependencies so it compiles standalone on any target.
 //!
-//! It is a Rust port of the design captured in `docs/ORT2.md` §3 (Graph IR),
+//! It is a Rust port of the design captured in `docs/architecture/ORT2.md` §3 (Graph IR),
 //! §5 (Striding & Layout) and §11 (Dynamic Shape), itself inspired by the
 //! Python [`onnx-ir`](https://github.com/onnx/ir-py) package.
 //!

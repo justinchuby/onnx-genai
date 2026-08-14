@@ -1,5 +1,5 @@
 //! Operator fusion: match a connected op-sequence and replace it with a single
-//! fused op (see `docs/ORT2.md` §18.2).
+//! fused op (see `docs/architecture/ORT2.md` §18.2).
 //!
 //! ## Matching model
 //!

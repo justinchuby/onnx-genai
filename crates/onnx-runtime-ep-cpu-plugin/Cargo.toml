@@ -23,6 +23,7 @@ onnx-runtime-ep-plugin = { path = "../onnx-runtime-ep-plugin", version = "=0.1.0
 onnx-runtime-ep-cpu = { workspace = true }
 onnx-runtime-ep-api = { workspace = true }
 onnx-runtime-ir = { workspace = true }
+onnx-std = { workspace = true }
 
 [lints]
 workspace = true

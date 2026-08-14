@@ -30,3 +30,5 @@ gate as an independent backstop; growing/paged KV stays vetoed. Prerequisite #3 
 the 5-blocker chain (#848 → #850 → #852 → #855 → #854). My pin exposed the bf16 GQA
 kernel gap I flagged to Sebastian (#855). Team result: native decode **11.4 → 23.13
 tok/s**, capture fully engaged (1 segment / 0 seams).
+
+- **2026-08-14 (#921, MERGED):** textproto fixture sweep — converted 29 committed inline-weight ONNX fixtures to `model.onnx.textproto` and established the convention (keep binary only for external-data sidecars or real-ORT/ORT-GenAI package loaders). Added the in-memory textproto→binary ORT shim `tests/common/ort_session.rs`; each conversion round-trip verified and suites re-run green.

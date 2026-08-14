@@ -1,6 +1,6 @@
 //! Synthetic end-to-end parity for the SDPA-core fusion
 //! (`MatMul → (Mul|Div) → [Add] → Softmax → MatMul → com.microsoft::FusedAttention`,
-//! `docs/ORT2.md` §18.x AttentionFusion).
+//! `docs/architecture/ORT2.md` §18.x AttentionFusion).
 //!
 //! This constructs a small scaled-dot-product-attention core by hand (via the
 //! ONNX IR API), encodes it to ONNX bytes, and runs it through the production

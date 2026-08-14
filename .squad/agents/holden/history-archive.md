@@ -11,7 +11,7 @@ Fixed PR #322 security blockers with HostTrust, open_with_trust, and symlink-res
 - 3 HIGH: `static mut` data race on HOST_ORT_API, missing null-check on `graphs` in `ep_compile`, unsound blanket `Send+Sync` on `OutboundGraphReader`.
 - 2 MEDIUM, 1 LOW (hardening, non-blocking).
 - Decision record filed: `.squad/decisions/inbox/holden-ep-plugin-ffi-audit.md`.
-- Full report: `docs/EP_PLUGIN_EXPORT_SECURITY_AUDIT.md`.
+- Full report: `docs/ep-plugin/EP_PLUGIN_EXPORT_SECURITY_AUDIT.md`.
 - `compute.rs` and `kernel_ctx.rs` flagged for re-audit when Phase 2 Compute lands.
 
 ## 2026-08-10T22:42:21+0000 — EP plugin final ship verdict (squad/ep-plugin-export)

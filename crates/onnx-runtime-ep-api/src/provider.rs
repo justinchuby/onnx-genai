@@ -645,13 +645,17 @@ pub trait ExecutionProvider: Send + Sync {
         false
     }
 
-    /// Launch an allocation-free device argmax over `elements` contiguous
-    /// `dtype` values (Float32 or Float16). `result` receives two native-endian
-    /// u32 values: token id, then the latching device capture-error bitmask.
+    /// Launch an allocation-free device argmax over `batch` sequences of
+    /// `elements` contiguous `dtype` values (Float32 or Float16) each, laid out
+    /// as a `[batch, elements]` row-major block. `result` receives, per sequence
+    /// `s`, two native-endian u32 values at word offset `2*s`: the token id, then
+    /// the latching device capture-error bitmask. At `batch == 1` this is the
+    /// previous single-sequence contract byte-for-byte.
     fn device_argmax(
         &self,
         _logits: &DeviceBuffer,
         _elements: usize,
+        _batch: usize,
         _dtype: DataType,
         _result: &mut DeviceBuffer,
     ) -> Result<()> {
@@ -945,7 +949,7 @@ pub trait ExecutionProvider: Send + Sync {
     }
 
     /// The `EPContext` node `source` key(s) this EP accepts for compiled-context
-    /// dispatch (`docs/ORT2.md` §55.6). The keys come from the EP's own
+    /// dispatch (`docs/architecture/ORT2.md` §55.6). The keys come from the EP's own
     /// config/data — **never** hardcoded in loader/session dispatch. An empty
     /// list (the default) means the EP does not participate in `EPContext`
     /// (e.g. the pure-Rust CPU EP has no compile step).

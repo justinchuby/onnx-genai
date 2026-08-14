@@ -86,7 +86,7 @@ fn graph_capture_auto_enables_for_owned_cuda_kv() {
     // Env unset, no programmatic override, offload disabled -> auto-enable from
     // structure.
     assert!(resolve_graph_capture_enabled(
-        None, false, false, structural, false, false
+        None, false, false, structural, false, None
     ));
 }
 
@@ -97,9 +97,9 @@ fn every_decode_level_capture_decline_names_its_predicate() {
         kv_ownership: KvOwnership::Owned,
     };
     let cases = [
-        resolve_graph_capture_decision(None, false, false, owned_cuda, true, false),
-        resolve_graph_capture_decision(Some(false), false, false, owned_cuda, false, false),
-        resolve_graph_capture_decision(None, true, false, owned_cuda, false, false),
+        resolve_graph_capture_decision(None, false, false, owned_cuda, true, Some(false)),
+        resolve_graph_capture_decision(Some(false), false, false, owned_cuda, false, None),
+        resolve_graph_capture_decision(None, true, false, owned_cuda, false, None),
         resolve_graph_capture_decision(
             None,
             false,
@@ -109,7 +109,7 @@ fn every_decode_level_capture_decline_names_its_predicate() {
                 kv_ownership: KvOwnership::Owned,
             },
             false,
-            false,
+            None,
         ),
         resolve_graph_capture_decision(
             None,
@@ -120,7 +120,7 @@ fn every_decode_level_capture_decline_names_its_predicate() {
                 kv_ownership: KvOwnership::Shared,
             },
             false,
-            false,
+            None,
         ),
     ];
 
@@ -135,7 +135,7 @@ fn every_decode_level_capture_decline_names_its_predicate() {
         );
     }
 
-    let enabled = resolve_graph_capture_decision(None, false, false, owned_cuda, false, false);
+    let enabled = resolve_graph_capture_decision(None, false, false, owned_cuda, false, None);
     assert!(enabled.is_enabled());
     assert!(enabled.decline_reason().is_none());
 }
@@ -150,10 +150,20 @@ fn weight_offload_forces_graph_capture_off() {
     // every other signal: auto-safe structure, an explicit env=1, and an
     // explicit programmatic request all still resolve to OFF.
     assert!(!resolve_graph_capture_enabled(
-        None, false, false, safe, true, false
+        None,
+        false,
+        false,
+        safe,
+        true,
+        Some(false)
     ));
     assert!(!resolve_graph_capture_enabled(
-        None, true, true, safe, true, false
+        None,
+        true,
+        true,
+        safe,
+        true,
+        Some(false)
     ));
     assert!(!resolve_graph_capture_enabled(
         Some(true),
@@ -161,12 +171,12 @@ fn weight_offload_forces_graph_capture_off() {
         true,
         safe,
         true,
-        false
+        Some(false)
     ));
     // Sanity: with offload disabled the same safe structure enables capture, so
     // the exclusion above is genuinely caused by offload.
     assert!(resolve_graph_capture_enabled(
-        None, false, false, safe, false, false
+        None, false, false, safe, false, None
     ));
 }
 
@@ -182,11 +192,21 @@ fn weight_offload_on_stable_va_path_keeps_graph_capture() {
     };
     // Auto-decision from a safe structure now enables capture with offload on.
     assert!(resolve_graph_capture_enabled(
-        None, false, false, safe, true, true
+        None,
+        false,
+        false,
+        safe,
+        true,
+        Some(true)
     ));
     // An explicit env=1 is honored.
     assert!(resolve_graph_capture_enabled(
-        None, true, true, safe, true, true
+        None,
+        true,
+        true,
+        safe,
+        true,
+        Some(true)
     ));
     // A programmatic request is honored in both directions.
     assert!(resolve_graph_capture_enabled(
@@ -195,7 +215,7 @@ fn weight_offload_on_stable_va_path_keeps_graph_capture() {
         false,
         safe,
         true,
-        true
+        Some(true)
     ));
     assert!(!resolve_graph_capture_enabled(
         Some(false),
@@ -203,7 +223,7 @@ fn weight_offload_on_stable_va_path_keeps_graph_capture() {
         false,
         safe,
         true,
-        true
+        Some(true)
     ));
     // An unsafe structure still declines, exactly as it would with offload off.
     let unsafe_structure = GraphCaptureStructuralSafety {
@@ -216,7 +236,7 @@ fn weight_offload_on_stable_va_path_keeps_graph_capture() {
         false,
         unsafe_structure,
         true,
-        true
+        Some(true)
     ));
 }
 
@@ -346,7 +366,7 @@ fn graph_capture_auto_declines_for_non_owned_or_non_cuda() {
     };
     assert!(!shared.is_capture_safe());
     assert!(!resolve_graph_capture_enabled(
-        None, false, false, shared, false, false
+        None, false, false, shared, false, None
     ));
 
     let cpu_owned = GraphCaptureStructuralSafety {
@@ -355,7 +375,7 @@ fn graph_capture_auto_declines_for_non_owned_or_non_cuda() {
     };
     assert!(!cpu_owned.is_capture_safe());
     assert!(!resolve_graph_capture_enabled(
-        None, false, false, cpu_owned, false, false
+        None, false, false, cpu_owned, false, None
     ));
 }
 
@@ -371,7 +391,7 @@ fn graph_capture_env_explicit_overrides_auto_decision() {
     };
     // ONNX_GENAI_CUDA_GRAPH=0 forces OFF even when structurally safe.
     assert!(!resolve_graph_capture_enabled(
-        None, true, false, safe, false, false
+        None, true, false, safe, false, None
     ));
     // ONNX_GENAI_CUDA_GRAPH=1 forces ON even when structure would decline
     // (the runtime decline machinery is still the final safety net).
@@ -381,7 +401,7 @@ fn graph_capture_env_explicit_overrides_auto_decision() {
         true,
         unsafe_structural,
         false,
-        false
+        None
     ));
 }
 
@@ -398,7 +418,7 @@ fn graph_capture_programmatic_override_wins_over_env_and_structure() {
         true,
         safe,
         false,
-        false
+        None
     ));
     // Programmatic Some(true) beats explicit env=0.
     assert!(resolve_graph_capture_enabled(
@@ -407,7 +427,7 @@ fn graph_capture_programmatic_override_wins_over_env_and_structure() {
         false,
         safe,
         false,
-        false
+        None
     ));
 }
 
@@ -1942,6 +1962,7 @@ fn persistent_auxiliary_output_shape_is_fixed_and_rejects_strings() {
         "auxiliary_state",
         DataType::Float16,
         &[Dim::Symbolic(SymbolId(0)), Dim::Static(1536)],
+        1,
     )
     .expect("numeric auxiliary output must be bindable");
     assert_eq!(shape, [1, 1536]);
@@ -1950,6 +1971,7 @@ fn persistent_auxiliary_output_shape_is_fixed_and_rejects_strings() {
         "auxiliary_text",
         DataType::String,
         &[Dim::Static(1)],
+        1,
     )
     .expect_err("variable-width auxiliary output must fail explicitly");
     let message = error.to_string();
@@ -1971,6 +1993,7 @@ fn cuda_persistent_state_shapes_preserve_growing_kv_and_fixed_recurrent_geometry
             Dim::Symbolic(past),
             Dim::Static(256),
         ],
+        1,
         512,
         false,
     )
@@ -1982,6 +2005,7 @@ fn cuda_persistent_state_shapes_preserve_growing_kv_and_fixed_recurrent_geometry
         "past_key_values.0.conv_state",
         DataType::Float16,
         &[Dim::Symbolic(batch), Dim::Static(10_240), Dim::Static(3)],
+        1,
         512,
         true,
     )
@@ -1998,12 +2022,91 @@ fn cuda_persistent_state_shapes_preserve_growing_kv_and_fixed_recurrent_geometry
             Dim::Static(128),
             Dim::Static(128),
         ],
+        1,
         512,
         true,
     )
     .expect("rank-4 fixed recurrent state");
     assert_eq!(recurrent_physical, [1, 48, 128, 128]);
     assert_eq!(recurrent_logical, recurrent_physical);
+}
+
+#[test]
+fn cuda_persistent_state_shapes_thread_batch_axis_0() {
+    // Stage 2b-impl-1 (#750): the batch extent is threaded to axis 0 rather than
+    // hard-coded to 1. The BNSH axis order must not move: axis 0 is batch, axis
+    // 2 is the grown seq capacity, regardless of `batch`.
+    let batch_sym = SymbolId(0);
+    let past = SymbolId(1);
+    let (kv_physical, kv_logical) = DecodeCudaState::persistent_state_shapes(
+        "past_key_values.0.key",
+        DataType::Float16,
+        &[
+            Dim::Symbolic(batch_sym),
+            Dim::Static(4),
+            Dim::Symbolic(past),
+            Dim::Static(256),
+        ],
+        3,
+        512,
+        false,
+    )
+    .expect("rank-4 growing KV threads batch");
+    assert_eq!(kv_physical, [3, 4, 512, 256]);
+    assert_eq!(kv_logical, [3, 4, 0, 256]);
+
+    // Fixed recurrent state threads batch on axis 0 too.
+    let (recurrent_physical, recurrent_logical) = DecodeCudaState::persistent_state_shapes(
+        "past_key_values.0.recurrent_state",
+        DataType::Float16,
+        &[
+            Dim::Symbolic(batch_sym),
+            Dim::Static(48),
+            Dim::Static(128),
+            Dim::Static(128),
+        ],
+        3,
+        512,
+        true,
+    )
+    .expect("rank-4 fixed recurrent state threads batch");
+    assert_eq!(recurrent_physical, [3, 48, 128, 128]);
+    assert_eq!(recurrent_logical, recurrent_physical);
+}
+
+#[test]
+fn persistent_output_shape_threads_batch_only_on_axis_0() {
+    // The batch axis (0) takes the threaded extent; every other symbolic axis is
+    // a query-seq unit collapsed to 1. Static axes (e.g. vocab) are preserved.
+    let batch = SymbolId(0);
+    let seq = SymbolId(1);
+    let shape = DecodeCudaState::persistent_output_shape(
+        "logits",
+        DataType::Float32,
+        &[
+            Dim::Symbolic(batch),
+            Dim::Symbolic(seq),
+            Dim::Static(151_936),
+        ],
+        3,
+    )
+    .expect("logits shape threads batch");
+    assert_eq!(shape, [3, 1, 151_936]);
+
+    // At batch 1 (every current caller) it is byte-identical to the historical
+    // collapse-every-symbolic-to-1 behavior.
+    let shape_batch_1 = DecodeCudaState::persistent_output_shape(
+        "logits",
+        DataType::Float32,
+        &[
+            Dim::Symbolic(batch),
+            Dim::Symbolic(seq),
+            Dim::Static(151_936),
+        ],
+        1,
+    )
+    .expect("logits shape at batch 1");
+    assert_eq!(shape_batch_1, [1, 1, 151_936]);
 }
 
 #[test]
@@ -2082,12 +2185,53 @@ fn seq_major_growth_is_fixed_stride_and_moves_no_bytes() {
     }
 }
 
+// Batch-N control (stage 2b-impl-2, #750): head-major growing-bucket growth is
+// batch-general, seq-major growing-bucket growth at batch>1 is an explicit named
+// refusal (it would relocate every sequence b>0). This asserts the geometry math
+// at batch>1 even though runtime batch stays fixed to 1 — a transposed axis or a
+// silently wrong capacity-dependent stride could not surface at batch=1.
+#[test]
+fn kv_growth_byte_layout_refuses_seq_major_batch_n_and_allows_head_major_batch_n() {
+    // Head-major: batch axis outermost, byte layout == declared shape, grow axis
+    // 2, block count = batch * kv_heads — each (batch, head) stripe re-strides
+    // independently and correctly, so batch-N growth is exact.
+    let head_batch_n = [3usize, 8, 512, 128];
+    let (bytes, axis) = kv_growth_byte_layout(&head_batch_n, KvCommitLayout::HeadMajor)
+        .expect("head-major batch-N growing bucket is batch-general");
+    assert_eq!(bytes, head_batch_n.to_vec());
+    assert_eq!(axis, 2);
+    let blocks: usize = bytes[..axis].iter().product();
+    assert_eq!(blocks, 3 * 8, "head-major blocks = batch * kv_heads");
+
+    // Seq-major growing bucket at batch>1 is refused with a named error rather
+    // than a silently wrong capacity-dependent stride.
+    let seq_batch_n = [3usize, 8, 512, 128];
+    let error = kv_growth_byte_layout(&seq_batch_n, KvCommitLayout::SeqMajor)
+        .expect_err("seq-major batch-N growing bucket must be refused");
+    let message = error.to_string();
+    assert!(message.contains("seq-major"), "names the layout: {message}");
+    assert!(message.contains("batch 3"), "names the batch: {message}");
+    assert!(
+        message.contains("relocat"),
+        "names the constraint: {message}"
+    );
+
+    // Batch-1 seq-major is unaffected: byte-identical BSNH permutation, grow
+    // axis 1.
+    let seq_batch_1 = [1usize, 8, 512, 128];
+    let (seq_bytes, seq_axis) = kv_growth_byte_layout(&seq_batch_1, KvCommitLayout::SeqMajor)
+        .expect("seq-major batch-1 unaffected");
+    assert_eq!(seq_bytes, vec![1, 512, 8, 128]);
+    assert_eq!(seq_axis, 1);
+}
+
 #[test]
 fn cuda_fixed_state_shapes_reject_unbounded_non_batch_dimensions() {
     let error = DecodeCudaState::persistent_state_shapes(
         "state",
         DataType::Float16,
         &[Dim::Symbolic(SymbolId(0)), Dim::Symbolic(SymbolId(1))],
+        1,
         128,
         true,
     )

@@ -1,9 +1,9 @@
-//! The core single-op dispatch flow (`docs/EAGER.md` §10.1), reconciled to the
+//! The core single-op dispatch flow (`docs/execution/EAGER.md` §10.1), reconciled to the
 //! real runtime APIs.
 //!
 //! ## Design-vs-real-API reconciliation
 //!
-//! The design pseudocode (`docs/EAGER.md` §10.1) calls
+//! The design pseudocode (`docs/execution/EAGER.md` §10.1) calls
 //! `registry.lookup(op_type, domain, opset)` then `factory.create(attrs)`. The
 //! real APIs are:
 //!
@@ -61,7 +61,7 @@ fn ephemeral_node(
 
 impl EagerContext {
     /// Dispatch a single ONNX op to a kernel and return its outputs
-    /// (`docs/EAGER.md` §10.1). The 7-step flow, reconciled to the real APIs:
+    /// (`docs/execution/EAGER.md` §10.1). The 7-step flow, reconciled to the real APIs:
     ///
     /// 1. resolve the effective opset (explicit per-call value > domain default),
     /// 2. resolve the target device from the inputs (mixed devices = error),
@@ -214,7 +214,7 @@ impl EagerContext {
         Ok(outputs)
     }
 
-    /// Per-op output shape/dtype inference (`docs/EAGER.md` §9), driven by the
+    /// Per-op output shape/dtype inference (`docs/execution/EAGER.md` §9), driven by the
     /// shared [`InferenceRegistry`](onnx_runtime_shape_inference::InferenceRegistry).
     /// Returns one `(dtype, shape)` per output slot.
     fn infer_output_meta(

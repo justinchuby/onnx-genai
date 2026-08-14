@@ -1,4 +1,4 @@
-//! The compiled-kernel cache (`docs/EAGER.md` §8.2).
+//! The compiled-kernel cache (`docs/execution/EAGER.md` §8.2).
 //!
 //! A bounded LRU keyed by the op identity plus the concrete input shapes,
 //! dtypes, and device — so that repeated eager calls with the same op and shapes
@@ -6,7 +6,7 @@
 //!
 //! ## Design-vs-real-API reconciliation
 //!
-//! The design stores `Arc<dyn Kernel>` (`docs/EAGER.md` §8.2). The real
+//! The design stores `Arc<dyn Kernel>` (`docs/execution/EAGER.md` §8.2). The real
 //! [`Kernel`](onnx_runtime_ep_api::Kernel) trait is `Send` **but not `Sync`**
 //! (`onnx-runtime-ep-api/src/kernel.rs`), so a bare `Arc<dyn Kernel>` is not
 //! `Send` and could not live inside the process-global, `Sync`
@@ -31,7 +31,7 @@ use onnx_runtime_ir::{DataType, DeviceId};
 /// for why this is `Arc<Mutex<Box<dyn Kernel>>>` rather than `Arc<dyn Kernel>`.
 pub type CachedKernel = Arc<Mutex<Box<dyn Kernel>>>;
 
-/// The cache key (`docs/EAGER.md` §8.2 `KernelCacheKey`).
+/// The cache key (`docs/execution/EAGER.md` §8.2 `KernelCacheKey`).
 ///
 /// Two dispatches share a compiled kernel iff they agree on the op identity
 /// (`op_type`, `domain`, `opset`), the input shapes, the input dtypes, and the
@@ -63,7 +63,7 @@ pub struct CacheStats {
     pub misses: u64,
 }
 
-/// A bounded LRU of compiled kernels (`docs/EAGER.md` §8.2).
+/// A bounded LRU of compiled kernels (`docs/execution/EAGER.md` §8.2).
 pub struct KernelCache {
     capacity: usize,
     map: HashMap<KernelCacheKey, CachedKernel>,
@@ -87,7 +87,7 @@ impl KernelCache {
     }
 
     /// Return the cached kernel for `key`, compiling and inserting it via
-    /// `create` on a miss (`docs/EAGER.md` §8.2 `get_or_create`).
+    /// `create` on a miss (`docs/execution/EAGER.md` §8.2 `get_or_create`).
     pub fn get_or_create<E>(
         &mut self,
         key: KernelCacheKey,

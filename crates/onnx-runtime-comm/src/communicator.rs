@@ -1,5 +1,5 @@
 //! The runtime-level [`Communicator`] abstraction
-//! (`docs/DISTRIBUTED_RUNTIME.md` §3.1).
+//! (`docs/distributed/DISTRIBUTED_RUNTIME.md` §3.1).
 //!
 //! The [`InProcessCommunicator`](crate::InProcessCommunicator) is the
 //! single-process correctness oracle: it implements every method, deterministic

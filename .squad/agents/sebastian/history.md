@@ -127,3 +127,18 @@ NO-GO and #899/#900 glue-collapse +0.9% ceiling). **Next lever (NOT funded):** f
 into the neighbouring multi-CTA int4 GEMV prologue/epilogue (bf16 analogue of
 `CudaSkipRmsNormMatMulFusion`) — keeps the reduction distributed. Do NOT self-merge (Chew gates
 numerics). Doc §8.6.
+
+- **2026-08-14 (#916, MERGED):** bf16 norm-into-GEMV-prologue fusion measured NO-GO — −4.6% regression AND numeric divergence (≈token 38) under CUDA-graph replay; fp16 prologue reduction is single-warp-serial on the critical GEMV path. Finding-only (docs §8.7), nothing landed. **Fourth** independent confirmation of the batch-1 decode latency floor; norm→GEMV-prologue kill-gate CLOSED.
+
+## 2026-08-14 — int4 decode GEMV bandwidth pass (#928, MERGED, main 8fe56961)
+`ncu` on the dominant Muse-Glimmer-30B int4 GEMV: sustains only **~29% peak DRAM** — kernel-efficiency
+floor, not hardware floor. Three phased levers, H200 GPU 7: **split-K (2→4→8) NO-GO** (K4 +1% noise,
+DRAM fell, K8 regressed; occupancy already ~91%); **cp.async double-buffered loads NO-GO −13%** (4 B/lane
+too small — needs 16 B `.cg` over a Marlin tiled relayout); **fold per-block scale into LOP3 dequant
+(`fma(code,scale,-zp·scale)`) = the only win, +2.7%** (~47.6 → 48.9–49.0 tok/s). Kernel −4.6% over ~61%
+GEMV fraction predicts +2.9%, measured +2.7% — **fully Amdahl-explained, no hidden serial-dispatch floor**.
+GEMV is **co-bound** (40.7% Long-Scoreboard + 64.8% dequant-ALU); ~39% non-GEMV Amdahl-caps end-to-end.
+Reframes the "launch-amortized floor" as HBM-bandwidth/dispatch-co-bound. Numerics: greedy 128-token stream
+byte-identical but not byte-exact per element (fails synthetic asymmetric-zp guard, near-zero cols only).
+**Ship opt-in default OFF** (`ONNX_GENAI_GEMV_FOLDSCALE=1`). Bigger single-GPU wins need a from-scratch
+Marlin int4 kernel (multi-week).

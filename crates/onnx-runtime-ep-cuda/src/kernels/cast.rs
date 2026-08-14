@@ -1,5 +1,5 @@
 //! `Cast` / `CastLike`: element-wise dtype conversion on the GPU via
-//! runtime-compiled (NVRTC) kernels (`docs/CUDA_COVERAGE.md`, "Shape /
+//! runtime-compiled (NVRTC) kernels (`docs/execution/CUDA_COVERAGE.md`, "Shape /
 //! data-movement" row).
 //!
 //! ## Backend choice — custom NVRTC (trivial pointwise), and *why*

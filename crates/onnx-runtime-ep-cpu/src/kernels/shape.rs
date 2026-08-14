@@ -1,5 +1,5 @@
 //! `Shape`: return the input tensor's dimensions as a 1-D `int64` tensor
-//! (`docs/ORT2.md` §4.4).
+//! (`docs/architecture/ORT2.md` §4.4).
 //!
 //! Opset-15 added the optional `start`/`end` attributes, which select a
 //! (possibly negative-indexed) slice of the dim list; when omitted the full

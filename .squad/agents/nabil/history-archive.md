@@ -11,18 +11,18 @@ Hired to lead the ORT plugin-EP integration for a new **Apple Metal/MPS executio
 Authored the ORT-schema-based model-package design document.
 
 ### 2026-07-16T00:00:03Z — Projection-fusion design recorded
-Authored `docs/PROJECTION_FUSION.md` for conservative load-time gate/up MatMulNBits fusion. Fact Checker confirmed QKV is already packed, gate/up is the available `4864|4864→9728` target, and qualified the roughly 125 MiB payload as a lower-bound memory cost. The design is awaiting user approval and is not implemented.
+Authored `docs/quantization/PROJECTION_FUSION.md` for conservative load-time gate/up MatMulNBits fusion. Fact Checker confirmed QKV is already packed, gate/up is the available `4864|4864→9728` target, and qualified the roughly 125 MiB payload as a lower-bound memory cost. The design is awaiting user approval and is not implemented.
 
 ### 2026-07-16T00:00:00Z — Native CUDA decode design
-Authored `docs/NATIVE_CUDA_DECODE.md` (`b416b7f`) and applied Fact Checker's stream/graph-ownership corrections (`33beb8d`). The fact-checked five-milestone `Arc<dyn ExecutionProvider>` design awaits user greenlight; implementation has not started.
+Authored `docs/execution/NATIVE_CUDA_DECODE.md` (`b416b7f`) and applied Fact Checker's stream/graph-ownership corrections (`33beb8d`). The fact-checked five-milestone `Arc<dyn ExecutionProvider>` design awaits user greenlight; implementation has not started.
 
 ## 2026-07-16T17:00:38+0000 — Weight offload design
-- Authored `docs/WEIGHT_OFFLOAD.md` (`f0d0890`): immutable mmap backing feeds bounded host and VRAM caches through weight-specific expert/page leases.
+- Authored `docs/memory/WEIGHT_OFFLOAD.md` (`f0d0890`): immutable mmap backing feeds bounded host and VRAM caches through weight-specific expert/page leases.
 - The design awaits user greenlight; no implementation has started.
 
 ## 2026-07-16T19-27-57+0000 — Scribe session update
 
-- Authored `docs/DEEPSEEK_CSA_MTP_RUNTIME.md` (`bca068c`), a native CSA/index-op and persistent iterative-MTP sidecar-state design. It awaits user greenlight.
+- Authored `docs/models/DEEPSEEK_CSA_MTP_RUNTIME.md` (`bca068c`), a native CSA/index-op and persistent iterative-MTP sidecar-state design. It awaits user greenlight.
 
 ## 2026-07-14T00:00:00Z — QMoE final approval
 
@@ -51,7 +51,7 @@ Authored `docs/NATIVE_CUDA_DECODE.md` (`b416b7f`) and applied Fact Checker's str
 ## ARCHIVED 2026-08-12T06:00:00Z (Scribe #762 memory-safety wave compaction)
 
 ### 2026-08-10 — Outbound plugin-EP ABI recon and gap analysis
-Completed outbound plugin-EP ABI recon and gap analysis. Verified ORT 1.27.0 / API v27 bindings. Enumerated all ORT plugin-EP structs and function-pointer fields. Produced lifecycle mapping table (2 DIRECT, 9 ADAPTABLE, 4 MISSING). CPU EP export is mechanical; CUDA EP has hard blockers around context/stream/allocator ownership. Written to `docs/EP_PLUGIN_EXPORT_ABI_GAPS.md`.
+Completed outbound plugin-EP ABI recon and gap analysis. Verified ORT 1.27.0 / API v27 bindings. Enumerated all ORT plugin-EP structs and function-pointer fields. Produced lifecycle mapping table (2 DIRECT, 9 ADAPTABLE, 4 MISSING). CPU EP export is mechanical; CUDA EP has hard blockers around context/stream/allocator ownership. Written to `docs/ep-plugin/EP_PLUGIN_EXPORT_ABI_GAPS.md`.
 
 ### 2026-08-10 — Implemented outbound ORT plugin-EP export (v1)
 Created `crates/onnx-runtime-ep-plugin` and `crates/onnx-runtime-ep-cpu-plugin`. CPU EP exports `CreateEpFactories` / `ReleaseEpFactory` as real C symbols. OrtEpFactory vtable fully wired. L2 dlopen integration test passing.

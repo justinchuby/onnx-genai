@@ -12,18 +12,27 @@ import struct
 
 import onnx
 from onnx import TensorProto, helper
+from google.protobuf import text_format
 import numpy as np
 
 FIXTURES_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def save(model, name, check=True):
-    path = os.path.join(FIXTURES_DIR, name, "model.onnx")
+    # Fixtures are committed as git-friendly ONNX protobuf TextFormat
+    # (`model.onnx.textproto`), which our runtime loader parses transparently
+    # (see `onnx_runtime_loader::is_textproto_path`). No binary `model.onnx` is
+    # committed. NOTE: the canonical committed textproto is produced by the Rust
+    # helper (`cargo run -p onnx-std --example convert_fixture`, which uses
+    # `onnx_std::textproto::to_textproto`); this Python path emits an equivalent,
+    # loader-compatible textproto whose exact formatting may differ from the
+    # Rust canonical output.
+    path = os.path.join(FIXTURES_DIR, name, "model.onnx.textproto")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     if check:
         onnx.checker.check_model(model)
-    with open(path, "wb") as f:
-        f.write(model.SerializeToString())
+    with open(path, "w") as f:
+        f.write(text_format.MessageToString(model))
     print(f"  wrote {path} ({os.path.getsize(path)} bytes)")
 
 

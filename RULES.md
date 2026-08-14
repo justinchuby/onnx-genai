@@ -13,7 +13,7 @@ These durable rules bind every human contributor and every AI coding agent worki
 - Prefer descriptive `Result`s over panics on user-facing paths; panic-fence FFI, fail closed on invalid input, and separate user/configuration errors from internal invariant failures.
 - Reviewers must report weak, opaque, context-losing, or unactionable errors as real findings.
 
-See [`docs/ORT2.md` §35](docs/ORT2.md#35-error-recovery--debug-experience) and §26.
+See [`docs/architecture/ORT2.md` §35](docs/architecture/ORT2.md#35-error-recovery--debug-experience) and §26.
 
 ## 2. Stay model-, vendor-, and EP-agnostic
 
@@ -27,7 +27,7 @@ See [`docs/ORT2.md` §35](docs/ORT2.md#35-error-recovery--debug-experience) and 
 - A fusion must generalize across every model that exhibits the pattern. Optimize per pattern category, not for one model; hardcoded shape constants that only match one model are review-blocking.
 - Fusion lives inside the EP claim/compile path. Reusable pattern matching and rewriting belongs in the IR crate, not ad-hoc per-EP string or shape checks.
 
-See [`docs/ORT2.md` §15.1](docs/ORT2.md#151-decision-summary), §55.6, [`docs/MODEL_METADATA.md`](docs/MODEL_METADATA.md), and [`docs/PROGRESS.md`](docs/PROGRESS.md).
+See [`docs/architecture/ORT2.md` §15.1](docs/architecture/ORT2.md#151-decision-summary), §55.6, [`docs/genai/MODEL_METADATA.md`](docs/genai/MODEL_METADATA.md), and [`docs/status/PROGRESS.md`](docs/status/PROGRESS.md).
 
 ## 3. Make pre-release changes cleanly
 
@@ -37,7 +37,7 @@ See [`docs/ORT2.md` §15.1](docs/ORT2.md#151-decision-summary), §55.6, [`docs/M
 - Do not retain duplicate old symbols “just in case.”
 - This does not waive product compatibility requirements such as supported ONNX opsets or the documented ORT/plugin ABI surface.
 
-See [`docs/PROGRESS.md`](docs/PROGRESS.md) and [`docs/CRATE_RESERVATION.md`](docs/CRATE_RESERVATION.md).
+See [`docs/status/PROGRESS.md`](docs/status/PROGRESS.md) and [`docs/architecture/CRATE_RESERVATION.md`](docs/architecture/CRATE_RESERVATION.md).
 
 ## 4. Do not rewrite what already works
 
@@ -46,7 +46,7 @@ See [`docs/PROGRESS.md`](docs/PROGRESS.md) and [`docs/CRATE_RESERVATION.md`](doc
 - CPU uses the built-in SIMD backend; CUDA uses cuBLAS/cuBLASLt and cuDNN before CuTe/CUTLASS custom fusions.
 - Profile before replacing proven implementations, and keep thin seams so reference and optimized paths remain testable.
 
-See [`docs/ORT2.md` §1](docs/ORT2.md#1-design-principles) and §15.
+See [`docs/architecture/ORT2.md` §1](docs/architecture/ORT2.md#1-design-principles) and §15.
 
 ## 5. Prefer explicit, inspectable behavior
 
@@ -56,7 +56,7 @@ See [`docs/ORT2.md` §1](docs/ORT2.md#1-design-principles) and §15.
 - Eager execution never performs implicit cross-device transfers; users request `.to(device)` explicitly.
 - Unsupported kernels, dtypes, attributes, opsets, or configurations fail clearly rather than silently changing semantics.
 
-See [`docs/ORT2.md` §1](docs/ORT2.md#1-design-principles), §6, and [`docs/EAGER.md` §1](docs/EAGER.md#1-design-principles) / §13.
+See [`docs/architecture/ORT2.md` §1](docs/architecture/ORT2.md#1-design-principles), §6, and [`docs/execution/EAGER.md` §1](docs/execution/EAGER.md#1-design-principles) / §13.
 
 ## 6. Use Rust types to enforce invariants
 
@@ -72,9 +72,9 @@ See [`docs/ORT2.md` §1](docs/ORT2.md#1-design-principles), §6, and [`docs/EAGE
 
 - Product, CLI, and planned Python package: `nxrt`; C ABI symbols: `nxrt_*`.
 - Runtime Rust crates: `onnx-runtime-*`; GenAI-stack Rust crates: `onnx-genai-*`.
-- Do not reintroduce legacy `ort2_*` public symbols or rename the retained design file `docs/ORT2.md`.
+- Do not reintroduce legacy `ort2_*` public symbols or rename the retained design file `docs/architecture/ORT2.md`.
 
-See [`docs/PROGRESS.md`](docs/PROGRESS.md) and [`docs/CRATE_RESERVATION.md`](docs/CRATE_RESERVATION.md).
+See [`docs/status/PROGRESS.md`](docs/status/PROGRESS.md) and [`docs/architecture/CRATE_RESERVATION.md`](docs/architecture/CRATE_RESERVATION.md).
 
 ## 8. Ship stable-ABI Python wheels
 
@@ -92,7 +92,7 @@ See [`docs/PROGRESS.md`](docs/PROGRESS.md) and [`docs/CRATE_RESERVATION.md`](doc
 - Update fixtures, expected counts, snapshots, conformance checks, and documentation examples with the API or behavior they describe.
 - Run the smallest relevant test/lint set before landing; do not leave known CI cleanup to the next contributor.
 
-See [`docs/PROGRESS.md`](docs/PROGRESS.md) for the project’s test, conformance, clippy, Miri, and audit expectations.
+See [`docs/status/PROGRESS.md`](docs/status/PROGRESS.md) for the project’s test, conformance, clippy, Miri, and audit expectations.
 
 ## 10. Keep history linear and review independent
 
@@ -114,4 +114,4 @@ The repository’s active `main` ruleset requires linear history; the non-author
 - Perf claims are tier-scoped: state the device/EP/tier a benchmark or "ceiling" was measured on; never generalize one device (e.g. H200) into a universal conclusion. A lever flat on one tier may win on a bandwidth-starved or VRAM-limited tier.
 - No hard runtime dependency on a specific vendor toolkit, driver, or arch beyond the declared minimum—keep the graceful-degradation contract consistent with Rule 2 and Rule 5.
 
-See [`docs/portability/2026-07-25-cuda-consumer-gpu-audit.md`](docs/portability/2026-07-25-cuda-consumer-gpu-audit.md), [`docs/CROSS_PLATFORM.md`](docs/CROSS_PLATFORM.md), [`docs/benchmarks/2026-07-25-gqa-decode-avx512.md`](docs/benchmarks/2026-07-25-gqa-decode-avx512.md), and [`docs/research/lowbit-quant-feasibility.md`](docs/research/lowbit-quant-feasibility.md).
+See [`docs/portability/2026-07-25-cuda-consumer-gpu-audit.md`](docs/portability/2026-07-25-cuda-consumer-gpu-audit.md), [`docs/architecture/CROSS_PLATFORM.md`](docs/architecture/CROSS_PLATFORM.md), [`docs/benchmarks/2026-07-25-gqa-decode-avx512.md`](docs/benchmarks/2026-07-25-gqa-decode-avx512.md), and [`docs/research/lowbit-quant-feasibility.md`](docs/research/lowbit-quant-feasibility.md).

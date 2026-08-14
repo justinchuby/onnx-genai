@@ -21,18 +21,18 @@ Pre-2026-08-10 entries in `history-archive.md` (sections: July waves, ORT2 shape
 ### 2026-08-11T06:34Z — PR #762 rejection response: doc rewrite for B1-B4 corrective wave
 
 Corrected docs after rubber-duck review rejected PR #762 with four blockers. Reframed CUDA from "hardware-blocked" to "implementation-blocked."
-- `docs/CUDA_EP_STATUS.md`: Rewrote to CODE EXISTS/STUB/VALIDATED table. Four defects documented as specification. Fail-closed state recorded.
-- `docs/EP_PLUGIN_EXPORT_PR.md`: Recorded rejection with B1–B4 details. Validation updated to `62f23440f`: 231 tests, 1 ignored (LayerNorm Mean).
-- `docs/NXRT_ABI.md`: Added inline-buffer rule and c_char portability rule. Test counts: 32/32 ABI + 10/10 host.
-- `docs/EP_PLUGIN_EXPORT_INVENTORY.md`: CUDA changed from 🟡 SCAFFOLDED to 🔴 IMPLEMENTATION-BLOCKED.
+- `docs/execution/CUDA_EP_STATUS.md`: Rewrote to CODE EXISTS/STUB/VALIDATED table. Four defects documented as specification. Fail-closed state recorded.
+- `docs/ep-plugin/EP_PLUGIN_EXPORT_PR.md`: Recorded rejection with B1–B4 details. Validation updated to `62f23440f`: 231 tests, 1 ignored (LayerNorm Mean).
+- `docs/architecture/NXRT_ABI.md`: Added inline-buffer rule and c_char portability rule. Test counts: 32/32 ABI + 10/10 host.
+- `docs/ep-plugin/EP_PLUGIN_EXPORT_INVENTORY.md`: CUDA changed from 🟡 SCAFFOLDED to 🔴 IMPLEMENTATION-BLOCKED.
 - Validated at `62f23440f`: 231 passing, 0 failures, 1 ignored.
 
 ### 2026-08-11 — Final documentation pass (PR #762 pre-undraft, commit `730889b94`)
 
 Fixed stale SHAs and corrected CUDA status terminology after B1-B4 fixes landed.
-- `docs/NXRT_ABI.md`: 4× SHA `087d34888` → `fb9d757b3`.
-- `docs/EP_PLUGIN_EXPORT_INVENTORY.md`: CUDA IMPLEMENTATION-BLOCKED → 🟡 HARDWARE-BLOCKED (3 locations).
-- `docs/EP_PLUGIN_EXPORT_PR.md`: 2× SHA updated.
+- `docs/architecture/NXRT_ABI.md`: 4× SHA `087d34888` → `fb9d757b3`.
+- `docs/ep-plugin/EP_PLUGIN_EXPORT_INVENTORY.md`: CUDA IMPLEMENTATION-BLOCKED → 🟡 HARDWARE-BLOCKED (3 locations).
+- `docs/ep-plugin/EP_PLUGIN_EXPORT_PR.md`: 2× SHA updated.
 - PR #762 body: complete rewrite — CPU proven (23 ORT tests), nxrt proven (10 roundtrip), CUDA unvalidated on hardware.
 
 ### 2026-08-11 — Session update (Scribe append)

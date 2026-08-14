@@ -1,6 +1,6 @@
 //! Additional f32 reduction kernels: `ReduceSum`, `ReduceMax`, `ReduceMin`,
 //! `ReduceProd`, `ReduceSumSquare`, `ReduceL1`, `ReduceL2`, `ReduceLogSum`, and
-//! `ReduceLogSumExp` (`docs/ORT2.md` §4.4).
+//! `ReduceLogSumExp` (`docs/architecture/ORT2.md` §4.4).
 //!
 //! These complement [`reduce::ReduceMeanKernel`](super::reduce) and share its
 //! reduce-walk structure, but add support for the **modern input signature**:

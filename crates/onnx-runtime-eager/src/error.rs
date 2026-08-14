@@ -1,4 +1,4 @@
-//! Error types for the eager execution engine (`docs/EAGER.md` §9, §10).
+//! Error types for the eager execution engine (`docs/execution/EAGER.md` §9, §10).
 //!
 //! Mirrors the `thiserror`-based `error.rs` style of the sibling runtime crates
 //! (e.g. `onnx-runtime-ep-api`, `onnx-runtime-shape-inference`): a crate-local
@@ -14,7 +14,7 @@ pub type Result<T> = std::result::Result<T, EagerError>;
 #[derive(Debug, thiserror::Error)]
 pub enum EagerError {
     /// No EP registered for the resolved device has a kernel for this op at the
-    /// requested opset (`docs/EAGER.md` §10.1 step 4).
+    /// requested opset (`docs/execution/EAGER.md` §10.1 step 4).
     #[error("no kernel for op '{op_type}' (domain {domain:?}) on device {device:?}")]
     NoKernel {
         op_type: String,
@@ -23,7 +23,7 @@ pub enum EagerError {
     },
 
     /// Inputs live on more than one device. Eager mode never transfers
-    /// implicitly (`docs/EAGER.md` §1.6 / Design Decision): the caller must
+    /// implicitly (`docs/execution/EAGER.md` §1.6 / Design Decision): the caller must
     /// `.to(device)` first.
     #[error("mixed-device inputs {devices:?}: {hint}")]
     MixedDeviceInputs {
@@ -41,7 +41,7 @@ pub enum EagerError {
     InvalidOutputCount,
 
     /// Per-op output shape/dtype inference is missing or could not resolve to a
-    /// concrete, allocatable shape (`docs/EAGER.md` §9). The kernel-provided
+    /// concrete, allocatable shape (`docs/execution/EAGER.md` §9). The kernel-provided
     /// inference fallback (§9.2) is DEFERRED, so an unresolved output is an
     /// error rather than a fall-through.
     #[error("shape inference failed for op '{op_type}' (domain {domain:?}): {reason}")]

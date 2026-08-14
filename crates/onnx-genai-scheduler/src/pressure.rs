@@ -1,5 +1,5 @@
 //! Ticketed non-blocking pressure protocol for machine-wide host memory
-//! (`docs/MEMORY_ARCHITECTURE.md` §5.3.1, refined against
+//! (`docs/memory/MEMORY_ARCHITECTURE.md` §5.3.1, refined against
 //! `specs/tla/PressureProtocol.tla` and `specs/tla/REFINEMENT.md`).
 //!
 //! # The invariant
@@ -114,7 +114,7 @@ pub struct HostAllocation {
     pub pinned: bool,
 }
 
-/// The state of a pressure ticket (`docs/MEMORY_ARCHITECTURE.md` §5.3.1).
+/// The state of a pressure ticket (`docs/memory/MEMORY_ARCHITECTURE.md` §5.3.1).
 #[derive(Debug)]
 pub enum PressureState {
     /// Waiting for capacity.

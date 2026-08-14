@@ -1,5 +1,5 @@
 //! Synthetic end-to-end parity for the `MatMul + Add + Relu → FusedGemm`
-//! fusion (`docs/ORT2.md` §18.2).
+//! fusion (`docs/architecture/ORT2.md` §18.2).
 //!
 //! Unlike LayerNorm and `FusedMatMulBias`, the `FusedGemm` pattern is **not**
 //! exercised by the `bert_toy` conformance model — that model's feed-forward

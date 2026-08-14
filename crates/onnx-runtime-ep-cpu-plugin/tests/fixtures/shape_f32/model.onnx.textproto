@@ -1,0 +1,42 @@
+ir_version: 8
+graph {
+  node: [{
+    input: ["X"]
+    output: ["Y"]
+    op_type: "Shape"
+  }]
+  name: "shape_f32"
+  input: [{
+    name: "X"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim: [{
+            dim_value: 3
+          }, {
+            dim_value: 4
+          }, {
+            dim_value: 5
+          }]
+        }
+      }
+    }
+  }]
+  output: [{
+    name: "Y"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim: [{
+            dim_value: 3
+          }]
+        }
+      }
+    }
+  }]
+}
+opset_import: [{
+  version: 17
+}]

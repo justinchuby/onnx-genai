@@ -1,4 +1,4 @@
-//! `MatMul` on the GPU via cuBLASLt (`docs/ORT2.md` §15.3).
+//! `MatMul` on the GPU via cuBLASLt (`docs/architecture/ORT2.md` §15.3).
 //!
 //! Supports dense rank >= 2 operands with NumPy/ONNX broadcasting across all
 //! leading batch dimensions for f32 / f16 / bf16, all in true fp32

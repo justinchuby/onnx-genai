@@ -1,5 +1,5 @@
 //! The [`CudaExecutionProvider`]: a GPU execution provider backed by cudarc +
-//! cuBLASLt (`docs/ORT2.md` §15). Phase 2a wires standard GEMM (`MatMul`) only;
+//! cuBLASLt (`docs/architecture/ORT2.md` §15). Phase 2a wires standard GEMM (`MatMul`) only;
 //! everything else returns an actionable "not implemented in CUDA EP Phase 2a"
 //! error rather than silently falling back or panicking.
 //!
@@ -231,7 +231,8 @@ impl CudaExecutionProvider {
                     .with_async_pagein(offload_policy.async_pagein)
                     .with_scan_resistant_dense(offload_policy.scan_resistant_dense)
                     .with_byte_aware_residency(offload_policy.byte_aware_residency)
-                    .with_evict_order_probe(offload_policy.evict_order_probe),
+                    .with_evict_order_probe(offload_policy.evict_order_probe)
+                    .with_zero_copy_hybrid(offload_policy.zero_copy_hybrid),
             )
         });
         let provider = Self {
@@ -1206,10 +1207,11 @@ impl ExecutionProvider for CudaExecutionProvider {
         &self,
         logits: &DeviceBuffer,
         elements: usize,
+        batch: usize,
         dtype: DataType,
         result: &mut DeviceBuffer,
     ) -> Result<()> {
-        crate::kernels::device_argmax::launch(&self.runtime, logits, elements, dtype, result)
+        crate::kernels::device_argmax::launch(&self.runtime, logits, elements, batch, dtype, result)
     }
 
     fn copy_from_host(&self, src: &[u8], dst: &mut DeviceBuffer) -> Result<()> {

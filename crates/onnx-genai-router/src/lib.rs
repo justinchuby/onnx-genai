@@ -1,7 +1,7 @@
 //! # onnx-genai-router
 //!
 //! A lightweight, **model-agnostic**, session-aware router for onnx-genai
-//! inference clusters (see `docs/DESIGN.md` §34).
+//! inference clusters (see `docs/architecture/DESIGN.md` §34).
 //!
 //! The router sits behind a standard load balancer (Nginx/Envoy) and in front
 //! of a fleet of inference nodes. It makes smart routing decisions that a

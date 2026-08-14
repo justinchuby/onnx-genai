@@ -1,7 +1,7 @@
 //! `Gemm` (ONNX standard domain) on the GPU: `Y = alpha·A'·B' + beta·C`, where
 //! `A'`/`B'` are `A`/`B` optionally transposed per the `transA`/`transB`
 //! attributes and the optional bias `C` is unidirectionally broadcast to
-//! `[M, N]` (`docs/ORT2.md` §15.3; RULES.md #4 — GEMM stays on cuBLASLt).
+//! `[M, N]` (`docs/architecture/ORT2.md` §15.3; RULES.md #4 — GEMM stays on cuBLASLt).
 //!
 //! ## Design — reuse the proven cuBLASLt path
 //!

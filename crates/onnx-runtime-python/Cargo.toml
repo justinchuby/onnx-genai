@@ -2,7 +2,7 @@
 #
 # Wheels: standard stable-ABI (`abi3`, tag `cp310-abi3`, min Python 3.10) built
 # from the `abi3-py310` PyO3 feature, plus a separate free-threaded (`abi3t`)
-# wheel — see README.md and docs/PIPELINE.md §12.4.
+# wheel — see README.md and docs/genai/PIPELINE.md §12.4.
 [package]
 name = "onnx-runtime-python"
 version.workspace = true

@@ -6,7 +6,7 @@
 //! `layers x 2 x kv_heads` granules, seq-major (BSNH, landed #782) at
 //! `layers x 2`, and **token-major across all layers** — one reservation with
 //! every layer's K and V interleaved by token — floors at **one granule per
-//! sequence** (~2 MiB). See `docs/TOKEN_MAJOR_KV_INVESTIGATION.md`.
+//! sequence** (~2 MiB). See `docs/memory/TOKEN_MAJOR_KV_INVESTIGATION.md`.
 //!
 //! The seq-major investigation (#778) already measured that the *stride
 //! magnitude itself* is free: reading one head strided by `kv_heads x head_dim`

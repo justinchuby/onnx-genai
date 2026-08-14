@@ -3,7 +3,7 @@
 **Role:** Metal/MPS kernel engineer for the Apple Metal EP, owning heavy kernels such as MatMulNBits, GQA, softmax, RoPE, and RMSNorm. Correctness against CPU reference comes first, then simdgroup/threadgroup optimization, using ExecuTorch/PyTorch MPS references and onnx-genai end-to-end tests.
 
 ## Durable lessons
-- Offline per-EP ONNX conformance harness and `docs/EP_CONFORMANCE.md` merged in `1dfab0d`; process-bridge design is recorded in decisions.
+- Offline per-EP ONNX conformance harness and `docs/execution/EP_CONFORMANCE.md` merged in `1dfab0d`; process-bridge design is recorded in decisions.
 - Vendored `cpuinfo` beneath its crate so cargo publish succeeds.
 - Mobius native block reviews require exact `BlockQuantizedMatMul` format/dimension/byte-preservation contracts, 4-bit/block-32 mixed-native scaffold, genai opset v1, and unchanged pure-Q8 behavior.
 - Attention, CUDA CSA, and MTP reviews needed rejection/fix cycles before approval; keep reviewer-lockout corrections canonical.

@@ -1,13 +1,13 @@
 //! # `onnx-runtime-ep-cpu`
 //!
-//! The CPU execution provider for the ORT 2.0 runtime (see `docs/ORT2.md` §4.4
+//! The CPU execution provider for the ORT 2.0 runtime (see `docs/architecture/ORT2.md` §4.4
 //! and §54 Phase 1). It implements [`onnx_runtime_ep_api::ExecutionProvider`]
 //! and hosts pure-Rust reference kernels for the Phase-1 op set (`MatMul`,
 //! `Add`, `Relu`, `Reshape`, `Transpose`, `Gather`, `LayerNormalization`).
 //!
 //! ## Backends: correctness baseline + SIMD fast path
 //!
-//! The GEMM hot spot is served through [`backend::CpuBackend`] (`docs/ORT2.md`
+//! The GEMM hot spot is served through [`backend::CpuBackend`] (`docs/architecture/ORT2.md`
 //! §25.2). The **default** backend is a pure-Rust blocked, register-tiled,
 //! rayon-parallelized f32 GEMM — the portable, offline correctness baseline that
 //! compiles anywhere with no C++/FFI. On supported x86 hosts, the built-in

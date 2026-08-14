@@ -1,5 +1,5 @@
 //! Synthetic end-to-end parity for the exact-GELU fusion
-//! (`0.5·x·(1 + Erf(x / √2)) → com.microsoft::Gelu`, `docs/ORT2.md` §18.2).
+//! (`0.5·x·(1 + Erf(x / √2)) → com.microsoft::Gelu`, `docs/architecture/ORT2.md` §18.2).
 //!
 //! The `bert_toy` conformance model DOES exercise this fusion (its 6
 //! feed-forward blocks each use the `Erf` GELU decomposition — see

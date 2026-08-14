@@ -8,7 +8,7 @@
 //! while executing the tiles across a low-overhead pool that is created once and
 //! reused. QNBit callers can pass `multithread=true` to run one full-width
 //! `MlasQNBitGemmBatch` call and let MLAS partition N internally, matching ORT's
-//! intra-op threadpool shape. See `docs/MLAS_SYS_SPIKE.md` for the original
+//! intra-op threadpool shape. See `docs/performance/MLAS_SYS_SPIKE.md` for the original
 //! single-thread feasibility spike.
 
 use std::os::raw::c_int;
@@ -1665,7 +1665,7 @@ mod tests {
     }
 
     /// Single-thread performance probe for the medium f32 MatMul shape
-    /// (32x512x512) recorded in docs/KERNEL_PERF.md. Ignored by default; run
+    /// (32x512x512) recorded in docs/performance/KERNEL_PERF.md. Ignored by default; run
     /// with:
     ///   cargo test -p mlas-sys --release -- --ignored --nocapture perf_sgemm_medium
     #[test]
@@ -1718,7 +1718,7 @@ mod tests {
              ({gflops_p:.1} GFLOP/s), checksum={checksum_p:.3}"
         );
         eprintln!(
-            "recorded baselines (docs/KERNEL_PERF.md): ORT 1-thread ~131 us, SimdX86 ~285 us"
+            "recorded baselines (docs/performance/KERNEL_PERF.md): ORT 1-thread ~131 us, SimdX86 ~285 us"
         );
     }
 
@@ -1760,7 +1760,7 @@ mod tests {
             );
         }
         eprintln!(
-            "recorded ORT baselines (docs/KERNEL_PERF.md): 1-thread ~131 us, 8-thread ~28-30 us"
+            "recorded ORT baselines (docs/performance/KERNEL_PERF.md): 1-thread ~131 us, 8-thread ~28-30 us"
         );
     }
 

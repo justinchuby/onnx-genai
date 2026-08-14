@@ -45,6 +45,10 @@ name = "native_full_pipeline_parity"
 required-features = ["native-backend"]
 
 [[test]]
+name = "deepseek_v2_tiny_qmoe_native_e2e"
+required-features = ["native-backend"]
+
+[[test]]
 name = "native_cuda_pipeline_decoder_parity"
 required-features = ["cuda", "native-backend"]
 

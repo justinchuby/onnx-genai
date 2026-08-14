@@ -1,4 +1,4 @@
-//! Shapes with static and symbolic (dynamic) dimensions (see `docs/ORT2.md`
+//! Shapes with static and symbolic (dynamic) dimensions (see `docs/architecture/ORT2.md`
 //! §3.2 and §11).
 
 /// Unique identifier for a symbolic dimension.
@@ -75,7 +75,7 @@ pub fn is_fully_static(shape: &[Dim]) -> bool {
 }
 
 /// Constraints on a symbolic dimension, used by shape bucketing, kernel
-/// specialization, and tiling (see `docs/ORT2.md` §11).
+/// specialization, and tiling (see `docs/architecture/ORT2.md` §11).
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct SymbolConstraints {
     pub id: Option<SymbolId>,

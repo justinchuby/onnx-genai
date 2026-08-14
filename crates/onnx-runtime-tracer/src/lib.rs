@@ -1,7 +1,7 @@
 //! # `onnx-runtime-tracer`
 //!
 //! Unified, pure-Rust tracing for the ORT 2.0 runtime. It implements the
-//! **`TraceCollector` collector architecture** from `docs/ORT2.md` §48: code is
+//! **`TraceCollector` collector architecture** from `docs/architecture/ORT2.md` §48: code is
 //! annotated **once** through a shared [`TraceContext`], and *which* backends
 //! consume those events is a configuration choice expressed as a
 //! [`TraceCollector`] (or a [`CompositeCollector`] fan-out to several at once).

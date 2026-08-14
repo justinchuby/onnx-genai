@@ -787,10 +787,12 @@ impl NativeDecodeSession {
             #[cfg(not(feature = "cuda"))]
             let weight_offload_enabled = false;
             // Issue #716: offload no longer forces capture OFF when it runs on
-            // the stable-VA VMM paging path. Default to the conservative (unsafe)
-            // assumption so any path that has not proven pointer stability keeps
-            // the old mutual exclusion.
-            let weight_offload_stable_va = cuda_options.weight_offload_stable_va.unwrap_or(false);
+            // the stable-VA VMM paging path. Pass the three-state Option through
+            // so the decline message can distinguish "policy proved unstable"
+            // (`Some(false)`) from "no policy supplied, conservative default"
+            // (`None`) — collapsing them to a bool here is what let a plumbing
+            // gap read as a runtime limitation.
+            let weight_offload_stable_va = cuda_options.weight_offload_stable_va;
             let graph_capture = resolve_graph_capture_decision(
                 cuda_options.graph_capture,
                 runtime_config.cuda_graph_explicit,

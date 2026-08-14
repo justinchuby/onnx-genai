@@ -1,4 +1,4 @@
-//! `Cast`: convert a tensor between element types (`docs/ORT2.md` §4.4).
+//! `Cast`: convert a tensor between element types (`docs/architecture/ORT2.md` §4.4).
 //!
 //! Numeric semantics follow ONNX / C++ `static_cast`:
 //! * float → integer truncates toward zero and **saturates** out-of-range

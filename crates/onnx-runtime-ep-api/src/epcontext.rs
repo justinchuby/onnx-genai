@@ -1,5 +1,5 @@
 //! Runtime `EpContext` form and the `source`-keyed [`EpContextRegistry`]
-//! (`docs/ORT2.md` §55.1 / §55.6).
+//! (`docs/architecture/ORT2.md` §55.1 / §55.6).
 //!
 //! ## Two forms of one thing
 //!
@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use crate::error::{EpError, Result};
 use crate::provider::{EpId, ExecutionProvider};
 
-/// The **runtime form** of a compiled-EP context (`docs/ORT2.md` §4 / §55.1).
+/// The **runtime form** of a compiled-EP context (`docs/architecture/ORT2.md` §4 / §55.1).
 ///
 /// This is the in-memory representation an EP produces from a freshly compiled
 /// subgraph ([`ExecutionProvider::save_context`]) or restores at load
@@ -69,7 +69,7 @@ impl EpContext {
 }
 
 /// Registry mapping an `EPContext` node's `source` key → the [`EpId`] that owns
-/// it (`docs/ORT2.md` §55.6).
+/// it (`docs/architecture/ORT2.md` §55.6).
 ///
 /// EPs register the `source` key(s) they accept; dispatch ([`claim`]) is a pure
 /// lookup. There are **no hardcoded vendor names** here — the keys come entirely

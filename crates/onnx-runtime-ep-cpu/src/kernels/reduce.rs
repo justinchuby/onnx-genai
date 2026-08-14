@@ -1,4 +1,4 @@
-//! `ReduceMean`: mean over a set of axes for f32 (`docs/ORT2.md` §4.4).
+//! `ReduceMean`: mean over a set of axes for f32 (`docs/architecture/ORT2.md` §4.4).
 //!
 //! Two axis-signature forms are supported:
 //! * **Legacy (opset ≤ 17):** the reduced axes are the `axes` **attribute**.

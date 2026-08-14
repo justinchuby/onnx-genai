@@ -1,4 +1,4 @@
-//! Variadic elementwise `Sum` and `Mean` (`docs/CUDA_COVERAGE.md`).
+//! Variadic elementwise `Sum` and `Mean` (`docs/execution/CUDA_COVERAGE.md`).
 //!
 //! Both ops accept `1..N` inputs and produce their NumPy multidirectional
 //! broadcast shape. Each input is added into an f32 accumulator scratch buffer —
