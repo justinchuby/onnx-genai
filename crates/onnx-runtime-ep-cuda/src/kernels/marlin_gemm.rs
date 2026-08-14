@@ -198,6 +198,90 @@ pub fn ensure_repacked(
     Ok((out, false))
 }
 
+/// Module-global pool of reusable device scratch buffers for the Marlin fused
+/// prefill paths (the gate projection buffer and the RMS-norm normalized-
+/// activation buffer). Like the repack cache, this exists so a **warm** replay
+/// performs no allocation and stays CUDA-graph capture-safe: during capture M is
+/// fixed, so warmup pre-allocates the exact size and replays reuse the same
+/// device pointer. Buffers are keyed by `(ordinal, slot, bytes)` — the `slot`
+/// discriminator guarantees two simultaneously-live scratches of equal size
+/// within one op (e.g. normalized `[M,K]` and gate `[M,N]` when `K == N`) never
+/// alias. Reuse across sequential ops is safe: each op fully consumes its
+/// scratch before returning and execution is serial on the stream.
+struct ScratchCache {
+    map: HashMap<(u32, u32, usize), RepackEntry>,
+    order: VecDeque<(u32, u32, usize)>,
+}
+
+const SCRATCH_CACHE_CAP: usize = 256;
+
+static SCRATCH_CACHE: OnceLock<Mutex<ScratchCache>> = OnceLock::new();
+
+fn scratch_cache() -> &'static Mutex<ScratchCache> {
+    SCRATCH_CACHE.get_or_init(|| {
+        Mutex::new(ScratchCache {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+        })
+    })
+}
+
+/// Ensure a reusable device scratch buffer of `bytes` bytes exists for `slot`,
+/// returning `(ptr, warm)`. `warm == true` means the buffer was already pooled
+/// (no allocation this call ⇒ capture-safe). A cold miss while capturing is
+/// rejected so the caller can fall back rather than allocate inside a capture.
+/// The returned buffer's contents are undefined; callers fully overwrite it.
+pub fn ensure_scratch(
+    runtime: &Arc<CudaRuntime>,
+    slot: u32,
+    bytes: usize,
+) -> Result<(CUdeviceptr, bool)> {
+    let key = (runtime.ordinal(), slot, bytes);
+    {
+        let cache = scratch_cache()
+            .lock()
+            .expect("marlin scratch cache poisoned");
+        if let Some(entry) = cache.map.get(&key) {
+            return Ok((entry.ptr, true));
+        }
+    }
+    if runtime.is_capturing()? {
+        return Err(EpError::KernelFailed(
+            "cuda_ep: Marlin fused scratch cannot allocate during CUDA-graph capture; \
+             the buffer must be warmed at this M before capture"
+                .into(),
+        ));
+    }
+    let ptr = runtime.alloc_raw(bytes.max(1))?;
+    let mut cache = scratch_cache()
+        .lock()
+        .expect("marlin scratch cache poisoned");
+    if let Some(entry) = cache.map.get(&key) {
+        let winner = entry.ptr;
+        drop(cache);
+        // SAFETY: `ptr` is our just-allocated duplicate; free it once.
+        let _ = unsafe { runtime.free_raw(ptr) };
+        return Ok((winner, true));
+    }
+    cache.map.insert(
+        key,
+        RepackEntry {
+            ptr,
+            runtime: runtime.clone(),
+        },
+    );
+    cache.order.push_back(key);
+    while cache.order.len() > SCRATCH_CACHE_CAP {
+        if let Some(evict) = cache.order.pop_front()
+            && let Some(entry) = cache.map.remove(&evict)
+        {
+            // SAFETY: exclusively owned by the cache; freed once on eviction.
+            let _ = unsafe { entry.runtime.free_raw(entry.ptr) };
+        }
+    }
+    Ok((ptr, false))
+}
+
 /// Repack ONNX `MatMulNBits` int4 weights (`[N, k_blocks, group/2]`, N-major
 /// nibble packing) into the per-lane tensor-core layout documented above.
 ///
