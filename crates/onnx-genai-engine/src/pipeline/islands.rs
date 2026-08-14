@@ -945,13 +945,14 @@ fn batching_safe_policy_contract(component: &WorkflowComponent) -> bool {
                 "iteration",
                 "max_iterations",
             ],
-            &["done", "continue"],
+            &["done", "next_active", "continue"],
         ),
         "onnx-genai.state-update" => (&["current", "update", "active", "done"], &["next"]),
         _ => return true,
     };
     let mut bound_ports = HashSet::new();
     contract.version == "2"
+        && contract.bindings.len() == input_roles.len() + output_roles.len()
         && input_roles
             .iter()
             .all(|role| batching_role_port(component, contract, role, true, &mut bound_ports))
@@ -1021,16 +1022,37 @@ fn batching_role_port(
     let Some(tensor) = tensor else {
         return false;
     };
+    let integer = tensor.dtype.starts_with("int") || tensor.dtype.starts_with("uint");
+    let first = tensor.shape.as_deref().and_then(|shape| shape.first());
+    if role == "continue" {
+        return tensor.dtype == "bool"
+            && tensor.rank == 1
+            && matches!(first, Some(onnx_genai_metadata::TensorDimension::Fixed(1)));
+    }
+    if role == "iteration" {
+        return integer
+            && tensor.rank == 1
+            && matches!(first, Some(onnx_genai_metadata::TensorDimension::Fixed(1)));
+    }
+    if role == "max_iterations" {
+        return integer
+            && tensor.rank == 1
+            && (matches!(first, Some(onnx_genai_metadata::TensorDimension::Fixed(1)))
+                || matches!(
+                    first,
+                    Some(onnx_genai_metadata::TensorDimension::Symbol(symbol)) if symbol == "batch"
+                ));
+    }
     if tensor.rank == 0
         || !matches!(
-            tensor.shape.as_deref().and_then(|shape| shape.first()),
+            first,
             Some(onnx_genai_metadata::TensorDimension::Symbol(symbol)) if symbol == "batch"
         )
     {
         return false;
     }
     match role {
-        "active" | "done" | "continue" => tensor.dtype == "bool" && tensor.rank == 1,
+        "active" | "done" | "next_active" => tensor.dtype == "bool" && tensor.rank == 1,
         "logits" => {
             matches!(tensor.dtype.as_str(), "float32" | "float16" | "bfloat16")
                 && matches!(tensor.rank, 2 | 3)
@@ -1042,10 +1064,8 @@ fn batching_role_port(
             (tensor.dtype.starts_with("int") || tensor.dtype.starts_with("uint"))
                 && tensor.rank == 2
         }
-        "top_k" | "seed" | "counter" | "next_counter" | "tokens" | "token" | "eos_lengths"
-        | "iteration" | "max_iterations" => {
-            (tensor.dtype.starts_with("int") || tensor.dtype.starts_with("uint"))
-                && tensor.rank == 1
+        "top_k" | "seed" | "counter" | "next_counter" | "tokens" | "token" | "eos_lengths" => {
+            integer && tensor.rank == 1
         }
         "current" | "update" | "next" => true,
         _ => false,
@@ -2023,6 +2043,15 @@ mod tests {
         }
     }
 
+    fn singleton_tensor(dtype: &str) -> onnx_genai_metadata::TensorContract {
+        onnx_genai_metadata::TensorContract {
+            dtype: dtype.into(),
+            rank: 1,
+            shape: Some(vec![onnx_genai_metadata::TensorDimension::Fixed(1)]),
+            optional: false,
+        }
+    }
+
     #[test]
     fn external_initializers_are_linked_by_path_without_copying_bytes() {
         let test_root = std::env::current_dir()
@@ -2285,20 +2314,28 @@ mod tests {
             ("active", "bool", 1),
             ("eos_ids", "int64", 2),
             ("eos_lengths", "int64", 1),
-            ("iteration", "int64", 1),
-            ("max_iterations", "int64", 1),
         ] {
             termination
                 .ports
                 .inputs
                 .insert(role.into(), batch_tensor(dtype, rank));
         }
-        for role in ["done", "continue"] {
+        for role in ["iteration", "max_iterations"] {
+            termination
+                .ports
+                .inputs
+                .insert(role.into(), singleton_tensor("int64"));
+        }
+        for role in ["done", "next_active"] {
             termination
                 .ports
                 .outputs
                 .insert(role.into(), batch_tensor("bool", 1));
         }
+        termination
+            .ports
+            .outputs
+            .insert("continue".into(), singleton_tensor("bool"));
         termination.contract = Some(onnx_genai_metadata::ComponentContract {
             id: "onnx-genai.termination-predicate".into(),
             version: "2".into(),
@@ -2310,6 +2347,7 @@ mod tests {
                 "iteration",
                 "max_iterations",
                 "done",
+                "next_active",
                 "continue",
             ]
             .into_iter()
@@ -2317,6 +2355,47 @@ mod tests {
             .collect(),
             parameters: parameters.clone(),
         });
+        assert!(is_fusible_component(&termination));
+        termination
+            .contract
+            .as_mut()
+            .unwrap()
+            .bindings
+            .insert("request_scalar".into(), "request_scalar".into());
+        assert!(!is_fusible_component(&termination));
+        termination
+            .contract
+            .as_mut()
+            .unwrap()
+            .bindings
+            .remove("request_scalar");
+        let next_active = termination
+            .contract
+            .as_mut()
+            .unwrap()
+            .bindings
+            .remove("next_active")
+            .unwrap();
+        assert!(!is_fusible_component(&termination));
+        termination
+            .contract
+            .as_mut()
+            .unwrap()
+            .bindings
+            .insert("next_active".into(), next_active);
+        termination
+            .ports
+            .outputs
+            .insert("continue".into(), batch_tensor("bool", 1));
+        assert!(!is_fusible_component(&termination));
+        termination
+            .ports
+            .outputs
+            .insert("continue".into(), singleton_tensor("bool"));
+        termination
+            .ports
+            .inputs
+            .insert("max_iterations".into(), batch_tensor("int64", 1));
         assert!(is_fusible_component(&termination));
         termination
             .ports

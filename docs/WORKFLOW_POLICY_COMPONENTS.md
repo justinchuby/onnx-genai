@@ -190,20 +190,27 @@ form an explicit optimization boundary without slowing the default path.
 
 ### Batched policy island contracts: version 2
 
-Policy components may join a fused execution island only through version 2 contracts with
-`batching: per_row` and `inactive_rows: preserve`. Version 1 artifacts remain valid unfused
-components, but their scalar-compatible ABI cannot establish continuous-batching safety.
+Policy components may join a fused execution island only through version 2 contracts with string
+parameters `batching: per_row` and `inactive_rows: preserve`. Version 1 artifacts remain valid
+unfused components, but their scalar-compatible ABI cannot establish continuous-batching safety.
 
-The version 2 token sampler binds per-row `active`, `done`, `temperature`, `top_k`, `top_p`,
-`min_p`, `seed`, and `counter` inputs in addition to `logits`, and returns `token` plus
-`next_counter`.
-The termination predicate binds `tokens`, `active`, ragged `eos_ids` with `eos_lengths`,
-`iteration`, and `max_iterations`, and returns both `done` and `continue`. State update binds
-`current`, `update`, `active`, and `done`, returning a shape- and dtype-identical `next`.
+The version 2 token sampler binds per-row `logits`, `active`, `done`, `temperature`, `top_k`,
+`top_p`, `min_p`, `seed`, and `counter`, and returns `token` plus `next_counter`. These are the
+exact semantic binding names; greedy workflows use the same ABI with `top_k=1`, while inactive or
+done rows return the sentinel token and preserve their counter.
 
-All ports have a symbolic leading `batch` axis. Inactive rows preserve RNG counters and semantic
-state and emit no token. This ABI permits stable max-batch buffers and CUDA graph replay while the
-active row set, row parameters, logical lengths, and EOS sets change between iterations.
+The termination predicate binds `tokens: int64[B]`, `active: bool[B]`,
+`eos_ids: int64[B,Emax]`, `eos_lengths: int64[B]`, `iteration: int64[1]`, and
+`max_iterations: int64[1|B]`. It returns `done: bool[B]`, `next_active: bool[B]`, and the
+reduce-any loop control `continue: bool[1]`. Inactive rows remain done and cannot reactivate.
+
+State update binds `current`, shape-identical `update`, `active`, and `done`, returning a
+shape- and dtype-identical `next`. Suppressed rows preserve `current`.
+
+All per-row ports have a symbolic leading `batch` axis; only the explicitly singleton loop-control
+ports above are exempt. Inactive rows preserve RNG counters and semantic state and emit no token.
+This ABI permits stable max-batch buffers and CUDA graph replay while the active row set, row
+parameters, logical lengths, and EOS sets change between iterations.
 
 ### Termination predicate: `onnx-genai.termination-predicate@1`
 
