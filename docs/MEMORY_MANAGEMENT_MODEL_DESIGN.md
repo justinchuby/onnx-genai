@@ -15,7 +15,66 @@ should consume only what it needs; multiple models and requests should share
 available capacity; and operators should be able to preserve enough headroom
 for the desktop and other applications.
 
-This requires the runtime to:
+### Why this is not an arena-tuning problem
+
+The first reasonable objection from anyone who knows ORT's memory model is that
+these are configuration knobs: set `gpu_mem_limit`, choose an arena extend
+strategy, size `OrtArenaCfg`, share allocators through `OrtEnv`. That is worth
+answering directly, because the limitation is structural rather than a matter of
+sizing.
+
+ORT today gives each pool a *bound*. What it does not give is a way for one
+holder to *lend* capacity to another, or for the runtime to *reclaim* capacity
+from a holder that is currently holding more than it needs. Concretely, in a
+process running one generative model:
+
+- the device BFC arena grows to its high-water mark and, absent an explicit
+  end-of-`Run` shrinkage request, keeps that memory for the rest of the run;
+  and even with shrinkage the decision is scheduled by the caller at a `Run`
+  boundary rather than driven by another holder's demand, so it cannot answer
+  pressure arriving mid-generation;
+- weight residency, KV/recurrent state, prefix caches, and collective staging
+  each size themselves independently, and none can see what the others left
+  unused;
+- a custom device allocator registered through `OrtEnv` is **not** wrapped in
+  BFC, so an EP-side integration must bring its own suballocator — the governed
+  path and the arena path are separate implementations today, not one policy;
+- `RegisteredAllocator` cannot be retired safely because ORT does not expose the
+  last session user, so it conservatively leaks;
+- limits describe individual pools, so no component can answer "what is this
+  process actually costing the machine right now?" — which is the question an
+  operator, a serving host, and the OS all ask.
+
+The result is stranded memory, avoidable offload or allocation failure, poor
+multi-model utilization, and reported limits that do not describe the runtime's
+true pressure on the machine.
+
+### The harm is measurable, not hypothetical
+
+This proposal is written against measurements from a working implementation, not
+from first principles. Three of them are worth stating up front because each is
+a class of bug the current structure invites rather than a one-off defect:
+
+- **A pool sized once, at load, from a declared maximum.** A weight budget
+  computed as `device_budget - kv_bytes_per_token x max_context` stranded
+  1.611 GB from the first token while weights streamed from host memory every
+  step. Making that split elastic against actual occupancy — while keeping a
+  guaranteed path to full context — cut streamed bytes **1.68x** (#857/#866).
+- **A number that no component owned.** Total weight bytes were measured from
+  the external-data file rather than from the extents the graph references. For
+  one 14B model half that blob was orphaned, so the runtime believed the model
+  was **2.00x** larger than it is and every derived budget was wrong (#853/#856).
+- **Managing bytes that should not have been managed.** For a model over budget,
+  copying single-touch weights into VRAM ourselves measured **30x slower** than
+  letting the OS demand-page them, because a weight read once per step has no
+  reuse to amortize the copy against. Deferring to the platform recovered
+  roughly **100x** end-to-end (#864/#874).
+
+The first two are accounting failures that a single authority prevents by
+construction. The third is the reason this design must also say *when not to
+manage* — see [Should the runtime manage these bytes at all?](#should-the-runtime-manage-these-bytes-at-all).
+
+### What the runtime therefore needs
 
 - use weight offload, tiered state, and demand commitment when a model exceeds
   one device's memory;
@@ -28,16 +87,11 @@ This requires the runtime to:
 - adapt placement and accounting to discrete, unified, multi-device,
   multi-process, and multi-node topologies.
 
-Today these bytes are retained independently by ORT/EP arenas, model residency,
-generation state, and backend caches. Each component can optimize its own pool
-but cannot safely lend unused capacity or reclaim it from another holder. The
-result is stranded memory, avoidable offload or allocation failure, poor
-multi-model utilization, and limits that do not describe the runtime's true
-pressure on the machine.
-
 This proposal defines the contracts that let those specialized components share
-one coordinated control plane without replacing their allocators, kernels, or
-state-specific policies.
+one coordinated control plane **without replacing their allocators, kernels, or
+state-specific policies**. Existing EPs, kernels, graphs, and arena
+implementations keep working; what changes is that they acquire capacity through
+a grant and can be asked to give some back.
 
 ## Contracts
 
@@ -93,7 +147,10 @@ I12 is the design obligation represented by
 ## Architecture
 
 The diagram keeps the process manager as one component and expands its internal
-entities in the label rather than routing edges through each of them.
+entities in the label rather than routing edges through each of them. Solid
+edges are **control plane** (requests, grants, pressure, reports); dotted edges
+are **data plane** (where bytes are bound or read). The distinction matters for
+reviewers: only the control plane is new work, and no data-plane edge changes.
 
 ```mermaid
 flowchart TB
@@ -120,14 +177,15 @@ flowchart TB
         GenAI -->|"owns generation state"| GenHolders
         Session -->|"owns execution buffers"| OrtHolders
         GenAI -->|"plan transaction"| PMM
-        GenAI -->|"bind views + Run"| Session
+        Session -->|"transient peak + granularity report"| PMM
+        GenAI -.->|"bind views + Run"| Session
         GenHolders <-->|"leases / grants / pressure"| PMM
         OrtHolders <-->|"leases / grants / pressure"| PMM
-        GenHolders -->|"allocate/map after grant"| Alloc
-        OrtHolders -->|"allocate after grant"| Alloc
-        GenHolders -->|"publish model views"| Session
-        Session -->|"dispatch"| Kernel
-        Alloc -->|"backing memory"| Kernel
+        GenHolders -.->|"allocate/map after grant"| Alloc
+        OrtHolders -.->|"allocate after grant"| Alloc
+        GenHolders -.->|"publish model views"| Session
+        Session -.->|"dispatch"| Kernel
+        Alloc -.->|"backing memory"| Kernel
     end
 
     Client --> Product
@@ -137,13 +195,21 @@ flowchart TB
     Cluster -->|"node placement / quota"| Serving
     Serving -->|"delegated worker quota"| PMM
     Standalone -->|"local manager"| PMM
-    Standalone -->|"create / Run"| Session
+    Standalone -.->|"create / Run"| Session
 ```
 
 The only bidirectional edges are the lease protocol: holders request capacity;
 the governor returns grants or pressure. All allocation happens after a grant.
 Standalone ORT enters directly at `ProcessMemoryManager` and
 `InferenceSession`, bypassing Foundry and ORT GenAI.
+
+`InferenceSession`/EP is a **reporter, not a holder**: it does not take leases
+itself — its buffers are held by the arenas in `OrtHolders` — but admission
+cannot be correct without it. I8 requires exact bytes including transient peaks,
+and the transient peak of a graph is a property only the session's plan knows;
+mapping granularity likewise comes from the EP through `TopologyProvider`. This
+is the main ORT-side integration point, and it is a reporting interface rather
+than an ownership change.
 
 ### Responsibility boundaries
 
@@ -288,9 +354,13 @@ safe victims.
 6. Extend model metadata/runtime APIs to declare complete C9 state bundles and
    C6 model views.
 7. Add communication/collective staging as a named lease holder.
-8. Implement completion-feasible request admission in the GenAI scheduler and
+8. Add an `InferenceSession`/EP **reporting** interface for per-run transient
+   peaks and EP mapping granularity, so admission can satisfy I8 with measured
+   graph geometry instead of an envelope. This is the smallest ORT-side change
+   in the list and the one the rest of admission depends on.
+9. Implement completion-feasible request admission in the GenAI scheduler and
    eviction-progress protection in model residency.
-9. Extend formal/refinement coverage from one HostGovernor to ordered,
+10. Extend formal/refinement coverage from one HostGovernor to ordered,
    starvation-free multi-authority transactions and completion-feasible
    admission.
 
