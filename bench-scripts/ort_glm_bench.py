@@ -7,7 +7,27 @@ decode_tokens = int(sys.argv[3]) if len(sys.argv) > 3 else 128
 iters = int(sys.argv[4]) if len(sys.argv) > 4 else 3
 
 t0 = time.time()
-model = og.Model(model_dir)
+# Force the execution provider (default: cuda). The builder genai_config.json
+# ships an empty provider_options list which makes og default to CPU; we must
+# explicitly append the provider for a fair GPU-vs-GPU comparison. Set
+# ORT_RAW=1 to instead honor the providers already baked into genai_config.json
+# (used for the fast-config dirs that carry cuda + enable_cuda_graph +
+# past_present_share_buffer, i.e. ORT's optimized decode path).
+ep = os.environ.get("ORT_EP", "cuda")
+if os.environ.get("ORT_RAW") == "1":
+    model = og.Model(model_dir)
+    print("og.Model loaded honoring config providers (ORT_RAW=1)", flush=True)
+else:
+    try:
+        cfg = og.Config(model_dir)
+        cfg.clear_providers()
+        if ep and ep != "cpu":
+            cfg.append_provider(ep)
+        model = og.Model(cfg)
+        print(f"og.Model loaded with provider={ep!r}", flush=True)
+    except Exception as e:
+        print(f"og.Config provider path failed ({str(e)[:80]}); falling back to og.Model(dir)", flush=True)
+        model = og.Model(model_dir)
 try:
     tok = og.Tokenizer(model)
     _enc = lambda s: tok.encode(s)

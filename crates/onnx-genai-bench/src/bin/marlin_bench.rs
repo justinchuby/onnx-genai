@@ -406,8 +406,10 @@ fn run_e2e(sess: &mut NativeDecodeSession, prompt: &[TokenId], args: &Args) -> R
     // Steady decode window.
     let total = args.e2e_tokens;
     let mut step_walls = Vec::with_capacity(total);
+    let mut greedy_tokens: Vec<TokenId> = Vec::with_capacity(total);
     for _ in 0..total {
         let token = argmax(&logits);
+        greedy_tokens.push(token);
         let at = sess.current_len();
         let start = Instant::now();
         logits = sess
@@ -416,6 +418,11 @@ fn run_e2e(sess: &mut NativeDecodeSession, prompt: &[TokenId], args: &Args) -> R
             .context("decode produced no logits")?;
         step_walls.push(start.elapsed().as_nanos() as u64);
     }
+    let dump = greedy_tokens.len().min(20);
+    println!(
+        "  greedy first {dump} tokens = {:?}",
+        &greedy_tokens[..dump]
+    );
     let skip = args.e2e_skip.min(step_walls.len().saturating_sub(1));
     let window = &step_walls[skip..];
     let med = median(window);
