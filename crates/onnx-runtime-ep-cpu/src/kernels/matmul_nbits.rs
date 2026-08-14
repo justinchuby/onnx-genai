@@ -50,6 +50,14 @@ mod mm_profile {
     static NARROW_NS: AtomicU64 = AtomicU64::new(0);
     #[cfg(feature = "mlas")]
     static CALLS: AtomicU64 = AtomicU64::new(0);
+    // One-time constant-weight repack/dequant done on the first execution of
+    // each MatMulNBits node (the `dequantize_weight` int4->f32 expansion for the
+    // non-MLAS hand path, or `build_mlas_*` for the MLAS path). This is the
+    // lazy O(weight-bytes) work that dominates the native load/init fixed cost;
+    // gated by the same `ONNX_GENAI_PROFILE_MM=1` switch.
+    static PREPACK_NS: AtomicU64 = AtomicU64::new(0);
+    static PREPACK_CALLS: AtomicU64 = AtomicU64::new(0);
+    static PREPACK_BYTES: AtomicU64 = AtomicU64::new(0);
 
     pub fn enabled() -> bool {
         static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -83,6 +91,31 @@ mod mm_profile {
     #[cfg(feature = "mlas")]
     pub fn time_narrow<T>(f: impl FnOnce() -> T) -> T {
         timed(&NARROW_NS, f)
+    }
+
+    /// Time one constant-weight one-time repack/dequant (`build_mlas_*` or
+    /// `dequantize_weight`), tagged with a `phase` label and its `weight_bytes`
+    /// (standard-layout `B` size). Every call emits the running total to stderr
+    /// so a harness can read the last line to get the whole model's one-time
+    /// prepack/dequant cost and its share of load time.
+    pub fn time_prepack<T>(phase: &'static str, weight_bytes: usize, f: impl FnOnce() -> T) -> T {
+        if !enabled() {
+            return f();
+        }
+        let start = Instant::now();
+        let out = f();
+        let ns = start.elapsed().as_nanos() as u64;
+        let total_ns = PREPACK_NS.fetch_add(ns, Ordering::Relaxed) + ns;
+        let calls = PREPACK_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        let bytes =
+            PREPACK_BYTES.fetch_add(weight_bytes as u64, Ordering::Relaxed) + weight_bytes as u64;
+        eprintln!(
+            "[mm_prepack] phase={phase} calls={calls} prepack_total={total:.1}ms \
+             cum_bytes={bytes} this={this:.2}ms this_bytes={weight_bytes}",
+            total = total_ns as f64 / 1e6,
+            this = ns as f64 / 1e6,
+        );
+        out
     }
 
     /// Record one MatMulNBits call and, every 512 calls, emit the running split
@@ -1125,13 +1158,16 @@ impl Kernel for MatMulNBitsKernel {
                 if let Some(weight) = self.weight_nk.get() {
                     weight
                 } else {
-                    let weight = self.dequantize_weight(
-                        &inputs[1],
-                        &inputs[2],
-                        zero_points,
-                        group_indices,
-                        WeightLayout::Nk,
-                    )?;
+                    let weight =
+                        mm_profile::time_prepack("dequant-nk", self.nbits_weight_bytes(), || {
+                            self.dequantize_weight(
+                                &inputs[1],
+                                &inputs[2],
+                                zero_points,
+                                group_indices,
+                                WeightLayout::Nk,
+                            )
+                        })?;
                     let weight = numa_place_nk(weight, self.n);
                     let _ = self.weight_nk.set(weight);
                     self.weight_nk
@@ -1178,13 +1214,16 @@ impl Kernel for MatMulNBitsKernel {
                 result,
             )?;
             if !used_fast_nt {
-                let weight_kn = self.dequantize_weight(
-                    &inputs[1],
-                    &inputs[2],
-                    zero_points,
-                    group_indices,
-                    WeightLayout::Kn,
-                )?;
+                let weight_kn =
+                    mm_profile::time_prepack("dequant-kn", self.nbits_weight_bytes(), || {
+                        self.dequantize_weight(
+                            &inputs[1],
+                            &inputs[2],
+                            zero_points,
+                            group_indices,
+                            WeightLayout::Kn,
+                        )
+                    })?;
                 gemm(&activations, &weight_kn, result, m, self.k, self.n)?;
             }
         }
@@ -1398,7 +1437,10 @@ impl MatMulNBitsKernel {
             let shards = if let Some(shards) = self.mlas_shards.get() {
                 shards
             } else {
-                let built = self.build_mlas_shards(packed, scales, zero_points, comp)?;
+                let built =
+                    mm_profile::time_prepack("mlas-shards", self.nbits_weight_bytes(), || {
+                        self.build_mlas_shards(packed, scales, zero_points, comp)
+                    })?;
                 let _ = self.mlas_shards.set(built);
                 self.mlas_shards
                     .get()
@@ -1417,7 +1459,10 @@ impl MatMulNBitsKernel {
             let cached = if let Some(cached) = self.mlas_packed.get() {
                 cached
             } else {
-                let built = self.build_mlas_packed(packed, scales, zero_points, comp)?;
+                let built =
+                    mm_profile::time_prepack("mlas-packed", self.nbits_weight_bytes(), || {
+                        self.build_mlas_packed(packed, scales, zero_points, comp)
+                    })?;
                 let _ = self.mlas_packed.set(built);
                 self.mlas_packed
                     .get()
@@ -1760,6 +1805,16 @@ impl MatMulNBitsKernel {
             Some(spmd) => spmd.output_column_segments(self.n, MLAS_SQNBIT_DECODE_SHARD_ALIGN),
             None => vec![(0, self.n)],
         }
+    }
+
+    /// Standard-layout `B` size in bytes for this node
+    /// (`[N, ceil(K / block_size), block_size * bits / 8]`), i.e. the number of
+    /// packed weight bytes a prepack/dequant reads. Used only to size the
+    /// one-time prepack/dequant cost under `ONNX_GENAI_PROFILE_MM=1`.
+    fn nbits_weight_bytes(&self) -> usize {
+        let k_blocks = self.k.div_ceil(self.block_size);
+        let blob_size = self.block_size * self.bits / 8;
+        self.n * k_blocks * blob_size
     }
 
     /// Pack the constant int4 weight into one MLAS SQNBit shard per entry of
