@@ -215,7 +215,9 @@ still needs hardware validation in this repository.
 
 Stable VA preserves pointers, but capture also requires compatible shapes,
 strides, launch geometry, table buffers, and state views. Mapping/page-in occurs
-outside replay after fences.
+outside replay after fences. Host-mapped device pointers are capture-compatible
+and replay bit-identically (#877/#880/#912) — capture is not the constraint on
+zero-copy tiering; aggregate host-mapped read capacity is.
 
 Dynamic weight eviction/re-admission is **not shippable today**: repository
 measurements found output corruption for large stable-slot residents. Until the
@@ -256,8 +258,33 @@ local/non-local budgets are changing external ceilings; `SharedSystemMemory` is
 a maximum, not free capacity.
 
 A host-backed GPU allocation takes one host physical lease plus a non-local
-residency allowance, not two physical leases. Prefer a resident hot set plus
-host-mapped cold, single-touch weights over copy-map-evict churn.
+residency allowance, not two physical leases.
+
+An earlier version of this appendix recommended preferring "a resident hot set
+plus host-mapped cold, single-touch weights over copy-map-evict churn." That
+recommendation was built and measured, and **it does not hold on this class of
+hardware** (#864/#912). Two independent limits defeat it:
+
+- **Correctness.** Aggregate distinct host-mapped bytes read per decode step
+  above ~0.44–0.65 GB silently returned stale data on an RTX 4060 Laptop —
+  generation collapsed 16 tokens to 3 with no error raised. A *single*
+  host-mapped read was bit-identical at 1, 8, 16 and 32 cold weights, and a
+  copy-instead A/B isolated the fault to the host-mapped read rather than the
+  admission flow. So this is an aggregate aperture ceiling, not a per-read bug,
+  and it is invisible: nothing fails, the answer is just wrong.
+- **Throughput.** Even capped at a provably safe 256 MiB budget, the hybrid ran
+  **0.73 tok/s against WDDM demand paging's 7.84** on the same model in the
+  same session. The safe aperture (0.26 GB/step) is structurally smaller than
+  the traffic it would have to displace (~0.6 GB/step), so the lever is too
+  short by construction, not by tuning.
+
+The correct statement is narrower and worth stating positively: **prefer a
+resident hot set, and let the platform move the cold remainder** unless C7
+reports a host-mapped read capacity large enough to cover the per-step cold
+traffic. The mechanism is sound — capture survives host-mapped pointers with
+bit-identical replay — so this is a capacity verdict about one class of GPU,
+not a rejection of the technique. Datacenter parts with larger host apertures
+should be re-measured rather than assumed to inherit this result.
 
 Managed no-spill CUDA VMM is a hard bound on *our own admission* — the ledger
 refuses to hand out more than `managed_limit`, and a request past it fails
@@ -306,7 +333,12 @@ with native CUDA is not implemented.
 | Governance overhead | Medium | Header host path measured about 15 ns; VMM charges on granule growth. Multi-session/device-arena contention remains. |
 | VMM granularity | Medium-high | 2 MiB CUDA granule and layout crossovers measured. Against the engine's actual packed head-major floor, token-major would reduce the floor by about 96x and is not implemented. The earlier 768x probe used a fixed full-context stride the engine does not instantiate. |
 | Remap/commit safety | Medium | Same-VA replay, stable slots, prefix multi-map, and accounting pass tests. In-flight unmap and multi-model/multi-stream stress remain. |
-| Dynamic weight lending | **Blocked** | Large stable-slot eviction/re-admission corrupts output. Static hot set only until isolated and token-parity gated. |
+| Dynamic weight lending | **Blocked** | Large stable-slot eviction/re-admission corrupts output. Static hot set only until isolated and token-parity gated. Eviction *order* is ruled out as the cause (#892) and bounded at ~10% of the gap (#901); the open lever is admission. |
+| Host-mapped cold weight reads | **Negative, closed** | Built end-to-end and measured (#912). Single reads bit-identical; aggregate distinct reads above ~0.44–0.65 GB/step silently corrupt; safe-capped arm ran 0.73 tok/s against WDDM's 7.84. Capture with host-mapped pointers works and replays bit-identically, so the mechanism is sound and the *capacity* is not. Re-measure on parts with larger host apertures; do not assume the result transfers either way. |
+| Managing vs. deferring to the platform | High | Direct A/B on a 14B model over budget: managed streaming 0.18 tok/s vs WDDM demand paging 5.53 (#864); shipping the default change measured ~100x end-to-end (#874). The structural cause is that each weight is read once per decode step, so copying it buys no reuse. |
+| Batching as the amortization lever | Medium-high | `1/N` amortization measured with batch-invariant totals and a KV-content control at `past_len` 0/512/2048 (#884/#891); ceiling `N_max ~ 19 @ 2048 ctx`. Requires one fused forward with `M = N`; `N` sequential forwards amortize nothing. |
+| Weight-byte accounting | High | Corrected 2.00x by summing referenced extents rather than the external-data blob (#853/#856); the error was found because measured traffic sat below its own theoretical floor. |
+| Static KV reservation | High | A load-time `bytes_per_token x max_context` split was charged in full from the first token; making it elastic cut streamed bytes 1.68x with the max-context guarantee tested through the production reclaim path (#857/#866). |
 | Pressure liveness | Medium | Single HostGovernor protocol has TLA/refinement and conformance. Multi-authority ordering, persistent non-owning intents, bounded-aging arbitration, and real-holder fault campaigns remain. |
 | State completeness | Medium | Native recurrent prefix parity exists; ORT hybrid reuse recomputes until full state restore lands. |
 | Coordinator quota leak | Medium-low | Authenticate spawned workers; heartbeat/epoch failure fences and initiates termination; quota remains charged until process exit; return is idempotent across restart. |
