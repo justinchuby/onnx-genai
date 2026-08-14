@@ -1,13 +1,13 @@
 //! Runtime communicator abstraction, in-process reference backend, and the
 //! backend buffer-ownership lease registry and collective ordering.
 //!
-//! See `docs/COMMUNICATOR_BUFFER_IMPL.md` and
-//! `docs/COLLECTIVE_ORDERING_IMPL.md`.
+//! See `docs/distributed/COMMUNICATOR_BUFFER_IMPL.md` and
+//! `docs/distributed/COLLECTIVE_ORDERING_IMPL.md`.
 //!
 //! # What this crate provides
 //!
 //! * [`Communicator`] — the runtime-level collective/point-to-point trait
-//!   (`docs/DISTRIBUTED_RUNTIME.md` §3.1).
+//!   (`docs/distributed/DISTRIBUTED_RUNTIME.md` §3.1).
 //! * [`InProcessCommunicator`] — the Phase-1 single-process, multi-rank
 //!   reference backend and test oracle (§4.6), including all collectives.
 //! * [`OwnershipRegistry`] — the backend buffer-ownership lease registry,
@@ -19,7 +19,7 @@
 //!
 //! This crate currently has **zero inbound Cargo edges** inside the workspace,
 //! and that is deliberate. It is the Phase-1 building block of the distributed
-//! runtime (see `docs/DISTRIBUTED_RUNTIME.md`): the [`Communicator`] trait, the
+//! runtime (see `docs/distributed/DISTRIBUTED_RUNTIME.md`): the [`Communicator`] trait, the
 //! [`InProcessCommunicator`] reference backend/test oracle, and the
 //! [`OwnershipRegistry`] lease machinery are validated *in isolation* via the
 //! independent replay-checker conformance harness (`tests/`) against the TLA+

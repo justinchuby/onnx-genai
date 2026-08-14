@@ -4,7 +4,7 @@
 //! whole physical granules; partial mapping does not exist. So the *committed*
 //! physical bytes of a KV binding are `granule × (windows touched by a live
 //! byte)`, and which windows the live prefix touches is decided by the tensor
-//! layout, not by the allocator (see `docs/MEMORY_ARCHITECTURE.md`, "KV layout
+//! layout, not by the allocator (see `docs/memory/MEMORY_ARCHITECTURE.md`, "KV layout
 //! and residency").
 //!
 //! Before this module the native CUDA binding always committed a single flat
@@ -40,7 +40,7 @@
 // and the measured residency floor are single-sourced here and cannot drift. The
 // seq-major (BSNH) fixed-stride physical-shape build that hangs the dense-prefix
 // commit on this geometry landed with #801/#812 (see
-// `docs/MEMORY_ARCHITECTURE.md`, "KV layout and residency"). The residency
+// `docs/memory/MEMORY_ARCHITECTURE.md`, "KV layout and residency"). The residency
 // projection helpers `committed_granules` / `live_prefix_committed_bytes` remain
 // measurement-only (they model the granule floor the driver test verifies), so
 // they carry a scoped dead-code allowance for non-test builds.

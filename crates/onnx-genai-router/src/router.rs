@@ -1,4 +1,4 @@
-//! Core routing logic (see `docs/DESIGN.md` §34.4 and §34.5).
+//! Core routing logic (see `docs/architecture/DESIGN.md` §34.4 and §34.5).
 //!
 //! [`Router::route`] is a **pure decision function** over the current node
 //! snapshot: given a [`RouteRequest`] it returns the chosen [`NodeId`] (or

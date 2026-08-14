@@ -219,7 +219,7 @@ onnx-genai generate models/my-vlm --image cat.png --image dog.png \
 A *partial* set is rejected rather than topped up: once you start positioning
 placeholders, guessing where the rest belong would silently change which image a
 sentence refers to. The metadata contract behind this is documented in
-[docs/MODEL_METADATA.md](docs/MODEL_METADATA.md#multimodal-input-the-placeholder-contract),
+[docs/genai/MODEL_METADATA.md](docs/genai/MODEL_METADATA.md#multimodal-input-the-placeholder-contract),
 which also covers how audio input differs.
 
 #### Asking again about the same attachment
@@ -377,7 +377,7 @@ onnx-genai --profile-trace trace.json generate models/qwen2.5-0.5b --prompt "...
 ### Generate images
 
 `generate --output-image` renders a prompt through a diffusion package (see
-[docs/DIFFUSION.md](docs/DIFFUSION.md)):
+[docs/genai/DIFFUSION.md](docs/genai/DIFFUSION.md)):
 
 ```bash
 ./target/release/onnx-genai generate models/stable-diffusion-1.5 \
@@ -722,7 +722,7 @@ Remaining advanced work includes:
 - Automatic hardware-profile probing/matching beyond explicit EP selection and
   metadata capability validation.
 
-See [docs/DESIGN.md](docs/DESIGN.md) for the design and roadmap.
+See [docs/architecture/DESIGN.md](docs/architecture/DESIGN.md) for the design and roadmap.
 
 ## License
 

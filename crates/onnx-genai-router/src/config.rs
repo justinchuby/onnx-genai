@@ -1,4 +1,4 @@
-//! Router configuration model (see `docs/DESIGN.md` §34.11).
+//! Router configuration model (see `docs/architecture/DESIGN.md` §34.11).
 //!
 //! The config is deliberately generalizable: routing policy is an enum with
 //! per-policy knobs, health thresholds are explicit, and session-map
@@ -63,7 +63,7 @@ impl Default for RoutingConfig {
     }
 }
 
-/// Routing strategy (see `docs/DESIGN.md` §34.5).
+/// Routing strategy (see `docs/architecture/DESIGN.md` §34.5).
 ///
 /// Deserializes from YAML in a user-friendly shape: unit variants are plain
 /// snake_case strings (`policy: affinity_then_load`), and

@@ -1,5 +1,5 @@
 //! Session → node affinity table with optional JSON persistence and migration
-//! accounting (see `docs/DESIGN.md` §34.4 and §34.6).
+//! accounting (see `docs/architecture/DESIGN.md` §34.4 and §34.6).
 //!
 //! Pure and unit-testable: no async, no I/O beyond explicit `save`/`load`.
 

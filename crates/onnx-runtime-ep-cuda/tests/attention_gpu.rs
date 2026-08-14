@@ -13,7 +13,7 @@
     clippy::clone_on_copy
 )]
 //! On-GPU integration test for the Phase-2a SDPA/GQA attention kernel
-//! (`docs/ORT2.md` §13 + §15.5).
+//! (`docs/architecture/ORT2.md` §13 + §15.5).
 //!
 //! Gated on a real device: CPU-only CI reports these as ignored unless
 //! `gpu-tests` is enabled. Feature-enabled runs fail loudly if CUDA cannot run.

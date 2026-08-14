@@ -1,5 +1,5 @@
 //! `Add`: elementwise addition with numpy-style broadcasting, generic over the
-//! ONNX numeric dtypes via the shared [`crate::dtype`] mechanism (`docs/ORT2.md`
+//! ONNX numeric dtypes via the shared [`crate::dtype`] mechanism (`docs/architecture/ORT2.md`
 //! §4.4).
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};

@@ -37,7 +37,7 @@ Reviewed round 1 of the tiny reasoning fixture. Locked out after round 1; rounds
 
 ### Output
 
-- Created `docs/EP_PLUGIN_EXPORT_TEST_PLAN.md` with:
+- Created `docs/ep-plugin/EP_PLUGIN_EXPORT_TEST_PLAN.md` with:
   - Full environment feasibility report (ORT 1.28 symbol evidence, API version compatibility)
   - Three-level test ladder: L1 (symbol export assertion), L2 (in-process dlopen ABI driver),
     L3 (real ORT e2e, marked not achievable with current wheel + rationale)

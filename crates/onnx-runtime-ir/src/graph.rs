@@ -1,5 +1,5 @@
 //! The mutable graph model: node/value arenas, edge-consistent mutation,
-//! topological ordering, and validation (see `docs/ORT2.md` §3.3 and §3.5).
+//! topological ordering, and validation (see `docs/architecture/ORT2.md` §3.3 and §3.5).
 
 use std::collections::{BinaryHeap, HashMap, HashSet};
 

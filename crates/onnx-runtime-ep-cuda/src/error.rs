@@ -1,7 +1,7 @@
 //! Error mapping from cudarc's driver / cuBLASLt errors into the shared
 //! [`onnx_runtime_ep_api::EpError`] vocabulary.
 //!
-//! ## KEY PROJECT RULE — actionable errors (`docs/ORT2.md` §15.1)
+//! ## KEY PROJECT RULE — actionable errors (`docs/architecture/ORT2.md` §15.1)
 //!
 //! Every failure on the dispatch path is turned into an [`EpError`] that states
 //! **what** failed, **why**, and — for unsupported cases — that it is a
@@ -60,7 +60,7 @@ pub(crate) fn nvrtc_err(context: &str, e: cudarc::nvrtc::CompileError) -> EpErro
 pub(crate) fn not_implemented(what: impl std::fmt::Display) -> EpError {
     EpError::KernelFailed(format!(
         "cuda_ep: {what} is not yet implemented on the CUDA EP. See \
-         docs/CUDA_COVERAGE.md for the op → backend roadmap; this op/case can run \
+         docs/execution/CUDA_COVERAGE.md for the op → backend roadmap; this op/case can run \
          on the CPU EP in the meantime."
     ))
 }

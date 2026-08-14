@@ -1,4 +1,4 @@
-//! CUDA kernels for the Phase-2a slice (`docs/ORT2.md` §15). Standard **GEMM**
+//! CUDA kernels for the Phase-2a slice (`docs/architecture/ORT2.md` §15). Standard **GEMM**
 //! (`MatMul`, cuBLASLt) plus the SDPA/GQA **Attention** baseline (`Attention` in
 //! the `com.microsoft` domain — cuBLAS batched GEMM + NVRTC softmax). One
 //! [`Kernel`] per op, keyed purely by (op type, domain) — there are **no**
@@ -166,7 +166,7 @@ use pointwise::{
 ///   honouring `keepdims` and `select_last_index`, matched to the CPU EP
 ///   `selection.rs` tie-breaking.
 ///
-/// See `docs/CUDA_COVERAGE.md` for the full op → backend mapping matrix and the
+/// See `docs/execution/CUDA_COVERAGE.md` for the full op → backend mapping matrix and the
 /// prioritised list of remaining / custom-kernel ops.
 pub const CUDA_COVERED_OPS: &[&str] = &[
     "MatMul",
@@ -978,7 +978,7 @@ pub fn build_cuda_registry_with_metrics(
         }),
     );
 
-    // ── CUDA Wave 2 — transformer-critical ops (see docs/CUDA_COVERAGE.md) ──
+    // ── CUDA Wave 2 — transformer-critical ops (see docs/execution/CUDA_COVERAGE.md) ──
 
     // Softmax (cuDNN, with f32 NVRTC fallback). Legacy coerce-to-2D at opset
     // ≤ 12, per-axis at opset ≥ 13.

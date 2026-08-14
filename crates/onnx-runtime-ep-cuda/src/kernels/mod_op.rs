@@ -1,4 +1,4 @@
-//! ONNX `Mod` (`docs/CUDA_COVERAGE.md`): elementwise remainder with NumPy
+//! ONNX `Mod` (`docs/execution/CUDA_COVERAGE.md`): elementwise remainder with NumPy
 //! right-aligned broadcasting.
 //!
 //! `fmod=0` (the default) is integer floor-modulo whose result takes the sign of

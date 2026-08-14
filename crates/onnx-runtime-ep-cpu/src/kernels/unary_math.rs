@@ -1,4 +1,4 @@
-//! Additional unary floating-point elementwise math kernels (`docs/ORT2.md` §4.4).
+//! Additional unary floating-point elementwise math kernels (`docs/architecture/ORT2.md` §4.4).
 //!
 //! These mirror the [`elementwise`](super::elementwise) unary family (a straight
 //! per-element map through [`to_dense_f32_widen`]/[`write_dense_f32_narrow`]) but

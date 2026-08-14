@@ -1,4 +1,4 @@
-//! Elementwise f32 kernels (`docs/ORT2.md` §4.4).
+//! Elementwise f32 kernels (`docs/architecture/ORT2.md` §4.4).
 //!
 //! Two tight families share this module because they share the same dense-f32
 //! read/write plumbing:

@@ -1,5 +1,5 @@
 //! Phase-4 double-buffered weight-prefetch **strategy** (executor half of
-//! `docs/WEIGHT_OFFLOAD.md` §4 and issue #87).
+//! `docs/memory/WEIGHT_OFFLOAD.md` §4 and issue #87).
 //!
 //! The compute/transfer overlap for MoE expert paging is split across two
 //! layers, per the issue's layering contract:

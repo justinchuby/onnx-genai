@@ -36,7 +36,7 @@ Full pre-compaction history in original `history.md` before 2026-07-29 compactio
 
 ## 2026-08-10T20:16:00+0000 — EP plugin-export inventory
 
-- Produced `docs/EP_PLUGIN_EXPORT_INVENTORY.md`: 2 production EPs (CPU NEAR, CUDA BLOCKED). Named 6 trait/ABI gaps.
+- Produced `docs/ep-plugin/EP_PLUGIN_EXPORT_INVENTORY.md`: 2 production EPs (CPU NEAR, CUDA BLOCKED). Named 6 trait/ABI gaps.
 
 ## 2026-08-10T21:09:00+0000 — EP Plugin Compute Path
 

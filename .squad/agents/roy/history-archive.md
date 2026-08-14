@@ -197,7 +197,7 @@ Large-model recon documented 27B runtime and GPU-capacity blockers; Granite unfu
 Verified provider inventory at HEAD `5fa8cb2a8`. 2 production EPs (CPU, CUDA). Metal/QNN out of scope. CUDA blocked: 9 missing OrtEp fields + no GPU toolkit. CPU plugin compile confirmed. ORT compatibility boundary: ORT 1.27.0 / API version 27. Docs: `EP_PLUGIN_EXPORT.md`, `EP_PLUGIN_EXPORT_ABI_TRUTH.md`, `EP_PLUGIN_EXPORT_INVENTORY.md`, `EP_PLUGIN_EXPORT_SECURITY_AUDIT.md`.
 
 ### 2026-08-10T22:42Z — EP plugin export: final docs + PR
-Verified M1 passing at `bad3682`: 82 lib + 21 integration tests, clippy clean. `conformance_two_sessions` no longer ignored (UAF fixed). `docs/EP_PLUGIN_EXPORT_PR.md` written; Holden verdict 🟡 YELLOW. Durable lesson: always re-run validation at HEAD; do not copy numbers from coordinator memo.
+Verified M1 passing at `bad3682`: 82 lib + 21 integration tests, clippy clean. `conformance_two_sessions` no longer ignored (UAF fixed). `docs/ep-plugin/EP_PLUGIN_EXPORT_PR.md` written; Holden verdict 🟡 YELLOW. Durable lesson: always re-run validation at HEAD; do not copy numbers from coordinator memo.
 
 ### 2026-08-10T22:56Z — EP plugin PR doc accuracy sweep
 Full stale-claim sweep at `bad3682`. Removed mutex-poison cascade note (fixed). Updated conformance_two_sessions, stress cycles, Holden verdict, security table, validate_dims fix. 21 total tests, 0 ignored.
@@ -212,7 +212,7 @@ HEAD `5a5b40877`. M2 largely complete: parity (9 tests), f16/bf16 e2e, device su
 Leon M2-1/M2-2 fixed; clippy clean. 142 ep-plugin tests, 23 cpu-plugin tests. Removed stale clippy blocker paragraph. Both M1 and M2 green and mergeable.
 
 ### 2026-08-11 — NXRT ABI doc + CUDA honest status (HEAD: `4212e090e`)
-Found nxrt-abi/nxrt-host crates not committed at HEAD `4212e090e`. Written `docs/NXRT_ABI.md` and `docs/CUDA_EP_STATUS.md` (honest hardware-column ❌). Integration gap: Nabil vtable model vs Isidore opaque-handle model — incompatible protocols. §524 nxrt row 🔴.
+Found nxrt-abi/nxrt-host crates not committed at HEAD `4212e090e`. Written `docs/architecture/NXRT_ABI.md` and `docs/execution/CUDA_EP_STATUS.md` (honest hardware-column ❌). Integration gap: Nabil vtable model vs Isidore opaque-handle model — incompatible protocols. §524 nxrt row 🔴.
 
 ### 2026-08-11 — nxrt ABI Landing Documentation Pass (HEAD `99560c876`)
 ABI reconciled: vtable ownership, struct_size forward compat, NXRT_CAP_KNOWN_MASK. 30/30 abi tests, 9/10 host (env-var race). Conformance runner committed. Docs updated.

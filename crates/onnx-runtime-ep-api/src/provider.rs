@@ -945,7 +945,7 @@ pub trait ExecutionProvider: Send + Sync {
     }
 
     /// The `EPContext` node `source` key(s) this EP accepts for compiled-context
-    /// dispatch (`docs/ORT2.md` §55.6). The keys come from the EP's own
+    /// dispatch (`docs/architecture/ORT2.md` §55.6). The keys come from the EP's own
     /// config/data — **never** hardcoded in loader/session dispatch. An empty
     /// list (the default) means the EP does not participate in `EPContext`
     /// (e.g. the pure-Rust CPU EP has no compile step).

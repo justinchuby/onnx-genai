@@ -50,7 +50,7 @@ Standing directive: portable optimizations, benchmark-backed claims, and SIMD/NP
 - Verified: clean stderr (no unconditional prints), all 33 decode_spmd tests pass, Deckard's dispatch test passes, x86_64 clippy clean, `check_profile_table.py` passes.
 
 ### 2026-07-27 — Tracing + half_gemm overlap analysis (post main merge)
-- **Commit `281481a6`**: Switched from `NXRT_CALIB_DEBUG` gated `eprintln!` to `tracing::debug!` (per `docs/ERROR_AND_LOGGING_CONVENTIONS.md`). Added `tracing = "0.1"` as optional dep behind existing `tracing` feature. Without feature, `NXRT_CALIB_DEBUG` fallback preserved.
+- **Commit `281481a6`**: Switched from `NXRT_CALIB_DEBUG` gated `eprintln!` to `tracing::debug!` (per `docs/architecture/ERROR_AND_LOGGING_CONVENTIONS.md`). Added `tracing = "0.1"` as optional dep behind existing `tracing` feature. Without feature, `NXRT_CALIB_DEBUG` fallback preserved.
 - **half_gemm.rs overlap**: Complementary, not duplicated. GEMV (M=1 bandwidth-optimal, inline asm fcvtl ARMv8 base) vs GEMM (M>1 compute-optimal, vcvt_f32_f16 intrinsic requiring FEAT_FP16). Dispatch collision fixed in `ed7a65e3`. Consolidation deferred to separate PR.
 
 ### 2026-07-27 — PR #275 Mac prefill campaign (BNNS/AMX + first-decode spike elimination)

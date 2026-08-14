@@ -1,4 +1,4 @@
-//! The sequential CPU executor (Track D, `docs/ORT2.md` §20, §11.3).
+//! The sequential CPU executor (Track D, `docs/architecture/ORT2.md` §20, §11.3).
 //!
 //! Turns a loaded [`Graph`] plus its live [`WeightStore`] into a runnable plan:
 //! resolve every value's concrete shape from the actual bound inputs at

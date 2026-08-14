@@ -1,5 +1,5 @@
 //! `Transpose`: permute axes by moving raw fixed-width element bytes. The `perm` attribute gives the axis
-//! order; it defaults to reversing all axes (`docs/ORT2.md` §4.4).
+//! order; it defaults to reversing all axes (`docs/architecture/ORT2.md` §4.4).
 
 use onnx_runtime_ep_api::{
     EpError, Kernel, KernelFactory, Result, TensorMut, TensorView, ViewOutput,

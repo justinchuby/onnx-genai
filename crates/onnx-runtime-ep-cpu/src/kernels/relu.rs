@@ -1,4 +1,4 @@
-//! `Relu`: elementwise `max(0, x)` for f32 (`docs/ORT2.md` §4.4).
+//! `Relu`: elementwise `max(0, x)` for f32 (`docs/architecture/ORT2.md` §4.4).
 //!
 //! Dispatch priority:
 //! 1. MLAS (when `feature = "mlas"` — x86-64 Linux only)

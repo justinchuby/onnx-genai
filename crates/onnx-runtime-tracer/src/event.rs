@@ -3,7 +3,7 @@
 //! [`TraceEvent`] is the single event type both the runtime and genai layers
 //! record. On the wire it serializes to the
 //! [Chrome Trace Event Format](https://docs.google.com/document/d/1CvAClvFfyA5R-PhYUmn5OOQtYMH4h6I0nSsKchNAySU/preview)
-//! object shape (the exact form in `docs/ORT2.md` §17.2), so a
+//! object shape (the exact form in `docs/architecture/ORT2.md` §17.2), so a
 //! [`ChromeJson`](crate::TraceFormat::ChromeJson) or
 //! [`Jsonl`](crate::TraceFormat::Jsonl) export is just a serialization of these
 //! events, and the [`perfetto`](crate::perfetto) exporter maps the same fields

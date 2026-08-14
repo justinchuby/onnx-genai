@@ -2,7 +2,7 @@
 //!
 //! Sessions have historically bound one [`ExecutionProvider`] to the whole
 //! executor, so a graph containing a single node the selected provider cannot
-//! run is rejected outright (`docs/HETEROGENEOUS_PLACEMENT.md`, issue #65). This
+//! run is rejected outright (`docs/execution/HETEROGENEOUS_PLACEMENT.md`, issue #65). This
 //! module lifts that restriction for the *planning* layer: given an ordered set
 //! of providers (front = highest priority), it
 //!
@@ -26,7 +26,7 @@
 //! provider. [`execute`] realizes the plan by extracting each partition as a
 //! standalone subgraph and running it on its assigned provider through the
 //! existing [`Executor`], staging boundary tensors through host memory
-//! (`docs/HETEROGENEOUS_PLACEMENT.md` §5.2, the correctness-first synchronous
+//! (`docs/execution/HETEROGENEOUS_PLACEMENT.md` §5.2, the correctness-first synchronous
 //! transfer phase). Because every cross-partition value is materialized on the
 //! host between partitions, this is a faithful, if unoptimized, realization of
 //! the transfer edges the planner computes.

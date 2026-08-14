@@ -49,7 +49,7 @@ thiserror = { workspace = true }
 half = { workspace = true }
 libloading = { workspace = true }
 
-# cudarc: pure-Rust CUDA bindings (docs/ORT2.md §15.2). `dynamic-loading` means
+# cudarc: pure-Rust CUDA bindings (docs/architecture/ORT2.md §15.2). `dynamic-loading` means
 # `cargo build` needs NO CUDA toolkit — the driver and cuBLASLt are dlopen'd at
 # runtime. `f16` pulls in `half` for f16/bf16 GEMM. Select exactly one CUDA API
 # version with this crate's `cuda-*` features; the default is CUDA 13.0.

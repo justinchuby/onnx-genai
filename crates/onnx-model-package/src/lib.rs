@@ -55,7 +55,7 @@ pub enum PackageLayout {
 /// Caller-supplied trust policy governing whether an `installed`-layout package
 /// may resolve references outside the package root.
 ///
-/// Packages are untrusted input (see `docs/MODEL_PACKAGE.md` §7), so the
+/// Packages are untrusted input (see `docs/genai/MODEL_PACKAGE.md` §7), so the
 /// manifest's own `layout` field must never be able to grant itself
 /// filesystem-escape privileges. Confinement is therefore always enforced
 /// unless the embedding application explicitly passes

@@ -1,5 +1,5 @@
 //! `ConstantOfShape`: build a tensor of a runtime-supplied shape, every element
-//! set to the scalar `value` attribute (`docs/ORT2.md` §4.4).
+//! set to the scalar `value` attribute (`docs/architecture/ORT2.md` §4.4).
 //!
 //! Input 0 is a 1-D `int64` tensor giving the output dimensions; the output
 //! rank equals that tensor's length (an empty length yields a scalar). The

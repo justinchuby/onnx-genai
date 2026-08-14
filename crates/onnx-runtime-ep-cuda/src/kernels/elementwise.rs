@@ -1,5 +1,5 @@
 //! Elementwise **unary** and **binary** ops on the GPU via runtime-compiled
-//! (NVRTC) kernels (`docs/ORT2.md` §15; RULES.md #4 — a fused NVRTC elementwise
+//! (NVRTC) kernels (`docs/architecture/ORT2.md` §15; RULES.md #4 — a fused NVRTC elementwise
 //! path is the endorsed "custom kernel" case: no NVIDIA library covers arbitrary
 //! ONNX elementwise chains, and keeping them as our own kernels is what later
 //! enables fusing an activation into a preceding GEMM epilogue).

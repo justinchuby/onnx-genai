@@ -1,4 +1,4 @@
-//! `Softmax`: numerically stable softmax for f32 (`docs/ORT2.md` §4.4).
+//! `Softmax`: numerically stable softmax for f32 (`docs/architecture/ORT2.md` §4.4).
 //!
 //! ## Two opset semantics (both implemented, selected by opset)
 //!

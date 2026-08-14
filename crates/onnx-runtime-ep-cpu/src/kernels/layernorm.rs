@@ -1,5 +1,5 @@
 //! `LayerNormalization`: normalize f32 `X` over the axes from `axis` onward,
-//! then scale and shift (`docs/ORT2.md` §4.4).
+//! then scale and shift (`docs/architecture/ORT2.md` §4.4).
 //!
 //! `Y = (X - mean) / sqrt(var + epsilon) * Scale + B`, where `mean`/`var` are
 //! the population statistics over the normalized axes. The optional `Mean` and

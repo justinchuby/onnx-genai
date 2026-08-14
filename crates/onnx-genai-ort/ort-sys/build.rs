@@ -337,7 +337,7 @@ fn download_prebuilt(target_dir: &Path) {
         // .zip (Windows). Extract with the pure-Rust `zip` crate instead of
         // shelling out to an external `unzip` binary, which is not present on a
         // clean Windows host and would fail the native build before compilation
-        // (docs/CROSS_PLATFORM.md, "ORT Windows bootstrap"). This path is
+        // (docs/architecture/CROSS_PLATFORM.md, "ORT Windows bootstrap"). This path is
         // identical on Linux/macOS/Windows and needs no external tool.
         extract_zip(&download_path, parent_dir);
         let extracted = parent_dir.join(format!("onnxruntime-{os}-{ORT_VERSION}"));

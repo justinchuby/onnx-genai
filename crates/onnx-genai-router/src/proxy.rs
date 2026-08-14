@@ -1,5 +1,5 @@
 //! Reverse proxy: forwards non-`/router/*` requests to the routed inference
-//! node and streams the response back (see `docs/DESIGN.md` §34.7).
+//! node and streams the response back (see `docs/architecture/DESIGN.md` §34.7).
 //!
 //! **Model-agnostic.** The proxy parses the request body *only* to extract an
 //! opaque `session_id` (for affinity) and to hash the system prompt / first

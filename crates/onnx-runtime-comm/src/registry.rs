@@ -1,5 +1,5 @@
 //! Backend buffer-ownership lease registry
-//! (`docs/DISTRIBUTED_RUNTIME.md` §3.1, refined against
+//! (`docs/distributed/DISTRIBUTED_RUNTIME.md` §3.1, refined against
 //! `specs/tla/BufferOwnership.tla` and `specs/tla/REFINEMENT.md`).
 //!
 //! # The invariant
@@ -33,7 +33,7 @@ use onnx_runtime_protocol_trace::{
 };
 
 /// The complete read/write lease set for one transport operation
-/// (`docs/DISTRIBUTED_RUNTIME.md` §3.1). Read/read aliasing is legal; a write
+/// (`docs/distributed/DISTRIBUTED_RUNTIME.md` §3.1). Read/read aliasing is legal; a write
 /// lease conflicts with every other read or write lease on the same physical
 /// allocation. An in-place operation lists its allocation in both sets and
 /// therefore acquires it exclusively.

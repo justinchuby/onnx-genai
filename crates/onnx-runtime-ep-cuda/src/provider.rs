@@ -1,5 +1,5 @@
 //! The [`CudaExecutionProvider`]: a GPU execution provider backed by cudarc +
-//! cuBLASLt (`docs/ORT2.md` §15). Phase 2a wires standard GEMM (`MatMul`) only;
+//! cuBLASLt (`docs/architecture/ORT2.md` §15). Phase 2a wires standard GEMM (`MatMul`) only;
 //! everything else returns an actionable "not implemented in CUDA EP Phase 2a"
 //! error rather than silently falling back or panicking.
 //!

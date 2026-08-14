@@ -1,8 +1,8 @@
 //! The domain registry: standard + custom ONNX operator domains and their
-//! default opset versions (`docs/EAGER.md` §6).
+//! default opset versions (`docs/execution/EAGER.md` §6).
 //!
 //! Each domain carries a `default_opset`. Unlike the design's `DomainInfo`
-//! (`docs/EAGER.md` §6.4), which also nests a per-domain `KernelRegistry`, the
+//! (`docs/execution/EAGER.md` §6.4), which also nests a per-domain `KernelRegistry`, the
 //! kernels here are **not** owned by the domain registry: they live in the
 //! execution provider's [`OpRegistry`](onnx_runtime_ep_api::OpRegistry), keyed
 //! on `(op_type, domain, opset)`. Reusing the EP registry keeps a single source
@@ -23,7 +23,7 @@ pub struct DomainInfo {
     pub default_opset: u64,
 }
 
-/// Registry of known operator domains and their default opsets (`docs/EAGER.md`
+/// Registry of known operator domains and their default opsets (`docs/execution/EAGER.md`
 /// §6.4).
 #[derive(Debug)]
 pub struct DomainRegistry {
@@ -32,7 +32,7 @@ pub struct DomainRegistry {
 
 impl DomainRegistry {
     /// A registry pre-populated with the standard and common contrib domains
-    /// (`docs/EAGER.md` §6.1): the default ONNX domain at [`LATEST_ONNX_OPSET`],
+    /// (`docs/execution/EAGER.md` §6.1): the default ONNX domain at [`LATEST_ONNX_OPSET`],
     /// `ai.onnx.ml` at 3, and `com.microsoft` at 1.
     pub fn new() -> Self {
         let mut reg = Self {
@@ -44,7 +44,7 @@ impl DomainRegistry {
         reg
     }
 
-    /// Register (or update) a domain with a default opset (`docs/EAGER.md` §6.1
+    /// Register (or update) a domain with a default opset (`docs/execution/EAGER.md` §6.1
     /// `register_domain`).
     pub fn register(&mut self, domain: &str, default_opset: u64) {
         self.domains.insert(
@@ -57,7 +57,7 @@ impl DomainRegistry {
     }
 
     /// The registered default opset for `domain`, or [`LATEST_ONNX_OPSET`] for
-    /// an unregistered domain (`docs/EAGER.md` §6.4 `resolve_opset`).
+    /// an unregistered domain (`docs/execution/EAGER.md` §6.4 `resolve_opset`).
     pub fn default_opset(&self, domain: &str) -> u64 {
         self.domains
             .get(domain)
@@ -66,7 +66,7 @@ impl DomainRegistry {
     }
 
     /// Resolve the effective opset for a dispatch: an explicit per-call value
-    /// wins, otherwise the domain's registered default (`docs/EAGER.md` §5.2).
+    /// wins, otherwise the domain's registered default (`docs/execution/EAGER.md` §5.2).
     pub fn resolve_opset(&self, domain: &str, explicit: Option<u64>) -> u64 {
         resolve_opset(self.default_opset(domain), explicit)
     }
@@ -76,7 +76,7 @@ impl DomainRegistry {
         self.domains.contains_key(domain)
     }
 
-    /// All registered domains and their default opsets (`docs/EAGER.md` §6.1
+    /// All registered domains and their default opsets (`docs/execution/EAGER.md` §6.1
     /// `domains()`).
     pub fn domains(&self) -> Vec<(String, u64)> {
         let mut out: Vec<(String, u64)> = self
