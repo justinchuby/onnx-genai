@@ -12,11 +12,12 @@
 use std::fs;
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::Context;
 use onnx_genai_engine::{
-    Engine, EngineConfig, GeneratePrompt, GenerateRequest, PipelineGenerateRequest,
+    Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest,
+    PipelineGenerateRequest, pipeline::WorkflowOutputRole,
 };
 use onnx_genai_ort::{Allocator, DataType, Environment, IoBinding, Session, SessionOptions, Value};
 
@@ -652,127 +653,128 @@ fn workflow_islands_are_competitive_with_native_composites() -> anyhow::Result<(
     Ok(())
 }
 
-fn muse_inputs() -> anyhow::Result<Vec<(String, Value)>> {
-    let mut inputs = vec![
-        (
-            "inputs_embeds".to_string(),
-            Value::from_raw_bytes(vec![0; 2 * 6656], &[1, 1, 6656], DataType::BFloat16)?,
-        ),
-        (
-            "attention_mask".to_string(),
-            Value::from_slice_i64(&[1, 1], &[1, 2])?,
-        ),
-    ];
-    for layer in 0..52 {
-        for kind in ["key", "value"] {
-            inputs.push((
-                format!("past_key_values.{layer}.{kind}"),
-                Value::from_raw_bytes(vec![0; 2 * 2 * 128], &[1, 2, 1, 128], DataType::BFloat16)?,
-            ));
-        }
-    }
-    inputs.push(("eos".to_string(), Value::from_slice_i64(&[0], &[1])?));
-    Ok(inputs)
-}
-
 #[test]
 #[ignore = "requires the local 30B Muse decoder package and an idle H200"]
 fn real_muse_policy_chain_matches_direct_ort() -> anyhow::Result<()> {
     let root = std::env::var("ONNX_GENAI_MUSE_WORKFLOW_PACKAGE")
         .context("ONNX_GENAI_MUSE_WORKFLOW_PACKAGE must point at the generated Muse package")?;
     let root = Path::new(&root);
-    let iterations = std::env::var("ONNX_GENAI_WORKFLOW_PERF_ITERS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(200);
     let samples = std::env::var("ONNX_GENAI_WORKFLOW_PERF_SAMPLES")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(5);
-    let engine = Engine::from_pipeline_dir(root, EngineConfig::default())?;
+    let prompt_ids_path = std::env::var_os("ONNX_GENAI_MUSE_PROMPT_IDS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            root.parent()
+                .unwrap_or(root)
+                .join("muse-native-harness/benchmarks/muse_prompt_ids.json")
+        });
+    let native_record_path = std::env::var_os("ONNX_GENAI_MUSE_NATIVE_BENCHMARK")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            root.parent()
+                .unwrap_or(root)
+                .join("muse-real-package/native-benchmark.json")
+        });
+    let prompt_ids: Vec<u32> = serde_json::from_slice(&fs::read(&prompt_ids_path)?)?;
+    anyhow::ensure!(
+        prompt_ids.len() == 68,
+        "Muse prompt must contain exactly 68 tokens"
+    );
+    let native_record: serde_json::Value = serde_json::from_slice(&fs::read(&native_record_path)?)?;
+    let native_tokens = native_record["token_ids"]
+        .as_array()
+        .context("native benchmark has no token_ids")?
+        .iter()
+        .map(|value| value.as_i64().context("native token is not int64"))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let native_rate = native_record["metrics"]["throughput_tok_s"]
+        .as_f64()
+        .context("native benchmark has no throughput")?;
+    let native_ttft_ms = native_record["metrics"]["ttft_ms"]
+        .as_f64()
+        .context("native benchmark has no TTFT")?;
+
+    let mut engine = Engine::from_pipeline_dir(root, EngineConfig::default())?;
     println!(
         "real Muse planned islands: {:?}",
         engine.workflow_performance_diagnostic().islands
     );
-    let workflow_inputs = muse_inputs()?;
-    let mut request =
-        PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(Vec::new())));
-    for (name, value) in workflow_inputs {
-        request = request.with_input(name, value);
-    }
-    let mut workflow = engine.prepare_workflow_execution(request)?;
 
-    let environment = Environment::new("muse-real-workflow-performance")?;
-    let native_values = muse_inputs()?;
-    let native_inputs = native_values
-        .iter()
-        .map(|(name, value)| (name.as_str(), value))
-        .collect::<Vec<_>>();
-    let mut native = StableRunner::new(
-        &environment,
-        &root.join("native.onnx"),
-        SessionOptions::default(),
-        &native_inputs,
-        &[
-            ("token", &[1], DataType::Int64),
-            ("done", &[1], DataType::Bool),
-        ],
-    )?;
+    let mut run_workflow = || -> anyhow::Result<(Vec<i64>, f64, f64)> {
+        let mut options = GenerateOptions::default();
+        options.max_new_tokens = 128;
+        options.greedy = true;
+        options.temperature = 1.0;
+        options.top_k = 1;
+        options.top_p = 1.0;
+        options.seed = Some(0);
+        options.stop_on_eos = false;
+        let output =
+            engine.run_pipeline_outputs(PipelineGenerateRequest::new(GenerateRequest {
+                prompt: GeneratePrompt::TokenIds(prompt_ids.clone()),
+                options,
+            }))?;
+        let tokens = engine
+            .structured_output_for_role(&output, WorkflowOutputRole::Tokens)
+            .context("Muse workflow did not emit tokens")?
+            .to_vec_i64()?;
+        let diagnostic = engine.workflow_performance_diagnostic();
+        let timestamps = &diagnostic.last_emit_timestamps_ns;
+        anyhow::ensure!(
+            timestamps.len() == 128,
+            "Muse workflow emitted {} timestamped tokens",
+            timestamps.len()
+        );
+        let decode_ns = timestamps[127] - timestamps[7];
+        let rate = 120.0 / (decode_ns as f64 / 1_000_000_000.0);
+        let ttft_ms = diagnostic
+            .last_ttft_ns
+            .context("Muse workflow did not report TTFT")? as f64
+            / 1_000_000.0;
+        Ok((tokens, rate, ttft_ms))
+    };
 
-    for _ in 0..3 {
-        black_box(workflow.execute()?);
-        black_box(native.run(&native_inputs)?);
+    let (warm_tokens, _, _) = run_workflow()?;
+    if warm_tokens != native_tokens {
+        let divergence = warm_tokens
+            .iter()
+            .zip(&native_tokens)
+            .position(|(workflow, native)| workflow != native);
+        let window_start = divergence.unwrap_or_default().saturating_sub(4);
+        let window_end = divergence
+            .map(|index| index.saturating_add(5))
+            .unwrap_or_default()
+            .min(warm_tokens.len())
+            .min(native_tokens.len());
+        anyhow::bail!(
+            "Muse warmup token parity failed: workflow_len={} native_len={} \
+             first_divergence={divergence:?} workflow_window={:?} native_window={:?}",
+            warm_tokens.len(),
+            native_tokens.len(),
+            &warm_tokens[window_start..window_end],
+            &native_tokens[window_start..window_end]
+        );
     }
-    let workflow_ttft = {
-        let started = Instant::now();
-        black_box(workflow.execute()?);
-        started.elapsed()
-    };
-    let native_ttft = {
-        let started = Instant::now();
-        black_box(native.run(&native_inputs)?);
-        started.elapsed()
-    };
-    let mut ratios = Vec::with_capacity(samples);
     let mut workflow_rates = Vec::with_capacity(samples);
-    let mut native_rates = Vec::with_capacity(samples);
-    for sample in 0..samples {
-        let mut workflow_elapsed = Duration::ZERO;
-        let mut native_elapsed = Duration::ZERO;
-        for iteration in 0..iterations {
-            let workflow_first = (sample + iteration) % 2 == 0;
-            if workflow_first {
-                let started = Instant::now();
-                black_box(workflow.execute()?);
-                workflow_elapsed += started.elapsed();
-                let started = Instant::now();
-                black_box(native.run(&native_inputs)?);
-                native_elapsed += started.elapsed();
-            } else {
-                let started = Instant::now();
-                black_box(native.run(&native_inputs)?);
-                native_elapsed += started.elapsed();
-                let started = Instant::now();
-                black_box(workflow.execute()?);
-                workflow_elapsed += started.elapsed();
-            }
-        }
-        let workflow_rate = iterations as f64 / workflow_elapsed.as_secs_f64();
-        let native_rate = iterations as f64 / native_elapsed.as_secs_f64();
+    let mut workflow_ttfts = Vec::with_capacity(samples);
+    for _ in 0..samples {
+        let (tokens, workflow_rate, workflow_ttft) = run_workflow()?;
+        anyhow::ensure!(tokens == native_tokens, "Muse measured token parity failed");
         workflow_rates.push(workflow_rate);
-        native_rates.push(native_rate);
-        ratios.push(workflow_rate / native_rate);
+        workflow_ttfts.push(workflow_ttft);
     }
     let median = |values: &mut Vec<f64>| {
         values.sort_by(f64::total_cmp);
         values[values.len() / 2]
     };
+    let workflow_rate = median(&mut workflow_rates);
+    let workflow_ttft_ms = median(&mut workflow_ttfts);
     println!(
-        "real-muse+sampler+termination: workflow={:.2} tok/s native={:.2} tok/s ratio={:.3} \
-         workflow_ttft={workflow_ttft:?} native_ttft={native_ttft:?}",
-        median(&mut workflow_rates),
-        median(&mut native_rates),
-        median(&mut ratios),
+        "real-muse exact: workflow={workflow_rate:.2} tok/s native={native_rate:.2} tok/s \
+         ratio={:.3} workflow_ttft={workflow_ttft_ms:.3} ms native_ttft={native_ttft_ms:.3} ms",
+        workflow_rate / native_rate,
     );
     for island in engine.workflow_performance_diagnostic().islands {
         println!("island={island:?}");
