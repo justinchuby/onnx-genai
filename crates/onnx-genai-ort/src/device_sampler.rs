@@ -2460,6 +2460,195 @@ mod split_argmax {
         ]
     }
 
+    /// Encode an f32 row into the device byte layout for `dtype`, so the same
+    /// case exercises every entry point the sampler dispatches to.
+    fn encode(logits: &[f32], dtype: DataType) -> Vec<u8> {
+        match dtype {
+            DataType::Float32 => logits.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            DataType::Float16 => logits
+                .iter()
+                .flat_map(|&v| half_bits(v).to_le_bytes())
+                .collect(),
+            DataType::BFloat16 => logits
+                .iter()
+                .flat_map(|&v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+                .collect(),
+            other => panic!("unsupported test dtype {other:?}"),
+        }
+    }
+
+    /// Round an f32 to binary16, matching the kernel's decode.
+    fn half_bits(value: f32) -> u16 {
+        let bits = value.to_bits();
+        let sign = ((bits >> 16) & 0x8000) as u16;
+        if value.is_nan() {
+            return sign | 0x7E00;
+        }
+        let exponent = ((bits >> 23) & 0xFF) as i32 - 127 + 15;
+        if exponent >= 0x1F {
+            return sign | 0x7C00;
+        }
+        if exponent <= 0 {
+            return sign;
+        }
+        sign | ((exponent as u16) << 10) | (((bits >> 13) & 0x3FF) as u16)
+    }
+
+    /// The reference answer for `row` once it has been rounded to `dtype`.
+    ///
+    /// Narrowing can create ties that do not exist in f32, so the oracle must
+    /// see exactly the values the kernel sees.
+    fn reference_in(row: &[f32], dtype: DataType) -> i32 {
+        let seen: Vec<f32> = match dtype {
+            DataType::Float32 => row.to_vec(),
+            DataType::Float16 => row.iter().map(|&v| half_to_f32(half_bits(v))).collect(),
+            DataType::BFloat16 => row
+                .iter()
+                .map(|&v| f32::from_bits(v.to_bits() & 0xFFFF_0000))
+                .collect(),
+            other => panic!("unsupported test dtype {other:?}"),
+        };
+        reference(&seen)
+    }
+
+    fn half_to_f32(bits: u16) -> f32 {
+        let sign = ((bits & 0x8000) as u32) << 16;
+        let exponent = ((bits >> 10) & 0x1F) as u32;
+        let mantissa = (bits & 0x3FF) as u32;
+        if exponent == 0 {
+            if mantissa == 0 {
+                return f32::from_bits(sign);
+            }
+            let mut e = 1u32;
+            let mut m = mantissa;
+            while m & 0x400 == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            return f32::from_bits(sign | ((e + 112) << 23) | ((m & 0x3FF) << 13));
+        }
+        if exponent == 0x1F {
+            return f32::from_bits(sign | 0x7F80_0000 | (mantissa << 13));
+        }
+        f32::from_bits(sign | ((exponent + 112) << 23) | (mantissa << 13))
+    }
+
+    /// The split path must agree with the single-launch path for every dtype the
+    /// sampler supports, not just the f32 one the decode loop happens to use.
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn split_matches_the_single_launch_path_for_every_dtype() {
+        let sampler = CudaSampler::new(0).expect("cuda sampler");
+        for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+            for (name, rows) in cases() {
+                let vocab = rows[0].len();
+                let flat: Vec<u8> = rows.iter().flat_map(|r| encode(r, dtype)).collect();
+                // SAFETY: the primary context is current after `CudaSampler::new`;
+                // this allocation is owned by the test and freed below.
+                let ptr =
+                    unsafe { cudarc::driver::result::malloc_sync(flat.len()) }.expect("malloc");
+                // SAFETY: `ptr` holds exactly `flat.len()` bytes.
+                unsafe { cudarc::driver::result::memcpy_htod_sync(ptr, &flat) }.expect("upload");
+                let expected: Vec<i32> = rows.iter().map(|r| reference_in(r, dtype)).collect();
+                for &parts in FORCED {
+                    let mut got = vec![-1i32; rows.len()];
+                    sampler
+                        .argmax_into(
+                            dtype,
+                            ptr as usize,
+                            rows.len(),
+                            vocab,
+                            &mut got,
+                            Some(parts),
+                        )
+                        .expect("argmax");
+                    assert_eq!(got, expected, "case {name:?} dtype {dtype:?} parts={parts}");
+                }
+                // SAFETY: `ptr` came from `malloc_sync` above and is freed once.
+                unsafe { cudarc::driver::result::free_sync(ptr) }.ok();
+            }
+        }
+    }
+
+    /// Batch sizes a serving loop actually uses, with a different winner per row
+    /// so a row-indexing mistake cannot pass by coincidence.
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn batched_rows_are_reduced_independently() {
+        let sampler = CudaSampler::new(0).expect("cuda sampler");
+        let vocab = 51_200usize;
+        for batch in [1usize, 2, 4, 8] {
+            let rows: Vec<Vec<f32>> = (0..batch)
+                .map(|row| {
+                    let mut values = vec![-1.0f32; vocab];
+                    // Winners spread across the row so different part counts put
+                    // them in different blocks.
+                    values[(row * 6_113 + 17) % vocab] = 3.0 + row as f32;
+                    values
+                })
+                .collect();
+            let flat: Vec<u8> = rows
+                .iter()
+                .flat_map(|r| r.iter().flat_map(|v| v.to_le_bytes()))
+                .collect();
+            // SAFETY: primary context is current; owned by the test.
+            let ptr = unsafe { cudarc::driver::result::malloc_sync(flat.len()) }.expect("malloc");
+            // SAFETY: `ptr` holds exactly `flat.len()` bytes.
+            unsafe { cudarc::driver::result::memcpy_htod_sync(ptr, &flat) }.expect("upload");
+            let expected: Vec<i32> = rows.iter().map(|r| reference(r)).collect();
+            for &parts in FORCED {
+                let mut got = vec![-1i32; batch];
+                sampler
+                    .argmax_into(
+                        DataType::Float32,
+                        ptr as usize,
+                        batch,
+                        vocab,
+                        &mut got,
+                        Some(parts),
+                    )
+                    .expect("argmax");
+                assert_eq!(got, expected, "batch={batch} parts={parts}");
+            }
+            // SAFETY: `ptr` came from `malloc_sync` above and is freed once.
+            unsafe { cudarc::driver::result::free_sync(ptr) }.ok();
+        }
+    }
+
+    /// Widths that divide no part count evenly, around the split threshold.
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn odd_widths_reduce_correctly() {
+        let sampler = CudaSampler::new(0).expect("cuda sampler");
+        let block = BLOCK as usize;
+        for vocab in [
+            block * 2 - 1,
+            block * 2,
+            block * 2 + 1,
+            block * 2 + 3,
+            4_099,
+            65_537,
+            131_071,
+            202_048 - 1,
+        ] {
+            let mut row = vec![0.25f32; vocab];
+            // The last element wins, which an off-by-one in the tail cannot hide.
+            row[vocab - 1] = 7.0;
+            let flat: Vec<u8> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
+            // SAFETY: primary context is current; owned by the test.
+            let ptr = unsafe { cudarc::driver::result::malloc_sync(flat.len()) }.expect("malloc");
+            // SAFETY: `ptr` holds exactly `flat.len()` bytes.
+            unsafe { cudarc::driver::result::memcpy_htod_sync(ptr, &flat) }.expect("upload");
+            let mut got = [0i32; 1];
+            sampler
+                .argmax_into(DataType::Float32, ptr as usize, 1, vocab, &mut got, None)
+                .expect("argmax");
+            assert_eq!(got[0], (vocab - 1) as i32, "vocab={vocab}");
+            // SAFETY: `ptr` came from `malloc_sync` above and is freed once.
+            unsafe { cudarc::driver::result::free_sync(ptr) }.ok();
+        }
+    }
+
     #[test]
     #[ignore = "requires a CUDA device"]
     fn split_matches_the_single_launch_path() {
@@ -2495,6 +2684,127 @@ mod split_argmax {
             // SAFETY: `ptr` came from `malloc_sync` above and is freed once.
             unsafe { cudarc::driver::result::free_sync(ptr) }.ok();
         }
+    }
+
+    /// Report the launch, scratch and occupancy shape of the split reduction.
+    ///
+    /// These are the properties that decide whether the kernel is usable inside
+    /// a captured graph and how much device memory a serving loop must reserve,
+    /// so they are measured rather than assumed.
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn split_launch_and_occupancy_shape() {
+        let sampler = CudaSampler::new(0).expect("cuda sampler");
+        let device = &sampler.ctx;
+        let sm_count = device
+            .attribute(
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+            )
+            .expect("sm count");
+        let max_threads_per_sm = device
+            .attribute(
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR,
+            )
+            .expect("threads per sm");
+        for (name, function) in [
+            ("argmax_part_f32", &sampler.f_part_f32),
+            ("argmax_join", &sampler.f_join),
+            ("argmax_f32 (one block per row)", &sampler.f_f32),
+        ] {
+            let blocks = function
+                .occupancy_max_active_blocks_per_multiprocessor(BLOCK, 0, None)
+                .expect("occupancy");
+            let registers = function.num_regs().unwrap_or(-1);
+            let shared = function.shared_size_bytes().unwrap_or(-1);
+            let occupancy =
+                f64::from(blocks) * f64::from(BLOCK) / f64::from(max_threads_per_sm) * 100.0;
+            println!(
+                "{name:34} regs/thread={registers:3} static shared={shared:4} B                  blocks/SM={blocks} occupancy={occupancy:.0}%"
+            );
+            assert!(blocks >= 1, "{name} must fit on an SM at {BLOCK} threads");
+        }
+
+        // Launch and scratch shape for the decode-sized case.
+        let vocab = 202_048usize;
+        let parts = argmax_parts(vocab);
+        println!(
+            "vocab={vocab} rows=1: parts={parts} launches=2 grid={parts}x1 block={BLOCK}              scratch={} B",
+            parts * 8
+        );
+        assert_eq!(parts.min(1), 1, "a decode-width row must split");
+        // Scratch is one (f32, i32) pair per part per row: small, and bounded by
+        // MAX_PARTS regardless of how wide the row is.
+        for rows in [1usize, 8, 64] {
+            assert!(rows * argmax_parts(vocab) * 8 <= rows * MAX_PARTS * 8);
+        }
+        println!("sm_count={sm_count} max_threads_per_sm={max_threads_per_sm}");
+
+        // Part-count sensitivity for the decode-sized row. The chosen value
+        // must not be beaten by a neighbour, or the tuning constant is stale.
+        let host: Vec<f32> = (0..vocab).map(|i| (i % 977) as f32 * 0.001).collect();
+        let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+        // SAFETY: primary context is current; owned by the test.
+        let ptr = unsafe { cudarc::driver::result::malloc_sync(bytes.len()) }.expect("malloc");
+        // SAFETY: `ptr` holds exactly `bytes.len()` bytes.
+        unsafe { cudarc::driver::result::memcpy_htod_sync(ptr, &bytes) }.expect("upload");
+        let mut timings = Vec::new();
+        for candidate in [33usize, 66, parts, 132, 165, 198, MAX_PARTS] {
+            let mut idx = [0i32; 1];
+            for _ in 0..40 {
+                sampler
+                    .argmax_into(
+                        DataType::Float32,
+                        ptr as usize,
+                        1,
+                        vocab,
+                        &mut idx,
+                        Some(candidate),
+                    )
+                    .expect("argmax");
+            }
+            let start = std::time::Instant::now();
+            const ITERS: u32 = 400;
+            for _ in 0..ITERS {
+                sampler
+                    .argmax_into(
+                        DataType::Float32,
+                        ptr as usize,
+                        1,
+                        vocab,
+                        &mut idx,
+                        Some(candidate),
+                    )
+                    .expect("argmax");
+            }
+            let each = start.elapsed().as_secs_f64() * 1e6 / f64::from(ITERS);
+            println!("  parts={candidate:4} {each:7.2} us end to end");
+            timings.push((candidate, each));
+        }
+        // SAFETY: `ptr` came from `malloc_sync` above and is freed once.
+        unsafe { cudarc::driver::result::free_sync(ptr) }.ok();
+        let best = timings
+            .iter()
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .expect("timings");
+        let chosen = timings
+            .iter()
+            .find(|(candidate, _)| *candidate == parts)
+            .expect("the chosen part count is measured");
+        println!(
+            "fastest part count: {} ({:.2} us); chosen {} ({:.2} us)",
+            best.0, best.1, chosen.0, chosen.1
+        );
+        // End to end is dominated by the result copy and the synchronisation
+        // around it, so neighbouring part counts land within noise of each
+        // other; this only catches a constant that has gone badly stale.
+        assert!(
+            chosen.1 <= best.1 * 1.10,
+            "the chosen part count {} ({:.2} us) is more than 10% off the best {} ({:.2} us)",
+            chosen.0,
+            chosen.1,
+            best.0,
+            best.1
+        );
     }
 
     #[test]
