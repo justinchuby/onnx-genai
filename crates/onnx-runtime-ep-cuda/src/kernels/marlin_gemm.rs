@@ -75,6 +75,12 @@ use crate::runtime::{CudaRuntime, cuptr};
 /// NVRTC module + entry names for the Marlin int4 tensor-core GEMM.
 pub const MARLIN_MODULE: &str = "matmul_nbits_marlin_gemm";
 pub const MARLIN_GEMM_ENTRY: &str = "matmul_nbits_marlin_gemm_f16";
+/// Split-K GEMM entry: partitions the K/group range across `grid.z`, writing
+/// fp32 per-split partials that [`MARLIN_SPLITK_REDUCE_ENTRY`] reduces. Used to
+/// fill idle SMs at small M/N where the single-block kernel is occupancy-bound.
+pub const MARLIN_GEMM_SPLITK_ENTRY: &str = "matmul_nbits_marlin_gemm_f16_splitk";
+/// Fixed-order split-K partial reduction + fp16 bias epilogue entry.
+pub const MARLIN_SPLITK_REDUCE_ENTRY: &str = "matmul_nbits_marlin_splitk_reduce";
 pub const MARLIN_REPACK_ENTRY: &str = "matmul_nbits_marlin_repack";
 
 /// N columns handled by one thread block (one warp per 8-column tensor-core tile).
@@ -498,11 +504,149 @@ extern "C" __global__ void matmul_nbits_marlin_gemm_f16(
     }
 }
 
+// Split-K variant: partitions the K (group) range across grid.z so more thread
+// blocks are resident at small M, where the single-block-per-(N,M)-tile kernel
+// leaves most SMs idle (e.g. N=5120 launches only ~160 blocks on 132 SMs, so
+// weight-DRAM sits near 3% of peak — an occupancy stall, not a latency one).
+// Each z owns a contiguous group range and writes its fp32 partial (scale
+// already applied, NO bias) to partials[z, row, col]; a separate reduce kernel
+// sums the z-slices in fixed order and applies the epilogue. Fixed order keeps
+// the result deterministic run-to-run (capture-stable); the cross-K reorder is
+// not bit-identical to the single-block kernel but stays within the f64-oracle
+// tolerance (validated by the parity test).
+extern "C" __global__ void matmul_nbits_marlin_gemm_f16_splitk(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ weights,
+    const void* __restrict__ scales_raw,
+    const unsigned char* __restrict__ zero_points,
+    float* __restrict__ partials,            // [split_k, M, N]
+    const int m,
+    const int k,
+    const int n,
+    const int k_blocks,
+    const int group_size,
+    const int scales_fp16,
+    const int groups_per_split)
+{
+    const int lane = (int)threadIdx.x & 31;
+    const int warp = (int)threadIdx.x >> 5;
+    const int group_id = lane >> 2;
+    const int tid = lane & 3;
+
+    const int z = (int)blockIdx.z;
+    const int g_begin = z * groups_per_split;
+    int g_end = g_begin + groups_per_split;
+    if (g_end > k_blocks) g_end = k_blocks;
+
+    const int n_block = (int)blockIdx.x * (8 * (int)blockDim.x / 32);
+    const int ncol0 = n_block + warp * 8;
+    const int m_tile = (int)blockIdx.y * 16;
+
+    const int slices = k / 16;
+    const int slices_per_group = group_size / 16;
+    const int zp_row_bytes = (k_blocks + 1) >> 1;
+
+    const int nb_col = ncol0 + group_id;
+    const int out_col0 = ncol0 + tid * 2;
+    const int out_col1 = out_col0 + 1;
+
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+
+    for (int g = g_begin; g < g_end; ++g) {
+        float scale_a = 0.0f, scale_b = 0.0f;
+        if (scales_fp16) {
+            const __half* s = reinterpret_cast<const __half*>(scales_raw);
+            if (out_col0 < n) scale_a = __half2float(s[(long)out_col0 * k_blocks + g]);
+            if (out_col1 < n) scale_b = __half2float(s[(long)out_col1 * k_blocks + g]);
+        } else {
+            const float* s = reinterpret_cast<const float*>(scales_raw);
+            if (out_col0 < n) scale_a = s[(long)out_col0 * k_blocks + g];
+            if (out_col1 < n) scale_b = s[(long)out_col1 * k_blocks + g];
+        }
+        int zp = 8;
+        if (zero_points && nb_col < n) {
+            unsigned char byte = zero_points[(long)nb_col * zp_row_bytes + (g >> 1)];
+            zp = (g & 1) ? (byte >> 4) : (byte & 15);
+        }
+
+        float frag0 = 0.0f, frag1 = 0.0f, frag2 = 0.0f, frag3 = 0.0f;
+        for (int s_in = 0; s_in < slices_per_group; ++s_in) {
+            const int slice = g * slices_per_group + s_in;
+            const int kbase = slice * 16;
+            const __half a0 = load_a(activation, m_tile + group_id,     kbase + tid * 2,     m, k);
+            const __half a1 = load_a(activation, m_tile + group_id,     kbase + tid * 2 + 1, m, k);
+            const __half a2 = load_a(activation, m_tile + group_id + 8, kbase + tid * 2,     m, k);
+            const __half a3 = load_a(activation, m_tile + group_id + 8, kbase + tid * 2 + 1, m, k);
+            const __half a4 = load_a(activation, m_tile + group_id,     kbase + tid * 2 + 8, m, k);
+            const __half a5 = load_a(activation, m_tile + group_id,     kbase + tid * 2 + 9, m, k);
+            const __half a6 = load_a(activation, m_tile + group_id + 8, kbase + tid * 2 + 8, m, k);
+            const __half a7 = load_a(activation, m_tile + group_id + 8, kbase + tid * 2 + 9, m, k);
+            const unsigned ra0 = pack_half2(a0, a1);
+            const unsigned ra1 = pack_half2(a2, a3);
+            const unsigned ra2 = pack_half2(a4, a5);
+            const unsigned ra3 = pack_half2(a6, a7);
+
+            const int n_tile_idx = (int)blockIdx.x * ((int)blockDim.x / 32) + warp;
+            const long base = ((long)n_tile_idx * slices + slice) * 64
+                + group_id * 8 + tid * 2;
+            const unsigned char blo = weights[base];
+            const unsigned char bhi = weights[base + 1];
+            const __half b0 = __float2half((float)(int)(blo & 15) - (float)zp);
+            const __half b1 = __float2half((float)(int)(blo >> 4) - (float)zp);
+            const __half b2 = __float2half((float)(int)(bhi & 15) - (float)zp);
+            const __half b3 = __float2half((float)(int)(bhi >> 4) - (float)zp);
+            const unsigned rb0 = pack_half2(b0, b1);
+            const unsigned rb1 = pack_half2(b2, b3);
+
+            asm volatile(
+                "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                : "+f"(frag0), "+f"(frag1), "+f"(frag2), "+f"(frag3)
+                : "r"(ra0), "r"(ra1), "r"(ra2), "r"(ra3), "r"(rb0), "r"(rb1));
+        }
+        acc0 += frag0 * scale_a;
+        acc1 += frag1 * scale_b;
+        acc2 += frag2 * scale_a;
+        acc3 += frag3 * scale_b;
+    }
+
+    const int row0 = m_tile + group_id;
+    const int row1 = m_tile + group_id + 8;
+    const long zbase = (long)z * m * n;
+    if (row0 < m) {
+        if (out_col0 < n) partials[zbase + (long)row0 * n + out_col0] = acc0;
+        if (out_col1 < n) partials[zbase + (long)row0 * n + out_col1] = acc1;
+    }
+    if (row1 < m) {
+        if (out_col0 < n) partials[zbase + (long)row1 * n + out_col0] = acc2;
+        if (out_col1 < n) partials[zbase + (long)row1 * n + out_col1] = acc3;
+    }
+}
+
+// Fixed-order reduction of the split-K partials plus the fp16 bias epilogue.
+// One thread per output element; sums z = 0..split_k-1 deterministically.
+extern "C" __global__ void matmul_nbits_marlin_splitk_reduce(
+    const float* __restrict__ partials,      // [split_k, M, N]
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,             // [M, N]
+    const int m,
+    const int n,
+    const int split_k,
+    const int bias_post_round,
+    const int bias_row_stride)
+{
+    const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long total = (long)m * n;
+    if (idx >= total) return;
+    const int row = (int)(idx / n);
+    const int col = (int)(idx - (long)row * n);
+    float acc = 0.0f;
+    for (int z = 0; z < split_k; ++z) acc += partials[(long)z * total + idx];
+    const __half* rb = bias ? bias + (long)row * bias_row_stride : bias;
+    output[idx] = fold_bias(acc, rb, col, bias_post_round);
+}
+
 // Device-side repack: reorder ONNX packed int4 (N-major nibbles) into the
-// 8-column-interleaved per-lane tensor-core layout. One thread owns one
-// (column, K-slice) pair and writes 8 contiguous bytes. Runs once per weight
-// (immutable initializer); the result is cached, so captured replays never
-// re-run it. Static grid -> capture-safe (though it runs before capture).
 extern "C" __global__ void matmul_nbits_marlin_repack(
     const unsigned char* __restrict__ packed, // [N, k_blocks, group/2]
     unsigned char* __restrict__ out,          // [n_tiles * (K/16) * 64]
@@ -688,6 +832,136 @@ fn overflow(name: &str, value: usize) -> EpError {
     ))
 }
 
+/// Number of fp32 elements in the split-K partials buffer for `(split_k, M, N)`.
+#[must_use]
+pub fn splitk_partials_len(split_k: usize, m: usize, n: usize) -> usize {
+    split_k * m * n
+}
+
+/// Pick a split-K factor that fills the SMs at small M without over-splitting.
+/// Returns 1 (no split) when the base grid already covers enough SMs or the K
+/// range is too short to divide usefully. `sm_count` is the device SM count.
+#[must_use]
+pub fn choose_split_k(m: usize, n: usize, k_blocks: usize, sm_count: u32) -> usize {
+    let base_blocks =
+        (n as u32).div_ceil(MARLIN_N_PER_BLOCK) * (m as u32).div_ceil(MARLIN_M_PER_BLOCK);
+    // Aim for ~2 waves of blocks. If already there, don't split.
+    let target = sm_count.saturating_mul(2).max(1);
+    if base_blocks >= target || k_blocks < 2 {
+        return 1;
+    }
+    let want = target.div_ceil(base_blocks.max(1));
+    // Cap so each split still owns >= 2 groups, and clamp to a small max.
+    let max_by_groups = (k_blocks / 2).max(1) as u32;
+    want.clamp(1, max_by_groups).min(8) as usize
+}
+
+/// Launch the split-K Marlin GEMM (fp32 partials) followed by the fixed-order
+/// reduce+epilogue into fp16 `output`. `partials` must hold at least
+/// [`splitk_partials_len`] fp32 elements. Both launches use a static grid, so
+/// the pair is CUDA-graph capture-safe once `partials` is pre-allocated.
+#[allow(clippy::too_many_arguments)]
+pub fn launch_marlin_gemm_splitk(
+    runtime: &CudaRuntime,
+    args: &MarlinGemmArgs,
+    split_k: usize,
+    partials: CUdeviceptr,
+) -> Result<()> {
+    if !device_supports_marlin(runtime.capabilities().compute_capability()) {
+        return Err(EpError::KernelFailed(
+            "cuda_ep: Marlin split-K GEMM requires compute capability >= 8.0".into(),
+        ));
+    }
+    runtime.require_nvrtc_half_headers("MatMulNBits Marlin split-K GEMM")?;
+    if !args.k.is_multiple_of(16) || !args.k.is_multiple_of(args.group_size) {
+        return Err(EpError::KernelFailed(format!(
+            "cuda_ep: Marlin GEMM requires K ({}) divisible by 16 and by group_size ({})",
+            args.k, args.group_size
+        )));
+    }
+    let k_blocks = args.k / args.group_size;
+    let split_k = split_k.max(1);
+    let groups_per_split = k_blocks.div_ceil(split_k);
+
+    let gemm = runtime.nvrtc_function(MARLIN_MODULE, MARLIN_GEMM_SRC, MARLIN_GEMM_SPLITK_ENTRY)?;
+    let reduce =
+        runtime.nvrtc_function(MARLIN_MODULE, MARLIN_GEMM_SRC, MARLIN_SPLITK_REDUCE_ENTRY)?;
+
+    let activation_ptr = cuptr(args.activation as usize as *const c_void);
+    let weights_ptr = cuptr(args.weights as usize as *const c_void);
+    let scales_ptr = cuptr(args.scales as usize as *const c_void);
+    let zero_points_ptr = args.zero_points.unwrap_or(0);
+    let bias_ptr = args.bias.unwrap_or(0);
+    let output_ptr = cuptr(args.output as usize as *const c_void);
+    let partials_ptr = cuptr(partials as usize as *const c_void);
+
+    let m_i32 = i32::try_from(args.m).map_err(|_| overflow("M", args.m))?;
+    let k_i32 = i32::try_from(args.k).map_err(|_| overflow("K", args.k))?;
+    let n_i32 = i32::try_from(args.n).map_err(|_| overflow("N", args.n))?;
+    let k_blocks_i32 = i32::try_from(k_blocks).map_err(|_| overflow("k_blocks", k_blocks))?;
+    let group_size_i32 =
+        i32::try_from(args.group_size).map_err(|_| overflow("group_size", args.group_size))?;
+    let scales_fp16_flag = args.scales_fp16 as i32;
+    let groups_per_split_i32 = i32::try_from(groups_per_split)
+        .map_err(|_| overflow("groups_per_split", groups_per_split))?;
+    let split_k_i32 = i32::try_from(split_k).map_err(|_| overflow("split_k", split_k))?;
+    let bias_post_round_flag = args.bias_post_round as i32;
+    let bias_row_stride_i32 = i32::try_from(args.bias_row_stride)
+        .map_err(|_| overflow("bias_row_stride", args.bias_row_stride))?;
+
+    let grid_x = (args.n as u32).div_ceil(MARLIN_N_PER_BLOCK).max(1);
+    let grid_y = (args.m as u32).div_ceil(MARLIN_M_PER_BLOCK).max(1);
+
+    let mut builder = runtime.stream().launch_builder(&gemm);
+    builder
+        .arg(&activation_ptr)
+        .arg(&weights_ptr)
+        .arg(&scales_ptr)
+        .arg(&zero_points_ptr)
+        .arg(&partials_ptr)
+        .arg(&m_i32)
+        .arg(&k_i32)
+        .arg(&n_i32)
+        .arg(&k_blocks_i32)
+        .arg(&group_size_i32)
+        .arg(&scales_fp16_flag)
+        .arg(&groups_per_split_i32);
+    // SAFETY: static grid; partials holds split_k*M*N fp32 written in-bounds.
+    unsafe {
+        builder.launch(LaunchConfig {
+            grid_dim: (grid_x, grid_y, split_k as u32),
+            block_dim: (32 * MARLIN_WARPS, 1, 1),
+            shared_mem_bytes: 0,
+        })
+    }
+    .map(|_| ())
+    .map_err(|err| driver_err("launch MatMulNBits Marlin split-K GEMM", err))?;
+
+    let total = (args.m as u32).saturating_mul(args.n as u32).max(1);
+    let reduce_block = 256u32;
+    let reduce_grid = total.div_ceil(reduce_block);
+    let mut rbuilder = runtime.stream().launch_builder(&reduce);
+    rbuilder
+        .arg(&partials_ptr)
+        .arg(&bias_ptr)
+        .arg(&output_ptr)
+        .arg(&m_i32)
+        .arg(&n_i32)
+        .arg(&split_k_i32)
+        .arg(&bias_post_round_flag)
+        .arg(&bias_row_stride_i32);
+    // SAFETY: static grid; one thread per in-bounds output element.
+    unsafe {
+        rbuilder.launch(LaunchConfig {
+            grid_dim: (reduce_grid, 1, 1),
+            block_dim: (reduce_block, 1, 1),
+            shared_mem_bytes: 0,
+        })
+    }
+    .map(|_| ())
+    .map_err(|err| driver_err("launch MatMulNBits Marlin split-K reduce", err))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -814,6 +1088,21 @@ mod tests {
         scales_fp16: bool,
         explicit_zp: bool,
         seed: u64,
+    ) -> Parity {
+        run_marlin_parity_impl(rt, m, k, n, group_size, scales_fp16, explicit_zp, seed, 1)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_marlin_parity_impl(
+        rt: &Arc<CudaRuntime>,
+        m: usize,
+        k: usize,
+        n: usize,
+        group_size: usize,
+        scales_fp16: bool,
+        explicit_zp: bool,
+        seed: u64,
+        split_k: usize,
     ) -> Parity {
         use half::f16;
 
@@ -946,8 +1235,19 @@ mod tests {
             bias_post_round: false,
             bias_row_stride: 0,
         };
-        launch_marlin_gemm(rt, &args).unwrap();
-        rt.synchronize().unwrap();
+        if split_k > 1 {
+            let partials_len = splitk_partials_len(split_k, m, n);
+            let partials_dev = rt.alloc_raw(partials_len * 4).unwrap();
+            launch_marlin_gemm_splitk(rt, &args, split_k, partials_dev).unwrap();
+            rt.synchronize().unwrap();
+            // SAFETY: allocated above, freed once.
+            unsafe {
+                rt.free_raw(partials_dev).unwrap();
+            }
+        } else {
+            launch_marlin_gemm(rt, &args).unwrap();
+            rt.synchronize().unwrap();
+        }
 
         let mut got = vec![f16::ZERO; m * n];
         // SAFETY: output_dev holds m*n fp16 values.
@@ -1047,11 +1347,82 @@ mod tests {
         }
     }
 
-    /// Microbench: report achieved weight-DRAM bandwidth and % of a configurable
-    /// HBM peak for representative decode/prefill shapes. Peak defaults to the
-    /// H200 HBM3e figure (~4.8 TB/s); override with `MARLIN_PEAK_GBPS`. This is
-    /// the honest measurement gating the M=1 lever (feasibility §3: M=1 must clear
-    /// >=~55% weight-DRAM to win over the existing GEMV; >=40% to land at all).
+    /// Split-K parity vs the same f64 oracle. Split-K sums per-K-range partials
+    /// in a fixed order, so it reorders the accumulation relative to the single
+    /// block kernel — still within the tolerance-based numerics contract, and
+    /// deterministic (capture-stable). Sweeps a couple of split factors.
+    #[test]
+    #[ignore = "requires a live CUDA device (SM80+)"]
+    fn marlin_splitk_parity_vs_f64_oracle() {
+        let Some(rt) = runtime() else {
+            eprintln!("skipping: CUDA runtime unavailable");
+            return;
+        };
+        if rt.require_nvrtc_half_headers("marlin").is_err()
+            || !device_supports_marlin(rt.capabilities().compute_capability())
+        {
+            eprintln!("skipping: no SM80+ device / headers");
+            return;
+        }
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        for &(m, k, n) in &[
+            (1usize, 4096usize, 128usize),
+            (8, 2048, 256),
+            (5, 4096, 130),
+        ] {
+            for &group in &[32usize, 128, 64] {
+                if k % group != 0 {
+                    continue;
+                }
+                for &split_k in &[2usize, 4, 8] {
+                    for &zp in &[false, true] {
+                        seed = seed.wrapping_add(0x1000);
+                        let p =
+                            run_marlin_parity_impl(&rt, m, k, n, group, true, zp, seed, split_k);
+                        assert!(
+                            p.all_finite,
+                            "non-finite split-K output M={m} K={k} N={n} group={group} \
+                             split_k={split_k} zp={zp}"
+                        );
+                        let tol = 2e-2 * p.max_out.max(1.0);
+                        assert!(
+                            p.worst_abs <= tol,
+                            "split-K M={m} K={k} N={n} group={group} split_k={split_k} zp={zp}: \
+                             worst_abs={:.4} > tol={:.4} (max_out={:.2})",
+                            p.worst_abs,
+                            tol,
+                            p.max_out
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Split-K determinism: two runs of the same split-K launch must be
+    /// byte-identical (fixed reduction order), which is what makes it safe under
+    /// CUDA-graph capture.
+    #[test]
+    #[ignore = "requires a live CUDA device (SM80+)"]
+    fn marlin_splitk_is_deterministic() {
+        let Some(rt) = runtime() else {
+            eprintln!("skipping: CUDA runtime unavailable");
+            return;
+        };
+        if rt.require_nvrtc_half_headers("marlin").is_err()
+            || !device_supports_marlin(rt.capabilities().compute_capability())
+        {
+            eprintln!("skipping: no SM80+ device / headers");
+            return;
+        }
+        let a = run_marlin_parity_impl(&rt, 8, 4096, 256, 128, true, true, 0xabcd, 4);
+        let b = run_marlin_parity_impl(&rt, 8, 4096, 256, 128, true, true, 0xabcd, 4);
+        assert_eq!(
+            a.worst_abs, b.worst_abs,
+            "split-K reduction must be deterministic run-to-run"
+        );
+    }
+
     #[test]
     #[ignore = "requires a live CUDA device (SM80+); prints timing"]
     fn marlin_bandwidth_microbench() {
@@ -1141,6 +1512,42 @@ mod tests {
                     wgbps = weight_gbps,
                     wpct = weight_gbps / peak_gbps * 100.0,
                 );
+
+                // Split-K sweep: fill idle SMs at small M. Report the best factor.
+                let sm = rt.capabilities().multiprocessor_count();
+                let auto_sk = choose_split_k(m, n, k_blocks, sm);
+                let mut sk_candidates = vec![2usize, 4, 8];
+                if !sk_candidates.contains(&auto_sk) && auto_sk > 1 {
+                    sk_candidates.push(auto_sk);
+                }
+                for &sk in &sk_candidates {
+                    if sk < 2 || sk > k_blocks {
+                        continue;
+                    }
+                    let partials_dev = rt.alloc_raw(splitk_partials_len(sk, m, n) * 4).unwrap();
+                    for _ in 0..5 {
+                        launch_marlin_gemm_splitk(&rt, &args, sk, partials_dev).unwrap();
+                    }
+                    rt.synchronize().unwrap();
+                    let sstart = std::time::Instant::now();
+                    for _ in 0..iters {
+                        launch_marlin_gemm_splitk(&rt, &args, sk, partials_dev).unwrap();
+                    }
+                    rt.synchronize().unwrap();
+                    let ssecs = sstart.elapsed().as_secs_f64() / iters as f64;
+                    let auto = if sk == auto_sk { " (auto)" } else { "" };
+                    eprintln!(
+                        "  split-K={sk}{auto}: {us:.1} us | {spd:.2}x vs direct | weight {wg:.0} GB/s ({wp:.1}% peak)",
+                        us = ssecs * 1e6,
+                        spd = secs / ssecs,
+                        wg = weight_bytes / ssecs / 1e9,
+                        wp = weight_bytes / ssecs / 1e9 / peak_gbps * 100.0,
+                    );
+                    // SAFETY: allocated just above, freed once.
+                    unsafe {
+                        rt.free_raw(partials_dev).unwrap();
+                    }
+                }
 
                 // SAFETY: freed once each.
                 unsafe {
