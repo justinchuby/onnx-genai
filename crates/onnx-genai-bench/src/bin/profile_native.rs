@@ -739,8 +739,9 @@ fn fused_tokens(prompt_tokens: &[u32], batch: usize) -> Vec<u32> {
 /// caller), but the weight/page/capture counters are content-invariant (#884),
 /// so they are the trustworthy batch-N measurement.
 fn run_native_decode_batch_sweep(
-    model: &Path,
+    model_dir: &Path,
     device: NativeDecodeDevice,
+    decode_precision: DecodePrecision,
     prompt_tokens: &[u32],
     batch_sizes: &[usize],
     tokens: usize,
@@ -773,37 +774,38 @@ fn run_native_decode_batch_sweep(
         unsafe {
             std::env::set_var("ONNX_GENAI_NATIVE_DECODE_BATCH", batch.to_string());
         }
-        let mut session = NativeDecodeSession::load_with_resolved_io(model, device.clone())
-            .with_context(|| format!("load native decoder {} at batch {batch}", model.display()))?;
+        // Build the *fully governed* engine so the native decode session carries
+        // the effective weight-offload policy (managed no-spill + stable-VA
+        // authority) instead of the conservative pointer-unstable default that
+        // `load_with_resolved_io` hardcodes. Only through this path can whole-step
+        // CUDA-graph capture stay ON while weights stream: the earlier bare-load
+        // sweep reported a capture decline that was a harness artifact of the
+        // default, not a runtime property. The batch extent is read from
+        // ONNX_GENAI_NATIVE_DECODE_BATCH during the native session load below.
+        let mut config = EngineConfig {
+            decode_backend: EngineDecodeBackend::Native,
+            decode_precision,
+            ..EngineConfig::default()
+        };
+        config.native_device = Some(device.clone());
+        apply_vram_limit_env(&mut config)?;
+        let mut engine = Engine::from_dir(model_dir, config).with_context(|| {
+            format!(
+                "load governed engine {} at batch {batch}",
+                model_dir.display()
+            )
+        })?;
+        let session = engine.native_decode_session_mut().ok_or_else(|| {
+            anyhow::anyhow!(
+                "engine did not build a native decode session at batch {batch}; the model likely \
+                 resolved to the ORT backend (batch-N needs the native CUDA persistent path)"
+            )
+        })?;
         let bound = session.native_decode_batch();
         if bound != batch {
             bail!(
                 "requested batch {batch} but the session bound batch {bound}; the model likely \
                  declined a CUDA persistent decode session (batch-N needs the captured CUDA path)"
-            );
-        }
-
-        // Optional over-budget arm: force a fixed weight-residency budget below
-        // the model's weight footprint so the managed streaming path (which needs
-        // ONNX_GENAI_MANAGED_WEIGHT_STREAMING=1 on WDDM, #874) must re-page
-        // weights every forward. Without this, an 8.3GB model on an 8GB board
-        // keeps its weights resident through steady decode (evictions=0) and
-        // htod_bytes_per_token stays 0 — there is no per-step stream to amortize.
-        // Forcing the budget reproduces the genuinely over-budget decode the
-        // 1/N amortization question is about.
-        if let Ok(raw) = std::env::var("ONNX_GENAI_NATIVE_DECODE_WEIGHT_BUDGET_BYTES") {
-            let budget: u64 = raw.trim().parse().with_context(|| {
-                format!("invalid ONNX_GENAI_NATIVE_DECODE_WEIGHT_BUDGET_BYTES: {raw:?}")
-            })?;
-            let previous = session
-                .set_weight_residency_budget(budget)
-                .with_context(|| {
-                    format!("force weight-residency budget {budget} at batch {batch}")
-                })?;
-            println!(
-                "native_decode_batch_weight_budget: batch={batch} forced_budget_bytes={budget} \
-                 previous_budget_bytes={previous:?} max_lazy_weight_working_set_bytes={}",
-                session.max_lazy_weight_working_set_bytes()
             );
         }
 
@@ -937,7 +939,10 @@ fn run_native_decode_batch_sweep(
         let emitted = (tokens as u64).saturating_mul(batch as u64);
         print_weight_offload_observability(emitted);
 
-        drop(session);
+        // `session` borrows `engine`; drop the engine to release the native
+        // session (and its VRAM) before the next batch shape reloads.
+        let _ = session;
+        drop(engine);
     }
 
     // SAFETY: single-threaded teardown.
@@ -1373,9 +1378,15 @@ fn main() -> Result<()> {
     }
     if let Some(batch_sizes) = args.native_decode_batch_sweep.clone() {
         drop(session);
+        let model_dir = args
+            .model
+            .as_deref()
+            .expect("validated model argument")
+            .to_path_buf();
         return run_native_decode_batch_sweep(
-            &model,
+            &model_dir,
             device.clone(),
+            args.decode_precision.into(),
             &prompt_tokens,
             &batch_sizes,
             args.tokens,
