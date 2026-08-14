@@ -55,6 +55,13 @@ KNOWN_UNIMPLEMENTED: dict[str, str] = {
     "ONNX_GENAI_WEIGHT_FOLD": "throwaway bandwidth-probe flag in "
     "lowbit-quant-feasibility.md, which states in both §5 and the appendix "
     "that the probe code was reverted and is not shipped",
+    "ONNX_GENAI_GEMV_KSPLIT": "NO-GO experiment knob documented in "
+    "dense-decode-megakernel-feasibility.md §9.2; the higher-way split-K path "
+    "regressed (K8 −4%, DRAM did not rise) and was reverted, not shipped",
+    "ONNX_GENAI_GEMV_CPASYNC": "NO-GO experiment knob documented in "
+    "dense-decode-megakernel-feasibility.md §9.2; the cp.async double-buffered "
+    "weight-load path regressed (−13%, 4 B/lane granularity) and was reverted, "
+    "not shipped",
     "NXRT_AUTO_INSTALL_CUDA": "referenced in prose about a proposed installer step",
     "NXRT_SQNBIT_PREFILL_MIN": "referenced in prose about a proposed tuning knob",
     "ONNX_GENAI_BASE_URL": "client-side variable read by external tooling, not by this workspace",
