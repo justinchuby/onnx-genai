@@ -946,6 +946,38 @@ fn batching_safe_policy_contract(component: &WorkflowComponent) -> bool {
             contract.parameters.get("inactive_rows"),
             Some(onnx_genai_metadata::ScalarValue::String(value)) if value == "preserve"
         )
+        && state_update_contracts_match(component, contract)
+}
+
+fn state_update_contracts_match(
+    component: &WorkflowComponent,
+    contract: &onnx_genai_metadata::ComponentContract,
+) -> bool {
+    if contract.id != "onnx-genai.state-update" {
+        return true;
+    }
+    let tensor = |role: &str, input: bool| {
+        contract.bindings.get(role).and_then(|port| {
+            if input {
+                component.ports.inputs.get(port)
+            } else {
+                component.ports.outputs.get(port)
+            }
+        })
+    };
+    let (Some(current), Some(update), Some(next)) = (
+        tensor("current", true),
+        tensor("update", true),
+        tensor("next", false),
+    ) else {
+        return false;
+    };
+    current.dtype == update.dtype
+        && current.dtype == next.dtype
+        && current.rank == update.rank
+        && current.rank == next.rank
+        && current.shape == update.shape
+        && current.shape == next.shape
 }
 
 fn batching_role_port(
@@ -979,12 +1011,21 @@ fn batching_role_port(
     }
     match role {
         "active" | "done" | "continue" => tensor.dtype == "bool" && tensor.rank == 1,
-        "temperature" | "top_p" | "min_p" | "logits" => {
+        "logits" => {
             matches!(tensor.dtype.as_str(), "float32" | "float16" | "bfloat16")
+                && matches!(tensor.rank, 2 | 3)
         }
-        "top_k" | "seed" | "counter" | "next_counter" | "tokens" | "token" | "eos_ids"
-        | "eos_lengths" | "iteration" | "max_iterations" => {
-            tensor.dtype.starts_with("int") || tensor.dtype.starts_with("uint")
+        "temperature" | "top_p" | "min_p" => {
+            matches!(tensor.dtype.as_str(), "float32" | "float16" | "bfloat16") && tensor.rank == 1
+        }
+        "eos_ids" => {
+            (tensor.dtype.starts_with("int") || tensor.dtype.starts_with("uint"))
+                && tensor.rank == 2
+        }
+        "top_k" | "seed" | "counter" | "next_counter" | "tokens" | "token" | "eos_lengths"
+        | "iteration" | "max_iterations" => {
+            (tensor.dtype.starts_with("int") || tensor.dtype.starts_with("uint"))
+                && tensor.rank == 1
         }
         "current" | "update" | "next" => true,
         _ => false,
@@ -2184,6 +2225,111 @@ mod tests {
             .bindings
             .remove("counter");
         assert!(!is_fusible_component(&sampler));
+
+        sampler
+            .contract
+            .as_mut()
+            .unwrap()
+            .bindings
+            .insert("counter".into(), "counter".into());
+        sampler
+            .ports
+            .inputs
+            .insert("temperature".into(), batch_tensor("float32", 2));
+        assert!(!is_fusible_component(&sampler));
+    }
+
+    #[test]
+    fn termination_and_state_fusion_require_heterogeneous_batch_contracts() {
+        let parameters = BTreeMap::from([
+            (
+                "batching".into(),
+                onnx_genai_metadata::ScalarValue::String("per_row".into()),
+            ),
+            (
+                "inactive_rows".into(),
+                onnx_genai_metadata::ScalarValue::String("preserve".into()),
+            ),
+        ]);
+        let mut termination = component(ComponentImplementation::Onnx {
+            artifact: "termination.onnx".into(),
+        });
+        for (role, dtype, rank) in [
+            ("tokens", "int64", 1),
+            ("active", "bool", 1),
+            ("eos_ids", "int64", 2),
+            ("eos_lengths", "int64", 1),
+            ("iteration", "int64", 1),
+            ("max_iterations", "int64", 1),
+        ] {
+            termination
+                .ports
+                .inputs
+                .insert(role.into(), batch_tensor(dtype, rank));
+        }
+        for role in ["done", "continue"] {
+            termination
+                .ports
+                .outputs
+                .insert(role.into(), batch_tensor("bool", 1));
+        }
+        termination.contract = Some(onnx_genai_metadata::ComponentContract {
+            id: "onnx-genai.termination-predicate".into(),
+            version: "2".into(),
+            bindings: [
+                "tokens",
+                "active",
+                "eos_ids",
+                "eos_lengths",
+                "iteration",
+                "max_iterations",
+                "done",
+                "continue",
+            ]
+            .into_iter()
+            .map(|role| (role.into(), role.into()))
+            .collect(),
+            parameters: parameters.clone(),
+        });
+        assert!(is_fusible_component(&termination));
+        termination
+            .ports
+            .inputs
+            .insert("eos_ids".into(), batch_tensor("int64", 1));
+        assert!(!is_fusible_component(&termination));
+
+        let mut state = component(ComponentImplementation::Onnx {
+            artifact: "state.onnx".into(),
+        });
+        for role in ["current", "update"] {
+            state
+                .ports
+                .inputs
+                .insert(role.into(), batch_tensor("float32", 2));
+        }
+        state
+            .ports
+            .inputs
+            .insert("active".into(), batch_tensor("bool", 1));
+        state
+            .ports
+            .outputs
+            .insert("next".into(), batch_tensor("float32", 2));
+        state.contract = Some(onnx_genai_metadata::ComponentContract {
+            id: "onnx-genai.state-update".into(),
+            version: "2".into(),
+            bindings: ["current", "update", "active", "next"]
+                .into_iter()
+                .map(|role| (role.into(), role.into()))
+                .collect(),
+            parameters,
+        });
+        assert!(is_fusible_component(&state));
+        state
+            .ports
+            .outputs
+            .insert("next".into(), batch_tensor("float16", 2));
+        assert!(!is_fusible_component(&state));
     }
 
     #[test]
