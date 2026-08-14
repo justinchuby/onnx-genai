@@ -500,6 +500,58 @@ pub unsafe fn governed_gemm(
     unsafe { launch_planned_gemm(handle, stream, p, &plan, ptr) }
 }
 
+/// A cuBLASLt plan (selected algorithm + its layouts/descriptor and workspace
+/// requirement) for one **fixed** GEMM shape, selected once and reusable across
+/// later launches — including CUDA-graph capture replays — with no further
+/// heuristic query, allocation, or synchronization. The caller pins the shape
+/// and supplies a persistent workspace of at least [`Self::workspace_bytes`]
+/// (see the capture-safe dense path in `kernels::matmul`).
+///
+/// For a given shape the plan reproduces [`governed_gemm`] exactly: both select
+/// the algorithm through the same [`plan_gemm`] heuristic, so caching changes
+/// only *when* the algorithm is chosen, never the arithmetic.
+pub struct CaptureGemmPlan(PlannedMatmul);
+
+// SAFETY: cuBLASLt layout/descriptor handles are context-independent host
+// objects; the algorithm is a plain value. Launches are serialized by the
+// owning kernel's plan mutex (same rationale as `F32GemvPlan`).
+unsafe impl Send for CaptureGemmPlan {}
+
+impl CaptureGemmPlan {
+    /// Workspace bytes the selected algorithm requires; the caller must supply a
+    /// persistent device buffer of at least this size to [`Self::launch`].
+    #[must_use]
+    pub fn workspace_bytes(&self) -> usize {
+        self.0.workspace_bytes
+    }
+
+    /// Launch the planned GEMM for `p` (which must have the same shape/dtype the
+    /// plan was selected for; only the `a`/`b`/`c` pointers may differ).
+    ///
+    /// # Safety
+    ///
+    /// Identical to [`gemm`]: `handle`/`stream` valid and current, `p.a`/`p.b`/
+    /// `p.c` live device allocations for the plan's shape, `workspace` a live
+    /// allocation of at least [`Self::workspace_bytes`] bytes (or 0 when that is
+    /// 0), and `p.c` not aliasing `p.a`/`p.b`.
+    pub unsafe fn launch(
+        &self,
+        handle: &CublasLt,
+        stream: cudarc::driver::sys::CUstream,
+        p: &GemmParams,
+        workspace: CUdeviceptr,
+    ) -> Result<()> {
+        // SAFETY: forwarded from the caller.
+        unsafe { launch_planned_gemm(handle, stream, p, &self.0, workspace) }
+    }
+}
+
+/// Select (once) a reusable [`CaptureGemmPlan`] for `p`'s shape via the same
+/// heuristic [`governed_gemm`] uses per call.
+pub fn plan_capture_gemm(handle: &CublasLt, p: &GemmParams) -> Result<CaptureGemmPlan> {
+    Ok(CaptureGemmPlan(plan_gemm(handle, p)?))
+}
+
 /// A single (non-batched) **column-major, native cuBLAS** GEMM request:
 /// `C = alpha · op(A) · op(B) + beta · C`, with all shapes and leading
 /// dimensions expressed in cuBLAS's own column-major terms.

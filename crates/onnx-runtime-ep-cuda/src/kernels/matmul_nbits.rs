@@ -14,6 +14,7 @@ use onnx_runtime_ir::{DataType, Node};
 
 use crate::blas::{self, GemmDtype, GemmEpilogue, GemmEpilogueKind, GemmParams};
 use crate::error::driver_err;
+use crate::kernels::marlin_gemm;
 use crate::runtime::{CudaRuntime, cuptr, raw_ptr};
 
 const DEQUANT_MODULE: &str = "matmul_nbits_dequant_f32";
@@ -4813,10 +4814,111 @@ impl MatMulNBitsKernel {
                 Some(bias) if bias.numel() == m * self.n && m * self.n != self.n => self.n,
                 _ => 0,
             };
+            // Opt-in Marlin int4 tensor-core GEMM for the M>1 path. Gated on
+            // SM80+, int4, no g_idx (checked above), no fused SwiGLU/RMSNorm
+            // epilogue yet, and `ONNX_GENAI_MARLIN_M_GT_1`. On any ineligibility
+            // or runtime error it falls through to the byte-identical portable
+            // tiled GEMM below (Rule 11 fallback contract).
+            if marlin_gemm::marlin_m_gt_1_enabled()
+                && self.bits == 4
+                && !self.gate_up_swiglu
+                && !self.decomposed_silu
+                && !self.rmsnorm_prologue
+                && marlin_gemm::device_supports_marlin(
+                    self.runtime.capabilities().compute_capability(),
+                )
+            {
+                match self.try_launch_marlin_gemm(
+                    &inputs[0],
+                    &inputs[1],
+                    &inputs[2],
+                    scales_fp16,
+                    zero_points,
+                    bias,
+                    &mut outputs[0],
+                    m,
+                    bias_row_stride,
+                ) {
+                    Ok(Some(warm)) => {
+                        // Static grid + (when warm) no alloc/repack/sync this
+                        // call ⇒ capture-safe. A cold first call repacked and is
+                        // reported unsafe; subsequent replays hit the cache.
+                        self.last_call_capture_safe.store(warm, Ordering::Relaxed);
+                        onnx_runtime_ep_api::record_kernel_variant!(
+                            "gemm_marlin_int4",
+                            "M={} prefill/verify: fp16 activation, int4, block_size={}, \
+                             zero_points={} → Marlin SM80 mma.sync int4 tensor-core GEMM \
+                             (static grid, capture-safe when weights are pre-repacked)",
+                            m,
+                            self.block_size,
+                            zero_points.is_some()
+                        );
+                        return Ok(());
+                    }
+                    Ok(None) => {
+                        // Not eligible at runtime (e.g. dims); fall through.
+                    }
+                    Err(_err) => {
+                        // Hard launch error: fall through to the portable tiled
+                        // GEMM rather than fail the op. The tiled variant records
+                        // its own kernel-variant note below.
+                    }
+                }
+            }
             if self.rmsnorm_prologue {
                 let gamma = gamma.ok_or_else(|| {
                     error("rmsnorm_prologue fusion requires the normalization weight at input 6")
                 })?;
+                // Opt-in Marlin int4 tensor-core GEMM with the fused RMS-norm
+                // prologue: stage the per-token normalized activation into
+                // scratch (byte-identical to the standalone prologue), then run
+                // Marlin over it. The scratch allocation keeps this off the
+                // advertised capture contract (like the tiled rmsnorm prefill),
+                // but prefill is outside the persistent decode graph. Falls
+                // through to the tiled rmsnorm GEMM on ineligibility / error.
+                if marlin_gemm::marlin_m_gt_1_enabled()
+                    && self.bits == 4
+                    && !self.gate_up_swiglu
+                    && !self.decomposed_silu
+                    && marlin_gemm::device_supports_marlin(
+                        self.runtime.capabilities().compute_capability(),
+                    )
+                {
+                    match self.try_launch_marlin_gemm_rmsnorm(
+                        &inputs[0],
+                        &inputs[1],
+                        &inputs[2],
+                        scales_fp16,
+                        zero_points,
+                        gamma,
+                        bias,
+                        &mut outputs[0],
+                        m,
+                        bias_row_stride,
+                    ) {
+                        Ok(Some(warm)) => {
+                            // Static grid + pooled scratch/weights ⇒ capture-safe
+                            // on a warm replay; a cold call allocated and is
+                            // reported unsafe.
+                            self.last_call_capture_safe.store(warm, Ordering::Relaxed);
+                            onnx_runtime_ep_api::record_kernel_variant!(
+                                "gemm_marlin_int4_rmsnorm",
+                                "M={} prefill/verify: RMS-normalization prologue \
+                                 (SkipSimplifiedLayerNormalization folded) into pooled scratch, \
+                                 then Marlin SM80 mma.sync int4 tensor-core GEMM (capture-safe \
+                                 when weights + scratch are pre-warmed)",
+                                m
+                            );
+                            return Ok(());
+                        }
+                        Ok(None) => {
+                            // Not eligible (e.g. dims); fall through to tiled.
+                        }
+                        Err(_err) => {
+                            // Hard error: fall through to the tiled rmsnorm GEMM.
+                        }
+                    }
+                }
                 onnx_runtime_ep_api::record_kernel_variant!(
                     "gemm_f16_tiled_rmsnorm",
                     "M={} prefill: RMS-normalization prologue (SkipSimplifiedLayerNormalization \
@@ -4952,6 +5054,288 @@ impl MatMulNBitsKernel {
             blob_size,
             zp_row_bytes,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// Attempt the opt-in Marlin int4 tensor-core GEMM for the M>1 path.
+    ///
+    /// Returns `Ok(Some(warm))` when the kernel launched (`warm == true` means
+    /// the repacked weights were already cached, so this call did no allocation
+    /// and is CUDA-graph capture-safe), `Ok(None)` when the inputs are not
+    /// eligible (caller falls through to the portable tiled GEMM), or `Err` on a
+    /// hard launch failure (caller also falls through).
+    ///
+    /// Eligibility (SM80, int4, no fused SwiGLU/RMSNorm epilogue, opt-in flag)
+    /// is checked by the caller; here we validate the numeric shape contract
+    /// (`K` divisible by 16 and by the group size) and ensure the weights are
+    /// repacked into the tensor-core layout exactly once.
+    #[allow(clippy::too_many_arguments)]
+    fn try_launch_marlin_gemm(
+        &self,
+        activation: &TensorView,
+        packed: &TensorView,
+        scales: &TensorView,
+        scales_fp16: bool,
+        zero_points: Option<&TensorView>,
+        bias: Option<&TensorView>,
+        output: &mut TensorMut,
+        m: usize,
+        bias_row_stride: usize,
+    ) -> Result<Option<bool>> {
+        // Shape contract: the tensor-core kernel tiles K in units of 16 and
+        // applies one scale per quantization group, so K must be divisible by
+        // both. Anything else stays on the portable tiled GEMM.
+        if self.block_size == 0
+            || !self.k.is_multiple_of(16)
+            || !self.k.is_multiple_of(self.block_size)
+        {
+            return Ok(None);
+        }
+        self.runtime
+            .require_nvrtc_half_headers("MatMulNBits Marlin int4 tensor-core GEMM")?;
+
+        let packed_ptr = cuptr(packed.data_ptr::<u8>() as *const c_void);
+        let (weights_ptr, warm) = marlin_gemm::ensure_repacked(
+            &self.runtime,
+            packed_ptr,
+            self.n,
+            self.k,
+            self.block_size,
+        )?;
+
+        let args = marlin_gemm::MarlinGemmArgs {
+            activation: cuptr(activation.data_ptr::<u8>() as *const c_void),
+            weights: weights_ptr,
+            scales: cuptr(scales.data_ptr::<u8>() as *const c_void),
+            zero_points: zero_points.map(|t| cuptr(t.data_ptr::<u8>() as *const c_void)),
+            bias: bias.map(|t| cuptr(t.data_ptr::<u8>() as *const c_void)),
+            output: cuptr(output.data_ptr_mut::<u8>() as *const c_void),
+            m,
+            k: self.k,
+            n: self.n,
+            group_size: self.block_size,
+            scales_fp16,
+            bias_post_round: self.fold_bias_post_round && bias.is_some(),
+            bias_row_stride,
+        };
+        // Split-K (opt-in): partition K across grid.z to fill idle SMs when the
+        // base block count is small. Partials come from the capture-safe scratch
+        // pool (slot 4) so warm replays stay allocation-free; the reduce applies
+        // the same fold_bias epilogue. Falls back to the byte-identical direct
+        // kernel whenever the heuristic declines to split.
+        let split_warm = self.maybe_launch_marlin_splitk(&args)?;
+        Ok(Some(warm && split_warm))
+    }
+
+    /// Launch `args` through split-K when enabled and the heuristic elects to
+    /// split, otherwise through the direct kernel. Returns whether the launch
+    /// was allocation-free (`true` for the direct kernel; for split-K, whether
+    /// the pooled partials scratch was already warm) so callers can propagate
+    /// capture-safety.
+    fn maybe_launch_marlin_splitk(&self, args: &marlin_gemm::MarlinGemmArgs) -> Result<bool> {
+        if marlin_gemm::marlin_splitk_enabled() {
+            let k_blocks = self.k / self.block_size.max(1);
+            let sm = self.runtime.capabilities().multiprocessor_count();
+            let split_k = marlin_gemm::choose_split_k(args.m, args.n, k_blocks, sm);
+            if split_k > 1 {
+                let bytes = marlin_gemm::splitk_partials_len(split_k, args.m, args.n)
+                    * std::mem::size_of::<f32>();
+                let (partials, warm) = marlin_gemm::ensure_scratch(&self.runtime, 4, bytes)?;
+                marlin_gemm::launch_marlin_gemm_splitk(&self.runtime, args, split_k, partials)?;
+                return Ok(warm);
+            }
+        }
+        marlin_gemm::launch_marlin_gemm(&self.runtime, args)?;
+        Ok(true)
+    }
+
+    /// Marlin M>1 GEMM with the fused RMS-normalization prologue. Stages the
+    /// per-token normalized activation into pooled scratch (byte-identical to the
+    /// standalone `launch_rmsnorm_prefill` output the tiled path uses), then runs
+    /// the Marlin int4 tensor-core GEMM over the normalized rows. Returns
+    /// `Some(warm)` when it launched (`warm` means both the repacked weights and
+    /// the scratch were already pooled ⇒ no allocation this call ⇒ capture-safe),
+    /// or `None` when the shape is ineligible (caller falls through to the tiled
+    /// rmsnorm GEMM).
+    #[allow(clippy::too_many_arguments)]
+    fn try_launch_marlin_gemm_rmsnorm(
+        &self,
+        activation: &TensorView,
+        packed: &TensorView,
+        scales: &TensorView,
+        scales_fp16: bool,
+        zero_points: Option<&TensorView>,
+        gamma: &TensorView,
+        bias: Option<&TensorView>,
+        output: &mut TensorMut,
+        m: usize,
+        bias_row_stride: usize,
+    ) -> Result<Option<bool>> {
+        if self.block_size == 0
+            || !self.k.is_multiple_of(16)
+            || !self.k.is_multiple_of(self.block_size)
+        {
+            return Ok(None);
+        }
+        self.runtime
+            .require_nvrtc_half_headers("MatMulNBits Marlin int4 tensor-core GEMM (rmsnorm)")?;
+
+        let packed_ptr = cuptr(packed.data_ptr::<u8>() as *const c_void);
+        let (weights_ptr, weights_warm) = marlin_gemm::ensure_repacked(
+            &self.runtime,
+            packed_ptr,
+            self.n,
+            self.k,
+            self.block_size,
+        )?;
+        // Pooled normalized-activation scratch (slot 0). On a warm replay this is
+        // already allocated, so the whole path is allocation-free.
+        let scratch_bytes = m * self.k * std::mem::size_of::<half::f16>();
+        let (scratch, scratch_warm) = marlin_gemm::ensure_scratch(&self.runtime, 0, scratch_bytes)?;
+
+        self.launch_rmsnorm_prefill(activation, gamma, scratch, m)?;
+        let args = marlin_gemm::MarlinGemmArgs {
+            activation: scratch,
+            weights: weights_ptr,
+            scales: cuptr(scales.data_ptr::<u8>() as *const c_void),
+            zero_points: zero_points.map(|t| cuptr(t.data_ptr::<u8>() as *const c_void)),
+            bias: bias.map(|t| cuptr(t.data_ptr::<u8>() as *const c_void)),
+            output: cuptr(output.data_ptr_mut::<u8>() as *const c_void),
+            m,
+            k: self.k,
+            n: self.n,
+            group_size: self.block_size,
+            scales_fp16,
+            bias_post_round: self.fold_bias_post_round && bias.is_some(),
+            bias_row_stride,
+        };
+        let split_warm = self.maybe_launch_marlin_splitk(&args)?;
+        Ok(Some(weights_warm && scratch_warm && split_warm))
+    }
+
+    /// Marlin M>1 path for the paired gate/up SwiGLU MLP fusion (optionally with
+    /// a fused RMS-norm prologue). Runs both projections through the Marlin int4
+    /// tensor-core GEMM into pooled scratch, then the same fp16 SiluMul epilogue
+    /// the tiled path uses (`silu(gate) * up`, decomposed or not). Returns
+    /// `Some(warm)` when it launched (`warm` ⇒ every repacked weight and scratch
+    /// buffer was already pooled, so the call is allocation-free and
+    /// capture-safe), or `None` when the shape is ineligible (caller falls
+    /// through to the tiled gate/up prefill).
+    #[allow(clippy::too_many_arguments)]
+    fn try_launch_marlin_gate_up_prefill(
+        &self,
+        activation: &TensorView,
+        packed_gate: &TensorView,
+        scales_gate: &TensorView,
+        packed_up: &TensorView,
+        scales_up: &TensorView,
+        zp_gate: Option<&TensorView>,
+        zp_up: Option<&TensorView>,
+        gamma: Option<&TensorView>,
+        output: &mut TensorMut,
+        m: usize,
+    ) -> Result<Option<bool>> {
+        if self.block_size == 0
+            || !self.k.is_multiple_of(16)
+            || !self.k.is_multiple_of(self.block_size)
+        {
+            return Ok(None);
+        }
+        self.runtime
+            .require_nvrtc_half_headers("MatMulNBits Marlin int4 gate/up SwiGLU GEMM")?;
+
+        let packed_gate_ptr = cuptr(packed_gate.data_ptr::<u8>() as *const c_void);
+        let packed_up_ptr = cuptr(packed_up.data_ptr::<u8>() as *const c_void);
+        let (weights_gate, gate_w_warm) = marlin_gemm::ensure_repacked(
+            &self.runtime,
+            packed_gate_ptr,
+            self.n,
+            self.k,
+            self.block_size,
+        )?;
+        let (weights_up, up_w_warm) = marlin_gemm::ensure_repacked(
+            &self.runtime,
+            packed_up_ptr,
+            self.n,
+            self.k,
+            self.block_size,
+        )?;
+
+        // Optionally stage the RMS-normalized activation into pooled scratch
+        // (slot 0), byte-identical to the standalone prologue; both projections
+        // then read that single normalized copy.
+        let (act_ptr, norm_warm) = if let Some(gamma) = gamma {
+            let norm_bytes = m * self.k * std::mem::size_of::<half::f16>();
+            let (norm, norm_warm) = marlin_gemm::ensure_scratch(&self.runtime, 0, norm_bytes)?;
+            self.launch_rmsnorm_prefill(activation, gamma, norm, m)?;
+            (norm, norm_warm)
+        } else {
+            (cuptr(activation.data_ptr::<u8>() as *const c_void), true)
+        };
+
+        // Pooled gate-projection scratch (slot 1). The up projection writes the
+        // real output; SiluMul folds them into the output in place.
+        let out_bytes = output.byte_size();
+        let (gate_buf, gate_s_warm) = marlin_gemm::ensure_scratch(&self.runtime, 1, out_bytes)?;
+        let output_ptr = cuptr(output.data_ptr_mut::<u8>() as *const c_void);
+
+        let gate_args = marlin_gemm::MarlinGemmArgs {
+            activation: act_ptr,
+            weights: weights_gate,
+            scales: cuptr(scales_gate.data_ptr::<u8>() as *const c_void),
+            zero_points: zp_gate.map(|t| cuptr(t.data_ptr::<u8>() as *const c_void)),
+            bias: None,
+            output: gate_buf,
+            m,
+            k: self.k,
+            n: self.n,
+            group_size: self.block_size,
+            scales_fp16: true,
+            bias_post_round: false,
+            bias_row_stride: 0,
+        };
+        // Route both projections through split-K: at the M=K speculative-verify
+        // width these gate/up GEMMs (the largest MLP projections) are
+        // memory/latency-bound, so `choose_split_k` elects an 8-way K split to
+        // fill the SMs. Partials use the shared slot-4 scratch sequentially (gate
+        // fully reduces into `gate_buf` before the up GEMM overwrites the
+        // partials), so the stream ordering keeps it correct and capture-safe.
+        let gate_split_warm = self.maybe_launch_marlin_splitk(&gate_args)?;
+
+        let up_args = marlin_gemm::MarlinGemmArgs {
+            activation: act_ptr,
+            weights: weights_up,
+            scales: cuptr(scales_up.data_ptr::<u8>() as *const c_void),
+            zero_points: zp_up.map(|t| cuptr(t.data_ptr::<u8>() as *const c_void)),
+            bias: None,
+            output: output_ptr,
+            m,
+            k: self.k,
+            n: self.n,
+            group_size: self.block_size,
+            scales_fp16: true,
+            bias_post_round: false,
+            bias_row_stride: 0,
+        };
+        let up_split_warm = self.maybe_launch_marlin_splitk(&up_args)?;
+
+        crate::kernels::elementwise::launch_silu_mul_f16_raw(
+            &self.runtime,
+            gate_buf,
+            output_ptr,
+            output_ptr,
+            output.numel(),
+            self.decomposed_silu,
+        )?;
+
+        Ok(Some(
+            gate_w_warm
+                && up_w_warm
+                && norm_warm
+                && gate_s_warm
+                && gate_split_warm
+                && up_split_warm,
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5474,6 +5858,55 @@ impl MatMulNBitsKernel {
         }
         if m > 1 {
             self.last_call_capture_safe.store(false, Ordering::Relaxed);
+            // Opt-in Marlin int4 tensor-core path for the paired gate/up MLP:
+            // both projections run on tensor cores, then the same fp16 SiluMul
+            // epilogue. This is the bulk of prefill/verify cost and the last
+            // MatMulNBits node that otherwise falls back to the tiled GEMM at
+            // M>1 (which would keep the captured forward segmented). Warm replays
+            // (pooled weights + scratch) are capture-safe. Falls through to the
+            // tiled gate/up prefill on ineligibility or launch error.
+            if marlin_gemm::marlin_m_gt_1_enabled()
+                && self.bits == 4
+                && marlin_gemm::device_supports_marlin(
+                    self.runtime.capabilities().compute_capability(),
+                )
+            {
+                match self.try_launch_marlin_gate_up_prefill(
+                    &inputs[0],
+                    &inputs[1],
+                    &inputs[2],
+                    &inputs[3],
+                    &inputs[4],
+                    zp_gate,
+                    zp_up,
+                    gamma,
+                    &mut outputs[0],
+                    m,
+                ) {
+                    Ok(Some(warm)) => {
+                        self.last_call_capture_safe.store(warm, Ordering::Relaxed);
+                        onnx_runtime_ep_api::record_kernel_variant!(
+                            "gate_up_swiglu_marlin_prefill",
+                            "M={} prefill/verify: {}paired gate/up Marlin SM80 mma.sync int4 \
+                             tensor-core GEMMs followed by fp16 SiluMul (capture-safe when \
+                             weights + scratch are pre-warmed)",
+                            m,
+                            if gamma.is_some() {
+                                "RMS-normalization prologue then "
+                            } else {
+                                ""
+                            }
+                        );
+                        return Ok(());
+                    }
+                    Ok(None) => {
+                        // Ineligible shape; fall through to the tiled prefill.
+                    }
+                    Err(_err) => {
+                        // Hard error; fall through to the tiled prefill.
+                    }
+                }
+            }
             if let Some(gamma) = gamma {
                 onnx_runtime_ep_api::record_kernel_variant!(
                     "gate_up_swiglu_rmsnorm_prefill",
@@ -6849,15 +7282,25 @@ impl Kernel for MatMulNBitsKernel {
         // shape-fixed persistent accuracy-4 activation workspace; it performs no
         // per-call allocation, D2H, or synchronization. The direct fp16 GEMV is
         // likewise capture-safe: fixed grid/block geometry from the shape
-        // signature and register/launch-time-shared scratch. The allocation-free
-        // fp16 prefill GEMM remains conservatively unadvertised because variable-M
-        // prefill is outside the persistent decode graph and lacks replay coverage;
-        // f32 prefill scratch and g_idx validation are also non-capturable.
+        // signature and register/launch-time-shared scratch.
+        //
+        // The opt-in Marlin M>1 tensor-core GEMM is ALSO capture-safe once its
+        // weights are repacked: its launch grid is a pure function of (M, N) and,
+        // on a warm repack-cache hit, the call performs no allocation, D2H, or
+        // synchronization. The dispatch records this by storing the cache-warm
+        // flag into `last_call_capture_safe`, so a cold (repacking) first call is
+        // reported unsupported and only warm replays advertise support — which is
+        // exactly what unlocks capture-stable speculative verification at M>1.
+        //
+        // The portable (non-Marlin) fp16 prefill GEMM remains conservatively
+        // unadvertised because variable-M prefill is outside the persistent
+        // decode graph and lacks replay coverage; f32 prefill scratch and g_idx
+        // validation are also non-capturable.
         if self.last_call_capture_safe.load(Ordering::Relaxed) {
             onnx_runtime_ep_api::CaptureSupport::Supported
         } else {
             onnx_runtime_ep_api::CaptureSupport::unsupported(
-                "requires M==1 decode GEMV without group_indices; prefill is outside the advertised capture contract and group_indices validation reads D2H",
+                "requires M==1 decode GEMV without group_indices, or a warm-cache Marlin M>1 GEMM; a cold Marlin repack and portable prefill are outside the advertised capture contract and group_indices validation reads D2H",
             )
         }
     }
@@ -7069,6 +7512,703 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                 std::mem::size_of_val(values),
             )
         }
+    }
+
+    /// Apples-to-apples wall-clock comparison of the Marlin M>1 tensor-core GEMM
+    /// against the portable tiled CUDA-core GEMM through the real op, across a
+    /// sweep of M at a production projection shape. Prints median kernel wall per
+    /// path; this is the measurement that quantifies the M=1→M=2 cliff collapse.
+    /// Ignored (perf, needs a dedicated idle SM80+ GPU).
+    #[test]
+    #[ignore = "perf microbench; requires a dedicated idle SM80+ CUDA device"]
+    fn marlin_m_gt_1_op_wall_vs_tiled() {
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping Marlin M>1 wall bench: CUDA runtime unavailable");
+            return;
+        };
+        if runtime
+            .require_nvrtc_half_headers("marlin_m_gt_1_wall")
+            .is_err()
+            || !marlin_gemm::device_supports_marlin(runtime.capabilities().compute_capability())
+        {
+            eprintln!("skipping Marlin M>1 wall bench: headers unavailable or pre-SM80");
+            return;
+        }
+
+        let k = 5120usize;
+        let n = 13824usize;
+        let block_size = 128usize;
+        let k_blocks = k / block_size;
+        let blob_size = block_size / 2;
+        let zp_row_bytes = k_blocks.div_ceil(2);
+
+        let mut state = 0xcafef00d_1234_5678u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+
+        let max_m = 128usize;
+        let mut activation_f16 = vec![f16::ZERO; max_m * k];
+        for h in activation_f16.iter_mut() {
+            *h = f16::from_f32(next());
+        }
+        let mut quant = vec![0u8; n * k];
+        for value in quant.iter_mut() {
+            *value = ((next() * 0.5 + 0.5) * 15.0).round().clamp(0.0, 15.0) as u8;
+        }
+        let mut packed = vec![0u8; n * k_blocks * blob_size];
+        for col in 0..n {
+            for block in 0..k_blocks {
+                for pair in 0..blob_size {
+                    let low = quant[col * k + block * block_size + pair * 2] & 15;
+                    let high = quant[col * k + block * block_size + pair * 2 + 1] & 15;
+                    packed[(col * k_blocks + block) * blob_size + pair] = low | (high << 4);
+                }
+            }
+        }
+        let mut zp_packed = vec![0u8; n * zp_row_bytes];
+        for byte in zp_packed.iter_mut() {
+            *byte = ((next() * 0.5 + 0.5) * 255.0) as u8;
+        }
+        let mut scale_f16 = vec![f16::ZERO; n * k_blocks];
+        for h in scale_f16.iter_mut() {
+            *h = f16::from_f32(0.015 + 0.01 * (next() * 0.5 + 0.5));
+        }
+
+        let activation_dev = runtime.alloc_raw(activation_f16.len() * 2).unwrap();
+        let packed_dev = runtime.alloc_raw(packed.len()).unwrap();
+        let scales_dev = runtime.alloc_raw(scale_f16.len() * 2).unwrap();
+        let zp_dev = runtime.alloc_raw(zp_packed.len()).unwrap();
+        let output_dev = runtime.alloc_raw(max_m * n * 2).unwrap();
+        // SAFETY: buffers sized to their sources.
+        unsafe {
+            runtime
+                .htod(as_bytes(&activation_f16), activation_dev)
+                .unwrap();
+            runtime.htod(&packed, packed_dev).unwrap();
+            runtime.htod(as_bytes(&scale_f16), scales_dev).unwrap();
+            runtime.htod(&zp_packed, zp_dev).unwrap();
+        }
+
+        let device = DeviceId::cuda(0);
+        let b_shape = [n, k_blocks, blob_size];
+        let b_strides = [(k_blocks * blob_size) as i64, blob_size as i64, 1];
+        let scales_shape = [n, k_blocks];
+        let scales_strides = [k_blocks as i64, 1];
+        let zp_shape = [n, zp_row_bytes];
+        let zp_strides = [zp_row_bytes as i64, 1];
+
+        let kernel = MatMulNBitsKernel {
+            runtime: runtime.clone(),
+            k,
+            n,
+            bits: 4,
+            block_size,
+            accuracy_level: 4,
+            accuracy4_workspace: None,
+            fold_bias_post_round: false,
+            gate_up_swiglu: false,
+            decomposed_silu: false,
+            rmsnorm_prologue: false,
+            rmsnorm_epsilon: 1e-5,
+            last_call_capture_safe: AtomicBool::new(false),
+            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+        };
+
+        let time_path = |kernel: &MatMulNBitsKernel, m: usize| -> f64 {
+            let a_shape = [m, k];
+            let a_strides = [k as i64, 1];
+            let y_shape = [m, n];
+            let y_strides = [n as i64, 1];
+            let inputs = vec![
+                TensorView::new(
+                    device_ptr(activation_dev),
+                    DataType::Float16,
+                    &a_shape,
+                    &a_strides,
+                    device,
+                ),
+                TensorView::new(
+                    device_ptr(packed_dev),
+                    DataType::Uint8,
+                    &b_shape,
+                    &b_strides,
+                    device,
+                ),
+                TensorView::new(
+                    device_ptr(scales_dev),
+                    DataType::Float16,
+                    &scales_shape,
+                    &scales_strides,
+                    device,
+                ),
+                TensorView::new(
+                    device_ptr(zp_dev),
+                    DataType::Uint8,
+                    &zp_shape,
+                    &zp_strides,
+                    device,
+                ),
+            ];
+            let run = || {
+                let mut outputs = [TensorMut::new(
+                    device_ptr_mut(output_dev),
+                    DataType::Float16,
+                    &y_shape,
+                    &y_strides,
+                    device,
+                )];
+                kernel.run(&inputs, &mut outputs, None).unwrap();
+            };
+            // Warm up (NVRTC compile, repack cache fill).
+            run();
+            runtime.synchronize().unwrap();
+            let iters = 30;
+            let mut samples = Vec::with_capacity(iters);
+            for _ in 0..iters {
+                let start = std::time::Instant::now();
+                run();
+                runtime.synchronize().unwrap();
+                samples.push(start.elapsed().as_secs_f64() * 1e6);
+            }
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            samples[samples.len() / 2]
+        };
+
+        eprintln!("Marlin M>1 wall vs tiled @ K={k} N={n} block={block_size} (median us):");
+        eprintln!("  M     tiled_us   marlin_us   speedup");
+        for &m in &[1usize, 2, 4, 8, 16, 32, 64, 128] {
+            // SAFETY: serial ignored bench; flag toggling is race-free here.
+            unsafe {
+                std::env::remove_var("ONNX_GENAI_MARLIN_M_GT_1");
+            }
+            let tiled = time_path(&kernel, m);
+            unsafe {
+                std::env::set_var("ONNX_GENAI_MARLIN_M_GT_1", "1");
+            }
+            let marlin = time_path(&kernel, m);
+            let marlin_used = m > 1;
+            eprintln!(
+                "  {m:<5} {tiled:>8.1}   {marlin:>8.1}   {:>6.2}x{}",
+                tiled / marlin,
+                if marlin_used {
+                    ""
+                } else {
+                    " (M=1 stays on GEMV)"
+                }
+            );
+        }
+        // SAFETY: clear the flag so it cannot leak into other tests.
+        unsafe {
+            std::env::remove_var("ONNX_GENAI_MARLIN_M_GT_1");
+        }
+
+        // SAFETY: every pointer came from this runtime's alloc_raw, freed once.
+        unsafe {
+            runtime.free_raw(activation_dev).unwrap();
+            runtime.free_raw(packed_dev).unwrap();
+            runtime.free_raw(scales_dev).unwrap();
+            runtime.free_raw(zp_dev).unwrap();
+            runtime.free_raw(output_dev).unwrap();
+        }
+    }
+
+    /// Parity of the fused RMS-norm + Marlin M>1 path against the already-trusted
+    /// fused RMS-norm + tiled GEMM. Both share the identical `launch_rmsnorm_prefill`
+    /// staging, so the residual isolates the tensor-core GEMM's reordered
+    /// accumulation. Drives the real op: flag off → tiled reference, flag on →
+    /// Marlin; compares within the relayout tolerance.
+    #[test]
+    #[ignore = "requires an SM80+ CUDA device"]
+    fn marlin_m_gt_1_rmsnorm_op_parity() {
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping Marlin M>1 rmsnorm parity: CUDA runtime unavailable");
+            return;
+        };
+        if runtime
+            .require_nvrtc_half_headers("marlin_m_gt_1_rmsnorm")
+            .is_err()
+            || !marlin_gemm::device_supports_marlin(runtime.capabilities().compute_capability())
+        {
+            eprintln!("skipping Marlin M>1 rmsnorm parity: headers unavailable or pre-SM80");
+            return;
+        }
+
+        let m = 8usize;
+        let k = 2048usize;
+        let n = 64usize;
+        let block_size = 128usize;
+        let k_blocks = k / block_size;
+        let blob_size = block_size / 2;
+        let zp_row_bytes = k_blocks.div_ceil(2);
+
+        let mut state = 0x0bad_c0de_feed_face_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+
+        let mut activation = vec![f16::ZERO; m * k];
+        for h in activation.iter_mut() {
+            *h = f16::from_f32(next());
+        }
+        let mut packed = vec![0u8; n * k_blocks * blob_size];
+        for byte in packed.iter_mut() {
+            *byte = ((next() * 0.5 + 0.5) * 255.0) as u8;
+        }
+        let mut zp_packed = vec![0u8; n * zp_row_bytes];
+        for byte in zp_packed.iter_mut() {
+            *byte = ((next() * 0.5 + 0.5) * 255.0) as u8;
+        }
+        let mut scale_f16 = vec![f16::ZERO; n * k_blocks];
+        for h in scale_f16.iter_mut() {
+            *h = f16::from_f32(0.015 + 0.01 * (next() * 0.5 + 0.5));
+        }
+        let mut gamma = vec![f16::ZERO; k];
+        for h in gamma.iter_mut() {
+            *h = f16::from_f32(0.5 + 0.5 * (next() * 0.5 + 0.5));
+        }
+
+        let activation_dev = runtime.alloc_raw(activation.len() * 2).unwrap();
+        let packed_dev = runtime.alloc_raw(packed.len()).unwrap();
+        let scales_dev = runtime.alloc_raw(scale_f16.len() * 2).unwrap();
+        let zp_dev = runtime.alloc_raw(zp_packed.len()).unwrap();
+        let gamma_dev = runtime.alloc_raw(gamma.len() * 2).unwrap();
+        let output_dev = runtime.alloc_raw(m * n * 2).unwrap();
+        // SAFETY: buffers sized to their sources.
+        unsafe {
+            runtime.htod(as_bytes(&activation), activation_dev).unwrap();
+            runtime.htod(&packed, packed_dev).unwrap();
+            runtime.htod(as_bytes(&scale_f16), scales_dev).unwrap();
+            runtime.htod(&zp_packed, zp_dev).unwrap();
+            runtime.htod(as_bytes(&gamma), gamma_dev).unwrap();
+        }
+
+        let device = DeviceId::cuda(0);
+        let a_shape = [m, k];
+        let a_strides = [k as i64, 1];
+        let b_shape = [n, k_blocks, blob_size];
+        let b_strides = [(k_blocks * blob_size) as i64, blob_size as i64, 1];
+        let scales_shape = [n, k_blocks];
+        let scales_strides = [k_blocks as i64, 1];
+        let zp_shape = [n, zp_row_bytes];
+        let zp_strides = [zp_row_bytes as i64, 1];
+        let gamma_shape = [k];
+        let gamma_strides = [1i64];
+        let y_shape = [m, n];
+        let y_strides = [n as i64, 1];
+
+        // Slots: 3=zero_points, 4=g_idx (absent), 5=bias (absent), 6=gamma.
+        let inputs = vec![
+            TensorView::new(
+                device_ptr(activation_dev),
+                DataType::Float16,
+                &a_shape,
+                &a_strides,
+                device,
+            ),
+            TensorView::new(
+                device_ptr(packed_dev),
+                DataType::Uint8,
+                &b_shape,
+                &b_strides,
+                device,
+            ),
+            TensorView::new(
+                device_ptr(scales_dev),
+                DataType::Float16,
+                &scales_shape,
+                &scales_strides,
+                device,
+            ),
+            TensorView::new(
+                device_ptr(zp_dev),
+                DataType::Uint8,
+                &zp_shape,
+                &zp_strides,
+                device,
+            ),
+            TensorView::absent(DataType::Int32),
+            TensorView::absent(DataType::Float16),
+            TensorView::new(
+                device_ptr(gamma_dev),
+                DataType::Float16,
+                &gamma_shape,
+                &gamma_strides,
+                device,
+            ),
+        ];
+
+        let kernel = MatMulNBitsKernel {
+            runtime: runtime.clone(),
+            k,
+            n,
+            bits: 4,
+            block_size,
+            accuracy_level: 4,
+            accuracy4_workspace: None,
+            fold_bias_post_round: false,
+            gate_up_swiglu: false,
+            decomposed_silu: false,
+            rmsnorm_prologue: true,
+            rmsnorm_epsilon: 1e-5,
+            last_call_capture_safe: AtomicBool::new(false),
+            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+        };
+
+        let run = |want_marlin: bool| -> Vec<f16> {
+            // SAFETY: serial ignored GPU test; flag toggling is race-free here.
+            unsafe {
+                if want_marlin {
+                    std::env::set_var("ONNX_GENAI_MARLIN_M_GT_1", "1");
+                } else {
+                    std::env::remove_var("ONNX_GENAI_MARLIN_M_GT_1");
+                }
+            }
+            let mut outputs = [TensorMut::new(
+                device_ptr_mut(output_dev),
+                DataType::Float16,
+                &y_shape,
+                &y_strides,
+                device,
+            )];
+            kernel.run(&inputs, &mut outputs, None).unwrap();
+            runtime.synchronize().unwrap();
+            let mut got = vec![f16::ZERO; m * n];
+            // SAFETY: `output_dev` holds `m * n` fp16 values.
+            unsafe {
+                runtime.dtoh(as_bytes_mut(&mut got), output_dev).unwrap();
+            }
+            got
+        };
+
+        let tiled = run(false);
+        let marlin = run(true);
+        // SAFETY: reset the flag so it cannot leak into other tests.
+        unsafe {
+            std::env::remove_var("ONNX_GENAI_MARLIN_M_GT_1");
+        }
+
+        // SAFETY: every pointer came from this runtime's alloc_raw, freed once.
+        unsafe {
+            runtime.free_raw(activation_dev).unwrap();
+            runtime.free_raw(packed_dev).unwrap();
+            runtime.free_raw(scales_dev).unwrap();
+            runtime.free_raw(zp_dev).unwrap();
+            runtime.free_raw(gamma_dev).unwrap();
+            runtime.free_raw(output_dev).unwrap();
+        }
+
+        let mut worst_abs = 0.0f32;
+        let mut max_out = 0.0f32;
+        for (mv, tv) in marlin.iter().zip(tiled.iter()) {
+            let mf = mv.to_f32();
+            let tf = tv.to_f32();
+            assert!(mf.is_finite(), "Marlin rmsnorm output must be finite");
+            worst_abs = worst_abs.max((mf - tf).abs());
+            max_out = max_out.max(tf.abs());
+        }
+        let tol = 2e-2 * max_out.max(1e-3);
+        eprintln!(
+            "Marlin M>1 rmsnorm parity: worst_abs={worst_abs:.5}, max_out={max_out:.5}, tol={tol:.5}"
+        );
+        assert!(
+            worst_abs <= tol,
+            "fused rmsnorm Marlin output diverges from tiled: worst_abs={worst_abs} > tol={tol}"
+        );
+    }
+
+    /// Gate/up SwiGLU MLP fusion parity + capture-safety for the Marlin M>1 path.
+    /// Drives the real fused op (gate_up_swiglu = true) with the flag off (tiled
+    /// two-GEMM + SiluMul reference) then on (paired Marlin GEMMs + the identical
+    /// SiluMul), and asserts the outputs match within the relayout tolerance.
+    /// Also checks the capture-safety contract on the plain (no-gamma) variant:
+    /// cold call allocates pooled weights/scratch and is NOT capture-safe; a warm
+    /// replay reuses them and IS capture-safe with byte-identical output.
+    fn run_marlin_gate_up_parity(with_gamma: bool, decomposed: bool, check_capture: bool) {
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping Marlin gate/up parity: CUDA runtime unavailable");
+            return;
+        };
+        if runtime
+            .require_nvrtc_half_headers("marlin_gate_up")
+            .is_err()
+            || !marlin_gemm::device_supports_marlin(runtime.capabilities().compute_capability())
+        {
+            eprintln!("skipping Marlin gate/up parity: headers unavailable or pre-SM80");
+            return;
+        }
+
+        let m = 8usize;
+        let k = 1024usize;
+        let n = 256usize;
+        let block_size = 32usize;
+        let k_blocks = k / block_size;
+        let blob_size = block_size / 2;
+        let zp_row_bytes = (k_blocks * 4).div_ceil(8);
+
+        let mut state = 0xa5a5_1234_dead_beef_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+
+        let mut activation = vec![f16::ZERO; m * k];
+        for h in activation.iter_mut() {
+            *h = f16::from_f32(next() * 0.5);
+        }
+        let mut make_weights = |scale: f32| {
+            let mut packed = vec![0u8; n * k_blocks * blob_size];
+            for byte in packed.iter_mut() {
+                *byte = ((next() * 0.5 + 0.5) * 255.0) as u8;
+            }
+            let mut scales = vec![f16::ZERO; n * k_blocks];
+            for h in scales.iter_mut() {
+                *h = f16::from_f32(scale * (0.5 + 0.5 * (next() * 0.5 + 0.5)));
+            }
+            let mut zp = vec![0u8; n * zp_row_bytes];
+            for byte in zp.iter_mut() {
+                *byte = ((next() * 0.5 + 0.5) * 255.0) as u8;
+            }
+            (packed, scales, zp)
+        };
+        // Modest weight magnitudes so silu stays in a well-conditioned range.
+        let (packed_gate, scales_gate, zp_gate) = make_weights(0.02);
+        let (packed_up, scales_up, zp_up) = make_weights(0.02);
+        let mut gamma = vec![f16::ZERO; k];
+        for h in gamma.iter_mut() {
+            *h = f16::from_f32(0.5 + 0.5 * (next() * 0.5 + 0.5));
+        }
+
+        let activation_dev = runtime.alloc_raw(activation.len() * 2).unwrap();
+        let packed_gate_dev = runtime.alloc_raw(packed_gate.len()).unwrap();
+        let scales_gate_dev = runtime.alloc_raw(scales_gate.len() * 2).unwrap();
+        let packed_up_dev = runtime.alloc_raw(packed_up.len()).unwrap();
+        let scales_up_dev = runtime.alloc_raw(scales_up.len() * 2).unwrap();
+        let zp_gate_dev = runtime.alloc_raw(zp_gate.len()).unwrap();
+        let zp_up_dev = runtime.alloc_raw(zp_up.len()).unwrap();
+        let gamma_dev = runtime.alloc_raw(gamma.len() * 2).unwrap();
+        let output_dev = runtime.alloc_raw(m * n * 2).unwrap();
+        // SAFETY: buffers sized to their sources.
+        unsafe {
+            runtime.htod(as_bytes(&activation), activation_dev).unwrap();
+            runtime.htod(&packed_gate, packed_gate_dev).unwrap();
+            runtime
+                .htod(as_bytes(&scales_gate), scales_gate_dev)
+                .unwrap();
+            runtime.htod(&packed_up, packed_up_dev).unwrap();
+            runtime.htod(as_bytes(&scales_up), scales_up_dev).unwrap();
+            runtime.htod(&zp_gate, zp_gate_dev).unwrap();
+            runtime.htod(&zp_up, zp_up_dev).unwrap();
+            runtime.htod(as_bytes(&gamma), gamma_dev).unwrap();
+        }
+
+        let device = DeviceId::cuda(0);
+        let a_shape = [m, k];
+        let a_strides = [k as i64, 1];
+        let b_shape = [n, k_blocks, blob_size];
+        let b_strides = [(k_blocks * blob_size) as i64, blob_size as i64, 1];
+        let scales_shape = [n, k_blocks];
+        let scales_strides = [k_blocks as i64, 1];
+        let zp_shape = [n, zp_row_bytes];
+        let zp_strides = [zp_row_bytes as i64, 1];
+        let gamma_shape = [k];
+        let gamma_strides = [1i64];
+        let y_shape = [m, n];
+        let y_strides = [n as i64, 1];
+
+        // [x, W_gate, scales_gate, W_up, scales_up, gamma@5, zp_gate@6, zp_up@7]
+        let mut inputs = vec![
+            TensorView::new(
+                device_ptr(activation_dev),
+                DataType::Float16,
+                &a_shape,
+                &a_strides,
+                device,
+            ),
+            TensorView::new(
+                device_ptr(packed_gate_dev),
+                DataType::Uint8,
+                &b_shape,
+                &b_strides,
+                device,
+            ),
+            TensorView::new(
+                device_ptr(scales_gate_dev),
+                DataType::Float16,
+                &scales_shape,
+                &scales_strides,
+                device,
+            ),
+            TensorView::new(
+                device_ptr(packed_up_dev),
+                DataType::Uint8,
+                &b_shape,
+                &b_strides,
+                device,
+            ),
+            TensorView::new(
+                device_ptr(scales_up_dev),
+                DataType::Float16,
+                &scales_shape,
+                &scales_strides,
+                device,
+            ),
+        ];
+        if with_gamma {
+            inputs.push(TensorView::new(
+                device_ptr(gamma_dev),
+                DataType::Float16,
+                &gamma_shape,
+                &gamma_strides,
+                device,
+            ));
+        } else {
+            inputs.push(TensorView::absent(DataType::Float16));
+        }
+        inputs.push(TensorView::new(
+            device_ptr(zp_gate_dev),
+            DataType::Uint8,
+            &zp_shape,
+            &zp_strides,
+            device,
+        ));
+        inputs.push(TensorView::new(
+            device_ptr(zp_up_dev),
+            DataType::Uint8,
+            &zp_shape,
+            &zp_strides,
+            device,
+        ));
+
+        let kernel = MatMulNBitsKernel {
+            runtime: runtime.clone(),
+            k,
+            n,
+            bits: 4,
+            block_size,
+            accuracy_level: 4,
+            accuracy4_workspace: None,
+            fold_bias_post_round: false,
+            gate_up_swiglu: true,
+            decomposed_silu: decomposed,
+            rmsnorm_prologue: with_gamma,
+            rmsnorm_epsilon: 1e-5,
+            last_call_capture_safe: AtomicBool::new(false),
+            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+        };
+
+        let run = |want_marlin: bool| -> Vec<f16> {
+            // SAFETY: serial ignored GPU test; flag toggling is race-free here.
+            unsafe {
+                if want_marlin {
+                    std::env::set_var("ONNX_GENAI_MARLIN_M_GT_1", "1");
+                } else {
+                    std::env::remove_var("ONNX_GENAI_MARLIN_M_GT_1");
+                }
+            }
+            let mut outputs = [TensorMut::new(
+                device_ptr_mut(output_dev),
+                DataType::Float16,
+                &y_shape,
+                &y_strides,
+                device,
+            )];
+            kernel.run(&inputs, &mut outputs, None).unwrap();
+            runtime.synchronize().unwrap();
+            let mut got = vec![f16::ZERO; m * n];
+            // SAFETY: `output_dev` holds `m * n` fp16 values.
+            unsafe {
+                runtime.dtoh(as_bytes_mut(&mut got), output_dev).unwrap();
+            }
+            got
+        };
+
+        let tiled = run(false);
+        let marlin_cold = run(true);
+        let cold_safe = kernel.last_call_capture_safe.load(Ordering::Relaxed);
+        let marlin_warm = run(true);
+        let warm_safe = kernel.last_call_capture_safe.load(Ordering::Relaxed);
+        // SAFETY: clear the flag so it cannot leak into other tests.
+        unsafe {
+            std::env::remove_var("ONNX_GENAI_MARLIN_M_GT_1");
+        }
+
+        // SAFETY: every pointer came from this runtime's alloc_raw, freed once.
+        unsafe {
+            runtime.free_raw(activation_dev).unwrap();
+            runtime.free_raw(packed_gate_dev).unwrap();
+            runtime.free_raw(scales_gate_dev).unwrap();
+            runtime.free_raw(packed_up_dev).unwrap();
+            runtime.free_raw(scales_up_dev).unwrap();
+            runtime.free_raw(zp_gate_dev).unwrap();
+            runtime.free_raw(zp_up_dev).unwrap();
+            runtime.free_raw(gamma_dev).unwrap();
+            runtime.free_raw(output_dev).unwrap();
+        }
+
+        let mut worst_abs = 0.0f32;
+        let mut max_out = 0.0f32;
+        for (mv, tv) in marlin_warm.iter().zip(tiled.iter()) {
+            let mf = mv.to_f32();
+            let tf = tv.to_f32();
+            assert!(mf.is_finite(), "Marlin gate/up output must be finite");
+            worst_abs = worst_abs.max((mf - tf).abs());
+            max_out = max_out.max(tf.abs());
+        }
+        let tol = 3e-2 * max_out.max(1e-3);
+        eprintln!(
+            "Marlin gate/up parity (gamma={with_gamma}, decomposed={decomposed}): \
+             worst_abs={worst_abs:.5}, max_out={max_out:.5}, tol={tol:.5}, \
+             cold_safe={cold_safe}, warm_safe={warm_safe}"
+        );
+        assert!(
+            worst_abs <= tol,
+            "Marlin gate/up output diverges from tiled: worst_abs={worst_abs} > tol={tol}"
+        );
+        assert_eq!(
+            marlin_cold, marlin_warm,
+            "warm gate/up Marlin replay must be byte-identical to the cold run"
+        );
+        if check_capture {
+            // The cold-miss (NOT capture-safe) contract is asserted with
+            // guaranteed-unique buffers in `marlin_m_gt_1_op_parity_and_capture_safety`.
+            // Here the module-global repack/scratch pools may already be warm from a
+            // prior test (freed device addresses get reused), so only the positive
+            // guarantee — a warm replay IS capture-safe — is order-independent.
+            assert!(
+                warm_safe,
+                "warm gate/up Marlin call reuses pooled buffers and must be capture-safe"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an SM80+ CUDA device"]
+    fn marlin_gate_up_swiglu_matches_tiled_plain() {
+        run_marlin_gate_up_parity(false, false, true);
+    }
+
+    #[test]
+    #[ignore = "requires an SM80+ CUDA device"]
+    fn marlin_gate_up_swiglu_matches_tiled_rmsnorm() {
+        run_marlin_gate_up_parity(true, false, true);
+    }
+
+    #[test]
+    #[ignore = "requires an SM80+ CUDA device"]
+    fn marlin_gate_up_decomposed_swiglu_matches_tiled_rmsnorm() {
+        run_marlin_gate_up_parity(true, true, false);
     }
 
     fn device_ptr(raw: CUdeviceptr) -> DevicePtr {
@@ -7407,6 +8547,274 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             max_out = max_out.max(e.abs());
         }
         (worst_abs, worst_rel, max_out, all_finite)
+    }
+
+    /// Op-level parity + capture-safety for the opt-in Marlin M>1 tensor-core
+    /// GEMM. Drives the real `MatMulNBitsKernel::run` dispatch with
+    /// `ONNX_GENAI_MARLIN_M_GT_1=1` so the `m > 1` seam routes to Marlin,
+    /// exercising eligibility gating, the device repack + module-level cache, and
+    /// the launch. Validates the output against an f64 dequant→GEMM oracle
+    /// (asymmetric zero points) within the relayout tolerance, and asserts the
+    /// capture-safety contract: the first (cold) call repacks and reports
+    /// NOT-capture-safe, while an identical second call hits the warm cache and
+    /// reports capture-safe with byte-identical output.
+    #[test]
+    #[ignore = "requires an SM80+ CUDA device"]
+    fn marlin_m_gt_1_op_parity_and_capture_safety() {
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping Marlin M>1 op parity: CUDA runtime unavailable");
+            return;
+        };
+        if runtime
+            .require_nvrtc_half_headers("marlin_m_gt_1_op_parity")
+            .is_err()
+        {
+            eprintln!("skipping Marlin M>1 op parity: fp16 NVRTC headers unavailable");
+            return;
+        }
+        if !marlin_gemm::device_supports_marlin(runtime.capabilities().compute_capability()) {
+            eprintln!("skipping Marlin M>1 op parity: device is pre-SM80");
+            return;
+        }
+
+        let m = 8usize;
+        let k = 4096usize;
+        let n = 70usize;
+        let block_size = 128usize;
+        let k_blocks = k / block_size;
+        let blob_size = block_size / 2;
+        let zp_row_bytes = k_blocks.div_ceil(2);
+
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+
+        let mut activation_f16 = vec![f16::ZERO; m * k];
+        let mut activation_ref = vec![0.0f32; m * k];
+        for (h, f) in activation_f16.iter_mut().zip(activation_ref.iter_mut()) {
+            let value = f16::from_f32(next());
+            *h = value;
+            *f = value.to_f32();
+        }
+
+        let mut quant = vec![0u8; n * k];
+        for value in quant.iter_mut() {
+            *value = ((next() * 0.5 + 0.5) * 15.0).round().clamp(0.0, 15.0) as u8;
+        }
+        let mut packed = vec![0u8; n * k_blocks * blob_size];
+        for col in 0..n {
+            for block in 0..k_blocks {
+                for pair in 0..blob_size {
+                    let low = quant[col * k + block * block_size + pair * 2] & 15;
+                    let high = quant[col * k + block * block_size + pair * 2 + 1] & 15;
+                    packed[(col * k_blocks + block) * blob_size + pair] = low | (high << 4);
+                }
+            }
+        }
+
+        // Asymmetric per-(col, block) zero points, nibble-packed as the kernel
+        // unpacks them (low nibble for even blocks).
+        let mut zp_codes = vec![0i32; n * k_blocks];
+        let mut zp_packed = vec![0u8; n * zp_row_bytes];
+        for code in zp_codes.iter_mut() {
+            *code = ((next() * 0.5 + 0.5) * 15.0).round().clamp(0.0, 15.0) as i32;
+        }
+        for col in 0..n {
+            for block in 0..k_blocks {
+                let code = (zp_codes[col * k_blocks + block] & 15) as u8;
+                let byte = &mut zp_packed[col * zp_row_bytes + block / 2];
+                if block & 1 == 0 {
+                    *byte = (*byte & 0xf0) | code;
+                } else {
+                    *byte = (*byte & 0x0f) | (code << 4);
+                }
+            }
+        }
+
+        let mut scale_ref = vec![0.0f32; n * k_blocks];
+        let mut scale_f16 = vec![f16::ZERO; n * k_blocks];
+        for i in 0..n * k_blocks {
+            let h = f16::from_f32(0.015 + 0.01 * (next() * 0.5 + 0.5));
+            scale_f16[i] = h;
+            scale_ref[i] = h.to_f32();
+        }
+
+        // f64 dequant→GEMM oracle: Y[row, col] = sum_k a[row,k] * (code-zp) * scale.
+        let mut expected = vec![0.0f32; m * n];
+        for row in 0..m {
+            for col in 0..n {
+                let mut acc = 0.0f64;
+                for block in 0..k_blocks {
+                    let scale = scale_ref[col * k_blocks + block] as f64;
+                    let zp = zp_codes[col * k_blocks + block];
+                    for within in 0..block_size {
+                        let depth = block * block_size + within;
+                        let q = quant[col * k + depth] as i32 - zp;
+                        acc += activation_ref[row * k + depth] as f64 * q as f64 * scale;
+                    }
+                }
+                expected[row * n + col] = acc as f32;
+            }
+        }
+
+        let activation_dev = runtime.alloc_raw(activation_f16.len() * 2).unwrap();
+        let packed_dev = runtime.alloc_raw(packed.len()).unwrap();
+        let scales_dev = runtime.alloc_raw(scale_f16.len() * 2).unwrap();
+        let zp_dev = runtime.alloc_raw(zp_packed.len()).unwrap();
+        let output_dev = runtime.alloc_raw(m * n * 2).unwrap();
+        // SAFETY: device buffers were sized to hold each source slice.
+        unsafe {
+            runtime
+                .htod(as_bytes(&activation_f16), activation_dev)
+                .unwrap();
+            runtime.htod(&packed, packed_dev).unwrap();
+            runtime.htod(as_bytes(&scale_f16), scales_dev).unwrap();
+            runtime.htod(&zp_packed, zp_dev).unwrap();
+        }
+
+        let device = DeviceId::cuda(0);
+        let a_shape = [m, k];
+        let a_strides = [k as i64, 1];
+        let b_shape = [n, k_blocks, blob_size];
+        let b_strides = [(k_blocks * blob_size) as i64, blob_size as i64, 1];
+        let scales_shape = [n, k_blocks];
+        let scales_strides = [k_blocks as i64, 1];
+        let zp_shape = [n, zp_row_bytes];
+        let zp_strides = [zp_row_bytes as i64, 1];
+        let y_shape = [m, n];
+        let y_strides = [n as i64, 1];
+
+        let inputs = vec![
+            TensorView::new(
+                device_ptr(activation_dev),
+                DataType::Float16,
+                &a_shape,
+                &a_strides,
+                device,
+            ),
+            TensorView::new(
+                device_ptr(packed_dev),
+                DataType::Uint8,
+                &b_shape,
+                &b_strides,
+                device,
+            ),
+            TensorView::new(
+                device_ptr(scales_dev),
+                DataType::Float16,
+                &scales_shape,
+                &scales_strides,
+                device,
+            ),
+            TensorView::new(
+                device_ptr(zp_dev),
+                DataType::Uint8,
+                &zp_shape,
+                &zp_strides,
+                device,
+            ),
+        ];
+
+        let kernel = MatMulNBitsKernel {
+            runtime: runtime.clone(),
+            k,
+            n,
+            bits: 4,
+            block_size,
+            accuracy_level: 4,
+            accuracy4_workspace: None,
+            fold_bias_post_round: false,
+            gate_up_swiglu: false,
+            decomposed_silu: false,
+            rmsnorm_prologue: false,
+            rmsnorm_epsilon: 1e-5,
+            last_call_capture_safe: AtomicBool::new(false),
+            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+        };
+
+        // Enable the opt-in Marlin path for the duration of this test.
+        // SAFETY: this ignored GPU test runs serially; no other thread reads the
+        // flag concurrently.
+        unsafe {
+            std::env::set_var("ONNX_GENAI_MARLIN_M_GT_1", "1");
+        }
+
+        let run_once = |capture_expectation: &str| -> Vec<f16> {
+            let mut outputs = [TensorMut::new(
+                device_ptr_mut(output_dev),
+                DataType::Float16,
+                &y_shape,
+                &y_strides,
+                device,
+            )];
+            kernel.run(&inputs, &mut outputs, None).unwrap();
+            runtime.synchronize().unwrap();
+            let mut got = vec![f16::ZERO; m * n];
+            // SAFETY: `output_dev` holds `m * n` fp16 values.
+            unsafe {
+                runtime.dtoh(as_bytes_mut(&mut got), output_dev).unwrap();
+            }
+            eprintln!(
+                "Marlin M>1 op {capture_expectation}: capture_safe={}",
+                kernel.last_call_capture_safe.load(Ordering::Relaxed)
+            );
+            got
+        };
+
+        // First call: cold repack ⇒ allocates ⇒ reported NOT capture-safe.
+        let got_cold = run_once("cold");
+        assert!(
+            !kernel.last_call_capture_safe.load(Ordering::Relaxed),
+            "cold Marlin call performs the repack allocation and must report NOT capture-safe"
+        );
+
+        // Second identical call: warm cache ⇒ no alloc ⇒ capture-safe, and the
+        // static-grid kernel is deterministic so the bytes match exactly.
+        let got_warm = run_once("warm");
+        assert!(
+            kernel.last_call_capture_safe.load(Ordering::Relaxed),
+            "warm Marlin call reuses the cached repack and must report capture-safe"
+        );
+        assert_eq!(
+            got_cold, got_warm,
+            "warm replay of the static-grid Marlin kernel must be byte-identical to the cold run"
+        );
+
+        // SAFETY: reset the process-global flag so it cannot leak into other tests.
+        unsafe {
+            std::env::remove_var("ONNX_GENAI_MARLIN_M_GT_1");
+        }
+
+        // SAFETY: each pointer came from this runtime's `alloc_raw`, freed once.
+        unsafe {
+            runtime.free_raw(activation_dev).unwrap();
+            runtime.free_raw(packed_dev).unwrap();
+            runtime.free_raw(scales_dev).unwrap();
+            runtime.free_raw(zp_dev).unwrap();
+            runtime.free_raw(output_dev).unwrap();
+        }
+
+        let mut worst_abs = 0.0f32;
+        let mut max_out = 0.0f32;
+        for (g16, e) in got_warm.iter().zip(expected.iter()) {
+            let g = g16.to_f32();
+            assert!(g.is_finite(), "Marlin M>1 output must be finite");
+            worst_abs = worst_abs.max((g - e).abs());
+            max_out = max_out.max(e.abs());
+        }
+        let tol = 2e-2 * max_out.max(1e-3);
+        eprintln!(
+            "Marlin M>1 op parity: worst_abs={worst_abs:.5}, max_out={max_out:.5}, tol={tol:.5}"
+        );
+        assert!(
+            worst_abs <= tol,
+            "Marlin M>1 op output exceeds tolerance: worst_abs={worst_abs} > tol={tol}"
+        );
     }
 
     fn zc_env_usize(key: &str, default: usize) -> usize {

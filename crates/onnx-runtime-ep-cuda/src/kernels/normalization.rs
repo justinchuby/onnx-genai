@@ -2295,17 +2295,20 @@ impl SkipSimplifiedLayerNormKernel {
         };
         unsafe { builder.launch(cfg) }
             .map_err(|e| driver_err(&format!("launch {}", selection.entry), e))?;
-        // Unlike the plain RMS/LayerNorm kernels, this fused residual norm is
-        // kept single-group for capture on purpose. It normalizes the hidden
-        // (last) axis per token, so decode — the only phase that captures — is
-        // always num_groups == 1; a fixed multi-group shape would only ever
-        // arise in the uncaptured prefill. Its capture drift is guarded by the
-        // shape-keyed `SkipBroadcastMetadataCache` (which rejects a shape change
-        // mid-capture) rather than a dtype-encoding `NormCaptureSignature`, so
-        // admitting multi-group here would broaden capture with no decode
-        // benefit and weaker drift detection. Left conservative by design.
-        self.last_call_capture_safe
-            .store(num_groups == 1, Ordering::Relaxed);
+        // Capture-safety at query-width > 1 (speculative-decode M=K). The launch
+        // grid is static (`groups_u` fixed for a fixed shape), no mid-kernel
+        // sync / host read-back / device alloc-free happens on the hot path, and
+        // the shape-keyed `SkipBroadcastMetadataCache` already rejects any
+        // shape change (which includes a change in `num_groups`, since it keys on
+        // the full input/skip shape) mid-capture — the same pre-warmed
+        // cold-miss safety valve the Marlin repack cache uses. So a fixed,
+        // pre-warmed M=K shape records and replays safely just like decode's
+        // M=1; the earlier `num_groups == 1` restriction was conservative, not a
+        // real capture hazard, and kept every batched (speculative-verify /
+        // prefill) node declaring KernelCaptureUnsupported. The bf16 staging path
+        // additionally demotes when its arena grows during capture (see
+        // `run_bf16_via_f32`).
+        self.last_call_capture_safe.store(true, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -2322,7 +2325,7 @@ impl Kernel for SkipSimplifiedLayerNormKernel {
             onnx_runtime_ep_api::CaptureSupport::Supported
         } else {
             onnx_runtime_ep_api::CaptureSupport::unsupported(
-                "SkipSimplifiedLayerNormalization shape/dtype signature does not match the warmed single-group capture signature",
+                "SkipSimplifiedLayerNormalization shape/dtype signature does not match the warmed capture signature (pre-warm the fixed M=K shape before capture)",
             )
         }
     }

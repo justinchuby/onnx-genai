@@ -2265,6 +2265,71 @@ least speculative to most speculative:
 Prediction must be optional and budgeted. It must not evict a leased expert or a
 demonstrably hotter resident expert merely to chase a weak prediction.
 
+### 3.7 The CPU path holds a dequantised f32 copy, and nothing checks whether it fits
+
+Measured 2026-08-14 on a 20-CPU / 63.8 GiB Windows box, CPU-only native build
+(`--no-default-features --features native-backend`), peak `PeakWorkingSet64`
+sampled to process exit.
+
+The CPU `MatMulNBits` kernel keeps a **session-resident** dequantised f32 copy of
+the weights (`weight_nk: OnceLock<Vec<f32>>`), built on the first `m == 1` decode
+step. The original packed int4 stays resident alongside it — added, not swapped.
+
+qwen2.5-0.5b int4, 353 MB on disk:
+
+| tokens generated | peak working set | ratio |
+|---|---|---|
+| 1 (prefill only, cache not yet built) | 982 MB | 2.87× |
+| 4 | 2,752 MB | **8.05×** |
+| 20 | 2,751 MB | 8.04× |
+
+Flat with token count, so this is a one-time resident materialisation rather than
+a per-token or prefill-only spike. 8.05× is exactly int4 → f32.
+
+**It is a deliberate trade, not a defect.** `matmul_nbits.rs` already carries
+several packed paths (`packed_int4_weight`, `packed_int4_n16_weight`,
+`packed_kai_qsi4_weight` for ARM SDOT, `packed_u8_weight`, `mlas_packed`), and its
+header documents that symmetric block-32 int4 at `accuracy_level=4` streams packed
+weights straight into VNNI. The f32 cache is the **fallback for shapes those paths
+do not cover**, and it is faster than dequantising per token:
+
+| model | on disk | peak WS | ratio | decode |
+|---|---|---|---|---|
+| qwen05b-q4 (zero-point / asymmetric) | 353 MB | 2,752 MB | 7.80× | **105.4 ms/tok** |
+| qwen2.5-0.5b-q4_0 (symmetric) | 362 MB | **430 MB** | **1.19×** | 248.5 ms/tok |
+
+So the cache buys ~2.4× decode for ~8× footprint.
+
+**The defect is that the trade is taken unconditionally.** Its value inverts
+violently with fit:
+
+- Fits: worth ~2.4×.
+- Does not fit: 8.33 GB of int4 becomes ~66 GB, the box pages, and decode collapses
+  to ~102 s/token — roughly **50× worse** than not caching. This is the whole of the
+  14B cliff recorded in #959, and it is neither a kernel nor a threading problem.
+
+Two consequences for everything above in this chapter:
+
+1. **`total_weight_bytes` is not the resident size.** It reports the on-disk int4
+   figure (8,330,595,870 for the 14B) while the session resides at ~8× that for
+   asymmetric models. Every fit/no-fit verdict, and the KV budget derived from
+   "capacity minus weights", is computed against a number 8× too small.
+2. **Enforcing a memory limit (#955) would therefore enforce the wrong number.**
+   Truthful accounting is upstream of enforcement, not parallel to it.
+
+Tracked in #971. The intended fix is to make the cache a governed decision — take
+it when the expanded footprint fits the budget, fall back to on-the-fly
+dequantisation when it does not, and report which was chosen — rather than removing
+it (which would cost 2.4× on every model that does fit).
+
+**Workaround available today:** symmetric block-32 int4 rather than zero-point
+quantisation, at 1.19× instead of 7.80×. For a 14B that is roughly 8.3 GB resident
+instead of ~66 GB.
+
+**Not established:** whether the expansion is f32 for every tensor (8.05× is
+consistent with it, but was derived from a whole-process peak, not per-tensor);
+and why ORT's own CPU path also peaks at 5.9× on the same model.
+
 ---
 
 ## 4. Layer 3a: DeviceGovernor (Per Compute Unit — Exclusive Memory)

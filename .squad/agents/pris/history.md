@@ -52,3 +52,17 @@ Earlier detailed history archived in `history-archive.md`. Pre-compaction summar
 **Action:** Fixed stale FEAT_FP16 comment in `mlas.h`. Pushed commit `a0a9d98`. Proposed PR body rewrite.
 
 **Head SHA:** `a0a9d98`
+
+## 2026-08-14 — Marlin int4 numerics gate: reusable f64 dequant→GEMM oracle (#961, MERGED 401af46f)
+Landed a reusable f64 oracle test any int4 `MatMulNBits` GEMM must pass before shipping — the red/green
+target for Deckard's Marlin kernel and Chew's sign-off. Oracle dequantizes `(code-zp)·scale` and accumulates
+`Σ a·w` in f64, sharing the candidate's fp16-rounded activations + rounded scale so the residual isolates
+ONLY accumulation precision + fp16 output rounding (never shared input quant). Coverage: groups {16,32,64,128},
+sym + asym-zp, M∈{1,2,4,8,16,32}, real glm-4-9b + Qwen2.5 projection shapes, fp16/fp32 scales. Justified
+tolerance envelope (single source `Envelope::for_output(max_out)`): `abs=max(max_out·4e-3,4e-3)`, `rel=5e-2`
+(denominator floored `max(1e-1,3e-2·max_out)`) — ~8 fp16-ULP headroom, tight enough that a structural
+relayout/dequant bug blows it, loose enough to pass fp32 reassociation drift. Current tiled path measured
+~8–10× inside abs / ~6× inside rel (≈1 fp16 ULP). **Harness lesson (durable): pre-zero the output buffer +
+`runtime.synchronize()` after `execute`** — an un-synced run reading stale device-pool memory once faked an
+abs-81.8 catastrophic divergence; not a kernel bug. Marlin driver must follow the same sync/zero discipline.
+Chew concurred the tolerance is engineering-justified, not a rubber stamp.

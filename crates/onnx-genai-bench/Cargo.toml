@@ -128,5 +128,9 @@ required-features = ["bench-native"]
 name = "verify_logits_probe"
 required-features = ["bench-native"]
 
+[[bin]]
+name = "marlin_bench"
+required-features = ["bench-native", "cuda"]
+
 [lints]
 workspace = true

@@ -375,6 +375,59 @@ fn leverb_phase0_capture_probe() -> anyhow::Result<()> {
     };
 
     // ------------------------------------------------------------------
+    // PART E — CAPTURED-vs-EAGER TOKEN PARITY at M=K (and M=1) on REAL tokens.
+    // Fills the "captured M=K == eager M=K, same Marlin config, no tiled oracle"
+    // cell: run the identical M=K forward eagerly (pre-capture warm) and via the
+    // CAPTURED graph replay over the identical device bindings, then compare the
+    // per-row greedy argmax AND the raw logits bytes. Deterministic (same kernel,
+    // same inputs) → byte-identical expected; argmax equality is the token-level
+    // gate even if low-order bits ever differ.
+    // ------------------------------------------------------------------
+    let prompt_i64: Vec<i64> = prompt.iter().map(|&t| t as i64).collect();
+    let mut parity_pass = true;
+    for &m in &[K_MAX, 1usize] {
+        let mut sess = load(&model_dir, true, KV_MAX);
+        sess.decode(&prompt, 0)?;
+        for _ in 0..16 {
+            let past = sess.current_len();
+            sess.decode(&[1], past)?;
+        }
+        let p = sess.leverb_increment0_token_parity_attempt(m, &prompt_i64)?;
+        drop(sess);
+
+        if !p.captured {
+            eprintln!(
+                "[leverb-phase0][E] M={m} token-parity UNAVAILABLE: capture declined ({:?})",
+                p.decline
+            );
+            parity_pass = false;
+            continue;
+        }
+        let argmax_match = p.warm_argmax == p.replay_argmax;
+        parity_pass &= argmax_match;
+        eprintln!(
+            "[leverb-phase0][E] M={m} captured-vs-eager: argmax_match={argmax_match} logits_byte_identical={:?} segments={} rows={}",
+            p.logits_byte_identical, p.segments, p.rows
+        );
+        eprintln!(
+            "[leverb-phase0][E] M={m} eager  argmax = {:?}",
+            p.warm_argmax
+        );
+        eprintln!(
+            "[leverb-phase0][E] M={m} capture argmax = {:?}",
+            p.replay_argmax
+        );
+    }
+    eprintln!(
+        "[leverb-phase0][E] CAPTURED-vs-EAGER TOKEN PARITY = {}",
+        if parity_pass {
+            "PASS (captured == eager)"
+        } else {
+            "FAIL"
+        }
+    );
+
+    // ------------------------------------------------------------------
     // VERDICT
     // ------------------------------------------------------------------
     // (a) capture-safe: real M=K capture instantiated, OR (fallback evidence)

@@ -783,27 +783,36 @@ impl Engine {
         // `BatchedDecodeSession`: per-row `row_len`, `assign_row`/`deactivate_row`,
         // `step_select` with a per-row `advance_rows` mask and per-row
         // `position_ids`, and host `[B, 1, vocab]` logits fed to the host sampler
-        // (`advance_row` -> `select_next_token_with_rng`). The native CUDA
-        // persistent batch path is *uniform*: `DecodeCudaState::extend_mask`
-        // writes one identical mask window to every row and sets a single shared
-        // logical length, `decode_cuda_greedy_batch` steps every row at one shared
-        // position (`vec![past_len; batch]`), there is no per-row length, and the
-        // device-argmax fast path returns tokens, not logits. Genuinely different
-        // requests can be batched only when they share a length and step in
-        // lockstep (see `profile_native --solo-equivalence-prompts`, stage 2c);
-        // mid-flight backfill of finished rows would make the batch ragged, which
-        // the uniform path cannot represent. Wiring the manager onto native
-        // requires per-row mask/position/length generalization in
-        // native_decode/cuda.rs, tracked under #750 stage 2c.
+        // (`advance_row` -> `select_next_token_with_rng`).
+        //
+        // Stage 3a (#750) generalized the native CUDA persistent batch path
+        // *geometry* to ragged: `DecodeCudaState` now carries a per-row
+        // `row_lens`, `extend_mask_ragged` writes each row its own mask window,
+        // and `decode_cuda_greedy_batch_ragged` steps each row at its own
+        // `position_ids[r] = past_lens[r]` with a per-row `advances` mask, so
+        // genuinely different-length rows share one fused forward (verified by
+        // `profile_native --ragged-solo-equivalence-prompts`).
+        //
+        // What is still missing to wire the manager (stage 3b): the native path
+        // returns *device-argmax tokens*, not the host `[B, 1, vocab]` logits the
+        // `ContinuousBatchManager`'s host sampler consumes, and it has no
+        // mid-flight `assign_row`/`deactivate_row` to backfill a finished row with
+        // a freshly-admitted request (the ragged geometry represents rows at
+        // different lengths, but not swapping a row's content while its peers keep
+        // their captured graph). Until the host-logits sampler seam and row
+        // assign/deactivate land, the manager cannot drive native even though the
+        // ragged geometry it needs now exists.
         if self.decode_backend == EngineDecodeBackend::Native {
             anyhow::bail!(
                 "continuous batching is unavailable on the native decode backend: the \
-                 ContinuousBatchManager needs a ragged BatchedDecodeSession (per-row length, \
-                 per-row advance/position, host logits for the sampler), but the native CUDA \
-                 batch path is uniform (one shared mask window and one shared position per step, \
-                 no per-row length, device-argmax tokens not logits). Same-length lockstep \
-                 batching is exercised by `profile_native --solo-equivalence-prompts` (#750 \
-                 stage 2c); ragged continuous batching needs per-row cuda.rs generalization."
+                 ContinuousBatchManager needs a ragged BatchedDecodeSession with host \
+                 `[B, 1, vocab]` logits for its sampler and mid-flight assign_row/deactivate_row \
+                 to backfill finished rows. Stage 3a (#750) generalized the native CUDA batch \
+                 geometry to ragged (per-row length, per-row position, per-row mask via \
+                 `decode_cuda_greedy_batch_ragged`, verified by \
+                 `profile_native --ragged-solo-equivalence-prompts`), but the native path still \
+                 returns device-argmax tokens (not host logits) and has no row assign/deactivate \
+                 backfill, so the sampler and admission seams (stage 3b) are still required."
             );
         }
         let session = self
