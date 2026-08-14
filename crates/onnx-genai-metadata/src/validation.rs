@@ -185,7 +185,10 @@ fn collect_workflow_capabilities(node: &WorkflowNode, capabilities: &mut BTreeSe
             }
         }
         WorkflowNode::Emit {
-            mode, valid_length, ..
+            mode,
+            valid_length,
+            row_ids,
+            ..
         } => {
             capabilities.insert("typed_emit".to_string());
             if matches!(mode, crate::schema::WorkflowEmitMode::Event) {
@@ -193,6 +196,9 @@ fn collect_workflow_capabilities(node: &WorkflowNode, capabilities: &mut BTreeSe
             }
             if valid_length.is_some() {
                 capabilities.insert("emit_valid_length".to_string());
+            }
+            if row_ids.is_some() {
+                capabilities.insert("emit_row_identity".to_string());
             }
         }
         WorkflowNode::Transfer { .. } => {
@@ -923,6 +929,7 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
         "pipeline.workflow.steps",
         errors,
     );
+    validate_emit_identity_consistency(&compiled.graph, &mut BTreeMap::new(), errors);
     if let Some(serving) = &workflow.serving {
         if serving.kv_service.groups.is_empty() {
             errors.push(
@@ -1082,6 +1089,48 @@ fn workflow_state_results(node: &WorkflowNode) -> BTreeMap<String, String> {
 
 // Recursive validation threads each independent symbol/effect table explicitly.
 #[allow(clippy::too_many_arguments)]
+fn validate_emit_identity_consistency(
+    node: &WorkflowNode,
+    outputs: &mut BTreeMap<String, bool>,
+    errors: &mut Vec<String>,
+) {
+    match node {
+        WorkflowNode::Sequence { nodes } => {
+            for node in nodes {
+                validate_emit_identity_consistency(node, outputs, errors);
+            }
+        }
+        WorkflowNode::Loop { setup, body, .. } => {
+            validate_emit_identity_consistency(setup, outputs, errors);
+            validate_emit_identity_consistency(body, outputs, errors);
+        }
+        WorkflowNode::Branch { cases, default, .. } => {
+            for case in cases.values() {
+                validate_emit_identity_consistency(case, outputs, errors);
+            }
+            if let Some(default) = default {
+                validate_emit_identity_consistency(default, outputs, errors);
+            }
+        }
+        WorkflowNode::Emit {
+            output, row_ids, ..
+        } => {
+            let row_wise = row_ids.is_some();
+            if let Some(previous) = outputs.insert(output.clone(), row_wise)
+                && previous != row_wise
+            {
+                errors.push(format!(
+                    "pipeline.workflow output '{output}' mixes aggregate and row-wise emits; \
+                     every emit for one output must agree on row_ids"
+                ));
+            }
+        }
+        WorkflowNode::Invoke { .. }
+        | WorkflowNode::Transfer { .. }
+        | WorkflowNode::ExecutionIsland { .. } => {}
+    }
+}
+
 fn validate_workflow_node(
     node: &WorkflowNode,
     workflow: &WorkflowSpec,
@@ -1677,6 +1726,7 @@ fn validate_workflow_node(
             value,
             when,
             valid_length,
+            row_ids,
             output,
             effect_name,
             effect,
@@ -1702,6 +1752,46 @@ fn validate_workflow_node(
                         &format!("{path}.valid_length"),
                         errors,
                     );
+                }
+            }
+            if let Some(row_ids) = row_ids {
+                require_workflow_value(row_ids, values, &format!("{path}.row_ids"), errors);
+                if let Some(contract) = value_contracts.get(row_ids) {
+                    if contract.dtype != "int64" || contract.rank != 1 {
+                        errors.push(format!("{path}.row_ids must be int64[B]"));
+                    }
+                    if let (Some(row_batch), Some(value_batch)) = (
+                        contract.shape.as_deref().and_then(|shape| shape.first()),
+                        value_contracts
+                            .get(value)
+                            .and_then(|contract| contract.shape.as_deref())
+                            .and_then(|shape| shape.first()),
+                    ) && row_batch != value_batch
+                    {
+                        errors.push(format!(
+                            "{path}.row_ids batch dimension must match {path}.value"
+                        ));
+                    }
+                }
+            } else {
+                for (field, control) in [
+                    ("when", when.as_ref()),
+                    ("valid_length", valid_length.as_ref()),
+                ] {
+                    let Some(contract) = control.and_then(|name| value_contracts.get(name)) else {
+                        continue;
+                    };
+                    let singleton = contract.rank == 0
+                        || (contract.rank == 1
+                            && matches!(
+                                contract.shape.as_deref().and_then(|shape| shape.first()),
+                                Some(crate::schema::TensorDimension::Fixed(1))
+                            ));
+                    if !singleton {
+                        errors.push(format!(
+                            "{path}.{field} is row-wise and requires explicit row_ids"
+                        ));
+                    }
                 }
             }
             if !workflow.outputs.contains_key(output) {
@@ -1965,6 +2055,7 @@ fn validate_optional_input_guards(
             value,
             when,
             valid_length,
+            row_ids,
             ..
         } => {
             check(value, &format!("{path}.value"), errors);
@@ -1973,6 +2064,9 @@ fn validate_optional_input_guards(
             }
             if let Some(valid_length) = valid_length {
                 check(valid_length, &format!("{path}.valid_length"), errors);
+            }
+            if let Some(row_ids) = row_ids {
+                check(row_ids, &format!("{path}.row_ids"), errors);
             }
         }
         WorkflowNode::Transfer {

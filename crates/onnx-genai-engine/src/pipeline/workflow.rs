@@ -216,6 +216,7 @@ struct WorkflowRunTelemetry {
     emitted_elements: u64,
     stage_runs: BTreeMap<String, u64>,
     stage_elapsed_ns: BTreeMap<String, u128>,
+    row_outputs: BTreeMap<String, BTreeMap<i64, String>>,
 }
 
 impl WorkflowRunTelemetry {
@@ -471,7 +472,11 @@ impl PipelineEngine {
         Ok(())
     }
 
-    fn package_outputs(&self, mut values: PipelineTensors) -> anyhow::Result<PipelineTensors> {
+    fn package_outputs(
+        &self,
+        mut values: PipelineTensors,
+        row_outputs: BTreeMap<String, BTreeMap<i64, String>>,
+    ) -> anyhow::Result<PipelineOutputs> {
         let mut outputs = PipelineTensors::new();
         for output in self.workflow.outputs.keys() {
             let row_prefix = format!("{output}.row.");
@@ -498,7 +503,10 @@ impl PipelineEngine {
                 );
             }
         }
-        Ok(outputs)
+        Ok(PipelineOutputs {
+            tensors: outputs,
+            rows: row_outputs,
+        })
     }
     pub fn workflow_performance_diagnostic(&self) -> WorkflowPerformanceDiagnostic {
         let counters = self.workflow_performance.borrow();
@@ -534,6 +542,13 @@ impl PipelineEngine {
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineTensors> {
         WorkflowExecutionPlan::new(self, request)?.execute()
+    }
+
+    pub(crate) fn run_workflow_outputs(
+        &self,
+        request: PipelineGenerateRequest,
+    ) -> anyhow::Result<PipelineOutputs> {
+        WorkflowExecutionPlan::new(self, request)?.execute_outputs()
     }
 }
 
@@ -639,6 +654,10 @@ impl<'a> WorkflowExecutionPlan<'a> {
 
     /// Execute the already-bound workflow and retain its input slots for replay.
     pub fn execute(&mut self) -> anyhow::Result<PipelineTensors> {
+        self.execute_outputs().map(PipelineOutputs::into_tensors)
+    }
+
+    pub fn execute_outputs(&mut self) -> anyhow::Result<PipelineOutputs> {
         let started = std::time::Instant::now();
         let mut telemetry = WorkflowRunTelemetry {
             started: Some(started),
@@ -740,7 +759,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
         counters.last_emitted_elements = telemetry.emitted_elements;
         drop(counters);
         let inputs = self.take_inputs(&mut values);
-        let outputs = engine.package_outputs(values);
+        let outputs = engine.package_outputs(values, telemetry.row_outputs);
         self.values = inputs;
         outputs
     }
@@ -1146,6 +1165,24 @@ impl PipelineEngine {
                     if let Some(value) = branch_values.get(&output) {
                         values.insert(output.clone(), clone_value(value)?);
                     }
+                    if let Some(rows) = telemetry.row_outputs.get(&output) {
+                        for row_output in rows.values() {
+                            if let Some(value) = branch_values.get(row_output) {
+                                values.insert(row_output.clone(), clone_value(value)?);
+                            }
+                            let start = emit_counts_before
+                                .get(row_output)
+                                .copied()
+                                .unwrap_or_default();
+                            let end = emit_counts.get(row_output).copied().unwrap_or_default();
+                            for index in start..end {
+                                let event = format!("{row_output}.{index}");
+                                if let Some(value) = branch_values.get(&event) {
+                                    values.insert(event, clone_value(value)?);
+                                }
+                            }
+                        }
+                    }
                     let start = emit_counts_before.get(&output).copied().unwrap_or_default();
                     let end = emit_counts.get(&output).copied().unwrap_or_default();
                     for index in start..end {
@@ -1186,6 +1223,7 @@ impl PipelineEngine {
                 value,
                 when,
                 valid_length,
+                row_ids,
                 output,
                 mode,
                 ..
@@ -1197,6 +1235,9 @@ impl PipelineEngine {
                 }
                 if let Some(valid_length) = valid_length {
                     self.materialize_workflow_value(values, valid_length)?;
+                }
+                if let Some(row_ids) = row_ids {
+                    self.materialize_workflow_value(values, row_ids)?;
                 }
                 let tensor = if self.movable_emit_values.contains(value) {
                     values
@@ -1218,17 +1259,11 @@ impl PipelineEngine {
                     .as_deref()
                     .map(|length| workflow_usize_rows(values, length))
                     .transpose()?;
-                let row_prefix = format!("{output}.row.");
-                let row_control = values.keys().any(|name| name.starts_with(&row_prefix))
-                    || [when.as_deref(), valid_length.as_deref()]
-                        .into_iter()
-                        .flatten()
-                        .any(|name| {
-                            values
-                                .get(name)
-                                .is_some_and(|control| control.shape().len() == 1)
-                        });
-                if row_control {
+                let identities = row_ids
+                    .as_deref()
+                    .map(|ids| workflow_i64_rows(values, ids))
+                    .transpose()?;
+                if let Some(identities) = identities.as_deref() {
                     emit_workflow_rows(
                         values,
                         &tensor,
@@ -1238,6 +1273,7 @@ impl PipelineEngine {
                         mode,
                         guards.as_deref(),
                         lengths.as_deref(),
+                        identities,
                         emit_counts,
                         telemetry,
                         symbols,
@@ -2639,6 +2675,7 @@ pub(super) fn compile_movable_emit_values(
                 value,
                 when,
                 valid_length,
+                row_ids,
                 ..
             } => {
                 used(value);
@@ -2646,6 +2683,9 @@ pub(super) fn compile_movable_emit_values(
                     used(value);
                 }
                 if let Some(value) = valid_length {
+                    used(value);
+                }
+                if let Some(value) = row_ids {
                     used(value);
                 }
             }
@@ -2840,6 +2880,7 @@ fn emit_workflow_rows(
     mode: &WorkflowEmitMode,
     guards: Option<&[bool]>,
     lengths: Option<&[usize]>,
+    identities: &[i64],
     emit_counts: &mut HashMap<String, usize>,
     telemetry: &mut WorkflowRunTelemetry,
     symbols: &HashMap<String, i64>,
@@ -2851,6 +2892,11 @@ fn emit_workflow_rows(
         .copied()
         .context("per-row workflow emit requires rank >= 1")?;
     let rows = usize::try_from(rows).context("workflow emit has a negative batch dimension")?;
+    anyhow::ensure!(
+        identities.len() == rows,
+        "workflow emit row_ids has {} values for batch {rows}",
+        identities.len()
+    );
     for cardinality in [guards.map(<[bool]>::len), lengths.map(<[usize]>::len)]
         .into_iter()
         .flatten()
@@ -2860,11 +2906,17 @@ fn emit_workflow_rows(
             "workflow emit row control has {cardinality} values for batch {rows}"
         );
     }
+    let mut active_ids = HashSet::new();
     for row in 0..rows {
         let active = guards.is_none_or(|values| values[if values.len() == 1 { 0 } else { row }]);
         if !active {
             continue;
         }
+        let identity = identities[row];
+        anyhow::ensure!(
+            active_ids.insert(identity),
+            "workflow emit row identity {identity} is duplicated among active rows"
+        );
         let length = lengths.map(|values| values[if values.len() == 1 { 0 } else { row }]);
         let emitted = slice_workflow_row(tensor, row, length)?;
         let validation_contract = if length.is_some() || matches!(mode, WorkflowEmitMode::Append) {
@@ -2894,7 +2946,12 @@ fn emit_workflow_rows(
         }
         telemetry.emit_events += 1;
         telemetry.emitted_elements += emitted.numel() as u64;
-        let row_output = format!("{output}.row.{row}");
+        let row_output = format!("{output}.row.{identity}");
+        telemetry
+            .row_outputs
+            .entry(output.to_string())
+            .or_default()
+            .insert(identity, row_output.clone());
         match mode {
             WorkflowEmitMode::Replace => {
                 values.insert(row_output, emitted);
@@ -3075,6 +3132,17 @@ fn workflow_usize_rows(values: &PipelineTensors, name: &str) -> anyhow::Result<V
         .collect()
 }
 
+fn workflow_i64_rows(values: &PipelineTensors, name: &str) -> anyhow::Result<Vec<i64>> {
+    let value = values
+        .get(name)
+        .with_context(|| format!("workflow row identity '{name}' is unavailable"))?;
+    anyhow::ensure!(
+        value.dtype() == DataType::Int64 && value.shape().len() == 1,
+        "workflow row identity '{name}' must be int64[B]"
+    );
+    value.to_vec_i64().map_err(Into::into)
+}
+
 fn workflow_scalar_usize(values: &PipelineTensors, name: &str) -> anyhow::Result<usize> {
     let value = values
         .get(name)
@@ -3224,6 +3292,7 @@ mod workflow_scalar_tests {
             &WorkflowEmitMode::Replace,
             Some(&[true, false][..]),
             Some(&[2, 1][..]),
+            &[10, 20],
             &mut counts,
             &mut telemetry,
             &HashMap::new(),
@@ -3232,7 +3301,7 @@ mod workflow_scalar_tests {
         .expect("row emit");
 
         assert_eq!(
-            values["tokens.row.0"]
+            values["tokens.row.10"]
                 .to_vec_i64()
                 .expect("first row values"),
             [10, 11]
@@ -3259,6 +3328,7 @@ mod workflow_scalar_tests {
             &WorkflowEmitMode::Replace,
             None,
             Some(&[2][..]),
+            &[7],
             &mut counts,
             &mut telemetry,
             &HashMap::new(),
@@ -3266,7 +3336,7 @@ mod workflow_scalar_tests {
         )
         .expect("row emit");
         assert_eq!(
-            values["tokens.row.0"].to_vec_i64().expect("row values"),
+            values["tokens.row.7"].to_vec_i64().expect("row values"),
             [10, 11]
         );
         assert!(!values.contains_key("tokens"));
@@ -3286,6 +3356,7 @@ mod workflow_scalar_tests {
             &WorkflowEmitMode::Replace,
             Some(&[true][..]),
             None,
+            &[0],
             &mut HashMap::new(),
             &mut WorkflowRunTelemetry::default(),
             &HashMap::new(),
@@ -3294,6 +3365,62 @@ mod workflow_scalar_tests {
         .expect_err("fixed output extent must be checked");
         let message = error.to_string();
         assert!(message.contains("axis 1 is 3, expected 4"), "{message}");
+    }
+
+    #[test]
+    fn row_emit_rejects_duplicate_active_identities() {
+        let tensor = Value::from_slice_i64(&[10, 20], &[2, 1]).expect("row tensor");
+        let contract: TensorContract =
+            serde_yaml::from_str("{ dtype: int64, rank: 2, shape: [batch, sequence] }")
+                .expect("contract");
+        let error = emit_workflow_rows(
+            &mut PipelineTensors::new(),
+            &tensor,
+            "token",
+            "tokens",
+            &contract,
+            &WorkflowEmitMode::Append,
+            Some(&[true, true]),
+            Some(&[1, 1]),
+            &[7, 7],
+            &mut HashMap::new(),
+            &mut WorkflowRunTelemetry::default(),
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        )
+        .expect_err("active identities must be unique");
+        assert!(error.to_string().contains("identity 7 is duplicated"));
+    }
+
+    #[test]
+    fn true_zero_length_row_emits_an_empty_value() {
+        let tensor = Value::from_slice_i64(&[10], &[1, 1]).expect("row tensor");
+        let contract: TensorContract =
+            serde_yaml::from_str("{ dtype: int64, rank: 2, shape: [batch, sequence] }")
+                .expect("contract");
+        let mut values = PipelineTensors::new();
+        let mut telemetry = WorkflowRunTelemetry::default();
+        emit_workflow_rows(
+            &mut values,
+            &tensor,
+            "token",
+            "tokens",
+            &contract,
+            &WorkflowEmitMode::Append,
+            Some(&[true]),
+            Some(&[0]),
+            &[42],
+            &mut HashMap::new(),
+            &mut telemetry,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        )
+        .expect("zero-length emit");
+        assert_eq!(values["tokens.row.42"].shape(), [1, 0]);
+        assert_eq!(
+            telemetry.row_outputs["tokens"].get(&42).map(String::as_str),
+            Some("tokens.row.42")
+        );
     }
 
     #[test]

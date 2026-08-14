@@ -1125,6 +1125,7 @@ fn collect_value_uses(node: &WorkflowNode, uses: &mut HashMap<String, usize>) {
             value,
             when,
             valid_length,
+            row_ids,
             ..
         } => {
             use_value(value);
@@ -1133,6 +1134,9 @@ fn collect_value_uses(node: &WorkflowNode, uses: &mut HashMap<String, usize>) {
             }
             if let Some(valid_length) = valid_length {
                 use_value(valid_length);
+            }
+            if let Some(row_ids) = row_ids {
+                use_value(row_ids);
             }
         }
         WorkflowNode::Transfer { input, .. } => use_value(input),

@@ -283,6 +283,87 @@ pipeline:
 }
 
 #[test]
+fn row_emit_requires_explicit_int64_identities() {
+    fn validate(
+        row_ids: &str,
+        ids_batch: &str,
+        capabilities: &str,
+        extra: &str,
+    ) -> Result<(), Vec<String>> {
+        let metadata: InferenceMetadata = serde_yaml::from_str(&format!(
+            r#"
+pipeline:
+  workflow:
+    manifest:
+      ir_version: "1.0"
+      onnx_opsets: {{ ai.onnx: 24 }}
+      capabilities: [workflow_ssa, typed_emit, emit_valid_length{capabilities}]
+    inputs:
+      value:
+        contract: {{ dtype: int64, rank: 2, shape: [batch, sequence] }}
+        role: {{ kind: opaque }}
+        source: {{ kind: application, name: value }}
+        required: true
+      length:
+        contract: {{ dtype: int64, rank: 1, shape: [batch] }}
+        role: {{ kind: opaque }}
+        source: {{ kind: application, name: length }}
+        required: true
+      ids:
+        contract: {{ dtype: int64, rank: 1, shape: [{ids_batch}] }}
+        role: {{ kind: opaque }}
+        source: {{ kind: application, name: ids }}
+        required: true
+    outputs:
+      result:
+        contract: {{ dtype: int64, rank: 2, shape: [batch, generated] }}
+        role: tokens
+        stage: pre_adapter
+    components: {{}}
+    steps:
+      - kind: emit
+        value: value
+        valid_length: length
+        {row_ids}
+        output: result
+        mode: append
+{extra}
+"#
+        ))
+        .expect("workflow metadata parses");
+        validate_metadata(&metadata)
+    }
+
+    let errors = validate("", "batch", "", "").expect_err("implicit row identity must fail");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("requires explicit row_ids"))
+    );
+    validate("row_ids: ids", "batch", ", emit_row_identity", "")
+        .expect("explicit row identity is valid");
+    let errors = validate("row_ids: ids", "1", ", emit_row_identity", "")
+        .expect_err("row identity batch must match the emitted tensor");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("batch dimension must match"))
+    );
+    let errors = validate(
+        "row_ids: ids",
+        "batch",
+        ", emit_row_identity",
+        "      - kind: emit\n        value: value\n        output: result\n        mode: append",
+    )
+    .expect_err("one output cannot mix aggregate and row-wise emits");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("mixes aggregate and row-wise emits"))
+    );
+}
+
+#[test]
 fn advisory_state_may_be_session_scoped_but_is_not_semantic() {
     let metadata: InferenceMetadata = serde_yaml::from_str(
         r#"
