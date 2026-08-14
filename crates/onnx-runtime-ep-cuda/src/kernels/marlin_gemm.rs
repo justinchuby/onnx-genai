@@ -60,7 +60,10 @@
 //! `ceil(N/8)*8 * (K/16) * 8` bytes ≈ `N*K/2` — a *reordering*, not an expansion.
 //! `scales` and `zero_points` keep their original `[N, k_blocks]` indexing.
 
+use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::ffi::c_void;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
@@ -88,6 +91,111 @@ pub const MARLIN_MIN_SM: (u32, u32) = (8, 0);
 #[must_use]
 pub fn device_supports_marlin(compute_capability: (u32, u32)) -> bool {
     compute_capability >= MARLIN_MIN_SM
+}
+
+/// Opt-in gate for routing the `MatMulNBits` M>1 path through Marlin. Default
+/// OFF so the tensor-core path never becomes the silent default that could
+/// regress a tier before it is proven faster than the portable tiled GEMM
+/// (Rule 11 / mission: Marlin is opt-in and tier-scoped). Enable with
+/// `ONNX_GENAI_MARLIN_M_GT_1=1` (or `true`/`on`).
+#[must_use]
+pub fn marlin_m_gt_1_enabled() -> bool {
+    matches!(
+        std::env::var("ONNX_GENAI_MARLIN_M_GT_1").ok().as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
+}
+
+/// Global cache of repacked weights, keyed by the source (packed) device pointer
+/// plus dims and device ordinal. Weights are immutable initializers, so the
+/// device repack runs **once** per weight and every later call — including
+/// captured CUDA-graph replays — reuses the cached buffer with no allocation.
+/// Kept module-global (rather than a per-kernel field) so wiring touches only
+/// the `matmul_nbits.rs` dispatch seam. A bounded FIFO frees the oldest entry via
+/// its owning runtime when the cap is exceeded.
+struct RepackEntry {
+    ptr: CUdeviceptr,
+    runtime: Arc<CudaRuntime>,
+}
+
+struct RepackCache {
+    map: HashMap<(usize, u32, usize, usize, usize), RepackEntry>,
+    order: VecDeque<(usize, u32, usize, usize, usize)>,
+}
+
+const REPACK_CACHE_CAP: usize = 4096;
+
+static REPACK_CACHE: OnceLock<Mutex<RepackCache>> = OnceLock::new();
+
+fn repack_cache() -> &'static Mutex<RepackCache> {
+    REPACK_CACHE.get_or_init(|| {
+        Mutex::new(RepackCache {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+        })
+    })
+}
+
+/// Ensure the repacked tensor-core weights for `packed` exist on device, running
+/// the device repack once and caching the result. Returns `(repacked_ptr,
+/// warm)`, where `warm == true` means the buffer was already cached (this call
+/// performed no allocation / repack / sync and is therefore CUDA-graph
+/// capture-safe). A cold miss while the stream is capturing is rejected so the
+/// caller can fall back rather than allocate inside a capture.
+pub fn ensure_repacked(
+    runtime: &Arc<CudaRuntime>,
+    packed: CUdeviceptr,
+    n: usize,
+    k: usize,
+    group_size: usize,
+) -> Result<(CUdeviceptr, bool)> {
+    let key = (packed as usize, runtime.ordinal(), n, k, group_size);
+    {
+        let cache = repack_cache().lock().expect("marlin repack cache poisoned");
+        if let Some(entry) = cache.map.get(&key) {
+            return Ok((entry.ptr, true));
+        }
+    }
+    if runtime.is_capturing()? {
+        return Err(EpError::KernelFailed(
+            "cuda_ep: Marlin weight repack cannot allocate during CUDA-graph capture; \
+             the weight must be repacked during warmup before capture"
+                .into(),
+        ));
+    }
+    let bytes = repacked_bytes(n, k);
+    let out = runtime.alloc_raw(bytes)?;
+    if let Err(e) = launch_marlin_repack(runtime, packed, out, n, k, group_size) {
+        // SAFETY: `out` was just allocated here and is otherwise unreferenced.
+        let _ = unsafe { runtime.free_raw(out) };
+        return Err(e);
+    }
+    let mut cache = repack_cache().lock().expect("marlin repack cache poisoned");
+    // Another thread may have inserted the same key while we repacked; keep one.
+    if let Some(entry) = cache.map.get(&key) {
+        let winner = entry.ptr;
+        drop(cache);
+        // SAFETY: `out` is our just-allocated duplicate; free it once.
+        let _ = unsafe { runtime.free_raw(out) };
+        return Ok((winner, true));
+    }
+    cache.map.insert(
+        key,
+        RepackEntry {
+            ptr: out,
+            runtime: runtime.clone(),
+        },
+    );
+    cache.order.push_back(key);
+    while cache.order.len() > REPACK_CACHE_CAP {
+        if let Some(evict) = cache.order.pop_front()
+            && let Some(entry) = cache.map.remove(&evict)
+        {
+            // SAFETY: exclusively owned by the cache; freed once on eviction.
+            let _ = unsafe { entry.runtime.free_raw(entry.ptr) };
+        }
+    }
+    Ok((out, false))
 }
 
 /// Repack ONNX `MatMulNBits` int4 weights (`[N, k_blocks, group/2]`, N-major
