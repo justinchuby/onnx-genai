@@ -334,7 +334,7 @@ pub fn launch_marlin_gemm(runtime: &CudaRuntime, args: &MarlinGemmArgs) -> Resul
         ));
     }
     runtime.require_nvrtc_half_headers("MatMulNBits Marlin int4 tensor-core GEMM")?;
-    if args.k % 16 != 0 || args.k % args.group_size != 0 {
+    if !args.k.is_multiple_of(16) || !args.k.is_multiple_of(args.group_size) {
         return Err(EpError::KernelFailed(format!(
             "cuda_ep: Marlin GEMM requires K ({}) divisible by 16 and by group_size ({})",
             args.k, args.group_size
