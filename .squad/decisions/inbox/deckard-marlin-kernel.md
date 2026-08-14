@@ -354,3 +354,47 @@ and B*≈2.69 out of the box. The lm_head being inside the captured graph remove
 its per-step eager launch + sync; measure whether that nudges B* toward ≤2. The
 final small increment to break-even is small-M GEMM throughput (split-K tuning),
 not segmentation.
+
+---
+
+## Update 7 — small-M split-K retune for the M=8 verify shape (crack toward B*≤2)
+
+Coordinator asked for "one more small-M GEMM increment" tuned to the M=K verify
+shape to crack B*≤2. Profiled the glm/qwen decode-GEMM dims at M=8 on H200
+(`marlin_bandwidth_microbench`, extended with glm dims + sk=16 candidate) and
+found **`choose_split_k` was systematically UNDER-splitting at M=8.**
+
+**Root cause:** the old rule ("aim ~2 waves of blocks, else don't split") uses
+block count as the fill proxy. At M=8 each block is latency-bound (weight DRAM
+2-6%), so the optimum is deeper K-splitting (more concurrent memory requests),
+not just ~2 waves. It picked sk=2-3 and, worse, sk=1 (no split) for large-N
+gate_up — leaving the biggest MLP GEMM on the slow path.
+
+**Fix (commit 4abe4e57):** split for `m <= 32`; oversubscribe ~8 waves; floor
+toward the measured optimum (8 for m<=16, 4 above) even when the base grid
+already spans many waves; cap at 8 (16 regresses medium-N). Measured M=8 auto
+factor before→after (weight-DRAM %):
+
+| GEMM (glm/qwen) | K,N | old auto | new auto | gain |
+|---|---|---|---|---|
+| o/q proj | 4096,4096 | sk3 2.34× | **sk8 2.93×** (6.0%) | +25% |
+| down_proj | 13696,4096 | sk3 2.45× | **sk8 3.18×** (7.0%) | +30% |
+| gate_up (glm) | 4096,27392 | sk1 none | **sk8 1.11×** (7.2%) | new |
+| gate_up (qwen) | 5120,13824 | sk1 none | **sk8 1.35×** (6.8%) | new |
+| kv proj | 4096,256 | sk8 5.30× | sk8 5.30× | — |
+
+The dominant verify cost (MLP gate_up + down_proj) now splits. Prefill (m>32)
+still returns sk=1 → byte-identical direct kernel. **Caveat (honest):** qwen
+square attn proj (K=5120,N=5120) is bimodal — cold-clock 0.9× / clocked-up 2.5×
+(a cold-clock microbench artifact; sustained decode clocks up). It's a minor
+fraction of verify cost vs the stably-winning MLP.
+
+**Gates:** split-K f64-oracle parity + determinism pass at sk=8; greedy tokens
+byte-identical on glm-4-9b-int4; fmt + lib clippy clean. `choose_split_k` only
+affects m≤32, so prefill/decode are unchanged.
+
+**→ Sebastian:** this is the "one more small-M increment." Re-probe 4abe4e57 with
+`ONNX_GENAI_MARLIN_M_GT_1=1` (split-K default; sk now auto=8 for the M=8 verify
+GEMMs incl. gate_up/down). Expect the M=8 verify wall below the 27.3ms that gave
+B*=2.71 → B* should drop toward/through ≤2. Report the number; if it plateaus a
+bit above 2, that's an honest landing (still GO for strong drafters).
