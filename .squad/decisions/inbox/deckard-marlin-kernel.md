@@ -195,3 +195,57 @@ precondition).
 **Next (P2):** split-K (fill SMs at small M) + cp.async multistage to lift the
 M>1 ratio; honest re-run at the M=1 DRAM precondition (keep M=1 on GEMV unless
 it truly clears ≥40% DRAM).
+
+---
+
+## Update 4 — P2: split-K (widen the win) + M=1 re-run + cp.async finding
+
+**cp.async multistage — REJECTED (measured, not assumed).** Implemented a
+2-slice/128B cp.async.cg pipelined loader (all 32 lanes issue, ring-slot indexed
+by `fetch % STAGES`). Passed f64-oracle parity but measured **SLOWER** across all
+M (M=1 N=5120 89→114µs; N=13824 100→130µs). Root cause: the small-M bottleneck is
+**occupancy** (too few blocks in flight to saturate DRAM), not per-load latency,
+so hiding load latency added barrier overhead without touching the real limiter.
+Reverted the whole experiment.
+
+**split-K — LANDED (opt-in `ONNX_GENAI_MARLIN_SPLITK=1`, default OFF).** Partition
+the K/group range across `grid.z`; each z accumulates its groups' `frag*scale`
+into fp32 `partials[split_k,M,N]` (no bias); a reduce kernel sums the z-slices in
+**fixed order** (deterministic ⇒ capture-stable) then applies fold_bias → fp16.
+`choose_split_k` is conservative: only splits when the base grid is under ~2 waves
+(so it NEVER regresses the already-occupied M≥32 / large-N cases), each split owns
+≥2 groups, factor ≤8. New CUDA in `marlin_gemm.rs` (module untouched elsewhere);
+wired into the plain + rmsnorm M>1 paths via `maybe_launch_marlin_splitk`;
+partials from the capture-safe scratch pool (slot 4).
+
+**Measured (H200 GPU 3, median µs, split-K vs direct kernel):**
+| shape | direct | best split-K | speedup | weight-DRAM |
+|---|---|---|---|---|
+| N=5120  M=1 | 90.0 | 32.0 (k=8) | **2.81×** | 3.0% → 8.5% |
+| N=5120  M=2 | 90.2 | 32.1 (k=8) | **2.81×** | 3.0% → 8.5% |
+| N=5120  M=8 | 105.5 | 42.9 (k=8) | **2.46×** | 2.6% → 6.4% |
+| N=13824 M=1 | 210.3 | 88.2 (k=2) | **2.38×** | 3.5% → 8.4% |
+| N=13824 M=2 | 127.3 | 81.3 (k=8) | **1.57×** | 5.8% → 9.1% |
+| M≥32 / large-N M≥8 | — | (heuristic returns 1) | stays direct | no regression |
+
+split-K wins big exactly in the occupancy-bound small-M/small-N regime
+(qkv/o_proj-shaped nodes during speculative verify at M=2–8), and correctly
+declines where the base grid already fills the SMs.
+
+**Gates — all intact:**
+- f64-oracle parity + determinism: `marlin_splitk_parity_vs_f64_oracle`,
+  `marlin_splitk_is_deterministic` (tol 2e-2, incl. asym-zp) pass.
+- e2e greedy tokens **BYTE-IDENTICAL** vs tiled with `SPLITK=1` on both
+  glm-4-9b-int4 and qwen2.5-14b-int4 (zp) M>1 prefill.
+- SM80 guard + tiled fallback unchanged; split-K is itself SM80-gated and opt-in.
+- Static-grid gemm+reduce pair, pooled partials ⇒ capture-safe warm replays.
+
+**M=1 DRAM precondition — HONEST re-run: still fails, keep M=1 on the GEMV.**
+Even the best split-K lifts the M=1 Marlin GEMM weight-DRAM only to **~8.5% peak**
+(N=5120) / ~8.4% (N=13824) — far below the ≥40% floor (feasibility §3). The
+full-tile MMA wastes 15/16 rows at M=1; split-K helps time but the weight-load
+efficiency stays low. **Decision: M=1 remains on the existing dedicated GEMV.**
+
+**Remaining work:** gate_up SwiGLU still uses the direct kernel at M>1 (its fused
+SiluMul epilogue would need a split-K reduce variant); left as follow-up since the
+plain path covers the bulk of split-K-eligible small-M nodes.
