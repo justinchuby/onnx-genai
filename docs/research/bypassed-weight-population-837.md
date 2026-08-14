@@ -150,48 +150,103 @@ resident anyway, so streaming is unchanged. Safe, and useless.
 | decoded text | `"Politiciens"` (garbage) |
 | `htod_bytes_per_token` | 2.412 GB (measured over the 3 tokens before collapse) |
 
-Byte-identity **failed** — the identical #886 signature reached by an
-independent mechanism.
+Byte-identity **failed** — the identical #886 signature. But *why* is not what I
+first claimed: the reviewer's control (below) refuted a churn-based explanation,
+and bisecting the 21 keys narrowed the trigger to **a single tensor**.
 
-### Reconciliation: this **confirms** #892, it does not refute it
+### The counter-control that refuted "conservation" (reviewer)
 
-The two arms differ only in *which* tensors are pinned, and that is the whole
-result. The VRAM budget is **saturated**: baseline already serves ~5.5 GB/step
-from residency against a ~6.1 GB device budget, with the ~0.6 GB slack being
-allocator/KV overhead, not packable weight space (arm 4a proves it — pinning 1.09
-GB of extra resident bytes moved `htod` by *nothing*). On a saturated budget,
-**pinning a tensor that currently bypasses necessarily evicts an equal byte-mass
-of large stable-slot residents to make room, and — since every tensor is read
-once per step — those displaced residents are re-admitted next step.** The pin
-does not *avoid* evict-and-re-admit; it *relocates* it onto the victims. That is
-precisely #892's corrupting pattern, which is why arm 4b reproduces #886 exactly.
+An earlier draft argued the budget is saturated, so pinning any bypasser
+*necessarily* evicts-and-re-admits an equal mass of large residents every step,
+and that churn is #892's corrupting pattern. A single control refutes it:
+over-pinning far past the slack — `PIN_THRESHOLD=30 MB`, `PIN_BUDGET=2.4 GB` —
+pins **67 tensors / 2.371 GB**, forces demonstrably *more* churn than arm 4b
+(`htod` 2.349 → 2.626 GB/step, +11.8%; `page_ins_per_token` 321 → 375), and
+stays **byte-identical** (full 16 reference IDs). Mass-forced evict-and-re-admit
+on a saturated budget does **not** corrupt. The trigger is *which* tensor is
+pinned, not how much churn pinning causes.
 
-Arm 4a is safe only because it pins tensors that were **already resident**, so it
-induces no new eviction — and buys nothing for the same reason. There is no
-static pin that is both safe (induces no evict-and-re-admit of large residents)
-and useful (reduces streamed bytes): on a saturated budget those two properties
-are mutually exclusive by conservation of VRAM.
+### Bisection: the trigger is one tensor — the int4 lm_head (key 919)
 
-## Conclusion (a definitive negative)
+`PIN_KEYS` is an allow-list, so the 21 keys bisect directly. Each row is a solo
+hardware run, byte-identity gated:
 
-On the managed-streaming (WDDM) path there is **no admission change — not even
-the provably-safe retention shape — that recovers item 3's gap without
-corrupting decode.** The gap is 23 single-read large tensors. Keeping any of
-them resident on a budget that is already full requires evicting-and-re-admitting
-an equal mass of large residents every step (because reuse is uniformly 1×/step),
-which is the #886/#892 corruption. This closes item 3 as a negative *and*
-strengthens #892's localisation rather than overturning it: the corruption is
-about evict-and-re-admit of large stable-slot residents, and a static pin cannot
-escape that on a saturated budget — it only moves the churn onto the displaced
-tensors.
+| Pinned keys | Count | Result |
+|---|---:|---|
+| 919,920,287,247,912,914,855,874,232,304 | 10 | **FAIL** (3 tokens) |
+| 919,920,287,247,912 | 5 | **FAIL** |
+| 919,920 | 2 | **FAIL** |
+| **919** | **1** | **FAIL** — 3 tokens `[96347, 3375, 724]` |
+| 920 (its int4 scales) | 1 | **PASS** (16 IDs) |
+| 287 (a 35 MiB block weight) | 1 | **PASS** (16 IDs) |
 
-The gap is only safely recoverable by the **#864 zero-copy hybrid** (a resident
-hot set + zero-copy cold reads, whose safety hinge never evicts a retained page
-for a cold weight, so no large tensor is ever evicted-and-re-admitted). That is
-already the funded direction; on Linux it is worth ~8× (#925/#936). On
-Windows/WDDM it is blocked by the aperture ceiling, not by admission. The
-correct action for item 3 is therefore to **close it as characterised** and not
-add a managed-path admission policy.
+Pinning **only key 919** corrupts; pinning any other single tensor tested does
+not. Key 919 is **389,283,840 bytes = 152 064 (vocab) × 5 120 (hidden) × 0.5** —
+the **int4-quantised vocabulary projection (lm_head / embedding-class weight)**,
+the one tensor that directly produces the logits that decide token identity. Key
+920 (48,660,480 B = 24 330 240 blockwise scales × 2 B fp16) is its scale tensor;
+pinning the scales alone is safe, so the trigger is the **weight matrix itself**,
+not its quantisation metadata.
 
-The per-key trace and the static-pin knobs land as the reusable instruments that
-produced this evidence.
+### Reconciliation: why the threshold rule is safe and the bypasser rule is not
+
+The two selection rules differ in exactly one thing that matters: **whether key
+919 ends up pinned.** Reproducing the reviewer's 2.4 GB threshold arm with the
+key trace on shows key 919 with `retained_page_ins=0 bypass_page_ins=16` — it is
+**never pinned**, even with 2.4 GB of budget and 67 tensors pinned. The lm_head
+is the *last* large tensor touched each step (the logits projection runs after
+every block), so by the time it is first touched the size-ordered pin budget is
+already spent on earlier-arriving block weights. The threshold rule is safe
+because it **structurally cannot reach the one poisonous tensor**; the explicit
+bypasser rule corrupts because its allow-list **contains** key 919. That
+difference between the two selection rules *is* the finding.
+
+### The mechanism is narrowed, not yet explained (graph capture ruled out)
+
+The stable-slot machinery (issue #716) exists to give retained weights a stable
+VA that a captured CUDA graph can bake — so the obvious hypothesis is a
+graph-pointer hazard when the lm_head is promoted from the bypass population
+(fresh throwaway VA, freed each step, never baked) into the stable-slot
+population. **A control refutes it:** pinning 919 with `ONNX_GENAI_CUDA_GRAPH=0`
+(`cuda_graph: enabled=false captures=0 replays=0`) still corrupts. So the
+corruption is **not** the CUDA graph. What remains: the first three tokens
+`[96347, 3375, 724]` *match the reference* before the collapse, so the retained
+lm_head reads correctly for the first steps and only then goes wrong — consistent
+with progressive staleness of the retained page's physical content (a pinned page
+is filled once and served as a hit thereafter, never re-filled), not with a
+first-read address error. This is a **leading hypothesis, not a proven cause**;
+the honest state is that the corruption is isolated to one tensor and one
+transition (retain-across-steps vs stream-fresh-each-step) but its precise
+mechanism is not yet root-caused.
+
+## Conclusion — #886 is isolated to a single tensor
+
+The item-3 measurement stands: reuse is uniformly 1×/step (867/867 keys), the
+gap is 23 single-read large tensors summing to 1.048 GB/step to the byte, and no
+*shipped* admission change recovers it safely. But the static-pin work turned the
+long-standing #886 corruption from "byte-aware retention breaks decode, cause
+unisolated" (`MEMORY_ARCHITECTURE.md` §3.5) into a **single-tensor bug**:
+
+- Retaining **key 919 — the int4 lm_head/vocab-projection weight — resident
+  across decode steps corrupts token identity.** Pinning it alone reproduces the
+  exact #886 3-token collapse; pinning 2.37 GB of *other* large tensors (more
+  churn) does not; pinning its scale tensor does not; pinning a block weight does
+  not.
+- The trigger is **selection-specific, not churn-mass-specific** — which refutes
+  the conservation/evict-and-re-admit story an earlier draft told, and means
+  #892's "evict-and-re-admit" localisation is at best incomplete: here there is
+  no re-admission (the page is pinned, never evicted) and it still corrupts.
+- The CUDA graph is **not** the mechanism (corrupts with capture off). The
+  mechanism beyond "retaining this one tensor resident is unsafe" is not yet
+  proven; the pre-collapse correct tokens point at retained-page staleness as the
+  lead.
+
+For item 3 itself the practical answer is unchanged — the gap is only safely
+recoverable by the funded **#864 zero-copy hybrid** (never evicts a retained page
+for a cold weight; ~8× on Linux #925/#936; WDDM-blocked by the aperture ceiling,
+not by admission), so no managed-path admission policy should ship. But the
+better deliverable is the isolation: #886 has been hiding behind the lm_head, and
+a single-tensor trigger is a bug that can be chased, not a wall. The per-key
+trace and the two static-pin knobs (threshold+budget, and the explicit key
+allow-list that did the bisection) land as the reusable instruments that produced
+this evidence.
