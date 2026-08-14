@@ -486,6 +486,18 @@ pub(crate) struct DecodeCudaState {
     /// (2b-impl-2..4) and are *not* generalized here.
     batch: usize,
     logical_len: usize,
+    /// Per-row logical KV length (stage 3a, #750): `row_lens[r]` is the number of
+    /// tokens sequence `r` has committed to its KV slice. In a *uniform* batch
+    /// every entry equals `logical_len`; a *ragged* batch lets rows sit at
+    /// genuinely different lengths (some admitted/advanced more than others). The
+    /// per-row length drives that row's attention-mask window (which keys it may
+    /// attend) and its `position_ids` value; the model derives each row's
+    /// `seqlens_k` from its own mask window and writes present KV at its own
+    /// offset, so a shared physical KV buffer carries rows of different lengths.
+    /// `logical_len` remains the shared *physical* extent (`max(row_lens)`) used
+    /// for capacity/KV-shape bookkeeping. Length `batch`, reset to `0` on
+    /// `rewind(0)`.
+    row_lens: Vec<usize>,
     /// Current physical KV bucket for the native CUDA decode session. The hard
     /// maximum lives in `capacity.max_len`; this bucket grows on demand via the
     /// shared `onnx_genai_kv::kv_capacity_bucket` policy. Growth is a capture
@@ -1832,10 +1844,55 @@ impl NativeDecodeSession {
     /// measurement harness (`profile_native --native-decode-batch-sweep`) and by
     /// row-identity assertions there. The greedy device argmax already returns N
     /// rows (2b-impl-3), so no logits round-trip is needed.
+    ///
+    /// Uniform batches are the special case of the ragged path (stage 3a, #750):
+    /// every row shares `past_len` and advances, so this forwards to
+    /// [`Self::decode_cuda_greedy_batch_ragged`] with a uniform per-row length
+    /// and an all-`true` advance mask. The delegation is byte-identical to the
+    /// former single-shared-window implementation (identical mask windows,
+    /// identical positions).
     pub(crate) fn decode_cuda_greedy_batch(
         &mut self,
         tokens: &[TokenId],
         past_len: usize,
+    ) -> anyhow::Result<Vec<TokenId>> {
+        let batch = self
+            .cuda
+            .as_ref()
+            .context("CUDA decode state is not initialized")?
+            .batch;
+        let past_lens = vec![past_len; batch];
+        let advances = vec![true; batch];
+        self.decode_cuda_greedy_batch_ragged(tokens, &past_lens, &advances)
+    }
+
+    /// Ragged batch-N greedy decode step (stage 3a, #750): step `batch`
+    /// sequences together, one token each, where row `r` sits at its own logical
+    /// length `past_lens[r]` and advances only if `advances[r]`. Returns the
+    /// `batch` selected token ids (row `i` = the greedy token of sequence `i`).
+    ///
+    /// Per-row geometry:
+    /// - **Length.** Each row's attention-mask window is `past_lens[r] + 1` (its
+    ///   own prefix plus the new token); the model reduces that to the row's
+    ///   `seqlens_k = past_lens[r]` and writes present KV at that per-row offset.
+    /// - **Position.** `position_ids[r] = past_lens[r]`, so each row's rotary
+    ///   position and causal frame match what it would see run alone.
+    /// - **Physical extent.** The shared KV logical length is advanced to
+    ///   `max(past_lens) + 1`; shorter rows ignore the padded suffix via their
+    ///   own (shorter) mask window.
+    ///
+    /// The mask width is frozen to the physical bucket, so only mask *values*
+    /// vary per step and CUDA-graph capture survives per-row lengths. A held row
+    /// (`advances[r] == false`) re-attends its own prefix and reprocesses at its
+    /// current position; its present KV write lands at its unchanged offset
+    /// (overwritten harmlessly next step) and its logical length does not grow —
+    /// the mechanism a continuous batcher uses to stall a row while its peers
+    /// advance.
+    pub(crate) fn decode_cuda_greedy_batch_ragged(
+        &mut self,
+        tokens: &[TokenId],
+        past_lens: &[usize],
+        advances: &[bool],
     ) -> anyhow::Result<Vec<TokenId>> {
         let state = self
             .cuda
@@ -1848,26 +1905,42 @@ impl NativeDecodeSession {
                 tokens.len()
             );
         }
+        if past_lens.len() != state.batch || advances.len() != state.batch {
+            bail!(
+                "native CUDA ragged batch greedy decode expects {} per-row lengths and advances, \
+                 got {} / {}",
+                state.batch,
+                past_lens.len(),
+                advances.len()
+            );
+        }
         if !state.greedy_fastpath_supported() {
             bail!(
                 "native CUDA batch greedy decode requires the device-argmax fast path; this \
                  decoder's logits binding does not support it"
             );
         }
-        let total_len = past_len
-            .checked_add(1)
-            .context("native decode context length overflow")?;
-        if total_len > state.capacity.max_len {
-            bail!("{}", state.capacity_exceeded_error(total_len));
+        // Per-row valid mask width (prefix + the new token) and the shared
+        // physical extent this step must cover.
+        let mut valid_lens = Vec::with_capacity(state.batch);
+        for &past_len in past_lens {
+            valid_lens.push(
+                past_len
+                    .checked_add(1)
+                    .context("native decode context length overflow")?,
+            );
         }
-        let grew = state.ensure_capacity(&mut self.session, total_len)?;
-        state.extend_mask(
-            if grew { 0 } else { past_len },
-            total_len,
-            state.decode_mask_expose_len(total_len),
-        )?;
-        let positions = vec![past_len; state.batch];
-        state.write_decode_inputs_batch(tokens, &positions)?;
+        let max_total = valid_lens
+            .iter()
+            .copied()
+            .max()
+            .context("native CUDA ragged batch requires at least one row")?;
+        if max_total > state.capacity.max_len {
+            bail!("{}", state.capacity_exceeded_error(max_total));
+        }
+        state.ensure_capacity(&mut self.session, max_total)?;
+        state.extend_mask_ragged(&valid_lens, state.decode_mask_expose_len(max_total))?;
+        state.write_decode_inputs_batch(tokens, past_lens)?;
         if let Err(error) = state.run_one_token(&mut self.session, &self.trace) {
             let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
             return Err(error.context(format!(
@@ -1886,8 +1959,15 @@ impl NativeDecodeSession {
                 );
             }
         }
-        state.set_logical_len(total_len)?;
-        self.current_len = total_len;
+        // Advance only the rows the caller stepped; a held row keeps its length.
+        for (row, &advance) in advances.iter().enumerate() {
+            if advance {
+                state.row_lens[row] = valid_lens[row];
+            }
+        }
+        let new_max = state.row_lens.iter().copied().max().unwrap_or(0);
+        state.set_logical_len(new_max)?;
+        self.current_len = new_max;
         Ok(rows.into_iter().map(|(token, _)| token).collect())
     }
 }
@@ -3289,6 +3369,7 @@ impl DecodeCudaState {
         Ok(Self {
             batch,
             logical_len: 0,
+            row_lens: vec![0; batch],
             max_len,
             bindings,
             base_binding_count,
@@ -3381,6 +3462,62 @@ impl DecodeCudaState {
         let row_stride = self.max_len * std::mem::size_of::<i64>();
         for sequence in 0..self.batch {
             let offset = sequence * row_stride + start * std::mem::size_of::<i64>();
+            self.bindings[0].write_bytes(offset, &ones)?;
+        }
+        self.bindings[0].set_logical_shape(vec![self.batch, expose_len])?;
+        Ok(())
+    }
+
+    /// Ragged per-row attention-mask update (stage 3a, #750). Unlike
+    /// [`Self::extend_mask`], which writes one identical `1`s window to every row
+    /// (uniform-length batch), this writes `valid_lens[r]` leading `1`s to row
+    /// `r` and reflects that row's own length. The model reduces each row's mask
+    /// to its own `seqlens_k` (= `valid_lens[r] - 1`) and writes present KV at
+    /// that per-row offset, so a shared physical KV buffer carries rows of
+    /// genuinely different lengths.
+    ///
+    /// The full `[0, valid_lens[r])` window is (re)written each step. Because
+    /// per-row lengths are monotonic under decode (a row's window only grows, or
+    /// stays put when the row is held), this leaves the persistent mask buffer in
+    /// the same state an incremental write would, while remaining robust across a
+    /// bucket reallocation (which discards prior contents). `expose_len` is
+    /// frozen to the physical bucket (`max_len`) exactly as the uniform path
+    /// does, so only mask *values* — not the mask *shape* — vary per step and
+    /// CUDA-graph capture survives (the reduction sees a fixed-width island whose
+    /// `1`-count, not its extent, encodes each row's length).
+    ///
+    /// At `batch == 1` with a single `valid_lens[0]` this is byte-identical to
+    /// `extend_mask(0, valid_lens[0], expose_len)`.
+    fn extend_mask_ragged(
+        &mut self,
+        valid_lens: &[usize],
+        expose_len: usize,
+    ) -> anyhow::Result<()> {
+        if valid_lens.len() != self.batch {
+            bail!(
+                "ragged CUDA mask update expects {} per-row lengths, got {}",
+                self.batch,
+                valid_lens.len()
+            );
+        }
+        if expose_len > self.max_len {
+            bail!(
+                "invalid ragged CUDA mask expose {expose_len} for capacity {}",
+                self.max_len
+            );
+        }
+        let word = std::mem::size_of::<i64>();
+        let row_stride = self.max_len * word;
+        for (sequence, &valid) in valid_lens.iter().enumerate() {
+            if valid > expose_len {
+                bail!(
+                    "ragged CUDA mask row {sequence} valid length {valid} exceeds expose {expose_len}"
+                );
+            }
+            let ones = (0..valid)
+                .flat_map(|_| 1i64.to_le_bytes())
+                .collect::<Vec<_>>();
+            let offset = sequence * row_stride;
             self.bindings[0].write_bytes(offset, &ones)?;
         }
         self.bindings[0].set_logical_shape(vec![self.batch, expose_len])?;
@@ -3588,6 +3725,9 @@ impl DecodeCudaState {
             }
         }
         self.set_logical_len(seq_len)?;
+        for row_len in &mut self.row_lens {
+            *row_len = seq_len;
+        }
         let expose = self.decode_mask_expose_len(seq_len);
         self.extend_mask(0, seq_len, expose)?;
         Ok(())
@@ -3595,10 +3735,24 @@ impl DecodeCudaState {
 
     pub(crate) fn rewind(&mut self, target_len: usize) -> anyhow::Result<()> {
         if target_len < self.logical_len {
+            // Clear the now-invalid mask tail on *every* row (the mask binding is
+            // physically `[batch, max_len]`). A uniform batch shares one length so
+            // one row would suffice, but a ragged batch (stage 3a, #750) can leave
+            // per-row `1`s beyond `target_len`; zeroing every row's tail keeps a
+            // reused batched session from inheriting a stale attend window.
             let zeros = vec![0u8; (self.logical_len - target_len) * std::mem::size_of::<i64>()];
-            self.bindings[0].write_bytes(target_len * std::mem::size_of::<i64>(), &zeros)?;
+            let row_stride = self.max_len * std::mem::size_of::<i64>();
+            for sequence in 0..self.batch {
+                let offset = sequence * row_stride + target_len * std::mem::size_of::<i64>();
+                self.bindings[0].write_bytes(offset, &zeros)?;
+            }
         }
         self.bindings[0].set_logical_shape(vec![self.batch, target_len])?;
+        // Ragged per-row lengths collapse back to the uniform rewind target
+        // (stage 3a, #750): after a rewind every row shares `target_len`.
+        for row_len in &mut self.row_lens {
+            *row_len = target_len;
+        }
         if target_len == 0 {
             // Fixed-size recurrent/conv states are unmasked rolling caches: a
             // reused session would otherwise inherit the previous generation's

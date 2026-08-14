@@ -243,6 +243,22 @@ struct Args {
     /// would all diverge — the real test that rows do not observe each other.
     #[arg(long)]
     solo_equivalence_prompts: Option<String>,
+    /// Stage 3a (#750): the batch-N **ragged** solo-equivalence correctness gate.
+    /// Same idea as `--solo-equivalence-prompts` but the prompts are kept at their
+    /// genuinely different token lengths (NOT truncated to a common `L`), so the
+    /// batch is ragged — rows sit at different logical lengths within one fused
+    /// forward. Give a `||`-separated list of K prompts whose tokenizations differ
+    /// in length. The tool right-aligns the prefills (each row is held with an
+    /// `advance=false` step until it is time for its prompt to finish alongside
+    /// the longest, so from the moment a shorter row starts it is at a different
+    /// length than its peers), then (1) runs each prompt **alone** at batch 1 and
+    /// (2) seeds all K prompts into one ragged batch-K session, and asserts every
+    /// batch row is **byte-identical** to its solo stream. If the per-row length,
+    /// position, or mask geometry is wrong, the different-length rows diverge —
+    /// that is the signal. The per-row prompt lengths and token ids are printed so
+    /// it is visible the lengths really differ.
+    #[arg(long)]
+    ragged_solo_equivalence_prompts: Option<String>,
     /// Speculative decoding mode. `prompt-lookup` enables native n-gram
     /// speculation (exact verification; lossless vs greedy). Only supported on
     /// the single-model native `--steady` path; rejected with `--pipeline`.
@@ -1391,6 +1407,279 @@ fn run_native_decode_solo_equivalence(
     Ok(())
 }
 
+/// Seed `prompts` of *genuinely different* token lengths into `session`'s
+/// `batch` decode rows using the ragged per-row geometry (stage 3a, #750), then
+/// greedily generate `gen_tokens` per row. Returns one `gen_tokens`-long token
+/// stream per row.
+///
+/// Prefills are **right-aligned**: a row with a shorter prompt is held (an
+/// `advance=false` step that reprocesses its first token at position 0 without
+/// growing its length) for `max_len − len_r` steps, then prefills its prompt so
+/// every row consumes its last prompt token on the same final prefill step. From
+/// the moment a shorter row begins, it sits at a different logical length than
+/// its still-prefilling peers — so the batch is genuinely ragged (different
+/// per-row mask windows and positions in one fused forward), not a uniform batch
+/// of equal-length rows. A held row's inert write lands at its own offset 0 and
+/// is overwritten byte-for-byte when its real prefill starts, so a row's KV
+/// state after prefill is identical to running it alone.
+fn drive_ragged_batch(
+    session: &mut NativeDecodeSession,
+    prompts: &[Vec<u32>],
+    gen_tokens: usize,
+) -> Result<Vec<Vec<u32>>> {
+    let batch = prompts.len();
+    if batch == 0 {
+        bail!("drive_ragged_batch requires at least one prompt");
+    }
+    let lens: Vec<usize> = prompts.iter().map(Vec::len).collect();
+    if lens.iter().any(|&len| len == 0) {
+        bail!("drive_ragged_batch requires every prompt to be non-empty");
+    }
+    let lmax = lens.iter().copied().max().expect("non-empty prompt set");
+    session.reset()?;
+
+    // Per-row committed length (== the `past_len` fed on the row's next step).
+    let mut row_len = vec![0usize; batch];
+    // Each row's first generated token, produced when it consumes its last
+    // prompt token (all rows reach that on the final right-aligned prefill step).
+    let mut first_gen = vec![0u32; batch];
+
+    for i in 0..lmax {
+        let mut tokens = vec![0u32; batch];
+        let mut past_lens = vec![0usize; batch];
+        let mut advances = vec![false; batch];
+        for row in 0..batch {
+            let offset = lmax - lens[row];
+            if i < offset {
+                // Held: reprocess this row's first token at position 0; length
+                // does not grow, so the row waits at length 0 while its peers
+                // prefill ahead of it.
+                tokens[row] = prompts[row][0];
+                past_lens[row] = 0;
+                advances[row] = false;
+            } else {
+                let local = i - offset;
+                tokens[row] = prompts[row][local];
+                past_lens[row] = local;
+                advances[row] = true;
+            }
+        }
+        let rows = session
+            .decode_greedy_batch_ragged(&tokens, &past_lens, &advances)
+            .with_context(|| format!("ragged batch prefill step {i}"))?;
+        if rows.len() != batch {
+            bail!(
+                "prefill step {i} returned {} rows, expected {batch}",
+                rows.len()
+            );
+        }
+        // Prove the device saw genuinely different per-row lengths in one fused
+        // forward: on the final prefill step every row is at its own prompt
+        // length, so `past_lens` spans distinct values (unless all prompts were
+        // the same length, which the gate refuses up front).
+        if i + 1 == lmax {
+            println!(
+                "native_decode_ragged_geometry: step={i} (final prefill) per_row_past_lens={past_lens:?} \
+                 advances={advances:?} — one fused forward, rows at distinct lengths"
+            );
+        }
+        for row in 0..batch {
+            if advances[row] {
+                row_len[row] += 1;
+                first_gen[row] = rows[row];
+            }
+        }
+    }
+
+    // Every row has now prefilled its whole prompt (length == its prompt length),
+    // and `first_gen` holds each row's first generated token.
+    for (row, &len) in lens.iter().enumerate() {
+        if row_len[row] != len {
+            bail!(
+                "ragged prefill left row {row} at length {} (expected {len})",
+                row_len[row]
+            );
+        }
+    }
+    let mut streams: Vec<Vec<u32>> = first_gen.iter().map(|&token| vec![token]).collect();
+
+    // Generation: every row advances each step, staying ragged (the per-row
+    // lengths keep their prefill offsets).
+    for _ in 0..gen_tokens.saturating_sub(1) {
+        let tokens: Vec<u32> = streams
+            .iter()
+            .map(|stream| *stream.last().expect("stream seeded with first token"))
+            .collect();
+        let past_lens = row_len.clone();
+        let advances = vec![true; batch];
+        let rows = session
+            .decode_greedy_batch_ragged(&tokens, &past_lens, &advances)
+            .context("ragged batch decode step")?;
+        if rows.len() != batch {
+            bail!("decode step returned {} rows, expected {batch}", rows.len());
+        }
+        for (row, &token) in rows.iter().enumerate() {
+            row_len[row] += 1;
+            streams[row].push(token);
+        }
+    }
+    Ok(streams)
+}
+
+/// Stage 3a (#750) batch-N **ragged** solo-equivalence gate: seed K prompts of
+/// genuinely different token lengths into one ragged batch-K decode session and
+/// assert every row reproduces the exact token stream that prompt produces run
+/// alone at batch 1. Because the rows sit at different logical lengths in the
+/// same fused forward, a wrong per-row mask window, position, or length would
+/// diverge — the direct test of the stage-3a geometry.
+fn run_native_decode_ragged_solo_equivalence(
+    model_dir: &Path,
+    device: NativeDecodeDevice,
+    decode_precision: DecodePrecision,
+    tokenizer: &Tokenizer,
+    prompt_spec: &str,
+    gen_tokens: usize,
+) -> Result<()> {
+    let own_pid = std::process::id();
+    report_foreign_compute_apps(own_pid);
+
+    let prompt_texts: Vec<&str> = prompt_spec
+        .split("||")
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .collect();
+    if prompt_texts.len() < 2 {
+        bail!(
+            "--ragged-solo-equivalence-prompts needs at least 2 distinct prompts separated by \
+             '||' (got {})",
+            prompt_texts.len()
+        );
+    }
+    let mut prompts: Vec<Vec<u32>> = Vec::with_capacity(prompt_texts.len());
+    for text in &prompt_texts {
+        let tokens = tokenizer
+            .encode(text)
+            .with_context(|| format!("tokenize ragged solo-equivalence prompt {text:?}"))?;
+        if tokens.is_empty() {
+            bail!("ragged solo-equivalence prompt {text:?} tokenized to an empty sequence");
+        }
+        prompts.push(tokens);
+    }
+    let lens: Vec<usize> = prompts.iter().map(Vec::len).collect();
+    // The whole point of the ragged gate is different-length rows: refuse a run
+    // that would silently degenerate into a uniform batch. A gate that passes
+    // because every prompt happened to be the same length is worthless.
+    let min_len = lens.iter().copied().min().expect("non-empty prompt set");
+    let max_len = lens.iter().copied().max().expect("non-empty prompt set");
+    let batch = prompts.len();
+    println!(
+        "native_decode_batch_ragged_solo_equivalence: own_pid={own_pid} prompts={batch} \
+         row_lens={lens:?} min_len={min_len} max_len={max_len} gen_tokens={gen_tokens} \
+         (ragged batch: prompts kept at their genuinely different token lengths, NOT truncated)"
+    );
+    for (row, (text, prompt)) in prompt_texts.iter().zip(prompts.iter()).enumerate() {
+        println!(
+            "native_decode_batch_ragged_solo_equivalence_prompt: row={row} len={} text={text:?} \
+             tokens={prompt:?}",
+            prompt.len()
+        );
+    }
+    if min_len == max_len {
+        bail!(
+            "ragged solo-equivalence requires prompts of genuinely different token lengths, but \
+             every prompt tokenized to {min_len} tokens — this would degenerate into a uniform \
+             batch and prove nothing about ragged geometry. Choose prompts whose tokenizations \
+             differ in length."
+        );
+    }
+
+    // 1) Solo reference: each prompt alone at batch 1 (reset between prompts).
+    // SAFETY: single-threaded benchmark setup.
+    unsafe {
+        std::env::set_var("ONNX_GENAI_NATIVE_DECODE_BATCH", "1");
+    }
+    let mut solo_engine = build_governed_batch_engine(model_dir, &device, decode_precision, 1)?;
+    let solo_session = solo_engine
+        .native_decode_session_mut()
+        .expect("batch-1 native session");
+    let mut solo_streams: Vec<Vec<u32>> = Vec::with_capacity(batch);
+    for (row, prompt) in prompts.iter().enumerate() {
+        let stream = drive_uniform_batch(solo_session, std::slice::from_ref(prompt), gen_tokens)?;
+        println!(
+            "native_decode_batch_ragged_solo_equivalence_solo: row={row} len={} stream={:?}",
+            prompt.len(),
+            stream[0]
+        );
+        solo_streams.push(stream.into_iter().next().expect("one solo row"));
+    }
+    drop(solo_engine);
+
+    // 2) Ragged batch-K: all K different-length prompts seeded into one session.
+    // SAFETY: single-threaded benchmark setup.
+    unsafe {
+        std::env::set_var("ONNX_GENAI_NATIVE_DECODE_BATCH", batch.to_string());
+    }
+    let mut batch_engine =
+        build_governed_batch_engine(model_dir, &device, decode_precision, batch)?;
+    let batch_session = batch_engine
+        .native_decode_session_mut()
+        .expect("batch-K native session");
+    let batch_streams = drive_ragged_batch(batch_session, &prompts, gen_tokens)?;
+    // Prove the captured decode graph survived the ragged per-row geometry: only
+    // mask/position *values* vary per step (the mask width stays frozen to the
+    // physical bucket), so capture must hold exactly as it does for a uniform
+    // batch (captures>0, invalidations==0, fallbacks==0). A ragged run that
+    // silently fell back to eager would show up here.
+    if let Some(stats) = batch_session.cuda_kv_debug_stats() {
+        println!(
+            "native_decode_batch_ragged_solo_equivalence_capture: graph_enabled={} captures={} \
+             replays={} fallbacks={} invalidations={} final_logical_len={}",
+            stats.graph.enabled,
+            stats.graph.captures,
+            stats.graph.replays,
+            stats.graph.fallbacks,
+            stats.graph.invalidations,
+            stats.logical_len
+        );
+    }
+    drop(batch_engine);
+
+    // SAFETY: single-threaded teardown.
+    unsafe {
+        std::env::remove_var("ONNX_GENAI_NATIVE_DECODE_BATCH");
+    }
+
+    // 3) Assert each ragged batch row reproduces its solo stream byte-for-byte.
+    let mut all_match = true;
+    for (row, (solo, batched)) in solo_streams.iter().zip(batch_streams.iter()).enumerate() {
+        let matches = solo == batched;
+        all_match &= matches;
+        println!(
+            "native_decode_batch_ragged_solo_equivalence_row: row={row} len={} matches_solo={matches} \
+             batch_stream={batched:?}",
+            lens[row]
+        );
+        if !matches {
+            println!(
+                "native_decode_batch_ragged_solo_equivalence_detail: row={row} solo={solo:?} \
+                 batch={batched:?}"
+            );
+        }
+    }
+    println!(
+        "native_decode_batch_ragged_solo_equivalence_result: prompts={batch} row_lens={lens:?} \
+         min_len={min_len} max_len={max_len} gen_tokens={gen_tokens} all_rows_match_solo={all_match}"
+    );
+    if !all_match {
+        bail!(
+            "ragged solo-equivalence FAILED: at least one different-length batch row diverged from \
+             its solo batch-1 stream — the ragged per-row geometry (mask window, position, or \
+             length) is wrong or rows are observing each other"
+        );
+    }
+    Ok(())
+}
+
 fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Result<()> {
     if args.synthetic {
         bail!("--steady requires a real model directory");
@@ -1824,6 +2113,22 @@ fn main() -> Result<()> {
             .expect("validated model argument")
             .to_path_buf();
         return run_native_decode_solo_equivalence(
+            &model_dir,
+            device.clone(),
+            args.decode_precision.into(),
+            &tokenizer,
+            &prompt_spec,
+            args.tokens,
+        );
+    }
+    if let Some(prompt_spec) = args.ragged_solo_equivalence_prompts.clone() {
+        drop(session);
+        let model_dir = args
+            .model
+            .as_deref()
+            .expect("validated model argument")
+            .to_path_buf();
+        return run_native_decode_ragged_solo_equivalence(
             &model_dir,
             device.clone(),
             args.decode_precision.into(),
