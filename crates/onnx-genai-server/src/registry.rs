@@ -330,7 +330,15 @@ impl ModelRegistry {
             snapshot.vram.used = used;
             snapshot.vram.limit = limit;
             snapshot.vram.headroom = headroom;
-            snapshot.resolved_limits.vram_bytes = limit;
+            // Keep `resolved_limits.vram_bytes` honest: it is the resolved device
+            // (VRAM) capacity limit, which stays `None` when the device capacity
+            // could not be measured (#947). The aggregate authority ceiling on a
+            // device-less box is a host-RAM-derived advisory bound (surfaced via
+            // `vram.limit`), not a measured VRAM capacity, so do not relabel it
+            // as one. Only refresh it when a real device capacity was resolved.
+            if snapshot.resolved_limits.vram_bytes.is_some() {
+                snapshot.resolved_limits.vram_bytes = Some(limit);
+            }
         }
         Ok(Some(snapshot))
     }

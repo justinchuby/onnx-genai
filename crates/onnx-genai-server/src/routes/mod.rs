@@ -251,7 +251,7 @@ struct ConfiguredResourceLimits {
 
 #[derive(Debug, Serialize)]
 struct ResolvedResourceLimits {
-    vram_bytes: u64,
+    vram_bytes: Option<u64>,
     host_ram_bytes: u64,
     disk_spill_bytes: Option<u64>,
 }
