@@ -2145,6 +2145,46 @@ impl MatMulNBitsKernel {
             return Ok(weight_kn);
         }
 
+        // Parallel `Kn` fast path: the transposed ([k, n]) layout the dense
+        // prefill GEMM consumes. Element `weight_kn[depth * n + output]` means
+        // one depth-row `[depth * n .. (depth + 1) * n)` is contiguous, so we can
+        // parallelize across depth-rows with `par_chunks_mut(n)` and fill every
+        // output within a row. This is byte-identical to the serial scatter
+        // below (same `dequantize_nbits_value`, same indices) but distributes the
+        // f32 materialization across the pool. Previously this `Kn` transpose was
+        // the single-threaded phase that dominated the cache-cold first prefill
+        // (~5 s on qwen0.5b-q4, ~43 s/GB), the load-time gap versus ORT (#959).
+        // The grouped path keeps the original serial scatter below.
+        if matches!(layout, WeightLayout::Kn) && group_indices.is_none() {
+            let bits = self.bits;
+            let block_size = self.block_size;
+            let n = self.n;
+            weight_kn
+                .par_chunks_mut(n)
+                .enumerate()
+                .for_each(|(depth, row)| {
+                    for (output, slot) in row.iter_mut().enumerate() {
+                        let packed_start = output * k_blocks * blob_size;
+                        let scale_start = output * k_blocks;
+                        let zero_point_start = output * zp_row_bytes;
+                        let packed_row = &packed[packed_start..packed_start + k_blocks * blob_size];
+                        let scale_row = &scales[scale_start..scale_start + k_blocks];
+                        let zero_point_row = packed_zero_points.as_ref().map(|points| {
+                            &points[zero_point_start..zero_point_start + zp_row_bytes]
+                        });
+                        *slot = dequantize_nbits_value(
+                            packed_row,
+                            scale_row,
+                            zero_point_row,
+                            depth,
+                            bits,
+                            block_size,
+                        );
+                    }
+                });
+            return Ok(weight_kn);
+        }
+
         for output in 0..self.n {
             if group_indices.is_none() {
                 let packed_start = output * k_blocks * blob_size;
