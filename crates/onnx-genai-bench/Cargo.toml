@@ -124,5 +124,9 @@ required-features = ["bench-native"]
 name = "muse_decode"
 required-features = ["bench-native"]
 
+[[bin]]
+name = "verify_logits_probe"
+required-features = ["bench-native"]
+
 [lints]
 workspace = true
