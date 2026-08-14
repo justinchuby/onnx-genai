@@ -5294,7 +5294,13 @@ impl MatMulNBitsKernel {
             bias_post_round: false,
             bias_row_stride: 0,
         };
-        marlin_gemm::launch_marlin_gemm(&self.runtime, &gate_args)?;
+        // Route both projections through split-K: at the M=K speculative-verify
+        // width these gate/up GEMMs (the largest MLP projections) are
+        // memory/latency-bound, so `choose_split_k` elects an 8-way K split to
+        // fill the SMs. Partials use the shared slot-4 scratch sequentially (gate
+        // fully reduces into `gate_buf` before the up GEMM overwrites the
+        // partials), so the stream ordering keeps it correct and capture-safe.
+        let gate_split_warm = self.maybe_launch_marlin_splitk(&gate_args)?;
 
         let up_args = marlin_gemm::MarlinGemmArgs {
             activation: act_ptr,
@@ -5311,7 +5317,7 @@ impl MatMulNBitsKernel {
             bias_post_round: false,
             bias_row_stride: 0,
         };
-        marlin_gemm::launch_marlin_gemm(&self.runtime, &up_args)?;
+        let up_split_warm = self.maybe_launch_marlin_splitk(&up_args)?;
 
         crate::kernels::elementwise::launch_silu_mul_f16_raw(
             &self.runtime,
@@ -5322,7 +5328,14 @@ impl MatMulNBitsKernel {
             self.decomposed_silu,
         )?;
 
-        Ok(Some(gate_w_warm && up_w_warm && norm_warm && gate_s_warm))
+        Ok(Some(
+            gate_w_warm
+                && up_w_warm
+                && norm_warm
+                && gate_s_warm
+                && gate_split_warm
+                && up_split_warm,
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
