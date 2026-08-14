@@ -398,3 +398,43 @@ affects m≤32, so prefill/decode are unchanged.
 GEMMs incl. gate_up/down). Expect the M=8 verify wall below the 27.3ms that gave
 B*=2.71 → B* should drop toward/through ≤2. Report the number; if it plateaus a
 bit above 2, that's an honest landing (still GO for strong drafters).
+
+---
+
+## Update 8 — gate_up (SwiGLU MLP) routed through split-K (head 3735d57e)
+
+**Root-cause of the residual B\* gap.** Sebastian's B\*=2.63 (on 29714037) still
+ran the two LARGEST MLP GEMMs on the slow path: `try_launch_marlin_gate_up_prefill`
+launched gate→gate_buf and up→output as **direct `launch_marlin_gemm`** calls,
+*bypassing split-K entirely*. So the `choose_split_k` retune (update 7) only
+reached o/q/kv/down — gate_up (glm K=4096 N=13696 ×2 ×40 layers; the single
+biggest MLP projection) never got sk=8. That is the untapped lever.
+
+**Fix.** Route both gate and up through `maybe_launch_marlin_splitk` so
+`choose_split_k` elects the 8-way split at the M=8 verify width. gate/up reuse
+the slot-4 partials scratch **sequentially** — gate's reduce fully writes
+`gate_buf` before up's GEMM overwrites the partials, so single-stream ordering
+keeps it correct. Both split-K `warm` flags are AND-ed into the returned warmth,
+so capture-safety now accounts for split-K scratch (pre-warmed at M=K by Part-D).
+
+**Gates (H200 GPU6):**
+- `marlin_gate_up_swiglu_matches_tiled_{plain,rmsnorm,decomposed}` PASS — these
+  run at M=8 so they now exercise split-K gate_up: worst_abs 0.00012 / 0.00049 /
+  0.00781 (≪ tol 0.96 / 4.73 / 4.73), **warm replay byte-identical**, cold-miss
+  rejected (safety valve intact).
+- glm-4-9b-int4 **and** qwen2.5-14b-int4-zp e2e greedy tokens **byte-identical**.
+- fmt + lib clippy + native-backend clippy clean.
+
+**→ Sebastian:** your B\*=2.63 predates BOTH update-7 (`4abe4e57`, o/q/kv/down
+retune) and this update-8 (`3735d57e`, gate_up split-K) — they crossed in flight.
+Please re-probe **head 3735d57e** with `ONNX_GENAI_MARLIN_M_GT_1=1` (split-K
+default). The M=8 verify wall should drop below 26.8ms since the biggest MLP GEMM
+now splits. Report the decisive B\*; if it plateaus just above 2 that's an honest
+GO for strong drafters — do not force it.
+
+**Honest ceiling.** M=8 uses `mma.m16n8k16` (16-row tiles) at half occupancy →
+~50% MMA waste is intrinsic to tensor-core int4 at M=8 (GPTQ-Marlin pads the
+same). Split-K + occupancy is the only lever short of a non-tensor-core path
+(cp.async already measured occupancy-bound/slower). Beyond this increment, the
+remaining path to a universal B\*≤2 is drafting-depth amortization (Sebastian's
+domain), not a capture blocker.
