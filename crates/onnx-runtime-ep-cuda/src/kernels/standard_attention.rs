@@ -569,7 +569,9 @@ const WS_OFFSETS: usize = 2;
 const WS_PAD_LIMITS: usize = 3;
 const WS_STAGE_KEY: usize = 4;
 const WS_STAGE_VALUE: usize = 5;
-const WS_COUNT: usize = 6;
+const WS_PRESENT_KEY: usize = 6;
+const WS_PRESENT_VALUE: usize = 7;
+const WS_COUNT: usize = 8;
 
 /// Alignment of the governed default-domain `Attention` score buffer (#736),
 /// matching the executor's 256-byte device-allocation granularity.
@@ -583,6 +585,20 @@ struct StdAttentionWorkspaceLayout {
     stage_key_bytes: usize,
     stage_value_offset: Option<usize>,
     stage_value_bytes: usize,
+    /// Present-K scratch served from the governed workspace when the present-key
+    /// output slot is unbound (the kernel still needs it as the attention K
+    /// source). `None` when a bound output slot supplies the storage.
+    present_key_offset: Option<usize>,
+    present_key_bytes: usize,
+    present_value_offset: Option<usize>,
+    present_value_bytes: usize,
+    /// Per-batch control arrays (`offsets`, `pad_limits`). Always served from the
+    /// governed workspace so the served-path dispatch performs no per-call device
+    /// allocation for them (requirement 3: allocation-free captured region).
+    offsets_offset: usize,
+    offsets_bytes: usize,
+    pad_limits_offset: usize,
+    pad_limits_bytes: usize,
     total_bytes: usize,
 }
 
@@ -643,6 +659,9 @@ fn std_attention_workspace_layout(
     element_bytes: usize,
     stage_key: bool,
     stage_value: bool,
+    present_key_scratch: bool,
+    present_value_scratch: bool,
+    control_batch: usize,
 ) -> Result<StdAttentionWorkspaceLayout> {
     let scores_bytes = std_attention_scores_bytes(batch, q_heads, q_seq, total_seq)?;
     let mut total_bytes = scores_bytes;
@@ -689,6 +708,63 @@ fn std_attention_workspace_layout(
         None
     };
 
+    // Present-K/V scratch: identical byte formula as the staged K/V regions
+    // (`batch·kv_heads·seq·head_size·element_bytes`), served when the present
+    // output slot is unbound so `run` never `alloc_raw`s it per dispatch.
+    let present_key_bytes = if present_key_scratch {
+        std_attention_stage_bytes(key_elements, element_bytes)?
+    } else {
+        0
+    };
+    let present_key_offset = if present_key_scratch {
+        total_bytes = std_attention_align_up(total_bytes)?;
+        let offset = total_bytes;
+        total_bytes = total_bytes.checked_add(present_key_bytes).ok_or_else(|| {
+            EpError::KernelFailed("Attention: present-key scratch workspace overflow".into())
+        })?;
+        Some(offset)
+    } else {
+        None
+    };
+
+    let present_value_bytes = if present_value_scratch {
+        std_attention_stage_bytes(value_elements, element_bytes)?
+    } else {
+        0
+    };
+    let present_value_offset = if present_value_scratch {
+        total_bytes = std_attention_align_up(total_bytes)?;
+        let offset = total_bytes;
+        total_bytes = total_bytes
+            .checked_add(present_value_bytes)
+            .ok_or_else(|| {
+                EpError::KernelFailed("Attention: present-value scratch workspace overflow".into())
+            })?;
+        Some(offset)
+    } else {
+        None
+    };
+
+    // Per-batch control arrays: `offsets` and `pad_limits`, one i64 per batch
+    // row each. Always governed so the served path uploads them into fixed
+    // workspace slots instead of allocating fresh device buffers per dispatch.
+    let control_elems = control_batch.max(1);
+    let control_bytes = control_elems
+        .checked_mul(std::mem::size_of::<i64>())
+        .ok_or_else(|| {
+            EpError::KernelFailed("Attention: control-array byte count overflow".into())
+        })?;
+    total_bytes = std_attention_align_up(total_bytes)?;
+    let offsets_offset = total_bytes;
+    total_bytes = total_bytes
+        .checked_add(control_bytes)
+        .ok_or_else(|| EpError::KernelFailed("Attention: offsets workspace overflow".into()))?;
+    total_bytes = std_attention_align_up(total_bytes)?;
+    let pad_limits_offset = total_bytes;
+    total_bytes = total_bytes
+        .checked_add(control_bytes)
+        .ok_or_else(|| EpError::KernelFailed("Attention: pad-limits workspace overflow".into()))?;
+
     Ok(StdAttentionWorkspaceLayout {
         scores_offset: 0,
         scores_bytes,
@@ -696,6 +772,14 @@ fn std_attention_workspace_layout(
         stage_key_bytes,
         stage_value_offset,
         stage_value_bytes,
+        present_key_offset,
+        present_key_bytes,
+        present_value_offset,
+        present_value_bytes,
+        offsets_offset,
+        offsets_bytes: control_bytes,
+        pad_limits_offset,
+        pad_limits_bytes: control_bytes,
         total_bytes,
     })
 }
@@ -843,6 +927,11 @@ fn std_attention_workspace_requirement(
         return Ok(WorkspaceRequirement::NONE);
     }
     let (stage_key, stage_value) = std_attention_staging_route(inputs, is_causal, output_count);
+    // Present-K/V scratch is served whenever the corresponding present output
+    // slot is unbound — `run` derives this from `present_*_out.is_none()`, which
+    // is exactly `output_count < 2` / `< 3`, so plan and execution agree.
+    let present_key_scratch = output_count < 2;
+    let present_value_scratch = output_count < 3;
     let layout = std_attention_workspace_layout(
         batch,
         q_heads,
@@ -856,6 +945,9 @@ fn std_attention_workspace_requirement(
         q.dtype.byte_size(),
         stage_key,
         stage_value,
+        present_key_scratch,
+        present_value_scratch,
+        batch,
     )?;
     let step_scoped = !(batch == 1 && q_seq == 1);
     let lifetime = if step_scoped {
@@ -1609,24 +1701,11 @@ impl StandardAttentionKernel {
                 Ok(ptr)
             };
 
-            // Present K/V: write directly into output slots when present, else
-            // into scratch (still needed as the attention kernel's K/V source).
-            let present_key_ptr = match present_key_out {
-                Some(ptr) => ptr,
-                None => alloc(
-                    &self.runtime,
-                    &mut owned,
-                    present_key_expected * element_bytes,
-                )?,
-            };
-            let present_value_ptr = match present_value_out {
-                Some(ptr) => ptr,
-                None => alloc(
-                    &self.runtime,
-                    &mut owned,
-                    present_value_expected * element_bytes,
-                )?,
-            };
+            // Present K/V pointers are resolved after the governed workspace
+            // layout is known (below): a bound output slot supplies the storage,
+            // otherwise the scratch is carved from the served workspace (or, on
+            // the pooled/eager paths, from the per-kernel pool / a per-call
+            // allocation) — never a per-dispatch allocation on the served path.
 
             // In-place KV growth. The decode graph binds the present K/V output
             // onto the same buffer as the past K/V input.
@@ -1700,6 +1779,9 @@ impl StandardAttentionKernel {
                 element_bytes,
                 stage_key,
                 stage_value,
+                present_key_out.is_none(),
+                present_value_out.is_none(),
+                offsets.len(),
             )?;
             if let Some(view) = prepared
                 && view.bytes() < workspace_layout.total_bytes
@@ -1725,6 +1807,67 @@ impl StandardAttentionKernel {
                 None => match ws.as_mut() {
                     Some(ws) => ws.reserve(WS_SCORES, workspace_layout.scores_bytes)?,
                     None => alloc(&self.runtime, &mut owned, workspace_layout.scores_bytes)?,
+                },
+            };
+            // Present K/V source pointers. A bound output slot supplies the
+            // storage directly; otherwise the scratch is served from the
+            // governed workspace on the executor-prepared (StepScoped) path, the
+            // per-kernel pool on the capture-eligible path, or a per-call
+            // allocation on the eager/opt-out path. Serving from `prepared`
+            // removes the per-dispatch `alloc_raw`/`cuMemAlloc` that previously
+            // scaled with step count (requirement 3).
+            let present_key_ptr = match present_key_out {
+                Some(ptr) => ptr,
+                None => match prepared {
+                    Some(view) => std_attention_carve(
+                        view,
+                        workspace_layout.present_key_offset.ok_or_else(|| {
+                            EpError::KernelFailed(
+                                "Attention: present-key scratch workspace layout is missing its \
+                                 offset"
+                                    .into(),
+                            )
+                        })?,
+                        workspace_layout.present_key_bytes,
+                        "present key scratch",
+                    )?,
+                    None => match ws.as_mut() {
+                        Some(ws) => {
+                            ws.reserve(WS_PRESENT_KEY, present_key_expected * element_bytes)?
+                        }
+                        None => alloc(
+                            &self.runtime,
+                            &mut owned,
+                            present_key_expected * element_bytes,
+                        )?,
+                    },
+                },
+            };
+            let present_value_ptr = match present_value_out {
+                Some(ptr) => ptr,
+                None => match prepared {
+                    Some(view) => std_attention_carve(
+                        view,
+                        workspace_layout.present_value_offset.ok_or_else(|| {
+                            EpError::KernelFailed(
+                                "Attention: present-value scratch workspace layout is missing its \
+                                 offset"
+                                    .into(),
+                            )
+                        })?,
+                        workspace_layout.present_value_bytes,
+                        "present value scratch",
+                    )?,
+                    None => match ws.as_mut() {
+                        Some(ws) => {
+                            ws.reserve(WS_PRESENT_VALUE, present_value_expected * element_bytes)?
+                        }
+                        None => alloc(
+                            &self.runtime,
+                            &mut owned,
+                            present_value_expected * element_bytes,
+                        )?,
+                    },
                 },
             };
             let key_kv_ptr = if stage_key {
@@ -1790,18 +1933,37 @@ impl StandardAttentionKernel {
                 0
             };
 
-            // Per-batch control arrays. On the capture path they live in fixed
-            // workspace slots and are (re)uploaded only outside capture — their
-            // values are host-constant for a frozen decode (offset unused with
-            // `is_causal=false`, pad `-1`), so the warmup upload is what a replay
-            // reuses. The eager/dense path uploads fresh per call.
-            let offsets_ptr = match ws.as_mut() {
-                Some(ws) => ws.reserve(WS_OFFSETS, offsets.len() * 8)?,
-                None => alloc(&self.runtime, &mut owned, offsets.len() * 8)?,
+            // Per-batch control arrays. On the served (StepScoped) path they are
+            // carved from the governed workspace and uploaded via a captured H2D
+            // copy — no per-dispatch device allocation (requirement 3). On the
+            // capture path they live in fixed pool slots and are (re)uploaded only
+            // outside capture — their values are host-constant for a frozen decode
+            // (offset unused with `is_causal=false`, pad `-1`), so the warmup
+            // upload is what a replay reuses. The eager path uploads fresh per
+            // call.
+            let offsets_ptr = match prepared {
+                Some(view) => std_attention_carve(
+                    view,
+                    workspace_layout.offsets_offset,
+                    workspace_layout.offsets_bytes,
+                    "offsets",
+                )?,
+                None => match ws.as_mut() {
+                    Some(ws) => ws.reserve(WS_OFFSETS, offsets.len() * 8)?,
+                    None => alloc(&self.runtime, &mut owned, offsets.len() * 8)?,
+                },
             };
-            let pad_limits_ptr = match ws.as_mut() {
-                Some(ws) => ws.reserve(WS_PAD_LIMITS, pad_limits.len() * 8)?,
-                None => alloc(&self.runtime, &mut owned, pad_limits.len() * 8)?,
+            let pad_limits_ptr = match prepared {
+                Some(view) => std_attention_carve(
+                    view,
+                    workspace_layout.pad_limits_offset,
+                    workspace_layout.pad_limits_bytes,
+                    "pad limits",
+                )?,
+                None => match ws.as_mut() {
+                    Some(ws) => ws.reserve(WS_PAD_LIMITS, pad_limits.len() * 8)?,
+                    None => alloc(&self.runtime, &mut owned, pad_limits.len() * 8)?,
+                },
             };
             if !capturing {
                 let offsets_bytes = unsafe {
@@ -2211,6 +2373,9 @@ mod alias_tests {
                     std::mem::size_of::<f32>(),
                     alias,
                     alias,
+                    false,
+                    false,
+                    1,
                 )
                 .unwrap();
                 let workspace_buf =
@@ -2689,7 +2854,15 @@ mod workspace_governance_tests {
         ];
         let req =
             std_attention_workspace_requirement(&inputs, Some(32), Some(32), true, 3).unwrap();
-        assert_eq!(req.bytes, 1u64 * 32 * 2048 * 2048 * 4);
+        // Bound present outputs (3-output node) need no served K/V scratch, so the
+        // composite is the always-live scores plus the per-batch control arrays.
+        let layout = std_attention_workspace_layout(
+            1, 32, 2048, 2048, 32, 2048, 128, 2048, 128, 4, false, false, false, false, 1,
+        )
+        .unwrap();
+        assert_eq!(req.bytes, layout.total_bytes as u64);
+        assert_eq!(layout.scores_bytes, 1 * 32 * 2048 * 2048 * 4);
+        assert!(layout.present_key_offset.is_none());
         assert_eq!(req.lifetime, WorkspaceLifetime::StepScoped);
         assert!(matches!(
             req.role,
@@ -2702,9 +2875,10 @@ mod workspace_governance_tests {
     fn dense_single_token_growth_stages_both_as_session_persistent() {
         let inputs = dense_inputs(DataType::Float16, 1, 1, 2048);
         assert_eq!(std_attention_staging_route(&inputs, true, 3), (true, true));
-        let layout =
-            std_attention_workspace_layout(1, 32, 1, 2049, 8, 2049, 128, 2049, 128, 2, true, true)
-                .unwrap();
+        let layout = std_attention_workspace_layout(
+            1, 32, 1, 2049, 8, 2049, 128, 2049, 128, 2, true, true, false, false, 1,
+        )
+        .unwrap();
         let req = std_attention_workspace_requirement(&inputs, Some(32), Some(8), true, 3).unwrap();
         assert_eq!(req.bytes, layout.total_bytes as u64);
         assert_eq!(layout.stage_key_bytes, 1 * 8 * 2049 * 128 * 2);
@@ -2719,9 +2893,10 @@ mod workspace_governance_tests {
     #[test]
     fn dense_prefill_growth_stages_both_as_step_scoped() {
         let inputs = dense_inputs(DataType::Float32, 2, 8, 128);
-        let layout =
-            std_attention_workspace_layout(2, 32, 8, 136, 8, 136, 128, 136, 128, 4, true, true)
-                .unwrap();
+        let layout = std_attention_workspace_layout(
+            2, 32, 8, 136, 8, 136, 128, 136, 128, 4, true, true, false, false, 2,
+        )
+        .unwrap();
         let req = std_attention_workspace_requirement(&inputs, Some(32), Some(8), true, 3).unwrap();
         assert_eq!(req.bytes, layout.total_bytes as u64);
         assert!(layout.stage_key_offset.is_some());
@@ -2744,9 +2919,18 @@ mod workspace_governance_tests {
         );
         let fixed_req =
             std_attention_workspace_requirement(&fixed, Some(32), Some(8), false, 3).unwrap();
+        // Bound present outputs charge zero staged-K/V bytes; the composite keeps
+        // its always-live scores plus the per-batch control arrays.
+        let fixed_layout = std_attention_workspace_layout(
+            1, 32, 1, 2049, 8, 2049, 128, 2049, 128, 2, false, false, false, false, 1,
+        )
+        .unwrap();
+        assert_eq!(fixed_req.bytes, fixed_layout.total_bytes as u64);
+        assert!(fixed_layout.stage_key_offset.is_none());
+        assert!(fixed_layout.present_key_offset.is_none());
         assert_eq!(
-            fixed_req.bytes,
-            std_attention_scores_bytes(1, 32, 1, 2049).unwrap() as u64,
+            fixed_layout.scores_bytes,
+            std_attention_scores_bytes(1, 32, 1, 2049).unwrap(),
             "the composite keeps its always-live scores but charges zero staged-K/V bytes"
         );
 
@@ -2764,7 +2948,17 @@ mod workspace_governance_tests {
         );
         let one_output_req =
             std_attention_workspace_requirement(&dense, Some(32), Some(8), true, 1).unwrap();
-        assert_eq!(one_output_req.bytes, fixed_req.bytes);
+        // A one-output node binds no present slots, so the served composite now
+        // also carries the present-K/V scratch the kernel needs as its attention
+        // source — strictly more than the scores+control-only bound-output case.
+        assert!(one_output_req.bytes > fixed_req.bytes);
+        let one_layout = std_attention_workspace_layout(
+            1, 32, 1, 2049, 8, 2049, 128, 2049, 128, 2, false, false, true, true, 1,
+        )
+        .unwrap();
+        assert_eq!(one_output_req.bytes, one_layout.total_bytes as u64);
+        assert!(one_layout.present_key_offset.is_some());
+        assert!(one_layout.present_value_offset.is_some());
     }
 
     #[test]
