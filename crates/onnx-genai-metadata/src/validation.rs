@@ -936,6 +936,7 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
                 &compiled.graph,
                 &serving.slot_ids,
                 "pipeline.workflow.steps",
+                false,
                 errors,
             );
         }
@@ -1143,6 +1144,7 @@ fn validate_compacted_emit_identity(
     node: &WorkflowNode,
     slot_ids: &str,
     path: &str,
+    inside_loop: bool,
     errors: &mut Vec<String>,
 ) {
     match node {
@@ -1152,6 +1154,7 @@ fn validate_compacted_emit_identity(
                     node,
                     slot_ids,
                     &format!("{path}[{index}]"),
+                    inside_loop,
                     errors,
                 );
             }
@@ -1162,17 +1165,26 @@ fn validate_compacted_emit_identity(
             carried,
             ..
         } => {
-            if !carried
-                .iter()
-                .any(|carry| carry.cell == slot_ids && carry.body_output == slot_ids)
+            // Compaction happens between workflow runs, so the outer lifecycle loop must retain
+            // semantic row identity. Nested control loops operate within that fixed permutation.
+            if !inside_loop
+                && !carried
+                    .iter()
+                    .any(|carry| carry.cell == slot_ids && carry.body_output == slot_ids)
             {
                 errors.push(format!(
                     "{path}.carried must preserve serving slot_ids '{slot_ids}' when compaction \
                      is enabled; its next value must be the carried slot_ids value"
                 ));
             }
-            validate_compacted_emit_identity(setup, slot_ids, &format!("{path}.setup"), errors);
-            validate_compacted_emit_identity(body, slot_ids, &format!("{path}.body"), errors);
+            validate_compacted_emit_identity(
+                setup,
+                slot_ids,
+                &format!("{path}.setup"),
+                true,
+                errors,
+            );
+            validate_compacted_emit_identity(body, slot_ids, &format!("{path}.body"), true, errors);
         }
         WorkflowNode::Branch { cases, default, .. } => {
             for (case, node) in cases {
@@ -1180,6 +1192,7 @@ fn validate_compacted_emit_identity(
                     node,
                     slot_ids,
                     &format!("{path}.cases.{case}"),
+                    inside_loop,
                     errors,
                 );
             }
@@ -1188,6 +1201,7 @@ fn validate_compacted_emit_identity(
                     default,
                     slot_ids,
                     &format!("{path}.default"),
+                    inside_loop,
                     errors,
                 );
             }
