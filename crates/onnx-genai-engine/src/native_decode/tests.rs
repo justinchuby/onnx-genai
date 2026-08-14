@@ -2165,6 +2165,46 @@ fn seq_major_growth_is_fixed_stride_and_moves_no_bytes() {
     }
 }
 
+// Batch-N control (stage 2b-impl-2, #750): head-major growing-bucket growth is
+// batch-general, seq-major growing-bucket growth at batch>1 is an explicit named
+// refusal (it would relocate every sequence b>0). This asserts the geometry math
+// at batch>1 even though runtime batch stays fixed to 1 — a transposed axis or a
+// silently wrong capacity-dependent stride could not surface at batch=1.
+#[test]
+fn kv_growth_byte_layout_refuses_seq_major_batch_n_and_allows_head_major_batch_n() {
+    // Head-major: batch axis outermost, byte layout == declared shape, grow axis
+    // 2, block count = batch * kv_heads — each (batch, head) stripe re-strides
+    // independently and correctly, so batch-N growth is exact.
+    let head_batch_n = [3usize, 8, 512, 128];
+    let (bytes, axis) = kv_growth_byte_layout(&head_batch_n, KvCommitLayout::HeadMajor)
+        .expect("head-major batch-N growing bucket is batch-general");
+    assert_eq!(bytes, head_batch_n.to_vec());
+    assert_eq!(axis, 2);
+    let blocks: usize = bytes[..axis].iter().product();
+    assert_eq!(blocks, 3 * 8, "head-major blocks = batch * kv_heads");
+
+    // Seq-major growing bucket at batch>1 is refused with a named error rather
+    // than a silently wrong capacity-dependent stride.
+    let seq_batch_n = [3usize, 8, 512, 128];
+    let error = kv_growth_byte_layout(&seq_batch_n, KvCommitLayout::SeqMajor)
+        .expect_err("seq-major batch-N growing bucket must be refused");
+    let message = error.to_string();
+    assert!(message.contains("seq-major"), "names the layout: {message}");
+    assert!(message.contains("batch 3"), "names the batch: {message}");
+    assert!(
+        message.contains("relocat"),
+        "names the constraint: {message}"
+    );
+
+    // Batch-1 seq-major is unaffected: byte-identical BSNH permutation, grow
+    // axis 1.
+    let seq_batch_1 = [1usize, 8, 512, 128];
+    let (seq_bytes, seq_axis) = kv_growth_byte_layout(&seq_batch_1, KvCommitLayout::SeqMajor)
+        .expect("seq-major batch-1 unaffected");
+    assert_eq!(seq_bytes, vec![1, 512, 8, 128]);
+    assert_eq!(seq_axis, 1);
+}
+
 #[test]
 fn cuda_fixed_state_shapes_reject_unbounded_non_batch_dimensions() {
     let error = DecodeCudaState::persistent_state_shapes(
