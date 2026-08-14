@@ -519,6 +519,7 @@ pub(crate) fn encode_kv_telemetry(
     output
 }
 
+#[cfg(feature = "metrics")]
 pub(crate) fn encode_mapped_growth(metrics: &onnx_genai_engine::MappedGrowthMetrics) -> String {
     let values = [
         (
