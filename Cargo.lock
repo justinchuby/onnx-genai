@@ -2412,6 +2412,7 @@ dependencies = [
  "onnx-runtime-ep-cpu",
  "onnx-runtime-ep-plugin",
  "onnx-runtime-ir",
+ "onnx-std",
 ]
 
 [[package]]

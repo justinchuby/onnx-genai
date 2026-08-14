@@ -70,6 +70,8 @@ fn find_ort_lib_dir() -> Option<PathBuf> {
 /// Canonical ORT discovery — single source of truth in `tests/common/ort_discovery.rs`.
 #[path = "common/ort_discovery.rs"]
 mod ort_discovery;
+#[path = "common/ort_session.rs"]
+mod ort_session;
 
 /// Find the EP cdylib produced by this crate.
 fn find_ep_cdylib() -> Option<PathBuf> {
@@ -252,7 +254,8 @@ fn ort_loads_our_ep_and_runs_model() {
     );
 
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/add_1x4/model.onnx");
+    let model_path =
+        PathBuf::from(manifest_dir).join("tests/fixtures/add_1x4/model.onnx.textproto");
     assert!(
         model_path.exists(),
         "Missing model fixture: {}",
@@ -328,10 +331,9 @@ fn ort_loads_our_ep_and_runs_model() {
         eprintln!("✓ Stage 4: EP appended to session options");
 
         // Stage 5: CreateSession
-        let model_c = ort_path::OrtPathBuf::new(&model_path);
         let mut session: *mut ort::OrtSession = ptr::null_mut();
         let status =
-            ((*api).CreateSession.unwrap())(env, model_c.as_ptr(), session_options, &mut session);
+            ort_session::create_session(api, env, session_options, &model_path, &mut session);
         check_status(api, status, "CreateSession");
         eprintln!("✓ Stage 5: CreateSession");
 
@@ -441,7 +443,8 @@ fn ort_unsupported_op_declines_not_crashes() {
     );
 
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/nonzero_1x4/model.onnx");
+    let model_path =
+        PathBuf::from(manifest_dir).join("tests/fixtures/nonzero_1x4/model.onnx.textproto");
     if !model_path.exists() {
         eprintln!(
             "*** SKIPPED: unsupported-op fixture missing at {}\n\
@@ -508,10 +511,9 @@ fn ort_unsupported_op_declines_not_crashes() {
         check_status(api, status, "SessionOptionsAppendExecutionProvider_V2");
 
         // CreateSession with unsupported-op model: should succeed (ORT falls back to default EP)
-        let model_c = ort_path::OrtPathBuf::new(&model_path);
         let mut session: *mut ort::OrtSession = ptr::null_mut();
         let status =
-            ((*api).CreateSession.unwrap())(env, model_c.as_ptr(), session_options, &mut session);
+            ort_session::create_session(api, env, session_options, &model_path, &mut session);
         check_status(api, status, "CreateSession(unsupported-op model)");
         assert!(
             !session.is_null(),
@@ -800,11 +802,9 @@ unsafe fn conformance_setup(
     unsafe { check_status(api, status, "SessionOptionsAppendExecutionProvider_V2") };
 
     // CreateSession
-    let model_c = ort_path::OrtPathBuf::new(model_path);
     let mut session: *mut ort::OrtSession = ptr::null_mut();
-    let status = unsafe {
-        ((*api).CreateSession.unwrap())(env, model_c.as_ptr(), session_options, &mut session)
-    };
+    let status =
+        unsafe { ort_session::create_session(api, env, session_options, model_path, &mut session) };
     unsafe { check_status(api, status, "CreateSession") };
 
     Some((lib, api, env, session_options, session))
@@ -1073,7 +1073,8 @@ unsafe fn make_int32_tensor(
 fn conformance_add_broadcast() {
     let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/add_broadcast/model.onnx");
+    let model_path =
+        PathBuf::from(manifest_dir).join("tests/fixtures/add_broadcast/model.onnx.textproto");
 
     let Some((_lib, api, env, opts, session)) =
         (unsafe { conformance_setup("cpu_ep_bc", &model_path, true) })
@@ -1149,7 +1150,8 @@ fn conformance_add_broadcast() {
 fn conformance_chain_add_mul() {
     let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/chain_add_mul/model.onnx");
+    let model_path =
+        PathBuf::from(manifest_dir).join("tests/fixtures/chain_add_mul/model.onnx.textproto");
 
     let Some((_lib, api, env, opts, session)) =
         (unsafe { conformance_setup("cpu_ep_chain", &model_path, true) })
@@ -1228,7 +1230,8 @@ fn conformance_chain_add_mul() {
 fn conformance_matmul_2d() {
     let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/matmul_2d/model.onnx");
+    let model_path =
+        PathBuf::from(manifest_dir).join("tests/fixtures/matmul_2d/model.onnx.textproto");
 
     let Some((_lib, api, env, opts, session)) =
         (unsafe { conformance_setup("cpu_ep_mm", &model_path, true) })
@@ -1303,7 +1306,8 @@ fn conformance_matmul_2d() {
 fn conformance_mixed_partition() {
     let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/mixed_partition/model.onnx");
+    let model_path =
+        PathBuf::from(manifest_dir).join("tests/fixtures/mixed_partition/model.onnx.textproto");
 
     let Some((_lib, api, env, opts, session)) =
         (unsafe { conformance_setup("cpu_ep_mix", &model_path, false) })
@@ -1396,7 +1400,8 @@ fn conformance_mixed_partition() {
 fn conformance_add_int32() {
     let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/add_int32/model.onnx");
+    let model_path =
+        PathBuf::from(manifest_dir).join("tests/fixtures/add_int32/model.onnx.textproto");
 
     let Some((_lib, api, env, opts, session)) =
         (unsafe { conformance_setup("cpu_ep_i32", &model_path, true) })
@@ -1469,7 +1474,8 @@ fn conformance_add_int32() {
 fn conformance_add_dynamic_dim() {
     let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/add_dynamic_dim/model.onnx");
+    let model_path =
+        PathBuf::from(manifest_dir).join("tests/fixtures/add_dynamic_dim/model.onnx.textproto");
 
     let Some((_lib, api, env, opts, session)) =
         (unsafe { conformance_setup("cpu_ep_dyn", &model_path, true) })
@@ -1560,7 +1566,8 @@ fn conformance_add_dynamic_dim() {
 fn conformance_multiple_run_calls() {
     let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/add_1x4/model.onnx");
+    let model_path =
+        PathBuf::from(manifest_dir).join("tests/fixtures/add_1x4/model.onnx.textproto");
 
     let Some((_lib, api, env, opts, session)) =
         (unsafe { conformance_setup("cpu_ep_runs", &model_path, true) })
@@ -1665,8 +1672,9 @@ fn conformance_multiple_run_calls() {
 fn conformance_two_sessions() {
     let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let model_a = PathBuf::from(manifest_dir).join("tests/fixtures/add_1x4/model.onnx");
-    let model_b = PathBuf::from(manifest_dir).join("tests/fixtures/add_broadcast/model.onnx");
+    let model_a = PathBuf::from(manifest_dir).join("tests/fixtures/add_1x4/model.onnx.textproto");
+    let model_b =
+        PathBuf::from(manifest_dir).join("tests/fixtures/add_broadcast/model.onnx.textproto");
 
     let ort_lib_dir = skip_if_missing!(
         find_ort_lib_dir(),
@@ -1741,9 +1749,8 @@ fn conformance_two_sessions() {
             0,
         );
         check_status(api, status, "AppendEP(A)");
-        let model_a_c = ort_path::OrtPathBuf::new(&model_a);
         let mut sess_a: *mut ort::OrtSession = ptr::null_mut();
-        let status = ((*api).CreateSession.unwrap())(env, model_a_c.as_ptr(), opts_a, &mut sess_a);
+        let status = ort_session::create_session(api, env, opts_a, &model_a, &mut sess_a);
         check_status(api, status, "CreateSession(A)");
         eprintln!("✓ Session A created (add_1x4)");
 
@@ -1763,9 +1770,8 @@ fn conformance_two_sessions() {
             0,
         );
         check_status(api, status, "AppendEP(B)");
-        let model_b_c = ort_path::OrtPathBuf::new(&model_b);
         let mut sess_b: *mut ort::OrtSession = ptr::null_mut();
-        let status = ((*api).CreateSession.unwrap())(env, model_b_c.as_ptr(), opts_b, &mut sess_b);
+        let status = ort_session::create_session(api, env, opts_b, &model_b, &mut sess_b);
         check_status(api, status, "CreateSession(B)");
         eprintln!("✓ Session B created (add_broadcast)");
 
@@ -1871,7 +1877,7 @@ fn conformance_matmul_batched_nd() {
     let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let model_path =
-        PathBuf::from(manifest_dir).join("tests/fixtures/matmul_batched_nd/model.onnx");
+        PathBuf::from(manifest_dir).join("tests/fixtures/matmul_batched_nd/model.onnx.textproto");
 
     let Some((_lib, api, env, opts, session)) =
         (unsafe { conformance_setup("cpu_ep_mm3d", &model_path, true) })
@@ -1972,7 +1978,8 @@ fn stress_register_run_unregister_cycles() {
         p.unwrap()
     };
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/add_1x4/model.onnx");
+    let model_path =
+        PathBuf::from(manifest_dir).join("tests/fixtures/add_1x4/model.onnx.textproto");
     if !model_path.exists() {
         eprintln!(
             "*** SKIPPED: stress_register_run_unregister_cycles — add_1x4 fixture missing ***"
@@ -2045,10 +2052,9 @@ fn stress_register_run_unregister_cycles() {
                 0,
             );
             check_status(api, status, &format!("AppendEP[{cycle}]"));
-            let model_c = ort_path::OrtPathBuf::new(&model_path);
             let mut session: *mut ort::OrtSession = ptr::null_mut();
             let status =
-                ((*api).CreateSession.unwrap())(env, model_c.as_ptr(), sess_opts, &mut session);
+                ort_session::create_session(api, env, sess_opts, &model_path, &mut session);
             check_status(api, status, &format!("CreateSession[{cycle}]"));
 
             // Run: [1,2,3,4] + [5,6,7,8] = [6,8,10,12]
@@ -2117,7 +2123,8 @@ fn stress_register_run_unregister_cycles() {
 fn conformance_add_float16() {
     let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/add_float16/model.onnx");
+    let model_path =
+        PathBuf::from(manifest_dir).join("tests/fixtures/add_float16/model.onnx.textproto");
 
     let Some((_lib, api, env, opts, session)) =
         (unsafe { conformance_setup("cpu_ep_f16", &model_path, true) })
@@ -2191,7 +2198,8 @@ fn conformance_add_float16() {
 fn conformance_add_bfloat16() {
     let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/add_bfloat16/model.onnx");
+    let model_path =
+        PathBuf::from(manifest_dir).join("tests/fixtures/add_bfloat16/model.onnx.textproto");
 
     let Some((_lib, api, env, opts, session)) =
         (unsafe { conformance_setup("cpu_ep_bf16", &model_path, true) })
@@ -2347,7 +2355,8 @@ unsafe fn assert_output_shape(
 fn conformance_cast_f32_to_i64() {
     let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/cast_f32_to_i64/model.onnx");
+    let model_path =
+        PathBuf::from(manifest_dir).join("tests/fixtures/cast_f32_to_i64/model.onnx.textproto");
 
     let Some((_lib, api, env, opts, session)) =
         (unsafe { conformance_setup("cpu_ep_cast", &model_path, true) })
@@ -2422,7 +2431,8 @@ fn conformance_cast_f32_to_i64() {
 fn conformance_where_bool_f32() {
     let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/where_bool_f32/model.onnx");
+    let model_path =
+        PathBuf::from(manifest_dir).join("tests/fixtures/where_bool_f32/model.onnx.textproto");
 
     let Some((_lib, api, env, opts, session)) =
         (unsafe { conformance_setup("cpu_ep_where", &model_path, true) })
@@ -2521,7 +2531,8 @@ fn conformance_where_bool_f32() {
 fn conformance_shape_f32() {
     let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/shape_f32/model.onnx");
+    let model_path =
+        PathBuf::from(manifest_dir).join("tests/fixtures/shape_f32/model.onnx.textproto");
 
     let Some((_lib, api, env, opts, session)) =
         (unsafe { conformance_setup("cpu_ep_shape", &model_path, true) })
@@ -2608,7 +2619,8 @@ fn conformance_shape_f32() {
 fn conformance_layer_norm_multi_output() {
     let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/layer_norm_f32/model.onnx");
+    let model_path =
+        PathBuf::from(manifest_dir).join("tests/fixtures/layer_norm_f32/model.onnx.textproto");
 
     let Some((_lib, api, env, opts, session)) =
         (unsafe { conformance_setup("cpu_ep_ln", &model_path, true) })
@@ -2756,8 +2768,8 @@ fn conformance_layer_norm_multi_output() {
 fn conformance_layer_norm_neg_axis() {
     let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let model_path =
-        PathBuf::from(manifest_dir).join("tests/fixtures/layer_norm_neg_axis_f32/model.onnx");
+    let model_path = PathBuf::from(manifest_dir)
+        .join("tests/fixtures/layer_norm_neg_axis_f32/model.onnx.textproto");
 
     let Some((_lib, api, env, opts, session)) =
         (unsafe { conformance_setup("cpu_ep_ln_neg", &model_path, true) })
@@ -2862,8 +2874,8 @@ fn conformance_layer_norm_neg_axis() {
 fn conformance_rms_norm() {
     let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let model_path =
-        PathBuf::from(manifest_dir).join("tests/fixtures/simplified_layer_norm_f32/model.onnx");
+    let model_path = PathBuf::from(manifest_dir)
+        .join("tests/fixtures/simplified_layer_norm_f32/model.onnx.textproto");
 
     let Some((_lib, api, env, opts, session)) =
         (unsafe { conformance_setup("cpu_ep_rms", &model_path, true) })
@@ -2955,8 +2967,8 @@ fn conformance_rms_norm() {
 fn conformance_matmul_initializer_weights() {
     let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let model_path =
-        PathBuf::from(manifest_dir).join("tests/fixtures/matmul_initializer_weights/model.onnx");
+    let model_path = PathBuf::from(manifest_dir)
+        .join("tests/fixtures/matmul_initializer_weights/model.onnx.textproto");
 
     let Some((_lib, api, env, opts, session)) =
         (unsafe { conformance_setup("cpu_ep_matmul_init", &model_path, true) })

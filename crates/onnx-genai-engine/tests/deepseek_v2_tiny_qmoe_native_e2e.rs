@@ -24,7 +24,7 @@ fn fixture_dir() -> Option<PathBuf> {
                 .join("../../tests/fixtures/tiny-deepseek-v2-qmoe-attention")
         });
     let required = [
-        "model.onnx",
+        "model.onnx.textproto",
         "inference_metadata.yaml",
         "tokenizer.json",
         "manifest.json",
@@ -70,7 +70,7 @@ fn generate(engine: &mut Engine) -> anyhow::Result<Vec<u32>> {
 }
 
 fn assert_current_emission(dir: &Path) -> anyhow::Result<()> {
-    let model = dir.join("model.onnx");
+    let model = dir.join("model.onnx.textproto");
     let graph = onnx_runtime_loader::load_model(&model)?;
     assert_eq!(
         graph

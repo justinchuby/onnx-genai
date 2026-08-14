@@ -18,6 +18,8 @@ mod cdylib_resolve;
 #[path = "common/ort_discovery.rs"]
 mod ort_discovery;
 mod ort_path;
+#[path = "common/ort_session.rs"]
+mod ort_session;
 
 use std::ffi::{CStr, CString};
 use std::path::PathBuf;
@@ -192,8 +194,8 @@ unsafe fn assert_op_assigned_to_our_ep(
 fn layernorm_dynamic_axis_mean_invstddev_shape() {
     let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let model_path =
-        PathBuf::from(manifest_dir).join("tests/fixtures/layer_norm_dynamic_axis/model.onnx");
+    let model_path = PathBuf::from(manifest_dir)
+        .join("tests/fixtures/layer_norm_dynamic_axis/model.onnx.textproto");
 
     let Some(ort_lib_dir) = find_ort_lib_dir() else {
         if std::env::var("NXRT_REQUIRE_ORT_TESTS").as_deref() == Ok("1") {
@@ -295,10 +297,9 @@ fn layernorm_dynamic_axis_mean_invstddev_shape() {
         );
         check_status(api, status, "SessionOptionsAppendExecutionProvider_V2");
 
-        let model_c = ort_path::OrtPathBuf::new(&model_path);
         let mut session: *mut ort::OrtSession = ptr::null_mut();
         let status =
-            ((*api).CreateSession.unwrap())(env, model_c.as_ptr(), session_options, &mut session);
+            ort_session::create_session(api, env, session_options, &model_path, &mut session);
         check_status(api, status, "CreateSession");
 
         // Assert that LayerNormalization is owned by our EP, not the built-in CPU EP.
