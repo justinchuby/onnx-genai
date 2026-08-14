@@ -931,6 +931,14 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
     );
     validate_emit_identity_consistency(&compiled.graph, &mut BTreeMap::new(), errors);
     if let Some(serving) = &workflow.serving {
+        if serving.kv_service.compaction {
+            validate_compacted_emit_identity(
+                &compiled.graph,
+                &serving.slot_ids,
+                "pipeline.workflow.steps",
+                errors,
+            );
+        }
         if serving.kv_service.groups.is_empty() {
             errors.push(
                 "pipeline.workflow.serving.kv_service.groups must declare at least one bound \
@@ -1126,6 +1134,75 @@ fn validate_emit_identity_consistency(
             }
         }
         WorkflowNode::Invoke { .. }
+        | WorkflowNode::Transfer { .. }
+        | WorkflowNode::ExecutionIsland { .. } => {}
+    }
+}
+
+fn validate_compacted_emit_identity(
+    node: &WorkflowNode,
+    slot_ids: &str,
+    path: &str,
+    errors: &mut Vec<String>,
+) {
+    match node {
+        WorkflowNode::Sequence { nodes } => {
+            for (index, node) in nodes.iter().enumerate() {
+                validate_compacted_emit_identity(
+                    node,
+                    slot_ids,
+                    &format!("{path}[{index}]"),
+                    errors,
+                );
+            }
+        }
+        WorkflowNode::Loop {
+            setup,
+            body,
+            carried,
+            ..
+        } => {
+            if !carried
+                .iter()
+                .any(|carry| carry.cell == slot_ids && carry.body_output == slot_ids)
+            {
+                errors.push(format!(
+                    "{path}.carried must preserve serving slot_ids '{slot_ids}' when compaction \
+                     is enabled; its next value must be the carried slot_ids value"
+                ));
+            }
+            validate_compacted_emit_identity(setup, slot_ids, &format!("{path}.setup"), errors);
+            validate_compacted_emit_identity(body, slot_ids, &format!("{path}.body"), errors);
+        }
+        WorkflowNode::Branch { cases, default, .. } => {
+            for (case, node) in cases {
+                validate_compacted_emit_identity(
+                    node,
+                    slot_ids,
+                    &format!("{path}.cases.{case}"),
+                    errors,
+                );
+            }
+            if let Some(default) = default {
+                validate_compacted_emit_identity(
+                    default,
+                    slot_ids,
+                    &format!("{path}.default"),
+                    errors,
+                );
+            }
+        }
+        WorkflowNode::Emit {
+            row_ids: Some(row_ids),
+            ..
+        } if row_ids != slot_ids => {
+            errors.push(format!(
+                "{path}.row_ids must reference serving slot_ids '{slot_ids}' when compaction is \
+                 enabled"
+            ));
+        }
+        WorkflowNode::Emit { .. }
+        | WorkflowNode::Invoke { .. }
         | WorkflowNode::Transfer { .. }
         | WorkflowNode::ExecutionIsland { .. } => {}
     }

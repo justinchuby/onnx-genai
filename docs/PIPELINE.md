@@ -35,5 +35,7 @@ valid as the active-row set changes without specializing the ONNX graph to batch
 
 Ragged emission is explicit: `emit.row_ids` binds physical rows to semantic `int64[B]`
 identities. Guards and valid lengths are zipped with tensors and IDs before compaction.
+Serving workflows normally bind the carried `serving.slot_ids`; compaction permutes it
+with every carried state value, and slot reuse begins a fresh request epoch/output stream.
 Consumers enumerate structured rows by output declaration or semantic role; compatibility
 keys such as `tokens.row.17` are serialization details and are not parsed for behavior.
