@@ -10,7 +10,7 @@
 //! compacted output slots and absent inputs silently read ORT input 0.
 
 mod cdylib_resolve;
-mod ort_path;
+use onnx_runtime_ort_testkit as ort_path;
 
 use std::ffi::CStr;
 use std::path::PathBuf;
@@ -32,9 +32,10 @@ fn find_ort_lib_dir() -> Option<PathBuf> {
     ort_discovery::find_ort_lib_dir()
 }
 
-/// Canonical ORT discovery — single source of truth in `tests/common/ort_discovery.rs`.
-#[path = "common/ort_discovery.rs"]
-mod ort_discovery;
+/// Canonical ORT discovery lives in the `onnx-runtime-ort-testkit` crate —
+/// aliased here so existing `ort_discovery::` call sites keep working.
+use onnx_runtime_ort_testkit as ort_discovery;
+/// Session-creation helper (binary + textproto fixtures) from `main`.
 #[path = "common/ort_session.rs"]
 mod ort_session;
 

@@ -16,6 +16,7 @@ onnx-runtime-ep-cpu = { workspace = true }
 onnx-runtime-ep-plugin = { path = "../onnx-runtime-ep-plugin", version = "=0.1.0-dev.5" }
 
 [dev-dependencies]
+onnx-runtime-ort-testkit = { workspace = true }
 libloading = { workspace = true }
 onnx-genai-ort-sys = { workspace = true }
 onnx-runtime-ep-plugin = { path = "../onnx-runtime-ep-plugin", version = "=0.1.0-dev.5" }

@@ -482,6 +482,25 @@ fn l1_required_symbols_resolve() {
     let _release: libloading::Symbol<'_, unsafe extern "C" fn()> =
         unsafe { lib.get(b"ReleaseEpFactory") }.expect("ReleaseEpFactory not exported from cdylib");
 
+    // The hardware-validation harness (`scripts/validate_ep_workspace_h200.py`)
+    // reads these through `dlopen` on the very library ORT loaded. If they stop
+    // being exported the harness silently loses its proof that a workspace was
+    // served, so their absence has to fail here instead.
+    for symbol in [
+        &b"nxrt_ep_compiled_node_count"[..],
+        &b"nxrt_ep_reset_compiled_node_count"[..],
+        &b"nxrt_ep_workspace_placement_queries"[..],
+        &b"nxrt_ep_reset_workspace_placement_queries"[..],
+    ] {
+        let _counter: libloading::Symbol<'_, unsafe extern "C" fn() -> usize> =
+            unsafe { lib.get(symbol) }.unwrap_or_else(|e| {
+                panic!(
+                    "{} not exported from cdylib: {e}",
+                    String::from_utf8_lossy(symbol)
+                )
+            });
+    }
+
     eprintln!("✓ l1_required_symbols_resolve: CreateEpFactories ✓  ReleaseEpFactory ✓");
 }
 
@@ -555,6 +574,8 @@ fn l1_no_symbol_leakage() {
                 && *name != "ReleaseEpFactory"
                 && *name != "nxrt_ep_compiled_node_count"
                 && *name != "nxrt_ep_reset_compiled_node_count"
+                && *name != "nxrt_ep_workspace_placement_queries"
+                && *name != "nxrt_ep_reset_workspace_placement_queries"
                 && !name.starts_with("_Z")
                 && !name.starts_with("__rust")
                 && !name.starts_with("__rdl_")
