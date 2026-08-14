@@ -305,3 +305,52 @@ already relies on the same invariant).
 - GroupQueryAttention ×40: fused-flash, on-device metadata, pre-warm valve. ✅
 - Residual eager seams at M>1 for the hot path: NONE expected — Sebastian's
   probe is the authoritative segment census.
+
+---
+
+## Update 6 — Sebastian's segment census confirmed; split-K default + last dense seam closed
+
+**Sebastian's Increment-0 re-probe of c842b759 (glm-4-9b, M=8, MARLIN_M_GT_1=1)
+CONFIRMED the capture-safety landing:** `segments 120 → 1`; all 40 GQA + 80
+SkipSimplifiedLayerNorm + 240 MatMulNBits M>1 capture seams GONE. Byte-identical
+tokens, no NaN under capture (the KV-tail zero-init / on-device tail-mask
+assumption holds). ✅
+
+**Key measured finding — B\* is COMPUTE-bound, not segmentation-bound.**
+Collapsing 120→1 segments moved the captured M=8 wall by ~0 (50.7→51.8ms, B*
+4.99→5.10×). Segmentation overhead was already negligible. **Split-K is the
+lever that moves B\*:** exploratory `ONNX_GENAI_MARLIN_SPLITK=1` (also
+capture-safe, segments=1, byte-identical tokens) drops **B\* 5.10× → 2.69×**
+(M=8 wall 51.8→27.3ms, cliff 40.5→16.5ms) — at the ≤2 GO line.
+
+**Actions this update (commit 29714037):**
+1. **Split-K default-ON within the opt-in Marlin M>1 path.** `marlin_splitk_enabled()`
+   now defaults true (opt out with `ONNX_GENAI_MARLIN_SPLITK=0`). It lives
+   *inside* `ONNX_GENAI_MARLIN_M_GT_1=1` (default OFF), so no default / consumer
+   / edge tier is affected; `choose_split_k` still elects a split only for
+   small-M / low-wave shapes (large-M prefill stays on the byte-identical direct
+   kernel). This makes the canonical GO probe reach B*≈2.69 without a second flag.
+2. **Closed the last M>1 capture seam — the dense `lm_head` logits projection.**
+   Sebastian's census left exactly one residual node: `lm_head/MatMul_node_734`
+   → `logits`, a plain fp16 dense `MatMul` (NOT MatMulNBits), which fell to
+   cuBLASLt's per-call heuristic path at M>1 (M=K verify). It does not fragment
+   the body (whole stack captures as 1 segment) but was the last node declaring
+   `KernelCaptureUnsupported`. **Fix:** a cached-plan fast path
+   (`blas::CaptureGemmPlan` + `DenseGemmPlan` in `kernels/matmul.rs`) for the
+   plain 2-D (`batch==1`) M>1 GEMM — select algorithm + persistent workspace
+   once at warmup, replay with no heuristic query / allocation / synchronization
+   (its own workspace is never shared, so no post-GEMM sync). M>1 analogue of
+   `F32GemvPlan`; reproduces `governed_gemm`'s arithmetic bit-for-bit at a fixed
+   shape (same heuristic-selected algo). Batched/broadcast GEMMs keep the
+   per-call path. Advertises capture after a warmed call.
+
+**Gates:** greedy tokens byte-identical on glm-4-9b-int4 AND qwen2.5-14b-int4-zp
+(`marlin_m_gt_1_matches_tiled_on_*`, GPU 5); fmt + lib clippy + native-backend
+clippy clean. SM80 guard + fallback unchanged.
+
+**→ Sebastian:** re-probe 29714037 with `ONNX_GENAI_MARLIN_M_GT_1=1` (split-K now
+default; no SPLITK flag needed). Expect segments=1 (now incl. the lm_head node)
+and B*≈2.69 out of the box. The lm_head being inside the captured graph removes
+its per-step eager launch + sync; measure whether that nudges B* toward ≤2. The
+final small increment to break-even is small-M GEMM throughput (split-K tuning),
+not segmentation.
