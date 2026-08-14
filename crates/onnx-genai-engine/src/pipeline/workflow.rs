@@ -755,7 +755,14 @@ impl<'a> WorkflowExecutionPlan<'a> {
                         "session-scoped workflow state '{cell}' has no final value '{value_ref}'"
                     )
                 })?;
-                updates.push(((session_id.clone(), cell.clone()), clone_value(value)?));
+                // Session state outlives the run that produced it, so it must be
+                // an independent tensor: a boundary value may be a view over a
+                // recurring island's stable output buffer that a later run —
+                // possibly for another session — overwrites in place.
+                updates.push((
+                    (session_id.clone(), cell.clone()),
+                    engine.materialize_workflow_value_copy(value)?,
+                ));
             }
             let mut session_state = engine.workflow_session_state.borrow_mut();
             for (key, value) in updates {
@@ -2774,6 +2781,7 @@ pub(super) fn compile_movable_emit_values(
 
 pub(super) fn compile_aliasable_output_values(
     node: &WorkflowNode,
+    workflow: &WorkflowSpec,
 ) -> std::collections::HashSet<String> {
     fn collect_single_run_outputs(
         node: &WorkflowNode,
@@ -2810,7 +2818,7 @@ pub(super) fn compile_aliasable_output_values(
 
     let mut outputs = std::collections::HashSet::new();
     collect_single_run_outputs(node, false, &mut outputs);
-    collect_recurring_aliasable_outputs(node, &mut outputs);
+    collect_recurring_aliasable_outputs(node, workflow, &mut outputs);
     outputs
 }
 
@@ -2844,6 +2852,7 @@ struct BodySlot {
 /// value outright.
 fn collect_recurring_aliasable_outputs(
     node: &WorkflowNode,
+    workflow: &WorkflowSpec,
     aliasable: &mut std::collections::HashSet<String>,
 ) {
     fn flatten(node: &WorkflowNode, slots: &mut Vec<BodySlot>) {
@@ -2930,23 +2939,23 @@ fn collect_recurring_aliasable_outputs(
         match node {
             WorkflowNode::Sequence { nodes } => {
                 for child in nodes {
-                    collect_recurring_aliasable_outputs(child, aliasable);
+                    collect_recurring_aliasable_outputs(child, workflow, aliasable);
                 }
             }
             WorkflowNode::Branch { cases, default, .. } => {
                 for case in cases.values() {
-                    collect_recurring_aliasable_outputs(case, aliasable);
+                    collect_recurring_aliasable_outputs(case, workflow, aliasable);
                 }
                 if let Some(default) = default {
-                    collect_recurring_aliasable_outputs(default, aliasable);
+                    collect_recurring_aliasable_outputs(default, workflow, aliasable);
                 }
             }
             _ => {}
         }
         return;
     };
-    collect_recurring_aliasable_outputs(setup, aliasable);
-    collect_recurring_aliasable_outputs(body, aliasable);
+    collect_recurring_aliasable_outputs(setup, workflow, aliasable);
+    collect_recurring_aliasable_outputs(body, workflow, aliasable);
 
     let mut slots = Vec::new();
     flatten(body, &mut slots);
@@ -2968,22 +2977,50 @@ fn collect_recurring_aliasable_outputs(
             // the top of the next iteration, so those reads must precede the
             // producer. Reading it at the producer's own position is fine: an
             // island copies its inputs into its own buffers before it runs.
-            let carry_read_after_write = carried
+            let unsafe_carry = carried
                 .iter()
                 .filter(|carry| &carry.body_output == value)
                 .any(|carry| {
-                    slots[position + 1..].iter().any(|later| {
+                    let read_after_write = slots[position + 1..].iter().any(|later| {
                         later.used.contains(&carry.body_input)
                             || later.used.contains(&carry.next)
                             || later.used.contains(&carry.current)
-                    })
+                    });
+                    read_after_write || !carry_retains_only_a_view(workflow, carry)
                 });
-            if carry_read_after_write {
+            if unsafe_carry {
                 continue;
             }
             aliasable.insert(value.clone());
         }
     }
+}
+
+/// Whether a loop carry only ever *retains* its body output, so the carried
+/// value may be a view over the producing island's stable buffer.
+///
+/// The loop machinery reads a carry after the body has run, and that read is not
+/// a body position the order analysis can see:
+///
+/// * a serving batch that retires rows independently merges the inactive rows of
+///   the *previous* iteration out of the carried value, which a view can no
+///   longer supply once the producer has overwritten its buffer — only a
+///   service-managed cell skips that merge and always retains its body output
+///   directly, and
+/// * a session-scoped cell outlives the run that produced it, so it must never
+///   be a view into a buffer that later runs — including runs for other
+///   sessions — overwrite.
+fn carry_retains_only_a_view(
+    workflow: &WorkflowSpec,
+    carry: &onnx_genai_metadata::WorkflowLoopCarry,
+) -> bool {
+    workflow.state.get(&carry.cell).is_some_and(|state| {
+        state.service_group.is_some()
+            && matches!(
+                state.scope,
+                onnx_genai_metadata::WorkflowStateScope::Invocation
+            )
+    })
 }
 
 fn append_workflow_value(previous: &Value, next: &Value) -> anyhow::Result<Value> {

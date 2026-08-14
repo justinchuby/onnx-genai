@@ -20,12 +20,20 @@
 //! index  = outer * tile + inner'[outer]           # (B, 1)
 //! ```
 //!
-//! The result is bit-exact, including tie-breaking. `ArgMax` with the default
-//! `select_last_index=0` returns the first maximal index in a row; the outer
-//! reduction then selects the first tile holding the running maximum, so the
-//! recombined index is the first maximal index of the flat row. With
-//! `select_last_index=1` both stages select the last, which recombines to the
-//! last maximal flat index. `ArgMin` follows the same argument on minima.
+//! For every finite row the result is bit-exact, including tie-breaking.
+//! `ArgMax` with the default `select_last_index=0` returns the first maximal
+//! index in a row; the outer reduction then selects the first tile holding the
+//! running maximum, so the recombined index is the first maximal index of the
+//! flat row. With `select_last_index=1` both stages select the last, which
+//! recombines to the last maximal flat index. `ArgMin` follows the same argument
+//! on minima.
+//!
+//! A NaN is the one input this does not reproduce: it can win its tile and hide
+//! that tile's real extremum, so the recombined index may differ from the flat
+//! scan's. ONNX leaves `ArgMax`/`ArgMin` NaN behaviour undefined and the flat
+//! kernel's own answer is already arbitrary, so this is a difference between two
+//! unspecified results rather than a regression — but it is not exactness, and
+//! callers that must match a specific kernel on NaN rows cannot use this pass.
 //!
 //! Only a statically known reduced extent is rewritten, so the emitted shapes
 //! stay fully static and the island remains capturable as a single CUDA graph.

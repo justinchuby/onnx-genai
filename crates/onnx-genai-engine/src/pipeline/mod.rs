@@ -323,7 +323,7 @@ impl PipelineEngine {
         let movable_emit_values =
             workflow::compile_movable_emit_values(&compiled_workflow.graph, &workflow);
         let aliasable_output_values =
-            workflow::compile_aliasable_output_values(&compiled_workflow.graph);
+            workflow::compile_aliasable_output_values(&compiled_workflow.graph, &workflow);
         let bridge_graph = compiled_workflow.graph.clone();
         let execution_islands = islands::plan_execution_islands(
             &mut compiled_workflow.graph,
