@@ -42,6 +42,7 @@
 //! allocate is a batch larger than any seen before; that is rejected during
 //! capture rather than silently perturbing the graph.
 
+use std::collections::HashMap;
 use std::ffi::{CString, c_char, c_void};
 use std::sync::{Mutex, OnceLock};
 
@@ -74,8 +75,8 @@ pub fn enabled() -> bool {
 // Device runtime
 // ---------------------------------------------------------------------------
 
-/// The compiled kernels plus their partial-result scratch, shared by every node
-/// and every session in the process that uses this op.
+/// The compiled kernels for one device, plus one partial-result buffer per
+/// stream that has used them.
 struct Runtime {
     /// Kept alive so the primary context outlives the module.
     _ctx: std::sync::Arc<CudaContext>,
@@ -84,7 +85,17 @@ struct Runtime {
     part_f16: CUfunction,
     part_bf16: CUfunction,
     join: CUfunction,
-    scratch: Mutex<Scratch>,
+    /// Keyed by the ORT stream the kernels are launched on. The part kernel
+    /// writes this buffer and the join kernel reads it, so two executions may
+    /// only share one buffer if something orders them — and within a CUDA
+    /// stream, that ordering is guaranteed. ONNX Runtime documents concurrent
+    /// `Run` calls on one session as safe and gives each concurrent run its own
+    /// stream, so keying on the stream is what keeps one run's partials from
+    /// being overwritten by another's before the join reads them. Executions
+    /// that do share a stream (several sampler nodes in a graph, or repeated
+    /// steps of a decode loop) are serialised by that stream and can safely
+    /// reuse the buffer.
+    scratch: Mutex<HashMap<usize, Scratch>>,
 }
 
 /// Growable device buffer holding `cap` partial `f32` values followed by `cap`
@@ -125,11 +136,6 @@ impl Runtime {
             unsafe { cudarc::driver::result::module::get_function(module, c) }
                 .map_err(|e| OrtError::Cuda(format!("fused argmax: load {name}: {e:?}")))
         };
-        // One pair-slot allocation so `Drop` always has something to free; grown
-        // to the real size when the first kernel is created.
-        // SAFETY: primary context is current; freed in `Drop`.
-        let ptr = unsafe { cudarc::driver::result::malloc_sync(8) }
-            .map_err(|e| OrtError::Cuda(format!("fused argmax: alloc scratch: {e:?}")))?;
         Ok(Self {
             part_f32: get("argmax_part_f32")?,
             part_f16: get("argmax_part_f16")?,
@@ -137,41 +143,48 @@ impl Runtime {
             join: get("argmax_join_i64")?,
             _module: module,
             _ctx: ctx,
-            scratch: Mutex::new(Scratch {
-                ptr,
-                cap: 1,
-                retired: Vec::new(),
-            }),
+            scratch: Mutex::new(HashMap::new()),
         })
     }
 
-    /// Ensure room for `pairs` partial results, returning the value and index
-    /// pointers. Growth allocates, so callers must reserve before capture.
-    fn reserve(&self, pairs: usize) -> Result<(CUdeviceptr, CUdeviceptr)> {
+    /// Ensure `stream`'s buffer has room for `pairs` partial results, returning
+    /// its value and index pointers. Growth allocates, so callers must reserve
+    /// every shape they will capture before capturing it.
+    fn reserve(&self, stream: CUstream, pairs: usize) -> Result<(CUdeviceptr, CUdeviceptr)> {
         let mut scratch = self.scratch.lock().expect("fused argmax scratch poisoned");
-        if pairs > scratch.cap {
+        let entry = scratch.entry(stream as usize).or_insert(Scratch {
+            ptr: 0,
+            cap: 0,
+            retired: Vec::new(),
+        });
+        if pairs > entry.cap {
             let bytes = pairs
                 .checked_mul(8)
                 .ok_or_else(|| OrtError::Cuda("fused argmax scratch overflow".into()))?;
-            // SAFETY: primary context is current; the old buffer is released
+            // SAFETY: primary context is current; the old buffer is retired
             // only after the new one exists, so a failure leaves it usable.
             let new_ptr = unsafe { cudarc::driver::result::malloc_sync(bytes) }
                 .map_err(|e| OrtError::Cuda(format!("fused argmax: grow scratch: {e:?}")))?;
-            let old = scratch.ptr;
-            scratch.ptr = new_ptr;
-            scratch.cap = pairs;
-            // Retired rather than freed: an already-captured graph replays
-            // against `old`'s address.
-            scratch.retired.push(old);
+            if entry.cap > 0 {
+                // Retired rather than freed: an already-captured graph replays
+                // against the old address.
+                entry.retired.push(entry.ptr);
+            }
+            entry.ptr = new_ptr;
+            entry.cap = pairs;
         }
-        Ok((scratch.ptr, scratch.ptr + (scratch.cap * 4) as CUdeviceptr))
+        Ok((entry.ptr, entry.ptr + (entry.cap * 4) as CUdeviceptr))
     }
 }
 
 impl Drop for Runtime {
     fn drop(&mut self) {
         if let Ok(scratch) = self.scratch.lock() {
-            for ptr in std::iter::once(scratch.ptr).chain(scratch.retired.iter().copied()) {
+            let live = scratch
+                .values()
+                .filter(|entry| entry.cap > 0)
+                .flat_map(|entry| std::iter::once(entry.ptr).chain(entry.retired.iter().copied()));
+            for ptr in live {
                 // SAFETY: every pointer came from `malloc_sync` and each is
                 // freed exactly once, here, after the last graph that could
                 // replay against it is gone.
@@ -418,7 +431,7 @@ unsafe fn compute_inner(
     // Only a batch larger than any seen before allocates; every other step just
     // reads the current pointers. Replays of a captured graph never reach this
     // code at all, because ORT does not call `Compute` for a replayed node.
-    let (pval, pidx) = runtime.reserve(pairs).map_err(|e| e.to_string())?;
+    let (pval, pidx) = runtime.reserve(stream, pairs).map_err(|e| e.to_string())?;
 
     let rows_i = i32::try_from(rows).map_err(|_| "batch exceeds i32")?;
     let vocab_i = i32::try_from(vocab_usize).map_err(|_| "last axis exceeds i32")?;

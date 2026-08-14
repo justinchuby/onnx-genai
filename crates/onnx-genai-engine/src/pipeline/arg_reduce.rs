@@ -77,10 +77,16 @@ impl ArgReduceRewrites {
 ///
 /// When `fused` is set, a node the fused CUDA kernel can serve exactly becomes a
 /// single [`FUSED_OP`] node; everything else — `ArgMin`, `select_last_index=1`,
-/// or any graph running without the kernel — falls back to the portable tiling,
-/// which computes the same result using only standard ONNX ops.
+/// a non-float input, or any graph running without the kernel — falls back to
+/// the portable tiling, which computes the same result using only standard ONNX
+/// ops.
 pub fn tile_degenerate_arg_reductions(graph: &mut GraphProto, fused: bool) -> ArgReduceRewrites {
     let shapes = static_shapes(graph);
+    let element_types = if fused {
+        element_types(graph)
+    } else {
+        HashMap::new()
+    };
     let mut rewritten = ArgReduceRewrites::default();
     let mut index = 0;
     while index < graph.node.len() {
@@ -88,7 +94,7 @@ pub fn tile_degenerate_arg_reductions(graph: &mut GraphProto, fused: bool) -> Ar
             index += 1;
             continue;
         };
-        let replacement = if fused && fusable(&graph.node[index]) {
+        let replacement = if fused && fusable(&graph.node[index], &element_types) {
             rewritten.fused += 1;
             fuse(&graph.node[index], &plan, &mut graph.initializer)
         } else {
@@ -102,13 +108,79 @@ pub fn tile_degenerate_arg_reductions(graph: &mut GraphProto, fused: bool) -> Ar
     rewritten
 }
 
+/// Element types the fused kernel implements. `ArgMax` is defined over every
+/// numeric tensor type, but the kernel dispatches only these, and an unsupported
+/// type would fail at the first `Run` rather than at session creation, where the
+/// island has no fallback left. Anything else takes the portable expansion,
+/// which is type agnostic.
+const FUSABLE_ELEMENT_TYPES: [i32; 3] = [
+    tensor_proto::DataType::Float as i32,
+    tensor_proto::DataType::Float16 as i32,
+    tensor_proto::DataType::Bfloat16 as i32,
+];
+
 /// Whether the fused kernel reproduces this node exactly.
 ///
-/// The kernel is a maximum reduction that keeps the lowest index on ties, so
-/// `ArgMin` and `select_last_index=1` stay on the portable expansion rather than
-/// being served by something that would answer a different question.
-fn fusable(node: &NodeProto) -> bool {
-    node.op_type == "ArgMax" && attribute_int(node, "select_last_index").unwrap_or(0) == 0
+/// The kernel is a maximum reduction over float data that keeps the lowest index
+/// on ties, so `ArgMin`, `select_last_index=1`, a non-float input and an input
+/// whose type the graph does not declare all stay on the portable expansion
+/// rather than being served by something that would answer a different question
+/// or not run at all.
+fn fusable(node: &NodeProto, element_types: &HashMap<String, i32>) -> bool {
+    if node.op_type != "ArgMax" || attribute_int(node, "select_last_index").unwrap_or(0) != 0 {
+        return false;
+    }
+    node.input
+        .first()
+        .and_then(|input| element_types.get(input))
+        .is_some_and(|elem| FUSABLE_ELEMENT_TYPES.contains(elem))
+}
+
+/// Declared element type of every value the graph types.
+///
+/// `Cast` is followed through its `to` attribute rather than its input, because
+/// changing the element type is the whole point of the node; `Identity` keeps
+/// its input's type. A value this cannot type is simply absent, which callers
+/// treat as "not known to be fusable".
+fn element_types(graph: &GraphProto) -> HashMap<String, i32> {
+    let mut types = HashMap::new();
+    for value in graph
+        .input
+        .iter()
+        .chain(&graph.value_info)
+        .chain(&graph.output)
+    {
+        if let Some(type_proto::Value::TensorType(tensor)) =
+            value.r#type.as_ref().and_then(|kind| kind.value.as_ref())
+        {
+            types.insert(value.name.clone(), tensor.elem_type);
+        }
+    }
+    for initializer in &graph.initializer {
+        types.insert(initializer.name.clone(), initializer.data_type);
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for node in &graph.node {
+            let (Some(input), Some(output)) = (node.input.first(), node.output.first()) else {
+                continue;
+            };
+            if types.contains_key(output) {
+                continue;
+            }
+            let produced = match node.op_type.as_str() {
+                "Cast" => attribute_int(node, "to").map(|to| to as i32),
+                "Identity" => types.get(input).copied(),
+                _ => None,
+            };
+            if let Some(elem) = produced {
+                types.insert(output.clone(), elem);
+                changed = true;
+            }
+        }
+    }
+    types
 }
 
 /// Replace a degenerate `ArgMax` with the fused custom op.
@@ -659,5 +731,114 @@ mod fused {
             ArgReduceRewrites::default()
         );
         assert_eq!(graph.node[0].op_type, "ArgMax");
+    }
+}
+
+/// The element types the fused substitution accepts.
+#[cfg(test)]
+mod fused_element_types {
+    use super::tests::tensor_input;
+    use super::*;
+
+    fn graph_with(
+        elem: tensor_proto::DataType,
+        cast_to: Option<tensor_proto::DataType>,
+    ) -> GraphProto {
+        let mut input = tensor_input("raw", &[None, Some(202_048)]);
+        if let Some(type_proto::Value::TensorType(tensor)) =
+            input.r#type.as_mut().and_then(|kind| kind.value.as_mut())
+        {
+            tensor.elem_type = elem as i32;
+        }
+        let mut node = vec![];
+        let reduced = match cast_to {
+            Some(to) => {
+                node.push(
+                    make_node("Cast", &["raw"], &["logits"], "cast")
+                        .with_int_attribute("to", to as i64),
+                );
+                "logits"
+            }
+            None => "raw",
+        };
+        node.push(
+            make_node("ArgMax", &[reduced], &["token"], "argmax")
+                .with_int_attribute("axis", -1)
+                .with_int_attribute("keepdims", 0),
+        );
+        GraphProto {
+            name: "sampler".to_string(),
+            input: vec![input],
+            node,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn float_inputs_are_fused() {
+        for elem in [
+            tensor_proto::DataType::Float,
+            tensor_proto::DataType::Float16,
+            tensor_proto::DataType::Bfloat16,
+        ] {
+            let mut graph = graph_with(elem, None);
+            assert_eq!(
+                tile_degenerate_arg_reductions(&mut graph, true).fused,
+                1,
+                "{elem:?} is a type the kernel implements"
+            );
+        }
+    }
+
+    #[test]
+    fn other_numeric_inputs_take_the_portable_expansion() {
+        // ArgMax is defined over every numeric type, but the kernel is not, and
+        // an unsupported type would fail at the first run rather than at
+        // session creation, where the island has no fallback left.
+        for elem in [
+            tensor_proto::DataType::Int32,
+            tensor_proto::DataType::Int64,
+            tensor_proto::DataType::Double,
+            tensor_proto::DataType::Uint8,
+        ] {
+            let mut graph = graph_with(elem, None);
+            assert_eq!(
+                tile_degenerate_arg_reductions(&mut graph, true),
+                ArgReduceRewrites { tiled: 1, fused: 0 },
+                "{elem:?} must not be fused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cast_retypes_the_reduction_input() {
+        // The tiling pass deliberately sees through a Cast to find the reduced
+        // shape, so the type check has to follow the Cast's target type rather
+        // than the type it consumed - in both directions.
+        let mut to_float = graph_with(
+            tensor_proto::DataType::Float16,
+            Some(tensor_proto::DataType::Float),
+        );
+        assert_eq!(tile_degenerate_arg_reductions(&mut to_float, true).fused, 1);
+        let mut to_int = graph_with(
+            tensor_proto::DataType::Float,
+            Some(tensor_proto::DataType::Int32),
+        );
+        assert_eq!(
+            tile_degenerate_arg_reductions(&mut to_int, true),
+            ArgReduceRewrites { tiled: 1, fused: 0 }
+        );
+    }
+
+    #[test]
+    fn an_untyped_input_is_not_fused() {
+        let mut graph = graph_with(tensor_proto::DataType::Float, None);
+        graph.input[0].r#type = None;
+        // Without a declared type the pass cannot know the kernel applies, and
+        // the tiling needs the shape, so nothing is rewritten at all.
+        assert_eq!(
+            tile_degenerate_arg_reductions(&mut graph, true),
+            ArgReduceRewrites::default()
+        );
     }
 }
