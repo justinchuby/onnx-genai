@@ -504,15 +504,54 @@ See [`deepseek-native-status-2026-07-25.md`](../models/deepseek-native-status-20
   escape hatch #844 anticipated and left `cuda.rs` untouched. **Stage 2b landed and
   measured (#891):** a batched-KV fused forward, with a control that could have falsified
   it — totals identical at `past_len` 0/512/2048, ruling out a KV-pressure artifact — plus
-  the honest ceiling, `N_max ≈ 19 @ 2048 ctx`. **Implementation is split four ways (#905)
-  and increment 1 landed (#913):** `batch` is now threaded through the CUDA decode
-  shape/IO-binding layer and constructor-fixed to `1`, byte-identical on hardware
-  (7.60 tok/s vs 7.84 on `main`, reference token IDs exact, `fallbacks=0`), with the
-  geometry unit-tested at `batch = 3` where a transposed axis would actually show up.
-  Remaining: **2b-impl-2** KV growth/commit geometry, **2b-impl-3** device argmax,
-  **2b-impl-4** pin the batch symbol and flip batch-N on (the only increment that changes
-  behaviour, and the one that must report measured recapture-per-shape), then **2c** wire
-  `continuous_batch_manager`.
+  the honest ceiling, `N_max ≈ 19 @ 2048 ctx`.   **The four-way implementation split (#905) is complete: #913, #920, #924, #930 all landed.**
+  - **#913 (2b-impl-1)** threaded `batch` through the CUDA decode shape/IO-binding layer,
+    constructor-fixed to `1`, byte-identical on hardware, with the geometry unit-tested at
+    `batch = 3` where a transposed axis would actually show up.
+  - **#920 (2b-impl-2)** made KV growth and commit geometry batch-aware, and drew the
+    distinction the scoping had missed: a **fixed full-context stride** commit is
+    batch-general in both layouts (batch axis outermost, sequences a constant
+    `capacity × bytes_per_token` apart), while a **growing bucket** is batch-general only
+    in head-major — seq-major's per-sequence stride *is* the mutable capacity, so growth
+    would relocate every sequence `b > 0`. It refuses that case with a named `bail!` rather
+    than computing a capacity-dependent stride that would have passed every batch-1 test
+    and corrupted the first batch-N run.
+  - **#924 (2b-impl-3)** made the device argmax batch-aware. Batch-1 tie-breaking is
+    provably unchanged two ways: the launch geometry is bit-identical at `gridDim.y == 1`,
+    and `argmax_update` is a total order on (value descending, index ascending), so the
+    reduction result cannot depend on the tree shape.
+  - **#930 (2b-impl-4)** pinned the batch symbol, wired the token writer, and turned batch-N
+    on behind `ONNX_GENAI_NATIVE_DECODE_BATCH` (default 1, byte-identical).
+
+  **The result the line was started for — capture survives batch-N *while weights stream*.**
+  Coordinator's independent reproduction, solo, `nvidia-smi` verified empty, managed
+  streaming forced, `qwen14b-zp`, context 64: at N=2 and N=4, `enabled=true captures=1
+  invalidations=0 fallbacks=0` with `htod_bytes_per_token` 1,234,271,232 and 547,528,704
+  respectively, `byte_hit_rate` 68.64% → 72.17%. `captures=0 replays=8` inside the measured
+  window is capture-once/replay-many working as intended. Both guards held at every N:
+  `all_rows_equal_row0=true` and `row0_matches_batch1=true`.
+
+  **This nearly landed as a false negative.** #930's first version reported capture and
+  weight streaming as *mutually exclusive on this build*, from a real decline message naming
+  a real predicate — `weight_offload_enabled && !weight_offload_stable_va`. The sweep harness
+  called `load_with_resolved_io`, which passes `cuda_offload_policy: None`, so `stable_va`
+  fell to its deliberately conservative `unwrap_or(false)` and capture declined **by
+  construction**. The harness asserted pointer-instability; the runtime was never asked.
+  Rewiring the sweep onto the governed `Engine::from_dir` path produced the table above.
+  Recorded as a general rule in the measurement-discipline skill (#931): when a subsystem
+  declines, print the **inputs** to the predicate, not just its name — `!stable_va` and
+  "this hardware cannot do it" render identically and mean opposite things. #930 now does.
+
+  **The #866 offset is measured within-sweep rather than inferred:** `byte_hit_rate` is flat
+  at ~62% for N=1,2,4 then drops 5.12 points at N=8 as evictions go 1273 → 1678, which is
+  exactly why N=8 sits +13.5% above the ideal `1/N` line. Batch-N multiplies KV occupancy by
+  N, which eats the elastic weight budget — the mechanism #866 predicted, now observed.
+  Amortization on the managed-streaming arm is **approximate** (per-load evictor variance);
+  quote the fixed-budget arm for byte-exact figures.
+
+  Remaining: **2c** — wire `continuous_batch_manager` to a native uniform-batch manager, and
+  real per-sequence prompt seeding, which is what makes token *values* at N>1 meaningful
+  rather than content-arbitrary (the counters are already content-invariant, #884).
 - [ ] **#851 — intermittent `ILLEGAL_ADDRESS` in the mobius gate.** Parked, not solved.
   Three hypotheses eliminated (not gate flakiness — 8/8 strict solo; not kept-graph replay —
   25/25 isolated; not a relocated weight mapping — the fault targets a freshly allocated
