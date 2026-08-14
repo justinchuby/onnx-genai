@@ -451,22 +451,33 @@ See [`deepseek-native-status-2026-07-25.md`](../models/deepseek-native-status-20
   platform that cannot report its host-mapped read capacity is treated as **zero**, not
   unbounded.
 
-  **Scope: this closure is WDDM-only. On Linux the hybrid is OPEN and untested (#925),**
-  and the reasoning that closed it does not carry over:
+  **Scope: the closure is WDDM-only, and the Linux question is now ANSWERED — the hybrid
+  is an ~8× win there (#925, measured; default raised in #936).** The reasoning that closed
+  it on Windows never carried over, and both halves of that argument have now been
+  confirmed by measurement rather than left as hypothesis:
   - **The comparison arm does not exist there.** Linux has no OS shared-memory fallback,
     so an over-budget model that does not stream simply fails. The hybrid's competitor on
-    Linux is managed streaming (0.11–0.86 tok/s on this box) or "does not run" — not
-    WDDM's 7.84. A result that loses badly to WDDM can still be the largest available win
-    on Linux.
-  - **The ceiling that killed it is plausibly WDDM's.** #863 already measured VidMm
-    demoting our own VMM granules behind our back; a host registration being silently
-    remapped is the same family of behaviour. On Linux `cuMemHostRegister` pins pages in
-    the driver with no VidMm layer above it. That is a hypothesis, not a measurement —
-    which is exactly why it needs measuring rather than assuming.
-  This is #783's lesson applied to our own result: do not inherit a platform-specific
-  conclusion. The code already keeps the platforms separate — `shared_memory_weight_fallback`
-  is `cfg!(windows)` and Linux still auto-enables managed streaming, unit-locked by
-  `managed_default_no_flag_over_budget_model_auto_streams`.
+    Linux is managed streaming or "does not run" — not WDDM's 7.84. A result that loses
+    badly to WDDM can still be the largest available win on Linux, and it is: **67 tok/s
+    against ~8.5 median for managed streaming** in the over-budget regime.
+  - **The ceiling that killed it was WDDM's, exactly as suspected.** #863 had already
+    measured VidMm demoting our own VMM granules behind our back, and a host registration
+    being silently remapped is the same family. On Linux `cuMemHostRegister(READ_ONLY |
+    DEVICEMAP)` pins pages in the driver with no VidMm layer above it. **Measured on H200
+    (driver 580.105.08, CUDA 13, kernel 6.6): the aperture ceiling is absent.** Generation
+    stayed byte-identical to the Step-0 baseline with `fallbacks=0` up to **6.795 GB** of
+    distinct host-mapped weights bound and re-read in place every decode step (704
+    `cuMemHostRegister` binds, n=3, all runs byte-identical) — ~15× the WDDM ~0.44 GB onset
+    and ~10× the top of its 0.44–0.65 GB corruption band.
+
+  The default is now platform-conditional: 256 MiB on Windows, **2 GiB elsewhere** —
+  deliberately bounded rather than unbounded, sitting >3× below the measured-safe 6.795 GB
+  because only one GPU class was tested, while clearing the entire WDDM corruption band by
+  >3×. This is #783's lesson applied in both directions: the negative was not inherited
+  onto Linux, and the Linux positive is not being extrapolated past the hardware that
+  produced it. The code keeps the platforms separate throughout —
+  `shared_memory_weight_fallback` is `cfg!(windows)`, and Linux still auto-enables managed
+  streaming, unit-locked by `managed_default_no_flag_over_budget_model_auto_streams`.
 - [ ] **#837 item 3 — residency policy gap.** Post-#866 the policy sits **1.97× above its
   own streaming floor** (2.349 vs 1.191 GB/step), i.e. **1.158 GB/step recoverable**, worth
   ~91 ms/step at measured bandwidths. `byte_hit_rate` 71.8% against an achievable 85.7%
