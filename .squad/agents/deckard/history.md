@@ -52,3 +52,5 @@ on Increment-0. **Increment-0 (#949) — DECISIVE:** built the capture-enablemen
 `KernelCaptureUnsupported` at M>1 → ~361 eager relaunches. **Verdict: NO-GO for Lever B** (gated behind a
 deep kernel-capture-support program, not "reuse existing machinery"); **Lever A (Marlin int4 relayout,
 unconditional ~1.3–1.6×) promoted to the primary decode lever.** Supersedes #938's Lever-B-first call.
+
+- 2026-08-14 (#957, MERGED 2f0b62b3): Spec-capture feasibility (design-only) → **CONDITIONAL-GO gated behind Marlin** — refines (not overturns) the Lever B NO-GO. Break-even B\*=8.5 today → ~1.2–2.0 post-Marlin; ~80 ms M=8 floor is the 240 MatMulNBits generic GEMMs (Marlin fixes it) + two cheap GQA/norm M>1 capture fixes. Do NOT fund the speculative build ahead of Marlin.
