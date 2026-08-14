@@ -2171,8 +2171,51 @@ into page-aligned transfer tiles.
 >
 > What survives unchanged: any **dynamic** scheme that churns large weight pages (#866's
 > elastic reclaim, #750 admission, any future byte-aware policy) **must assert token
-> identity rather than assume it** — and so must any static one. The default size-blind
-> path is safe because it never retains large tensors, so the buggy path is unreachable.
+> identity rather than assume it** — and so must any static one.
+>
+> **Default-path safety is by luck, not by construction — 2026-08-14 (#945 round 2).**
+> This entry previously ended "the default size-blind path is safe because it never
+> retains large tensors, so the buggy path is unreachable." That is **not a safety
+> property**. The size-blind `StableResident` policy has **no rule** against retaining key
+> 919; 919 bypasses today only because it is the **last** large tensor touched each step,
+> so arrival-order first-fit spends the budget before reaching it (#944). That is an
+> accident of arrival order, this budget, and this card. Measured on `qwen14b-zp`:
+>
+> - **Raising the weight budget cannot retain 919 on this 8 GB card.**
+>   `ONNX_GENAI_WEIGHT_OFFLOAD_DEVICE_BYTES` raised to 6.5 GB: 919 still bypasses
+>   (`retained_page_ins=0 bypass_page_ins=16`), baseline byte-identical. Raising the
+>   physical ceiling toward holding the full 8.33 GB weight set (`ONNX_GENAI_VRAM_LIMIT`
+>   0.97 / 8 GiB) **OOMs at model load** — the full weight set never fits, and 919 is
+>   touched last, so natural clean-fit retention of 919 is *physically unreachable here*.
+>   The default's safety on this box rests on the **VRAM ceiling**, not the policy.
+> - **A non-pin residency policy that retains 919 reproduces the corruption identically.**
+>   `ONNX_GENAI_WEIGHT_OFFLOAD_BYTE_AWARE=1` (retains the largest tensors by evicting
+>   smaller residents; no `PIN_KEYS` allow-list) retains 919 (its 389 MiB drops out of the
+>   bypass set: total `bypass_bytes_per_step` falls *below* 919's own size) and collapses
+>   with the **same cross-generation signature** — run 1 byte-identical, run 2 diverges
+>   ("native decode was not deterministic across measured runs"). So the collapse is **not**
+>   an artifact of the `PIN_KEYS` instrument: a residency *policy* that retains 919
+>   corrupts too.
+>
+> **Consequence, stated loudly:** any of a **larger device budget**, a **bigger card**,
+> #866's **elastic budget** freeing weight space as KV occupancy falls, a **smaller model**
+> that fits, or a **different layer order** that puts the projection earlier in the walk
+> could make the shipped default retain 919 with **no knob set** — and users would then hit
+> **silent** corruption (three correct tokens then a stop, no error). The default must
+> assert token identity, not rely on the VRAM ceiling.
+>
+> **Two fix hypotheses eliminated (#945 round 2).** Both the `#888` fill-time drain
+> (`ONNX_GENAI_WEIGHT_OFFLOAD_SYNC_BEFORE_FILL=1`) and a new reused-slot-bypass retain
+> control (`ONNX_GENAI_WEIGHT_SLOT_BYPASS_RETAIN=1`, keep a re-requested slotted key
+> resident instead of re-bypassing it) leave the corruption intact under both `PIN_KEYS=919`
+> and byte-aware. The `#888` `stable_slot`/residency disagreement fires on every corrupting
+> run and is a reliable **symptom**, but neither closing that disagreement at re-admission
+> nor fencing the fill fixes decode — so the damaging event is the **earlier eviction** of
+> a slotted key's physical granules (returned to the shared pool and re-mapped under the
+> forced large retention), not the re-admission bookkeeping or the fill fence. The exact
+> corruption line is still **not** isolated; `compute-sanitizer` / `nvcc` are unavailable
+> on this box (NVRTC only), which continues to block the write-after-read localisation on
+> the shared granule pool.
 >
 > **3. The residency gap is an *admission* problem, not an eviction problem
 > (#837/#886).** ~90% of the recoverable 1.158 GB/step is bypass traffic: 11% of

@@ -1034,6 +1034,46 @@ fn pin_refill_every() -> Option<u64> {
     })
 }
 
+/// #945 control — isolate the *reused-slot bypass* hazard. When enabled, a key
+/// that already owns a persistent stable-VA slot (#716) but that admission would
+/// classify as a **bypass** is kept **resident** instead of re-entering as a
+/// transient bypass. The bypass path reuses the slot's persistent VA for a
+/// throwaway page whose physical is later returned to the shared granule pool
+/// while the baked VA still references it — the `#888` `stable_slot`/residency
+/// disagreement. Force-retaining a large tensor (via `PIN_KEYS` or the
+/// byte-aware policy) is exactly what evicts a slotted key's physical while
+/// keeping its slot, so a later step re-requests it as a slotted bypass.
+///
+/// A **null (unset) value keeps the shipped behavior byte-for-byte** — the
+/// override only ever fires for the `reused_slot && bypass` case, which is
+/// unreachable on the size-blind default path — so a positive reading here is
+/// not an artifact of the knob's presence (measurement discipline #1).
+///
+/// RESULT (#945, 2026-08-14): measured **INSUFFICIENT**. Enabling this over
+/// `PIN_KEYS=919` still collapses decode (`not deterministic across measured
+/// runs`) and the `#888` diagnostic still fires. Keeping the re-requested
+/// slotted key resident does not undo the corruption, because the damaging event
+/// is the *earlier eviction* of that slotted key's physical granules (returned
+/// to the shared pool and re-mapped under the forced large retention), not the
+/// bookkeeping of the later re-admission. This ELIMINATES the reused-slot-bypass
+/// re-admission as the fix site. Kept as a documented negative control.
+const WEIGHT_SLOT_BYPASS_RETAIN_ENV: &str = "ONNX_GENAI_WEIGHT_SLOT_BYPASS_RETAIN";
+
+/// Read [`WEIGHT_SLOT_BYPASS_RETAIN_ENV`], cached once per process. `false` on
+/// the shipped path (unset/any non-truthy value).
+fn slot_bypass_retain_enabled() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        matches!(
+            std::env::var(WEIGHT_SLOT_BYPASS_RETAIN_ENV)
+                .ok()
+                .as_deref()
+                .map(|value| value.trim().to_ascii_lowercase()),
+            Some(ref v) if v == "1" || v == "true" || v == "yes" || v == "on"
+        )
+    })
+}
+
 /// FNV-1a hash of a byte slice, used only by the #945 granule-checksum probe.
 fn fnv1a_64(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
@@ -2911,7 +2951,7 @@ impl CudaWeightResidency {
                 .map_err(|error| WeightHandleError::DeviceBinding(error.to_string()))?,
         };
 
-        let bypass = match self.admit_committed_span(
+        let mut bypass = match self.admit_committed_span(
             &mut inner,
             physical,
             &allowance,
@@ -2950,7 +2990,7 @@ impl CudaWeightResidency {
         // retained (not bypassed) becomes a persistent slot; a fresh bypassed
         // page keeps its throwaway VA and is freed outright on Drop, so two
         // concurrent bypass page-ins can never alias one physical granule.
-        let stable_slot = reused_slot.is_some() || !bypass;
+        //
         // #888 diagnostic: a *slotted* key that admission decides to *bypass*
         // is the one place `stable_slot` (drives Drop) and residency (drives
         // hits) disagree — the page is decommitted-but-VA-kept yet never joins
@@ -2969,7 +3009,19 @@ impl CudaWeightResidency {
                      len={len}) — stable_slot/residency disagreement reachable under byte-aware"
                 );
             }
+            // #945 control (measured INSUFFICIENT — see
+            // `WEIGHT_SLOT_BYPASS_RETAIN_ENV`): keep this slotted key *resident*
+            // rather than re-entering it as a transient bypass. The fill already
+            // ran into the slot VA above, so joining `pages` here is consistent,
+            // but it does NOT eliminate the corruption — the damaging event is
+            // the earlier eviction of the slotted physical, not this
+            // re-admission. Default OFF: byte-identical unless
+            // `WEIGHT_SLOT_BYPASS_RETAIN_ENV` is set.
+            if slot_bypass_retain_enabled() {
+                bypass = false;
+            }
         }
+        let stable_slot = reused_slot.is_some() || !bypass;
         if stable_slot && reused_slot.is_none() {
             inner.slots.insert(
                 key,
