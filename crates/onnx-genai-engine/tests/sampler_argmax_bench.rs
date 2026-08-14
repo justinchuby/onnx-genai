@@ -95,10 +95,16 @@ fn source_graph() -> GraphProto {
     }
 }
 
-fn model_from(graph: GraphProto, fused: bool) -> (Vec<u8>, usize) {
+fn model_from(
+    graph: GraphProto,
+    lowering: onnx_genai_engine::pipeline::WideArgReduceLowering,
+) -> (Vec<u8>, usize) {
+    use onnx_genai_engine::pipeline::WideArgReduceLowering;
     let mut graph = graph;
-    let rewrites = onnx_genai_engine::pipeline::lower_degenerate_arg_reductions(&mut graph, fused);
-    assert_eq!(rewrites.total(), 1, "the source argmax must be lowered");
+    let rewrites =
+        onnx_genai_engine::pipeline::lower_degenerate_arg_reductions(&mut graph, lowering);
+    let expected = usize::from(lowering != WideArgReduceLowering::Direct);
+    assert_eq!(rewrites.total(), expected, "unexpected lowering outcome");
     let nodes = graph.node.len();
     let mut opset_import = vec![OperatorSetIdProto {
         domain: String::new(),
@@ -189,9 +195,10 @@ fn measure(name: &str, model: &[u8], nodes: usize, logits: &[f32]) -> Option<f64
 #[test]
 #[ignore = "requires a CUDA device"]
 fn fused_argmax_beats_the_portable_tiling() {
+    use onnx_genai_engine::pipeline::WideArgReduceLowering;
     let logits = canonical_logits();
-    let (tiled_model, tiled_nodes) = model_from(source_graph(), false);
-    let (fused_model, fused_nodes) = model_from(source_graph(), true);
+    let (tiled_model, tiled_nodes) = model_from(source_graph(), WideArgReduceLowering::Tiled);
+    let (fused_model, fused_nodes) = model_from(source_graph(), WideArgReduceLowering::Fused);
     assert!(
         fused_nodes < tiled_nodes,
         "the fused lowering must emit fewer nodes"
@@ -208,4 +215,36 @@ fn fused_argmax_beats_the_portable_tiling() {
         fused < tiled,
         "fused {fused:.2} us must beat tiled {tiled:.2} us"
     );
+}
+
+/// Every lowering of the same source graph, on the same device logits.
+///
+/// This is the comparison that decides whether the workaround is still needed:
+/// `direct` is the graph as authored, so on a runtime whose arg-reduction
+/// parallelises a wide last axis it should be at least as fast as the
+/// lowerings, and on one that does not it is the degenerate case they exist to
+/// avoid. Reported, not asserted, because which one wins is a property of the
+/// runtime under test.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn report_every_wide_argmax_lowering() {
+    use onnx_genai_engine::pipeline::WideArgReduceLowering;
+    let logits = canonical_logits();
+    println!(
+        "runtime: {} | direct-capable: {}",
+        onnx_genai_ort::runtime_capability::loaded_version().unwrap_or_else(|| "unknown".into()),
+        onnx_genai_ort::runtime_capability::reduces_wide_last_axis_on_cuda()
+    );
+    for lowering in [
+        WideArgReduceLowering::Direct,
+        WideArgReduceLowering::Tiled,
+        WideArgReduceLowering::Fused,
+    ] {
+        let (model, nodes) = model_from(source_graph(), lowering);
+        let name = format!("{lowering:?}").to_lowercase();
+        if measure(&name, &model, nodes, &logits).is_none() {
+            eprintln!("skipping: no CUDA session available");
+            return;
+        }
+    }
 }

@@ -1846,6 +1846,25 @@ fn fused_argmax_is_available() -> bool {
     false
 }
 
+/// How this island should lower a degenerate last-axis arg-reduction.
+///
+/// The lowering only exists to work around a runtime that reduces a wide last
+/// axis serially, so a runtime that does not need the workaround is handed the
+/// node as authored: fewer nodes, fewer launches, no intermediate buffers. The
+/// probe is version based and currently answers "still needed" for every
+/// released ONNX Runtime, so this repository does not depend on any unreleased
+/// runtime change.
+fn wide_arg_reduce_lowering(cuda: bool) -> super::arg_reduce::WideArgReduceLowering {
+    use super::arg_reduce::WideArgReduceLowering;
+    if cuda && onnx_genai_ort::runtime_capability::reduces_wide_last_axis_on_cuda() {
+        return WideArgReduceLowering::Direct;
+    }
+    if cuda && fused_argmax_is_available() {
+        return WideArgReduceLowering::Fused;
+    }
+    WideArgReduceLowering::Tiled
+}
+
 fn link_models(
     id: usize,
     invocations: &[IslandInvocation],
@@ -2067,15 +2086,16 @@ fn link_models(
         graph.value_info.extend(source_graph.value_info);
     }
     graph.input.extend(graph_inputs.into_values());
-    let fused_argmax_available = cuda && fused_argmax_is_available();
-    let arg_reductions =
-        super::arg_reduce::tile_degenerate_arg_reductions(graph, fused_argmax_available);
-    if arg_reductions.total() > 0 {
+    let lowering = wide_arg_reduce_lowering(cuda);
+    let arg_reductions = super::arg_reduce::lower_degenerate_arg_reductions(graph, lowering);
+    if arg_reductions.total() > 0 || arg_reductions.direct > 0 {
         tracing::debug!(
             island = id,
+            ?lowering,
             tiled = arg_reductions.tiled,
             fused = arg_reductions.fused,
-            "rewrote degenerate last-axis arg-reductions inside execution island"
+            direct = arg_reductions.direct,
+            "lowered degenerate last-axis arg-reductions inside execution island"
         );
     }
     if arg_reductions.fused > 0 {

@@ -58,6 +58,24 @@ pub const FUSED_DOMAIN: &str = "com.github.onnx_genai";
 /// Op name of the optional fused CUDA kernel.
 pub const FUSED_OP: &str = "ArgMaxLastAxis";
 
+/// How a degenerate last-axis arg-reduction should be lowered.
+///
+/// This exists because the workaround is only worth its extra nodes while the
+/// runtime needs it. A runtime that reduces a wide last axis efficiently should
+/// be handed the node as authored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WideArgReduceLowering {
+    /// Leave the node exactly as authored. Correct on any runtime; only fast on
+    /// one whose arg-reduction parallelises a wide last axis.
+    Direct,
+    /// Replace with the fused CUDA custom op where it is exactly equivalent,
+    /// and with the portable expansion everywhere else.
+    Fused,
+    /// Replace with the portable `rows x tile` ONNX expansion, which needs
+    /// nothing but standard ops.
+    Tiled,
+}
+
 /// What each rewritten node was replaced with.
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArgReduceRewrites {
@@ -65,23 +83,32 @@ pub struct ArgReduceRewrites {
     pub tiled: usize,
     /// Nodes replaced by the single fused custom-op node.
     pub fused: usize,
+    /// Degenerate nodes deliberately left as authored because the runtime
+    /// reduces them efficiently on its own.
+    pub direct: usize,
 }
 
 impl ArgReduceRewrites {
+    /// Nodes actually rewritten. `direct` is not a rewrite.
     pub fn total(self) -> usize {
         self.tiled + self.fused
     }
 }
 
-/// Rewrite every degenerate last-axis arg-reduction in `graph`.
+/// Lower every degenerate last-axis arg-reduction in `graph`.
 ///
-/// When `fused` is set, a node the fused CUDA kernel can serve exactly becomes a
-/// single [`FUSED_OP`] node; everything else — `ArgMin`, `select_last_index=1`,
-/// a non-float input, or any graph running without the kernel — falls back to
-/// the portable tiling, which computes the same result using only standard ONNX
-/// ops.
-pub fn tile_degenerate_arg_reductions(graph: &mut GraphProto, fused: bool) -> ArgReduceRewrites {
+/// Under [`WideArgReduceLowering::Fused`] a node the fused CUDA kernel can serve
+/// exactly becomes a single [`FUSED_OP`] node; everything else — `ArgMin`,
+/// `select_last_index=1`, a non-float input, or any graph running without the
+/// kernel — falls back to the portable tiling, which computes the same result
+/// using only standard ONNX ops. Under [`WideArgReduceLowering::Direct`] nothing
+/// is rewritten at all.
+pub fn lower_degenerate_arg_reductions(
+    graph: &mut GraphProto,
+    lowering: WideArgReduceLowering,
+) -> ArgReduceRewrites {
     let shapes = static_shapes(graph);
+    let fused = lowering == WideArgReduceLowering::Fused;
     let element_types = if fused {
         element_types(graph)
     } else {
@@ -94,6 +121,13 @@ pub fn tile_degenerate_arg_reductions(graph: &mut GraphProto, fused: bool) -> Ar
             index += 1;
             continue;
         };
+        if lowering == WideArgReduceLowering::Direct {
+            // The runtime handles this shape; counting it keeps the decision
+            // visible in diagnostics instead of looking like nothing matched.
+            rewritten.direct += 1;
+            index += 1;
+            continue;
+        }
         let replacement = if fused && fusable(&graph.node[index], &element_types) {
             rewritten.fused += 1;
             fuse(&graph.node[index], &plan, &mut graph.initializer)
@@ -579,7 +613,10 @@ mod tests {
     #[test]
     fn degenerate_sampler_argmax_is_tiled_into_two_stages() {
         let mut graph = sampler_graph(&[None, Some(202_048)], 0);
-        assert_eq!(tile_degenerate_arg_reductions(&mut graph, false).tiled, 1);
+        assert_eq!(
+            lower_degenerate_arg_reductions(&mut graph, WideArgReduceLowering::Tiled).tiled,
+            1
+        );
         let ops = graph
             .node
             .iter()
@@ -612,7 +649,10 @@ mod tests {
     #[test]
     fn keepdims_output_skips_the_trailing_reshape() {
         let mut graph = sampler_graph(&[None, Some(202_048)], 1);
-        assert_eq!(tile_degenerate_arg_reductions(&mut graph, false).tiled, 1);
+        assert_eq!(
+            lower_degenerate_arg_reductions(&mut graph, WideArgReduceLowering::Tiled).tiled,
+            1
+        );
         assert_eq!(graph.node.last().expect("output node").op_type, "Add");
         assert_eq!(graph.node.last().expect("output node").output, ["token"]);
     }
@@ -621,11 +661,14 @@ mod tests {
     fn symbolic_or_small_reductions_are_not_rewritten() {
         let mut symbolic = sampler_graph(&[None, None], 0);
         assert_eq!(
-            tile_degenerate_arg_reductions(&mut symbolic, false).tiled,
+            lower_degenerate_arg_reductions(&mut symbolic, WideArgReduceLowering::Tiled).tiled,
             0
         );
         let mut small = sampler_graph(&[None, Some(1_024)], 0);
-        assert_eq!(tile_degenerate_arg_reductions(&mut small, false).tiled, 0);
+        assert_eq!(
+            lower_degenerate_arg_reductions(&mut small, WideArgReduceLowering::Tiled).tiled,
+            0
+        );
     }
 
     #[test]
@@ -641,7 +684,10 @@ mod tests {
             ],
             ..Default::default()
         };
-        assert_eq!(tile_degenerate_arg_reductions(&mut graph, false).tiled, 1);
+        assert_eq!(
+            lower_degenerate_arg_reductions(&mut graph, WideArgReduceLowering::Tiled).tiled,
+            1
+        );
     }
 }
 
@@ -654,8 +700,15 @@ mod fused {
     #[test]
     fn degenerate_argmax_becomes_a_single_custom_node() {
         let mut graph = sampler_graph(&[None, Some(202_048)], 0);
-        let rewrites = tile_degenerate_arg_reductions(&mut graph, true);
-        assert_eq!(rewrites, ArgReduceRewrites { tiled: 0, fused: 1 });
+        let rewrites = lower_degenerate_arg_reductions(&mut graph, WideArgReduceLowering::Fused);
+        assert_eq!(
+            rewrites,
+            ArgReduceRewrites {
+                tiled: 0,
+                fused: 1,
+                direct: 0,
+            }
+        );
         assert_eq!(graph.node.len(), 1, "the fused form is one node, not nine");
         assert_eq!(graph.node[0].op_type, FUSED_OP);
         assert_eq!(graph.node[0].domain, FUSED_DOMAIN);
@@ -669,7 +722,10 @@ mod fused {
     #[test]
     fn keepdims_is_restored_by_a_reshape() {
         let mut graph = sampler_graph(&[None, Some(202_048)], 1);
-        assert_eq!(tile_degenerate_arg_reductions(&mut graph, true).fused, 1);
+        assert_eq!(
+            lower_degenerate_arg_reductions(&mut graph, WideArgReduceLowering::Fused).fused,
+            1
+        );
         let ops = graph
             .node
             .iter()
@@ -698,8 +754,15 @@ mod fused {
             ],
             ..Default::default()
         };
-        let rewrites = tile_degenerate_arg_reductions(&mut graph, true);
-        assert_eq!(rewrites, ArgReduceRewrites { tiled: 1, fused: 0 });
+        let rewrites = lower_degenerate_arg_reductions(&mut graph, WideArgReduceLowering::Fused);
+        assert_eq!(
+            rewrites,
+            ArgReduceRewrites {
+                tiled: 1,
+                fused: 0,
+                direct: 0,
+            }
+        );
         assert!(graph.node.iter().all(|node| node.domain.is_empty()));
     }
 
@@ -717,8 +780,47 @@ mod fused {
             ],
             ..Default::default()
         };
-        let rewrites = tile_degenerate_arg_reductions(&mut graph, true);
-        assert_eq!(rewrites, ArgReduceRewrites { tiled: 1, fused: 0 });
+        let rewrites = lower_degenerate_arg_reductions(&mut graph, WideArgReduceLowering::Fused);
+        assert_eq!(
+            rewrites,
+            ArgReduceRewrites {
+                tiled: 1,
+                fused: 0,
+                direct: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn a_capable_runtime_gets_the_node_as_authored() {
+        // The lowering is a workaround; a runtime that reduces a wide last axis
+        // efficiently must be handed the graph the producer wrote, with no
+        // extra nodes and no custom domain.
+        let mut graph = sampler_graph(&[None, Some(202_048)], 0);
+        let before = graph.node.clone();
+        let rewrites = lower_degenerate_arg_reductions(&mut graph, WideArgReduceLowering::Direct);
+        assert_eq!(
+            rewrites,
+            ArgReduceRewrites {
+                tiled: 0,
+                fused: 0,
+                direct: 1,
+            }
+        );
+        assert_eq!(rewrites.total(), 0, "leaving a node alone is not a rewrite");
+        assert_eq!(graph.node, before, "the graph must be untouched");
+        assert!(graph.initializer.is_empty());
+    }
+
+    #[test]
+    fn direct_lowering_still_reports_nothing_for_narrow_reductions() {
+        // A narrow reduction is not degenerate on any runtime, so it is not
+        // counted as a decision the capability probe influenced.
+        let mut graph = sampler_graph(&[None, Some(1_024)], 0);
+        assert_eq!(
+            lower_degenerate_arg_reductions(&mut graph, WideArgReduceLowering::Direct),
+            ArgReduceRewrites::default()
+        );
     }
 
     #[test]
@@ -727,7 +829,7 @@ mod fused {
         // neither rewrite applies and the graph is untouched.
         let mut graph = sampler_graph(&[None, Some(1_024)], 0);
         assert_eq!(
-            tile_degenerate_arg_reductions(&mut graph, true),
+            lower_degenerate_arg_reductions(&mut graph, WideArgReduceLowering::Fused),
             ArgReduceRewrites::default()
         );
         assert_eq!(graph.node[0].op_type, "ArgMax");
@@ -783,7 +885,7 @@ mod fused_element_types {
         ] {
             let mut graph = graph_with(elem, None);
             assert_eq!(
-                tile_degenerate_arg_reductions(&mut graph, true).fused,
+                lower_degenerate_arg_reductions(&mut graph, WideArgReduceLowering::Fused).fused,
                 1,
                 "{elem:?} is a type the kernel implements"
             );
@@ -803,8 +905,12 @@ mod fused_element_types {
         ] {
             let mut graph = graph_with(elem, None);
             assert_eq!(
-                tile_degenerate_arg_reductions(&mut graph, true),
-                ArgReduceRewrites { tiled: 1, fused: 0 },
+                lower_degenerate_arg_reductions(&mut graph, WideArgReduceLowering::Fused),
+                ArgReduceRewrites {
+                    tiled: 1,
+                    fused: 0,
+                    direct: 0,
+                },
                 "{elem:?} must not be fused"
             );
         }
@@ -819,14 +925,21 @@ mod fused_element_types {
             tensor_proto::DataType::Float16,
             Some(tensor_proto::DataType::Float),
         );
-        assert_eq!(tile_degenerate_arg_reductions(&mut to_float, true).fused, 1);
+        assert_eq!(
+            lower_degenerate_arg_reductions(&mut to_float, WideArgReduceLowering::Fused).fused,
+            1
+        );
         let mut to_int = graph_with(
             tensor_proto::DataType::Float,
             Some(tensor_proto::DataType::Int32),
         );
         assert_eq!(
-            tile_degenerate_arg_reductions(&mut to_int, true),
-            ArgReduceRewrites { tiled: 1, fused: 0 }
+            lower_degenerate_arg_reductions(&mut to_int, WideArgReduceLowering::Fused),
+            ArgReduceRewrites {
+                tiled: 1,
+                fused: 0,
+                direct: 0,
+            }
         );
     }
 
@@ -837,7 +950,7 @@ mod fused_element_types {
         // Without a declared type the pass cannot know the kernel applies, and
         // the tiling needs the shape, so nothing is rewritten at all.
         assert_eq!(
-            tile_degenerate_arg_reductions(&mut graph, true),
+            lower_degenerate_arg_reductions(&mut graph, WideArgReduceLowering::Fused),
             ArgReduceRewrites::default()
         );
     }
