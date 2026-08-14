@@ -182,6 +182,22 @@ The planner links the default pure ONNX implementation normally. Selecting a rep
 that island invocation to its validated component sequence; host/stateful replacements therefore
 form an explicit optimization boundary without slowing the default path.
 
+### Batched policy island contracts: version 2
+
+Policy components may join a fused execution island only through version 2 contracts with
+`batching: per_row` and `inactive_rows: preserve`. Version 1 artifacts remain valid unfused
+components, but their scalar-compatible ABI cannot establish continuous-batching safety.
+
+The version 2 token sampler binds per-row `active`, `temperature`, `top_k`, `top_p`, `min_p`,
+`seed`, and `counter` inputs in addition to `logits`, and returns `token` plus `next_counter`.
+The termination predicate binds `tokens`, `active`, ragged `eos_ids` with `eos_lengths`,
+`iteration`, and `max_iterations`, and returns both `done` and `continue`. State update binds
+`current`, `update`, and `active`, returning a shape- and dtype-identical `next`.
+
+All ports have a symbolic leading `batch` axis. Inactive rows preserve RNG counters and semantic
+state and emit no token. This ABI permits stable max-batch buffers and CUDA graph replay while the
+active row set, row parameters, logical lengths, and EOS sets change between iterations.
+
 ### Termination predicate: `onnx-genai.termination-predicate@1`
 
 Inputs: `tokens: int64[B]`, `eos_ids: int64[E]`, zero-based `iteration: int64[]|[B]`, and
