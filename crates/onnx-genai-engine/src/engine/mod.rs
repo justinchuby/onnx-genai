@@ -78,7 +78,7 @@ mod speculative_load;
 
 pub(crate) use decode_backend::*;
 pub(crate) use governor::*;
-pub use governor::{EngineGovernorError, EngineResourceGovernor};
+pub use governor::{EngineGovernorError, EngineResourceGovernor, resolve_device_vram_limit_bytes};
 #[cfg(all(feature = "cuda", feature = "native-backend"))]
 pub(crate) use load::managed_vmm_default_enabled;
 pub(crate) use load::{
@@ -1315,7 +1315,7 @@ mod tests {
         .unwrap();
         let snapshot = governor.snapshot();
         assert_eq!(snapshot.configured_limits, limits);
-        assert_eq!(snapshot.resolved_limits.vram_bytes, 500);
+        assert_eq!(snapshot.resolved_limits.vram_bytes, Some(500));
         assert_eq!(snapshot.derived_budget.total_pages, 5);
         assert_eq!(snapshot.vram.headroom, 500);
         assert_eq!(snapshot.host_ram.used, 0);
@@ -1324,7 +1324,7 @@ mod tests {
         assert_eq!(snapshot.disk_spill, None);
 
         let outcome = governor.set_vram_limit(ResourceLimit::Bytes(800)).unwrap();
-        assert_eq!(outcome.new_limits.vram_bytes, 800);
+        assert_eq!(outcome.new_limits.vram_bytes, Some(800));
         assert_eq!(
             governor.snapshot().configured_limits.vram_limit,
             ResourceLimit::Bytes(800)
@@ -1370,14 +1370,16 @@ mod tests {
     }
 
     #[test]
-    fn an_explicit_byte_limit_is_honored_above_the_provisional_capacity() {
-        // The device-capacity provider is still a fixed constant, not a probe.
-        // Clamping an explicit limit to it would cap every machine at the
-        // constant — a 40 GB GPU could not be told about its own memory — so an
-        // absolute byte limit is taken as the caller's authoritative statement.
-        // Fractions and `auto` remain relative to the reported capacity.
+    fn an_explicit_byte_limit_is_honored_without_a_device_query() {
+        // There is no device-capacity probe on this path, so a fraction of the
+        // (unknown) device capacity is unknown. But an absolute byte limit is
+        // the caller's authoritative statement and must be honoured exactly,
+        // capacity query or not (#947). Host RAM and disk are measured from the
+        // OS, so their fractions/auto resolve against real, non-fabricated
+        // numbers rather than the old provisional constants.
+        const EXPLICIT_VRAM_BYTES: u64 = (40u64 << 30) + 1;
         let limits = ResourceLimits {
-            vram_limit: ResourceLimit::Bytes(PROVISIONAL_VRAM_CAPACITY_BYTES + 1),
+            vram_limit: ResourceLimit::Bytes(EXPLICIT_VRAM_BYTES),
             host_ram_limit: ResourceLimit::Fraction(0.5),
             disk_spill_limit: Some(ResourceLimit::Auto),
         };
@@ -1386,17 +1388,22 @@ mod tests {
         let snapshot = governor.snapshot();
         assert_eq!(
             snapshot.resolved_limits.vram_bytes,
-            PROVISIONAL_VRAM_CAPACITY_BYTES + 1,
-            "an explicit byte limit must not be clamped to a provisional constant"
+            Some(EXPLICIT_VRAM_BYTES),
+            "an explicit byte limit must be honoured exactly, with no device query"
         );
-        assert_eq!(
-            snapshot.resolved_limits.host_ram_bytes,
-            PROVISIONAL_HOST_RAM_CAPACITY_BYTES / 2,
-            "a fraction stays relative to the reported capacity"
+        let host_ram_bytes = snapshot.resolved_limits.host_ram_bytes;
+        assert!(
+            host_ram_bytes > 0,
+            "a fraction of measured host RAM must be a real, positive number"
         );
-        assert_eq!(
-            snapshot.resolved_limits.disk_spill_bytes,
-            Some(PROVISIONAL_DISK_CAPACITY_BYTES)
+        assert_ne!(
+            host_ram_bytes,
+            (16u64 << 30) / 2,
+            "host RAM must be measured, not half of the old fabricated 16 GiB constant"
+        );
+        assert!(
+            snapshot.resolved_limits.disk_spill_bytes.unwrap_or(0) > 0,
+            "auto disk spill must resolve against measured free space"
         );
     }
 
