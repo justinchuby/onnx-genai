@@ -119,12 +119,27 @@ pub(crate) fn resolve_graph_capture_decision(
     env_value: bool,
     structural: GraphCaptureStructuralSafety,
     weight_offload_enabled: bool,
-    weight_offload_stable_va: bool,
+    weight_offload_stable_va: Option<bool>,
 ) -> GraphCaptureDecision {
-    if weight_offload_enabled && !weight_offload_stable_va {
+    // `weight_offload_stable_va` is three-state on purpose: `Some(true)` proved
+    // stable (capture-safe), `Some(false)` proved unstable by the effective
+    // offload policy, and `None` means no policy was supplied so the caller took
+    // the conservative default. The first two are runtime facts; the third is a
+    // harness/plumbing gap that must not masquerade as a runtime fact — print the
+    // predicate inputs and their source so a declined capture is diagnosable.
+    let stable_va_safe = weight_offload_stable_va == Some(true);
+    if weight_offload_enabled && !stable_va_safe {
+        let source = match weight_offload_stable_va {
+            Some(false) => "effective offload policy: pointer-unstable paging path",
+            None => "caller default, cuda_offload_policy not supplied (unwrap_or false)",
+            Some(true) => unreachable!("stable_va_safe would be true"),
+        };
         return GraphCaptureDecision::declined(
             "weight_offload_enabled && !weight_offload_stable_va",
-            "weight offload is using the pointer-unstable paging path",
+            format_args!(
+                "weight_offload_enabled={weight_offload_enabled} \
+                 weight_offload_stable_va={stable_va_safe} (source: {source})"
+            ),
         );
     }
     if let Some(explicit) = programmatic {
@@ -172,7 +187,7 @@ pub(crate) fn resolve_graph_capture_enabled(
     env_value: bool,
     structural: GraphCaptureStructuralSafety,
     weight_offload_enabled: bool,
-    weight_offload_stable_va: bool,
+    weight_offload_stable_va: Option<bool>,
 ) -> bool {
     resolve_graph_capture_decision(
         programmatic,

@@ -86,7 +86,7 @@ fn graph_capture_auto_enables_for_owned_cuda_kv() {
     // Env unset, no programmatic override, offload disabled -> auto-enable from
     // structure.
     assert!(resolve_graph_capture_enabled(
-        None, false, false, structural, false, false
+        None, false, false, structural, false, None
     ));
 }
 
@@ -97,9 +97,9 @@ fn every_decode_level_capture_decline_names_its_predicate() {
         kv_ownership: KvOwnership::Owned,
     };
     let cases = [
-        resolve_graph_capture_decision(None, false, false, owned_cuda, true, false),
-        resolve_graph_capture_decision(Some(false), false, false, owned_cuda, false, false),
-        resolve_graph_capture_decision(None, true, false, owned_cuda, false, false),
+        resolve_graph_capture_decision(None, false, false, owned_cuda, true, Some(false)),
+        resolve_graph_capture_decision(Some(false), false, false, owned_cuda, false, None),
+        resolve_graph_capture_decision(None, true, false, owned_cuda, false, None),
         resolve_graph_capture_decision(
             None,
             false,
@@ -109,7 +109,7 @@ fn every_decode_level_capture_decline_names_its_predicate() {
                 kv_ownership: KvOwnership::Owned,
             },
             false,
-            false,
+            None,
         ),
         resolve_graph_capture_decision(
             None,
@@ -120,7 +120,7 @@ fn every_decode_level_capture_decline_names_its_predicate() {
                 kv_ownership: KvOwnership::Shared,
             },
             false,
-            false,
+            None,
         ),
     ];
 
@@ -135,7 +135,7 @@ fn every_decode_level_capture_decline_names_its_predicate() {
         );
     }
 
-    let enabled = resolve_graph_capture_decision(None, false, false, owned_cuda, false, false);
+    let enabled = resolve_graph_capture_decision(None, false, false, owned_cuda, false, None);
     assert!(enabled.is_enabled());
     assert!(enabled.decline_reason().is_none());
 }
@@ -150,10 +150,20 @@ fn weight_offload_forces_graph_capture_off() {
     // every other signal: auto-safe structure, an explicit env=1, and an
     // explicit programmatic request all still resolve to OFF.
     assert!(!resolve_graph_capture_enabled(
-        None, false, false, safe, true, false
+        None,
+        false,
+        false,
+        safe,
+        true,
+        Some(false)
     ));
     assert!(!resolve_graph_capture_enabled(
-        None, true, true, safe, true, false
+        None,
+        true,
+        true,
+        safe,
+        true,
+        Some(false)
     ));
     assert!(!resolve_graph_capture_enabled(
         Some(true),
@@ -161,12 +171,12 @@ fn weight_offload_forces_graph_capture_off() {
         true,
         safe,
         true,
-        false
+        Some(false)
     ));
     // Sanity: with offload disabled the same safe structure enables capture, so
     // the exclusion above is genuinely caused by offload.
     assert!(resolve_graph_capture_enabled(
-        None, false, false, safe, false, false
+        None, false, false, safe, false, None
     ));
 }
 
@@ -182,11 +192,21 @@ fn weight_offload_on_stable_va_path_keeps_graph_capture() {
     };
     // Auto-decision from a safe structure now enables capture with offload on.
     assert!(resolve_graph_capture_enabled(
-        None, false, false, safe, true, true
+        None,
+        false,
+        false,
+        safe,
+        true,
+        Some(true)
     ));
     // An explicit env=1 is honored.
     assert!(resolve_graph_capture_enabled(
-        None, true, true, safe, true, true
+        None,
+        true,
+        true,
+        safe,
+        true,
+        Some(true)
     ));
     // A programmatic request is honored in both directions.
     assert!(resolve_graph_capture_enabled(
@@ -195,7 +215,7 @@ fn weight_offload_on_stable_va_path_keeps_graph_capture() {
         false,
         safe,
         true,
-        true
+        Some(true)
     ));
     assert!(!resolve_graph_capture_enabled(
         Some(false),
@@ -203,7 +223,7 @@ fn weight_offload_on_stable_va_path_keeps_graph_capture() {
         false,
         safe,
         true,
-        true
+        Some(true)
     ));
     // An unsafe structure still declines, exactly as it would with offload off.
     let unsafe_structure = GraphCaptureStructuralSafety {
@@ -216,7 +236,7 @@ fn weight_offload_on_stable_va_path_keeps_graph_capture() {
         false,
         unsafe_structure,
         true,
-        true
+        Some(true)
     ));
 }
 
@@ -346,7 +366,7 @@ fn graph_capture_auto_declines_for_non_owned_or_non_cuda() {
     };
     assert!(!shared.is_capture_safe());
     assert!(!resolve_graph_capture_enabled(
-        None, false, false, shared, false, false
+        None, false, false, shared, false, None
     ));
 
     let cpu_owned = GraphCaptureStructuralSafety {
@@ -355,7 +375,7 @@ fn graph_capture_auto_declines_for_non_owned_or_non_cuda() {
     };
     assert!(!cpu_owned.is_capture_safe());
     assert!(!resolve_graph_capture_enabled(
-        None, false, false, cpu_owned, false, false
+        None, false, false, cpu_owned, false, None
     ));
 }
 
@@ -371,7 +391,7 @@ fn graph_capture_env_explicit_overrides_auto_decision() {
     };
     // ONNX_GENAI_CUDA_GRAPH=0 forces OFF even when structurally safe.
     assert!(!resolve_graph_capture_enabled(
-        None, true, false, safe, false, false
+        None, true, false, safe, false, None
     ));
     // ONNX_GENAI_CUDA_GRAPH=1 forces ON even when structure would decline
     // (the runtime decline machinery is still the final safety net).
@@ -381,7 +401,7 @@ fn graph_capture_env_explicit_overrides_auto_decision() {
         true,
         unsafe_structural,
         false,
-        false
+        None
     ));
 }
 
@@ -398,7 +418,7 @@ fn graph_capture_programmatic_override_wins_over_env_and_structure() {
         true,
         safe,
         false,
-        false
+        None
     ));
     // Programmatic Some(true) beats explicit env=0.
     assert!(resolve_graph_capture_enabled(
@@ -407,7 +427,7 @@ fn graph_capture_programmatic_override_wins_over_env_and_structure() {
         false,
         safe,
         false,
-        false
+        None
     ));
 }
 
