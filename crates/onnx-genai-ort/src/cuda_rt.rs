@@ -42,6 +42,9 @@ type CudaDeviceSynchronizeFn = unsafe extern "C" fn() -> i32;
 type CudaSetDeviceFn = unsafe extern "C" fn(i32) -> i32;
 type CudaGetDeviceFn = unsafe extern "C" fn(*mut i32) -> i32;
 type CudaMemGetInfoFn = unsafe extern "C" fn(*mut usize, *mut usize) -> i32;
+type CudaStreamCreateFn = unsafe extern "C" fn(*mut *mut c_void) -> i32;
+type CudaStreamDestroyFn = unsafe extern "C" fn(*mut c_void) -> i32;
+type CudaStreamSynchronizeFn = unsafe extern "C" fn(*mut c_void) -> i32;
 
 struct CudaRt {
     // Kept alive so the resolved function pointers remain valid; never called
@@ -53,6 +56,9 @@ struct CudaRt {
     set_device: CudaSetDeviceFn,
     get_device: CudaGetDeviceFn,
     mem_get_info: CudaMemGetInfoFn,
+    stream_create: CudaStreamCreateFn,
+    stream_destroy: CudaStreamDestroyFn,
+    stream_synchronize: CudaStreamSynchronizeFn,
 }
 
 // SAFETY: the resolved `cudart` entry points are plain C functions that are
@@ -95,6 +101,10 @@ fn load() -> std::result::Result<CudaRt, String> {
         let set_device = unsafe { lib.get::<CudaSetDeviceFn>(b"cudaSetDevice\0") };
         let get_device = unsafe { lib.get::<CudaGetDeviceFn>(b"cudaGetDevice\0") };
         let mem_get_info = unsafe { lib.get::<CudaMemGetInfoFn>(b"cudaMemGetInfo\0") };
+        let stream_create = unsafe { lib.get::<CudaStreamCreateFn>(b"cudaStreamCreate\0") };
+        let stream_destroy = unsafe { lib.get::<CudaStreamDestroyFn>(b"cudaStreamDestroy\0") };
+        let stream_synchronize =
+            unsafe { lib.get::<CudaStreamSynchronizeFn>(b"cudaStreamSynchronize\0") };
         match (
             memcpy,
             memset,
@@ -102,6 +112,9 @@ fn load() -> std::result::Result<CudaRt, String> {
             set_device,
             get_device,
             mem_get_info,
+            stream_create,
+            stream_destroy,
+            stream_synchronize,
         ) {
             (
                 Ok(memcpy),
@@ -110,6 +123,9 @@ fn load() -> std::result::Result<CudaRt, String> {
                 Ok(set_device),
                 Ok(get_device),
                 Ok(mem_get_info),
+                Ok(stream_create),
+                Ok(stream_destroy),
+                Ok(stream_synchronize),
             ) => {
                 // Copy the function pointers out before `lib` is moved into the
                 // struct; the borrows on `lib` end here.
@@ -119,6 +135,9 @@ fn load() -> std::result::Result<CudaRt, String> {
                 let set_device = *set_device;
                 let get_device = *get_device;
                 let mem_get_info = *mem_get_info;
+                let stream_create = *stream_create;
+                let stream_destroy = *stream_destroy;
+                let stream_synchronize = *stream_synchronize;
                 return Ok(CudaRt {
                     _lib: lib,
                     memcpy,
@@ -127,11 +146,14 @@ fn load() -> std::result::Result<CudaRt, String> {
                     set_device,
                     get_device,
                     mem_get_info,
+                    stream_create,
+                    stream_destroy,
+                    stream_synchronize,
                 });
             }
             _ => {
                 last_err = format!(
-                    "{name}: missing cudaMemcpy/cudaMemset/cudaDeviceSynchronize/cudaSetDevice/cudaGetDevice/cudaMemGetInfo symbol"
+                    "{name}: missing cudaMemcpy/cudaMemset/cudaDeviceSynchronize/cudaSetDevice/cudaGetDevice/cudaMemGetInfo/cudaStreamCreate/cudaStreamDestroy/cudaStreamSynchronize symbol"
                 );
             }
         }
@@ -165,6 +187,128 @@ pub fn device_synchronize() -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Create a CUDA compute stream for one pipeline to share across its sessions.
+///
+/// ORT gives each session its own stream by default, and alternating between
+/// per-session streams within one step costs far more than the extra sessions'
+/// work: on an H200 with stock ORT 1.28 a 2499-node captured decoder island
+/// replays in 15.40 ms alone and 16.11 ms with a second single-node session
+/// between replays on its own stream. Sharing one stream also gives the
+/// pipeline a single ordered timeline, which is what lets stream-ordered copies
+/// between sessions replace device-wide barriers. Upstream ORT GenAI configures
+/// its CUDA sessions the same way.
+///
+/// Each call returns a *distinct* stream, and callers are expected to create one
+/// per pipeline rather than one per device. Stream capture is a property of the
+/// stream, not the thread: ORT captures with `cudaStreamCaptureModeGlobal`, so
+/// if two independently driven pipelines shared a stream, work one of them
+/// enqueued could be silently recorded into the other's graph instead of
+/// executing. A stream per pipeline keeps that impossible.
+///
+/// The stream is created with `cudaStreamCreate`, matching GenAI: a blocking
+/// stream stays ordered against the legacy default stream that the engine's own
+/// host-visible copies use, so those copies need no extra barrier.
+///
+/// The stream is owned. It is handed out as an `Arc`, every session built from
+/// options carrying it keeps a clone, and `Drop` destroys it once the last of
+/// them is gone — so a server that loads and unloads models returns each
+/// pipeline's stream instead of accumulating one per load. The type is
+/// deliberately neither `Copy` nor `Clone`, so the number of owners is always
+/// known.
+pub struct CudaComputeStream {
+    handle: std::ptr::NonNull<c_void>,
+    device_id: i32,
+}
+
+// SAFETY: a CUDA stream handle is usable from any thread; CUDA serialises the
+// work issued to it. The handle is immutable after construction.
+unsafe impl Send for CudaComputeStream {}
+unsafe impl Sync for CudaComputeStream {}
+
+impl CudaComputeStream {
+    /// Create a stream on `device_id`, owned by the returned handle.
+    pub fn new(device_id: i32) -> Result<std::sync::Arc<Self>> {
+        let _guard = DeviceGuard::set(device_id)?;
+        let rt = runtime()?;
+        let mut stream: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `stream` is a valid out-parameter and the signature matches the
+        // documented `cudart` ABI for `cudaStreamCreate`.
+        let code = unsafe { (rt.stream_create)(&mut stream) };
+        if code != 0 {
+            return Err(OrtError::InvalidArgument(format!(
+                "cudaStreamCreate failed with CUDA error code {code}"
+            )));
+        }
+        let handle = std::ptr::NonNull::new(stream).ok_or(OrtError::NullPointer)?;
+        Ok(std::sync::Arc::new(Self { handle, device_id }))
+    }
+
+    /// The raw stream handle, for the provider option that takes one.
+    #[must_use]
+    pub fn handle(&self) -> usize {
+        self.handle.as_ptr() as usize
+    }
+
+    /// The device this stream belongs to. A stream is only valid on its device.
+    #[must_use]
+    pub fn device_id(&self) -> i32 {
+        self.device_id
+    }
+
+    /// Block until everything queued on this stream has finished.
+    ///
+    /// Also the cheapest way to ask the driver whether the stream is still a
+    /// live handle: a destroyed stream fails here rather than succeeding
+    /// silently.
+    pub fn synchronize(&self) -> Result<()> {
+        let _guard = DeviceGuard::set(self.device_id)?;
+        let rt = runtime()?;
+        // SAFETY: the handle came from `cudaStreamCreate` on this device and is
+        // still owned by `self`.
+        let code = unsafe { (rt.stream_synchronize)(self.handle.as_ptr()) };
+        if code != 0 {
+            return Err(OrtError::InvalidArgument(format!(
+                "cudaStreamSynchronize failed with CUDA error code {code}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for CudaComputeStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CudaComputeStream")
+            .field("handle", &self.handle())
+            .field("device_id", &self.device_id)
+            .finish()
+    }
+}
+
+impl Drop for CudaComputeStream {
+    fn drop(&mut self) {
+        // `cudaStreamDestroy` returns immediately and releases the stream once
+        // the work already queued on it finishes, so no synchronize is needed.
+        // Every session that used this stream is already gone by construction,
+        // because each held an `Arc` to it.
+        let Ok(_guard) = DeviceGuard::set(self.device_id) else {
+            return;
+        };
+        let Ok(rt) = runtime() else {
+            return;
+        };
+        // SAFETY: the handle came from `cudaStreamCreate` on this device and is
+        // destroyed exactly once, here, when the last owner drops.
+        let code = unsafe { (rt.stream_destroy)(self.handle.as_ptr()) };
+        if code != 0 {
+            tracing::warn!(
+                device_id = self.device_id,
+                code,
+                "cudaStreamDestroy failed; this stream is leaked"
+            );
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -378,4 +522,153 @@ pub fn memcpy_device_to_device(dst: usize, src: usize, bytes: usize) -> Result<(
         )));
     }
     Ok(())
+}
+
+/// Ownership and isolation of the shared compute stream.
+///
+/// These are the properties a serving process depends on: a pipeline that is
+/// unloaded must give its stream back, and two pipelines must never end up on
+/// one stream, because ONNX Runtime captures with `cudaStreamCaptureModeGlobal`
+/// and would record one pipeline's work into the other's graph.
+#[cfg(test)]
+mod compute_stream_ownership {
+
+    use crate::session::{SessionOptions, ep_selection};
+
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn each_pipeline_gets_its_own_stream() {
+        let mut first = SessionOptions::with_execution_provider(ep_selection("cuda"));
+        let mut second = SessionOptions::with_execution_provider(ep_selection("cuda"));
+        first.share_cuda_compute_stream();
+        second.share_cuda_compute_stream();
+        let (Some(a), Some(b)) = (
+            first.cuda_user_compute_stream.as_ref(),
+            second.cuda_user_compute_stream.as_ref(),
+        ) else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        assert_ne!(
+            a.handle(),
+            b.handle(),
+            "two independently driven pipelines must not share a capture stream"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn cloning_options_shares_the_stream_but_asking_again_does_not() {
+        let mut pipeline = SessionOptions::with_execution_provider(ep_selection("cuda"));
+        pipeline.share_cuda_compute_stream();
+        let Some(original) = pipeline
+            .cuda_user_compute_stream
+            .as_ref()
+            .map(|s| s.handle())
+        else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+
+        // Cloning is how one pipeline builds several sessions on one timeline.
+        let sibling = pipeline.clone();
+        assert_eq!(
+            sibling
+                .cuda_user_compute_stream
+                .as_ref()
+                .map(|s| s.handle()),
+            Some(original),
+            "sessions of one pipeline must share its stream"
+        );
+
+        // But a clone that is then made into its own pipeline must not inherit
+        // the first pipeline's timeline, even though it was cloned from it.
+        let mut adopted = pipeline.clone();
+        adopted.share_cuda_compute_stream();
+        assert_ne!(
+            adopted
+                .cuda_user_compute_stream
+                .as_ref()
+                .map(|s| s.handle()),
+            Some(original),
+            "asking for a shared stream must always install a fresh one"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn unloading_a_pipeline_returns_its_stream() {
+        // A server that loads and unloads models must not accumulate a stream
+        // per load. Two streams that are alive at the same time cannot share a
+        // handle, so a batch held together gives a set of distinct handles;
+        // if dropping that batch really releases them, creating the same number
+        // again hands back handles from that set.
+        let batch = |count: usize| -> Option<Vec<usize>> {
+            let mut held = Vec::new();
+            for _ in 0..count {
+                let mut options = SessionOptions::with_execution_provider(ep_selection("cuda"));
+                options.share_cuda_compute_stream();
+                held.push(options.cuda_user_compute_stream.clone()?);
+            }
+            Some(held.iter().map(|stream| stream.handle()).collect())
+        };
+        let Some(first) = batch(8) else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let live: std::collections::HashSet<_> = first.iter().copied().collect();
+        assert_eq!(
+            live.len(),
+            first.len(),
+            "streams alive together must differ"
+        );
+        // `first`'s owners were dropped inside `batch`, so this batch is created
+        // against a driver that has had all eight returned to it.
+        let second = batch(8).expect("the first batch built, so this one must too");
+        let reused = second.iter().filter(|handle| live.contains(handle)).count();
+        assert!(
+            reused > 0,
+            "no handle from the released batch came back, so releasing them did nothing: \
+             {first:?} then {second:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn a_device_change_drops_a_stream_from_the_old_device() {
+        let mut options = SessionOptions::with_execution_provider(ep_selection("cuda"));
+        options.share_cuda_compute_stream();
+        if options.cuda_user_compute_stream.is_none() {
+            eprintln!("skipping: no CUDA device");
+            return;
+        }
+        // Selecting a provider with no CUDA device leaves the old stream
+        // pointing at a device this session will not use.
+        options.execution_providers =
+            SessionOptions::with_execution_provider(ep_selection("cpu")).execution_providers;
+        options.invalidate_stream_for_device_change();
+        assert!(
+            options.cuda_user_compute_stream.is_none(),
+            "a stream from the previous device must not survive a provider change"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn a_stream_outlives_the_options_that_created_it() {
+        // Sessions hold an `Arc`, so dropping the options must not destroy the
+        // stream underneath them.
+        let mut options = SessionOptions::with_execution_provider(ep_selection("cuda"));
+        options.share_cuda_compute_stream();
+        let Some(held) = options.cuda_user_compute_stream.clone() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        drop(options);
+        // Touch the stream rather than re-reading an immutable field: a
+        // destroyed handle fails here, a live one does not.
+        held.synchronize()
+            .expect("the stream must still be usable after its options are dropped");
+        assert_eq!(std::sync::Arc::strong_count(&held), 1);
+    }
 }

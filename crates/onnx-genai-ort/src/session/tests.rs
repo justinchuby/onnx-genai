@@ -307,7 +307,7 @@ fn cpu_ort_auto_default_is_disabled_off_windows_arm64() {
 #[test]
 fn unfused_cuda_attention_uses_math_provider_option() {
     assert_eq!(
-        cuda_provider_options("3".to_string(), true, &CudaAttentionMode::Unfused),
+        cuda_provider_options("3".to_string(), true, &CudaAttentionMode::Unfused, None),
         vec![
             ("device_id".to_string(), "3".to_string()),
             ("enable_cuda_graph".to_string(), "1".to_string()),
@@ -315,11 +315,11 @@ fn unfused_cuda_attention_uses_math_provider_option() {
         ]
     );
     assert_eq!(
-        cuda_provider_options("0".to_string(), false, &CudaAttentionMode::Auto),
+        cuda_provider_options("0".to_string(), false, &CudaAttentionMode::Auto, None),
         vec![("device_id".to_string(), "0".to_string())]
     );
     assert_eq!(
-        cuda_provider_options("0".to_string(), false, &CudaAttentionMode::Fused),
+        cuda_provider_options("0".to_string(), false, &CudaAttentionMode::Fused, None),
         vec![("device_id".to_string(), "0".to_string())]
     );
 }
@@ -353,6 +353,7 @@ fn cuda_request_requires_compile_time_feature() {
         &resolved,
         false,
         &CudaAttentionMode::Auto,
+        None,
         &[],
     )
     .expect_err("CUDA must be rejected without the cargo feature");

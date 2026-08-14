@@ -169,6 +169,11 @@ pub struct Session {
     /// (CUDA `enable_cuda_graph=1`). Decode runners use this to drive the
     /// static-shape captured-graph replay path.
     graph_capture: bool,
+    /// The caller-owned CUDA stream this session was told to compute on, if any.
+    /// Kept alive for the session's lifetime so the stream it computes on
+    /// cannot be destroyed while ORT still holds it.
+    #[cfg(feature = "cuda")]
+    user_compute_stream: Option<std::sync::Arc<crate::cuda_rt::CudaComputeStream>>,
 }
 
 impl Session {
@@ -216,46 +221,48 @@ impl Session {
         // files. Both steps can fail for a requested non-CPU provider, so keep
         // them together behind one closure that can be retried with CPU-only
         // options.
-        let create_session =
-            |opts: &SessionOptions| -> Result<*mut onnx_genai_ort_sys::OrtSession> {
-                let session_options = RawSessionOptions::new(env, opts)?;
-                let mut ptr = std::ptr::null_mut();
-                match &model_bytes {
-                    Some(bytes) => {
-                        let create = api
-                            .CreateSessionFromArray
-                            .ok_or(OrtError::ApiUnavailable("CreateSessionFromArray"))?;
-                        // SAFETY: `env` and `session_options` are valid ORT handles,
-                        // `bytes` outlives the call, and `ptr` is an out-param.
-                        crate::error::check_status(unsafe {
-                            create(
-                                env.as_ptr(),
-                                bytes.as_ptr() as *const std::ffi::c_void,
-                                bytes.len(),
-                                session_options.as_ptr(),
-                                &mut ptr,
-                            )
-                        })?;
-                    }
-                    None => {
-                        let create = api
-                            .CreateSession
-                            .ok_or(OrtError::ApiUnavailable("CreateSession"))?;
-                        // SAFETY: `env` and `session_options` are valid ORT handles,
-                        // `path_c` is NUL-terminated for the call, and `ptr` is an
-                        // out-param.
-                        crate::error::check_status(unsafe {
-                            create(
-                                env.as_ptr(),
-                                path_c.as_ptr(),
-                                session_options.as_ptr(),
-                                &mut ptr,
-                            )
-                        })?;
-                    }
+        let create_session = |opts: &SessionOptions| -> Result<(
+            *mut onnx_genai_ort_sys::OrtSession,
+            providers::AdoptedStream,
+        )> {
+            let session_options = RawSessionOptions::new(env, opts)?;
+            let mut ptr = std::ptr::null_mut();
+            match &model_bytes {
+                Some(bytes) => {
+                    let create = api
+                        .CreateSessionFromArray
+                        .ok_or(OrtError::ApiUnavailable("CreateSessionFromArray"))?;
+                    // SAFETY: `env` and `session_options` are valid ORT handles,
+                    // `bytes` outlives the call, and `ptr` is an out-param.
+                    crate::error::check_status(unsafe {
+                        create(
+                            env.as_ptr(),
+                            bytes.as_ptr() as *const std::ffi::c_void,
+                            bytes.len(),
+                            session_options.as_ptr(),
+                            &mut ptr,
+                        )
+                    })?;
                 }
-                Ok(ptr)
-            };
+                None => {
+                    let create = api
+                        .CreateSession
+                        .ok_or(OrtError::ApiUnavailable("CreateSession"))?;
+                    // SAFETY: `env` and `session_options` are valid ORT handles,
+                    // `path_c` is NUL-terminated for the call, and `ptr` is an
+                    // out-param.
+                    crate::error::check_status(unsafe {
+                        create(
+                            env.as_ptr(),
+                            path_c.as_ptr(),
+                            session_options.as_ptr(),
+                            &mut ptr,
+                        )
+                    })?;
+                }
+            }
+            Ok((ptr, session_options.adopted_stream.clone()))
+        };
 
         // Auto-selected providers (e.g. the macOS MLX default) always fall back
         // to CPU; explicitly requested strict providers (CUDA and plugin EPs)
@@ -263,15 +270,20 @@ impl Session {
         let allow_cpu_fallback = options.auto_selected
             || (requested_non_cpu_provider(&options) && !requested_strict_provider(&options));
 
-        let (ptr, effective_providers) = match create_session(&options) {
-            Ok(ptr) => (ptr, options.execution_providers.clone()),
+        // Bound on every build so the fallback arms stay symmetric, but only a
+        // CUDA build has a field to put it in.
+        #[cfg_attr(not(feature = "cuda"), allow(unused_variables))]
+        let (ptr, effective_providers, adopted_stream) = match create_session(&options) {
+            Ok((ptr, stream)) => (ptr, options.execution_providers.clone(), stream),
             Err(err) if allow_cpu_fallback => {
                 tracing::warn!(
                     "ORT session creation failed with requested execution provider(s): {err}; retrying with CPU"
                 );
+                // The CPU options carry no stream, so a session that fell back
+                // reports none, which is exactly what it is using.
                 let cpu_options = SessionOptions::cpu();
-                let ptr = create_session(&cpu_options)?;
-                (ptr, cpu_options.execution_providers)
+                let (ptr, stream) = create_session(&cpu_options)?;
+                (ptr, cpu_options.execution_providers, stream)
             }
             Err(err) => return Err(err),
         };
@@ -292,6 +304,8 @@ impl Session {
             outputs,
             execution_providers: effective_providers,
             graph_capture: options.graph_capture,
+            #[cfg(feature = "cuda")]
+            user_compute_stream: adopted_stream,
         })
     }
 
@@ -367,6 +381,31 @@ impl Session {
     /// Whether this session was created with EP graph capture enabled.
     pub fn graph_capture(&self) -> bool {
         self.graph_capture
+    }
+
+    /// The caller-owned CUDA stream this session computes on, when one was
+    /// shared with it. Work issued to the same stream needs no device barrier
+    /// to be ordered against this session's runs.
+    ///
+    /// This is the stream an execution provider *adopted*, not the one the
+    /// options happened to carry: it is the value `append_execution_providers`
+    /// returned, so the provider and this getter cannot disagree. A session
+    /// whose provider took no stream - a host provider, or a CUDA provider on
+    /// a different device than the stream - reports `None`, because a caller
+    /// that ordered work against a stream this session does not use would race
+    /// instead of synchronising.
+    #[must_use]
+    pub fn user_compute_stream(&self) -> Option<usize> {
+        #[cfg(feature = "cuda")]
+        {
+            self.user_compute_stream
+                .as_ref()
+                .map(|stream| stream.handle())
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            None
+        }
     }
 
     /// The CUDA device id this session runs on, if a CUDA EP was requested.
@@ -704,6 +743,9 @@ unsafe impl Sync for Session {}
 
 struct RawSessionOptions {
     ptr: NonNull<onnx_genai_ort_sys::OrtSessionOptions>,
+    /// The shared CUDA stream a provider actually adopted, so the session can
+    /// report exactly the stream it computes on.
+    adopted_stream: providers::AdoptedStream,
 }
 
 impl RawSessionOptions {
@@ -717,6 +759,10 @@ impl RawSessionOptions {
         crate::error::check_status(unsafe { create(&mut ptr) })?;
         let this = Self {
             ptr: NonNull::new(ptr).ok_or(OrtError::NullPointer)?,
+            #[cfg(feature = "cuda")]
+            adopted_stream: None,
+            #[cfg(not(feature = "cuda"))]
+            adopted_stream: (),
         };
 
         if let Some(set_opt) = api.SetSessionGraphOptimizationLevel {
@@ -751,7 +797,12 @@ impl RawSessionOptions {
             add_session_config_entry(this.ptr.as_ptr(), key, value)?;
         }
 
-        append_execution_providers(env, this.ptr.as_ptr(), options)?;
+        // Assign into the existing value rather than rebuilding it: `ptr` is a
+        // `NonNull`, which is `Copy`, so struct update syntax would copy the
+        // handle into a second `RawSessionOptions` while this one still drops -
+        // releasing the same `OrtSessionOptions` twice.
+        let mut this = this;
+        this.adopted_stream = append_execution_providers(env, this.ptr.as_ptr(), options)?;
         apply_webgpu_provider_options(this.ptr.as_ptr(), options)?;
 
         Ok(this)

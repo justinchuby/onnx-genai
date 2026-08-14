@@ -51,3 +51,82 @@ fn loads_and_runs_textproto_fixture() {
     assert_eq!(outputs.len(), 1);
     assert_eq!(outputs[0].shape(), &[1, 4, 4]);
 }
+
+/// A session that adopted no shared stream must report none.
+///
+/// `Session::user_compute_stream()` exists so a caller can order its own work
+/// against the session's runs without a device barrier. A session that reports
+/// a stream it is not computing on would make that ordering a lie, so the
+/// getter has to be `None` whenever no provider adopted one. This runs on CPU,
+/// so it covers the options -> provider -> session threading and the accessor
+/// in a lane with no GPU.
+#[test]
+fn a_session_with_no_shared_stream_reports_none() {
+    let path = tiny_whisper_encoder_textproto();
+    if !path.exists() {
+        eprintln!("a_session_with_no_shared_stream_reports_none: fixture absent, skipping");
+        return;
+    }
+    let session =
+        Session::new(test_environment(), &path, SessionOptions::default()).expect("session loads");
+    assert_eq!(
+        session.user_compute_stream(),
+        None,
+        "no provider adopted a stream, so the session must not claim one"
+    );
+}
+
+/// A CUDA session given a shared stream must adopt it, report it, and order
+/// work on it.
+///
+/// This is the end-to-end form of the provider-option invariant. Session
+/// creation now reads the provider options back from ONNX Runtime and fails if
+/// `has_user_compute_stream` is not set, so this test fails if the typed
+/// `UpdateCUDAProviderOptionsWithValue` is dropped or moved before the string
+/// update that reparses and clears the flag. Graph capture is enabled because
+/// that is the configuration where a half-adopted stream aborts at run time.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn a_cuda_session_adopts_reports_and_orders_work_on_the_shared_stream() {
+    let path = tiny_whisper_encoder_textproto();
+    if !path.exists() {
+        eprintln!("fixture absent, skipping");
+        return;
+    }
+    let mut options =
+        SessionOptions::with_execution_provider(onnx_genai_ort::session::ep_selection("cuda"));
+    options.graph_capture = true;
+    options.share_cuda_compute_stream();
+    let Some(stream) = options.cuda_user_compute_stream.clone() else {
+        eprintln!("no CUDA device, skipping");
+        return;
+    };
+    let handle = stream.handle();
+
+    // If the provider options did not record the stream, this fails here.
+    let session = match Session::new(test_environment(), &path, options) {
+        Ok(session) => session,
+        Err(error) => {
+            // A machine without a usable CUDA EP is a skip, but a rejected
+            // shared stream is the regression this test exists for.
+            let message = error.to_string();
+            assert!(
+                !message.contains("did not record the shared CUDA compute stream"),
+                "ONNX Runtime rejected the shared stream configuration: {message}"
+            );
+            eprintln!("CUDA session unavailable, skipping: {message}");
+            return;
+        }
+    };
+
+    assert_eq!(
+        session.user_compute_stream(),
+        Some(handle),
+        "the session must report exactly the stream its provider adopted"
+    );
+
+    // Work issued by the session must be ordered by that stream alone.
+    stream
+        .synchronize()
+        .expect("the reported stream is the one the session computes on");
+}

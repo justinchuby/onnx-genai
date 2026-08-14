@@ -11,6 +11,7 @@ pub(super) fn append_cuda_execution_provider(
     device_id: i32,
     graph_capture: bool,
     attention_mode: &CudaAttentionMode,
+    user_compute_stream: Option<usize>,
     available: &[String],
 ) -> Result<()> {
     const PROVIDER_NAME: &str = "CUDAExecutionProvider";
@@ -39,7 +40,12 @@ pub(super) fn append_cuda_execution_provider(
     crate::error::check_status(unsafe { create(&mut cuda_options) })?;
     let result = (|| {
         let device_id = device_id.to_string();
-        let provider_options = cuda_provider_options(device_id, graph_capture, attention_mode);
+        let provider_options = cuda_provider_options(
+            device_id,
+            graph_capture,
+            attention_mode,
+            user_compute_stream,
+        );
         let option_keys = provider_options
             .iter()
             .map(|(key, _)| {
@@ -74,6 +80,46 @@ pub(super) fn append_cuda_execution_provider(
                 provider_options.len(),
             )
         })?;
+        if let Some(stream) = user_compute_stream {
+            // The typed entry point is authoritative and must run *after* every
+            // string update. It sets both fields directly
+            // (`provider_bridge_ort.cc`: `has_user_compute_stream = 1;
+            // user_compute_stream = value;`), whereas a string update reparses
+            // the whole option set and can reset the flag. Passing the pointer
+            // as text alone is not enough on every ORT, and a session that
+            // half-adopts the stream aborts ORT-managed graph capture with
+            // `operation not permitted when stream is capturing`.
+            let update_value =
+                api.UpdateCUDAProviderOptionsWithValue
+                    .ok_or(OrtError::ApiUnavailable(
+                        "UpdateCUDAProviderOptionsWithValue",
+                    ))?;
+            let key = CString::new("user_compute_stream").map_err(|_| {
+                OrtError::InvalidArgument("CUDA provider option key contains NUL".into())
+            })?;
+            // SAFETY: the options handle and key are valid for the call, and
+            // `stream` is a live `cudaStream_t` that outlives every session.
+            crate::error::check_status(unsafe {
+                update_value(cuda_options, key.as_ptr(), stream as *mut std::ffi::c_void)
+            })?;
+        }
+        // The invariant this function exists to hold, checked rather than
+        // commented: ORT must believe it has a user compute stream exactly when
+        // we gave it one. Reading the options back catches a reordered or
+        // dropped typed update at session creation, instead of leaving the
+        // caller to discover it as an unordered copy at run time.
+        if let Some(stream) = user_compute_stream
+            && !records_user_compute_stream(cuda_options, stream)?
+        {
+            return Err(OrtError::SessionCreation(
+                "ONNX Runtime did not record the shared CUDA compute stream (it must report \
+                 both has_user_compute_stream=1 and the exact stream address). Every string \
+                 update reparses the whole option set and overwrites has_user_compute_stream, \
+                 so the stream keys must be present in that set and the typed \
+                 UpdateCUDAProviderOptionsWithValue must run after it."
+                    .into(),
+            ));
+        }
         crate::error::check_status(unsafe { append(session_options, cuda_options) })
     })();
     // SAFETY: `cuda_options` was created above and is released exactly once.
@@ -85,6 +131,7 @@ pub(super) fn append_cuda_execution_provider(
                 device_id,
                 graph_capture,
                 ?attention_mode,
+                shared_compute_stream = user_compute_stream.is_some(),
                 "Enabled ONNX Runtime CUDA execution provider"
             );
             Ok(())
@@ -104,8 +151,24 @@ pub(super) fn cuda_provider_options(
     device_id: String,
     graph_capture: bool,
     attention_mode: &CudaAttentionMode,
+    user_compute_stream: Option<usize>,
 ) -> Vec<(String, String)> {
     let mut options = vec![("device_id".to_string(), device_id)];
+    if let Some(stream) = user_compute_stream {
+        // Both keys, together, deliberately.
+        //
+        // ONNX Runtime's string update rebuilds the provider options from a
+        // freshly parsed info: it *always* overwrites `has_user_compute_stream`
+        // from that parse, and overwrites the pointer only when the
+        // `has_user_compute_stream` key is present in the map
+        // (`cuda_provider_factory.cc`, `UpdateProviderOptions`). So a later
+        // string update that omits these keys would clear the flag while
+        // leaving the pointer set - ORT would ignore the stream while this
+        // process still believed it was shared. Carrying both keys means any
+        // update built from these options preserves the whole configuration.
+        options.push(("has_user_compute_stream".to_string(), "1".to_string()));
+        options.push(("user_compute_stream".to_string(), stream.to_string()));
+    }
     if graph_capture {
         options.push(("enable_cuda_graph".to_string(), "1".to_string()));
     }
@@ -116,6 +179,53 @@ pub(super) fn cuda_provider_options(
         options.push(("sdpa_kernel".to_string(), "16".to_string()));
     }
     options
+}
+
+/// Whether ORT records these provider options as carrying a user compute stream.
+///
+/// Read back through `GetCUDAProviderOptionsAsString`, which serialises the
+/// live option struct, so this reflects what ORT will actually act on rather
+/// than what this code believes it set.
+#[cfg(feature = "cuda")]
+fn records_user_compute_stream(
+    cuda_options: *mut onnx_genai_ort_sys::OrtCUDAProviderOptionsV2,
+    expected: usize,
+) -> Result<bool> {
+    let api = crate::error::api()?;
+    let Some(as_string) = api.GetCUDAProviderOptionsAsString else {
+        // An ORT without the accessor cannot be checked; the typed update is
+        // still the last write, which is the invariant this would confirm.
+        return Ok(true);
+    };
+    let allocator = crate::allocator::Allocator::default_cpu()?;
+    let mut text: *mut std::os::raw::c_char = std::ptr::null_mut();
+    // SAFETY: `cuda_options` is live, the allocator outlives the call, and
+    // `text` is an out-parameter owned by that allocator on success.
+    crate::error::check_status(unsafe { as_string(cuda_options, allocator.as_ptr(), &mut text) })?;
+    if text.is_null() {
+        return Ok(false);
+    }
+    // SAFETY: ORT returned a NUL-terminated string allocated by `allocator`.
+    let serialized = unsafe { std::ffi::CStr::from_ptr(text) }
+        .to_string_lossy()
+        .into_owned();
+    // SAFETY: the buffer came from this allocator and is freed exactly once
+    // through that allocator's own `Free`.
+    unsafe {
+        if let Some(free) = (*allocator.as_ptr()).Free {
+            free(allocator.as_ptr(), text.cast());
+        }
+    }
+    // Both halves matter: the flag alone can be set while the pointer is null,
+    // and the pointer alone is ignored. ORT serialises the pointer as a decimal
+    // address (`cuda_execution_provider_info.cc`).
+    let entries: Vec<&str> = serialized.split(';').map(str::trim).collect();
+    let flagged = entries.contains(&"has_user_compute_stream=1");
+    let addressed = entries
+        .iter()
+        .filter_map(|entry| entry.strip_prefix("user_compute_stream="))
+        .any(|value| value.parse::<usize>() == Ok(expected));
+    Ok(flagged && addressed)
 }
 
 #[cfg(feature = "cuda")]
