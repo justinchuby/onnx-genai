@@ -438,3 +438,22 @@ same). Split-K + occupancy is the only lever short of a non-tensor-core path
 (cp.async already measured occupancy-bound/slower). Beyond this increment, the
 remaining path to a universal B\*≤2 is drafting-depth amortization (Sebastian's
 domain), not a capture blocker.
+
+---
+
+## Update 9 — FINAL: gate_up split-K measured; frozen for merge review (head dffabf0d / code 3735d57e)
+
+Sebastian re-probed **3735d57e** (glm M=8, GPU7, ×2): **B\* = 2.15–2.19×**,
+captured M=8 verify wall **stable 21.9ms**, segments=1 whole-graph, **zero
+unsupported nodes**, byte-identical greedy tokens, no NaN, split-K slot-4 covered
+by Part-D M=8 pre-warm (capture_alloc=(0,0), no cold-miss). The run-to-run ratio
+jitter (2.15–2.19) is entirely the M=1 captured baseline (9.98–10.18ms); the M=8
+wall itself is rock-stable. So the frozen head is now the *measured* commit.
+
+**FROZEN for merge review.** Perf/capture side is DONE + GO (Sebastian concurs).
+Full arc: segments **41→1** whole-graph zero-seams; capture **B\* 8.76 → 4.99
+(Marlin) → 2.71 (split-K) → 2.63 (lm_head dense-plan) → 2.16× (small-M retune +
+gate_up split-K)**, byte-identical throughout. B\*≈2.16 is the intrinsic small-M
+GEMM floor (M=8 `mma.m16n8k16` ~50% MMA waste); universal ≤2 is a drafting-depth
+story, not a GEMM-tuning one. Practical GO: any 8-wide draft accepting >2.16
+tok/verify wins. Next: Chew (numerics) + Gaff (quality) review of PR #960.
