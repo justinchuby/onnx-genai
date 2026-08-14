@@ -399,6 +399,59 @@ pub(crate) struct LeverBPhase0CaptureAttempt {
     /// segmented M=K capture (`op_type[seam_reason] × count`), the root cause of
     /// a >1-segment capture that never reaches the whole-graph replay fast path.
     pub seam_summary: Option<String>,
+    /// Captured-vs-eager token parity (only populated when the attempt is asked
+    /// to `collect_parity` with real token inputs): the per-row greedy argmax of
+    /// the EAGER pre-capture warm forward. Empty when parity was not collected.
+    pub warm_argmax: Vec<i64>,
+    /// Captured-vs-eager token parity: the per-row greedy argmax of the last
+    /// CAPTURED-graph replay over the identical device bindings. Empty when
+    /// parity was not collected. Compared against [`Self::warm_argmax`] this is
+    /// the "captured M=K matches eager M=K" token-equality cell.
+    pub replay_argmax: Vec<i64>,
+    /// Whether the raw logits bytes of the eager warm forward and the captured
+    /// replay were byte-for-byte identical (the strongest captured-vs-eager
+    /// statement). `None` when parity was not collected or capture declined.
+    pub logits_byte_identical: Option<bool>,
+}
+
+/// Per-row greedy argmax over a `[rows, vocab]` logits buffer of raw device
+/// bytes. Supports the three logits dtypes the decoder emits (f32/f16/bf16). Ties
+/// resolve to the lowest index (matching the decoder's argmax tie-break).
+#[cfg(all(test, feature = "cuda"))]
+fn logits_rows_argmax(bytes: &[u8], dtype: DataType, rows: usize, vocab: usize) -> Vec<i64> {
+    let mut out = Vec::with_capacity(rows);
+    let decode = |b: &[u8]| -> f32 {
+        match dtype {
+            DataType::Float16 => half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32(),
+            DataType::BFloat16 => {
+                let bits = (u32::from(u16::from_le_bytes([b[0], b[1]]))) << 16;
+                f32::from_bits(bits)
+            }
+            _ => f32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+        }
+    };
+    let width = match dtype {
+        DataType::Float16 | DataType::BFloat16 => 2,
+        _ => 4,
+    };
+    for row in 0..rows {
+        let base = row * vocab * width;
+        let mut best_idx: i64 = 0;
+        let mut best_val = f32::NEG_INFINITY;
+        for col in 0..vocab {
+            let off = base + col * width;
+            if off + width > bytes.len() {
+                break;
+            }
+            let val = decode(&bytes[off..off + width]);
+            if val > best_val {
+                best_val = val;
+                best_idx = col as i64;
+            }
+        }
+        out.push(best_idx);
+    }
+    out
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1000,6 +1053,9 @@ impl NativeDecodeSession {
             warm_alloc_delta: None,
             replay_walls_ns: Vec::new(),
             seam_summary: None,
+            warm_argmax: Vec::new(),
+            replay_argmax: Vec::new(),
+            logits_byte_identical: None,
         };
 
         match capture {
@@ -1071,6 +1127,31 @@ impl NativeDecodeSession {
         m: usize,
         replays: usize,
     ) -> anyhow::Result<LeverBPhase0CaptureAttempt> {
+        self.leverb_increment0_capture_attempt_inner(m, replays, None, false)
+    }
+
+    /// Captured-vs-eager token-parity variant of the Increment-0 probe: writes
+    /// the supplied `tokens` (cycled to fill the M rows) instead of a constant,
+    /// records the EAGER warm-forward per-row argmax and the CAPTURED replay
+    /// per-row argmax, and compares the raw logits bytes. This fills the
+    /// "captured M=K == eager M=K, same Marlin config, no tiled oracle" cell.
+    #[cfg(all(test, feature = "cuda"))]
+    pub(crate) fn leverb_increment0_token_parity_attempt(
+        &mut self,
+        m: usize,
+        tokens: &[i64],
+    ) -> anyhow::Result<LeverBPhase0CaptureAttempt> {
+        self.leverb_increment0_capture_attempt_inner(m, 1, Some(tokens), true)
+    }
+
+    #[cfg(all(test, feature = "cuda"))]
+    fn leverb_increment0_capture_attempt_inner(
+        &mut self,
+        m: usize,
+        replays: usize,
+        tokens: Option<&[i64]>,
+        collect_parity: bool,
+    ) -> anyhow::Result<LeverBPhase0CaptureAttempt> {
         let past_len = self.current_len;
         let total_len = past_len
             .checked_add(m)
@@ -1128,10 +1209,17 @@ impl NativeDecodeSession {
             vec![1, m],
         )?;
         let mut token_bytes = Vec::with_capacity(m * 8);
-        for _ in 0..m {
-            // Token value is irrelevant to capture/timing (KV correctness is out
-            // of scope); a constant keeps the device buffer fixed for replay.
-            token_bytes.extend_from_slice(&1_i64.to_ne_bytes());
+        for i in 0..m {
+            // For a timing/segments attempt the token value is irrelevant to
+            // capture/timing (KV correctness is out of scope); a constant keeps
+            // the device buffer fixed for replay. For a parity attempt we cycle
+            // real prompt tokens so the argmax is non-degenerate (avoids a
+            // constant-token near-tie).
+            let tok = match tokens {
+                Some(t) if !t.is_empty() => t[i % t.len()],
+                _ => 1_i64,
+            };
+            token_bytes.extend_from_slice(&tok.to_ne_bytes());
         }
         padded_ids.write_bytes(0, &token_bytes)?;
 
@@ -1193,6 +1281,15 @@ impl NativeDecodeSession {
             _ => None,
         };
 
+        // Snapshot the EAGER warm-forward logits before capture overwrites the
+        // padded binding on replay. This is the "eager M=K" side of the
+        // captured-vs-eager token-parity cell.
+        let warm_logits_bytes = if collect_parity {
+            Some(state.bindings[logits_index].read_bytes()?)
+        } else {
+            None
+        };
+
         // ---- Capture the real M=K forward against the full device binding set
         // (KV + mask + token + position + padded logits), no owned host inputs. ----
         let alloc_before = self.session.device_allocation_counts();
@@ -1248,8 +1345,12 @@ impl NativeDecodeSession {
             warm_alloc_delta,
             replay_walls_ns: Vec::new(),
             seam_summary,
+            warm_argmax: Vec::new(),
+            replay_argmax: Vec::new(),
+            logits_byte_identical: None,
         };
 
+        let mut last_replay_bytes: Option<Vec<u8>> = None;
         match capture {
             Ok(DeviceGraphCaptureResult::Captured(outputs)) => {
                 attempt.captured = true;
@@ -1263,7 +1364,10 @@ impl NativeDecodeSession {
                     let still_valid = self.session.replay_device_graph(&mut state.bindings[..])?;
                     // Sync on the padded logits D2H read (the real hot path syncs
                     // on the per-step logits read), making the wall GPU-inclusive.
-                    let _ = state.bindings[logits_index].read_bytes()?;
+                    let replay_bytes = state.bindings[logits_index].read_bytes()?;
+                    if collect_parity {
+                        last_replay_bytes = Some(replay_bytes);
+                    }
                     attempt
                         .replay_walls_ns
                         .push(start.elapsed().as_nanos() as u64);
@@ -1278,6 +1382,16 @@ impl NativeDecodeSession {
             Err(error) => {
                 attempt.decline = Some(format!("capture attempt errored: {error}"));
             }
+        }
+
+        // Captured-vs-eager token parity: compare the eager warm-forward logits
+        // against the captured replay logits over the identical device bindings.
+        if let (Some(warm_bytes), Some(replay_bytes)) =
+            (warm_logits_bytes.as_ref(), last_replay_bytes.as_ref())
+        {
+            attempt.warm_argmax = logits_rows_argmax(warm_bytes, logits_dtype, m, vocab);
+            attempt.replay_argmax = logits_rows_argmax(replay_bytes, logits_dtype, m, vocab);
+            attempt.logits_byte_identical = Some(warm_bytes == replay_bytes);
         }
 
         // Restore the persistent bindings and leave the graph slot clean; the KV
