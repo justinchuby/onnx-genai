@@ -705,7 +705,8 @@ ALU co-bound and the Amdahl tail.
 Baseline this pass: **~47.6–47.7 tok/s** (plain `..._zp_splitk`, K_SPLIT=2).
 
 **Phase A — higher-way split-K (2→4→8).** More cooperating warps per output column ⇒ more concurrent
-global loads to hide Long Scoreboard. Env-parametrized `ONNX_GENAI_GEMV_KSPLIT`.
+global loads to hide Long Scoreboard. Env-parametrized `ONNX_GENAI_GEMV_KSPLIT` (experiment-only —
+**NOT shipped**; the path below regressed and was reverted, so no crate reads this knob).
 
 | K_SPLIT | tok/s | DRAM% (ncu) | dominant-kernel µs |
 | --- | --- | --- | --- |
@@ -720,7 +721,8 @@ dominate).
 
 **Phase B — cp.async double-buffered weight loads (attacks the 40% Long Scoreboard directly).** Separate
 2-stage `cp.async.ca.shared.global` (4 B/lane) template, arch-guarded `#if __CUDA_ARCH__>=800` with a
-synchronous fallback, env `ONNX_GENAI_GEMV_CPASYNC`.
+synchronous fallback, env `ONNX_GENAI_GEMV_CPASYNC` (experiment-only — **NOT shipped**; this path
+regressed and was reverted, so no crate reads this knob).
 
 | variant | tok/s |
 | --- | --- |
