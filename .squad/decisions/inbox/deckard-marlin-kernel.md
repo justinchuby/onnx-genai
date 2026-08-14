@@ -118,3 +118,32 @@ silently dropped: reported.
 so those M>1 entry points can also use Marlin; small-M perf levers (split-K /
 cp.async) to push M=1 toward the precondition; Stage 5 e2e on glm-4-9b-int4 +
 qwen2.5-14b (coordinate with Sebastian on squad/marlin-bench).
+
+---
+
+### 2026-08-14 (update 2): fused RMS-norm epilogue + Stage-5 e2e PASS
+
+**Status:** Fused rmsnorm-prologue path landed; e2e parity on both target models
+PASSES. Head: a3ece463.
+
+**What landed:**
+- **Fused RMS-norm prologue for Marlin M>1** (first of the fused epilogues that
+  MatMulNBits must preserve). Stages the per-token normalized activation into
+  scratch via the existing `launch_rmsnorm_prefill` (byte-identical to the
+  standalone prologue the tiled path uses), then runs Marlin over the normalized
+  rows. Scratch alloc keeps it off the capture contract (like the tiled rmsnorm
+  prefill; prefill is outside the decode graph). Falls through to tiled on
+  ineligibility/error. Test `marlin_m_gt_1_rmsnorm_op_parity` vs the trusted
+  fused-tiled path: **worst_abs=0.0156 ≪ tol=0.90**.
+- **Stage-5 e2e** (`crates/onnx-genai-engine/tests/marlin_m_gt_1_e2e.rs`, native
+  CUDA): runs each real model twice through the engine — tiled (flag off) then
+  Marlin (flag on) — and diffs the greedy token stream. Prefill runs MatMulNBits
+  at M=prompt-length (Marlin path); decode stays on the M=1 GEMV.
+  - **glm-4-9b-int4:** 24 greedy tokens **byte-identical** tiled vs Marlin.
+  - **qwen2.5-14b-instruct-int4 (asymmetric zp):** 24 greedy tokens
+    **byte-identical** tiled vs Marlin.
+
+**Remaining (perf-focused, mission = full production kernel):** swiglu/gate_up/down
+fused epilogues; small-M levers (split-K to fill SMs, cp.async multistage) to lift
+M=1 DRAM% toward the feasibility precondition and further widen the M>1 win.
+Coordinate with Sebastian (squad/marlin-bench) on the ORT e2e + capture re-probe.
