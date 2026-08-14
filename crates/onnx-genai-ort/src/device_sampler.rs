@@ -101,7 +101,7 @@ pub(crate) trait DeviceSampler: Send {
 
 /// Threads per block. One block reduces the whole row via a grid-stride loop
 /// then a shared-memory tree reduction, so this is also the shared-array width.
-const BLOCK: u32 = 1024;
+pub(crate) const BLOCK: u32 = 1024;
 
 /// Whether to issue a device-wide `cuCtxSynchronize` before reading the logits.
 /// ORT's built-in CUDA EP synchronizes its compute stream at the end of each
@@ -127,7 +127,7 @@ fn ctx_sync_enabled() -> bool {
 /// breaking ties toward the lowest index, writing index 0 when nothing is valid.
 /// Handling `rows > 1` lets speculative decoding argmax every verified position
 /// (`logits [1, N, vocab]`) in a single launch, not just the final token.
-const ARGMAX_SRC: &str = r#"
+pub(crate) const ARGMAX_SRC: &str = r#"
 #define BLOCK 1024
 
 // binary16 -> f32 via pure integer bit math (no <cuda_fp16.h> dependency).
@@ -180,6 +180,128 @@ __device__ __forceinline__ void block_reduce_argmax(float best, int bidx, int* o
     }
     if (tid == 0) {
         out[row] = (sidx[0] == 0x7fffffff) ? 0 : sidx[0];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Split (two-stage) argmax.
+//
+// The single-launch kernels above give each row exactly one block, so one row's
+// reduction reads the whole row through one SM. For decode-sized vocabularies
+// (2e5 logits = 0.8 MB) that caps the scan at a single SM's read bandwidth. The
+// kernels below split each row across `parts` blocks, reduce each part to one
+// (value, index) pair, and join the pairs in a second launch. The combine rule
+// is bit-identical to `block_reduce_argmax` (NaN never enters, ties resolve to
+// the lowest index, an all-NaN/empty row yields index 0), so the split path is
+// an exact drop-in for the single-launch path.
+// ---------------------------------------------------------------------------
+
+__device__ __forceinline__ void warp_reduce_argmax(float& v, int& i) {
+    for (int off = 16; off > 0; off >>= 1) {
+        float ov = __shfl_down_sync(0xffffffffu, v, off);
+        int   oi = __shfl_down_sync(0xffffffffu, i, off);
+        if (ov > v || (ov == v && oi < i)) { v = ov; i = oi; }
+    }
+}
+
+// Reduce one block's (value, index) candidates and write the winner to
+// `*oval` / `*oidx`. Warp shuffles first, then a single warp joins the
+// per-warp winners: 6 reduction steps instead of the 10 shared-memory
+// rounds of `block_reduce_argmax`.
+__device__ __forceinline__ void block_reduce_pair(float v, int i, float* oval, int* oidx) {
+    __shared__ float sv[BLOCK / 32];
+    __shared__ int   si[BLOCK / 32];
+    const float NEG_INF = __int_as_float(0xff800000);
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    warp_reduce_argmax(v, i);
+    if (lane == 0) { sv[warp] = v; si[warp] = i; }
+    __syncthreads();
+    if (warp == 0) {
+        int warps = (int)(blockDim.x >> 5);
+        v = (lane < warps) ? sv[lane] : NEG_INF;
+        i = (lane < warps) ? si[lane] : 0x7fffffff;
+        warp_reduce_argmax(v, i);
+        if (lane == 0) { *oval = v; *oidx = i; }
+    }
+}
+
+// `blockIdx.x` selects the part, `blockIdx.y` the row. Each block strides its
+// row with `parts * BLOCK`, starting at `part * BLOCK + threadIdx.x`, so the
+// whole grid walks the row in fully coalesced order.
+#define SPLIT_BODY(CONV, T)                                                        \
+    int row  = blockIdx.y;                                                         \
+    int part = blockIdx.x;                                                         \
+    if (row >= rows) return;                                                       \
+    const T* r = x + (size_t)row * (size_t)vocab;                                  \
+    const float NEG_INF = __int_as_float(0xff800000);                              \
+    float best = NEG_INF;                                                          \
+    int   bidx = 0x7fffffff;                                                       \
+    int stride = parts * BLOCK;                                                    \
+    for (int i = part * BLOCK + threadIdx.x; i < vocab; i += stride) {             \
+        float v = CONV(r[i]);                                                      \
+        if (v == v && (v > best || (v == best && i < bidx))) { best = v; bidx = i; }\
+    }                                                                              \
+    block_reduce_pair(best, bidx, &pval[row * parts + part], &pidx[row * parts + part]);
+
+#define IDENT(v) (v)
+
+extern "C" __global__ void argmax_part_f16(const unsigned short* x, int rows, int vocab,
+                                           int parts, float* pval, int* pidx) {
+    SPLIT_BODY(h2f, unsigned short)
+}
+
+extern "C" __global__ void argmax_part_bf16(const unsigned short* x, int rows, int vocab,
+                                            int parts, float* pval, int* pidx) {
+    SPLIT_BODY(bf2f, unsigned short)
+}
+
+extern "C" __global__ void argmax_part_f32(const float* x, int rows, int vocab,
+                                           int parts, float* pval, int* pidx) {
+    SPLIT_BODY(IDENT, float)
+}
+
+// As `argmax_join`, but writing ONNX ArgMax's `int64` output type.
+extern "C" __global__ void argmax_join_i64(const float* pval, const int* pidx,
+                                           int rows, int parts, long long* out) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    const float NEG_INF = __int_as_float(0xff800000);
+    float best = NEG_INF;
+    int   bidx = 0x7fffffff;
+    for (int p = threadIdx.x; p < parts; p += BLOCK) {
+        float v = pval[row * parts + p];
+        int   i = pidx[row * parts + p];
+        if (i != 0x7fffffff && (v > best || (v == best && i < bidx))) { best = v; bidx = i; }
+    }
+    __shared__ float ov;
+    __shared__ int   oi;
+    block_reduce_pair(best, bidx, &ov, &oi);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        out[row] = (oi == 0x7fffffff) ? 0LL : (long long)oi;
+    }
+}
+
+// One block per row joins that row's `parts` partial winners.
+extern "C" __global__ void argmax_join(const float* pval, const int* pidx,
+                                       int rows, int parts, int* out) {
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    const float NEG_INF = __int_as_float(0xff800000);
+    float best = NEG_INF;
+    int   bidx = 0x7fffffff;
+    for (int p = threadIdx.x; p < parts; p += BLOCK) {
+        float v = pval[row * parts + p];
+        int   i = pidx[row * parts + p];
+        if (i != 0x7fffffff && (v > best || (v == best && i < bidx))) { best = v; bidx = i; }
+    }
+    __shared__ float ov;
+    __shared__ int   oi;
+    block_reduce_pair(best, bidx, &ov, &oi);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        out[row] = (oi == 0x7fffffff) ? 0 : oi;
     }
 }
 
@@ -550,6 +672,13 @@ pub(crate) struct CudaSampler {
     f_sample_f16: CudaFunction,
     f_sample_bf16: CudaFunction,
     f_sample_f32: CudaFunction,
+    /// Split (two-stage) argmax entry points: per-part reduction plus the join.
+    /// Used instead of `f_*` whenever a row is wide enough that a single block
+    /// would bottleneck on one SM's read bandwidth (see [`argmax_parts`]).
+    f_part_f16: CudaFunction,
+    f_part_bf16: CudaFunction,
+    f_part_f32: CudaFunction,
+    f_join: CudaFunction,
     /// Reused device scratch holding one `i32` winning index per row. Guarded by
     /// `lock`; grown on demand for wider speculative-verification launches.
     out: Mutex<OutScratch>,
@@ -557,6 +686,38 @@ pub(crate) struct CudaSampler {
     /// pipeline to hold the intermediate scaled logits / probabilities. Grown on
     /// demand; guarded by its own `Mutex` (always locked after `out`).
     work: Mutex<WorkScratch>,
+    /// Reused device scratch holding the split argmax's `rows * parts` partial
+    /// `(value, index)` pairs. Guarded by its own `Mutex` (locked after `out`).
+    parts: Mutex<PartScratch>,
+}
+
+/// Number of blocks the split argmax spreads one row over.
+///
+/// Zero means "row is too narrow to be worth splitting" and the caller uses the
+/// single-launch kernel. Otherwise each block handles `>= ELEMS_PER_THREAD`
+/// elements per thread, capped at [`MAX_PARTS`] so the join stays a single
+/// block, and clamped so no block would run empty.
+pub(crate) fn argmax_parts(vocab: usize) -> usize {
+    const ELEMS_PER_THREAD: usize = 2;
+    let per_block = BLOCK as usize * ELEMS_PER_THREAD;
+    if vocab <= per_block {
+        return 0;
+    }
+    vocab.div_ceil(per_block).min(MAX_PARTS)
+}
+
+/// Cap on split parts per row. The join kernel is a single block of [`BLOCK`]
+/// threads, so any cap `<= BLOCK` keeps the join to one shared reduction.
+const MAX_PARTS: usize = 256;
+
+/// Growable device scratch for the split argmax's partial `(value, index)` pairs.
+///
+/// One allocation holds `cap` f32 values followed by `cap` i32 indices, so a
+/// single `malloc`/`free` covers both halves and they stay mutually aligned.
+struct PartScratch {
+    ptr: CUdeviceptr,
+    /// Capacity in pairs.
+    cap: usize,
 }
 
 /// Growable device scratch for the per-row argmax indices.
@@ -602,6 +763,18 @@ impl CudaSampler {
         let f_f32 = module
             .load_function("argmax_f32")
             .map_err(|e| OrtError::Cuda(format!("load argmax_f32: {e:?}")))?;
+        let f_part_f16 = module
+            .load_function("argmax_part_f16")
+            .map_err(|e| OrtError::Cuda(format!("load argmax_part_f16: {e:?}")))?;
+        let f_part_bf16 = module
+            .load_function("argmax_part_bf16")
+            .map_err(|e| OrtError::Cuda(format!("load argmax_part_bf16: {e:?}")))?;
+        let f_part_f32 = module
+            .load_function("argmax_part_f32")
+            .map_err(|e| OrtError::Cuda(format!("load argmax_part_f32: {e:?}")))?;
+        let f_join = module
+            .load_function("argmax_join")
+            .map_err(|e| OrtError::Cuda(format!("load argmax_join: {e:?}")))?;
 
         // Second module: the non-greedy sampling pipeline.
         let sample_module = load_kernels_for_device(&ctx, SAMPLE_SRC, "sample", capability)?;
@@ -622,6 +795,9 @@ impl CudaSampler {
         // SAFETY: same context; freed in `Drop`. Grown on first non-greedy call.
         let work_ptr = unsafe { cudarc::driver::result::malloc_sync(4) }
             .map_err(|e| OrtError::Cuda(format!("alloc sample scratch: {e:?}")))?;
+        // SAFETY: same context; freed in `Drop`. Grown on the first split argmax.
+        let part_ptr = unsafe { cudarc::driver::result::malloc_sync(8) }
+            .map_err(|e| OrtError::Cuda(format!("alloc argmax part scratch: {e:?}")))?;
 
         Ok(Self {
             ctx,
@@ -632,9 +808,17 @@ impl CudaSampler {
             f_sample_f16,
             f_sample_bf16,
             f_sample_f32,
+            f_part_f16,
+            f_part_bf16,
+            f_part_f32,
+            f_join,
             out: Mutex::new(OutScratch { ptr, cap: 1 }),
             work: Mutex::new(WorkScratch {
                 ptr: work_ptr,
+                cap: 1,
+            }),
+            parts: Mutex::new(PartScratch {
+                ptr: part_ptr,
                 cap: 1,
             }),
         })
@@ -655,7 +839,7 @@ impl CudaSampler {
         vocab: usize,
     ) -> Result<Vec<u32>> {
         let mut idx = vec![0i32; rows];
-        self.argmax_into(dtype, ptr_addr, rows, vocab, &mut idx)?;
+        self.argmax_into(dtype, ptr_addr, rows, vocab, &mut idx, None)?;
         Ok(idx.into_iter().map(|v| v as u32).collect())
     }
 
@@ -670,6 +854,7 @@ impl CudaSampler {
         rows: usize,
         vocab: usize,
         out_idx: &mut [i32],
+        parts_override: Option<usize>,
     ) -> Result<()> {
         if rows == 0 {
             return Ok(());
@@ -705,18 +890,74 @@ impl CudaSampler {
             .map_err(|_| OrtError::Cuda(format!("row count {rows} exceeds i32")))?;
         let vocab_i = i32::try_from(vocab)
             .map_err(|_| OrtError::Cuda(format!("vocab {vocab} exceeds i32")))?;
-        let cfg = LaunchConfig {
-            grid_dim: (rows_i as u32, 1, 1),
-            block_dim: (BLOCK, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut builder = self.stream.launch_builder(func);
-        builder.arg(&x_ptr).arg(&rows_i).arg(&vocab_i).arg(&out.ptr);
-        // SAFETY: `func` is the compiled argmax entry; the argument list matches
-        // its (const T*, int, int, int*) signature; `x_ptr` is a live device
-        // buffer of `rows * vocab` elements and `out.ptr` holds `rows` i32 slots.
-        unsafe { builder.launch(cfg) }
-            .map_err(|e| OrtError::Cuda(format!("launch argmax: {e:?}")))?;
+        let parts = parts_override.unwrap_or_else(|| argmax_parts(vocab));
+        if parts > 1 {
+            // Split path: `parts` blocks scan each row in parallel, then one
+            // block per row joins the partial winners. Identical result to the
+            // single-launch path; see the kernel comments.
+            let split = match dtype {
+                DataType::Float16 => &self.f_part_f16,
+                DataType::BFloat16 => &self.f_part_bf16,
+                _ => &self.f_part_f32,
+            };
+            let mut scratch = self.parts.lock().expect("cuda argmax parts poisoned");
+            let pairs = rows
+                .checked_mul(parts)
+                .ok_or_else(|| OrtError::Cuda("argmax part count overflow".into()))?;
+            scratch.ensure(pairs)?;
+            let parts_i = parts as i32;
+            let pval = scratch.ptr;
+            let pidx = scratch.idx_ptr();
+            let part_cfg = LaunchConfig {
+                grid_dim: (parts_i as u32, rows_i as u32, 1),
+                block_dim: (BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut builder = self.stream.launch_builder(split);
+            builder
+                .arg(&x_ptr)
+                .arg(&rows_i)
+                .arg(&vocab_i)
+                .arg(&parts_i)
+                .arg(&pval)
+                .arg(&pidx);
+            // SAFETY: `split` is the compiled per-part entry; the argument list
+            // matches its (const T*, int, int, int, float*, int*) signature;
+            // `x_ptr` covers `rows * vocab` elements and the scratch holds
+            // `rows * parts` pairs.
+            unsafe { builder.launch(part_cfg) }
+                .map_err(|e| OrtError::Cuda(format!("launch argmax part: {e:?}")))?;
+            let join_cfg = LaunchConfig {
+                grid_dim: (rows_i as u32, 1, 1),
+                block_dim: (BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut builder = self.stream.launch_builder(&self.f_join);
+            builder
+                .arg(&pval)
+                .arg(&pidx)
+                .arg(&rows_i)
+                .arg(&parts_i)
+                .arg(&out.ptr);
+            // SAFETY: `f_join` matches (const float*, const int*, int, int, int*);
+            // both scratch halves hold `rows * parts` live slots and `out.ptr`
+            // holds `rows` i32 slots.
+            unsafe { builder.launch(join_cfg) }
+                .map_err(|e| OrtError::Cuda(format!("launch argmax join: {e:?}")))?;
+        } else {
+            let cfg = LaunchConfig {
+                grid_dim: (rows_i as u32, 1, 1),
+                block_dim: (BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut builder = self.stream.launch_builder(func);
+            builder.arg(&x_ptr).arg(&rows_i).arg(&vocab_i).arg(&out.ptr);
+            // SAFETY: `func` is the compiled argmax entry; the argument list matches
+            // its (const T*, int, int, int*) signature; `x_ptr` is a live device
+            // buffer of `rows * vocab` elements and `out.ptr` holds `rows` i32 slots.
+            unsafe { builder.launch(cfg) }
+                .map_err(|e| OrtError::Cuda(format!("launch argmax: {e:?}")))?;
+        }
 
         let bytes =
             unsafe { std::slice::from_raw_parts_mut(out_idx.as_mut_ptr().cast::<u8>(), rows * 4) };
@@ -862,7 +1103,7 @@ impl CudaSampler {
     ) -> Result<u32> {
         let mut idx = [0i32; 1];
         if params.greedy {
-            self.argmax_into(dtype, ptr_addr, 1, vocab, &mut idx)?;
+            self.argmax_into(dtype, ptr_addr, 1, vocab, &mut idx, None)?;
         } else {
             self.sample_into(dtype, ptr_addr, 1, vocab, params, &mut idx)?;
         }
@@ -950,6 +1191,38 @@ impl DeviceSampler for CudaSampler {
     }
 }
 
+impl PartScratch {
+    /// Device pointer to the `i32` index half, which follows the `f32` value
+    /// half. Both halves are `cap` entries, so the index half starts at
+    /// `cap * 4` bytes and inherits the allocation's alignment.
+    fn idx_ptr(&self) -> CUdeviceptr {
+        self.ptr + (self.cap * 4) as CUdeviceptr
+    }
+
+    /// Ensure the scratch can hold `pairs` `(f32, i32)` partial results.
+    ///
+    /// Allocate-new-first, then free-old-and-swap only after the new allocation
+    /// succeeds, so a failed `malloc_sync` leaves the existing buffer live and
+    /// neither a retry nor `Drop` can double-free.
+    fn ensure(&mut self, pairs: usize) -> Result<()> {
+        if pairs <= self.cap {
+            return Ok(());
+        }
+        let bytes = pairs
+            .checked_mul(8)
+            .ok_or_else(|| OrtError::Cuda("argmax part scratch size overflow".into()))?;
+        // SAFETY: primary context is current (caller bound it); we own the result.
+        let new_ptr = unsafe { cudarc::driver::result::malloc_sync(bytes) }
+            .map_err(|e| OrtError::Cuda(format!("grow argmax part scratch: {e:?}")))?;
+        let old_ptr = self.ptr;
+        self.ptr = new_ptr;
+        self.cap = pairs;
+        // SAFETY: `old_ptr` came from `malloc_sync` and is no longer referenced.
+        let _ = unsafe { cudarc::driver::result::free_sync(old_ptr) };
+        Ok(())
+    }
+}
+
 impl OutScratch {
     /// Ensure the scratch can hold `rows` i32 indices, reallocating if needed.
     ///
@@ -1015,13 +1288,17 @@ impl Drop for CudaSampler {
                 // SAFETY: `work.ptr` came from `malloc_sync` and is freed once here.
                 let _ = unsafe { cudarc::driver::result::free_sync(work.ptr) };
             }
+            if let Ok(parts) = self.parts.lock() {
+                // SAFETY: `parts.ptr` came from `malloc_sync` and is freed once here.
+                let _ = unsafe { cudarc::driver::result::free_sync(parts.ptr) };
+            }
         }
     }
 }
 
 /// `compute_XY` string for the device's CUDA compute capability.
 /// A device's compute capability as `(major, minor)`.
-fn compute_capability(ctx: &CudaContext) -> Result<(i32, i32)> {
+pub(crate) fn compute_capability(ctx: &CudaContext) -> Result<(i32, i32)> {
     use cudarc::driver::sys::CUdevice_attribute;
     let major = ctx
         .attribute(CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)
@@ -2230,5 +2507,191 @@ mod tests {
                 .expect("multi inf sample");
             assert_eq!(ids, vec![3], "multi +inf rng={rng}");
         }
+    }
+}
+
+/// Split-argmax equivalence and cost tests.
+///
+/// The split (two-stage) path must be an exact drop-in for the single-launch
+/// path: same winner for ties, NaN, +/-inf, widths that do not divide evenly by
+/// the part count, and heterogeneous batches. These tests force both paths over
+/// identical device data and require identical output.
+#[cfg(test)]
+mod split_argmax {
+    use super::*;
+
+    /// Part counts the split kernels must handle: the auto choice, a single
+    /// part, prime counts that leave ragged tails, and the cap.
+    const FORCED: &[usize] = &[0, 1, 3, 7, 64, MAX_PARTS];
+
+    #[test]
+    fn narrow_rows_do_not_split() {
+        // A row a single block can scan with two elements per thread is not
+        // worth a second launch.
+        assert_eq!(argmax_parts(0), 0);
+        assert_eq!(argmax_parts(1), 0);
+        assert_eq!(argmax_parts(BLOCK as usize * 2), 0);
+    }
+
+    #[test]
+    fn wide_rows_split_up_to_the_cap() {
+        assert_eq!(argmax_parts(BLOCK as usize * 2 + 1), 2);
+        assert_eq!(argmax_parts(202_048), 99);
+        // Beyond the cap the parts saturate so the join stays one block.
+        assert_eq!(argmax_parts(usize::from(u16::MAX) * 4096), MAX_PARTS);
+    }
+
+    /// Host model of the kernels' shared combine rule, used as the oracle.
+    fn reference(row: &[f32]) -> i32 {
+        let mut best = f32::NEG_INFINITY;
+        let mut bidx = i32::MAX;
+        for (i, &v) in row.iter().enumerate() {
+            let i = i as i32;
+            if !v.is_nan() && (v > best || (v == best && i < bidx)) {
+                best = v;
+                bidx = i;
+            }
+        }
+        if bidx == i32::MAX { 0 } else { bidx }
+    }
+
+    fn cases() -> Vec<(&'static str, Vec<Vec<f32>>)> {
+        let wide = 202_048usize;
+        let mut xorshift = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            xorshift ^= xorshift << 13;
+            xorshift ^= xorshift >> 7;
+            xorshift ^= xorshift << 17;
+            (xorshift >> 40) as f32 / 16_777_216.0 - 0.5
+        };
+        let mut random: Vec<f32> = (0..wide).map(|_| next()).collect();
+        random[180_559] = 12.5;
+        vec![
+            ("canonical", vec![random]),
+            // Every element equal: the lowest index must win regardless of how
+            // the row is partitioned.
+            ("all ties", vec![vec![1.5f32; 5_000]]),
+            // A tie between two parts, resolved toward the lower index.
+            ("split tie", {
+                let mut r = vec![0.0f32; 9_001];
+                r[10] = 7.0;
+                r[8_000] = 7.0;
+                vec![r]
+            }),
+            // NaN must never be selected, including when it precedes the max.
+            ("leading nan", {
+                let mut r = vec![f32::NAN; 4_096];
+                r[3_000] = 2.0;
+                vec![r]
+            }),
+            ("all nan", vec![vec![f32::NAN; 4_096]]),
+            // An all -inf row still has a well-defined lowest-index winner.
+            ("all neg inf", vec![vec![f32::NEG_INFINITY; 4_096]]),
+            ("pos inf", {
+                let mut r = vec![1.0f32; 4_096];
+                r[4_095] = f32::INFINITY;
+                vec![r]
+            }),
+            // Width that divides no part count evenly.
+            ("ragged width", {
+                let mut r = vec![0.5f32; 3_331];
+                r[3_330] = 9.0;
+                vec![r]
+            }),
+            // Heterogeneous batch: each row's winner is independent.
+            ("batch", {
+                (0..5)
+                    .map(|row| {
+                        let mut r = vec![0.0f32; 4_100];
+                        r[row * 800] = 3.0 + row as f32;
+                        r
+                    })
+                    .collect()
+            }),
+        ]
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn split_matches_the_single_launch_path() {
+        let sampler = CudaSampler::new(0).expect("cuda sampler");
+        for (name, rows) in cases() {
+            let vocab = rows[0].len();
+            assert!(rows.iter().all(|r| r.len() == vocab));
+            let flat: Vec<u8> = rows
+                .iter()
+                .flat_map(|r| r.iter().flat_map(|v| v.to_le_bytes()))
+                .collect();
+            // SAFETY: the primary context is current after `CudaSampler::new`;
+            // this allocation is owned by the test and freed below.
+            let ptr = unsafe { cudarc::driver::result::malloc_sync(flat.len()) }.expect("malloc");
+            // SAFETY: `ptr` holds exactly `flat.len()` bytes.
+            unsafe { cudarc::driver::result::memcpy_htod_sync(ptr, &flat) }.expect("upload");
+
+            let expected: Vec<i32> = rows.iter().map(|r| reference(r)).collect();
+            for &parts in FORCED {
+                let mut got = vec![-1i32; rows.len()];
+                sampler
+                    .argmax_into(
+                        DataType::Float32,
+                        ptr as usize,
+                        rows.len(),
+                        vocab,
+                        &mut got,
+                        Some(parts),
+                    )
+                    .expect("argmax");
+                assert_eq!(got, expected, "case {name:?} with parts={parts}");
+            }
+            // SAFETY: `ptr` came from `malloc_sync` above and is freed once.
+            unsafe { cudarc::driver::result::free_sync(ptr) }.ok();
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn split_is_faster_than_one_block_per_row() {
+        let vocab = 202_048usize;
+        let sampler = CudaSampler::new(0).expect("cuda sampler");
+        let mut xorshift = 0x2545_F491_4F6C_DD1Du64;
+        let host: Vec<f32> = (0..vocab)
+            .map(|_| {
+                xorshift ^= xorshift << 13;
+                xorshift ^= xorshift >> 7;
+                xorshift ^= xorshift << 17;
+                (xorshift >> 40) as f32 / 16_777_216.0 - 0.5
+            })
+            .collect();
+        let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+        // SAFETY: the primary context is current; owned by the test.
+        let ptr = unsafe { cudarc::driver::result::malloc_sync(bytes.len()) }.expect("malloc");
+        // SAFETY: `ptr` holds exactly `bytes.len()` bytes.
+        unsafe { cudarc::driver::result::memcpy_htod_sync(ptr, &bytes) }.expect("upload");
+
+        let measure = |parts: Option<usize>| -> f64 {
+            let mut idx = [0i32; 1];
+            for _ in 0..50 {
+                sampler
+                    .argmax_into(DataType::Float32, ptr as usize, 1, vocab, &mut idx, parts)
+                    .expect("argmax");
+            }
+            let start = std::time::Instant::now();
+            const ITERS: u32 = 500;
+            for _ in 0..ITERS {
+                sampler
+                    .argmax_into(DataType::Float32, ptr as usize, 1, vocab, &mut idx, parts)
+                    .expect("argmax");
+            }
+            start.elapsed().as_secs_f64() * 1e6 / f64::from(ITERS)
+        };
+        let single = measure(Some(1));
+        let split = measure(None);
+        // SAFETY: `ptr` came from `malloc_sync` above and is freed once.
+        unsafe { cudarc::driver::result::free_sync(ptr) }.ok();
+        println!("one-block-per-row {single:.2} us | split {split:.2} us");
+        assert!(
+            split < single,
+            "split argmax must beat one block per row: {split:.2} us vs {single:.2} us"
+        );
     }
 }
