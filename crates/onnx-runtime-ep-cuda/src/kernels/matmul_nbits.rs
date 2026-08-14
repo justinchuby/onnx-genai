@@ -4869,6 +4869,53 @@ impl MatMulNBitsKernel {
                 let gamma = gamma.ok_or_else(|| {
                     error("rmsnorm_prologue fusion requires the normalization weight at input 6")
                 })?;
+                // Opt-in Marlin int4 tensor-core GEMM with the fused RMS-norm
+                // prologue: stage the per-token normalized activation into
+                // scratch (byte-identical to the standalone prologue), then run
+                // Marlin over it. The scratch allocation keeps this off the
+                // advertised capture contract (like the tiled rmsnorm prefill),
+                // but prefill is outside the persistent decode graph. Falls
+                // through to the tiled rmsnorm GEMM on ineligibility / error.
+                if marlin_gemm::marlin_m_gt_1_enabled()
+                    && self.bits == 4
+                    && !self.gate_up_swiglu
+                    && !self.decomposed_silu
+                    && marlin_gemm::device_supports_marlin(
+                        self.runtime.capabilities().compute_capability(),
+                    )
+                {
+                    match self.try_launch_marlin_gemm_rmsnorm(
+                        &inputs[0],
+                        &inputs[1],
+                        &inputs[2],
+                        scales_fp16,
+                        zero_points,
+                        gamma,
+                        bias,
+                        &mut outputs[0],
+                        m,
+                        bias_row_stride,
+                    ) {
+                        Ok(true) => {
+                            self.last_call_capture_safe.store(false, Ordering::Relaxed);
+                            onnx_runtime_ep_api::record_kernel_variant!(
+                                "gemm_marlin_int4_rmsnorm",
+                                "M={} prefill: RMS-normalization prologue \
+                                 (SkipSimplifiedLayerNormalization folded) into a per-token \
+                                 scratch, then Marlin SM80 mma.sync int4 tensor-core GEMM; \
+                                 not advertised as CUDA-graph capture-safe (scratch alloc)",
+                                m
+                            );
+                            return Ok(());
+                        }
+                        Ok(false) => {
+                            // Not eligible (e.g. dims); fall through to tiled.
+                        }
+                        Err(_err) => {
+                            // Hard error: fall through to the tiled rmsnorm GEMM.
+                        }
+                    }
+                }
                 onnx_runtime_ep_api::record_kernel_variant!(
                     "gemm_f16_tiled_rmsnorm",
                     "M={} prefill: RMS-normalization prologue (SkipSimplifiedLayerNormalization \
@@ -5070,6 +5117,75 @@ impl MatMulNBitsKernel {
         };
         marlin_gemm::launch_marlin_gemm(&self.runtime, &args)?;
         Ok(Some(warm))
+    }
+
+    /// Marlin M>1 GEMM with the fused RMS-normalization prologue. Stages the
+    /// per-token normalized activation into scratch (byte-identical to the
+    /// standalone `launch_rmsnorm_prefill` output the tiled path uses), then runs
+    /// the Marlin int4 tensor-core GEMM over the normalized rows. Returns `true`
+    /// when it launched, `false` when the shape is ineligible (caller falls
+    /// through to the tiled rmsnorm GEMM). The scratch allocation means this call
+    /// is never advertised capture-safe; prefill is outside the decode graph.
+    #[allow(clippy::too_many_arguments)]
+    fn try_launch_marlin_gemm_rmsnorm(
+        &self,
+        activation: &TensorView,
+        packed: &TensorView,
+        scales: &TensorView,
+        scales_fp16: bool,
+        zero_points: Option<&TensorView>,
+        gamma: &TensorView,
+        bias: Option<&TensorView>,
+        output: &mut TensorMut,
+        m: usize,
+        bias_row_stride: usize,
+    ) -> Result<bool> {
+        if self.block_size == 0
+            || !self.k.is_multiple_of(16)
+            || !self.k.is_multiple_of(self.block_size)
+        {
+            return Ok(false);
+        }
+        self.runtime
+            .require_nvrtc_half_headers("MatMulNBits Marlin int4 tensor-core GEMM (rmsnorm)")?;
+
+        // Repack the weights first so a failure here does not leak scratch.
+        let packed_ptr = cuptr(packed.data_ptr::<u8>() as *const c_void);
+        let (weights_ptr, _warm) = marlin_gemm::ensure_repacked(
+            &self.runtime,
+            packed_ptr,
+            self.n,
+            self.k,
+            self.block_size,
+        )?;
+
+        let scratch = self
+            .runtime
+            .alloc_raw(m * self.k * std::mem::size_of::<half::f16>())?;
+        let result = self
+            .launch_rmsnorm_prefill(activation, gamma, scratch, m)
+            .and_then(|()| {
+                let args = marlin_gemm::MarlinGemmArgs {
+                    activation: scratch,
+                    weights: weights_ptr,
+                    scales: cuptr(scales.data_ptr::<u8>() as *const c_void),
+                    zero_points: zero_points.map(|t| cuptr(t.data_ptr::<u8>() as *const c_void)),
+                    bias: bias.map(|t| cuptr(t.data_ptr::<u8>() as *const c_void)),
+                    output: cuptr(output.data_ptr_mut::<u8>() as *const c_void),
+                    m,
+                    k: self.k,
+                    n: self.n,
+                    group_size: self.block_size,
+                    scales_fp16,
+                    bias_post_round: self.fold_bias_post_round && bias.is_some(),
+                    bias_row_stride,
+                };
+                marlin_gemm::launch_marlin_gemm(&self.runtime, &args)
+            });
+        // SAFETY: `scratch` came from `alloc_raw` above and is freed exactly
+        // once; `cuMemFree` waits for the preceding norm + GEMM stream work.
+        let free_scratch = unsafe { self.runtime.free_raw(scratch) };
+        result.and(free_scratch).map(|()| true)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7400,6 +7516,214 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             runtime.free_raw(zp_dev).unwrap();
             runtime.free_raw(output_dev).unwrap();
         }
+    }
+
+    /// Parity of the fused RMS-norm + Marlin M>1 path against the already-trusted
+    /// fused RMS-norm + tiled GEMM. Both share the identical `launch_rmsnorm_prefill`
+    /// staging, so the residual isolates the tensor-core GEMM's reordered
+    /// accumulation. Drives the real op: flag off → tiled reference, flag on →
+    /// Marlin; compares within the relayout tolerance.
+    #[test]
+    #[ignore = "requires an SM80+ CUDA device"]
+    fn marlin_m_gt_1_rmsnorm_op_parity() {
+        let Some(runtime) = runtime() else {
+            eprintln!("skipping Marlin M>1 rmsnorm parity: CUDA runtime unavailable");
+            return;
+        };
+        if runtime
+            .require_nvrtc_half_headers("marlin_m_gt_1_rmsnorm")
+            .is_err()
+            || !marlin_gemm::device_supports_marlin(runtime.capabilities().compute_capability())
+        {
+            eprintln!("skipping Marlin M>1 rmsnorm parity: headers unavailable or pre-SM80");
+            return;
+        }
+
+        let m = 8usize;
+        let k = 2048usize;
+        let n = 64usize;
+        let block_size = 128usize;
+        let k_blocks = k / block_size;
+        let blob_size = block_size / 2;
+        let zp_row_bytes = k_blocks.div_ceil(2);
+
+        let mut state = 0x0bad_c0de_feed_face_u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+
+        let mut activation = vec![f16::ZERO; m * k];
+        for h in activation.iter_mut() {
+            *h = f16::from_f32(next());
+        }
+        let mut packed = vec![0u8; n * k_blocks * blob_size];
+        for byte in packed.iter_mut() {
+            *byte = ((next() * 0.5 + 0.5) * 255.0) as u8;
+        }
+        let mut zp_packed = vec![0u8; n * zp_row_bytes];
+        for byte in zp_packed.iter_mut() {
+            *byte = ((next() * 0.5 + 0.5) * 255.0) as u8;
+        }
+        let mut scale_f16 = vec![f16::ZERO; n * k_blocks];
+        for h in scale_f16.iter_mut() {
+            *h = f16::from_f32(0.015 + 0.01 * (next() * 0.5 + 0.5));
+        }
+        let mut gamma = vec![f16::ZERO; k];
+        for h in gamma.iter_mut() {
+            *h = f16::from_f32(0.5 + 0.5 * (next() * 0.5 + 0.5));
+        }
+
+        let activation_dev = runtime.alloc_raw(activation.len() * 2).unwrap();
+        let packed_dev = runtime.alloc_raw(packed.len()).unwrap();
+        let scales_dev = runtime.alloc_raw(scale_f16.len() * 2).unwrap();
+        let zp_dev = runtime.alloc_raw(zp_packed.len()).unwrap();
+        let gamma_dev = runtime.alloc_raw(gamma.len() * 2).unwrap();
+        let output_dev = runtime.alloc_raw(m * n * 2).unwrap();
+        // SAFETY: buffers sized to their sources.
+        unsafe {
+            runtime.htod(as_bytes(&activation), activation_dev).unwrap();
+            runtime.htod(&packed, packed_dev).unwrap();
+            runtime.htod(as_bytes(&scale_f16), scales_dev).unwrap();
+            runtime.htod(&zp_packed, zp_dev).unwrap();
+            runtime.htod(as_bytes(&gamma), gamma_dev).unwrap();
+        }
+
+        let device = DeviceId::cuda(0);
+        let a_shape = [m, k];
+        let a_strides = [k as i64, 1];
+        let b_shape = [n, k_blocks, blob_size];
+        let b_strides = [(k_blocks * blob_size) as i64, blob_size as i64, 1];
+        let scales_shape = [n, k_blocks];
+        let scales_strides = [k_blocks as i64, 1];
+        let zp_shape = [n, zp_row_bytes];
+        let zp_strides = [zp_row_bytes as i64, 1];
+        let gamma_shape = [k];
+        let gamma_strides = [1i64];
+        let y_shape = [m, n];
+        let y_strides = [n as i64, 1];
+
+        // Slots: 3=zero_points, 4=g_idx (absent), 5=bias (absent), 6=gamma.
+        let inputs = vec![
+            TensorView::new(
+                device_ptr(activation_dev),
+                DataType::Float16,
+                &a_shape,
+                &a_strides,
+                device,
+            ),
+            TensorView::new(
+                device_ptr(packed_dev),
+                DataType::Uint8,
+                &b_shape,
+                &b_strides,
+                device,
+            ),
+            TensorView::new(
+                device_ptr(scales_dev),
+                DataType::Float16,
+                &scales_shape,
+                &scales_strides,
+                device,
+            ),
+            TensorView::new(
+                device_ptr(zp_dev),
+                DataType::Uint8,
+                &zp_shape,
+                &zp_strides,
+                device,
+            ),
+            TensorView::absent(DataType::Int32),
+            TensorView::absent(DataType::Float16),
+            TensorView::new(
+                device_ptr(gamma_dev),
+                DataType::Float16,
+                &gamma_shape,
+                &gamma_strides,
+                device,
+            ),
+        ];
+
+        let kernel = MatMulNBitsKernel {
+            runtime: runtime.clone(),
+            k,
+            n,
+            bits: 4,
+            block_size,
+            accuracy_level: 4,
+            accuracy4_workspace: None,
+            fold_bias_post_round: false,
+            gate_up_swiglu: false,
+            decomposed_silu: false,
+            rmsnorm_prologue: true,
+            rmsnorm_epsilon: 1e-5,
+            last_call_capture_safe: AtomicBool::new(false),
+            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+        };
+
+        let run = |want_marlin: bool| -> Vec<f16> {
+            // SAFETY: serial ignored GPU test; flag toggling is race-free here.
+            unsafe {
+                if want_marlin {
+                    std::env::set_var("ONNX_GENAI_MARLIN_M_GT_1", "1");
+                } else {
+                    std::env::remove_var("ONNX_GENAI_MARLIN_M_GT_1");
+                }
+            }
+            let mut outputs = [TensorMut::new(
+                device_ptr_mut(output_dev),
+                DataType::Float16,
+                &y_shape,
+                &y_strides,
+                device,
+            )];
+            kernel.run(&inputs, &mut outputs, None).unwrap();
+            runtime.synchronize().unwrap();
+            let mut got = vec![f16::ZERO; m * n];
+            // SAFETY: `output_dev` holds `m * n` fp16 values.
+            unsafe {
+                runtime.dtoh(as_bytes_mut(&mut got), output_dev).unwrap();
+            }
+            got
+        };
+
+        let tiled = run(false);
+        let marlin = run(true);
+        // SAFETY: reset the flag so it cannot leak into other tests.
+        unsafe {
+            std::env::remove_var("ONNX_GENAI_MARLIN_M_GT_1");
+        }
+
+        // SAFETY: every pointer came from this runtime's alloc_raw, freed once.
+        unsafe {
+            runtime.free_raw(activation_dev).unwrap();
+            runtime.free_raw(packed_dev).unwrap();
+            runtime.free_raw(scales_dev).unwrap();
+            runtime.free_raw(zp_dev).unwrap();
+            runtime.free_raw(gamma_dev).unwrap();
+            runtime.free_raw(output_dev).unwrap();
+        }
+
+        let mut worst_abs = 0.0f32;
+        let mut max_out = 0.0f32;
+        for (mv, tv) in marlin.iter().zip(tiled.iter()) {
+            let mf = mv.to_f32();
+            let tf = tv.to_f32();
+            assert!(mf.is_finite(), "Marlin rmsnorm output must be finite");
+            worst_abs = worst_abs.max((mf - tf).abs());
+            max_out = max_out.max(tf.abs());
+        }
+        let tol = 2e-2 * max_out.max(1e-3);
+        eprintln!(
+            "Marlin M>1 rmsnorm parity: worst_abs={worst_abs:.5}, max_out={max_out:.5}, tol={tol:.5}"
+        );
+        assert!(
+            worst_abs <= tol,
+            "fused rmsnorm Marlin output diverges from tiled: worst_abs={worst_abs} > tol={tol}"
+        );
     }
 
     fn device_ptr(raw: CUdeviceptr) -> DevicePtr {
