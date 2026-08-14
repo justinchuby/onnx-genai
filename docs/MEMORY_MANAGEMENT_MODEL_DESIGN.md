@@ -60,8 +60,8 @@ state-specific policies.
 | **C4 Capacity transaction** | State-visible or cross-holder/tier/device change uses `plan -> reserve -> provisional view -> execute -> commit`. Delegated-quota negotiation and waiting happen before open. Open transactions acquire authorities in stable order with try-only reservation and release all on failure; a retry retains its original arbitration identity without holding capacity. |
 | **C5 Reclaimable holder** | Pressure is a cancellable ticket with bytes, priority, deadline, and generation. The holder chooses safe victims and may release zero. |
 | **C6 Model memory view** | A backend exposes contiguous, blocks-plus-table, indexed, or opaque views valid for the consuming execution. |
-| **C7 Topology and capability** | The platform reports physical/aliased pools, capacity, granularity, links, allocator capabilities, and supported model views. |
-| **C8 Reconfiguration and observability** | Authorities report used, available, oversubscribed, role, reclaimable, and unattributed bytes. Lowering uses prepare/reclaim/commit; failure preserves the old limit and reports completed actions. |
+| **C7 Topology and capability** | The platform reports physical/aliased pools, capacity, granularity, links, allocator capabilities, and supported model views. It must also report the two quantities a tiering decision needs but cannot infer: **resident-vs-host read bandwidth** for the access pattern in question, and the **aggregate host-mapped read capacity** — the total distinct host-mapped bytes a device may read per execution before results stop being trustworthy. The second is not a theoretical limit; it was measured at ~0.44–0.65 GB/step on one consumer WDDM GPU, above which reads silently returned stale data (#912). A platform that cannot report it must be treated as having a capacity of zero rather than unbounded. |
+| **C8 Reconfiguration and observability** | Authorities report used, available, oversubscribed, role, reclaimable, and unattributed bytes. Every one of these is a statement about **charge**, not physical residency (I8b); a report that conflates them is worse than no report, because it will be believed. Rates reported for policy decisions must be byte-weighted — a count-based hit rate over a population whose members differ by orders of magnitude in size can rise while the byte gap widens, which is exactly what happened here (57.09% -> 81.31% while the gap grew 1.78x -> 2.30x, #869). Lowering uses prepare/reclaim/commit; failure preserves the old limit and reports completed actions. |
 | **C9 Persistent state bundle** | Managed mode requires declarations for all loop-carried state and its lifetime, growth/update pattern, view, and checkpoint/fork/migrate/recompute capabilities. Missing declarations are rejected or enter reported conservative compatibility: inferred/enveloped bytes are unattributed and prefix reuse/migration is disabled. |
 | **C10 Cooperative hierarchy** | Foundry delegates quotas only to authenticated workers it spawned/authorized. Workers never hold local reservations while awaiting quota and return uncommitted delegated capacity on defer. The coordinator retains submit identity, priority, and bounded aging as a non-owning retry intent. Heartbeat failure fences/terminates the worker; quota stays charged until exit. |
 
@@ -71,13 +71,15 @@ state-specific policies.
 |---|---|
 | **I1 Single charge per scope** | Physical bytes are charged once in each scope. Parent quota and child lease are linked attribution, not independently grantable copies. |
 | **I2 Charge before commit** | Allocation/mapping follows a grant. Accomplished allocations are recorded even when that reveals oversubscription. |
-| **I3 Honest compatibility** | Managed mode never silently escapes authority. Capability-inferred compatibility (including the WDDM default) must report that hard managed limits no longer apply. |
+| **I3 Honest compatibility** | Managed mode never silently escapes authority. Capability-inferred compatibility (including the WDDM default) must report that hard managed limits no longer apply. The WDDM case is concrete and shipping: when a model does not fit the resolved device budget on Windows, the runtime **stops managing weight residency and lets the platform demand-page**, because managing it was measured 30x slower (#864/#874). That is a correct choice and a reportable one — the runtime must not keep advertising a bound it has just handed to the OS. |
 | **I4a Physical ownership** | A reservation/allocation identity is provisional, committed to one holder, or terminally released; allocation IDs are never reused. |
 | **I4b Allowance ownership** | Allowances have independent free/reserved/committed state, never exceed charged capacity, and transfer without moving the physical charge. |
 | **I5 Transaction/failure scope** | Pre-commit failure restores all cooperating state. Post-commit disagreement poisons the smallest rebuildable unit; shared-ledger corruption poisons the worker. |
 | **I6 Live-state safety** | The authority never takes bytes directly. Holders cannot reclaim pinned or in-flight data. |
 | **I7 Non-blocking governance** | No lock is held while waiting. Allocator callbacks fail fast; cancellation/timeout returns any grant exactly once. |
-| **I8 Bytes are authoritative** | Admission derives exact bytes from model geometry and queried granularity, including rounding and transient peaks. |
+| **I8 Bytes are authoritative** | Admission derives exact bytes from model geometry and queried granularity, including rounding and transient peaks. Bytes are the **referenced** extents of the model, not the size of the file or external-data blob that contains them: a blob may carry orphaned or superseded regions that no initializer references. Measuring the container rather than the references overstated one model's weights by exactly 2.00x and made every derived budget wrong (#853/#856). |
+| **I8b Charge is not residency** | An authority accounts **charged** bytes, not physically resident bytes. On virtualized-memory platforms the two diverge without notification: WDDM may demote granules the ledger still counts as committed, and the ledger cannot observe it (#863). Observability (C8) must therefore label its numbers as charge, and any statement about physical residency must name its measurement source (for example `nvidia-smi`) and the conditions under which it was verified. A design that treats the ledger as physical truth will be correct on TCC and quietly wrong on every consumer Windows machine. |
+| **I8c Reservations are elastic against occupancy** | Capacity set aside for future state is sized against **current** occupancy plus a guaranteed path to the declared maximum, not against the declared maximum from the start. A one-shot split — reserve `bytes_per_token x max_context` at load and never revisit it — is charged in full from the first token and strands everything the model has not yet used; correcting one such split cut streamed bytes 1.68x with the max-context guarantee preserved (#857/#866). The guarantee is the hard part and must be tested through the production reclaim path, not asserted. |
 | **I9 Mapping synchronization** | Mapping changes fence all users and are keyed by allocation ID plus mapping generation. |
 | **I10 State-complete commit** | KV, recurrent/conv state, sampler/search state, and request progress commit or roll back together. |
 | **I11 Honest enforcement scope** | Hard guarantees cover participating workers and delegated quotas only. External programs are OS-observed pressure, never reclaimable holders. |
@@ -154,6 +156,53 @@ Standalone ORT enters directly at `ProcessMemoryManager` and
 Plain ORT creates a default local manager. Foundry owns only the optional serving
 coordinator; the OS/driver remains the whole-machine authority. If ORT GenAI
 merges into ORT, the logical Generation API and contracts remain unchanged.
+
+## Should the runtime manage these bytes at all?
+
+Every contract above describes how to manage memory. The prior question is
+whether managing a given class of bytes beats leaving it to the OS or driver,
+and the honest answer is that **sometimes it does not**. This is not a caveat;
+it is the decision rule that determines when the rest of this design pays for
+itself.
+
+**Copying data into device memory only pays when the data is re-read from
+device memory before it is evicted.** A weight that a decode step reads exactly
+once has no intra-step reuse to amortize against, so moving it ourselves costs
+the same PCIe bytes the OS would have moved, *plus* a host copy, a device
+allocation, a mapping, an eviction and a synchronization. On a 14B model whose
+weights exceed VRAM, that arithmetic produced a **30x slowdown** against simply
+letting WDDM demand-page the same bytes (0.18 vs 5.53 tok/s); changing the
+platform default to stop managing recovered roughly **100x** on end-to-end
+decode (#864, #874). The runtime was not losing to a better algorithm — it was
+losing to *not being in the path at all*.
+
+The rule generalizes past that one measurement:
+
+| Condition | Who should move the bytes |
+|---|---|
+| Data is re-read from device memory before eviction (weights under batching, hot experts, prefix-shared KV). | The runtime. Reuse amortizes the transfer, and only the runtime knows the reuse pattern. |
+| Data is read once per execution and the working set exceeds capacity. | The platform. Managing it adds cost to the identical transfer and buys no reuse. |
+| Capacity is sufficient and residency is stable. | Either; prefer the runtime for predictability and to keep accounting honest. |
+| Correctness depends on the bytes being where the ledger says (fences, capture, IPC). | The runtime, unconditionally — this is not a performance decision. |
+
+Two obligations follow, and they are contracts, not advice:
+
+1. **A governor must be able to decline.** Choosing not to manage a class of
+   bytes is a legitimate, reportable outcome, not a fallback or a failure. It is
+   what I3 (honest compatibility) exists to make visible: when the runtime steps
+   out of the path, hard managed limits no longer apply and the runtime must say
+   so rather than continue reporting a bound it is not enforcing.
+2. **The comparison must be measured, not assumed.** The 30x above was
+   discovered only by running the platform path as an explicit A/B arm against
+   our own. Any implementation of this design should keep that arm runnable —
+   an unmanaged control is the only thing that can tell you the control plane is
+   costing more than it saves.
+
+Batching is what moves data across the first row of that table: `N` sequences
+sharing one fused forward read each weight once for `N` tokens instead of once
+per token, which is why multi-request batching and weight offload are the same
+lever rather than two features. That amortization is measured at `1/N` with a
+ceiling of roughly `N_max ~ 19` at 2048 context on this hardware (#884/#891).
 
 ## Do we still need PagedAttention?
 
@@ -249,7 +298,8 @@ safe victims.
 
 | Risk | Mitigation / exit condition |
 |---|---|
-| **Dynamic weight lending corrupts output** | **Blocked.** Large stable-slot eviction/re-admission must be isolated and pass token-identity stress. Until then use a static hot set and lend only never-retained capacity. |
+| **Dynamic weight lending corrupts output** | **Blocked.** Large stable-slot eviction/re-admission must be isolated and pass token-identity stress. Until then use a static hot set and lend only never-retained capacity. **Do not spend the fix on eviction policy:** correctness does not depend on eviction order (default, MRU and smallest-first are all byte-identical, the last driven to 10,816 page-ins, #892), and an eviction-order change can reach at most ~10% of the recoverable gap because eviction cannot admit a tensor that admission already refused (#901). Roughly 90% of the gap is *admission* — weights bypassed on arrival-order first fit, 11% of events but 44.6% of streamed bytes. |
+| **Host-mapped cold reads silently return stale data** | **Measured, bounded, opt-in only.** Above ~0.44–0.65 GB of distinct host-mapped bytes read per step, results are wrong with no error raised (#912). Any implementation must treat C7's host-mapped read capacity as zero unless the platform reports otherwise, and must gate the path on byte-identical output rather than on absence of failures. |
 | Incomplete accounting | Fix #628 byte geometry; account activations/runtime/ORT VMM or reserve visible unattributed headroom. |
 | Cross-authority deadlock/starvation | Pre-negotiate delegated quota; ordered try-only reservation; persistent non-owning intents with bounded aging; model-check/fault-test schedules. |
 | Incomplete hybrid state | Cache hits require exact state-schema identity and complete-bundle restore; otherwise recompute. |
