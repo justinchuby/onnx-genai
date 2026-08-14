@@ -1325,6 +1325,53 @@ __device__ __forceinline__ float dot_int4x8_f16(
     return dot;
 }
 
+// Zero-point-aware [`dot_int4x8_f16`]. `sub2` is the fp16x2 subtrahend for this
+// block (the packed zero point, or fp16 8.0 for symmetric weights). Because the
+// centered code `(code - zp)` is an exact fp16 integer in [-15, 15], converting
+// each `q` to float and accumulating the eight products in fp32 in ascending
+// element order reproduces the scalar `(float)(code - zp) * __half2float(act)`
+// path byte-for-byte — the LOP3 unpack only changes *how* the nibbles are
+// decoded, not the arithmetic that follows. With `sub2 == 0x48004800` this is
+// identical to [`dot_int4x8_f16`].
+__device__ __forceinline__ float dot_int4x8_f16_sub(
+    const unsigned int packed,
+    const __half* __restrict__ activation,
+    const unsigned int sub2)
+{
+    const uint4 a = *reinterpret_cast<const uint4*>(activation);
+    constexpr unsigned int low_halves = 0x5410;
+    constexpr unsigned int high_halves = 0x7632;
+    uint4 permuted;
+    asm volatile("prmt.b32 %0, %1, %2, %3;\n"
+                 : "=r"(permuted.x) : "r"(a.x), "r"(a.z), "r"(low_halves));
+    asm volatile("prmt.b32 %0, %1, %2, %3;\n"
+                 : "=r"(permuted.y) : "r"(a.x), "r"(a.z), "r"(high_halves));
+    asm volatile("prmt.b32 %0, %1, %2, %3;\n"
+                 : "=r"(permuted.z) : "r"(a.y), "r"(a.w), "r"(low_halves));
+    asm volatile("prmt.b32 %0, %1, %2, %3;\n"
+                 : "=r"(permuted.w) : "r"(a.y), "r"(a.w), "r"(high_halves));
+
+    __half2 q[4];
+    int4x8_to_half2x4_sub(packed, q, sub2);
+    const float2 q04 = __half22float2(q[0]);
+    const float2 q15 = __half22float2(q[1]);
+    const float2 q26 = __half22float2(q[2]);
+    const float2 q37 = __half22float2(q[3]);
+    const float2 a04 = __half22float2(*reinterpret_cast<const __half2*>(&permuted.x));
+    const float2 a15 = __half22float2(*reinterpret_cast<const __half2*>(&permuted.y));
+    const float2 a26 = __half22float2(*reinterpret_cast<const __half2*>(&permuted.z));
+    const float2 a37 = __half22float2(*reinterpret_cast<const __half2*>(&permuted.w));
+    float dot = q04.x * a04.x;
+    dot += q15.x * a15.x;
+    dot += q26.x * a26.x;
+    dot += q37.x * a37.x;
+    dot += q04.y * a04.y;
+    dot += q15.y * a15.y;
+    dot += q26.y * a26.y;
+    dot += q37.y * a37.y;
+    return dot;
+}
+
 __device__ __forceinline__ uint4 permute_activation_f16x8(
     const __half* __restrict__ activation)
 {
@@ -3455,11 +3502,21 @@ extern "C" __global__ void matmul_nbits_gemv_f16_general_bs(
                 }
                 const unsigned int packed_word =
                     *reinterpret_cast<const unsigned int*>(packed + blob_base + (within >> 1));
+                if (valid == 8) {
+                    // Fast path: LOP3 int4->fp16 dequant + 128-bit activation
+                    // load. Byte-identical to the scalar loop below (same
+                    // ascending-order fp32 products) but replaces the per-nibble
+                    // shift/and/convert with 4 lop3 + f16x2 debias, cutting the
+                    // dequant-ALU pressure that dominates the block!=32 GEMV.
+                    const unsigned int sub2 = int4_zero_point_sub2(zero_point);
+                    partial = dot_int4x8_f16_sub(packed_word, activation + depth, sub2);
+                } else {
 #pragma unroll
-                for (int i = 0; i < 8; ++i) {
-                    if (i < valid) {
-                        const int q = (int)((packed_word >> (i * 4)) & 15u) - zero_point;
-                        partial += (float)q * __half2float(activation[depth + i]);
+                    for (int i = 0; i < 8; ++i) {
+                        if (i < valid) {
+                            const int q = (int)((packed_word >> (i * 4)) & 15u) - zero_point;
+                            partial += (float)q * __half2float(activation[depth + i]);
+                        }
                     }
                 }
             }
