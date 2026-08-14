@@ -4,6 +4,12 @@
 **Primary model:** Qwen2.5-0.5B int4 (`qwen2.5-0.5b-int4-onnx`)<br>
 **Date:** 2026-07-16
 
+> **Batching (#750):** the persistent single-sequence decode step described here
+> is pinned to batch 1. The coupled sites that must move together to reach a
+> batch-N decode step, the on-hardware batch-1 baseline, and the proposed
+> increment split are inventoried in
+> [`NATIVE_BATCH_DECODE_2B_IMPL_SCOPING.md`](NATIVE_BATCH_DECODE_2B_IMPL_SCOPING.md).
+
 ## 1. Executive summary
 
 The native runtime already has a substantial CUDA execution provider, but the

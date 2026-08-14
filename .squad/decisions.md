@@ -1,17 +1,15 @@
 # Decisions — live standing directives
 
+Last consolidated: 2026-08-13T18:57:00Z (Scribe decode-latency-floor batch, local state; merged 3 inbox drops — sebastian-glue-replay-gate (#899) + batty-glue-node-collapse (#900) + sebastian-bf16-skip-rmsnorm (#903) — into ONE "Decode latency-floor: node-collapse arc" section, deduped against the megakernel/glue/lowbit sections. KEY MILESTONE: native CUDA int4 batch-1 decode is confirmed at its launch-amortized LATENCY FLOOR from THREE independent directions — megakernel NO-GO (#898), glue-collapse +0.9% ceiling (#899/#900), skip-RMSNorm fold −1.5% regression (#903); consistent mechanism = at M=1 folding parallel work into a single-CTA reduction serializes what per-op spread across 132 SMs. Native ~47.6–47.8 tok/s (beats ORT ~40). SHIPPED: #900 bf16 SiLU/SwiGLU-mul glue collapse (+0.9%, byte-exact, Rule 11 portability fix) + #903 bf16 skip-RMSNorm KERNEL (0-ulp byte-exact); NO-SHIP as default: #903 standalone fold (−1.5%, opt-in behind ONNX_GENAI_CUDA_ENABLE_SKIP_RMSNORM_FUSION default OFF). Only speculative remaining lever = norm-into-GEMV-prologue fusion (NOT funded). Size gate: adding the section would exceed 50 KB → archived the 2026-08-12 VMM/offload/streaming + #762 absent-slot durable-lessons narratives to decisions-archive/2026-08.md → decisions.md now ~48.4 KB, under gate. Histories: appended #903 to sebastian, #900 to batty; checked chronicle + 15,360 B gates.)
+
+Last consolidated: 2026-08-13T17:07:00Z (Scribe megakernel-P2-NO-GO batch, local state; merged 6 inbox drops — sebastian-megakernel-feasibility + sebastian-megakernel-p15 + sebastian-megakernel-multicta (folded into one "Dense-decode megakernel arc" section), sebastian-lowbit-machine-tiers, roy-portability-rule (RULES.md §11), copilot-eviction-order-correctness (#888). KEY SEMANTIC CORRECTION: the persistent multi-CTA cooperative GEMV megakernel — earlier reopened as "the true remaining latency lever" — was BUILT AND MEASURED a 🟥 NO-GO (~3% SLOWER, 0.656→0.676–0.680 ms/layer-MLP, byte-exact 0-ulp; grid.sync 2.23 µs/barrier; PR #898 @ main 0790849c). Annotated all three prior "megakernel is the reopened lever" claims (#885 correction block, lowbit section, lowbit KEY-CONCLUSION) to reflect the NO-GO; the surviving datacenter lever is graph-side glue node-collapse (Batty, optimizer.rs). Lower-bit quant remains H200 NO-GO but is device-dependent (kept on roadmap for consumer/edge). Size gate: after merge decisions.md would exceed 50 KB → archived the 2026-08-12 Profiling gotchas + Parallel-work decisions sections to decisions-archive/2026-08.md → under gate. Histories: appended multi-CTA NO-GO to sebastian, graph-side node-collapse-is-primary-lever to batty; checked chronicle + 15,360 B gates.) 
+
 Last consolidated: 2026-08-13T14:45:00Z (Scribe lowbit-nogo-probe batch @ main 26bd410f; merged 2 inbox drops — sebastian-lowbit-feasibility + fact-checker-lowbit-accuracy — into new "Lower-bit quant — MEASURED no-go; ceiling is latency-bound not bandwidth-bound" section [PR #885]. KEY: byte-fold probe (−75% weight DRAM → +2.8%, HBM util ~15%) REFUTES the earlier "weight-bandwidth-bound" attribution; decode is LATENCY-bound on the ~2568-node serial chain (~8.2 µs/node). Appended a Correction note to the #870/#872/#873 fusion-arc entry (ceiling VALUE + "marginal fusion not a lever" stand; mechanism + lower-bit future-lever were wrong). Also corrected the mechanism wording in docs/PROGRESS.md (#875 lines) + bumped HEAD → 26bd410f. Megakernel/node-collapse REOPENED as true lever. Size gate: after merge decisions.md hit 53,745 B (>50 KB) → archived the detailed #870/#871/#872/#873 fusion-arc sub-entries to decisions-archive/2026-08.md (milestone conclusion + correction kept live) → 49,381 B, under the 50 KB gate. Histories: appended probe+NO-GO to sebastian/fact-checker history.md; checked chronicle + 15,360 B gates.)
 
 Last consolidated: 2026-08-13T05:15:00Z (Scribe fusion-arc batch @ main 887e3742; merged 4 inbox drops — chew-pr871-numerics, batty-fusion-contract, batty-qkv-contract, sebastian-bf16-swiglu-fusion-contract, sebastian-gqa-not-a-capture-lever — into the "Fusion arc — 47.25 tok/s is the architectural ceiling" milestone section [PRs #870/#871/#872/#873]. KEY CONCLUSION: three byte-exact A/B experiments prove native int4 decode of Muse-Glimmer-30B is weight-bandwidth/compute-floor bound at ~47.25 tok/s, NOT dispatch-bound — node/launch fusion (cheap OR expensive) does not help; #873 QKV fusion retained opt-in behind ONNX_GENAI_CUDA_ENABLE_QKV_FUSION=1. Size gate: after merge decisions.md exceeded 50 KB → archived the detailed #867 MatMulNBits narrative to decisions-archive/2026-08.md, kept milestone + standing numerics rule live. Histories: appended #871/#872/#873 + ceiling to sebastian/chew/batty history.md; all < 15,360 B chronicle gate, none summarized.)
 Last consolidated: 2026-08-13T04:10:00Z (Scribe CUDA-47tok/s-beats-ORT batch @ main 1002e360; merged sebastian-cuda-matmulnbits-gemv (PR #867, MatMulNBits bf16 constant-scale cache, native decode 40.21 → 47.25 tok/s — native now clearly beats ORT ~40, +18%). Size gate: 49,418 B + drop would exceed 50 KB → archived the detailed 23→40 (#860) narrative to decisions-archive/2026-08.md, kept its standing numerics rule live → decisions.md now 48,855 B, under charter 50 KB gate. Histories: appended PR #867 milestone to sebastian/history.md; checked all histories against the chronicle + 15,360 B gates — none summarized.)
 Last consolidated: 2026-08-13T03:03:13Z (Scribe CUDA-40tok/s milestone batch; merged sebastian-cuda-cast-elimination (PR #860) + recorded Chew's PR #860 numerics sign-off — Chew's inbox drop file was absent, decision reconstructed from spawn manifest. NO archive: decisions.md 44,755 B, below charter 50 KB gate. NOTE: the spawn prompt's "archive entries older than 30 days at ≥20,480 B" is an age-based gate the charter forbids — it no-ops since all live entries are 2026-07/08, and 20 KB is below the standing-directive floor. Histories: sebastian 3,948 B / chew 6,951 B, both below the chronicle + 15,360 B gates, none summarized.)
-Last consolidated: 2026-08-12T00:00:00Z (Scribe inbox-consolidation run @ main f85a82f0; 18 inbox drops merged — 9 CUDA-graph-capture-arc drops folded into a single "CUDA-graph capture arc" section (classify #848 → load #850 → pin #852 → bf16 kernel #855 → skip-norm #854; native decode 11.4→23.13 tok/s; capture fully engaged 1 segment / 0 seams; next lever = Cast round-trip elimination) + 9 parallel-work drops preserved as their own entries (copilot fence-witness/#851 mobius-flake/VMM-release, isidore win-arm64/ort-retry, nabil ort-discovery, resch cpu-bf16/clippy, roy registry-shrink). NO archive this run — decisions.md 28,679 B, below the gate. Histories checked: max 8,105 B (holden), below the 15,360 B gate, none summarized.)
-Last consolidated: 2026-08-12T00:00:00Z (Scribe CUDA-capture escalation batch; 1 inbox drop merged — coordinator-profiling-staging-gotchas (Muse-Glimmer native-CUDA profiling gotchas + vram-governor portability bug, no dedup collision). Size gate: 37,960 → archived EP-wheels/bf16/H200 narrative wave + verbatim inbox drops to decisions-archive/2026-08.md → ~28 KB, well under charter 50 KB. NOTE: charter mandates archive-by-SIZE; an "older than 30 days" age filter would have no-op'd here since all live entries are dated 2026-07-30..2026-08-12. Standing-directive floor is ~25 KB, so the prompt's 20,480-byte gate is below what can be shed without deleting standing directives.)
-Last consolidated: 2026-08-12T20:40:00Z (Scribe EP-wheels/bf16/H200 merge session; 3 inbox drops merged — sebastian PyPI packaging + CUDA wheel-fix, leon #762 test-quality followups; new findings entry for #829/#831/#832/#838 merges + CDN incident + vlm KV regression. Size gate: 49,117 → archived #762 active-wave + all upstream-ORT PR narrative to decisions-archive/2026-08.md → 37,540 bytes, well under 50 KB.)
-Last consolidated: 2026-08-12T15:52:00Z (Scribe nxrt-ep PyPI-publish session; 2 inbox drops merged — coordinator-nxrt-ep-cuda13 + copilot-vmm-push-summary; no dedup collisions. Size gate: 43,278 → ~50 KB, under 50 KB charter threshold, nothing archived.)
-Last consolidated: 2026-08-12T06:00:00Z (Scribe #762 memory-safety wave; 6 inbox drops merged; wave narratives archived to decisions-archive/2026-08.md; live file compacted)
-Last consolidated: 2026-08-12T04:30:00Z (Scribe #31974 coverage wave; 2 inbox drops merged; narrative waves from 2026-08-10 through 2026-08-12 archived to decisions-archive/2026-08.md; live file compacted from 50,788 bytes to ~19 KB)
-Last consolidated: 2026-08-11T17:55:00Z (Scribe issue-triage session + autonomous fixes; 7 inbox drops merged — 6 new: mobius io-metadata #477 + cosmos3-edge readiness assessment, GBQ zero-point #785, ORT recurrent guard/loader dedup #786, VLM fixture #788, DRY decoder-io #784, VMM contiguous-VA investigation; 1 deduped: qwen35-27b-native already recorded under #779. 30-day archive gate evaluated at 28KB: no dated entries older than 2026-07-12, so nothing archived. Prior: 2026-08-11T16:03:10Z Scribe TopK-perf + 27B-native batch; 37 inbox drops merged, full narrative archived to 2026-08.md)
+Earlier 'Last consolidated' chronicle lines (2026-08-11/12, six entries) archived to `.squad/decisions-archive/2026-08.md`.
 
 Standing governance rules and active directives. Full narrative is archived in `.squad/decisions-archive/2026-07.md`, `.squad/decisions-archive/2026-08.md`, and older `.squad/decisions/archive/` files.
 
@@ -65,8 +63,11 @@ no code perf change shipped, one opt-in pass retained.**
 > NOT weight-bandwidth-bound. The ceiling VALUE (~47.25) and the "marginal node/launch fusion is
 > not a lever" conclusion still stand; only the WHY changes. Consequently the "cut weight
 > BYTES/token (lower-bit quant, sparsity)" future-lever above is a **MEASURED no-go** (see the
-> Lower-bit quant section below), and **drastic per-layer node-collapse (decode megakernel,
-> activations resident) is REOPENED as the true next lever.**
+> Lower-bit quant section below). The correction reopened a **decode megakernel** as a
+> candidate lever — but that has since been **BUILT AND MEASURED: a persistent multi-CTA
+> cooperative GEMV megakernel is a 🟥 NO-GO** (~3% slower, #898; see "Dense-decode megakernel
+> arc" below). **The remaining recoverable-overhead lever is graph-side glue node-collapse
+> (Batty, `optimizer.rs`), NOT a GEMV megakernel.**
 
 ### Detailed #870/#871/#872/#873 sub-entries → archived
 The four detailed per-PR narratives (bf16 SiLU #871, GQA-not-a-lever #870, cheap-Add regression #872, QKV-fusion-flat #873) are in `.squad/decisions-archive/2026-08.md` ("Archived by Scribe 2026-08-13T14:45Z"). The milestone conclusion + latency-bound correction above are the live record; #873's `CudaQkvProjectionFusion` stays opt-in via `ONNX_GENAI_CUDA_ENABLE_QKV_FUSION=1`.
@@ -84,7 +85,10 @@ capture-safe env-gated A/B on a single release binary.
 mis-attribution.** Decode is **latency-bound on the serial ~2568-node dependency chain
 (~8.2 µs/node × 2568 ≈ 21 ms/token)**, NOT weight-bandwidth-bound. Reconciles both prior
 negatives: not bandwidth (byte-fold flat) AND not marginal-node-sensitive (#872/#873 flat/worse).
-**Megakernel / drastic per-layer node-collapse (activations resident) is the reopened true lever.**
+**Megakernel note (SUPERSEDED — see "Dense-decode megakernel arc" below):** the correction
+originally reopened a decode megakernel / per-layer node-collapse as "the true lever." That
+GEMV megakernel has since been built and measured a 🟥 NO-GO (#898, ~3% slower); the surviving
+lever is graph-side glue node-collapse (Batty, `optimizer.rs`).
 
 ### 2026-08-13: Bandwidth probe (#885 MERGED, docs-only) — the mechanism is latency, not bytes
 **By:** Sebastian (Perf). Full brief: `docs/research/lowbit-quant-feasibility.md`.
@@ -123,10 +127,174 @@ merged from `fact-checker-lowbit-accuracy.md`.
   (2) ORT-stack tooling for sub-4-bit >7B is immature (GGUF/imatrix ships it but off-stack; Olive not
   demonstrated). Chew is the numerics gate if any sub-4-bit path is ever funded.
 
-**Disposition:** no code/quant change made or planned. Lower-bit quant replaced on the roadmap by a
-one-layer decode-megakernel prototype (the only direction consistent with all three measurements:
-byte-fold flat, marginal fusion flat/worse, ~15% HBM util). Decision drops merged & deleted:
+**Disposition:** no code/quant change made or planned. Lower-bit quant was replaced on the roadmap
+by a one-layer decode-megakernel prototype — **but that prototype has since been built and measured
+a 🟥 NO-GO** (persistent multi-CTA GEMV megakernel ~3% slower, #898; see "Dense-decode megakernel
+arc" below). The surviving datacenter lever is **graph-side glue node-collapse (Batty,
+`optimizer.rs`)**, not a GEMV megakernel. Decision drops merged & deleted:
 `sebastian-lowbit-feasibility.md`, `fact-checker-lowbit-accuracy.md`.
+
+### 2026-08-13: Lower-bit quant is DEVICE-DEPENDENT — H200 NO-GO, but a real lever on consumer/edge
+**By:** Sebastian (Perf). Extends `docs/research/lowbit-quant-feasibility.md` §6 "Machine-class
+sensitivity". Branch `squad/lowbit-machine-tiers`. Docs-only, no code change.
+The measured 🟥 NO-GO above is **H200-specific**: the byte-fold probe ran on this ~4.8 TB/s box,
+where weight reads are hidden behind the serial ~2568-node launch-latency chain (~21 ms/token), so
+cutting bytes buys ~+3% max. Two-component model: `T_latency` (~21 ms, ~bandwidth-independent) vs
+`T_weightread = 15.3 GB / B_device`; per-token ≈ `max(...)` overlapped. **Crossover ≈
+15.3 GB / 21 ms ≈ 0.73 TB/s** (extrapolation from one device — a model, not a measurement). Below
+that (mid-consumer RTX 4060/4070 ~270–500 GB/s and edge/Jetson) lower-bit is 🟢 a real **speed**
+lever; near it (RTX 4090/5090 ~1–1.8 TB/s) 🟡 modest. Independently, lower-bit is the only way to
+**fit** 30B on ≤12 GB VRAM (int4 ~15 GB won't load; int3 ~11.5 GB / int2 ~7.7 GB makes it *run*) —
+a portability win separate from the speed roofline. **Recommendation:** H200/datacenter 🟥 NO-GO
+for speed (lever is the node-collapse path); **keep lower-bit ON THE ROADMAP for consumer/edge**,
+gated on running the SAME `ONNX_GENAI_WEIGHT_FOLD` byte-fold probe on a representative consumer GPU
+(we only have an H200 and cannot measure that regime here). Accuracy path is device-independent
+(Fact Checker: int3/~3.5 bpw imatrix/SpQR 🟢; int2 needs codebook/trellis 🟡; scalar int2 🔴; all
+require re-quant from the fp16 source). Ties to Roy's RULES.md §11 portability rule (below).
+
+## Dense-decode megakernel arc — MEASURED 🟥 NO-GO on the whole-layer GEMV megakernel (2026-08-13, PR #898)
+
+**KEY CONCLUSION (record prominently):** After the #885 correction reopened a decode megakernel as
+the candidate datacenter lever, Sebastian **built and measured** the persistent multi-CTA
+cooperative GEMV megakernel end-to-end. **FINAL VERDICT: NO-GO.** The megakernel is **~3% SLOWER**
+per layer than an identical-math per-op baseline. Projected whole-model gain from a GEMV megakernel
+≈ **0% (decode stays ~47 tok/s)**. **The only remaining recoverable-overhead lever is graph-side
+glue node-collapse (Batty, `optimizer.rs`)** — no cooperative kernel, no grid.sync tax, no numerics
+reorder. Merged as PR #898 (main @ 0790849c). Full brief:
+`docs/research/dense-decode-megakernel-feasibility.md` §7 (§5/§6 marked superseded).
+
+**Staged arc (all H200, throwaway `#[ignore]` GPU probes, never pipeline-wired):**
+- **Phase A/B feasibility (GO-to-prototype, now SUPERSEDED by the P2 measurement):** headroom gate
+  passed (captured 21.4 ms/token; recoverable overhead ~85% of the token); a glue-only micro-bench
+  fused 22 glue ops into 1 launch recovering 85.6% of the *glue* chain. This projected large upside
+  **but did NOT build the int4 GEMV path** — that per-layer number was the real P2 gate.
+- **P1.5 (architecture pinned):** single-CTA fused int4 MLP = **926× SLOWER** (one SM ≈ 1/132 of
+  device weight-read bandwidth) → residency-only fusion is dead; the megakernel MUST be multi-CTA.
+  Confirmed **`grid.sync` / cooperative launch IS capturable** under CUDA-graph capture on this
+  H200/driver (keep a runtime capability check + graph-break fallback for older drivers).
+- **P2 (multi-CTA cooperative, the deciding measurement — NO-GO):** built the pinned persistent
+  multi-CTA megakernel for the MLP triple-GEMV block (1056 co-resident CTAs = 8/SM × 132 SMs,
+  grid.sync seams, L2-resident global scratch) with production int4 GEMV math, measured vs
+  identical-math per-op baseline. **Per-op baseline 0.656 ms/layer-MLP → megakernel 0.676–0.680 ms
+  = recovered fraction −3.2% (−2.9%…−3.5%), ~3% SLOWER, byte-exact 0-ulp.** grid.sync =
+  2.23 µs/barrier (full 1056-CTA grid); a full layer would pay ~0.7–0.9 ms/token of barrier tax
+  across 52 layers.
+
+**Why the megakernel loses (mechanism, kernel-speed-independent):** (1) CUDA-graph replay already
+removes the per-launch overhead the megakernel targets (eager 27.6 → captured 21.4 ms, ~6.1 ms
+already banked); (2) the multi-CTA design must PAY a grid.sync tax the per-op path never pays, which
+roughly cancels/exceeds the savings; (3) GEMVs are genuine full-device weight-read work already
+fanned across all 132 SMs per-op — a megakernel does the *same* reads and cannot accelerate them,
+and removed activation round-trips are already L2-resident (~80 KB, ~nothing saved).
+
+**Ownership / redirect:** graph-side glue node-collapse (the live lever) = **Batty**
+(`optimizer.rs`); fused kernel epilogues that enable node deletion (#867 SwiGLU-mul, #854
+skip-RMSNorm) = **Sebastian** (already landed); numerics gate for any future fused reduction reorder
+= **Chew**. One un-excluded future path (scope only if node-collapse + GQA tuning are exhausted): a
+software-pipelined design overlapping next-layer int4 weight prefetch with current compute
+(Hazy-style) attacks the GEMV time itself, not launch overhead. Decision drops merged & deleted:
+`sebastian-megakernel-feasibility.md`, `sebastian-megakernel-p15.md`,
+`sebastian-megakernel-multicta.md`.
+
+## Decode latency-floor: node-collapse arc — glue collapse ships +0.9%, skip-RMSNorm fold is a no-ship; batch-1 latency FLOOR three-way confirmed (2026-08-13, PRs #899/#900/#903)
+
+**KEY MILESTONE (record prominently):** Native CUDA int4 **batch-1 decode is now confirmed at its
+launch-amortized LATENCY FLOOR from THREE independent directions** — GEMV megakernel NO-GO (#898),
+graph-side glue-collapse +0.9% ceiling (#899/#900), and skip-RMSNorm fold −1.5% regression (#903).
+The consistent mechanism across all three: **at M=1, folding parallel work into a single-CTA
+reduction serializes what per-op spread across 132 SMs.** CUDA-graph replay already amortizes
+per-launch overhead (~0.9 µs/node dispatch floor survives replay), so any scheme that trades
+whole-GPU multi-CTA parallelism for a fused single-CTA launch is strictly heavier. Native decode
+sits at **~47.6–47.8 tok/s** (beats the ORT backend ~40). The only speculative remaining decode
+lever is **norm-into-GEMV-prologue fusion** (bf16 analogue of `CudaSkipRmsNormMatMulFusion`, keeps
+the reduction distributed across the GEMV's CTAs) — a larger GEMV-kernel job, uncertain payoff,
+**NOT yet funded.** Docs: `docs/research/dense-decode-megakernel-feasibility.md` §8/§8.5/§8.6.
+
+### 2026-08-13: Glue node-collapse is a GO — survives graph replay (#899, Sebastian)
+Before staffing a multi-week `optimizer.rs` pass, Sebastian measured whether glue collapse recovers
+anything **under graph replay** (the real production decode path), since #898's own mechanism was
+"replay already removes per-launch overhead." Per-op glue chain (22 nodes) vs fused (1 node), each
+captured into a CUDA graph and timed under replay: eager recovers 84–85%, **under replay 74.0–75.5%
+recovered — a ~0.9 µs/node residual dispatch cost SURVIVES replay** (22 trivial graph nodes vs 1),
+byte-exact 0-ulp. Whole-model projection was **+5.3% ceiling** (46.7 → ~49.2 tok/s) — a projection,
+since glue nodes interleave with the dominant GEMVs. **GO** — the opposite of the megakernel because
+glue ops are tiny L2-resident dispatch-bound work (not irreducible GEMV work) and collapse uses an
+ordinary fused launch (no grid.sync tax, no reduction reorder, no Chew gate).
+
+### 2026-08-13: Glue collapse REALIZED — bf16 SiLU/SwiGLU-mul, +0.9% byte-exact (#900, Batty)
+Converted the #899 ceiling into a measured number on the production Muse-Glimmer-30B decode graph.
+**Root cause:** `CudaSiluFusion` (`crates/onnx-runtime-ep-cuda/src/optimizer.rs`) was gated to
+**Float16 only** and never fired on the bf16 stream — extended to accept **BFloat16** (a portability
+fix under Rule 11). The standalone `Sigmoid`+`Mul`+`Mul` glue then collapses through
+`CudaSiluFusion`→`CudaSwiGluFusion` into the tagged `Mul[_cuda_silu_mul]`, lowered to the landed
+`decomposed_silu_mul_bf16` epilogue (#867). **Measured (H200, CUDA_GRAPH=1, interleaved A/B):
+47.20 → 47.63 tok/s = +0.9%**, byte-exact (24-token stream bit-identical), node count 22→20
+glue/layer (−104 total: `Sigmoid` 104→52, `Mul` 210→158). `CudaGateUpSwiGluFusion` needs an fp16
+activation so stays dormant → **int4 GEMVs untouched**. **SHIP** (small-but-real). Honest bound vs
+the +5.3% ceiling: only the 2 SiLU/SwiGLU-mul nodes/layer are byte-exactly collapsible; bigger levers
+blocked — (1) **6 norms/layer** need a byte-exact bf16 skip-RMSNorm kernel (see #903); (2) **~208
+`gamma+1` Adds/layer** already MEASURED −2.8% (#872) — do not re-attempt; (3) **4 reshapes/layer** are
+GQA head-split metadata coupled to the attention kernel, not free deletions.
+
+### 2026-08-13: bf16 skip-RMSNorm — KERNEL ships byte-exact, standalone FOLD is a no-ship (#903, Sebastian)
+Closed the #900 blocker by building the missing **byte-exact bf16 skip-RMSNorm kernel** for
+Gemma3 sandwich-norm (6 norms/layer × 52 = 312 nodes, seam `Add(residual, sublayer)→
+SimplifiedLayerNormalization`). The `skip_rmsnorm_bf16` NVRTC kernel
+(`crates/onnx-runtime-ep-cuda/src/kernels/normalization.rs`) computes
+`sum = __float2bfloat16_rn(f32(residual)+f32(x))` (bit-for-bit a standalone bf16 `Add`), then the
+identical `rmsnorm_bf16` block-tree reduction. **Numeric fidelity (Chew gate): BYTE-EXACT, 0-ulp** —
+GPU unit tests bit-identical vs standalone `Add`→`rmsnorm_bf16` at H=6656; real-model greedy stream
+fold OFF vs ON bit-identical (128/128 tokens). **KERNEL: SHIP.**
+**But the standalone fold REGRESSES:** perf A/B (H200, CUDA_GRAPH=1, interleaved) — fold OFF (default)
+**47.77 tok/s**, fold ON **47.06 tok/s = −1.5%** (104 seams folded). **Why:** at M=1 the RMS reduction
+is single-CTA (all H=6656 in one block); folding the residual add into it **serializes** work the
+standalone `Add` spread across all 132 SMs. Under replay the launch saving is already banked, so the
+fused single-CTA skip kernel is strictly heavier than `multi-CTA Add + single-CTA norm` — same
+structural reason as the megakernel NO-GO. **FOLD: NO-SHIP as default** — retained opt-in behind
+**`ONNX_GENAI_CUDA_ENABLE_SKIP_RMSNORM_FUSION` (default OFF)**; default binary unchanged (47.77 tok/s
+== baseline). The kernel is the prerequisite for the only bf16 path that could win: folding the norm
+into the neighbouring **multi-CTA int4 GEMV prologue/epilogue** (keeps the reduction distributed) —
+a larger GEMV-kernel job, NOT this fold, and NOT yet funded. **Do NOT self-merge** — Chew gates
+numerics. Drops merged & deleted: `sebastian-glue-replay-gate.md`, `batty-glue-node-collapse.md`,
+`sebastian-bf16-skip-rmsnorm.md`.
+
+## Hardware-tier portability is now an explicit project rule — RULES.md §11 (2026-08-13)
+
+**By:** Roy (Lead), req. by Justin (@justinchuby). Branch `squad/rules-portability`. Governance doc
+only — no kernel/code change. Added **Rule 11 "Run portably across hardware tiers"** to `RULES.md`,
+codifying: (1) runtime capability detection with graceful fallback (CPU ISA AVX-512/AVX2/NEON/SVE
+fast path + correct scalar fallback; GPU kernels JIT to the device actually present); (2)
+hardware-tier awareness (a feature needing more VRAM/bandwidth than the tier has must degrade or opt
+out clearly, never silently OOM — e.g. 30B int4 ~15 GB fits H200 not an 8–12 GB consumer GPU); (3)
+**perf claims are tier-scoped** — state the device/EP/tier a benchmark or "ceiling" was measured on,
+never generalize one device into a universal conclusion; (4) no hard runtime dependency on a
+specific vendor toolkit/driver/arch beyond the declared minimum. Grounded in the lower-bit-quant
+NO-GO being an **H200** finding (latency-bound per #885), explicitly *not* universal. Cross-refs
+Rules 2/4/5; cites `docs/portability/2026-07-25-cuda-consumer-gpu-audit.md`, `docs/CROSS_PLATFORM.md`,
+`docs/benchmarks/2026-07-25-gqa-decode-avx512.md`, `docs/research/lowbit-quant-feasibility.md`.
+
+## Decode correctness does NOT depend on eviction order (2026-08-13, #888)
+
+**By:** Copilot. Branch `squad/eviction-order-correctness`. Investigation only — no shipped behaviour
+changed, all knobs added are default-OFF and byte-identical on the default path.
+#886 rejected a byte-aware residency policy that corrupts decode (16→3 tokens) when weight offload
+engages, speculating a latent *order-dependent* defect in the shipped offload path (which would block
+#864's hybrid). **Refuted:** a default-OFF probe (`ONNX_GENAI_WEIGHT_OFFLOAD_EVICT_ORDER`) changing
+only the eviction *victim* on the size-blind path shows two independent still-correct orders — MRU
+reverse-recency AND byte-aware's exact smallest-first victim under 10,192 evictions — are
+**byte-identical** with clean ledgers. **Changing eviction order alone is value-neutral.** The
+corruption comes solely from byte-aware's *other* change: the **retain-vs-bypass flip** (promoting a
+large transiently-streamed tensor into a retained stable-slot resident served as a hit across steps).
+Mechanism is NOT captured-VA baking (graph-OFF corrupts too) and NOT a copy/compute fence hazard
+(full drain before every page-in fill doesn't fix it); one secondary consistency bug found
+(`stable_slot=true` key never rejoins `pages`; `ONNX_GENAI_WEIGHT_OFFLOAD_RETAIN_SLOTTED=1` closes it
+but does NOT stop corruption). **Consequence:** the shipped size-blind path is **safe** (never
+retains large tensors → buggy path unreachable), so **#864's hybrid is NOT blocked by an
+eviction-order invariant** — a hybrid pinning a **static** hot set (retain once, never
+evict/re-admit) does not exercise the corrupting retain-then-churn path. Any dynamic scheme moving
+large weight residents in/out (byte-aware, possibly #866/#750 if they churn large pages) must
+validate token identity and prefer a pinned non-churning hot set. Drop merged & deleted:
+`copilot-eviction-order-correctness.md`.
 
 ## nxrt EP plugins on PyPI + CUDA 13 target (2026-08-12)
 
@@ -161,65 +329,12 @@ crates/onnx-runtime-python/pyproject.toml.
 **Why:** User directive "记得用cuda 13"; keeps EP wheel consistent with the main nxrt CUDA
 wheel toolchain.
 
-## VMM / offload / streaming / batching push — durable results (2026-08-12)
-
-**By:** Copilot (coordinator). Every claim is backed by a merged, executable test;
-refutations are recorded alongside confirmations.
-
-**Governing rule (#772/#776/#787):** `cuMemMap` maps whole granule-aligned windows onto
-whole physical granules, so `committed bytes = granule × (windows containing ≥1 live byte)`.
-**Layout controls residency** — the allocator cannot compact what layout scattered.
-`CU_MEM_ALLOC_GRANULARITY_MINIMUM == RECOMMENDED == 2 MiB` here, so the floor is fixable
-only by layout, not by shrinking the granule. Minimum mapping granularity spans ~500× across
-platforms (Level Zero/Vulkan ~64 KiB, CPU mmap 4 KiB) → layout must be a queried per-EP,
-per-platform capability (#783), not a constant.
-
-**Confirmed:**
-- Floor is layout-determined: 768 granules (~1.5 GiB) head-major → 96 (~192 MiB) seq-major →
-  1/seq (~2 MiB) token-major = **768× reduction** (#787).
-- Strided reads are not the obstacle: seq/head bandwidth ratio 0.80–1.02; 192 KB token-major
-  stride measured 1.000 at 6 GiB working set — reads are DRAM-bound independent of stride
-  (device memory already 2 MiB-page backed) (#778/#787).
-- Offload and capture no longer mutually exclusive (#796): weights page under a stable VA;
-  page-in remaps physical granules instead of returning a new pointer. Unblocked #755.
-- Managed no-spill VMM is default, auto weight-streaming when a model exceeds budget (#798);
-  a fitting model does not page (`FullResident`, offload off, 0 page-ins).
-- Prefix sharing is sound (#793/#803): one handle maps into N=8 sequences under captured
-  replay; ledger charges once, alive until last sharer, additional sharer costs 0 bytes.
-
-**Refuted (and why it mattered):**
-- "seq-major landed ⇒ 8× floor realised" — false: #794 measured head-major and seq-major
-  committing identical bytes (bindings didn't consume the layout descriptor); fixed #797.
-- "decoder structurally declines capture" — false (#804): `captures=0` came from a cached
-  `ONNX_GENAI_CUDA_GRAPH=0` in a long-lived test process. #794/#801 misattributed it.
-- "fixed KV stride removes growth-triggered re-capture" — true in mechanism, irrelevant:
-  engine invalidates the graph unconditionally on growth (#805).
-- "tokens per granule" KV cost model — wrong for head-major (retracted), exactly right for
-  token-major. Layout is the whole story.
-
-**#736 audit recurring finding (six slices):** 4/5 completed slices found **over-reservation**
-(bytes charged on a path that never uses them), not ungoverned allocation — #751 IndexShare,
-#795 GQA WS_SCORES (~128 MiB f32-only), #799 cuBLASLt GEMM (32 MiB heuristic ceiling, measured
-0–96 B), #802 default-domain Attention scores (genuinely needed), #806 GQA QKV staging. Guidance
-in `MEMORY_ARCHITECTURE.md`: **start from use, not from allocation** — governing a bypass without
-sizing it to use converts invisible waste into charged waste (tightens #745 admission, reduces
-concurrency).
-
-**Method notes:** order-dependent test state cost two wrong conclusions this week
-(process-frozen `RuntimeConfig` #804; CUDA context warmed by alphabetically-earlier sibling
-#797) — #807 added a debug-only freeze guard, single-stream helper, and an inventory. Negative
-results delivered as first-class outcomes. Never extrapolate an unmeasured number (`qwen14b-zp`
-lacks `inference_metadata.yaml`, not native-loadable #384 — reported as not measured).
-
-## Durable lessons — #762 absent-slot machinery (2026-08-12)
-
-- **The absent-slot machinery has now produced four distinct defects:** compacted output slots, absent inputs aliased to input 0, a forgeable name-based sentinel, and a 2× heap buffer overflow. Any change touching optional-slot handling deserves disproportionate scrutiny.
-- **Allocate and interpret with the same dtype.** Sizing a buffer from one dtype while handing the consumer a different one is a memory-safety bug. Derive both from one source and fail closed when it is unknown.
-- **A canary test must mirror production allocation exactly.** Canaries allocating at `byte_size` while production used `max(byte_size, 8)` could not detect wrong-dtype writes — the padding absorbed them. A test that passes for a reason unrelated to its claim is the most-repeated defect on this PR.
-- **Verify a fail-loud gate by actually creating the failure condition.** Renaming one `ort-prebuilt` directory was a false negative; only renaming all 16 proved the gate fires.
-- **Third false "API does not exist" deferral.** `MemoryDevice_GetDeviceId` and `Session_GetEpGraphAssignmentInfo` (twice) were all claimed unavailable and all existed — the latter already in use in our own tree. Check the generated bindings before deferring.
-- **Merging upstream `main` into a long-lived branch:** resolve append-only archives and `.gitignore` as **unions**, never by taking one side, or user work is silently lost.
-
+## VMM/offload/streaming + #762 absent-slot durable lessons → archived (2026-08-12)
+The full "VMM / offload / streaming / batching push — durable results" narrative and the
+"#762 absent-slot machinery" durable lessons are archived in `.squad/decisions-archive/2026-08.md`
+("Archived by Scribe 2026-08-13T18:57Z"). Standing takeaway retained: **layout controls VMM
+residency** (committed bytes = granule × windows with ≥1 live byte); **start governance from use,
+not allocation**; optional-slot handling deserves disproportionate scrutiny (four distinct defects).
 
 ## Extension contract standing directive (#524)
 
@@ -369,18 +484,6 @@ This **narrows** the earlier Apple framework policy entry (Accelerate/BNNS/vDSP 
 ---
 
 
-## 2026-08-12: Profiling Muse-Glimmer-30B on native CUDA — two gotchas + a portability bug
-
-**By:** Squad (Coordinator), for Justin Chu (merged from inbox: coordinator-profiling-staging-gotchas.md)
-**What:**
-1. **Multimodal genai_config ≠ single-decoder profiling.** Muse-Glimmer's genai_config.json declares `vision`+`embedding`+`decoder`, so the compat translation resolves `shape()==Multimodal` and NEVER builds the single-decoder `model.io` block (kv_inputs/kv_outputs). Result: `profile_native --model <dir>` (single-decoder path) fails governor init with "cannot derive the KV memory budget ... declare model.io.kv_inputs". This is NOT a KV-geometry regression — the KV tensor head dims are concrete ([batch,2,seq,128]). Fix for profiling: stage a decoder-only dir with a genai_config.json that has vision/embedding stripped (shape()==SingleDecoder), model.onnx+data+tokenizer.json co-located. Staged copy lives at /tmp/muse-glimmer-staged. Alternative: `profile_native --pipeline` against the real multimodal dir.
-2. **profile_native model resolver** needs a dir containing BOTH model.onnx AND tokenizer.json (not the decoder/ subdir alone, not the top-level models/ dir).
-3. **PORTABILITY BUG (real):** `resolve_vram_limit_bytes` resolves the default `Fraction(0.90)` vram_limit against `fallback_capacity_providers` = PROVISIONAL 8 GiB (governor.rs:93), never the real device. So on any GPU (even 143GB H200) the governor caps device leases at ~7.2GB and models >7.2GB fail to load resident. profile_native has no vram flag; `ONNX_GENAI_VRAM_LIMIT` is wired only into the server CLI. Sebastian is fixing this via real cuMemGetInfo device-capacity detection (branch squad/native-cuda-decode-perf). [UPDATE: landed in batch #840 / 629fbf90 — real cudaMemGetInfo device-capacity detection + CudaFoldConstantCast pass; native decode 10.2→11.4 tok/s, +11.8%.]
-
-**Why:** Two agents already lost time re-hitting the model-path/KV errors when profiling this multimodal 30B. The provisional-8GB cap silently forces weight offload/paging, which corrupts perf measurements. Recording so the team stops re-deriving it.
-
----
-
 ## CUDA-graph capture arc — Muse-Glimmer-30B native decode 11.4 → 23.13 tok/s (2026-08-12)
 
 Full 5-blocker narrative (CLASSIFY #848 → LOAD #850 → PIN #852 → bf16 GQA kernel #855 →
@@ -396,35 +499,6 @@ fixed-capacity device-KV**; pin the seq symbol engine-side, keeping the kernel
 after a warm-time arena grow reads false at the worst moment — gate the demotion on
 `is_capturing()`. (d) bf16 kernels accumulate in fp32; bf16 only at load/store boundaries,
 oracle-gated against f64 softmax.
-
-## Parallel-work decisions (2026-08-12)
-
-### Enforce async-copy fence-safety with a type-level completion witness (#843, Copilot)
-When a host buffer is the *source* of an async H2D copy and later reused/freed (pinned-staging pool), reuse must be ordered after the copy **completes**, not enqueues. Enforce with a type, not a comment: the host-syncing copy primitive (`CudaRuntime::htod_async_elapsed_ms`) returns a `CopyCompleted` witness (zero-sized, field private to the `runtime` module — unforgeable); the reuse path (`PinnedStagingPool::release`/`PooledStaging::retire`) **consumes** one, so reuse is unreachable without proof the copy finished. A future switch to non-blocking copy fails to compile until a witness is threaded post-fence. `Drop` cannot *require* an argument → make `retire(self, CopyCompleted)` explicit and demote `Drop` to a leak-safe free-only fallback (never returns to pool; catch misuse with a `pinned_alloc_calls` counter). **Never assert in `Drop`** on this codebase (STATUS_STACK_BUFFER_OVERRUN). Compile-time only — no runtime/perf change.
-
-### mobius_seqmajor parity gate is intrinsically flaky ~10–20% solo — issue #851 (Copilot)
-`mobius_seqmajor_growth_parity_native_cuda` is flaky **even solo on a clean base** (coordinator measured 4/5 on clean `dccb40e8`; combined ~1 failure per ~10 solo runs) — an earlier "5/5 solo reliable" claim was under-sampled and is **retracted**. Mechanism hypothesis (#851): seq-major + capture ON + KV-growth retains a captured graph whose baked-in **weight** pointer is invalidated when a growth commit remaps backing in the shared VMM arena → replay dereferences a stale ptr → intermittent `CUDA_ERROR_ILLEGAL_ADDRESS` on a weight `cuMemcpyHtoD` (node/layer varies run-to-run). **A single green run is ~80–90% reliable, NOT 100%** — do not treat one pass as proof; do not dismiss a red without classifying it (crash vs data-mismatch). Contention adds its OWN OOM-family reds on top of the ~15% intrinsic flake, so a contended red is still worth a solo re-run — but a **solo red is a real signal to preserve**. Operational triage (still valid): check `nvidia-smi --query-compute-apps`; prefer a verified-solo window; a real return-to-pool-before-fence corruption fails the bit-identical parity subtest *deterministically and solo*.
-
-### VMM releases counted as driver unmap runs (Copilot)
-`GlobalVmmStats::releases` now counts contiguous `cuMemUnmap` operations rather than individual granules (adjacent weight-page granules are unmapped in one driver call). Keeps the metric honest about release-side driver churn reduction; committed-byte gauges still track the full released quantity.
-
-### Windows ARM64 wheel for nxrt-ep-cpu (#829, Isidore)
-Per Justin ("我们的ep也要发 windows arm 64的wheel"), added a `win_arm64` matrix row (`os: windows-11-arm`, `archs: ARM64`) to the **cpu** job of `.github/workflows/publish-ep-plugins.yml`. CUDA EP out of scope (no CUDA on Windows ARM64). **Critical caveat:** official CPython has **no `win_arm64` build for 3.10** (ARM64 Windows CPython starts at 3.11), so the global `build="cp310-*"` selector matches nothing there. The ARM64 row overrides `CIBW_BUILD: cp311-*` and setup-python to 3.11; other rows keep 3.10. The wheel is ABI-less (`py3-none-win_arm64`, bundles a plain C-ABI cdylib), so any CPython ≥3.11 drives the build. `rustup` installs the native `aarch64-pc-windows-msvc` toolchain (no cross-compile). Build-only CI (run 31623032180) validated the runner provisioning.
-
-### Harden ort-sys ORT download against transient network flakes (#829, Isidore)
-`onnx-genai-ort/ort-sys/build.rs::download_prebuilt` used `--retry 3` but not `--retry-all-errors`, so curl exit 52 (`CURLE_GOT_NOTHING`, empty reply) — not in curl's default retryable set — failed the whole job. **`--retry-all-errors` is NOT portable**: it's a curl ≥7.71.0 flag and the manylinux_2_28 (AlmaLinux 8) build container ships curl 7.61.1, which rejects it (exit 2). Fix: a **Rust-level retry loop** (4 attempts, success = `status.success()` AND `http_code == "200"`, 3s/6s/12s backoff) plus portable curl flags 7.61 supports (`--retry 5 --retry-delay 2 --connect-timeout 30 --max-time 300`). Preserves the exact 404/missing-asset panic messages on the final attempt; checksum/magic verification runs only after success.
-
-### Unify ORT library filename via `ort_discovery::ort_lib_name()` (#762, Nabil)
-`plugin_ort_e2e.rs` hardcoded `"libonnxruntime.so"` in 7 sites, panicking on Windows (`onnxruntime.dll`)/macOS (`.dylib`). Standing rules: all tests use `ort_discovery::ort_lib_name()` (never a hardcoded string); use `PathBuf::join` (never string concat) for path construction; `skip_if_missing!` is the ONLY skip mechanism in EP e2e tests (respects `NXRT_REQUIRE_ORT_TESTS=1`) — a hand-rolled match in `diag_ort_ep_api_nullcheck` bypassed the fail-loud gate and was fixed. Windows/macOS correct-by-construction (`cfg!(target_os)`), CI-verified only.
-
-### Native bfloat16 coverage for the CPU EP — all ops (#831, Resch)
-Per Justin ("全面检查cpu ep对bfloat16的原生支持 一口气支持所有op"). Audit of all **194 registered op keys**: the CPU EP already had broad first-class bf16 via the shared compute-in-f32 machinery (`dtype.rs` `dispatch_arith`/`dispatch_float` + `to_dense_f32_widen`/`write_dense_f32_narrow`); no op special-cased f16 while forgetting bf16. Only 4 f32-locked kernels that already compute in f32 rejected non-f32 at their gate — widened `DFT`, `VarlenAttention` (`pkg.nxrt`), `MoE` (`com.microsoft`), `IndexShare` (`pkg.nxrt`) to accept f32/f16/bf16 via the same helpers. Deliberately excluded (bf16 not a valid native type): integer/bitwise ops, quantized-int ops (`QLinearMatMul`, `DynamicQuantizeLinear`), `CompressedSparseAttention` (FP8/FP4 compressed-cache contract), and int/bool-output value-agnostic ops. **Principle: compute in f32, widen on read, narrow on write — never a bespoke bf16 arithmetic path.** Regression lock: data-driven `tests/bf16_conformance.rs` (~68 nodes, f32-vs-bf16). Compliant with Justin's instruction-availability directive by construction: bf16↔f32 widen/narrow is an exact scalar op requiring no CPU feature; the one native bf16 arithmetic path (`_mm512_dpbf16_ps` in `x86_bf16.rs`, used by MatMul/Gemm) is runtime-gated with a proven portable fallback.
-
-### Fix arch-gated `dot_kernel` unused-param clippy error blocking CI (Resch)
-Main's quality lane (`RUSTFLAGS="-D warnings" cargo clippy --all-targets`) was RED: `borrowed_affine_int4_matmul` (`matmul_nbits.rs`) takes `dot_kernel: DotKernel` referenced only inside `#[cfg(target_arch="aarch64")]` blocks → `unused_variables` hard error on x86_64. Fix: `let _ = dot_kernel;` at the function top — mirrors the in-file convention (three sibling helpers at ~3779/4272/4448 already do this; chosen over `cfg_attr(...allow...)` for DRY consistency). No behavior change.
-
-### Fix server registry shrink test assertion (#821, Roy)
-`failed_runtime_shrink_preserves_policy_and_ledger_limit`: updated assertion from `error.contains("committed bytes")` to `error.contains("cannot satisfy lowered resource limit")`. Commit `c7633eec4` (#740, VMM handle pooling) changed the wording "committed bytes"→"leased bytes" without updating the test. The stable prefix is the only anchor covering both rejection paths (`state.rs` pooled-unmapped + `memory_authority.rs` mapped-or-leased, which have different suffixes); the test's purpose (reject+rollback shrink-below-usage) is also guarded behaviorally by a snapshot-rollback assertion, not just the string.
 
 ## Archived narrative waves pointer
 

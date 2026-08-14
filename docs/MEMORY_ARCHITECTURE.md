@@ -13,6 +13,37 @@
 
 ---
 
+## Which memory document to read
+
+There are several, and they are not peers. Read this table before trusting a
+number from any of them — more than once a figure here has been superseded by a
+measurement recorded elsewhere, and a reader with no map has no way to tell.
+
+| Document | Role | Trust it for |
+|---|---|---|
+| **MEMORY_ARCHITECTURE.md** (this file) | **Authoritative for measured behaviour.** The single source for KV geometry, the §2.1 raw-allocation audit, residency-policy facts (§3.5), and the failure-mode lessons | What the code *does*, with the measurement behind it |
+| [WEIGHT_OFFLOAD.md](./WEIGHT_OFFLOAD.md) | The offload design plus its **north-star scorecard** (does it degrade into latency, present one number, beat the OS, keep one authority) | Whether offload is meeting its goals, and the WDDM comparison |
+| [KV_INSERTION_DESIGN.md](./KV_INSERTION_DESIGN.md) | KV insertion/commit design | The insertion contract; geometry lives here |
+| [TOKEN_MAJOR_KV_INVESTIGATION.md](./TOKEN_MAJOR_KV_INVESTIGATION.md), [SEQ_MAJOR_KV_INVESTIGATION.md](./SEQ_MAJOR_KV_INVESTIGATION.md), [VMM_KV_CONTIGUOUS_VA.md](./VMM_KV_CONTIGUOUS_VA.md), [GQA_KV_MATERIALIZATION_DESIGN.md](./GQA_KV_MATERIALIZATION_DESIGN.md) | **Historical investigations.** Snapshots of what was believed when they were written | The reasoning and the falsifiers, **not** current numbers |
+| `docs/research/*` | Sweep reports and feasibility probes | The protocol and the raw table for one experiment |
+
+**Two standing rules, learned the hard way:**
+
+**A design document is not evidence.** Where a design doc and a measurement
+disagree, the measurement wins and the design doc is stale — including this one.
+This file has been wrong at least three times (Phase-2a scores described as
+fp16-sized when the code used `dtype.element_size()`; a stale #811 invalidation
+claim; the `layers × 2 × kv_heads = 768` floor quoted as the engine's baseline
+when head-major re-packs its bucket dense and never instantiates that geometry).
+**The single source is not exempt from verification.**
+
+**Numbers carry their conditions.** A figure without the platform, the model, the
+budget and whether the run was solo is not reusable. Wall-clock on the
+development box is not evidence at all — identical configurations have ranged
+3.9–28 tok/s, much of it the OS paging our own memory (#863).
+
+---
+
 ## Implementation status
 
 This document describes the target architecture. Most of it is not built yet,
@@ -2047,6 +2078,51 @@ into page-aligned transfer tiles.
   current kernel wave; it does not imply the whole expert is copied at once.
 
 ### 3.5 Residency Policy
+
+> **Measured facts about the CUDA weight-residency policy (2026-08-13). Read these
+> before changing admission or eviction — two of them cost a full investigation each.**
+>
+> **1. Decode correctness does *not* depend on eviction order (#888/#892).** Default
+> LRU, MRU (reverse recency), and smallest-first all produce **byte-identical tokens**,
+> the last driven to 10,816 page-ins with the count hit rate at 22%. An earlier
+> speculation that "the scan-resistant recency discipline is load-bearing for
+> correctness" is **refuted** — recency is load-bearing for *hit rate* only.
+>
+> **2. But evicting and re-admitting large stable-slot residents *does* corrupt output.**
+> A byte-aware policy (#886) silently collapsed greedy generation 16 → 3 tokens whenever
+> offload actually engaged, with **and without** CUDA graph capture. The corruption
+> tracks the **retain flip**, not the reorder — isolated by a probe that changes only the
+> eviction victim while keeping the shipped always-bypass decision. It is not captured-VA
+> baking (graph-OFF corrupts too) and not a copy/compute fence (a full drain of both
+> streams before every fill does not fix it). The exact value-corruption line is **not**
+> isolated; settling it needs granule-level checksums across steps, and
+> `compute-sanitizer` is unavailable on this box.
+>
+> **Design consequence:** a **static** hot set — retain once, never evict, never
+> re-admit — provably does not exercise the corrupting path, which is why #864's hybrid
+> is safe in that shape. Any **dynamic** scheme that churns large weight pages (#866's
+> elastic reclaim, #750 admission, any future byte-aware policy) **must assert token
+> identity rather than assume it.** The default size-blind path is safe because it never
+> retains large tensors, so the buggy path is unreachable.
+>
+> **3. The residency gap is an *admission* problem, not an eviction problem
+> (#837/#886).** ~90% of the recoverable 1.158 GB/step is bypass traffic: 11% of
+> page-in events carrying **44.6% of streamed bytes**, because `StableResident` bypasses
+> a tensor when `!can_fit(bytes)` (`weight_paging.rs`), which is *arrival-order
+> first-fit*. Small tensors (avg 7.8 MB retained) win the free budget; large projections
+> (avg 49.9 MB) then fail `can_fit` on every subsequent step and re-stream forever,
+> **never entering the eviction population at all**. That is the mechanical reason an
+> eviction reorder cannot close the gap — it cannot promote a tensor refused admission.
+>
+> **4. Judge policy on the byte-weighted hit rate.** The count-based rate weights a
+> 10 KiB norm like an 11 MiB projection: raising the budget once moved `hit_rate`
+> 57.09% → 81.31% while the gap to the streaming floor **widened** 1.78× → 2.30×.
+> `GlobalOffloadStats::byte_hit_rate()` exists for this (#869).
+>
+> **Open (#893):** MRU measured *better* than the shipped LRU on `qwen14b-zp` —
+> page-ins 3,008 → 2,160, `byte_hit_rate` 70.16% → 79.15%, byte-identical — which is
+> plausible since a cyclic layer scan is the textbook LRU pathology (#723 measured plain
+> LRU at 0 hits / 6,936). Not acted on: one model, one budget, and favourable.
 
 - Shared attention, router, normalization, embeddings, and other dense weights have
   higher base priority than routed experts because they are touched predictably.
