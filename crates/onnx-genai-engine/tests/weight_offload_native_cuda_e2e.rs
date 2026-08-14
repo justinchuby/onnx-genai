@@ -247,7 +247,11 @@ fn vram_limit_auto_enables_offload_or_fails_at_load() -> anyhow::Result<()> {
     let used = engine
         .governor()
         .leased_bytes_on(onnx_runtime_memory_governor::Tier::Device);
-    let limit = engine.resource_snapshot().resolved_limits.vram_bytes;
+    let limit = engine
+        .resource_snapshot()
+        .resolved_limits
+        .vram_bytes
+        .expect("native CUDA load resolves a measured device VRAM budget");
     assert!(
         used <= limit,
         "load admitted {used} committed device bytes under a {limit} byte VRAM limit"

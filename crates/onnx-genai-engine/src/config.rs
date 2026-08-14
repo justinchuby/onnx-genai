@@ -789,6 +789,10 @@ pub enum DecisionSource {
     ExplicitOverride,
     CompatibilityDefault,
     Unknown,
+    /// The value could not be measured on this platform (e.g. no device-capacity
+    /// query is available), so no number was resolved. Distinct from `Unknown`,
+    /// which marks an inference the evidence could not decide (#947).
+    Unavailable,
 }
 
 /// Engine configuration.
