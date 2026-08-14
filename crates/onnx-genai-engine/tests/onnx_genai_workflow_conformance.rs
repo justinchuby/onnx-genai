@@ -86,15 +86,7 @@ fn decoder_batch_request(
     )
     .with_input("request.seed", Value::from_slice_i64(&seeds, &[batch])?)
     .with_input(
-        "request.grammar_mask",
-        Value::from_raw_bytes(
-            vec![1; usize::try_from(batch * 128)?],
-            &[batch, 128],
-            DataType::Bool,
-        )?,
-    )
-    .with_input(
-        "request.rng_offset",
+        "request.rng_counter",
         Value::from_slice_i64(&zeros, &[batch])?,
     )
     .with_input(

@@ -194,24 +194,21 @@ Policy components may join a fused execution island only through version 2 contr
 parameters `batching: per_row` and `inactive_rows: preserve`. Version 1 artifacts remain valid
 unfused components, but their scalar-compatible ABI cannot establish continuous-batching safety.
 
-The version 2 token sampler binds per-row `logits`, `temperature`, `top_k`, `top_p`, `min_p`,
-`grammar_mask`, `active`, `done`, `rng_seed`, and `rng_offset`, and returns `token` plus
-`rng_next_offset`. These are the exact semantic binding names; greedy workflows use the same ABI
-with `top_k=1`, while inactive or done rows return the sentinel token and preserve their offset.
+The version 2 token sampler binds per-row `logits`, `active`, `done`, `temperature`, `top_k`,
+`top_p`, `min_p`, `seed`, and `counter`, and returns `token` plus `next_counter`. These are the
+exact semantic binding names; greedy workflows use the same ABI with `top_k=1`, while inactive or
+done rows return the sentinel token and preserve their counter.
 
 The termination predicate binds `tokens: int64[B]`, `eos_ids: int64[B,Emax]`,
-`eos_lengths: int64[B]`, `iteration: int64[B]`, `max_iterations: int64[B]`,
-`active: bool[B]`, and `previous_done: bool[B]`. It returns `done: bool[B]`,
-`next_active: bool[B]`, and the reduce-any loop control `continue: bool[1]`. Inactive rows remain
-done and cannot reactivate.
+`eos_lengths: int64[B]`, `iteration: int64[1]`, `max_iterations: int64[B]`, and
+`active: bool[B]`. It returns `done: bool[B]`, `next_active: bool[B]`, and the reduce-any loop
+control `continue: bool[1]`. Inactive rows remain done and cannot reactivate.
 
-State update binds `current: int64[B,1]`, `update: int64[B]`, `lengths: int64[B]`,
-`active: bool[B]`, and `done: bool[B]`, returning `next: int64[B,1]`,
-`next_lengths: int64[B]`, and `emitted_length: int64[B]`. Suppressed rows preserve current state
-and lengths and emit length zero.
+State update binds `current: int64[B,1]`, `update: int64[B,1]`, `active: bool[B]`, and
+`done: bool[B]`, returning `next: int64[B,1]`. Suppressed rows preserve current state.
 
-All per-row ports have a symbolic leading `batch` axis; only `continue` is singleton. Inactive rows
-preserve RNG offsets and semantic state and emit no token.
+All per-row ports have a symbolic leading `batch` axis; `iteration` and `continue` are singleton.
+Inactive rows preserve RNG counters and semantic state and emit no token.
 This ABI permits stable max-batch buffers and CUDA graph replay while the active row set, row
 parameters, logical lengths, and EOS sets change between iterations.
 
