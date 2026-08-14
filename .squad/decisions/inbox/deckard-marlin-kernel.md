@@ -147,3 +147,51 @@ PASSES. Head: a3ece463.
 fused epilogues; small-M levers (split-K to fill SMs, cp.async multistage) to lift
 M=1 DRAM% toward the feasibility precondition and further widen the M>1 win.
 Coordinate with Sebastian (squad/marlin-bench) on the ORT e2e + capture re-probe.
+
+---
+
+### 2026-08-14 (update 3): P1 COMPLETE — full M>1 coverage (gate_up SwiGLU fused), zero tiled fallbacks
+
+**Status:** Every hot MatMulNBits node in glm-4-9b and qwen2.5-14b now runs
+through Marlin at M>1. Zero tiled M>1 fallbacks. Head: 1154c977.
+
+**What landed:**
+- **gate_up SwiGLU MLP fusion at M>1** (`try_launch_marlin_gate_up_prefill`,
+  wired into `run_f16_gate_up_swiglu`): paired gate/up Marlin int4 GEMMs +
+  the identical `launch_silu_mul_f16_raw` epilogue the tiled path uses, with an
+  optional RMS-norm prologue (into pooled scratch). This is the MLP — the bulk
+  of prefill/verify cost. down_proj is a plain tall-skinny MatMulNBits already
+  covered by the plain `gemm_marlin_int4` path.
+- **Capture-safe scratch pool** (`ensure_scratch` in marlin_gemm.rs): size- and
+  slot-keyed module-global pool (FIFO cap 256, rejects cold-miss during capture)
+  so warm replays of the gate_up + rmsnorm paths allocate NOTHING → capture-safe.
+  `try_launch_marlin_gemm_rmsnorm` was migrated onto it (now returns the warm flag
+  instead of always allocating), so the rmsnorm prefill is now capture-safe on
+  warm replay too.
+- **Tracer-driven per-node coverage audit** (e2e test): runs prefill with the flag
+  on, tallies per-op `kernel_variant`, asserts zero `gemm_f16_tiled{,_rmsnorm}` /
+  `gate_up_swiglu{,_rmsnorm}_prefill` at M>1.
+- **Unit tests:** gate_up SwiGLU M>1 Marlin-vs-tiled parity + capture-safety
+  (plain / rmsnorm / decomposed-silu): worst_abs 0.0001–0.008 vs tiled, warm
+  replays capture-safe and byte-identical.
+
+**Measured coverage audit (H200, GPU 7, Marlin M>1 enabled):**
+- **glm-4-9b-int4:** 240 `gemm_marlin_int4`, **0 tiled M>1**. (glm's MLP is
+  separate plain MatMulNBits nodes → covered by the plain Marlin path.)
+- **qwen2.5-14b-int4 (asym zp):** 240 `gemm_marlin_int4` + 48
+  `gate_up_swiglu_marlin_prefill` + 1 `gemm_marlin_int4_rmsnorm` = **289 Marlin
+  M>1, 0 tiled**.
+- Greedy token streams remain **byte-identical** tiled-vs-Marlin on both (24 tokens).
+
+**Nodes that still can't go through Marlin at M>1:** NONE for the hot path.
+Remaining non-Marlin variants observed are all legitimately M=1 decode
+(`gemv_f16_*`, `gate_up_swiglu_rmsnorm_fused`) or non-MatMulNBits (attention,
+rmsnorm). M=1 stays on the GEMV by design (has not cleared the ≥40% DRAM
+precondition).
+
+**→ Unblocks Sebastian's Increment-0 capture re-probe** with
+`ONNX_GENAI_MARLIN_M_GT_1=1` for the decisive segments→1 and captured-M=8/M=1 B*.
+
+**Next (P2):** split-K (fill SMs at small M) + cp.async multistage to lift the
+M>1 ratio; honest re-run at the M=1 DRAM precondition (keep M=1 on GEMV unless
+it truly clears ≥40% DRAM).
