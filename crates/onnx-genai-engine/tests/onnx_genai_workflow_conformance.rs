@@ -47,6 +47,7 @@ fn decoder_batch_request(
     let eos_ids = vec![127_i64; usize::try_from(batch)?];
     let row_max_iterations = vec![i64::try_from(max_new_tokens)?; usize::try_from(batch)?];
     let slot_ids = (0..batch).collect::<Vec<_>>();
+    let row_ids = (100..100 + batch).collect::<Vec<_>>();
     Ok(PipelineGenerateRequest::new(GenerateRequest {
         prompt: GeneratePrompt::TokenIds(vec![0]),
         options: options(max_new_tokens),
@@ -111,6 +112,10 @@ fn decoder_batch_request(
         Value::from_slice_i64(&slot_ids, &[batch])?,
     )
     .with_input(
+        "request.row_ids",
+        Value::from_slice_i64(&row_ids, &[batch])?,
+    )
+    .with_input(
         "package.cache_lengths",
         Value::from_slice_i64(&zeros, &[batch])?,
     )
@@ -142,7 +147,8 @@ fn mobius_decoder_workflow_executes() -> anyhow::Result<()> {
             prompt: GeneratePrompt::TokenIds(vec![4, 5]),
             options: options(3),
         })
-        .with_input("package.slot_ids", Value::from_slice_i64(&[0], &[1])?),
+        .with_input("package.slot_ids", Value::from_slice_i64(&[0], &[1])?)
+        .with_input("request.row_ids", Value::from_slice_i64(&[0], &[1])?),
     )?;
     assert_eq!(
         engine
@@ -195,7 +201,7 @@ fn mobius_decoder_rows_match_independent_runs_and_dynamic_batch_replay() -> anyh
     let batched_output = engine.run_pipeline_outputs(batched)?;
     let rows = engine.output_rows_for_role(&batched_output, WorkflowOutputRole::Tokens);
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].0, 0);
+    assert_eq!(rows[0].0, 100);
     assert_eq!(rows[0].1.to_vec_i64()?, first_tokens);
 
     let mut independent = Engine::from_pipeline_dir(&root("decoder")?, EngineConfig::default())?;
@@ -205,14 +211,14 @@ fn mobius_decoder_rows_match_independent_runs_and_dynamic_batch_replay() -> anyh
         .structured_output_for_role(&second_output, WorkflowOutputRole::Tokens)
         .expect("independent second row must emit tokens")
         .to_vec_i64()?;
-    assert_eq!(rows[1].0, 1);
+    assert_eq!(rows[1].0, 101);
     assert_eq!(rows[1].1.to_vec_i64()?, second_tokens);
 
     let inactive = decoder_batch_request(&[4, 5, 6, 0], 2, 2, &[2, 1], &[true, false], 3)?;
     let inactive_output = engine.run_pipeline_outputs(inactive)?;
     let inactive_rows = engine.output_rows_for_role(&inactive_output, WorkflowOutputRole::Tokens);
     assert_eq!(inactive_rows.len(), 1);
-    assert_eq!(inactive_rows[0].0, 0);
+    assert_eq!(inactive_rows[0].0, 100);
     assert_eq!(inactive_rows[0].1.to_vec_i64()?, first_tokens);
 
     let first_inactive = decoder_batch_request(&[4, 5, 6, 0], 2, 2, &[2, 1], &[false, true], 3)?;
@@ -220,7 +226,7 @@ fn mobius_decoder_rows_match_independent_runs_and_dynamic_batch_replay() -> anyh
     let first_inactive_rows =
         engine.output_rows_for_role(&first_inactive_output, WorkflowOutputRole::Tokens);
     assert_eq!(first_inactive_rows.len(), 1);
-    assert_eq!(first_inactive_rows[0].0, 1);
+    assert_eq!(first_inactive_rows[0].0, 101);
     assert_eq!(first_inactive_rows[0].1.to_vec_i64()?, second_tokens);
     assert_eq!(
         engine
@@ -259,7 +265,8 @@ fn mobius_vlm_workflow_executes_complete_image_path() -> anyhow::Result<()> {
         "request.image",
         Value::from_raw_bytes(png, &[png_len], DataType::Uint8)?,
     )
-    .with_input("package.slot_ids", Value::from_slice_i64(&[0], &[1])?);
+    .with_input("package.slot_ids", Value::from_slice_i64(&[0], &[1])?)
+    .with_input("request.row_ids", Value::from_slice_i64(&[0], &[1])?);
     let output = engine.run_pipeline_outputs(request)?;
     assert_eq!(
         engine
@@ -341,6 +348,7 @@ fn mobius_speculative_workflow_executes_rejection_and_correction() -> anyhow::Re
         options: options(1),
     })
     .with_input("serving.slot_ids", Value::from_slice_i64(&[0], &[1])?)
+    .with_input("serving.row_ids", Value::from_slice_i64(&[0], &[1])?)
     .with_input(
         "verifier.past_key_values.0.key",
         Value::from_slice_f32(&[], &[1, 2, 0, 8])?,
