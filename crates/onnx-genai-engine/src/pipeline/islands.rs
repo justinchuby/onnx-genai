@@ -158,6 +158,24 @@ impl ExecutionIsland {
             .any(|component| overrides.contains_key(component))
     }
 
+    pub(crate) fn has_zero_sized_input(&self, values: &PipelineTensors) -> anyhow::Result<bool> {
+        self.inputs.values().try_fold(false, |found, value| {
+            let tensor = values.get(value).with_context(|| {
+                format!(
+                    "execution island {} input value '{value}' is unavailable",
+                    self.id
+                )
+            })?;
+            Ok(found || tensor.numel() == 0)
+        })
+    }
+
+    pub(crate) fn prepare_zero_sized_fallback(&self) {
+        for binding in self.bindings.borrow_mut().values_mut() {
+            binding.service_generation = u64::MAX;
+        }
+    }
+
     pub(crate) fn fallback(&self) -> &WorkflowNode {
         &self.fallback
     }
@@ -698,6 +716,7 @@ impl ExecutionIsland {
                 )
             })?;
             if self.shared_buffer_output_values.contains(value_ref) {
+                values.remove(value_ref);
                 continue;
             }
             values.insert(value_ref.clone(), tensor);

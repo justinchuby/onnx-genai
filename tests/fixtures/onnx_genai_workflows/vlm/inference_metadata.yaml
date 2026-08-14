@@ -54,7 +54,7 @@ preprocessing:
       content: pixels
       dtype: float32
       source: image.transform_4
-      contract: &id004
+      contract:
         dtype: float32
         rank: 2
         shape:
@@ -64,7 +64,7 @@ preprocessing:
       content: grid_dimensions
       dtype: int64
       source: image.output_grid_dimensions
-      contract: &id005
+      contract:
         dtype: int64
         rank: 2
         shape:
@@ -84,6 +84,7 @@ pipeline:
       - nested_control_flow
       - loop_induction_values
       - typed_emit
+      - emit_valid_length
       - serving_service_contract
       - bounded_state_recurrence
     inputs:
@@ -115,7 +116,7 @@ pipeline:
           kind: request
         required: true
       request.max_iterations:
-        contract: &id001
+        contract:
           dtype: int64
           rank: 1
           shape:
@@ -127,6 +128,19 @@ pipeline:
         source:
           kind: request
         required: true
+      request.prompt_lengths:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: prompt_lengths
+        required: false
+        default: -1
       package.eos_ids:
         contract:
           dtype: int64
@@ -140,7 +154,11 @@ pipeline:
         required: false
         default: 2
       package.max_context:
-        contract: *id001
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
         role:
           kind: opaque
         source:
@@ -148,7 +166,11 @@ pipeline:
         required: false
         default: 8192
       package.one:
-        contract: *id001
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
         role:
           kind: opaque
         source:
@@ -156,7 +178,7 @@ pipeline:
         required: false
         default: 1
       package.active:
-        contract: &id002
+        contract:
           dtype: bool
           rank: 1
           shape:
@@ -168,7 +190,11 @@ pipeline:
         required: false
         default: true
       package.false:
-        contract: *id002
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
         role:
           kind: opaque
         source:
@@ -176,7 +202,7 @@ pipeline:
         required: false
         default: false
       package.zero_batch:
-        contract: &id003
+        contract:
           dtype: int64
           rank: 1
           shape:
@@ -188,7 +214,11 @@ pipeline:
         required: false
         default: 0
       package.slot_ids:
-        contract: *id003
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
         role:
           kind: opaque
         source:
@@ -243,8 +273,18 @@ pipeline:
               shape:
               - encoded_bytes
           outputs:
-            pixel_values: *id004
-            grid_thw: *id005
+            pixel_values:
+              dtype: float32
+              rank: 2
+              shape:
+              - 4
+              - 1176
+            grid_thw:
+              dtype: int64
+              rank: 2
+              shape:
+              - 1
+              - 3
       token_sampler:
         implementation:
           kind: onnx
@@ -254,6 +294,8 @@ pipeline:
           version: '1'
           bindings:
             logits: logits
+            active: active
+            done: done
             token: token
           parameters:
             mode: greedy
@@ -270,7 +312,10 @@ pipeline:
             eos_ids: eos_ids
             iteration: iteration
             max_iterations: max_iterations
+            active: active
+            previous_done: previous_done
             done: done
+            next_active: next_active
             continue: continue
       token_state_update:
         implementation:
@@ -282,7 +327,12 @@ pipeline:
           bindings:
             current: current
             update: update
+            lengths: lengths
+            active: active
+            done: done
             next: next
+            next_lengths: next_lengths
+            emitted_length: emitted_length
       last_token_logits:
         implementation:
           kind: onnx
@@ -322,6 +372,17 @@ pipeline:
         initializer: decoder.setup.last_logits
         recurrence:
           kind: invariant
+      generated_lengths:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+        class: semantic
+        scope: invocation
+        initializer: initializer.generated_lengths
+        recurrence:
+          kind: invariant
       attention_mask:
         contract:
           dtype: int64
@@ -330,45 +391,62 @@ pipeline:
           - batch
           - context
         scope: invocation
-        initializer: initializer.body_attention_mask
+        initializer: initializer.attention_mask
         recurrence:
-          kind: growing
-          axis: 1
-          increment: package.one
-          max: package.max_context
+          kind: invariant
       active:
-        contract: *id002
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
         class: semantic
         scope: invocation
         initializer: package.active
         recurrence:
           kind: invariant
       done:
-        contract: *id002
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
         class: semantic
         scope: invocation
         initializer: package.false
         recurrence:
           kind: invariant
       accepted_len:
-        contract: *id003
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
         class: semantic
         scope: invocation
         initializer: package.zero_batch
         recurrence:
           kind: invariant
       slot_ids:
-        contract: *id003
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
         class: semantic
         scope: invocation
         initializer: package.slot_ids
         recurrence:
           kind: invariant
       cache_lengths:
-        contract: *id003
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
         class: semantic
         scope: invocation
-        initializer: package.zero_batch
+        initializer: initializer.cache_lengths
         recurrence:
           kind: invariant
       position_ids:
@@ -430,15 +508,15 @@ pipeline:
       accepted_len: accepted_len
       slot_ids: slot_ids
       kv_service:
-        paging: paged
+        paging: none
         allocation: runtime
-        compaction: true
+        compaction: false
         groups:
           decoder_cache:
             sequence_axis: 2
             layout: bnsh
             logical_lengths: cache_lengths
-            storage: paged
+            storage: shared_buffer
             ports:
               decoder:
                 cache_0:
@@ -468,10 +546,14 @@ pipeline:
         component: decoder_state_initializer
         inputs:
           prompt_tokens: request.prompt_tokens
+          prompt_lengths: request.prompt_lengths
+          max_iterations: request.max_iterations
         outputs:
           attention_mask: initializer.attention_mask
           body_attention_mask: initializer.body_attention_mask
           token_slot: initializer.token_slot
+          generated_lengths: initializer.generated_lengths
+          cache_lengths: initializer.cache_lengths
           position_ids: initializer.position_ids
           body_position_ids: initializer.body_position_ids
           past_key_values.0.key: initializer.past_key_values.0.key
@@ -506,6 +588,8 @@ pipeline:
         component: token_sampler
         inputs:
           logits: logits
+          active: active
+          done: done
         outputs:
           token: sample.body
       - kind: invoke
@@ -515,14 +599,19 @@ pipeline:
           eos_ids: package.eos_ids
           iteration: loop.iteration
           max_iterations: request.max_iterations
+          active: active
+          previous_done: done
         outputs:
           done: loop.done
+          next_active: loop.next_active
           continue: loop.continue
       - kind: invoke
         component: cache_length_update
         inputs:
           left: cache_lengths
           right: package.one
+          active: active
+          done: done
         outputs:
           total: cache_lengths.next
       - kind: invoke
@@ -530,6 +619,8 @@ pipeline:
         inputs:
           left: package.zero_batch
           right: package.one
+          active: active
+          done: done
         outputs:
           total: accepted_len.next
       - kind: invoke
@@ -537,12 +628,28 @@ pipeline:
         inputs:
           current: token
           update: sample.body
+          lengths: generated_lengths
+          active: active
+          done: done
         outputs:
           next: token.body
+          next_lengths: token.next_lengths
+          emitted_length: token.emitted_length
       - kind: emit
         value: token.body
         output: tokens
         mode: append
+        valid_length: token.emitted_length
+        when: active
+      - kind: invoke
+        component: decoder_step_update
+        inputs:
+          attention_mask: attention_mask
+          logical_length: cache_lengths
+          position_ids: position_ids
+        outputs:
+          next_attention_mask: decoder_step.body_attention_mask
+          next_position_ids: decoder_step.body_position_ids
       - kind: invoke
         component: embedding
         inputs:
@@ -554,7 +661,7 @@ pipeline:
         component: decoder
         inputs:
           inputs_embeds: embedding.body.embeds
-          attention_mask: attention_mask
+          attention_mask: decoder_step.body_attention_mask
           position_ids: position_ids
           past_key_values.0.key: cache_0
           past_key_values.0.value: cache_1
@@ -568,14 +675,6 @@ pipeline:
           logits: decoder.body.logits
         outputs:
           last_logits: decoder.body.last_logits
-      - kind: invoke
-        component: decoder_step_update
-        inputs:
-          attention_mask: attention_mask
-          position_ids: position_ids
-        outputs:
-          next_attention_mask: decoder_step.body_attention_mask
-          next_position_ids: decoder_step.body_position_ids
       continue_when: loop_0_active
       max_iterations: request.max_iterations
       carried:
@@ -585,8 +684,10 @@ pipeline:
         next: decoder.body.last_logits
       - cell: attention_mask
         next: decoder_step.body_attention_mask
+      - cell: generated_lengths
+        next: token.next_lengths
       - cell: active
-        next: loop.continue
+        next: loop.next_active
       - cell: done
         next: loop.done
       - cell: accepted_len
@@ -603,6 +704,11 @@ pipeline:
         next: decoder.body.present.0.value
       - cell: loop_0_active
         next: loop.continue
+      termination: generation_eos
       iteration:
         value: loop.iteration
-        contract: *id003
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch

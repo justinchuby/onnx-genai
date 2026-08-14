@@ -1175,23 +1175,17 @@ pipeline:
         implementation: { kind: onnx, artifact: sampler.onnx.textproto }
         application_overridable: true
         contract:
-          id: onnx-genai.token-sampler
+          id: test.greedy-sampler
           version: "1"
           bindings: { logits: logits, token: token }
-          parameters: { mode: greedy }
       alternate_sampler:
         implementation: { kind: onnx, artifact: alternate-sampler.onnx.textproto }
         contract:
-          id: onnx-genai.token-sampler
+          id: test.greedy-sampler
           version: "1"
           bindings: { logits: logits, token: token }
-          parameters: { mode: alternate }
       termination:
         implementation: { kind: onnx, artifact: eos.onnx.textproto }
-        contract:
-          id: onnx-genai.termination-predicate
-          version: "1"
-          bindings: { tokens: token, eos_ids: eos, done: done }
     steps:
       - kind: invoke
         component: min_p_filter
@@ -1367,7 +1361,10 @@ pipeline:
             ),
     )?;
     assert_eq!(output["token"].to_vec_i64()?, [2]);
-    assert_eq!(engine.execution_island_diagnostics().len(), 1);
+    assert_eq!(
+        engine.execution_island_diagnostics().len(),
+        usize::from(std::env::var("ONNX_GENAI_FILE_BACKED_SUPER_ISLAND").as_deref() == Ok("1"))
+    );
     Ok(())
 }
 
