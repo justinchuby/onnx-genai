@@ -94,6 +94,7 @@ impl KernelFactory for MatMulFactory {
         Ok(Box::new(MatMulKernel {
             runtime: self.runtime.clone(),
             f32_gemv: Mutex::new(None),
+            dense_plan: Mutex::new(None),
             last_call_capture_safe: AtomicBool::new(false),
         }))
     }
@@ -107,6 +108,12 @@ pub struct MatMulKernel {
     /// Reusing the exact algorithm preserves bitwise parity with the old path
     /// while eliminating all capture-time setup and device allocation.
     f32_gemv: Mutex<Option<F32GemvPlan>>,
+    /// cuBLASLt plan + persistent workspace preselected for the current 2-D
+    /// (`batch == 1`) dense M>1 shape. Reusing the algorithm keeps bitwise
+    /// parity with the per-call [`governed_gemm`](crate::blas::governed_gemm)
+    /// path while making the plain-`MatMul` M>1 path (e.g. the logits projection
+    /// at a speculative M=K verify width) CUDA-graph capturable.
+    dense_plan: Mutex<Option<DenseGemmPlan>>,
     /// Set after every [`execute`](Kernel::execute) to record whether the call
     /// took the allocation- and sync-free GEMV fast path (capture-safe) or the
     /// cuBLASLt path (per-call workspace + heuristic, not capturable). Mirrors
@@ -248,6 +255,108 @@ impl F32GemvPlan {
             )
         }
         .map_err(|e| cublas_err("cublasLtMatmul f32 M==1", e))
+    }
+}
+
+/// Cached cuBLASLt plan + persistent workspace for a fixed 2-D (`batch == 1`)
+/// dense GEMM shape at M>1. Selected once, then replayed with no heuristic
+/// query, allocation, or synchronization — the M>1 analogue of [`F32GemvPlan`].
+/// This makes the plain-`MatMul` M>1 path CUDA-graph capturable, closing the
+/// last capture seam at a speculative M=K verify width (the logits projection).
+struct DenseGemmPlan {
+    runtime: Arc<CudaRuntime>,
+    dtype: GemmDtype,
+    m: usize,
+    k: usize,
+    n: usize,
+    plan: blas::CaptureGemmPlan,
+    workspace: CUdeviceptr,
+}
+
+// SAFETY: the plan holds only context-independent cuBLASLt host handles and a
+// device workspace pointer; launches are serialized by `MatMulKernel::dense_plan`.
+unsafe impl Send for DenseGemmPlan {}
+
+impl Drop for DenseGemmPlan {
+    fn drop(&mut self) {
+        if self.workspace != 0 {
+            // SAFETY: allocated once in `new`, freed exactly once here.
+            unsafe {
+                let _ = self.runtime.free_raw(self.workspace);
+            }
+        }
+    }
+}
+
+impl DenseGemmPlan {
+    fn matches(&self, dtype: GemmDtype, m: usize, k: usize, n: usize) -> bool {
+        self.dtype == dtype && self.m == m && self.k == k && self.n == n
+    }
+
+    fn new(
+        runtime: Arc<CudaRuntime>,
+        dtype: GemmDtype,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<Self> {
+        let params = dense_gemm_params(dtype, m, k, n, 0, 0, 0);
+        let plan = blas::plan_capture_gemm(runtime.blas(), &params)?;
+        let workspace_bytes = plan.workspace_bytes();
+        let workspace = if workspace_bytes > 0 {
+            runtime.alloc_raw(workspace_bytes)?
+        } else {
+            0
+        };
+        Ok(Self {
+            runtime,
+            dtype,
+            m,
+            k,
+            n,
+            plan,
+            workspace,
+        })
+    }
+
+    fn launch(&self, a: u64, b: u64, c: u64) -> Result<()> {
+        let params = dense_gemm_params(self.dtype, self.m, self.k, self.n, a, b, c);
+        // SAFETY: `params` matches the shape the plan was selected for; a/b/c are
+        // live device buffers for this call; `workspace` covers the plan's
+        // requirement; the runtime stream is valid and current.
+        unsafe {
+            self.plan.launch(
+                self.runtime.blas(),
+                self.runtime.stream_ptr(),
+                &params,
+                self.workspace,
+            )
+        }
+    }
+}
+
+/// Build [`GemmParams`] for a plain 2-D (`batch == 1`) dense GEMM.
+fn dense_gemm_params(
+    dtype: GemmDtype,
+    m: usize,
+    k: usize,
+    n: usize,
+    a: u64,
+    b: u64,
+    c: u64,
+) -> GemmParams {
+    GemmParams {
+        dtype,
+        a,
+        b,
+        c,
+        m,
+        k,
+        n,
+        batch: 1,
+        a_batch_stride: 0,
+        b_batch_stride: 0,
+        epilogue: None,
     }
 }
 
@@ -478,8 +587,21 @@ impl MatMulKernel {
         let b_matrix_bytes = plan.k * plan.n * elem_bytes;
         let c_matrix_bytes = plan.m * plan.n * elem_bytes;
 
-        plan.batch_runs()
-            .into_iter()
+        let runs = plan.batch_runs();
+
+        // M>1 capture-safe fast path: a plain 2-D (`batch == 1`) dense GEMM
+        // reuses a cuBLASLt plan + persistent workspace selected once at warmup,
+        // so replays perform no heuristic query, allocation, or synchronization
+        // (its own workspace is never shared, so no post-GEMM sync is needed).
+        // This closes the last CUDA-graph capture seam at a speculative M=K
+        // verify width — the logits projection (`lm_head`).
+        if runs.len() == 1 && runs[0].batch == 1 {
+            self.launch_dense_capturable(dtype, plan.m, plan.k, plan.n, a_ptr, b_ptr, c_ptr)?;
+            self.last_call_capture_safe.store(true, Ordering::Relaxed);
+            return Ok(());
+        }
+
+        runs.into_iter()
             .try_for_each(|run| {
                 let params = GemmParams {
                     dtype,
@@ -639,6 +761,56 @@ impl MatMulKernel {
             .unwrap()
             .launch(self.runtime.stream_ptr(), a_ptr, b_ptr, c_ptr)
     }
+
+    /// Launch a plain 2-D (`batch == 1`) dense M>1 GEMM through a cached
+    /// cuBLASLt plan (algorithm + persistent workspace) selected once at warmup.
+    ///
+    /// Reusing the heuristic-selected algorithm reproduces the per-call
+    /// [`governed_gemm`](crate::blas::governed_gemm) arithmetic bit-for-bit at a
+    /// fixed shape, while eliminating the capture-time heuristic query,
+    /// allocation, and synchronization — so the launch is legal to record into
+    /// and replay from a CUDA graph. Mirrors [`Self::launch_dense_gemv_f32`]'s
+    /// warm-once / reject-cold-miss-during-capture contract.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_dense_capturable(
+        &self,
+        dtype: GemmDtype,
+        m: usize,
+        k: usize,
+        n: usize,
+        a_ptr: u64,
+        b_ptr: u64,
+        c_ptr: u64,
+    ) -> Result<()> {
+        let capturing = self.runtime.is_capturing()?;
+        let mut cached = self.dense_plan.lock().map_err(|_| {
+            EpError::KernelFailed("cuda_ep MatMul: dense GEMM plan lock poisoned".into())
+        })?;
+        if cached
+            .as_ref()
+            .is_some_and(|plan| !plan.matches(dtype, m, k, n))
+        {
+            if capturing {
+                let plan = cached.as_ref().unwrap();
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep MatMul: dense GEMM signature changed during capture \
+                     (warmed dtype={:?} M={} K={} N={}; current dtype={dtype:?} M={m} K={k} N={n})",
+                    plan.dtype, plan.m, plan.k, plan.n,
+                )));
+            }
+            *cached = None;
+        }
+        if cached.is_none() {
+            if capturing {
+                return Err(EpError::KernelFailed(format!(
+                    "cuda_ep MatMul: dense GEMM dtype={dtype:?} M={m} K={k} N={n} \
+                     was not warmed before capture"
+                )));
+            }
+            *cached = Some(DenseGemmPlan::new(self.runtime.clone(), dtype, m, k, n)?);
+        }
+        cached.as_ref().unwrap().launch(a_ptr, b_ptr, c_ptr)
+    }
 }
 
 impl Kernel for MatMulKernel {
@@ -665,15 +837,18 @@ impl Kernel for MatMulKernel {
     }
 
     fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
-        // The dense f32/fp16 M==1 fast paths perform no per-call allocation,
-        // D2H, heuristic query, or synchronization. Advertise capture only after
-        // such a call has warmed any required persistent state.
+        // The dense f32/fp16 M==1 GEMV fast paths and the plain 2-D (`batch==1`)
+        // M>1 cached-plan path perform no per-call allocation, D2H, heuristic
+        // query, or synchronization. Advertise capture only after such a call
+        // has warmed the required persistent state (algorithm + workspace).
         if self.last_call_capture_safe.load(Ordering::Relaxed) {
             onnx_runtime_ep_api::CaptureSupport::Supported
         } else {
             onnx_runtime_ep_api::CaptureSupport::unsupported(
-                "requires a dense f32/fp16 M==1 GEMV fast path; the cuBLASLt path's \
-                 per-call heuristic query and synchronization are not capturable",
+                "requires a dense f32/fp16 GEMV (M==1) or a plain 2-D (batch==1) \
+                 dense GEMM warmed at the captured shape; batched/broadcast \
+                 cuBLASLt GEMMs still perform a per-call heuristic query and are \
+                 not capturable",
             )
         }
     }

@@ -112,19 +112,28 @@ pub fn marlin_m_gt_1_enabled() -> bool {
     )
 }
 
-/// Opt-in gate for split-K within the Marlin M>1 path. Split-K partitions the
-/// K/group range across `grid.z` to fill idle SMs when M (and thus the base
-/// block count) is small, at the cost of a fixed-order fp32 partial reduction
-/// that is NOT byte-identical to the single-block kernel (it stays within the
-/// f64-oracle tolerance and is deterministic). Default OFF so the byte-identical
-/// direct kernel remains the default greedy-token path; enable with
-/// `ONNX_GENAI_MARLIN_SPLITK=1` (or `true`/`on`). Requires the M>1 Marlin path
-/// to also be enabled.
+/// Gate for split-K within the Marlin M>1 path. Split-K partitions the K/group
+/// range across `grid.z` to fill idle SMs when M (and thus the base block count)
+/// is small, at the cost of a fixed-order fp32 partial reduction that is NOT
+/// byte-identical to the single-block kernel (it stays within the f64-oracle
+/// tolerance and is deterministic — greedy/argmax tokens remain byte-identical,
+/// validated e2e on glm-4-9b and qwen2.5-14b).
+///
+/// This gate lives *inside* the already-opt-in Marlin M>1 path
+/// ([`marlin_m_gt_1_enabled`], default OFF), so it never affects a default /
+/// consumer / edge tier; and [`choose_split_k`] only elects a split for
+/// small-M / low-wave shapes (returns 1 for large-M prefill and short-K),
+/// leaving those on the byte-identical direct kernel. Split-K is the measured
+/// lever that collapses the speculative-verify (M=K) wall — capture B* 5.10x ->
+/// 2.69x at M=8 on glm-4-9b (Sebastian's Increment-0 re-probe) — so it is ON by
+/// default whenever Marlin M>1 is enabled. Opt out with
+/// `ONNX_GENAI_MARLIN_SPLITK=0` (or `false`/`off`) to force the byte-identical
+/// direct kernel for every M.
 #[must_use]
 pub fn marlin_splitk_enabled() -> bool {
-    matches!(
+    !matches!(
         std::env::var("ONNX_GENAI_MARLIN_SPLITK").ok().as_deref(),
-        Some("1") | Some("true") | Some("on")
+        Some("0") | Some("false") | Some("off")
     )
 }
 
