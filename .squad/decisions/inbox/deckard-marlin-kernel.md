@@ -501,3 +501,31 @@ is fully solved (whole-graph, zero seams, byte-identical eager parity), the M=8
 wall is compute-bound at the intrinsic small-M `mma.m16n8k16` floor, and closing
 qwen's B\* is a drafting-depth story (deeper/stronger drafter amortizes the higher
 ratio), NOT a frozen-kernel fix. No further kernel change; freeze stands.
+
+---
+
+## Update 11 — test hardening: marlin M>1 e2e parity robust to greedy near-ties (head 4803b4fc, test-only)
+
+Sebastian found `marlin_m_gt_1_matches_tiled_on_qwen2_5_14b_int4` ~25% flaky: it
+asserted exact greedy-token equality against the portable **tiled** GEMM, whose
+fp32 atomic reduction order is nondeterministic. At a near-degenerate argmax (a
+near-tie) the TILED reference flips run-to-run (Marlin is the deterministic
+side), and greedy decode is autoregressive so one early flip cascades. glm's
+prompt has no such tie → its test was already clean. **Not a Marlin bug — a test
+oracle bug.**
+
+**Fix (test-only; kernel unchanged, frozen at 3735d57e):** replaced exact-equality
+with a cascade-robust classifier. Compare one tiled vs one Marlin stream; if
+identical → full-strength pass (glm). If they first diverge at position `d`
+(sharing the identical prefix `tokens[0..d]`), re-run the tiled config: a
+prefix-matching tiled flip at `d` proves `d` is a near-tie (nondeterministic in
+the tiled reference itself) → not a regression; only a divergence where the tiled
+reference stays deterministic across all probes fails. The decision is a pure,
+GPU-free `classify_parity()` with deterministic unit tests for every outcome
+(identical / length-mismatch / near-tie-from-probe / prefix-unstable-near-tie /
+real-regression), so the hard-to-reproduce branch is verified in CI without a
+live tie.
+
+**Gates:** 5 classify_parity unit tests PASS; glm + qwen e2e PASS (18+ consecutive
+qwen runs, zero flakiness on idle GPU6); fmt + lib + native-backend + cuda
+all-targets clippy clean.
