@@ -70,6 +70,11 @@ jobs:
           python-version: "3.12"
       - name: Install Python test dependencies
         run: python -m pip install --upgrade numpy onnxscript
+      - name: Native benchmark harness self-test
+        # Needs no GPU, no CUDA toolkit and no runtime package, but it does need
+        # numpy: the defect it guards is a numpy array compared against a list,
+        # so a lane without numpy would skip the only cases that catch it.
+        run: python scripts/benchmark_muse_native_local.py --self-test --require-numpy
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Build Linux offline crates
