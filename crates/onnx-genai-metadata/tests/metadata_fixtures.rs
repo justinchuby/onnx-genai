@@ -364,6 +364,48 @@ pipeline:
 }
 
 #[test]
+fn serving_compaction_keeps_emit_identity_in_the_carried_slot_permutation() {
+    let fixture = include_str!(
+        "../../../tests/fixtures/onnx_genai_workflows/decoder/inference_metadata.yaml"
+    );
+    let compacted = fixture.replacen("compaction: false", "compaction: true", 1);
+    let mismatched = compacted.replacen("row_ids: slot_ids", "row_ids: active", 1);
+    let metadata: InferenceMetadata =
+        serde_yaml::from_str(&mismatched).expect("modified decoder metadata parses");
+    let errors = validate_metadata(&metadata).expect_err("compacted identity must use slot_ids");
+    assert!(
+        errors
+            .iter()
+            .any(|error| { error.contains("row_ids must reference serving slot_ids 'slot_ids'") })
+    );
+
+    let uncarried = compacted.replacen("      - cell: slot_ids\n        next: slot_ids\n", "", 1);
+    let metadata: InferenceMetadata =
+        serde_yaml::from_str(&uncarried).expect("modified decoder metadata parses");
+    let errors = validate_metadata(&metadata).expect_err("compacted slot IDs must be carried");
+    assert!(
+        errors
+            .iter()
+            .any(|error| { error.contains("carried must preserve serving slot_ids 'slot_ids'") })
+    );
+
+    let corrupted = compacted.replacen(
+        "      - cell: slot_ids\n        next: slot_ids\n",
+        "      - cell: slot_ids\n        next: cache_lengths.next\n",
+        1,
+    );
+    let metadata: InferenceMetadata =
+        serde_yaml::from_str(&corrupted).expect("modified decoder metadata parses");
+    let errors =
+        validate_metadata(&metadata).expect_err("compacted slot identity cannot change provenance");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("next value must be the carried slot_ids value"))
+    );
+}
+
+#[test]
 fn advisory_state_may_be_session_scoped_but_is_not_semantic() {
     let metadata: InferenceMetadata = serde_yaml::from_str(
         r#"

@@ -94,8 +94,10 @@ must have exactly one unique identity per active physical row.
 
 Aggregate emits omit `row_ids` and retain one tensor under the declared output. Ragged compatibility
 keys use `output.row.<semantic-id>`, but consumers use the structured output API rather than parsing
-those names. Compaction must gather row IDs with every carried state tensor, and slot reassignment
-starts a new request output stream so reusable physical positions never define output identity.
+those names. Under serving compaction, `row_ids` is the carried `serving.slot_ids` value: it is the
+scheduler's semantic identity for the request in that slot, not the current physical batch index.
+Compaction applies one permutation to slot IDs and every carried KV/token/RNG/length state. Slot
+reuse starts a new request epoch and therefore a new output stream.
 
 ONNX port contracts may be omitted when the artifact is authoritative. Declare only semantic
 bindings, bounds/overrides, cross-component constraints, or adapter ports that ONNX cannot describe.
@@ -440,8 +442,9 @@ SSA, recurrence, KV service-group, contract-binding, and capability invariants.
 
 1. Replace loop `condition` with pre-test `continue_when`. Initialize it before loop entry; carry
    the next activity value when the body changes it. A false initial value is a valid zero-trip.
-2. Emit per-row prefixes with `valid_length: int64[B]`; do not reduce across rows. Consume ragged
-   results from `output.row.<index>` (and the event suffix for event mode).
+2. Emit per-row prefixes with `row_ids: int64[B]` and `valid_length: int64[B]`; do not reduce
+   across rows. Consume structured results by `(output, semantic_id)`; flattened
+   `output.row.<semantic-id>` keys (plus event suffixes) are compatibility-only.
 3. Declare serving `active: bool[B]`, `done: bool[B]`, `accepted_len: int64[B]`, and
    `slot_ids: int64[B]`. Inactive rows retain prior logical carry values.
 4. Bind each cache tensor state through `service_group`. Each KV group declares
