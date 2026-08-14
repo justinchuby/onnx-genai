@@ -1,4 +1,4 @@
-use onnx_genai_metadata::{InferenceMetadata, validate_metadata};
+use onnx_genai_metadata::{InferenceMetadata, WorkflowNode, compile_workflow, validate_metadata};
 
 #[test]
 fn minimal_workflow_document_is_valid() {
@@ -407,13 +407,154 @@ fn serving_compaction_keeps_emit_identity_in_the_carried_slot_permutation() {
 
 #[test]
 fn nested_control_loops_inherit_the_outer_compaction_permutation() {
-    let fixture =
-        include_str!("../../../tests/fixtures/onnx_genai_workflows/tts/inference_metadata.yaml");
-    let compacted = fixture.replacen("compaction: false", "compaction: true", 1);
-    let metadata: InferenceMetadata =
-        serde_yaml::from_str(&compacted).expect("modified TTS metadata parses");
+    let metadata: InferenceMetadata = serde_yaml::from_str(
+        r#"
+pipeline:
+  workflow:
+    manifest:
+      ir_version: "1.0"
+      onnx_opsets: { ai.onnx: 24 }
+      capabilities:
+        - workflow_ssa
+        - linear_effects
+        - nested_control_flow
+        - typed_emit
+        - emit_valid_length
+        - emit_row_identity
+        - serving_service_contract
+    inputs:
+      value:
+        contract: { dtype: int64, rank: 2, shape: [batch, sequence] }
+        role: { kind: opaque }
+        source: { kind: application, name: value }
+        required: true
+      valid_length:
+        contract: { dtype: int64, rank: 1, shape: [batch] }
+        role: { kind: opaque }
+        source: { kind: application, name: valid_length }
+        required: true
+      active.initial:
+        contract: { dtype: bool, rank: 1, shape: [batch] }
+        role: { kind: opaque }
+        source: { kind: application, name: active }
+        required: true
+      done.initial:
+        contract: { dtype: bool, rank: 1, shape: [batch] }
+        role: { kind: opaque }
+        source: { kind: application, name: done }
+        required: true
+      slot_ids.initial:
+        contract: { dtype: int64, rank: 1, shape: [batch] }
+        role: { kind: opaque }
+        source: { kind: application, name: slot_ids }
+        required: true
+      cache.initial:
+        contract: { dtype: float32, rank: 2, shape: [batch, capacity] }
+        role: { kind: opaque }
+        source: { kind: application, name: cache }
+        required: true
+      max_iterations:
+        contract: { dtype: int64, rank: 0, shape: [] }
+        role: { kind: opaque }
+        source: { kind: application, name: max_iterations }
+        required: true
+    outputs:
+      result:
+        contract: { dtype: int64, rank: 2, shape: [batch, generated] }
+        role: tokens
+        stage: pre_adapter
+    components: {}
+    state:
+      active:
+        contract: { dtype: bool, rank: 1, shape: [batch] }
+        scope: invocation
+        initializer: active.initial
+        recurrence: { kind: invariant }
+      done:
+        contract: { dtype: bool, rank: 1, shape: [batch] }
+        scope: invocation
+        initializer: done.initial
+        recurrence: { kind: invariant }
+      slot_ids:
+        contract: { dtype: int64, rank: 1, shape: [batch] }
+        scope: invocation
+        initializer: slot_ids.initial
+        recurrence: { kind: invariant }
+      accepted_len:
+        contract: { dtype: int64, rank: 1, shape: [batch] }
+        scope: invocation
+        initializer: valid_length
+        recurrence: { kind: invariant }
+      cache:
+        contract: { dtype: float32, rank: 2, shape: [batch, capacity] }
+        scope: invocation
+        initializer: cache.initial
+        recurrence: { kind: invariant }
+        service_group: cache
+    serving:
+      active: active
+      done: done
+      accepted_len: accepted_len
+      slot_ids: slot_ids
+      kv_service:
+        paging: none
+        allocation: runtime
+        compaction: true
+        groups:
+          cache:
+            sequence_axis: 1
+            layout: batch_sequence
+            logical_lengths: accepted_len
+            storage: shared_buffer
+    steps:
+      - kind: loop
+        continue_when: active
+        max_iterations: max_iterations
+        carried:
+          - { cell: active, next: active }
+          - { cell: done, next: done }
+          - { cell: slot_ids, next: slot_ids }
+          - { cell: accepted_len, next: accepted_len }
+          - { cell: cache, next: cache }
+        steps:
+          - kind: loop
+            continue_when: active
+            max_iterations: max_iterations
+            steps:
+              - kind: emit
+                value: value
+                valid_length: accepted_len
+                row_ids: slot_ids
+                output: result
+                mode: append
+"#,
+    )
+    .expect("nested compaction workflow parses");
     validate_metadata(&metadata)
         .expect("nested loops may use the invariant slot permutation carried by the outer loop");
+    let graph = compile_workflow(&metadata.pipeline.expect("pipeline").workflow)
+        .expect("nested compaction workflow lowers")
+        .graph;
+    let WorkflowNode::Sequence { nodes } = graph else {
+        panic!("workflow must lower to a sequence");
+    };
+    let WorkflowNode::Loop { body, .. } = &nodes[0] else {
+        panic!("outer lifecycle loop must be preserved");
+    };
+    let WorkflowNode::Sequence { nodes } = body.as_ref() else {
+        panic!("outer loop body must be a sequence");
+    };
+    let WorkflowNode::Loop { body, carried, .. } = &nodes[0] else {
+        panic!("nested control loop must be preserved");
+    };
+    assert!(carried.is_empty(), "nested loop must not redefine slot_ids");
+    let WorkflowNode::Sequence { nodes } = body.as_ref() else {
+        panic!("nested loop body must be a sequence");
+    };
+    let WorkflowNode::Emit { row_ids, .. } = &nodes[0] else {
+        panic!("nested row-wise emit must be preserved");
+    };
+    assert_eq!(row_ids.as_deref(), Some("slot_ids"));
 }
 
 #[test]
