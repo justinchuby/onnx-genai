@@ -457,3 +457,47 @@ gate_up split-K)**, byte-identical throughout. B\*≈2.16 is the intrinsic small
 GEMM floor (M=8 `mma.m16n8k16` ~50% MMA waste); universal ≤2 is a drafting-depth
 story, not a GEMM-tuning one. Practical GO: any 8-wide draft accepting >2.16
 tok/verify wins. Next: Chew (numerics) + Gaff (quality) review of PR #960.
+
+---
+
+## Update 10 — CORRECTION + qwen breadth: gate_up fusion is block-32-only (glm is block-128)
+
+Sebastian probed qwen at 3735d57e and flagged a per-model gap; investigating the
+code resolves the attribution:
+
+**Fused gate_up SwiGLU requires `block_size==32`** (hard gate in
+`run_f16_gate_up_swiglu`, matmul_nbits.rs:5782). Model block sizes:
+- **glm-4-9b = block-128** → the ≥5-input fused gate_up node is NEVER formed;
+  glm runs gate/up as *separate* MatMulNBits nodes through the **general** Marlin
+  split-K dispatch (`try_launch_marlin_gemm`→`maybe_launch_marlin_splitk`). Those
+  were already covered by the update-7 `choose_split_k` retune. **⇒ 3735d57e
+  (fused gate_up split-K) is a NO-OP for glm.** glm's 2.63→2.16× was ENTIRELY the
+  4abe4e57 retune; my update-8 claim that gate_up split-K drove the glm number was
+  WRONG — corrected here.
+- **qwen2.5-14b = block-32** → the fused gate_up node forms; `try_launch_marlin_
+  gate_up_prefill` fires at M>1 (eligibility gates block≠0 / k%16 / k%block all
+  pass for K=5120), and 3735d57e routes its gate/up through split-K. **Confirmed
+  firing:** qwen's Increment-0 census is segments=1 / zero-unsupported — a
+  None/Err fall-through would go to the NON-capture-safe tiled prefill and
+  fragment the graph, so segments=1 *proves* `gate_up_swiglu_marlin_prefill` is
+  the path taken. The 35.5ms M=8 wall is WITH gate_up Marlin split-K active.
+
+**qwen M=8 verify @ 3735d57e (Sebastian, GPU7 ×2):** B\* = 4.62/4.72× (captured
+M=8 35.5ms, M=1 7.5ms); segments=1, whole-graph, zero unsupported (all 48 GQA +
+96 LN capture-safe — capture-safety generalizes to qwen ✅).
+
+**Diagnosis (honest, not a bug):** qwen's higher B\* is a *denominator* effect,
+not a coverage gap. Capture accelerates qwen's launch-bound block-32 M=1 GEMV 34%
+(11.4→7.5ms) but the heavier 14B/48-layer M=8 verify only 18% (43.1→35.5ms), so
+the RATIO inflates even though both walls drop. qwen's tuned block-32 M=1 is
+genuinely fast (7.5ms < glm's 10.2ms), which raises B\* (more accepted tokens
+needed to break even). caveat #1 (qwen square-attn K=5120 cold-clock bimodal) is
+NOT biting — the probe warms 1000 decode steps so clocks are up; the bimodal was
+a cold-clock microbench artifact.
+
+**Net:** glm-4-9b (canonical gate, block-128) is a clean practical GO at 2.16×.
+qwen (block-32) at 4.7× is an honest second-model characteristic — capture-safety
+is fully solved (whole-graph, zero seams, byte-identical eager parity), the M=8
+wall is compute-bound at the intrinsic small-M `mma.m16n8k16` floor, and closing
+qwen's B\* is a drafting-depth story (deeper/stronger drafter amortizes the higher
+ratio), NOT a frozen-kernel fix. No further kernel change; freeze stands.
