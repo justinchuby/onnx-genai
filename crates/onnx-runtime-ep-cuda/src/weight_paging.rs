@@ -16,7 +16,7 @@
 //! into the executor's live MoE dispatch so the fused kernel consumes the device
 //! page, and async prefetch overlap (issues #82/#87).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -311,7 +311,112 @@ pub fn reset_global_offload_stats() {
     // window reset), so they are preserved exactly like the residency gauges.
     GLOBAL_ZERO_COPY_READS.store(0, Ordering::Relaxed);
     GLOBAL_ZERO_COPY_BYTES.store(0, Ordering::Relaxed);
+    reset_key_trace();
     crate::pinned_pool::reset_pinned_pool_counters();
+}
+
+// ----- Per-key page-in trace (#837 item 3 characterisation) -----
+//
+// OFF by default. When `ONNX_GENAI_WEIGHT_PAGING_KEY_TRACE` is truthy, every
+// weight lookup routed through the residency cache is attributed to its key so
+// the bypassed population can be characterised by size **and read count per
+// decode step** — the question that decides whether admitting bypassed tensors
+// is worth anything. A tensor read exactly once per decode step (the structural
+// case for a transformer weight, #864) gains no residency benefit from a reuse
+// reservation, so read count is the discriminator. This is pure process-local
+// accounting under a `Mutex`, taken only when the env is enabled, and never
+// touches device state, so it does not perturb the counters it explains.
+
+/// One weight key's residency activity over the current measurement window.
+///
+/// Populated only when `ONNX_GENAI_WEIGHT_PAGING_KEY_TRACE` is truthy. `hits`
+/// are reads served from residency (no copy); `retained_page_ins` paged the
+/// weight in and kept it resident; `bypass_page_ins` paged it in transiently
+/// (copied H2D, handed back without joining the resident set), so its `len`
+/// bytes re-stream every subsequent step it is read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WeightKeyTrace {
+    pub len: u64,
+    pub hits: u64,
+    pub retained_page_ins: u64,
+    pub bypass_page_ins: u64,
+}
+
+impl WeightKeyTrace {
+    /// Total reads of this key in the window (`hits + retained + bypass`). Over
+    /// `S` decode steps a value of `S` means the key is read exactly once per
+    /// step — the structural transformer-weight case where residency saves the
+    /// per-step copy but reuse-frequency admission has nothing to rank on.
+    #[must_use]
+    pub fn reads(&self) -> u64 {
+        self.hits
+            .saturating_add(self.retained_page_ins)
+            .saturating_add(self.bypass_page_ins)
+    }
+}
+
+fn key_trace_enabled() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        matches!(
+            std::env::var("ONNX_GENAI_WEIGHT_PAGING_KEY_TRACE")
+                .ok()
+                .as_deref()
+                .map(|value| value.trim().to_ascii_lowercase()),
+            Some(ref value) if matches!(value.as_str(), "1" | "true" | "yes" | "on")
+        )
+    })
+}
+
+fn key_trace_map() -> &'static Mutex<HashMap<u64, WeightKeyTrace>> {
+    static MAP: OnceLock<Mutex<HashMap<u64, WeightKeyTrace>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[derive(Clone, Copy)]
+enum KeyTraceEvent {
+    Hit,
+    Retained,
+    Bypass,
+}
+
+fn record_key_trace(key: u64, len: u64, event: KeyTraceEvent) {
+    if !key_trace_enabled() {
+        return;
+    }
+    let mut map = key_trace_map().lock().unwrap_or_else(|e| e.into_inner());
+    let row = map.entry(key).or_default();
+    row.len = len;
+    match event {
+        KeyTraceEvent::Hit => row.hits = row.hits.saturating_add(1),
+        KeyTraceEvent::Retained => row.retained_page_ins = row.retained_page_ins.saturating_add(1),
+        KeyTraceEvent::Bypass => row.bypass_page_ins = row.bypass_page_ins.saturating_add(1),
+    }
+}
+
+fn reset_key_trace() {
+    if key_trace_enabled() {
+        key_trace_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+}
+
+/// Snapshot the per-key weight-paging trace, sorted by the bytes each key
+/// **re-streams** per window (`bypass_page_ins * len`) descending, so the head
+/// of the list is the population that dominates the recoverable streaming gap
+/// (#837 item 3). Empty unless `ONNX_GENAI_WEIGHT_PAGING_KEY_TRACE` is set.
+#[must_use]
+pub fn weight_paging_key_trace() -> Vec<(u64, WeightKeyTrace)> {
+    let mut rows: Vec<(u64, WeightKeyTrace)> = key_trace_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|(&key, &row)| (key, row))
+        .collect();
+    rows.sort_by_key(|(_, row)| std::cmp::Reverse(row.bypass_page_ins.saturating_mul(row.len)));
+    rows
 }
 
 /// Environment switch that enables the CUDA device residency cache. Reuses the
@@ -826,9 +931,71 @@ fn retain_slotted_enabled() -> bool {
     })
 }
 
-/// Whether/how the CUDA EP should page offloaded weights into a bounded VRAM
-/// residency cache. Disabled by default so the resident fast path is untouched
-/// and byte-identical.
+/// Static hot-set pin (#837 item 3, reviewer follow-up). A tensor whose byte
+/// length is at least the threshold is admitted **once** and never evicted or
+/// re-admitted, up to a total pin budget. This is the provably-safe retention
+/// shape: unlike byte-aware residency (which evicts and can re-admit a large
+/// stable-slot tensor — the #886/#888 corruption pattern), a pinned tensor never
+/// enters the eviction population at all, so it can never be evicted-and-re-
+/// admitted. It is served as a hit across steps, saving its bytes every step.
+/// Both variables must be set to positive integers to engage; either unset or
+/// zero leaves the shipped size-blind path byte-identical.
+const WEIGHT_OFFLOAD_PIN_THRESHOLD_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_PIN_THRESHOLD_BYTES";
+const WEIGHT_OFFLOAD_PIN_BUDGET_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_PIN_BUDGET_BYTES";
+
+/// `(threshold_bytes, budget_bytes)` when static hot-set pinning is engaged, or
+/// `None` on the shipped path. Cached once per process.
+fn static_pin_config() -> Option<(u64, u64)> {
+    static CACHE: OnceLock<Option<(u64, u64)>> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let threshold = parse_numeric_env(WEIGHT_OFFLOAD_PIN_THRESHOLD_ENV)
+            .into_option(WEIGHT_OFFLOAD_PIN_THRESHOLD_ENV)?;
+        let budget = parse_numeric_env(WEIGHT_OFFLOAD_PIN_BUDGET_ENV)
+            .into_option(WEIGHT_OFFLOAD_PIN_BUDGET_ENV)?;
+        (threshold > 0 && budget > 0).then_some((threshold, budget))
+    })
+}
+
+/// Explicit key allow-list for the static hot-set pin (#837 item 3, reviewer
+/// follow-up). Comma-separated `u64` weight keys; when set, *exactly* those keys
+/// are pinned (admitted once, never evicted, never re-admitted) regardless of
+/// size or budget, and the size-threshold path above is ignored. This lets the
+/// measurement pin the specific chronic-bypasser tensors identified by the
+/// per-key trace, rather than whichever large tensors happen to arrive first.
+/// Unset on the shipped path.
+const WEIGHT_OFFLOAD_PIN_KEYS_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_PIN_KEYS";
+
+/// Parsed explicit pin allow-list, or `None` when the variable is unset/empty.
+/// Cached once per process.
+fn static_pin_keys() -> Option<&'static HashSet<u64>> {
+    static CACHE: OnceLock<Option<HashSet<u64>>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let raw = std::env::var(WEIGHT_OFFLOAD_PIN_KEYS_ENV).ok()?;
+            let keys: HashSet<u64> = raw
+                .split(',')
+                .filter_map(|token| token.trim().parse::<u64>().ok())
+                .collect();
+            (!keys.is_empty()).then_some(keys)
+        })
+        .as_ref()
+}
+
+/// Distinct weight keys currently held in the static pin set (a live gauge).
+static GLOBAL_PINNED_KEYS: AtomicU64 = AtomicU64::new(0);
+/// Distinct weight bytes held in the static pin set (a live gauge).
+static GLOBAL_PINNED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Distinct keys and bytes in the static hot-set pin (#837 item 3). Both zero on
+/// the shipped path.
+#[must_use]
+pub fn pinned_hot_set() -> (u64, u64) {
+    (
+        GLOBAL_PINNED_KEYS.load(Ordering::Relaxed),
+        GLOBAL_PINNED_BYTES.load(Ordering::Relaxed),
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeviceOffloadPolicy {
     pub enabled: bool,
@@ -1627,6 +1794,14 @@ struct ResidencyInner {
     /// device pointer is stable for the residency's lifetime), so steady-state
     /// cold lookups allocate nothing.
     cold_pages: HashMap<u64, Arc<CudaWeightPage>>,
+    /// Keys in the static hot-set pin (#837 item 3): admitted once and never
+    /// evicted or re-admitted. Excluded from every eviction-victim selector, so
+    /// a pinned page is served as a hit across steps and never re-enters the
+    /// evict-and-re-admit population #886/#888 localised the corruption to.
+    /// Empty on the shipped path (`static_pin_config()` is `None`).
+    pinned: HashSet<u64>,
+    /// Distinct bytes held by [`Self::pinned`], for the pin-budget cap.
+    pinned_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1888,6 +2063,8 @@ impl CudaWeightResidency {
                 admission_no_progress: 0,
                 slots: HashMap::new(),
                 cold_pages: HashMap::new(),
+                pinned: HashSet::new(),
+                pinned_bytes: 0,
             }),
         }
     }
@@ -1943,6 +2120,8 @@ impl CudaWeightResidency {
                 admission_no_progress: 0,
                 slots: HashMap::new(),
                 cold_pages: HashMap::new(),
+                pinned: HashSet::new(),
+                pinned_bytes: 0,
             }),
         })
     }
@@ -2584,6 +2763,7 @@ impl CudaWeightResidency {
             &mut inner,
             physical,
             &allowance,
+            key,
             ptr,
             len,
             eviction,
@@ -2660,7 +2840,7 @@ impl CudaWeightResidency {
             shape,
         });
         if bypass {
-            inner.record_bypassed_page_in(len as u64);
+            inner.record_bypassed_page_in(key, len as u64);
         } else {
             inner.insert_page(key, Arc::clone(&page), len as u64);
         }
@@ -2694,6 +2874,7 @@ impl CudaWeightResidency {
         inner: &mut ResidencyInner,
         physical: &PhysicalAdmission,
         allowance: &onnx_runtime_memory_governor::MappedAllowance,
+        key: u64,
         ptr: NonNull<u8>,
         len: usize,
         eviction: WeightEvictionPolicy,
@@ -2709,6 +2890,24 @@ impl CudaWeightResidency {
         let mut evictions = 0usize;
         let mut bypass = false;
         let mut streams_drained = false;
+        // Static hot-set pin (#837 item 3): a large-enough tensor, within the
+        // pin budget and not already pinned, is retained once and never evicted
+        // or re-admitted. Decided once here (independent of whether it happens
+        // to fit right now) so that a qualifying tensor which fits early — before
+        // the budget fills — is still protected from later churn eviction, which
+        // is what keeps it out of the evict-and-re-admit corruption population.
+        let pin_this = if let Some(keys) = static_pin_keys() {
+            keys.contains(&key) && !inner.pinned.contains(&key)
+        } else {
+            match static_pin_config() {
+                Some((threshold, budget)) => {
+                    (len as u64) >= threshold
+                        && !inner.pinned.contains(&key)
+                        && inner.pinned_bytes.saturating_add(len as u64) <= budget
+                }
+                None => false,
+            }
+        };
         loop {
             let required_owned = physical
                 .allocator
@@ -2773,6 +2972,13 @@ impl CudaWeightResidency {
                             &self.runtime,
                             ptr.as_ptr() as CUdeviceptr,
                         )?;
+                        // The span is filled and (if not a bypass) about to join
+                        // the resident set. Pin it now so no later admission can
+                        // ever select it as an eviction victim — the whole point
+                        // of the static hot set.
+                        if pin_this && !bypass {
+                            inner.mark_pinned(key, len as u64);
+                        }
                         return Ok(SpanAdmit::Filled { bypass });
                     }
                     Err(error) => {
@@ -2805,11 +3011,12 @@ impl CudaWeightResidency {
                 // corrupts decode output (token-identity failure). It is
                 // default-OFF and never set on the shipped path; see
                 // `WEIGHT_OFFLOAD_BYTE_AWARE_ENV` for the measured evidence.
-                bypass = !(self.byte_aware
-                    && (has_stable_slot && retain_slotted_enabled()
-                        || inner
-                            .smallest_evictable()
-                            .is_some_and(|(_, smallest)| (len as u64) > smallest)));
+                bypass = !(pin_this
+                    || self.byte_aware
+                        && (has_stable_slot && retain_slotted_enabled()
+                            || inner
+                                .smallest_evictable()
+                                .is_some_and(|(_, smallest)| (len as u64) > smallest)));
             }
 
             // Zero-copy hybrid (#864): the instant admission would need to evict
@@ -2843,7 +3050,14 @@ impl CudaWeightResidency {
             // large tensor; size-blind residency evicts by `evict_order_probe`,
             // which is front-of-order LRU on the shipped default path and only
             // varies under the #888 eviction-order investigation knob.
-            let evicted_key = if self.byte_aware {
+            // Byte-aware admission and a static-pin admission both evict the
+            // smallest evictable resident so a large incoming tensor displaces
+            // cheap smalls rather than another large tensor; size-blind
+            // residency evicts by `evict_order_probe`, which is front-of-order
+            // LRU on the shipped default path and only varies under the #888
+            // eviction-order investigation knob. Pinned residents are excluded
+            // from every selector, so eviction here never touches the hot set.
+            let evicted_key = if self.byte_aware || pin_this {
                 inner.smallest_evictable().map(|(key, _)| key)
             } else {
                 inner.evictable_key_by_probe(self.evict_order_probe, eviction)
@@ -2971,7 +3185,7 @@ impl CudaWeightResidency {
             return Ok(existing);
         }
         if eviction == WeightEvictionPolicy::StableResident && !inner.policy.can_fit(bytes) {
-            inner.record_bypassed_page_in(bytes);
+            inner.record_bypassed_page_in(key, bytes);
             return Ok(page);
         }
         inner.evict_to_fit(bytes, eviction);
@@ -3164,12 +3378,14 @@ impl ResidencyInner {
         GLOBAL_HITS.fetch_add(1, Ordering::Relaxed);
         if let Some(page) = self.pages.get(&key) {
             GLOBAL_HIT_BYTES.fetch_add(page.len as u64, Ordering::Relaxed);
+            record_key_trace(key, page.len as u64, KeyTraceEvent::Hit);
         }
     }
 
     /// Insert a freshly paged-in `page` of `bytes` under `key`, updating the
     /// order, residency accounting, and the page-in counters.
     fn insert_page(&mut self, key: u64, page: Arc<CudaWeightPage>, bytes: u64) {
+        record_key_trace(key, bytes, KeyTraceEvent::Retained);
         self.pages.insert(key, page);
         self.policy.insert_page(key, bytes);
         let global_resident = GLOBAL_CONTENT_RESIDENT_BYTES
@@ -3181,19 +3397,33 @@ impl ResidencyInner {
 
     /// Count a miss whose freshly paged-in allocation is returned directly to
     /// the caller instead of becoming part of the resident set.
-    fn record_bypassed_page_in(&mut self, bytes: u64) {
+    fn record_bypassed_page_in(&mut self, key: u64, bytes: u64) {
+        record_key_trace(key, bytes, KeyTraceEvent::Bypass);
         self.policy.record_page_in();
         GLOBAL_PAGE_INS.fetch_add(1, Ordering::Relaxed);
         GLOBAL_BYPASSED_PAGE_INS.fetch_add(1, Ordering::Relaxed);
         GLOBAL_BYPASSED_PAGE_IN_BYTES.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    /// Add `key` (of `bytes`) to the static hot-set pin so it is never selected
+    /// as an eviction victim again (#837 item 3). Idempotent; updates the live
+    /// pinned-set gauges once per distinct key.
+    fn mark_pinned(&mut self, key: u64, bytes: u64) {
+        if self.pinned.insert(key) {
+            self.pinned_bytes = self.pinned_bytes.saturating_add(bytes);
+            GLOBAL_PINNED_KEYS.fetch_add(1, Ordering::Relaxed);
+            GLOBAL_PINNED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+
     fn next_evictable_key(&self, eviction: WeightEvictionPolicy) -> Option<u64> {
         self.policy
             .next_evictable_index(eviction, &mut |key| {
-                self.pages
-                    .get(&key)
-                    .is_some_and(|page| Arc::strong_count(page) == 1)
+                !self.pinned.contains(&key)
+                    && self
+                        .pages
+                        .get(&key)
+                        .is_some_and(|page| Arc::strong_count(page) == 1)
             })
             .map(|index| self.policy.order[index])
     }
@@ -3202,17 +3432,19 @@ impl ResidencyInner {
     /// page is evictable.
     ///
     /// "Evictable" is the same predicate [`Self::next_evictable_key`] uses: the
-    /// cache must be the page's sole owner (`Arc::strong_count == 1`), so a page
-    /// still read by an in-flight kernel is never a candidate. Byte-aware
-    /// admission uses this to displace only the cheapest resident, protecting
-    /// the large tensors that dominate streaming cost (#837 item 3).
+    /// cache must be the page's sole owner (`Arc::strong_count == 1`) and the key
+    /// must not be pinned, so a page still read by an in-flight kernel — or held
+    /// in the static hot set — is never a candidate. Byte-aware admission uses
+    /// this to displace only the cheapest resident, protecting the large tensors
+    /// that dominate streaming cost (#837 item 3).
     fn smallest_evictable(&self) -> Option<(u64, u64)> {
         let mut best: Option<(u64, u64)> = None;
         for (&key, &bytes) in &self.policy.bytes_by_key {
-            let evictable = self
-                .pages
-                .get(&key)
-                .is_some_and(|page| Arc::strong_count(page) == 1);
+            let evictable = !self.pinned.contains(&key)
+                && self
+                    .pages
+                    .get(&key)
+                    .is_some_and(|page| Arc::strong_count(page) == 1);
             if evictable && best.is_none_or(|(_, best_bytes)| bytes < best_bytes) {
                 best = Some((key, bytes));
             }
@@ -3224,18 +3456,21 @@ impl ResidencyInner {
     /// #888 eviction-order probe. [`EvictOrderProbe::Lru`] delegates to
     /// [`Self::next_evictable_key`], so the default path is byte-identical to
     /// the shipped code. Every variant applies the identical "evictable" filter
-    /// (`Arc::strong_count == 1`), so no order can ever target a page still read
-    /// by an in-flight kernel — the only thing that changes is *which*
-    /// unreferenced page is freed for physical room.
+    /// (`Arc::strong_count == 1` and not pinned), so no order can ever target a
+    /// page still read by an in-flight kernel or held in the static hot set —
+    /// the only thing that changes is *which* unreferenced page is freed for
+    /// physical room.
     fn evictable_key_by_probe(
         &self,
         probe: EvictOrderProbe,
         eviction: WeightEvictionPolicy,
     ) -> Option<u64> {
         let is_evictable = |key: u64| -> bool {
-            self.pages
-                .get(&key)
-                .is_some_and(|page| Arc::strong_count(page) == 1)
+            !self.pinned.contains(&key)
+                && self
+                    .pages
+                    .get(&key)
+                    .is_some_and(|page| Arc::strong_count(page) == 1)
         };
         match probe {
             EvictOrderProbe::Lru => self.next_evictable_key(eviction),
