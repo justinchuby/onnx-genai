@@ -93,39 +93,68 @@ impl KvBindingGeometry {
 }
 
 /// The byte ranges (within one binding's allocation) that must be committed to
-/// make the live prefix of `valid_len` tokens physically resident, given the
-/// layout and a fixed full-context `capacity` (the grow-axis stride).
+/// make the live prefix of `valid_len` tokens physically resident for each of
+/// `batch` sequences, given the layout and a fixed full-context `capacity` (the
+/// grow-axis stride).
 ///
-/// * Seq-major returns a single dense range `0..(valid_len × bytes_per_token)`.
-/// * Head-major returns one range per head stripe, each covering that head's
-///   live fragment `[h × capacity × head_dim × elem .. + valid_len × head_dim ×
-///   elem]`. This is the per-stripe floor of a fixed full-context stride.
+/// * Seq-major returns one dense range per sequence, sequence `b` covering
+///   `[b × capacity × bytes_per_token .. + valid_len × bytes_per_token]`. The
+///   per-sequence stride is the fixed full-context `capacity`, so a sequence's
+///   bytes never move as the *committed* prefix grows.
+/// * Head-major returns one range per `(sequence, head)` stripe, stripe
+///   `(b, h)` covering `[(b × kv_heads + h) × capacity × head_dim × elem .. +
+///   valid_len × head_dim × elem]`. This is the per-stripe floor of a fixed
+///   full-context stride.
+///
+/// **Batch generality (stage 2b-impl-2, #750):** the batch axis is the
+/// *outermost* axis of both layouts, so a sequence's fragments are a fixed
+/// `per_sequence_stride = capacity × bytes_per_token` apart and computing them
+/// needs no relocation — this is why the *fixed full-context stride* commit path
+/// is batch-general. It is only a *growing bucket* (the realloc / VMM
+/// growing-bucket path, not this fixed-stride commit) whose seq-major
+/// per-sequence stride depends on the mutable bucket capacity and would relocate
+/// every sequence `b > 0` on growth; that case is refused explicitly in
+/// [`super::cuda::kv_growth_byte_layout`]. At `batch == 1` this function is
+/// byte-identical to the historical single-sequence form.
 ///
 /// Returns `None` on arithmetic overflow. An empty vec means nothing to commit
 /// (`valid_len == 0`).
 pub(crate) fn live_prefix_ranges(
     layout: KvCommitLayout,
     geometry: KvBindingGeometry,
+    batch: usize,
     capacity: usize,
     valid_len: usize,
 ) -> Option<Vec<Range<usize>>> {
-    if valid_len == 0 {
+    if valid_len == 0 || batch == 0 {
         return Some(Vec::new());
     }
     let valid_len = valid_len.min(capacity);
     match layout {
         KvCommitLayout::SeqMajor => {
-            let bytes = valid_len.checked_mul(geometry.bytes_per_token()?)?;
-            Some(std::iter::once(0..bytes).collect())
+            let bytes_per_token = geometry.bytes_per_token()?;
+            let live_width = valid_len.checked_mul(bytes_per_token)?;
+            let per_sequence_stride = capacity.checked_mul(bytes_per_token)?;
+            let mut ranges = Vec::with_capacity(batch);
+            for sequence in 0..batch {
+                let start = sequence.checked_mul(per_sequence_stride)?;
+                let end = start.checked_add(live_width)?;
+                ranges.push(start..end);
+            }
+            Some(ranges)
         }
         KvCommitLayout::HeadMajor => {
             let head_stride = capacity.checked_mul(geometry.bytes_per_token_per_head()?)?;
+            let per_sequence_stride = geometry.kv_heads.checked_mul(head_stride)?;
             let live_width = valid_len.checked_mul(geometry.bytes_per_token_per_head()?)?;
-            let mut ranges = Vec::with_capacity(geometry.kv_heads);
-            for head in 0..geometry.kv_heads {
-                let start = head.checked_mul(head_stride)?;
-                let end = start.checked_add(live_width)?;
-                ranges.push(start..end);
+            let mut ranges = Vec::with_capacity(batch.checked_mul(geometry.kv_heads)?);
+            for sequence in 0..batch {
+                let sequence_base = sequence.checked_mul(per_sequence_stride)?;
+                for head in 0..geometry.kv_heads {
+                    let start = sequence_base.checked_add(head.checked_mul(head_stride)?)?;
+                    let end = start.checked_add(live_width)?;
+                    ranges.push(start..end);
+                }
             }
             Some(ranges)
         }
@@ -174,11 +203,12 @@ pub(crate) fn committed_granules(ranges: &[Range<usize>], granule: usize) -> usi
 pub(crate) fn live_prefix_committed_bytes(
     layout: KvCommitLayout,
     geometry: KvBindingGeometry,
+    batch: usize,
     capacity: usize,
     valid_len: usize,
     granule: usize,
 ) -> Option<usize> {
-    let ranges = live_prefix_ranges(layout, geometry, capacity, valid_len)?;
+    let ranges = live_prefix_ranges(layout, geometry, batch, capacity, valid_len)?;
     committed_granules(&ranges, granule).checked_mul(granule)
 }
 
@@ -202,7 +232,7 @@ mod tests {
 
     #[test]
     fn seq_major_is_one_dense_run_from_zero() {
-        let ranges = live_prefix_ranges(KvCommitLayout::SeqMajor, QWEN14B, 32_768, 100).unwrap();
+        let ranges = live_prefix_ranges(KvCommitLayout::SeqMajor, QWEN14B, 1, 32_768, 100).unwrap();
         assert_eq!(ranges, vec![0..(100 * 8 * 128 * 2)]);
     }
 
@@ -211,7 +241,7 @@ mod tests {
         let capacity = 32_768;
         let valid = 100;
         let ranges =
-            live_prefix_ranges(KvCommitLayout::HeadMajor, QWEN14B, capacity, valid).unwrap();
+            live_prefix_ranges(KvCommitLayout::HeadMajor, QWEN14B, 1, capacity, valid).unwrap();
         assert_eq!(ranges.len(), QWEN14B.kv_heads);
         let head_stride = capacity * QWEN14B.head_dim * QWEN14B.elem_bytes;
         let live_width = valid * QWEN14B.head_dim * QWEN14B.elem_bytes;
@@ -221,15 +251,66 @@ mod tests {
         }
     }
 
+    // Batch>1 control (stage 2b-impl-2, #750): seq-major returns one dense run
+    // per sequence, each a fixed `capacity × bytes_per_token` apart, so a
+    // transposed axis or a capacity-dependent stride would show up here (it
+    // could not at batch=1). No relocation: the per-sequence stride is the fixed
+    // full-context `capacity`, independent of `valid_len`.
+    #[test]
+    fn seq_major_batch_n_is_one_dense_run_per_sequence() {
+        let batch = 3;
+        let capacity = 32_768;
+        let valid = 100;
+        let ranges =
+            live_prefix_ranges(KvCommitLayout::SeqMajor, QWEN14B, batch, capacity, valid).unwrap();
+        assert_eq!(ranges.len(), batch);
+        let bpt = QWEN14B.kv_heads * QWEN14B.head_dim * QWEN14B.elem_bytes;
+        let seq_stride = capacity * bpt;
+        let live = valid * bpt;
+        for (sequence, range) in ranges.iter().enumerate() {
+            assert_eq!(range.start, sequence * seq_stride);
+            assert_eq!(range.end, sequence * seq_stride + live);
+        }
+        // Sequence 0's fragment is byte-identical to the batch-1 result.
+        let batch1 =
+            live_prefix_ranges(KvCommitLayout::SeqMajor, QWEN14B, 1, capacity, valid).unwrap();
+        assert_eq!(ranges[0], batch1[0]);
+    }
+
+    // Batch>1 control: head-major scatters `batch × kv_heads` fragments, batch
+    // outermost, `(b, h)` at `(b × kv_heads + h) × head_stride`.
+    #[test]
+    fn head_major_batch_n_is_one_fragment_per_sequence_head() {
+        let batch = 3;
+        let capacity = 32_768;
+        let valid = 100;
+        let ranges =
+            live_prefix_ranges(KvCommitLayout::HeadMajor, QWEN14B, batch, capacity, valid).unwrap();
+        assert_eq!(ranges.len(), batch * QWEN14B.kv_heads);
+        let head_stride = capacity * QWEN14B.head_dim * QWEN14B.elem_bytes;
+        let live_width = valid * QWEN14B.head_dim * QWEN14B.elem_bytes;
+        for (index, range) in ranges.iter().enumerate() {
+            let start = index * head_stride; // dense (b*kv_heads + h) enumeration
+            assert_eq!(range.start, start);
+            assert_eq!(range.end, start + live_width);
+        }
+    }
+
     #[test]
     fn empty_prefix_commits_nothing() {
         assert!(
-            live_prefix_ranges(KvCommitLayout::SeqMajor, QWEN14B, 32_768, 0)
+            live_prefix_ranges(KvCommitLayout::SeqMajor, QWEN14B, 1, 32_768, 0)
+                .unwrap()
+                .is_empty()
+        );
+        // Batch has no effect when there is nothing live to commit.
+        assert!(
+            live_prefix_ranges(KvCommitLayout::SeqMajor, QWEN14B, 4, 32_768, 0)
                 .unwrap()
                 .is_empty()
         );
         assert_eq!(
-            live_prefix_committed_bytes(KvCommitLayout::HeadMajor, QWEN14B, 32_768, 0, GRANULE)
+            live_prefix_committed_bytes(KvCommitLayout::HeadMajor, QWEN14B, 1, 32_768, 0, GRANULE)
                 .unwrap(),
             0
         );
@@ -254,6 +335,7 @@ mod tests {
         let head_major = live_prefix_committed_bytes(
             KvCommitLayout::HeadMajor,
             QWEN14B,
+            1,
             capacity,
             valid,
             GRANULE,
@@ -262,6 +344,7 @@ mod tests {
         let seq_major = live_prefix_committed_bytes(
             KvCommitLayout::SeqMajor,
             QWEN14B,
+            1,
             capacity,
             valid,
             GRANULE,
@@ -277,11 +360,17 @@ mod tests {
     #[test]
     fn near_empty_floor_is_kv_heads_times_smaller_seq_major_qwen05b() {
         let capacity = 32_768;
-        let head_major =
-            live_prefix_committed_bytes(KvCommitLayout::HeadMajor, QWEN05B, capacity, 1, GRANULE)
-                .unwrap();
+        let head_major = live_prefix_committed_bytes(
+            KvCommitLayout::HeadMajor,
+            QWEN05B,
+            1,
+            capacity,
+            1,
+            GRANULE,
+        )
+        .unwrap();
         let seq_major =
-            live_prefix_committed_bytes(KvCommitLayout::SeqMajor, QWEN05B, capacity, 1, GRANULE)
+            live_prefix_committed_bytes(KvCommitLayout::SeqMajor, QWEN05B, 1, capacity, 1, GRANULE)
                 .unwrap();
         assert_eq!(head_major / seq_major, QWEN05B.kv_heads); // 2×
     }
@@ -296,6 +385,7 @@ mod tests {
         let head_major = live_prefix_committed_bytes(
             KvCommitLayout::HeadMajor,
             QWEN14B,
+            1,
             capacity,
             valid,
             GRANULE,
@@ -304,6 +394,7 @@ mod tests {
         let seq_major = live_prefix_committed_bytes(
             KvCommitLayout::SeqMajor,
             QWEN14B,
+            1,
             capacity,
             valid,
             GRANULE,
@@ -316,7 +407,8 @@ mod tests {
 
     #[test]
     fn valid_len_is_clamped_to_capacity() {
-        let ranges = live_prefix_ranges(KvCommitLayout::SeqMajor, QWEN14B, 256, 100_000).unwrap();
+        let ranges =
+            live_prefix_ranges(KvCommitLayout::SeqMajor, QWEN14B, 1, 256, 100_000).unwrap();
         assert_eq!(ranges, vec![0..(256 * 8 * 128 * 2)]);
     }
 
