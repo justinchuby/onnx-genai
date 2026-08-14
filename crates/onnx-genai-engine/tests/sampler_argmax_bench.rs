@@ -248,3 +248,287 @@ fn report_every_wide_argmax_lowering() {
         }
     }
 }
+
+/// Edge-case rows the three lowerings must agree on.
+///
+/// Width is above the tiling threshold so every lowering actually engages, and
+/// each case targets one property: tie position, NaN placement, infinities, and
+/// a winner in the last element where an off-by-one would hide.
+fn parity_cases(vocab: usize) -> Vec<(&'static str, Vec<f32>, bool)> {
+    let mut random = Vec::with_capacity(vocab);
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    for _ in 0..vocab {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        random.push((state >> 40) as f32 / 16_777_216.0 - 0.5);
+    }
+    let mut spiked = random.clone();
+    spiked[vocab / 3] = 9.5;
+    vec![
+        ("random with a clear maximum", spiked, false),
+        ("all equal", vec![2.0; vocab], false),
+        (
+            "tie across tiles",
+            {
+                let mut row = vec![0.0; vocab];
+                row[5] = 4.0;
+                row[vocab - 5] = 4.0;
+                row
+            },
+            false,
+        ),
+        (
+            "maximum in the last element",
+            {
+                let mut row = vec![-3.0; vocab];
+                row[vocab - 1] = -2.0;
+                row
+            },
+            false,
+        ),
+        (
+            "negative infinity everywhere but one",
+            {
+                let mut row = vec![f32::NEG_INFINITY; vocab];
+                row[777] = f32::NEG_INFINITY;
+                row[1_234] = -1.0;
+                row
+            },
+            false,
+        ),
+        (
+            "positive infinity",
+            {
+                let mut row = vec![1.0; vocab];
+                row[9_000 % vocab] = f32::INFINITY;
+                row
+            },
+            false,
+        ),
+        // NaN is undefined for ONNX ArgMax, so the lowerings are allowed to
+        // disagree here; the case is kept to record what each one does.
+        (
+            "leading nan",
+            {
+                let mut row = vec![f32::NAN; vocab];
+                row[4_321] = 1.0;
+                row
+            },
+            true,
+        ),
+        (
+            "nan after the maximum",
+            {
+                let mut row = vec![0.0; vocab];
+                row[100] = 5.0;
+                row[200] = f32::NAN;
+                row
+            },
+            true,
+        ),
+    ]
+}
+
+/// Every lowering must select the same token, on whatever runtime is loaded.
+///
+/// This is the gate for treating the lowerings as interchangeable. It is also
+/// how a runtime whose arg-reduction was rewritten gets checked against the
+/// two lowerings that do not depend on it.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn every_wide_argmax_lowering_selects_the_same_token() {
+    use onnx_genai_engine::pipeline::WideArgReduceLowering;
+    let vocab = 16_384usize;
+    let lowerings = [
+        WideArgReduceLowering::Direct,
+        WideArgReduceLowering::Tiled,
+        WideArgReduceLowering::Fused,
+    ];
+    println!(
+        "runtime: {}",
+        onnx_genai_ort::runtime_capability::loaded_version().unwrap_or_else(|| "unknown".into())
+    );
+
+    let mut sessions = Vec::new();
+    for lowering in lowerings {
+        let mut graph = source_graph_with(vocab as i64);
+        onnx_genai_engine::pipeline::lower_degenerate_arg_reductions(&mut graph, lowering);
+        let model = wrap_model(graph, lowering);
+        let name = format!("parity-{lowering:?}").to_lowercase();
+        let Some(session) = open_session(&model, &name) else {
+            eprintln!("skipping: no CUDA session available");
+            return;
+        };
+        sessions.push((lowering, session));
+    }
+
+    let mut disagreements = 0;
+    for (name, row, nan_undefined) in parity_cases(vocab) {
+        let answers: Vec<(WideArgReduceLowering, i64)> = sessions
+            .iter()
+            .map(|(lowering, (_environment, session))| (*lowering, run_one(session, vocab, &row)))
+            .collect();
+        let first = answers[0].1;
+        let agreed = answers.iter().all(|(_, token)| *token == first);
+        if agreed {
+            println!("  {name:38} all -> {first}");
+            continue;
+        }
+        disagreements += 1;
+        let detail: Vec<String> = answers
+            .iter()
+            .map(|(lowering, token)| format!("{lowering:?}={token}"))
+            .collect();
+        println!("  {name:38} DIFFER {}", detail.join(" "));
+        assert!(
+            nan_undefined,
+            "case {name:?} has a defined answer but the lowerings disagree: {}",
+            detail.join(" ")
+        );
+    }
+    println!("cases disagreeing (all NaN-only, which ONNX leaves undefined): {disagreements}");
+}
+
+fn source_graph_with(vocab: i64) -> GraphProto {
+    let mut graph = source_graph();
+    if let Some(type_proto::Value::TensorType(tensor)) = graph.input[0]
+        .r#type
+        .as_mut()
+        .and_then(|kind| kind.value.as_mut())
+        && let Some(shape) = tensor.shape.as_mut()
+    {
+        shape.dim[1].value = Some(tensor_shape_proto::dimension::Value::DimValue(vocab));
+    }
+    graph
+}
+
+fn wrap_model(
+    graph: GraphProto,
+    lowering: onnx_genai_engine::pipeline::WideArgReduceLowering,
+) -> Vec<u8> {
+    use onnx_genai_engine::pipeline::WideArgReduceLowering;
+    let mut opset_import = vec![OperatorSetIdProto {
+        domain: String::new(),
+        version: 17,
+    }];
+    if lowering == WideArgReduceLowering::Fused {
+        opset_import.push(OperatorSetIdProto {
+            domain: onnx_genai_engine::pipeline::FUSED_ARGMAX_DOMAIN.to_string(),
+            version: 1,
+        });
+    }
+    ModelProto {
+        ir_version: 8,
+        producer_name: "sampler-argmax-parity".into(),
+        opset_import,
+        graph: Some(graph),
+        ..Default::default()
+    }
+    .encode_to_vec()
+}
+
+fn open_session(model: &[u8], name: &str) -> Option<(Environment, Session)> {
+    let directory = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("argmax-parity");
+    std::fs::create_dir_all(&directory).expect("model directory");
+    let path = directory.join(format!("{name}.onnx"));
+    std::fs::write(&path, model).expect("write model");
+    let environment = Environment::new("sampler-argmax-parity").ok()?;
+    let options = SessionOptions::with_execution_provider(ep_selection("cuda"));
+    let session = Session::new(&environment, &path, options).ok()?;
+    Some((environment, session))
+}
+
+fn run_one(session: &Session, vocab: usize, row: &[f32]) -> i64 {
+    let input = Value::from_slice_f32(row, &[1, vocab as i64]).expect("logits");
+    let outputs = session.run(&[("logits", &input)]).expect("run");
+    outputs[0].to_vec_i64().expect("token")[0]
+}
+
+/// The runtime's own `ArgMax` must match a host reference over many random
+/// decode-shaped rows.
+///
+/// The single-case checks above only prove a lowering is right for the inputs
+/// they name. A reduction that splits a row across cooperating blocks can be
+/// correct for a row with one clear maximum and wrong for one whose maximum is
+/// duplicated, or whose runner-up sits in another block, so this sweeps
+/// distributions that make those cases likely at the real decode width.
+#[test]
+#[ignore = "requires a CUDA device"]
+fn direct_argmax_matches_a_host_reference_over_random_rows() {
+    use onnx_genai_engine::pipeline::WideArgReduceLowering;
+    let vocab = VOCAB as usize;
+    let mut graph = source_graph();
+    onnx_genai_engine::pipeline::lower_degenerate_arg_reductions(
+        &mut graph,
+        WideArgReduceLowering::Direct,
+    );
+    let model = wrap_model(graph, WideArgReduceLowering::Direct);
+    let Some((_environment, session)) = open_session(&model, "direct-random") else {
+        eprintln!("skipping: no CUDA session available");
+        return;
+    };
+    println!(
+        "runtime: {}",
+        onnx_genai_ort::runtime_capability::loaded_version().unwrap_or_else(|| "unknown".into())
+    );
+
+    let mut state = 0x1234_5678_9ABC_DEF0u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut failures = Vec::new();
+    const ROWS: usize = 240;
+    for case in 0..ROWS {
+        // Quantising to a few distinct levels makes exact ties common, which is
+        // where a cross-block reduction has to agree with a serial scan on
+        // which index wins.
+        let levels = 1u64 << (case % 6 + 1);
+        let mut row: Vec<f32> = (0..vocab)
+            .map(|_| (next() % levels) as f32 / levels as f32 - 0.5)
+            .collect();
+        // Half the cases also get a unique maximum somewhere in the row.
+        if case % 2 == 0 {
+            row[(next() as usize) % vocab] = 8.0;
+        }
+        let expected = row
+            .iter()
+            .enumerate()
+            .fold(
+                (f32::NEG_INFINITY, 0usize),
+                |(best, at), (index, &value)| {
+                    if value > best {
+                        (value, index)
+                    } else {
+                        (best, at)
+                    }
+                },
+            )
+            .1 as i64;
+        let got = run_one(&session, vocab, &row);
+        if got != expected {
+            let ties = row
+                .iter()
+                .filter(|value| **value == row[expected as usize])
+                .count();
+            failures.push(format!(
+                "case {case}: levels={levels} expected {expected} got {got} \
+                 (value at expected {}, value at got {}, {ties} elements share the maximum)",
+                row[expected as usize], row[got as usize]
+            ));
+        }
+    }
+    if !failures.is_empty() {
+        for failure in failures.iter().take(8) {
+            println!("  {failure}");
+        }
+        panic!(
+            "{}/{ROWS} random rows selected the wrong index",
+            failures.len()
+        );
+    }
+    println!("all {ROWS} random rows matched the host reference");
+}
