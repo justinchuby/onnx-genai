@@ -6,7 +6,8 @@
 #![allow(clippy::field_reassign_with_default)]
 
 use onnx_genai_engine::{
-    Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest, PipelineGenerateRequest,
+    Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest,
+    PipelineGenerateRequest, pipeline::WorkflowOutputRole,
 };
 use onnx_genai_ort::{DataType, Value};
 use std::path::PathBuf;
@@ -28,6 +29,49 @@ fn options(max_new_tokens: usize) -> GenerateOptions {
     options
 }
 
+fn decoder_batch_request(
+    input_ids: &[i64],
+    batch: i64,
+    sequence: i64,
+    prompt_lengths: &[i64],
+    active: &[bool],
+    max_new_tokens: usize,
+) -> anyhow::Result<PipelineGenerateRequest> {
+    let bool_bytes = active.iter().map(|value| u8::from(*value)).collect();
+    let zeros = vec![0_i64; usize::try_from(batch)?];
+    let ones = vec![1_i64; usize::try_from(batch)?];
+    Ok(PipelineGenerateRequest::new(GenerateRequest {
+        prompt: GeneratePrompt::TokenIds(vec![0]),
+        options: options(max_new_tokens),
+    })
+    .with_input(
+        "request.input_ids",
+        Value::from_slice_i64(input_ids, &[batch, sequence])?,
+    )
+    .with_input(
+        "request.prompt_lengths",
+        Value::from_slice_i64(prompt_lengths, &[batch])?,
+    )
+    .with_input(
+        "package.active",
+        Value::from_raw_bytes(bool_bytes, &[batch], DataType::Bool)?,
+    )
+    .with_input(
+        "package.not_done",
+        Value::from_raw_bytes(vec![0; usize::try_from(batch)?], &[batch], DataType::Bool)?,
+    )
+    .with_input("package.one_token", Value::from_slice_i64(&ones, &[batch])?)
+    .with_input("package.slot_ids", Value::from_slice_i64(&zeros, &[batch])?)
+    .with_input(
+        "package.cache_lengths",
+        Value::from_slice_i64(&zeros, &[batch])?,
+    )
+    .with_input(
+        "package.zero_batch",
+        Value::from_slice_i64(&zeros, &[batch])?,
+    ))
+}
+
 #[test]
 fn mobius_decoder_workflow_executes() -> anyhow::Result<()> {
     let mut engine = Engine::from_pipeline_dir(&root("decoder")?, EngineConfig::default())?;
@@ -35,7 +79,75 @@ fn mobius_decoder_workflow_executes() -> anyhow::Result<()> {
         prompt: GeneratePrompt::TokenIds(vec![4, 5]),
         options: options(3),
     }))?;
-    assert_eq!(output["tokens"].to_vec_i64()?.len(), 3);
+    assert_eq!(
+        engine
+            .output_for_role(&output, WorkflowOutputRole::Tokens)
+            .expect("decoder must emit tokens")
+            .to_vec_i64()?
+            .len(),
+        3
+    );
+    Ok(())
+}
+
+#[test]
+fn mobius_decoder_rows_match_independent_runs_and_dynamic_batch_replay() -> anyhow::Result<()> {
+    let mut engine = Engine::from_pipeline_dir(&root("decoder")?, EngineConfig::default())?;
+    let first = decoder_batch_request(&[4, 5], 1, 2, &[2], &[true], 3)?;
+    let first_output = engine.run_pipeline(first)?;
+    let first_tokens = engine
+        .output_for_role(&first_output, WorkflowOutputRole::Tokens)
+        .expect("batch-one decoder must emit tokens")
+        .to_vec_i64()?;
+
+    let batched = decoder_batch_request(&[4, 5, 6, 0], 2, 2, &[2, 1], &[true, true], 3)?;
+    let batched_output = engine.run_pipeline(batched)?;
+    let rows = engine.output_rows_for_role(&batched_output, WorkflowOutputRole::Tokens);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0, 0);
+    assert_eq!(rows[0].1.to_vec_i64()?, first_tokens);
+
+    let mut independent = Engine::from_pipeline_dir(&root("decoder")?, EngineConfig::default())?;
+    let second = decoder_batch_request(&[6, 0], 1, 2, &[1], &[true], 3)?;
+    let second_output = independent.run_pipeline(second)?;
+    let second_tokens = independent
+        .output_for_role(&second_output, WorkflowOutputRole::Tokens)
+        .expect("independent second row must emit tokens")
+        .to_vec_i64()?;
+    assert_eq!(rows[1].0, 1);
+    assert_eq!(rows[1].1.to_vec_i64()?, second_tokens);
+
+    let inactive = decoder_batch_request(&[4, 5, 6, 0], 2, 2, &[2, 1], &[true, false], 3)?;
+    let inactive_output = engine.run_pipeline(inactive)?;
+    let inactive_rows = engine.output_rows_for_role(&inactive_output, WorkflowOutputRole::Tokens);
+    assert_eq!(inactive_rows.len(), 1);
+    assert_eq!(inactive_rows[0].0, 0);
+    assert_eq!(inactive_rows[0].1.to_vec_i64()?, first_tokens);
+
+    let first_inactive = decoder_batch_request(&[4, 5, 6, 0], 2, 2, &[2, 1], &[false, true], 3)?;
+    let first_inactive_output = engine.run_pipeline(first_inactive)?;
+    let first_inactive_rows =
+        engine.output_rows_for_role(&first_inactive_output, WorkflowOutputRole::Tokens);
+    assert_eq!(first_inactive_rows.len(), 1);
+    assert_eq!(first_inactive_rows[0].0, 1);
+    assert_eq!(first_inactive_rows[0].1.to_vec_i64()?, second_tokens);
+    assert_eq!(
+        engine
+            .output_for_role(&first_inactive_output, WorkflowOutputRole::Tokens)
+            .expect("semantic lookup must return the first emitted row")
+            .to_vec_i64()?,
+        second_tokens
+    );
+
+    let replay = decoder_batch_request(&[4, 5], 1, 2, &[2], &[true], 3)?;
+    let replay_output = engine.run_pipeline(replay)?;
+    assert_eq!(
+        engine
+            .output_for_role(&replay_output, WorkflowOutputRole::Tokens)
+            .expect("batch-one replay must emit tokens")
+            .to_vec_i64()?,
+        first_tokens
+    );
     Ok(())
 }
 
@@ -57,7 +169,13 @@ fn mobius_vlm_workflow_executes_complete_image_path() -> anyhow::Result<()> {
         Value::from_raw_bytes(png, &[png_len], DataType::Uint8)?,
     );
     let output = engine.run_pipeline(request)?;
-    assert_eq!(output["tokens"].shape(), [1, 2]);
+    assert_eq!(
+        engine
+            .output_for_role(&output, WorkflowOutputRole::Tokens)
+            .expect("VLM must emit tokens")
+            .shape(),
+        [1, 2]
+    );
     Ok(())
 }
 

@@ -1232,12 +1232,16 @@ impl PipelineEngine {
                     emit_workflow_rows(
                         values,
                         &tensor,
+                        value,
                         output,
+                        &output_contract.contract,
                         mode,
                         guards.as_deref(),
                         lengths.as_deref(),
                         emit_counts,
                         telemetry,
+                        symbols,
+                        dynamic_symbols,
                     )?;
                     telemetry.record_stage("emit", emit_started.elapsed().as_nanos());
                     return Ok(());
@@ -1322,7 +1326,11 @@ impl PipelineEngine {
                 let island = self.execution_islands.get(*id).with_context(|| {
                     format!("workflow references unknown execution island {id}")
                 })?;
-                if island.uses_override(component_overrides) {
+                let zero_sized_fallback = island.has_zero_sized_input(values)?;
+                if island.uses_override(component_overrides) || zero_sized_fallback {
+                    if zero_sized_fallback {
+                        island.prepare_zero_sized_fallback();
+                    }
                     self.run_workflow_node(
                         island.fallback(),
                         workflow,
@@ -2826,12 +2834,16 @@ fn slice_workflow_prefix(value: &Value, valid_length: usize) -> anyhow::Result<V
 fn emit_workflow_rows(
     values: &mut PipelineTensors,
     tensor: &Value,
+    value_name: &str,
     output: &str,
+    output_contract: &onnx_genai_metadata::TensorContract,
     mode: &WorkflowEmitMode,
     guards: Option<&[bool]>,
     lengths: Option<&[usize]>,
     emit_counts: &mut HashMap<String, usize>,
     telemetry: &mut WorkflowRunTelemetry,
+    symbols: &HashMap<String, i64>,
+    dynamic_symbols: &std::collections::HashSet<String>,
 ) -> anyhow::Result<()> {
     let rows = tensor
         .shape()
@@ -2855,6 +2867,26 @@ fn emit_workflow_rows(
         }
         let length = lengths.map(|values| values[if values.len() == 1 { 0 } else { row }]);
         let emitted = slice_workflow_row(tensor, row, length)?;
+        let validation_contract = if length.is_some() || matches!(mode, WorkflowEmitMode::Append) {
+            emit_chunk_contract(output_contract, &emitted)?
+        } else {
+            output_contract.clone()
+        };
+        let mut row_symbols = symbols.clone();
+        if let Some(TensorDimension::Symbol(batch)) = validation_contract
+            .shape
+            .as_ref()
+            .and_then(|shape| shape.first())
+        {
+            row_symbols.insert(batch.clone(), 1);
+        }
+        validate_workflow_value(
+            value_name,
+            &emitted,
+            &validation_contract,
+            &mut row_symbols,
+            dynamic_symbols,
+        )?;
         if telemetry.first_emit_ns.is_none() {
             telemetry.first_emit_ns = telemetry
                 .started
@@ -3180,15 +3212,22 @@ mod workflow_scalar_tests {
         let mut values = PipelineTensors::new();
         let mut counts = HashMap::new();
         let mut telemetry = WorkflowRunTelemetry::default();
+        let contract: TensorContract =
+            serde_yaml::from_str("{ dtype: int64, rank: 2, shape: [batch, sequence] }")
+                .expect("contract");
         emit_workflow_rows(
             &mut values,
             &tensor,
+            "token",
             "tokens",
+            &contract,
             &WorkflowEmitMode::Replace,
-            Some(&[true, false]),
-            Some(&[2, 1]),
+            Some(&[true, false][..]),
+            Some(&[2, 1][..]),
             &mut counts,
             &mut telemetry,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
         )
         .expect("row emit");
 
@@ -3208,15 +3247,22 @@ mod workflow_scalar_tests {
         let mut values = PipelineTensors::new();
         let mut counts = HashMap::new();
         let mut telemetry = WorkflowRunTelemetry::default();
+        let contract: TensorContract =
+            serde_yaml::from_str("{ dtype: int64, rank: 2, shape: [batch, sequence] }")
+                .expect("contract");
         emit_workflow_rows(
             &mut values,
             &tensor,
+            "token",
             "tokens",
+            &contract,
             &WorkflowEmitMode::Replace,
             None,
-            Some(&[2]),
+            Some(&[2][..]),
             &mut counts,
             &mut telemetry,
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
         )
         .expect("row emit");
         assert_eq!(
@@ -3224,6 +3270,30 @@ mod workflow_scalar_tests {
             [10, 11]
         );
         assert!(!values.contains_key("tokens"));
+    }
+
+    #[test]
+    fn row_replace_without_ragged_length_preserves_declared_extent_validation() {
+        let tensor = Value::from_slice_i64(&[10, 11, 12], &[1, 3]).expect("row tensor");
+        let contract: TensorContract =
+            serde_yaml::from_str("{ dtype: int64, rank: 2, shape: [batch, 4] }").expect("contract");
+        let error = emit_workflow_rows(
+            &mut PipelineTensors::new(),
+            &tensor,
+            "token",
+            "tokens",
+            &contract,
+            &WorkflowEmitMode::Replace,
+            Some(&[true][..]),
+            None,
+            &mut HashMap::new(),
+            &mut WorkflowRunTelemetry::default(),
+            &HashMap::new(),
+            &std::collections::HashSet::new(),
+        )
+        .expect_err("fixed output extent must be checked");
+        let message = error.to_string();
+        assert!(message.contains("axis 1 is 3, expected 4"), "{message}");
     }
 
     #[test]

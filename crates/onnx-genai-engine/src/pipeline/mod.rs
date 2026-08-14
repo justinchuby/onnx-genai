@@ -15,7 +15,7 @@ use anyhow::Context;
 use onnx_genai_metadata::{
     CompiledWorkflow, ComponentImplementation, DeviceKind, PreprocessingSpec, RuntimeInputRole,
     ScalarValue, TensorContract, TensorDimension, WorkflowEmitMode, WorkflowInputSource,
-    WorkflowNode, WorkflowOutputRole, WorkflowSpec,
+    WorkflowNode, WorkflowSpec,
 };
 use onnx_genai_ort::{DataType, PipelineModelDirectory, PipelineModels, SessionOptions, Value};
 use std::cell::{Cell, RefCell};
@@ -27,6 +27,7 @@ mod islands;
 mod workflow;
 
 pub use islands::ExecutionIslandDiagnostic;
+pub use onnx_genai_metadata::WorkflowOutputRole;
 pub use workflow::{WorkflowExecutionPlan, WorkflowPerformanceDiagnostic};
 
 pub type PipelineTensors = HashMap<String, Value>;
@@ -353,6 +354,55 @@ impl PipelineEngine {
         request: PipelineGenerateRequest,
     ) -> anyhow::Result<PipelineTensors> {
         self.run_workflow(request)
+    }
+
+    /// Return the aggregate output or the first row-wise output for a semantic role.
+    pub fn output_for_role<'a>(
+        &self,
+        outputs: &'a PipelineTensors,
+        role: WorkflowOutputRole,
+    ) -> Option<&'a Value> {
+        let name = self
+            .workflow
+            .outputs
+            .iter()
+            .find(|(_, output)| output.role == role)
+            .map(|(name, _)| name)?;
+        outputs.get(name).or_else(|| {
+            self.output_rows_for_role(outputs, role)
+                .into_iter()
+                .next()
+                .map(|(_, value)| value)
+        })
+    }
+
+    /// Return explicit row-wise outputs for a semantic role, ordered by row index.
+    pub fn output_rows_for_role<'a>(
+        &self,
+        outputs: &'a PipelineTensors,
+        role: WorkflowOutputRole,
+    ) -> Vec<(usize, &'a Value)> {
+        let Some(name) = self
+            .workflow
+            .outputs
+            .iter()
+            .find(|(_, output)| output.role == role)
+            .map(|(name, _)| name)
+        else {
+            return Vec::new();
+        };
+        let prefix = format!("{name}.row.");
+        let mut rows = outputs
+            .iter()
+            .filter_map(|(output, value)| {
+                output
+                    .strip_prefix(&prefix)
+                    .and_then(|suffix| suffix.parse::<usize>().ok())
+                    .map(|row| (row, value))
+            })
+            .collect::<Vec<_>>();
+        rows.sort_unstable_by_key(|(row, _)| *row);
+        rows
     }
 
     /// Compile request bindings and reusable interpreter state for repeated execution.
