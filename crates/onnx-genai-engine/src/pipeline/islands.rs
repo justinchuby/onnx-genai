@@ -49,6 +49,14 @@ pub struct ExecutionIslandDiagnostic {
     pub device_memory_min_free_bytes: Option<u64>,
     pub observed_device_memory_high_watermark_bytes: Option<u64>,
     pub total_run_ns: u128,
+    /// Host time resolving workflow values and pointers for the bound inputs.
+    pub resolve_ns: u128,
+    /// Host time refreshing stable input buffers that changed since the last run.
+    pub refresh_ns: u128,
+    /// Time inside `OrtSession::Run`, including any ORT-managed graph replay.
+    pub session_run_ns: u128,
+    /// Host time retaining or copying boundary outputs back into workflow values.
+    pub store_ns: u128,
     pub fallback_reason: Option<String>,
 }
 
@@ -58,8 +66,6 @@ pub(crate) struct IslandInvocation {
     pub inputs: BTreeMap<String, String>,
     pub outputs: BTreeMap<String, String>,
 }
-
-type IslandBindingKey = Vec<(String, Vec<i64>)>;
 
 pub(crate) struct ExecutionIsland {
     pub id: usize,
@@ -74,7 +80,7 @@ pub(crate) struct ExecutionIsland {
     capture_eligible: bool,
     capture_disabled: Cell<bool>,
     device: String,
-    bindings: RefCell<HashMap<IslandBindingKey, StableIslandBinding>>,
+    bindings: RefCell<Vec<StableIslandBinding>>,
     device_allocator: Option<Allocator>,
     linked_node_count: usize,
     external_initializer_bytes: u64,
@@ -99,25 +105,68 @@ pub(crate) struct ExecutionIsland {
     device_memory_baseline_free_bytes: Cell<Option<u64>>,
     device_memory_min_free_bytes: Cell<Option<u64>>,
     total_run_ns: Cell<u128>,
+    resolve_ns: Cell<u128>,
+    refresh_ns: Cell<u128>,
+    session_run_ns: Cell<u128>,
+    store_ns: Cell<u128>,
     fallback_reason: RefCell<Option<String>>,
     execution_generation: Cell<u64>,
+}
+
+/// Per-input dispatch decided once, when a stable binding is created.
+///
+/// The refresh path then reads three machine words per input instead of hashing
+/// names and formatting dtypes on every step. `destination_ptr` is recorded at
+/// construction because ORT bakes device addresses into a captured graph, so a
+/// stable input's buffer address never moves afterwards.
+struct IslandInputSlot {
+    shared_service: bool,
+    immutable: bool,
+    destination_ptr: usize,
 }
 
 struct StableIslandBinding {
     binding: IoBinding,
     inputs: Vec<(String, Value)>,
     outputs: Vec<(String, Value)>,
+    slots: Vec<IslandInputSlot>,
+    shape_key: Vec<(onnx_genai_ort::DataType, Vec<i64>)>,
     captured: bool,
     graph_id: i32,
     service_generation: u64,
     source_ptrs: Vec<usize>,
 }
 
+impl StableIslandBinding {
+    /// Match a resolved input list against this binding's dtypes and extents.
+    ///
+    /// Graph buckets are keyed by shape, so a serving batch that changes extent
+    /// selects a different binding — and therefore a different captured graph —
+    /// without ever rebinding this one.
+    fn matches(&self, resolved: &[(&str, &Value)]) -> bool {
+        self.shape_key.len() == resolved.len()
+            && self
+                .shape_key
+                .iter()
+                .zip(resolved)
+                .all(|((dtype, shape), (_, value))| {
+                    *dtype == value.dtype() && shape.as_slice() == value.shape()
+                })
+    }
+}
+
+/// Capture the dtype and extents a stable binding was built for.
+fn shape_key(resolved: &[(&str, &Value)]) -> Vec<(onnx_genai_ort::DataType, Vec<i64>)> {
+    resolved
+        .iter()
+        .map(|(_, value)| (value.dtype(), value.shape().to_vec()))
+        .collect()
+}
+
 impl ExecutionIsland {
     pub(crate) fn begin_execution(&self, generation: u64) {
         self.execution_generation.set(generation);
     }
-
     pub(crate) fn clear_bindings(&mut self) {
         self.bindings.get_mut().clear();
     }
@@ -254,6 +303,10 @@ impl ExecutionIsland {
                 .zip(self.device_memory_min_free_bytes.get())
                 .map(|(baseline, minimum)| baseline.saturating_sub(minimum)),
             total_run_ns: self.total_run_ns.get(),
+            resolve_ns: self.resolve_ns.get(),
+            refresh_ns: self.refresh_ns.get(),
+            session_run_ns: self.session_run_ns.get(),
+            store_ns: self.store_ns.get(),
             fallback_reason: self.fallback_reason.borrow().clone(),
         }
     }
@@ -302,40 +355,35 @@ impl ExecutionIsland {
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let signature = resolved
-            .iter()
-            .map(|(_, value)| (format!("{:?}", value.dtype()), value.shape().to_vec()))
-            .collect::<Vec<_>>();
         self.runs.set(self.runs.get() + 1);
+        self.resolve_ns
+            .set(self.resolve_ns.get() + started.elapsed().as_nanos());
 
         let mut bindings = self.bindings.borrow_mut();
-        if let Some(stable) = bindings.get_mut(&signature) {
+        if let Some(stable) = bindings
+            .iter_mut()
+            .find(|candidate| candidate.matches(&resolved))
+        {
             self.stable_binding_runs
                 .set(self.stable_binding_runs.get() + 1);
+            let refresh_started = Instant::now();
             let reset_services = stable.service_generation != self.execution_generation.get();
-            for (index, ((name, source), (_, destination))) in
-                resolved.iter().zip(&stable.inputs).enumerate()
-            {
+            for index in 0..resolved.len() {
+                let (name, source) = resolved[index];
                 let source_ptr = source_ptrs[index];
                 if source.numel() == 0 {
                     continue;
                 }
-                let shared_service = self.shared_buffer_inputs.contains_key(*name);
-                let aliases_destination = source_ptr
-                    == destination.data_ptr_addr().with_context(|| {
-                        format!(
-                            "execution island {} stable input '{name}' lost its tensor data",
-                            self.id
-                        )
-                    })?;
-                let unchanged_immutable = !reset_services
-                    && self.immutable_inputs.contains(*name)
-                    && source_ptr == stable.source_ptrs[index];
-                if (shared_service && !reset_services)
-                    || (!shared_service && (aliases_destination || unchanged_immutable))
+                let slot = &stable.slots[index];
+                let aliases_destination = source_ptr == slot.destination_ptr;
+                let unchanged_immutable =
+                    !reset_services && slot.immutable && source_ptr == stable.source_ptrs[index];
+                if (slot.shared_service && !reset_services)
+                    || (!slot.shared_service && (aliases_destination || unchanged_immutable))
                 {
                     continue;
                 }
+                let destination = &stable.inputs[index].1;
                 self.record_copy(source, destination).with_context(|| {
                     format!(
                         "execution island {} could not classify input '{name}'",
@@ -357,6 +405,9 @@ impl ExecutionIsland {
                 stable.source_ptrs[index] = source_ptr;
             }
             stable.service_generation = self.execution_generation.get();
+            self.refresh_ns
+                .set(self.refresh_ns.get() + refresh_started.elapsed().as_nanos());
+            let run_started = Instant::now();
             let replay = stable.captured;
             let capture_enabled = self.capture_eligible
                 && self.session.graph_capture()
@@ -402,6 +453,9 @@ impl ExecutionIsland {
                     stable.captured = true;
                 }
             }
+            self.session_run_ns
+                .set(self.session_run_ns.get() + run_started.elapsed().as_nanos());
+            let store_started = Instant::now();
             let mut pending_copies = false;
             for (port, output) in &stable.outputs {
                 let value_ref = &self.outputs[port];
@@ -420,12 +474,15 @@ impl ExecutionIsland {
                 self.record_device_synchronization();
                 self.session.synchronize_device()?;
             }
+            self.store_ns
+                .set(self.store_ns.get() + store_started.elapsed().as_nanos());
             self.record_elapsed(started);
             return Ok(());
         }
 
         // Warmup resolves any artifact-inferred dynamic output extents. The next
         // equal-shape run uses stable buffers and becomes capture/replay eligible.
+        let shape_key = shape_key(&resolved);
         if self.device_allocator.is_some() {
             let allocator = self.device_allocator.as_ref().with_context(|| {
                 format!(
@@ -479,7 +536,9 @@ impl ExecutionIsland {
                 // Populate ORT's non-arena constants and discover output extents
                 // without consuming a graph id. The stable binding is captured
                 // only on its next run, after every OrtValue address is fixed.
-                self.session.run_with_binding_graph(&binding, -1)?;
+                self.session
+                    .run_with_binding_graph(&binding, -1)
+                    .with_context(|| format!("island {} discovery run", self.id))?;
             } else {
                 self.session.run_with_binding(&binding)?;
             }
@@ -538,7 +597,9 @@ impl ExecutionIsland {
             // address, so discovery output is not a semantic substitute.
             self.session_runs.set(self.session_runs.get() + 1);
             if self.session.graph_capture() {
-                self.session.run_with_binding_graph(&binding, -1)?;
+                self.session
+                    .run_with_binding_graph(&binding, -1)
+                    .with_context(|| format!("island {} alias rerun", self.id))?;
             } else {
                 self.session.run_with_binding(&binding)?;
             }
@@ -556,18 +617,18 @@ impl ExecutionIsland {
                 self.session.synchronize_device()?;
             }
             self.record_stable_binding_bytes(&stable_inputs, &stable_outputs);
-            bindings.insert(
-                signature,
-                StableIslandBinding {
-                    binding,
-                    inputs: stable_inputs,
-                    outputs: stable_outputs,
-                    captured: false,
-                    graph_id,
-                    service_generation: self.execution_generation.get(),
-                    source_ptrs,
-                },
-            );
+            let slots = self.lower_input_slots(&stable_inputs)?;
+            bindings.push(StableIslandBinding {
+                binding,
+                inputs: stable_inputs,
+                outputs: stable_outputs,
+                slots,
+                shape_key,
+                captured: false,
+                graph_id,
+                service_generation: self.execution_generation.get(),
+                source_ptrs,
+            });
             self.record_elapsed(started);
             return Ok(());
         }
@@ -597,18 +658,18 @@ impl ExecutionIsland {
         let graph_id = self.next_graph_id.get();
         self.next_graph_id.set(graph_id + 1);
         self.record_stable_binding_bytes(&stable_inputs, &stable_outputs);
-        bindings.insert(
-            signature,
-            StableIslandBinding {
-                binding,
-                inputs: stable_inputs,
-                outputs: stable_outputs,
-                captured: false,
-                graph_id,
-                service_generation: self.execution_generation.get(),
-                source_ptrs,
-            },
-        );
+        let slots = self.lower_input_slots(&stable_inputs)?;
+        bindings.push(StableIslandBinding {
+            binding,
+            inputs: stable_inputs,
+            outputs: stable_outputs,
+            slots,
+            shape_key,
+            captured: false,
+            graph_id,
+            service_generation: self.execution_generation.get(),
+            source_ptrs,
+        });
         self.store_outputs(values, produced)?;
         self.record_elapsed(started);
         Ok(())
@@ -618,6 +679,32 @@ impl ExecutionIsland {
         self.record_device_memory_if_due();
         self.total_run_ns
             .set(self.total_run_ns.get() + started.elapsed().as_nanos());
+    }
+
+    /// Resolve every input's dispatch decision once, when its binding is built.
+    fn lower_input_slots(
+        &self,
+        stable_inputs: &[(String, Value)],
+    ) -> anyhow::Result<Vec<IslandInputSlot>> {
+        stable_inputs
+            .iter()
+            .map(|(name, destination)| {
+                Ok(IslandInputSlot {
+                    shared_service: self.shared_buffer_inputs.contains_key(name),
+                    immutable: self.immutable_inputs.contains(name),
+                    destination_ptr: if destination.numel() == 0 {
+                        0
+                    } else {
+                        destination.data_ptr_addr().with_context(|| {
+                            format!(
+                                "execution island {} stable input '{name}' has no tensor data",
+                                self.id
+                            )
+                        })?
+                    },
+                })
+            })
+            .collect()
     }
 
     fn record_device_memory_if_due(&self) {
@@ -1059,7 +1146,11 @@ fn v1_policy_contract_is_batching_safe(
         })
     };
     let dimension = |tensor: &onnx_genai_metadata::TensorContract, axis: usize| {
-        tensor.shape.as_deref().and_then(|shape| shape.get(axis)).cloned()
+        tensor
+            .shape
+            .as_deref()
+            .and_then(|shape| shape.get(axis))
+            .cloned()
     };
     let row_axis = |tensor: &onnx_genai_metadata::TensorContract| {
         matches!(
@@ -1075,7 +1166,9 @@ fn v1_policy_contract_is_batching_safe(
     };
     let bound_roles = |roles: &[&str]| -> bool {
         contract.bindings.len() == roles.len()
-            && roles.iter().all(|role| contract.bindings.contains_key(*role))
+            && roles
+                .iter()
+                .all(|role| contract.bindings.contains_key(*role))
     };
     match contract.id.as_str() {
         "onnx-genai.token-sampler" => {
@@ -1511,7 +1604,7 @@ fn build_execution_island(
         capture_eligible,
         capture_disabled: Cell::new(false),
         device: device.to_string(),
-        bindings: RefCell::new(HashMap::new()),
+        bindings: RefCell::new(Vec::new()),
         device_allocator,
         linked_node_count: linked.node_count,
         external_initializer_bytes,
@@ -1536,6 +1629,10 @@ fn build_execution_island(
         device_memory_baseline_free_bytes: Cell::new(None),
         device_memory_min_free_bytes: Cell::new(None),
         total_run_ns: Cell::new(0),
+        resolve_ns: Cell::new(0),
+        refresh_ns: Cell::new(0),
+        session_run_ns: Cell::new(0),
+        store_ns: Cell::new(0),
         fallback_reason: RefCell::new(if let Some(reason) = capture_session_failure {
             Some(reason)
         } else if !device.starts_with("cuda:") {

@@ -1486,7 +1486,9 @@ impl PipelineEngine {
                 if !stable.captured {
                     session.synchronize_device()?;
                 }
-                session.run_with_binding_graph(&stable.binding, stable.graph_id)?;
+                session
+                    .run_with_binding_graph(&stable.binding, stable.graph_id)
+                    .with_context(|| format!("stable component '{component}' graph run"))?;
                 stable.captured = true;
             } else {
                 session.run_with_binding(&stable.binding)?;
@@ -1638,7 +1640,9 @@ impl PipelineEngine {
         if session.graph_capture() {
             // Warm the final fixed-address binding without capturing. The next
             // equal-shape invocation owns the non-negative graph id.
-            session.run_with_binding_graph(&binding, -1)?;
+            session
+                .run_with_binding_graph(&binding, -1)
+                .with_context(|| format!("stable component '{component}' warm run"))?;
         } else {
             session.run_with_binding(&binding)?;
         }
@@ -2806,7 +2810,180 @@ pub(super) fn compile_aliasable_output_values(
 
     let mut outputs = std::collections::HashSet::new();
     collect_single_run_outputs(node, false, &mut outputs);
+    collect_recurring_aliasable_outputs(node, &mut outputs);
     outputs
+}
+
+/// One flattened program position inside a loop body.
+#[derive(Default)]
+struct BodySlot {
+    /// Values this position writes when it is a single `Invoke`, and therefore
+    /// the values that can be retained as views over its stable output buffers.
+    invoke_outputs: Vec<String>,
+    used: std::collections::HashSet<String>,
+    /// Values this position consumes in a way that must observe an independent
+    /// snapshot rather than a live view of the producer's buffer.
+    snapshot_required: std::collections::HashSet<String>,
+}
+
+/// Admit a loop-produced value as a view over its producer's stable buffer.
+///
+/// A recurring producer keeps one set of output buffers for the whole session,
+/// so retaining a view of an output — instead of allocating and copying a fresh
+/// tensor every iteration — is correct exactly when every reader observes the
+/// buffer before the producer writes it again. Each node appears once in the
+/// compiled graph, so one iteration is precisely the window between two writes,
+/// and the check reduces to program order inside the body:
+///
+/// * a direct read of the value must not sit before its producer, and
+/// * a read through the loop carry must not sit after it, because that name is
+///   re-bound to the producer's buffer at the top of the next iteration.
+///
+/// A reader that has to keep an independent snapshot — an event emit, which
+/// retains one tensor per occurrence, or a device transfer — disqualifies the
+/// value outright.
+fn collect_recurring_aliasable_outputs(
+    node: &WorkflowNode,
+    aliasable: &mut std::collections::HashSet<String>,
+) {
+    fn flatten(node: &WorkflowNode, slots: &mut Vec<BodySlot>) {
+        if let WorkflowNode::Sequence { nodes } = node {
+            for child in nodes {
+                flatten(child, slots);
+            }
+            return;
+        }
+        let mut slot = BodySlot::default();
+        describe(node, &mut slot, true);
+        slots.push(slot);
+    }
+
+    fn describe(node: &WorkflowNode, slot: &mut BodySlot, top: bool) {
+        match node {
+            WorkflowNode::Sequence { nodes } => {
+                for child in nodes {
+                    describe(child, slot, false);
+                }
+            }
+            WorkflowNode::Invoke {
+                inputs, outputs, ..
+            } => {
+                slot.used.extend(inputs.values().cloned());
+                if top {
+                    slot.invoke_outputs.extend(outputs.values().cloned());
+                }
+            }
+            WorkflowNode::Emit {
+                value,
+                when,
+                valid_length,
+                row_ids,
+                mode,
+                ..
+            } => {
+                slot.used.insert(value.clone());
+                slot.used
+                    .extend([when, valid_length, row_ids].into_iter().flatten().cloned());
+                if matches!(mode, WorkflowEmitMode::Event) {
+                    slot.snapshot_required.insert(value.clone());
+                }
+            }
+            WorkflowNode::Transfer { input, .. } => {
+                slot.used.insert(input.clone());
+                slot.snapshot_required.insert(input.clone());
+            }
+            WorkflowNode::Loop {
+                setup,
+                body,
+                continue_when,
+                max_iterations,
+                carried,
+                ..
+            } => {
+                describe(setup, slot, false);
+                describe(body, slot, false);
+                slot.used.insert(continue_when.clone());
+                slot.used.insert(max_iterations.clone());
+                for carry in carried {
+                    slot.used.insert(carry.current.clone());
+                }
+            }
+            WorkflowNode::Branch { cases, default, .. } => {
+                for case in cases.values() {
+                    describe(case, slot, false);
+                }
+                if let Some(default) = default {
+                    describe(default, slot, false);
+                }
+            }
+            WorkflowNode::ExecutionIsland { .. } => {}
+        }
+    }
+
+    let WorkflowNode::Loop {
+        setup,
+        body,
+        carried,
+        ..
+    } = node
+    else {
+        match node {
+            WorkflowNode::Sequence { nodes } => {
+                for child in nodes {
+                    collect_recurring_aliasable_outputs(child, aliasable);
+                }
+            }
+            WorkflowNode::Branch { cases, default, .. } => {
+                for case in cases.values() {
+                    collect_recurring_aliasable_outputs(case, aliasable);
+                }
+                if let Some(default) = default {
+                    collect_recurring_aliasable_outputs(default, aliasable);
+                }
+            }
+            _ => {}
+        }
+        return;
+    };
+    collect_recurring_aliasable_outputs(setup, aliasable);
+    collect_recurring_aliasable_outputs(body, aliasable);
+
+    let mut slots = Vec::new();
+    flatten(body, &mut slots);
+    for (position, slot) in slots.iter().enumerate() {
+        for value in &slot.invoke_outputs {
+            let snapshot_required = slots
+                .iter()
+                .any(|other| other.snapshot_required.contains(value));
+            if snapshot_required {
+                continue;
+            }
+            let read_before_write = slots[..position]
+                .iter()
+                .any(|earlier| earlier.used.contains(value));
+            if read_before_write {
+                continue;
+            }
+            // A carry re-binds the producer's buffer under the body-input name at
+            // the top of the next iteration, so those reads must precede the
+            // producer. Reading it at the producer's own position is fine: an
+            // island copies its inputs into its own buffers before it runs.
+            let carry_read_after_write = carried
+                .iter()
+                .filter(|carry| &carry.body_output == value)
+                .any(|carry| {
+                    slots[position + 1..].iter().any(|later| {
+                        later.used.contains(&carry.body_input)
+                            || later.used.contains(&carry.next)
+                            || later.used.contains(&carry.current)
+                    })
+                });
+            if carry_read_after_write {
+                continue;
+            }
+            aliasable.insert(value.clone());
+        }
+    }
 }
 
 fn append_workflow_value(previous: &Value, next: &Value) -> anyhow::Result<Value> {

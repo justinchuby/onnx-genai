@@ -1039,7 +1039,8 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
             println!(
                 "workflow_island {}: components={:?} runs={} session_runs={} eager={} stable={} \
                  captures={} replays={} syncs={} h2d={}/{}B d2h={}/{}B d2d={}/{}B \
-                 elapsed={:.3}ms fallback={:?}",
+                 elapsed={:.3}ms resolve={:.3}ms refresh={:.3}ms run={:.3}ms store={:.3}ms \
+                 fallback={:?}",
                 island.id,
                 island.components,
                 island.runs,
@@ -1056,6 +1057,10 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
                 island.device_to_device_copies,
                 island.device_to_device_bytes,
                 island.total_run_ns as f64 / 1_000_000.0,
+                island.resolve_ns as f64 / 1_000_000.0,
+                island.refresh_ns as f64 / 1_000_000.0,
+                island.session_run_ns as f64 / 1_000_000.0,
+                island.store_ns as f64 / 1_000_000.0,
                 island.fallback_reason
             );
         }

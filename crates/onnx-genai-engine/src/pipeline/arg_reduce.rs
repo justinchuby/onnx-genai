@@ -79,9 +79,7 @@ fn plan_tiles(extent: i64) -> Option<(i64, i64)> {
     while divisor.saturating_mul(divisor) <= extent {
         if extent % divisor == 0 {
             let candidate = (divisor, extent / divisor);
-            if best.is_none_or(|(rows, tile)| {
-                candidate.0 + candidate.1 < rows + tile
-            }) {
+            if best.is_none_or(|(rows, tile)| candidate.0 + candidate.1 < rows + tile) {
                 best = Some(candidate);
             }
         }
@@ -133,10 +131,7 @@ fn expand(
     let tiled_shape = format!("{base}__tiled_shape");
     let rows_shape = format!("{base}__rows_shape");
     let tile_scale = format!("{base}__tile");
-    initializers.push(int64_initializer(
-        &tiled_shape,
-        &[0, plan.rows, plan.tile],
-    ));
+    initializers.push(int64_initializer(&tiled_shape, &[0, plan.rows, plan.tile]));
     initializers.push(int64_initializer(&rows_shape, &[0, plan.rows]));
     initializers.push(int64_initializer(&tile_scale, &[plan.tile]));
 
@@ -156,7 +151,12 @@ fn expand(
 
     let mut nodes = vec![
         // (B, extent) -> (B, rows, tile); axis 0 is copied so the row axis stays dynamic.
-        make_node("Reshape", &[&source, &tiled_shape], &[&tiled], &format!("{base}_reshape")),
+        make_node(
+            "Reshape",
+            &[&source, &tiled_shape],
+            &[&tiled],
+            &format!("{base}_reshape"),
+        ),
         // Per-tile extremum position, one lane per (row, tile) pair.
         arg_node(
             &node.op_type,
@@ -210,7 +210,12 @@ fn expand(
             &[&scaled],
             &format!("{base}_scale"),
         ),
-        make_node("Add", &[&scaled, &selected], &[&flat], &format!("{base}_combine")),
+        make_node(
+            "Add",
+            &[&scaled, &selected],
+            &[&flat],
+            &format!("{base}_combine"),
+        ),
     ];
     if !plan.keepdims {
         let squeeze_shape = format!("{base}__squeeze_shape");
@@ -229,7 +234,12 @@ fn expand(
 /// and initializers. A dimension that is symbolic or absent stays `None`.
 fn static_shapes(graph: &GraphProto) -> HashMap<String, Vec<Option<i64>>> {
     let mut shapes = HashMap::new();
-    for value in graph.input.iter().chain(&graph.value_info).chain(&graph.output) {
+    for value in graph
+        .input
+        .iter()
+        .chain(&graph.value_info)
+        .chain(&graph.output)
+    {
         let Some(type_proto::Value::TensorType(tensor)) =
             value.r#type.as_ref().and_then(|kind| kind.value.as_ref())
         else {
@@ -244,9 +254,7 @@ fn static_shapes(graph: &GraphProto) -> HashMap<String, Vec<Option<i64>>> {
                 .dim
                 .iter()
                 .map(|dimension| match dimension.value {
-                    Some(tensor_shape_proto::dimension::Value::DimValue(extent))
-                        if extent > 0 =>
-                    {
+                    Some(tensor_shape_proto::dimension::Value::DimValue(extent)) if extent > 0 => {
                         Some(extent)
                     }
                     _ => None,
@@ -257,7 +265,11 @@ fn static_shapes(graph: &GraphProto) -> HashMap<String, Vec<Option<i64>>> {
     for initializer in &graph.initializer {
         shapes.insert(
             initializer.name.clone(),
-            initializer.dims.iter().map(|extent| Some(*extent)).collect(),
+            initializer
+                .dims
+                .iter()
+                .map(|extent| Some(*extent))
+                .collect(),
         );
     }
     // Shape-transparent producers let a rewrite see through the casts a policy
