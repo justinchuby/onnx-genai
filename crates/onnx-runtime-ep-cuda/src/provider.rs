@@ -41,6 +41,20 @@ use crate::weight_paging::{CudaWeightResidency, DeviceOffloadPolicy};
 /// `ONNX_GENAI_WEIGHT_OFFLOAD_DEVICE_BYTES` override (4 GiB).
 pub const DEFAULT_DEVICE_OFFLOAD_BUDGET_BYTES: u64 = 4 << 30;
 
+/// Default retained-byte bound for the standalone (plugin, no-governor) VMM
+/// arena's physical-handle pool, used when
+/// `ONNX_GENAI_CUDA_PHYSICAL_HANDLE_POOL_BYTES` is not set (#956).
+///
+/// The plugin path has no memory governor to supply a pool bound, so without a
+/// default the standalone arena would unmap-and-release every scratch
+/// allocation's physical granules on free and re-create them on the next
+/// same-size request — trading `cuMemAlloc` per dispatch for
+/// `cuMemCreate`/`cuMemRelease` per dispatch. Retaining 256 MiB of unmapped
+/// granules (matching the governor path's default) lets repeated same-size
+/// scratch requests reuse committed memory. It bounds retained-but-unmapped
+/// physical memory, so it cannot leak without bound.
+pub const DEFAULT_STANDALONE_PHYSICAL_POOL_BYTES: usize = 256 << 20;
+
 fn dynamic_lending_enabled() -> bool {
     dynamic_lending_enabled_for(
         std::env::var("ONNX_GENAI_DYNAMIC_KV_WEIGHT_LENDING")
@@ -292,6 +306,15 @@ impl CudaExecutionProvider {
                                 step_scoped: false,
                             },
                             teardown_synchronizer,
+                            // Standalone (plugin, no-governor) VMM path: retain a
+                            // pool of physical granules by default so repeated
+                            // same-size ORT scratch requests reuse committed
+                            // memory instead of a per-dispatch
+                            // cuMemCreate/cuMemRelease churn (#956). An explicit
+                            // ONNX_GENAI_CUDA_PHYSICAL_HANDLE_POOL_BYTES still
+                            // overrides this. This mirrors the governor path,
+                            // which already passes a default pool bound.
+                            Some(DEFAULT_STANDALONE_PHYSICAL_POOL_BYTES),
                         ),
                     };
                     match resolve_vmm_initialization(
@@ -1669,6 +1692,249 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
         unsafe { runtime.dtoh(&mut value, cuptr(second.as_ptr())) }.expect("read reused mapping");
         assert_eq!(u32::from_ne_bytes(value), 0x736);
         provider.deallocate(second).expect("final deallocation");
+    }
+
+    /// #956: the standalone (plugin, no-governor) VMM path serves repeated
+    /// same-size scratch requests from a retained physical-handle pool, so the
+    /// arena's physical allocation call (`cuMemCreate`, the analog of the
+    /// `cuMemAlloc` the default path makes per dispatch) does **not** scale with
+    /// the number of allocate/free cycles.
+    ///
+    /// This constructs the *exact* arena the plugin path builds — `new_default`
+    /// takes the `None` governor branch of the constructor, which calls
+    /// `standalone_with_teardown_synchronizer` with
+    /// `DEFAULT_STANDALONE_PHYSICAL_POOL_BYTES` — directly, so the measurement
+    /// establishes its condition instead of depending on a process-global env
+    /// var (measurement-discipline #906).
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn standalone_vmm_scratch_reuse_pools_committed_memory_and_does_not_scale_cumemcreate() {
+        use onnx_runtime_memory_governor::DeviceAllocator;
+
+        let Ok(provider) = CudaExecutionProvider::new(0) else {
+            eprintln!(
+                "SKIPPED (no CUDA runtime): the #956 scratch-reuse proof did NOT run. A skip that \
+                 reads like a pass is exactly how a knob that never engaged produces a headline."
+            );
+            panic!("CUDA test path did not run; report as a failed GPU test, not a pass");
+        };
+        let runtime = provider.runtime().clone();
+        let sync_runtime = Arc::clone(&runtime);
+        let teardown: crate::virtual_memory::TeardownSynchronizer = Arc::new(move || {
+            sync_runtime.synchronize().map_err(|e| e.to_string())?;
+            sync_runtime
+                .copy_stream()
+                .synchronize()
+                .map_err(|e| e.to_string())
+        });
+        let arena = crate::vmm_allocator::CudaVmmAllocator::standalone_with_teardown_synchronizer(
+            runtime.cuda_context(),
+            onnx_runtime_memory_governor::DeviceKey::device(0),
+            0,
+            64 << 30,
+            onnx_runtime_memory_governor::HolderId::new(64),
+            onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: false },
+            teardown,
+            Some(DEFAULT_STANDALONE_PHYSICAL_POOL_BYTES),
+        )
+        .expect("standalone pooled arena");
+
+        let stats = arena
+            .physical_pool_stats()
+            .expect("#956: the default installs a retained physical-handle pool");
+
+        // A representative decode-scratch size. One 2 MiB granule backs it.
+        const SCRATCH_BYTES: usize = 512 * 1024;
+        // Written-and-verified header proving reused committed memory returns
+        // exactly the bytes written this cycle — the numerics property a pooled
+        // reuse could break (stale contents surviving a free/reuse). `n` tags
+        // the cycle so a stale read from a previous cycle would mismatch.
+        let cycle = |arena: &crate::vmm_allocator::CudaVmmAllocator, n: usize| {
+            let ptr = arena.allocate(SCRATCH_BYTES, 256).expect("scratch alloc");
+            let tag = ((n % 251) + 1) as u8;
+            let header = vec![tag; 256];
+            // SAFETY: `ptr` is this arena's live SCRATCH_BYTES allocation; the
+            // 256-byte header is within it, and the copies are ordered by the
+            // synchronous htod/dtoh.
+            unsafe {
+                runtime
+                    .htod(&header, cuptr(ptr.as_ptr().cast::<std::ffi::c_void>()))
+                    .expect("write scratch header");
+                let mut read_back = vec![0u8; 256];
+                runtime
+                    .dtoh(
+                        &mut read_back,
+                        cuptr(ptr.as_ptr().cast::<std::ffi::c_void>()),
+                    )
+                    .expect("read scratch header");
+                assert_eq!(
+                    read_back, header,
+                    "reused committed memory must return exactly what was written this cycle"
+                );
+            }
+            // SAFETY: `ptr` is this arena's live SCRATCH_BYTES/256 allocation,
+            // freed exactly once here.
+            unsafe { arena.deallocate(ptr, SCRATCH_BYTES, 256) };
+        };
+
+        // Warm up: the first cycle creates and maps the granule, then retains
+        // it in the pool on free.
+        cycle(&arena, 0);
+        let warm = stats.snapshot();
+
+        for n in 0..16 {
+            cycle(&arena, n + 1);
+        }
+        let after16 = stats.snapshot();
+        for n in 0..64 {
+            cycle(&arena, n + 100);
+        }
+        let after64 = stats.snapshot();
+
+        eprintln!(
+            "#956 standalone scratch reuse: warm(creates={} hits={} owned={}B) \
+             +16cyc(creates={} hits={} owned={}B) +64cyc(creates={} hits={} owned={}B)",
+            warm.creates,
+            warm.pool_hits,
+            warm.total_owned_bytes,
+            after16.creates,
+            after16.pool_hits,
+            after16.total_owned_bytes,
+            after64.creates,
+            after64.pool_hits,
+            after64.total_owned_bytes,
+        );
+
+        // The arena's physical allocation call does not scale with steps: after
+        // warmup no further `cuMemCreate` happens, at 16 or at 64 cycles.
+        assert_eq!(
+            after16.creates, warm.creates,
+            "no new cuMemCreate across 16 reuse cycles"
+        );
+        assert_eq!(
+            after64.creates, warm.creates,
+            "no new cuMemCreate across 64 reuse cycles"
+        );
+        // Measured, not inferred: the pool actually served each request, so its
+        // hit count grew one-for-one with the cycle count.
+        assert!(
+            after16.pool_hits >= warm.pool_hits + 16,
+            "16 reuse cycles must be served from the retained pool (measured hits, not an absent \
+             symptom): {} -> {}",
+            warm.pool_hits,
+            after16.pool_hits
+        );
+        assert!(
+            after64.pool_hits >= after16.pool_hits + 64,
+            "64 further reuse cycles must be served from the retained pool: {} -> {}",
+            after16.pool_hits,
+            after64.pool_hits
+        );
+        // No leak: retained physical bytes are identical at 16 and 64 cycles.
+        assert_eq!(
+            after64.total_owned_bytes, after16.total_owned_bytes,
+            "committed physical bytes must be bounded across steps"
+        );
+        assert_eq!(
+            after64.releases, warm.releases,
+            "retained handles are reused, not released per cycle"
+        );
+    }
+
+    /// #956 contrast: the default `cuMemAlloc` path makes exactly one driver
+    /// allocation per request, so it scales one-for-one with decode steps —
+    /// which is the residual the VMM arena removes. Fully isolated (per-instance
+    /// counter, no env, direct construction).
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn default_allocator_cumemalloc_scales_one_for_one_with_requests() {
+        use onnx_runtime_memory_governor::DeviceAllocator;
+
+        let Ok(provider) = CudaExecutionProvider::new(0) else {
+            eprintln!(
+                "SKIPPED (no CUDA runtime): the #956 cuMemAlloc-scaling contrast did NOT run."
+            );
+            panic!("CUDA test path did not run; report as a failed GPU test, not a pass");
+        };
+        let context = provider.runtime().cuda_context();
+        const SCRATCH_BYTES: usize = 512 * 1024;
+
+        let run_cycles = |n: usize| -> u64 {
+            let allocator = crate::device_allocator::CudaDeviceAllocator::new(context.clone());
+            for _ in 0..n {
+                let ptr = allocator.allocate(SCRATCH_BYTES, 256).expect("cuMemAlloc");
+                // SAFETY: freed exactly once, same size/align it was allocated.
+                unsafe { allocator.deallocate(ptr, SCRATCH_BYTES, 256) };
+            }
+            allocator.cumemalloc_calls()
+        };
+
+        let calls16 = run_cycles(16);
+        let calls64 = run_cycles(64);
+        eprintln!(
+            "#956 default path cuMemAlloc calls: 16 requests -> {calls16}, 64 requests -> {calls64}"
+        );
+        assert_eq!(calls16, 16, "cuMemAlloc fires once per request");
+        assert_eq!(
+            calls64, 64,
+            "cuMemAlloc scales one-for-one with request count on the default path"
+        );
+    }
+
+    /// #956 integration: the provider built exactly as the CUDA plugin builds it
+    /// (`CudaExecutionProvider::new_default` == `new(0)`) routes every device
+    /// allocation — including the ORT scratch the plugin projects through
+    /// `allocate`/`deallocate` — through the pooled VMM arena when the arena is
+    /// enabled, rather than through `cuMemAlloc`.
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn plugin_construction_path_routes_device_memory_through_pooled_vmm_arena() {
+        // SAFETY: single-process test; the plugin path reads this at
+        // construction. The `.or(default)` in the standalone constructor means
+        // the assertion below holds whether or not a pool-bytes override is also
+        // set, so a concurrent test setting it cannot make this vacuous.
+        unsafe { std::env::set_var(crate::vmm_allocator::CUDA_VMM_ENV, "1") };
+
+        let provider =
+            CudaExecutionProvider::new(0).expect("plugin-path CUDA provider under VMM arena");
+        assert!(
+            provider.commits_on_demand(),
+            "the VMM arena, not the cuMemAlloc path, must serve allocations on the plugin path"
+        );
+        let stats = provider
+            .vmm
+            .get()
+            .and_then(|arena| arena.physical_pool_stats())
+            .expect(
+                "#956: the standalone plugin path installs a retained physical-handle pool by \
+                 default",
+            );
+
+        // The arena actually serves a real EP allocation (creates or reuses a
+        // pooled granule) — not merely installed.
+        let before = stats.snapshot();
+        let buffer = provider
+            .allocate(512 * 1024, 256)
+            .expect("device allocation via the arena");
+        provider.deallocate(buffer).expect("free via the arena");
+        let after = stats.snapshot();
+        assert!(
+            (after.creates + after.pool_hits) > (before.creates + before.pool_hits),
+            "the arena must have served the EP allocation (creates {}->{}, hits {}->{})",
+            before.creates,
+            after.creates,
+            before.pool_hits,
+            after.pool_hits
+        );
     }
 
     #[cfg_attr(
