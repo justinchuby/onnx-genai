@@ -35,6 +35,8 @@ fn find_ort_lib_dir() -> Option<PathBuf> {
 /// Canonical ORT discovery — single source of truth in `tests/common/ort_discovery.rs`.
 #[path = "common/ort_discovery.rs"]
 mod ort_discovery;
+#[path = "common/ort_session.rs"]
+mod ort_session;
 
 fn find_ep_cdylib() -> Option<PathBuf> {
     cdylib_resolve::find_cpu_plugin_cdylib_optional()
@@ -215,11 +217,9 @@ unsafe fn setup(
     };
     unsafe { check_status(api, status, "AppendEP") };
 
-    let model_c = ort_path::OrtPathBuf::new(model_path);
     let mut session: *mut ort::OrtSession = ptr::null_mut();
-    let status = unsafe {
-        ((*api).CreateSession.unwrap())(env, model_c.as_ptr(), session_options, &mut session)
-    };
+    let status =
+        unsafe { ort_session::create_session(api, env, session_options, model_path, &mut session) };
     unsafe { check_status(api, status, "CreateSession") };
 
     Some((lib, api, env, session_options, session))
@@ -374,8 +374,8 @@ unsafe fn assert_ops_assigned_to_our_ep(
 fn skip_layer_norm_output_sum_position() {
     let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let model_path =
-        PathBuf::from(manifest_dir).join("tests/fixtures/skip_layer_norm_output_sum/model.onnx");
+    let model_path = PathBuf::from(manifest_dir)
+        .join("tests/fixtures/skip_layer_norm_output_sum/model.onnx.textproto");
 
     let Some((_lib, api, env, opts, session)) = (unsafe { setup("cpu_ep_sln_sum", &model_path) })
     else {
@@ -463,7 +463,8 @@ fn skip_layer_norm_output_sum_position() {
 fn clip_omitted_min_with_max() {
     let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let model_path = PathBuf::from(manifest_dir).join("tests/fixtures/clip_no_min/model.onnx");
+    let model_path =
+        PathBuf::from(manifest_dir).join("tests/fixtures/clip_no_min/model.onnx.textproto");
 
     let Some((_lib, api, env, opts, session)) = (unsafe { setup("cpu_ep_clip", &model_path) })
     else {
@@ -538,8 +539,8 @@ fn clip_omitted_min_with_max() {
 fn skip_layer_norm_omitted_beta_bias() {
     let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let model_path =
-        PathBuf::from(manifest_dir).join("tests/fixtures/skip_layer_norm_no_beta_bias/model.onnx");
+    let model_path = PathBuf::from(manifest_dir)
+        .join("tests/fixtures/skip_layer_norm_no_beta_bias/model.onnx.textproto");
 
     let Some((_lib, api, env, opts, session)) = (unsafe { setup("cpu_ep_sln_nb", &model_path) })
     else {
@@ -640,7 +641,7 @@ fn simplified_layer_norm_two_outputs_position() {
     let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let model_path = PathBuf::from(manifest_dir)
-        .join("tests/fixtures/simplified_layer_norm_two_outputs/model.onnx");
+        .join("tests/fixtures/simplified_layer_norm_two_outputs/model.onnx.textproto");
 
     let Some((_lib, api, env, opts, session)) = (unsafe { setup("cpu_ep_sln2", &model_path) })
     else {
@@ -861,7 +862,7 @@ fn skip_layer_norm_f16_absent_output_no_overflow() {
     let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let model_path = PathBuf::from(manifest_dir)
-        .join("tests/fixtures/skip_layer_norm_f16_absent_output/model.onnx");
+        .join("tests/fixtures/skip_layer_norm_f16_absent_output/model.onnx.textproto");
 
     let Some((_lib, api, env, opts, session)) = (unsafe { setup("cpu_ep_slnf16", &model_path) })
     else {
@@ -959,7 +960,7 @@ fn skip_layer_norm_bf16_absent_output_no_overflow() {
     let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let model_path = PathBuf::from(manifest_dir)
-        .join("tests/fixtures/skip_layer_norm_bf16_absent_output/model.onnx");
+        .join("tests/fixtures/skip_layer_norm_bf16_absent_output/model.onnx.textproto");
 
     let Some((_lib, api, env, opts, session)) = (unsafe { setup("cpu_ep_slnbf16", &model_path) })
     else {
@@ -1053,8 +1054,8 @@ fn skip_layer_norm_bf16_absent_output_no_overflow() {
 fn layer_norm_f16_absent_output_no_overflow() {
     let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let model_path =
-        PathBuf::from(manifest_dir).join("tests/fixtures/layer_norm_f16_absent_output/model.onnx");
+    let model_path = PathBuf::from(manifest_dir)
+        .join("tests/fixtures/layer_norm_f16_absent_output/model.onnx.textproto");
 
     let Some((_lib, api, env, opts, session)) = (unsafe { setup("cpu_ep_lnf16", &model_path) })
     else {
@@ -1141,8 +1142,8 @@ fn layer_norm_f16_absent_output_no_overflow() {
 fn layer_norm_bf16_absent_output_no_overflow() {
     let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let model_path =
-        PathBuf::from(manifest_dir).join("tests/fixtures/layer_norm_bf16_absent_output/model.onnx");
+    let model_path = PathBuf::from(manifest_dir)
+        .join("tests/fixtures/layer_norm_bf16_absent_output/model.onnx.textproto");
 
     let Some((_lib, api, env, opts, session)) = (unsafe { setup("cpu_ep_lnbf16", &model_path) })
     else {
@@ -1233,8 +1234,8 @@ fn layer_norm_bf16_absent_output_no_overflow() {
 fn add_skip_layer_norm_mul_routed() {
     let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let model_path =
-        PathBuf::from(manifest_dir).join("tests/fixtures/add_skip_layer_norm_mul/model.onnx");
+    let model_path = PathBuf::from(manifest_dir)
+        .join("tests/fixtures/add_skip_layer_norm_mul/model.onnx.textproto");
 
     let Some((_lib, api, env, opts, session)) = (unsafe { setup("cpu_ep_aslnm", &model_path) })
     else {

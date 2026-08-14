@@ -16,6 +16,7 @@ from pathlib import Path
 import numpy as np
 import onnx
 from onnx import TensorProto, helper, numpy_helper
+from google.protobuf import text_format
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
@@ -201,9 +202,13 @@ def build(output: Path) -> None:
     model.ir_version = 10
 
     output.mkdir(parents=True, exist_ok=True)
-    for name in ["model.onnx", "inference_metadata.yaml", "tokenizer.json", "manifest.json"]:
+    for name in ["model.onnx", "model.onnx.textproto", "inference_metadata.yaml", "tokenizer.json", "manifest.json"]:
         (output / name).unlink(missing_ok=True)
-    onnx.save(model, output / "model.onnx")
+    # The committed fixture is git-friendly ONNX protobuf TextFormat
+    # (`model.onnx.textproto`), which the runtime loader parses transparently.
+    (output / "model.onnx.textproto").write_text(
+        text_format.MessageToString(model), encoding="utf-8"
+    )
     write_tokenizer(output / "tokenizer.json")
     (output / "inference_metadata.yaml").write_text(
         "required_capabilities:\n"
@@ -229,7 +234,7 @@ def build(output: Path) -> None:
         "      - present.0.value\n",
         encoding="utf-8",
     )
-    files = {name: (output / name).stat().st_size for name in ["model.onnx", "inference_metadata.yaml", "tokenizer.json"]}
+    files = {name: (output / name).stat().st_size for name in ["model.onnx.textproto", "inference_metadata.yaml", "tokenizer.json"]}
     manifest = {
         "generator": "tests/fixtures/tiny-deepseek-v2-qmoe-attention/generate.py",
         "seed": SEED,
