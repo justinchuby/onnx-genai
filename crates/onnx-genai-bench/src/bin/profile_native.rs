@@ -642,6 +642,56 @@ fn print_weight_offload_observability(emitted_tokens: u64) {
          effective_htod_gbps={:.3}",
         stats.pinned_alloc_calls, stats.pinned_reuses, htod_gbps
     );
+    print_weight_paging_key_trace(emitted_tokens);
+}
+
+/// Dump the per-key weight-paging trace (#837 item 3 characterisation). Empty
+/// unless `ONNX_GENAI_WEIGHT_PAGING_KEY_TRACE` was set for the run, so this
+/// prints nothing on a normal profile. `reads_per_step = reads / emitted_tokens`
+/// (one decode step per emitted token) is the discriminator: a bypassed key with
+/// `reads_per_step ~= 1` is read once per step, so admitting it saves its `len`
+/// bytes per step but a reuse-frequency reservation has nothing to rank it on.
+fn print_weight_paging_key_trace(emitted_tokens: u64) {
+    let rows = onnx_runtime_ep_cuda::weight_paging_key_trace();
+    if rows.is_empty() {
+        return;
+    }
+    let steps = emitted_tokens.max(1) as f64;
+    let mut bypass_keys = 0u64;
+    let mut bypass_bytes_per_step = 0.0f64;
+    let mut retained_keys = 0u64;
+    for (_, row) in &rows {
+        if row.bypass_page_ins > 0 {
+            bypass_keys += 1;
+            bypass_bytes_per_step += (row.bypass_page_ins * row.len) as f64 / steps;
+        }
+        if row.retained_page_ins > 0 && row.bypass_page_ins == 0 {
+            retained_keys += 1;
+        }
+    }
+    println!(
+        "weight_paging_key_trace_summary: distinct_keys={} bypass_keys={} retained_only_keys={} \
+         bypass_bytes_per_step={:.0} emitted_tokens={}",
+        rows.len(),
+        bypass_keys,
+        retained_keys,
+        bypass_bytes_per_step,
+        emitted_tokens
+    );
+    // Head of the list is sorted by bytes re-streamed (bypass_page_ins * len).
+    for (key, row) in rows.iter().take(40) {
+        println!(
+            "weight_paging_key: key={key} len={} reads={} reads_per_step={:.3} hits={} \
+             retained_page_ins={} bypass_page_ins={} bypass_bytes_per_step={:.0}",
+            row.len,
+            row.reads(),
+            row.reads() as f64 / steps,
+            row.hits,
+            row.retained_page_ins,
+            row.bypass_page_ins,
+            (row.bypass_page_ins * row.len) as f64 / steps,
+        );
+    }
 }
 
 fn print_vmm_observability(engine: &Engine) {

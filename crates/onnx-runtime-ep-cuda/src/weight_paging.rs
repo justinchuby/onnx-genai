@@ -311,7 +311,112 @@ pub fn reset_global_offload_stats() {
     // window reset), so they are preserved exactly like the residency gauges.
     GLOBAL_ZERO_COPY_READS.store(0, Ordering::Relaxed);
     GLOBAL_ZERO_COPY_BYTES.store(0, Ordering::Relaxed);
+    reset_key_trace();
     crate::pinned_pool::reset_pinned_pool_counters();
+}
+
+// ----- Per-key page-in trace (#837 item 3 characterisation) -----
+//
+// OFF by default. When `ONNX_GENAI_WEIGHT_PAGING_KEY_TRACE` is truthy, every
+// weight lookup routed through the residency cache is attributed to its key so
+// the bypassed population can be characterised by size **and read count per
+// decode step** — the question that decides whether admitting bypassed tensors
+// is worth anything. A tensor read exactly once per decode step (the structural
+// case for a transformer weight, #864) gains no residency benefit from a reuse
+// reservation, so read count is the discriminator. This is pure process-local
+// accounting under a `Mutex`, taken only when the env is enabled, and never
+// touches device state, so it does not perturb the counters it explains.
+
+/// One weight key's residency activity over the current measurement window.
+///
+/// Populated only when `ONNX_GENAI_WEIGHT_PAGING_KEY_TRACE` is truthy. `hits`
+/// are reads served from residency (no copy); `retained_page_ins` paged the
+/// weight in and kept it resident; `bypass_page_ins` paged it in transiently
+/// (copied H2D, handed back without joining the resident set), so its `len`
+/// bytes re-stream every subsequent step it is read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WeightKeyTrace {
+    pub len: u64,
+    pub hits: u64,
+    pub retained_page_ins: u64,
+    pub bypass_page_ins: u64,
+}
+
+impl WeightKeyTrace {
+    /// Total reads of this key in the window (`hits + retained + bypass`). Over
+    /// `S` decode steps a value of `S` means the key is read exactly once per
+    /// step — the structural transformer-weight case where residency saves the
+    /// per-step copy but reuse-frequency admission has nothing to rank on.
+    #[must_use]
+    pub fn reads(&self) -> u64 {
+        self.hits
+            .saturating_add(self.retained_page_ins)
+            .saturating_add(self.bypass_page_ins)
+    }
+}
+
+fn key_trace_enabled() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        matches!(
+            std::env::var("ONNX_GENAI_WEIGHT_PAGING_KEY_TRACE")
+                .ok()
+                .as_deref()
+                .map(|value| value.trim().to_ascii_lowercase()),
+            Some(ref value) if matches!(value.as_str(), "1" | "true" | "yes" | "on")
+        )
+    })
+}
+
+fn key_trace_map() -> &'static Mutex<HashMap<u64, WeightKeyTrace>> {
+    static MAP: OnceLock<Mutex<HashMap<u64, WeightKeyTrace>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[derive(Clone, Copy)]
+enum KeyTraceEvent {
+    Hit,
+    Retained,
+    Bypass,
+}
+
+fn record_key_trace(key: u64, len: u64, event: KeyTraceEvent) {
+    if !key_trace_enabled() {
+        return;
+    }
+    let mut map = key_trace_map().lock().unwrap_or_else(|e| e.into_inner());
+    let row = map.entry(key).or_default();
+    row.len = len;
+    match event {
+        KeyTraceEvent::Hit => row.hits = row.hits.saturating_add(1),
+        KeyTraceEvent::Retained => row.retained_page_ins = row.retained_page_ins.saturating_add(1),
+        KeyTraceEvent::Bypass => row.bypass_page_ins = row.bypass_page_ins.saturating_add(1),
+    }
+}
+
+fn reset_key_trace() {
+    if key_trace_enabled() {
+        key_trace_map()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+}
+
+/// Snapshot the per-key weight-paging trace, sorted by the bytes each key
+/// **re-streams** per window (`bypass_page_ins * len`) descending, so the head
+/// of the list is the population that dominates the recoverable streaming gap
+/// (#837 item 3). Empty unless `ONNX_GENAI_WEIGHT_PAGING_KEY_TRACE` is set.
+#[must_use]
+pub fn weight_paging_key_trace() -> Vec<(u64, WeightKeyTrace)> {
+    let mut rows: Vec<(u64, WeightKeyTrace)> = key_trace_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|(&key, &row)| (key, row))
+        .collect();
+    rows.sort_by_key(|(_, row)| std::cmp::Reverse(row.bypass_page_ins.saturating_mul(row.len)));
+    rows
 }
 
 /// Environment switch that enables the CUDA device residency cache. Reuses the
@@ -2660,7 +2765,7 @@ impl CudaWeightResidency {
             shape,
         });
         if bypass {
-            inner.record_bypassed_page_in(len as u64);
+            inner.record_bypassed_page_in(key, len as u64);
         } else {
             inner.insert_page(key, Arc::clone(&page), len as u64);
         }
@@ -2971,7 +3076,7 @@ impl CudaWeightResidency {
             return Ok(existing);
         }
         if eviction == WeightEvictionPolicy::StableResident && !inner.policy.can_fit(bytes) {
-            inner.record_bypassed_page_in(bytes);
+            inner.record_bypassed_page_in(key, bytes);
             return Ok(page);
         }
         inner.evict_to_fit(bytes, eviction);
@@ -3164,12 +3269,14 @@ impl ResidencyInner {
         GLOBAL_HITS.fetch_add(1, Ordering::Relaxed);
         if let Some(page) = self.pages.get(&key) {
             GLOBAL_HIT_BYTES.fetch_add(page.len as u64, Ordering::Relaxed);
+            record_key_trace(key, page.len as u64, KeyTraceEvent::Hit);
         }
     }
 
     /// Insert a freshly paged-in `page` of `bytes` under `key`, updating the
     /// order, residency accounting, and the page-in counters.
     fn insert_page(&mut self, key: u64, page: Arc<CudaWeightPage>, bytes: u64) {
+        record_key_trace(key, bytes, KeyTraceEvent::Retained);
         self.pages.insert(key, page);
         self.policy.insert_page(key, bytes);
         let global_resident = GLOBAL_CONTENT_RESIDENT_BYTES
@@ -3181,7 +3288,8 @@ impl ResidencyInner {
 
     /// Count a miss whose freshly paged-in allocation is returned directly to
     /// the caller instead of becoming part of the resident set.
-    fn record_bypassed_page_in(&mut self, bytes: u64) {
+    fn record_bypassed_page_in(&mut self, key: u64, bytes: u64) {
+        record_key_trace(key, bytes, KeyTraceEvent::Bypass);
         self.policy.record_page_in();
         GLOBAL_PAGE_INS.fetch_add(1, Ordering::Relaxed);
         GLOBAL_BYPASSED_PAGE_INS.fetch_add(1, Ordering::Relaxed);
