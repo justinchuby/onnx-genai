@@ -368,7 +368,7 @@ fn serving_compaction_keeps_emit_identity_in_the_carried_slot_permutation() {
     let fixture = include_str!(
         "../../../tests/fixtures/onnx_genai_workflows/decoder/inference_metadata.yaml"
     );
-    let compacted = fixture.replacen("compaction: false", "compaction: true", 1);
+    let compacted = fixture.to_owned();
     let mismatched = compacted.replacen("row_ids: slot_ids", "row_ids: active", 1);
     let metadata: InferenceMetadata =
         serde_yaml::from_str(&mismatched).expect("modified decoder metadata parses");
@@ -403,6 +403,17 @@ fn serving_compaction_keeps_emit_identity_in_the_carried_slot_permutation() {
             .iter()
             .any(|error| error.contains("next value must be the carried slot_ids value"))
     );
+}
+
+#[test]
+fn nested_control_loops_inherit_the_outer_compaction_permutation() {
+    let fixture =
+        include_str!("../../../tests/fixtures/onnx_genai_workflows/tts/inference_metadata.yaml");
+    let compacted = fixture.replacen("compaction: false", "compaction: true", 1);
+    let metadata: InferenceMetadata =
+        serde_yaml::from_str(&compacted).expect("modified TTS metadata parses");
+    validate_metadata(&metadata)
+        .expect("nested loops may use the invariant slot permutation carried by the outer loop");
 }
 
 #[test]
