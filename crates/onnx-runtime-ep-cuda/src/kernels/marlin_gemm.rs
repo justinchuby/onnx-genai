@@ -72,6 +72,7 @@ use crate::runtime::{CudaRuntime, cuptr};
 /// NVRTC module + entry names for the Marlin int4 tensor-core GEMM.
 pub const MARLIN_MODULE: &str = "matmul_nbits_marlin_gemm";
 pub const MARLIN_GEMM_ENTRY: &str = "matmul_nbits_marlin_gemm_f16";
+pub const MARLIN_REPACK_ENTRY: &str = "matmul_nbits_marlin_repack";
 
 /// N columns handled by one thread block (one warp per 8-column tensor-core tile).
 pub const MARLIN_WARPS: u32 = 4;
@@ -304,7 +305,103 @@ extern "C" __global__ void matmul_nbits_marlin_gemm_f16(
         }
     }
 }
+
+// Device-side repack: reorder ONNX packed int4 (N-major nibbles) into the
+// 8-column-interleaved per-lane tensor-core layout. One thread owns one
+// (column, K-slice) pair and writes 8 contiguous bytes. Runs once per weight
+// (immutable initializer); the result is cached, so captured replays never
+// re-run it. Static grid -> capture-safe (though it runs before capture).
+extern "C" __global__ void matmul_nbits_marlin_repack(
+    const unsigned char* __restrict__ packed, // [N, k_blocks, group/2]
+    unsigned char* __restrict__ out,          // [n_tiles * (K/16) * 64]
+    const int n,
+    const int k,
+    const int k_blocks,
+    const int group_size)
+{
+    const int slices = k / 16;
+    const int blob = group_size / 2;
+    const int n_tiles = (n + 7) / 8;
+    const int total = n_tiles * 8 * slices;
+    const int idx = (int)blockIdx.x * (int)blockDim.x + (int)threadIdx.x;
+    if (idx >= total) return;
+
+    const int slice = idx % slices;
+    const int col = idx / slices;            // 0 .. n_tiles*8-1 (col == global col)
+    const int n_tile = col >> 3;
+    const int group_id = col & 7;
+    const int kbase = slice * 16;
+    const long tile_base = ((long)n_tile * slices + slice) * 64 + group_id * 8;
+
+    // code(kk) for this column, 0 if the column is padding (col >= n).
+    // packed nibble: byte[(col*k_blocks + kk/group)*blob + (kk%group)/2],
+    // low nibble for even kk%group.
+    #define MARLIN_CODE(kk) ( (col < n) ? ( \
+        ((kk % group_size) & 1) \
+            ? (packed[((long)col * k_blocks + (kk) / group_size) * blob + ((kk) % group_size) / 2] >> 4) \
+            : (packed[((long)col * k_blocks + (kk) / group_size) * blob + ((kk) % group_size) / 2] & 15) \
+        ) : 0 )
+#pragma unroll
+    for (int tid = 0; tid < 4; ++tid) {
+        const unsigned char lo =
+            (unsigned char)(MARLIN_CODE(kbase + tid * 2) | (MARLIN_CODE(kbase + tid * 2 + 1) << 4));
+        const unsigned char hi =
+            (unsigned char)(MARLIN_CODE(kbase + tid * 2 + 8) | (MARLIN_CODE(kbase + tid * 2 + 9) << 4));
+        out[tile_base + tid * 2] = lo;
+        out[tile_base + tid * 2 + 1] = hi;
+    }
+    #undef MARLIN_CODE
+}
 "#;
+
+/// Size in bytes of the repacked weight buffer for the given dims.
+#[must_use]
+pub fn repacked_bytes(n: usize, k: usize) -> usize {
+    n.div_ceil(8) * (k / 16) * 64
+}
+
+/// Launch the device-side weight repack (original ONNX packed int4 → the
+/// tensor-core layout). `out` must be at least [`repacked_bytes`].
+pub fn launch_marlin_repack(
+    runtime: &CudaRuntime,
+    packed: CUdeviceptr,
+    out: CUdeviceptr,
+    n: usize,
+    k: usize,
+    group_size: usize,
+) -> Result<()> {
+    let k_blocks = k / group_size;
+    let function = runtime.nvrtc_function(MARLIN_MODULE, MARLIN_GEMM_SRC, MARLIN_REPACK_ENTRY)?;
+    let packed_ptr = cuptr(packed as usize as *const c_void);
+    let out_ptr = cuptr(out as usize as *const c_void);
+    let n_i32 = i32::try_from(n).map_err(|_| overflow("N", n))?;
+    let k_i32 = i32::try_from(k).map_err(|_| overflow("K", k))?;
+    let k_blocks_i32 = i32::try_from(k_blocks).map_err(|_| overflow("k_blocks", k_blocks))?;
+    let group_size_i32 =
+        i32::try_from(group_size).map_err(|_| overflow("group_size", group_size))?;
+    let total = (n.div_ceil(8) * 8 * (k / 16)) as u32;
+    const THREADS: u32 = 256;
+    let grid = total.div_ceil(THREADS).max(1);
+    let mut builder = runtime.stream().launch_builder(&function);
+    builder
+        .arg(&packed_ptr)
+        .arg(&out_ptr)
+        .arg(&n_i32)
+        .arg(&k_i32)
+        .arg(&k_blocks_i32)
+        .arg(&group_size_i32);
+    // SAFETY: static grid; `packed` covers [N,k_blocks,group/2] bytes and `out`
+    // covers repacked_bytes(n,k); the kernel bounds-checks the thread index.
+    unsafe {
+        builder.launch(LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        })
+    }
+    .map(|_| ())
+    .map_err(|err| driver_err("launch MatMulNBits Marlin repack", err))
+}
 
 /// Launch parameters for [`launch_marlin_gemm`].
 #[derive(Clone, Copy)]
@@ -864,6 +961,50 @@ mod tests {
                 rt.free_raw(weights_dev).unwrap();
                 rt.free_raw(scales_dev).unwrap();
             }
+        }
+    }
+
+    /// The device repack kernel must produce byte-identical output to the host
+    /// [`repack_int4_weights`] (which the GPU parity test already validates), so
+    /// the wired op path and the standalone path share one layout.
+    #[test]
+    #[ignore = "requires a live CUDA device"]
+    fn device_repack_matches_host() {
+        let Some(rt) = runtime() else {
+            eprintln!("skipping: CUDA runtime unavailable");
+            return;
+        };
+        for &(n, group) in &[(70usize, 128usize), (37, 32), (8, 16), (200, 64)] {
+            let k = group * 5;
+            let k_blocks = k / group;
+            let blob = group / 2;
+            let mut packed = vec![0u8; n * k_blocks * blob];
+            let mut state = 0xdead_beefu32;
+            for b in packed.iter_mut() {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                *b = (state >> 24) as u8;
+            }
+            let host = repack_int4_weights(&packed, n, k, group);
+
+            let packed_dev = rt.alloc_raw(packed.len()).unwrap();
+            let out_dev = rt.alloc_raw(host.len()).unwrap();
+            // SAFETY: sized for the slices.
+            unsafe {
+                rt.htod(&packed, packed_dev).unwrap();
+            }
+            launch_marlin_repack(&rt, packed_dev, out_dev, n, k, group).unwrap();
+            rt.synchronize().unwrap();
+            let mut got = vec![0u8; host.len()];
+            // SAFETY: out_dev holds host.len() bytes.
+            unsafe {
+                rt.dtoh(&mut got, out_dev).unwrap();
+                rt.free_raw(packed_dev).unwrap();
+                rt.free_raw(out_dev).unwrap();
+            }
+            assert_eq!(
+                got, host,
+                "device repack != host repack for n={n} group={group}"
+            );
         }
     }
 }
