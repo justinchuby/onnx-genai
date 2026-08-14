@@ -645,13 +645,17 @@ pub trait ExecutionProvider: Send + Sync {
         false
     }
 
-    /// Launch an allocation-free device argmax over `elements` contiguous
-    /// `dtype` values (Float32 or Float16). `result` receives two native-endian
-    /// u32 values: token id, then the latching device capture-error bitmask.
+    /// Launch an allocation-free device argmax over `batch` sequences of
+    /// `elements` contiguous `dtype` values (Float32 or Float16) each, laid out
+    /// as a `[batch, elements]` row-major block. `result` receives, per sequence
+    /// `s`, two native-endian u32 values at word offset `2*s`: the token id, then
+    /// the latching device capture-error bitmask. At `batch == 1` this is the
+    /// previous single-sequence contract byte-for-byte.
     fn device_argmax(
         &self,
         _logits: &DeviceBuffer,
         _elements: usize,
+        _batch: usize,
         _dtype: DataType,
         _result: &mut DeviceBuffer,
     ) -> Result<()> {

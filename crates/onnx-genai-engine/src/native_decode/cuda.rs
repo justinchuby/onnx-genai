@@ -2661,15 +2661,19 @@ impl DecodeCudaState {
             let vocab = *logits_shape
                 .last()
                 .context("CUDA logits shape has no vocabulary dimension")?;
-            2 + onnx_runtime_ep_cuda::device_argmax_scratch_words(vocab)
+            // The device-argmax result buffer holds a `2 × batch` header (a token
+            // id + capture-error pair per sequence) plus per-sequence scratch
+            // (stage 2b-impl-3, #750). At `batch == 1` this is byte-identical to
+            // the previous `2 + scratch_words(vocab)` allocation.
+            2 * batch + onnx_runtime_ep_cuda::device_argmax_scratch_words(vocab, batch)
         };
         #[cfg(not(feature = "cuda"))]
-        let argmax_words = 2;
+        let argmax_words = 2 * batch;
         let greedy_result = session.allocate_device_output_binding(
             "__native_greedy_argmax",
             DataType::Uint32,
             vec![argmax_words],
-            vec![2],
+            vec![2 * batch],
         )?;
 
         // A graph records launch geometry, so replay is unsafe when a persistent
@@ -3312,26 +3316,49 @@ impl DecodeCudaState {
         self.bindings[self.logits_binding].device_argmax_supported()
     }
 
-    fn read_greedy_result(&mut self) -> anyhow::Result<(TokenId, u32)> {
+    /// Run the batched device argmax over the `[batch, 1, vocab]` logits binding
+    /// and read back the `batch` selected token ids paired with the shared
+    /// device capture-error word (stage 2b-impl-3, #750). Row `i` of the returned
+    /// vector is the greedy token of sequence `i`; every row carries the same
+    /// latched capture-error bitmask (the kernel copies the one shared word into
+    /// each slot). At `batch == 1` the argmax launch geometry and the 8-byte
+    /// read-back are byte-identical to the previous single-sequence path.
+    fn read_greedy_result_batch(&mut self) -> anyhow::Result<Vec<(TokenId, u32)>> {
         let vocab = *self
             .logits_shape
             .last()
             .context("CUDA logits shape has no vocabulary dimension")?;
-        self.bindings[self.logits_binding].device_argmax(vocab, &mut self.greedy_result)?;
-        let mut bytes = [0_u8; 2 * std::mem::size_of::<u32>()];
+        self.bindings[self.logits_binding].device_argmax(
+            vocab,
+            self.batch,
+            &mut self.greedy_result,
+        )?;
+        let word = std::mem::size_of::<u32>();
+        let mut bytes = vec![0_u8; self.batch * 2 * word];
         self.greedy_result.read_bytes_into(&mut bytes)?;
-        Ok((
-            u32::from_ne_bytes(
-                bytes[..4]
+        let mut rows = Vec::with_capacity(self.batch);
+        for sequence in 0..self.batch {
+            let base = sequence * 2 * word;
+            let token = u32::from_ne_bytes(
+                bytes[base..base + word]
                     .try_into()
                     .map_err(|_| anyhow::anyhow!("four token-id bytes"))?,
-            ),
-            u32::from_ne_bytes(
-                bytes[4..]
+            );
+            let capture_error = u32::from_ne_bytes(
+                bytes[base + word..base + 2 * word]
                     .try_into()
                     .map_err(|_| anyhow::anyhow!("four capture-error bytes"))?,
-            ),
-        ))
+            );
+            rows.push((token, capture_error));
+        }
+        Ok(rows)
+    }
+
+    fn read_greedy_result(&mut self) -> anyhow::Result<(TokenId, u32)> {
+        let rows = self.read_greedy_result_batch()?;
+        rows.into_iter()
+            .next()
+            .context("device argmax returned no rows")
     }
 
     pub(crate) fn invalidate_graph(

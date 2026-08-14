@@ -1207,10 +1207,11 @@ impl ExecutionProvider for CudaExecutionProvider {
         &self,
         logits: &DeviceBuffer,
         elements: usize,
+        batch: usize,
         dtype: DataType,
         result: &mut DeviceBuffer,
     ) -> Result<()> {
-        crate::kernels::device_argmax::launch(&self.runtime, logits, elements, dtype, result)
+        crate::kernels::device_argmax::launch(&self.runtime, logits, elements, batch, dtype, result)
     }
 
     fn copy_from_host(&self, src: &[u8], dst: &mut DeviceBuffer) -> Result<()> {

@@ -127,8 +127,10 @@ pub use weight_paging::{
     global_offload_stats, reset_global_offload_stats, zero_copy_hybrid_from_env,
 };
 
-/// Number of additional u32 words required by the CUDA device argmax result buffer.
-pub fn device_argmax_scratch_words(elements: usize) -> usize {
-    kernels::device_argmax::scratch_words(elements)
+/// Number of additional u32 words the CUDA device argmax result buffer needs
+/// beyond its `2 × batch` header words, for `batch` sequences of `elements`
+/// logits each.
+pub fn device_argmax_scratch_words(elements: usize, batch: usize) -> usize {
+    kernels::device_argmax::scratch_words(elements, batch)
 }
 pub use runtime::{CudaAllocationCounts, CudaRuntime};
