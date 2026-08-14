@@ -64,6 +64,7 @@ pub mod indexing;
 pub(crate) mod kv_stride;
 pub mod linear_attention;
 pub mod log_softmax;
+pub mod marlin_gemm;
 pub mod matmul;
 pub mod matmul_nbits;
 pub mod mod_op;

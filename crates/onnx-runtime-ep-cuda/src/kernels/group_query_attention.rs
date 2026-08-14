@@ -1928,20 +1928,52 @@ impl GroupQueryAttentionKernel {
                 .cast_const()
                 == inputs[4].data_ptr::<u8>();
         let capture_candidate = requested_present_capacity
-            .filter(|&present_capacity| {
-                (q.dtype == DataType::Float32
-                    || (q.dtype == DataType::Float16 && gqa_decode_fp16::supported(q_seq, dim))
-                    || (q.dtype == DataType::BFloat16 && gqa_decode_bf16::supported(q_seq, dim)))
-                    && q_seq == 1
-                    && k_seq <= 1
-                    && has_past_key
+            .and_then(|present_capacity| {
+                // Structural preconditions shared by every capture-safe GQA
+                // signature: an in-place, fixed-capacity, aliased device-KV cache
+                // whose past and present extents match, so the prep append and
+                // attention read replay against stable addresses.
+                let structural = has_past_key
                     && present_capacity >= 1
                     && past_capacity == present_capacity
-                    && aliased_device_kv
-                    && self.selected_backend_for_shape(q.dtype, q_seq, present_capacity, dim)
-                        == GroupQueryAttentionBackend::Phase2a
+                    && aliased_device_kv;
+                if !structural {
+                    return None;
+                }
+                // Resolve the backend against the fixed `present_capacity` (never
+                // the runtime valid length), so the warm and captured runs agree
+                // on the dispatch and the signature stays stable.
+                let backend =
+                    self.selected_backend_for_shape(q.dtype, q_seq, present_capacity, dim);
+                let eligible = match backend {
+                    // Single-token device-KV decode (M=1): the existing Phase2a
+                    // split-K flash-decode kernels read the valid length on-device.
+                    GroupQueryAttentionBackend::Phase2a => {
+                        (q.dtype == DataType::Float32
+                            || (q.dtype == DataType::Float16
+                                && gqa_decode_fp16::supported(q_seq, dim))
+                            || (q.dtype == DataType::BFloat16
+                                && gqa_decode_bf16::supported(q_seq, dim)))
+                            && q_seq == 1
+                            && k_seq <= 1
+                    }
+                    // Batched query-width > 1 (speculative-verify / prefill M=K):
+                    // the fused flash kernel is capture-safe by construction
+                    // (static grid, device `total_lengths`/`past_lengths`, no
+                    // host read-back, no mid-launch sync). It handles the fp16/bf16
+                    // shapes flash supports; f32 M>1 would take the reference-scores
+                    // path (host-sized) and is left on the eager fallback.
+                    GroupQueryAttentionBackend::Fused => {
+                        matches!(q.dtype, DataType::Float16 | DataType::BFloat16)
+                            && flash_attention::supported(q_seq, dim)
+                            && q_seq > 1
+                            && k_seq == q_seq
+                    }
+                    GroupQueryAttentionBackend::Auto => false,
+                };
+                eligible.then_some((present_capacity, backend))
             })
-            .map(|present_capacity| GqaCaptureSignature {
+            .map(|(present_capacity, backend)| GqaCaptureSignature {
                 dtype: q.dtype,
                 batch,
                 query_sequence_length: q_seq,
@@ -1968,7 +2000,7 @@ impl GroupQueryAttentionKernel {
                     })
                     .collect(),
                 output_shapes: outputs.iter().map(|output| output.shape.to_vec()).collect(),
-                backend: GroupQueryAttentionBackend::Phase2a,
+                backend,
             });
         require_matching_capture_signature(
             &self.runtime,
@@ -3102,7 +3134,7 @@ impl Kernel for GroupQueryAttentionKernel {
         match self.last_capture_safe_signature.lock() {
             Ok(signature) if signature.is_some() => onnx_runtime_ep_api::CaptureSupport::Supported,
             Ok(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
-                "requires a warmed f32/fp16/bf16 q_seq==1 k_seq<=1 fixed-capacity device-KV decode path; the current signature was not warmed as capture-safe",
+                "requires a warmed fixed-capacity aliased device-KV signature: either f32/fp16/bf16 q_seq==1 (Phase2a split-K decode) or fp16/bf16 q_seq>1 (fused flash verify/prefill); the current signature was not warmed as capture-safe",
             ),
             Err(_) => onnx_runtime_ep_api::CaptureSupport::unsupported(
                 "GroupQueryAttention capture signature is unavailable because its state lock was poisoned",
