@@ -6967,15 +6967,25 @@ impl Kernel for MatMulNBitsKernel {
         // shape-fixed persistent accuracy-4 activation workspace; it performs no
         // per-call allocation, D2H, or synchronization. The direct fp16 GEMV is
         // likewise capture-safe: fixed grid/block geometry from the shape
-        // signature and register/launch-time-shared scratch. The allocation-free
-        // fp16 prefill GEMM remains conservatively unadvertised because variable-M
-        // prefill is outside the persistent decode graph and lacks replay coverage;
-        // f32 prefill scratch and g_idx validation are also non-capturable.
+        // signature and register/launch-time-shared scratch.
+        //
+        // The opt-in Marlin M>1 tensor-core GEMM is ALSO capture-safe once its
+        // weights are repacked: its launch grid is a pure function of (M, N) and,
+        // on a warm repack-cache hit, the call performs no allocation, D2H, or
+        // synchronization. The dispatch records this by storing the cache-warm
+        // flag into `last_call_capture_safe`, so a cold (repacking) first call is
+        // reported unsupported and only warm replays advertise support — which is
+        // exactly what unlocks capture-stable speculative verification at M>1.
+        //
+        // The portable (non-Marlin) fp16 prefill GEMM remains conservatively
+        // unadvertised because variable-M prefill is outside the persistent
+        // decode graph and lacks replay coverage; f32 prefill scratch and g_idx
+        // validation are also non-capturable.
         if self.last_call_capture_safe.load(Ordering::Relaxed) {
             onnx_runtime_ep_api::CaptureSupport::Supported
         } else {
             onnx_runtime_ep_api::CaptureSupport::unsupported(
-                "requires M==1 decode GEMV without group_indices; prefill is outside the advertised capture contract and group_indices validation reads D2H",
+                "requires M==1 decode GEMV without group_indices, or a warm-cache Marlin M>1 GEMM; a cold Marlin repack and portable prefill are outside the advertised capture contract and group_indices validation reads D2H",
             )
         }
     }
