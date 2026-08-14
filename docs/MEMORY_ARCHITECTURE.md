@@ -13,6 +13,37 @@
 
 ---
 
+## Which memory document to read
+
+There are several, and they are not peers. Read this table before trusting a
+number from any of them — more than once a figure here has been superseded by a
+measurement recorded elsewhere, and a reader with no map has no way to tell.
+
+| Document | Role | Trust it for |
+|---|---|---|
+| **MEMORY_ARCHITECTURE.md** (this file) | **Authoritative for measured behaviour.** The single source for KV geometry, the §2.1 raw-allocation audit, residency-policy facts (§3.5), and the failure-mode lessons | What the code *does*, with the measurement behind it |
+| [WEIGHT_OFFLOAD.md](./WEIGHT_OFFLOAD.md) | The offload design plus its **north-star scorecard** (does it degrade into latency, present one number, beat the OS, keep one authority) | Whether offload is meeting its goals, and the WDDM comparison |
+| [KV_INSERTION_DESIGN.md](./KV_INSERTION_DESIGN.md) | KV insertion/commit design | The insertion contract; geometry lives here |
+| [TOKEN_MAJOR_KV_INVESTIGATION.md](./TOKEN_MAJOR_KV_INVESTIGATION.md), [SEQ_MAJOR_KV_INVESTIGATION.md](./SEQ_MAJOR_KV_INVESTIGATION.md), [VMM_KV_CONTIGUOUS_VA.md](./VMM_KV_CONTIGUOUS_VA.md), [GQA_KV_MATERIALIZATION_DESIGN.md](./GQA_KV_MATERIALIZATION_DESIGN.md) | **Historical investigations.** Snapshots of what was believed when they were written | The reasoning and the falsifiers, **not** current numbers |
+| `docs/research/*` | Sweep reports and feasibility probes | The protocol and the raw table for one experiment |
+
+**Two standing rules, learned the hard way:**
+
+**A design document is not evidence.** Where a design doc and a measurement
+disagree, the measurement wins and the design doc is stale — including this one.
+This file has been wrong at least three times (Phase-2a scores described as
+fp16-sized when the code used `dtype.element_size()`; a stale #811 invalidation
+claim; the `layers × 2 × kv_heads = 768` floor quoted as the engine's baseline
+when head-major re-packs its bucket dense and never instantiates that geometry).
+**The single source is not exempt from verification.**
+
+**Numbers carry their conditions.** A figure without the platform, the model, the
+budget and whether the run was solo is not reusable. Wall-clock on the
+development box is not evidence at all — identical configurations have ranged
+3.9–28 tok/s, much of it the OS paging our own memory (#863).
+
+---
+
 ## Implementation status
 
 This document describes the target architecture. Most of it is not built yet,
