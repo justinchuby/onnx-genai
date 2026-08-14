@@ -16,8 +16,10 @@ impl SamplingRng {
         Self { rng }
     }
 
-    pub(crate) fn for_row(seed: Option<u64>, row_index: usize) -> Self {
-        Self::new(seed.map(|seed| seed.wrapping_add(row_index as u64)))
+    pub(crate) fn for_row(seed: Option<u64>, _row_index: usize) -> Self {
+        // A request's deterministic stream must not depend on which physical
+        // continuous-batch slot happens to host it.
+        Self::new(seed)
     }
 
     pub(crate) fn value_for(&mut self, options: &GenerateOptions) -> f32 {

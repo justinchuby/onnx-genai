@@ -895,6 +895,100 @@ fn is_fusible_component(component: &WorkflowComponent) -> bool {
             component.implementation,
             ComponentImplementation::Onnx { .. }
         )
+        && batching_safe_policy_contract(component)
+}
+
+fn batching_safe_policy_contract(component: &WorkflowComponent) -> bool {
+    let Some(contract) = &component.contract else {
+        return true;
+    };
+    let (input_roles, output_roles): (&[&str], &[&str]) = match contract.id.as_str() {
+        "onnx-genai.token-sampler" => (
+            &[
+                "logits",
+                "active",
+                "temperature",
+                "top_k",
+                "top_p",
+                "min_p",
+                "seed",
+                "counter",
+            ],
+            &["token", "next_counter"],
+        ),
+        "onnx-genai.termination-predicate" => (
+            &[
+                "tokens",
+                "active",
+                "eos_ids",
+                "eos_lengths",
+                "iteration",
+                "max_iterations",
+            ],
+            &["done", "continue"],
+        ),
+        "onnx-genai.state-update" => (&["current", "update", "active"], &["next"]),
+        _ => return true,
+    };
+    let mut bound_ports = HashSet::new();
+    contract.version == "2"
+        && input_roles
+            .iter()
+            .all(|role| batching_role_port(component, contract, role, true, &mut bound_ports))
+        && output_roles
+            .iter()
+            .all(|role| batching_role_port(component, contract, role, false, &mut bound_ports))
+        && matches!(
+            contract.parameters.get("batching"),
+            Some(onnx_genai_metadata::ScalarValue::String(value)) if value == "per_row"
+        )
+        && matches!(
+            contract.parameters.get("inactive_rows"),
+            Some(onnx_genai_metadata::ScalarValue::String(value)) if value == "preserve"
+        )
+}
+
+fn batching_role_port(
+    component: &WorkflowComponent,
+    contract: &onnx_genai_metadata::ComponentContract,
+    role: &str,
+    input: bool,
+    bound_ports: &mut HashSet<String>,
+) -> bool {
+    let Some(port) = contract.bindings.get(role) else {
+        return false;
+    };
+    if !bound_ports.insert(port.clone()) {
+        return false;
+    }
+    let tensor = if input {
+        component.ports.inputs.get(port)
+    } else {
+        component.ports.outputs.get(port)
+    };
+    let Some(tensor) = tensor else {
+        return false;
+    };
+    if tensor.rank == 0
+        || !matches!(
+            tensor.shape.as_deref().and_then(|shape| shape.first()),
+            Some(onnx_genai_metadata::TensorDimension::Symbol(symbol)) if symbol == "batch"
+        )
+    {
+        return false;
+    }
+    match role {
+        "active" | "done" | "continue" => tensor.dtype == "bool" && tensor.rank == 1,
+        "temperature" | "top_p" | "min_p" | "logits" => {
+            matches!(tensor.dtype.as_str(), "float32" | "float16" | "bfloat16")
+        }
+        "top_k" | "seed" | "counter" | "next_counter" | "tokens" | "token" | "eos_ids"
+        | "eos_lengths" | "iteration" | "max_iterations" => {
+            tensor.dtype.starts_with("int") || tensor.dtype.starts_with("uint")
+        }
+        "current" | "update" | "next" => true,
+        _ => false,
+    }
 }
 
 fn island_invocation(node: &WorkflowNode) -> anyhow::Result<IslandInvocation> {
@@ -1848,6 +1942,22 @@ mod tests {
         }
     }
 
+    fn batch_tensor(dtype: &str, rank: usize) -> onnx_genai_metadata::TensorContract {
+        onnx_genai_metadata::TensorContract {
+            dtype: dtype.into(),
+            rank,
+            shape: Some(
+                std::iter::once(onnx_genai_metadata::TensorDimension::Symbol("batch".into()))
+                    .chain(
+                        (1..rank)
+                            .map(|_| onnx_genai_metadata::TensorDimension::Symbol("axis".into())),
+                    )
+                    .collect(),
+            ),
+            optional: false,
+        }
+    }
+
     #[test]
     fn external_initializers_are_linked_by_path_without_copying_bytes() {
         let test_root = std::env::current_dir()
@@ -1986,6 +2096,94 @@ mod tests {
             custom_ops: BTreeMap::new(),
         });
         assert!(!is_fusible_component(&adapter));
+    }
+
+    #[test]
+    fn sampler_fusion_requires_the_per_row_batching_abi() {
+        let mut sampler = component(ComponentImplementation::Onnx {
+            artifact: "sampler.onnx".into(),
+        });
+        sampler.contract = Some(onnx_genai_metadata::ComponentContract {
+            id: "onnx-genai.token-sampler".into(),
+            version: "1".into(),
+            bindings: BTreeMap::from([
+                ("logits".into(), "logits".into()),
+                ("token".into(), "token".into()),
+            ]),
+            parameters: BTreeMap::new(),
+        });
+        assert!(!is_fusible_component(&sampler));
+
+        for (role, dtype, rank) in [
+            ("logits", "float32", 2),
+            ("active", "bool", 1),
+            ("temperature", "float32", 1),
+            ("top_k", "int64", 1),
+            ("top_p", "float32", 1),
+            ("min_p", "float32", 1),
+            ("seed", "int64", 1),
+            ("counter", "int64", 1),
+        ] {
+            sampler
+                .ports
+                .inputs
+                .insert(role.into(), batch_tensor(dtype, rank));
+        }
+        for (role, dtype) in [("token", "int64"), ("next_counter", "int64")] {
+            sampler
+                .ports
+                .outputs
+                .insert(role.into(), batch_tensor(dtype, 1));
+        }
+        {
+            let contract = sampler.contract.as_mut().unwrap();
+            contract.version = "2".into();
+            for role in [
+                "logits",
+                "active",
+                "temperature",
+                "top_k",
+                "top_p",
+                "min_p",
+                "seed",
+                "counter",
+            ] {
+                contract.bindings.insert(role.into(), role.into());
+            }
+            for role in ["token", "next_counter"] {
+                contract.bindings.insert(role.into(), role.into());
+            }
+            contract.parameters.insert(
+                "batching".into(),
+                onnx_genai_metadata::ScalarValue::String("per_row".into()),
+            );
+            contract.parameters.insert(
+                "inactive_rows".into(),
+                onnx_genai_metadata::ScalarValue::String("preserve".into()),
+            );
+        }
+        assert!(is_fusible_component(&sampler));
+
+        sampler
+            .contract
+            .as_mut()
+            .unwrap()
+            .bindings
+            .insert("active".into(), "logits".into());
+        assert!(!is_fusible_component(&sampler));
+        sampler
+            .contract
+            .as_mut()
+            .unwrap()
+            .bindings
+            .insert("active".into(), "active".into());
+        sampler
+            .contract
+            .as_mut()
+            .unwrap()
+            .bindings
+            .remove("counter");
+        assert!(!is_fusible_component(&sampler));
     }
 
     #[test]

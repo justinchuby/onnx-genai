@@ -17,3 +17,18 @@ through declared phi mappings.
 Generic serving services—admission, continuous batching, compaction, KV paging/slot
 allocation, resource governance, and device placement—remain runtime mechanisms and
 are driven by typed workflow values rather than model-family dispatch.
+
+## Batched policy islands
+
+Sampler and termination components may enter an execution island only through their
+version 2 per-row ABI. A sampler must bind `logits`, `active`, `temperature`, `top_k`,
+`top_p`, `min_p`, `seed`, `counter`, `token`, and `next_counter`, with contract
+parameters `batching: per_row` and `inactive_rows: preserve`. Termination additionally
+binds per-row EOS lengths and iteration limits; state updates bind an `active` mask.
+
+These are semantic requirements, not scalar-broadcast conveniences. Every row owns
+its sampling parameters, ragged logical lengths, deterministic RNG seed/counter,
+termination state, and KV/state update decision. Inactive rows consume no RNG,
+preserve semantic state, and produce no compacted emit event. Stable max-batch device
+buffers may contain inactive capacity, but capture and super-island plans must remain
+valid as the active-row set changes without specializing the ONNX graph to batch one.
