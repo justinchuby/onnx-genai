@@ -257,9 +257,22 @@ a maximum, not free capacity.
 
 A host-backed GPU allocation takes one host physical lease plus a non-local
 residency allowance, not two physical leases. Prefer a resident hot set plus
-host-mapped cold, single-touch weights over copy-map-evict churn. Managed
-no-spill CUDA VMM remains a hard bound and cannot assume WDDM spill. CUDA managed
-memory is a separate capability with limited Windows support.
+host-mapped cold, single-touch weights over copy-map-evict churn.
+
+Managed no-spill CUDA VMM is a hard bound on *our own admission* — the ledger
+refuses to hand out more than `managed_limit`, and a request past it fails
+rather than silently degrading. It is **not** a guarantee that the granules we
+did admit stay in device memory. #863 measured WDDM paging out our own VMM
+granules under system-wide over-commit, so the correct statement is narrower:
+solo and under `managed_limit`, no-spill holds physically (`nvidia-smi` tracks
+our ledger 1:1); once the *system* is over-committed, VidMm may demote our
+granules and our ledger cannot see it. Neither we nor WDDM can pin against
+that on this platform. The design consequence is unchanged — never treat WDDM
+spill as a capacity extension we can plan against — but the reason is that
+spill is invisible and slow, not that it cannot happen to us. Under TCC,
+`cuMemCreate` should fail rather than spill (#783).
+
+CUDA managed memory is a separate capability with limited Windows support.
 
 ## G. Prefix caching, batching, and model switching
 
