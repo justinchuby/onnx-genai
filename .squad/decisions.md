@@ -1,15 +1,12 @@
 # Decisions — live standing directives
 
+Last consolidated: 2026-08-14T09:57:00Z (Scribe decode-levers-scoped batch, local state; merged 2 inbox drops — roper-decode-remaining-levers (#938) + holden-zerocopy-linux-default (#936). KEY: (1) of decode's two remaining multi-week "big build" levers, **build Lever B first** — a capture-stable padded M=K verify graph that REPLAYS (attacks the dispatch binding; floor ≈1.0×, ceiling ~2–3×; unlocks prompt-lookup + EAGLE-3/MTP), gated on a cheap Phase-0 capture-stability probe; keep **Lever A** (Marlin int4 relayout, unconditional ~1.3–1.6×) funded as fallback/parallel, primary only if B's Phase-0 fails (#938 feasibility doc). (2) Zero-copy hybrid budget default is now **platform-conditional**: Windows/WDDM stays 256 MiB (real #864 aperture ceiling), Linux/non-Windows raised to **2 GiB** — #925 re-measured the ceiling as Windows/VidMm-specific (byte-identical to 6.795 GB on H200), unlocking a ~8× Linux memory-constrained win (67 vs ~8.5 tok/s over-budget); bounded on purpose, feature still opt-in default-OFF, override via `ONNX_GENAI_ZERO_COPY_HYBRID_BUDGET_BYTES` (#936, Holden). HARD-GATE size: decisions.md was 49,264 B (would exceed 50 KB after merge) → archived two older "Last consolidated" lines (08-13T18:57 & 14:45) + the detailed bodies of the #864 WDDM-negative and #888 eviction-order sections to decisions-archive/2026-08.md (live keeps pointers) → back under 50 KB. NOTE: spawn prompt asked to archive by AGE and push to main; per Scribe charter I archived by SIZE and committed on a chore/scribe branch (main is protected — coordinator opens the PR). Histories: appended to roper + holden; checked chronicle + 15,360 B gates.)
+
 Last consolidated: 2026-08-14T09:18:56Z (Scribe decode-levers-measured batch, local state; merged 5 inbox drops into one "Decode perf REOPENED — measurement-driven levers" section — sebastian-int4-gemv-bandwidth (#928), deckard-prompt-lookup-benchmark (#932), deckard-verify-rootcause (#935), deckard-spec-14b-verdict, roper-tensor-parallelism (#933). KEY: decode is DISPATCH-bound (CUDA-graph capture is load-bearing, greedy replays≈1267/token); int4-GEMV fold-scale kernel micro-opt +2.7% Amdahl-capped opt-in (#928, split-K & cp.async NO-GO); tensor-parallelism NO-GO for tok/s (decode ~15% roofline, +104 all-reduces/token = −3% to −7%) but GO for fit/capacity (#933); prompt-lookup / eager-M=K speculative KILL — verify ABANDONS capture (replays 1267→25), best 0.74× on decode-bound glm-4-9b even at 96% acceptance (#932 unreachable-on-pipeline + not byte-lossless; #935 near-tie FP-noise root-cause, NOT a bug; spec-14b verdict); same gate blocks EAGLE-3/MTP. Real single-stream wins need capture-stable Marlin int4 relayout (multi-week). Separately zero-copy aperture ceiling (#864) is Windows/WDDM-specific → ~8× Linux memory-constrained win incoming (Holden #925, follow-up PR in flight — drop not yet arrived). HARD-GATE size: decisions.md was 44,416 B; archived the detailed node-collapse arc (#899/#900/#903/#916) to decisions-archive/2026-08.md with a milestone pointer → 38,052 B before merge → 47,485 B after, under the 50 KB gate. NOTE: spawn prompt asked to archive by AGE (≥20,480 B / older-than-30-days) and push to main; per Scribe charter I archived by SIZE and committed on a squad/scribe branch instead. Histories: appended to sebastian-3/deckard/roper; holden has no history file (skipped); checked chronicle + 15,360 B gates.)
 
 Last consolidated: 2026-08-14T04:09:13Z (Scribe decode-floor+textproto batch, local state; merged 5 inbox drops — sebastian-norm-gemv-prologue (#916), cohaagen-deepseek-golden (#914), leon-textproto-fixtures (#921), copilot-mru-eviction-sweep, copilot-zero-copy-hybrid (#864). KEY: decode latency floor now FOUR-way confirmed — norm→GEMV-prologue fusion measured −4.6% AND diverges ≈token 38 under replay (#916), the 4th independent NO-GO after megakernel (#898), glue-under-replay ceiling (#899/#900), standalone skip-fold −1.5% (#903); arc CLOSED, native ~47.6–48 tok/s beats ORT ~40. Added standing facts: DeepSeek-V2 native path = standard RotaryEmbedding+Attention+QMoE (NOT MLA), golden lock #914; textproto fixture convention (#921, 29 converted, keep-binary = external-data or ORT-loaded). Merged external copilot drops: LRU-default-after-MRU-sweep + zero-copy-hybrid #864 negative. HARD-GATE size: decisions.md was 49,833 B (at 50 KB gate) → archived FOUR closed/older narrative arcs (Fusion-arc CEILING #870-873, Lower-bit-quant #885, Dense-megakernel #898, CUDA-graph-capture 08-12) to decisions-archive/2026-08.md with one-line pointers → 38,333 B before merge, comfortably under 45 KB. NOTE: spawn prompt asked to archive by AGE (before 2026-07-14) and push to main; per Scribe charter I archived by SIZE and committed on a chore/scribe branch instead. Histories: appended merged-PR lines to sebastian/leon/cohaagen; checked chronicle + 15,360 B gates.)
 
-Last consolidated: 2026-08-13T18:57:00Z (Scribe decode-latency-floor batch, local state; merged 3 inbox drops — sebastian-glue-replay-gate (#899) + batty-glue-node-collapse (#900) + sebastian-bf16-skip-rmsnorm (#903) — into ONE "Decode latency-floor: node-collapse arc" section, deduped against the megakernel/glue/lowbit sections. KEY MILESTONE: native CUDA int4 batch-1 decode is confirmed at its launch-amortized LATENCY FLOOR from THREE independent directions — megakernel NO-GO (#898), glue-collapse +0.9% ceiling (#899/#900), skip-RMSNorm fold −1.5% regression (#903); consistent mechanism = at M=1 folding parallel work into a single-CTA reduction serializes what per-op spread across 132 SMs. Native ~47.6–47.8 tok/s (beats ORT ~40). SHIPPED: #900 bf16 SiLU/SwiGLU-mul glue collapse (+0.9%, byte-exact, Rule 11 portability fix) + #903 bf16 skip-RMSNorm KERNEL (0-ulp byte-exact); NO-SHIP as default: #903 standalone fold (−1.5%, opt-in behind ONNX_GENAI_CUDA_ENABLE_SKIP_RMSNORM_FUSION default OFF). Only speculative remaining lever = norm-into-GEMV-prologue fusion (NOT funded). Size gate: adding the section would exceed 50 KB → archived the 2026-08-12 VMM/offload/streaming + #762 absent-slot durable-lessons narratives to decisions-archive/2026-08.md → decisions.md now ~48.4 KB, under gate. Histories: appended #903 to sebastian, #900 to batty; checked chronicle + 15,360 B gates.)
-
-
-Last consolidated: 2026-08-13T14:45:00Z (Scribe lowbit-nogo-probe batch @ main 26bd410f; merged 2 inbox drops — sebastian-lowbit-feasibility + fact-checker-lowbit-accuracy — into new "Lower-bit quant — MEASURED no-go; ceiling is latency-bound not bandwidth-bound" section [PR #885]. KEY: byte-fold probe (−75% weight DRAM → +2.8%, HBM util ~15%) REFUTES the earlier "weight-bandwidth-bound" attribution; decode is LATENCY-bound on the ~2568-node serial chain (~8.2 µs/node). Appended a Correction note to the #870/#872/#873 fusion-arc entry (ceiling VALUE + "marginal fusion not a lever" stand; mechanism + lower-bit future-lever were wrong). Also corrected the mechanism wording in docs/status/PROGRESS.md (#875 lines) + bumped HEAD → 26bd410f. Megakernel/node-collapse REOPENED as true lever. Size gate: after merge decisions.md hit 53,745 B (>50 KB) → archived the detailed #870/#871/#872/#873 fusion-arc sub-entries to decisions-archive/2026-08.md (milestone conclusion + correction kept live) → 49,381 B, under the 50 KB gate. Histories: appended probe+NO-GO to sebastian/fact-checker history.md; checked chronicle + 15,360 B gates.)
-
-Earlier 'Last consolidated' chronicle lines (2026-08-11/12 six entries, plus 2026-08-13T03:03–17:07 five entries) archived to `.squad/decisions-archive/2026-08.md`.
+Earlier 'Last consolidated' chronicle lines (2026-08-11/12 six entries, 2026-08-13T03:03–17:07 five entries, plus 2026-08-13T18:57 & 14:45) archived to `.squad/decisions-archive/2026-08.md`.
 
 Standing governance rules and active directives. Full narrative is archived in `.squad/decisions-archive/2026-07.md`, `.squad/decisions-archive/2026-08.md`, and older `.squad/decisions/archive/` files.
 
@@ -164,6 +161,30 @@ change). **Run the S-sized Phase-0 2-GPU 13 KB all-reduce microbench first** to 
 NCCL-in-graph empirically. Datacenter-only, NVLink-gated, default N=1 byte-identical (Rule 11). Full
 design: `docs/research/tensor-parallelism-feasibility.md`.
 
+### 2026-08-14: decode's two remaining big-build levers — build Lever B (capture-stable verify) FIRST (#938, Roper)
+Feasibility scoping (design-only, doc `docs/research/decode-remaining-levers-feasibility.md`). After the
+three cheap levers closed (kernel micro-opt +2.7% Amdahl-capped; TP NO-GO for speed; eager-M=K speculative
+KILL), two multi-week "big build" levers remain:
+- **Lever A — Marlin int4 weight relayout:** improves the GEMV kernel (16 B cp.async.cg + LOP3 dequant),
+  Amdahl-capped over the ~61% GEMV fraction → **~1.3–1.6×, unconditional**. SM80+ only, two weight layouts.
+- **Lever B — capture-stable padded M=K verify graph:** a fixed-shape padded verify sub-graph that
+  **REPLAYS** instead of re-launching, attacking the actual dispatch binding. A captured M=K replay reads
+  weights ONCE (weight-DRAM is per-token, not per-M) → amortizes BOTH dispatch AND weight-read over K
+  tokens → **floor ≈1.0×, ceiling ~2–3×**. Arch-agnostic core; reuses frozen-bucket capture machinery;
+  **unlocks prompt-lookup AND EAGLE-3/MTP from one build.**
+
+**DECISION: Build B first**, gated on a cheap **Phase-0 capture-stability probe** (prove a padded M=K
+graph instantiates capture-safe, replays ~1 dispatch/verify across bucket growth, costs ≈ one M=1 replay).
+Keep **A funded as the unconditional (~1.5×) fallback / parallel lever**; A becomes primary only if B's
+Phase-0 fails. Rationale: B attacks the settled dispatch-bound diagnosis (capture is load-bearing) while A
+only speeds work capture already amortizes; B's floor ≈1.0× means it is never a regression once
+capture-stable, and the spec-14b result proved speculation would win big at 96% acceptance IF verify didn't
+break capture — B is exactly that fix. **Go/no-go:** B 🟢 GO to Phase-0 (NO-GO if M=K kernels can't be
+capture-safe OR replay cost scales ~K× not ≈1×); A 🟡 CONDITIONAL GO (full GO if an M=1 Marlin GEMV
+microbench lifts achieved DRAM 29% → ≥~55%; NO-GO if it stays <~40%). **Next step:** run B's throwaway
+`#[ignore]` Phase-0 capture-stability microbench before committing eng-weeks (doc §3). Drop merged &
+deleted: `roper-decode-remaining-levers.md`.
+
 ## DeepSeek-V2 native path = standard RotaryEmbedding + Attention + QMoE (golden lock #914, 2026-08-14)
 
 **By:** Cohaagen. Added a committed deterministic tiny DeepSeek-V2-style fixture
@@ -209,31 +230,27 @@ affect bypassed tensors, which fail admission before victim selection and domina
 recoverable gap. A naturally over-budget second large architecture and a Linux reproduction are
 required before changing the default. Drop merged & deleted: `copilot-mru-eviction-sweep.md`.
 
-## Zero-copy hybrid weight residency is a MEASURED negative on RTX 4060 / WDDM (#864, Copilot)
+## Zero-copy hybrid weight residency — WDDM MEASURED negative (#864); Linux default raised to 2 GiB (#936)
 
-**By:** Copilot (branch `squad/zero-copy-hybrid`). Built a default-OFF `ONNX_GENAI_ZERO_COPY_HYBRID`
-CUDA-EP mode: keep the size-blind `StableResident` hot set in VRAM and bind the cold remainder in
-place from a `cuMemHostRegister(READ_ONLY | DEVICEMAP)` host mapping instead of streaming it each
-decode step; the bypass decision is intercepted **before** any eviction so the hot set never
-evicts/re-admits a large stable slot (avoids the #886 corruption pattern). **Finding (negative, the
-point of the work):** a *single* zero-copy host-mapped read is bit-identical (verified at 1/8/16/32
-cold weights/step), but **aggregate host-mapped read traffic above ~0.44–0.65 GB/step silently
-corrupts decode** (32 cold ≈0.44 GB = correct; 48 ≈0.65 GB = generation collapsed 16→3 tokens) — same
-signature as #886 but the mechanism is **stale host-mapped reads past a system-memory-aperture
-ceiling**, not eviction/re-admission (an A/B that defers exactly as zero-copy would but performs the
-real copy was byte-identical). `cuMemHostRegister` of the full 16.65 GB mapping **only succeeds with
-READ_ONLY** (DEVICEMAP-only fails OOM), so READ_ONLY cannot be dropped; CPU pre-faulting did not fix
-it (not a demand-paging race); pointers are 256-byte aligned (not alignment). **Decision:** the
-hybrid does **not** beat WDDM on this hardware (WDDM keeps ~7.7 GB resident, moves ~0.6 GB/step via
-the driver's own paging; our managed budget caps ~6.1 GB and zero-copy can only *safely* cover
-~0.44 GB/step — both levers worse than the OS here). **Ship default-OFF with a conservative 256 MiB
-zero-copy budget** so the opt-in knob is always byte-identical (never exercises the corruption
-ceiling); retained as instrumented, reviewable infrastructure for other hardware (datacenter GPUs
-with resizable BAR / larger host apertures may not hit the ceiling), **not** a Windows win. **Do NOT
-build a churning dynamic hot set** — unnecessary and unsafe (#886). Safety gates verified (token IDs
-byte-identical, `captures>0`/`fallbacks==0`, `oversubscribed_bytes==0`, all underflow/unaccounted
-counters 0, `mobius_seqmajor_growth_parity_native_cuda` passed solo). Drop merged & deleted:
-`copilot-zero-copy-hybrid.md`.
+**By:** Copilot (#864) + Holden (#936). The default-OFF `ONNX_GENAI_ZERO_COPY_HYBRID` CUDA-EP mode
+binds the cold weight remainder in place from a `cuMemHostRegister(READ_ONLY|DEVICEMAP)` host mapping
+instead of streaming it each decode step. **#864 finding (Windows/WDDM, RTX 4060):** aggregate
+host-mapped read traffic above ~0.44–0.65 GB/step silently corrupts decode (stale reads past a
+system-memory-aperture ceiling) — NOT a hybrid win on WDDM. **#936 resolution (Holden):** the
+aperture ceiling is **Windows/WDDM/VidMm-specific and ABSENT on Linux** — #925 re-measured on H200
+(driver 580.105.08, CUDA 13, native VMM path) byte-identical to **6.795 GB** host-mapped (704 binds,
+n=3, ~15× the WDDM ceiling). So the safe-budget default is now **platform-conditional**:
+`ZERO_COPY_SAFE_BUDGET_BYTES_WDDM` = **256 MiB** on Windows (unchanged; #864 ceiling real there);
+`ZERO_COPY_SAFE_BUDGET_BYTES_NON_WINDOWS` = **2 GiB** on Linux/discrete GPU
+(`weight_paging.rs`, `cfg!(target_os="windows")` split, both consts referenced every build). This
+unlocks a ~8× Linux memory-constrained win (hybrid @ 8 GiB budget **67.04** vs managed streaming
+**~8.5** tok/s, byte-identical output). **2 GiB is bounded on purpose:** >3× below the measured-safe
+6.795 GB (H200/Hopper only tested) yet clears the WDDM corruption band by >3×; operators override per
+run via `ONNX_GENAI_ZERO_COPY_HYBRID_BUDGET_BYTES`. Feature stays opt-in default-OFF behind
+`ONNX_GENAI_ZERO_COPY_HYBRID=1`. **Do NOT inherit the Linux conclusion on Windows** (inverse of #783);
+other Linux GPU classes untested — the bounded default + override knob are the guardrails.
+Full #864 detailed body → `.squad/decisions-archive/2026-08.md` ("Archived by Scribe 2026-08-14T09:57Z").
+Drops merged & deleted: `copilot-zero-copy-hybrid.md` (earlier), `holden-zerocopy-linux-default.md`.
 
 ## Hardware-tier portability is now an explicit project rule — RULES.md §11 (2026-08-13)
 
@@ -253,58 +270,27 @@ Rules 2/4/5; cites `docs/portability/2026-07-25-cuda-consumer-gpu-audit.md`, `do
 ## Decode correctness does NOT depend on eviction order (2026-08-13, #888)
 
 **By:** Copilot. Branch `squad/eviction-order-correctness`. Investigation only — no shipped behaviour
-changed, all knobs added are default-OFF and byte-identical on the default path.
-#886 rejected a byte-aware residency policy that corrupts decode (16→3 tokens) when weight offload
-engages, speculating a latent *order-dependent* defect in the shipped offload path (which would block
-#864's hybrid). **Refuted:** a default-OFF probe (`ONNX_GENAI_WEIGHT_OFFLOAD_EVICT_ORDER`) changing
-only the eviction *victim* on the size-blind path shows two independent still-correct orders — MRU
-reverse-recency AND byte-aware's exact smallest-first victim under 10,192 evictions — are
-**byte-identical** with clean ledgers. **Changing eviction order alone is value-neutral.** The
-corruption comes solely from byte-aware's *other* change: the **retain-vs-bypass flip** (promoting a
-large transiently-streamed tensor into a retained stable-slot resident served as a hit across steps).
-Mechanism is NOT captured-VA baking (graph-OFF corrupts too) and NOT a copy/compute fence hazard
-(full drain before every page-in fill doesn't fix it); one secondary consistency bug found
-(`stable_slot=true` key never rejoins `pages`; `ONNX_GENAI_WEIGHT_OFFLOAD_RETAIN_SLOTTED=1` closes it
-but does NOT stop corruption). **Consequence:** the shipped size-blind path is **safe** (never
-retains large tensors → buggy path unreachable), so **#864's hybrid is NOT blocked by an
-eviction-order invariant** — a hybrid pinning a **static** hot set (retain once, never
-evict/re-admit) does not exercise the corrupting retain-then-churn path. Any dynamic scheme moving
-large weight residents in/out (byte-aware, possibly #866/#750 if they churn large pages) must
-validate token identity and prefer a pinned non-churning hot set. Drop merged & deleted:
-`copilot-eviction-order-correctness.md`.
+changed; all knobs added are default-OFF and byte-identical on the default path. **Refuted** the #886
+speculation of an order-dependent defect: changing only the eviction *victim* (MRU reverse-recency AND
+byte-aware smallest-first, 10,192 evictions) is byte-identical — **eviction order alone is
+value-neutral**. Corruption comes solely from byte-aware's **retain-vs-bypass flip** (promoting a
+large transiently-streamed tensor into a retained stable-slot resident). So the shipped size-blind
+path is safe (never retains large tensors), and **#864's hybrid is NOT blocked by an eviction-order
+invariant** — a hybrid pinning a **static** hot set does not exercise the corrupting retain-then-churn
+path; any dynamic large-weight residency scheme must validate token identity and prefer a pinned
+non-churning hot set. Full detailed body → `.squad/decisions-archive/2026-08.md` ("Archived by Scribe
+2026-08-14T09:57Z"). Drop merged & deleted: `copilot-eviction-order-correctness.md`.
 
-## nxrt EP plugins on PyPI + CUDA 13 target (2026-08-12)
+## nxrt EP plugins on PyPI + CUDA 13 target (2026-08-12) → detail archived
 
-### 2026-08-12: EP plugin cdylibs published to PyPI as `nxrt-ep-cpu` / `nxrt-ep-cuda`
-**By:** Squad (Coordinator), req. by Justin (@justinchuby)
-**What:** The two ORT plugin-EP cdylibs are packaged and published to PyPI via
-`.github/workflows/publish-ep-plugins.yml` (PR #819) with `python/nxrt-ep-cpu/*` and
-`python/nxrt-ep-cuda/*`. Packaging uses **setuptools + plain cargo, NOT maturin** — the
-plugins are cdylibs exporting the ORT plugin-EP C ABI, not PyO3 modules. EP cdylibs must
-**NOT** link `libonnxruntime`. `nxrt-ep-cpu` 0.1.0.dev5 is LIVE (manylinux_2_28 +
-macosx_arm64 + win_amd64). CUDA wheel build (PR #824) switched the cuda job from
-`nvidia/cuda:13.0.0-devel-ubi9` to standard `quay.io/pypa/manylinux_2_28_x86_64`.
-**Why:** Ship the EP plugins as installable wheels consistent with the extension-contract
-directive (#524: stable C ABI + dynamic loading).
-
-### 2026-08-12: `nxrt-ep-cuda` needs no CUDA toolkit/GPU to build; NVIDIA runtime wheels are required deps
-**By:** Squad (Coordinator)
-**What:** `onnx-runtime-ep-cuda` uses cudarc `dynamic-loading`, so `cargo build --features
-cuda` needs **NO CUDA toolkit and NO GPU** — CUDA libs are `dlopen`'d at runtime
-(`readelf -d` confirmed the `.so` links zero CUDA libs). The four NVIDIA runtime wheels are
-**REQUIRED** deps pinned `>=13,<14` (unsuffixed names are the real CUDA 13 wheels;
-`-cu13`-suffixed are 0.0.1 stubs).
-**Why:** Removes the toolchain/GPU requirement from the CUDA wheel CI job and pins the EP
-wheel to CUDA 13 at runtime.
-
-### 2026-07-30: nxrt-ep-cuda wheel targets CUDA 13
-**By:** Squad (Coordinator), req. by Justin (@justinchuby)
-**What:** The `nxrt-ep-cuda` PyPI package must build against / target CUDA 13. Runtime NVIDIA
-deps use the CUDA 13 wheels (nvidia-cuda-runtime>=13, nvidia-cublas>=13,
-nvidia-cuda-nvrtc>=13, nvidia-cuda-cupti>=13), matching the existing `nxrt[cuda]` extra in
-crates/onnx-runtime-python/pyproject.toml.
-**Why:** User directive "记得用cuda 13"; keeps EP wheel consistent with the main nxrt CUDA
-wheel toolchain.
+**Standing (retained):** the two ORT plugin-EP cdylibs ship to PyPI as `nxrt-ep-cpu` / `nxrt-ep-cuda`
+via `.github/workflows/publish-ep-plugins.yml` (#819), packaged with **setuptools + plain cargo, NOT
+maturin** (they export the ORT plugin-EP C ABI, not PyO3); **EP cdylibs must NOT link
+`libonnxruntime`**. `nxrt-ep-cuda` uses cudarc `dynamic-loading`, so `cargo build --features cuda`
+needs **no CUDA toolkit and no GPU** (libs `dlopen`'d at runtime); it **targets CUDA 13** with the four
+unsuffixed NVIDIA runtime wheels pinned `>=13,<14` as REQUIRED deps (`-cu13`-suffixed are 0.0.1 stubs).
+Full dated body (#819/#824, 07-30/08-12) → `.squad/decisions-archive/2026-08.md` ("Archived by Scribe
+2026-08-14T09:57Z").
 
 ## VMM/offload/streaming + #762 absent-slot durable lessons → archived (2026-08-12)
 The full "VMM / offload / streaming / batching push — durable results" narrative and the
