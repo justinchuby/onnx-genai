@@ -863,22 +863,54 @@ pub fn splitk_partials_len(split_k: usize, m: usize, n: usize) -> usize {
     split_k * m * n
 }
 
-/// Pick a split-K factor that fills the SMs at small M without over-splitting.
-/// Returns 1 (no split) when the base grid already covers enough SMs or the K
-/// range is too short to divide usefully. `sm_count` is the device SM count.
+/// Split-K cap. Microbenchmarks on the glm-4-9b / qwen2.5-14b decode-GEMM
+/// shapes (K∈{4096,5120,13696}, N∈{256..27392}) at the M≤8 speculative-verify
+/// width show `split_k = 8` is the universal best or near-best factor; `16`
+/// regresses the medium-N shapes (extra reduction traffic outweighs the SM fill)
+/// while helping only large-N by ~3%. So we cap at 8.
+const SPLITK_MAX: u32 = 8;
+
+/// Highest M we split at. Split-K trades reduction overhead for weight-DRAM
+/// throughput and SM fill; it wins big while the GEMM is memory/latency-bound
+/// (M≤8: up to 3.2×; M=32: still ~1.3-1.5×) but is neutral-to-negative once the
+/// direct kernel becomes compute-bound (M≥64-128). Speculative verify widths
+/// (draft length, typically 4-8, up to a small tree) sit well inside this.
+const SPLITK_MAX_M: usize = 32;
+
+/// Pick a split-K factor for the small-M (speculative-verify / decode) regime.
+///
+/// Returns 1 (no split) once the GEMM is compute-bound (`m > SPLITK_MAX_M`) or
+/// the K range is too short to divide (`k_blocks < 2`). Otherwise it partitions
+/// K across `grid.z` to fill the SMs and raise achieved weight-DRAM bandwidth.
+///
+/// The earlier "aim for ~2 waves of blocks, else don't split" rule systematically
+/// *under*-split at M=8: it picked `split_k = 2-3` where the microbench optimum is
+/// 8 (e.g. K=13696,N=4096: sk3 108µs vs sk8 84µs), and bailed to no-split entirely
+/// for large-N projections (gate_up N=27392) where `split_k = 8` still wins ~1.1×.
+/// The block count is a poor proxy at small M because each block is
+/// latency-bound (low DRAM %), so oversubscribing K keeps more memory requests in
+/// flight. We therefore target several waves and floor the factor toward the
+/// measured small-M optimum. `sm_count` is the device SM count.
 #[must_use]
 pub fn choose_split_k(m: usize, n: usize, k_blocks: usize, sm_count: u32) -> usize {
-    let base_blocks =
-        (n as u32).div_ceil(MARLIN_N_PER_BLOCK) * (m as u32).div_ceil(MARLIN_M_PER_BLOCK);
-    // Aim for ~2 waves of blocks. If already there, don't split.
-    let target = sm_count.saturating_mul(2).max(1);
-    if base_blocks >= target || k_blocks < 2 {
+    if m > SPLITK_MAX_M || k_blocks < 2 {
         return 1;
     }
-    let want = target.div_ceil(base_blocks.max(1));
-    // Cap so each split still owns >= 2 groups, and clamp to a small max.
+    let base_blocks =
+        (n as u32).div_ceil(MARLIN_N_PER_BLOCK) * (m as u32).div_ceil(MARLIN_M_PER_BLOCK);
+    // Oversubscribe the SMs (~8 waves) so small-M, latency-bound blocks overlap.
+    let target = sm_count.saturating_mul(8).max(1);
+    let mut want = target.div_ceil(base_blocks.max(1));
+    // Floor toward the measured small-M optimum even when the base grid already
+    // spans many waves: deeper K-splitting raises weight-DRAM throughput at M≤8
+    // regardless of the N-block count (a shallow 2-way split can even regress
+    // large-N, whereas 8-way helps). Smaller M is more latency-bound, so floor
+    // higher there.
+    let floor = if m <= 16 { SPLITK_MAX } else { SPLITK_MAX / 2 };
+    want = want.max(floor);
+    // Cap so each split still owns >= 2 groups, and clamp to the measured max.
     let max_by_groups = (k_blocks / 2).max(1) as u32;
-    want.clamp(1, max_by_groups).min(8) as usize
+    want.clamp(1, max_by_groups).min(SPLITK_MAX) as usize
 }
 
 /// Launch the split-K Marlin GEMM (fp32 partials) followed by the fixed-order
@@ -1470,8 +1502,17 @@ mod tests {
         let iters: usize = 100;
 
         // Qwen2.5-14B-ish projections: gate/up (K=5120,N=13824) and a square-ish
-        // attention proj (K=5120,N=5120). Sweep M across the decode->prefill range.
-        for &(k, n) in &[(5120usize, 5120usize), (5120, 13824)] {
+        // attention proj (K=5120,N=5120). Plus glm-4-9b-int4 projections: o/q
+        // proj (K=4096,N=4096), gate_up (K=4096,N=27392), down (K=13696,N=4096),
+        // and the small kv proj (K=4096,N=256). Sweep M across decode->prefill.
+        for &(k, n) in &[
+            (5120usize, 5120usize),
+            (5120, 13824),
+            (4096, 4096),
+            (4096, 27392),
+            (13696, 4096),
+            (4096, 256),
+        ] {
             let group = 128usize;
             let k_blocks = k / group;
             let blob = group / 2;
@@ -1541,7 +1582,7 @@ mod tests {
                 // Split-K sweep: fill idle SMs at small M. Report the best factor.
                 let sm = rt.capabilities().multiprocessor_count();
                 let auto_sk = choose_split_k(m, n, k_blocks, sm);
-                let mut sk_candidates = vec![2usize, 4, 8];
+                let mut sk_candidates = vec![2usize, 4, 8, 16];
                 if !sk_candidates.contains(&auto_sk) && auto_sk > 1 {
                     sk_candidates.push(auto_sk);
                 }
