@@ -367,6 +367,31 @@ fn ns_to_ms(ns: u64) -> f64 {
     ns as f64 / 1_000_000.0
 }
 
+/// Result of one [`NativeDecodeSession::leverb_phase0_capture_attempt`] call —
+/// a THROWAWAY Lever-B Phase-0 probe (leverb-phase0), not part of any shipping
+/// contract.
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LeverBPhase0CaptureAttempt {
+    /// Query rows in the attempted forward (`k_max` for M=K, `1` for M=1).
+    pub rows: usize,
+    /// Committed past length the forward attended.
+    pub past_len: usize,
+    /// Physical KV bucket (`max_len`) the capture was frozen to.
+    pub bucket: usize,
+    /// Whether `try_capture_with_device_bindings` instantiated a device graph.
+    pub captured: bool,
+    /// Installed captured segment count (`1` = whole-subgraph, `>=2` = seamed).
+    pub segments: usize,
+    /// Decline reason when not captured, or a note when captured-with-caveat.
+    pub decline: Option<String>,
+    /// Device (allocations, frees) observed across the capture run — Phase-0
+    /// pass criterion (a) requires zero alloc/free inside the captured region.
+    pub alloc_delta: Option<(u64, u64)>,
+    /// Per-replay wall (ns), GPU-inclusive (synchronized by a logits read).
+    pub replay_walls_ns: Vec<u64>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CudaKvDebugStats {
     pub logical_len: usize,
@@ -859,6 +884,136 @@ impl NativeDecodeSession {
         state.set_logical_len(total_len)?;
         self.current_len = total_len;
         Ok(logits)
+    }
+
+    /// THROWAWAY Lever-B Phase-0 capture-stability probe (leverb-phase0).
+    ///
+    /// NOT wired into any decode path — invoked only by the `#[ignore]`d
+    /// `leverb_phase0_probe` test. It attempts to CUDA-graph capture a single
+    /// fixed-shape `[1, m]` (padded M=K) forward against the existing persistent
+    /// KV/mask/logits bindings and, if the capture instantiates, replays it
+    /// `replays` times, timing each replay wall (the replay is synchronized by a
+    /// D2H read of the logits binding, mirroring the real per-step logits sync).
+    ///
+    /// This measures Phase-0 pass criteria (a) "instantiates capture-safe" and
+    /// (c) "per-verify replay wall" on the REAL batched GQA/GEMM (`MatMulNBits`)
+    /// kernels — it does not hand-roll a toy graph. It deliberately does NOT
+    /// commit KV or advance the logical length: the captured/replayed forward
+    /// dirties device KV, and KV-commit correctness is explicitly out of Phase-0
+    /// scope, so the caller MUST discard the session afterwards.
+    #[cfg(test)]
+    pub(crate) fn leverb_phase0_capture_attempt(
+        &mut self,
+        m: usize,
+        replays: usize,
+    ) -> anyhow::Result<LeverBPhase0CaptureAttempt> {
+        let past_len = self.current_len;
+        let total_len = past_len
+            .checked_add(m)
+            .context("leverb phase0 probe length overflow")?;
+        let token_input = self
+            .step_input_name(NativeStepInputSource::TokenIds)
+            .context("native CUDA decoder has no token input binding")?
+            .to_owned();
+        let position_input = self
+            .step_input_name(NativeStepInputSource::PositionIds)
+            .map(str::to_owned);
+
+        // Build the fixed padded `[1, m]` token/position inputs. Token *values*
+        // are irrelevant to Phase-0 (acceptance/KV correctness is out of scope);
+        // a constant id keeps the shape fixed so a captured graph can replay
+        // without re-instantiation.
+        let ids = vec![1_i64; m];
+        let input_ids = Tensor::from_i64(&[1, m], &ids)?;
+        let mut owned: Vec<(String, Tensor)> = Vec::with_capacity(2);
+        owned.push((token_input, input_ids));
+        if let Some(position_ids_name) = position_input {
+            owned.push((
+                position_ids_name,
+                self.build_step_positions(past_len, total_len)?,
+            ));
+        }
+
+        let state = self
+            .cuda
+            .as_mut()
+            .context("CUDA decode state is not initialized")?;
+        if total_len > state.capacity.max_len {
+            bail!("{}", state.capacity_exceeded_error(total_len));
+        }
+        // Keep the whole probe inside one physical bucket: growth is a capture
+        // boundary and is exercised separately by the M=1 stability loop.
+        let grew = state.ensure_capacity(&mut self.session, total_len)?;
+        state.extend_mask(if grew { 0 } else { past_len }, total_len, total_len)?;
+        // Start from a clean graph slot so the capture attempt is unambiguous.
+        state.invalidate_graph(&mut self.session)?;
+
+        let borrowed = owned
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+            .collect::<Vec<_>>();
+        let base = state.base_binding_count;
+
+        let alloc_before = self.session.device_allocation_counts();
+        let capture = self
+            .session
+            .try_capture_with_device_bindings(&borrowed, &mut state.bindings[..base])?;
+        let alloc_after = self.session.device_allocation_counts();
+        let alloc_delta = match (alloc_before, alloc_after) {
+            (Some(before), Some(after)) => Some((
+                after.allocations.saturating_sub(before.allocations),
+                after.frees.saturating_sub(before.frees),
+            )),
+            _ => None,
+        };
+        let segments = self.session.captured_graph_segment_count();
+
+        let mut attempt = LeverBPhase0CaptureAttempt {
+            rows: m,
+            past_len,
+            bucket: state.max_len,
+            captured: false,
+            segments,
+            decline: None,
+            alloc_delta,
+            replay_walls_ns: Vec::new(),
+        };
+
+        match capture {
+            DeviceGraphCaptureResult::Captured(outputs) => {
+                attempt.captured = true;
+                if outputs.iter().any(Option::is_some) {
+                    // A materialized (host-returned) output means the padded M=K
+                    // logits do not fit the single-token logits binding; still a
+                    // capture, but record it as a decline note for the findings.
+                    attempt.decline = Some(
+                        "captured, but the forward materialized a host output (padded logits do not fit the single-token logits binding)".to_string(),
+                    );
+                }
+                for _ in 0..replays {
+                    let start = std::time::Instant::now();
+                    let still_valid = self
+                        .session
+                        .replay_device_graph(&mut state.bindings[..base])?;
+                    // Force stream completion with a D2H read of the logits
+                    // binding (the real hot path syncs on the per-step logits
+                    // read); this makes the wall the GPU-inclusive replay time.
+                    let _ = state.bindings[state.logits_binding].read_bytes()?;
+                    attempt
+                        .replay_walls_ns
+                        .push(start.elapsed().as_nanos() as u64);
+                    if !still_valid {
+                        break;
+                    }
+                }
+            }
+            DeviceGraphCaptureResult::NotCapturable(report) => {
+                attempt.decline = Some(report.to_string());
+            }
+        }
+        // Leave the graph slot clean; state is intentionally left dirty.
+        state.invalidate_graph(&mut self.session)?;
+        Ok(attempt)
     }
 
     pub(crate) fn decode_cuda(

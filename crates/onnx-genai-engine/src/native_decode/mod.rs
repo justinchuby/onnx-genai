@@ -32,6 +32,9 @@ pub(crate) use tensor::recurrent_state_bytes_from_graph;
 #[cfg(test)]
 mod tests;
 
+#[cfg(all(test, feature = "cuda"))]
+mod leverb_phase0_probe;
+
 use backend::*;
 use cpu::DecodeCpuKvState;
 use cpu::*;
