@@ -73,6 +73,19 @@ pub(super) fn single_split_direct_flag() -> i32 {
     )
 }
 
+/// Optional split-count override for the split-K decode kernels. This is an
+/// A/B and rollback knob for flash-decoding tuning; the value is read once and
+/// clamped by the dtype-specific caller.
+pub(super) fn split_fill_override(max_splits: usize) -> Option<usize> {
+    use std::sync::OnceLock;
+    static VALUE: OnceLock<Option<usize>> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        let value = std::env::var("ONNX_GENAI_CUDA_GQA_SPLITS").ok()?;
+        let parsed = value.parse::<usize>().ok()?;
+        Some(parsed.clamp(1, max_splits))
+    })
+}
+
 /// Test-only override for [`single_split_direct_flag`]: `-1` defers to the env
 /// var (default), `0`/`1` force the two-step / direct path so parity tests can
 /// A/B both branches within one process.
