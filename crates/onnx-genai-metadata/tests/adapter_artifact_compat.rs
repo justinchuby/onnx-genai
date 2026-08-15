@@ -40,7 +40,8 @@ adapters:
       - id: projection
         component: decoder
         parameter: projection.weight
-        output_value: projection.output
+        node_name: projection
+        output_name: projection.output
         activation_dtype: float32
         input_features: 2
         output_features: 2
@@ -70,6 +71,7 @@ adapters:
           sha256: {peft_weights_sha}
           config_location: adapters/peft/adapter_config.json
           config_sha256: {peft_config_sha}
+          scale_encoding: alpha_over_rank
           format: hf_peft
       bindings: [{{ target: projection, weight_key: projection }}]
     ort:
@@ -84,6 +86,7 @@ adapters:
         - location: adapters/ort/adapter.onnx_adapter
           loader_capability: onnxruntime.lora-adapter@1
           sha256: {ort_sha}
+          scale_encoding: baked
           format: ort_genai
       bindings: [{{ target: projection, weight_key: projection }}]
 pipeline:

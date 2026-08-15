@@ -292,7 +292,8 @@ adapters:
       - id: decoder.layers.0.q_proj
         component: decoder
         parameter: layers.0.attention.q_proj.weight
-        output_value: layers.0.attention.q_proj.output
+        node_name: /model/layers.0/attention/q_proj/MatMul
+        output_name: layers.0.attention.q_proj.output
         activation_dtype: float16
         input_features: 4096
         output_features: 4096
@@ -325,6 +326,10 @@ adapters:
       rank: 8
       alpha: 16.0
       dtype: float16
+      provenance:
+        producer: mobius
+        source: hf://example/summarizer
+        revision: <immutable revision>
       weights:
         - format: hf_peft
           loader_capability: onnx-genai.adapters.hf-peft@1
@@ -332,10 +337,12 @@ adapters:
           sha256: <exact-safetensors sha256>
           config_location: adapters/summarizer/adapter_config.json
           config_sha256: <exact-config sha256>
+          scale_encoding: alpha_over_rank
         - format: ort_genai
           loader_capability: onnxruntime.lora-adapter@1
           location: adapters/summarizer/adapter.onnx_adapter
           sha256: <exact-file sha256>
+          scale_encoding: baked
       bindings:
         - target: decoder.layers.0.q_proj
           weight_key: layers.0.attention.q_proj
@@ -348,7 +355,7 @@ This matrix audits Phase 1 at `813a9b53` and Phase 2 at `326fddcf`.
 | Prior surface | Exact prior location/type | v1 disposition | Current location/type |
 |---|---|---|---|
 | Top-level adapter metadata | #318/#374 `schema/adapters.rs::LoraCapabilities`, `InferenceMetadata.adapters` | **Adapt** | `schema/mod.rs::InferenceMetadata.adapters` now carries `AdapterServiceContract`; no parallel `workflow.adapters` |
-| Declared target map | #374 `schema/adapters.rs::LoraTargetManifest`, `LoraTargetDescriptor`, `LoraTargetSlice` | **Adapt** | `schema/ir.rs::LoraTargetManifest`, `LoraTargetDescriptor`, `LoraTargetSlice`; semantic module/layer and Qwen-specific discovery are lowered to generic component/parameter/value/slice bindings |
+| Declared target map | #374 `schema/adapters.rs::LoraTargetManifest`, `LoraTargetDescriptor`, `LoraTargetSlice` | **Adapt** | `schema/ir.rs::LoraTargetManifest`, `LoraTargetDescriptor`, `LoraTargetSlice`; exact node/output identity and resolved labeled slices are retained, while semantic module/layer and Qwen-specific discovery stay in producer tooling |
 | PEFT loader contract | #318 `engine/lora/format.rs::load_peft_adapter` | **Reuse ABI, separate implementation** | `AdapterWeightFormat::HfPeft` declares config+safetensors and loader capability; loader implementation belongs in a main-targeted runtime PR |
 | ORT FlatBuffer loader | #374 `engine/lora/format.rs::load_onnx_adapter` and `adapter_schema.fbs` | **Reuse ABI, separate implementation** | `AdapterWeightFormat::OrtGenai` maps to upstream `TORT` version 1; Mobius may emit PEFT instead |
 | Canonical loaded artifact | #318/#374 `engine/lora/format.rs::LoadedAdapter`, `LoadedAdapterModule` | **Adapt** | all declared source formats normalize to `AdapterArtifact` + manifest-keyed `AdapterTargetBinding`; format-specific names never reach execution planning |
@@ -366,14 +373,17 @@ This matrix audits Phase 1 at `813a9b53` and Phase 2 at `326fddcf`.
 Artifact map keys are package-local aliases and `index` is the stable segment ID. Indices are
 unique and contiguous from zero. Every source file is beneath `adapters/<alias>/`; SHA-256 is over
 exact bytes and is checked before parsing or upload. `hf_peft` pairs `adapter_config.json` with
-safetensors. `ort_genai` is upstream `.onnx_adapter` (`TORT`, format version 1). `json` is the
+safetensors with `scale_encoding: alpha_over_rank`. `ort_genai` is upstream `.onnx_adapter`
+(`TORT`, format version 1) with its static scale already baked into factors and therefore requires
+`scale_encoding: baked`; a loader must not apply alpha/rank again. `json` is the
 float32 RFC 8785 reference bundle `{"targets":{"<weight_key>":{"a":[...],"b":[...]}}}`. A
 manifest-keyed safetensors source uses `<weight_key>.a` and `<weight_key>.b`. Source formats may
 coexist for one artifact only when they encode the same canonical factors.
 
 The authoritative manifest contains exact generic graph identities. Producer/import tooling owns
-architecture-specific work such as fused-QKV discovery and lowers it to `output_slice`; execution
-never branches on a model family. `graph_inputs` preserves Phase-1 optional overridable A/B inputs.
+architecture-specific work such as fused-QKV discovery and lowers it to exact `node_name`,
+`output_name`, and a labeled `output_slice`; execution never branches on a model family.
+`graph_inputs` preserves Phase-1 optional overridable A/B inputs.
 If absent, a capable runtime may apply an immutable parameter overlay or invoke a portable standard
 ONNX delta component. Base initializers are never modified.
 

@@ -648,9 +648,11 @@ fn validate_adapter_service(
         if target.id.trim().is_empty()
             || target.component.trim().is_empty()
             || target.parameter.trim().is_empty()
+            || target.node_name.trim().is_empty()
+            || target.output_name.trim().is_empty()
         {
             errors.push(format!(
-                "{path} id, component, and parameter must not be empty"
+                "{path} id, component, parameter, node_name, and output_name must not be empty"
             ));
         }
         if manifest_targets.insert(target.id.clone(), target).is_some() {
@@ -680,14 +682,15 @@ fn validate_adapter_service(
             ));
         }
         if let Some(slice) = &target.output_slice
-            && (slice.width == 0
+            && (slice.role.trim().is_empty()
+                || slice.width == 0
                 || slice
                     .offset
                     .checked_add(slice.width)
                     .is_none_or(|end| end > target.output_features))
         {
             errors.push(format!(
-                "{path}.output_slice must be non-empty and within output_features"
+                "{path}.output_slice role must be non-empty and its range must be within output_features"
             ));
         }
         if let Some(native) = &target.graph_inputs
@@ -722,6 +725,21 @@ fn validate_adapter_service(
         let path = format!("adapters.artifacts.{name}");
         if artifact.identity.trim().is_empty() || artifact.version.trim().is_empty() {
             errors.push(format!("{path} identity and version must not be empty"));
+        }
+        if let Some(provenance) = &artifact.provenance
+            && (provenance.producer.trim().is_empty()
+                || provenance
+                    .source
+                    .as_ref()
+                    .is_some_and(|value| value.trim().is_empty())
+                || provenance
+                    .revision
+                    .as_ref()
+                    .is_some_and(|value| value.trim().is_empty()))
+        {
+            errors.push(format!(
+                "{path}.provenance producer and present source/revision values must not be empty"
+            ));
         }
         if !indices.insert(artifact.index) {
             errors.push(format!(
@@ -799,6 +817,24 @@ fn validate_adapter_service(
                     "{path}.weights[{index}].loader_capability must be {expected_loader} for format {:?}",
                     weight.format
                 ));
+            }
+            match (&weight.format, &weight.scale_encoding) {
+                (
+                    crate::schema::AdapterWeightFormat::HfPeft,
+                    crate::schema::AdapterScaleEncoding::AlphaOverRank,
+                )
+                | (
+                    crate::schema::AdapterWeightFormat::OrtGenai,
+                    crate::schema::AdapterScaleEncoding::Baked,
+                )
+                | (crate::schema::AdapterWeightFormat::Json, _)
+                | (crate::schema::AdapterWeightFormat::Safetensors, _) => {}
+                (crate::schema::AdapterWeightFormat::HfPeft, _) => errors.push(format!(
+                    "{path}.weights[{index}].scale_encoding must be alpha_over_rank for hf_peft"
+                )),
+                (crate::schema::AdapterWeightFormat::OrtGenai, _) => errors.push(format!(
+                    "{path}.weights[{index}].scale_encoding must be baked for ort_genai"
+                )),
             }
             if weight.sha256.len() != 64
                 || !weight

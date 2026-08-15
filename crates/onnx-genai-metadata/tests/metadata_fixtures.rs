@@ -9,6 +9,8 @@ adapters:
       - id: projection
         component: decoder
         parameter: projection.weight
+        node_name: projection
+        output_name: projection.output
         activation_dtype: float32
         input_features: 2
         output_features: 2
@@ -35,11 +37,12 @@ adapters:
       rank: 1
       alpha: 1.0
       dtype: float32
-      provenance: synthetic-test
+      provenance: { producer: synthetic-test }
       weights:
         - location: adapters/red/adapter.json
           loader_capability: onnx-genai.adapters.json@1
           sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          scale_encoding: alpha_over_rank
           format: json
       bindings:
         - target: projection
@@ -192,6 +195,7 @@ fn adapter_manifest_and_source_contracts_fail_loud() {
             "loader_capability: onnx-genai.adapters.json@1",
             "loader_capability: onnxruntime.lora-adapter@1",
         )
+        .replace("scale_encoding: alpha_over_rank", "scale_encoding: baked")
         .replace("format: json", "format: hf_peft");
     let metadata: InferenceMetadata =
         serde_yaml::from_str(&invalid).expect("invalid adapter contracts parse");
@@ -210,6 +214,11 @@ fn adapter_manifest_and_source_contracts_fail_loud() {
         errors
             .iter()
             .any(|error| error.contains("hf_peft requires config_location"))
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("scale_encoding must be alpha_over_rank"))
     );
 }
 

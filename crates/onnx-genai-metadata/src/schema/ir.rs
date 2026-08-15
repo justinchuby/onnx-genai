@@ -146,7 +146,7 @@ pub struct AdapterArtifact {
     #[serde(default)]
     pub bindings: Vec<AdapterTargetBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provenance: Option<String>,
+    pub provenance: Option<AdapterProvenance>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
@@ -163,6 +163,8 @@ pub struct AdapterWeightArtifact {
     /// Lowercase SHA-256 of the exact PEFT config bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_sha256: Option<String>,
+    /// Whether alpha/rank remains to be applied or is already baked into B.
+    pub scale_encoding: AdapterScaleEncoding,
     #[serde(default)]
     pub format: AdapterWeightFormat,
 }
@@ -181,6 +183,15 @@ pub enum AdapterWeightFormat {
     HfPeft,
     /// Manifest-keyed safetensors parameter bundle.
     Safetensors,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AdapterScaleEncoding {
+    /// Runtime applies the binding/artifact `alpha / rank` factor.
+    AlphaOverRank,
+    /// Source factors already encode the complete static scale (ORT `TORT` convention).
+    Baked,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
@@ -214,9 +225,10 @@ pub struct LoraTargetDescriptor {
     pub component: String,
     /// Exact immutable base initializer name.
     pub parameter: String,
-    /// Exact graph value produced by the projection, when graph-native lowering needs it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_value: Option<String>,
+    /// Exact ONNX projection node name used for load-time manifest validation.
+    pub node_name: String,
+    /// Exact graph value produced by the projection.
+    pub output_name: String,
     /// Projection activation dtype used by graph-native delta application.
     #[schemars(with = "schema_vocabulary::TensorDType")]
     pub activation_dtype: String,
@@ -233,6 +245,8 @@ pub struct LoraTargetDescriptor {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LoraTargetSlice {
+    /// Producer-defined semantic label; runtime execution uses only the resolved range.
+    pub role: String,
     pub offset: usize,
     pub width: usize,
 }
@@ -245,6 +259,19 @@ pub struct LoraGraphInputBinding {
     /// Optional graph input for request scale; otherwise scale is folded into stable factors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scale: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AdapterProvenance {
+    /// Producer/importer that resolved the manifest and normalized the artifact.
+    pub producer: String,
+    /// Source model or adapter URI without credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Immutable source revision, commit, or content identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]

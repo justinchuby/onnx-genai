@@ -61,9 +61,13 @@
           "type": "integer"
         },
         "provenance": {
-          "type": [
-            "string",
-            "null"
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AdapterProvenance"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "rank": {
@@ -147,6 +151,47 @@
         }
       },
       "type": "object"
+    },
+    "AdapterProvenance": {
+      "additionalProperties": false,
+      "properties": {
+        "producer": {
+          "description": "Producer/importer that resolved the manifest and normalized the artifact.",
+          "type": "string"
+        },
+        "revision": {
+          "description": "Immutable source revision, commit, or content identifier.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "description": "Source model or adapter URI without credentials.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "producer"
+      ],
+      "type": "object"
+    },
+    "AdapterScaleEncoding": {
+      "oneOf": [
+        {
+          "const": "alpha_over_rank",
+          "description": "Runtime applies the binding/artifact `alpha / rank` factor.",
+          "type": "string"
+        },
+        {
+          "const": "baked",
+          "description": "Source factors already encode the complete static scale (ORT `TORT` convention).",
+          "type": "string"
+        }
+      ]
     },
     "AdapterSelectionContract": {
       "additionalProperties": false,
@@ -317,6 +362,10 @@
         "location": {
           "type": "string"
         },
+        "scale_encoding": {
+          "$ref": "#/$defs/AdapterScaleEncoding",
+          "description": "Whether alpha/rank remains to be applied or is already baked into B."
+        },
         "sha256": {
           "description": "Lowercase SHA-256 of the exact external artifact bytes.",
           "type": "string"
@@ -325,7 +374,8 @@
       "required": [
         "location",
         "loader_capability",
-        "sha256"
+        "sha256",
+        "scale_encoding"
       ],
       "type": "object"
     },
@@ -1517,10 +1567,18 @@
           "minimum": 0,
           "type": "integer"
         },
+        "node_name": {
+          "description": "Exact ONNX projection node name used for load-time manifest validation.",
+          "type": "string"
+        },
         "output_features": {
           "format": "uint",
           "minimum": 0,
           "type": "integer"
+        },
+        "output_name": {
+          "description": "Exact graph value produced by the projection.",
+          "type": "string"
         },
         "output_slice": {
           "anyOf": [
@@ -1533,13 +1591,6 @@
           ],
           "description": "Resolved child range within a fused output; producer/import tooling owns discovery."
         },
-        "output_value": {
-          "description": "Exact graph value produced by the projection, when graph-native lowering needs it.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "parameter": {
           "description": "Exact immutable base initializer name.",
           "type": "string"
@@ -1549,6 +1600,8 @@
         "id",
         "component",
         "parameter",
+        "node_name",
+        "output_name",
         "activation_dtype",
         "input_features",
         "output_features"
@@ -1579,6 +1632,10 @@
           "minimum": 0,
           "type": "integer"
         },
+        "role": {
+          "description": "Producer-defined semantic label; runtime execution uses only the resolved range.",
+          "type": "string"
+        },
         "width": {
           "format": "uint",
           "minimum": 0,
@@ -1586,6 +1643,7 @@
         }
       },
       "required": [
+        "role",
         "offset",
         "width"
       ],

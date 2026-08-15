@@ -1,5 +1,7 @@
 use anyhow::Context;
-use onnx_genai_metadata::{AdapterArtifact, AdapterServiceContract, AdapterWeightFormat};
+use onnx_genai_metadata::{
+    AdapterArtifact, AdapterScaleEncoding, AdapterServiceContract, AdapterWeightFormat,
+};
 use onnx_genai_ort::Value;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -587,13 +589,17 @@ fn load_adapter(
                 tensors.b.len()
             );
         }
+        let factor = match &weight.scale_encoding {
+            AdapterScaleEncoding::AlphaOverRank => (alpha / rank as f64) as f32,
+            AdapterScaleEncoding::Baked => 1.0,
+        };
         targets.insert(
             (target.component.clone(), target.parameter.clone()),
             AdapterTargetWeights {
                 input_features: target.input_features,
                 output_features: target.output_features,
                 rank,
-                factor: (alpha / rank as f64) as f32,
+                factor,
                 a: tensors.a.clone(),
                 b: tensors.b.clone(),
             },
@@ -607,8 +613,8 @@ mod tests {
     use super::*;
     use onnx_genai_metadata::{
         AdapterCacheContract, AdapterDiscoveryFallback, AdapterEvictionPolicy,
-        AdapterPlanningContract, AdapterSelectionContract, AdapterTargetBinding,
-        AdapterWeightArtifact, LoraTargetDescriptor, LoraTargetManifest,
+        AdapterPlanningContract, AdapterProvenance, AdapterScaleEncoding, AdapterSelectionContract,
+        AdapterTargetBinding, AdapterWeightArtifact, LoraTargetDescriptor, LoraTargetManifest,
     };
 
     fn artifact(name: &str, location: &str, bytes: &[u8]) -> AdapterArtifact {
@@ -629,6 +635,7 @@ mod tests {
                 sha256: format!("{:x}", Sha256::digest(bytes)),
                 config_location: None,
                 config_sha256: None,
+                scale_encoding: AdapterScaleEncoding::AlphaOverRank,
                 format: AdapterWeightFormat::Json,
             }],
             bindings: vec![AdapterTargetBinding {
@@ -637,7 +644,11 @@ mod tests {
                 rank: None,
                 alpha: None,
             }],
-            provenance: Some("synthetic-test".to_string()),
+            provenance: Some(AdapterProvenance {
+                producer: "synthetic-test".to_string(),
+                source: None,
+                revision: None,
+            }),
         }
     }
 
@@ -652,7 +663,8 @@ mod tests {
                     id: "projection".to_string(),
                     component: "decoder".to_string(),
                     parameter: "projection".to_string(),
-                    output_value: None,
+                    node_name: "projection".to_string(),
+                    output_name: "projection.output".to_string(),
                     activation_dtype: "float32".to_string(),
                     input_features: 2,
                     output_features: 2,

@@ -89,6 +89,8 @@ adapters:
       - id: projection
         component: decoder
         parameter: projection
+        node_name: projection
+        output_name: projection.output
         activation_dtype: float32
         input_features: 2
         output_features: 2
@@ -113,7 +115,7 @@ adapters:
       dtype: float32
       weights:
         - {{ location: adapters/red/adapter.json, loader_capability: onnx-genai.adapters.json@1,
-             sha256: {red_sha} }}
+             sha256: {red_sha}, scale_encoding: alpha_over_rank }}
       bindings:
         - {{ target: projection, weight_key: projection }}
     blue:
@@ -126,7 +128,7 @@ adapters:
       dtype: float32
       weights:
         - {{ location: adapters/blue/adapter.json, loader_capability: onnx-genai.adapters.json@1,
-             sha256: {blue_sha} }}
+             sha256: {blue_sha}, scale_encoding: alpha_over_rank }}
       bindings:
         - {{ target: projection, weight_key: projection }}
 pipeline:
