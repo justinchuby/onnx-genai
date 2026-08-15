@@ -231,7 +231,7 @@ pub(crate) fn tanh_gelu_bias_f32_slice(
 ) {
     debug_assert_eq!(input.len(), output.len());
     debug_assert_eq!(bias.len(), width);
-    debug_assert!(width != 0 && input.len() % width == 0);
+    debug_assert!(width != 0 && input.len().is_multiple_of(width));
     #[cfg(target_arch = "x86_64")]
     {
         // Gated on total length, exactly as `tanh_gelu_f32_slice` is: whether a
@@ -1056,7 +1056,7 @@ mod tests {
             let borrowed: &[f32] =
                 unsafe { std::slice::from_raw_parts(view.data_ptr_mut::<f32>(), n) };
             let borrowed: &[f32] = unsafe { std::mem::transmute(borrowed) };
-            write_mapped("Tanh", &mut view, borrowed, |x, y| tanh_f32_slice(x, y)).unwrap();
+            write_mapped("Tanh", &mut view, borrowed, tanh_f32_slice).unwrap();
         }
         assert_eq!(aliased.to_f32(), expected);
 
