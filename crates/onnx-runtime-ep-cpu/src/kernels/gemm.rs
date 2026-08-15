@@ -8,9 +8,13 @@
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
 
+use std::borrow::Cow;
+
 use super::add::broadcast_apply;
 use super::check_arity;
 use super::half_gemm::{self, HalfFormat, MatrixLayout};
+use super::matmul::{self, MatMulPrepack};
+use super::weight_transpose::transpose_row_major;
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 
 /// f32 Gemm kernel carrying its scalar/transpose attributes.
@@ -19,6 +23,9 @@ pub struct GemmKernel {
     beta: f32,
     trans_a: bool,
     trans_b: bool,
+    /// Densification and weight-transpose memos for constant (initializer)
+    /// operands, shared with `MatMul` so both ops cache a given weight once.
+    prepack: MatMulPrepack,
 }
 
 /// Factory reading `alpha`/`beta` (default 1.0) and `transA`/`transB`
@@ -36,11 +43,16 @@ impl KernelFactory for GemmFactory {
             beta,
             trans_a,
             trans_b,
+            prepack: MatMulPrepack::default(),
         }))
     }
 }
 
 impl Kernel for GemmKernel {
+    fn set_constant_inputs(&mut self, constant_inputs: &[bool]) {
+        self.prepack.set_constant_inputs(constant_inputs);
+    }
+
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Gemm", inputs, outputs, 2, 3, 1)?;
         let a_shape = inputs[0].shape;
@@ -91,36 +103,34 @@ impl Kernel for GemmKernel {
             }
             half_output
         } else {
-            let a = to_dense_f32_widen("Gemm", &inputs[0])?;
-            let b = to_dense_f32_widen("Gemm", &inputs[1])?;
+            let a = self.prepack.dense(0, &inputs[0])?;
+            let b = self.prepack.dense(1, &inputs[1])?;
 
-            // Accessors into the row-major dense buffers, applying transposition.
-            let a_at = |i: usize, p: usize| -> f32 {
-                if self.trans_a {
-                    a[p * m + i] // A stored [K,M]
-                } else {
-                    a[i * k + p] // A stored [M,K]
-                }
+            // The shared GEMM consumes row-major `A[M,K]` and `B[K,N]`, so an
+            // operand stored transposed is materialized in that layout first.
+            // The transposes are O(M*K) and O(K*N) against an O(M*N*K) product,
+            // and a constant `B` is transposed once per session and memoized.
+            let a_rm: Cow<'_, [f32]> = if self.trans_a {
+                Cow::Owned(transpose_row_major(&a, k, m))
+            } else {
+                a
             };
-            let b_at = |p: usize, j: usize| -> f32 {
-                if self.trans_b {
-                    b[j * k + p] // B stored [N,K]
-                } else {
-                    b[p * n + j] // B stored [K,N]
+            let b_rm: Cow<'_, [f32]> = if self.trans_b {
+                match self.prepack.transposed_b(&b, n, k) {
+                    Some(cached) => Cow::Borrowed(cached),
+                    None => Cow::Owned(transpose_row_major(&b, n, k)),
                 }
+            } else {
+                b
             };
 
             let mut output = vec![0.0f32; m * n];
-            for i in 0..m {
-                for p in 0..k {
-                    let aip = self.alpha * a_at(i, p);
-                    if aip == 0.0 {
-                        continue;
-                    }
-                    let row = &mut output[i * n..i * n + n];
-                    for (j, cell) in row.iter_mut().enumerate() {
-                        *cell += aip * b_at(p, j);
-                    }
+            if m != 0 && n != 0 && k != 0 {
+                matmul::gemm(&a_rm, &b_rm, &mut output, m, k, n)?;
+            }
+            if self.alpha != 1.0 {
+                for value in &mut output {
+                    *value *= self.alpha;
                 }
             }
             output
@@ -215,6 +225,7 @@ mod tests {
             beta,
             trans_a: ta,
             trans_b: tb,
+            prepack: MatMulPrepack::default(),
         };
         let mut ins = vec![a.view(), b.view()];
         if let Some(c) = c {
@@ -300,6 +311,7 @@ mod tests {
             beta: 1.0,
             trans_a: false,
             trans_b: false,
+            prepack: MatMulPrepack::default(),
         }
         .execute(&[a.view(), b.view(), c.view()], &mut [out.view_mut()])
         .unwrap();
@@ -317,6 +329,7 @@ mod tests {
             beta: 1.0,
             trans_a: false,
             trans_b: false,
+            prepack: MatMulPrepack::default(),
         }
         .execute(&[a.view(), b.view()], &mut [out.view_mut()])
         .unwrap();
@@ -350,6 +363,7 @@ mod tests {
             beta: -0.5,
             trans_a: true,
             trans_b: true,
+            prepack: MatMulPrepack::default(),
         };
 
         for dtype in [DataType::Float16, DataType::BFloat16] {
