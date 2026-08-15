@@ -29,6 +29,7 @@
 
 use std::ffi::c_void;
 use std::hint::black_box;
+use std::process::Command;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
@@ -280,11 +281,48 @@ fn fit_latency_bandwidth(points: &[Point]) -> Option<(f64, f64)> {
 fn median(values: &mut [f64]) -> f64 {
     values.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let mid = values.len() / 2;
-    if values.len() % 2 == 0 {
+    if values.len().is_multiple_of(2) {
         (values[mid - 1] + values[mid]) / 2.0
     } else {
         values[mid]
     }
+}
+
+/// Query the GPU's current performance state (pstate) via `nvidia-smi`.
+///
+/// Returns the raw pstate string (e.g. `"P0"`, `"P8"`) if it could be read.
+/// A **parked** laptop GPU sits in a deep pstate (`P8`) that downclocks the
+/// PCIe link (Gen4→Gen1), collapsing measured host<->device bandwidth by ~7×
+/// on the #995 box. The number measured in that state is *not* the rate that
+/// applies during decode (when the GPU is active), so the operator must record
+/// it as `MeasuredLinkState::Parked` in the cost model rather than trusting it.
+fn query_pstate(device: u32) -> Option<String> {
+    let out = Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=pstate",
+            "--format=csv,noheader",
+            "-i",
+            &device.to_string(),
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+/// Whether a pstate string denotes a parked / low-power state (`P8` or deeper),
+/// where the PCIe link is downclocked and bandwidth is unrepresentative of
+/// decode. `P0`–`P7` are treated as active-enough; anything at or past `P8` is
+/// parked. An unparseable string is treated as not-parked (we do not know).
+fn pstate_is_parked(pstate: &str) -> bool {
+    pstate
+        .strip_prefix('P')
+        .or_else(|| pstate.strip_prefix('p'))
+        .and_then(|n| n.trim().parse::<u32>().ok())
+        .is_some_and(|n| n >= 8)
 }
 
 fn measure_regime(
@@ -353,6 +391,16 @@ fn main() -> Result<()> {
         .with_context(|| format!("open CUDA device {}", args.device))?;
     let stream = ctx.default_stream();
 
+    // Sample the pstate before the sweep so the operator knows whether these
+    // rates are decode-representative or a parked-GPU under-estimate (§6.2
+    // MeasuredLinkState). See `query_pstate` for why this matters.
+    let pstate_before = query_pstate(args.device);
+    let link_state = match pstate_before.as_deref() {
+        Some(p) if pstate_is_parked(p) => "parked",
+        Some(_) => "active",
+        None => "unknown",
+    };
+
     println!(
         "roofline_transfer: device={} iters={} warmups={} repeats={} sizes_kib=[{}]",
         args.device,
@@ -365,6 +413,27 @@ fn main() -> Result<()> {
             .collect::<Vec<_>>()
             .join(",")
     );
+    println!(
+        "roofline_transfer: pstate_at_start={} measured_link_state={} \
+         (pass this to the cost model as MeasuredLinkState::{})",
+        pstate_before.as_deref().unwrap_or("unknown"),
+        link_state,
+        match link_state {
+            "parked" => "Parked",
+            "active" => "Active",
+            _ => "Unknown",
+        }
+    );
+    if link_state == "parked" {
+        eprintln!(
+            "roofline_transfer: WARNING — GPU is parked ({}); the PCIe link is \
+             downclocked and these bandwidths UNDER-STATE the decode-time link \
+             (up to ~7x low on RTX 4060 Laptop). Do NOT record them as \
+             decode-representative: run a GPU workload to wake the device first, \
+             or record MeasuredLinkState::Parked.",
+            pstate_before.as_deref().unwrap_or("P8")
+        );
+    }
     println!("direction,host,bytes,gb_s_median,gb_s_min,gb_s_max,per_copy_us");
 
     let mut fits: Vec<(Direction, HostKind, f64, f64, f64)> = Vec::new();
@@ -408,6 +477,18 @@ fn main() -> Result<()> {
             latency_us,
             bw_gb_s,
             peak
+        );
+    }
+    // Re-sample the pstate: if the GPU parked partway through the sweep, the
+    // later (larger-size) points are contaminated and the operator should know.
+    if let Some(after) = query_pstate(args.device)
+        && pstate_is_parked(&after)
+        && link_state != "parked"
+    {
+        eprintln!(
+            "roofline_transfer: WARNING — GPU parked during the run \
+             (pstate now {after}); later points may under-state bandwidth. \
+             Re-run with the GPU kept active for a decode-representative rate."
         );
     }
     eprintln!(

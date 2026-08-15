@@ -16,7 +16,7 @@
 use crate::device::DeviceKey;
 use crate::model::PlacementCostModel;
 use crate::profile::MemoryBandwidth;
-use crate::transfer::TransferProfile;
+use crate::transfer::{MeasuredLinkState, TransferProfile};
 use std::time::Duration;
 
 /// Direction of a host<->device transfer measurement.
@@ -69,12 +69,18 @@ pub fn apply_memory_bandwidth(
 /// profiles, merging the pinned and pageable bandwidths for each direction.
 /// `latency_base` is taken as the min over the direction's fits (the pinned fit
 /// is the cleaner latency estimate). Unmeasured host-memory kinds stay `None`.
+///
+/// `measured_state` records the device power state the probe ran under (see
+/// [`MeasuredLinkState`]). A link measured while the GPU was parked (P8) is a
+/// known under-estimate — up to ~7× low on this box — so the rate must carry
+/// that provenance rather than passing as a decode-representative number.
 pub fn apply_transfer_fits(
     model: &mut PlacementCostModel,
     host: DeviceKey,
     device: DeviceKey,
     fits: &[TransferFit],
     is_async_capable: bool,
+    measured_state: MeasuredLinkState,
 ) {
     let build = |direction: TransferDirection| -> Option<TransferProfile> {
         let matching: Vec<&TransferFit> =
@@ -84,6 +90,7 @@ pub fn apply_transfer_fits(
         }
         let mut profile = TransferProfile {
             is_async_capable,
+            measured_link_state: measured_state,
             ..TransferProfile::unknown()
         };
         let mut min_latency_us: Option<f64> = None;
@@ -238,6 +245,7 @@ mod tests {
             DeviceKey::cuda(0),
             &fits,
             true,
+            MeasuredLinkState::Active,
         );
         let h2d = model
             .transfer_matrix()
@@ -247,6 +255,7 @@ mod tests {
         assert_eq!(h2d.bandwidth(HostMemoryKind::Pageable), Some(6.1e9));
         // latency = min(12.0, 8.3) us.
         assert_eq!(h2d.latency_base, Some(Duration::from_secs_f64(8.3e-6)));
+        assert!(h2d.is_decode_representative());
         let d2h = model
             .transfer_matrix()
             .get(&DeviceKey::cuda(0), &DeviceKey::cpu())
