@@ -365,6 +365,7 @@ pub mod gelu;
 pub mod gemm;
 pub mod group_query_attention;
 mod half_gemm;
+mod half_gemv;
 pub mod hardmax;
 pub mod identity;
 pub mod index_share;
