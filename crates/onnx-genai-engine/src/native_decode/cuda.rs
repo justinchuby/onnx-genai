@@ -811,6 +811,22 @@ fn capture_step_inputs_enabled() -> bool {
     )
 }
 
+/// Opt-in flag for the per-row M=1 GEMV captured verify (Leon byte-identity
+/// reference). Default OFF: the per-row decomposition is byte-identical to plain
+/// greedy but re-reads int4 weights W times per verify step (~6x slower on 14b),
+/// so it is only armed for byte-identity validation / A-B measurement via
+/// `ONNX_GENAI_SPEC_PERROW_VERIFY=1` (`1`/`true`/`on`/`yes`).
+#[cfg(feature = "cuda")]
+fn onnx_genai_perrow_verify_enabled() -> bool {
+    matches!(
+        std::env::var("ONNX_GENAI_SPEC_PERROW_VERIFY")
+            .ok()
+            .as_deref()
+            .map(str::trim),
+        Some("1") | Some("true") | Some("on") | Some("yes")
+    )
+}
+
 /// Pure opt-out parse for `ONNX_GENAI_NATIVE_DECODER_CAPTURE_STEP_INPUTS`.
 /// Capture is **default-on**: only an explicit falsy value
 /// (`0`/`false`/`no`/`off`, case/whitespace-insensitive) opts out to eager;
@@ -1962,6 +1978,34 @@ impl NativeDecodeSession {
                     .with("rows", tokens.len() as u64)
                     .with("width", width as u64),
             );
+        // GREEDY BYTE-IDENTITY CONTRACT (Leon, Phase 1 diagnosis): the captured
+        // M=W verify forward can compute every row through the exact M=1 GEMV
+        // kernel plain greedy decode uses. Any batched M=W int4 GEMM — Marlin's
+        // fp16-accumulate tensor-core GEMM, or even the portable fp32-accumulate
+        // tiled GEMM — reassociates the K reduction differently and flips the
+        // greedy argmax at sensitive positions (dropping/altering committed
+        // tokens vs plain greedy on qwen2.5-14b / glm-4-9b). `PerRowVerifyGuard`
+        // makes the fp16 M>1 MatMulNBits path decompose into W per-row M=1 GEMV
+        // launches, so each verify row is byte-identical to plain greedy *by
+        // construction*; every launch is static-grid capture-safe, so the verify
+        // graph still captures and replays.
+        //
+        // OPT-IN: this per-row decomposition is byte-identical but re-reads the
+        // int4 weights W times per verify step (~6x slower than plain greedy on
+        // 14b — a bandwidth regression of the same class as the rejected #998
+        // per-token verify), so it is DISABLED by default and only armed when
+        // `ONNX_GENAI_SPEC_PERROW_VERIFY=1`. It stands as a validated
+        // byte-identity *reference oracle* for the speed-preserving follow-up: a
+        // batched M=W fp32-accumulate GEMV (weights read once, W byte-identical
+        // fp32 row-accumulators per lane). See
+        // `.squad/decisions/inbox/leon-spec-verify.md`. When unset, the verify
+        // path is unchanged from the aceed718 baseline.
+        #[cfg(feature = "cuda")]
+        let _per_row_verify =
+            onnx_genai_perrow_verify_enabled().then(onnx_runtime_ep_cuda::PerRowVerifyGuard::new);
+        #[cfg(feature = "cuda")]
+        let _marlin_suppress = onnx_genai_perrow_verify_enabled()
+            .then(onnx_runtime_ep_cuda::MarlinSuppressionGuard::new);
         let total_len = past_len
             .checked_add(width)
             .context("native captured verify context length overflow")?;

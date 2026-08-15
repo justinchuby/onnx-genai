@@ -129,18 +129,15 @@ fn captured_verify_from_env() -> bool {
 /// Resolve the row-0 near-tie margin for the captured-verify base-token contract
 /// guard (`ONNX_GENAI_SPEC_ROW0_TIE_EPS`).
 ///
-/// In the fused captured path row 0 (the base next-token distribution) is
-/// produced by the Marlin M=W kernel, whereas plain greedy — the byte-identity
-/// reference the reviewers made binding — selects the base token from the M=1
-/// GEMV. The two kernels reassociate partial sums differently, so at a *genuine*
-/// logit near-tie their argmax can flip (Chew/Gaff #984, the qwen one-token
-/// divergence). Whenever the base row's top-1/top-2 margin is within this eps we
-/// fall the base token back to a fresh M=1 GEMV decode, so the committed base
-/// token is always exactly what plain greedy would pick. A generous default is
-/// safe: the flip only occurs when the margin is below the (much smaller) kernel
-/// delta, and confident positions (favorable/repetitive prompts) sit far above
-/// eps, so they never fall back and keep the speculative win. `0` disables the
-/// guard (only for A/B measurement — the default MUST stay on for the contract).
+/// Row 0 (the base next-token distribution) is produced by the M=W verify
+/// forward, whereas plain greedy — the byte-identity reference — selects the
+/// base token from the fp32-accumulate M=1 GEMV. When the M=W verify uses the
+/// Marlin fp16-accumulate (or portable tiled) GEMM their argmax can flip, so
+/// this guard falls the base token back to a fresh M=1 GEMV decode whenever row
+/// 0 is a near-tie within `eps`. (Leon: this is unnecessary under the opt-in
+/// per-row M=1 GEMV verify — `ONNX_GENAI_SPEC_PERROW_VERIFY=1` — which makes row
+/// 0 byte-identical to the M=1 GEMV by construction, but it is kept for the
+/// default Marlin/tiled verify path.)
 fn row0_tie_eps_from_env() -> f32 {
     const DEFAULT_ROW0_TIE_EPS: f32 = 1.0;
     std::env::var("ONNX_GENAI_SPEC_ROW0_TIE_EPS")

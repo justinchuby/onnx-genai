@@ -5024,6 +5024,19 @@ impl MatMulNBitsKernel {
         }
 
         if m > 1 {
+            // GREEDY BYTE-IDENTITY CONTRACT (Leon, Phase 1 diagnosis): the
+            // captured speculative verify sets a thread-local so every M=W row is
+            // computed by the exact M=1 GEMV kernel plain greedy uses, one launch
+            // per row. This is the only way the verify logits are byte-identical
+            // to plain M=1 greedy *by construction* — the batched M=W GEMMs
+            // (Marlin fp16-accumulate, and even the portable tiled
+            // fp32-accumulate GEMM) reassociate the K reduction differently and
+            // flip the greedy argmax at sensitive positions. Each per-row GEMV is
+            // a static-grid capture-safe launch, so the verify graph still
+            // captures/replays; prefill runs outside the guard and keeps Marlin.
+            if marlin_gemm::per_row_verify_enabled() {
+                return self.run_f16_per_row_verify(inputs, outputs, m);
+            }
             // SAFETY: the tiled prefill kernel itself has fixed pointers and no
             // allocation or host synchronization. We nevertheless keep the
             // advertised capture contract conservative: variable-M prefill is
@@ -5276,6 +5289,105 @@ impl MatMulNBitsKernel {
             blob_size,
             zp_row_bytes,
         )
+    }
+
+    /// Decompose an fp16-activation M=W forward into W independent M=1 GEMV
+    /// forwards, one per row, reusing [`Self::run_f16`]'s M=1 path verbatim.
+    ///
+    /// Used by the captured speculative verify (see [`PerRowVerifyGuard`]).
+    /// Because each row is computed by the identical M=1 GEMV kernel plain
+    /// greedy decode uses — same fp32 K-reduction, same fused epilogue
+    /// (RMSNorm/SwiGLU), same zero-point handling — every verify row's logits
+    /// are byte-identical to what plain M=1 greedy would produce for that row,
+    /// eliminating the batched-GEMM reassociation that flips the greedy argmax.
+    /// Every launch is static-grid with no host alloc/sync, so the composed
+    /// verify graph is captured and replayed like any other decode graph.
+    ///
+    /// The weight / scale / zero-point / gamma inputs are shape-invariant across
+    /// rows and are re-borrowed unchanged; only the activation input, an
+    /// optional per-token residual bias, and the output are sliced to row `r`.
+    fn run_f16_per_row_verify(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        m: usize,
+    ) -> Result<()> {
+        // Contiguous single-row [1, 1, K] activation / [1, 1, N] output shapes;
+        // function-scoped so the borrowed views outlive each recursive call.
+        let a_row_shape = [1usize, 1, self.k];
+        let a_row_strides = [self.k as i64, self.k as i64, 1];
+        let y_row_shape = [1usize, 1, self.n];
+        let y_row_strides = [self.n as i64, self.n as i64, 1];
+
+        let a = &inputs[0];
+        let a_esize = a.dtype.storage_bytes(1);
+        let y_esize = outputs[0].dtype.storage_bytes(1);
+        let a_base = a.byte_offset;
+        let y_base = outputs[0].byte_offset;
+        let y_data = outputs[0].data;
+        let y_dtype = outputs[0].dtype;
+        let y_device = outputs[0].device;
+
+        // A per-token folded-residual bias binds `rows * N` elements in the bias
+        // slot; slice it per row. A genuine broadcast bias (`N` elements) and an
+        // absent bias are re-borrowed unchanged.
+        let bias_residual = inputs
+            .get(5)
+            .filter(|bias| !bias.is_absent())
+            .map(|bias| bias.numel() == m * self.n && m * self.n != self.n)
+            .unwrap_or(false);
+        let bias_base = inputs.get(5).map(|bias| bias.byte_offset).unwrap_or(0);
+
+        for row in 0..m {
+            let mut row_inputs: Vec<TensorView> = Vec::with_capacity(inputs.len());
+            for (index, view) in inputs.iter().enumerate() {
+                if index == 0 {
+                    let a_row =
+                        TensorView::new(a.data, a.dtype, &a_row_shape, &a_row_strides, a.device)
+                            .with_byte_offset(a_base + row * self.k * a_esize)
+                            .with_backing(a.backing);
+                    row_inputs.push(a_row);
+                } else if index == 5 && bias_residual {
+                    row_inputs.push(
+                        TensorView::new(
+                            view.data,
+                            view.dtype,
+                            &y_row_shape,
+                            &y_row_strides,
+                            view.device,
+                        )
+                        .with_byte_offset(bias_base + row * self.n * y_esize)
+                        .with_backing(view.backing),
+                    );
+                } else {
+                    // Shape-invariant input: re-borrow with the same shape /
+                    // strides / offset (the borrow lifetime narrows via
+                    // covariance so it can live in the row-scoped vector).
+                    row_inputs.push(
+                        TensorView::new(
+                            view.data,
+                            view.dtype,
+                            view.shape,
+                            view.strides,
+                            view.device,
+                        )
+                        .with_byte_offset(view.byte_offset)
+                        .with_backing(view.backing),
+                    );
+                }
+            }
+
+            let mut row_output =
+                TensorMut::new(y_data, y_dtype, &y_row_shape, &y_row_strides, y_device)
+                    .with_byte_offset(y_base + row * self.n * y_esize);
+            self.run_f16(&row_inputs, std::slice::from_mut(&mut row_output))?;
+        }
+
+        // Every per-row launch is capture-safe (static grid, no alloc/sync); the
+        // recursive M=1 path already stored `true`, but assert it explicitly so
+        // the composed verify forward advertises capture-safety.
+        self.last_call_capture_safe.store(true, Ordering::Relaxed);
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
