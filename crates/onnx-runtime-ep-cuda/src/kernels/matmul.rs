@@ -501,6 +501,13 @@ fn uses_dense_gemv(plan: &MatMulPlan, dtype: GemmDtype) -> bool {
         && matches!(dtype, GemmDtype::F16 | GemmDtype::F32)
 }
 
+fn lmhead_cublaslt_enabled() -> bool {
+    matches!(
+        std::env::var("ONNX_GENAI_LMHEAD_CUBLASLT").ok().as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
+}
+
 impl MatMulKernel {
     fn run(
         &self,
@@ -570,7 +577,19 @@ impl MatMulKernel {
         if uses_dense_gemv(&plan, dtype) {
             match dtype {
                 GemmDtype::F16 => {
-                    self.launch_dense_gemv_f16(a_ptr, b_ptr, c_ptr, plan.k, plan.n)?
+                    if lmhead_cublaslt_enabled() {
+                        match self.launch_dense_capturable(
+                            dtype, plan.m, plan.k, plan.n, a_ptr, b_ptr, c_ptr,
+                        ) {
+                            Ok(()) => {}
+                            Err(_err) if !self.runtime.is_capturing()? => {
+                                self.launch_dense_gemv_f16(a_ptr, b_ptr, c_ptr, plan.k, plan.n)?;
+                            }
+                            Err(err) => return Err(err),
+                        }
+                    } else {
+                        self.launch_dense_gemv_f16(a_ptr, b_ptr, c_ptr, plan.k, plan.n)?
+                    }
                 }
                 GemmDtype::F32 => {
                     self.launch_dense_gemv_f32(a_ptr, b_ptr, c_ptr, plan.k, plan.n)?

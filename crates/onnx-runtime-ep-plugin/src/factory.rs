@@ -608,6 +608,12 @@ unsafe extern "C" fn factory_get_supported_devices(
             Some(f) => f,
             None => return fail_status("GetSupportedDevices: HardwareDevice_Type not available"),
         };
+        // Vendor is load-bearing, not cosmetic: hardware type alone cannot tell a
+        // discrete NVIDIA GPU from the integrated Intel/AMD GPU that sits beside
+        // it on most laptops. Claiming the wrong one hands a CUDA EP a device
+        // that has no CUDA context, and the failure surfaces far away as a
+        // synchronous memcpy that never returns (#982).
+        let hw_vendor_fn = unsafe { (*api).HardwareDevice_VendorId };
         let get_ep_api = match unsafe { (*api).GetEpApi } {
             Some(f) => f,
             None => return fail_status("GetSupportedDevices: GetEpApi not available"),
@@ -636,6 +642,15 @@ unsafe extern "C" fn factory_get_supported_devices(
             }
             let dev_type = unsafe { hw_type_fn(hw_device) };
             if !support.serves(dev_type) {
+                continue;
+            }
+            // A zero `vendor_id` means "any vendor" (the CPU EP). When an EP
+            // names a vendor, honour it: a CUDA EP must not claim an Intel iGPU
+            // just because both report as GPU.
+            if support.vendor_id != 0
+                && let Some(vendor_fn) = hw_vendor_fn
+                && unsafe { vendor_fn(hw_device) } != support.vendor_id
+            {
                 continue;
             }
 

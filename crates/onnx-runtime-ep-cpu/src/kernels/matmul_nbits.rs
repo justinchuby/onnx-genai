@@ -2467,10 +2467,18 @@ pub fn matmul_nbits_decode_caches_dequant_f32(
     }
     let dot_kernel = selected_dot_kernel();
     // (A) borrowed_affine_int4 on-the-fly path: bits==4, accuracy_level==0,
-    // asymmetric (zero-points present), no g_idx. Dequantizes per call, no
-    // resident cache. Constant initializers are contiguous host slices, so the
-    // runtime slice guards this path also checks always hold here.
-    if bits == 4 && accuracy_level == 0 && !has_g_idx && has_zero_points {
+    // no g_idx, symmetric OR asymmetric. Dequantizes per call, no resident
+    // cache. Constant initializers are contiguous host slices, so the runtime
+    // slice guards this path also checks always hold here.
+    //
+    // Symmetry is deliberately NOT part of this condition. #979 extended the
+    // borrowed path to symmetric int4 (implicit midpoint 8, no zero_points
+    // input); before that, symmetric fell through to the resident f32 cache and
+    // paid ~8x the file size in RAM. This predictor must track the kernel's gate
+    // exactly — when it did not, it over-reported `resident_f32_cache_bytes` for
+    // symmetric models and the governed cache decision (#987) would have
+    // declined a cache that was never going to be built.
+    if bits == 4 && accuracy_level == 0 && !has_g_idx {
         return false;
     }
     // (B) MLAS SQNBit path (feature-gated). When present and the shape is
