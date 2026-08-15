@@ -1792,16 +1792,20 @@ __device__ __forceinline__ void decode_activation8_h2(
 // `MatMulFloatInt4Kernel` is fp16 for exactly this reason, so this is the
 // fp16-vs-fp16 equal-conditions path.
 //
-// PRECISION CONTRACT: only the 32 products of ONE weight/activation chunk (a
-// single quant block, so a single per-block scale) are summed in fp16, into a
-// `__half2` accumulator (16 terms per lane). That per-chunk fp16 partial is then
-// reduced to fp32, scaled, and added into the fp32 `values[c]` running sum. So
-// the full K=4096 reduction stays in fp32 (fp32 accumulate ACROSS chunks) — this
-// is NOT a full-fp16 accumulation of the K axis (that loses mantissa and flips
-// tokens). The 32-element fp16 sub-sum error is bounded (~sqrt(32)*2^-11 RMS)
-// and is validated to be <= ORT's own int4 kernel error against an f64 oracle;
-// it is NOT byte-identical to the fp32 path by construction, so it is gated on
-// accuracy, not bit-identity.
+// PRECISION CONTRACT (matches ORT's `MatMulFloat4BitsKernelM1` exactly): the
+// per-lane K reduction runs entirely in fp16 __half2 accumulators — each 32-term
+// chunk is summed in fp16, its per-block scale is folded in with __hfma2, and the
+// result accumulates into a per-column fp16 running `total`. fp32 is used ONLY in
+// the final cross-lane `warp_sum` (the 5-step shuffle). This is safe because the
+// fp16 accumulation is a WIDE, SHALLOW tree: with 32 lanes striding K by 32, each
+// lane folds only ~K/1024 chunks (≈4 for K=4096, ≈13 for K=13696), and inside a
+// chunk the __half2 holds two 16-deep lanes — a total fp16 depth of tens, not
+// thousands, so mantissa loss is negligible. (A NAIVE deep single-accumulator
+// fp16 sum of all K *does* lose mantissa and flip tokens — that is the trap this
+// wide-tree layout avoids, and why ORT accumulates in fp16 throughout.) Because
+// the arithmetic mirrors ORT's, the f64-oracle error lands in ORT's own error
+// class; it is NOT byte-identical to the fp32 path, so it ships gated on accuracy
+// (error <= ORT vs the f64 oracle), not on bit-identity.
 __device__ __forceinline__ void gemv_int4_fp16_lane_dot_multicol(
     const __half* __restrict__ activation,
     const unsigned char* __restrict__ packed,
@@ -1821,9 +1825,20 @@ __device__ __forceinline__ void gemv_int4_fp16_lane_dot_multicol(
 {
     bool valid[WIDE_NC];
     long col_kb[WIDE_NC];
+    // Per-column fp16 running total across the lane's chunks (ORT-style): the
+    // per-block scale is folded into this __half2 accumulator with __hfma2, so
+    // the entire per-lane K reduction stays in fp16 and only the final
+    // cross-lane `warp_sum` runs in fp32. Matching ORT's arithmetic exactly puts
+    // this kernel in the same error class as ORT's own int4 M=1 kernel. A single
+    // fp16 accumulator is a *wide, shallow* reduction tree — each lane folds only
+    // a handful of chunks (K / (32 lanes * 32) ≈ 4 for K=4096, ≈13 for K=13696),
+    // so almost no mantissa is lost (this is why full-fp16 accumulate is
+    // production-safe here, unlike a naive deep single-accumulator fp16 sum).
+    __half2 total[WIDE_NC];
 #pragma unroll
     for (int c = 0; c < WIDE_NC; ++c) {
         values[c] = 0.0f;
+        total[c] = __float2half2_rn(0.0f);
         const long column = col_base + c;
         valid[c] = (column < n);
         col_kb[c] = column * (long)k_blocks;
@@ -1835,7 +1850,7 @@ __device__ __forceinline__ void gemv_int4_fp16_lane_dot_multicol(
         const int within = depth - block * block_size;
 
         uint4 w[WIDE_NC];
-        float scale[WIDE_NC];
+        __half2 scale2[WIDE_NC];
         unsigned int sub2[WIDE_NC];
 #pragma unroll
         for (int c = 0; c < WIDE_NC; ++c) {
@@ -1844,16 +1859,18 @@ __device__ __forceinline__ void gemv_int4_fp16_lane_dot_multicol(
             }
             const long base = (col_kb[c] + block) * (long)blob_size;
             w[c] = *reinterpret_cast<const uint4*>(packed + base + (within >> 1));
+            // Splat the per-block scale into both half lanes so it can be folded
+            // into the fp16 accumulator with a single __hfma2.
             if (scales_fp16) {
-                scale[c] = __half2float(reinterpret_cast<const __half*>(scales)[col_kb[c] + block]);
+                scale2[c] = __half2half2(reinterpret_cast<const __half*>(scales)[col_kb[c] + block]);
             } else {
-                scale[c] = reinterpret_cast<const float*>(scales)[col_kb[c] + block];
+                scale2[c] = __float2half2_rn(reinterpret_cast<const float*>(scales)[col_kb[c] + block]);
             }
             sub2[c] = int4_zero_point_sub2(
                 int4_block_zero_point(zero_points, col_base + c, block, zp_row_bytes));
         }
 
-        // fp16 accumulators for this chunk's 32 products, one per column.
+        // fp16 accumulators for this chunk's 32 (unscaled) products, one per col.
         __half2 acc[WIDE_NC];
 #pragma unroll
         for (int c = 0; c < WIDE_NC; ++c) {
@@ -1883,16 +1900,24 @@ __device__ __forceinline__ void gemv_int4_fp16_lane_dot_multicol(
             }
         }
 
-        // Reduce each column's fp16 chunk partial to fp32, scale, accumulate.
+        // Scale this chunk's fp16 partial by the block scale and fold it into the
+        // fp16 running total (one __hfma2 per column) — fp32 is deferred to the
+        // final cross-lane reduction.
 #pragma unroll
         for (int c = 0; c < WIDE_NC; ++c) {
             if (!valid[c]) {
                 continue;
             }
-            const float2 f = __half22float2(acc[c]);
-            values[c] += scale[c] * (f.x + f.y);
+            total[c] = __hfma2(acc[c], scale2[c], total[c]);
         }
         depth += warp_stride;
+    }
+
+    // Collapse each column's fp16 running total to fp32 (the two half lanes are
+    // the two halves of the dot product). The tail below adds into this in fp32.
+#pragma unroll
+    for (int c = 0; c < WIDE_NC; ++c) {
+        values[c] = __low2float(total[c]) + __high2float(total[c]);
     }
 
     // Partial trailing chunk: compute in fp32 exactly like the fp32 multicol tail
