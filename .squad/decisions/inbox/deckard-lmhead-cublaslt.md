@@ -1,8 +1,8 @@
 # Decision drop — optional cuBLASLt fp16 lm_head decode path
 
-**Author:** Deckard  
-**Branch:** `squad/int4-gemv-wideload-v2`  
-**Date:** 2026-08-15  
+**Author:** Deckard
+**Branch:** `squad/int4-gemv-wideload-v2`
+**Date:** 2026-08-15
 **Scope:** dense fp16 M=1 `MatMul` used by glm lm_head / final vocab projection. GEMV kernels in `matmul_nbits.rs` were not touched.
 
 ## Baseline profile
@@ -49,12 +49,12 @@ Command: `profile_native --model /home/justinchu/glm-e2e-artifacts/glm-4-9b-int4
 
 | path | median tok/s | token status |
 |---|---:|---|
-| native lm_head (default) | **186.17 tok/s** | baseline |
-| `ONNX_GENAI_LMHEAD_CUBLASLT=1` | **190.02 tok/s** | **byte-identical** to default (160-token diff clean) |
+| native lm_head (default, with Deckard-3 multicol GEMV commit on branch) | **207.78 tok/s** | baseline |
+| `ONNX_GENAI_LMHEAD_CUBLASLT=1` + multicol GEMV | **213.44 tok/s** | **byte-identical** to default (160-token diff clean) |
 
-qwen regression smoke (`/home/justinchu/shared-models/qwen2.5-14b-instruct-int4-zp-onnx`, 64 tokens, decode-skip 16): default **152.40 tok/s**, cuBLASLt **154.67 tok/s**, generated token stream byte-identical.
+qwen regression smoke (`/home/justinchu/shared-models/qwen2.5-14b-instruct-int4-zp-onnx`, 64 tokens, decode-skip 16): final same-session default **70.16 tok/s**, cuBLASLt **86.77 tok/s** under a contended host, generated token stream byte-identical. Earlier quiet same-session run before the multicol commit measured default **152.40 tok/s**, cuBLASLt **154.67 tok/s**; no token regression in either run.
 
-Fresh ORT comparison available from this harness on the ORT-fair artifact (`/home/justinchu/glm-e2e-artifacts/glm-4-9b-int4-cuda-ortfair`, graph off due the known graph-on `ort_value` failure): **194.84 tok/s**, byte-identical to native for the measured prompt. The standing certified CUDA-graph ORT comparator remains ~250 tok/s.
+Fresh ORT comparison available from this harness on the ORT-fair artifact (`/home/justinchu/glm-e2e-artifacts/glm-4-9b-int4-cuda-ortfair`, graph off due the known graph-on `ort_value` failure): **194.84 tok/s**, byte-identical to native for the measured prompt. The combined branch now measures **213.44 tok/s** native with multicol GEMV + opt-in cuBLASLt lm_head, but the standing certified CUDA-graph ORT comparator remains ~250 tok/s.
 
 ## Validation
 
