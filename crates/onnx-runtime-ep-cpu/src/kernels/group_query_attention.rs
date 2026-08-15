@@ -78,17 +78,43 @@ pub fn attention_split_count() -> usize {
     ATTENTION_SPLIT_COUNT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Whether the M=1 KV-group-fused decode path is enabled (default on). Set
-/// `ONNX_GENAI_GQA_GROUP_FUSED=0` (or `false`/`off`) to force the per-query-head
-/// decode path — used to A/B the fusion against the baseline on one binary.
+/// Test-only tri-state override of [`group_fusion_enabled`]: `-1` defers to the
+/// environment, `0` forces off, `1` forces on.
+static GROUP_FUSION_OVERRIDE: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+
+/// Whether the M=1 KV-group-fused decode path is enabled. **Opt-in**: set
+/// `ONNX_GENAI_GQA_GROUP_FUSED=1` (or `true`/`on`) to enable it.
+///
+/// The fused schedule is bit-identical and, where both gates open, is a
+/// 1.25x – 2.76x win on the attention operator and 1.31x end to end at a fixed
+/// decode width. It is nonetheless off by default because
+/// [`GROUP_FUSED_MIN_KV_BYTES`] is a *fixed* per-KV-head threshold calibrated on
+/// a single 64 MiB-L3 host. On a much larger last-level cache the real crossover
+/// sits above 8 MiB, so the gate would open while the attended KV still fits
+/// cache — exactly the regime the sweeps measure as a 0.64x – 0.9x loss. No
+/// large-L3 host was available to check that, and no model-level measurement
+/// exists for the batch >= 2 regime the gate also admits.
+///
+/// Flip the default once either (a) a wall-clock A/B on a large-L3 host at a
+/// reachable geometry shows no regression, or (b) the threshold becomes
+/// `llc_bytes / worker_count`.
 fn group_fusion_enabled() -> bool {
+    match GROUP_FUSION_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => group_fusion_env_default(),
+    }
+}
+
+/// Environment default for [`group_fusion_enabled`], latched on first read.
+fn group_fusion_env_default() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| match std::env::var("ONNX_GENAI_GQA_GROUP_FUSED") {
-        Ok(value) => !matches!(
+        Ok(value) => matches!(
             value.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off"
+            "1" | "true" | "on"
         ),
-        Err(_) => true,
+        Err(_) => false,
     })
 }
 
@@ -99,6 +125,37 @@ static GROUP_FUSED_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::At
 /// Number of decode forwards that took the KV-group-fused path so far.
 pub fn group_fused_count() -> usize {
     GROUP_FUSED_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Serialises tests that force [`group_fusion_enabled`] on, so the override
+/// cannot leak into a test running concurrently in the same process.
+#[cfg(test)]
+static GROUP_FUSION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Forces [`group_fusion_enabled`] on for the lifetime of the guard. Tests need
+/// this because the path is opt-in and the environment default latches in a
+/// `OnceLock`, so it cannot be toggled twice in one process.
+#[cfg(test)]
+struct GroupFusionOverride {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl GroupFusionOverride {
+    fn forced_on() -> Self {
+        let guard = GROUP_FUSION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        GROUP_FUSION_OVERRIDE.store(1, std::sync::atomic::Ordering::Relaxed);
+        Self { _guard: guard }
+    }
+}
+
+#[cfg(test)]
+impl Drop for GroupFusionOverride {
+    fn drop(&mut self) {
+        GROUP_FUSION_OVERRIDE.store(-1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Whether collapsing the decode schedule to one task per `(batch, kv_head)`
@@ -1163,12 +1220,12 @@ impl Kernel for GroupQueryAttentionKernel {
         //
         // Measured end to end on Qwen3-0.6B-int4 at ~11.8k context with
         // `ONNX_GENAI_CPU_DECODE_THREADS=8` (the only batch-1 configuration on a
-        // 16-core host where both gates open): 151 ms/token fused vs 200
-        // ms/token per-head, 4 interleaved trials, token output identical.
-        // Note this does not beat the *default* 16-worker per-head config
-        // (129 ms/token) — narrowing the pool to reach the gate costs more than
-        // the fusion returns at batch 1. It is a win within a given decode
-        // width, not a new best configuration.
+        // 16-core host where both gates open): median per-pair ratio 1.31x over
+        // 5 interleaved trials, token output identical in every run. Note this
+        // does not beat the *default* 16-worker per-head config (129 ms/token) —
+        // narrowing the pool to reach the gate costs more than the fusion
+        // returns at batch 1. It is a win within a given decode width, not a new
+        // best configuration, which is part of why the path is opt-in.
         let attended_window = fused_attended_window(total_sequence_length, self.local_window_size);
         let group_fused = q.seq == 1
             && group > 1
@@ -3308,15 +3365,15 @@ mod tests {
     /// The KV-group-fused decode path must be *bit-identical* to the
     /// per-query-head path and must actually be reached.
     ///
-    /// The A/B is driven through the reachability gate rather than the env flag
-    /// (which latches in a `OnceLock` and so cannot be toggled twice in one
-    /// process): the same inputs run on a decode pool the fused schedule
-    /// saturates (`batch * kv_num_heads >= workers`) and on one it does not.
-    /// The first must take the fused branch — asserted against
-    /// [`group_fused_count`], so the test cannot pass vacuously — and both must
-    /// agree to the last bit.
+    /// The path is opt-in, so the test forces it on for its own duration. The
+    /// A/B is then driven through the reachability gate: the same inputs run on
+    /// a decode pool the fused schedule saturates (`batch * kv_num_heads >=
+    /// workers`) and on one it does not. The first must take the fused branch —
+    /// asserted against [`group_fused_count`], so the test cannot pass
+    /// vacuously — and both must agree to the last bit.
     #[test]
     fn group_fused_decode_is_bit_identical_to_per_head_decode() {
+        let _fusion = GroupFusionOverride::forced_on();
         // Long enough that `group_fusion_pays_for_traffic` opens the gate
         // (8 MiB of attended K+V per KV head at f32 width).
         const PAST_SEQUENCE_LENGTH: usize = 8_192;
@@ -3416,6 +3473,24 @@ mod tests {
             fused.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
             per_head.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
             "KV-group fusion must not change a single bit of the decode output"
+        );
+    }
+
+    /// The fused schedule is calibrated on one host's LLC and has no
+    /// model-level evidence for the batch >= 2 regime its gate admits, so it
+    /// must stay opt-in. Guards against someone flipping the default back.
+    #[test]
+    fn group_fusion_is_opt_in_by_default() {
+        if std::env::var("ONNX_GENAI_GQA_GROUP_FUSED").is_ok() {
+            // The caller opted in for this process; nothing to assert.
+            return;
+        }
+        let _serialise = GROUP_FUSION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            !group_fusion_enabled(),
+            "KV-group-fused decode must stay opt-in (ONNX_GENAI_GQA_GROUP_FUSED=1)"
         );
     }
 

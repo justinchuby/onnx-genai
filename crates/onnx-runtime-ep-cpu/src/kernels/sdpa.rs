@@ -600,8 +600,8 @@ pub fn sdpa_decode_group(
 
 /// Keys per KV tile in [`sdpa_decode_group`], sized so one tile of K (or V) rows
 /// is about 16 KiB and therefore stays in L1D while the whole query group reads
-/// it. Head sizes are powers of two in practice (64/80/96/128/256), so this is a
-/// cheap division rather than a tuned table.
+/// it. Head sizes are small and few in practice (64/80/96/128/256), so this is
+/// a cheap division rather than a tuned table.
 #[inline]
 fn group_kv_tile(head_size: usize) -> usize {
     const TILE_BYTES: usize = 16 * 1024;
