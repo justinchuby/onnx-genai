@@ -2030,6 +2030,7 @@ dependencies = [
  "clap",
  "criterion",
  "cudarc",
+ "half",
  "onnx-genai-engine",
  "onnx-genai-kv",
  "onnx-genai-metadata",

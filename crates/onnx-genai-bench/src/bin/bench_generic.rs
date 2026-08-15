@@ -33,6 +33,11 @@ struct Args {
     /// runs native alone so ORT's intra-op threadpool is not spinning and polluting native samples.
     #[arg(long)]
     native_only: bool,
+    /// ORT `intra_op_num_threads` for the timed session. `0` keeps ORT's default
+    /// (one thread per logical core), which is what a user gets out of the box;
+    /// set it to the native decode-pool width for a thread-matched comparison.
+    #[arg(long, default_value_t = 0)]
+    ort_intra_threads: i32,
     /// Relative tolerance used for Float32 output parity.
     #[arg(long, default_value_t = 1e-3)]
     rel_tolerance: f32,
@@ -151,6 +156,30 @@ fn synthetic_i64(count: usize) -> Vec<i64> {
     (0..count).map(|index| (index % 17) as i64).collect()
 }
 
+/// Float16 bit patterns for the same values [`synthetic_f32`] produces, so a
+/// Float16 graph is fed the numerically closest version of the f32 input.
+fn synthetic_f16_bits(count: usize) -> Vec<u16> {
+    synthetic_f32(count)
+        .into_iter()
+        .map(|value| half::f16::from_f32(value).to_bits())
+        .collect()
+}
+
+/// Unsigned 8-bit inputs spread over the whole quantized range (QLinearMatMul
+/// and friends interpret these through a scale/zero-point, so the raw spread
+/// matters more than the float value).
+fn synthetic_u8(count: usize) -> Vec<u8> {
+    (0..count)
+        .map(|index| (index.wrapping_mul(37) % 251) as u8)
+        .collect()
+}
+
+fn synthetic_i8_bytes(count: usize) -> Vec<u8> {
+    (0..count)
+        .map(|index| (((index.wrapping_mul(37) % 251) as i32 - 125) as i8) as u8)
+        .collect()
+}
+
 fn synthetic_i32(count: usize) -> Vec<i32> {
     (0..count).map(|index| (index % 17) as i32).collect()
 }
@@ -219,9 +248,32 @@ fn build_inputs(
                         Value::from_raw_bytes(bytes, &ort_shape, OrtDataType::Int32)?,
                     )
                 }
+                (NativeDataType::Float16, OrtDataType::Float16) => {
+                    let bits = synthetic_f16_bits(count);
+                    let bytes = bits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
+                    (
+                        Tensor::from_raw(NativeDataType::Float16, shape.clone(), &bytes)?,
+                        Value::from_slice_f16_bits(&bits, &ort_shape)?,
+                    )
+                }
+                (NativeDataType::Uint8, OrtDataType::Uint8) => {
+                    let bytes = synthetic_u8(count);
+                    (
+                        Tensor::from_raw(NativeDataType::Uint8, shape.clone(), &bytes)?,
+                        Value::from_raw_bytes(bytes, &ort_shape, OrtDataType::Uint8)?,
+                    )
+                }
+                (NativeDataType::Int8, OrtDataType::Int8) => {
+                    let bytes = synthetic_i8_bytes(count);
+                    (
+                        Tensor::from_raw(NativeDataType::Int8, shape.clone(), &bytes)?,
+                        Value::from_raw_bytes(bytes, &ort_shape, OrtDataType::Int8)?,
+                    )
+                }
                 (native, ort) => bail!(
                     "input '{}' has unsupported or mismatched dtype: native={native:?} ORT={ort:?}; \
-                     bench_generic currently synthesizes Float32, Int32, and Int64 inputs",
+                     bench_generic currently synthesizes Float32, Float16, Int32, Int64, Uint8, \
+                     and Int8 inputs",
                     input.name
                 ),
             };
@@ -294,6 +346,36 @@ fn run_ort_only(
     Ok(())
 }
 
+/// Largest absolute and relative gap between two f32 sequences, plus whether
+/// every element is inside `abs_tolerance + rel_tolerance * max(|a|, |b|)`.
+fn compare_f32(
+    native: &[f32],
+    ort: &[f32],
+    abs_tolerance: f32,
+    rel_tolerance: f32,
+) -> (f32, f32, bool) {
+    let mut max_abs = 0.0_f32;
+    let mut max_rel = 0.0_f32;
+    let mut pass = true;
+    for (&native, &ort) in native.iter().zip(ort) {
+        if native == ort {
+            continue;
+        }
+        if !native.is_finite() || !ort.is_finite() {
+            max_abs = f32::INFINITY;
+            max_rel = f32::INFINITY;
+            pass = false;
+            continue;
+        }
+        let abs = (native - ort).abs();
+        let rel = abs / native.abs().max(ort.abs()).max(f32::MIN_POSITIVE);
+        max_abs = max_abs.max(abs);
+        max_rel = max_rel.max(rel);
+        pass &= abs <= abs_tolerance + rel_tolerance * native.abs().max(ort.abs());
+    }
+    (max_abs, max_rel, pass)
+}
+
 fn compare_outputs(
     native: &[Tensor],
     ort: &[Value],
@@ -327,32 +409,68 @@ fn compare_outputs(
             }
             match (native.dtype, ort.dtype()) {
                 (NativeDataType::Float32, OrtDataType::Float32) => {
-                    let native = native.to_vec_f32();
-                    let ort = ort.to_vec_f32()?;
-                    let mut max_abs = 0.0_f32;
-                    let mut max_rel = 0.0_f32;
-                    let mut pass = true;
-                    for (&native, &ort) in native.iter().zip(&ort) {
-                        if native == ort {
-                            continue;
-                        }
-                        if !native.is_finite() || !ort.is_finite() {
-                            max_abs = f32::INFINITY;
-                            max_rel = f32::INFINITY;
-                            pass = false;
-                            continue;
-                        }
-                        let abs = (native - ort).abs();
-                        let rel = abs / native.abs().max(ort.abs()).max(f32::MIN_POSITIVE);
-                        max_abs = max_abs.max(abs);
-                        max_rel = max_rel.max(rel);
-                        pass &= abs <= abs_tolerance + rel_tolerance * native.abs().max(ort.abs());
-                    }
+                    let (max_abs, max_rel, pass) = compare_f32(
+                        &native.to_vec_f32(),
+                        &ort.to_vec_f32()?,
+                        abs_tolerance,
+                        rel_tolerance,
+                    );
                     Ok(OutputDiff {
                         index,
                         max_abs,
                         max_rel,
                         pass,
+                    })
+                }
+                (NativeDataType::Float16, OrtDataType::Float16) => {
+                    let widen = |bits: &[u16]| -> Vec<f32> {
+                        bits.iter()
+                            .map(|&bits| half::f16::from_bits(bits).to_f32())
+                            .collect()
+                    };
+                    let native_bits: Vec<u16> = native
+                        .as_bytes()
+                        .chunks_exact(2)
+                        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                        .collect();
+                    let (max_abs, max_rel, pass) = compare_f32(
+                        &widen(&native_bits),
+                        &widen(&ort.to_vec_f16_bits()?),
+                        abs_tolerance,
+                        rel_tolerance,
+                    );
+                    Ok(OutputDiff {
+                        index,
+                        max_abs,
+                        max_rel,
+                        pass,
+                    })
+                }
+                (NativeDataType::Uint8, OrtDataType::Uint8)
+                | (NativeDataType::Int8, OrtDataType::Int8) => {
+                    // Quantized outputs are exact integers: any mismatch is a
+                    // real disagreement, so report the largest code-unit gap and
+                    // require zero of them.
+                    let ort_bytes = ort.to_raw_bytes()?;
+                    let signed = native.dtype == NativeDataType::Int8;
+                    let max_abs = native
+                        .as_bytes()
+                        .iter()
+                        .zip(&ort_bytes)
+                        .map(|(&native, &ort)| {
+                            if signed {
+                                ((native as i8) as i32 - (ort as i8) as i32).unsigned_abs()
+                            } else {
+                                (native as i32 - ort as i32).unsigned_abs()
+                            }
+                        })
+                        .max()
+                        .unwrap_or(0);
+                    Ok(OutputDiff {
+                        index,
+                        max_abs: max_abs as f32,
+                        max_rel: 0.0,
+                        pass: max_abs == 0,
                     })
                 }
                 (NativeDataType::Int64, OrtDataType::Int64) => {
@@ -403,6 +521,33 @@ fn median_ms(mut samples: Vec<f64>) -> f64 {
     samples[samples.len() / 2]
 }
 
+/// p50/p90/min of one runtime's samples. p90 uses the nearest-rank definition
+/// (`ceil(0.9 * n)`-th smallest), so a 10-run comparison reports the 9th
+/// sample rather than interpolating; dispersion is reported as p90/p50 so a
+/// noisy shared host is visible in the record instead of hidden by the median.
+#[derive(Clone, Copy)]
+struct Stats {
+    p50: f64,
+    p90: f64,
+    min: f64,
+}
+
+impl Stats {
+    fn from(mut samples: Vec<f64>) -> Self {
+        samples.sort_by(f64::total_cmp);
+        let rank = ((samples.len() as f64) * 0.9).ceil().max(1.0) as usize;
+        Self {
+            p50: samples[samples.len() / 2],
+            p90: samples[rank.min(samples.len()) - 1],
+            min: samples[0],
+        }
+    }
+
+    fn spread(&self) -> f64 {
+        self.p90 / self.p50
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     if args.runs == 0 {
@@ -418,7 +563,13 @@ fn main() -> Result<()> {
         .map_err(anyhow::Error::msg)?;
 
     let environment = Environment::new("bench-generic")?;
-    let ort_intra_threads = if args.native_only { 1 } else { 0 };
+    let ort_intra_threads = if args.ort_intra_threads > 0 {
+        args.ort_intra_threads
+    } else if args.native_only {
+        1
+    } else {
+        0
+    };
     let ort_options = SessionOptions::with_execution_provider(ep_selection("cpu"))
         .with_intra_op_threads(ort_intra_threads);
     let ort_session = Session::new(&environment, &args.model, ort_options)
@@ -534,23 +685,36 @@ fn main() -> Result<()> {
         }
     }
 
-    let native_ms = median_ms(native_samples);
+    let native = Stats::from(native_samples);
     if args.native_only {
         println!(
-            "result: native={native_ms:.3} ms ({:.2} infer/s) ort=skipped native-only=true \
-             parity={}",
-            1_000.0 / native_ms,
+            "result: native={:.3} ms ({:.2} infer/s) native_p90={:.3} ms native_min={:.3} ms \
+             native_spread={:.2} ort=skipped native-only=true parity={}",
+            native.p50,
+            1_000.0 / native.p50,
+            native.p90,
+            native.min,
+            native.spread(),
             if parity_pass { "PASS" } else { "FAIL" }
         );
         return Ok(());
     }
-    let ort_ms = median_ms(ort_samples);
+    let ort = Stats::from(ort_samples);
     println!(
-        "result: native={native_ms:.3} ms ({:.2} infer/s) ort={ort_ms:.3} ms \
-         ({:.2} infer/s) native/ort={:.3} parity={}",
-        1_000.0 / native_ms,
-        1_000.0 / ort_ms,
-        native_ms / ort_ms,
+        "result: native={:.3} ms ({:.2} infer/s) ort={:.3} ms ({:.2} infer/s) \
+         native/ort={:.3} native_p90={:.3} ort_p90={:.3} native_min={:.3} ort_min={:.3} \
+         native_spread={:.2} ort_spread={:.2} ort_intra_threads={ort_intra_threads} parity={}",
+        native.p50,
+        1_000.0 / native.p50,
+        ort.p50,
+        1_000.0 / ort.p50,
+        native.p50 / ort.p50,
+        native.p90,
+        ort.p90,
+        native.min,
+        ort.min,
+        native.spread(),
+        ort.spread(),
         if parity_pass { "PASS" } else { "FAIL" }
     );
     Ok(())
