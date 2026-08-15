@@ -105,9 +105,24 @@ pub(super) fn append_cuda_execution_provider(
         }
         // The invariant this function exists to hold, checked rather than
         // commented: ORT must believe it has a user compute stream exactly when
-        // we gave it one. Reading the options back catches a reordered or
-        // dropped typed update at session creation, instead of leaving the
-        // caller to discover it as an unordered copy at run time.
+        // we gave it one, so that `Session::user_compute_stream` cannot report
+        // a stream the provider is not using.
+        //
+        // What the readback does and does not prove. It checks the *net*
+        // recorded state after every update above, so it fires whenever that
+        // state is wrong - a stream that was never configured, or a later
+        // string update whose map omits the stream keys, which
+        // `UpdateProviderOptions` answers by recomputing
+        // `has_user_compute_stream` from a null pointer and clearing the flag.
+        // It cannot prove that the typed update specifically ran, because the
+        // string map above is already self-sufficient: ORT parses
+        // `user_compute_stream` into the pointer, copies it because the
+        // `has_user_compute_stream` key is present, and then sets the flag from
+        // `user_compute_stream != nullptr`. The typed call is an authoritative
+        // last write over a value the string path also sets, not the only
+        // mechanism that sets it, and dropping it would be correct rather than
+        // a regression. What must never happen is the two disagreeing, and that
+        // is what is checked here.
         if let Some(stream) = user_compute_stream
             && !records_user_compute_stream(cuda_options, stream)?
         {

@@ -79,12 +79,16 @@ fn a_session_with_no_shared_stream_reports_none() {
 /// A CUDA session given a shared stream must adopt it, report it, and order
 /// work on it.
 ///
-/// This is the end-to-end form of the provider-option invariant. Session
-/// creation now reads the provider options back from ONNX Runtime and fails if
-/// `has_user_compute_stream` is not set, so this test fails if the typed
-/// `UpdateCUDAProviderOptionsWithValue` is dropped or moved before the string
-/// update that reparses and clears the flag. Graph capture is enabled because
-/// that is the configuration where a half-adopted stream aborts at run time.
+/// This is the end-to-end form of the provider-option invariant: the stream the
+/// getter reports is the stream the provider actually runs on. Session creation
+/// reads the provider options back from ONNX Runtime and fails unless they
+/// report both `has_user_compute_stream=1` and this exact address, so the test
+/// fails if the stream stops being configured - verified by removing both the
+/// string keys and the typed update, which turns this into a failure. It does
+/// not discriminate the typed update alone, because the string keys already
+/// configure the stream on their own; see the note in `session::cuda`. Graph
+/// capture is enabled because that is the configuration where a stream the
+/// session did not adopt aborts at run time rather than merely running slowly.
 #[test]
 #[ignore = "requires a CUDA device"]
 fn a_cuda_session_adopts_reports_and_orders_work_on_the_shared_stream() {
