@@ -2377,6 +2377,43 @@ acted on.
 consistent with it, but was derived from a whole-process peak, not per-tensor);
 and why ORT's own CPU path also peaks at 5.9× on the same model.
 
+### 3.7.1 MLAS SQNBit packing is a second full copy, and the ledger cannot see it
+
+The f32 cache is not the only unaccounted weight expansion on the CPU path. Routing
+`MatMulNBits` int4 nodes to MLAS SQNBit (PR #1027) is a large decode win and a large
+memory regression at the same time, and only the first half was being reported.
+
+Measured on the RTX 4060 laptop box (20 logical CPUs, 68.5 GB RAM, AVX2 + FMA +
+F16C + AVX-VNNI, no AVX-512), same binary toggled with
+`ONNX_GENAI_CPU_MM_MLAS_QNBIT=0/1`, `--backend native`:
+
+| model | borrowed path | MLAS route | decode |
+| --- | --- | --- | --- |
+| qwen05b-symzp (367 MB weights) | 380 MB peak | 993 MB peak | 146 → 54.4 ms/token |
+| qwen14b-symzp (8.55 GB weights) | 8.17 GB peak | **25.5 GB peak** | not isolated |
+
+The packed buffer is flat across 2/4/8/16 threads, so it is not per-thread sharding.
+It is a private copy of the weights, packed to roughly 2× the int4 bytes, held
+**beside** the still-resident mapped file rather than replacing it. Generated text is
+byte-identical either way, and the one-time pack costs ~1.05 s on the 0.5B — repaid
+after about 11 tokens, so the speed case is genuine.
+
+Two lessons, both instances of the same recurring defect:
+
+- `resident_f32_cache_bytes` read **0** in both modes. The field exists, it is
+  printed on every load, and it does not observe MLAS's allocation at all. A memory
+  ledger that only counts the one expansion we already knew about will keep
+  reporting zero while the process triples.
+- The PR argued "#979 is preserved" from `weight_nk` staying empty. That is a proxy
+  for the footprint, not the footprint. A regression test asserting that a field
+  stays empty passes straight through a different allocation of the same bytes.
+
+The policy this implies is the same one §3.7 asks for: the route must be **admitted**
+against the budget, exactly like the f32 cache, and must decline to the borrowed path
+when the packed buffer does not fit. A 2.7× decode win is worth taking on a machine
+with headroom and is not worth 17 GB on a machine without it — which of those applies
+is a runtime question, so it cannot be answered by a compile-time gate.
+
 ---
 
 ## 4. Layer 3a: DeviceGovernor (Per Compute Unit — Exclusive Memory)
