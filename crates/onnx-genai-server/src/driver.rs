@@ -1227,10 +1227,13 @@ fn deferred_permit_holder_count(deferred: &VecDeque<DriverCommand>) -> usize {
 /// Commands that *reconfigure* engine state are deferred until the batch drains by design.
 /// Only read-only observability is answered immediately here.
 pub(crate) fn handle_or_defer_during_batch(
-    resource_snapshot: &Mutex<Option<GovernorSnapshot>>,
+    _resource_snapshot: &Mutex<Option<GovernorSnapshot>>,
     command: DriverCommand,
 ) -> Option<DriverCommand> {
     match command {
+        // The variant itself is `#[cfg(test)]`: in production `/v1/resources`
+        // reads the same mirror directly rather than routing through the driver.
+        #[cfg(test)]
         DriverCommand::ResourceSnapshot(reply) => {
             // Served from the mirror, not from `&Engine`: during a batch the
             // engine is mutably borrowed by the ContinuousBatchManager, and the
@@ -1238,7 +1241,7 @@ pub(crate) fn handle_or_defer_during_batch(
             // `/v1/resources` must not appear to hang until every in-flight
             // generation completes. The mirror is the same value that endpoint
             // serves elsewhere, refreshed by `refresh_resource_snapshot`.
-            let snapshot = resource_snapshot
+            let snapshot = _resource_snapshot
                 .lock()
                 .ok()
                 .and_then(|guard| guard.clone());
