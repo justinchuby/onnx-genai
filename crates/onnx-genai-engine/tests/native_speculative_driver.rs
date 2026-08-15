@@ -338,3 +338,67 @@ fn native_captured_verify_short_prompt_grows_gqa_workspace_cuda() -> anyhow::Res
     );
     Ok(())
 }
+
+/// Regression for the qwen width-dependent workspace contract failure found in
+/// #988 re-review: pre-reserving the cold generation workspace at W leaked a
+/// width-dependent GQA layout into later M=1 fallback decode. W=7 was the
+/// smallest failing width and W=9 was the original escaped case. Both must stay
+/// byte-identical to plain greedy even on this degenerate prompt.
+#[test]
+fn native_captured_verify_qwen_w7_w9_match_plain_greedy_cuda() -> anyhow::Result<()> {
+    if std::env::var_os("ONNX_GENAI_RUN_CUDA_SMOKE").is_none() {
+        eprintln!("skipping CUDA smoke; set ONNX_GENAI_RUN_CUDA_SMOKE=1 to run");
+        return Ok(());
+    }
+    unsafe {
+        std::env::set_var("ONNX_GENAI_SPEC_CAPTURED_VERIFY", "1");
+        std::env::set_var("ONNX_GENAI_MARLIN_M_GT_1", "1");
+        std::env::set_var("ONNX_GENAI_SPEC_GATE", "0");
+    }
+    let model_dir = std::env::var_os("ONNX_GENAI_NATIVE_SPEC_QWEN_MODEL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from("/home/justinchu/shared-models/qwen2.5-14b-instruct-int4-zp-onnx")
+        });
+    if !model_dir.join("model.onnx").is_file() {
+        eprintln!(
+            "skipping CUDA smoke; qwen model is not installed at {}",
+            model_dir.display()
+        );
+        return Ok(());
+    }
+
+    let prompt = "哈哈哈哈哈哈哈哈哈哈哈哈哈哈哈哈哈哈哈哈";
+    let device = Some(NativeDecodeDevice::Cuda { index: Some(0) });
+    let mut baseline = native_engine(&model_dir, device.clone())?;
+    let expected = baseline.generate(greedy_request(
+        GeneratePrompt::Text(prompt.to_string()),
+        160,
+    ))?;
+
+    for spec_tokens in [6, 8] {
+        let mut speculative = native_engine(&model_dir, device.clone())?;
+        let actual = speculative.generate(with_prompt_lookup(
+            greedy_request(GeneratePrompt::Text(prompt.to_string()), 160),
+            1,
+            spec_tokens,
+        ))?;
+        let stats = speculative.last_speculative_stats();
+        assert_eq!(
+            actual.token_ids,
+            expected.token_ids,
+            "qwen captured-spec W={} diverged from plain greedy: stats={stats:?}",
+            spec_tokens + 1
+        );
+        assert_eq!(actual.finish_reason, expected.finish_reason);
+        eprintln!(
+            "qwen W={} captured-spec: proposed={} accepted={} steps={} near_tie_rejections={}",
+            spec_tokens + 1,
+            stats.proposed_tokens,
+            stats.accepted_tokens,
+            stats.verification_steps,
+            stats.near_tie_rejections
+        );
+    }
+    Ok(())
+}
