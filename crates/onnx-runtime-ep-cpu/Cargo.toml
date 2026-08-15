@@ -87,5 +87,9 @@ harness = false
 name = "activation_bench"
 harness = false
 
+[[bench]]
+name = "gqa_decode"
+harness = false
+
 [lints]
 workspace = true
