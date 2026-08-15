@@ -406,6 +406,15 @@ static N16_SDOT_M1_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 static KAI_SDOT_M1_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(all(test, feature = "mlas"))]
 static MLAS_SQNBIT_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
+/// Positive-proof counters for the zero-copy borrowed int4 decode path (#979).
+/// Split by symmetry so a test can assert the *symmetric* branch is the one that
+/// executed, not merely that some path avoided the resident `weight_nk` f32
+/// cache. Incremented once per `execute` that routes into
+/// [`borrowed_affine_int4_matmul`].
+#[cfg(test)]
+static BORROWED_INT4_SYMMETRIC_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static BORROWED_INT4_ASYMMETRIC_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 /// Standard ONNX row-major packed NBits weight with affine block metadata.
 ///
 /// This preserves the wire layout instead of expanding it to f32. Direct
@@ -774,6 +783,12 @@ impl Kernel for MatMulNBitsKernel {
             // resident f32 `weight_nk` cache (~8x the file size in RAM). It now
             // borrows the packed int4 in place like the asymmetric case, using
             // `None` zero points to mean the implicit midpoint (see #979).
+            #[cfg(test)]
+            if borrowed_zero_points.is_none() {
+                BORROWED_INT4_SYMMETRIC_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
+            } else {
+                BORROWED_INT4_ASYMMETRIC_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
+            }
             with_decode_pool(|| {
                 borrowed_affine_int4_matmul(
                     &activations,
@@ -10890,6 +10905,7 @@ mod tests {
         let scales = Owned::f32(&[n, 2], &scales);
         let zero_points = Owned::u8(&[n, 1], &zero_points);
         let mut y = Owned::zeros_f32(&[1, n]);
+        let asym_before = BORROWED_INT4_ASYMMETRIC_TEST_CALLS.load(Ordering::Relaxed);
         kernel
             .execute(
                 &[a.view(), b.view(), scales.view(), zero_points.view()],
@@ -10898,6 +10914,10 @@ mod tests {
             .unwrap();
 
         assert_close(&y.to_f32(), &reference(&a_values, &dequantized, 1, k, n));
+        assert!(
+            BORROWED_INT4_ASYMMETRIC_TEST_CALLS.load(Ordering::Relaxed) > asym_before,
+            "asymmetric INT4 decode must route into the borrowed zero-copy path"
+        );
         assert!(
             !prepack_cache_populated(&kernel),
             "asymmetric INT4 must borrow packed inputs instead of building a weight cache"
@@ -10932,11 +10952,22 @@ mod tests {
         let b = Owned::u8(&[n, 4, 16], &packed);
         let scales = Owned::f32(&[n, 4], &scales);
         let mut y = Owned::zeros_f32(&[1, n]);
+        let sym_before = BORROWED_INT4_SYMMETRIC_TEST_CALLS.load(Ordering::Relaxed);
         kernel
             .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
             .unwrap();
 
         assert_close(&y.to_f32(), &reference(&a_values, &dequantized, 1, k, n));
+        // Positive proof the *symmetric borrowed* branch is the one that ran.
+        // The symmetric counter is bumped only by `borrowed_zero_points.is_none()`,
+        // so a strict increase across this symmetric-only `execute` attributes the
+        // route to that branch (`>` not `==` because the global counter is shared
+        // with other tests running in parallel).
+        assert!(
+            BORROWED_INT4_SYMMETRIC_TEST_CALLS.load(Ordering::Relaxed) > sym_before,
+            "symmetric INT4 decode must route into the borrowed zero-copy path (#979)"
+        );
+        // ...and negative proof no resident f32 / prepack cache was ever built.
         assert!(
             kernel.weight_nk.get().is_none(),
             "symmetric INT4 must not expand the weight to a resident f32 cache (#979)"
