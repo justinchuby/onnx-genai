@@ -22,7 +22,7 @@ use super::check_arity;
 use super::simd_activations;
 use crate::dtype::{
     ComputeDomain, FloatElem, NumericElem, to_dense, to_dense_f32_widen, to_dense_float,
-    write_dense, write_dense_f32_narrow, write_dense_float,
+    write_dense, write_dense_float,
 };
 use crate::strided::numel;
 use crate::{dispatch_arith, dispatch_float};
@@ -534,13 +534,10 @@ impl Kernel for UnaryKernel {
         // keep their exact scalar forms (see `kernels::simd_activations` for
         // why `Erf` is deliberately not approximated).
         if matches!(op, UnOp::Tanh) && inputs[0].dtype != DataType::Float64 {
-            let y = {
-                let x = to_dense_f32_widen(op.name(), &inputs[0])?;
-                let mut y = vec![0.0f32; x.len()];
-                simd_activations::tanh_f32_slice(&x, &mut y);
-                y
-            };
-            return write_dense_f32_narrow(op.name(), &mut outputs[0], &y);
+            let x = to_dense_f32_widen(op.name(), &inputs[0])?;
+            return simd_activations::write_mapped(op.name(), &mut outputs[0], &x, |x, y| {
+                simd_activations::tanh_f32_slice(x, y)
+            });
         }
         dispatch_float!(inputs[0].dtype, op.name(), T => unary_typed::<T>(op, inputs, outputs))
     }

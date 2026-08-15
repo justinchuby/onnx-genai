@@ -5,8 +5,6 @@
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Node};
 
-use std::borrow::Cow;
-
 use super::check_arity;
 use super::gelu::exact_gelu;
 use super::layernorm::layer_norm_dense;
@@ -141,24 +139,19 @@ impl Kernel for FastGeluKernel {
             .as_deref()
             .map(|b| last_dim_bias(inputs[0].shape, b, "FastGelu"))
             .transpose()?;
-        // Fold the bias into a scratch row first (a no-op memcpy when there is
-        // no bias) so the transcendental runs over a contiguous slice and can
-        // be vectorised. See `kernels::simd_activations`.
-        let biased: Cow<'_, [f32]> = match (bias.as_deref(), width) {
+        // The bias is a broadcast over the last dimension. Fuse it into the
+        // activation rather than materialising `x + bias`, so the op stays at
+        // one read and one write of the tensor. See `kernels::simd_activations`.
+        match (bias.as_deref(), width) {
             (Some(bias), Some(width)) if width != 0 => {
-                let mut scratch = vec![0.0f32; x.len()];
-                for (row_in, row_out) in x.chunks(width).zip(scratch.chunks_mut(width)) {
-                    for ((o, &v), &b) in row_out.iter_mut().zip(row_in).zip(bias) {
-                        *o = v + b;
-                    }
-                }
-                Cow::Owned(scratch)
+                simd_activations::write_mapped("FastGelu", &mut outputs[0], &x, |x, y| {
+                    simd_activations::tanh_gelu_bias_f32_slice(x, bias, width, y)
+                })
             }
-            _ => Cow::Borrowed(&x[..]),
-        };
-        let mut y = vec![0.0f32; biased.len()];
-        simd_activations::tanh_gelu_f32_slice(&biased, &mut y);
-        write_dense_f32_narrow("FastGelu", &mut outputs[0], &y)
+            _ => simd_activations::write_mapped("FastGelu", &mut outputs[0], &x, |x, y| {
+                simd_activations::tanh_gelu_f32_slice(x, y)
+            }),
+        }
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -187,13 +180,11 @@ impl Kernel for QuickGeluKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("QuickGelu", inputs, outputs, 1, 1, 1)?;
         require_fused_float_dtype("QuickGelu", inputs, outputs)?;
-        let y = {
-            let x = to_dense_f32_widen("QuickGelu", &inputs[0])?;
-            let mut y = vec![0.0f32; x.len()];
-            simd_activations::quick_gelu_f32_slice(&x, &mut y, self.alpha);
-            y
-        };
-        write_dense_f32_narrow("QuickGelu", &mut outputs[0], &y)
+        let x = to_dense_f32_widen("QuickGelu", &inputs[0])?;
+        let alpha = self.alpha;
+        simd_activations::write_mapped("QuickGelu", &mut outputs[0], &x, |x, y| {
+            simd_activations::quick_gelu_f32_slice(x, y, alpha)
+        })
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {

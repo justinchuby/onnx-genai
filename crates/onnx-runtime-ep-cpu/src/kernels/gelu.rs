@@ -109,21 +109,21 @@ impl KernelFactory for StdGeluFactory {
 impl Kernel for StdGeluKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Gelu", inputs, outputs, 1, 1, 1)?;
-        let y = {
-            let x = to_dense_f32_widen("Gelu", &inputs[0])?;
-            if self.tanh {
+        let x = to_dense_f32_widen("Gelu", &inputs[0])?;
+        let tanh = self.tanh;
+        super::simd_activations::write_mapped("Gelu", &mut outputs[0], &x, |x, y| {
+            if tanh {
                 // Vectorised on AVX2+FMA; see `kernels::simd_activations`.
-                let mut y = vec![0.0f32; x.len()];
-                super::simd_activations::tanh_gelu_f32_slice(&x, &mut y);
-                y
+                super::simd_activations::tanh_gelu_f32_slice(x, y);
             } else {
                 // Exact GELU stays on `libm::erf`: the conformance suite's
                 // `Erf` reference is tighter than any f32 polynomial we would
                 // want to ship here.
-                x.iter().map(|&v| exact_gelu(v)).collect()
+                for (o, &v) in y.iter_mut().zip(x.iter()) {
+                    *o = exact_gelu(v);
+                }
             }
-        };
-        write_dense_f32_narrow("Gelu", &mut outputs[0], &y)
+        })
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {

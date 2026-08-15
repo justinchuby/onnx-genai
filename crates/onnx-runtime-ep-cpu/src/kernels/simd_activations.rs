@@ -43,6 +43,52 @@
 
 #![allow(clippy::excessive_precision)]
 
+use crate::dtype::{output_direct_write_eligible, slice_byte_range, write_dense_f32_narrow};
+use onnx_runtime_ep_api::{Result, TensorMut};
+
+// ---------------------------------------------------------------------------
+// Direct-write plumbing
+// ---------------------------------------------------------------------------
+
+/// Apply `f` to `x` and land the result in `out`, writing straight into the
+/// output tensor's storage whenever that is sound.
+///
+/// The obvious spelling — `let mut y = vec![0.0; n]; f(&x, &mut y);
+/// write_dense_f32_narrow(op, out, &y)` — makes three passes over the data
+/// (zero the scratch, compute into it, copy it out) plus an allocation. At
+/// prefill sizes the activation itself is a handful of cycles per element, so
+/// those extra passes, not the arithmetic, set the runtime: they cost more than
+/// the kernel.
+///
+/// So when [`output_direct_write_eligible`] says the output is a contiguous,
+/// host-visible, correctly-sized `f32` buffer that does *not* alias the input we
+/// still have to read, `f` writes into it in place and the scratch disappears.
+/// Any other case — f16/bf16/f64 output, a strided view, a device pointer, or
+/// an in-place `y = act(y)` node where the ranges do overlap — falls back to the
+/// owned buffer, which is exactly the situation `write_dense_f32_narrow` exists
+/// to handle. Correctness never depends on which arm runs.
+pub(crate) fn write_mapped<F>(op: &str, out: &mut TensorMut, x: &[f32], f: F) -> Result<()>
+where
+    F: FnOnce(&[f32], &mut [f32]),
+{
+    let n = x.len();
+    if output_direct_write_eligible(out, n, &[slice_byte_range(x)]) {
+        out.validate()?;
+        if n == 0 {
+            return Ok(());
+        }
+        // SAFETY: `output_direct_write_eligible` confirmed a validated,
+        // contiguous, host-accessible Float32 tensor holding exactly `n`
+        // elements, and that its bytes are disjoint from `x`.
+        let dst = unsafe { std::slice::from_raw_parts_mut(out.data_ptr_mut::<f32>(), n) };
+        f(x, dst);
+        return Ok(());
+    }
+    let mut y = vec![0.0f32; n];
+    f(x, &mut y);
+    write_dense_f32_narrow(op, out, &y)
+}
+
 /// Smallest slice length for which the vector path is worth its dispatch
 /// overhead. Below this the scalar loop wins (measured: crossover sits between
 /// 8 and 32 elements; 32 is the conservative side of it).
@@ -161,6 +207,48 @@ pub(crate) fn quick_gelu_f32_slice(input: &[f32], output: &mut [f32], alpha: f32
     }
     for (o, &i) in output.iter_mut().zip(input) {
         *o = quick_gelu_scalar(i, alpha);
+    }
+}
+
+/// `tanh_gelu(x[i] + bias[i % width])` for every element, without ever
+/// materialising `x + bias`.
+///
+/// FastGelu's bias is a broadcast over the last dimension, so folding it into a
+/// scratch row before the transcendental costs a full extra write *and* read of
+/// the activation tensor — at prefill sizes that is more traffic than the GELU
+/// itself. Adding it in-register instead keeps the whole op at one read of `x`,
+/// one write of `y`, and repeated reads of a `width`-element bias row that stays
+/// resident in L1.
+///
+/// `width` must be non-zero and must divide `input.len()`; `bias.len()` must
+/// equal `width`. Results are bit-identical to folding first, because the
+/// in-register add is the same IEEE `f32` addition in the same order.
+pub(crate) fn tanh_gelu_bias_f32_slice(
+    input: &[f32],
+    bias: &[f32],
+    width: usize,
+    output: &mut [f32],
+) {
+    debug_assert_eq!(input.len(), output.len());
+    debug_assert_eq!(bias.len(), width);
+    debug_assert!(width != 0 && input.len() % width == 0);
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Gated on total length, exactly as `tanh_gelu_f32_slice` is: whether a
+        // FastGelu node carries a bias must not change which polynomial its
+        // elements go through. `map_bias_ps` handles `width < 8` through its
+        // masked tail, so narrow rows stay correct (if unexciting) here.
+        if input.len() >= SIMD_MIN_LEN && vector_path_available() {
+            // SAFETY: guarded by the runtime AVX2+FMA detection above; the
+            // debug asserts above are the caller's contract.
+            unsafe { tanh_gelu_bias_avx2(input, bias, width, output) };
+            return;
+        }
+    }
+    for (row_in, row_out) in input.chunks(width).zip(output.chunks_mut(width)) {
+        for ((o, &v), &b) in row_out.iter_mut().zip(row_in).zip(bias) {
+            *o = tanh_gelu_scalar(v + b);
+        }
     }
 }
 
@@ -367,6 +455,44 @@ mod avx2 {
     /// the output — tail included — is computed identically.
     #[inline]
     #[target_feature(enable = "avx2,fma")]
+    /// Like [`map_ps`], but adds a `width`-element bias row to each `width`-element
+    /// slab of the input before applying `kernel`.
+    pub(super) unsafe fn map_bias_ps(
+        input: &[f32],
+        bias: &[f32],
+        width: usize,
+        output: &mut [f32],
+        kernel: impl Fn(__m256) -> __m256,
+    ) {
+        unsafe {
+            let body = width & !7;
+            let rem = width - body;
+            let mask = if rem != 0 { Some(tail_mask(rem)) } else { None };
+            let bptr = bias.as_ptr();
+            for (row_in, row_out) in input
+                .chunks_exact(width)
+                .zip(output.chunks_exact_mut(width))
+            {
+                let src = row_in.as_ptr();
+                let dst = row_out.as_mut_ptr();
+                let mut i = 0;
+                while i < body {
+                    let v =
+                        _mm256_add_ps(_mm256_loadu_ps(src.add(i)), _mm256_loadu_ps(bptr.add(i)));
+                    _mm256_storeu_ps(dst.add(i), kernel(v));
+                    i += 8;
+                }
+                if let Some(mask) = mask {
+                    let v = _mm256_add_ps(
+                        _mm256_maskload_ps(src.add(body), mask),
+                        _mm256_maskload_ps(bptr.add(body), mask),
+                    );
+                    _mm256_maskstore_ps(dst.add(body), mask, kernel(v));
+                }
+            }
+        }
+    }
+
     pub(super) unsafe fn map_ps(
         input: &[f32],
         output: &mut [f32],
@@ -402,6 +528,12 @@ unsafe fn tanh_avx2(input: &[f32], output: &mut [f32]) {
 #[target_feature(enable = "avx2,fma")]
 unsafe fn sigmoid_avx2(input: &[f32], output: &mut [f32]) {
     unsafe { avx2::map_ps(input, output, |v| avx2::sigmoid_ps(v)) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn tanh_gelu_bias_avx2(input: &[f32], bias: &[f32], width: usize, output: &mut [f32]) {
+    unsafe { avx2::map_bias_ps(input, bias, width, output, |v| avx2::tanh_gelu_ps(v)) }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -886,5 +1018,114 @@ mod tests {
                 "lane {i}: vector {v} vs scalar {scalar}, err {e:e}"
             );
         }
+    }
+
+    // ── direct-write plumbing ─────────────────────────────────────────────
+
+    use crate::kernels::testutil::Owned;
+
+    /// `write_mapped` must produce the same bytes whether it took the
+    /// direct-write arm or the owned-scratch arm. The interesting case is an
+    /// in-place node (`y = tanh(y)`), where the widened input borrows the
+    /// output's own storage: writing through would corrupt the tail of the
+    /// input mid-kernel, so `output_direct_write_eligible` has to reject it and
+    /// send us to the scratch buffer.
+    #[test]
+    fn write_mapped_agrees_between_direct_and_aliased_outputs() {
+        let n = 257; // not a multiple of 8, so the masked tail runs too
+        let src: Vec<f32> = (0..n).map(|i| (i as f32 - 128.0) * 0.11).collect();
+
+        let mut expected = vec![0.0f32; n];
+        tanh_f32_slice(&src, &mut expected);
+
+        // Disjoint output: takes the direct-write arm.
+        let mut disjoint = Owned::f32(&[n], &vec![0.0f32; n]);
+        write_mapped("Tanh", &mut disjoint.view_mut(), &src, |x, y| {
+            tanh_f32_slice(x, y)
+        })
+        .unwrap();
+        assert_eq!(disjoint.to_f32(), expected);
+
+        // Aliased output: the input slice *is* the output storage.
+        let mut aliased = Owned::f32(&[n], &src);
+        {
+            let mut view = aliased.view_mut();
+            // SAFETY: `view` addresses `n` contiguous f32; the slice is only
+            // read while `write_mapped` decides which arm to take, which is
+            // exactly the aliasing `output_direct_write_eligible` must detect.
+            let borrowed: &[f32] =
+                unsafe { std::slice::from_raw_parts(view.data_ptr_mut::<f32>(), n) };
+            let borrowed: &[f32] = unsafe { std::mem::transmute(borrowed) };
+            write_mapped("Tanh", &mut view, borrowed, |x, y| tanh_f32_slice(x, y)).unwrap();
+        }
+        assert_eq!(aliased.to_f32(), expected);
+
+        // A non-f32 output can never take the direct arm; it must still narrow
+        // correctly.
+        let mut narrowed = Owned::f16(&[n], &vec![0.0f32; n]);
+        write_mapped("Tanh", &mut narrowed.view_mut(), &src, |x, y| {
+            tanh_f32_slice(x, y)
+        })
+        .unwrap();
+        let got = narrowed.to_u16_bits();
+        for (g, e) in got.iter().zip(&expected) {
+            assert_eq!(*g, half::f16::from_f32(*e).to_bits());
+        }
+    }
+
+    /// Fusing FastGelu's bias into the vector kernel must be bit-identical to
+    /// materialising `x + bias` and mapping over it — that equivalence is the
+    /// whole justification for the fused path.
+    #[test]
+    fn bias_fusion_is_bit_identical_to_folding_first() {
+        for width in [1usize, 7, 8, 31, 32, 33, 64, 129] {
+            let rows = 5;
+            let n = rows * width;
+            let x: Vec<f32> = (0..n).map(|i| (i as f32).sin() * 7.0).collect();
+            let bias: Vec<f32> = (0..width).map(|i| (i as f32).cos() * 3.0).collect();
+
+            let mut folded_in = vec![0.0f32; n];
+            for (row_in, row_out) in x.chunks(width).zip(folded_in.chunks_mut(width)) {
+                for ((o, &v), &b) in row_out.iter_mut().zip(row_in).zip(&bias) {
+                    *o = v + b;
+                }
+            }
+            let mut want = vec![0.0f32; n];
+            tanh_gelu_f32_slice(&folded_in, &mut want);
+
+            let mut got = vec![0.0f32; n];
+            tanh_gelu_bias_f32_slice(&x, &bias, width, &mut got);
+
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "width={width} i={i}: fused {g} != folded {w}"
+                );
+            }
+        }
+    }
+
+    /// Special values must survive the fused bias add: `+inf + finite` stays
+    /// `+inf`, `-inf` maps to `0`, and a NaN bias poisons the row.
+    #[test]
+    fn bias_fusion_handles_special_values() {
+        let width = 40;
+        let mut x = vec![1.0f32; width * 2];
+        x[0] = f32::INFINITY;
+        x[1] = f32::NEG_INFINITY;
+        x[2] = f32::NAN;
+        let mut bias = vec![0.5f32; width];
+        bias[3] = f32::NAN;
+        bias[4] = f32::INFINITY;
+
+        let mut got = vec![0.0f32; x.len()];
+        tanh_gelu_bias_f32_slice(&x, &bias, width, &mut got);
+
+        assert_eq!(got[0], f32::INFINITY);
+        assert_eq!(got[1], 0.0);
+        assert!(got[2].is_nan());
+        assert!(got[3].is_nan());
+        assert_eq!(got[4], f32::INFINITY);
     }
 }

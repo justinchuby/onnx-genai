@@ -83,5 +83,9 @@ onnx-runtime-operator-selection = { workspace = true }
 name = "kernels"
 harness = false
 
+[[bench]]
+name = "activation_bench"
+harness = false
+
 [lints]
 workspace = true
