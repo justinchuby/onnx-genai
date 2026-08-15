@@ -194,7 +194,16 @@ impl AdapterCache {
             };
             let mut resolved = Vec::with_capacity(activations.len());
             let mut row_key = Vec::with_capacity(activations.len());
+            let mut row_adapters = std::collections::HashSet::new();
             for activation in activations {
+                if !row_adapters.insert(activation.adapter.clone()) {
+                    anyhow::bail!(
+                        "adapter selection for row {} epoch {} contains duplicate adapter '{}'",
+                        identity.row_id,
+                        identity.request_epoch,
+                        activation.adapter
+                    );
+                }
                 if !activation.scale.is_finite()
                     || activation.scale < -16.0
                     || activation.scale > 16.0
@@ -667,6 +676,27 @@ mod tests {
         .expect("inactive row uses immutable base");
         assert_eq!(inactive_output, vec![1.0, 2.0]);
         assert_eq!(inactive_cache.diagnostic().loads, 0);
+
+        let duplicate = AdapterSelection::default().with_row(
+            10,
+            0,
+            [
+                AdapterActivation::new("red", 1.0),
+                AdapterActivation::new("red", 0.5),
+            ],
+        );
+        let error = cache
+            .prepare(
+                &root,
+                &service,
+                &duplicate,
+                &[10],
+                &[0],
+                &[true],
+                &HashMap::new(),
+            )
+            .expect_err("duplicate row adapter must fail");
+        assert!(error.to_string().contains("duplicate adapter"));
 
         // A one-entry cache evicts, reloads, and invalidates captured plan variants.
         let service = service_contract(red, blue, 1);
