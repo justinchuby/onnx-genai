@@ -44,11 +44,14 @@ bounded by `DENSE_PLAN_CACHE_CAP = 8`.
 - **#999 GQA flash-decoding is already default-on** (audited): its env vars
   (`ONNX_GENAI_CUDA_GQA_DIRECT_SINGLE_SPLIT`, `ONNX_GENAI_CUDA_GQA_SPLITS`) are
   rollback/A-B knobs, defaults = the optimized path. No flip needed.
-- **GEMV fp16 (#996) NOT flipped** — not present in this base (still in Chew's
-  accuracy gate). One-liner hook when it lands: invert its `use_gemv_fp16()`
-  gate the same way this PR inverts `lmhead_cublaslt_enabled()`. Bonus rationale
-  for #996 default-on: fp16 GEMV is deterministic, which also fixes the fp32
-  default path's run-to-run nondeterminism Gaff flagged.
+- **GEMV fp16 (#996) stays PERMANENTLY opt-in — NOT flipped, no default hook.**
+  Chew's #996 verdict (🟡 land-as-opt-in): the fp16 K-accumulate is not
+  byte-identity-safe vs the fp32 path — glm has intermittent knife-edge argmax
+  flips (English↔Chinese at idx 3, dup at idx 12; ~2 in first 4 runs then 0
+  across 70+). So fp16 GEMV is not a default-on candidate and the earlier
+  "one-liner hook to flip it later / fp16 fixes fp32 nondeterminism → default it"
+  plan is **withdrawn**. Out-of-box GEMV stays fp32 (byte-identical). fp16
+  remains available via `ONNX_GENAI_GEMV_FP16=1` for users who opt in.
 
 ## Measured (glm-4-9b-int4, H200 GPU3, graph-on, median)
 
@@ -65,12 +68,14 @@ bounded by `DENSE_PLAN_CACHE_CAP = 8`.
   token-0 logprobs are **byte-identical** (both select token 315).
 - **qwen no regression:** 152.16 (on) vs 153.60 (off), within noise, fallbacks=0.
 
-## Note on the 232 target
+## Note on the 232 number (out-of-box is ~208, and that is final)
 
 The ~232 combined number (deckard-combined-stack-measurement) required #996's
-fp16 GEMV, which is NOT in this base. Off plain main, default-on banks #991 +
-#999 only => **~208 short / ~172 KV2048**. The remaining jump to 232/182 is the
-one-liner #996 fp16-GEMV default flip after its accuracy gate passes.
+fp16 GEMV **opt-in ON**. Since fp16 GEMV now ships **permanently opt-in** (Chew
+knife-edge flip — not byte-identity-safe for default), the honest out-of-box
+default-on config is **fp32 GEMV + cuBLASLt lm_head + flash-decoding =
+~207.7 short / ~171.7 KV2048** (measured here, fp16 OFF). 232 remains reachable
+only by a user setting `ONNX_GENAI_GEMV_FP16=1`; it is not the default.
 
 ## Gates
 - f64 oracle 7/7; GQA fp16 2/2; `cargo fmt` + `cargo clippy` clean.
