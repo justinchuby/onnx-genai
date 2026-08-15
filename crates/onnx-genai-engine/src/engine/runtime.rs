@@ -2470,7 +2470,7 @@ mod tests {
         // batching: the cap is a property of the native decode path, not the
         // model. This is the honesty guarantee -- capability is not read off the
         // decode_path alone.
-        let engine = Engine {
+        let mut engine = Engine {
             decode_backend: EngineDecodeBackend::Native,
             metadata: InferenceMetadata::default(),
             metadata_hints: MetadataHints::default(),

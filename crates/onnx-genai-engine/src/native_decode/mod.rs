@@ -996,6 +996,14 @@ impl NativeDecodeSession {
         self.cuda.as_ref().map(DecodeCudaState::batch).unwrap_or(1)
     }
 
+    /// The hard physical KV capacity (`max_len`) of the persistent CUDA decode
+    /// bindings, if a CUDA decode session is bound. This is the ceiling a
+    /// continuous-batch manager clamps per-request context limits to. `None` when
+    /// there is no CUDA session (the batched path is unavailable anyway).
+    pub fn batch_kv_max_len(&self) -> Option<usize> {
+        self.cuda.as_ref().map(DecodeCudaState::hard_max_len)
+    }
+
     /// Run one target step with arbitrary named tensors supplied by pipeline
     /// routing. Generated roles (token ids, attention mask, and position ids)
     /// come from `ModelIoSpec`; every other non-KV graph input is resolved by its

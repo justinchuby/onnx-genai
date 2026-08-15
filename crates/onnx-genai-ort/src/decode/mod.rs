@@ -150,17 +150,76 @@ pub use dynamic::DecodeSession;
 mod kv_growth;
 use kv_growth::{GrowDevice, grow_kv_value, kv_capacity_bucket};
 
+/// Logits produced by one batched decode step, in a form every backend can
+/// return without an extra per-step copy of the ~`[B, vocab]` logits.
+///
+/// The two batched backends produce logits in physically different places:
+/// the ORT sessions hand back a host `[B, 1, vocab]` `Value`, while the native
+/// CUDA seam (`decode_greedy_batch_ragged_logits`) reads the device logits into
+/// per-row host `Vec<f32>` itself. Typing the trait around ORT `Value` alone
+/// would force the native path to rebuild a `Value` (pulling ORT into the native
+/// logits path) or the ORT path to eagerly demux; either way one backend pays a
+/// copy purely to satisfy the signature. This enum lets each backend return what
+/// it already has and defers the per-row extraction to [`Self::take_row`]:
+///
+/// - `Ort` wraps the host `Value` unchanged; [`Self::take_row`] copies one row
+///   out exactly as the previous `row_logits(&Value, ..)` demux did, so the ORT
+///   path keeps its behaviour and its cost.
+/// - `HostRows` carries the per-row owned host logits the native seam already
+///   allocated; [`Self::take_row`] *moves* a row out, adding no copy on top of
+///   the single device→host read the throughput path already pays.
+pub enum BatchStepLogits {
+    /// Host `[B, 1, vocab]` ORT logits, indexed as the producing call documents
+    /// (`step_select`: physical-row; `step_active`: active-row order).
+    Ort(Value),
+    /// Pre-demuxed per-row host logits in the same index order the producing
+    /// call documents. `None` marks a row already taken by [`take_row`].
+    ///
+    /// [`take_row`]: BatchStepLogits::take_row
+    HostRows(Vec<Option<Vec<f32>>>),
+}
+
+impl BatchStepLogits {
+    /// Take one row's `[vocab]` logits out of the step.
+    ///
+    /// For `Ort` this copies the row out of the shared host `Value` (the
+    /// pre-existing demux cost paid by [`BatchedStaticCacheDecodeSession::row_logits`]);
+    /// for `HostRows` it moves the already-owned row out with no copy. Each row
+    /// may be taken at most once — a second take of the same `HostRows` row is an
+    /// error rather than a silent second copy.
+    pub fn take_row(&mut self, row: usize, seq_index: usize) -> Result<Vec<f32>> {
+        match self {
+            BatchStepLogits::Ort(value) => {
+                BatchedStaticCacheDecodeSession::row_logits(value, row, seq_index)
+            }
+            BatchStepLogits::HostRows(rows) => {
+                rows.get_mut(row).and_then(Option::take).ok_or_else(|| {
+                    OrtError::InvalidArgument(format!(
+                        "batch step logits row {row} already taken or out of range \
+                         (have {} rows)",
+                        rows.len()
+                    ))
+                })
+            }
+        }
+    }
+}
+
 /// KV-representation-agnostic operations a continuous-batch manager needs from a
 /// batched decode session.
 ///
 /// Both [`BatchedStaticCacheDecodeSession`] (TensorScatter static cache) and
 /// [`BatchedSharedBufferDecodeSession`] (past/present share-buffer GQA) implement
-/// this so the same `ContinuousBatchManager` can drive either backend.
+/// this so the same `ContinuousBatchManager` can drive either backend; the native
+/// CUDA backend implements it in `onnx-genai-engine` over its host-logits seam.
 ///
-/// Logits returned by `step_select`/`step_active` are `Float32 [batch, 1, vocab]`;
-/// `step_select` returns one row per physical batch slot (physical-row indexed),
-/// while `step_active` returns one row per active row in [`Self::active_rows`]
-/// order.
+/// Logits returned by `step_select`/`step_active` are per-row `Float32 [vocab]`
+/// rows carried by [`BatchStepLogits`]; `step_select` indexes them by physical
+/// batch slot (physical-row indexed), while `step_active` indexes them by active
+/// row in [`Self::active_rows`] order. The manager extracts a row with
+/// [`BatchStepLogits::take_row`], which is a copy on the ORT path and a move on
+/// the native path — neither backend is charged an extra logits copy to satisfy
+/// the shared signature.
 pub trait BatchedDecodeSession<'a> {
     /// Fixed number of physical batch rows.
     fn batch_size(&self) -> usize;
@@ -175,16 +234,39 @@ pub trait BatchedDecodeSession<'a> {
     /// Reset a row's cursor to zero and mark it active for a new sequence.
     fn assign_row(&mut self, row: usize) -> Result<()>;
     /// Advance one token for rows where `advance_rows[row]` is true and the row
-    /// is active, returning physical-row-indexed `[B, 1, vocab]` logits.
+    /// is active, returning physical-row-indexed `[vocab]` logits per slot.
     fn step_select(
         &mut self,
         next_token_ids: &[i64],
         position_ids: &[i64],
         advance_rows: &[bool],
-    ) -> Result<Value>;
-    /// Advance one token for every active row, returning `[active, 1, vocab]`
-    /// logits ordered by [`Self::active_rows`].
-    fn step_active(&mut self, next_token_ids: &[i64], position_ids: &[i64]) -> Result<Value>;
+    ) -> Result<BatchStepLogits>;
+    /// Advance one token for every active row, returning `[vocab]` logits per
+    /// active row ordered by [`Self::active_rows`].
+    fn step_active(
+        &mut self,
+        next_token_ids: &[i64],
+        position_ids: &[i64],
+    ) -> Result<BatchStepLogits>;
+    /// Cumulative device→host logits transfer cost, for backends that read the
+    /// logits back to the host each step (the native host-logits seam). The ORT
+    /// backends keep logits host-side already and report `None`, so a caller can
+    /// tell the manager's honest D2H cost from a backend that pays none.
+    fn logits_d2h_stats(&self) -> Option<LogitsD2hStats> {
+        None
+    }
+}
+
+/// Cumulative device→host logits transfer cost reported by a batched decode
+/// backend that round-trips logits to the host each step.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LogitsD2hStats {
+    /// Total bytes transferred device→host across all steps.
+    pub bytes: u128,
+    /// Total wall time of those transfers.
+    pub time: std::time::Duration,
+    /// Number of steps that performed a logits read.
+    pub steps: u64,
 }
 
 mod shared_batch;
