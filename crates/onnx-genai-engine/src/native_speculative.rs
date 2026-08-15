@@ -50,6 +50,126 @@ pub(crate) fn verification_width(
     draft_width.min(remaining_tokens).min(remaining_context)
 }
 
+/// Outcome of greedy speculative acceptance over one verify pass.
+pub(crate) struct AcceptOutcome {
+    /// Number of leading draft tokens accepted (each equals the target argmax,
+    /// or a near-tie co-winner when tie-tolerant acceptance is enabled).
+    pub(crate) accepted: usize,
+    /// The free bonus token: the target's own argmax at the first mismatch (or
+    /// the trailing verify row when every draft token is accepted).
+    pub(crate) bonus: TokenId,
+    /// Draft positions rejected where the draft token was a near-tie co-winner
+    /// of the row argmax (its logit within `tie_eps` of the row maximum).
+    pub(crate) near_tie_rejections: usize,
+}
+
+/// Numerical near-tie guard for greedy speculative acceptance.
+///
+/// `eps` is the absolute logit margin below the row maximum within which a
+/// draft token is treated as a *co-winner* of the argmax. `tolerant` decides
+/// what happens on a near-tie mismatch:
+///   - `tolerant == false` (default): near-ties are only *counted* (diagnostic);
+///     the committed token stays the strict argmax, so the stream is
+///     byte-identical to plain greedy. This is the safe default and the regime
+///     the `spec == greedy` correctness gate asserts.
+///   - `tolerant == true`: a near-tie draft token is *accepted* (committed as-is),
+///     trading exact byte-identity — only at genuine numerical ties, where
+///     greedy is itself ill-defined and nondeterministic run-to-run — for higher
+///     acceptance on models with tie-prone logits (e.g. block-32 qwen).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TieGuard {
+    pub(crate) eps: f32,
+    pub(crate) tolerant: bool,
+}
+
+impl TieGuard {
+    /// Strict argmax acceptance (byte-identical to plain greedy). `eps == 0`
+    /// disables the near-tie probe entirely.
+    pub(crate) const STRICT: TieGuard = TieGuard {
+        eps: 0.0,
+        tolerant: false,
+    };
+
+    /// Resolve the guard from the environment (`ONNX_GENAI_SPEC_TIE_EPS`,
+    /// `ONNX_GENAI_SPEC_TIE_TOLERANT`). Absent/zero eps ⇒ strict, so the default
+    /// decode path is unchanged and byte-identical.
+    pub(crate) fn from_env() -> TieGuard {
+        let eps = std::env::var("ONNX_GENAI_SPEC_TIE_EPS")
+            .ok()
+            .and_then(|value| value.trim().parse::<f32>().ok())
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .unwrap_or(0.0);
+        if eps == 0.0 {
+            // No margin configured ⇒ strict argmax, byte-identical to plain greedy.
+            return TieGuard::STRICT;
+        }
+        let tolerant = matches!(
+            std::env::var("ONNX_GENAI_SPEC_TIE_TOLERANT")
+                .ok()
+                .as_deref(),
+            Some("1") | Some("true") | Some("yes")
+        );
+        TieGuard { eps, tolerant }
+    }
+}
+
+/// Greedy speculative acceptance with an optional numerical near-tie guard.
+///
+/// `base_logits` is the target distribution for the first uncommitted position
+/// (`base + 0`); `verify_rows[i]` is the distribution for `base + i + 1`. The
+/// longest draft prefix whose tokens equal the target's strict argmax is
+/// accepted, plus one free bonus token (the target's argmax at the stopping
+/// row). The tie guard only affects the *mismatch* boundary and never changes
+/// the bonus, so with [`TieGuard::STRICT`] this reproduces plain greedy exactly.
+pub(crate) fn greedy_accept(
+    base_logits: &[f32],
+    verify_rows: &[Vec<f32>],
+    draft: &[TokenId],
+    guard: TieGuard,
+) -> AcceptOutcome {
+    let row = |idx: usize| -> &[f32] {
+        if idx == 0 {
+            base_logits
+        } else {
+            &verify_rows[idx - 1]
+        }
+    };
+    let mut accepted = 0usize;
+    let mut near_tie_rejections = 0usize;
+    while accepted < draft.len() {
+        let logits = row(accepted);
+        if sample_greedy(logits) == draft[accepted] {
+            accepted += 1;
+            continue;
+        }
+        // Strict mismatch. Probe whether the draft token is a near-tie co-winner
+        // (its logit within `eps` of the row maximum) before rejecting.
+        let near_tie = guard.eps > 0.0 && {
+            let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            logits
+                .get(draft[accepted] as usize)
+                .map(|&draft_logit| {
+                    draft_logit.is_finite() && (max_logit - draft_logit) <= guard.eps
+                })
+                .unwrap_or(false)
+        };
+        if near_tie {
+            near_tie_rejections += 1;
+            if guard.tolerant {
+                accepted += 1;
+                continue;
+            }
+        }
+        break;
+    }
+    let bonus = sample_greedy(row(accepted));
+    AcceptOutcome {
+        accepted,
+        bonus,
+        near_tie_rejections,
+    }
+}
+
 /// Outer speculative token loop bound to a single [`NativeDecodeSession`].
 ///
 /// Peer to the plain [`NativeDecodeSession::generate_with_callback`] loop; it
@@ -60,6 +180,8 @@ pub(crate) struct NativeSpeculativeDriver<'a> {
     proposer: NativeProposer<'a>,
     /// Maximum draft width proposed per verify pass.
     draft_width: usize,
+    /// Numerical near-tie acceptance guard (strict by default; byte-identical).
+    tie_guard: TieGuard,
 }
 
 enum NativeProposer<'a> {
@@ -84,6 +206,7 @@ impl<'a> NativeSpeculativeDriver<'a> {
             session,
             proposer: NativeProposer::PromptLookup(NgramProposer::new(ngram, max_tokens)?),
             draft_width: draft_width.max(1),
+            tie_guard: TieGuard::from_env(),
         })
     }
 
@@ -111,6 +234,7 @@ impl<'a> NativeSpeculativeDriver<'a> {
                 hidden_size,
             },
             draft_width: draft_width.max(1),
+            tie_guard: TieGuard::from_env(),
         })
     }
 
@@ -300,31 +424,23 @@ impl<'a> NativeSpeculativeDriver<'a> {
             // the token AFTER each draft token). current_len advances to base + K.
             let rows = self.session.decode_verify(&draft, base)?;
 
-            // ==== WP3 device-accept seam ====
-            // Host argmax over the [K+1, vocab] rows. `target_tokens[idx]` is the
-            // target's greedy token for output position `base + idx`:
-            //   idx == 0 -> base_logits (committed prefix -> next token)
-            //   idx  > 0 -> rows[idx - 1] (draft[idx-1] -> next token)
-            // WP3 replaces this block with a single device `argmax_rows` launch
-            // over the [K+1, vocab] device logits, returning these K+1 ids without
-            // copying host logits. The accept / rewind / commit logic below is
-            // unchanged and does not need to know which side produced the ids.
-            let mut target_tokens = Vec::with_capacity(rows.len() + 1);
-            target_tokens.push(sample_greedy(&base_logits));
-            for row in &rows {
-                target_tokens.push(sample_greedy(row));
-            }
-
-            let mut accepted = 0usize;
-            while accepted < draft.len() && target_tokens[accepted] == draft[accepted] {
-                accepted += 1;
-            }
-            // The free bonus token: the target's own pick at the first mismatch
-            // (or, when every draft token is accepted, the extra token verify
-            // yields at position base + K).
-            let bonus = target_tokens[accepted];
+            // Greedy acceptance with the numerical near-tie guard. `base_logits`
+            // is the target distribution for position `base`; `rows[i]` predicts
+            // `base + i + 1`. The longest strict-argmax draft prefix is accepted
+            // plus one free bonus token. With `TieGuard::STRICT` (default) the
+            // committed stream is byte-identical to plain greedy; a non-zero
+            // `near_tie_rejections` flags acceptance (not correctness) lost to
+            // tie-prone logits. WP3 will replace the host argmax inside
+            // `greedy_accept` with a device `argmax_rows` launch; the accept /
+            // rewind / commit logic here is agnostic to which side produced the ids.
+            let AcceptOutcome {
+                accepted,
+                bonus,
+                near_tie_rejections,
+            } = greedy_accept(&base_logits, &rows, &draft, self.tie_guard);
 
             stats.accepted_tokens += accepted;
+            stats.near_tie_rejections += near_tie_rejections;
             if accepted >= 2 {
                 stats.multi_token_accepts += 1;
             }
@@ -381,5 +497,112 @@ impl<'a> NativeSpeculativeDriver<'a> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod accept_tests {
+    use super::{TieGuard, greedy_accept};
+    use crate::logits::TokenId;
+
+    /// One-hot logits row whose argmax is `token`.
+    fn onehot(vocab: usize, token: usize, peak: f32) -> Vec<f32> {
+        let mut row = vec![0.0f32; vocab];
+        row[token] = peak;
+        row
+    }
+
+    #[test]
+    fn strict_accepts_full_matching_prefix_plus_bonus() {
+        // base -> 5, then rows predict 6, 7, 8. Draft [5, 6, 7] all match.
+        let base = onehot(16, 5, 10.0);
+        let rows = vec![
+            onehot(16, 6, 10.0),
+            onehot(16, 7, 10.0),
+            onehot(16, 8, 10.0),
+        ];
+        let draft: Vec<TokenId> = vec![5, 6, 7];
+        let out = greedy_accept(&base, &rows, &draft, TieGuard::STRICT);
+        assert_eq!(out.accepted, 3);
+        assert_eq!(out.bonus, 8); // trailing verify row after the full accept
+        assert_eq!(out.near_tie_rejections, 0);
+    }
+
+    #[test]
+    fn strict_stops_at_first_mismatch_and_bonus_is_target_argmax() {
+        // base -> 5 (draft ok), row0 predicts 6 but draft says 9 -> mismatch at 1.
+        let base = onehot(16, 5, 10.0);
+        let rows = vec![onehot(16, 6, 10.0), onehot(16, 7, 10.0)];
+        let draft: Vec<TokenId> = vec![5, 9, 7];
+        let out = greedy_accept(&base, &rows, &draft, TieGuard::STRICT);
+        assert_eq!(out.accepted, 1);
+        assert_eq!(out.bonus, 6); // the target's own pick at the mismatch row
+        assert_eq!(out.near_tie_rejections, 0);
+    }
+
+    #[test]
+    fn near_tie_is_counted_but_not_accepted_under_strict_default() {
+        // Row0 argmax is 6 (10.0) but draft token 9 is within eps (9.95).
+        let base = onehot(16, 5, 10.0);
+        let mut row0 = onehot(16, 6, 10.0);
+        row0[9] = 9.95;
+        let rows = vec![row0, onehot(16, 7, 10.0)];
+        let draft: Vec<TokenId> = vec![5, 9, 7];
+        let guard = TieGuard {
+            eps: 0.1,
+            tolerant: false,
+        };
+        let out = greedy_accept(&base, &rows, &draft, guard);
+        // Strict: rejected at the near-tie, but the near-tie is DIAGNOSED.
+        assert_eq!(out.accepted, 1);
+        assert_eq!(out.bonus, 6); // still the strict argmax => byte-identical
+        assert_eq!(out.near_tie_rejections, 1);
+    }
+
+    #[test]
+    fn tolerant_accepts_the_near_tie_draft_token() {
+        let base = onehot(16, 5, 10.0);
+        let mut row0 = onehot(16, 6, 10.0);
+        row0[9] = 9.95;
+        // rows.len() == draft.len() is the real verify invariant (one row per draft token).
+        let rows = vec![row0, onehot(16, 7, 10.0), onehot(16, 11, 10.0)];
+        let draft: Vec<TokenId> = vec![5, 9, 7];
+        let guard = TieGuard {
+            eps: 0.1,
+            tolerant: true,
+        };
+        let out = greedy_accept(&base, &rows, &draft, guard);
+        // Tolerant: the near-tie draft (9) is accepted, then row1 predicts 7 == draft.
+        assert_eq!(out.accepted, 3);
+        assert_eq!(out.near_tie_rejections, 1);
+        assert_eq!(out.bonus, 11); // trailing verify row after the full accept
+    }
+
+    #[test]
+    fn a_real_mismatch_outside_eps_is_never_a_near_tie() {
+        let base = onehot(16, 5, 10.0);
+        let mut row0 = onehot(16, 6, 10.0);
+        row0[9] = 2.0; // far below max -> genuine rejection
+        let rows = vec![row0];
+        let draft: Vec<TokenId> = vec![5, 9];
+        let guard = TieGuard {
+            eps: 0.5,
+            tolerant: true,
+        };
+        let out = greedy_accept(&base, &rows, &draft, guard);
+        assert_eq!(out.accepted, 1);
+        assert_eq!(out.near_tie_rejections, 0);
+        assert_eq!(out.bonus, 6);
+    }
+
+    #[test]
+    fn empty_draft_yields_base_argmax_bonus() {
+        let base = onehot(16, 5, 10.0);
+        let rows: Vec<Vec<f32>> = Vec::new();
+        let draft: Vec<TokenId> = Vec::new();
+        let out = greedy_accept(&base, &rows, &draft, TieGuard::STRICT);
+        assert_eq!(out.accepted, 0);
+        assert_eq!(out.bonus, 5);
+        assert_eq!(out.near_tie_rejections, 0);
     }
 }

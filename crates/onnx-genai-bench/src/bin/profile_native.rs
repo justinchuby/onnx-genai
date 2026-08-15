@@ -507,11 +507,12 @@ fn print_speculative_observability(stats: &SpeculativeStats) {
     };
     println!(
         "speculative_stats: verify_steps={} proposed={} accepted={} acceptance={acceptance:.1}% \
-         multi_token_accepts={} tokens_per_verify_step={tokens_per_step:.2}",
+         multi_token_accepts={} near_tie_rejections={} tokens_per_verify_step={tokens_per_step:.2}",
         stats.verification_steps,
         stats.proposed_tokens,
         stats.accepted_tokens,
         stats.multi_token_accepts,
+        stats.near_tie_rejections,
     );
 }
 
