@@ -315,8 +315,10 @@ fn read_strided<T: Copy>(view: &TensorView, want: DataType) -> Result<Vec<T>> {
         // in-shape element offset (each component `< shape[d]`), so the address
         // lies within the extent the view describes — bounds-checked against the
         // backing allocation by the owning EP (ep-api invariant #1). `T` is a
-        // plain numeric/`half` type with no invalid bit patterns.
-        out.push(unsafe { *origin.offset(off) });
+        // plain numeric/`half` type with no invalid bit patterns. `read_unaligned`
+        // because `data_ptr` is a cast from a byte pointer plus an arbitrary
+        // `byte_offset`, so `T`'s alignment is not guaranteed.
+        out.push(unsafe { origin.offset(off).read_unaligned() });
         if !next_index(view.shape, &mut idx) {
             break;
         }
@@ -364,8 +366,10 @@ fn write_strided<T: Copy>(out: &mut TensorMut, data: &[T], want: DataType) -> Re
         // is an in-shape offset within the extent the view describes (bounds-
         // checked by the EP per invariant #1). The row-major walk visits every
         // logical index exactly once, so each address is written once.
+        // `write_unaligned` because `data_ptr_mut` is a cast from a byte pointer
+        // plus an arbitrary `byte_offset`, so `T`'s alignment is not guaranteed.
         unsafe {
-            *origin.offset(off) = data[i];
+            origin.offset(off).write_unaligned(data[i]);
         }
         i += 1;
         if !next_index(shape, &mut idx) {
