@@ -444,4 +444,196 @@ mod tests {
             );
         }
     }
+
+    /// Reference `Y = alpha * A' * B' + beta * C`, written the obvious way. The
+    /// production path now reshapes both operands and calls the shared GEMM
+    /// backend, so this is what proves the reshaping is right for every
+    /// transpose combination.
+    #[allow(clippy::too_many_arguments)]
+    fn reference(
+        alpha: f32,
+        beta: f32,
+        ta: bool,
+        tb: bool,
+        a: &[f32],
+        b: &[f32],
+        bias: Option<&[f32]>,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = 0.0f32;
+                for p in 0..k {
+                    let av = if ta { a[p * m + i] } else { a[i * k + p] };
+                    let bv = if tb { b[j * k + p] } else { b[p * n + j] };
+                    acc += av * bv;
+                }
+                out[i * n + j] = alpha * acc;
+                if let Some(bias) = bias {
+                    out[i * n + j] += beta * bias[j];
+                }
+            }
+        }
+        out
+    }
+
+    fn pseudo(len: usize, seed: f32) -> Vec<f32> {
+        (0..len)
+            .map(|i| (i as f32 * 0.7 + seed).sin() * 1.5)
+            .collect()
+    }
+
+    /// The reshape-and-dispatch rewrite has to hold for every `transA`/`transB`
+    /// combination, for `alpha != 1` (which used to be folded into `A` and is
+    /// now applied to the product), for a broadcast bias, and for shapes that
+    /// are not multiples of any register tile -- `K = 67` and `N = 33` land in
+    /// the microkernel's edge handling, which is exactly where a layout mistake
+    /// hides.
+    #[test]
+    fn gemm_matches_reference_across_transposes_and_odd_shapes() {
+        for &(m, k, n) in &[
+            (1usize, 67usize, 33usize),
+            (5, 64, 32),
+            (3, 1, 7),
+            (17, 129, 65),
+        ] {
+            for &ta in &[false, true] {
+                for &tb in &[false, true] {
+                    for &alpha in &[1.0f32, 0.5] {
+                        let a_values = pseudo(m * k, 0.1);
+                        let b_values = pseudo(k * n, 0.3);
+                        let bias = pseudo(n, 0.9);
+                        let a_shape = if ta { [k, m] } else { [m, k] };
+                        let b_shape = if tb { [n, k] } else { [k, n] };
+                        let a = Owned::f32(&a_shape, &a_values);
+                        let b = Owned::f32(&b_shape, &b_values);
+                        let c = Owned::f32(&[n], &bias);
+                        let mut out = Owned::zeros_f32(&[m, n]);
+                        gemm(alpha, 1.0, ta, tb, &a, &b, Some(&c), &mut out);
+
+                        let expected = reference(
+                            alpha,
+                            1.0,
+                            ta,
+                            tb,
+                            &a_values,
+                            &b_values,
+                            Some(&bias),
+                            m,
+                            k,
+                            n,
+                        );
+                        let got = out.to_f32();
+                        let max_error = got
+                            .iter()
+                            .zip(&expected)
+                            .map(|(actual, want)| (actual - want).abs())
+                            .fold(0.0f32, f32::max);
+                        assert!(
+                            max_error <= 1e-4,
+                            "m={m} k={k} n={n} transA={ta} transB={tb} alpha={alpha}: \
+                             max error {max_error} against the reference"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Repeated execution of one kernel must keep returning the same answer.
+    ///
+    /// A constant `B` with `transB = 1` is transposed once and memoized in the
+    /// process-global weight-transpose cache, keyed by source address and shape.
+    /// A stale or mis-keyed entry would show up here as a second call that
+    /// disagrees with the first -- the failure mode #845 was filed for.
+    #[test]
+    fn gemm_constant_transposed_weight_is_stable_across_calls() {
+        let (m, k, n) = (2usize, 48usize, 24usize);
+        let a_values = pseudo(m * k, 0.2);
+        let b_values = pseudo(n * k, 0.6);
+        let a = Owned::f32(&[m, k], &a_values);
+        let b = Owned::f32(&[n, k], &b_values);
+
+        let mut kernel = GemmKernel {
+            alpha: 1.0,
+            beta: 1.0,
+            trans_a: false,
+            trans_b: true,
+            prepack: MatMulPrepack::default(),
+        };
+        kernel.set_constant_inputs(&[false, true]);
+
+        let expected = reference(1.0, 1.0, false, true, &a_values, &b_values, None, m, k, n);
+        for round in 0..3 {
+            let mut out = Owned::zeros_f32(&[m, n]);
+            kernel
+                .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+                .unwrap();
+            let got = out.to_f32();
+            let max_error = got
+                .iter()
+                .zip(&expected)
+                .map(|(actual, want)| (actual - want).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_error <= 1e-4,
+                "round {round}: cached transposed weight gave max error {max_error}"
+            );
+        }
+    }
+
+    /// Performance regression guard, not a benchmark.
+    ///
+    /// The defect this file's rewrite fixes was structural: `Gemm` computed its
+    /// product with a scalar triple loop while every other f32 matrix multiply
+    /// in the EP used the shared, SIMD, multi-threaded backend, which measured
+    /// 30x-1053x slower than ORT depending on shape. Reintroducing a scalar loop
+    /// would not fail any correctness test, so the guard is a wall-clock ratio
+    /// against `matmul::gemm` on the same data: `Gemm` may pay for reshaping its
+    /// operands, but it may not be in a different performance class.
+    ///
+    /// Ignored by default -- timing on a shared CI runner is not a gate -- and
+    /// run explicitly with `--ignored`.
+    #[test]
+    #[ignore = "timing-sensitive; run explicitly with --ignored"]
+    fn gemm_stays_within_reach_of_the_shared_backend() {
+        use std::time::Instant;
+
+        let (m, k, n) = (64usize, 512usize, 512usize);
+        let a_values = pseudo(m * k, 0.2);
+        let b_values = pseudo(k * n, 0.6);
+        let a = Owned::f32(&[m, k], &a_values);
+        let b = Owned::f32(&[k, n], &b_values);
+
+        let mut direct = vec![0.0f32; m * n];
+        for _ in 0..3 {
+            matmul::gemm(&a_values, &b_values, &mut direct, m, k, n).unwrap();
+        }
+        let started = Instant::now();
+        for _ in 0..10 {
+            matmul::gemm(&a_values, &b_values, &mut direct, m, k, n).unwrap();
+        }
+        let backend = started.elapsed();
+
+        let mut out = Owned::zeros_f32(&[m, n]);
+        for _ in 0..3 {
+            gemm(1.0, 1.0, false, false, &a, &b, None, &mut out);
+        }
+        let started = Instant::now();
+        for _ in 0..10 {
+            gemm(1.0, 1.0, false, false, &a, &b, None, &mut out);
+        }
+        let kernel = started.elapsed();
+
+        // 8x is deliberately loose: this catches "fell back to a scalar loop"
+        // (two to three orders of magnitude) without failing on a noisy runner.
+        assert!(
+            kernel.as_secs_f64() <= backend.as_secs_f64() * 8.0 + 1e-3,
+            "Gemm took {kernel:?} against {backend:?} for the same product; \
+             it is no longer using the shared GEMM backend"
+        );
+    }
 }
