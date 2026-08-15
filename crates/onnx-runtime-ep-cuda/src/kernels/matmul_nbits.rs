@@ -113,6 +113,19 @@ const GEMV_F16_GENERAL_BS_SPLITK_WIDE_ENTRY: &str = "matmul_nbits_gemv_f16_gener
 /// unchanged). Non-split-K only (used on the wide, occupancy-filled gate_up).
 const GEMV_F16_GENERAL_BS_WIDE_MULTICOL_ENTRY: &str =
     "matmul_nbits_gemv_f16_general_bs_wide_multicol";
+/// fp16 mixed-precision counterpart of
+/// [`GEMV_F16_GENERAL_BS_WIDE_MULTICOL_ENTRY`]
+/// (`matmul_nbits_gemv_f16_general_bs_wide_multicol_fp16`): identical
+/// column-register-blocking, but the per-chunk MAC runs in fp16 `__hfma2` (two
+/// fused MACs/instruction) to cut the dequant/MAC ALU that limits the fp32
+/// multicol kernel — the fp16-vs-fp16 equal-conditions path against ORT's fp16
+/// `MatMulFloatInt4Kernel`. Each 32-product quant chunk is summed in fp16 then
+/// reduced to fp32 and accumulated across chunks in fp32 (the K reduction stays
+/// fp32; NOT a full-fp16 K accumulate). NOT byte-identical to the fp32 path —
+/// opt-in via [`use_gemv_fp16`] and gated on accuracy (error <= ORT vs an f64
+/// oracle), not bit-identity.
+const GEMV_F16_GENERAL_BS_WIDE_MULTICOL_FP16_ENTRY: &str =
+    "matmul_nbits_gemv_f16_general_bs_wide_multicol_fp16";
 /// Output columns each warp emits in the register-blocked wide GEMV. Must match
 /// `#define WIDE_NC` in the CUDA source. A 256-thread CTA (8 warps) therefore
 /// covers `8 * GEMV_F16_WIDE_MULTICOL_NC` columns.
@@ -1697,6 +1710,193 @@ __device__ __forceinline__ void gemv_int4_wide_lane_dot_multicol(
 
     // Partial trailing chunk (`depth < k < depth + 32`): replicate the
     // single-column tail arithmetic per column.
+    if (depth < k) {
+        const int block = depth / block_size;
+#pragma unroll
+        for (int c = 0; c < WIDE_NC; ++c) {
+            if (!valid[c]) {
+                continue;
+            }
+            float scale;
+            if (scales_fp16) {
+                scale = __half2float(reinterpret_cast<const __half*>(scales)[col_kb[c] + block]);
+            } else {
+                scale = reinterpret_cast<const float*>(scales)[col_kb[c] + block];
+            }
+            const int zero_point =
+                int4_block_zero_point(zero_points, col_base + c, block, zp_row_bytes);
+            const unsigned int sub2 = int4_zero_point_sub2(zero_point);
+            const long blob_base = (col_kb[c] + block) * (long)blob_size;
+            for (int off = 0; off < 32 && depth + off < k; off += 8) {
+                const int d = depth + off;
+                const int within = d - block * block_size;
+                const int valid_n = min(8, k - d);
+                const unsigned int packed_word =
+                    *reinterpret_cast<const unsigned int*>(packed + blob_base + (within >> 1));
+                if (valid_n == 8) {
+                    values[c] += scale * dot_int4x8_f16_sub(packed_word, activation + d, sub2);
+                } else {
+                    float partial = 0.0f;
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        if (i < valid_n) {
+                            const int q = (int)((packed_word >> (i * 4)) & 15u) - zero_point;
+                            partial += (float)q * __half2float(activation[d + i]);
+                        }
+                    }
+                    values[c] += partial * scale;
+                }
+            }
+        }
+    }
+}
+
+// Decode eight contiguous fp16 activations into four `__half2` lanes laid out in
+// the SAME element pairing that `int4x8_to_half2x4_sub` produces for the weights
+// (`ah[i] = (a_i, a_{i+4})`), so `__hfma2(q[i], ah[i], acc)` multiplies matching
+// (weight, activation) pairs. This is the fp16 sibling of `decode_activation8`:
+// it stops at the permute step and keeps the halves packed (NO fp16->fp32
+// conversion), because the fp16-mixed kernel consumes them directly in half2
+// fused multiply-adds.
+__device__ __forceinline__ void decode_activation8_h2(
+    const __half* __restrict__ activation,
+    __half2* __restrict__ ah /* [4] */)
+{
+    const uint4 av = *reinterpret_cast<const uint4*>(activation);
+    constexpr unsigned int low_halves = 0x5410;
+    constexpr unsigned int high_halves = 0x7632;
+    uint4 permuted;
+    asm volatile("prmt.b32 %0, %1, %2, %3;\n"
+                 : "=r"(permuted.x) : "r"(av.x), "r"(av.z), "r"(low_halves));
+    asm volatile("prmt.b32 %0, %1, %2, %3;\n"
+                 : "=r"(permuted.y) : "r"(av.x), "r"(av.z), "r"(high_halves));
+    asm volatile("prmt.b32 %0, %1, %2, %3;\n"
+                 : "=r"(permuted.z) : "r"(av.y), "r"(av.w), "r"(low_halves));
+    asm volatile("prmt.b32 %0, %1, %2, %3;\n"
+                 : "=r"(permuted.w) : "r"(av.y), "r"(av.w), "r"(high_halves));
+    ah[0] = *reinterpret_cast<const __half2*>(&permuted.x);
+    ah[1] = *reinterpret_cast<const __half2*>(&permuted.y);
+    ah[2] = *reinterpret_cast<const __half2*>(&permuted.z);
+    ah[3] = *reinterpret_cast<const __half2*>(&permuted.w);
+}
+
+// ---------------------------------------------------------------------------
+// fp16 mixed-precision column register-blocked wide GEMV.
+//
+// Identical column-register-blocking + wide-load structure as
+// `gemv_int4_wide_lane_dot_multicol`, but the inner multiply-accumulate runs in
+// fp16 `__hfma2` (two fused MACs per instruction) instead of fp32 FFMA. This is
+// the ONLY way to actually cut the dequant/MAC ALU that limits the multicol
+// kernel (fp32 FFMA is already one fused op, so a "fp16-multiply then
+// fp32-add-every-product" scheme is strictly MORE ops and cannot win). ORT's
+// `MatMulFloatInt4Kernel` is fp16 for exactly this reason, so this is the
+// fp16-vs-fp16 equal-conditions path.
+//
+// PRECISION CONTRACT: only the 32 products of ONE weight/activation chunk (a
+// single quant block, so a single per-block scale) are summed in fp16, into a
+// `__half2` accumulator (16 terms per lane). That per-chunk fp16 partial is then
+// reduced to fp32, scaled, and added into the fp32 `values[c]` running sum. So
+// the full K=4096 reduction stays in fp32 (fp32 accumulate ACROSS chunks) — this
+// is NOT a full-fp16 accumulation of the K axis (that loses mantissa and flips
+// tokens). The 32-element fp16 sub-sum error is bounded (~sqrt(32)*2^-11 RMS)
+// and is validated to be <= ORT's own int4 kernel error against an f64 oracle;
+// it is NOT byte-identical to the fp32 path by construction, so it is gated on
+// accuracy, not bit-identity.
+__device__ __forceinline__ void gemv_int4_fp16_lane_dot_multicol(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales,
+    const unsigned char* __restrict__ zero_points,
+    const int k,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int scales_fp16,
+    const long col_base,
+    const int n,
+    const int depth0,
+    const int warp_stride,
+    float* __restrict__ values /* [WIDE_NC] */)
+{
+    bool valid[WIDE_NC];
+    long col_kb[WIDE_NC];
+#pragma unroll
+    for (int c = 0; c < WIDE_NC; ++c) {
+        values[c] = 0.0f;
+        const long column = col_base + c;
+        valid[c] = (column < n);
+        col_kb[c] = column * (long)k_blocks;
+    }
+
+    int depth = depth0;
+    while (depth + 32 <= k) {
+        const int block = depth / block_size;
+        const int within = depth - block * block_size;
+
+        uint4 w[WIDE_NC];
+        float scale[WIDE_NC];
+        unsigned int sub2[WIDE_NC];
+#pragma unroll
+        for (int c = 0; c < WIDE_NC; ++c) {
+            if (!valid[c]) {
+                continue;
+            }
+            const long base = (col_kb[c] + block) * (long)blob_size;
+            w[c] = *reinterpret_cast<const uint4*>(packed + base + (within >> 1));
+            if (scales_fp16) {
+                scale[c] = __half2float(reinterpret_cast<const __half*>(scales)[col_kb[c] + block]);
+            } else {
+                scale[c] = reinterpret_cast<const float*>(scales)[col_kb[c] + block];
+            }
+            sub2[c] = int4_zero_point_sub2(
+                int4_block_zero_point(zero_points, col_base + c, block, zp_row_bytes));
+        }
+
+        // fp16 accumulators for this chunk's 32 products, one per column.
+        __half2 acc[WIDE_NC];
+#pragma unroll
+        for (int c = 0; c < WIDE_NC; ++c) {
+            acc[c] = __float2half2_rn(0.0f);
+        }
+
+        // Decode each 8-element activation sub-word to half2 once, reuse across
+        // columns (the multicol L1-traffic win), and fold it into every column's
+        // fp16 accumulator with __hfma2 (2 fused MACs/instruction).
+#pragma unroll
+        for (int s = 0; s < 4; ++s) {
+            __half2 ah[4];
+            decode_activation8_h2(activation + depth + s * 8, ah);
+#pragma unroll
+            for (int c = 0; c < WIDE_NC; ++c) {
+                if (!valid[c]) {
+                    continue;
+                }
+                const unsigned int word =
+                    (s == 0) ? w[c].x : (s == 1) ? w[c].y : (s == 2) ? w[c].z : w[c].w;
+                __half2 q[4];
+                int4x8_to_half2x4_sub(word, q, sub2[c]);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    acc[c] = __hfma2(q[i], ah[i], acc[c]);
+                }
+            }
+        }
+
+        // Reduce each column's fp16 chunk partial to fp32, scale, accumulate.
+#pragma unroll
+        for (int c = 0; c < WIDE_NC; ++c) {
+            if (!valid[c]) {
+                continue;
+            }
+            const float2 f = __half22float2(acc[c]);
+            values[c] += scale[c] * (f.x + f.y);
+        }
+        depth += warp_stride;
+    }
+
+    // Partial trailing chunk: compute in fp32 exactly like the fp32 multicol tail
+    // so the K-tail stays precise (negligible perf, avoids fp16 edge cases).
     if (depth < k) {
         const int block = depth / block_size;
 #pragma unroll
@@ -4143,6 +4343,49 @@ extern "C" __global__ void matmul_nbits_gemv_f16_general_bs_wide_multicol(
     }
 }
 
+// fp16 mixed-precision sibling of `matmul_nbits_gemv_f16_general_bs_wide_multicol`
+// (see `gemv_int4_fp16_lane_dot_multicol`). Same launch geometry and grid; the
+// only difference is the per-chunk fp16 __hfma2 MAC. Opt-in (gated by
+// `use_gemv_fp16`) and accuracy-gated (NOT byte-identical to the fp32 path).
+extern "C" __global__ void matmul_nbits_gemv_f16_general_bs_wide_multicol_fp16(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales,
+    const unsigned char* __restrict__ zero_points,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int scales_fp16,
+    const int bias_post_round,
+    const int bits)
+{
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const long col_base =
+        ((long)blockIdx.x * warps_per_block + warp) * (long)WIDE_NC;
+
+    float values[WIDE_NC];
+    gemv_int4_fp16_lane_dot_multicol(
+        activation, packed, scales, zero_points, k, block_size, k_blocks,
+        blob_size, zp_row_bytes, scales_fp16, col_base, n, lane * 32, 32 * 32,
+        values);
+#pragma unroll
+    for (int c = 0; c < WIDE_NC; ++c) {
+        const float reduced = warp_sum(values[c]);
+        const long column = col_base + c;
+        if (lane == 0 && column < n) {
+            output[column] = fold_bias_f16(reduced, bias, column, bias_post_round);
+        }
+    }
+}
+
 // Model-agnostic fp16 int4/int8 prefill GEMM supporting any power-of-two
 // block_size. Identical 16x16 tiling and fp32 accumulation as the tuned
 // block-32 GEMM, but the reduction walks K in fixed 32-wide tiles and derives
@@ -4436,6 +4679,22 @@ fn use_gemv_wide_multicol() -> bool {
             .ok()
             .as_deref(),
         Some("0") | Some("false") | Some("off")
+    )
+}
+
+/// Whether the column register-blocked wide GEMV should take the fp16
+/// mixed-precision entry ([`GEMV_F16_GENERAL_BS_WIDE_MULTICOL_FP16_ENTRY`])
+/// instead of the fp32 [`GEMV_F16_GENERAL_BS_WIDE_MULTICOL_ENTRY`]. Only
+/// consulted once wide-load + multicol are already in effect. The fp16 kernel
+/// runs the per-chunk MAC in `__hfma2` (matching ORT's fp16 arithmetic, the
+/// equal-conditions fp16-vs-fp16 path) at the cost of NOT being byte-identical
+/// to the fp32 path — so it is OPT-IN during the accuracy-validation phase via
+/// `ONNX_GENAI_GEMV_FP16=1` and gated on accuracy (error <= ORT vs an f64
+/// oracle), not bit-identity. It becomes default-on only after passing that gate.
+fn use_gemv_fp16() -> bool {
+    matches!(
+        std::env::var("ONNX_GENAI_GEMV_FP16").ok().as_deref(),
+        Some("1") | Some("true") | Some("on")
     )
 }
 
@@ -7210,7 +7469,11 @@ impl MatMulNBitsKernel {
                 }
             } else if use_gemv_wideload(self.bits, self.block_size, self.k) {
                 if use_gemv_wide_multicol() {
-                    GEMV_F16_GENERAL_BS_WIDE_MULTICOL_ENTRY
+                    if use_gemv_fp16() {
+                        GEMV_F16_GENERAL_BS_WIDE_MULTICOL_FP16_ENTRY
+                    } else {
+                        GEMV_F16_GENERAL_BS_WIDE_MULTICOL_ENTRY
+                    }
                 } else {
                     GEMV_F16_GENERAL_BS_WIDE_ENTRY
                 }
@@ -7301,7 +7564,9 @@ impl MatMulNBitsKernel {
                     (threads / 32) as usize / GENERAL_BS_SPLITK
                 } else if use_scales_f16_splitk {
                     (threads / 32) as usize / GEMV_F16_SCALES_F16_ZP_SPLITK
-                } else if entry == GEMV_F16_GENERAL_BS_WIDE_MULTICOL_ENTRY {
+                } else if entry == GEMV_F16_GENERAL_BS_WIDE_MULTICOL_ENTRY
+                    || entry == GEMV_F16_GENERAL_BS_WIDE_MULTICOL_FP16_ENTRY
+                {
                     // Each warp emits WIDE_NC columns, so a `threads/32`-warp CTA
                     // covers `warps * WIDE_NC` output columns; the grid shrinks by
                     // WIDE_NC accordingly.
@@ -7337,6 +7602,7 @@ impl MatMulNBitsKernel {
             || entry == GEMV_F16_GENERAL_BS_WIDE_ENTRY
             || entry == GEMV_F16_GENERAL_BS_SPLITK_WIDE_ENTRY
             || entry == GEMV_F16_GENERAL_BS_WIDE_MULTICOL_ENTRY
+            || entry == GEMV_F16_GENERAL_BS_WIDE_MULTICOL_FP16_ENTRY
         {
             builder.arg(&bits);
         }
