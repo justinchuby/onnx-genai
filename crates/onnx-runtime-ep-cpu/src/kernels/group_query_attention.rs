@@ -29,7 +29,8 @@
 //! greedy parity is established empirically by profiling.
 
 use super::sdpa::{
-    DecodePartial, SoftmaxExp, combine_decode_partials, sdpa_decode_partial, sdpa_decode_row,
+    DecodePartial, SoftmaxExp, combine_decode_partials, sdpa_decode_group, sdpa_decode_partial,
+    sdpa_decode_row,
 };
 use super::{check_arity, to_dense_i64};
 use crate::dtype::{to_dense_f32_widen, widen_bf16_slice_into, write_dense_f32_narrow};
@@ -75,6 +76,85 @@ static ATTENTION_SPLIT_COUNT: std::sync::atomic::AtomicUsize =
 /// Number of decode forwards that took the flash-decoding split path so far.
 pub fn attention_split_count() -> usize {
     ATTENTION_SPLIT_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether the M=1 KV-group-fused decode path is enabled (default on). Set
+/// `ONNX_GENAI_GQA_GROUP_FUSED=0` (or `false`/`off`) to force the per-query-head
+/// decode path — used to A/B the fusion against the baseline on one binary.
+fn group_fusion_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("ONNX_GENAI_GQA_GROUP_FUSED") {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off"
+        ),
+        Err(_) => true,
+    })
+}
+
+/// Count of decode attention forwards that engaged the KV-group-fused path.
+/// Cheap reachability evidence for A/B runs; read via [`group_fused_count`].
+static GROUP_FUSED_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Number of decode forwards that took the KV-group-fused path so far.
+pub fn group_fused_count() -> usize {
+    GROUP_FUSED_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether collapsing the decode schedule to one task per `(batch, kv_head)`
+/// still keeps every decode worker busy.
+///
+/// KV-group fusion trades parallel tasks for KV-cache traffic: it turns
+/// `batch * num_heads` independent attention rows into `batch * kv_num_heads`
+/// group tasks. Paired A/B on an 8-worker decode pool shows the trade is only
+/// worth taking while the pool stays saturated — starving it costs far more
+/// than the traffic saving is worth:
+///
+/// | geometry (heads/kv_heads/head_size) | fused tasks | fused vs per-head |
+/// |---|---|---|
+/// | 14/2/64   | 2 | 0.32x – 0.39x (2.6x slower) |
+/// | 28/4/128  | 4 | 0.59x – 0.75x (1.7x slower) |
+/// | 32/8/128  | 8 | 0.89x – 2.05x (length dependent) |
+///
+/// so the gate is simply "the fused task count still covers the workers".
+/// A single-worker scope (`worker_count <= 1`) has no parallelism to lose, so
+/// the traffic saving is taken unconditionally there.
+fn group_fusion_saturates_pool(fused_tasks: usize, worker_count: usize) -> bool {
+    fused_tasks >= worker_count
+}
+
+/// Attended KV bytes per KV head (K and V, at the f32 width SDPA reads) below
+/// which KV-group fusion is not worth taking.
+///
+/// Re-reading a KV head `group` times is only expensive once those re-reads
+/// miss the last-level cache. While the concurrently attended KV fits in LLC the
+/// repeat traffic is served at cache bandwidth, the fusion's saving is worth
+/// little, and its extra score-buffer traffic makes it a net loss. Measured on
+/// an 8-worker decode pool with a 64 MiB L3 (so 8 MiB per concurrent KV head is
+/// exactly the LLC crossover), at `head_size = 128`:
+///
+/// | attended KV per head | group 2 | group 3 | group 4 | group 6 | group 8 |
+/// |---|---|---|---|---|---|
+/// | 1 MiB (kv 1024)  | 1.05x | 0.94x | 1.12x | 0.83x | 0.81x |
+/// | 2 MiB (kv 2048)  | 1.00x | 1.18x | 1.11x | 0.81x | 0.83x |
+/// | 4 MiB (kv 4096)  | 0.96x | 1.18x | 0.89x | 0.83x | 0.82x |
+/// | 8 MiB (kv 8192)  | 1.32x | 1.44x | 1.41x | 1.11x | 1.00x |
+/// | 16 MiB (kv 16384)| 1.49x | 1.68x | 2.05x | 1.61x | 1.56x |
+///
+/// Below 8 MiB the sign of the effect flips with geometry and does not
+/// reproduce across runs; at and above it every geometry measured is a win. The
+/// threshold is therefore empirical, calibrated on that host — the decode pool
+/// is capped at 8 workers (`MAX_TOPOLOGY_DECODE_THREADS`), so it is not
+/// rescaled by worker count.
+const GROUP_FUSED_MIN_KV_BYTES: usize = 8 << 20;
+
+/// Whether the attended window is long enough for the fusion's traffic saving
+/// to beat its overhead. See [`GROUP_FUSED_MIN_KV_BYTES`].
+fn group_fusion_pays_for_traffic(window: usize, k_dim: usize, v_dim: usize) -> bool {
+    window
+        .saturating_mul(k_dim.saturating_add(v_dim))
+        .saturating_mul(size_of::<f32>())
+        >= GROUP_FUSED_MIN_KV_BYTES
 }
 
 /// Contiguous `[start, end)` bounds of chunk `chunk` when the KV window
@@ -1035,13 +1115,65 @@ impl Kernel for GroupQueryAttentionKernel {
         let attention_work = attention_rows
             .saturating_mul(total_sequence_length)
             .saturating_mul(cache_dim);
+        let worker_count = crate::kernels::matmul_nbits::active_decode_worker_count();
+        // KV-group fusion (M=1 decode): every query head in a GQA group attends
+        // the *same* KV head over the *same* window, so scoring them one row at
+        // a time streams the KV cache `group` times per layer per token. At M=1
+        // the window is a GEMV (~2 flops per loaded float), so that repeat
+        // traffic — not the arithmetic — is the cost. `sdpa_decode_group` runs
+        // the whole group in one pass over K and V, cutting KV bytes by `group`
+        // while performing bit-identical arithmetic per head.
+        //
+        // The fusion costs parallelism: it collapses `batch * num_heads` tasks
+        // into `batch * kv_num_heads`. Measured on an 8-worker decode pool,
+        // starving the pool dominates the traffic saving by a wide margin — a
+        // 2-KV-head geometry runs ~2.6x *slower* fused, a 4-KV-head one ~1.7x
+        // slower. And while the attended KV still fits the last-level cache the
+        // repeat reads are cheap, so the saving does not pay for the fused
+        // path's score-buffer traffic. Both conditions must hold; see
+        // `group_fusion_saturates_pool` and `group_fusion_pays_for_traffic`.
+        let group_fused = q.seq == 1
+            && group > 1
+            && group_fusion_saturates_pool(q.batch * self.kv_num_heads, worker_count)
+            && group_fusion_pays_for_traffic(total_sequence_length, cache_dim, v.dim)
+            && group_fusion_enabled();
+        let compute_group = |b: usize, kvh: usize, out_block: &mut [f32], scores: &mut Vec<f32>| {
+            let causal_limit = query_starts[b];
+            let local_start = if self.local_window_size > 0 {
+                (causal_limit + 1).saturating_sub(self.local_window_size as usize)
+            } else {
+                0
+            };
+            let q_base = (b * self.num_heads + kvh * group) * cache_dim;
+            let q_group = &q.data[q_base..q_base + group * cache_dim];
+            let kv_head_base = (b * self.kv_num_heads + kvh) * present_sequence_length;
+            let k_head = &present_k
+                [kv_head_base * cache_dim..(kv_head_base + present_sequence_length) * cache_dim];
+            let v_head =
+                &present_v[kv_head_base * v.dim..(kv_head_base + present_sequence_length) * v.dim];
+            sdpa_decode_group(
+                q_group,
+                k_head,
+                v_head,
+                present_sequence_length,
+                group,
+                cache_dim,
+                v.dim,
+                local_start,
+                causal_limit + 1,
+                scale,
+                (self.softcap != 0.0).then_some(self.softcap),
+                SoftmaxExp::F64Intermediate,
+                out_block,
+                scores,
+            );
+        };
         // Flash-decoding (split-KV): when the attended window is long and the
         // decode pool has more workers than query heads, the per-head schedule
         // leaves cores idle (it parallelizes only over `attention_rows`). Split
         // each head's window into `split_count` contiguous KV chunks so those
         // idle cores stream the KV cache in parallel, then combine the per-chunk
         // softmax partials with the online-rescale reduction.
-        let worker_count = crate::kernels::matmul_nbits::active_decode_worker_count();
         let split_count = if attention_split_enabled()
             && attention_rows >= 1
             && worker_count > attention_rows
@@ -1128,6 +1260,34 @@ impl Kernel for GroupQueryAttentionKernel {
                     v_head_size,
                     &mut y_bhsd[row_index * v_head_size..(row_index + 1) * v_head_size],
                 );
+            }
+        } else if group_fused {
+            // One task per `(batch, kv_head)` group; each writes the `group`
+            // contiguous output rows of that group (`q_seq == 1`, so a query
+            // head's single output row sits at `(b * num_heads + qh) * v.dim`
+            // and the group's rows are adjacent).
+            let group_rows = q.batch * self.kv_num_heads;
+            GROUP_FUSED_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if group_rows > 1 && attention_work >= MIN_PARALLEL_ATTENTION_WORK {
+                crate::kernels::matmul_nbits::decode_parallel_output_row_blocks(
+                    &mut y_bhsd,
+                    group * v.dim,
+                    group_rows,
+                    |row_index, out_block| {
+                        let b = row_index / self.kv_num_heads;
+                        let kvh = row_index % self.kv_num_heads;
+                        let mut scores = Vec::new();
+                        compute_group(b, kvh, out_block, &mut scores);
+                    },
+                );
+            } else {
+                let mut scores = Vec::new();
+                for b in 0..q.batch {
+                    for kvh in 0..self.kv_num_heads {
+                        let base = (b * self.kv_num_heads + kvh) * group * v.dim;
+                        compute_group(b, kvh, &mut y_bhsd[base..base + group * v.dim], &mut scores);
+                    }
+                }
             }
         } else if attention_rows > 1 && attention_work >= MIN_PARALLEL_ATTENTION_WORK {
             // Route through the active decode pool (the same resident workers the
@@ -3097,6 +3257,152 @@ mod tests {
                 (actual - expected).abs()
             );
         }
+    }
+
+    /// The KV-group-fused decode path must be *bit-identical* to the
+    /// per-query-head path and must actually be reached.
+    ///
+    /// The A/B is driven through the reachability gate rather than the env flag
+    /// (which latches in a `OnceLock` and so cannot be toggled twice in one
+    /// process): the same inputs run on a decode pool the fused schedule
+    /// saturates (`batch * kv_num_heads >= workers`) and on one it does not.
+    /// The first must take the fused branch — asserted against
+    /// [`group_fused_count`], so the test cannot pass vacuously — and both must
+    /// agree to the last bit.
+    #[test]
+    fn group_fused_decode_is_bit_identical_to_per_head_decode() {
+        // Long enough that `group_fusion_pays_for_traffic` opens the gate
+        // (8 MiB of attended K+V per KV head at f32 width).
+        const PAST_SEQUENCE_LENGTH: usize = 8_192;
+        const TOTAL_SEQUENCE_LENGTH: usize = PAST_SEQUENCE_LENGTH + 1;
+        const QUERY_HEAD_COUNT: usize = 4;
+        const KEY_VALUE_HEAD_COUNT: usize = 2;
+        const HEAD_WIDTH: usize = 128;
+
+        let query: Vec<f32> = (0..QUERY_HEAD_COUNT * HEAD_WIDTH)
+            .map(|index| mixed_scale_value(index, 0x7f01))
+            .collect();
+        let current_key: Vec<f32> = (0..KEY_VALUE_HEAD_COUNT * HEAD_WIDTH)
+            .map(|index| mixed_scale_value(index, 0x7f02))
+            .collect();
+        let current_value: Vec<f32> = (0..KEY_VALUE_HEAD_COUNT * HEAD_WIDTH)
+            .map(|index| mixed_scale_value(index, 0x7f03))
+            .collect();
+        let past_key: Vec<f32> = (0..KEY_VALUE_HEAD_COUNT * PAST_SEQUENCE_LENGTH * HEAD_WIDTH)
+            .map(|index| mixed_scale_value(index, 0x7f04))
+            .collect();
+        let past_value: Vec<f32> = (0..KEY_VALUE_HEAD_COUNT * PAST_SEQUENCE_LENGTH * HEAD_WIDTH)
+            .map(|index| mixed_scale_value(index, 0x7f05))
+            .collect();
+
+        // `local_window_size` and `softcap` are set so the fused path's masking
+        // and softcap branches are covered too, not just the plain causal case.
+        let run = |workers: usize| -> Vec<f32> {
+            let mut output = Owned::zeros_f32(&[1, 1, QUERY_HEAD_COUNT * HEAD_WIDTH]);
+            let mut present_key =
+                Owned::zeros_f32(&[1, KEY_VALUE_HEAD_COUNT, TOTAL_SEQUENCE_LENGTH, HEAD_WIDTH]);
+            let mut present_value =
+                Owned::zeros_f32(&[1, KEY_VALUE_HEAD_COUNT, TOTAL_SEQUENCE_LENGTH, HEAD_WIDTH]);
+            let kernel_attrs = [
+                ("local_window_size", Attribute::Int(6_000)),
+                ("softcap", Attribute::Float(30.0)),
+            ];
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .expect("test decode pool")
+                .install(|| {
+                    let kernel = gqa_kernel_with_heads(
+                        QUERY_HEAD_COUNT as i64,
+                        KEY_VALUE_HEAD_COUNT as i64,
+                        &kernel_attrs,
+                    );
+                    kernel
+                        .execute(
+                            &[
+                                Owned::f32(&[1, 1, QUERY_HEAD_COUNT * HEAD_WIDTH], &query).view(),
+                                Owned::f32(
+                                    &[1, 1, KEY_VALUE_HEAD_COUNT * HEAD_WIDTH],
+                                    &current_key,
+                                )
+                                .view(),
+                                Owned::f32(
+                                    &[1, 1, KEY_VALUE_HEAD_COUNT * HEAD_WIDTH],
+                                    &current_value,
+                                )
+                                .view(),
+                                Owned::f32(
+                                    &[1, KEY_VALUE_HEAD_COUNT, PAST_SEQUENCE_LENGTH, HEAD_WIDTH],
+                                    &past_key,
+                                )
+                                .view(),
+                                Owned::f32(
+                                    &[1, KEY_VALUE_HEAD_COUNT, PAST_SEQUENCE_LENGTH, HEAD_WIDTH],
+                                    &past_value,
+                                )
+                                .view(),
+                                Owned::i32(&[1], &[PAST_SEQUENCE_LENGTH as i32]).view(),
+                                Owned::i32(&[], &[TOTAL_SEQUENCE_LENGTH as i32]).view(),
+                            ],
+                            &mut [
+                                output.view_mut(),
+                                present_key.view_mut(),
+                                present_value.view_mut(),
+                            ],
+                        )
+                        .unwrap();
+                });
+            output.to_f32()
+        };
+
+        // `KEY_VALUE_HEAD_COUNT` fused tasks against 2 workers: gate open.
+        let before = group_fused_count();
+        let fused = run(2);
+        assert!(
+            group_fused_count() > before,
+            "fused decode path was never reached — the A/B would be vacuous"
+        );
+        // Same tasks against more workers than the fused schedule can fill:
+        // gate closed, per-query-head schedule.
+        let per_head = run(KEY_VALUE_HEAD_COUNT * 2);
+
+        assert_eq!(
+            fused.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            per_head.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            "KV-group fusion must not change a single bit of the decode output"
+        );
+    }
+
+    /// The fusion trades parallel tasks for KV traffic, so it must only engage
+    /// while the collapsed schedule still covers every decode worker.
+    #[test]
+    fn group_fusion_gate_requires_a_saturated_decode_pool() {
+        // Qwen2.5-0.5B (2 KV heads) and Qwen2.5-7B (4) starve an 8-wide pool.
+        assert!(!group_fusion_saturates_pool(2, 8));
+        assert!(!group_fusion_saturates_pool(4, 8));
+        // Llama-3.1-8B / Qwen3-0.6B (8 KV heads) fill it exactly.
+        assert!(group_fusion_saturates_pool(8, 8));
+        // Batching restores saturation for a narrow-KV model.
+        assert!(group_fusion_saturates_pool(4 * 2, 8));
+        // A single-worker scope has no parallelism to lose.
+        assert!(group_fusion_saturates_pool(2, 1));
+    }
+
+    /// Below the last-level-cache crossover the repeat KV reads the fusion
+    /// removes are served from cache, so the fusion must stay off.
+    #[test]
+    fn group_fusion_gate_requires_out_of_cache_kv() {
+        // head_size 128: 8 MiB of K+V is reached at 8192 attended tokens.
+        assert!(!group_fusion_pays_for_traffic(4_096, 128, 128));
+        assert!(group_fusion_pays_for_traffic(8_192, 128, 128));
+        // head_size 64 needs twice the window for the same bytes.
+        assert!(!group_fusion_pays_for_traffic(8_192, 64, 64));
+        assert!(group_fusion_pays_for_traffic(16_384, 64, 64));
+        // Asymmetric K/V head widths count both.
+        assert!(group_fusion_pays_for_traffic(8_192, 128, 192));
+        // Degenerate inputs must not overflow into a spurious open gate.
+        assert!(!group_fusion_pays_for_traffic(0, 128, 128));
+        assert!(group_fusion_pays_for_traffic(usize::MAX, 128, 128));
     }
 
     #[test]
