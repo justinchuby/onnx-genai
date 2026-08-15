@@ -126,6 +126,17 @@ const GEMV_F16_GENERAL_BS_WIDE_MULTICOL_ENTRY: &str =
 /// oracle), not bit-identity.
 const GEMV_F16_GENERAL_BS_WIDE_MULTICOL_FP16_ENTRY: &str =
     "matmul_nbits_gemv_f16_general_bs_wide_multicol_fp16";
+/// PORT-1 register/occupancy probe entry
+/// (`matmul_nbits_gemv_f16_general_bs_wide_multicol_fp16_natural`): identical to
+/// [`GEMV_F16_GENERAL_BS_WIDE_MULTICOL_FP16_ENTRY`] but the activation decode
+/// drops the 4 `prmt.b32` reorder ops (assumes an offline-interleaved weight
+/// layout, PORT-1). Dispatched ONLY behind `ONNX_GENAI_GEMV_FP16_NATURAL=1` to
+/// read registers/thread + achieved occupancy and quantify whether the PORT-1
+/// interleave can lift occupancy on this asymmetric-zp multicol kernel. Its
+/// numeric output is intentionally wrong vs the current (non-interleaved)
+/// weights — NEVER a correctness path.
+const GEMV_F16_GENERAL_BS_WIDE_MULTICOL_FP16_NATURAL_ENTRY: &str =
+    "matmul_nbits_gemv_f16_general_bs_wide_multicol_fp16_natural";
 /// Output columns each warp emits in the register-blocked wide GEMV. Must match
 /// `#define WIDE_NC` in the CUDA source. A 256-thread CTA (8 warps) therefore
 /// covers `8 * GEMV_F16_WIDE_MULTICOL_NC` columns.
@@ -1780,6 +1791,26 @@ __device__ __forceinline__ void decode_activation8_h2(
     ah[3] = *reinterpret_cast<const __half2*>(&permuted.w);
 }
 
+// PORT-1 mechanism probe: prmt-free activation decode. If the int4 weights are
+// repacked OFFLINE into natural nibble order (so the LOP3 weight dequant emits
+// `q[i] = (w_{2i}, w_{2i+1})` in consecutive order), the activation no longer
+// needs the `prmt.b32` reorder — the 8 contiguous fp16 activations map directly
+// to four `__half2` lanes. This variant exists ONLY to measure the register /
+// occupancy delta of dropping the 4 `prmt.b32` ops (the sole runtime cost the
+// PORT-1 offline interleave removes on this asymmetric-zp multicol kernel); its
+// numeric output is intentionally wrong against the CURRENT (non-interleaved)
+// weight layout and it is never dispatched as a correctness path.
+__device__ __forceinline__ void decode_activation8_h2_natural(
+    const __half* __restrict__ activation,
+    __half2* __restrict__ ah /* [4] */)
+{
+    const uint4 av = *reinterpret_cast<const uint4*>(activation);
+    ah[0] = *reinterpret_cast<const __half2*>(&av.x);
+    ah[1] = *reinterpret_cast<const __half2*>(&av.y);
+    ah[2] = *reinterpret_cast<const __half2*>(&av.z);
+    ah[3] = *reinterpret_cast<const __half2*>(&av.w);
+}
+
 // ---------------------------------------------------------------------------
 // fp16 mixed-precision column register-blocked wide GEMV.
 //
@@ -1806,6 +1837,7 @@ __device__ __forceinline__ void decode_activation8_h2(
 // the arithmetic mirrors ORT's, the f64-oracle error lands in ORT's own error
 // class; it is NOT byte-identical to the fp32 path, so it ships gated on accuracy
 // (error <= ORT vs the f64 oracle), not on bit-identity.
+template <bool NATURAL>
 __device__ __forceinline__ void gemv_int4_fp16_lane_dot_multicol(
     const __half* __restrict__ activation,
     const unsigned char* __restrict__ packed,
@@ -1883,7 +1915,11 @@ __device__ __forceinline__ void gemv_int4_fp16_lane_dot_multicol(
 #pragma unroll
         for (int s = 0; s < 4; ++s) {
             __half2 ah[4];
-            decode_activation8_h2(activation + depth + s * 8, ah);
+            if (NATURAL) {
+                decode_activation8_h2_natural(activation + depth + s * 8, ah);
+            } else {
+                decode_activation8_h2(activation + depth + s * 8, ah);
+            }
 #pragma unroll
             for (int c = 0; c < WIDE_NC; ++c) {
                 if (!valid[c]) {
@@ -4397,7 +4433,53 @@ extern "C" __global__ void matmul_nbits_gemv_f16_general_bs_wide_multicol_fp16(
         ((long)blockIdx.x * warps_per_block + warp) * (long)WIDE_NC;
 
     float values[WIDE_NC];
-    gemv_int4_fp16_lane_dot_multicol(
+    gemv_int4_fp16_lane_dot_multicol<false>(
+        activation, packed, scales, zero_points, k, block_size, k_blocks,
+        blob_size, zp_row_bytes, scales_fp16, col_base, n, lane * 32, 32 * 32,
+        values);
+#pragma unroll
+    for (int c = 0; c < WIDE_NC; ++c) {
+        const float reduced = warp_sum(values[c]);
+        const long column = col_base + c;
+        if (lane == 0 && column < n) {
+            output[column] = fold_bias_f16(reduced, bias, column, bias_post_round);
+        }
+    }
+}
+
+// PORT-1 register/occupancy probe entry. Identical to the fp16 multicol kernel
+// but the activation decode drops the 4 `prmt.b32` reorder ops (assumes an
+// offline-interleaved weight layout). Output is intentionally wrong against the
+// current non-interleaved weights; this entry is dispatched ONLY to read
+// `launch__registers_per_thread` / achieved occupancy and quantify whether the
+// PORT-1 offline interleave can lift occupancy on this kernel. NOT a correctness
+// path.
+extern "C" __global__ void matmul_nbits_gemv_f16_general_bs_wide_multicol_fp16_natural(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales,
+    const unsigned char* __restrict__ zero_points,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int scales_fp16,
+    const int bias_post_round,
+    const int bits)
+{
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const long col_base =
+        ((long)blockIdx.x * warps_per_block + warp) * (long)WIDE_NC;
+
+    float values[WIDE_NC];
+    gemv_int4_fp16_lane_dot_multicol<true>(
         activation, packed, scales, zero_points, k, block_size, k_blocks,
         blob_size, zp_row_bytes, scales_fp16, col_base, n, lane * 32, 32 * 32,
         values);
@@ -4719,6 +4801,22 @@ fn use_gemv_wide_multicol() -> bool {
 fn use_gemv_fp16() -> bool {
     matches!(
         std::env::var("ONNX_GENAI_GEMV_FP16").ok().as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
+}
+
+/// PORT-1 register/occupancy probe switch. When `ONNX_GENAI_GEMV_FP16_NATURAL=1`
+/// the fp16 multicol path dispatches the prmt-free
+/// [`GEMV_F16_GENERAL_BS_WIDE_MULTICOL_FP16_NATURAL_ENTRY`] instead of the real
+/// fp16 kernel, so ncu can read its registers/thread + achieved occupancy. The
+/// probe's numeric output is intentionally wrong against the current
+/// (non-interleaved) weight layout — this switch is for MECHANISM MEASUREMENT
+/// only and must never be enabled for a correctness/perf-of-record run.
+fn use_gemv_fp16_natural_probe() -> bool {
+    matches!(
+        std::env::var("ONNX_GENAI_GEMV_FP16_NATURAL")
+            .ok()
+            .as_deref(),
         Some("1") | Some("true") | Some("on")
     )
 }
@@ -7495,7 +7593,11 @@ impl MatMulNBitsKernel {
             } else if use_gemv_wideload(self.bits, self.block_size, self.k) {
                 if use_gemv_wide_multicol() {
                     if use_gemv_fp16() {
-                        GEMV_F16_GENERAL_BS_WIDE_MULTICOL_FP16_ENTRY
+                        if use_gemv_fp16_natural_probe() {
+                            GEMV_F16_GENERAL_BS_WIDE_MULTICOL_FP16_NATURAL_ENTRY
+                        } else {
+                            GEMV_F16_GENERAL_BS_WIDE_MULTICOL_FP16_ENTRY
+                        }
                     } else {
                         GEMV_F16_GENERAL_BS_WIDE_MULTICOL_ENTRY
                     }
@@ -7591,6 +7693,7 @@ impl MatMulNBitsKernel {
                     (threads / 32) as usize / GEMV_F16_SCALES_F16_ZP_SPLITK
                 } else if entry == GEMV_F16_GENERAL_BS_WIDE_MULTICOL_ENTRY
                     || entry == GEMV_F16_GENERAL_BS_WIDE_MULTICOL_FP16_ENTRY
+                    || entry == GEMV_F16_GENERAL_BS_WIDE_MULTICOL_FP16_NATURAL_ENTRY
                 {
                     // Each warp emits WIDE_NC columns, so a `threads/32`-warp CTA
                     // covers `warps * WIDE_NC` output columns; the grid shrinks by
@@ -7628,6 +7731,7 @@ impl MatMulNBitsKernel {
             || entry == GEMV_F16_GENERAL_BS_SPLITK_WIDE_ENTRY
             || entry == GEMV_F16_GENERAL_BS_WIDE_MULTICOL_ENTRY
             || entry == GEMV_F16_GENERAL_BS_WIDE_MULTICOL_FP16_ENTRY
+            || entry == GEMV_F16_GENERAL_BS_WIDE_MULTICOL_FP16_NATURAL_ENTRY
         {
             builder.arg(&bits);
         }
