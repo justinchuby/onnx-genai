@@ -215,17 +215,17 @@ impl Kernel for SkipSimplifiedLayerNormKernel {
                 )
             } else {
                 // `skip` broadcasts along the normalized axis: one scalar per row.
+                // Assemble first, then reduce with the shared helper, so this
+                // branch keeps the same lane-parallel accumulation order (and so
+                // the same rounding) as every other path in this kernel.
                 let skip_value = skip[skip_base];
-                let mut total = 0.0f32;
                 for (element, (slot, &value)) in
                     sum_row.iter_mut().zip(input_row.iter()).enumerate()
                 {
-                    let assembled =
+                    *slot =
                         value + skip_value + bias.as_ref().map_or(0.0, |values| values[element]);
-                    *slot = assembled;
-                    total += assembled * assembled;
                 }
-                total
+                crate::kernels::simd_sumsq::sum_of_squares(sum_row)
             };
             let variance = square_sum / hidden as f32;
             let inv_std_var = 1.0 / (variance + self.epsilon).sqrt();
@@ -904,76 +904,80 @@ mod tests {
     /// index unravel, so every broadcast form needs a bit-exact guard.
     #[test]
     fn skip_simplified_layer_norm_broadcast_matches_expanded_skip() {
-        let shape = [2usize, 3, 5];
-        let len: usize = shape.iter().product();
-        let hidden = shape[2];
-        let input_data = values(len, 101);
-        let gamma_data = values(hidden, 103);
+        // `hidden` must cross the 8-lane accumulator width used by
+        // `simd_sumsq`: below it the lane-parallel reduction degenerates to a
+        // serial remainder loop and cannot distinguish accumulation orders.
+        for hidden in [5usize, 8, 33, 128] {
+            let shape = [2usize, 3, hidden];
+            let len: usize = shape.iter().product();
+            let input_data = values(len, 101);
+            let gamma_data = values(hidden, 103);
 
-        for skip_shape in [
-            vec![5usize],
-            vec![1, 5],
-            vec![3, 5],
-            vec![1, 3, 5],
-            vec![2, 1, 5],
-            vec![2, 3, 5],
-            vec![1],
-            vec![3, 1],
-            vec![2, 3, 1],
-        ] {
-            let skip_len: usize = skip_shape.iter().product();
-            let skip_data = values(skip_len, 107);
+            for skip_shape in [
+                vec![hidden],
+                vec![1, hidden],
+                vec![3, hidden],
+                vec![1, 3, hidden],
+                vec![2, 1, hidden],
+                vec![2, 3, hidden],
+                vec![1],
+                vec![3, 1],
+                vec![2, 3, 1],
+            ] {
+                let skip_len: usize = skip_shape.iter().product();
+                let skip_data = values(skip_len, 107);
 
-            // Materialize the broadcast by hand, right-aligned NumPy rules.
-            let offset = shape.len() - skip_shape.len();
-            let mut expanded = vec![0.0f32; len];
-            for (flat, slot) in expanded.iter_mut().enumerate() {
-                let mut remainder = flat;
-                let mut coords = [0usize; 3];
-                for axis in (0..shape.len()).rev() {
-                    coords[axis] = remainder % shape[axis];
-                    remainder /= shape[axis];
+                // Materialize the broadcast by hand, right-aligned NumPy rules.
+                let offset = shape.len() - skip_shape.len();
+                let mut expanded = vec![0.0f32; len];
+                for (flat, slot) in expanded.iter_mut().enumerate() {
+                    let mut remainder = flat;
+                    let mut coords = [0usize; 3];
+                    for axis in (0..shape.len()).rev() {
+                        coords[axis] = remainder % shape[axis];
+                        remainder /= shape[axis];
+                    }
+                    let mut source = 0usize;
+                    let mut stride = 1usize;
+                    for axis in (0..skip_shape.len()).rev() {
+                        let coord = if skip_shape[axis] == 1 {
+                            0
+                        } else {
+                            coords[offset + axis]
+                        };
+                        source += coord * stride;
+                        stride *= skip_shape[axis];
+                    }
+                    *slot = skip_data[source];
                 }
-                let mut source = 0usize;
-                let mut stride = 1usize;
-                for axis in (0..skip_shape.len()).rev() {
-                    let coord = if skip_shape[axis] == 1 {
-                        0
-                    } else {
-                        coords[offset + axis]
-                    };
-                    source += coord * stride;
-                    stride *= skip_shape[axis];
-                }
-                *slot = skip_data[source];
+
+                let input = Owned::f32(&shape, &input_data);
+                let gamma = Owned::f32(&[hidden], &gamma_data);
+                let broadcast_skip = Owned::f32(&skip_shape, &skip_data);
+                let expanded_skip = Owned::f32(&shape, &expanded);
+
+                let mut broadcast_output = Owned::zeros_f32(&shape);
+                SkipSimplifiedLayerNormKernel { epsilon: 1e-5 }
+                    .execute(
+                        &[input.view(), broadcast_skip.view(), gamma.view()],
+                        &mut [broadcast_output.view_mut()],
+                    )
+                    .unwrap();
+
+                let mut expanded_output = Owned::zeros_f32(&shape);
+                SkipSimplifiedLayerNormKernel { epsilon: 1e-5 }
+                    .execute(
+                        &[input.view(), expanded_skip.view(), gamma.view()],
+                        &mut [expanded_output.view_mut()],
+                    )
+                    .unwrap();
+
+                assert_eq!(
+                    bits(&broadcast_output.to_f32()),
+                    bits(&expanded_output.to_f32()),
+                    "hidden {hidden}, skip shape {skip_shape:?} does not match its expansion"
+                );
             }
-
-            let input = Owned::f32(&shape, &input_data);
-            let gamma = Owned::f32(&[hidden], &gamma_data);
-            let broadcast_skip = Owned::f32(&skip_shape, &skip_data);
-            let expanded_skip = Owned::f32(&shape, &expanded);
-
-            let mut broadcast_output = Owned::zeros_f32(&shape);
-            SkipSimplifiedLayerNormKernel { epsilon: 1e-5 }
-                .execute(
-                    &[input.view(), broadcast_skip.view(), gamma.view()],
-                    &mut [broadcast_output.view_mut()],
-                )
-                .unwrap();
-
-            let mut expanded_output = Owned::zeros_f32(&shape);
-            SkipSimplifiedLayerNormKernel { epsilon: 1e-5 }
-                .execute(
-                    &[input.view(), expanded_skip.view(), gamma.view()],
-                    &mut [expanded_output.view_mut()],
-                )
-                .unwrap();
-
-            assert_eq!(
-                bits(&broadcast_output.to_f32()),
-                bits(&expanded_output.to_f32()),
-                "skip shape {skip_shape:?} does not match its expansion"
-            );
         }
     }
 
