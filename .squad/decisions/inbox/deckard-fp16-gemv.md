@@ -25,15 +25,35 @@ top of #992's multicol NC=4 activation reuse:
 - Rust wiring: entry const, `use_gemv_fp16()` gate, dispatch selection,
   columns_per_block, ABI bits check.
 
-### Precision contract (the crux)
-The MAC runs in fp16 `__hfma2` (two fused MACs/instruction — the ALU win ORT
-gets) **only within one 32-element quant chunk** (a single per-block scale). Each
-chunk's `__half2` accumulator is then reduced to fp32, scaled, and accumulated
-**across chunks in fp32**. The K = 4096..13696 reduction therefore stays fp32 —
-this is NOT a full-fp16-K accumulate (that loses mantissa and flips tokens, which
-bit us in the earlier fp16 spike). A strict per-product fp32-accumulate was
-rejected: it is *more* ops than fp32 FFMA (already one fused op) and cannot win;
-the win requires `hfma2` within the chunk.
+### Precision contract (the crux) — matches ORT's `MatMulFloat4BitsKernelM1`
+**FINAL design (updated after `ortsource` read of ORT's actual M=1 kernel):** the
+per-lane K reduction runs **entirely in fp16 `__half2`** — each 32-element chunk
+is `__hfma2`-summed in fp16, its per-block scale folded in with `__hfma2`, and the
+result accumulated into a per-column fp16 running `total`. **fp32 is used ONLY in
+the final cross-lane `warp_sum`** (the 5-step shuffle). This mirrors ORT's
+arithmetic exactly.
+
+Why full-fp16 accumulate is safe over K (this reverses the earlier caution): the
+per-lane fp16 reduction is a **wide, shallow tree** — 32 lanes stride K by 32, so
+each lane folds only ~K/1024 chunks (≈4 for K=4096, ≈13 for K=13696), and the
+`__half2` holds two ~16-deep sub-lanes. Total fp16 depth is **tens, not
+thousands** → negligible mantissa loss. The earlier token-flip came from a NAIVE
+deep *single-accumulator* fp16 sum of all K; ORT's wide-tree layout is what makes
+full-fp16 production-safe, and matching it puts us in **ORT's own error class by
+construction**.
+
+**Honest note — the "full-fp16 is faster" hypothesis was DISPROVEN at the kernel
+level.** I first shipped a per-chunk-fp32 variant (fp16 MAC within a chunk, fp32
+accumulate across chunks). Switching to ORT's full-fp16 accumulate is a **speed
+TIE** (kernel 26.4 vs 27.0 µs; e2e 212.8 vs 212.4 tok/s) and is **2× less
+precise** (f64 max_rel 1.16e-2 vs 6.3e-3, both far under the 5e-2 bound). The
+limiter is the multicol WIDE_NC=4 register state (64 regs) + wave/tail
+quantization (achieved occupancy 41% << register-theoretical), **not** the
+accumulator width. I ship the full-fp16 version to match ORT's arithmetic exactly
+(cleanest "same error class as ORT" story for the gate), not for a speed win.
+`WIDE_NC_FP16=2` (fewer cols → fewer regs) was tried and **rejected**: registers
+dropped 64→54 but occupancy only 41→43% (wave-bound, not register-bound) and the
+kernel got *slower* (L1/TEX 37→56% as activation reuse dropped).
 
 ## Performance (glm-4-9b-int4, GPU5 H200, `--steady --tokens 160 --decode-skip 40 --runs 3`)
 | variant | tok/s | vs narrow |
@@ -41,25 +61,32 @@ the win requires `hfma2` within the chunk.
 | narrow (pre-#986) | 136.7 | — |
 | wide-load #986 | ~185 | +35% |
 | multicol NC=4 #992 (fp32) | **199.4** | +46% |
-| **fp16 mixed (this PR)** | **212.4** | **+55%** |
+| **fp16 full-accumulate (this PR)** | **212.8** | **+56%** |
 
-**+6.5% over the merged fp32 multicol.** ORT base (certified fair, foundry-local
+**+6.7% over the merged fp32 multicol.** ORT base (certified fair, foundry-local
 fastcfg, Sebastian/GPU7) = ~250–252 → **native-vs-ORT base gap 1.30× → 1.18×**.
 
 ### ncu (glm gate_up, `--graph-profiling node`, launch-skip 240)
 | metric | fp32 multicol | **fp16 mixed** | ORT |
 |---|---|---|---|
-| kernel time | 34.3 µs | **27.0 µs** | 24.9 µs |
-| DRAM | 1.76 TB/s | **2.24 TB/s** | 2.42 TB/s |
+| kernel time | 34.3 µs | **26.4 µs** | 24.9 µs |
+| DRAM | 1.76 TB/s | **2.29 TB/s** | 2.42 TB/s |
 | L1/TEX | 28% | 36% | — |
 | SM throughput | 60% | 54% | — |
 | regs / occupancy | 64 / 41% | 64 / 41% | 32 / — |
 
 The fp16 MAC halves ALU pressure → the kernel is now **~parity with ORT's
-gate_up kernel** (27.0 vs 24.9 µs) and DRAM approaches ORT's (2.24 vs 2.42 TB/s).
-New limiter is **occupancy (41%, register-bound at 64)**, not L1 or ALU. Deeper
-NC (6/8) hit the register cliff on the fp32 path; a separate fp16 `WIDE_NC` is a
-possible follow-up but not required to land this win.
+gate_up kernel** (26.4 vs 24.9 µs) and DRAM approaches ORT's (2.29 vs 2.42 TB/s).
+New limiter is **occupancy (41%)** — but it is **wave/tail-quantization bound, not
+register-bound**: achieved occupancy (41%) sits far below the register-theoretical
+ceiling (50–59% at 64 regs), and cutting registers via `WIDE_NC_FP16=2` moved
+occupancy only 41→43% while slowing the kernel. So the remaining gap to ORT's
+24.9 µs is ORT's fundamentally higher-occupancy 1-col/warp 32-reg layout, not
+something reachable from the multicol layout the coordinator asked to keep. The
+`idioms` ORT listed (LOP3 dequant, prmt activation reorder) were **already present**
+in this kernel (`int4x8_to_half2x4_sub`, `decode_activation8_h2`) before the
+ORT-source read — the only arithmetic delta was per-chunk-fp32 → full-fp16
+accumulate, which is a speed tie.
 
 ## Accuracy gate (the bar for an opt-in non-byte-identical kernel)
 Since the kernel is not bit-identical by design, it ships gated on **accuracy**,
@@ -70,12 +97,13 @@ not bit-identity. Two independent lines of evidence:
    glm's real block-128 M=1 shapes (qkv / o / gate_up / down × sym+asym zp ×
    fp16+fp32 scales) against the same f64 dequant→GEMM oracle, held to the
    **SAME justified `Envelope` the reviewed fp32 int4 path meets** — no
-   weakening. Result: **fp16 `max_rel = 6.3e-3`, 8× under the `5e-2` bound**;
-   `max_abs` always << `abs_bound`. Symmetric-zp fp16 error is ~1.05–1.20× the
-   fp32 path; asymmetric-zp rel-ratios are 9–13× **only because the output
-   magnitude is smaller** (rel amplifies) — the absolute error stays tiny
-   (e.g. 3.8e-2 vs a 0.46 bound). The test also asserts the fp16 output diverges
-   from fp32 (proves the fp16 entry was actually selected, not a vacuous pass).
+   weakening. Result (shipped full-fp16-accumulate version): **fp16
+   `max_rel = 1.16e-2`, 4.3× under the `5e-2` bound**; `max_abs` always <<
+   `abs_bound`. (The earlier per-chunk-fp32 variant measured 6.3e-3; full-fp16
+   accumulate is ~2× less precise but still comfortably inside the envelope and
+   in ORT's own error class by construction.) The test also asserts the fp16
+   output diverges from fp32 (proves the fp16 entry was actually selected, not a
+   vacuous pass).
 
 2. **Empirical token identity**: fp16 greedy tokens are **bit-identical to the
    fp32 path over 160 tokens on both a generic and a repetitive prompt** (0
