@@ -6,8 +6,8 @@
 #![allow(clippy::field_reassign_with_default)]
 
 use onnx_genai_engine::{
-    Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest,
-    PipelineGenerateRequest,
+    AdapterActivation, AdapterSelection, Engine, EngineConfig, GenerateOptions, GeneratePrompt,
+    GenerateRequest, PipelineGenerateRequest,
     pipeline::{PipelineEngine, WorkflowOutputRole},
 };
 use onnx_genai_ort::{DataType, Value};
@@ -28,6 +28,151 @@ fn options(max_new_tokens: usize) -> GenerateOptions {
     options.max_new_tokens = max_new_tokens;
     options.seed = Some(7);
     options
+}
+
+fn adapter_request(
+    slot_ids: &[i64],
+    request_epochs: &[i64],
+    active: &[bool],
+    values: &[f32],
+    selection: AdapterSelection,
+) -> anyhow::Result<PipelineGenerateRequest> {
+    let batch = i64::try_from(slot_ids.len())?;
+    let mut segments = vec![-1i64; slot_ids.len() * 2];
+    let mut adapter_counts = vec![0i64; slot_ids.len()];
+    let mut adapter_scales = vec![0.0f32; slot_ids.len() * 2];
+    for (row, (&slot_id, &request_epoch)) in slot_ids.iter().zip(request_epochs).enumerate() {
+        let identity = onnx_genai_engine::AdapterSlotIdentity {
+            slot_id,
+            request_epoch,
+        };
+        if let Some(activations) = selection.rows.get(&identity) {
+            adapter_counts[row] = i64::try_from(activations.len())?;
+            for (slot, activation) in activations.iter().enumerate() {
+                segments[row * 2 + slot] = match activation.adapter.as_str() {
+                    "blue" => 0,
+                    "green" => 1,
+                    "red" => 3,
+                    other => anyhow::bail!("unknown test adapter {other}"),
+                };
+                adapter_scales[row * 2 + slot] = activation.scale;
+            }
+        }
+    }
+    Ok(PipelineGenerateRequest::new(GenerateRequest {
+        prompt: GeneratePrompt::TokenIds(vec![]),
+        options: Default::default(),
+    })
+    .with_input(
+        "request.slot_ids",
+        Value::from_slice_i64(slot_ids, &[batch])?,
+    )
+    .with_input(
+        "request.request_epochs",
+        Value::from_slice_i64(request_epochs, &[batch])?,
+    )
+    .with_input(
+        "request.adapter_segments",
+        Value::from_slice_i64(&segments, &[batch, 2])?,
+    )
+    .with_input(
+        "request.adapter_counts",
+        Value::from_slice_i64(&adapter_counts, &[batch])?,
+    )
+    .with_input(
+        "request.adapter_scales",
+        Value::from_slice_f32(&adapter_scales, &[batch, 2])?,
+    )
+    .with_input(
+        "request.active",
+        Value::from_raw_bytes(
+            active.iter().map(|value| u8::from(*value)).collect(),
+            &[batch],
+            DataType::Bool,
+        )?,
+    )
+    .with_input("activations", Value::from_slice_f32(values, &[batch, 2])?))
+}
+
+#[test]
+fn mobius_parameter_adapters_preserve_order_rows_compaction_and_epochs() -> anyhow::Result<()> {
+    let mut engine = Engine::from_pipeline_dir(&root("adapter")?, EngineConfig::default())?;
+    let selection = AdapterSelection::default()
+        .with_slot(10, 0, [AdapterActivation::new("red", 1.0)])
+        .with_slot(20, 0, [AdapterActivation::new("blue", 1.0)])
+        .with_slot(
+            30,
+            0,
+            [
+                AdapterActivation::new("red", 0.5),
+                AdapterActivation::new("blue", 1.0),
+            ],
+        );
+    let output = engine.run_pipeline(adapter_request(
+        &[10, 20, 30],
+        &[0, 0, 0],
+        &[true, false, true],
+        &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        selection.clone(),
+    )?)?;
+    assert_eq!(
+        output["result"].to_vec_f32()?,
+        vec![2.0, 4.0, 3.0, 4.0, 25.5, 35.0]
+    );
+    let compacted = engine.run_pipeline(adapter_request(
+        &[30, 10],
+        &[0, 0],
+        &[true, true],
+        &[5.0, 6.0, 1.0, 2.0],
+        selection,
+    )?)?;
+    assert_eq!(
+        compacted["result"].to_vec_f32()?,
+        vec![25.5, 35.0, 2.0, 4.0]
+    );
+    let reused =
+        AdapterSelection::default().with_slot(10, 1, [AdapterActivation::new("blue", 1.0)]);
+    let stale = engine.run_pipeline(adapter_request(
+        &[10],
+        &[1],
+        &[true],
+        &[1.0, 2.0],
+        AdapterSelection::default().with_slot(10, 0, [AdapterActivation::new("red", 1.0)]),
+    )?)?;
+    assert_eq!(stale["result"].to_vec_f32()?, vec![1.0, 2.0]);
+    for _ in 0..2 {
+        let output = engine.run_pipeline(adapter_request(
+            &[10],
+            &[1],
+            &[true],
+            &[1.0, 2.0],
+            reused.clone(),
+        )?)?;
+        assert_eq!(output["result"].to_vec_f32()?, vec![7.0, 10.0]);
+    }
+    let green =
+        AdapterSelection::default().with_slot(40, 0, [AdapterActivation::new("green", 1.0)]);
+    let output = engine.run_pipeline(adapter_request(&[40], &[0], &[true], &[1.0, 2.0], green)?)?;
+    assert_eq!(output["result"].to_vec_f32()?, vec![4.0, 5.0]);
+    let red = AdapterSelection::default().with_slot(50, 0, [AdapterActivation::new("red", 1.0)]);
+    for _ in 0..2 {
+        let output = engine.run_pipeline(adapter_request(
+            &[50],
+            &[0],
+            &[true],
+            &[1.0, 2.0],
+            red.clone(),
+        )?)?;
+        assert_eq!(output["result"].to_vec_f32()?, vec![2.0, 4.0]);
+    }
+    let diagnostic = engine.adapter_lifecycle_diagnostic();
+    assert_eq!(diagnostic.loads, 4);
+    assert!(diagnostic.cache_hits > 0);
+    assert_eq!(diagnostic.evictions, 2);
+    assert_eq!(diagnostic.reloads, 1);
+    assert_eq!(diagnostic.capture_invalidations, 2);
+    assert!(diagnostic.replayed_plans > 0);
+    Ok(())
 }
 
 fn assert_batched_policy_super_island(engine: &PipelineEngine) {
