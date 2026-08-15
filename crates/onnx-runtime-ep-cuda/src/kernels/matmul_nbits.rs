@@ -105,6 +105,26 @@ const GENERAL_BS_SPLITK: usize = 4;
 /// `block = depth / block_size`, decoupling the tile width from the block width.
 const GEMM_F16_GENERAL_BS_ENTRY: &str = "matmul_nbits_gemm_f16_general_bs";
 const GEMV_F16_SCALES_F16_ENTRY: &str = "matmul_nbits_gemv_f16_scales_f16";
+/// Batched byte-identical verify GEMV entries (M=2..9), one per draft width.
+/// Each is the compile-time-`M` sibling of [`GEMV_F16_SCALES_F16_ENTRY`]
+/// (symmetric int4, block_size==32, fp16 scales): a single launch reduces every
+/// output column for all M draft rows, reading each int4 weight once while
+/// keeping each row's reduction the identical op sequence the M=1 GEMV uses.
+/// Indexed by `M - 2`. Only defined for the captured speculative verify.
+const GEMV_F16_SCALES_F16_BATCHED_VERIFY_ENTRIES: [&str; 8] = [
+    "matmul_nbits_gemv_f16_scales_f16_batched_verify_m2",
+    "matmul_nbits_gemv_f16_scales_f16_batched_verify_m3",
+    "matmul_nbits_gemv_f16_scales_f16_batched_verify_m4",
+    "matmul_nbits_gemv_f16_scales_f16_batched_verify_m5",
+    "matmul_nbits_gemv_f16_scales_f16_batched_verify_m6",
+    "matmul_nbits_gemv_f16_scales_f16_batched_verify_m7",
+    "matmul_nbits_gemv_f16_scales_f16_batched_verify_m8",
+    "matmul_nbits_gemv_f16_scales_f16_batched_verify_m9",
+];
+/// Smallest / largest draft width the batched verify GEMV specializes for.
+/// Widths outside this range fall back to the per-row M=1 GEMV oracle.
+const MIN_BATCHED_VERIFY_ROWS: usize = 2;
+const MAX_BATCHED_VERIFY_ROWS: usize = 9;
 /// Asymmetric-zero-point specialization of [`GEMV_F16_SCALES_F16_ENTRY`]. The
 /// symmetric entry above is compiled with `HasZp == false`, which
 /// dead-code-eliminates the per-block zero-point global load and folds the
@@ -3753,6 +3773,162 @@ extern "C" __global__ void matmul_nbits_gemm_f16_general_bs(
             fold_bias_f16(value, row_bias, column, bias_post_round);
     }
 }
+
+// Maximum verify width (draft rows M) the batched byte-identity verify GEMV
+// specializes for. Must match MAX_BATCHED_VERIFY_ROWS on the Rust side; wider
+// verifies fall back to the per-row oracle launcher.
+#define MAX_BATCHED_VERIFY_ROWS 9
+
+// Batched byte-identical verify GEMV: symmetric int4, block_size==32, fp16
+// scales, single-warp reduction. This is the M=W sibling of
+// `matmul_nbits_gemv_f16_scales_f16` (HasZp==false). ONE warp reduces ONE
+// output column for ALL M activation rows: the WEIGHT-only work (packed load,
+// int4->fp16 dequant, `* scale`) is done ONCE per (column, lane, K-step) and
+// reused across every row, so each int4 weight is read exactly once (recovering
+// the speed the per-row oracle loses by re-reading weights M times), while each
+// row's K reduction is the SAME sequence of `__hfma2`/scalar-tail ops as the
+// M=1 kernel — so every output row is BYTE-IDENTICAL to plain M=1 greedy by
+// construction. `activation` is `[M, k]` row-major; `output` is `[M, n]`. M is a
+// compile-time constant so the per-row accumulators stay in registers (a
+// runtime bound would spill them to local memory and erase the win).
+template <int M>
+__device__ __forceinline__ void matmul_nbits_gemv_f16_scales_f16_batched_verify_tpl(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales_raw,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int k_blocks,
+    const int blob_size,
+    const int bias_post_round)
+{
+    const __half* __restrict__ scales =
+        reinterpret_cast<const __half*>(scales_raw);
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int columns_per_block = (int)blockDim.x >> 5;
+    const int column = (int)blockIdx.x * columns_per_block + warp;
+
+    __half2 sum0[M];
+    __half2 sum1[M];
+    __half2 sum2[M];
+    __half2 sum3[M];
+    float tail[M];
+#pragma unroll
+    for (int r = 0; r < M; ++r) {
+        sum0[r] = __float2half2_rn(0.0f);
+        sum1[r] = __float2half2_rn(0.0f);
+        sum2[r] = __float2half2_rn(0.0f);
+        sum3[r] = __float2half2_rn(0.0f);
+        tail[r] = 0.0f;
+    }
+
+    if (column < n) {
+        const int lane_depth = lane * 8;
+        const unsigned char* packed_ptr =
+            packed + (long)column * k_blocks * blob_size + lane * 4;
+        const __half* scale_ptr =
+            scales + (long)column * k_blocks + (lane >> 2);
+        int depth_base = 0;
+        for (; depth_base + lane_depth + 8 <= k; depth_base += 256) {
+            // WEIGHT-only work: load + dequant + apply block scale ONCE.
+            const unsigned int packed_word =
+                *reinterpret_cast<const unsigned int*>(packed_ptr);
+            __half2 q[4];
+            int4x8_to_half2x4(packed_word, q);  // symmetric (sub2 == 8)
+            const __half scale = *scale_ptr;
+            const __half2 scale2 = __halves2half2(scale, scale);
+            const __half2 qs0 = __hmul2(q[0], scale2);
+            const __half2 qs1 = __hmul2(q[1], scale2);
+            const __half2 qs2 = __hmul2(q[2], scale2);
+            const __half2 qs3 = __hmul2(q[3], scale2);
+            const __half* activation_ptr = activation + depth_base + lane_depth;
+#pragma unroll
+            for (int r = 0; r < M; ++r) {
+                const uint4 permuted = permute_activation_f16x8(activation_ptr);
+                sum0[r] = __hfma2(qs0, *reinterpret_cast<const __half2*>(&permuted.x), sum0[r]);
+                sum1[r] = __hfma2(qs1, *reinterpret_cast<const __half2*>(&permuted.y), sum1[r]);
+                sum2[r] = __hfma2(qs2, *reinterpret_cast<const __half2*>(&permuted.z), sum2[r]);
+                sum3[r] = __hfma2(qs3, *reinterpret_cast<const __half2*>(&permuted.w), sum3[r]);
+                activation_ptr += k;
+            }
+            packed_ptr += 128;
+            scale_ptr += 8;
+        }
+        const int tail_depth = depth_base + lane_depth;
+        if (tail_depth < k) {
+            const unsigned int packed_word =
+                *reinterpret_cast<const unsigned int*>(packed_ptr);
+            const float scale = __half2float(*scale_ptr);
+            const int valid = min(8, k - tail_depth);
+            const __half* activation_ptr = activation + tail_depth;
+#pragma unroll
+            for (int r = 0; r < M; ++r) {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    if (i < valid) {
+                        // Symmetric zero point is 8; matches the M=1 tail path.
+                        const int q = (int)((packed_word >> (i * 4)) & 15u) - 8;
+                        tail[r] += (float)q * __half2float(activation_ptr[i]) * scale;
+                    }
+                }
+                activation_ptr += k;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < M; ++r) {
+        const float2 value04 = __half22float2(sum0[r]);
+        const float2 value15 = __half22float2(sum1[r]);
+        const float2 value26 = __half22float2(sum2[r]);
+        const float2 value37 = __half22float2(sum3[r]);
+        float value = tail[r] + value04.x;
+        value += value15.x;
+        value += value26.x;
+        value += value37.x;
+        value += value04.y;
+        value += value15.y;
+        value += value26.y;
+        value += value37.y;
+        value = warp_sum(value);
+        if (lane == 0 && column < n) {
+            output[(long)r * n + column] =
+                fold_bias_f16(value, bias, column, bias_post_round);
+        }
+    }
+}
+
+#define BATCHED_VERIFY_ENTRY(WIDTH)                                            \
+    extern "C" __global__ void                                                \
+    matmul_nbits_gemv_f16_scales_f16_batched_verify_m##WIDTH(                 \
+        const __half* __restrict__ activation,                               \
+        const unsigned char* __restrict__ packed,                            \
+        const void* __restrict__ scales_raw,                                 \
+        const __half* __restrict__ bias,                                     \
+        __half* __restrict__ output,                                         \
+        const int k,                                                         \
+        const int n,                                                         \
+        const int k_blocks,                                                  \
+        const int blob_size,                                                 \
+        const int bias_post_round)                                           \
+    {                                                                        \
+        matmul_nbits_gemv_f16_scales_f16_batched_verify_tpl<WIDTH>(          \
+            activation, packed, scales_raw, bias, output, k, n, k_blocks,    \
+            blob_size, bias_post_round);                                     \
+    }
+
+BATCHED_VERIFY_ENTRY(2)
+BATCHED_VERIFY_ENTRY(3)
+BATCHED_VERIFY_ENTRY(4)
+BATCHED_VERIFY_ENTRY(5)
+BATCHED_VERIFY_ENTRY(6)
+BATCHED_VERIFY_ENTRY(7)
+BATCHED_VERIFY_ENTRY(8)
+BATCHED_VERIFY_ENTRY(9)
 "#;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5037,6 +5213,9 @@ impl MatMulNBitsKernel {
             if marlin_gemm::per_row_verify_enabled() {
                 return self.run_f16_per_row_verify(inputs, outputs, m);
             }
+            if marlin_gemm::batched_verify_enabled() {
+                return self.run_f16_batched_verify(inputs, outputs, m, scales_fp16);
+            }
             // SAFETY: the tiled prefill kernel itself has fixed pointers and no
             // allocation or host synchronization. We nevertheless keep the
             // advertised capture contract conservative: variable-M prefill is
@@ -5386,6 +5565,126 @@ impl MatMulNBitsKernel {
         // Every per-row launch is capture-safe (static grid, no alloc/sync); the
         // recursive M=1 path already stored `true`, but assert it explicitly so
         // the composed verify forward advertises capture-safety.
+        self.last_call_capture_safe.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Batched byte-identical captured-verify forward for the fp16 M>1 path.
+    ///
+    /// For ops the batched GEMV covers — symmetric int4, `block_size == 32`,
+    /// fp16 scales, the single-warp `General` reduction (not down-projection, not
+    /// split-K), no fused SwiGLU/RMSNorm epilogue, broadcast-or-absent bias — a
+    /// single kernel launch computes all `m` draft rows for every output column,
+    /// reading each int4 weight exactly once. Each row's K reduction is the
+    /// identical op sequence the M=1 GEMV greedy decode uses, so every output row
+    /// is byte-identical to plain M=1 greedy *by construction*, while the weights
+    /// are streamed once (not `m` times as in the per-row oracle) so the
+    /// speculative speedup is preserved. The launch is static-grid and
+    /// allocation-free, so the composed verify graph still captures and replays.
+    ///
+    /// Every op the batched kernel does not (yet) cover falls back to the per-row
+    /// M=1 GEMV oracle, which is byte-identical for any shape — so byte-identity
+    /// holds regardless of batched coverage; only speed depends on coverage.
+    fn run_f16_batched_verify(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        m: usize,
+        scales_fp16: bool,
+    ) -> Result<()> {
+        let zero_points = optional_input(inputs, 3);
+        let bias = optional_input(inputs, 5);
+        // A per-token folded-residual bias binds `m * N` elements; the batched
+        // kernel only applies a broadcast `[N]` (or absent) bias. Anything else
+        // routes to the per-row oracle.
+        let bias_broadcast = match bias {
+            Some(bias) => bias.numel() == self.n,
+            None => true,
+        };
+        let selection =
+            select_f16_gemv_variant(self.k, self.n, self.block_size, scales_fp16, false);
+        let capabilities = self.runtime.capabilities();
+        let symmetric_splitk = use_f16_symmetric_splitk(
+            self.k,
+            self.n,
+            capabilities.multiprocessor_count(),
+            capabilities.max_threads_per_block(),
+        );
+        let eligible = (MIN_BATCHED_VERIFY_ROWS..=MAX_BATCHED_VERIFY_ROWS).contains(&m)
+            && self.bits == 4
+            && self.block_size == 32
+            && scales_fp16
+            && zero_points.is_none()
+            && !self.gate_up_swiglu
+            && !self.decomposed_silu
+            && !self.rmsnorm_prologue
+            && matches!(selection.variant, F16GemvVariant::General)
+            && !symmetric_splitk
+            && bias_broadcast;
+        if !eligible {
+            return self.run_f16_per_row_verify(inputs, outputs, m);
+        }
+
+        let k_blocks = self.k.div_ceil(self.block_size);
+        let blob_size = self.block_size * self.bits / 8;
+        let entry = GEMV_F16_SCALES_F16_BATCHED_VERIFY_ENTRIES[m - MIN_BATCHED_VERIFY_ROWS];
+        onnx_runtime_ep_api::record_kernel_variant!(
+            "gemv_f16_scales_f16_batched_verify",
+            "M={} captured verify: fp16 activation, int4, block_size=32, symmetric, fp16 \
+             scales → single-launch batched byte-identical GEMV (weights read once; each row's \
+             reduction identical to the M=1 greedy GEMV; static grid, capture-safe)",
+            m
+        );
+        self.runtime
+            .require_nvrtc_half_headers("MatMulNBits batched verify GEMV")?;
+        let function = self
+            .runtime
+            .nvrtc_function(GEMV_F16_MODULE, GEMV_F16_SRC, entry)?;
+
+        let activation_ptr = cuptr(inputs[0].data_ptr::<u8>() as *const c_void);
+        let packed_ptr = cuptr(inputs[1].data_ptr::<u8>() as *const c_void);
+        let scales_ptr = cuptr(inputs[2].data_ptr::<u8>() as *const c_void);
+        let bias_ptr = bias
+            .map(|tensor| cuptr(tensor.data_ptr::<u8>() as *const c_void))
+            .unwrap_or(0);
+        let output_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
+        let k = as_i32("K", self.k)?;
+        let n = as_i32("N", self.n)?;
+        let k_blocks_i = as_i32("K block count", k_blocks)?;
+        let blob_size_i = as_i32("block blob size", blob_size)?;
+        let bias_post_round_flag: i32 = (self.fold_bias_post_round && bias.is_some()) as i32;
+
+        // One warp reduces one output column for all M rows; a 256-thread block
+        // covers 8 columns. The per-column reduction is independent of the block
+        // width, so the result is byte-identical regardless of this launch shape.
+        let threads = GEMV_F16_LARGE_THREADS;
+        let columns_per_block = (threads / 32) as usize;
+
+        let mut builder = self.runtime.stream().launch_builder(&function);
+        builder
+            .arg(&activation_ptr)
+            .arg(&packed_ptr)
+            .arg(&scales_ptr)
+            .arg(&bias_ptr)
+            .arg(&output_ptr)
+            .arg(&k)
+            .arg(&n)
+            .arg(&k_blocks_i)
+            .arg(&blob_size_i)
+            .arg(&bias_post_round_flag);
+        // SAFETY: fp16 inputs validated (dtype/shape/contiguity) by the caller;
+        // symmetric block-32 fp16-scales layout with no zero points. The kernel
+        // uses only registers (no shared memory, no per-call alloc or sync), so
+        // the launch is legal to record into and replay from a CUDA graph.
+        unsafe {
+            builder.launch(LaunchConfig {
+                grid_dim: (self.n.div_ceil(columns_per_block) as u32, 1, 1),
+                block_dim: (threads, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }
+        .map(|_| ())
+        .map_err(|err| driver_err("launch MatMulNBits batched verify GEMV", err))?;
         self.last_call_capture_safe.store(true, Ordering::Relaxed);
         Ok(())
     }

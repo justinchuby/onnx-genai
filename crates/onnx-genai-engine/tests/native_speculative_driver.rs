@@ -421,6 +421,18 @@ fn run_byte_identity_gate(
     prompt: &str,
     device: Option<NativeDecodeDevice>,
 ) -> anyhow::Result<bool> {
+    run_byte_identity_gate_mode(model_dir, prompt, device, "perrow")
+}
+
+/// `verify_mode`: "perrow" arms the per-row M=1 GEMV oracle
+/// (`ONNX_GENAI_SPEC_PERROW_VERIFY`); "batched" arms the batched byte-identical
+/// verify (`ONNX_GENAI_SPEC_BATCHED_VERIFY`).
+fn run_byte_identity_gate_mode(
+    model_dir: &std::path::Path,
+    prompt: &str,
+    device: Option<NativeDecodeDevice>,
+    verify_mode: &str,
+) -> anyhow::Result<bool> {
     // Deterministic reference: Marlin prefill OFF (default). The captured verify
     // is byte-identical to M=1 greedy per row regardless of this setting.
     unsafe {
@@ -440,9 +452,14 @@ fn run_byte_identity_gate(
     unsafe {
         std::env::set_var("ONNX_GENAI_SPEC_CAPTURED_VERIFY", "1");
         std::env::set_var("ONNX_GENAI_SPEC_GATE", "0");
-        // Arm the opt-in per-row M=1 GEMV verify (byte-identity reference).
-        std::env::set_var("ONNX_GENAI_SPEC_PERROW_VERIFY", "1");
+        std::env::remove_var("ONNX_GENAI_SPEC_PERROW_VERIFY");
+        std::env::remove_var("ONNX_GENAI_SPEC_BATCHED_VERIFY");
+        match verify_mode {
+            "batched" => std::env::set_var("ONNX_GENAI_SPEC_BATCHED_VERIFY", "1"),
+            _ => std::env::set_var("ONNX_GENAI_SPEC_PERROW_VERIFY", "1"),
+        }
     }
+    eprintln!("verify_mode={verify_mode}");
     let mut all_ok = true;
     for spec_tokens in [4usize, 5, 6, 7, 8] {
         let w = spec_tokens + 1;
@@ -479,6 +496,7 @@ fn run_byte_identity_gate(
         std::env::remove_var("ONNX_GENAI_SPEC_CAPTURED_VERIFY");
         std::env::remove_var("ONNX_GENAI_SPEC_GATE");
         std::env::remove_var("ONNX_GENAI_SPEC_PERROW_VERIFY");
+        std::env::remove_var("ONNX_GENAI_SPEC_BATCHED_VERIFY");
     }
     Ok(all_ok)
 }
@@ -487,12 +505,7 @@ fn run_byte_identity_gate(
 ///   ONNX_GENAI_RUN_CUDA_SMOKE=1 CUDA_VISIBLE_DEVICES=<idle> cargo test -p \
 ///     onnx-genai-engine --features cuda,native-backend \
 ///     --test native_speculative_driver leon_gate1_qwen -- --nocapture --test-threads=1
-#[test]
-fn leon_gate1_qwen_byte_identity_cuda() -> anyhow::Result<()> {
-    if std::env::var_os("ONNX_GENAI_RUN_CUDA_SMOKE").is_none() {
-        eprintln!("skipping CUDA smoke; set ONNX_GENAI_RUN_CUDA_SMOKE=1 to run");
-        return Ok(());
-    }
+fn leon_qwen_model_dir() -> Option<PathBuf> {
     let model_dir = std::env::var_os("ONNX_GENAI_NATIVE_SPEC_QWEN_MODEL")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -500,17 +513,70 @@ fn leon_gate1_qwen_byte_identity_cuda() -> anyhow::Result<()> {
         });
     if !model_dir.join("model.onnx").is_file() {
         eprintln!("skipping; qwen model not at {}", model_dir.display());
+        return None;
+    }
+    Some(model_dir)
+}
+
+fn leon_qwen_prompt() -> &'static str {
+    "The quick brown fox jumps over the lazy dog. The dog was not amused, \
+     and the fox ran away into the forest. In the forest there were many \
+     trees, and the trees were tall and green. The fox found a river and \
+     drank from the river before continuing on its journey through the"
+}
+
+fn leon_glm_model_dir() -> Option<PathBuf> {
+    let model_dir = std::env::var_os("ONNX_GENAI_NATIVE_SPEC_GLM_MODEL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/home/justinchu/glm-e2e-artifacts/glm-4-9b-int4-cuda"));
+    if !model_dir.join("model.onnx").is_file() {
+        eprintln!("skipping; glm model not at {}", model_dir.display());
+        return None;
+    }
+    Some(model_dir)
+}
+
+fn leon_glm_prompt() -> &'static str {
+    "The history of the ancient city was long and storied. The city was \
+     founded by settlers who came from across the sea. The settlers built \
+     walls around the city, and the walls protected the city from raiders. \
+     Over the centuries the city grew, and the people of the city prospered \
+     as they traded goods along the river that flowed beside the"
+}
+
+#[test]
+fn leon_gate1_qwen_byte_identity_cuda() -> anyhow::Result<()> {
+    if std::env::var_os("ONNX_GENAI_RUN_CUDA_SMOKE").is_none() {
+        eprintln!("skipping CUDA smoke; set ONNX_GENAI_RUN_CUDA_SMOKE=1 to run");
         return Ok(());
     }
-    let prompt = "The quick brown fox jumps over the lazy dog. The dog was not amused, \
-                  and the fox ran away into the forest. In the forest there were many \
-                  trees, and the trees were tall and green. The fox found a river and \
-                  drank from the river before continuing on its journey through the";
+    let Some(model_dir) = leon_qwen_model_dir() else {
+        return Ok(());
+    };
     let device = Some(NativeDecodeDevice::Cuda { index: Some(0) });
-    let ok = run_byte_identity_gate(&model_dir, prompt, device)?;
+    let ok = run_byte_identity_gate(&model_dir, leon_qwen_prompt(), device)?;
     assert!(
         ok,
         "qwen normal-prompt byte-identity gate failed (see per-W lines)"
+    );
+    Ok(())
+}
+
+/// GATE 1 (batched fast verify) on qwen2.5-14b int4.
+#[test]
+fn leon_gate1_qwen_batched_verify_cuda() -> anyhow::Result<()> {
+    if std::env::var_os("ONNX_GENAI_RUN_CUDA_SMOKE").is_none() {
+        eprintln!("skipping CUDA smoke; set ONNX_GENAI_RUN_CUDA_SMOKE=1 to run");
+        return Ok(());
+    }
+    let Some(model_dir) = leon_qwen_model_dir() else {
+        return Ok(());
+    };
+    let device = Some(NativeDecodeDevice::Cuda { index: Some(0) });
+    let ok = run_byte_identity_gate_mode(&model_dir, leon_qwen_prompt(), device, "batched")?;
+    assert!(
+        ok,
+        "qwen batched-verify byte-identity gate failed (see per-W lines)"
     );
     Ok(())
 }
@@ -522,23 +588,33 @@ fn leon_gate1_glm_byte_identity_cuda() -> anyhow::Result<()> {
         eprintln!("skipping CUDA smoke; set ONNX_GENAI_RUN_CUDA_SMOKE=1 to run");
         return Ok(());
     }
-    let model_dir = std::env::var_os("ONNX_GENAI_NATIVE_SPEC_GLM_MODEL")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/home/justinchu/glm-e2e-artifacts/glm-4-9b-int4-cuda"));
-    if !model_dir.join("model.onnx").is_file() {
-        eprintln!("skipping; glm model not at {}", model_dir.display());
+    let Some(model_dir) = leon_glm_model_dir() else {
         return Ok(());
-    }
-    let prompt = "The history of the ancient city was long and storied. The city was \
-                  founded by settlers who came from across the sea. The settlers built \
-                  walls around the city, and the walls protected the city from raiders. \
-                  Over the centuries the city grew, and the people of the city prospered \
-                  as they traded goods along the river that flowed beside the";
+    };
     let device = Some(NativeDecodeDevice::Cuda { index: Some(0) });
-    let ok = run_byte_identity_gate(&model_dir, prompt, device)?;
+    let ok = run_byte_identity_gate(&model_dir, leon_glm_prompt(), device)?;
     assert!(
         ok,
         "glm normal-prompt byte-identity gate failed (see per-W lines)"
+    );
+    Ok(())
+}
+
+/// GATE 1 (batched fast verify) on glm-4-9b int4.
+#[test]
+fn leon_gate1_glm_batched_verify_cuda() -> anyhow::Result<()> {
+    if std::env::var_os("ONNX_GENAI_RUN_CUDA_SMOKE").is_none() {
+        eprintln!("skipping CUDA smoke; set ONNX_GENAI_RUN_CUDA_SMOKE=1 to run");
+        return Ok(());
+    }
+    let Some(model_dir) = leon_glm_model_dir() else {
+        return Ok(());
+    };
+    let device = Some(NativeDecodeDevice::Cuda { index: Some(0) });
+    let ok = run_byte_identity_gate_mode(&model_dir, leon_glm_prompt(), device, "batched")?;
+    assert!(
+        ok,
+        "glm batched-verify byte-identity gate failed (see per-W lines)"
     );
     Ok(())
 }

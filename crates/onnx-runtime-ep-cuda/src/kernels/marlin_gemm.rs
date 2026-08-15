@@ -214,6 +214,56 @@ impl Drop for PerRowVerifyGuard {
     }
 }
 
+thread_local! {
+    /// When `true`, the `MatMulNBits` fp16 M>1 path routes each eligible op
+    /// through the batched byte-identical verify GEMV (one launch, weights read
+    /// once, per-row-identical reduction), falling back to the per-row M=1 GEMV
+    /// oracle for ops it does not yet cover. Toggled only by [`BatchedVerifyGuard`].
+    static BATCHED_VERIFY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the batched byte-identical verify path is active on the current thread.
+#[must_use]
+pub fn batched_verify_enabled() -> bool {
+    BATCHED_VERIFY.with(std::cell::Cell::get)
+}
+
+/// RAII guard that makes the `MatMulNBits` fp16 M>1 path run the captured
+/// speculative verify through the *batched* byte-identical GEMV: a single
+/// kernel launch computes all M draft rows for each output column, reading each
+/// int4 weight exactly once while keeping every row's K reduction the identical
+/// op sequence the M=1 GEMV greedy uses — so the verify logits are byte-identical
+/// to plain M=1 greedy *by construction* AND the speculative speedup is preserved
+/// (the per-row oracle, [`PerRowVerifyGuard`], is byte-identical too but re-reads
+/// the weights M times and is ~6x slower). Ops the batched kernels do not yet
+/// cover fall back to the per-row oracle, so byte-identity holds regardless of
+/// coverage. Every batched launch is static-grid capture-safe, so the verify
+/// graph still captures and replays.
+#[must_use = "the guard must be held for the duration of the batched verify region"]
+pub struct BatchedVerifyGuard {
+    previous: bool,
+}
+
+impl BatchedVerifyGuard {
+    /// Enter a batched byte-identical verify region on the current thread.
+    pub fn new() -> Self {
+        let previous = BATCHED_VERIFY.with(|cell| cell.replace(true));
+        Self { previous }
+    }
+}
+
+impl Default for BatchedVerifyGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for BatchedVerifyGuard {
+    fn drop(&mut self) {
+        BATCHED_VERIFY.with(|cell| cell.set(self.previous));
+    }
+}
+
 /// Gate for split-K within the Marlin M>1 path. Split-K partitions the K/group
 /// range across `grid.z` to fill idle SMs when M (and thus the base block count)
 /// is small, at the cost of a fixed-order fp32 partial reduction that is NOT
