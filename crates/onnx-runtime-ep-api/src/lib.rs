@@ -53,7 +53,7 @@ pub use kernel::{
 pub use onnx_runtime_optimizer::OptimizationPass as OptimizerPass;
 pub use provider::{
     CaptureRegionShapeStatus, DeviceBuffer, EpConfig, EpId, ExecutionProvider, Fence,
-    StructuralCaptureDecline,
+    HostToDeviceCopier, StructuralCaptureDecline,
 };
 pub use registry::{EpRegistry, KernelFactory, OpKey, OpRegistry};
 pub use tensor::{

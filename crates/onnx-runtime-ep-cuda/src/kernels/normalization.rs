@@ -422,7 +422,43 @@ __device__ __forceinline__ float load_skip_val(
         : ((const float*)values)[index];
 }
 
-template <bool DenseSkip>
+// Warp-shuffle tail of the launch-invariant `red[tid]` power-of-two tree.
+//
+// Precondition: `red[tid]` already holds this thread's fp32 partial and the
+// caller has executed a `__syncthreads()`. `nt` is a power of two (the block
+// size chosen by `reduction_launch_config`).
+//
+// The inter-warp offsets (>= 32) combine threads living in DIFFERENT warps, so
+// they must stay in shared memory with a `__syncthreads()` barrier. Once the
+// tree has collapsed to `offset == 32`, `red[0..31]` hold the 32 per-warp
+// partial sums. The remaining offsets 16,8,4,2,1 pair lane `tid` with lane
+// `tid+offset` ENTIRELY inside warp 0 — exactly the pairing and order that
+// `__shfl_down_sync(0xffffffff, v, offset)` produces — so warp 0 finishes the
+// reduction in registers, dropping 5 `__syncthreads` + 5 shared read/write
+// rounds. The accumulation order (and `__fadd_rn` round-to-nearest fp32 add) is
+// BIT-IDENTICAL to the full shared-memory tree; see the `warp_reduce` unit tests
+// which assert byte-for-byte equality of the `y` output flag-off vs flag-on.
+//
+// After this returns, `red[0]` holds the total for every thread to read.
+__device__ __forceinline__ float skip_rmsnorm_warp_tail(
+    float* red, const int tid, const int nt) {
+    for (int offset = nt >> 1; offset >= 32; offset >>= 1) {
+        if (tid < offset) red[tid] = __fadd_rn(red[tid], red[tid + offset]);
+        __syncthreads();
+    }
+    if (tid < 32) {
+        float v = (tid < nt) ? red[tid] : 0.0f;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            v = __fadd_rn(v, __shfl_down_sync(0xffffffffu, v, o));
+        }
+        if (tid == 0) red[0] = v;
+    }
+    __syncthreads();
+    return red[0];
+}
+
+template <bool DenseSkip, bool WarpTail>
 __device__ __forceinline__ void skip_rmsnorm_f32_tpl(
     const float* input,
     const float* skip,
@@ -469,16 +505,24 @@ __device__ __forceinline__ void skip_rmsnorm_f32_tpl(
     }
 
     // Fixed block tree: every thread owns the same strided subsequence, then
-    // power-of-two offsets combine partials in a launch-invariant order.
+    // power-of-two offsets combine partials in a launch-invariant order. With
+    // WarpTail, the intra-warp offsets (<= 16) finish via __shfl_down_sync in
+    // registers — bit-identical pairing/order to the full shared tree.
     red[tid] = sum_squares;
     __syncthreads();
-    for (int offset = nt >> 1; offset > 0; offset >>= 1) {
-        if (tid < offset) {
-            red[tid] = __fadd_rn(red[tid], red[tid + offset]);
+    float reduced;
+    if (WarpTail) {
+        reduced = skip_rmsnorm_warp_tail(red, tid, nt);
+    } else {
+        for (int offset = nt >> 1; offset > 0; offset >>= 1) {
+            if (tid < offset) {
+                red[tid] = __fadd_rn(red[tid], red[tid + offset]);
+            }
+            __syncthreads();
         }
-        __syncthreads();
+        reduced = red[0];
     }
-    const float inv_std = 1.0f / sqrtf(red[0] / (float)norm_size + epsilon);
+    const float inv_std = 1.0f / sqrtf(reduced / (float)norm_size + epsilon);
     if (tid == 0) {
         if (mean_out) mean_out[g] = 0.0f;
         if (invstd_out) invstd_out[g] = inv_std;
@@ -504,7 +548,27 @@ extern "C" __global__ void skip_rmsnorm_f32_dense(
     const int has_bias,
     const float epsilon)
 {
-    skip_rmsnorm_f32_tpl<true>(input, skip, gamma, bias, y, sum_out, mean_out,
+    skip_rmsnorm_f32_tpl<true, false>(input, skip, gamma, bias, y, sum_out, mean_out,
+        invstd_out, metadata, rank, num_groups, norm_size, has_bias, epsilon);
+}
+
+extern "C" __global__ void skip_rmsnorm_f32_dense_warp(
+    const float* input,
+    const float* skip,
+    const float* gamma,
+    const float* bias,
+    float* y,
+    float* sum_out,
+    float* mean_out,
+    float* invstd_out,
+    const unsigned long long* metadata,
+    const int rank,
+    const int num_groups,
+    const int norm_size,
+    const int has_bias,
+    const float epsilon)
+{
+    skip_rmsnorm_f32_tpl<true, true>(input, skip, gamma, bias, y, sum_out, mean_out,
         invstd_out, metadata, rank, num_groups, norm_size, has_bias, epsilon);
 }
 
@@ -524,7 +588,27 @@ extern "C" __global__ void skip_rmsnorm_f32(
     const int has_bias,
     const float epsilon)
 {
-    skip_rmsnorm_f32_tpl<false>(input, skip, gamma, bias, y, sum_out, mean_out,
+    skip_rmsnorm_f32_tpl<false, false>(input, skip, gamma, bias, y, sum_out, mean_out,
+        invstd_out, metadata, rank, num_groups, norm_size, has_bias, epsilon);
+}
+
+extern "C" __global__ void skip_rmsnorm_f32_warp(
+    const float* input,
+    const float* skip,
+    const float* gamma,
+    const float* bias,
+    float* y,
+    float* sum_out,
+    float* mean_out,
+    float* invstd_out,
+    const unsigned long long* metadata,
+    const int rank,
+    const int num_groups,
+    const int norm_size,
+    const int has_bias,
+    const float epsilon)
+{
+    skip_rmsnorm_f32_tpl<false, true>(input, skip, gamma, bias, y, sum_out, mean_out,
         invstd_out, metadata, rank, num_groups, norm_size, has_bias, epsilon);
 }
 
@@ -549,7 +633,8 @@ __device__ __forceinline__ float load_skip_bf16_param(
         : ((const float*)values)[index];
 }
 
-extern "C" __global__ void skip_rmsnorm_bf16(
+template <bool WarpTail>
+__device__ __forceinline__ void skip_rmsnorm_bf16_tpl(
     const __nv_bfloat16* input,
     const __nv_bfloat16* skip,
     const void*          gamma,
@@ -604,11 +689,17 @@ extern "C" __global__ void skip_rmsnorm_bf16(
     }
     red[tid] = ss;
     __syncthreads();
-    for (int off = nt >> 1; off > 0; off >>= 1) {
-        if (tid < off) red[tid] += red[tid + off];
-        __syncthreads();
+    float reduced;
+    if (WarpTail) {
+        reduced = skip_rmsnorm_warp_tail(red, tid, nt);
+    } else {
+        for (int off = nt >> 1; off > 0; off >>= 1) {
+            if (tid < off) red[tid] += red[tid + off];
+            __syncthreads();
+        }
+        reduced = red[0];
     }
-    const float inv_std = 1.0f / sqrtf(red[0] / (float)norm_size + epsilon);
+    const float inv_std = 1.0f / sqrtf(reduced / (float)norm_size + epsilon);
     if (tid == 0) {
         if (mean_out) {
             if (stat_is_bf16) ((__nv_bfloat16*)mean_out)[g] = __float2bfloat16_rn(0.0f);
@@ -627,6 +718,56 @@ extern "C" __global__ void skip_rmsnorm_bf16(
             * load_skip_bf16_param(gamma, gamma_is_bf16, j);
         y[base + j] = __float2bfloat16_rn(o);
     }
+}
+
+extern "C" __global__ void skip_rmsnorm_bf16(
+    const __nv_bfloat16* input,
+    const __nv_bfloat16* skip,
+    const void*          gamma,
+    const void*          bias,       // null when absent
+    __nv_bfloat16*       y,
+    __nv_bfloat16*       sum_out,    // null when not requested
+    void*                mean_out,   // null when not requested (always zero)
+    void*                invstd_out, // null when not requested
+    const unsigned long long* metadata,
+    const int     rank,
+    const int     num_groups,
+    const int     norm_size,
+    const int     has_bias,
+    const int     dense_skip,
+    const int     gamma_is_bf16,
+    const int     bias_is_bf16,
+    const int     stat_is_bf16,
+    const float   epsilon)
+{
+    skip_rmsnorm_bf16_tpl<false>(input, skip, gamma, bias, y, sum_out, mean_out,
+        invstd_out, metadata, rank, num_groups, norm_size, has_bias, dense_skip,
+        gamma_is_bf16, bias_is_bf16, stat_is_bf16, epsilon);
+}
+
+extern "C" __global__ void skip_rmsnorm_bf16_warp(
+    const __nv_bfloat16* input,
+    const __nv_bfloat16* skip,
+    const void*          gamma,
+    const void*          bias,       // null when absent
+    __nv_bfloat16*       y,
+    __nv_bfloat16*       sum_out,    // null when not requested
+    void*                mean_out,   // null when not requested (always zero)
+    void*                invstd_out, // null when not requested
+    const unsigned long long* metadata,
+    const int     rank,
+    const int     num_groups,
+    const int     norm_size,
+    const int     has_bias,
+    const int     dense_skip,
+    const int     gamma_is_bf16,
+    const int     bias_is_bf16,
+    const int     stat_is_bf16,
+    const float   epsilon)
+{
+    skip_rmsnorm_bf16_tpl<true>(input, skip, gamma, bias, y, sum_out, mean_out,
+        invstd_out, metadata, rank, num_groups, norm_size, has_bias, dense_skip,
+        gamma_is_bf16, bias_is_bf16, stat_is_bf16, epsilon);
 }
 
 union SkipHalf4 {
@@ -765,7 +906,8 @@ extern "C" __global__ void skip_rmsnorm_f16_warp_half4(
 // `sum_out`) is written per-chunk by exactly one thread with the identical
 // __hadd2 rounding, so it is byte-identical to the warp path; only the fp32
 // sum-of-squares reduction order differs, perturbing the shared 1/rms by ULPs.
-extern "C" __global__ void skip_rmsnorm_f16_block_half4(
+template <bool WarpTail>
+__device__ __forceinline__ void skip_rmsnorm_f16_block_half4_tpl(
     const __half* input,
     const __half* skip,
     const void*   gamma,
@@ -823,11 +965,17 @@ extern "C" __global__ void skip_rmsnorm_f16_block_half4(
 
     red[tid] = ss;
     __syncthreads();
-    for (int offset = nt >> 1; offset > 0; offset >>= 1) {
-        if (tid < offset) red[tid] += red[tid + offset];
-        __syncthreads();
+    float reduced;
+    if (WarpTail) {
+        reduced = skip_rmsnorm_warp_tail(red, tid, nt);
+    } else {
+        for (int offset = nt >> 1; offset > 0; offset >>= 1) {
+            if (tid < offset) red[tid] += red[tid + offset];
+            __syncthreads();
+        }
+        reduced = red[0];
     }
-    const float inv_std = 1.0f / sqrtf(red[0] / (float)norm_size + epsilon);
+    const float inv_std = 1.0f / sqrtf(reduced / (float)norm_size + epsilon);
     if (tid == 0) {
         if (mean_out) {
             if (stat_is_half) ((__half*)mean_out)[g] = __float2half_rn(0.0f);
@@ -871,6 +1019,56 @@ extern "C" __global__ void skip_rmsnorm_f16_block_half4(
             value1.y * inv_std * scale1y);
         y4[chunk] = output.raw;
     }
+}
+
+extern "C" __global__ void skip_rmsnorm_f16_block_half4(
+    const __half* input,
+    const __half* skip,
+    const void*   gamma,
+    const void*   bias,
+    __half*       y,
+    __half*       sum_out,
+    void*         mean_out,
+    void*         invstd_out,
+    const unsigned long long* metadata,
+    const int     rank,
+    const int     num_groups,
+    const int     norm_size,
+    const int     has_bias,
+    const int     dense_skip,
+    const int     gamma_is_half,
+    const int     bias_is_half,
+    const int     stat_is_half,
+    const float   epsilon)
+{
+    skip_rmsnorm_f16_block_half4_tpl<false>(input, skip, gamma, bias, y, sum_out,
+        mean_out, invstd_out, metadata, rank, num_groups, norm_size, has_bias,
+        dense_skip, gamma_is_half, bias_is_half, stat_is_half, epsilon);
+}
+
+extern "C" __global__ void skip_rmsnorm_f16_block_half4_warp(
+    const __half* input,
+    const __half* skip,
+    const void*   gamma,
+    const void*   bias,
+    __half*       y,
+    __half*       sum_out,
+    void*         mean_out,
+    void*         invstd_out,
+    const unsigned long long* metadata,
+    const int     rank,
+    const int     num_groups,
+    const int     norm_size,
+    const int     has_bias,
+    const int     dense_skip,
+    const int     gamma_is_half,
+    const int     bias_is_half,
+    const int     stat_is_half,
+    const float   epsilon)
+{
+    skip_rmsnorm_f16_block_half4_tpl<true>(input, skip, gamma, bias, y, sum_out,
+        mean_out, invstd_out, metadata, rank, num_groups, norm_size, has_bias,
+        dense_skip, gamma_is_half, bias_is_half, stat_is_half, epsilon);
 }
 
 extern "C" __global__ void skip_rmsnorm_f16(
@@ -1110,6 +1308,23 @@ const SKIP_RMSNORM_BLOCK_DISABLE_ENV: &str = "ONNX_GENAI_CUDA_DISABLE_SKIP_RMSNO
 
 fn skip_rmsnorm_block_disabled() -> bool {
     std::env::var_os(SKIP_RMSNORM_BLOCK_DISABLE_ENV)
+        .is_some_and(|value| value != "0" && !value.is_empty())
+}
+
+/// Opt-in switch for the warp-shuffle tail of the skip-RMSNorm block-tree
+/// reduction. When set (any value other than unset/empty/`0`), the fused
+/// Add→RMSNorm block kernels finish the intra-warp offsets (<= 16) of the
+/// sum-of-squares reduction with `__shfl_down_sync` in registers instead of the
+/// shared-memory tree — dropping 5 `__syncthreads` + 5 shared read/write rounds
+/// per row. The pairing/order (and `__fadd_rn` rounding) is BIT-IDENTICAL to the
+/// full shared tree (proven by the `warp_reduce` byte-for-byte unit tests), so
+/// this is a pure launch-latency optimization with no numeric change. Default
+/// OFF (base kernels untouched) because decode throughput is knife-edge and the
+/// win must be measured per host before it becomes the default.
+const SKIP_RMSNORM_WARP_REDUCE_ENV: &str = "ONNX_GENAI_RMSNORM_WARP_REDUCE";
+
+fn skip_rmsnorm_warp_reduce_enabled() -> bool {
+    std::env::var_os(SKIP_RMSNORM_WARP_REDUCE_ENV)
         .is_some_and(|value| value != "0" && !value.is_empty())
 }
 const SKIP_LAYERNORM_MODULE: &str = "skip_layernorm_f32";
@@ -2167,16 +2382,19 @@ impl SkipSimplifiedLayerNormKernel {
         let has_bias = 0i32;
         let gamma_is_bf16 = i32::from(gamma.dtype == DataType::BFloat16);
         let bias_is_bf16 = 0i32;
+        let bf16_entry = if skip_rmsnorm_warp_reduce_enabled() {
+            "skip_rmsnorm_bf16_warp"
+        } else {
+            "skip_rmsnorm_bf16"
+        };
         onnx_runtime_ep_api::record_kernel_variant!(
             "skip_rmsnorm_bf16",
             "SkipSimplifiedLayerNormalization hidden={norm_size}: native byte-exact bf16 \
              (bf16-rounded residual sum, rmsnorm_bf16 block-tree reduction)"
         );
-        let func = self.runtime.nvrtc_function(
-            SKIP_RMSNORM_MODULE,
-            SKIP_RMSNORM_SRC,
-            "skip_rmsnorm_bf16",
-        )?;
+        let func =
+            self.runtime
+                .nvrtc_function(SKIP_RMSNORM_MODULE, SKIP_RMSNORM_SRC, bf16_entry)?;
         let stream = self.runtime.stream();
         let mut builder = stream.launch_builder(&func);
         let groups_i = groups_u_i32(groups_u);
@@ -2394,8 +2612,24 @@ impl SkipSimplifiedLayerNormKernel {
         let use_skip_block = matches!(selection.variant, SkipRmsnormVariant::F16WarpHalf4)
             && groups_u <= SKIP_RMSNORM_BLOCK_MAX_GROUPS
             && !skip_rmsnorm_block_disabled();
+        // Opt-in warp-shuffle reduction tail (bit-identical, see
+        // `skip_rmsnorm_warp_reduce_enabled`). Only the block-tree kernels have a
+        // shared-memory tail to hoist into registers; the one-warp `warp_half4`
+        // and generic `skip_rmsnorm_f16` paths already reduce via `__shfl` and are
+        // left untouched.
+        let warp_reduce = skip_rmsnorm_warp_reduce_enabled();
         let entry = if use_skip_block {
-            "skip_rmsnorm_f16_block_half4"
+            if warp_reduce {
+                "skip_rmsnorm_f16_block_half4_warp"
+            } else {
+                "skip_rmsnorm_f16_block_half4"
+            }
+        } else if warp_reduce {
+            match selection.variant {
+                SkipRmsnormVariant::F32Dense => "skip_rmsnorm_f32_dense_warp",
+                SkipRmsnormVariant::F32 => "skip_rmsnorm_f32_warp",
+                _ => selection.entry,
+            }
         } else {
             selection.entry
         };
@@ -2901,6 +3135,11 @@ mod tests {
         assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_f16"));
         assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_f16_warp_half4"));
         assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_f16_block_half4"));
+        assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_f16_block_half4_warp"));
+        assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_f32_warp"));
+        assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_f32_dense_warp"));
+        assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_bf16_warp"));
+        assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_warp_tail"));
     }
 
     #[test]
@@ -4065,7 +4304,7 @@ mod tests {
             .find("extern \"C\" __global__ void skip_rmsnorm_f16_warp_half4")
             .unwrap();
         let block_start = SKIP_RMSNORM_SRC
-            .find("extern \"C\" __global__ void skip_rmsnorm_f16_block_half4")
+            .find("__device__ __forceinline__ void skip_rmsnorm_f16_block_half4_tpl")
             .unwrap();
         assert!(block_start > warp_start);
         let warp_body = &SKIP_RMSNORM_SRC[warp_start..block_start];
@@ -4293,5 +4532,143 @@ mod tests {
             tree_err <= serial_err * 1.000_001 + 1e-9,
             "tree mean-square error {tree_err:e} exceeds serial error {serial_err:e}"
         );
+    }
+
+    /// Run the fused skip-RMSNorm block kernel for `dtype`/`hidden` (dense skip,
+    /// no bias, num_groups == 1 — the decode shape) and return the raw `y` bytes.
+    /// The current process env decides whether the warp-shuffle reduction tail is
+    /// used, so a caller can compare flag-off vs flag-on byte-for-byte.
+    fn run_skip_rmsnorm_y_bits(
+        ep: &CudaExecutionProvider,
+        dtype: DataType,
+        hidden: usize,
+    ) -> Vec<u8> {
+        let shape = [1usize, hidden];
+        let strides = compute_contiguous_strides(&shape);
+        let gamma_shape = [hidden];
+        let gamma_strides = compute_contiguous_strides(&gamma_shape);
+        let elem = if dtype == DataType::Float32 { 4 } else { 2 };
+        let encode = |values: &[f32]| -> Vec<u8> {
+            match dtype {
+                DataType::Float32 => values.iter().flat_map(|v| v.to_ne_bytes()).collect(),
+                DataType::Float16 => values
+                    .iter()
+                    .flat_map(|v| f16::from_f32(*v).to_bits().to_ne_bytes())
+                    .collect(),
+                DataType::BFloat16 => values
+                    .iter()
+                    .flat_map(|v| bf16::from_f32(*v).to_bits().to_ne_bytes())
+                    .collect(),
+                _ => unreachable!(),
+            }
+        };
+        let input: Vec<f32> = (0..hidden)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 31.0)
+            .collect();
+        let skip: Vec<f32> = (0..hidden)
+            .map(|i| ((i * 17 % 67) as f32 - 33.0) / 47.0)
+            .collect();
+        let gamma: Vec<f32> = (0..hidden)
+            .map(|i| 0.75 + (i * 13 % 41) as f32 / 64.0)
+            .collect();
+        let input_bytes = encode(&input);
+        let skip_bytes = encode(&skip);
+        let gamma_bytes = encode(&gamma);
+        let bytes = hidden * elem;
+        let runtime = ep.runtime();
+        let input_buffer = ep.allocate(bytes, 256).unwrap();
+        let skip_buffer = ep.allocate(bytes, 256).unwrap();
+        let gamma_buffer = ep.allocate(bytes, 256).unwrap();
+        let mut y_buffer = ep.allocate(bytes, 256).unwrap();
+        unsafe {
+            runtime
+                .htod(&input_bytes, cuptr(input_buffer.as_ptr()))
+                .unwrap();
+            runtime
+                .htod(&skip_bytes, cuptr(skip_buffer.as_ptr()))
+                .unwrap();
+            runtime
+                .htod(&gamma_bytes, cuptr(gamma_buffer.as_ptr()))
+                .unwrap();
+        }
+        {
+            let inputs = [
+                TensorView::new(
+                    DevicePtr(input_buffer.as_ptr()),
+                    dtype,
+                    &shape,
+                    &strides,
+                    ep.device_id(),
+                ),
+                TensorView::new(
+                    DevicePtr(skip_buffer.as_ptr()),
+                    dtype,
+                    &shape,
+                    &strides,
+                    ep.device_id(),
+                ),
+                TensorView::new(
+                    DevicePtr(gamma_buffer.as_ptr()),
+                    dtype,
+                    &gamma_shape,
+                    &gamma_strides,
+                    ep.device_id(),
+                ),
+            ];
+            let output = TensorMut::new(
+                DevicePtrMut(y_buffer.as_mut_ptr()),
+                dtype,
+                &shape,
+                &strides,
+                ep.device_id(),
+            );
+            let kernel = SkipSimplifiedLayerNormKernel {
+                epsilon: 1e-5,
+                runtime: runtime.clone(),
+                metadata: Mutex::new(SkipBroadcastMetadataCache::new(runtime.clone())),
+                bf16_scratch: Mutex::new(NormBf16Scratch::new(runtime.clone())),
+                last_call_capture_safe: AtomicBool::new(false),
+            };
+            kernel.run(&inputs, &mut [output]).unwrap();
+        }
+        runtime.synchronize().unwrap();
+        let mut out = vec![0u8; bytes];
+        unsafe {
+            runtime.dtoh(&mut out, cuptr(y_buffer.as_ptr())).unwrap();
+        }
+        ep.deallocate(input_buffer).unwrap();
+        ep.deallocate(skip_buffer).unwrap();
+        ep.deallocate(gamma_buffer).unwrap();
+        ep.deallocate(y_buffer).unwrap();
+        out
+    }
+
+    /// Parity gate for the opt-in warp-shuffle reduction tail
+    /// (`ONNX_GENAI_RMSNORM_WARP_REDUCE`). The intra-warp offsets finished by
+    /// `__shfl_down_sync` pair lanes in the SAME power-of-two order as the shared
+    /// tree, so the fp32 sum-of-squares — and therefore the entire `y` output —
+    /// must be BYTE-IDENTICAL flag-off vs flag-on across dtypes and block sizes.
+    #[test]
+    fn warp_reduce_tail_is_byte_identical_to_shared_tree() {
+        let Ok(ep) = CudaExecutionProvider::new(0) else {
+            eprintln!("skipping skip-RMSNorm warp-reduce parity test: CUDA unavailable");
+            return;
+        };
+        for dtype in [DataType::Float16, DataType::BFloat16, DataType::Float32] {
+            for hidden in [128usize, 256, 512, 2048, 4096] {
+                // SAFETY: single-threaded test; the kernel reads the flag at
+                // launch time, so toggling it between the two runs is sufficient.
+                unsafe { std::env::remove_var(SKIP_RMSNORM_WARP_REDUCE_ENV) };
+                let base = run_skip_rmsnorm_y_bits(&ep, dtype, hidden);
+                unsafe { std::env::set_var(SKIP_RMSNORM_WARP_REDUCE_ENV, "1") };
+                let warp = run_skip_rmsnorm_y_bits(&ep, dtype, hidden);
+                unsafe { std::env::remove_var(SKIP_RMSNORM_WARP_REDUCE_ENV) };
+                assert_eq!(
+                    base, warp,
+                    "dtype={dtype:?} hidden={hidden}: warp-reduce `y` must be \
+                     byte-identical to the shared-memory tree"
+                );
+            }
+        }
     }
 }

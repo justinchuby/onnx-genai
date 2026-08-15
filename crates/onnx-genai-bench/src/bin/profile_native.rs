@@ -579,6 +579,12 @@ fn print_cuda_observability(
         if let Some(report) = &stats.graph.fallback_report {
             println!("cuda_graph_fallback_report: {report}");
         }
+        if stats.graph.device_token_loop_k > 0 || stats.graph.device_token_loop_steps > 0 {
+            println!(
+                "device_token_loop: k={} chained_steps={}",
+                stats.graph.device_token_loop_k, stats.graph.device_token_loop_steps
+            );
+        }
     }
 }
 

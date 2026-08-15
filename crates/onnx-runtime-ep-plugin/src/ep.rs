@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use onnx_genai_ort_sys as ort;
 use onnx_runtime_ep_api::provider::ExecutionProvider;
-use onnx_runtime_ir::{DataType, NodeIndex, ValueId};
+use onnx_runtime_ir::{DataType, DeviceType, NodeIndex, ValueId};
 
 /// How an [`ExportedEp`] holds its backing Rust [`ExecutionProvider`].
 ///
@@ -586,6 +586,31 @@ fn ep_compile_inner(
 
     let exported = unsafe { &*(ep.cast::<ExportedEp>()) };
 
+    // Capture the device staging context once (#982). `Some` only for a device
+    // EP: it lets each subgraph's `Compute` upload host-resident boundary inputs
+    // into device scratch on an interspersed CPU→device partition. A CPU EP
+    // returns `None` and its subgraphs run with inputs verbatim, unchanged.
+    let device_staging: Option<(
+        Arc<dyn onnx_runtime_ep_api::HostToDeviceCopier>,
+        String,
+        ort::OrtMemoryInfoDeviceType,
+        u32,
+    )> = exported.ep.with(|ep| {
+        ep.host_to_device_copier().map(|copier| {
+            let mem_dev_type = match ep.device_type() {
+                DeviceType::Cpu => ort::OrtMemoryInfoDeviceType_CPU,
+                DeviceType::Qnn => ort::OrtMemoryInfoDeviceType_NPU,
+                _ => ort::OrtMemoryInfoDeviceType_GPU,
+            };
+            (
+                copier,
+                ep.name().to_string(),
+                mem_dev_type,
+                ep.memory_vendor_id(),
+            )
+        })
+    });
+
     for i in 0..count {
         let graph_ptr = unsafe { *graphs.add(i) };
         if graph_ptr.is_null() {
@@ -760,6 +785,12 @@ fn ep_compile_inner(
 
         // Wrap kernels in OrtNodeComputeInfo.
         let mut info = ExportedComputeInfo::new(entries);
+
+        // Attach device staging so an interspersed CPU→device partition can
+        // upload host-resident boundary inputs before launching (#982).
+        if let Some((ref copier, ref alloc_name, mem_dev_type, vendor_id)) = device_staging {
+            info.set_device_staging(Arc::clone(copier), alloc_name, mem_dev_type, vendor_id);
+        }
 
         // For multi-node fused subgraphs, construct the SubgraphRouting so
         // intermediates are threaded correctly in topological order.

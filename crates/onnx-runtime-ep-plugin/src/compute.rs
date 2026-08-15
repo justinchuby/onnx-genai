@@ -16,9 +16,10 @@
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use onnx_genai_ort_sys as ort;
+use onnx_runtime_ep_api::HostToDeviceCopier;
 use onnx_runtime_ep_api::kernel::{
     Kernel, TensorMetadata, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
@@ -930,6 +931,49 @@ pub struct ExportedComputeInfo {
     /// [`ExportedComputeInfo::new`] so it is always exactly as long as
     /// `entries`.
     workspace_plans: Vec<WorkspacePlanCache>,
+    /// Device staging context (#982). `Some` only for a device EP: it lets
+    /// `Compute` upload a host-resident boundary input into device scratch
+    /// before launching a device kernel, on an interspersed CPU→device
+    /// partition where ORT never inserts the host→device copy. `None` for the
+    /// CPU EP (and any host EP), which uses its inputs verbatim exactly as
+    /// before.
+    device_staging: Option<DeviceStaging>,
+}
+
+/// Everything `Compute` needs to stage host-resident boundary inputs onto the
+/// EP's device (#982): a synchronous uploader and a reconstructed device
+/// `OrtMemoryInfo` used as a fallback allocation target when no device-resident
+/// `OrtValue` is otherwise visible in the call.
+struct DeviceStaging {
+    copier: Arc<dyn HostToDeviceCopier>,
+    /// Reconstructed device memory info, matching the one the plugin factory
+    /// registered the device allocator against. Used only when neither an
+    /// input nor an output of the node yields a device `OrtMemoryInfo`.
+    recon_mem_info: Option<ReconstructedMemInfo>,
+}
+
+/// Owns an `OrtMemoryInfo` rebuilt via `CreateMemoryInfo_V2`, released on drop.
+struct ReconstructedMemInfo {
+    ptr: *const ort::OrtMemoryInfo,
+}
+
+// SAFETY: the pointer is read-only after construction and released only on drop.
+unsafe impl Send for ReconstructedMemInfo {}
+unsafe impl Sync for ReconstructedMemInfo {}
+
+impl Drop for ReconstructedMemInfo {
+    fn drop(&mut self) {
+        if self.ptr.is_null() {
+            return;
+        }
+        let api = crate::status::host_api();
+        if api.is_null() {
+            return;
+        }
+        if let Some(release) = unsafe { (*api).ReleaseMemoryInfo } {
+            unsafe { release(self.ptr.cast_mut()) };
+        }
+    }
 }
 
 /// Per-session state created by `CreateState`.
@@ -950,7 +994,27 @@ impl ExportedComputeInfo {
             entries,
             routing: None,
             workspace_plans,
+            device_staging: None,
         }
+    }
+
+    /// Attach the device staging context (#982) captured at compile time from a
+    /// device EP. Given a `copier`, this also reconstructs the device
+    /// `OrtMemoryInfo` (from `allocator_name`, `device_type`, `vendor_id`) that
+    /// serves as the fallback scratch target for all-host-input nodes. A CPU EP
+    /// never calls this, so its `device_staging` stays `None`.
+    pub fn set_device_staging(
+        &mut self,
+        copier: Arc<dyn HostToDeviceCopier>,
+        allocator_name: &str,
+        device_type: ort::OrtMemoryInfoDeviceType,
+        vendor_id: u32,
+    ) {
+        let recon_mem_info = reconstruct_device_mem_info(allocator_name, device_type, vendor_id);
+        self.device_staging = Some(DeviceStaging {
+            copier,
+            recon_mem_info,
+        });
     }
 
     /// Attach a subgraph routing table (for multi-node fused subgraphs).
@@ -1003,7 +1067,40 @@ unsafe extern "C" fn compute_create_state(
 unsafe fn device_mem_info(
     api: &ort::OrtApi,
     ctx: *mut ort::OrtKernelContext,
+    staging: Option<&DeviceStaging>,
 ) -> Option<*const ort::OrtMemoryInfo> {
+    // A routed subgraph's intermediates must be allocated in *device* memory so
+    // the device kernels that produce and consume them dereference valid device
+    // pointers. On an interspersed CPU→device partition, kernel-context input 0
+    // may be a *host* boundary input (#982), so we must not assume input 0 lives
+    // on the device — scan every input for a genuinely device-resident one.
+    if let Some(get_count) = api.KernelContext_GetInputCount {
+        let mut count: usize = 0;
+        let status = unsafe { get_count(ctx, &mut count) };
+        if status.is_null() {
+            for i in 0..count {
+                if let Some(mi) = unsafe { ort_input_mem_info(api, ctx, i) }
+                    && unsafe { mem_info_is_device(api, mi) }
+                {
+                    return Some(mi);
+                }
+            }
+        }
+    }
+    // No device-resident input (e.g. every boundary input is host): if this is a
+    // device EP, fall back to the reconstructed EP device memory info — the same
+    // recipe the plugin factory registered its device allocator against — so
+    // intermediates still land on the device instead of silently on the host.
+    if let Some(staging) = staging
+        && let Some(recon) = staging.recon_mem_info.as_ref()
+        && !recon.ptr.is_null()
+    {
+        return Some(recon.ptr);
+    }
+    // Host EP (no device staging context): preserve the historical behavior of
+    // using input 0's memory info. For a host EP this is host memory, which is
+    // exactly where its intermediates belong, so host-only partitions are
+    // unchanged by the #982 device-staging work.
     unsafe { ort_input_mem_info(api, ctx, 0) }
 }
 
@@ -1217,6 +1314,285 @@ unsafe fn alloc_scratch(
         return Err("KernelContext_GetScratchBuffer returned null".into());
     }
     Ok(out)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Host→device boundary-input staging (#982)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// `true` when `ONNX_GENAI_PLUGIN_TRANSFER_TRACE=1` asks the input-staging path
+/// to print, *before* each synchronous host→device upload, which operand it is
+/// staging, the memory-info source it resolved, and the destination pointer —
+/// so a hang inside the driver memcpy can be named to the exact call (#982).
+fn staging_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ONNX_GENAI_PLUGIN_TRANSFER_TRACE").as_deref() == Ok("1"))
+}
+
+/// Emit one staging-trace line. Goes to stderr (buffered by pipes, so it can be
+/// lost when the process hangs) *and*, when `ONNX_GENAI_PLUGIN_TRANSFER_TRACE_FILE`
+/// is set, is appended to that file with an immediate flush — the file path is
+/// the only trace that survives a boundary hang. No-op unless the trace is on.
+fn staging_log(msg: &str) {
+    if !staging_trace_enabled() {
+        return;
+    }
+    eprintln!("{msg}");
+    use std::io::Write as _;
+    let _ = std::io::stderr().flush();
+    if let Ok(path) = std::env::var("ONNX_GENAI_PLUGIN_TRANSFER_TRACE_FILE")
+        && let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+    {
+        let _ = writeln!(f, "{msg}");
+        let _ = f.flush();
+    }
+}
+
+/// Reconstruct the device `OrtMemoryInfo` the plugin factory registered the
+/// device allocator against (`GetSupportedDevices` uses the same
+/// `CreateMemoryInfo_V2` recipe). ORT keys its allocator lookup by the
+/// `OrtDevice` fields — device type, vendor id, device id, memory type — so a
+/// memory info rebuilt with matching fields resolves to the same allocator in
+/// `KernelContext_GetScratchBuffer`. `device_id` is 0 to match the factory.
+///
+/// Returns `None` if the API is unavailable; the caller then falls back to a
+/// device memory info sourced from a live `OrtValue`.
+fn reconstruct_device_mem_info(
+    allocator_name: &str,
+    device_type: ort::OrtMemoryInfoDeviceType,
+    vendor_id: u32,
+) -> Option<ReconstructedMemInfo> {
+    let api = crate::status::host_api();
+    if api.is_null() {
+        return None;
+    }
+    let create = unsafe { (*api).CreateMemoryInfo_V2 }?;
+    let name = std::ffi::CString::new(allocator_name).ok()?;
+    let mut ptr: *mut ort::OrtMemoryInfo = std::ptr::null_mut();
+    let status = unsafe {
+        create(
+            name.as_ptr(),
+            device_type,
+            vendor_id,
+            0,
+            ort::OrtDeviceMemoryType_DEFAULT,
+            0,
+            ort::OrtDeviceAllocator,
+            &mut ptr,
+        )
+    };
+    if !status.is_null() {
+        if let Some(release) = unsafe { (*api).ReleaseStatus } {
+            unsafe { release(status) };
+        }
+        return None;
+    }
+    if ptr.is_null() {
+        return None;
+    }
+    Some(ReconstructedMemInfo { ptr })
+}
+
+/// Device type ORT placed a memory info on, or `None` if unreadable.
+///
+/// # Safety
+///
+/// `api` and `mem_info` must be valid.
+unsafe fn mem_info_device_type(
+    api: &ort::OrtApi,
+    mem_info: *const ort::OrtMemoryInfo,
+) -> Option<ort::OrtMemoryInfoDeviceType> {
+    let f = api.MemoryInfoGetDeviceType?;
+    let mut out: ort::OrtMemoryInfoDeviceType = ort::OrtMemoryInfoDeviceType_CPU;
+    unsafe { f(mem_info, &mut out) };
+    Some(out)
+}
+
+/// Whether a memory info denotes non-host (device) memory.
+///
+/// # Safety
+///
+/// `api` and `mem_info` must be valid.
+unsafe fn mem_info_is_device(api: &ort::OrtApi, mem_info: *const ort::OrtMemoryInfo) -> bool {
+    matches!(
+        unsafe { mem_info_device_type(api, mem_info) },
+        Some(t) if t != ort::OrtMemoryInfoDeviceType_CPU
+    )
+}
+
+/// Node-operand positions that a kernel legitimately reads on **host** — the
+/// shape/index/axes control operands `infer_shapes` dereferences via
+/// `read_i64_tensor`. These are the `OrtMemTypeCPUInput`-style operands that
+/// must **never** be uploaded to the device: they are supposed to stay on host,
+/// and staging them would both waste a copy and hand the host-reading path a
+/// device pointer. Every other host-resident input of a device kernel is a data
+/// operand that crossed a CPU→device boundary and must be staged (#982).
+fn host_operand_indices(strategy: &ShapeInference) -> &'static [usize] {
+    match strategy {
+        ShapeInference::ReshapeData { .. } => &[1],
+        ShapeInference::SliceData => &[1, 2, 3, 4],
+        ShapeInference::ReductionFromInput { .. } => &[1],
+        _ => &[],
+    }
+}
+
+/// Stage every host-resident **data** operand of one node into device scratch,
+/// substituting the device pointer into `kernel_inputs` in place (#982).
+///
+/// For each operand position `p`:
+///  - skipped if it is not ORT-bound (`ort_indices[p]` is `None`) — intermediate
+///    buffers already live on the device;
+///  - skipped if it is a host-required control operand (`host_operands`);
+///  - skipped if absent or zero-length;
+///  - skipped if ORT already placed it on the device.
+///
+/// A host-resident data operand is uploaded into ORT device scratch (freed by
+/// ORT after `Compute`, past the stream sync, so the async kernel that reads it
+/// cannot outlive the buffer) and `kernel_inputs[p].data` is repointed at it.
+///
+/// The scratch is allocated against a device `OrtMemoryInfo` resolved, in order,
+/// from: a device-resident ORT input, a device-resident node output, then the
+/// reconstructed EP device memory info. If a data operand needs staging but no
+/// device memory info can be found, this fails closed rather than launching a
+/// device kernel on a host pointer.
+///
+/// # Safety
+///
+/// `api` and `ctx` must be valid; `ort_indices[p]`, when `Some`, must be a valid
+/// kernel-context input index for `ctx`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn stage_host_boundary_inputs(
+    api: &ort::OrtApi,
+    ctx: *mut ort::OrtKernelContext,
+    staging: &DeviceStaging,
+    kernel_inputs: &mut [TensorView<'_>],
+    ort_indices: &[Option<usize>],
+    host_operands: &[usize],
+    output_mem_infos: &[*const ort::OrtMemoryInfo],
+    label: &str,
+) -> Result<(), String> {
+    // First pass: which operands are host-resident data operands needing upload?
+    let mut to_stage: Vec<usize> = Vec::new();
+    staging_log(&format!(
+        "[plugin/staging #982] {label}: enter operands={} host_operands={:?}",
+        ort_indices.len(),
+        host_operands
+    ));
+    for (p, slot) in ort_indices.iter().enumerate() {
+        let Some(ort_idx) = *slot else {
+            staging_log(&format!(
+                "[plugin/staging #982] {label}: op[{p}] skip (not ORT-bound)"
+            ));
+            continue;
+        };
+        if host_operands.contains(&p) {
+            staging_log(&format!(
+                "[plugin/staging #982] {label}: op[{p}] ort_idx={ort_idx} skip (host control operand)"
+            ));
+            continue;
+        }
+        let view = &kernel_inputs[p];
+        if view.is_absent() || view.data.0.is_null() {
+            staging_log(&format!(
+                "[plugin/staging #982] {label}: op[{p}] ort_idx={ort_idx} skip (absent/null)"
+            ));
+            continue;
+        }
+        let numel: usize = view.shape.iter().product();
+        if numel == 0 || view.dtype.byte_size() == 0 {
+            staging_log(&format!(
+                "[plugin/staging #982] {label}: op[{p}] ort_idx={ort_idx} skip (empty)"
+            ));
+            continue;
+        }
+        let Some(mem_info) = (unsafe { ort_input_mem_info(api, ctx, ort_idx) }) else {
+            staging_log(&format!(
+                "[plugin/staging #982] {label}: op[{p}] ort_idx={ort_idx} skip (no mem info)"
+            ));
+            continue;
+        };
+        let dev_type = unsafe { mem_info_device_type(api, mem_info) };
+        if unsafe { mem_info_is_device(api, mem_info) } {
+            staging_log(&format!(
+                "[plugin/staging #982] {label}: op[{p}] ort_idx={ort_idx} skip (already device, dev_type={dev_type:?})"
+            ));
+            continue; // already on device — nothing to do
+        }
+        staging_log(&format!(
+            "[plugin/staging #982] {label}: op[{p}] ort_idx={ort_idx} HOST (dev_type={dev_type:?}) → will stage"
+        ));
+        to_stage.push(p);
+    }
+
+    if to_stage.is_empty() {
+        return Ok(());
+    }
+
+    // Resolve a device memory info to allocate scratch against.
+    let mut device_mi: *const ort::OrtMemoryInfo = std::ptr::null();
+    for slot in ort_indices.iter() {
+        if let Some(ort_idx) = *slot
+            && let Some(mi) = unsafe { ort_input_mem_info(api, ctx, ort_idx) }
+            && unsafe { mem_info_is_device(api, mi) }
+        {
+            device_mi = mi;
+            break;
+        }
+    }
+    if device_mi.is_null() {
+        for &mi in output_mem_infos {
+            if !mi.is_null() && unsafe { mem_info_is_device(api, mi) } {
+                device_mi = mi;
+                break;
+            }
+        }
+    }
+    if device_mi.is_null()
+        && let Some(recon) = staging.recon_mem_info.as_ref()
+    {
+        device_mi = recon.ptr;
+        staging_log(&format!(
+            "[plugin/staging #982] {label}: no device OrtValue found; \
+             falling back to reconstructed EP memory info recon={device_mi:?}"
+        ));
+    }
+    if device_mi.is_null() {
+        return Err(format!(
+            "{label}: a host-resident boundary input must be uploaded to the \
+             device, but no device memory info is available (no device-resident \
+             operand and no reconstructed EP memory info). Refusing to launch a \
+             device kernel on a host pointer."
+        ));
+    }
+
+    // Second pass: upload and repoint.
+    let mem_dev = unsafe { mem_info_device_type(api, device_mi) };
+    for p in to_stage {
+        let view = &kernel_inputs[p];
+        let numel: usize = view.shape.iter().product();
+        let byte_len = numel * view.dtype.byte_size();
+        let dst = unsafe { alloc_scratch(api, ctx, device_mi, byte_len) }
+            .map_err(|e| format!("{label}: staging scratch alloc failed: {e}"))?;
+        staging_log(&format!(
+            "[plugin/staging #982] {label}: staging op[{p}] byte_len={byte_len} \
+             mem_dev={mem_dev:?} dst={dst:?} — issuing host→device upload"
+        ));
+        // SAFETY: the source is a host tensor of `byte_len` contiguous bytes
+        // (ORT-provided, contiguous strides); `dst` is device scratch of the
+        // same size.
+        let src = unsafe { std::slice::from_raw_parts(view.data.0.cast::<u8>(), byte_len) };
+        unsafe { staging.copier.copy_host_to_device(src, dst) }
+            .map_err(|e| format!("{label}: host→device upload failed: {e}"))?;
+        staging_log(&format!(
+            "[plugin/staging #982] {label}: op[{p}] host→device upload complete"
+        ));
+        kernel_inputs[p].data = DevicePtr(dst.cast_const());
+    }
+
+    Ok(())
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1588,6 +1964,13 @@ unsafe extern "C" fn compute_execute(
             return fail_status("Compute: no kernels compiled for this subgraph");
         }
 
+        staging_log(&format!(
+            "[plugin/staging #982] compute_execute enter: entries={} routing={} device_staging={}",
+            exported.entries.len(),
+            exported.routing.is_some(),
+            exported.device_staging.is_some()
+        ));
+
         let api = crate::status::host_api();
         if api.is_null() {
             return fail_status("Compute: host ORT API not available");
@@ -1598,7 +1981,8 @@ unsafe extern "C" fn compute_execute(
         // memory, so multi-node intermediates stay on the GPU (a host buffer
         // would make the next kernel dereference a host pointer as device →
         // CUDA_ERROR_ILLEGAL_ADDRESS). `None` falls back to host buffers.
-        let scratch_mem_info = unsafe { device_mem_info(api_ref, kernel_context) };
+        let scratch_mem_info =
+            unsafe { device_mem_info(api_ref, kernel_context, exported.device_staging.as_ref()) };
 
         let inputs = match unsafe { read_inputs(api_ref, kernel_context) } {
             Ok(v) => v,
@@ -1753,6 +2137,36 @@ unsafe extern "C" fn compute_execute(
                     }
                 }
 
+                // Stage host-resident boundary inputs onto the device before
+                // this node launches (#982). Buffer/absent operands are skipped
+                // inside the helper (only ORT-bound inputs can be host
+                // boundaries); host-required control operands are excluded.
+                if let Some(staging) = exported.device_staging.as_ref() {
+                    let ort_indices: Vec<Option<usize>> = sources
+                        .iter()
+                        .map(|src| match src {
+                            NodeInputSource::Ort(i) => Some(*i),
+                            NodeInputSource::Buffer(_) | NodeInputSource::Absent => None,
+                        })
+                        .collect();
+                    let output_mem_infos: Vec<*const ort::OrtMemoryInfo> =
+                        ort_outputs.iter().map(|o| o.mem_info).collect();
+                    if let Err(e) = unsafe {
+                        stage_host_boundary_inputs(
+                            api_ref,
+                            kernel_context,
+                            staging,
+                            &mut kernel_inputs,
+                            &ort_indices,
+                            host_operand_indices(&entry.shape_inference),
+                            &output_mem_infos,
+                            &format!("Compute: node {node_idx}"),
+                        )
+                    } {
+                        return fail_status(&e);
+                    }
+                }
+
                 // Build mutable output views: ORT outputs first, then buffer outputs.
                 let mut ort_out_views: Vec<_> =
                     ort_outputs.iter_mut().map(|o| o.view_mut()).collect();
@@ -1891,7 +2305,7 @@ unsafe extern "C" fn compute_execute(
             let entry = &exported.entries[0];
             // Reconstruct positional inputs with absent sentinels so the
             // kernel sees the correct arity and position.
-            let kernel_inputs: Vec<_> = entry
+            let mut kernel_inputs: Vec<_> = entry
                 .input_slots
                 .iter()
                 .map(|slot| match slot {
@@ -1962,6 +2376,27 @@ unsafe extern "C" fn compute_execute(
                     Err(e) => return fail_status(&format!("Compute: {e}")),
                 }
                 ort_out_idx += 1;
+            }
+            // Stage host-resident boundary inputs onto the device before the
+            // kernel launches (#982). No-op for a host EP (device_staging is
+            // None) or when every operand already lives where it should.
+            if let Some(staging) = exported.device_staging.as_ref() {
+                let output_mem_infos: Vec<*const ort::OrtMemoryInfo> =
+                    owned_outputs.iter().map(|o| o.mem_info).collect();
+                if let Err(e) = unsafe {
+                    stage_host_boundary_inputs(
+                        api_ref,
+                        kernel_context,
+                        staging,
+                        &mut kernel_inputs,
+                        &entry.input_slots,
+                        host_operand_indices(&entry.shape_inference),
+                        &output_mem_infos,
+                        "Compute: node 0",
+                    )
+                } {
+                    return fail_status(&e);
+                }
             }
             // Build output views in node-output order so the kernel sees the
             // full arity including absent scratch slots.

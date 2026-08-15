@@ -758,6 +758,60 @@ impl DeviceIoBinding {
         )?)
     }
 
+    /// Fold the just-selected greedy token into the persistent decode bindings
+    /// device-to-device for the native CUDA device-token-loop. `self` is the
+    /// device-argmax result binding (`result[0]` = token id, `result[1]` =
+    /// capture-error word). The token is written as an `i64` into `input_ids`,
+    /// `next_position` into `position_ids`, a `1` into `attention_mask` at
+    /// `next_position` (guarded by the binding's mask width), the token is
+    /// appended to `scratch[step]`, and the capture-error word is OR-ed into
+    /// `scratch[capacity]`. No host sync is issued; the caller drains `scratch`
+    /// once per chain. All bindings must belong to the same execution provider.
+    #[allow(clippy::too_many_arguments)]
+    pub fn device_token_writer(
+        &self,
+        input_ids: &DeviceIoBinding,
+        position_ids: Option<&DeviceIoBinding>,
+        attention_mask: &DeviceIoBinding,
+        scratch: &DeviceIoBinding,
+        capacity: usize,
+        next_position: i64,
+        mask_len: usize,
+        step: u32,
+    ) -> Result<()> {
+        if self.dtype != DataType::Uint32 || scratch.dtype != DataType::Uint32 {
+            return Err(SessionError::Internal(format!(
+                "device token writer requires u32 result/scratch, got {:?} and {:?}",
+                self.dtype, scratch.dtype
+            )));
+        }
+        let write_position = position_ids.is_some();
+        // When the model has no persistent position_ids binding (position is
+        // derived from the mask), reuse input_ids as a harmless stand-in buffer
+        // and gate the position write off in the kernel.
+        let position_binding = position_ids.unwrap_or(input_ids);
+        for binding in [input_ids, position_binding, attention_mask, scratch] {
+            if !Arc::ptr_eq(&self.allocator, &binding.allocator) {
+                return Err(SessionError::Internal(
+                    "device token writer bindings must belong to the same execution provider"
+                        .into(),
+                ));
+            }
+        }
+        Ok(self.allocator.device_token_writer(
+            self.buffer(),
+            input_ids.buffer(),
+            position_binding.buffer(),
+            attention_mask.buffer(),
+            scratch.buffer(),
+            capacity,
+            next_position,
+            mask_len,
+            write_position,
+            step,
+        )?)
+    }
+
     pub(crate) fn buffer(&self) -> &DeviceBuffer {
         self.buffer
             .as_ref()
