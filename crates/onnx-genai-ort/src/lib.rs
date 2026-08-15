@@ -64,8 +64,7 @@ pub use decode::{
     BatchStepLogits, BatchedDecodeSession, BatchedSharedBufferDecodeSession,
     BatchedStaticCacheDecodeSession, DecodeKvMode, DecodeSession, DecodeSessionOptions,
     DeviceSampleParams, LogitsD2hStats, SharedBufferBatchOptions, StaticCacheBindingMode,
-    StaticCacheBufferInfo, StaticCacheDecodeOptions, StaticCacheDecodeSession,
-    StaticCacheSignature,
+    StaticCacheBufferInfo, StaticCacheDecodeOptions, StaticCacheDecodeSession, StaticCacheSignature,
 };
 pub use eagle3::{
     Eagle3DecodeOptions, Eagle3DecodeSession, Eagle3DraftKvMode, Eagle3HeadSignature,
