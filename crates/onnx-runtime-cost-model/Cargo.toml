@@ -1,0 +1,18 @@
+[package]
+name = "onnx-runtime-cost-model"
+description = "Placement cost model for the ORT 2.0 runtime (docs/architecture/ORT2.md §6): machine-specific device/transfer rate profiles that combine with EP-reported kernel structure to estimate cost. Calibrated from hardware probes, serializable for offline planning."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["onnx", "cost-model", "placement", "runtime", "calibration"]
+categories = ["science", "hardware-support"]
+
+[dependencies]
+onnx-runtime-ir = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

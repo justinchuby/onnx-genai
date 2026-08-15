@@ -434,14 +434,24 @@ impl MatMulPrepack {
 #[derive(Default)]
 pub struct MatMulKernel {
     prepack: MatMulPrepack,
+    /// Structural FLOPs (`2*batch*M*N*K`) when both operand shapes were static
+    /// at build time; `None` otherwise (issue #995 — never fabricated).
+    flops: Option<u64>,
 }
 
 /// Factory for [`MatMulKernel`] (no attributes).
 pub struct MatMulFactory;
 
 impl KernelFactory for MatMulFactory {
-    fn create(&self, _node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        Ok(Box::new(MatMulKernel::default()))
+    fn create(&self, _node: &Node, input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        let flops = match (input_shapes.first(), input_shapes.get(1)) {
+            (Some(a), Some(b)) => super::flops::matmul_flops(a, b),
+            _ => None,
+        };
+        Ok(Box::new(MatMulKernel {
+            flops,
+            ..MatMulKernel::default()
+        }))
     }
 }
 
@@ -675,7 +685,7 @@ impl Kernel for MatMulKernel {
     }
 
     fn estimated_flops(&self) -> Option<u64> {
-        None
+        self.flops
     }
 }
 

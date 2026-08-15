@@ -27,6 +27,12 @@ mlas = [
 ]
 gqa_phase_profile = ["onnx-runtime-ep-cpu/gqa_phase_profile"]
 cuda = ["onnx-genai-engine/cuda", "onnx-runtime-session/cuda"]
+# Host<->device bandwidth probe (`roofline_transfer` bin). Pulls in `cudarc`
+# directly so the probe measures the raw link the runtime uses, independent of
+# any EP. The CUDA API version tracks the crate's `cuda-*` feature (default
+# 13.0) via the `cudarc?/cuda-*` mappings below, so it never build-depends on a
+# toolkit — the driver is dlopen'd at runtime like the CUDA EP.
+transfer-probe = ["dep:cudarc"]
 # Device-sampler-only CUDA: enables the ORT built-in CUDA EP path plus the
 # on-device argmax/sampler in `onnx-genai-ort` WITHOUT the pure-Rust
 # `onnx-runtime-ep-cuda`. Use this to benchmark the captured decode / device
@@ -37,29 +43,42 @@ cuda-12060 = [
     "onnx-genai-ort?/cuda-12060",
     "onnx-runtime-ep-cuda?/cuda-12060",
     "onnx-runtime-session?/cuda-12060",
+    "cudarc?/cuda-12060",
 ]
 cuda-12080 = [
     "onnx-genai-engine/cuda-12080",
     "onnx-genai-ort?/cuda-12080",
     "onnx-runtime-ep-cuda?/cuda-12080",
     "onnx-runtime-session?/cuda-12080",
+    "cudarc?/cuda-12080",
 ]
 cuda-12090 = [
     "onnx-genai-engine/cuda-12090",
     "onnx-genai-ort?/cuda-12090",
     "onnx-runtime-ep-cuda?/cuda-12090",
     "onnx-runtime-session?/cuda-12090",
+    "cudarc?/cuda-12090",
 ]
 cuda-13000 = [
     "onnx-genai-engine/cuda-13000",
     "onnx-genai-ort?/cuda-13000",
     "onnx-runtime-ep-cuda?/cuda-13000",
     "onnx-runtime-session?/cuda-13000",
+    "cudarc?/cuda-13000",
 ]
 
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
+# Pure-Rust CUDA bindings for the `roofline_transfer` H2D/D2H probe (behind the
+# `transfer-probe` feature). `dynamic-loading` keeps the no-build-time-toolkit
+# property: the driver is dlopen'd at runtime. Exactly one `cuda-*` version is
+# selected transitively via this crate's `cuda-*` features (default 13.0).
+cudarc = { version = "0.19", default-features = false, features = [
+    "std",
+    "driver",
+    "dynamic-loading",
+], optional = true }
 onnx-genai-engine = { path = "../onnx-genai-engine", version = "=0.1.0-dev.5", default-features = false }
 onnx-genai-kv = { workspace = true }
 onnx-genai-ort = { path = "../onnx-genai-ort", version = "=0.1.0-dev.5", default-features = false, optional = true }
@@ -131,6 +150,10 @@ required-features = ["bench-native"]
 [[bin]]
 name = "marlin_bench"
 required-features = ["bench-native", "cuda"]
+
+[[bin]]
+name = "roofline_transfer"
+required-features = ["transfer-probe"]
 
 [lints]
 workspace = true
