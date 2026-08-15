@@ -1,58 +1,102 @@
-# Decision drop — GEMV-v2 MLP deepening no-go
+# Decision drop — GEMV v2: column register-blocked int4 wide GEMV (glm 184→197.6, byte-identical)
 
-**Author:** Deckard  
-**Branch:** `squad/int4-gemv-wideload-v2`  
-**Date:** 2026-08-15  
-**Scope:** native CUDA int4 M=1 decode GEMV, glm-4-9b block-128, H200 GPU6.
+**Author:** Deckard (Systems Dev, CUDA/decode-perf) — sole driver, `matmul_nbits.rs`
+**Branch:** `squad/int4-gemv-wideload-v2` (continuation of merged #986; refs #986)
+**Date:** 2026-08-15  **GPU:** H200 GPU6 (verified 0 MiB / 0% idle before every run)
+**Scope:** native CUDA int4 M=1 decode GEMV, glm-4-9b block-128; qwen block-32 as no-regression control.
 
-## Baseline re-profile
+## Headline
+`ncu` proved the #986 wide-load GEMV is **NOT DRAM/load-MLP bound** (DRAM only ~28% / 1.40 TB/s) but
+**L1/TEX-throughput bound (~72%)** — all 8 warps in a CTA redundantly re-read the full-K activation
+row, so activation L1 traffic ≈ 4× the weight DRAM traffic. The original "deepen the load pipeline to
+2.42 TB/s" premise was therefore **wrong** and is abandoned.
 
-Command shape: `profile_native --model /home/justinchu/glm-e2e-artifacts/glm-4-9b-int4-cuda --ep cuda --backend native --steady --tokens 160 --decode-skip 40 --warmups 1 --runs 3`.
+The winning lever is **column register-blocking**: each warp now emits `WIDE_NC=4` output columns,
+decoding each 8-element activation sub-word to fp32 **once** and reusing it across the 4 columns
+(~4× less activation L1 traffic). The 4 independent 128-bit weight loads per chunk supply the
+memory-level parallelism — no software pipeline, no smem staging.
 
-Final clean HEAD (no v2 code kept): **183.49 tok/s** median (runs 182.75 / 183.49 / 183.53), greedy token stream stable. This is below the prior quiet-host 192 tok/s and still below the certified ORT comparator (~250 tok/s).
+**glm base decode (fresh, GPU6, --steady --tokens 160 --decode-skip 40 --runs 3):**
 
-Nsight Compute on `matmul_nbits_gemv_f16_general_bs_wide` (3 launches, `--set full --graph-profiling node`) showed the current v1 wide kernel already at the same wall as before:
-
-| metric | median |
+| variant | tok/s |
 |---|---:|
-| kernel time | 42.88 us |
-| DRAM bytes/s | 1.407 TB/s |
-| DRAM read pct of peak | 28.07% |
-| L1/TEX / LSU throughput | 72.04% |
-| SM throughput | 71.54% |
-| active warps | 65.53% |
-| registers/thread | 40 |
-| global load instructions | 657,408 |
-| global-load sectors | 15,887,360 |
-| global-load bytes/sector | 17.77 B |
-| long-scoreboard stall | 1.95 warps/issue |
-| math-pipe throttle | 3.26 warps/issue |
+| narrow (`ONNX_GENAI_GEMV_WIDELOAD=0`) | 136.31 |
+| wide single-col (#986) | 184.01 |
+| **multicol NC=4 (v2, default)** | **197.62**  (+7.4% over #986, +45% over narrow) |
 
-**Limiter found:** not pure DRAM bandwidth. The v1 wide-load path is now L1/LSU + SM-issue co-bound (~72% L1/TEX, ~71% SM) with only ~28% DRAM read peak. More MLP alone cannot reach ORT's 2.42 TB/s unless it also lowers the per-output activation/scales/L1 traffic or instruction pressure.
+## ncu delta — gate_up GEMV, glm (fresh GPU6, `--set full`/`--metrics`, `--graph-profiling node`)
 
-## Levers tried
+| metric | wide single-col (#986) | **multicol NC=4** |
+|---|---:|---:|
+| kernel time | 43.20 µs | **34.34 µs** |
+| DRAM throughput | 1.40 TB/s | **1.76 TB/s** |
+| **L1/TEX throughput** | **71.9 %** | **27.9 %**  ← limiter collapsed |
+| SM throughput | 71.4 % | 60.5 % |
+| registers/thread | 40 | 64 |
+| active warps (occupancy) | 65.5 % | ~41 % |
+| grid | 3424 | 856 (÷4, NC=4) |
 
-| lever | result | decision |
-|---|---:|---|
-| Shared activation row in CTA dynamic shared memory (`..._wide_smem`, K*fp32 stage once/CTA) | 91.99 tok/s smoke; large regression | reverted. Staging/sync/shared-read cost outweighed removing redundant activation L1 reads. |
-| Depth-4 software pipeline (`..._wide_d4`) | e2e noisy 186.41 tok/s vs same-session D2 185.58; ncu worse: 47.62 us, 1.266 TB/s, active warps 45.0%, regs 57 | reverted. Extra prefetch registers dropped occupancy and slowed the actual target kernel. |
-| 512-thread / 16-column CTA for wide single-warp path | e2e noisy 187.24 tok/s; ncu worse: 44.06 us, 1.368 TB/s, L1 70.16%, same 40 regs | reverted. Same resident warps with fewer CTAs did not improve MLP; kernel slower. |
-| lm_head / final MatMul backup check | `ONNX_GENAI_PROFILE_OPS=1` steady captured window showed MatMul ~0.016 ms in the measured decode report; MatMulNBits remains dominant | did not pursue cuBLASLt int4 lm_head; not the current wall. |
+L1/TEX (the real limiter) collapses 72%→28%; DRAM rises; kernel shrinks 43→34 µs. The new co-limiter
+is SM/occupancy (60.5% SM at 64 regs / 41% occ) on the fp32 dequant ALU — see wall below.
 
-No v2 kernel change survived the measurement gate.
+## NC sweep (byte-identical at every NC)
+NC=2 →196, NC=3 →195, **NC=4 →197.6 (best)**, NC=6 →182, NC=8 →182 (register cliff).
+`__launch_bounds__(256, N)` register-capping regressed (local-mem spills): NC=5→187, NC=6→162.
+**NC=4 is optimal**; the natural 64-reg / 41%-occ config beats any register cap.
 
-## Correctness / regression gates run
+## Correctness / regression gates (all PASS, fresh GPU6)
+- **glm greedy BYTE-IDENTICAL** multicol vs narrow — full 160-token streams, **0 diffs**, on BOTH a
+  generic prompt (Industrial Revolution) AND a repetitive prompt (ha-ha loop).
+- **f64 dequant→GEMM oracle** `matmul_nbits_marlin_numerics` → **7/7 pass**.
+- **qwen no-regression** (block-32, control): narrow 148.92 vs default 151.26 = within noise;
+  tokens **byte-identical**. qwen never routes through `general_bs` (block!=32 arm), so multicol
+  cannot touch it — unchanged by construction.
+- **default-on, portable** (no SM arch guard — pure fp32 load-scheduling, byte-identical), **capture-safe**
+  (static grid 856, no alloc/sync/host-readback). Opt-out `ONNX_GENAI_GEMV_WIDE_MULTICOL=0`.
+- fmt clean; clippy `-p onnx-runtime-ep-cuda --features cuda --lib -D warnings` clean.
 
-- f64 dequant→GEMM oracle: `cargo test -p onnx-runtime-ep-cuda --features cuda,gpu-tests --test matmul_nbits_marlin_numerics --quiet` → **7/7 pass**.
-- qwen regression smoke: `/home/justinchu/shared-models/qwen2.5-14b-instruct-int4-zp-onnx`, native CUDA, 64 tokens, decode-skip 16 → **154.71 tok/s**, stable generated tokens; no code change kept.
-- glm greedy tokens: clean HEAD generated-token stream remained stable across runs; no source change kept, so byte identity to current main is preserved by construction.
+## Byte-identity mechanism (why it is bit-exact vs #986/narrow)
+Per-column accumulation keeps the exact sequence `values[c] += scale*dot(w.x); += scale*dot(w.y); ...`
+(4 separate fp32 adds, NOT `scale*(d0+d1+d2+d3)`). `decode_activation8` produces the fp32 activations
+in the exact order `dot_int4x8_f16_sub` consumes; `dot_int4x8_f16_sub_act` does the identical 8-term
+fp32 dot. Sub-word loop order 0→3 preserves ascending-K. Each column is therefore bit-for-bit equal to
+#986's single-col wide → token-identical to narrow/main.
 
-## ORT comparison
+## base-vs-ORT (the honest headline)
+- Native base decode arc: 136 (narrow) → 184 (#986) → **197.6 (v2)**.
+- Certified ORT base (foundry-local glm-4-9b-fastcfg, CUDA-graph, ORT 1.27): **~250–252 tok/s** (Sebastian, GPU7).
+  Gap 1.84× → 1.36× → **1.27×**.
+- In-harness `--backend ort` on the same GPU6 measured **192 tok/s** (fastcfg) / 191.6 (ortfair) — but that
+  path runs ORT WITHOUT CUDA graph, so it under-measures ORT and is NOT the fair comparator. ORT+CUDA-graph
+  through `profile_native` fails at warmup (`ort_value must contain a constructed tensor` — a harness bug,
+  reproduced independently; not our kernel). The fair bar stays the ~250 foundry number.
 
-Fresh ORT graph-off fair artifact (`/home/justinchu/glm-e2e-artifacts/glm-4-9b-int4-cuda-ortfair`, `ONNX_GENAI_ORT_LIB=/home/justinchu/onnx-genai/.ort-cuda-1.27/root/lib/libonnxruntime.so.1.27.0`) measured **196.18 tok/s** but is not the certified fastcfg comparator.
+## STRUCTURAL WALL (strategic finding — needs a product ruling)
+We did **not** reach ORT's ~250 base, and cannot while **byte-identical to the fp32 narrow path**. At NC=4 we
+are now Compute-SM(60%)/occupancy(41%)-bound on the **fp32 dequant ALU**. ORT's `MatMulFloatInt4Kernel` gets
+its speed from **fp16 dequant-math** (half the ALU). A pure-fp16 (half2 foldscale) MAC was measured earlier at
+~204 tok/s BUT **flips one greedy token** on glm-generic → fails the byte-identical gate. So closing the last
+~1.27× on the GEMV requires a ruling: **is byte-identical-to-narrow a hard requirement, or is oracle-gated
+token-parity (like split-K #978) acceptable for the base GEMV?** If the latter, fp16-dequant math is the path
+to ~250 base parity; if the former, 197.6 is the byte-identical ceiling and further base gains must come from
+non-GEMV ops (e.g. fp16 lm_head).
 
-Attempting fresh ORT CUDA-graph fastcfg with `ONNX_GENAI_CUDA_GRAPH=1` failed during warmup with `ORT error: the ort_value must contain a constructed tensor or sparse tensor`; the non-ortfair artifact fails ORT load on `GroupQueryAttention.rotary_embedding_dim`. Therefore I did not produce a valid fresh 250 tok/s ORT run from this harness; the standing certified comparator remains ~250.3 tok/s.
+## Rejected alternatives (measured, reverted — search was exhaustive)
+| lever | result | verdict |
+|---|---|---|
+| Shared-activation smem (stage K*fp32 once/CTA, `__syncthreads`) | 91.99 tok/s (2× regression) | NO-GO — staging barrier serializes the load ahead of compute in a latency-bound kernel |
+| Depth-4 software pipeline | e2e 186.41 vs D2 185.58 (noise); ncu worse 47.6 µs / 1.27 TB/s / 57 regs / 45% occ | NO-GO — extra prefetch registers kill occupancy, slow the kernel |
+| 512-thread / 16-col CTA | ncu 44.06 µs / 1.368 TB/s (worse) | NO-GO — same resident warps, fewer CTAs, no MLP gain |
+| MLP-deepening (original v2 premise) | — | ABANDONED — limiter is L1/TEX, not DRAM |
+| fp16 dequant-math MAC | ~204 tok/s but flips a greedy token | BLOCKED on byte-identity — needs the ruling above |
+| lm_head cuBLASLt | ~5.7% of decode, ~+2% projected; cuBLAS not bit-identical to hand GEMV | DEFERRED — separate scoping + parity ruling |
+
+## Files
+- `crates/onnx-runtime-ep-cuda/src/kernels/matmul_nbits.rs` — ONLY source changed. New CUDA helpers
+  `decode_activation8` / `dot_int4x8_f16_sub_act`, device fn `gemv_int4_wide_lane_dot_multicol`
+  (`#define WIDE_NC 4`), kernel `matmul_nbits_gemv_f16_general_bs_wide_multicol`; Rust entry const +
+  `GEMV_F16_WIDE_MULTICOL_NC=4`, gate `use_gemv_wide_multicol()`, dispatch + `columns_per_block` + ABI wiring.
 
 ## Final status
-
-**NO-GO / hard wall proven for this v2 pass.** The important number is **183.49 tok/s native glm base decode vs ~250.3 tok/s certified ORT** (0.73× ORT), byte-identical by construction because all losing code was reverted. The next plausible direction is not deeper prefetch; it must reduce L1/LSU work per output (activation/scales traffic or instruction mix) while keeping 40-reg occupancy, or obtain a working ORT fastcfg harness to revalidate the comparator before more kernel surgery.
+**GO — byte-identical +7.4% base-decode win banked** (glm 197.6 tok/s, gap → 1.27× ORT). The remaining gap to
+250 is a byte-identity-vs-fp16 product decision, not a kernel dead-end.
