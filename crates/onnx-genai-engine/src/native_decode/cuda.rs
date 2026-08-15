@@ -210,6 +210,38 @@ fn cuda_step_profile_enabled() -> bool {
     })
 }
 
+/// Upper bound on the device-token-loop chain depth `k`, matching the scratch
+/// token-log capacity. A small `k` keeps the host stop/EOS checks cheap (at most
+/// `k - 1` speculatively-run replays are discarded when generation stops
+/// mid-chain) while still amortizing the host token round-trip across the chain.
+pub(crate) const DEVICE_TOKEN_LOOP_MAX_K: usize = 16;
+/// Default chain depth when `ONNX_GENAI_DEVICE_TOKEN_LOOP` is set to an enabling
+/// value without an explicit count (e.g. `1`/`true`/`on`).
+const DEVICE_TOKEN_LOOP_DEFAULT_K: usize = 4;
+
+/// Parse the requested device-token-loop chain depth from
+/// `ONNX_GENAI_DEVICE_TOKEN_LOOP`. `0`/unset/`false`/`off` disable it; a bare
+/// enabling value (`1`/`true`/`yes`/`on`) selects [`DEVICE_TOKEN_LOOP_DEFAULT_K`];
+/// an explicit integer `>= 2` selects that depth, clamped to
+/// [`DEVICE_TOKEN_LOOP_MAX_K`].
+fn device_token_loop_k_from_env() -> usize {
+    let Some(value) = std::env::var_os("ONNX_GENAI_DEVICE_TOKEN_LOOP") else {
+        return 0;
+    };
+    let value = value.to_string_lossy();
+    let value = value.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "" | "0" | "false" | "no" | "off" => 0,
+        "1" | "true" | "yes" | "on" => DEVICE_TOKEN_LOOP_DEFAULT_K,
+        other => match other.parse::<usize>() {
+            Ok(0) => 0,
+            Ok(1) => DEVICE_TOKEN_LOOP_DEFAULT_K,
+            Ok(k) => k.min(DEVICE_TOKEN_LOOP_MAX_K),
+            Err(_) => 0,
+        },
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct StepOffloadSnapshot {
     materialize_ns: u64,
@@ -517,6 +549,11 @@ pub struct CudaGraphDebugStats {
     pub growth_decision: Option<String>,
     /// Structured reasons from the most recent capture fallback.
     pub fallback_report: Option<CaptureDeclineReport>,
+    /// Configured device-token-loop chain depth (`0` = disabled/not armed).
+    pub device_token_loop_k: usize,
+    /// Chained device-token-loop replays run this session (each advanced the
+    /// device one token without a host argmax→next-token round-trip).
+    pub device_token_loop_steps: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -687,6 +724,32 @@ pub(crate) struct DecodeCudaState {
     /// dormant `configure_padded_verify_capture` switch (not on the hot path).
     #[cfg(test)]
     pub(crate) padded_query_capacity: Option<usize>,
+    /// Device-resident token-feedback loop (opt-in via `ONNX_GENAI_DEVICE_TOKEN_LOOP`).
+    /// `0` disables it; `k > 0` chains `k` captured decode replays back-to-back
+    /// with a device token-writer stitched between them, so the host leaves the
+    /// per-step critical path and drains `k` selected token ids in one D2H read.
+    /// Only armed when the topology is device-loopable (see `device_token_loop_ready`).
+    device_token_loop_k: usize,
+    /// `true` when the persistent-decode topology supports the device token loop:
+    /// batch 1, graph capture engaged, the attention-mask frozen to physical
+    /// `max_len` (not logical-exposed), an i64 `input_ids`/mask, and — when the
+    /// model exposes a `position_ids` binding — a rank-1 i64 one. When `false`
+    /// the loop stays off regardless of `device_token_loop_k`.
+    device_token_loop_ready: bool,
+    /// `true` when the model exposes a persistent `position_ids` binding that the
+    /// device token-writer must advance each step; `false` when position is
+    /// derived from the attention mask alone (no position binding — e.g. GLM-4),
+    /// in which case the writer only folds the token id and mask bit.
+    device_token_loop_write_position: bool,
+    /// Scratch device binding for the token loop: `k` u32 token-log slots
+    /// followed by one u32 capture-error accumulator word (index `k`). The
+    /// device token-writer appends each step's selected token and ORs the shared
+    /// capture-error word here; the host drains all `k + 1` words in one D2H per
+    /// chain. `None` unless the loop is armed.
+    device_token_loop_scratch: Option<DeviceIoBinding>,
+    /// Count of device-token-loop chained replays actually run (each advances the
+    /// device one token without a host round-trip). A diagnostics counter.
+    device_token_loop_steps: u64,
 }
 
 pub(crate) struct DecodeCudaIo<'a> {
@@ -1968,7 +2031,150 @@ impl NativeDecodeSession {
         Ok(token_id)
     }
 
-    /// Batch-N greedy decode step (stage 2b-impl-4, #750): step `batch`
+    /// The configured device-token-loop chain depth for this session (`0` when
+    /// the loop is disabled or the topology is not device-loopable).
+    pub(crate) fn device_token_loop_k(&self) -> usize {
+        self.cuda
+            .as_ref()
+            .map_or(0, DecodeCudaState::device_token_loop_k)
+    }
+
+    /// Device-resident token-feedback loop (opt-in via
+    /// `ONNX_GENAI_DEVICE_TOKEN_LOOP`): enqueue up to `k_request` captured decode
+    /// replays back-to-back with a device token-writer stitched between them, so
+    /// the host leaves the per-step critical path (no argmax read-back sync, no
+    /// next-token H2D between replays), and drain the accumulated token ids in
+    /// **one** D2H read.
+    ///
+    /// Byte-identical to the per-token [`Self::decode_cuda_greedy`] path: the
+    /// device token-writer folds the *same* device-argmax token (`greedy_result[0]`)
+    /// into the *same* persistent `input_ids`/`position_ids`/mask bindings the
+    /// host writes would, so the greedy token sequence is unchanged. Capture-error
+    /// latching is preserved (the per-step words are OR-ed on-device and rejected
+    /// at drain).
+    ///
+    /// Any structural reason to decline — the loop is off, the graph is not yet
+    /// in the replay-ready phase, an inline-routed step, or a capacity boundary —
+    /// falls back to a single captured [`Self::decode_cuda_greedy`] step, which
+    /// owns the warmup/capture/growth state machine. Returns the `1..=k` selected
+    /// token ids in order.
+    pub(crate) fn decode_cuda_greedy_loop(
+        &mut self,
+        seed_token: TokenId,
+        past_len: usize,
+        k_request: usize,
+    ) -> anyhow::Result<Vec<TokenId>> {
+        // Keep inline-routing state coherent with the per-token entry point,
+        // then decide whether the device loop applies to this step.
+        self.maybe_enable_decode_inline(std::slice::from_ref(&seed_token));
+        let route_inline = self.route_decode_inline(std::slice::from_ref(&seed_token));
+        let applies = {
+            let state = self
+                .cuda
+                .as_ref()
+                .context("CUDA decode state is not initialized")?;
+            state.device_token_loop_ready
+                && state.device_token_loop_k >= 2
+                && k_request >= 2
+                && state.graph_phase == DecodeCudaGraphPhase::Ready
+        };
+        if route_inline || !applies {
+            return Ok(vec![self.decode_cuda_greedy(seed_token, past_len)?]);
+        }
+
+        // Clamp the chain depth to the configured cap and keep the whole chain
+        // inside the current KV bucket so no reallocation (which retires the
+        // captured graph) happens mid-chain.
+        let (cap_k, max_len, hard_max_len) = {
+            let state = self.cuda.as_ref().unwrap();
+            (
+                state.device_token_loop_k,
+                state.max_len,
+                state.hard_max_len(),
+            )
+        };
+        let mut k = k_request.min(cap_k);
+        k = k.min(max_len.saturating_sub(past_len));
+        if k < 2 || past_len + k > hard_max_len {
+            return Ok(vec![self.decode_cuda_greedy(seed_token, past_len)?]);
+        }
+        let total_len = past_len + k;
+
+        // Ensure capacity for the full chain up-front; a growth here retires the
+        // captured graph, so route this step through the single captured path.
+        let grew = {
+            let state = self.cuda.as_mut().unwrap();
+            state.ensure_capacity(&mut self.session, total_len)?
+        };
+        if grew || self.cuda.as_ref().unwrap().graph_phase != DecodeCudaGraphPhase::Ready {
+            return Ok(vec![self.decode_cuda_greedy(seed_token, past_len)?]);
+        }
+
+        // Prime the first step on the host (one async H2D, no sync) so the chain
+        // is byte-identical to the per-token path regardless of prior device
+        // state, and clear the capture-error accumulator.
+        {
+            let state = self.cuda.as_mut().unwrap();
+            state.write_decode_inputs(seed_token, past_len)?;
+            let expose = state.decode_mask_expose_len(past_len + 1);
+            state.extend_mask(past_len, past_len + 1, expose)?;
+            state.reset_device_token_loop_error()?;
+        }
+
+        // Enqueue k replays back-to-back with the device token-writer stitched
+        // between them — no host sync inside the loop.
+        let mut produced = 0_usize;
+        for step in 0..k {
+            let state = self.cuda.as_mut().unwrap();
+            if let Err(error) = state.run_one_token(&mut self.session, &self.trace) {
+                let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
+                return Err(error.context(format!(
+                    "native CUDA device-token-loop forward pass failed{diagnosis}"
+                )));
+            }
+            let still_ready = state.graph_phase == DecodeCudaGraphPhase::Ready;
+            state.run_device_argmax()?;
+            let next_position = i64::try_from(past_len + 1 + step)
+                .context("device token loop position exceeds i64 range")?;
+            state.device_token_writer_step(next_position, step as u32)?;
+            state.device_token_loop_steps += 1;
+            produced += 1;
+            if !still_ready {
+                // A control-flow branch flip retired the captured graph after
+                // this step (its token was produced eagerly and is valid); stop
+                // chaining and let the next call re-warm on the single-step path.
+                break;
+            }
+        }
+
+        // One D2H drain for the whole chain: the accumulated token ids plus the
+        // OR-ed capture-error word (detection-before-consumption).
+        let (tokens, capture_error) = {
+            let state = self.cuda.as_mut().unwrap();
+            state.drain_device_token_loop(produced)?
+        };
+        if capture_error != 0 {
+            let state = self.cuda.as_mut().unwrap();
+            let _ = state.invalidate_graph(&mut self.session);
+            bail!(
+                "native CUDA device-token-loop aborted: device capture validation violation (flags=0x{capture_error:x}) detected during a chained captured graph replay; the produced tokens were rejected before consumption and the decode graph was invalidated"
+            );
+        }
+
+        let new_len = past_len + produced;
+        {
+            let state = self.cuda.as_mut().unwrap();
+            // Undo the device token-writer's trailing mask bit one position past
+            // the last consumed token so the persistent mask matches the
+            // per-token path exactly (byte-identical, and no stale `1` leaks into
+            // a later prefill after reset).
+            state.clear_trailing_mask_bit(new_len)?;
+            state.set_logical_len(new_len)?;
+        }
+        self.current_len = new_len;
+        Ok(tokens)
+    }
+
     /// sequences together, one token each, and return the `batch` selected token
     /// ids (row `i` = the greedy token of sequence `i`). Every sequence shares
     /// the uniform decode length `past_len → past_len + 1`, so a single mask
@@ -3588,6 +3794,62 @@ impl DecodeCudaState {
             }
         }
 
+        // Arm the device-resident token-feedback loop (opt-in) when the topology
+        // is device-loopable: graph capture engaged, a single sequence, a rank-1
+        // i64 `position_ids` binding, and an i64 attention mask frozen to
+        // physical `max_len` (not logical-exposed). The scratch binding holds `k`
+        // u32 token-log slots plus one u32 capture-error accumulator word; the
+        // device token-writer folds each step's token straight into the
+        // persistent `input_ids`/`position_ids`/mask bindings device-to-device.
+        let device_token_loop_k_req = device_token_loop_k_from_env();
+        let input_ids_is_i64 = bindings[input_ids_binding].dtype == DataType::Int64;
+        let position_is_i64 =
+            position_ids_binding.is_some_and(|index| bindings[index].dtype == DataType::Int64);
+        let mask_is_i64 = bindings
+            .first()
+            .is_some_and(|binding| binding.dtype == DataType::Int64);
+        // When the model has a persistent position_ids binding it must be a
+        // rank-1 i64 binding the writer can advance; when there is none, position
+        // is derived from the mask alone (still byte-identical) and the writer
+        // only folds the token id and mask bit.
+        let position_topology_ok = match position_ids_binding {
+            Some(_) => position_rank == 1 && position_is_i64,
+            None => true,
+        };
+        let device_token_loop_write_position = position_ids_binding.is_some();
+        let device_token_loop_ready = device_token_loop_k_req > 0
+            && graph_enabled
+            && !mask_exposes_logical
+            && batch == 1
+            && input_ids_is_i64
+            && mask_is_i64
+            && position_topology_ok;
+        let device_token_loop_k = if device_token_loop_ready {
+            device_token_loop_k_req
+        } else {
+            0
+        };
+        let device_token_loop_scratch = if device_token_loop_ready {
+            let words = device_token_loop_k + 1;
+            Some(session.allocate_device_output_binding(
+                "__native_device_token_loop",
+                DataType::Uint32,
+                vec![words],
+                vec![words],
+            )?)
+        } else {
+            None
+        };
+        if device_token_loop_k_req > 0 {
+            tracing::info!(
+                requested_k = device_token_loop_k_req,
+                armed = device_token_loop_ready,
+                effective_k = device_token_loop_k,
+                write_position = device_token_loop_write_position,
+                "native CUDA device token loop configuration"
+            );
+        }
+
         Ok(Self {
             batch,
             logical_len: 0,
@@ -3638,6 +3900,11 @@ impl DecodeCudaState {
             retain_graph_on_rewind: false,
             #[cfg(test)]
             padded_query_capacity: None,
+            device_token_loop_k,
+            device_token_loop_ready,
+            device_token_loop_write_position,
+            device_token_loop_scratch,
+            device_token_loop_steps: 0,
         })
     }
 
@@ -4362,6 +4629,122 @@ impl DecodeCudaState {
         extract_logits(&logits)
     }
 
+    /// The configured device-token-loop chain depth (`0` when disabled or the
+    /// topology is not device-loopable).
+    pub(crate) fn device_token_loop_k(&self) -> usize {
+        self.device_token_loop_k
+    }
+
+    /// Launch the device argmax over the current logits into `greedy_result`
+    /// **without** the host read-back, so a chained replay can proceed on-stream
+    /// with no host sync (the device token-writer consumes `greedy_result[0]`).
+    fn run_device_argmax(&mut self) -> anyhow::Result<()> {
+        let vocab = *self
+            .logits_shape
+            .last()
+            .context("CUDA logits shape has no vocabulary dimension")?;
+        self.bindings[self.logits_binding].device_argmax(
+            vocab,
+            self.batch,
+            &mut self.greedy_result,
+        )?;
+        Ok(())
+    }
+
+    /// Clear the device-token-loop capture-error accumulator (the u32 word at
+    /// index `k` of the scratch binding) before enqueuing a fresh chain.
+    fn reset_device_token_loop_error(&mut self) -> anyhow::Result<()> {
+        let k = self.device_token_loop_k;
+        let scratch = self
+            .device_token_loop_scratch
+            .as_mut()
+            .context("device token loop scratch is not allocated")?;
+        scratch.write_bytes(k * std::mem::size_of::<u32>(), &0u32.to_ne_bytes())?;
+        Ok(())
+    }
+
+    /// Clear the single trailing attention-mask `1` the device token-writer set
+    /// one position beyond the chain's last consumed token. The writer sets
+    /// `mask[next_position]` on *every* step (so the following in-chain replay
+    /// attends the new token); on the final step there is no following replay, so
+    /// that bit is one past `current_len` and must be undone to leave the mask in
+    /// exactly the state the per-token path leaves — otherwise, with the mask
+    /// frozen to physical width (`mask_exposes_logical == false`), that stray `1`
+    /// inflates the derived sequence length for a later prefill after `reset()`.
+    /// No-op when the position is at/over physical capacity (the writer guarded
+    /// it, so nothing was written).
+    fn clear_trailing_mask_bit(&mut self, position: usize) -> anyhow::Result<()> {
+        if position >= self.max_len {
+            return Ok(());
+        }
+        let word = std::mem::size_of::<i64>();
+        let row_stride = self.max_len * word;
+        for sequence in 0..self.batch {
+            let offset = sequence * row_stride + position * word;
+            self.bindings[0].write_bytes(offset, &0i64.to_le_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Stitch the just-selected token (in `greedy_result`) into the persistent
+    /// decode bindings for the next replay: token id → `input_ids`,
+    /// `next_position` → `position_ids`, mask `1` at `next_position`, token →
+    /// `scratch[step]`, capture-error OR-ed into `scratch[k]`. Device-to-device,
+    /// no host sync.
+    fn device_token_writer_step(&self, next_position: i64, step: u32) -> anyhow::Result<()> {
+        let scratch = self
+            .device_token_loop_scratch
+            .as_ref()
+            .context("device token loop scratch is not allocated")?;
+        let position_binding = if self.device_token_loop_write_position {
+            let position_index = self
+                .position_ids_binding
+                .context("device token loop requires a position_ids binding")?;
+            Some(&self.bindings[position_index])
+        } else {
+            None
+        };
+        self.greedy_result.device_token_writer(
+            &self.bindings[self.input_ids_binding],
+            position_binding,
+            &self.bindings[0],
+            scratch,
+            self.device_token_loop_k,
+            next_position,
+            self.max_len,
+            step,
+        )?;
+        Ok(())
+    }
+
+    /// Drain the enqueued chain in one D2H read: the first `produced` token-log
+    /// slots as token ids, plus the OR-ed capture-error accumulator word.
+    fn drain_device_token_loop(&mut self, produced: usize) -> anyhow::Result<(Vec<TokenId>, u32)> {
+        let k = self.device_token_loop_k;
+        let scratch = self
+            .device_token_loop_scratch
+            .as_mut()
+            .context("device token loop scratch is not allocated")?;
+        let word = std::mem::size_of::<u32>();
+        let mut bytes = vec![0_u8; (k + 1) * word];
+        scratch.read_bytes_into(&mut bytes)?;
+        let mut tokens = Vec::with_capacity(produced);
+        for slot in 0..produced {
+            let base = slot * word;
+            tokens.push(u32::from_ne_bytes(
+                bytes[base..base + word]
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("four token-id bytes"))?,
+            ));
+        }
+        let error = u32::from_ne_bytes(
+            bytes[k * word..k * word + word]
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("four capture-error bytes"))?,
+        );
+        Ok((tokens, error))
+    }
+
     pub(crate) fn greedy_fastpath_supported(&self) -> bool {
         self.bindings[self.logits_binding].device_argmax_supported()
     }
@@ -4508,6 +4891,8 @@ impl DecodeCudaState {
                 decline_reason: self.graph_decline_reason.clone(),
                 growth_decision: self.graph_growth_decision.clone(),
                 fallback_report: self.graph_fallback_report.clone(),
+                device_token_loop_k: self.device_token_loop_k,
+                device_token_loop_steps: self.device_token_loop_steps,
             },
         }
     }

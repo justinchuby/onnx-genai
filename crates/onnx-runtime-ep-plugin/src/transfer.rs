@@ -172,6 +172,29 @@ fn transfer_trace_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("ONNX_GENAI_PLUGIN_TRANSFER_TRACE").as_deref() == Ok("1"))
 }
 
+/// Emit one transfer-trace line to stderr and, when
+/// `ONNX_GENAI_PLUGIN_TRANSFER_TRACE_FILE` is set, append it to that file with an
+/// immediate flush. The file copy is the only trace that survives a driver hang
+/// (piped stderr buffers and is lost when the process never returns). No-op
+/// unless the trace is enabled.
+pub(crate) fn transfer_log(msg: &str) {
+    if !transfer_trace_enabled() {
+        return;
+    }
+    eprintln!("{msg}");
+    use std::io::Write as _;
+    let _ = std::io::stderr().flush();
+    if let Ok(path) = std::env::var("ONNX_GENAI_PLUGIN_TRANSFER_TRACE_FILE")
+        && let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+    {
+        let _ = writeln!(f, "{msg}");
+        let _ = f.flush();
+    }
+}
+
 // ─── ORT data-transfer adapter ───────────────────────────────────────────────
 
 /// Heap-allocated data-transfer adapter projecting an EP's copy methods through
@@ -535,11 +558,11 @@ unsafe extern "C" fn transfer_full_can_copy(
         if transfer_trace_enabled() {
             let src_id = memory_device_id(ep_api, src_memory_device);
             let dst_id = memory_device_id(ep_api, dst_memory_device);
-            eprintln!(
+            transfer_log(&format!(
                 "[plugin/transfer #982] CanCopy dir={direction:?} \
                  src(type={src_type},id={src_id}) dst(type={dst_type},id={dst_id}) \
                  -> supported={supported}"
-            );
+            ));
         }
         supported
     }));
@@ -769,12 +792,12 @@ unsafe extern "C" fn transfer_full_copy_tensors(
                 };
                 let src_dev_id = memory_device_id(ep_api, src_mem_device);
                 let dst_dev_id = memory_device_id(ep_api, dst_mem_device);
-                eprintln!(
+                transfer_log(&format!(
                     "[plugin/transfer #982] i={i} dir={direction:?} \
                      src(type={src_type},id={src_dev_id},ptr={src_data:p}) \
                      dst(type={dst_type},id={dst_dev_id},ptr={dst_data:p}) \
                      byte_len={byte_len} has_stream={has_stream}"
-                );
+                ));
             }
 
             // B3 fix: dispatch by classified direction.
@@ -867,7 +890,13 @@ unsafe extern "C" fn transfer_full_copy_tensors(
             });
 
             match copy_result {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => {
+                    if transfer_trace_enabled() {
+                        transfer_log(&format!(
+                            "[plugin/transfer #982] i={i} dir={direction:?} copy COMPLETE"
+                        ));
+                    }
+                }
                 Ok(Err(e)) => return fail_status(&format!("CopyTensors: {e}")),
                 Err(msg) => return fail_status(&format!("CopyTensors: {msg}")),
             }
