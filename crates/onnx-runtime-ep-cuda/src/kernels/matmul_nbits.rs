@@ -83,6 +83,36 @@ const GEMM_F16_ENTRY: &str = "matmul_nbits_gemm_f16";
 /// `block_size` (`block = depth / block_size`) so a lane's contiguous 8-element
 /// chunk maps to the correct block regardless of block width.
 const GEMV_F16_GENERAL_BS_ENTRY: &str = "matmul_nbits_gemv_f16_general_bs";
+/// Split-K counterpart of [`GEMV_F16_GENERAL_BS_ENTRY`]: `K_SPLIT` warps
+/// cooperate on one output column and reduce their fp32 partials through shared
+/// memory, so the launch grid is `K_SPLIT`x larger and fills the SMs on the
+/// grid-starved block!=32 decode projections (medium/KV GEMVs run at ~0.5
+/// waves single-warp). Near-equal (not byte-identical) to the single-warp
+/// entry — the split reorders the partial-sum association, the same trade the
+/// block-32 split-K entries already ship by default.
+const GEMV_F16_GENERAL_BS_SPLITK_ENTRY: &str = "matmul_nbits_gemv_f16_general_bs_splitk";
+/// Wide-load (128-bit `uint4` weight load, software-pipelined) counterpart of
+/// [`GEMV_F16_GENERAL_BS_ENTRY`]. Each lane owns 32 contiguous nibbles per step
+/// and streams them with one pipelined `uint4` load (4x fewer load instructions,
+/// 2+ loads in flight) to raise memory-level parallelism / DRAM bandwidth on
+/// the M=1 int4 decode GEMV toward ORT's (head-to-head: ORT 2.42 TB/s vs our
+/// 0.92 TB/s at the same grid/occupancy — a pure narrow-load-issue gap). int4
+/// only; requires `block_size % 32 == 0 && k % 32 == 0`. Near-equal (32-wide
+/// lane interleave regroups the fp32 partials), gated greedy-token-identical.
+const GEMV_F16_GENERAL_BS_WIDE_ENTRY: &str = "matmul_nbits_gemv_f16_general_bs_wide";
+/// Wide-load counterpart of [`GEMV_F16_GENERAL_BS_SPLITK_ENTRY`] (see
+/// [`GEMV_F16_GENERAL_BS_WIDE_ENTRY`]): `K_SPLIT` warps each walk a
+/// `32 * K_SPLIT`-strided set of 32-nibble chunks with pipelined `uint4` loads.
+const GEMV_F16_GENERAL_BS_SPLITK_WIDE_ENTRY: &str = "matmul_nbits_gemv_f16_general_bs_splitk_wide";
+/// Warps cooperating per output column in the block!=32 general_bs split-K GEMV.
+/// Must match `constexpr int K_SPLIT` in `matmul_nbits_gemv_f16_general_bs_splitk`.
+/// A block keeps its `blockDim.x / 32` warps but now covers `warps / K_SPLIT`
+/// columns, so the launch grid grows by this factor. Tuned to 4 on glm-4-9b
+/// (block-128, N=4096 medium projections): K_SPLIT=2 lifts the grid-starved
+/// single-warp launch from ~0.5 to ~1 wave, K_SPLIT=4 to ~2 waves (the
+/// latency-hiding target), which measured fastest (+9.7% decode vs single-warp);
+/// K_SPLIT=8 saturated.
+const GENERAL_BS_SPLITK: usize = 4;
 /// Model-agnostic fp16 int4/int8 prefill GEMM for any power-of-two `block_size`.
 /// Mirrors [`GEMM_F16_ENTRY`] but walks `K` in fixed 32-wide tiles and computes
 /// `block = depth / block_size`, decoupling the tile width from the block width.
@@ -1323,6 +1353,184 @@ __device__ __forceinline__ float dot_int4x8_f16(
     dot += q26.y * a26.y;
     dot += q37.y * a37.y;
     return dot;
+}
+
+// Zero-point-aware [`dot_int4x8_f16`]. `sub2` is the fp16x2 subtrahend for this
+// block (the packed zero point, or fp16 8.0 for symmetric weights). Because the
+// centered code `(code - zp)` is an exact fp16 integer in [-15, 15], converting
+// each `q` to float and accumulating the eight products in fp32 in ascending
+// element order reproduces the scalar `(float)(code - zp) * __half2float(act)`
+// path byte-for-byte — the LOP3 unpack only changes *how* the nibbles are
+// decoded, not the arithmetic that follows. With `sub2 == 0x48004800` this is
+// identical to [`dot_int4x8_f16`].
+__device__ __forceinline__ float dot_int4x8_f16_sub(
+    const unsigned int packed,
+    const __half* __restrict__ activation,
+    const unsigned int sub2)
+{
+    const uint4 a = *reinterpret_cast<const uint4*>(activation);
+    constexpr unsigned int low_halves = 0x5410;
+    constexpr unsigned int high_halves = 0x7632;
+    uint4 permuted;
+    asm volatile("prmt.b32 %0, %1, %2, %3;\n"
+                 : "=r"(permuted.x) : "r"(a.x), "r"(a.z), "r"(low_halves));
+    asm volatile("prmt.b32 %0, %1, %2, %3;\n"
+                 : "=r"(permuted.y) : "r"(a.x), "r"(a.z), "r"(high_halves));
+    asm volatile("prmt.b32 %0, %1, %2, %3;\n"
+                 : "=r"(permuted.z) : "r"(a.y), "r"(a.w), "r"(low_halves));
+    asm volatile("prmt.b32 %0, %1, %2, %3;\n"
+                 : "=r"(permuted.w) : "r"(a.y), "r"(a.w), "r"(high_halves));
+
+    __half2 q[4];
+    int4x8_to_half2x4_sub(packed, q, sub2);
+    const float2 q04 = __half22float2(q[0]);
+    const float2 q15 = __half22float2(q[1]);
+    const float2 q26 = __half22float2(q[2]);
+    const float2 q37 = __half22float2(q[3]);
+    const float2 a04 = __half22float2(*reinterpret_cast<const __half2*>(&permuted.x));
+    const float2 a15 = __half22float2(*reinterpret_cast<const __half2*>(&permuted.y));
+    const float2 a26 = __half22float2(*reinterpret_cast<const __half2*>(&permuted.z));
+    const float2 a37 = __half22float2(*reinterpret_cast<const __half2*>(&permuted.w));
+    float dot = q04.x * a04.x;
+    dot += q15.x * a15.x;
+    dot += q26.x * a26.x;
+    dot += q37.x * a37.x;
+    dot += q04.y * a04.y;
+    dot += q15.y * a15.y;
+    dot += q26.y * a26.y;
+    dot += q37.y * a37.y;
+    return dot;
+}
+
+// ---------------------------------------------------------------------------
+// High-memory-level-parallelism (wide-load) int4 decode GEMV.
+//
+// The single-warp `..._general_bs` loop loads ONE 32-bit weight word (8 nibbles)
+// per lane per step and immediately dequant+FMAs it — a dependent
+// load->dequant->FMA chain that keeps ~1 weight load in flight per lane, so at
+// M=1 (where the weight stream is the entire DRAM traffic) DRAM tops out ~19%
+// while the SM pipe saturates on narrow-load issue. A head-to-head ncu of ORT's
+// `MatMulFloatInt4Kernel` on the identical gate_up matrix showed it streams the
+// same weights at 2.42 TB/s (50% DRAM) vs our 0.92 TB/s at the SAME grid/block/
+// registers/occupancy — a pure memory-level-parallelism gap, not a math or
+// tiling difference.
+//
+// This helper closes that gap: each lane owns 32 CONTIGUOUS nibbles per step and
+// loads them with ONE 128-bit `uint4` weight load (4x fewer load instructions,
+// 4x bytes/instruction), and the next step's `uint4` is issued BEFORE the
+// current step's dequant/FMA so >=2 wide loads are always in flight to hide the
+// ~10-cycle Long-Scoreboard global-load latency. It reuses the byte-tested LOP3
+// dequant (`dot_int4x8_f16_sub`) on the four 8-nibble sub-words, so the
+// per-element arithmetic is unchanged. NOT cp.async (pure issue overhead at M=1,
+// proven regressing) and NOT a scalar `#pragma unroll` of the LOP3 body
+// (register bloat -> occupancy cliff, proven regressing) — just wider
+// synchronous vector loads at ~constant register footprint, the mechanism ORT
+// uses.
+//
+// Numerics: the 32-wide lane interleave (vs the 8-wide single-warp interleave)
+// regroups the fp32 partial sums, so the result is near-equal, NOT byte-
+// identical, to `..._general_bs` — exactly the K-slice reassociation the split-K
+// entries already ship by default. Each 32-nibble chunk lies inside ONE block
+// (guarded to `block_size % 32 == 0`, i.e. glm block-128 and qwen block-32; the
+// rare block-16 export falls back to the narrow kernel), so a single scale and
+// zero point cover the chunk and the `uint4` load is 16-byte aligned.
+//
+// Returns this lane's fp32 partial (pre warp-reduction) for the weight column
+// `column`, walking chunk starts `depth0, depth0+warp_stride, ...`.
+__device__ __forceinline__ float gemv_int4_wide_lane_dot(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales,
+    const unsigned char* __restrict__ zero_points,
+    const int k,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int scales_fp16,
+    const long column,
+    const int depth0,
+    const int warp_stride)
+{
+    const long col_kb = column * (long)k_blocks;
+
+    float value = 0.0f;
+    int depth = depth0;
+    bool have = (depth + 32 <= k);
+    uint4 w;
+    if (have) {
+        const int block = depth / block_size;
+        const long blob_base = (col_kb + block) * (long)blob_size;
+        const int within = depth - block * block_size;
+        w = *reinterpret_cast<const uint4*>(packed + blob_base + (within >> 1));
+    }
+    while (have) {
+        const int ndepth = depth + warp_stride;
+        const bool have_next = (ndepth + 32 <= k);
+        uint4 wn;
+        if (have_next) {
+            // Issue the next wide weight load before consuming the current one,
+            // so two 128-bit loads are in flight across the dequant/FMA below.
+            const int nblock = ndepth / block_size;
+            const long nblob = (col_kb + nblock) * (long)blob_size;
+            const int nwithin = ndepth - nblock * block_size;
+            wn = *reinterpret_cast<const uint4*>(packed + nblob + (nwithin >> 1));
+        }
+        // `depth` is 32-aligned and `block_size % 32 == 0`, so `[depth, depth+32)`
+        // is inside a single block: one scale + one zero point cover the chunk.
+        const int block = depth / block_size;
+        float scale;
+        if (scales_fp16) {
+            scale = __half2float(reinterpret_cast<const __half*>(scales)[col_kb + block]);
+        } else {
+            scale = reinterpret_cast<const float*>(scales)[col_kb + block];
+        }
+        const unsigned int sub2 =
+            int4_zero_point_sub2(int4_block_zero_point(zero_points, column, block, zp_row_bytes));
+        value += scale * dot_int4x8_f16_sub(w.x, activation + depth, sub2);
+        value += scale * dot_int4x8_f16_sub(w.y, activation + depth + 8, sub2);
+        value += scale * dot_int4x8_f16_sub(w.z, activation + depth + 16, sub2);
+        value += scale * dot_int4x8_f16_sub(w.w, activation + depth + 24, sub2);
+        depth = ndepth;
+        w = wn;
+        have = have_next;
+    }
+
+    // Partial trailing chunk for this lane (`depth < k < depth + 32`): decode the
+    // valid 8-nibble sub-words, matching the narrow kernel's tail arithmetic.
+    if (depth < k) {
+        const int block = depth / block_size;
+        float scale;
+        if (scales_fp16) {
+            scale = __half2float(reinterpret_cast<const __half*>(scales)[col_kb + block]);
+        } else {
+            scale = reinterpret_cast<const float*>(scales)[col_kb + block];
+        }
+        const int zero_point = int4_block_zero_point(zero_points, column, block, zp_row_bytes);
+        const unsigned int sub2 = int4_zero_point_sub2(zero_point);
+        const long blob_base = (col_kb + block) * (long)blob_size;
+        for (int off = 0; off < 32 && depth + off < k; off += 8) {
+            const int d = depth + off;
+            const int within = d - block * block_size;
+            const int valid = min(8, k - d);
+            const unsigned int packed_word =
+                *reinterpret_cast<const unsigned int*>(packed + blob_base + (within >> 1));
+            if (valid == 8) {
+                value += scale * dot_int4x8_f16_sub(packed_word, activation + d, sub2);
+            } else {
+                float partial = 0.0f;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    if (i < valid) {
+                        const int q = (int)((packed_word >> (i * 4)) & 15u) - zero_point;
+                        partial += (float)q * __half2float(activation[d + i]);
+                    }
+                }
+                value += partial * scale;
+            }
+        }
+    }
+    return value;
 }
 
 __device__ __forceinline__ uint4 permute_activation_f16x8(
@@ -3455,11 +3663,21 @@ extern "C" __global__ void matmul_nbits_gemv_f16_general_bs(
                 }
                 const unsigned int packed_word =
                     *reinterpret_cast<const unsigned int*>(packed + blob_base + (within >> 1));
+                if (valid == 8) {
+                    // Fast path: LOP3 int4->fp16 dequant + 128-bit activation
+                    // load. Byte-identical to the scalar loop below (same
+                    // ascending-order fp32 products) but replaces the per-nibble
+                    // shift/and/convert with 4 lop3 + f16x2 debias, cutting the
+                    // dequant-ALU pressure that dominates the block!=32 GEMV.
+                    const unsigned int sub2 = int4_zero_point_sub2(zero_point);
+                    partial = dot_int4x8_f16_sub(packed_word, activation + depth, sub2);
+                } else {
 #pragma unroll
-                for (int i = 0; i < 8; ++i) {
-                    if (i < valid) {
-                        const int q = (int)((packed_word >> (i * 4)) & 15u) - zero_point;
-                        partial += (float)q * __half2float(activation[depth + i]);
+                    for (int i = 0; i < 8; ++i) {
+                        if (i < valid) {
+                            const int q = (int)((packed_word >> (i * 4)) & 15u) - zero_point;
+                            partial += (float)q * __half2float(activation[depth + i]);
+                        }
                     }
                 }
             }
@@ -3470,6 +3688,207 @@ extern "C" __global__ void matmul_nbits_gemv_f16_general_bs(
     value = warp_sum(value);
     if (lane == 0 && column < n) {
         output[column] = fold_bias_f16(value, bias, column, bias_post_round);
+    }
+}
+
+// Split-K counterpart of `matmul_nbits_gemv_f16_general_bs`: K_SPLIT warps
+// cooperate on one output column, each walking a strided subset of the 256-wide
+// K steps, then summing their fp32 partials through shared memory. The launch
+// grid is K_SPLIT x larger than the single-warp kernel, which fills the SMs on
+// the grid-starved, latency-bound block!=32 decode GEMV (the medium
+// projections run at ~0.5 waves/SM single-warp). Each warp keeps the same fp32
+// LOP3 dequant loop as the single-warp kernel, so the only numeric difference
+// is the new K-slice partial-sum association (near-equal, not byte-identical) —
+// the same trade the block-32 split-K entries already ship by default.
+extern "C" __global__ void matmul_nbits_gemv_f16_general_bs_splitk(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales,
+    const unsigned char* __restrict__ zero_points,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int scales_fp16,
+    const int bias_post_round,
+    const int bits)
+{
+    constexpr int K_SPLIT = 4;  // must match Rust GENERAL_BS_SPLITK
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const int cols_per_block = warps_per_block / K_SPLIT;
+    const int col_local = warp / K_SPLIT;
+    const int ks = warp % K_SPLIT;
+    const int column = (int)blockIdx.x * cols_per_block + col_local;
+
+    __shared__ float partials[8][K_SPLIT];
+
+    float value = 0.0f;
+    if (column < n) {
+        for (int depth = ks * 256 + lane * 8; depth < k; depth += K_SPLIT * 256) {
+            const int block = depth / block_size;
+            const int within = depth - block * block_size;
+            const long blob_base = ((long)column * k_blocks + block) * blob_size;
+            float scale;
+            if (scales_fp16) {
+                scale = __half2float(
+                    reinterpret_cast<const __half*>(scales)[(long)column * k_blocks + block]);
+            } else {
+                scale =
+                    reinterpret_cast<const float*>(scales)[(long)column * k_blocks + block];
+            }
+            const int valid = min(8, k - depth);
+            float partial = 0.0f;
+            if (bits == 8) {
+                const int zero_point =
+                    zero_points ? (int)zero_points[(long)column * k_blocks + block] : 128;
+                const unsigned char* block_bytes = packed + blob_base + within;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    if (i < valid) {
+                        const int q = (int)block_bytes[i] - zero_point;
+                        partial += (float)q * __half2float(activation[depth + i]);
+                    }
+                }
+            } else {
+                int zero_point = 8;
+                if (zero_points) {
+                    const unsigned char zp =
+                        zero_points[(long)column * zp_row_bytes + (block >> 1)];
+                    zero_point = (block & 1) ? (zp >> 4) : (zp & 15);
+                }
+                const unsigned int packed_word =
+                    *reinterpret_cast<const unsigned int*>(packed + blob_base + (within >> 1));
+                if (valid == 8) {
+                    const unsigned int sub2 = int4_zero_point_sub2(zero_point);
+                    partial = dot_int4x8_f16_sub(packed_word, activation + depth, sub2);
+                } else {
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        if (i < valid) {
+                            const int q = (int)((packed_word >> (i * 4)) & 15u) - zero_point;
+                            partial += (float)q * __half2float(activation[depth + i]);
+                        }
+                    }
+                }
+            }
+            value += partial * scale;
+        }
+    }
+
+    value = warp_sum(value);
+    if (lane == 0) {
+        partials[col_local][ks] = (column < n) ? value : 0.0f;
+    }
+    __syncthreads();
+    if (ks == 0 && lane == 0 && column < n) {
+        float acc = 0.0f;
+#pragma unroll
+        for (int s = 0; s < K_SPLIT; ++s) {
+            acc += partials[col_local][s];
+        }
+        output[column] = fold_bias_f16(acc, bias, column, bias_post_round);
+    }
+}
+
+// Wide-load counterpart of `matmul_nbits_gemv_f16_general_bs` (see
+// `gemv_int4_wide_lane_dot`). Same launch geometry (one warp per output column,
+// 8 columns per 256-thread CTA) and same fp32/warp-sum reduction, but each lane
+// streams 32 nibbles/step via a pipelined 128-bit weight load to lift DRAM
+// throughput toward ORT's on the wide (already occupancy-filled) gate_up shape.
+extern "C" __global__ void matmul_nbits_gemv_f16_general_bs_wide(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales,
+    const unsigned char* __restrict__ zero_points,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int scales_fp16,
+    const int bias_post_round,
+    const int bits)
+{
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int columns_per_block = (int)blockDim.x >> 5;
+    const int column = (int)blockIdx.x * columns_per_block + warp;
+
+    float value = 0.0f;
+    if (column < n) {
+        value = gemv_int4_wide_lane_dot(
+            activation, packed, scales, zero_points, k, block_size, k_blocks,
+            blob_size, zp_row_bytes, scales_fp16, column, lane * 32, 32 * 32);
+    }
+    value = warp_sum(value);
+    if (lane == 0 && column < n) {
+        output[column] = fold_bias_f16(value, bias, column, bias_post_round);
+    }
+}
+
+// Wide-load counterpart of `matmul_nbits_gemv_f16_general_bs_splitk`: K_SPLIT
+// warps cooperate on one output column, each walking a `32 * K_SPLIT`-strided
+// set of 32-nibble chunks with the pipelined 128-bit loads, then summing their
+// fp32 partials through shared memory (same grid-fill as the narrow split-K).
+extern "C" __global__ void matmul_nbits_gemv_f16_general_bs_splitk_wide(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales,
+    const unsigned char* __restrict__ zero_points,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int scales_fp16,
+    const int bias_post_round,
+    const int bits)
+{
+    constexpr int K_SPLIT = 4;  // must match Rust GENERAL_BS_SPLITK
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const int cols_per_block = warps_per_block / K_SPLIT;
+    const int col_local = warp / K_SPLIT;
+    const int ks = warp % K_SPLIT;
+    const int column = (int)blockIdx.x * cols_per_block + col_local;
+
+    __shared__ float partials[8][K_SPLIT];
+
+    float value = 0.0f;
+    if (column < n) {
+        value = gemv_int4_wide_lane_dot(
+            activation, packed, scales, zero_points, k, block_size, k_blocks,
+            blob_size, zp_row_bytes, scales_fp16, column, ks * 32 * 32 + lane * 32,
+            K_SPLIT * 32 * 32);
+    }
+    value = warp_sum(value);
+    if (lane == 0) {
+        partials[col_local][ks] = (column < n) ? value : 0.0f;
+    }
+    __syncthreads();
+    if (ks == 0 && lane == 0 && column < n) {
+        float acc = 0.0f;
+#pragma unroll
+        for (int s = 0; s < K_SPLIT; ++s) {
+            acc += partials[col_local][s];
+        }
+        output[column] = fold_bias_f16(acc, bias, column, bias_post_round);
     }
 }
 
@@ -3683,6 +4102,72 @@ fn select_down_columns(n: usize, multiprocessor_count: u32) -> (usize, &'static 
 /// of resident CTAs.
 const ACCURACY4_GEMV_FILL_CTAS_PER_SM: usize = 12;
 const F16_SYMMETRIC_SPLITK_TARGET_WARPS_PER_SM: usize = 16;
+
+/// Per-SM CTA target for the block!=32 general_bs split-K decode GEMV. The
+/// single-warp `general_bs` launch emits one 256-thread (8-warp) CTA per 8
+/// output columns, so a projection is grid-starved (leaves SMs idle, starving
+/// the latency-bound global loads of in-flight work) when `ceil(N/8)` CTAs is
+/// below ~2 waves of resident CTAs. glm-4-9b's medium projections (N=4096) sit
+/// at ~0.5 waves single-warp; K_SPLIT=2 doubles the grid to ~1 wave. The fused
+/// gate_up (N~27k) is already >3 waves and stays single-warp.
+const GENERAL_BS_SPLITK_TARGET_CTAS_PER_SM: usize = 16;
+
+/// Whether the block!=32 int4 decode GEMV should take the split-K entry
+/// ([`GEMV_F16_GENERAL_BS_SPLITK_ENTRY`]) instead of the single-warp
+/// [`GEMV_F16_GENERAL_BS_ENTRY`]. Enabled only for grid-starved int4
+/// projections so the well-occupied wide GEMVs (fused gate_up) keep the
+/// single-warp path. `ONNX_GENAI_GENERAL_SPLITK=0|1` forces off/on for A/B
+/// measurement; unset uses the device-derived heuristic.
+fn use_general_bs_splitk(k: usize, n: usize, bits: usize, multiprocessor_count: u32) -> bool {
+    if let Some(forced) = general_bs_splitk_override() {
+        return forced;
+    }
+    let single_warp_ctas = n.div_ceil((GEMV_F16_LARGE_THREADS / 32) as usize);
+    bits == 4
+        && k >= 512
+        // Split-K needs >= K_SPLIT warps/block; the small-shape path uses only
+        // 64 threads (2 warps) < K_SPLIT, so restrict to the 256-thread large
+        // path (matches the block-32 split-K gating).
+        && !(n <= GEMV_F16_SMALL_N_MAX && k <= GEMV_F16_SMALL_N_MAX)
+        && single_warp_ctas
+            < (multiprocessor_count.max(1) as usize)
+                .saturating_mul(GENERAL_BS_SPLITK_TARGET_CTAS_PER_SM)
+}
+
+/// Developer override for the general_bs split-K decode GEMV: `1`/`true`/`on`
+/// forces the split-K entry, `0`/`false`/`off` forces the single-warp entry,
+/// and any other/unset value defers to the device-derived heuristic.
+fn general_bs_splitk_override() -> Option<bool> {
+    match std::env::var("ONNX_GENAI_GENERAL_SPLITK").ok().as_deref() {
+        Some("1") | Some("true") | Some("on") => Some(true),
+        Some("0") | Some("false") | Some("off") => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether the block!=32 int4 decode GEMV should take the wide-load (128-bit
+/// `uint4`, software-pipelined) entries ([`GEMV_F16_GENERAL_BS_WIDE_ENTRY`] /
+/// [`GEMV_F16_GENERAL_BS_SPLITK_WIDE_ENTRY`]) instead of the 32-bit narrow-load
+/// entries. Default-on (the wide load is portable — no SM80 intrinsic — and
+/// raises DRAM bandwidth on the memory-latency-bound M=1 GEMV toward ORT's).
+/// Restricted to int4 with `block_size % 32 == 0 && k % 32 == 0` so each lane's
+/// 32-nibble `uint4` chunk lies inside a single block; other layouts fall back
+/// to the narrow entry byte-for-byte. Only wired into the `block_size != 32`
+/// general_bs dispatch arm (glm-class block-128 large-N GEMV, measured +35%
+/// decode); the block-32 (`scales_f16` / fused gate_up) path was measured a
+/// NO-GO — those kernels are compute/SM-bound, not DRAM-bound, so the wide
+/// fp32 path is flat-to-negative there (see the decode decision drop), and they
+/// keep their tuned fp16-accumulate narrow entries. `ONNX_GENAI_GEMV_WIDELOAD=0`
+/// forces the narrow entry for A/B measurement, `1` forces wide where permitted.
+fn use_gemv_wideload(bits: usize, block_size: usize, k: usize) -> bool {
+    if bits != 4 || !block_size.is_multiple_of(32) || !k.is_multiple_of(32) {
+        return false;
+    }
+    !matches!(
+        std::env::var("ONNX_GENAI_GEMV_WIDELOAD").ok().as_deref(),
+        Some("0") | Some("false") | Some("off")
+    )
+}
 
 fn use_f16_symmetric_splitk(
     k: usize,
@@ -6427,6 +6912,18 @@ impl MatMulNBitsKernel {
         let down_choice = down_columns_override().unwrap_or_else(|| {
             select_down_columns(self.n, self.runtime.capabilities().multiprocessor_count())
         });
+        // Grid-fill split-K for the block!=32 int4 decode GEMV: the single-warp
+        // general_bs launch under-fills the SMs on the medium/KV projections
+        // (~0.5 waves), starving the latency-bound global loads. K_SPLIT warps
+        // per column doubles the grid to fill the device; the wide gate_up GEMV
+        // (already >3 waves) keeps the single-warp entry.
+        let use_general_splitk = self.block_size != 32
+            && use_general_bs_splitk(
+                self.k,
+                self.n,
+                self.bits,
+                self.runtime.capabilities().multiprocessor_count(),
+            );
         let entry = if self.block_size != 32 {
             // Any non-block-32 layout uses the model-agnostic general kernel; the
             // tuned DownProjection / scales_f16 / general entries bake in the
@@ -6435,7 +6932,17 @@ impl MatMulNBitsKernel {
             // below (the `General` arm) applies unchanged. The general_bs kernel
             // dequantizes an optional asymmetric zero point per block, so it is
             // correct for both symmetric (zp==8) and asymmetric layouts.
-            GEMV_F16_GENERAL_BS_ENTRY
+            if use_general_splitk {
+                if use_gemv_wideload(self.bits, self.block_size, self.k) {
+                    GEMV_F16_GENERAL_BS_SPLITK_WIDE_ENTRY
+                } else {
+                    GEMV_F16_GENERAL_BS_SPLITK_ENTRY
+                }
+            } else if use_gemv_wideload(self.bits, self.block_size, self.k) {
+                GEMV_F16_GENERAL_BS_WIDE_ENTRY
+            } else {
+                GEMV_F16_GENERAL_BS_ENTRY
+            }
         } else {
             match selection.variant {
                 F16GemvVariant::DownProjection => down_choice.1,
@@ -6502,15 +7009,23 @@ impl MatMulNBitsKernel {
         let (threads, columns_per_block, shared_mem_bytes) = match selection.variant {
             F16GemvVariant::DownProjection => (GEMV_F16_DOWN_THREADS, down_choice.0, 0),
             F16GemvVariant::General => {
-                let threads = if self.n <= GEMV_F16_SMALL_N_MAX && self.k <= GEMV_F16_SMALL_N_MAX {
+                let threads = if self.n <= GEMV_F16_SMALL_N_MAX
+                    && self.k <= GEMV_F16_SMALL_N_MAX
+                    && !use_general_splitk
+                {
                     GEMV_F16_SMALL_THREADS
                 } else {
                     GEMV_F16_LARGE_THREADS
                 };
                 // Split-K assigns K_SPLIT warps per output column, so a block of
                 // `threads/32` warps now covers `warps / K_SPLIT` columns and the
-                // grid grows by K_SPLIT to fill the SMs.
-                let columns_per_block = if use_scales_f16_splitk {
+                // grid grows by K_SPLIT to fill the SMs. The block-32 scales_f16
+                // split-K uses K_SPLIT = GEMV_F16_SCALES_F16_ZP_SPLITK; the
+                // block!=32 general_bs split-K uses GENERAL_BS_SPLITK. Both force
+                // the 256-thread path so `threads/32 >= K_SPLIT`.
+                let columns_per_block = if use_general_splitk {
+                    (threads / 32) as usize / GENERAL_BS_SPLITK
+                } else if use_scales_f16_splitk {
                     (threads / 32) as usize / GEMV_F16_SCALES_F16_ZP_SPLITK
                 } else {
                     (threads / 32) as usize
@@ -6537,7 +7052,12 @@ impl MatMulNBitsKernel {
         // The model-agnostic general-block-size GEMV takes one extra trailing
         // scalar (`bits`) to select the packed int4/int8 layout for any block
         // width; the tuned block-32 entries bake in their bit width and take none.
-        if entry == GEMV_F16_GENERAL_BS_ENTRY {
+        // The general_bs split-K entry shares the same trailing `bits` ABI.
+        if entry == GEMV_F16_GENERAL_BS_ENTRY
+            || entry == GEMV_F16_GENERAL_BS_SPLITK_ENTRY
+            || entry == GEMV_F16_GENERAL_BS_WIDE_ENTRY
+            || entry == GEMV_F16_GENERAL_BS_SPLITK_WIDE_ENTRY
+        {
             builder.arg(&bits);
         }
         // SAFETY: M=1 fp16 inputs; all tensors were dtype/shape/contiguity
@@ -12432,15 +12952,27 @@ extern "C" __global__ void ref_silu_mul_f16(
                 );
             }
             // The fused projection matches the three-op sequence. It is normally
-            // bit-identical, EXCEPT the asymmetric int8-zp M=1 case: the three-op
-            // reference's standalone int8 GEMV now routes to the split-K entry
-            // (K % 256 == 0, grid-starved), which reorders the fp32 block-sum
-            // association across K_SPLIT cooperating warps (fp reassociation),
-            // while the fused following kernel keeps the single-warp association.
-            // Both are near-equal valid computations, so that path is validated to
-            // a tight magnitude-relative tolerance instead of byte-identity.
+            // bit-identical, EXCEPT two fp-reassociation sources make it merely
+            // near-equal:
+            //   (1) the asymmetric int8-zp M=1 case, where the three-op
+            //       reference's standalone int8 GEMV routes to the split-K entry
+            //       (K % 256 == 0, grid-starved), reordering the fp32 block-sum
+            //       across K_SPLIT cooperating warps; and
+            //   (2) any decode-shaped norm (num_groups <=
+            //       SKIP_RMSNORM_BLOCK_MAX_GROUPS), where the reference's
+            //       standalone SkipSimplifiedLayerNorm routes to the multi-warp
+            //       `skip_rmsnorm_f16_block_half4` variant, which reduces the
+            //       fp32 sum-of-squares in block-tree order while the fused norm
+            //       prologue keeps the single-warp order.
+            // Both are near-equal valid computations, so those paths are
+            // validated to a tight magnitude-relative tolerance (which still
+            // catches a dropped zero point or fp16 accumulation, both of which
+            // diverge grossly) instead of byte-identity.
             let splitk_path = bits == 8 && explicit_zp && m == 1;
-            if splitk_path {
+            let norm_block_reference =
+                m as u32 <= crate::kernels::normalization::SKIP_RMSNORM_BLOCK_MAX_GROUPS;
+            let near_equal = splitk_path || norm_block_reference;
+            if near_equal {
                 let mut max_abs = 0.0f32;
                 let mut worst = 0.0f32;
                 for index in 0..m * post_n {
@@ -12448,7 +12980,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                     let reference = y_ref_host[index].to_f32();
                     assert!(
                         fused.is_finite(),
-                        "split-K int8-zp GEMV produced a non-finite output at M={m}, \
+                        "near-equal fused int8-zp GEMV produced a non-finite output at M={m}, \
                          following_bias={following_bias}, column={}",
                         index % post_n
                     );
@@ -12458,7 +12990,8 @@ extern "C" __global__ void ref_silu_mul_f16(
                 let bound = (max_abs * 2e-3).max(1e-3);
                 assert!(
                     worst < bound,
-                    "fused norm prologue diverged from split-K skip_rmsnorm + GEMV at \
+                    "fused norm prologue diverged (beyond fp reassociation) from \
+                     skip_rmsnorm + GEMV at \
                      M={m}, following_bias={following_bias}: \
                      max_abs_diff={worst:.3e} bound={bound:.3e}"
                 );

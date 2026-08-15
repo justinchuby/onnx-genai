@@ -1,5 +1,5 @@
 #![cfg_attr(
-    not(feature = "native-backend"),
+    all(not(feature = "native-backend"), not(test)),
     expect(
         dead_code,
         reason = "exact native KV sizing is consumed only by the native backend"

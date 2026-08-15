@@ -69,9 +69,103 @@ fn generate(dir: &Path) -> anyhow::Result<GenerateResult> {
     engine.generate(request)
 }
 
-/// Runs the model twice — tiled (flag off) then Marlin (flag on) — and asserts
-/// the greedy token streams match. The Marlin M>1 GEMM reorders partial sums so
-/// it is not byte-exact, but on greedy decode the argmax token must be stable.
+/// Number of extra tiled generations used to decide whether the first
+/// tiled/Marlin divergence is a near-tie (see [`assert_marlin_matches_tiled`]).
+///
+/// Sized to mirror the empirical evidence in PR #962: a 4-run tiled A/B on
+/// qwen2.5-14b-int4 showed the *tiled* reference flipping the token-19 argmax on
+/// 1 of 4 runs while Marlin stayed deterministic across all runs — i.e. the tiled
+/// GEMM's fp32 atomic reduction order is the nondeterministic side at a near-tie.
+const TIE_PROBE_RUNS: usize = 4;
+
+/// Verdict of comparing a tiled greedy stream against a Marlin greedy stream,
+/// using extra tiled "probe" streams to classify the first divergence.
+#[derive(Debug, PartialEq, Eq)]
+enum ParityVerdict {
+    /// The two streams are identical (full-strength match).
+    Identical,
+    /// The streams share a prefix but differ in length.
+    LengthMismatch { tiled: usize, marlin: usize },
+    /// First divergence at `position` is a confirmed near-tie: a tiled probe
+    /// reproduced the shared prefix yet produced a different token there
+    /// (`prefix_unstable` = no probe could even reproduce the prefix, so the
+    /// prefix region itself is tie-dominated). Not a Marlin regression.
+    NearTie {
+        position: usize,
+        prefix_unstable: bool,
+    },
+    /// First divergence at `position` where the tiled reference stayed
+    /// deterministic across every probe — a genuine Marlin regression.
+    Regression {
+        position: usize,
+        tiled: u32,
+        marlin: u32,
+    },
+}
+
+/// Classifies a tiled-vs-Marlin greedy-stream comparison. Pure and GPU-free so
+/// the near-tie logic is unit-tested deterministically (see the tests below).
+///
+/// `probes` are independent re-runs of the *tiled* configuration. Greedy decode
+/// is autoregressive and at a near-tie the argmax is nondeterministic (fp
+/// atomics), so a single early flip cascades. We therefore look only at the first
+/// divergence `d`: if a tiled probe reproduces the identical shared prefix
+/// `tiled[..d]` but yields a different token at `d`, the tiled reference is itself
+/// nondeterministic there (a near-tie, not a Marlin regression). Only a
+/// divergence at a position where every prefix-matching probe agrees with the
+/// tiled reference is a regression.
+fn classify_parity(tiled: &[u32], marlin: &[u32], probes: &[Vec<u32>]) -> ParityVerdict {
+    let Some(d) = tiled.iter().zip(marlin).position(|(t, m)| t != m) else {
+        return if tiled.len() == marlin.len() {
+            ParityVerdict::Identical
+        } else {
+            ParityVerdict::LengthMismatch {
+                tiled: tiled.len(),
+                marlin: marlin.len(),
+            }
+        };
+    };
+
+    let prefix = &tiled[..d];
+    let tiled_tok = tiled[d];
+    let mut prefix_reproduced = false;
+    for probe in probes {
+        if probe.get(..d) != Some(prefix) {
+            continue;
+        }
+        prefix_reproduced = true;
+        if probe.get(d) != Some(&tiled_tok) {
+            return ParityVerdict::NearTie {
+                position: d,
+                prefix_unstable: false,
+            };
+        }
+    }
+
+    if !prefix_reproduced {
+        return ParityVerdict::NearTie {
+            position: d,
+            prefix_unstable: true,
+        };
+    }
+
+    ParityVerdict::Regression {
+        position: d,
+        tiled: tiled_tok,
+        marlin: marlin[d],
+    }
+}
+
+/// Asserts the opt-in Marlin M>1 path does not regress the greedy token stream
+/// versus the portable tiled GEMM.
+///
+/// Subtlety (why this is not a plain `assert_eq!` of two streams): greedy decode
+/// is autoregressive, and at a near-degenerate argmax (a near-tie) the chosen
+/// token is nondeterministic run-to-run for *either* configuration — the flip
+/// comes from fp atomic/reduction-order nondeterminism in the pipeline (the tiled
+/// GEMM's fp32 atomics, attention reductions), not from a Marlin error. A single
+/// early tie flip then cascades and desyncs the entire tail. See
+/// [`classify_parity`] for the near-tie classification (unit-tested separately).
 fn assert_marlin_matches_tiled(dir: &Path, label: &str) -> anyhow::Result<()> {
     // SAFETY: ignored e2e test runs serially; no concurrent readers of the flag.
     unsafe {
@@ -94,11 +188,124 @@ fn assert_marlin_matches_tiled(dir: &Path, label: &str) -> anyhow::Result<()> {
 
     eprintln!("[{label}] tiled : {:?}", tiled.token_ids);
     eprintln!("[{label}] marlin: {:?}", marlin.token_ids);
+
+    // Only pay for tiled probe re-runs if the two streams actually diverge.
+    let diverges = tiled
+        .token_ids
+        .iter()
+        .zip(&marlin.token_ids)
+        .any(|(t, m)| t != m)
+        || tiled.token_ids.len() != marlin.token_ids.len();
+    let mut probes: Vec<Vec<u32>> = Vec::new();
+    if diverges {
+        eprintln!("[{label}] streams diverge — probing whether the first divergence is a near-tie");
+        for _ in 0..TIE_PROBE_RUNS {
+            probes.push(generate(dir)?.token_ids);
+        }
+    }
+
+    match classify_parity(&tiled.token_ids, &marlin.token_ids, &probes) {
+        ParityVerdict::Identical => {
+            eprintln!(
+                "[{label}] greedy streams identical ({} tokens) — full-strength match",
+                tiled.token_ids.len()
+            );
+            Ok(())
+        }
+        ParityVerdict::NearTie {
+            position,
+            prefix_unstable,
+        } => {
+            eprintln!(
+                "[{label}] first divergence at token {position} is a near-tie \
+                 (prefix_unstable={prefix_unstable}) — nondeterministic in the tiled reference \
+                 itself, not a Marlin regression"
+            );
+            Ok(())
+        }
+        ParityVerdict::LengthMismatch { tiled, marlin } => {
+            panic!(
+                "[{label}] Marlin and tiled greedy streams differ in length: {tiled} vs {marlin}"
+            )
+        }
+        ParityVerdict::Regression {
+            position,
+            tiled: tiled_tok,
+            marlin: marlin_tok,
+        } => {
+            panic!(
+                "[{label}] Marlin M>1 changed the greedy token at position {position} \
+                 (tiled={tiled_tok}, marlin={marlin_tok}) while the tiled reference stayed \
+                 deterministic there across {TIE_PROBE_RUNS} probes — a genuine regression"
+            )
+        }
+    }
+}
+
+#[test]
+fn classify_parity_identical_streams() {
+    let s = vec![1, 2, 3, 4];
+    assert_eq!(classify_parity(&s, &s, &[]), ParityVerdict::Identical);
+}
+
+#[test]
+fn classify_parity_flags_length_mismatch() {
     assert_eq!(
-        marlin.token_ids, tiled.token_ids,
-        "[{label}] Marlin M>1 prefill changed the greedy token stream vs the tiled GEMM"
+        classify_parity(&[1, 2, 3], &[1, 2, 3, 4], &[]),
+        ParityVerdict::LengthMismatch {
+            tiled: 3,
+            marlin: 4
+        }
     );
-    Ok(())
+}
+
+#[test]
+fn classify_parity_confirms_near_tie_from_probe() {
+    // Streams diverge at index 2; a tiled probe reproduces the prefix [1,2] but
+    // yields a different token (99) there → confirmed near-tie.
+    let tiled = vec![1, 2, 30, 40];
+    let marlin = vec![1, 2, 31, 41];
+    let probes = vec![vec![1, 2, 99, 7]];
+    assert_eq!(
+        classify_parity(&tiled, &marlin, &probes),
+        ParityVerdict::NearTie {
+            position: 2,
+            prefix_unstable: false
+        }
+    );
+}
+
+#[test]
+fn classify_parity_reports_regression_when_tiled_is_deterministic() {
+    // Diverge at index 2; every prefix-matching probe agrees with tiled (30) →
+    // tiled is deterministic there, so Marlin's 31 is a real regression.
+    let tiled = vec![1, 2, 30, 40];
+    let marlin = vec![1, 2, 31, 41];
+    let probes = vec![vec![1, 2, 30, 40], vec![1, 2, 30, 99]];
+    assert_eq!(
+        classify_parity(&tiled, &marlin, &probes),
+        ParityVerdict::Regression {
+            position: 2,
+            tiled: 30,
+            marlin: 31
+        }
+    );
+}
+
+#[test]
+fn classify_parity_near_tie_when_prefix_never_reproduced() {
+    // Diverge at index 2, but no probe reproduces the prefix [1,2] (the prefix
+    // region is itself tie-dominated) → treated as a near-tie, not a regression.
+    let tiled = vec![1, 2, 30, 40];
+    let marlin = vec![1, 2, 31, 41];
+    let probes = vec![vec![1, 77, 30, 40], vec![9, 2, 30, 40]];
+    assert_eq!(
+        classify_parity(&tiled, &marlin, &probes),
+        ParityVerdict::NearTie {
+            position: 2,
+            prefix_unstable: true
+        }
+    );
 }
 
 /// The M>1 tiled-fallback kernel variants. Every one of these fires only inside

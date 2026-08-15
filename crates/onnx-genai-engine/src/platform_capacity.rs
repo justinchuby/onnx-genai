@@ -243,6 +243,11 @@ fn statvfs_capacity(path: &std::path::Path) -> Option<(u64, u64)> {
         return None;
     }
     let buf = unsafe { buf.assume_init() };
+    // `c_ulong` is already 64-bit on LP64 targets and 32-bit elsewhere, so this
+    // widening is redundant on some targets and load-bearing on others. Keep it
+    // and silence the lint rather than making the arithmetic below
+    // target-dependent.
+    #[allow(clippy::unnecessary_cast)]
     let unit = if buf.f_frsize != 0 {
         buf.f_frsize as u64
     } else {

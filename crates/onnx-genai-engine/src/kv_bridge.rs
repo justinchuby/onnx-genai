@@ -27,7 +27,7 @@ pub(crate) struct KvModelInfo {
     /// Native past tensors, retained independently so asymmetric K/V geometry
     /// and storage types are charged exactly as the allocator sizes them.
     #[cfg_attr(
-        not(feature = "native-backend"),
+        all(not(feature = "native-backend"), not(test)),
         expect(
             dead_code,
             reason = "native KV tensors are consumed only by the native backend"

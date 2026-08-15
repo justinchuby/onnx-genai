@@ -752,6 +752,127 @@ extern "C" __global__ void skip_rmsnorm_f16_warp_half4(
     }
 }
 
+// Decode-shaped variant of `skip_rmsnorm_f16_warp_half4`. The warp path runs one
+// 32-lane warp per row, which saturates the machine only when there are many
+// rows (prefill). At decode there is a single row (num_groups == 1), so a lone
+// warp leaves the GPU almost entirely idle (measured 1.56% achieved occupancy,
+// Grid 1 x Block 32) and stalls ~92% of cycles on Long-Scoreboard global-load
+// latency with too few resident warps to hide it. This variant spreads the same
+// half4 chunks of one row across a full multi-warp block and reduces the
+// sum-of-squares through the file's launch-invariant `red[tid]` block tree, so
+// many warps are resident to hide the load latency. Same launch predicate as the
+// warp path (norm_size % 128 == 0, dense skip, no bias). The residual (`y` /
+// `sum_out`) is written per-chunk by exactly one thread with the identical
+// __hadd2 rounding, so it is byte-identical to the warp path; only the fp32
+// sum-of-squares reduction order differs, perturbing the shared 1/rms by ULPs.
+extern "C" __global__ void skip_rmsnorm_f16_block_half4(
+    const __half* input,
+    const __half* skip,
+    const void*   gamma,
+    const void*   bias,
+    __half*       y,
+    __half*       sum_out,
+    void*         mean_out,
+    void*         invstd_out,
+    const unsigned long long* metadata,
+    const int     rank,
+    const int     num_groups,
+    const int     norm_size,
+    const int     has_bias,
+    const int     dense_skip,
+    const int     gamma_is_half,
+    const int     bias_is_half,
+    const int     stat_is_half,
+    const float   epsilon)
+{
+    const int g = blockIdx.x;
+    if (g >= num_groups) return;
+    const size_t base = (size_t)g * norm_size;
+    const int tid = threadIdx.x;
+    const int nt = blockDim.x;
+    const int chunks = norm_size >> 2;
+    const unsigned long long* input4 =
+        (const unsigned long long*)(input + base);
+    const unsigned long long* skip4 =
+        (const unsigned long long*)(skip + base);
+    const unsigned long long* gamma4 =
+        (const unsigned long long*)gamma;
+    unsigned long long* y4 = (unsigned long long*)(y + base);
+    unsigned long long* sum4 =
+        sum_out ? (unsigned long long*)(sum_out + base) : 0;
+
+    extern __shared__ float red[];
+    float ss = 0.0f;
+    for (int chunk = tid; chunk < chunks; chunk += nt) {
+        SkipHalf4 input_v;
+        SkipHalf4 skip_v;
+        SkipHalf4 residual;
+        input_v.raw = input4[chunk];
+        skip_v.raw = skip4[chunk];
+        residual.pair[0] = __hadd2(input_v.pair[0], skip_v.pair[0]);
+        residual.pair[1] = __hadd2(input_v.pair[1], skip_v.pair[1]);
+        y4[chunk] = residual.raw;
+        if (sum4) sum4[chunk] = residual.raw;
+        const float2 rounded0 = __half22float2(residual.pair[0]);
+        const float2 rounded1 = __half22float2(residual.pair[1]);
+        ss += rounded0.x * rounded0.x;
+        ss += rounded0.y * rounded0.y;
+        ss += rounded1.x * rounded1.x;
+        ss += rounded1.y * rounded1.y;
+    }
+
+    red[tid] = ss;
+    __syncthreads();
+    for (int offset = nt >> 1; offset > 0; offset >>= 1) {
+        if (tid < offset) red[tid] += red[tid + offset];
+        __syncthreads();
+    }
+    const float inv_std = 1.0f / sqrtf(red[0] / (float)norm_size + epsilon);
+    if (tid == 0) {
+        if (mean_out) {
+            if (stat_is_half) ((__half*)mean_out)[g] = __float2half_rn(0.0f);
+            else ((float*)mean_out)[g] = 0.0f;
+        }
+        if (invstd_out) {
+            if (stat_is_half) ((__half*)invstd_out)[g] = __float2half_rn(inv_std);
+            else ((float*)invstd_out)[g] = inv_std;
+        }
+    }
+
+    const float* gamma_f = (const float*)gamma;
+    for (int chunk = tid; chunk < chunks; chunk += nt) {
+        SkipHalf4 residual;
+        SkipHalf4 output;
+        residual.raw = y4[chunk];
+        const float2 value0 = __half22float2(residual.pair[0]);
+        const float2 value1 = __half22float2(residual.pair[1]);
+        float scale0x, scale0y, scale1x, scale1y;
+        if (gamma_is_half) {
+            SkipHalf4 scale;
+            scale.raw = gamma4[chunk];
+            const float2 scale0 = __half22float2(scale.pair[0]);
+            const float2 scale1 = __half22float2(scale.pair[1]);
+            scale0x = scale0.x;
+            scale0y = scale0.y;
+            scale1x = scale1.x;
+            scale1y = scale1.y;
+        } else {
+            const int j = chunk << 2;
+            scale0x = gamma_f[j];
+            scale0y = gamma_f[j + 1];
+            scale1x = gamma_f[j + 2];
+            scale1y = gamma_f[j + 3];
+        }
+        output.pair[0] = __floats2half2_rn(
+            value0.x * inv_std * scale0x,
+            value0.y * inv_std * scale0y);
+        output.pair[1] = __floats2half2_rn(
+            value1.x * inv_std * scale1x,
+            value1.y * inv_std * scale1y);
+        y4[chunk] = output.raw;
+    }
+}
+
 extern "C" __global__ void skip_rmsnorm_f16(
     const __half* input,
     const __half* skip,
@@ -964,7 +1085,33 @@ extern "C" __global__ void skip_layernorm_f32(
 
 const LAYERNORM_MODULE: &str = "layernorm_bf16_v2";
 const RMSNORM_MODULE: &str = "rmsnorm_bf16_v4";
-const SKIP_RMSNORM_MODULE: &str = "skip_rmsnorm_f16_warp_v5";
+const SKIP_RMSNORM_MODULE: &str = "skip_rmsnorm_f16_warp_v6_block";
+
+/// Max `num_groups` (rows) that routes the fp16 half4 skip-RMSNorm through the
+/// multi-warp `skip_rmsnorm_f16_block_half4` variant instead of one warp per row.
+/// At decode there is a single row, and speculative verify runs a small query
+/// width (M<=8); both leave the one-warp-per-row grid so starved that the kernel
+/// hits ~1.6% occupancy and stalls on global-load latency. Filling one row
+/// across a whole block hides that latency. Above this many rows the warp path
+/// already has enough resident warps (one per row) to saturate, so prefill keeps
+/// the byte-for-byte warp kernel untouched.
+pub(crate) const SKIP_RMSNORM_BLOCK_MAX_GROUPS: u32 = 8;
+
+/// Threads per block for the decode `skip_rmsnorm_f16_block_half4` launch. Sized
+/// to put many warps on the single active SM to hide the Long-Scoreboard load
+/// latency; `reduction_launch_config` rounds this down to a device-legal power
+/// of two and sizes the `red[tid]` reduction's dynamic shared memory.
+const SKIP_RMSNORM_BLOCK_THREADS: u32 = 1024;
+
+/// Environment opt-out for the decode multi-warp block skip-RMSNorm, mirroring
+/// the other CUDA A/B switches. Any value other than unset/empty/`0` forces the
+/// one-warp half4 kernel even at decode (for A/B measurement or rollback).
+const SKIP_RMSNORM_BLOCK_DISABLE_ENV: &str = "ONNX_GENAI_CUDA_DISABLE_SKIP_RMSNORM_BLOCK";
+
+fn skip_rmsnorm_block_disabled() -> bool {
+    std::env::var_os(SKIP_RMSNORM_BLOCK_DISABLE_ENV)
+        .is_some_and(|value| value != "0" && !value.is_empty())
+}
 const SKIP_LAYERNORM_MODULE: &str = "skip_layernorm_f32";
 
 /// Threads per block for the norm reductions (power of two → exact tree reduce).
@@ -2238,14 +2385,28 @@ impl SkipSimplifiedLayerNormKernel {
             SkipRmsnormVariant::F16Generic => "skip_rmsnorm_f16_generic",
             SkipRmsnormVariant::F16WarpHalf4 => "skip_rmsnorm_f16_warp_half4",
         };
+        // Decode/speculative-verify grids (few rows) route the one-warp half4
+        // path through the multi-warp block kernel so the single row is spread
+        // over a whole block, hiding the Long-Scoreboard global-load latency the
+        // lone warp cannot. Prefill (many rows) keeps the byte-identical warp
+        // kernel. The residual/sum outputs stay byte-identical either way; only
+        // the fp32 sum-of-squares reduction order changes.
+        let use_skip_block = matches!(selection.variant, SkipRmsnormVariant::F16WarpHalf4)
+            && groups_u <= SKIP_RMSNORM_BLOCK_MAX_GROUPS
+            && !skip_rmsnorm_block_disabled();
+        let entry = if use_skip_block {
+            "skip_rmsnorm_f16_block_half4"
+        } else {
+            selection.entry
+        };
         onnx_runtime_ep_api::record_kernel_variant!(
             variant_name,
             "SkipSimplifiedLayerNormalization hidden={norm_size}: {}",
             selection.reason
         );
-        let func =
-            self.runtime
-                .nvrtc_function(SKIP_RMSNORM_MODULE, SKIP_RMSNORM_SRC, selection.entry)?;
+        let func = self
+            .runtime
+            .nvrtc_function(SKIP_RMSNORM_MODULE, SKIP_RMSNORM_SRC, entry)?;
         let stream = self.runtime.stream();
         let mut builder = stream.launch_builder(&func);
         let groups_i = groups_u_i32(groups_u);
@@ -2275,7 +2436,16 @@ impl SkipSimplifiedLayerNormKernel {
         }
         // SAFETY: all pointers reference validated device buffers; metadata has
         // two rank-length u64 arrays describing the output shape and skip strides.
-        let cfg = if is_half {
+        let cfg = if use_skip_block {
+            // Multi-warp block per row: `reduction_launch_config` sizes the
+            // power-of-two thread count and the `red[tid]` dynamic shared memory.
+            self.runtime.reduction_launch_config(
+                &func,
+                groups_u,
+                SKIP_RMSNORM_BLOCK_THREADS,
+                std::mem::size_of::<f32>() as u32,
+            )?
+        } else if is_half {
             LaunchConfig {
                 grid_dim: (groups_u, 1, 1),
                 block_dim: (32, 1, 1),
@@ -2293,8 +2463,7 @@ impl SkipSimplifiedLayerNormKernel {
                 std::mem::size_of::<f32>() as u32,
             )?
         };
-        unsafe { builder.launch(cfg) }
-            .map_err(|e| driver_err(&format!("launch {}", selection.entry), e))?;
+        unsafe { builder.launch(cfg) }.map_err(|e| driver_err(&format!("launch {entry}"), e))?;
         // Capture-safety at query-width > 1 (speculative-decode M=K). The launch
         // grid is static (`groups_u` fixed for a fixed shape), no mid-kernel
         // sync / host read-back / device alloc-free happens on the hot path, and
@@ -2731,6 +2900,7 @@ mod tests {
         assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_f32_dense"));
         assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_f16"));
         assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_f16_warp_half4"));
+        assert!(SKIP_RMSNORM_SRC.contains("skip_rmsnorm_f16_block_half4"));
     }
 
     #[test]
@@ -3887,14 +4057,28 @@ mod tests {
 
     #[test]
     fn fp16_skip_rmsnorm_source_uses_one_warp_without_shared_reduction() {
-        let start = SKIP_RMSNORM_SRC
-            .find("extern \"C\" __global__ void skip_rmsnorm_f16")
+        // The prefill (many-rows) fp16 skip path stays one warp per row with a
+        // pure warp-shuffle reduction. Scope the assertions to the warp kernel
+        // body only — the decode `skip_rmsnorm_f16_block_half4` variant that
+        // follows it deliberately uses a `__syncthreads` block-tree reduction.
+        let warp_start = SKIP_RMSNORM_SRC
+            .find("extern \"C\" __global__ void skip_rmsnorm_f16_warp_half4")
             .unwrap();
-        let source = &SKIP_RMSNORM_SRC[start..];
-        assert!(source.contains("__half2"));
-        assert!(source.contains("__shfl_down_sync"));
-        assert!(!source.contains("extern __shared__"));
-        assert!(!source.contains("__syncthreads"));
+        let block_start = SKIP_RMSNORM_SRC
+            .find("extern \"C\" __global__ void skip_rmsnorm_f16_block_half4")
+            .unwrap();
+        assert!(block_start > warp_start);
+        let warp_body = &SKIP_RMSNORM_SRC[warp_start..block_start];
+        assert!(warp_body.contains("__half2"));
+        assert!(warp_body.contains("__shfl_down_sync"));
+        assert!(!warp_body.contains("extern __shared__"));
+        assert!(!warp_body.contains("__syncthreads"));
+
+        // The decode block variant fans one row across a whole block and reduces
+        // through the file's launch-invariant `red[tid]` block tree.
+        let block_body = &SKIP_RMSNORM_SRC[block_start..];
+        assert!(block_body.contains("extern __shared__ float red[]"));
+        assert!(block_body.contains("__syncthreads"));
     }
 
     #[test]
