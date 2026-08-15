@@ -72,3 +72,32 @@ ONNX_GENAI_RUN_CUDA_SMOKE=1 ONNX_GENAI_MARLIN_M_GT_1=1 ONNX_GENAI_SPEC_CAPTURED_
   --test native_speculative_driver native_prompt_lookup_matches_plain_greedy_cuda -- --nocapture
 ```
 `ONNX_GENAI_SPEC_DEBUG=1` prints the per-step capture state machine (`phase`, `captures`, `replays`, `fallback`) for verification.
+
+---
+
+## UPDATE (2026-08-15) — adaptive hit-density gate: generic-prose regression removed (head `9b8776d4`)
+
+The single-graph-slot re-warm tax that caused the generic-prose regression is now **mitigated in the driver** (the second-slot EP work below is still the way to fully clear ORT everywhere, but is no longer required to make the feature safe).
+
+### What changed
+1. **`HitDensityGate`** (native_speculative.rs): the n-gram proposal is a cheap CPU search, so the driver **always proposes** but only **engages** the width-W captured verify once recent would-hit density (sliding 16-step window, ≥50% by default) predicts the warmed graph will *replay* repeatedly. Sparse hits stay on the plain-decode floor; clustered hits get the full ~1.9–3.1× win. Env-tunable: `ONNX_GENAI_SPEC_GATE` (`0`=always-engage A/B baseline), `ONNX_GENAI_SPEC_GATE_WINDOW`, `ONNX_GENAI_SPEC_GATE_MIN_HITS`.
+2. **Miss/gated-out steps run the normal M=1 *captured* decode** (device-graph replay = full baseline speed) instead of an M=1 *eager* forward, then reset the verify phase so the next engage re-warms cleanly. `decode` invalidates the slot on signature mismatch before any kernel launch → safe alongside a stale width-W graph. Removed the obsolete `decode_base_eager_keep_verify_graph` + always-false `preserve_graph` plumbing.
+
+### AFTER numbers (glm-4-9b-int4, H200 GPU7, steady tokens=200, decode-skip 40, 3 runs, CUDA-graph on)
+| prompt regime | gate | K | mean-B | accept | **tok/s** | vs non-spec 111 |
+|---|---|---|---|---|---|---|
+| generic prose | **ON (default)** | 8 | — | 0% (verify_steps=0) | **104.1** | 0.94× (was **0.60× / 66.8** always-engage) |
+| generic prose | OFF (always-engage) | 8 | 3.4 | 7% | 75.8 | 0.68× |
+| repetitive | **ON** | 8 | 8.64 | 95.5% | **347.3** | **3.12× — beats ORT 250** |
+| repetitive | OFF | 8 | 8.57 | 94.6% | 355.8 | 3.19× |
+
+Net: the gate **eliminates the catastrophic generic-prose regression** (−40% → −6%) at a **~2% cost on fully-favorable prompts**, and repetitive/copy/code-continuation prompts now **clear ORT 250** (347 tok/s).
+
+### Correctness (re-verified on cleaned head `9b8776d4`)
+- **glm** captured-spec (gate ON) token stream **== non-spec byte-identical** on generic prose (heavy miss path exercising the new fast gated decode). ✓
+- CUDA smoke `native_prompt_lookup_matches_plain_greedy_cuda` green (gate disabled in-test to exercise engage). ✓
+- **12** GPU-free unit tests green (6 `greedy_accept`/tie-guard + **6 new `HitDensityGate`**). ✓
+- fmt clean; engine clippy `--all-targets` clean except the 2 pre-existing `platform_capacity.rs` casts.
+
+### KNOWN pre-existing numerics boundary (flag for Chew — NOT introduced here)
+On **qwen2.5-14b** with a prompt that drives a **degenerate repetition loop**, captured-spec diverges from non-spec by **one token at a genuine logit near-tie**: the fused **Marlin M=W row-0** base distribution and the **M=1 GEMV** base distribution pick different argmax at the tie (both streams remain the same degenerate loop, offset by one repetition — benign). **Verified pre-existing**: the pre-gate committed head (`c55de4ef`) diverges identically on the same prompt; non-spec qwen is deterministic run-to-run. This is the same Marlin-vs-GEMV near-tie class handled by #960/#961's f64-oracle + `classify_parity`, surfacing at the base-token selection (which the draft-acceptance `TieGuard` does not cover). Recommend Chew decide whether the spec contract is "== plain greedy" (needs base token derived from the M=1 GEMV kernel) or "== greedy-under-Marlin" (accept the boundary).
