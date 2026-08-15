@@ -102,11 +102,17 @@ impl Kernel for BiasGeluKernel {
         let x = to_dense_f32_widen("BiasGelu", &inputs[0])?;
         let bias = to_dense_f32_widen("BiasGelu", &inputs[1])?;
         let width = last_dim_bias(inputs[0].shape, &bias, "BiasGelu")?;
-        let y = x
-            .iter()
-            .enumerate()
-            .map(|(i, &v)| exact_gelu(v + bias[i % width]))
-            .collect::<Vec<_>>();
+        // Walk `x` a bias-row at a time. The bias index used to be `i % width`,
+        // a hardware integer division on every element, which cost more than
+        // the GELU it was feeding.
+        let mut y = Vec::with_capacity(x.len());
+        for row in x.chunks(width) {
+            y.extend(
+                row.iter()
+                    .zip(bias.iter())
+                    .map(|(&v, &b)| exact_gelu(v + b)),
+            );
+        }
         write_dense_f32_narrow("BiasGelu", &mut outputs[0], &y)
     }
 
@@ -138,11 +144,16 @@ impl Kernel for FastGeluKernel {
             .as_deref()
             .map(|b| last_dim_bias(inputs[0].shape, b, "FastGelu"))
             .transpose()?;
-        let y = x
-            .iter()
-            .enumerate()
-            .map(|(i, &v)| tanh_gelu(v + bias.as_ref().map_or(0.0, |b| b[i % width.unwrap()])))
-            .collect::<Vec<_>>();
+        let mut y = Vec::with_capacity(x.len());
+        match (bias.as_deref(), width) {
+            (Some(bias), Some(width)) => {
+                // See `BiasGelu`: row-at-a-time instead of `i % width`.
+                for row in x.chunks(width) {
+                    y.extend(row.iter().zip(bias.iter()).map(|(&v, &b)| tanh_gelu(v + b)));
+                }
+            }
+            _ => y.extend(x.iter().map(|&v| tanh_gelu(v + 0.0))),
+        }
         write_dense_f32_narrow("FastGelu", &mut outputs[0], &y)
     }
 
@@ -246,12 +257,22 @@ impl Kernel for SkipLayerNormKernel {
             .map(|b| last_dim_bias(inputs[0].shape, b, "SkipLayerNormalization"))
             .transpose()?;
         // sum = X + skip + bias (bias broadcasts over the last dimension).
-        let sum = x
-            .iter()
-            .zip(skip.iter())
-            .enumerate()
-            .map(|(i, (&a, &b))| a + b + bias.as_ref().map_or(0.0, |v| v[i % width.unwrap()]))
-            .collect::<Vec<_>>();
+        let mut sum = Vec::with_capacity(x.len());
+        match (bias.as_deref(), width) {
+            (Some(bias), Some(width)) => {
+                // See `BiasGelu`: row-at-a-time instead of `i % width`.
+                for (x_row, skip_row) in x.chunks(width).zip(skip.chunks(width)) {
+                    sum.extend(
+                        x_row
+                            .iter()
+                            .zip(skip_row.iter())
+                            .zip(bias.iter())
+                            .map(|((&a, &b), &c)| a + b + c),
+                    );
+                }
+            }
+            _ => sum.extend(x.iter().zip(skip.iter()).map(|(&a, &b)| a + b + 0.0)),
+        }
         let (y, means, inv_stds) = layer_norm_dense(
             &sum,
             inputs[0].shape,
