@@ -34,6 +34,7 @@ use rayon::prelude::*;
 
 use super::check_arity;
 use super::half_gemm::{self, HalfFormat, MatrixLayout};
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use super::half_gemv;
 use super::weight_transpose::{self, WeightTransposeKey};
 use crate::backend::CpuBackend;
@@ -2641,9 +2642,60 @@ mod tests {
         }
     }
 
+    /// A non-contiguous B must be declined by the dispatch guard: the kernel
+    /// reads `B` as a flat `k * n` slice, so a strided view would be read with
+    /// the wrong layout. Pinned as a negative test because the guard is the
+    /// only thing standing between a strided weight and a silently wrong
+    /// answer.
+    #[test]
+    fn f16_decode_declines_a_non_contiguous_weight_and_stays_correct() {
+        let k = 6usize;
+        let n = 4usize;
+        // Build B as the transpose of a [n, k] buffer so the [k, n] view is
+        // genuinely strided rather than merely offset.
+        let mut bt_data = vec![0.0f32; n * k];
+        let mut b_data = vec![0.0f32; k * n];
+        for p in 0..k {
+            for j in 0..n {
+                let v = ((p * n + j) % 9) as f32 / 8.0 - 0.5;
+                b_data[p * n + j] = v;
+                bt_data[j * k + p] = v;
+            }
+        }
+        let a_data: Vec<f32> = (0..k).map(|i| (i % 5) as f32 / 4.0 - 0.5).collect();
+        let expected = naive_matmul(&a_data, &b_data, 1, k, n);
+
+        let a = Owned::f16(&[1, k], &a_data);
+        let bt = Owned::f16(&[n, k], &bt_data);
+        let mut b_view = bt.view();
+        let shape = [k, n];
+        let strided = [1i64, k as i64];
+        b_view.shape = &shape;
+        b_view.strides = &strided;
+        assert!(
+            !b_view.is_contiguous(),
+            "test must present a genuinely strided B"
+        );
+
+        let mut out = Owned::zeros_f32(&[1, n]);
+        let mut kernel = MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, true]);
+        kernel
+            .execute(&[a.view(), b_view], &mut [out.view_mut()])
+            .unwrap();
+
+        for (actual, want) in out.to_f32().iter().zip(expected.iter()) {
+            assert!(
+                (actual - want).abs() <= 1e-3,
+                "strided B gave {actual}, want {want}"
+            );
+        }
+    }
+
     /// The GEMV must not allocate a weight copy: it reads B straight from the
     /// stored `[K, N]` layout. Pinned because a transposed variant would cost
     /// a permanent `2 * K * N` bytes that `try_matmul_half` never paid.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[test]
     fn f16_decode_gemv_does_not_cache_a_copy_of_the_weight() {
         let k = 64usize;

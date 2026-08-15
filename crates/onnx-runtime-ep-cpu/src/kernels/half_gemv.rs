@@ -53,27 +53,31 @@ const STRIPE: usize = 512;
 const PARALLEL_MIN_WORK: usize = 1 << 16;
 
 /// Is the hardware-accelerated f16 GEMV available on this host?
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub(crate) fn simd_available() -> bool {
     std::arch::is_x86_feature_detected!("f16c")
         && std::arch::is_x86_feature_detected!("avx2")
         && std::arch::is_x86_feature_detected!("fma")
 }
 
-#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-pub(crate) fn simd_available() -> bool {
-    false
-}
-
 /// `out[j] = sum_p a[p] * b[p * n + j]`, with `b` the `[K, N]` row-major f16
 /// weight exactly as stored — no transpose, no copy, no cache.
 ///
 /// # Panics
-/// Debug-only: when `a.len() != k`, `out.len() != n`, or `b.len() != k * n`.
+/// When `b` is shorter than `k * n`. This is a real check, not a
+/// `debug_assert`: [`stripe_simd`] does unchecked pointer arithmetic derived
+/// from `k`, `n` and `j0`, so a short `b` would be a memory-safety bug rather
+/// than a wrong answer. `k * n` is computed with `checked_mul` so an
+/// overflowing geometry fails closed instead of wrapping to a small bound.
 pub(crate) fn gemv_f16_kn(a: &[f32], b: &[u16], out: &mut [f32], k: usize, n: usize) {
     debug_assert_eq!(a.len(), k);
     debug_assert_eq!(out.len(), n);
-    debug_assert_eq!(b.len(), k.saturating_mul(n));
+    let weights = k.checked_mul(n).expect("f16 GEMV geometry overflows usize");
+    assert!(
+        b.len() >= weights && a.len() >= k,
+        "f16 GEMV operands are too small for k={k} n={n}: a={} b={}",
+        a.len(),
+        b.len()
+    );
     if n == 0 {
         return;
     }
@@ -90,15 +94,17 @@ pub(crate) fn gemv_f16_kn(a: &[f32], b: &[u16], out: &mut [f32], k: usize, n: us
             // SAFETY: `simd_available()` confirmed f16c + avx2 + fma. `j0` and
             // `acc.len()` come from a `chunks_mut(STRIPE)` over an `n`-element
             // slice, so `j0 + acc.len() <= n`; `a.len() == k` and
-            // `b.len() == k * n` were asserted above, so every read below is
+            // `b.len() >= k * n` was asserted above, so every read below is
             // in bounds.
-            unsafe { stripe_simd(a, b, acc, j0, k, n) }
-        } else {
-            stripe_scalar(a, b, acc, j0, k, n);
+            unsafe {
+                stripe_simd(a, b, acc, j0, k, n);
+            }
+            return;
         }
+        stripe_scalar(a, b, acc, j0, k, n);
     };
 
-    let work = k.saturating_mul(n);
+    let work = weights;
     if work < PARALLEL_MIN_WORK || rayon::current_num_threads() <= 1 {
         for (tile, acc) in out.chunks_mut(STRIPE).enumerate() {
             stripe(tile * STRIPE, acc);
@@ -136,7 +142,6 @@ fn stripe_scalar(a: &[f32], b: &[u16], acc: &mut [f32], j0: usize, k: usize, n: 
 /// [`simd_available`]); `a.len() >= k`; and `(k - 1) * n + j0 + acc.len() <=
 /// b.len()`, i.e. every `b[p * n + j0 .. p * n + j0 + acc.len()]` for `p < k`
 /// must be in bounds.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "f16c,avx2,fma")]
 unsafe fn stripe_simd(a: &[f32], b: &[u16], acc: &mut [f32], j0: usize, k: usize, n: usize) {
     #[cfg(target_arch = "x86")]
@@ -317,6 +322,16 @@ mod tests {
         let mut out = vec![0.0f32; n];
         gemv_f16_kn(&a, &b, &mut out, k, n);
         assert_eq!(out[0], 2048.0 + (k as f32 - 1.0));
+    }
+
+    #[test]
+    #[should_panic(expected = "operands are too small")]
+    fn a_short_weight_panics_rather_than_reading_out_of_bounds() {
+        // `stripe_simd` derives raw pointers from `k`, `n` and `j0`, so a
+        // short `b` must fail closed in release too -- not just under
+        // `debug_assert`.
+        let mut out = vec![0.0f32; 4];
+        gemv_f16_kn(&[1.0, 2.0], &[0u16; 5], &mut out, 2, 4);
     }
 
     #[test]
