@@ -827,7 +827,7 @@ pub(crate) fn governor_kv_config(
 }
 
 #[cfg_attr(
-    not(feature = "native-backend"),
+    all(not(feature = "native-backend"), not(test)),
     expect(
         dead_code,
         reason = "native KV admission is used only by the native backend"

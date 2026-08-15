@@ -21,10 +21,12 @@ use std::cell::Cell;
 #[cfg(feature = "mlas")]
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{DataType, Node};
+use onnx_runtime_ep_api::{
+    EpError, Kernel, KernelFactory, LazyWeightBoundary, Result, TensorMut, TensorView,
+};
+use onnx_runtime_ir::{Attribute, DataType, Graph, Node};
 use rayon::prelude::*;
 
 use super::matmul::gemm;
@@ -148,6 +150,21 @@ const DECODE_THREADS_ENV: &str = "ONNX_GENAI_CPU_DECODE_THREADS";
 /// Process-local override set by first-class callers such as the CLI. Zero means
 /// no override, so the environment variable and automatic default still apply.
 static DECODE_THREADS_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
+
+/// Governed opt-out of the resident dequantized-f32 decode cache.
+///
+/// The `m == 1` generic decode path (`weight_nk`) materializes a full f32
+/// expansion of the packed weight and holds it in a per-kernel `OnceLock` for
+/// the session -- ~8x the packed int4 bytes. That trade buys ~2.4x decode
+/// throughput and is worth it whenever the expansion fits; when it does not, the
+/// box pages and decode collapses (#971). When this flag is set the caching
+/// branches skip the resident `OnceLock` and dequantize into a transient
+/// per-call buffer that is dropped after each GEMV -- byte-identical output,
+/// slower per token, but no resident 8x footprint. The memory-strategy plan
+/// owns the fit decision and calls [`set_resident_dequant_f32_cache_enabled`]
+/// before the native session loads. Default: enabled (unchanged fast path).
+static RESIDENT_DEQUANT_F32_CACHE_DISABLED: AtomicBool = AtomicBool::new(false);
+
 /// Decode is bandwidth-bound and pays one fork/join per projection. Profiling
 /// across the existing 4--96 worker sweep found no gain above eight workers and
 /// clear regressions at 16+, so topology scaling is capped here; the environment
@@ -406,6 +423,15 @@ static N16_SDOT_M1_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 static KAI_SDOT_M1_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(all(test, feature = "mlas"))]
 static MLAS_SQNBIT_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
+/// Positive-proof counters for the zero-copy borrowed int4 decode path (#979).
+/// Split by symmetry so a test can assert the *symmetric* branch is the one that
+/// executed, not merely that some path avoided the resident `weight_nk` f32
+/// cache. Incremented once per `execute` that routes into
+/// [`borrowed_affine_int4_matmul`].
+#[cfg(test)]
+static BORROWED_INT4_SYMMETRIC_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static BORROWED_INT4_ASYMMETRIC_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 /// Standard ONNX row-major packed NBits weight with affine block metadata.
 ///
 /// This preserves the wire layout instead of expanding it to f32. Direct
@@ -763,17 +789,29 @@ impl Kernel for MatMulNBitsKernel {
             && self.accuracy_level == 0
             && !self.weight_prepacked
             && group_indices.is_none()
-            && let Some(zero_points) = zero_points
             && let Some(packed) = contiguous_host_slice::<u8>(&inputs[1])
             && let Some(scales) = borrowed_scales(&inputs[2])
-            && let Some(zero_points) = contiguous_host_slice::<u8>(zero_points)
+            && let Some(borrowed_zero_points) = borrow_optional_int4_zero_points(zero_points)
         {
+            // Gate on *symmetry* explicitly, not on "a zero_points input happens
+            // to exist". Symmetric int4 (no zero_points) has the implicit
+            // midpoint 8 and is mathematically simpler than the asymmetric case,
+            // yet it used to fall past this zero-copy path all the way to the
+            // resident f32 `weight_nk` cache (~8x the file size in RAM). It now
+            // borrows the packed int4 in place like the asymmetric case, using
+            // `None` zero points to mean the implicit midpoint (see #979).
+            #[cfg(test)]
+            if borrowed_zero_points.is_none() {
+                BORROWED_INT4_SYMMETRIC_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
+            } else {
+                BORROWED_INT4_ASYMMETRIC_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
+            }
             with_decode_pool(|| {
                 borrowed_affine_int4_matmul(
                     &activations,
                     packed,
                     scales,
-                    zero_points,
+                    borrowed_zero_points,
                     bias.as_deref(),
                     result,
                     m,
@@ -1154,7 +1192,7 @@ impl Kernel for MatMulNBitsKernel {
             }
         } else if m == 1 {
             let owned_weight;
-            let weight_nk = if can_prepack {
+            let weight_nk = if can_prepack && resident_dequant_f32_cache_enabled() {
                 if let Some(weight) = self.weight_nk.get() {
                     weight
                 } else {
@@ -1520,7 +1558,7 @@ impl MatMulNBitsKernel {
         }
 
         let owned_weight;
-        let weight_nk: &[f32] = if can_prepack {
+        let weight_nk: &[f32] = if can_prepack && resident_dequant_f32_cache_enabled() {
             if let Some(weight) = self.weight_nk.get() {
                 weight
             } else {
@@ -2359,7 +2397,174 @@ fn decode_threads_override() -> Option<usize> {
         .map(std::num::NonZeroUsize::get)
 }
 
-/// Resolve the number of worker threads the **global Rayon pool** (which drives
+/// Enable or disable the resident dequantized-f32 decode cache for the process.
+///
+/// The memory-strategy plan calls this before the native decode session is
+/// built. Passing `false` makes every `MatMulNBits` decode kernel dequantize its
+/// weight into a transient per-call buffer instead of materializing the resident
+/// ~8x f32 `weight_nk` expansion, trading decode throughput for footprint when
+/// the expansion would not fit the budget (#971). The result is byte-identical
+/// (the same `dequantize_weight` + `gemv_nk` math, just not retained). Default
+/// is enabled, so an unset process keeps the unchanged fast path.
+pub fn set_resident_dequant_f32_cache_enabled(enabled: bool) {
+    RESIDENT_DEQUANT_F32_CACHE_DISABLED.store(!enabled, Ordering::Release);
+}
+
+/// Whether the resident dequantized-f32 decode cache is currently enabled.
+fn resident_dequant_f32_cache_enabled() -> bool {
+    !RESIDENT_DEQUANT_F32_CACHE_DISABLED.load(Ordering::Acquire)
+}
+
+/// Predict whether an `m == 1` (decode) `MatMulNBits` node with **constant**
+/// weights will materialize the resident dequantized-f32 `weight_nk` cache
+/// (the ~8x expansion of #971), given its static attributes and the host's
+/// selected decode dot-kernel.
+///
+/// This is the single authority the engine's memory plan consults so its
+/// footprint accounting cannot silently drift from the kernel's own dispatch
+/// (the #947 failure mode). It mirrors the branch order of
+/// [`MatMulNBitsKernel::execute`] exactly: any earlier packed / on-the-fly path
+/// that claims the node returns `false`; only the terminal generic `m == 1`
+/// branch that populates `weight_nk` returns `true`. A control test
+/// (`predictor_matches_actual_resident_cache`) runs real kernels and asserts
+/// this function agrees with the weight actually cached, so a change to the
+/// dispatch that this predictor does not track fails the build.
+///
+/// `n`/`k` are the canonical output/reduction dims and are only consulted on the
+/// MLAS path (whose SQNBit interception depends on the shape).
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_nbits_decode_caches_dequant_f32(
+    bits: usize,
+    block_size: usize,
+    accuracy_level: i64,
+    n: usize,
+    k: usize,
+    has_zero_points: bool,
+    has_g_idx: bool,
+    weight_prepacked: bool,
+) -> bool {
+    // Prepacked MLAS SQNBit weights are never expanded to f32; they take the
+    // dedicated packed path (or are rejected). Not the f32 cache.
+    if weight_prepacked {
+        return false;
+    }
+    let dot_kernel = selected_dot_kernel();
+    // (A) borrowed_affine_int4 on-the-fly path: bits==4, accuracy_level==0,
+    // asymmetric (zero-points present), no g_idx. Dequantizes per call, no
+    // resident cache. Constant initializers are contiguous host slices, so the
+    // runtime slice guards this path also checks always hold here.
+    if bits == 4 && accuracy_level == 0 && !has_g_idx && has_zero_points {
+        return false;
+    }
+    // (B) MLAS SQNBit path (feature-gated). When present and the shape is
+    // supported it consumes the packed weight directly, never the f32 cache.
+    #[cfg(feature = "mlas")]
+    {
+        if !has_g_idx && mlas_qnbit_enabled() {
+            let comp = if accuracy_level == 4 {
+                mlas_sys::SQNBitComputeType::Int8
+            } else {
+                mlas_sys::SQNBitComputeType::Fp32
+            };
+            if mlas_sys::sqnbit_packed_b_size(n, k, bits, block_size, has_zero_points, comp)
+                .is_some()
+            {
+                return false;
+            }
+        }
+    }
+    #[cfg(not(feature = "mlas"))]
+    {
+        let _ = (n, k);
+    }
+    // (C) 2-bit packed path.
+    if bits == 2 && !has_g_idx {
+        return false;
+    }
+    // (D) int4-direct decode (accuracy_level==4, host supports it).
+    if bits == 4
+        && accuracy_level == 4
+        && !has_g_idx
+        && dot_kernel.supports_int4_direct(block_size, has_zero_points)
+    {
+        return false;
+    }
+    // (E) int8-repacked decode (accuracy_level==4).
+    if bits == 4 && accuracy_level == 4 && !has_g_idx {
+        return false;
+    }
+    // (F) 8-bit on-the-fly decode (one byte per element, no f32 expansion).
+    if bits == 8 && !has_g_idx {
+        return false;
+    }
+    // (G) Terminal generic m==1 path: materializes the resident f32 weight_nk.
+    true
+}
+
+/// Total resident dequantized-f32 decode-cache bytes this CPU EP will hold for
+/// `graph`, i.e. the #971 expansion the plan must budget for.
+///
+/// For every constant-weight `MatMulNBits` node whose decode path
+/// [`matmul_nbits_decode_caches_dequant_f32`] predicts will cache, this adds the
+/// fully-expanded f32 weight size `N * K * 4`. Nodes that take a packed or
+/// on-the-fly path contribute nothing. Non-constant-weight nodes never cache
+/// (they rebuild a transient buffer per call) and are excluded.
+pub fn resident_dequant_f32_cache_bytes(graph: &Graph) -> u64 {
+    let mut total = 0_u64;
+    for node in graph.nodes.values() {
+        if !LazyWeightBoundary::MatMulNBits.matches(&node.domain, &node.op_type) {
+            continue;
+        }
+        // Only constant weights are cached; a non-constant B input rebuilds a
+        // transient dequant per call, so it never holds a resident expansion.
+        let Some(Some(weight_value)) = node.inputs.get(1) else {
+            continue;
+        };
+        if !graph.initializers.contains_key(weight_value) {
+            continue;
+        }
+        let bits = node
+            .attr("bits")
+            .and_then(Attribute::as_int)
+            .unwrap_or(4)
+            .max(0) as usize;
+        let block_size = node
+            .attr("block_size")
+            .and_then(Attribute::as_int)
+            .unwrap_or(0)
+            .max(0) as usize;
+        let accuracy_level = node
+            .attr("accuracy_level")
+            .and_then(Attribute::as_int)
+            .unwrap_or(0);
+        let Some(n) = node.attr("N").and_then(Attribute::as_int) else {
+            continue;
+        };
+        let Some(k) = node.attr("K").and_then(Attribute::as_int) else {
+            continue;
+        };
+        if n <= 0 || k <= 0 {
+            continue;
+        }
+        let (n, k) = (n as u64, k as u64);
+        let has_zero_points = matches!(node.inputs.get(3), Some(Some(_)));
+        let has_g_idx = matches!(node.inputs.get(4), Some(Some(_)));
+        if matmul_nbits_decode_caches_dequant_f32(
+            bits,
+            block_size,
+            accuracy_level,
+            n as usize,
+            k as usize,
+            has_zero_points,
+            has_g_idx,
+            false,
+        ) {
+            total = total.saturating_add(n.saturating_mul(k).saturating_mul(4));
+        }
+    }
+    total
+}
+
 /// prefill and every MLAS GEMM through the `mlas-sys` parallel-for backend)
 /// should be built with, given the explicit decode budget.
 ///
@@ -4960,6 +5165,24 @@ fn packed_nbits_output_row(
     }
 }
 
+/// Borrow the optional int4 zero-point tensor for the zero-copy decode path.
+///
+/// Returns `Some(None)` for a symmetric model (no zero_points input) — the
+/// borrowed kernel then uses the implicit midpoint 8. Returns `Some(Some(zp))`
+/// when an asymmetric uint8 zero_points input is present and host-contiguous.
+/// Returns `None` only when a zero_points input exists but cannot be borrowed
+/// in place, so the caller must fall through to another path. Gating on this
+/// (rather than on "a zero_points input happens to exist") is what lets
+/// symmetric int4 take the borrowed path instead of the resident f32 cache.
+fn borrow_optional_int4_zero_points<'a>(
+    zero_points: Option<&TensorView<'a>>,
+) -> Option<Option<&'a [u8]>> {
+    match zero_points {
+        None => Some(None),
+        Some(view) => contiguous_host_slice::<u8>(view).map(Some),
+    }
+}
+
 fn contiguous_host_slice<'a, T>(view: &TensorView<'a>) -> Option<&'a [T]> {
     if !view.device.is_host_accessible() || !view.is_contiguous() {
         return None;
@@ -4983,7 +5206,7 @@ fn borrowed_affine_int4_matmul(
     activations: &[f32],
     packed: &[u8],
     scales: BorrowedScales<'_>,
-    zero_points: &[u8],
+    zero_points: Option<&[u8]>,
     bias: Option<&[f32]>,
     result: &mut [f32],
     m: usize,
@@ -5030,8 +5253,10 @@ fn borrowed_affine_int4_matmul(
                 let output_index = output_start + offset;
                 let packed_row =
                     &packed[output_index * packed_row_size..(output_index + 1) * packed_row_size];
-                let zp_row = &zero_points
-                    [output_index * zero_point_row_size..(output_index + 1) * zero_point_row_size];
+                let zp_row = zero_points.map(|zp| {
+                    &zp[output_index * zero_point_row_size
+                        ..(output_index + 1) * zero_point_row_size]
+                });
                 let mut sum = bias.map_or(0.0, |values| values[output_index]);
                 for block in 0..block_count {
                     let depth_start = block * block_size;
@@ -5039,7 +5264,7 @@ fn borrowed_affine_int4_matmul(
                     let block_values = &packed_row[block * layout.packed_block_size()
                         ..(block + 1) * layout.packed_block_size()];
                     let scale = scales.get(output_index * block_count + block);
-                    let zero_point = layout.zero_point(Some(zp_row), block) as f32;
+                    let zero_point = layout.zero_point(zp_row, block) as f32;
                     let mut dot;
                     #[cfg(target_arch = "aarch64")]
                     if valid == 32 && block_size == 32 {
@@ -5078,7 +5303,7 @@ fn borrowed_affine_int4_matmul_m1_neon_dot(
     activation: &[f32],
     packed: &[u8],
     scales: &BorrowedScales<'_>,
-    zero_points: &[u8],
+    zero_points: Option<&[u8]>,
     bias: Option<&[f32]>,
     result: &mut [f32],
     k: usize,
@@ -5103,8 +5328,9 @@ fn borrowed_affine_int4_matmul_m1_neon_dot(
             let output_index = output_start + offset;
             let packed_row =
                 &packed[output_index * packed_row_size..(output_index + 1) * packed_row_size];
-            let zp_row = &zero_points
-                [output_index * zero_point_row_size..(output_index + 1) * zero_point_row_size];
+            let zp_row = zero_points.map(|zp| {
+                &zp[output_index * zero_point_row_size..(output_index + 1) * zero_point_row_size]
+            });
             let mut sum = bias.map_or(0.0, |values| values[output_index]);
             for block in 0..block_count {
                 let packed_block = &packed_row[block * 16..(block + 1) * 16];
@@ -5112,7 +5338,7 @@ fn borrowed_affine_int4_matmul_m1_neon_dot(
                 // SAFETY: runtime dispatch selected FEAT_DotProd and both slices
                 // contain exactly one block32 payload.
                 let dot = unsafe { affine_int4_block32_sdot_neon(activation_block, packed_block) };
-                let zero_point = layout.zero_point(Some(zp_row), block) as i32;
+                let zero_point = layout.zero_point(zp_row, block) as i32;
                 let correction = (8 - zero_point) * activation_sums[block];
                 sum += (dot + correction) as f32
                     * (activation_scales[block] * scales.get(output_index * block_count + block));
@@ -6971,7 +7197,142 @@ mod tests {
         }
     }
 
-    /// Address of whichever prepack reuse cache the routed path populated, or
+    /// Serializes the two tests that toggle the process-global resident-cache
+    /// flag so they never observe each other's setting under Rust's parallel
+    /// test harness. Every existing residency assertion checks `is_none`, which
+    /// the disabled flag preserves, so only these two tests need coordinating.
+    static CACHE_FLAG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Build the constant `MatMulNBits` decode inputs for a bits=4 weight.
+    fn cache_probe_inputs(
+        weights: &[f32],
+        a: &[f32],
+        n: usize,
+        k: usize,
+        block_size: usize,
+        asymmetric: bool,
+    ) -> (Owned, Owned, Owned, Option<Owned>) {
+        let blocks = k.div_ceil(block_size);
+        let (packed, scales, zps, _) = quantize(weights, n, k, block_size, asymmetric);
+        let b = Owned::u8(&[n, blocks, block_size / 2], &packed);
+        let scales_t = Owned::f32(&[n, blocks], &scales);
+        let a_t = Owned::f32(&[1, k], a);
+        let zp_t = zps.as_ref().map(|z| Owned::u8(&[n, blocks.div_ceil(2)], z));
+        (b, scales_t, a_t, zp_t)
+    }
+
+    /// Control that could falsify the #971 footprint predictor: for a matrix of
+    /// bits=4 decode configurations, run a real constant-weight kernel and assert
+    /// [`matmul_nbits_decode_caches_dequant_f32`] agrees with whether the kernel
+    /// actually materialized the resident f32 `weight_nk`. If the dispatch in
+    /// `execute` changes which path a config takes and the predictor is not
+    /// updated to match, this test fails — the engine's accounting cannot silently
+    /// drift from the kernel (#947).
+    #[test]
+    fn predictor_matches_actual_resident_cache() {
+        let _guard = CACHE_FLAG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_resident_dequant_f32_cache_enabled(true);
+        let (k, n, block_size) = (128usize, 16usize, 32usize);
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 19 % 47) as f32 - 23.0) / 12.0)
+            .collect();
+        let a: Vec<f32> = (0..k)
+            .map(|i| ((i * 17 % 43) as f32 - 21.0) / 13.0)
+            .collect();
+
+        for &accuracy_level in &[0i64, 4] {
+            for &asymmetric in &[false, true] {
+                let (b, scales_t, a_t, zp_t) =
+                    cache_probe_inputs(&weights, &a, n, k, block_size, asymmetric);
+                let mut kernel = MatMulNBitsKernel {
+                    accuracy_level,
+                    ..test_kernel(k, n, block_size)
+                };
+                kernel.set_constant_inputs(&[true; 5]);
+                let mut inputs = vec![a_t.view(), b.view(), scales_t.view()];
+                if let Some(zp) = &zp_t {
+                    inputs.push(zp.view());
+                }
+                let mut y = Owned::zeros_f32(&[1, n]);
+                kernel.execute(&inputs, &mut [y.view_mut()]).unwrap();
+
+                let predicted = matmul_nbits_decode_caches_dequant_f32(
+                    4,
+                    block_size,
+                    accuracy_level,
+                    n,
+                    k,
+                    asymmetric,
+                    false,
+                    false,
+                );
+                assert_eq!(
+                    predicted,
+                    kernel.weight_nk.get().is_some(),
+                    "predictor disagreed with actual weight_nk residency \
+                     (accuracy_level={accuracy_level}, asymmetric={asymmetric})",
+                );
+            }
+        }
+    }
+
+    /// Declining the resident cache (#971 governed decision) must hold no f32
+    /// expansion and yet produce byte-identical decode output: the transient
+    /// per-call dequant runs the same math, just without retaining it.
+    #[test]
+    fn declining_resident_cache_is_byte_identical_and_holds_no_expansion() {
+        let _guard = CACHE_FLAG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (k, n, block_size) = (128usize, 16usize, 32usize);
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 19 % 47) as f32 - 23.0) / 12.0)
+            .collect();
+        let a: Vec<f32> = (0..k)
+            .map(|i| ((i * 17 % 43) as f32 - 21.0) / 13.0)
+            .collect();
+        // bits=4, accuracy_level=0, symmetric -> the generic weight_nk path.
+        assert!(
+            matmul_nbits_decode_caches_dequant_f32(4, block_size, 0, n, k, false, false, false),
+            "test premise: this config must be a caching config",
+        );
+
+        let run = |enabled: bool| {
+            set_resident_dequant_f32_cache_enabled(enabled);
+            let (b, scales_t, a_t, _) = cache_probe_inputs(&weights, &a, n, k, block_size, false);
+            let mut kernel = test_kernel(k, n, block_size);
+            kernel.set_constant_inputs(&[true; 5]);
+            let mut y = Owned::zeros_f32(&[1, n]);
+            kernel
+                .execute(
+                    &[a_t.view(), b.view(), scales_t.view()],
+                    &mut [y.view_mut()],
+                )
+                .unwrap();
+            let cached = kernel.weight_nk.get().is_some();
+            (y.bytes, cached)
+        };
+
+        let (bytes_enabled, cached_enabled) = run(true);
+        let (bytes_disabled, cached_disabled) = run(false);
+        set_resident_dequant_f32_cache_enabled(true);
+
+        assert!(
+            cached_enabled,
+            "enabled arm must materialize the resident cache"
+        );
+        assert!(
+            !cached_disabled,
+            "declined arm must hold no resident f32 expansion",
+        );
+        assert_eq!(
+            bytes_enabled, bytes_disabled,
+            "declining the resident cache changed decode output",
+        );
+    }
+
     /// `None` if none is populated yet. Which cache is filled depends on the
     /// route: MLAS SQNBit (`mlas_shards` or serialized `mlas_packed`) when
     /// available, otherwise the hand GEMV/int8 caches. Returning a raw address
@@ -10793,7 +11154,11 @@ mod tests {
     }
 
     #[test]
-    fn matmulnbits_prepacked_m1_block32_symmetric_reuses_weight_for_new_activations() {
+    fn matmulnbits_m1_block32_symmetric_borrows_weight_for_new_activations() {
+        // Post-#979: symmetric int4 (constant B) borrows the packed weight in
+        // place per call instead of building/reusing a resident cache. The
+        // per-activation correctness invariant still holds; the difference is
+        // that no prepack/f32 cache is ever populated.
         let (k, n, block_size) = (35, 7, 32);
         let a1_values: Vec<f32> = (0..k)
             .map(|i| ((i * 11 % 41) as f32 - 20.0) / 13.0)
@@ -10822,18 +11187,17 @@ mod tests {
 
         let cached_ptr = prepack_cache_ptr(&kernel);
         assert!(
-            cached_ptr.is_some(),
-            "M=1 constant B must populate a prepacked weight cache"
+            cached_ptr.is_none(),
+            "symmetric M=1 constant B must borrow in place, not populate a weight cache (#979)"
         );
         let a2 = Owned::f32(&[1, k], &a2_values);
         let mut y2 = Owned::zeros_f32(&[1, n]);
         kernel
             .execute(&[a2.view(), b.view(), scales.view()], &mut [y2.view_mut()])
             .unwrap();
-        assert_eq!(
-            prepack_cache_ptr(&kernel),
-            cached_ptr,
-            "prepacked weight cache must be reused (stable) across activations"
+        assert!(
+            !prepack_cache_populated(&kernel),
+            "symmetric decode must stay on the borrowed path across activations (#979)"
         );
         assert_close(&y2.to_f32(), &reference(&a2_values, &dequantized, 1, k, n));
         assert_ne!(y1.to_f32(), y2.to_f32());
@@ -10860,6 +11224,7 @@ mod tests {
         let scales = Owned::f32(&[n, 2], &scales);
         let zero_points = Owned::u8(&[n, 1], &zero_points);
         let mut y = Owned::zeros_f32(&[1, n]);
+        let asym_before = BORROWED_INT4_ASYMMETRIC_TEST_CALLS.load(Ordering::Relaxed);
         kernel
             .execute(
                 &[a.view(), b.view(), scales.view(), zero_points.view()],
@@ -10869,8 +11234,66 @@ mod tests {
 
         assert_close(&y.to_f32(), &reference(&a_values, &dequantized, 1, k, n));
         assert!(
+            BORROWED_INT4_ASYMMETRIC_TEST_CALLS.load(Ordering::Relaxed) > asym_before,
+            "asymmetric INT4 decode must route into the borrowed zero-copy path"
+        );
+        assert!(
             !prepack_cache_populated(&kernel),
             "asymmetric INT4 must borrow packed inputs instead of building a weight cache"
+        );
+    }
+
+    #[test]
+    fn matmulnbits_symmetric_m1_borrows_instead_of_building_f32_cache() {
+        // Regression for #979: symmetric int4 (no zero_points input) must take
+        // the zero-copy borrowed decode path using the implicit midpoint 8, and
+        // must NOT fall through to the resident f32 `weight_nk` cache (~8x the
+        // file size in RAM). With constant B/scales, the pre-#979 code populated
+        // `weight_nk`; the borrowed path returns before any cache is built, so
+        // `!prepack_cache_populated` is a *positive* proof the branch changed.
+        let (k, n, block_size) = (128, 7, 32);
+        let a_values: Vec<f32> = (0..k)
+            .map(|i| ((i * 11 % 41) as f32 - 20.0) / 13.0)
+            .collect();
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 23 % 47) as f32 - 19.0) / 12.0)
+            .collect();
+        let (packed, scales, zero_points, _) = quantize(&weights, n, k, block_size, false);
+        assert!(
+            zero_points.is_none(),
+            "symmetric quantize must omit the zero_points tensor"
+        );
+        let dequantized = dequantize_reference(&packed, &scales, None, n, k, block_size);
+        let mut kernel = test_kernel(k, n, block_size);
+        kernel.set_constant_inputs(&[false, true, true]);
+
+        let a = Owned::f32(&[1, k], &a_values);
+        let b = Owned::u8(&[n, 4, 16], &packed);
+        let scales = Owned::f32(&[n, 4], &scales);
+        let mut y = Owned::zeros_f32(&[1, n]);
+        let sym_before = BORROWED_INT4_SYMMETRIC_TEST_CALLS.load(Ordering::Relaxed);
+        kernel
+            .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
+            .unwrap();
+
+        assert_close(&y.to_f32(), &reference(&a_values, &dequantized, 1, k, n));
+        // Positive proof the *symmetric borrowed* branch is the one that ran.
+        // The symmetric counter is bumped only by `borrowed_zero_points.is_none()`,
+        // so a strict increase across this symmetric-only `execute` attributes the
+        // route to that branch (`>` not `==` because the global counter is shared
+        // with other tests running in parallel).
+        assert!(
+            BORROWED_INT4_SYMMETRIC_TEST_CALLS.load(Ordering::Relaxed) > sym_before,
+            "symmetric INT4 decode must route into the borrowed zero-copy path (#979)"
+        );
+        // ...and negative proof no resident f32 / prepack cache was ever built.
+        assert!(
+            kernel.weight_nk.get().is_none(),
+            "symmetric INT4 must not expand the weight to a resident f32 cache (#979)"
+        );
+        assert!(
+            !prepack_cache_populated(&kernel),
+            "symmetric INT4 must borrow packed inputs instead of building any weight cache (#979)"
         );
     }
 

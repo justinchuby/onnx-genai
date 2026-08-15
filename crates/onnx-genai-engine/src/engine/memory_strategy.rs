@@ -55,6 +55,20 @@ pub(crate) struct MemoryStrategyPlanInput<'a> {
     /// number. `None` only when even the host tier could not be measured.
     pub(crate) residency_ceiling_bytes: Option<u64>,
     pub(crate) model_weight_bytes: u64,
+    /// Predicted resident dequantized-f32 decode-cache expansion for this model
+    /// on the native CPU EP (#971). The `MatMulNBits` generic decode path holds
+    /// a full f32 dequant of its packed weight (~8x) resident for the session on
+    /// the shapes no packed / on-the-fly path covers. This is the sum of that
+    /// expansion, queried from the EP so the accounting cannot drift from the
+    /// kernel's own dispatch (#947). Zero on backends/models that never take the
+    /// f32 cache (CUDA, ORT, and — on the native CPU path — any int4 node whose
+    /// dispatch avoids it, e.g. an asymmetric zero-point int4 node that takes
+    /// the on-the-fly `borrowed_affine` path). The discriminator is kernel
+    /// dispatch (`bits`/`accuracy_level`/`group_indices`/`m`), *not* symmetry;
+    /// the EP is the sole authority so this comment stays illustrative, not a
+    /// rule. The plan uses it to (a) report a truthful weight footprint and
+    /// (b) govern whether the cache is affordable.
+    pub(crate) resident_f32_cache_bytes: u64,
     pub(crate) kv_config: ModelKvConfig,
     pub(crate) graph: GraphMemoryEvidence,
     pub(crate) required_device_non_weight_bytes: u64,
@@ -180,16 +194,40 @@ pub(crate) fn build_memory_strategy_plan(input: MemoryStrategyPlanInput<'_>) -> 
     // still has its weights demonstrably resident in host RAM, and whether they
     // fit there is knowable. #947 must stop us fabricating a device size; it
     // must not stop us stating a residency we can measure.
+    // #971: the native CPU `MatMulNBits` generic decode path holds a resident
+    // f32 dequant cache ~8x the packed weight for the whole session. That trade
+    // buys ~2.4x decode throughput when it fits and collapses to paging (~50x
+    // slower) when it does not. `resident_f32_cache_bytes` is the predicted
+    // expansion (0 on backends/models that never take the path). The plan
+    // governs the trade here: admit the cache only when the *expanded* footprint
+    // fits the residency budget, else decline it -- the kernels then dequantize
+    // on the fly, so the runtime holds only the on-disk weights. The reported
+    // weight figure follows the decision so it states what the runtime will
+    // actually hold, not an on-disk number ~8x too small.
+    let on_disk_weight_bytes = input.model_weight_bytes;
+    let expanded_weight_bytes = on_disk_weight_bytes.saturating_add(input.resident_f32_cache_bytes);
+    let f32_weight_cache_admitted = if input.resident_f32_cache_bytes == 0 {
+        true
+    } else {
+        input
+            .residency_ceiling_bytes
+            .is_none_or(|budget| expanded_weight_bytes <= budget)
+    };
+    let effective_weight_bytes = if f32_weight_cache_admitted {
+        expanded_weight_bytes
+    } else {
+        on_disk_weight_bytes
+    };
     let fits = input
         .residency_ceiling_bytes
-        .map(|budget| input.model_weight_bytes <= budget);
+        .map(|budget| effective_weight_bytes <= budget);
     // The *reported* device-budget fit is a strictly device-capacity fact and
     // stays `None` when the device capacity could not be measured -- it never
     // borrows the host-tier ceiling. Rendering unknown device capacity as
     // `Some(false)` (or as a fabricated number) is exactly the #947 bug.
     let device_fits = input
         .resolved_vram_bytes
-        .map(|budget| input.model_weight_bytes <= budget);
+        .map(|budget| effective_weight_bytes <= budget);
     let available_weight_budget_bytes = input
         .resolved_vram_bytes
         .map(|budget| budget.saturating_sub(input.required_device_non_weight_bytes));
@@ -391,11 +429,15 @@ pub(crate) fn build_memory_strategy_plan(input: MemoryStrategyPlanInput<'_>) -> 
         ),
         MemoryStrategyDecision::new(
             "total_weight_bytes",
-            input.model_weight_bytes.to_string(),
+            effective_weight_bytes.to_string(),
             DecisionSource::Inference,
-            "computed by the shared model-package weight helper",
+            "on-disk package weight plus the resident f32 decode-cache expansion the runtime will \
+             actually hold (#971); reverts to on-disk when the cache is declined",
             format!(
-                "fits_resolved_device_budget={}",
+                "on_disk_weight_bytes={} resident_f32_cache_bytes={} f32_weight_cache_admitted={} fits_resolved_device_budget={}",
+                on_disk_weight_bytes,
+                input.resident_f32_cache_bytes,
+                f32_weight_cache_admitted,
                 opt_bool_or_unknown(device_fits)
             ),
         ),
@@ -441,7 +483,7 @@ pub(crate) fn build_memory_strategy_plan(input: MemoryStrategyPlanInput<'_>) -> 
             "inferred unconditionally from graph evidence and the residency tier",
             format!(
                 "total_weight_bytes={} residency_ceiling_bytes={} fits={}",
-                input.model_weight_bytes,
+                effective_weight_bytes,
                 opt_bytes_or_unknown(input.residency_ceiling_bytes),
                 opt_bool_or_unknown(fits)
             ),
@@ -462,6 +504,47 @@ pub(crate) fn build_memory_strategy_plan(input: MemoryStrategyPlanInput<'_>) -> 
         strategy_decision = strategy_decision.with_inferred_value(format!("{inferred_strategy:?}"));
     }
     decisions.push(strategy_decision);
+
+    // #971: surface the governed f32 decode-cache decision wherever the plan is
+    // read. A user who is ~2.4x slower than expected must be able to see that the
+    // runtime declined the resident dequant cache because its expanded footprint
+    // would not fit the budget -- the same visibility rationale as
+    // `advisory_only`/#955. Only emitted when a f32 expansion is actually in play.
+    if input.resident_f32_cache_bytes > 0 {
+        let (value, reason): (&str, String) = if f32_weight_cache_admitted {
+            (
+                "admitted",
+                format!(
+                    "the resident f32 decode cache fits the budget, so it is taken for ~2.4x \
+                     faster decode; it adds {} resident bytes on top of the {} on-disk weights",
+                    input.resident_f32_cache_bytes, on_disk_weight_bytes
+                ),
+            )
+        } else {
+            (
+                "declined",
+                format!(
+                    "the expanded footprint ({expanded_weight_bytes} bytes) exceeds the residency \
+                     budget ({}), so the runtime skips the resident f32 decode cache and \
+                     dequantizes on the fly -- slower per token, but avoids the ~8x resident \
+                     blow-up that would page the box (#971)",
+                    opt_bytes_or_unknown(input.residency_ceiling_bytes)
+                ),
+            )
+        };
+        decisions.push(MemoryStrategyDecision::new(
+            "resident_f32_weight_cache",
+            value,
+            DecisionSource::Inference,
+            reason,
+            format!(
+                "on_disk_weight_bytes={on_disk_weight_bytes} resident_f32_cache_bytes={} \
+                 expanded_weight_bytes={expanded_weight_bytes} residency_ceiling_bytes={}",
+                input.resident_f32_cache_bytes,
+                opt_bytes_or_unknown(input.residency_ceiling_bytes)
+            ),
+        ));
+    }
 
     if inferred_over_budget_streaming && input.shared_memory_weight_fallback {
         let (value, source, reason): (&str, DecisionSource, &str) = if prefer_shared_memory_fallback
@@ -492,7 +575,7 @@ pub(crate) fn build_memory_strategy_plan(input: MemoryStrategyPlanInput<'_>) -> 
                 "shared_memory_weight_fallback={} force_managed_weight_streaming={} total_weight_bytes={} resolved_device_budget_bytes={}",
                 input.shared_memory_weight_fallback,
                 input.force_managed_weight_streaming,
-                input.model_weight_bytes,
+                effective_weight_bytes,
                 opt_bytes_or_unknown(input.resolved_vram_bytes)
             ),
         ));
@@ -582,7 +665,9 @@ pub(crate) fn build_memory_strategy_plan(input: MemoryStrategyPlanInput<'_>) -> 
         strategy,
         inferred_strategy,
         weight_access_pattern: input.graph.access_pattern,
-        total_weight_bytes: input.model_weight_bytes,
+        total_weight_bytes: effective_weight_bytes,
+        resident_f32_cache_bytes: input.resident_f32_cache_bytes,
+        f32_weight_cache_admitted,
         kv_bytes_per_token,
         per_layer_weight_bytes: input.graph.per_layer_weight_bytes,
         resolved_device_budget_bytes: input.resolved_vram_bytes,
@@ -663,6 +748,8 @@ pub(crate) fn log_memory_strategy_plan(plan: &MemoryStrategyPlan, scope: &'stati
         inferred_strategy = ?plan.inferred_strategy,
         weight_access_pattern = ?plan.weight_access_pattern,
         total_weight_bytes = plan.total_weight_bytes,
+        resident_f32_cache_bytes = plan.resident_f32_cache_bytes,
+        f32_weight_cache_admitted = plan.f32_weight_cache_admitted,
         kv_bytes_per_token = ?plan.kv_bytes_per_token,
         resolved_device_budget_bytes = ?plan.resolved_device_budget_bytes,
         fits_resolved_device_budget = ?plan.fits_resolved_device_budget,
@@ -1052,6 +1139,7 @@ mod tests {
             resolved_vram_bytes: Some(limit),
             residency_ceiling_bytes: Some(limit),
             model_weight_bytes: weights,
+            resident_f32_cache_bytes: 0,
             kv_config: ModelKvConfig::known(160, 16),
             graph,
             required_device_non_weight_bytes: 0,
@@ -1091,6 +1179,7 @@ mod tests {
             resolved_vram_bytes: None,
             residency_ceiling_bytes: None,
             model_weight_bytes: weights,
+            resident_f32_cache_bytes: 0,
             kv_config: ModelKvConfig::known(160, 16),
             graph,
             required_device_non_weight_bytes: 0,
@@ -1120,6 +1209,7 @@ mod tests {
             resolved_vram_bytes: None,
             residency_ceiling_bytes: Some(host_ceiling),
             model_weight_bytes: weights,
+            resident_f32_cache_bytes: 0,
             kv_config: ModelKvConfig::known(160, 16),
             graph,
             required_device_non_weight_bytes: 0,
@@ -1132,6 +1222,133 @@ mod tests {
             shared_memory_weight_fallback: true,
             force_managed_weight_streaming: false,
         })
+    }
+
+    #[test]
+    fn resident_f32_cache_admitted_when_expanded_footprint_fits() {
+        // #971: when a native CPU model takes the resident f32 decode cache and
+        // the *expanded* footprint fits the residency budget, the plan admits
+        // the cache and reports the expanded weight figure -- not the on-disk
+        // size that is ~8x too small. The user sees the truthful resident bytes.
+        let config = EngineConfig::default();
+        let on_disk = 353_000_000_u64;
+        let cache = 1_975_844_864_u64; // measured f32 expansion for qwen05b-q4
+        let budget = 8_000_000_000_u64; // comfortably above on_disk + cache
+        let plan = build_memory_strategy_plan(MemoryStrategyPlanInput {
+            config: &config,
+            resolved_vram_bytes: Some(budget),
+            residency_ceiling_bytes: Some(budget),
+            model_weight_bytes: on_disk,
+            resident_f32_cache_bytes: cache,
+            kv_config: ModelKvConfig::known(160, 16),
+            graph: graph_with_boundary("com.microsoft", "MatMulNBits"),
+            required_device_non_weight_bytes: 0,
+            minimum_useful_weight_budget_bytes: 0,
+            default_dynamic_device_budget_bytes: None,
+            inferred_policy_enabled: true,
+            managed_vmm: true,
+            overrides: MemoryStrategyOverrides::default(),
+            advisory_only: false,
+            shared_memory_weight_fallback: false,
+            force_managed_weight_streaming: false,
+        });
+        assert!(
+            plan.f32_weight_cache_admitted,
+            "the cache must be admitted when the expanded footprint fits"
+        );
+        assert_eq!(plan.resident_f32_cache_bytes, cache);
+        assert_eq!(
+            plan.total_weight_bytes,
+            on_disk + cache,
+            "the reported weight figure must include the admitted f32 cache"
+        );
+        assert!(
+            plan.decisions
+                .iter()
+                .any(|d| d.field == "resident_f32_weight_cache" && d.value == "admitted"),
+            "an admitted decision must be reported for visibility"
+        );
+    }
+
+    #[test]
+    fn resident_f32_cache_declined_when_expanded_footprint_exceeds_budget() {
+        // #971: when the expanded footprint would not fit the residency budget
+        // the plan declines the cache (kernels dequantize on the fly), and the
+        // reported weight figure falls back to the on-disk size the runtime
+        // will actually hold -- not the expansion it refused to build.
+        let config = EngineConfig::default();
+        let on_disk = 353_000_000_u64;
+        let cache = 1_975_844_864_u64;
+        let budget = 1_073_741_824_u64; // 1 GiB -- below on_disk + cache
+        let plan = build_memory_strategy_plan(MemoryStrategyPlanInput {
+            config: &config,
+            resolved_vram_bytes: Some(budget),
+            residency_ceiling_bytes: Some(budget),
+            model_weight_bytes: on_disk,
+            resident_f32_cache_bytes: cache,
+            kv_config: ModelKvConfig::known(160, 16),
+            graph: graph_with_boundary("com.microsoft", "MatMulNBits"),
+            required_device_non_weight_bytes: 0,
+            minimum_useful_weight_budget_bytes: 0,
+            default_dynamic_device_budget_bytes: None,
+            inferred_policy_enabled: true,
+            managed_vmm: true,
+            overrides: MemoryStrategyOverrides::default(),
+            advisory_only: false,
+            shared_memory_weight_fallback: false,
+            force_managed_weight_streaming: false,
+        });
+        assert!(
+            !plan.f32_weight_cache_admitted,
+            "the cache must be declined when the expanded footprint exceeds the budget"
+        );
+        assert_eq!(
+            plan.total_weight_bytes, on_disk,
+            "a declined cache must report the on-disk weight the runtime actually holds"
+        );
+        assert!(
+            plan.decisions
+                .iter()
+                .any(|d| d.field == "resident_f32_weight_cache" && d.value == "declined"),
+            "a declined decision must be reported so the user sees why decode is slower"
+        );
+    }
+
+    #[test]
+    fn zero_f32_cache_always_admits_and_reports_on_disk_weight() {
+        // Backends/models that never take the f32 path (ORT, CUDA, or a native
+        // CPU int4 node whose dispatch avoids the resident cache) pass zero cache
+        // bytes: the decision defaults to admitted, the reported weight is the
+        // on-disk size, and no cache decision is emitted.
+        let config = EngineConfig::default();
+        let on_disk = 362_000_000_u64;
+        let plan = build_memory_strategy_plan(MemoryStrategyPlanInput {
+            config: &config,
+            resolved_vram_bytes: Some(500_000_000),
+            residency_ceiling_bytes: Some(500_000_000),
+            model_weight_bytes: on_disk,
+            resident_f32_cache_bytes: 0,
+            kv_config: ModelKvConfig::known(160, 16),
+            graph: graph_with_boundary("com.microsoft", "MatMulNBits"),
+            required_device_non_weight_bytes: 0,
+            minimum_useful_weight_budget_bytes: 0,
+            default_dynamic_device_budget_bytes: None,
+            inferred_policy_enabled: true,
+            managed_vmm: true,
+            overrides: MemoryStrategyOverrides::default(),
+            advisory_only: false,
+            shared_memory_weight_fallback: false,
+            force_managed_weight_streaming: false,
+        });
+        assert!(plan.f32_weight_cache_admitted);
+        assert_eq!(plan.total_weight_bytes, on_disk);
+        assert!(
+            !plan
+                .decisions
+                .iter()
+                .any(|d| d.field == "resident_f32_weight_cache"),
+            "no cache decision should be emitted when there is no f32 expansion in play"
+        );
     }
 
     #[test]

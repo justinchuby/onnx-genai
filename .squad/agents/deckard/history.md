@@ -74,3 +74,6 @@ tuned block-32 M=1), a drafting-depth follow-up not a kernel bug. Gates the #957
 CONDITIONAL-GO — Lever A delivered. Reviews: Chew 🟡 APPROVE-WITH-NOTES, Gaff 🟢 APPROVE. Lesson: keep the
 flag opt-in until broader prompt/model parity coverage; add a fallback logging/counter (Chew N2) before any
 default flip.
+
+## 2026-08-15 — glm int4 decode second act in flight
+After #978 split-K and #981 block SkipRMSNorm landed, the post-#981 base-floor read was overturned by the ORT GEMV head-to-head: ORT streams the same gate_up int4 GEMV at 2.42 TB/s vs native 0.92 TB/s with similar tiling/occupancy. Current program: `squad/int4-gemv-wideload` on GPU6, byte-identical 128-bit synchronous wide-load GEMV preserving per-lane accumulation order; target ~180-236 tok/s base decode and ORT base parity. cp.async M=1 remains a measured NO-GO.
