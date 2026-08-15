@@ -360,17 +360,143 @@ impl<'a> NativeSpeculativeDriver<'a> {
                 };
                 draft.truncate(width);
                 let bonus_token = pending[0];
+                // Keep the retained verify graph alive across the per-step rewind
+                // (sticky for both arms below) so a lookup hit REPLAYS the width-W
+                // graph instead of re-capturing it.
+                self.session.set_retain_graph_on_rewind(true);
                 if draft.is_empty() {
-                    // No proposal: a single eager greedy step (needs base_logits).
-                    // The eager base forward may reset the shared graph slot, so
-                    // force the retained verify graph to re-warm next step.
+                    // Lookup miss: run a CHEAP M=1 base forward that preserves the
+                    // installed width-W verify graph (no width-W cost, no graph-slot
+                    // stomp). This is the critical throughput guard — on realistic
+                    // prompts most steps miss, and paying the ~2.2x width-W verify
+                    // cost to commit a single token would tank decode below plain
+                    // greedy. Degrades to exactly a plain greedy step (accepted=0).
                     let base_logits = self
                         .session
-                        .decode(&pending, past)?
-                        .pop()
-                        .context("native speculative decode produced no base logits")?;
+                        .decode_base_eager_keep_verify_graph(bonus_token, past)?;
                     pending.clear();
-                    self.session.reset_captured_verify();
+                    let base = past + 1;
+                    debug_assert_eq!(base, context_len);
+                    (base_logits, base, Vec::new(), Vec::new())
+                } else {
+                    stats.verification_steps += 1;
+                    stats.proposed_tokens += draft.len();
+                    // Run ONE fused forward over `[bonus ⊕ draft]` padded to the
+                    // fixed capture width. Row 0 is the base next-token
+                    // distribution; rows 1..=k are the verify rows — identical
+                    // numbers to the eager base + verify forwards. The fixed width
+                    // keeps a single constant-signature graph in the slot so it
+                    // replays across steps.
+                    let fused_tokens: Vec<TokenId> = std::iter::once(bonus_token)
+                        .chain(draft.iter().copied())
+                        .collect();
+                    let fixed_width = 1 + self.draft_width;
+                    let mut fused =
+                        self.session
+                            .decode_verify_captured(&fused_tokens, past, fixed_width)?;
+                    pending.clear();
+                    debug_assert_eq!(fused.len(), draft.len() + 1);
+                    let rows = fused.split_off(1);
+                    let base_logits = fused
+                        .pop()
+                        .context("native fused verify produced no base logits")?;
+                    let base = past + 1;
+                    debug_assert_eq!(base, context_len);
+                    (base_logits, base, draft, rows)
+                }
+            } else {
+                let base_logits = self
+                    .session
+                    .decode(&pending, past)?
+                    .pop()
+                    .context("native speculative decode produced no base logits")?;
+                pending.clear();
+                let base = self.session.current_len();
+                debug_assert_eq!(base, context_len);
+                let mut draft = match &mut self.proposer {
+                    NativeProposer::PromptLookup(proposer) => {
+                        let proposer_context = SpeculativeProposerContext {
+                            width,
+                            context_tokens: &context_tokens,
+                            generated_tokens: &state.generated_tokens,
+                            generated_text: &state.generated_text,
+                            first_step: state.step,
+                            options,
+                            chain,
+                            target_hidden: None,
+                            target_hidden_layers: None,
+                            guaranteed_token: None,
+                            shared_kv_slices: None,
+                        };
+                        proposer.propose(&proposer_context)?.tokens
+                    }
+                    NativeProposer::SharedKv {
+                        session: proposer,
+                        embedder,
+                        groups,
+                        hidden_size,
+                    } => {
+                        let target_hidden = self.session.last_hidden().with_context(|| {
+                        "native shared-KV proposer requires the target decoder's declared io.hidden_output; the target forward produced no hidden state"
+                    })?;
+                        if target_hidden.len() != *hidden_size {
+                            anyhow::bail!(
+                                "native target hidden output has width {}, but shared-KV metadata declares backbone_hidden_size {}; fix model.io.hidden_output or speculative.backbone_hidden_size",
+                                target_hidden.len(),
+                                hidden_size
+                            );
+                        }
+                        let guaranteed = TokenId::try_from(
+                            argmax(&base_logits).context("native target logits were empty")?,
+                        )
+                        .context("native target token id exceeds u32 range")?;
+                        let shared_inputs = self.session.shared_kv_inputs(groups)?;
+                        let seed = *context_tokens.last().context(
+                            "native shared-KV proposer requires at least one context token",
+                        )?;
+                        let mut hidden = target_hidden.to_vec();
+                        let mut token = seed;
+                        let mut embeddings = vec![0.0; hidden_size.saturating_mul(2)];
+                        let mut tokens = Vec::with_capacity(width);
+                        tokens.push(guaranteed);
+                        let position = context_tokens.len().saturating_sub(1);
+                        for step in 0..width {
+                            embedder.embed(token, &mut embeddings[..*hidden_size])?;
+                            embeddings[*hidden_size..].copy_from_slice(&hidden);
+                            let output = proposer.step_inputs_embeds(
+                                &embeddings,
+                                position,
+                                &shared_inputs,
+                            )?;
+                            hidden = output.projected_state.with_context(|| {
+                            "native shared-KV proposer metadata must assign io.hidden_output to its projected recurrent state"
+                        })?;
+                            let logits = output.logits.with_context(
+                            || "native shared-KV proposer metadata must assign io.logits_output",
+                        )?;
+                            let drafted =
+                                TokenId::try_from(
+                                    argmax(logits.last().context(
+                                        "native shared-KV proposer emitted no logits rows",
+                                    )?)
+                                    .context("native shared-KV proposer logits row was empty")?,
+                                )
+                                .context("native shared-KV proposer token id exceeds u32 range")?;
+                            if step == 0 {
+                                token = guaranteed;
+                            } else {
+                                tokens.push(drafted);
+                                token = drafted;
+                            }
+                        }
+                        tokens
+                    }
+                };
+                draft.truncate(width);
+
+                if draft.is_empty() {
+                    // No proposal: fall back to a single plain greedy step. Worst case
+                    // is "no regression", never a slowdown (design §10).
                     let token = sample_greedy(&base_logits);
                     if let Some(reason) = commit_selected_token(
                         &mut state,
@@ -392,149 +518,13 @@ impl<'a> NativeSpeculativeDriver<'a> {
                     pending.push(token);
                     continue;
                 }
+
                 stats.verification_steps += 1;
                 stats.proposed_tokens += draft.len();
-                // Retain the captured verify graph across the per-step rewind so
-                // it replays instead of re-capturing, then run ONE fused forward
-                // over `[bonus ⊕ draft]` padded to the fixed capture width. Row 0
-                // is the base next-token distribution; rows 1..=k are the verify
-                // rows — identical numbers to the eager base + verify forwards.
-                self.session.set_retain_graph_on_rewind(true);
-                let fused_tokens: Vec<TokenId> = std::iter::once(bonus_token)
-                    .chain(draft.iter().copied())
-                    .collect();
-                let fixed_width = 1 + self.draft_width;
-                let mut fused =
-                    self.session
-                        .decode_verify_captured(&fused_tokens, past, fixed_width)?;
-                pending.clear();
-                debug_assert_eq!(fused.len(), draft.len() + 1);
-                let rows = fused.split_off(1);
-                let base_logits = fused
-                    .pop()
-                    .context("native fused verify produced no base logits")?;
-                let base = past + 1;
-                debug_assert_eq!(base, context_len);
-                (base_logits, base, draft, rows)
-            } else {
-                let base_logits = self
-                    .session
-                    .decode(&pending, past)?
-                    .pop()
-                    .context("native speculative decode produced no base logits")?;
-                pending.clear();
-                let base = self.session.current_len();
-                debug_assert_eq!(base, context_len);
-                let mut draft = match &mut self.proposer {
-                NativeProposer::PromptLookup(proposer) => {
-                    let proposer_context = SpeculativeProposerContext {
-                        width,
-                        context_tokens: &context_tokens,
-                        generated_tokens: &state.generated_tokens,
-                        generated_text: &state.generated_text,
-                        first_step: state.step,
-                        options,
-                        chain,
-                        target_hidden: None,
-                        target_hidden_layers: None,
-                        guaranteed_token: None,
-                        shared_kv_slices: None,
-                    };
-                    proposer.propose(&proposer_context)?.tokens
-                }
-                NativeProposer::SharedKv {
-                    session: proposer,
-                    embedder,
-                    groups,
-                    hidden_size,
-                } => {
-                    let target_hidden = self.session.last_hidden().with_context(|| {
-                        "native shared-KV proposer requires the target decoder's declared io.hidden_output; the target forward produced no hidden state"
-                    })?;
-                    if target_hidden.len() != *hidden_size {
-                        anyhow::bail!(
-                            "native target hidden output has width {}, but shared-KV metadata declares backbone_hidden_size {}; fix model.io.hidden_output or speculative.backbone_hidden_size",
-                            target_hidden.len(),
-                            hidden_size
-                        );
-                    }
-                    let guaranteed = TokenId::try_from(
-                        argmax(&base_logits).context("native target logits were empty")?,
-                    )
-                    .context("native target token id exceeds u32 range")?;
-                    let shared_inputs = self.session.shared_kv_inputs(groups)?;
-                    let seed = *context_tokens
-                        .last()
-                        .context("native shared-KV proposer requires at least one context token")?;
-                    let mut hidden = target_hidden.to_vec();
-                    let mut token = seed;
-                    let mut embeddings = vec![0.0; hidden_size.saturating_mul(2)];
-                    let mut tokens = Vec::with_capacity(width);
-                    tokens.push(guaranteed);
-                    let position = context_tokens.len().saturating_sub(1);
-                    for step in 0..width {
-                        embedder.embed(token, &mut embeddings[..*hidden_size])?;
-                        embeddings[*hidden_size..].copy_from_slice(&hidden);
-                        let output =
-                            proposer.step_inputs_embeds(&embeddings, position, &shared_inputs)?;
-                        hidden = output.projected_state.with_context(|| {
-                            "native shared-KV proposer metadata must assign io.hidden_output to its projected recurrent state"
-                        })?;
-                        let logits = output.logits.with_context(
-                            || "native shared-KV proposer metadata must assign io.logits_output",
-                        )?;
-                        let drafted = TokenId::try_from(
-                            argmax(
-                                logits
-                                    .last()
-                                    .context("native shared-KV proposer emitted no logits rows")?,
-                            )
-                            .context("native shared-KV proposer logits row was empty")?,
-                        )
-                        .context("native shared-KV proposer token id exceeds u32 range")?;
-                        if step == 0 {
-                            token = guaranteed;
-                        } else {
-                            tokens.push(drafted);
-                            token = drafted;
-                        }
-                    }
-                    tokens
-                }
-            };
-            draft.truncate(width);
 
-            if draft.is_empty() {
-                // No proposal: fall back to a single plain greedy step. Worst case
-                // is "no regression", never a slowdown (design §10).
-                let token = sample_greedy(&base_logits);
-                if let Some(reason) = commit_selected_token(
-                    &mut state,
-                    prompt_tokens,
-                    token,
-                    options,
-                    chain,
-                    tokenizer,
-                    callback.as_deref_mut(),
-                )? {
-                    return finish_result(
-                        tokenizer,
-                        &state.generated_tokens,
-                        reason,
-                        0,
-                        state.logprobs.as_deref(),
-                    );
-                }
-                pending.push(token);
-                continue;
-            }
-
-            stats.verification_steps += 1;
-            stats.proposed_tokens += draft.len();
-
-            // Eager M=K verify pass: one target row per draft position (predicts
-            // the token AFTER each draft token). current_len advances to base + K.
-            let rows = self.session.decode_verify(&draft, base)?;
+                // Eager M=K verify pass: one target row per draft position (predicts
+                // the token AFTER each draft token). current_len advances to base + K.
+                let rows = self.session.decode_verify(&draft, base)?;
                 (base_logits, base, draft, rows)
             };
 

@@ -207,16 +207,6 @@ impl NativeDecodeSession {
         self.current_len
     }
 
-    /// WP4 speculative driver switch: retain the captured M=width verify graph
-    /// across the per-step `rewind` (option (c) contents-only mutation) instead
-    /// of invalidating it (the eager default). Only the captured-verify
-    /// speculative path flips this on; it is a no-op on non-CUDA sessions.
-    pub fn set_retain_graph_on_rewind(&mut self, retain: bool) {
-        if let Some(state) = self.cuda.as_mut() {
-            state.retain_graph_on_rewind = retain;
-        }
-    }
-
     /// Whether this session has a CUDA decode state (captured verify is only
     /// available — and only worth arming — on the CUDA execution provider).
     pub fn is_cuda(&self) -> bool {
@@ -880,12 +870,14 @@ impl NativeDecodeSession {
         }
     }
 
-    /// Toggle the option (c) "rewind retains the captured graph" guard directly.
-    /// Dormant: bring-up / correctness tests only.
-    #[cfg(test)]
-    pub(crate) fn set_retain_graph_on_rewind(&mut self, retain: bool) {
+    /// WP4 speculative driver switch: retain the captured M=width verify graph
+    /// across the per-step `rewind` (option (c) contents-only mutation) instead
+    /// of invalidating it (the eager default). Only the captured-verify
+    /// speculative path (and correctness tests) flip this on; a no-op on non-CUDA
+    /// sessions.
+    pub fn set_retain_graph_on_rewind(&mut self, retain: bool) {
         if let Some(state) = self.cuda.as_mut() {
-            state.set_retain_graph_on_rewind(retain);
+            state.retain_graph_on_rewind = retain;
         }
     }
 
