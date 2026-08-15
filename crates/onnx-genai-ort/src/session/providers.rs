@@ -119,6 +119,19 @@ pub(super) type AdoptedStream = Option<std::sync::Arc<crate::cuda_rt::CudaComput
 #[cfg(not(feature = "cuda"))]
 pub(super) type AdoptedStream = ();
 
+/// Copy an [`AdoptedStream`] without naming which of the two types it is.
+///
+/// With CUDA it is an `Option<Arc<_>>` that must be cloned; without CUDA it is
+/// `()`, where a `.clone()` at the call site would be a clippy error. Both
+/// arms live here so callers do not need their own `cfg`.
+#[cfg(feature = "cuda")]
+pub(super) fn clone_adopted(adopted: &AdoptedStream) -> AdoptedStream {
+    adopted.clone()
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(super) fn clone_adopted(_adopted: &AdoptedStream) -> AdoptedStream {}
+
 pub(super) fn append_execution_provider(
     env: &Environment,
     session_options: *mut onnx_genai_ort_sys::OrtSessionOptions,

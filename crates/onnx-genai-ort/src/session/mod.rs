@@ -261,7 +261,10 @@ impl Session {
                     })?;
                 }
             }
-            Ok((ptr, session_options.adopted_stream.clone()))
+            Ok((
+                ptr,
+                providers::clone_adopted(&session_options.adopted_stream),
+            ))
         };
 
         // Auto-selected providers (e.g. the macOS MLX default) always fall back
