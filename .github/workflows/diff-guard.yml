@@ -1,0 +1,76 @@
+name: Diff guard
+
+# PR #1026 was titled "docs: RTX/consumer GeForce perf-tuning catalog" and deleted
+# 3,153 files / 1,157,751 lines -- everything except `docs/` -- leaving `main` with
+# two tracked files. Nothing stopped it, and it was found by accident days later,
+# when an unrelated `git worktree add origin/main` produced a tree with no
+# Cargo.toml. Review reads a diff; nobody reads a diff that large, so the size
+# itself has to be the signal.
+#
+# This job fails when a pull request deletes an implausible share of the tree. It
+# is deliberately crude: it does not try to judge whether the deletion is correct,
+# only to make a repository-scale deletion impossible to merge silently. A genuine
+# large removal passes by adding the `bulk-delete-approved` label, which leaves a
+# record of the decision on the PR.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+jobs:
+  deletion-ratio:
+    name: Deletion ratio
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fail on repository-scale deletions
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          set -euo pipefail
+
+          # Tracked files on the base commit, and files this PR deletes outright.
+          tracked=$(git ls-tree -r --name-only "$BASE_SHA" | wc -l)
+          deleted=$(git diff --diff-filter=D --name-only "$BASE_SHA" "$HEAD_SHA" | wc -l)
+
+          echo "tracked on base: $tracked"
+          echo "deleted by PR:   $deleted"
+
+          if [ "$tracked" -eq 0 ]; then
+            echo "Base commit has no tracked files; nothing to compare against."
+            exit 0
+          fi
+
+          # Integer percent, rounded down.
+          ratio=$(( deleted * 100 / tracked ))
+          echo "deletion ratio:  ${ratio}%"
+
+          # A PR that removes more than a quarter of the repository, or more than
+          # 500 files, is not a change anyone reviewed line by line.
+          if [ "$ratio" -lt 25 ] && [ "$deleted" -lt 500 ]; then
+            echo "Within limits."
+            exit 0
+          fi
+
+          case ",$LABELS," in
+            *,bulk-delete-approved,*)
+              echo "Deletion is large (${deleted} files, ${ratio}%) but carries the"
+              echo "'bulk-delete-approved' label. Allowing."
+              exit 0
+              ;;
+          esac
+
+          echo "::error::This pull request deletes ${deleted} of ${tracked} tracked files (${ratio}%)."
+          echo "::error::A deletion this large is almost always accidental -- PR #1026 deleted the"
+          echo "::error::entire repository under a docs-only title. If the removal is intended, add"
+          echo "::error::the 'bulk-delete-approved' label to record that decision, and say in the PR"
+          echo "::error::description what is being removed and why."
+          exit 1

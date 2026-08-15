@@ -1128,10 +1128,13 @@ impl NativeDecodeSession {
             bail!("native generation requires at least one prompt token");
         }
         self.reset()?;
+        let device_loop_k = self.device_token_loop_k();
         let mut backend = NativeLoopAdapter {
             session: self,
             prompt_tokens: prompt_tokens.to_vec(),
             pending_tokens: prompt_tokens.to_vec(),
+            device_loop_k,
+            lookahead: std::collections::VecDeque::new(),
         };
         let mut state = DecodeLoopState::new(0, options.seed, options.top_logprobs);
         run_decode_loop(
@@ -1237,10 +1240,13 @@ impl NativeDecodeSession {
                 "incremental generation requires at least one new token beyond the cached prefix"
             );
         }
+        let device_loop_k = self.device_token_loop_k();
         let mut backend = NativeLoopAdapter {
             session: self,
             prompt_tokens: prompt_tokens.to_vec(),
             pending_tokens: new_tokens.to_vec(),
+            device_loop_k,
+            lookahead: std::collections::VecDeque::new(),
         };
         let mut state = DecodeLoopState::new(resume_from, options.seed, options.top_logprobs);
         run_decode_loop(
