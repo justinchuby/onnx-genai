@@ -454,8 +454,52 @@ fn logits_rows_argmax(bytes: &[u8], dtype: DataType, rows: usize, vocab: usize) 
     out
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CudaKvDebugStats {
+/// Materialize a `[rows, vocab]` device logits buffer of raw bytes into host
+/// `f32` rows. The captured-verify path (WP4) needs the *full* per-row
+/// distributions (not just argmax) so the driver's greedy accept + near-tie eps
+/// guard operate on identical numbers to the eager verify. Mirrors
+/// [`logits_rows_argmax`]'s three-dtype handling (f32/f16/bf16).
+fn logits_bytes_to_rows(
+    bytes: &[u8],
+    dtype: DataType,
+    rows: usize,
+    vocab: usize,
+) -> anyhow::Result<Vec<Vec<f32>>> {
+    let width = match dtype {
+        DataType::Float16 | DataType::BFloat16 => 2,
+        _ => 4,
+    };
+    let need = rows
+        .checked_mul(vocab)
+        .and_then(|n| n.checked_mul(width))
+        .context("captured verify logits size overflow")?;
+    if bytes.len() < need {
+        bail!(
+            "captured verify logits buffer holds {} bytes but [{rows}, {vocab}] needs {need}",
+            bytes.len()
+        );
+    }
+    let decode = |b: &[u8]| -> f32 {
+        match dtype {
+            DataType::Float16 => half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32(),
+            DataType::BFloat16 => {
+                f32::from_bits((u32::from(u16::from_le_bytes([b[0], b[1]]))) << 16)
+            }
+            _ => f32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+        }
+    };
+    let mut out = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let mut distribution = Vec::with_capacity(vocab);
+        let base = row * vocab * width;
+        for col in 0..vocab {
+            let off = base + col * width;
+            distribution.push(decode(&bytes[off..off + width]));
+        }
+        out.push(distribution);
+    }
+    Ok(out)
+}
     pub logical_len: usize,
     pub max_len: usize,
     pub kv_committed_len: usize,
@@ -525,6 +569,32 @@ enum DecodeCudaGraphPhase {
     Armed,
     Ready,
     Unsupported,
+}
+
+/// Persistent padded `[1, W]` bindings + single-capture graph phase for the
+/// fused captured-verify speculative path (WP4). Allocated on the driver's first
+/// captured verify at a fixed width `W = 1 + draft_width` and retained across
+/// speculative steps so the M=W verify graph *replays* instead of re-eager'ing
+/// each step. The device buffers outlive every replay (the captured graph
+/// recorded their addresses); they are swapped into the persistent binding
+/// vector around each forward and swapped back out so the M=1 bindings are
+/// untouched. Dropped on `rewind(0)` / session reset.
+pub(crate) struct VerifyCaptureBindings {
+    /// Fixed query-row width the graph is captured at (`1 + draft_width`).
+    width: usize,
+    phase: DecodeCudaGraphPhase,
+    /// `[1, W]` int64 token-id input, device-resident (written each step).
+    token: DeviceIoBinding,
+    /// `[1, W]` int64 position-id input, when the decoder declares one.
+    position: Option<DeviceIoBinding>,
+    /// `[1, W, vocab]` logits output that absorbs the forward so nothing
+    /// materializes to host except the explicit `read_bytes` below.
+    logits: DeviceIoBinding,
+    /// Capture declined for this generation ⇒ permanent eager fallback (never
+    /// retried), so a NotCapturable model degrades cleanly to the eager verify.
+    fallback: bool,
+    captures: u64,
+    replays: u64,
 }
 
 pub(crate) struct DecodeCudaState {
@@ -663,6 +733,10 @@ pub(crate) struct DecodeCudaState {
     /// dormant `configure_padded_verify_capture` switch (not on the hot path).
     #[cfg(test)]
     pub(crate) padded_query_capacity: Option<usize>,
+    /// Live WP4 captured-verify bindings (fused speculative path). `None` until
+    /// the driver's first `decode_verify_captured` call, then retained across
+    /// steps so the M=W verify graph replays. Dropped on `rewind(0)`.
+    pub(crate) verify_capture: Option<VerifyCaptureBindings>,
 }
 
 pub(crate) struct DecodeCudaIo<'a> {
@@ -1821,6 +1895,353 @@ impl NativeDecodeSession {
         // CPU sessions already run any M>1 forward eagerly through the shared
         // decode path, which returns the full [K, vocab] rows verify needs.
         <Self as DecodeBackend>::decode(self, draft, past)
+    }
+
+    /// WP4 fused **captured** verify: run a fixed-width `[1, width]` forward under
+    /// a single-capture CUDA-graph state machine and return the first
+    /// `tokens.len()` logits rows. `tokens` is the fused `[bonus ⊕ draft]`
+    /// sequence (`bonus` at row 0 yields the base next-token distribution; rows
+    /// `1..=draft.len()` are the verify rows) padded internally to the constant
+    /// `width = 1 + draft_width` so the captured graph *replays* across
+    /// speculative steps instead of re-eager'ing each verify. The extra padding
+    /// rows are computed but never read for acceptance and are dropped by the
+    /// driver's subsequent `rewind`, exactly like the eager verify+rewind pattern.
+    ///
+    /// Graceful degradation: on a non-CUDA session, or if capture is declined
+    /// (`NotCapturable`), the forward runs eagerly and returns identical logits,
+    /// so correctness never depends on the captured path being available.
+    pub fn decode_verify_captured(
+        &mut self,
+        tokens: &[TokenId],
+        past: usize,
+        width: usize,
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        if tokens.is_empty() {
+            bail!("native decode_verify_captured requires at least one token");
+        }
+        if tokens.len() > width {
+            bail!(
+                "native decode_verify_captured got {} tokens but the fixed capture width is {width}",
+                tokens.len()
+            );
+        }
+        if past != self.current_len {
+            bail!(
+                "native decode_verify_captured past length mismatch: caller supplied {past}, adapter holds {}",
+                self.current_len
+            );
+        }
+        if self.cuda.is_none() {
+            // CPU / non-CUDA: no capture. Run the eager verify over the real
+            // (unpadded) fused tokens — the same rows the captured path returns.
+            return <Self as DecodeBackend>::decode(self, tokens, past);
+        }
+        self.run_verify_captured_cuda(tokens, past, width)
+    }
+
+    /// CUDA body of [`Self::decode_verify_captured`]: drive the persistent padded
+    /// `[1, width]` verify bindings through the warm → arm → capture → replay
+    /// graph state machine (mirrors [`DecodeCudaState::run_one_token`] at M=width),
+    /// reusing the exact allocate/swap/read mechanics proven byte-identical by the
+    /// Increment-0 capture probe. The KV logical length advances to `past+width`;
+    /// the driver rewinds it to the accepted prefix afterwards.
+    fn run_verify_captured_cuda(
+        &mut self,
+        tokens: &[TokenId],
+        past_len: usize,
+        width: usize,
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        let _span = self
+            .trace
+            .span("native_decode_verify_captured", "spec")
+            .with_args(
+                Args::new()
+                    .with("rows", tokens.len() as u64)
+                    .with("width", width as u64),
+            );
+        let total_len = past_len
+            .checked_add(width)
+            .context("native captured verify context length overflow")?;
+        let token_input = self
+            .step_input_name(NativeStepInputSource::TokenIds)
+            .context("native CUDA decoder has no token input binding")?
+            .to_owned();
+        let position_input = self
+            .step_input_name(NativeStepInputSource::PositionIds)
+            .map(str::to_owned);
+
+        let state = self
+            .cuda
+            .as_mut()
+            .context("CUDA decode state is not initialized")?;
+        if total_len > state.capacity.max_len {
+            bail!("{}", state.capacity_exceeded_error(total_len));
+        }
+        let vocab = *state
+            .logits_shape
+            .last()
+            .context("CUDA logits shape has no vocabulary dimension")?;
+        let logits_dtype = state.logits_dtype;
+        let logits_index = state.logits_binding;
+        let input_ids_index = state.input_ids_binding;
+        let position_ids_index = state.position_ids_binding;
+
+        // (Re)allocate the persistent padded bindings if this is the first call
+        // or the fixed width changed (a new generation with a different draft
+        // budget). Reusing them across steps is what lets the graph be captured
+        // once and replayed.
+        let needs_alloc = state
+            .verify_capture
+            .as_ref()
+            .map(|capture| capture.width)
+            != Some(width);
+        if needs_alloc {
+            state.invalidate_graph(&mut self.session)?;
+            let logits_name = state.bindings[logits_index]
+                .output_name()
+                .context("logits binding has no output name")?
+                .to_owned();
+            let padded_logits = self.session.allocate_device_output_binding(
+                logits_name,
+                logits_dtype,
+                vec![1, width, vocab],
+                vec![1, width, vocab],
+            )?;
+            let padded_ids = self.session.allocate_device_binding(
+                token_input.clone(),
+                None::<String>,
+                DataType::Int64,
+                vec![1, width],
+                vec![1, width],
+            )?;
+            let padded_positions = if let Some(pos_name) = position_input.as_deref() {
+                Some(self.session.allocate_device_binding(
+                    pos_name.to_owned(),
+                    None::<String>,
+                    DataType::Int64,
+                    vec![1, width],
+                    vec![1, width],
+                )?)
+            } else {
+                None
+            };
+            let state = self
+                .cuda
+                .as_mut()
+                .context("CUDA decode state is not initialized")?;
+            state.verify_capture = Some(VerifyCaptureBindings {
+                width,
+                phase: DecodeCudaGraphPhase::NeedsWarmup,
+                token: padded_ids,
+                position: padded_positions,
+                logits: padded_logits,
+                fallback: false,
+                captures: 0,
+                replays: 0,
+            });
+        }
+
+        // Grow the KV/mask bindings if the context crossed a bucket; a grow moves
+        // device addresses, so the captured verify graph must be re-warmed.
+        let state = self
+            .cuda
+            .as_mut()
+            .context("CUDA decode state is not initialized")?;
+        let grew = state.ensure_capacity(&mut self.session, total_len)?;
+        let state = self
+            .cuda
+            .as_mut()
+            .context("CUDA decode state is not initialized")?;
+        if grew {
+            state.invalidate_graph(&mut self.session)?;
+            if let Some(capture) = state.verify_capture.as_mut() {
+                capture.phase = DecodeCudaGraphPhase::NeedsWarmup;
+            }
+        }
+        state.extend_mask(if grew { 0 } else { past_len }, total_len, total_len)?;
+
+        // Write the padded token ids + positions into the persistent verify
+        // buffers. Padding rows repeat the last real token (value is irrelevant —
+        // those rows are never read and their KV is dropped by the driver rewind).
+        {
+            let capture = state
+                .verify_capture
+                .as_mut()
+                .context("captured verify bindings missing after allocation")?;
+            let last = i64::from(tokens[tokens.len() - 1]);
+            let mut token_bytes = Vec::with_capacity(width * 8);
+            for i in 0..width {
+                let value = if i < tokens.len() {
+                    i64::from(tokens[i])
+                } else {
+                    last
+                };
+                token_bytes.extend_from_slice(&value.to_ne_bytes());
+            }
+            capture.token.write_bytes(0, &token_bytes)?;
+            if let Some(position) = capture.position.as_mut() {
+                let mut position_bytes = Vec::with_capacity(width * 8);
+                for pos in past_len..total_len {
+                    position_bytes.extend_from_slice(&(pos as i64).to_ne_bytes());
+                }
+                position.write_bytes(0, &position_bytes)?;
+            }
+        }
+
+        // Take the padded bindings out and swap them into the persistent vector,
+        // parking the M=1 originals. They are restored before returning so the
+        // eager fallback paths (empty-draft / prefill) keep their [1,1] bindings.
+        let mut capture = state
+            .verify_capture
+            .take()
+            .context("captured verify bindings missing before swap")?;
+        let phase_in = capture.phase;
+        let fallback_in = capture.fallback;
+        let width_in = capture.width;
+        let mut captures = capture.captures;
+        let mut replays = capture.replays;
+        let orig_ids = std::mem::replace(&mut state.bindings[input_ids_index], capture.token);
+        let orig_logits =
+            std::mem::replace(&mut state.bindings[logits_index], capture.logits);
+        let orig_positions = position_ids_index.map(|index| {
+            let padded = capture
+                .position
+                .take()
+                .expect("captured verify position binding missing for a positioned decoder");
+            (index, std::mem::replace(&mut state.bindings[index], padded))
+        });
+
+        // Drive the capture state machine inline (a closure cannot capture the
+        // disjoint `self.session` / `state` borrows the way these field-access
+        // call expressions can). Every arm produces valid logits in the padded
+        // logits binding for THIS step's `past`, so exactly one real forward runs
+        // per call (matching `run_one_token`). Errors are captured (not `?`-ed)
+        // so the parked M=1 bindings are always restored before returning.
+        let mut phase_out = phase_in;
+        let mut fallback_out = fallback_in;
+        let mut machine: anyhow::Result<()> = Ok(());
+        if fallback_in {
+            machine = self
+                .session
+                .run_with_device_bindings(&[], &mut state.bindings[..])
+                .map(|_| ())
+                .map_err(anyhow::Error::from);
+        } else {
+            match phase_in {
+                DecodeCudaGraphPhase::NeedsWarmup => {
+                    match self
+                        .session
+                        .run_with_device_bindings(&[], &mut state.bindings[..])
+                    {
+                        Ok(_) => phase_out = DecodeCudaGraphPhase::Armed,
+                        Err(error) => machine = Err(error.into()),
+                    }
+                }
+                DecodeCudaGraphPhase::Armed => {
+                    match self
+                        .session
+                        .try_capture_with_device_bindings(&[], &mut state.bindings[..])
+                    {
+                        Ok(DeviceGraphCaptureResult::Captured(outputs)) => {
+                            if outputs.iter().any(Option::is_some) {
+                                machine = Err(anyhow::anyhow!(
+                                    "captured CUDA verify unexpectedly materialized a host output"
+                                ));
+                            } else {
+                                captures += 1;
+                                phase_out = DecodeCudaGraphPhase::Ready;
+                            }
+                        }
+                        Ok(DeviceGraphCaptureResult::NotCapturable(report)) => {
+                            fallback_out = true;
+                            phase_out = DecodeCudaGraphPhase::Unsupported;
+                            tracing::warn!(
+                                "native captured verify disabled for this generation, \
+                                 falling back to eager verify: {report}"
+                            );
+                            machine = self
+                                .session
+                                .run_with_device_bindings(&[], &mut state.bindings[..])
+                                .map(|_| ())
+                                .map_err(anyhow::Error::from);
+                        }
+                        Err(error) => machine = Err(error.into()),
+                    }
+                }
+                DecodeCudaGraphPhase::Ready => {
+                    match self.session.replay_device_graph(&mut state.bindings[..]) {
+                        Ok(still_valid) => {
+                            replays += 1;
+                            if !still_valid {
+                                // A control-flow branch flip retired the graph
+                                // after producing this step's logits eagerly;
+                                // re-warm next step.
+                                phase_out = DecodeCudaGraphPhase::NeedsWarmup;
+                            }
+                        }
+                        Err(error) => machine = Err(error.into()),
+                    }
+                }
+                DecodeCudaGraphPhase::Unsupported => {
+                    machine = self
+                        .session
+                        .run_with_device_bindings(&[], &mut state.bindings[..])
+                        .map(|_| ())
+                        .map_err(anyhow::Error::from);
+                }
+            }
+        }
+
+        // Read the padded logits BEFORE restoring bindings, then reclaim the
+        // padded bindings and restore the M=1 originals.
+        let mut logits_bytes: Option<Vec<u8>> = None;
+        if machine.is_ok() {
+            match state.bindings[logits_index].read_bytes() {
+                Ok(bytes) => logits_bytes = Some(bytes),
+                Err(error) => machine = Err(error),
+            }
+        }
+        let used_ids = std::mem::replace(&mut state.bindings[input_ids_index], orig_ids);
+        let used_logits =
+            std::mem::replace(&mut state.bindings[logits_index], orig_logits);
+        let used_positions = orig_positions
+            .map(|(index, original)| std::mem::replace(&mut state.bindings[index], original));
+        state.verify_capture = Some(VerifyCaptureBindings {
+            width: width_in,
+            phase: phase_out,
+            token: used_ids,
+            position: used_positions,
+            logits: used_logits,
+            fallback: fallback_out,
+            captures,
+            replays,
+        });
+
+        let logits_bytes = match logits_bytes {
+            Some(bytes) => bytes,
+            None => {
+                let error = machine.unwrap_err();
+                let diagnosis = diagnose_native_failure(&self.session, &error.to_string());
+                // The graph slot may hold a half-captured verify graph; drop it
+                // so a retry re-warms cleanly.
+                let _ = state.invalidate_graph(&mut self.session);
+                if let Some(capture) = state.verify_capture.as_mut() {
+                    capture.phase = DecodeCudaGraphPhase::NeedsWarmup;
+                }
+                return Err(error.context(format!(
+                    "native CUDA captured verify forward pass failed{diagnosis}"
+                )));
+            }
+        };
+
+        state.set_logical_len(total_len)?;
+        self.current_len = total_len;
+
+        let rows = logits_bytes_to_rows(&logits_bytes, logits_dtype, tokens.len(), vocab)?;
+        if rows.iter().flatten().any(|value| !value.is_finite()) {
+            bail!("native captured verify produced non-finite logits");
+        }
+        Ok(rows)
     }
 
     /// Eager multi-token (M=K) CUDA forward used by the verify primitive.
@@ -3529,6 +3950,7 @@ impl DecodeCudaState {
             retain_graph_on_rewind: false,
             #[cfg(test)]
             padded_query_capacity: None,
+            verify_capture: None,
         })
     }
 
@@ -4211,6 +4633,15 @@ impl DecodeCudaState {
         rows.into_iter()
             .next()
             .context("device argmax returned no rows")
+    }
+
+    /// Force the retained captured-verify graph to re-warm on the next call
+    /// (keeps the padded bindings allocated). Used when an intervening eager
+    /// forward may have reset the shared EP graph slot out from under it.
+    pub(crate) fn reset_verify_capture_phase(&mut self) {
+        if let Some(capture) = self.verify_capture.as_mut() {
+            capture.phase = DecodeCudaGraphPhase::NeedsWarmup;
+        }
     }
 
     pub(crate) fn invalidate_graph(
