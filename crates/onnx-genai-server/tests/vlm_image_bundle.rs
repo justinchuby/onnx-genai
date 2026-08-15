@@ -1,0 +1,782 @@
+use std::{
+    fs,
+    io::Cursor,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+use axum::{
+    body::{Body, to_bytes},
+    http::{Request, StatusCode, header},
+};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
+use onnx_genai_server::{AppState, app};
+use serde_json::{Value, json};
+use tower::ServiceExt;
+
+static FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+
+struct FixtureDir(PathBuf);
+
+impl FixtureDir {
+    fn new(max_context: usize) -> Self {
+        Self::with_tokens_per_patch(max_context, 3)
+    }
+
+    fn rank4(max_context: usize) -> Self {
+        let root = fixture_root();
+        fs::create_dir_all(&root).expect("create fixture directory");
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-gemma4-vlm");
+        copy_shared_assets(&source, &root);
+        let vision_model = fs::read_to_string(source.join("vision_encoder.onnx.textproto"))
+            .expect("read rank-4 vision model")
+            .replace("pixel_values", "image_tensor");
+        fs::write(root.join("vision_encoder.onnx.textproto"), vision_model)
+            .expect("write renamed rank-4 vision model");
+        fs::write(
+            root.join("inference_metadata.yaml"),
+            rank4_metadata(max_context),
+        )
+        .expect("write rank-4 fixture metadata");
+        fs::write(
+            root.join("chat_template.jinja"),
+            "{% for message in messages %}{{ message.content }}{% endfor %}",
+        )
+        .expect("write fixture chat template");
+        Self(root)
+    }
+
+    fn with_tokens_per_patch(max_context: usize, tokens_per_patch: usize) -> Self {
+        let root = fixture_root();
+        fs::create_dir_all(&root).expect("create fixture directory");
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-gemma4-vlm");
+        copy_shared_assets(&source, &root);
+        fs::write(
+            root.join("vision_encoder.onnx.textproto"),
+            VISION_MODEL_TEXTPROTO,
+        )
+        .expect("write generated vision model");
+        fs::write(
+            root.join("inference_metadata.yaml"),
+            metadata(max_context, tokens_per_patch),
+        )
+        .expect("write fixture metadata");
+        fs::write(
+            root.join("chat_template.jinja"),
+            "{% for message in messages %}{{ message.content }}{% endfor %}",
+        )
+        .expect("write fixture chat template");
+        Self(root)
+    }
+}
+
+fn fixture_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/vlm-image-bundle-tests")
+        .join(format!(
+            "{}-{}",
+            std::process::id(),
+            FIXTURE_ID.fetch_add(1, Ordering::Relaxed)
+        ))
+}
+
+fn copy_shared_assets(source: &Path, root: &Path) {
+    for name in [
+        "embedding.onnx.textproto",
+        "decoder.onnx.textproto",
+        "tokenizer.json",
+    ] {
+        fs::copy(source.join(name), root.join(name)).expect("copy shared fixture asset");
+    }
+}
+
+impl Drop for FixtureDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+async fn chat(fixture: &FixtureDir, content: Value, max_tokens: usize) -> (StatusCode, Value) {
+    let state =
+        AppState::load(&fixture.0, Some("tiny-packed-vlm".to_string())).expect("load fixture");
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-packed-vlm",
+                        "messages": [{"role": "user", "content": content}],
+                        "max_tokens": max_tokens,
+                        "temperature": 0.0,
+                        "logprobs": true,
+                        "top_logprobs": 0
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("server response");
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body");
+    (
+        status,
+        serde_json::from_slice(&body).expect("JSON response body"),
+    )
+}
+
+fn image_part(uri: String) -> Value {
+    json!({"type": "image_url", "image_url": {"url": uri}})
+}
+
+fn data_uri(color: [u8; 3]) -> String {
+    let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(2, 2, Rgb(color)));
+    let mut bytes = Cursor::new(Vec::new());
+    image
+        .write_to(&mut bytes, ImageFormat::Png)
+        .expect("encode PNG");
+    format!(
+        "data:image/png;base64,{}",
+        STANDARD.encode(bytes.into_inner())
+    )
+}
+
+fn patterned_data_uri(red_pixel_index: usize) -> String {
+    let image = RgbImage::from_fn(2, 2, |x, y| {
+        let index = (y * 2 + x) as usize;
+        Rgb(if index == red_pixel_index {
+            [255, 0, 0]
+        } else {
+            [0, 0, 0]
+        })
+    });
+    let mut bytes = Cursor::new(Vec::new());
+    DynamicImage::ImageRgb8(image)
+        .write_to(&mut bytes, ImageFormat::Png)
+        .expect("encode patterned PNG");
+    format!(
+        "data:image/png;base64,{}",
+        STANDARD.encode(bytes.into_inner())
+    )
+}
+
+#[tokio::test]
+async fn public_chat_path_injects_both_vision_inputs_and_expands_placeholder() {
+    let fixture = FixtureDir::new(64);
+    let (status, body) = chat(
+        &fixture,
+        json!([
+            {"type": "text", "text": "three <image>"},
+            image_part(patterned_data_uri(1))
+        ]),
+        4,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+    assert_eq!(body["choices"][0]["message"]["content"], "five six five");
+    assert_eq!(body["usage"]["prompt_tokens"], 4);
+}
+
+#[tokio::test]
+async fn metadata_declared_rank4_endpoint_preserves_legacy_image_path() {
+    let fixture = FixtureDir::rank4(64);
+    let (status, body) = chat(
+        &fixture,
+        json!([
+            {"type": "text", "text": "three <image>"},
+            image_part(patterned_data_uri(1))
+        ]),
+        4,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+    assert_eq!(body["usage"]["prompt_tokens"], 4);
+}
+
+#[tokio::test]
+async fn two_images_follow_prompt_order() {
+    let fixture = FixtureDir::new(64);
+    let first_slot = patterned_data_uri(1);
+    let last_slot = patterned_data_uri(2);
+    let ordered = json!([
+        {"type": "text", "text": "three <image> "},
+        image_part(first_slot.clone()),
+        {"type": "text", "text": "<image>"},
+        image_part(last_slot.clone())
+    ]);
+    let reversed = json!([
+        {"type": "text", "text": "three <image> "},
+        image_part(last_slot),
+        {"type": "text", "text": "<image>"},
+        image_part(first_slot)
+    ]);
+
+    let (ordered_status, ordered_body) = chat(&fixture, ordered.clone(), 1).await;
+    let (repeat_status, repeat_body) = chat(&fixture, ordered, 1).await;
+    let (reversed_status, reversed_body) = chat(&fixture, reversed, 1).await;
+
+    assert_eq!(ordered_status, StatusCode::OK, "{ordered_body:#}");
+    assert_eq!(repeat_status, StatusCode::OK, "{repeat_body:#}");
+    assert_eq!(reversed_status, StatusCode::OK, "{reversed_body:#}");
+    assert_eq!(
+        ordered_body["choices"][0]["message"]["content"],
+        repeat_body["choices"][0]["message"]["content"]
+    );
+    assert_ne!(
+        ordered_body["choices"][0]["message"]["content"],
+        reversed_body["choices"][0]["message"]["content"],
+        "swapping image content parts must change the order-sensitive vision result"
+    );
+}
+
+#[tokio::test]
+async fn a_prompt_that_writes_no_placeholder_has_the_image_positioned_for_it() {
+    // The placeholder spelling is the package's private business, so a caller
+    // who writes none still gets a working request: the image part is rendered
+    // where it was written.
+    let fixture = FixtureDir::new(64);
+    let (status, body) = chat(
+        &fixture,
+        json!([
+            {"type": "text", "text": "three"},
+            image_part(data_uri([255, 0, 0]))
+        ]),
+        1,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+}
+
+#[tokio::test]
+async fn a_hand_written_placeholder_that_undercounts_the_images_is_rejected() {
+    let fixture = FixtureDir::new(64);
+    let (status, body) = chat(
+        &fixture,
+        json!([
+            {"type": "text", "text": "three <image>"},
+            image_part(data_uri([255, 0, 0])),
+            image_part(data_uri([0, 0, 255]))
+        ]),
+        1,
+    )
+    .await;
+
+    // Writing the placeholder yourself means you positioned the images; one
+    // placeholder for two images leaves the second one homeless, and guessing
+    // where it belongs would silently change what the sentence refers to.
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_structured_error(&body, "do not match the 2 image(s)");
+}
+
+#[tokio::test]
+async fn expanded_context_overflow_is_rejected_before_driver_admission() {
+    let fixture = FixtureDir::new(4);
+    let (status, body) = chat(
+        &fixture,
+        json!([
+            {"type": "text", "text": "three <image>"},
+            image_part(data_uri([255, 0, 0]))
+        ]),
+        1,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_structured_error(&body, "final prefill length");
+}
+
+#[tokio::test]
+async fn extreme_expansion_metadata_is_rejected_before_driver_admission() {
+    let fixture = FixtureDir::with_tokens_per_patch(64, usize::MAX / 2);
+    let (status, body) = chat(
+        &fixture,
+        json!([
+            {"type": "text", "text": "three <image>"},
+            image_part(data_uri([255, 0, 0]))
+        ]),
+        1,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_structured_error(&body, "pre-allocation limit");
+}
+
+#[tokio::test]
+async fn malformed_base64_has_actionable_public_route_error() {
+    let fixture = FixtureDir::new(64);
+    let (status, body) = chat(
+        &fixture,
+        json!([
+            {"type": "text", "text": "three <image>"},
+            image_part("data:image/png;base64,not%%%base64".to_string())
+        ]),
+        1,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_structured_error(&body, "not valid standard base64");
+}
+
+#[tokio::test]
+async fn unsupported_image_scheme_has_actionable_public_route_error() {
+    let fixture = FixtureDir::new(64);
+    let (status, body) = chat(
+        &fixture,
+        json!([
+            {"type": "text", "text": "three <image>"},
+            image_part("file:///private/model/image.png".to_string())
+        ]),
+        1,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_structured_error(&body, "scheme 'file'");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(!message.contains("/private/model/image.png"), "{message}");
+}
+
+#[tokio::test]
+async fn failed_http_image_fetch_redacts_path_query_and_token_on_public_route() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind failing image server");
+    let address = listener.local_addr().expect("image server address");
+    let server = tokio::spawn(async move {
+        let (connection, _) = listener.accept().await.expect("accept image request");
+        drop(connection);
+    });
+    let origin = format!("http://{address}");
+    let secret_path = "/private/customer/image.png";
+    let secret_query = "token=super-secret-token";
+    let fixture = FixtureDir::new(64);
+    let (status, body) = chat(
+        &fixture,
+        json!([
+            {"type": "text", "text": "three <image>"},
+            image_part(format!("{origin}{secret_path}?{secret_query}"))
+        ]),
+        1,
+    )
+    .await;
+    server.await.expect("failing image server task");
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_structured_error(&body, &format!("image URL fetch failed for {origin}"));
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(!message.contains(secret_path), "{message}");
+    assert!(!message.contains(secret_query), "{message}");
+    assert!(!message.contains("super-secret-token"), "{message}");
+}
+
+fn assert_structured_error(body: &Value, expected: &str) {
+    let message = body["error"]["message"]
+        .as_str()
+        .expect("error message string");
+    assert!(message.contains("What:"), "{message}");
+    assert!(message.contains("Why:"), "{message}");
+    assert!(message.contains("How:"), "{message}");
+    assert!(message.contains(expected), "{message}");
+}
+
+fn metadata(max_context: usize, tokens_per_patch: usize) -> String {
+    format!(
+        r#"schema_version: v1
+model:
+  max_sequence_length: {max_context}
+preprocessing:
+  image:
+    transforms:
+      - op: decode_rgb
+      - op: resize
+        size: 2
+        mode: stretch
+        interpolation: bicubic
+      - op: rescale
+        scale: 0.00392156862745098
+      - op: patchify
+        patch_size: 2
+        flatten: true
+    outputs:
+      - name: vision_encoder.packed_pixels
+        content: pixels
+        dtype: float32
+      - name: vision_encoder.patch_positions
+        content: patch_coordinates
+        dtype: int64
+pipeline:
+  models:
+    vision_encoder:
+      filename: vision_encoder.onnx.textproto
+      type: vision_encoder
+    embedding:
+      filename: embedding.onnx.textproto
+      type: encoder
+      io:
+        token_input: input_ids
+    decoder:
+      filename: decoder.onnx.textproto
+      type: decoder
+      tokenizer: tokenizer.json
+      io:
+        sequence_source: inputs_embeds
+        inputs_embeds_input: inputs_embeds
+        logits_output: logits
+        kv_inputs:
+          - past_key_values.0.key
+          - past_key_values.0.value
+        kv_outputs:
+          - present.0.key
+          - present.0.value
+  dataflow:
+    - from: vision_encoder.image_features
+      to: embedding.image_features
+      dtype: fp32
+      device_transfer: false
+    - from: embedding.inputs_embeds
+      to: decoder.inputs_embeds
+      dtype: fp32
+      device_transfer: false
+  strategy:
+    kind: composite
+    stages:
+      - name: encode_vision
+        strategy:
+          kind: single_pass
+          model: vision_encoder
+        run_on: prompt_only
+      - name: fuse_embeddings
+        strategy:
+          kind: single_pass
+          model: embedding
+        run_on: every_step
+      - name: decode
+        strategy:
+          kind: autoregressive
+          decoder: decoder
+          max_tokens: 4
+        run_on: every_step
+  phases:
+    vision_encoder:
+      run_on: prompt_only
+    embedding:
+      run_on: every_step
+    decoder:
+      run_on: every_step
+  vision:
+    image_placeholder_token_id: 7
+    image_token_id: 7
+    token_count_source: per_patch
+    tokens_per_patch: {tokens_per_patch}
+    placeholder_per_image: true
+    thumbnail_order: none
+"#
+    )
+}
+
+fn rank4_metadata(max_context: usize) -> String {
+    format!(
+        r#"schema_version: v1
+model:
+  max_sequence_length: {max_context}
+preprocessing:
+  image:
+    transforms:
+      - op: decode_rgb
+      - op: resize
+        size: 2
+        mode: stretch
+        interpolation: bicubic
+      - op: rescale
+        scale: 0.00392156862745098
+    outputs:
+      - name: vision_encoder.image_tensor
+        content: pixels
+        dtype: float32
+pipeline:
+  models:
+    vision_encoder:
+      filename: vision_encoder.onnx.textproto
+      type: vision_encoder
+    embedding:
+      filename: embedding.onnx.textproto
+      type: encoder
+      io:
+        token_input: input_ids
+    decoder:
+      filename: decoder.onnx.textproto
+      type: decoder
+      tokenizer: tokenizer.json
+      io:
+        sequence_source: inputs_embeds
+        inputs_embeds_input: inputs_embeds
+        logits_output: logits
+        kv_inputs:
+          - past_key_values.0.key
+          - past_key_values.0.value
+        kv_outputs:
+          - present.0.key
+          - present.0.value
+  dataflow:
+    - from: vision_encoder.image_features
+      to: embedding.image_features
+      dtype: fp32
+      device_transfer: false
+    - from: embedding.inputs_embeds
+      to: decoder.inputs_embeds
+      dtype: fp32
+      device_transfer: false
+  strategy:
+    kind: composite
+    stages:
+      - name: encode_vision
+        strategy:
+          kind: single_pass
+          model: vision_encoder
+        run_on: prompt_only
+      - name: fuse_embeddings
+        strategy:
+          kind: single_pass
+          model: embedding
+        run_on: every_step
+      - name: decode
+        strategy:
+          kind: autoregressive
+          decoder: decoder
+          max_tokens: 4
+        run_on: every_step
+  phases:
+    vision_encoder:
+      run_on: prompt_only
+    embedding:
+      run_on: every_step
+    decoder:
+      run_on: every_step
+  vision:
+    image_placeholder_token_id: 7
+    image_token_id: 7
+    token_count_source: per_tile
+    tokens_per_tile: 3
+    placeholder_per_image: true
+    thumbnail_order: none
+"#
+    )
+}
+
+// Generated and ONNX-checked with onnxscript.ir (ir.Value/Node/Graph/Model + ir.to_proto).
+const VISION_MODEL_TEXTPROTO: &str = r#"ir_version: 8
+producer_name: "onnx-genai VLM WP5 fixture"
+graph {
+  node {
+    output: "first_idx"
+    name: "node_Constant_0"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        dims: 1
+        data_type: 7
+        name: "first_idx_value"
+        raw_data: "\000\000\000\000\000\000\000\000"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    output: "feature_idx"
+    name: "node_Constant_1"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        dims: 4
+        data_type: 7
+        name: "feature_idx_value"
+        raw_data: "\000\000\000\000\000\000\000\000\001\000\000\000\000\000\000\000\002\000\000\000\000\000\000\000\003\000\000\000\000\000\000\000"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    output: "reduce_axes"
+    name: "node_Constant_2"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        dims: 2
+        data_type: 7
+        name: "reduce_axes_value"
+        raw_data: "\000\000\000\000\000\000\000\000\001\000\000\000\000\000\000\000"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    output: "unsqueeze_axis"
+    name: "node_Constant_3"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        dims: 1
+        data_type: 7
+        name: "unsqueeze_axis_value"
+        raw_data: "\001\000\000\000\000\000\000\000"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    output: "feature_scale"
+    name: "node_Constant_4"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        data_type: 1
+        name: "feature_scale_value"
+        raw_data: "\000\000\000@"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    input: "packed_pixels"
+    input: "first_idx"
+    output: "first_patch"
+    name: "node_Gather_5"
+    op_type: "Gather"
+    attribute {
+      name: "axis"
+      i: 0
+      type: INT
+    }
+  }
+  node {
+    input: "first_patch"
+    input: "feature_idx"
+    output: "first_four"
+    name: "node_Gather_6"
+    op_type: "Gather"
+    attribute {
+      name: "axis"
+      i: 1
+      type: INT
+    }
+  }
+  node {
+    input: "patch_positions"
+    output: "positions_f32"
+    name: "node_Cast_7"
+    op_type: "Cast"
+    attribute {
+      name: "to"
+      i: 1
+      type: INT
+    }
+  }
+  node {
+    input: "positions_f32"
+    input: "reduce_axes"
+    output: "position_sum"
+    name: "node_ReduceSum_8"
+    op_type: "ReduceSum"
+    attribute {
+      name: "keepdims"
+      i: 0
+      type: INT
+    }
+  }
+  node {
+    input: "first_four"
+    input: "feature_scale"
+    output: "scaled_features"
+    name: "node_Mul_9"
+    op_type: "Mul"
+  }
+  node {
+    input: "scaled_features"
+    input: "position_sum"
+    output: "combined"
+    name: "node_Add_10"
+    op_type: "Add"
+  }
+  node {
+    input: "combined"
+    input: "unsqueeze_axis"
+    output: "image_features"
+    name: "node_Unsqueeze_11"
+    op_type: "Unsqueeze"
+  }
+  name: "tiny_packed_two_input_vision"
+  input {
+    name: "packed_pixels"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "patches"
+          }
+          dim {
+            dim_value: 12
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "patch_positions"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "patches"
+          }
+          dim {
+            dim_value: 2
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "image_features"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 4
+          }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 13
+}
+"#;

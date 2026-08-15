@@ -1,0 +1,2535 @@
+//! Runtime session, generation, and prefix-connector APIs.
+
+use super::*;
+
+fn generate_uses_scheduler(_backend: EngineDecodeBackend) -> bool {
+    true
+}
+
+fn generation_budget_cap(cap: ScheduledBudgetCap) -> GenerationBudgetCap {
+    GenerationBudgetCap {
+        requested_max_new_tokens: cap.requested_max_tokens,
+        admitted_max_new_tokens: cap.admitted_max_tokens,
+        requested_bytes: cap.requested_bytes,
+        admitted_bytes: cap.admitted_bytes,
+        available_bytes: cap.available_bytes,
+    }
+}
+
+#[cfg(feature = "native-backend")]
+fn native_workspace_query_rows(
+    prompt_rows: usize,
+    plan: Option<&NativeSpeculationPlan>,
+    effective_max_new_tokens: usize,
+    max_context: Option<usize>,
+) -> usize {
+    let remaining_context = max_context
+        .map(|limit| limit.saturating_sub(prompt_rows))
+        .unwrap_or(effective_max_new_tokens);
+    let verify_rows = plan.map_or(0, |plan| {
+        crate::native_speculative::verification_width(
+            plan.width,
+            effective_max_new_tokens,
+            remaining_context,
+        )
+    });
+    prompt_rows.max(verify_rows)
+}
+
+fn metadata_eos_token_ids(metadata: &InferenceMetadata) -> Vec<TokenId> {
+    metadata
+        .tokens
+        .as_ref()
+        .and_then(|tokens| tokens.eos_token_id.as_ref())
+        .into_iter()
+        .flatten()
+        .filter_map(|&id| TokenId::try_from(id).ok())
+        .collect()
+}
+
+#[cfg(test)]
+mod eos_tests {
+    use super::*;
+
+    #[test]
+    fn metadata_eos_token_ids_preserves_multiple_valid_ids() {
+        let metadata: InferenceMetadata = serde_json::from_value(serde_json::json!({
+            "tokens": { "eos_token_id": [151645, -1, 4294967296_u64, 151643] }
+        }))
+        .unwrap();
+
+        assert_eq!(metadata_eos_token_ids(&metadata), vec![151645, 151643]);
+    }
+}
+
+impl Engine {
+    fn admit_generate_request_with_scheduler(
+        &mut self,
+        session_id: SessionId,
+        prompt_tokens: usize,
+        max_new_tokens: usize,
+        priority: Priority,
+    ) -> anyhow::Result<ScheduledRequest> {
+        let request_id = self.scheduler.enqueue_generate_request(
+            session_id,
+            prompt_tokens,
+            max_new_tokens,
+            priority,
+        );
+        let scheduled = match self.scheduler.drive_next_fcfs_result() {
+            Ok(Some(scheduled)) => scheduled,
+            Ok(None) => {
+                self.scheduler.cancel_request(request_id);
+                anyhow::bail!(
+                    "scheduler had no waiting request after enqueueing request {request_id} for session {session_id}"
+                );
+            }
+            Err(error) => {
+                self.scheduler.cancel_request(request_id);
+                return Err(error.into());
+            }
+        };
+        if scheduled.request_id != request_id || scheduled.seq_id != session_id {
+            self.scheduler.cancel_request(scheduled.request_id);
+            if scheduled.request_id != request_id {
+                self.scheduler.cancel_request(request_id);
+            }
+            anyhow::bail!(
+                "scheduler admitted request {} for session {}, expected request {} for session {}",
+                scheduled.request_id,
+                scheduled.seq_id,
+                request_id,
+                session_id
+            );
+        }
+        Ok(scheduled)
+    }
+
+    fn default_eos_token_ids(&self) -> Vec<TokenId> {
+        let mut ids = metadata_eos_token_ids(&self.metadata);
+        for id in self.tokenizer.eos_token_ids() {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+
+    fn apply_eos_defaults(&self, options: &mut GenerateOptions) {
+        if !options.stop_on_eos || options.eos_token_id.is_some() {
+            return;
+        }
+        let ids = self.default_eos_token_ids();
+        if let Some(&id) = ids.first() {
+            options.eos_token_id = Some(id);
+        }
+        for id in ids {
+            push_unique_stop_sequence(&mut options.stop_sequences, StopSequence::Tokens(vec![id]));
+        }
+    }
+
+    /// Effective context limit for a request, combining model metadata,
+    /// per-request override, and decode-path capacity.
+    pub fn effective_max_context(&self, options: &GenerateOptions) -> Option<usize> {
+        self.max_context_for_request(options)
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn generate_native_cold_with_callback(
+        &mut self,
+        mut request: GenerateRequest,
+        mut admission_callback: Option<&mut dyn FnMut()>,
+        callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        self.last_speculative_stats = SpeculativeStats::default();
+        if request.options.speculative_mode.is_none() && self.native_shared_kv_proposer.is_some() {
+            request.options.speculative_mode = Some(self.speculative_mode.clone());
+        }
+        reject_native_request_speculation(&request.options)?;
+        request.options.validate()?;
+        let mut options = request.options;
+        self.apply_eos_defaults(&mut options);
+        let prompt_tokens = self.tokenize_prompt(&request.prompt)?;
+        if prompt_tokens.is_empty() {
+            anyhow::bail!("prompt must contain at least one token");
+        }
+        options.max_context = self.max_context_for_request(&options);
+        let chain = build_processor_chain(&options, Some(&self.tokenizer))?;
+        let speculation_plan = native_speculation_plan(&options, &chain);
+        let scheduler_session_id = self.next_native_session_id();
+        let scheduled = self.admit_generate_request_with_scheduler(
+            scheduler_session_id,
+            prompt_tokens.len(),
+            options.max_new_tokens,
+            Priority::Normal,
+        )?;
+        let budget_cap = scheduled.budget_cap.map(generation_budget_cap);
+        options.max_new_tokens = scheduled.max_tokens;
+        let workspace_query_rows = native_workspace_query_rows(
+            prompt_tokens.len(),
+            speculation_plan.as_ref(),
+            options.max_new_tokens,
+            options.max_context,
+        );
+        if let Err(error) = self
+            .native_session
+            .as_mut()
+            .context("native decoder session is unavailable")?
+            .prepare_generation_workspace_for_query_rows(&prompt_tokens, workspace_query_rows)
+        {
+            self.scheduler.complete(scheduler_session_id);
+            return Err(error);
+        }
+        if let Some(callback) = admission_callback.as_mut() {
+            callback();
+        }
+
+        // Speculation ON (implemented greedy prompt-lookup) → the native
+        // speculative driver. Every other request stays on the untouched plain
+        // M=1 fast path below, preserving the 762 tok/s non-regression guarantee.
+        let result = if let Some(plan) = speculation_plan {
+            let mut stats = SpeculativeStats::default();
+            let result = (|| {
+                let native_session = self
+                    .native_session
+                    .as_mut()
+                    .context("native decoder session is unavailable")?;
+                let mut driver = match plan.kind {
+                    NativeSpeculationKind::PromptLookup { ngram, max_tokens } => {
+                        crate::native_speculative::NativeSpeculativeDriver::new_prompt_lookup(
+                            native_session,
+                            ngram,
+                            max_tokens,
+                            plan.width,
+                        )?
+                    }
+                    NativeSpeculationKind::SharedKv => {
+                        let proposer = self.native_shared_kv_proposer.as_mut().context(
+                            "native shared-KV speculation requested without a loaded proposer session",
+                        )?;
+                        crate::native_speculative::NativeSpeculativeDriver::new_shared_kv(
+                            native_session,
+                            &mut proposer.session,
+                            &proposer.embedder,
+                            &proposer.groups,
+                            proposer.hidden_size,
+                            plan.width,
+                        )?
+                    }
+                };
+                driver.generate(
+                    &prompt_tokens,
+                    &options,
+                    &chain,
+                    &self.tokenizer,
+                    &mut stats,
+                    callback,
+                )
+            })();
+            self.last_speculative_stats = stats;
+            result
+        } else {
+            let native_session = self
+                .native_session
+                .as_mut()
+                .context("native decoder session is unavailable")?;
+            native_session.generate_with_callback(
+                &prompt_tokens,
+                &options,
+                &chain,
+                &self.tokenizer,
+                callback,
+            )
+        };
+        self.scheduler.complete(scheduler_session_id);
+        let mut result = augment_backend_error(result, EngineDecodeBackend::Native)?;
+        result.budget_cap = budget_cap;
+        Ok(result)
+    }
+
+    #[cfg(not(feature = "native-backend"))]
+    fn generate_native_cold_with_callback(
+        &mut self,
+        _request: GenerateRequest,
+        _admission_callback: Option<&mut dyn FnMut()>,
+        _callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        anyhow::bail!(
+            "native decoder backend requires building onnx-genai-engine with the 'native-backend' feature"
+        )
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn next_native_session_id(&mut self) -> SessionId {
+        self.native_session_counter = self.native_session_counter.saturating_add(1);
+        SessionId::from(self.native_session_counter)
+    }
+
+    /// Stamp a session as most-recently-used and return the new stamp.
+    #[cfg(feature = "native-backend")]
+    fn touch_native_session(&mut self) -> u64 {
+        self.native_access_counter = self.native_access_counter.saturating_add(1);
+        self.native_access_counter
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn create_native_session_state(&mut self) -> anyhow::Result<SessionId> {
+        if self.decode_backend != EngineDecodeBackend::Native {
+            anyhow::bail!("native session state requires the native decode backend");
+        }
+        let id = self.next_native_session_id();
+        let last_access = self.touch_native_session();
+        self.native_sessions.insert(
+            id,
+            NativeSessionState {
+                tokens: Vec::new(),
+                last_access,
+            },
+        );
+        self.evict_native_sessions(id);
+        Ok(id)
+    }
+
+    /// Drop least-recently-used sessions until the retention limit is met.
+    ///
+    /// `keep` is the session the caller is currently working with and is
+    /// structurally excluded: there is a `filter` and deliberately **no**
+    /// fallback scan. An earlier version had one, and under a byte budget it
+    /// let a session pick itself as the victim and be deleted while the caller
+    /// was writing to it -- generation returned `Ok`, and the failure surfaced
+    /// later as a bare "session not found".
+    ///
+    /// With only a count limit that path is unreachable, because every caller
+    /// touches `keep` immediately before evicting, making it the *most*
+    /// recently used. So this is defensive and no test claims to cover it. It
+    /// is written this way because adding any limit that `keep` alone can
+    /// exceed would make a fallback reachable again instantly.
+    ///
+    /// This bounds retained history, not memory. Native sessions hold only a
+    /// token list -- one KV cache exists and switching resets it -- so a byte
+    /// budget here would bound nothing. That belongs to the resource governor
+    /// once native sessions hold leases on the central KV manager.
+    #[cfg(feature = "native-backend")]
+    fn evict_native_sessions(&mut self, keep: SessionId) {
+        while self.native_max_sessions != 0 && self.native_sessions.len() > self.native_max_sessions
+        {
+            let Some(victim) = self
+                .native_sessions
+                .iter()
+                .filter(|(id, _)| **id != keep)
+                .min_by_key(|(_, state)| state.last_access)
+                .map(|(&id, _)| id)
+            else {
+                break;
+            };
+            self.native_sessions.remove(&victim);
+            if self.native_active_session == Some(victim) {
+                self.native_active_session = None;
+            }
+            if self.native_default_session == Some(victim) {
+                self.native_default_session = None;
+            }
+        }
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn default_native_session(&mut self) -> anyhow::Result<SessionId> {
+        if let Some(id) = self.native_default_session
+            && self.native_sessions.contains_key(&id)
+        {
+            return Ok(id);
+        }
+        let id = self.create_native_session_state()?;
+        self.native_default_session = Some(id);
+        Ok(id)
+    }
+
+    fn require_ort_backend(&self, feature: &str) -> anyhow::Result<()> {
+        if self.decode_backend == EngineDecodeBackend::Native {
+            anyhow::bail!(
+                "the native single-session backend does not support {feature}; use independent serialized requests"
+            );
+        }
+        Ok(())
+    }
+
+    /// Generate text for a request.
+    ///
+    pub fn generate(&mut self, request: GenerateRequest) -> anyhow::Result<GenerateResult> {
+        self.generate_with_callback(request, None)
+    }
+
+    /// Generate text using a caller-supplied [`Sampler`] for final token
+    /// selection.
+    ///
+    /// The logit-processor chain (temperature, top-k, top-p, min-p, penalties,
+    /// constraints, …) still runs; only the terminal greedy/categorical pick is
+    /// replaced by `sampler`. This is the public extension seam that the C ABI
+    /// ([`crate::capi`]) exposes to foreign samplers. Not supported on the
+    /// native single-session backend.
+    pub fn generate_with_sampler(
+        &mut self,
+        request: GenerateRequest,
+        sampler: Box<dyn Sampler>,
+    ) -> anyhow::Result<GenerateResult> {
+        if self.decode_backend == EngineDecodeBackend::Native {
+            anyhow::bail!("custom samplers are not supported on the native single-session backend");
+        }
+        let session_id = self.create_session()?;
+        let result = self.generate_in_session_with_sampler(session_id, request, sampler);
+        let close_result = self.close_session(session_id);
+        match (result, close_result) {
+            (Ok(result), Ok(())) => Ok(result),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
+    /// Speculative verification diagnostics from the most recent generation.
+    pub fn last_speculative_stats(&self) -> SpeculativeStats {
+        self.last_speculative_stats
+    }
+
+    /// Native CUDA decode diagnostics from the engine-owned session.
+    #[cfg(feature = "native-backend")]
+    pub fn native_cuda_debug_stats(&self) -> Option<crate::native_decode::CudaKvDebugStats> {
+        self.native_session
+            .as_ref()
+            .and_then(crate::native_decode::NativeDecodeSession::cuda_kv_debug_stats)
+    }
+
+    /// Mutable access to the engine-owned native decode session, if any.
+    ///
+    /// Exposed so measurement harnesses can drive the batch-N decode entry
+    /// points (`decode_greedy_batch`) against the *fully governed* session —
+    /// the one whose weight-offload policy carries the managed no-spill
+    /// stable-VA authority. A bare `load_with_resolved_io` session takes the
+    /// conservative pointer-unstable default and would decline capture by
+    /// construction, so a harness that wants to observe the real
+    /// capture-plus-streaming behaviour must go through the engine.
+    #[cfg(feature = "native-backend")]
+    pub fn native_decode_session_mut(
+        &mut self,
+    ) -> Option<&mut crate::native_decode::NativeDecodeSession> {
+        self.native_session.as_mut()
+    }
+
+    /// Access the engine-owned Resource Governor handle.
+    pub fn governor(&self) -> &EngineResourceGovernor {
+        &self.governor
+    }
+
+    /// Convenience snapshot of configured and live resource state.
+    pub fn resource_snapshot(&self) -> GovernorSnapshot {
+        self.governor.snapshot()
+    }
+
+    /// Bytes by which the device memory ledger exceeds its live ceiling.
+    pub fn device_oversubscribed_bytes(&self) -> u64 {
+        self.governor.device_oversubscribed_bytes()
+    }
+
+    /// Static weight placement computed from `device_policy` at model load.
+    pub fn weight_placement_report(&self) -> Option<&WeightPlacementReport> {
+        #[cfg(feature = "native-backend")]
+        {
+            self.weight_placement.as_ref()
+        }
+        #[cfg(not(feature = "native-backend"))]
+        {
+            None
+        }
+    }
+
+    pub fn memory_strategy_plan(&self) -> &MemoryStrategyPlan {
+        &self.memory_strategy_plan
+    }
+
+    /// Change the live VRAM ceiling when runtime overrides are enabled.
+    pub fn set_vram_limit(
+        &self,
+        limit: ResourceLimit,
+    ) -> Result<GovernorReconfigureOutcome, EngineGovernorError> {
+        self.governor.set_vram_limit(limit)
+    }
+
+    /// Cumulative KV page activity: allocations, frees, and evictions.
+    ///
+    /// Evictions or allocation failures mean the KV pool is under pressure,
+    /// which no per-token latency figure explains on its own.
+    /// What the KV page pool is holding right now.
+    pub fn page_usage(&self) -> onnx_genai_kv::PageUsage {
+        self.kv_cache.page_table.usage()
+    }
+
+    pub fn page_stats(&self) -> onnx_genai_kv::PageStats {
+        self.kv_cache.page_table.stats()
+    }
+
+    /// Attach a lock-free mirror of the KV pool's aggregate state.
+    ///
+    /// [`page_usage`](Self::page_usage) cannot serve a live monitor: it is
+    /// `O(pages)` and allocates, and reaching it requires `&self` on an engine
+    /// that is mutably borrowed for the whole of a generation. The mirror is
+    /// updated incrementally at the pool's mutation sites and read from any
+    /// thread, so a reader can observe the pool *during* generation, which is
+    /// the only time paged-KV behaviour is worth watching.
+    ///
+    /// Returns `false` when this engine's KV cannot page, so a caller can
+    /// report the numbers as not-applicable rather than presenting a pool that
+    /// will never move as one that is merely idle. The pool is attached either
+    /// way: its capacity is a real number, and a client that knows the
+    /// mechanism is inactive can still show it truthfully.
+    ///
+    /// A caller must not infer this from the *absence* of some other
+    /// capability. See [`pages_kv`](Self::pages_kv).
+    pub fn attach_kv_telemetry(
+        &mut self,
+        telemetry: std::sync::Arc<onnx_genai_kv::KvTelemetry>,
+    ) -> bool {
+        self.kv_cache.page_table.attach_telemetry(telemetry);
+        self.pages_kv()
+    }
+
+    /// Whether this engine's KV cache can actually hold paged tensors.
+    ///
+    /// Both halves are required and neither implies the other: an engine can
+    /// own a KV model while its page table carries no tensor storage, in which
+    /// case the page table is bookkeeping the decoder never consults.
+    ///
+    /// Do not derive this from the absence of another capability. A pool that
+    /// reports a non-zero capacity is not thereby in use, which is exactly the
+    /// reading that makes an inactive mechanism look active.
+    pub fn pages_kv(&self) -> bool {
+        self.kv_model.is_some() && self.kv_cache.page_table.tensor_config.is_some()
+    }
+
+    /// External KV connector activity from the most recent generation.
+    ///
+    /// Reflects lookups, would-be prefix extensions, tokens actually fetched and
+    /// injected (K4 materialization), and chunk stores. Returns
+    /// [`ConnectorStats::default`] when no connector is configured.
+    pub fn last_connector_stats(&self) -> ConnectorStats {
+        self.connector.stats().clone()
+    }
+
+    #[cfg(feature = "native-backend")]
+    pub fn recurrent_prefix_cache_stats(&self) -> RecurrentPrefixCacheStats {
+        self.native_recurrent_prefix_stats
+    }
+
+    /// Generate the middle text for a fill-in-the-middle request.
+    pub fn generate_fim(
+        &mut self,
+        prefix: impl AsRef<str>,
+        suffix: impl AsRef<str>,
+        options: GenerateOptions,
+    ) -> anyhow::Result<GenerateResult> {
+        let fim_config = self
+            .fim_config
+            .clone()
+            .context("model tokenizer_config.json does not declare recognized FIM tokens")?;
+        self.generate_fim_with_config(prefix, suffix, options, &fim_config)
+    }
+
+    /// Generate the middle text using an explicit fill-in-the-middle configuration.
+    pub fn generate_fim_with_config(
+        &mut self,
+        prefix: impl AsRef<str>,
+        suffix: impl AsRef<str>,
+        options: GenerateOptions,
+        fim_config: &FimConfig,
+    ) -> anyhow::Result<GenerateResult> {
+        self.generate_fim_with_config_and_callbacks(prefix, suffix, options, fim_config, None, None)
+    }
+
+    /// Generate FIM text and notify the caller immediately after scheduler admission.
+    pub fn generate_fim_with_config_and_callbacks(
+        &mut self,
+        prefix: impl AsRef<str>,
+        suffix: impl AsRef<str>,
+        options: GenerateOptions,
+        fim_config: &FimConfig,
+        admission_callback: Option<&mut dyn FnMut()>,
+        token_callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        let prompt = fim_config.format_prompt(prefix.as_ref(), suffix.as_ref());
+        let mut request = GenerateRequest::new(prompt);
+        request.options = self.fim_options(fim_config, options);
+        self.generate_with_callbacks(request, admission_callback, token_callback)
+    }
+
+    /// Generate text and optionally stream each generated token to `callback`.
+    pub fn generate_with_callback(
+        &mut self,
+        request: GenerateRequest,
+        callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        self.generate_with_callbacks(request, None, callback)
+    }
+
+    /// Generate text, notifying `admission_callback` after scheduler admission
+    /// and before backend execution, then streaming tokens to `token_callback`.
+    pub fn generate_with_callbacks(
+        &mut self,
+        request: GenerateRequest,
+        admission_callback: Option<&mut dyn FnMut()>,
+        token_callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        #[cfg(feature = "native-backend")]
+        if self.decode_backend == EngineDecodeBackend::Native {
+            // Speculation still runs cold: the native speculative paths own
+            // the KV cache themselves and cannot resume a shared prefix. Both
+            // cold and session-reusing paths still admit through the scheduler
+            // before touching the native backend.
+            let native_spec_requested = request.options.speculative_mode.is_some()
+                || request.options.num_speculative_tokens.is_some();
+            if request.options.cold_start || native_spec_requested {
+                let result = self.generate_native_cold_with_callback(
+                    request,
+                    admission_callback,
+                    token_callback,
+                );
+                self.native_active_session = None;
+                return result;
+            }
+            let session_id = self.default_native_session()?;
+            return self.generate_native_in_session_with_callbacks(
+                session_id,
+                request,
+                admission_callback,
+                token_callback,
+            );
+        }
+        if !generate_uses_scheduler(self.decode_backend) {
+            #[cfg(not(feature = "native-backend"))]
+            {
+                return self.generate_native_cold_with_callback(
+                    request,
+                    admission_callback,
+                    token_callback,
+                );
+            }
+        }
+        let session_id = self.create_session()?;
+        let result = self.generate_in_session_with_priority_and_callback(
+            session_id,
+            request,
+            Priority::Normal,
+            None,
+            admission_callback,
+            token_callback,
+        );
+        let close_result = self.close_session(session_id);
+        match (result, close_result) {
+            (Ok(result), Ok(())) => Ok(result),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
+    /// Generate text in a persistent session, reusing the session's accumulated KV state.
+    pub fn generate_in_session(
+        &mut self,
+        session_id: SessionId,
+        request: GenerateRequest,
+    ) -> anyhow::Result<GenerateResult> {
+        self.generate_in_session_with_callback(session_id, request, None)
+    }
+
+    /// Generate text in a persistent session with an explicit scheduler priority.
+    pub fn generate_in_session_with_priority(
+        &mut self,
+        session_id: SessionId,
+        request: GenerateRequest,
+        priority: Priority,
+    ) -> anyhow::Result<GenerateResult> {
+        self.generate_in_session_with_priority_and_callback(
+            session_id, request, priority, None, None, None,
+        )
+    }
+
+    /// Generate text in a persistent session and optionally stream generated tokens.
+    pub fn generate_in_session_with_callback(
+        &mut self,
+        session_id: SessionId,
+        request: GenerateRequest,
+        callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        self.generate_in_session_with_priority_and_callback(
+            session_id,
+            request,
+            Priority::Normal,
+            None,
+            None,
+            callback,
+        )
+    }
+
+    /// Generate in a persistent session with an explicit admission notification.
+    pub fn generate_in_session_with_callbacks(
+        &mut self,
+        session_id: SessionId,
+        request: GenerateRequest,
+        admission_callback: Option<&mut dyn FnMut()>,
+        token_callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        self.generate_in_session_with_priority_and_callback(
+            session_id,
+            request,
+            Priority::Normal,
+            None,
+            admission_callback,
+            token_callback,
+        )
+    }
+
+    /// Generate text in a persistent session using a caller-supplied [`Sampler`].
+    ///
+    /// The custom sampler replaces the built-in greedy/categorical token
+    /// selection while the full logit-processor chain (temperature, top-k,
+    /// top-p, penalties, constraints, …) still runs first. This is the Rust
+    /// extension seam that the C ABI ([`crate::capi`]) plugs foreign samplers
+    /// into. The device greedy fast path is bypassed so the sampler always sees
+    /// the processed logits.
+    pub fn generate_in_session_with_sampler(
+        &mut self,
+        session_id: SessionId,
+        request: GenerateRequest,
+        sampler: Box<dyn Sampler>,
+    ) -> anyhow::Result<GenerateResult> {
+        self.generate_in_session_with_priority_and_callback(
+            session_id,
+            request,
+            Priority::Normal,
+            Some(sampler),
+            None,
+            None,
+        )
+    }
+
+    fn generate_in_session_with_priority_and_callback(
+        &mut self,
+        session_id: SessionId,
+        request: GenerateRequest,
+        priority: Priority,
+        mut custom_sampler: Option<Box<dyn Sampler>>,
+        mut admission_callback: Option<&mut dyn FnMut()>,
+        mut callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        #[cfg(feature = "native-backend")]
+        if self.decode_backend == EngineDecodeBackend::Native {
+            if priority != Priority::Normal {
+                anyhow::bail!("native backend does not support prioritized session generation");
+            }
+            if custom_sampler.is_some() {
+                anyhow::bail!("custom samplers are not supported on the native backend");
+            }
+            return self.generate_native_in_session_with_callbacks(
+                session_id,
+                request,
+                admission_callback,
+                callback,
+            );
+        }
+        self.last_speculative_stats = SpeculativeStats::default();
+        request.options.validate()?;
+        let mut options = request.options.clone();
+        self.apply_eos_defaults(&mut options);
+        let prompt_tokens = self.tokenize_prompt(&request.prompt)?;
+        if prompt_tokens.is_empty() {
+            anyhow::bail!("prompt must contain at least one token");
+        }
+        if !self.sessions.contains_key(&session_id) {
+            anyhow::bail!("session {session_id} not found");
+        }
+
+        let max_context = self.max_context_for_request(&options);
+        let chain = build_processor_chain(&options, Some(&self.tokenizer))?;
+
+        let scheduled = self.admit_generate_request_with_scheduler(
+            session_id,
+            prompt_tokens.len(),
+            options.max_new_tokens,
+            priority,
+        )?;
+        let budget_cap = scheduled.budget_cap.map(generation_budget_cap);
+        options.max_new_tokens = scheduled.max_tokens;
+        if let Some(callback) = admission_callback.as_mut() {
+            callback();
+        }
+
+        let Some(mut state) = self.sessions.remove(&session_id) else {
+            self.scheduler.complete(session_id);
+            anyhow::bail!("session {session_id} not found");
+        };
+
+        let result = (|| -> anyhow::Result<GenerateResult> {
+            let prefix_cache_hit_len =
+                self.prepare_session_prefix(session_id, &mut state, &prompt_tokens)?;
+            let mut loop_state =
+                DecodeLoopState::new(prefix_cache_hit_len, options.seed, options.top_logprobs);
+            let has_custom_sampler = custom_sampler.is_some();
+            loop_state.custom_sampler = custom_sampler.take();
+
+            if self.should_use_speculative(&options) && !has_custom_sampler {
+                return self.generate_speculative_loop(crate::speculative::SpeculativeLoopState {
+                    session_id,
+                    state: &mut state,
+                    options: &options,
+                    chain: &chain,
+                    max_context,
+                    prefix_cache_hit_len,
+                    generated_tokens: &mut loop_state.generated_tokens,
+                    generated_text: &mut loop_state.generated_text,
+                    generated_logprobs: &mut loop_state.logprobs,
+                    rng: &mut loop_state.rng,
+                    callback: callback.as_deref_mut(),
+                });
+            }
+
+            let mut backend = SessionDecodeLoopBackend {
+                session: self
+                    .session
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))?,
+                kv_model: self.kv_model.as_ref(),
+                kv_cache: &mut self.kv_cache,
+                scheduler: &mut self.scheduler,
+                session_id,
+                state: &mut state,
+            };
+            run_decode_loop(
+                &mut backend,
+                &mut loop_state,
+                &options,
+                &chain,
+                &self.tokenizer,
+                max_context,
+                callback.as_deref_mut(),
+            )
+        })()
+        .and_then(|mut result| {
+            if !exceeded_context_limit(state.tokens.len(), max_context) {
+                self.ensure_session_kv_current(session_id, &mut state)?;
+                self.insert_cached_prefixes(session_id, &state, prompt_tokens.len())?;
+            }
+            result.budget_cap = budget_cap;
+            Ok(result)
+        });
+        self.sessions.insert(session_id, state);
+        self.scheduler.complete(session_id);
+        result
+    }
+
+    /// Drive a set of already-arrived prioritized requests to completion.
+    ///
+    /// This is the Phase 3 engine-facing scheduler drive API. It runs one
+    /// sequence at a time for now, but honors priority ordering and scheduler
+    /// preemption decisions while preserving session decode state and KV in place.
+    pub fn drive_prioritized_requests(
+        &mut self,
+        requests: Vec<PrioritizedGenerateRequest>,
+    ) -> anyhow::Result<Vec<PrioritizedGenerateResult>> {
+        let arrivals = requests
+            .into_iter()
+            .map(|request| ScheduledGenerateArrival {
+                arrival_step: 0,
+                request,
+            })
+            .collect();
+        self.drive_prioritized_arrivals(arrivals)
+    }
+
+    /// Drive prioritized requests that arrive after specific generated-token steps.
+    ///
+    /// This lets async server code drain newly-arrived requests between scheduler
+    /// iterations. Preemption is swap-style: active `EngineSession` state, ORT past
+    /// tensors, and mirrored paged KV stay owned by the engine and are resumed
+    /// without recomputation.
+    pub fn drive_prioritized_arrivals(
+        &mut self,
+        mut arrivals: Vec<ScheduledGenerateArrival>,
+    ) -> anyhow::Result<Vec<PrioritizedGenerateResult>> {
+        self.require_ort_backend("prioritized request scheduling")?;
+        arrivals.sort_by_key(|arrival| arrival.arrival_step);
+        let total_requests = arrivals.len();
+        let mut next_arrival = 0;
+        let mut generated_steps = 0;
+        let mut active: HashMap<SessionId, ActiveGenerate> = HashMap::new();
+        let mut results = Vec::with_capacity(total_requests);
+
+        while results.len() < total_requests {
+            while next_arrival < arrivals.len()
+                && arrivals[next_arrival].arrival_step <= generated_steps
+            {
+                let arrival = arrivals[next_arrival].clone();
+                next_arrival += 1;
+                let active_request = self.prepare_active_generate(arrival.request)?;
+                if active
+                    .insert(active_request.session_id, active_request)
+                    .is_some()
+                {
+                    anyhow::bail!("session already has an active generation request");
+                }
+            }
+
+            let decision = self.scheduler.schedule();
+            self.execute_kv_movement(&decision)?;
+            let mut runnable = Vec::new();
+            for seq in decision
+                .prefill
+                .iter()
+                .chain(decision.swap_in.iter())
+                .chain(decision.decode.iter())
+            {
+                if !decision.preempt.contains(seq) && !runnable.contains(seq) {
+                    runnable.push(*seq);
+                }
+            }
+
+            if runnable.is_empty() {
+                if next_arrival < arrivals.len() {
+                    generated_steps = arrivals[next_arrival].arrival_step;
+                    continue;
+                }
+                anyhow::bail!("scheduler made no runnable decision with active requests remaining");
+            }
+
+            for session_id in runnable {
+                let mut active_request = active.remove(&session_id).with_context(|| {
+                    format!("active request for session {session_id} not found")
+                })?;
+                if let Some(max_tokens) = self.scheduler.running_max_tokens(session_id) {
+                    active_request.budget_cap = self
+                        .scheduler
+                        .running_budget_cap(session_id)
+                        .map(generation_budget_cap);
+                    active_request.options.max_new_tokens = max_tokens;
+                }
+                let step_result = self.step_active_generate(&mut active_request)?;
+                generated_steps += 1;
+                if let Some(result) = step_result {
+                    let session_id = active_request.session_id;
+                    self.finish_active_generate(active_request)?;
+                    results.push(PrioritizedGenerateResult { session_id, result });
+                } else {
+                    active.insert(session_id, active_request);
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Execute the KV-cache movement a scheduler decision calls for.
+    ///
+    /// This is the engine-side counterpart to the scheduler's preemption
+    /// bookkeeping: a `ScheduleDecision::preempt` entry evicts that sequence's
+    /// paged KV off the hot tier (freeing residency for higher-priority work),
+    /// and a `ScheduleDecision::swap_in` entry restores it before the sequence
+    /// runs again. Preemption only re-tags the pages' device tier; the KV data
+    /// is preserved in place, so a preempted-then-restored sequence resumes with
+    /// byte-identical KV and decodes the same tokens as if it had never been
+    /// preempted (see [`PagedKvCache::preempt_sequence`]).
+    ///
+    /// When the scheduler emits neither preemption nor swap-in (the common
+    /// single-sequence / no-pressure path) this is a no-op, keeping normal
+    /// decoding behavior-identical.
+    fn execute_kv_movement(&mut self, decision: &ScheduleDecision) -> anyhow::Result<()> {
+        for seq in &decision.preempt {
+            self.kv_cache
+                .preempt_sequence(*seq)
+                .map_err(|e| anyhow::anyhow!("failed to preempt KV for sequence {seq}: {e}"))?;
+        }
+        for seq in &decision.swap_in {
+            self.kv_cache
+                .restore_sequence(*seq)
+                .map_err(|e| anyhow::anyhow!("failed to restore KV for sequence {seq}: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Create a new generation session.
+    pub fn create_session(&mut self) -> anyhow::Result<SessionId> {
+        #[cfg(feature = "native-backend")]
+        if self.decode_backend == EngineDecodeBackend::Native {
+            return self.create_native_session_state();
+        }
+        let decode_state = self.new_target_decode_state()?;
+        let id = self.kv_cache.create_sequence();
+        let draft = if let Some(draft_model) = &mut self.draft {
+            Some(DraftSession {
+                seq: draft_model.kv_cache.create_sequence(),
+                tokens: Vec::new(),
+                kv_token_count: 0,
+                decode_state: DecodeState::new_for_path_with_io(
+                    &draft_model.session,
+                    &draft_model.decode_path,
+                    draft_model.io.as_ref(),
+                )?,
+            })
+        } else {
+            None
+        };
+        let state = EngineSession {
+            tokens: Vec::new(),
+            kv_token_count: 0,
+            decode_state,
+            draft,
+            sampled_fastpath_failed: false,
+        };
+        self.sessions.insert(id, state);
+        Ok(id)
+    }
+
+    /// Checkpoint the current logical token boundary for a persistent session.
+    ///
+    /// The returned checkpoint is intentionally small: restoring a session uses
+    /// the same rewind machinery as speculative decoding and keeps prefix-cache
+    /// page ownership intact. Checkpoints are invalid after the session is
+    /// closed or reset.
+    pub fn checkpoint_session(&self, session_id: SessionId) -> anyhow::Result<SessionCheckpoint> {
+        #[cfg(feature = "native-backend")]
+        if self.decode_backend == EngineDecodeBackend::Native {
+            let state = self
+                .native_sessions
+                .get(&session_id)
+                .with_context(|| format!("session {session_id} not found"))?;
+            return Ok(SessionCheckpoint {
+                session_id,
+                position: SessionPosition::new(state.tokens.len()),
+            });
+        }
+        self.require_ort_backend("session checkpoints")?;
+        let state = self
+            .sessions
+            .get(&session_id)
+            .with_context(|| format!("session {session_id} not found"))?;
+        Ok(SessionCheckpoint {
+            session_id,
+            position: SessionPosition::new(state.tokens.len()),
+        })
+    }
+
+    /// Restore a persistent session to a previously checkpointed token boundary.
+    pub fn restore_session(&mut self, checkpoint: SessionCheckpoint) -> anyhow::Result<()> {
+        self.rewind_session_to(checkpoint.session_id, checkpoint.position)
+    }
+
+    /// Rewind a persistent session by `tokens` logical tokens.
+    ///
+    /// This mutates only the named session. Cached prefixes remain valid because
+    /// they own their page-table references independently of session ownership;
+    /// pages that are no longer referenced by the session or a prefix cache entry
+    /// are released by the underlying paged KV cache.
+    pub fn rewind_session_by(
+        &mut self,
+        session_id: SessionId,
+        tokens: RewindTokenCount,
+    ) -> anyhow::Result<SessionPosition> {
+        #[cfg(feature = "native-backend")]
+        if self.decode_backend == EngineDecodeBackend::Native {
+            let tokens = tokens.get();
+            let current = self
+                .native_sessions
+                .get(&session_id)
+                .with_context(|| format!("session {session_id} not found"))?
+                .tokens
+                .len();
+            let target = current.checked_sub(tokens).with_context(|| {
+                format!(
+                    "cannot rewind session {session_id} by {tokens} tokens from length {current}"
+                )
+            })?;
+            let target = SessionPosition::new(target);
+            self.rewind_session_to(session_id, target)?;
+            return Ok(target);
+        }
+        self.require_ort_backend("session rewind")?;
+        let tokens = tokens.get();
+        let current = self
+            .sessions
+            .get(&session_id)
+            .with_context(|| format!("session {session_id} not found"))?
+            .tokens
+            .len();
+        let target = current.checked_sub(tokens).with_context(|| {
+            format!("cannot rewind session {session_id} by {tokens} tokens from length {current}")
+        })?;
+        let target = SessionPosition::new(target);
+        self.rewind_session_to(session_id, target)?;
+        Ok(target)
+    }
+
+    /// Rewind a persistent session to an absolute logical token position.
+    ///
+    /// Rewind reuses the same KV truncation path as speculative decoding, after
+    /// validating the requested target against the logical length and backend KV
+    /// support so rejected rewinds leave the session untouched.
+    pub fn rewind_session_to(
+        &mut self,
+        session_id: SessionId,
+        position: SessionPosition,
+    ) -> anyhow::Result<()> {
+        #[cfg(feature = "native-backend")]
+        if self.decode_backend == EngineDecodeBackend::Native {
+            let position = position.get();
+            let current = self
+                .native_sessions
+                .get(&session_id)
+                .with_context(|| format!("session {session_id} not found"))?
+                .tokens
+                .len();
+            if position > current {
+                anyhow::bail!(
+                    "cannot rewind session {session_id} to token {position}; current length is {current}"
+                );
+            }
+            let state = self
+                .native_sessions
+                .get_mut(&session_id)
+                .with_context(|| format!("session {session_id} not found"))?;
+            state.tokens.truncate(position);
+            if self.native_active_session == Some(session_id) {
+                let native = self
+                    .native_session
+                    .as_mut()
+                    .context("native decoder session is unavailable")?;
+                native.rewind(position.min(native.current_len()))?;
+            }
+            let last_access = self.touch_native_session();
+            if let Some(state) = self.native_sessions.get_mut(&session_id) {
+                state.last_access = last_access;
+            }
+            return Ok(());
+        }
+        self.require_ort_backend("session rewind")?;
+        let position = position.get();
+        let state = self
+            .sessions
+            .get(&session_id)
+            .with_context(|| format!("session {session_id} not found"))?;
+        let current = state.tokens.len();
+        if position > current {
+            anyhow::bail!(
+                "cannot rewind session {session_id} to token {position}; current length is {current}"
+            );
+        }
+        validate_target_state_rewind_to_len(
+            self.kv_model.as_ref(),
+            &self.kv_cache,
+            session_id,
+            state,
+            RewindRequest::new(position, RewindRunnerPolicy::RejectRunnerRewind),
+        )?;
+        if let (Some(draft_model), Some(draft)) = (&self.draft, &state.draft) {
+            let draft_target = position.min(draft.tokens.len());
+            validate_draft_state_rewind_to_len(
+                draft_model,
+                draft,
+                RewindRequest::new(draft_target, RewindRunnerPolicy::RejectRunnerRewind),
+            )?;
+        }
+
+        self.scheduler.complete(session_id);
+        let mut state = self
+            .sessions
+            .remove(&session_id)
+            .with_context(|| format!("session {session_id} not found"))?;
+        let result = (|| {
+            let session = self.session.as_deref().context(MISSING_ORT_SESSION)?;
+            rewind_target_state_to_len(
+                session,
+                self.kv_model.as_ref(),
+                &mut self.kv_cache,
+                session_id,
+                &mut state,
+                RewindRequest::new(position, RewindRunnerPolicy::RejectRunnerRewind),
+            )?;
+            if let (Some(draft_model), Some(draft)) = (&mut self.draft, &mut state.draft) {
+                let draft_target = position.min(draft.tokens.len());
+                rewind_draft_state_to_len(
+                    draft_model,
+                    draft,
+                    RewindRequest::new(draft_target, RewindRunnerPolicy::RejectRunnerRewind),
+                )?;
+            }
+            Ok(())
+        })();
+        self.sessions.insert(session_id, state);
+        result
+    }
+
+    /// Capability for session fork, if the selected backend supports safe CoW
+    /// fork at the engine level.
+    ///
+    /// Current ORT decode runners do not expose clone/import semantics strong
+    /// enough to fork without deep-copying or aliasing mutable KV, so this
+    /// returns `None` today. A future supported backend should return `Some` and
+    /// route fork through [`Engine::fork_session`].
+    pub fn session_fork_capability(&self) -> Option<SessionForkCapability> {
+        None
+    }
+
+    /// Fork a persistent session at a logical token boundary.
+    ///
+    /// Callers can obtain `capability` only from
+    /// [`Engine::session_fork_capability`], which is `None` for all current
+    /// backends. Keeping the capability token in the signature prevents
+    /// unsupported engines from being asked to fork through the typed API.
+    pub fn fork_session(
+        &mut self,
+        _capability: &SessionForkCapability,
+        source: SessionId,
+        position: SessionPosition,
+    ) -> anyhow::Result<SessionId> {
+        self.require_ort_backend("session fork")?;
+        let state = self
+            .sessions
+            .get(&source)
+            .with_context(|| format!("session {source} not found"))?;
+        let position = position.get();
+        let current = state.tokens.len();
+        if position > current {
+            anyhow::bail!(
+                "cannot fork session {source} at token {position}; current length is {current}"
+            );
+        }
+        anyhow::bail!(
+            "session fork is not yet enabled: safe CoW fork requires cloneable/importable decoder state aligned with paged KV; current ORT runner/static-cache paths would require deep-copying or unsafe KV aliasing"
+        )
+    }
+
+    /// Reset a persistent session, freeing its current state while keeping the id usable.
+    pub fn reset_session(&mut self, session_id: SessionId) -> anyhow::Result<()> {
+        #[cfg(feature = "native-backend")]
+        if self.decode_backend == EngineDecodeBackend::Native {
+            let last_access = self.touch_native_session();
+            let state = self
+                .native_sessions
+                .get_mut(&session_id)
+                .with_context(|| format!("session {session_id} not found"))?;
+            state.tokens.clear();
+            state.last_access = last_access;
+            if self.native_active_session == Some(session_id) {
+                let native = self
+                    .native_session
+                    .as_mut()
+                    .context("native decoder session is unavailable")?;
+                native.reset()?;
+                self.native_active_session = None;
+            }
+            return Ok(());
+        }
+        self.require_ort_backend("persistent sessions")?;
+        if !self.sessions.contains_key(&session_id) {
+            anyhow::bail!("session {session_id} not found");
+        }
+        self.scheduler.complete(session_id);
+        self.kv_cache
+            .remove(session_id)
+            .map_err(|e| anyhow::anyhow!("Failed to reset KV sequence {session_id}: {e}"))?;
+        self.kv_cache.page_table.create_sequence(session_id);
+        let decode_state = self.new_target_decode_state()?;
+        let state = self
+            .sessions
+            .get_mut(&session_id)
+            .context("session disappeared during reset")?;
+        state.tokens.clear();
+        state.kv_token_count = 0;
+        state.decode_state = decode_state;
+        if let (Some(draft_model), Some(draft)) = (&mut self.draft, &mut state.draft) {
+            draft_model
+                .kv_cache
+                .remove(draft.seq)
+                .map_err(|e| anyhow::anyhow!("Failed to reset draft KV sequence: {e}"))?;
+            draft.seq = draft_model.kv_cache.create_sequence();
+            draft.tokens.clear();
+            draft.kv_token_count = 0;
+            draft.decode_state = DecodeState::new_for_path_with_io(
+                &draft_model.session,
+                &draft_model.decode_path,
+                draft_model.io.as_ref(),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn new_target_decode_state(&self) -> anyhow::Result<DecodeState> {
+        let session = self
+            .session
+            .as_deref()
+            .context("ORT decoder session is unavailable")?;
+        // Bind ports from explicit metadata or unambiguous tensor shapes.
+        let io = self
+            .metadata
+            .model
+            .as_ref()
+            .and_then(|model| model.io.as_ref());
+        let fixed_state_budget_bytes = self.governor.snapshot().resolved_limits.host_ram_bytes;
+        if matches!(
+            &self.speculative_mode,
+            SpeculativeMode::Mtp(_) | SpeculativeMode::Eagle3(_) | SpeculativeMode::SharedKv(_)
+        ) {
+            DecodeState::new_with_io_positions_and_state_budget(
+                session,
+                io,
+                None,
+                fixed_state_budget_bytes,
+            )
+        } else {
+            DecodeState::new_for_path_with_io_positions_and_state_budget(
+                session,
+                &self.decode_path,
+                io,
+                None,
+                fixed_state_budget_bytes,
+            )
+        }
+    }
+
+    /// Close a persistent session and free its associated state.
+    pub fn close_session(&mut self, session_id: SessionId) -> anyhow::Result<()> {
+        #[cfg(feature = "native-backend")]
+        if self.decode_backend == EngineDecodeBackend::Native {
+            self.native_sessions
+                .remove(&session_id)
+                .with_context(|| format!("session {session_id} not found"))?;
+            if self.native_active_session == Some(session_id) {
+                let native = self
+                    .native_session
+                    .as_mut()
+                    .context("native decoder session is unavailable")?;
+                native.reset()?;
+                self.native_active_session = None;
+            }
+            if self.native_default_session == Some(session_id) {
+                self.native_default_session = None;
+            }
+            return Ok(());
+        }
+        self.require_ort_backend("persistent sessions")?;
+        self.scheduler.complete(session_id);
+        let state = self
+            .sessions
+            .remove(&session_id)
+            .with_context(|| format!("session {session_id} not found"))?;
+        self.kv_cache
+            .remove(session_id)
+            .map_err(|e| anyhow::anyhow!("Failed to remove KV sequence {session_id}: {e}"))?;
+        if let (Some(draft_model), Some(draft)) = (&mut self.draft, state.draft) {
+            draft_model
+                .kv_cache
+                .remove(draft.seq)
+                .map_err(|e| anyhow::anyhow!("Failed to remove draft KV sequence: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Number of logical tokens retained in a persistent session.
+    pub fn session_token_count(&self, session_id: SessionId) -> anyhow::Result<usize> {
+        #[cfg(feature = "native-backend")]
+        if self.decode_backend == EngineDecodeBackend::Native {
+            return self
+                .native_sessions
+                .get(&session_id)
+                .map(|state| state.tokens.len())
+                .with_context(|| format!("session {session_id} not found"));
+        }
+        self.require_ort_backend("persistent sessions")?;
+        self.sessions
+            .get(&session_id)
+            .map(|state| state.tokens.len())
+            .with_context(|| format!("session {session_id} not found"))
+    }
+
+    /// Get the loaded metadata.
+    pub fn metadata(&self) -> &InferenceMetadata {
+        &self.metadata
+    }
+
+    /// Validated `onnx_runtime.*` hints consumed while loading the model.
+    pub fn metadata_hints(&self) -> &MetadataHints {
+        &self.metadata_hints
+    }
+
+    /// Resolved decoder execution backend.
+    pub fn decode_backend(&self) -> EngineDecodeBackend {
+        self.decode_backend
+    }
+
+    /// Latest native activation-memory planner measurement, if the current
+    /// backend is native and has executed far enough to resolve concrete shapes.
+    pub fn activation_memory_plan_stats(&self) -> Option<crate::ActivationMemoryPlanSummary> {
+        #[cfg(feature = "native-backend")]
+        {
+            self.native_session
+                .as_ref()
+                .and_then(crate::native_decode::NativeDecodeSession::activation_memory_plan_stats)
+        }
+        #[cfg(not(feature = "native-backend"))]
+        {
+            None
+        }
+    }
+
+    /// Process-global CUDA VMM arena counters, when this build has the native
+    /// CUDA execution provider.
+    ///
+    /// `None` means the build cannot have an arena. All-zero means no arena was
+    /// ever built, which is the normal state without `ONNX_GENAI_CUDA_VMM` --
+    /// and is distinguishable from an arena that was built and never committed
+    /// anything (`reserved_bytes > 0, commits == 0`), which is the bug #659 hid
+    /// behind a log line for an entire release.
+    pub fn vmm_arena_stats(&self) -> Option<crate::VmmArenaStats> {
+        #[cfg(feature = "cuda")]
+        {
+            let stats = onnx_runtime_ep_cuda::vmm_allocator::global_vmm_stats();
+            Some(crate::VmmArenaStats {
+                commits: stats.commits,
+                releases: stats.releases,
+                committed_bytes: stats.committed_bytes,
+                reserved_bytes: stats.reserved_bytes,
+                peak_committed_bytes: stats.peak_committed_bytes,
+                allocations: stats.allocations,
+                ref_underflows: stats.ref_underflows,
+                byte_underflows: stats.byte_underflows,
+                unaccounted_committed_bytes: stats.unaccounted_committed_bytes,
+            })
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            None
+        }
+    }
+
+    /// Auto-detected fill-in-the-middle configuration, if the tokenizer declares one.
+    pub fn fim_config(&self) -> Option<&FimConfig> {
+        self.fim_config.as_ref()
+    }
+
+    fn fim_options(&self, fim_config: &FimConfig, mut options: GenerateOptions) -> GenerateOptions {
+        self.apply_eos_defaults(&mut options);
+        for token in [
+            fim_config.prefix_token.as_str(),
+            fim_config.middle_token.as_str(),
+            fim_config.suffix_token.as_str(),
+            "<|fim_pad|>",
+            "<|endoftext|>",
+            "<|file_sep|>",
+        ] {
+            if let Some(token_id) = self.tokenizer.token_id(token) {
+                push_unique_stop_sequence(
+                    &mut options.stop_sequences,
+                    StopSequence::Tokens(vec![token_id]),
+                );
+            }
+        }
+        options
+    }
+
+    fn max_context_for_request(&self, options: &GenerateOptions) -> Option<usize> {
+        let configured = self
+            .metadata
+            .model
+            .as_ref()
+            .and_then(|model| model.max_sequence_length)
+            .or(options.max_context);
+        match self.decode_path_max_len() {
+            Some(runtime_max) => {
+                Some(configured.map_or(runtime_max, |limit| limit.min(runtime_max)))
+            }
+            None => configured,
+        }
+    }
+
+    fn decode_path_max_len(&self) -> Option<usize> {
+        match self.decode_path {
+            ModelDecodePath::StaticCache { max_len } => Some(max_len),
+            ModelDecodePath::PastPresent {
+                shared_buffer: true,
+                max_len,
+                ..
+            } => max_len,
+            ModelDecodePath::PastPresent { .. } | ModelDecodePath::Legacy => None,
+        }
+    }
+
+    /// Tokenize `text` with the model's own tokenizer.
+    ///
+    /// This is the public tokenization seam used by higher-level pipelines to
+    /// convert prompt text into token ids (e.g. to compute prompt length or
+    /// `max_length`, or to feed [`Engine::embed`] and the generation APIs). It
+    /// uses the same tokenizer path as the engine's internal prompt handling.
+    pub fn tokenize(&self, text: &str) -> anyhow::Result<Vec<TokenId>> {
+        self.tokenizer.encode(text).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to tokenize input text with the model's tokenizer: {e}; \
+                 verify the model directory contains a valid tokenizer.json"
+            )
+        })
+    }
+
+    fn tokenize_prompt(&self, prompt: &GeneratePrompt) -> anyhow::Result<Vec<TokenId>> {
+        match prompt {
+            GeneratePrompt::TokenIds(tokens) => Ok(tokens.clone()),
+            GeneratePrompt::Text(text) => self
+                .tokenizer
+                .encode(text)
+                .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {e}")),
+        }
+    }
+
+    fn prepare_session_prefix(
+        &mut self,
+        session_id: SessionId,
+        state: &mut EngineSession,
+        prompt_tokens: &[TokenId],
+    ) -> anyhow::Result<usize> {
+        if self.connector.is_active() {
+            self.connector.reset_stats();
+        }
+        let same_session_hit_len = if state.decode_state.has_runner() {
+            state.decode_state.runner_len().min(state.tokens.len())
+        } else if state.decode_state.use_kv {
+            state.kv_token_count.min(state.tokens.len())
+        } else {
+            0
+        };
+        let started_empty = state.tokens.is_empty();
+        let mut loaded_prompt_prefix = 0;
+        let mut cross_session_hit_len = 0;
+
+        if started_empty && state.decode_state.uses_token_prefix_cache() {
+            cross_session_hit_len = self
+                .token_prefix_cache
+                .iter()
+                .map(|cached| common_prefix_len(cached, prompt_tokens).min(cached.len()))
+                .filter(|&len| len > 0)
+                .max()
+                .unwrap_or(0);
+        } else if started_empty
+            && state.decode_state.use_kv
+            && self.kv_model.is_some()
+            && self.kv_cache.page_table.tensor_config.is_some()
+            && !self.ort_session_has_recurrent_state()
+        {
+            let matched = self
+                .prefix_cache
+                .lookup_shared(prompt_tokens, &mut self.kv_cache.page_table);
+            if matched.matched_tokens > 0 {
+                cross_session_hit_len = matched.matched_tokens;
+                let materialized_len = if matched.matched_tokens == prompt_tokens.len() {
+                    matched.matched_tokens.saturating_sub(1)
+                } else {
+                    matched.matched_tokens
+                };
+                let page_ids = matched
+                    .page_ids
+                    .iter()
+                    .copied()
+                    .take(materialized_len.div_ceil(self.kv_cache.page_table.page_size))
+                    .collect::<Vec<_>>();
+                for &page_id in &page_ids {
+                    self.kv_cache.page_table.retain(page_id);
+                }
+                self.prefix_cache.release_shared(
+                    prompt_tokens,
+                    matched.matched_tokens,
+                    &mut self.kv_cache.page_table,
+                );
+                if materialized_len > 0 {
+                    attach_pages_to_sequence(
+                        &mut self.kv_cache,
+                        session_id,
+                        &page_ids,
+                        materialized_len,
+                    )?;
+                    let materialized = self
+                        .kv_cache
+                        .materialize_sequence(session_id)
+                        .map_err(|e| anyhow::anyhow!("Failed to materialize prefix KV: {e}"))?;
+                    load_materialized_past(
+                        self.ort_session()?,
+                        self.kv_model.as_ref().expect("checked above"),
+                        &mut state.decode_state,
+                        &materialized,
+                    )?;
+                    state.kv_token_count = materialized_len;
+                    state
+                        .tokens
+                        .extend_from_slice(&prompt_tokens[..materialized_len]);
+                    loaded_prompt_prefix = materialized_len;
+                }
+            }
+        }
+
+        if started_empty {
+            state
+                .tokens
+                .extend_from_slice(&prompt_tokens[loaded_prompt_prefix..]);
+        } else {
+            state.tokens.extend_from_slice(prompt_tokens);
+        }
+        let in_process_hit = same_session_hit_len.max(cross_session_hit_len);
+
+        // K4: consult the external connector for prefix reuse *beyond* the
+        // in-process hit. When the active decode path can accept an owned-KV
+        // handoff (a ZeroCopyRebind `PastPresent` runner with f32 KV) and the
+        // session started empty, fetch the real KV bytes for the contiguous hit
+        // chunks and inject them into the runner so prefill genuinely skips
+        // those tokens. Because the chunk key is prefix-dependent, an equal key
+        // guarantees an identical prefix, so injecting fetched KV at the same
+        // absolute positions is byte-exact — proven token-identical by the gold
+        // integration test. If injection is not possible we fall back to the
+        // reporting-only `lookup_extension`, never claiming a hit we can't serve.
+        if self.connector.is_active() {
+            let injected = self.try_connector_kv_injection(state, prompt_tokens, in_process_hit)?;
+            if let Some(total) = injected {
+                return Ok(in_process_hit.max(total));
+            }
+            let _ = self
+                .connector
+                .lookup_extension(prompt_tokens, in_process_hit);
+        }
+        Ok(in_process_hit)
+    }
+
+    /// Try to materialize cross-session KV from the connector into the decode
+    /// runner, genuinely shortening prefill. Returns `Some(total_len)` (the KV
+    /// token count now resident in the runner) when injection happened, else
+    /// `None` (caller falls back to reporting-only lookup).
+    ///
+    /// Only runs for a freshly started session on a ZeroCopyRebind `PastPresent`
+    /// runner whose KV is f32. `import_kv` *replaces* the runner KV, so the
+    /// boundary must be the current `kv_token_count` (0 for a fresh session).
+    /// At least one prompt token is always left un-injected so decode has an
+    /// input to feed.
+    fn try_connector_kv_injection(
+        &mut self,
+        state: &mut EngineSession,
+        prompt_tokens: &[TokenId],
+        in_process_hit: usize,
+    ) -> anyhow::Result<Option<usize>> {
+        if !state.decode_state.has_runner()
+            || !state.decode_state.runner_supports_kv_handoff()
+            || state.kv_token_count != 0
+            || in_process_hit != 0
+        {
+            return Ok(None);
+        }
+        // Scope the immutable `kv_model` borrow so it does not overlap the
+        // `&mut self.connector` fetch below.
+        let past_is_f32 = match self.kv_model.as_ref() {
+            Some(kv_model) => kv_model_past_is_f32(self.ort_session()?, kv_model),
+            None => false,
+        };
+        if !past_is_f32 {
+            return Ok(None);
+        }
+
+        let boundary = 0usize;
+        // Leave at least one prompt token to feed the decoder: cap the fetch to
+        // `prompt_len - 1` tokens so `fetched_tokens` equals what we inject.
+        let max_tokens = prompt_tokens.len().saturating_sub(1);
+        let outcome =
+            self.connector
+                .fetch_extension(prompt_tokens, boundary, max_tokens, Device::Cpu);
+        if outcome.fetched_tokens == 0 {
+            return Ok(None);
+        }
+
+        let mut chunks = outcome.chunks;
+        let mut total: usize = boundary + chunks.iter().map(|c| c.num_tokens).sum::<usize>();
+        // Safety net: the `max_tokens` cap already guarantees `total <
+        // prompt_len`, but drop trailing chunks if any invariant slipped.
+        while total >= prompt_tokens.len() {
+            match chunks.pop() {
+                Some(dropped) => total -= dropped.num_tokens,
+                None => return Ok(None),
+            }
+        }
+        if chunks.is_empty() || total == 0 {
+            return Ok(None);
+        }
+
+        let placed: Vec<PlacedPayload<'_>> = chunks
+            .iter()
+            .map(|chunk| PlacedPayload {
+                relative_start: chunk.start - boundary,
+                payload: &chunk.payload,
+            })
+            .collect();
+        let kv_model = self.kv_model.as_ref().expect("checked present above");
+        let kv = past_kv_from_payloads(self.ort_session()?, kv_model, &placed, total)?;
+        state.decode_state.import_runner_kv(total, kv)?;
+        state.kv_token_count = total;
+        Ok(Some(total))
+    }
+
+    fn prepare_active_generate(
+        &mut self,
+        request: PrioritizedGenerateRequest,
+    ) -> anyhow::Result<ActiveGenerate> {
+        request.request.options.validate()?;
+        let mut options = request.request.options.clone();
+        self.apply_eos_defaults(&mut options);
+        let prompt_tokens = self.tokenize_prompt(&request.request.prompt)?;
+        if prompt_tokens.is_empty() {
+            anyhow::bail!("prompt must contain at least one token");
+        }
+        if !self.sessions.contains_key(&request.session_id) {
+            anyhow::bail!("session {} not found", request.session_id);
+        }
+        if self.should_use_speculative(&options) {
+            anyhow::bail!(
+                "prioritized drive API currently supports the single-sequence non-speculative path; batched/speculative drive is future work"
+            );
+        }
+
+        let max_context = self.max_context_for_request(&options);
+        let chain = build_processor_chain(&options, Some(&self.tokenizer))?;
+        let mut state = self
+            .sessions
+            .remove(&request.session_id)
+            .with_context(|| format!("session {} not found", request.session_id))?;
+        let prefix_cache_hit_len =
+            self.prepare_session_prefix(request.session_id, &mut state, &prompt_tokens)?;
+        let rng = SamplingRng::new(options.seed);
+        let logprobs = options.top_logprobs.map(|_| Vec::new());
+        self.scheduler.enqueue_generate_request(
+            request.session_id,
+            prompt_tokens.len(),
+            options.max_new_tokens,
+            request.priority,
+        );
+        Ok(ActiveGenerate {
+            session_id: request.session_id,
+            state,
+            options,
+            chain,
+            max_context,
+            prompt_len: prompt_tokens.len(),
+            prefix_cache_hit_len,
+            generated_tokens: Vec::new(),
+            generated_text: String::new(),
+            logprobs,
+            budget_cap: None,
+            step: 0,
+            rng,
+        })
+    }
+
+    fn step_active_generate(
+        &mut self,
+        active: &mut ActiveGenerate,
+    ) -> anyhow::Result<Option<GenerateResult>> {
+        let mut loop_state = DecodeLoopState {
+            generated_tokens: std::mem::take(&mut active.generated_tokens),
+            generated_text: std::mem::take(&mut active.generated_text),
+            logprobs: active.logprobs.take(),
+            step: active.step,
+            prefix_cache_hit_len: active.prefix_cache_hit_len,
+            rng: std::mem::replace(&mut active.rng, SamplingRng::new(Some(0))),
+            custom_sampler: None,
+        };
+        let step_result = {
+            let mut backend = SessionDecodeLoopBackend {
+                session: self
+                    .session
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))?,
+                kv_model: self.kv_model.as_ref(),
+                kv_cache: &mut self.kv_cache,
+                scheduler: &mut self.scheduler,
+                session_id: active.session_id,
+                state: &mut active.state,
+            };
+            step_decode_loop(
+                &mut backend,
+                &mut loop_state,
+                &active.options,
+                &active.chain,
+                &self.tokenizer,
+                active.max_context,
+                None,
+            )?
+        };
+        active.generated_tokens = loop_state.generated_tokens;
+        active.generated_text = loop_state.generated_text;
+        active.logprobs = loop_state.logprobs;
+        active.step = loop_state.step;
+        active.rng = loop_state.rng;
+        if let Some(mut result) = step_result {
+            result.budget_cap = active.budget_cap;
+            return Ok(Some(result));
+        }
+        if active.generated_tokens.len() >= active.options.max_new_tokens {
+            ensure_constrained_finish(
+                &active.options,
+                &active.generated_text,
+                FinishReason::MaxTokens,
+            )?;
+            return self
+                .finish_result(
+                    &active.generated_tokens,
+                    FinishReason::MaxTokens,
+                    active.prefix_cache_hit_len,
+                    active.logprobs.as_deref(),
+                )
+                .map(|mut result| {
+                    result.budget_cap = active.budget_cap;
+                    Some(result)
+                });
+        }
+
+        Ok(None)
+    }
+
+    fn finish_active_generate(&mut self, mut active: ActiveGenerate) -> anyhow::Result<()> {
+        if !exceeded_context_limit(active.state.tokens.len(), active.max_context) {
+            self.ensure_session_kv_current(active.session_id, &mut active.state)?;
+            self.insert_cached_prefixes(active.session_id, &active.state, active.prompt_len)?;
+        }
+        self.sessions.insert(active.session_id, active.state);
+        self.scheduler.complete(active.session_id);
+        Ok(())
+    }
+
+    /// Borrow the ORT decoder session, returning an error instead of aborting
+    /// the host when the backend is in an invalid state without a session. The
+    /// ORT decode paths structurally guarantee a session is present, so this is
+    /// a defensive accessor: a future invalid backend state surfaces as a
+    /// recoverable error rather than a process abort.
+    fn ort_session(&self) -> anyhow::Result<&Session> {
+        self.session
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))
+    }
+
+    /// Whether the loaded ORT decoder declares loop-carried recurrent state, in
+    /// which case paged / materialized-past prefix reuse must be declined and a
+    /// full recompute forced (#701), mirroring the native `has_recurrent_state`
+    /// gate (#700). Returns `false` when no ORT session is loaded — the paged
+    /// reuse path requires one, so the guard cannot suppress a legitimate reuse.
+    fn ort_session_has_recurrent_state(&self) -> bool {
+        let Some(session) = self.session.as_deref() else {
+            return false;
+        };
+        let io = self
+            .metadata
+            .model
+            .as_ref()
+            .and_then(|model| model.io.as_ref());
+        ort_session_has_recurrent_state(session, io)
+    }
+
+    fn ensure_session_kv_current(
+        &mut self,
+        session_id: SessionId,
+        state: &mut EngineSession,
+    ) -> anyhow::Result<()> {
+        while state.decode_state.use_kv && state.kv_token_count < state.tokens.len() {
+            let _ = next_session_token_logits(
+                self.session
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!(MISSING_ORT_SESSION))?,
+                self.kv_model.as_ref(),
+                &mut self.kv_cache,
+                session_id,
+                state,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Extract the runner's freshly computed KV and store each complete resident
+    /// chunk in the connector. Best-effort: any gating failure or extraction
+    /// error skips storing (never surfaced to inference). See
+    /// [`crate::connector_bridge::ConnectorBridge::store_prefix_with`].
+    fn store_connector_prefix(&mut self, state: &EngineSession) {
+        if !state.decode_state.runner_supports_kv_handoff() {
+            return;
+        }
+        let config = match (self.kv_model.as_ref(), self.session.as_deref()) {
+            (Some(kv_model), Some(session)) if kv_model_past_is_f32(session, kv_model) => {
+                kv_model.tensor_config
+            }
+            _ => return,
+        };
+        let exported = match state.decode_state.export_runner_kv() {
+            Ok(exported) => exported,
+            Err(error) => {
+                tracing::debug!(%error, "runner KV export failed; not storing to connector");
+                return;
+            }
+        };
+        let kv_model = self.kv_model.as_ref().expect("checked present above");
+        let layers = match exported_layers_from_runner(kv_model, &exported) {
+            Ok(layers) => layers,
+            Err(error) => {
+                tracing::debug!(%error, "collecting exported runner KV failed; not storing");
+                return;
+            }
+        };
+        self.connector.store_prefix_with(
+            &state.tokens,
+            state.kv_token_count,
+            |chunk_start, num_tokens| {
+                chunk_payload_from_exported(&layers, config, chunk_start, num_tokens)
+            },
+        );
+    }
+
+    fn insert_cached_prefixes(
+        &mut self,
+        session_id: SessionId,
+        state: &EngineSession,
+        prompt_len: usize,
+    ) -> anyhow::Result<()> {
+        // K4: extract the freshly computed KV for each complete resident chunk
+        // and push the real bytes to the external connector for future
+        // cross-session / cross-node reuse. Only ZeroCopyRebind `PastPresent`
+        // runners with f32 KV can hand off owned tensors; other paths skip
+        // (store is a no-op for the default `Null` connector regardless).
+        if self.connector.is_active() {
+            self.store_connector_prefix(state);
+        }
+        if state.decode_state.uses_token_prefix_cache() {
+            if prompt_len > 0 && prompt_len <= state.kv_token_count {
+                self.insert_token_prefix(&state.tokens[..prompt_len]);
+            }
+            if state.kv_token_count == state.tokens.len() {
+                self.insert_token_prefix(&state.tokens);
+            }
+            return Ok(());
+        }
+        if self.kv_model.is_none() || state.kv_token_count == 0 {
+            return Ok(());
+        }
+        if prompt_len > 0 && prompt_len <= state.kv_token_count {
+            self.insert_cached_prefix(session_id, &state.tokens[..prompt_len])?;
+        }
+        if state.kv_token_count == state.tokens.len() {
+            self.insert_cached_prefix(session_id, &state.tokens)?;
+        }
+        Ok(())
+    }
+
+    fn insert_cached_prefix(
+        &mut self,
+        session_id: SessionId,
+        tokens: &[TokenId],
+    ) -> anyhow::Result<()> {
+        if tokens.is_empty() || self.prefix_cache.lookup(tokens).0 == tokens.len() {
+            return Ok(());
+        }
+        let page_ids = sequence_pages_for_len(&self.kv_cache, session_id, tokens.len())?;
+        self.prefix_cache
+            .insert_pages(tokens, &page_ids, &mut self.kv_cache.page_table);
+        Ok(())
+    }
+
+    fn insert_token_prefix(&mut self, tokens: &[TokenId]) {
+        if tokens.is_empty()
+            || self
+                .token_prefix_cache
+                .iter()
+                .any(|cached| cached.as_slice() == tokens)
+        {
+            return;
+        }
+        self.token_prefix_cache.push(tokens.to_vec());
+    }
+
+    pub(crate) fn finish_result(
+        &self,
+        generated_tokens: &[TokenId],
+        finish_reason: FinishReason,
+        prefix_cache_hit_len: usize,
+        logprobs: Option<&[crate::config::TokenLogprob]>,
+    ) -> anyhow::Result<GenerateResult> {
+        Ok(GenerateResult {
+            text: self
+                .tokenizer
+                .decode(generated_tokens)
+                .map_err(|e| anyhow::anyhow!("Failed to detokenize generated tokens: {e}"))?,
+            token_ids: generated_tokens.to_vec(),
+            finish_reason,
+            prefix_cache_hit_len,
+            logprobs: logprobs.map(<[crate::config::TokenLogprob]>::to_vec),
+            budget_cap: None,
+        })
+    }
+}
+
+struct SessionDecodeLoopBackend<'a> {
+    session: &'a Session,
+    kv_model: Option<&'a KvModelInfo>,
+    kv_cache: &'a mut PagedKvCache,
+    scheduler: &'a mut Scheduler,
+    session_id: SessionId,
+    state: &'a mut EngineSession,
+}
+
+impl DecodeLoopBackend for SessionDecodeLoopBackend<'_> {
+    fn context_len(&self) -> usize {
+        self.state.tokens.len()
+    }
+
+    fn processor_prompt_tokens(&self) -> &[TokenId] {
+        &self.state.tokens
+    }
+
+    fn next_logits(&mut self) -> anyhow::Result<Vec<f32>> {
+        next_session_token_logits(
+            self.session,
+            self.kv_model,
+            self.kv_cache,
+            self.session_id,
+            self.state,
+        )
+    }
+
+    fn commit_token(&mut self, token_id: TokenId) -> anyhow::Result<()> {
+        self.state.tokens.push(token_id);
+        self.scheduler.advance(self.session_id);
+        Ok(())
+    }
+
+    fn greedy_fastpath_supported(&self) -> bool {
+        self.state.decode_state.has_runner() && self.state.decode_state.runner_supports_argmax()
+    }
+
+    fn next_token_greedy(&mut self) -> anyhow::Result<TokenId> {
+        next_session_token_argmax(
+            self.session,
+            self.kv_model,
+            self.kv_cache,
+            self.session_id,
+            self.state,
+        )?
+        .context("greedy fast path unexpectedly returned no token")
+    }
+
+    fn sampled_fastpath_supported(&self) -> bool {
+        !self.state.sampled_fastpath_failed
+            && self.state.decode_state.has_runner()
+            && self.state.decode_state.runner_supports_sampled()
+    }
+
+    fn next_token_sampled(
+        &mut self,
+        params: &onnx_genai_ort::DeviceSampleParams,
+    ) -> anyhow::Result<Option<TokenId>> {
+        next_session_token_sampled(
+            self.session,
+            self.kv_model,
+            self.kv_cache,
+            self.session_id,
+            self.state,
+            params,
+        )
+    }
+
+    fn sampled_fastpath_failed(&mut self) {
+        self.state.sampled_fastpath_failed = true;
+    }
+}
+
+// ─── Native session shims and implementation ────────────────────────────────
+
+#[cfg(feature = "native-backend")]
+impl Engine {
+    /// Deprecated native-only shim. Use [`Engine::create_session`] for both ORT
+    /// and native backends.
+    pub fn create_native_session(&mut self) -> anyhow::Result<SessionId> {
+        if self.decode_backend != EngineDecodeBackend::Native {
+            anyhow::bail!("create_native_session requires the native decode backend");
+        }
+        self.create_session()
+    }
+
+    /// Deprecated native-only shim. Use [`Engine::close_session`].
+    pub fn close_native_session(&mut self, session_id: SessionId) -> anyhow::Result<()> {
+        self.close_session(session_id)
+    }
+
+    /// Deprecated native-only shim. Use [`Engine::generate_in_session`].
+    pub fn generate_native_in_session(
+        &mut self,
+        session_id: SessionId,
+        request: GenerateRequest,
+    ) -> anyhow::Result<GenerateResult> {
+        self.generate_in_session(session_id, request)
+    }
+
+    /// Deprecated native-only shim. Use [`Engine::generate_in_session_with_callback`].
+    pub fn generate_native_in_session_with_callback(
+        &mut self,
+        session_id: SessionId,
+        request: GenerateRequest,
+        callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        self.generate_native_in_session_with_callbacks(session_id, request, None, callback)
+    }
+
+    fn generate_native_in_session_with_callbacks(
+        &mut self,
+        session_id: SessionId,
+        request: GenerateRequest,
+        mut admission_callback: Option<&mut dyn FnMut()>,
+        callback: Option<&mut GenerateTokenCallback<'_>>,
+    ) -> anyhow::Result<GenerateResult> {
+        self.last_speculative_stats = SpeculativeStats::default();
+        request.options.validate()?;
+        let mut options = request.options;
+        reject_native_request_speculation(&options)?;
+        self.apply_eos_defaults(&mut options);
+        let prompt_tokens = self.tokenize_prompt(&request.prompt)?;
+        if prompt_tokens.is_empty() {
+            anyhow::bail!("prompt must contain at least one token");
+        }
+        options.max_context = self.max_context_for_request(&options);
+        let chain = build_processor_chain(&options, Some(&self.tokenizer))?;
+        if native_speculation_plan(&options, &chain).is_some() {
+            anyhow::bail!(
+                "native session generation does not support speculative decoding; use stateless generate() for native prompt-lookup/shared-KV speculation"
+            );
+        }
+        if !self.native_sessions.contains_key(&session_id) {
+            anyhow::bail!("session {session_id} not found");
+        }
+        let scheduled = self.admit_generate_request_with_scheduler(
+            session_id,
+            prompt_tokens.len(),
+            options.max_new_tokens,
+            Priority::Normal,
+        )?;
+        let budget_cap = scheduled.budget_cap.map(generation_budget_cap);
+        options.max_new_tokens = scheduled.max_tokens;
+        if let Err(error) = self
+            .native_session
+            .as_mut()
+            .context("native decoder session is unavailable")?
+            .prepare_generation_workspace_preserving_state(&prompt_tokens)
+        {
+            self.scheduler.complete(session_id);
+            return Err(error);
+        }
+        if let Some(callback) = admission_callback.as_mut() {
+            callback();
+        }
+
+        let result = (|| -> anyhow::Result<GenerateResult> {
+            let active_matches = self.native_active_session == Some(session_id);
+            let semantic_prefix_len = options
+                .semantic_prefix_len
+                .filter(|&len| len > 0 && len < prompt_tokens.len());
+            if !active_matches {
+                let native = self
+                    .native_session
+                    .as_mut()
+                    .context("native decoder session is unavailable")?;
+                native.reset()?;
+                self.native_active_session = Some(session_id);
+            }
+
+            let prefix_len = {
+                let state = self
+                    .native_sessions
+                    .get(&session_id)
+                    .with_context(|| format!("session {session_id} not found"))?;
+                common_prefix_len(&state.tokens, &prompt_tokens)
+            };
+
+            let supports_past_snapshots = self
+                .native_session
+                .as_ref()
+                .is_some_and(|native| native.supports_past_snapshots());
+            let mut restored_prefix_len = None;
+            let mut should_store_semantic_snapshot = false;
+            if !active_matches
+                && supports_past_snapshots
+                && let Some(boundary) = semantic_prefix_len
+            {
+                self.native_recurrent_prefix_stats.lookups += 1;
+                if let Some((matched, snapshot)) = self
+                    .prefix_cache
+                    .lookup_snapshot::<NativePrefixSnapshot>(&prompt_tokens)
+                    .filter(|(matched, _)| *matched >= boundary && *matched < prompt_tokens.len())
+                {
+                    let native = self
+                        .native_session
+                        .as_mut()
+                        .context("native decoder session is unavailable")?;
+                    match native.restore_past_snapshot(&snapshot.snapshot) {
+                        Ok(()) => {
+                            self.native_recurrent_prefix_stats.hits += 1;
+                            self.native_recurrent_prefix_stats.restored_tokens += matched as u64;
+                            restored_prefix_len = Some(matched);
+                        }
+                        Err(error) => {
+                            tracing::debug!(
+                                "skipping native recurrent prefix snapshot restore after failure: \
+                             {error:#}"
+                            );
+                        }
+                    }
+                } else {
+                    should_store_semantic_snapshot = true;
+                }
+            }
+
+            if should_store_semantic_snapshot
+                && supports_past_snapshots
+                && let Some(boundary) = semantic_prefix_len
+            {
+                let snapshot = {
+                    let native = self
+                        .native_session
+                        .as_mut()
+                        .context("native decoder session is unavailable")?;
+                    native.prefill_prefix(&prompt_tokens[..boundary])?;
+                    native.snapshot_past()
+                };
+                match snapshot {
+                    Ok(snapshot) => {
+                        let reserve_snapshot = || {
+                            onnx_runtime_memory_governor::MemoryGovernor::reserve(
+                                self.governor.memory(),
+                                onnx_runtime_memory_governor::Tier::Host,
+                                snapshot.bytes(),
+                                Holder::RecurrentPrefixSnapshot.role(),
+                                Holder::RecurrentPrefixSnapshot.id(),
+                            )
+                        };
+                        let lease = match reserve_snapshot() {
+                            Ok(lease) => Some(lease),
+                            Err(first_error) if self.prefix_cache.evict_lru_snapshot() => {
+                                match reserve_snapshot() {
+                                    Ok(lease) => Some(lease),
+                                    Err(error) => {
+                                        tracing::debug!(
+                                            "skipping native recurrent prefix snapshot store; cannot \
+                                         reserve {} bytes after evicting an older snapshot: \
+                                         {first_error}; retry: {error}",
+                                            snapshot.bytes()
+                                        );
+                                        None
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                tracing::debug!(
+                                    "skipping native recurrent prefix snapshot store; cannot reserve \
+                                 {} bytes: {error}",
+                                    snapshot.bytes()
+                                );
+                                None
+                            }
+                        };
+                        if let Some(lease) = lease {
+                            self.prefix_cache.insert_snapshot(
+                                &prompt_tokens[..boundary],
+                                Arc::new(NativePrefixSnapshot {
+                                    snapshot,
+                                    _lease: lease,
+                                }),
+                            );
+                            self.native_recurrent_prefix_stats.stores += 1;
+                        }
+                        restored_prefix_len = Some(boundary);
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            "skipping native recurrent prefix snapshot store after snapshot failure: \
+                         {error:#}"
+                        );
+                    }
+                }
+            }
+
+            let mut result = {
+                let native = self
+                    .native_session
+                    .as_mut()
+                    .context("native decoder session is unavailable")?;
+
+                let mut resume_from = if let Some(restored) = restored_prefix_len {
+                    restored
+                } else if active_matches {
+                    prefix_len.min(native.current_len())
+                } else {
+                    0
+                };
+                if resume_from >= prompt_tokens.len() {
+                    resume_from = prompt_tokens.len().saturating_sub(1);
+                }
+
+                native.generate_incremental_with_callback(
+                    &prompt_tokens,
+                    resume_from,
+                    &options,
+                    &chain,
+                    &self.tokenizer,
+                    callback,
+                )?
+            };
+            result.budget_cap = budget_cap;
+            let last_access = self.touch_native_session();
+
+            let state = self
+                .native_sessions
+                .get_mut(&session_id)
+                .with_context(|| format!("session {session_id} not found"))?;
+            state.tokens.truncate(prefix_len);
+            state.tokens.extend_from_slice(&prompt_tokens[prefix_len..]);
+            state.tokens.extend_from_slice(&result.token_ids);
+            state.last_access = last_access;
+            self.evict_native_sessions(session_id);
+
+            Ok(result)
+        })();
+        self.scheduler.complete(session_id);
+        result
+    }
+
+    /// Deprecated native-only shim. Use [`Engine::rewind_session_by`].
+    pub fn rewind_native_session(
+        &mut self,
+        session_id: SessionId,
+        token_count: RewindTokenCount,
+    ) -> anyhow::Result<SessionPosition> {
+        self.rewind_session_by(session_id, token_count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(feature = "native-backend")]
+    use crate::ProcessorChain;
+    #[cfg(feature = "native-backend")]
+    use std::path::PathBuf;
+
+    #[test]
+    fn ort_and_native_generation_use_scheduler_admission() {
+        assert!(generate_uses_scheduler(EngineDecodeBackend::Ort));
+        assert!(generate_uses_scheduler(EngineDecodeBackend::Native));
+        assert!(generate_uses_scheduler(EngineDecodeBackend::Auto));
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn speculative_workspace_rows_follow_the_exact_runtime_plan() {
+        let chain = ProcessorChain::new();
+        let mut options = GenerateOptions {
+            greedy: true,
+            temperature: 0.0,
+            speculative_mode: Some(SpeculativeMode::PromptLookup {
+                ngram: 1,
+                max_tokens: 4,
+            }),
+            ..GenerateOptions::default()
+        };
+        let plan = native_speculation_plan(&options, &chain).unwrap();
+        assert_eq!(native_workspace_query_rows(1, Some(&plan), 8, None), 4);
+        assert_eq!(native_workspace_query_rows(8, Some(&plan), 8, None), 8);
+
+        options.num_speculative_tokens = Some(1024);
+        let widened = native_speculation_plan(&options, &chain).unwrap();
+        assert_eq!(widened.width, 1024);
+        assert_eq!(native_workspace_query_rows(1, Some(&widened), 1, None), 1);
+        assert_eq!(
+            native_workspace_query_rows(1, Some(&widened), 8, Some(3)),
+            2
+        );
+        let runtime_width = crate::native_speculative::verification_width(widened.width, 5, 3);
+        assert_eq!(
+            native_workspace_query_rows(1, Some(&widened), 5, Some(4)),
+            1usize.max(runtime_width)
+        );
+
+        options.num_speculative_tokens = None;
+        options.speculative_mode = Some(SpeculativeMode::SharedKv(
+            crate::config::SharedKvProposerConfig {
+                assistant_model: PathBuf::from("assistant.onnx"),
+                target_hidden_output: "hidden".to_string(),
+                input_embedding_weights: PathBuf::from("embedding.bin"),
+                backbone_hidden_size: 1,
+                vocab_size: 1,
+                num_speculative_tokens: 3,
+                shared_kv: Vec::new(),
+            },
+        ));
+        let shared_kv = native_speculation_plan(&options, &chain).unwrap();
+        assert_eq!(shared_kv.width, 4);
+        assert_eq!(native_workspace_query_rows(1, Some(&shared_kv), 8, None), 4);
+
+        assert_eq!(native_workspace_query_rows(3, None, 8, None), 3);
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_generate_rejects_over_kv_byte_budget_before_backend_run() -> anyhow::Result<()> {
+        let tokenizer_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm/tokenizer.json")
+            .canonicalize()?;
+        let tokenizer = Tokenizer::from_file(&tokenizer_path)
+            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
+        let scheduler_config = onnx_genai_scheduler::SchedulerConfig {
+            bytes_per_token: Some(10),
+            ..onnx_genai_scheduler::SchedulerConfig::default()
+        };
+        let governor = EngineResourceGovernor::new(
+            ResourceLimits::default(),
+            false,
+            ModelKvConfig::known(10, 1),
+            0,
+        )?;
+        let mut engine = Engine {
+            decode_backend: EngineDecodeBackend::Native,
+            metadata: InferenceMetadata::default(),
+            metadata_hints: MetadataHints::default(),
+            kv_cache: PagedKvCache::new(1, 1),
+            prefix_cache: PrefixCache::new(),
+            token_prefix_cache: Vec::new(),
+            kv_model: None,
+            decode_path: ModelDecodePath::Legacy,
+            scheduler: Scheduler::with_byte_budget(
+                scheduler_config,
+                onnx_genai_scheduler::ByteBudget::new(10),
+            ),
+            governor,
+            sessions: HashMap::new(),
+            session: None,
+            native_session: None,
+            weight_placement: None,
+            memory_strategy_plan: MemoryStrategyPlan::unknown(0, None, "test engine fixture"),
+            native_sessions: HashMap::new(),
+            native_active_session: None,
+            native_session_counter: 0,
+            native_access_counter: 0,
+            native_default_session: None,
+            native_max_sessions: 8,
+            native_shared_kv_proposer: None,
+            native_recurrent_prefix_stats: RecurrentPrefixCacheStats::default(),
+            draft: None,
+            mtp: None,
+            eagle3: None,
+            shared_kv_proposer: None,
+            tokenizer,
+            fim_config: None,
+            num_speculative_tokens: 1,
+            speculative_mode: SpeculativeMode::None,
+            last_speculative_stats: SpeculativeStats::default(),
+            connector: ConnectorBridge::null(),
+            _environment: None,
+        };
+        let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![1]));
+        request.options.max_new_tokens = 1;
+        request.options.stop_on_eos = false;
+
+        let mut admitted = false;
+        let mut on_admitted = || admitted = true;
+        let error = engine
+            .generate_with_callbacks(request, Some(&mut on_admitted), None)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("scheduler admission failed: KV byte budget"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("native decoder session is unavailable"),
+            "native backend was touched before scheduler admission rejected: {error}"
+        );
+        assert!(!admitted, "refused requests must not signal admission");
+        Ok(())
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_backend_batching_capability_reports_single_sequence() -> anyhow::Result<()> {
+        let tokenizer_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm/tokenizer.json")
+            .canonicalize()?;
+        let tokenizer = Tokenizer::from_file(&tokenizer_path)
+            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
+        let governor = EngineResourceGovernor::new(
+            ResourceLimits::default(),
+            false,
+            ModelKvConfig::known(10, 1),
+            0,
+        )?;
+        // A native engine reports batch=1 even when the model's KV I/O shape
+        // (here StaticCache, which batches under ORT) would otherwise support
+        // batching: the cap is a property of the native decode path, not the
+        // model. This is the honesty guarantee -- capability is not read off the
+        // decode_path alone.
+        let mut engine = Engine {
+            decode_backend: EngineDecodeBackend::Native,
+            metadata: InferenceMetadata::default(),
+            metadata_hints: MetadataHints::default(),
+            kv_cache: PagedKvCache::new(1, 1),
+            prefix_cache: PrefixCache::new(),
+            token_prefix_cache: Vec::new(),
+            kv_model: None,
+            decode_path: ModelDecodePath::StaticCache { max_len: 16 },
+            scheduler: Scheduler::with_byte_budget(
+                onnx_genai_scheduler::SchedulerConfig::default(),
+                onnx_genai_scheduler::ByteBudget::new(10),
+            ),
+            governor,
+            sessions: HashMap::new(),
+            session: None,
+            native_session: None,
+            weight_placement: None,
+            memory_strategy_plan: MemoryStrategyPlan::unknown(0, None, "test engine fixture"),
+            native_sessions: HashMap::new(),
+            native_active_session: None,
+            native_session_counter: 0,
+            native_access_counter: 0,
+            native_default_session: None,
+            native_max_sessions: 8,
+            native_shared_kv_proposer: None,
+            native_recurrent_prefix_stats: RecurrentPrefixCacheStats::default(),
+            draft: None,
+            mtp: None,
+            eagle3: None,
+            shared_kv_proposer: None,
+            tokenizer,
+            fim_config: None,
+            num_speculative_tokens: 1,
+            speculative_mode: SpeculativeMode::None,
+            last_speculative_stats: SpeculativeStats::default(),
+            connector: ConnectorBridge::null(),
+            _environment: None,
+        };
+
+        let capability = engine.batching_capability();
+        assert_eq!(
+            capability.max_concurrent_sequences(),
+            Some(1),
+            "native decode path pins batch to 1"
+        );
+        assert!(!capability.supports_batching());
+        assert!(!capability.allows(2));
+        assert_eq!(capability.effective_max_batch(4), 1);
+        assert!(
+            capability.reason().contains("native"),
+            "reason must name the backend: {}",
+            capability.reason()
+        );
+        // Tie the reported capability to reality: the native engine cannot
+        // actually build a batched manager for more than one sequence.
+        assert!(
+            engine.continuous_batch_manager(2).is_err(),
+            "native backend must not build a >1 continuous batch manager"
+        );
+        Ok(())
+    }
+}

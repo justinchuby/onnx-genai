@@ -1,0 +1,334 @@
+//! Normalisation and reduction rules: `LayerNormalization`, `Softmax`,
+//! `ReduceMean`/`ReduceSum` (and related reductions).
+
+use crate::context::InferenceContext;
+use crate::dim_expr::DimExpr;
+use crate::error::ShapeInferError;
+use crate::handlers::norm_axis;
+use crate::registry::InferenceRegistry;
+
+/// `LayerNormalization`: output 0 is the input shape; optional `Mean` and
+/// `InvStdDev` outputs are the input shape with the normalised axes set to `1`.
+pub fn layer_norm(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let Some(x) = ctx.input_type(0).cloned() else {
+        return Ok(());
+    };
+    ctx.set_output_type(0, x.clone());
+    let rank = x.rank();
+    let axis = ctx.node.attr("axis").and_then(|a| a.as_int()).unwrap_or(-1);
+    let axis = norm_axis(axis, rank.max(1));
+    let mut reduced = x.shape.clone();
+    for d in reduced.iter_mut().skip(axis) {
+        *d = DimExpr::constant(1);
+    }
+    if ctx.num_outputs() > 1 {
+        ctx.set_output(1, x.dtype, reduced.clone());
+    }
+    if ctx.num_outputs() > 2 {
+        ctx.set_output(2, x.dtype, reduced);
+    }
+    Ok(())
+}
+
+/// `SkipLayerNormalization` (com.microsoft): output 0 is the input shape;
+/// optional `mean` (1) and `inv_std_var` (2) are the input shape with the
+/// normalised last axis set to `1`; optional `input_skip_bias_sum` (3) is the
+/// full input shape (`X + skip + bias`). Only the outputs the node requests are
+/// emitted.
+pub fn skip_layer_norm(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let Some(x) = ctx.input_type(0).cloned() else {
+        return Ok(());
+    };
+    ctx.set_output_type(0, x.clone());
+    let rank = x.rank();
+    let axis = norm_axis(-1, rank.max(1));
+    let mut reduced = x.shape.clone();
+    for d in reduced.iter_mut().skip(axis) {
+        *d = DimExpr::constant(1);
+    }
+    if ctx.num_outputs() > 1 {
+        ctx.set_output(1, x.dtype, reduced.clone());
+    }
+    if ctx.num_outputs() > 2 {
+        ctx.set_output(2, x.dtype, reduced);
+    }
+    if ctx.num_outputs() > 3 {
+        ctx.set_output_type(3, x);
+    }
+    Ok(())
+}
+
+/// `SkipSimplifiedLayerNormalization` (com.microsoft) has the same output
+/// shapes as `SkipLayerNormalization`: the normalized output and optional
+/// residual sum preserve `X`, while optional statistics reduce the last axis.
+pub fn skip_simplified_layer_norm(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    skip_layer_norm(ctx)
+}
+
+/// `RMSNormalization`: output 0 has the input shape and the scale element type
+/// (`V` in the standard schema).
+pub fn rms_norm(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    if let (Some(shape), Some(dtype)) = (
+        ctx.input_shape(0).map(<[DimExpr]>::to_vec),
+        ctx.input_dtype(1),
+    ) {
+        ctx.set_output(0, dtype, shape);
+    }
+    Ok(())
+}
+
+/// `BatchNormalization` in inference mode: output `Y` preserves the shape and
+/// dtype of `X`. Training-only outputs are intentionally left unresolved.
+pub fn batch_norm(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    if let Some(x) = ctx.input_type(0).cloned() {
+        ctx.set_output_type(0, x);
+    }
+    Ok(())
+}
+
+/// `InstanceNormalization`: output `Y` preserves the shape and dtype of `X`.
+pub fn instance_norm(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    if let Some(x) = ctx.input_type(0).cloned() {
+        ctx.set_output_type(0, x);
+    }
+    Ok(())
+}
+
+/// `RotaryEmbedding`: output shape and dtype equal the input `X` (input 0).
+pub fn rotary_embedding(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    if let Some(x) = ctx.input_type(0).cloned() {
+        ctx.set_output_type(0, x);
+    }
+    Ok(())
+}
+
+/// `com.microsoft::GroupQueryAttention`: attention output preserves query shape;
+/// present K/V preserve the past-cache capacity and grow only when the logical
+/// total sequence length exceeds it.
+pub fn group_query_attention(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let Some(query) = ctx.input_type(0).cloned() else {
+        return Ok(());
+    };
+    let Some(query_shape) = ctx.input_shape(0).map(<[_]>::to_vec) else {
+        return Ok(());
+    };
+    if query_shape.len() != 3 {
+        return Ok(());
+    }
+    let Some(num_heads) = ctx
+        .node
+        .attr("num_heads")
+        .and_then(|attribute| attribute.as_int())
+        .filter(|&heads| heads > 0)
+    else {
+        return Ok(());
+    };
+    let Some(kv_heads) = ctx
+        .node
+        .attr("kv_num_heads")
+        .and_then(|attribute| attribute.as_int())
+        .filter(|&heads| heads > 0)
+    else {
+        return Ok(());
+    };
+    let (output_shape, head_dim) = if ctx.has_input(1) {
+        let Some(key) = ctx.input_shape(1) else {
+            return Ok(());
+        };
+        if key.len() != 3 {
+            return Ok(());
+        }
+        (
+            query_shape.clone(),
+            key[2]
+                .checked_div(&DimExpr::constant(kv_heads))
+                .unwrap_or_else(DimExpr::overflow),
+        )
+    } else {
+        let head_dim = query_shape[2]
+            .checked_div(&DimExpr::constant(num_heads + 2 * kv_heads))
+            .unwrap_or_else(DimExpr::overflow);
+        let mut output_shape = query_shape.clone();
+        output_shape[2] = head_dim.mul(&DimExpr::constant(num_heads));
+        (output_shape, head_dim)
+    };
+    ctx.set_output(0, query.dtype, output_shape);
+    if ctx.num_outputs() < 2 {
+        return Ok(());
+    }
+    let total_sequence = ctx
+        .input_shape_data(6)
+        .filter(|data| data.is_scalar())
+        .and_then(|data| data.elems.first())
+        .and_then(DimExpr::as_const);
+    let present_sequence = match (
+        ctx.input_shape(3)
+            .filter(|past| past.len() == 4)
+            .and_then(|past| past[2].as_const()),
+        total_sequence,
+    ) {
+        (Some(capacity), Some(total)) => DimExpr::constant(capacity.max(total)),
+        // `max(capacity, total)` is not representable by DimExpr. An opaque
+        // symbol keeps the output data-dependent so the executor can size it
+        // from the runtime total instead of forcing the growing-cache upper
+        // bound (`past + key`) onto a fixed-capacity cache. The same graceful
+        // degradation applies when the past-cache shape is absent or not rank 4.
+        _ => ctx.fresh_dim(),
+    };
+    let present = vec![
+        query_shape[0].clone(),
+        DimExpr::constant(kv_heads),
+        present_sequence,
+        head_dim,
+    ];
+    ctx.set_output(1, query.dtype, present.clone());
+    if ctx.num_outputs() > 2 {
+        ctx.set_output(2, query.dtype, present);
+    }
+    Ok(())
+}
+
+/// `Softmax`/`LogSoftmax`: shape- and dtype-preserving.
+pub fn softmax(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    if let Some(t) = ctx.input_type(0).cloned() {
+        ctx.set_output_type(0, t);
+    }
+    Ok(())
+}
+
+/// `ReduceMean`/`ReduceSum`/… — reduce over `axes` (from the attribute pre-opset
+/// 18, or input 1 as shape-data from opset 18), honouring `keepdims`.
+pub fn reduce(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    let Some(x) = ctx.input_type(0).cloned() else {
+        return Ok(());
+    };
+    let rank = x.rank();
+    let keepdims = ctx
+        .node
+        .attr("keepdims")
+        .and_then(|a| a.as_int())
+        .unwrap_or(1)
+        != 0;
+    let noop_empty = ctx
+        .node
+        .attr("noop_with_empty_axes")
+        .and_then(|a| a.as_int())
+        .unwrap_or(0)
+        != 0;
+
+    // Axes: attribute first (opset ≤17), then a shape-data input (opset-18).
+    let axes_attr: Option<Vec<i64>> = ctx
+        .node
+        .attr("axes")
+        .and_then(|a| a.as_ints())
+        .map(<[i64]>::to_vec);
+    let axes_raw: Option<Vec<i64>> = axes_attr.clone().or_else(|| {
+        ctx.input_shape_data(1).and_then(|sd| {
+            sd.elems
+                .iter()
+                .map(|e| e.as_const())
+                .collect::<Option<Vec<i64>>>()
+        })
+    });
+
+    // Distinguish a genuinely-absent/empty axes list from an axes *input* that
+    // is present but unresolved (missing or symbolic shape-data). In the latter
+    // case we cannot know which axes are reduced — nor, under
+    // `noop_with_empty_axes`, whether this node is a no-op — so leaving the
+    // output unresolved is more honest than fabricating a reduce-all shape.
+    if axes_raw.is_none() && axes_attr.is_none() && ctx.has_input(1) {
+        return Ok(());
+    }
+
+    let axes: Vec<usize> = match axes_raw {
+        Some(a) if !a.is_empty() => a.into_iter().map(|ax| norm_axis(ax, rank.max(1))).collect(),
+        Some(_) if noop_empty => {
+            // Explicitly empty axes with noop flag: identity.
+            ctx.set_output_type(0, x);
+            return Ok(());
+        }
+        // No axes given (or empty without noop): reduce all axes.
+        _ => (0..rank).collect(),
+    };
+
+    let mut out = Vec::with_capacity(rank);
+    for (i, d) in x.shape.iter().enumerate() {
+        if axes.contains(&i) {
+            if keepdims {
+                out.push(DimExpr::constant(1));
+            }
+        } else {
+            out.push(d.clone());
+        }
+    }
+    ctx.set_output(0, x.dtype, out);
+    Ok(())
+}
+
+/// Register the normalisation/reduction family.
+pub fn register(reg: &mut InferenceRegistry) {
+    reg.register("", "LayerNormalization", 1, layer_norm);
+    // The optimizer emits fused `LayerNormalization` in the `com.microsoft`
+    // contrib domain; register the same rule there so the fused op's shape
+    // still resolves (identical output-shape semantics as the standard op).
+    reg.register("com.microsoft", "LayerNormalization", 1, layer_norm);
+    reg.register(
+        "com.microsoft",
+        "SkipLayerNormalization",
+        1,
+        skip_layer_norm,
+    );
+    reg.register(
+        "com.microsoft",
+        "SkipSimplifiedLayerNormalization",
+        1,
+        skip_simplified_layer_norm,
+    );
+    reg.register(
+        "com.microsoft",
+        "SimplifiedLayerNormalization",
+        1,
+        layer_norm,
+    );
+    reg.register("", "SimplifiedLayerNormalization", 1, layer_norm);
+    reg.register("", "Softmax", 1, softmax);
+    reg.register("", "LogSoftmax", 1, softmax);
+    reg.register("", "BatchNormalization", 9, batch_norm);
+    reg.register("", "BatchNormalization", 14, batch_norm);
+    reg.register("", "BatchNormalization", 15, batch_norm);
+    reg.register("", "InstanceNormalization", 6, instance_norm);
+    // `LRN` (opset 1) and `MeanVarianceNormalization` (opset 9) are both
+    // shape- and dtype-preserving, so they reuse the elementwise same-shape rule.
+    reg.register("", "LRN", 1, super::elementwise::unary);
+    reg.register(
+        "",
+        "MeanVarianceNormalization",
+        9,
+        super::elementwise::unary,
+    );
+    // Standard LLM/transformer norm primitives (ai.onnx): both are
+    // shape-preserving (output == input X).
+    reg.register("", "RMSNormalization", 23, rms_norm);
+    reg.register("", "RotaryEmbedding", 23, rotary_embedding);
+    reg.register(
+        "com.microsoft",
+        "GroupQueryAttention",
+        1,
+        group_query_attention,
+    );
+
+    for op in [
+        "ReduceMean",
+        "ReduceSum",
+        "ReduceMax",
+        "ReduceMin",
+        "ReduceProd",
+        "ReduceL1",
+        "ReduceL2",
+        "ReduceLogSum",
+        "ReduceLogSumExp",
+        "ReduceSumSquare",
+    ] {
+        reg.register("", op, 1, reduce);
+    }
+}

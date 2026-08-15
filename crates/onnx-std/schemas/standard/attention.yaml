@@ -1,0 +1,29 @@
+domain: ""
+name: Attention
+since_version: 24
+doc: Multi-head attention with optional mask and key/value cache.
+attributes:
+  - { name: qk_matmul_output_mode, type: int, default: 0 }
+  - { name: softcap, type: float, default: 0.0 }
+  - { name: softmax_precision, type: int }
+  - { name: kv_num_heads, type: int }
+  - { name: q_num_heads, type: int }
+  - { name: scale, type: float }
+  - { name: is_causal, type: int, default: 0 }
+inputs:
+  - { name: Q, type_str: T1 }
+  - { name: K, type_str: T1 }
+  - { name: V, type_str: T2 }
+  - { name: attn_mask, type_str: U, optional: true }
+  - { name: past_key, type_str: T1, optional: true }
+  - { name: past_value, type_str: T2, optional: true }
+  - { name: nonpad_kv_seqlen, type_str: "tensor(int64)", optional: true }
+outputs:
+  - { name: Y, type_str: T1 }
+  - { name: present_key, type_str: T1, optional: true }
+  - { name: present_value, type_str: T2, optional: true }
+  - { name: qk_matmul_output, type_str: T1, optional: true }
+type_constraints:
+  - { type_param: T1, allowed: [bfloat16, float16, float32, float64] }
+  - { type_param: T2, allowed: [bfloat16, float16, float32, float64] }
+  - { type_param: U, allowed: [uint8, uint16, uint32, uint64, int8, int16, int32, int64, bfloat16, float16, float32, float64, bool] }

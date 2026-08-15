@@ -1,0 +1,57 @@
+{
+  "schema_version": "1.7",
+  "package_name": "tiny",
+  "package_version": "1.0.0",
+  "layout": "portable",
+  "components": {
+    "model": {
+      "component_name": "model",
+      "variants": {
+        "cpu-fp32": {
+          "variant_directory": "cpu-fp32",
+          "ep": "CPUExecutionProvider",
+          "device": "cpu",
+          "executor_info": {
+            "ort": {
+              "model_file": "model.onnx"
+            },
+            "nxrt": "nxrt_info.json"
+          },
+          "additional_metadata": {
+            "precision": "float32"
+          }
+        },
+        "cpu-fp16": {
+          "variant_directory": "cpu-fp16",
+          "ep": "CPUExecutionProvider",
+          "device": "cpu",
+          "executor_info": {
+            "nxrt": {
+              "schema_version": "1.0",
+              "model_file": "model.onnx",
+              "genai_config": "genai_config.json"
+            }
+          },
+          "additional_metadata": {
+            "precision": "float16"
+          }
+        },
+        "cuda-fp16": {
+          "variant_directory": "cuda-fp16",
+          "ep": "CUDAExecutionProvider",
+          "device": "gpu",
+          "compatibility_string": "opaque",
+          "executor_info": {
+            "nxrt": {
+              "schema_version": "1.3",
+              "model_file": "model.onnx"
+            }
+          },
+          "additional_metadata": {
+            "precision": "float16"
+          }
+        }
+      }
+    }
+  }
+}

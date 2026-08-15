@@ -1,0 +1,65 @@
+# nxrt — Python packaging via maturin.
+#
+# Standard wheel: stable ABI `abi3`, tagged `cp310-abi3` (min Python 3.10),
+# buildable with any interpreter >= 3.10. Free-threaded `abi3t` wheels are a
+# separate build path — see README.md "abi3 vs abi3t" and docs/genai/PIPELINE.md §12.4.
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "nxrt"
+description = "Python binding for nxrt ONNX inference, eager ops, and text generation"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Justin Chu" }]
+readme = "README.md"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+    "License :: OSI Approved :: MIT License",
+]
+dependencies = ["numpy>=1.21"]
+dynamic = ["version"]
+
+[project.optional-dependencies]
+# bfloat16 numpy interop (nxrt only needs this to *return* bf16 outputs).
+bfloat16 = ["ml_dtypes"]
+# Runtime NVIDIA libraries for CUDA wheels, so `nxrt[cuda]` needs no CUDA toolkit.
+# This opt-in extra keeps CPU/macOS wheels from pulling NVIDIA packages; the CUDA
+# driver (`libcuda.so.1`) remains a host prerequisite. These wheels target Linux/Windows.
+# Add nvidia-cudnn-cu13 and nvidia-curand when the cuDNN backend lands.
+cuda = [
+    "nvidia-cuda-runtime>=13",
+    "nvidia-cublas>=13", # provides libcublas + libcublasLt (cuBLASLt MatMul)
+    "nvidia-cuda-nvrtc>=13", # runtime NVRTC compilation of fused/pointwise kernels
+    "nvidia-cuda-cupti>=13", # GPU kernel tracing (tracer cupti feature)
+]
+
+[project.urls]
+repository = "https://github.com/justinchuby/onnx-genai"
+
+[tool.maturin]
+# The importable module is `nxrt` (set via [lib].name in Cargo.toml).
+manifest-path = "Cargo.toml"
+# Build the stable-ABI wheel. `abi3-py310` pins Py_LIMITED_API to 3.10 so the
+# wheel is tagged cp310-abi3 and loads on CPython 3.10+ from a single build.
+features = ["pyo3/abi3-py310", "pyo3/extension-module"]
+strip = true
+
+[tool.cibuildwheel]
+# One stable-ABI build per platform; maturin emits cp310-abi3 from this CPython
+# 3.10 build, and that wheel remains installable on later CPython versions.
+build = "cp310-*"
+skip = "*-musllinux_*"
+test-command = 'python -c "import nxrt"'
+
+[tool.cibuildwheel.linux]
+# Linux wheel builds run inside a manylinux container, so provision bindgen's
+# libclang dependency and Rust.
+before-all = "dnf install -y clang-devel && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal"
+environment = { PATH = "$HOME/.cargo/bin:$PATH" }

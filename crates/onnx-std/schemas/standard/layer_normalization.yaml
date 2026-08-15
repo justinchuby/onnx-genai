@@ -1,0 +1,21 @@
+domain: ""
+name: LayerNormalization
+since_version: 17
+doc: Layer normalization over the trailing dimensions.
+attributes:
+  - { name: axis, type: int, default: -1 }
+  - { name: epsilon, type: float, default: 0.00001 }
+  - { name: stash_type, type: int, default: 1 }
+inputs:
+  - { name: X, type_str: T }
+  - { name: Scale, type_str: T }
+  - { name: B, type_str: T, optional: true }
+outputs:
+  - { name: Y, type_str: T }
+  - { name: Mean, type_str: U, optional: true }
+  - { name: InvStdDev, type_str: U, optional: true }
+type_constraints:
+  - type_param: T
+    allowed: [float16, float32, float64, bfloat16]
+  - type_param: U
+    allowed: [float32, bfloat16]

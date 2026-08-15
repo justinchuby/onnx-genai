@@ -7,10 +7,9 @@
 (A100 / Hopper / Blackwell) optimization catalog so future work — including agents
 on other machines and future hardware tiers — can pick this up without re-deriving it.
 **Hardware reality at time of writing:** development + all live benchmarks on 8×H200
-(Hopper, `sm_90`). **No A100, Blackwell, or RTX consumer hardware available** — the
-A100/Blackwell/RTX sections below are built from *known/published* optimizations;
-they are arch-guarded, compile-validated on H200, and ready to benchmark when
-hardware lands. RTX/consumer specifics are in §7.
+(Hopper, `sm_90`). **No A100 or Blackwell hardware available** — the A100/Blackwell
+sections below are built from *known/published* optimizations; they are arch-guarded,
+compile-validated on H200, and ready to benchmark when hardware lands.
 
 > **Headline (read first).** Our M=1 int4 decode kernels are **issue/latency-bound,
 > not bandwidth-bound** (ncu: L1TEX scoreboard ~61%, DRAM ~2% of peak). That means
@@ -204,75 +203,6 @@ pre-activation values as the parity gate.
    Qwen3.5/Qwen3-Next) and causal short-conv — already ported for correctness
    (one thread per column/row, f32 state); FLA chunked-recurrent + causal-conv1d's
    64-thread/channel update kernel are the perf upgrades, gated on f32 parity.
-
----
-
-## 7. RTX / consumer GeForce — performance tuning (correctness already shipped)
-
-**Correctness on consumer cards is already established** (see the audit
-`docs/portability/2026-07-25-cuda-consumer-gpu-audit.md`): the CUDA EP ships no
-AOT cubin — every kernel is NVRTC-compiled to the *live device's* compute
-capability, tensor-core/dtype paths are guarded `cc >= 7` with fp32 fallbacks, and
-shared memory is clamped to each device's opt-in ceiling. So RTX cards **run**
-today. The open work is **perf tuning**, which is currently H200-shaped (tiles,
-occupancy, and bandwidth strategy assume sm_90 / 132 SM / ~227 KB smem / 4.8 TB/s
-HBM3e). No consumer hardware on hand — build from known optimizations, tune from
-**device properties** (not compute-capability alone), compile-validate on H200,
-benchmark when hardware lands.
-
-### 7.1 The RTX generations
-
-| GeForce | Arch | SM | Async-copy | Tensor cores | Opt-in smem | L2 | Memory | PDL? |
-|---|---|---|---|---|---|---|---|---|
-| RTX 30 | Ampere | `sm_86` | `cp.async` | 3rd-gen (fp16/bf16) | ~100 KB | small (4–6 MB) | GDDR6/6X | no |
-| RTX 40 | Ada | `sm_89` | `cp.async` | 4th-gen (**+fp8**) | ~100 KB | **huge (up to 72 MB)** | GDDR6X | no |
-| RTX 50 | Blackwell | `sm_120` | TMA + `cp.async` | 5th-gen (**+NVFP4**), no 2-SM MMA | large | large | GDDR7 | yes |
-
-Note consumer opt-in smem (~100 KB on sm_86/sm_89) is **less than A100's ~163 KB
-and H200's ~227 KB** — any kernel tuned to the H200 smem ceiling must scale its
-tile to the device's `max_shared_memory_per_block_optin` (the audit already
-hardened the three GEMV sites that staged `K × sizeof(f16)`), and RTX 50 vs RTX 40
-tiles must be re-derived, not shared.
-
-### 7.2 RTX-specific levers (from known optimizations)
-
-1. **Interleave dequant (already merged, `ONNX_GENAI_INTERLEAVE_DEQUANT`) helps RTX
-   more, not less.** RTX GDDR bandwidth is far below HBM (e.g. ~1 TB/s class vs
-   4.8 TB/s), but M=1 int4 decode is still issue/latency-bound; cutting dequant
-   instruction count (§1, ~9 vs ~14 instrs/8 values) is arch-independent and pays
-   off on every RTX generation. Validate the opt-in flag on RTX when hardware lands.
-2. **Ada (sm_89) oversized L2 → L2-residency is the standout consumer lever.** A
-   4090's ~72 MB L2 can hold a large fraction of an int4 model's hot weights,
-   cutting *effective* DRAM traffic dramatically — exactly the regime where a
-   **persistent-kernel / L2-residency** strategy (TRT-LLM notes a persistent-kernel
-   / L2-hot-activation trick) converts a bandwidth-bound decode into an L2-bound
-   one. This is Ada-specific (Ampere/Blackwell consumer L2 is far smaller) and
-   should be gated on measured L2 size, not just `sm_89`.
-3. **Device-property-driven tiling + split-K degree.** Consumer cards have far
-   fewer SMs (RTX 4060 ≈ 24 SM vs H200 132). Split-K degree and grid sizing must
-   scale with `multiProcessorCount` so a small card is not under-occupied (too few
-   CTAs) or over-subscribed. Extend the existing `tile_for(compute_capability, …)`
-   selection to also read SM count + L2 + smem ceiling.
-4. **Ada/Hopper fp8 (4th/5th-gen TC), RTX 50 NVFP4.** sm_89 has fp8 tensor cores
-   (no TMA/wgmma); if an fp8-activation path is added it benefits RTX 40 as well as
-   Hopper. RTX 50 adds native NVFP4 (needs an FP4 activation path, as §2.3).
-5. **Launch latency: cuda-graph, not PDL, for RTX 30/40.** PDL is `sm_90+`, so only
-   RTX 50 (`sm_120`) gets programmatic dependent launch (§3). On RTX 30/40 the
-   launch-latency lever for the long decode kernel chain is **cuda-graph capture**
-   (`ONNX_GENAI_CUDA_GRAPH=1`), which matters more on consumer hosts (weaker
-   single-thread CPU, PCIe rather than NVLink).
-6. **Small VRAM (8–24 GB) makes memory strategy first-order.** Weight offload, KV
-   budget, and quantization dominate whether a model *fits* on a consumer card —
-   this is the memory workstream's domain (governor / offload). Perf tuning is moot
-   if the model does not fit; coordinate arch tuning with offload policy.
-
-### 7.3 No-TMA path is shared with A100
-
-RTX 30/40 (and A100) all lack TMA, so the `cp.async` (LDGSTS) KV-prefetch variant
-scoped for A100 in §2.1 is the **same code path** that should be validated on RTX
-30/40 — one Ampere/Ada-family `cp.async` implementation covers A100 + RTX 30 + RTX
-40, guarded by "`cc >= 8.0` and no TMA". Only RTX 50 / Hopper / Blackwell-DC take
-the TMA path.
 
 ---
 

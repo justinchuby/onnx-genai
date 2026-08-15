@@ -1,0 +1,129 @@
+name: Benchmarks
+
+# Informational micro-benchmark comparison posted as a PR comment.
+# Does NOT block CI — the real regression gates live in
+# crates/onnx-genai-bench/tests/profile_native.rs (throughput floors +
+# dispatch-reachability tests on real hardware).
+#
+# This workflow's job is VISIBILITY: surface the comparison on the PR
+# that caused a change, while the author is still looking at it.
+#
+# Design:
+#   - Base benchmarked FIRST (eats cold-start), PR SECOND (warm runner).
+#   - Reports % change as the reliable signal; absolutes are informational.
+#   - Measured run-to-run variance included so readers can judge signal vs noise.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: benchmark-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  micro-benchmarks:
+    name: Kernel micro-benchmarks
+    runs-on: macos-latest
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: bench-v1
+
+      # ── Benchmark the merge-base FIRST (eats cold-start) ──────────────
+      - name: Determine merge-base
+        id: merge-base
+        run: |
+          BASE=$(git merge-base HEAD origin/${{ github.event.pull_request.base.ref }})
+          echo "sha=$BASE" >> "$GITHUB_OUTPUT"
+          echo "Merge-base: $BASE"
+
+      - name: Checkout merge-base
+        run: git checkout ${{ steps.merge-base.outputs.sha }}
+
+      - name: Benchmark merge-base (ep-cpu kernels)
+        run: cargo bench -p onnx-runtime-ep-cpu --bench kernels -- --noplot
+
+      - name: Benchmark merge-base (genai-bench no_model)
+        run: cargo bench -p onnx-genai-bench --bench no_model -- --noplot
+
+      - name: Save base criterion results
+        run: cp -R target/criterion base-criterion
+
+      # ── Benchmark the PR head SECOND (warm runner) ────────────────────
+      - name: Checkout PR head
+        run: git checkout ${{ github.event.pull_request.head.sha }}
+
+      - name: Benchmark PR head (ep-cpu kernels)
+        run: cargo bench -p onnx-runtime-ep-cpu --bench kernels -- --noplot
+
+      - name: Benchmark PR head (genai-bench no_model)
+        run: cargo bench -p onnx-genai-bench --bench no_model -- --noplot
+
+      - name: Smoke-check PR model benchmarks
+        run: cargo bench -p onnx-genai-bench --features bench-ort --bench model -- --test
+
+      - name: Save PR criterion results
+        run: cp -R target/criterion pr-criterion
+
+      # ── Compare and comment ────────────────────────────────────────────
+      - name: Collect host info
+        id: host
+        run: |
+          {
+            echo 'info<<EOF'
+            echo "CPU: $(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo unknown)"
+            echo "Cores: $(sysctl -n hw.logicalcpu 2>/dev/null || echo unknown)"
+            echo "OS: $(uname -srm)"
+            echo "Rust: $(rustc --version)"
+            echo "Load avg: $(sysctl -n vm.loadavg 2>/dev/null || uptime | sed 's/.*load averages: //')"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Generate comparison
+        run: |
+          python3 scripts/ci_bench_compare.py \
+            --base-dir base-criterion \
+            --pr-dir pr-criterion \
+            --output benchmark-comment.md \
+            --host-info "${{ steps.host.outputs.info }}"
+
+      - name: Find existing comment
+        id: find-comment
+        run: |
+          COMMENT_ID=$(gh api \
+            "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
+            --paginate --jq '.[] | select(.body | startswith("## ")) | select(.body | contains("Benchmark")) | .id' \
+            | head -1)
+          echo "id=$COMMENT_ID" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Post or update PR comment
+        run: |
+          BODY=$(cat benchmark-comment.md)
+          if [ -n "${{ steps.find-comment.outputs.id }}" ]; then
+            gh api \
+              --method PATCH \
+              "repos/${{ github.repository }}/issues/comments/${{ steps.find-comment.outputs.id }}" \
+              -f body="$BODY"
+            echo "Updated existing comment ${{ steps.find-comment.outputs.id }}"
+          else
+            gh pr comment "${{ github.event.pull_request.number }}" --body "$BODY"
+            echo "Posted new comment"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

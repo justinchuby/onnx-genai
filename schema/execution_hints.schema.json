@@ -1,0 +1,166 @@
+{
+  "$id": "https://github.com/justinchuby/onnx-genai/schemas/execution_hints",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ONNX Runtime Execution Hints",
+  "description": "User-provided hints for device placement and memory planning. Can be embedded in inference_metadata.yaml under 'execution_hints' or provided as a standalone execution_hints.json file. Hints are soft preferences unless strength is 'force'.",
+  "type": "object",
+  "properties": {
+    "placement": {
+      "description": "Device placement hints for graph partitioning.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/PlacementHint" }
+    },
+    "memory": {
+      "description": "Memory planning hints.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/MemoryHint" }
+    },
+    "scheduling": {
+      "description": "Execution scheduling hints.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/SchedulingHint" }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "NodeSelector": {
+      "description": "Selects nodes/tensors by name or pattern. Supports glob patterns (*, ?).",
+      "type": "object",
+      "properties": {
+        "names": {
+          "description": "Exact node/tensor names.",
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "pattern": {
+          "description": "Glob pattern matching node/tensor names. E.g. 'layers.*.attention.*'",
+          "type": "string"
+        },
+        "op_types": {
+          "description": "Match by op type. E.g. ['MatMul', 'Attention']",
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "layer_range": {
+          "description": "Match nodes in layer index range (for transformer models).",
+          "type": "object",
+          "properties": {
+            "start": { "type": "integer", "minimum": 0 },
+            "end": { "type": "integer", "minimum": 0 }
+          },
+          "required": ["start", "end"]
+        }
+      },
+      "minProperties": 1
+    },
+
+    "DeviceTarget": {
+      "description": "Target device specification.",
+      "type": "object",
+      "properties": {
+        "type": {
+          "description": "Device type.",
+          "type": "string",
+          "enum": ["gpu", "cpu", "npu", "any"]
+        },
+        "index": {
+          "description": "Device index for multi-device systems.",
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": ["type"]
+    },
+
+    "PlacementHint": {
+      "description": "Hint for device placement of a set of nodes.",
+      "type": "object",
+      "properties": {
+        "selector": { "$ref": "#/$defs/NodeSelector" },
+        "device": { "$ref": "#/$defs/DeviceTarget" },
+        "strength": {
+          "description": "How strongly the optimizer should respect this hint.",
+          "type": "string",
+          "enum": ["prefer", "force"],
+          "default": "prefer"
+        },
+        "reason": {
+          "description": "Human-readable reason for this hint (for documentation/debugging).",
+          "type": "string"
+        }
+      },
+      "required": ["selector", "device"],
+      "additionalProperties": false
+    },
+
+    "ColocateHint": {
+      "description": "Keep selected nodes on the same device (minimize partition cuts).",
+      "type": "object",
+      "properties": {
+        "selector": { "$ref": "#/$defs/NodeSelector" },
+        "reason": { "type": "string" }
+      },
+      "required": ["selector"],
+      "additionalProperties": false
+    },
+
+    "MemoryHint": {
+      "description": "Memory planning hint for tensors.",
+      "type": "object",
+      "properties": {
+        "action": {
+          "description": "What to do with the selected tensors.",
+          "type": "string",
+          "enum": [
+            "pin",
+            "low_priority",
+            "allow_alias",
+            "arena_size",
+            "prefetch"
+          ]
+        },
+        "selector": {
+          "description": "Which tensors this applies to (for pin/low_priority/allow_alias/prefetch).",
+          "$ref": "#/$defs/NodeSelector"
+        },
+        "device": {
+          "description": "Target device (for arena_size).",
+          "$ref": "#/$defs/DeviceTarget"
+        },
+        "bytes": {
+          "description": "Size in bytes (for arena_size).",
+          "type": "integer",
+          "minimum": 0
+        },
+        "reason": { "type": "string" }
+      },
+      "required": ["action"],
+      "additionalProperties": false
+    },
+
+    "SchedulingHint": {
+      "description": "Execution scheduling hint.",
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "overlap",
+            "cuda_graph_region",
+            "no_cuda_graph",
+            "chunk_size"
+          ]
+        },
+        "selector": { "$ref": "#/$defs/NodeSelector" },
+        "chunk_size": {
+          "description": "For overlap/chunk_size: number of micro-chunks.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "reason": { "type": "string" }
+      },
+      "required": ["action"],
+      "additionalProperties": false
+    }
+  }
+}

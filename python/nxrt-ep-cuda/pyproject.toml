@@ -1,0 +1,88 @@
+# nxrt-ep-cuda — packaging for the ORT plugin-EP (CUDA) shared library.
+#
+# EXPERIMENTAL / PRE-RELEASE. The wheel bundles the compiled
+# `onnx-runtime-ep-cuda-plugin` cdylib built WITH the `cuda` cargo feature
+# (CUDA 13). It exports the ORT plugin-EP C ABI (`CreateEpFactories` /
+# `ReleaseEpFactory`) and is consumed by ONNX Runtime via
+# `RegisterExecutionProviderLibrary`. It is NOT a PyO3 extension, so we build
+# it with plain cargo (see setup.py) and vendor the shared library as package
+# data. A thin pure-Python `__init__` exposes `get_library_path()` and
+# `register()`.
+#
+# The CUDA EP is not yet hardware-validated (issue #768); this package is marked
+# pre-release. Building needs the CUDA 13 toolkit (nvcc) on the host, but no GPU.
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nxrt-ep-cuda"
+version = "0.1.0.dev5"
+description = "ONNX Runtime plugin execution provider (CUDA 13, EXPERIMENTAL) — bundled cdylib for register_execution_provider_library"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "Justin Chu" }]
+readme = "README.md"
+keywords = ["onnx", "onnxruntime", "execution-provider", "cuda", "plugin"]
+classifiers = [
+    # Pre-release: the CUDA EP is not yet validated on physical GPUs (#768).
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Environment :: GPU :: NVIDIA CUDA :: 13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# CUDA 13 runtime NVIDIA libraries (mirrors crates/onnx-runtime-python's [cuda]
+# set). REQUIRED deps (not an extra): `pip install nxrt-ep-cuda` must pull them
+# so the EP's dlopen'd libs (libcudart / libcublas(+Lt) / libnvrtc / libcupti,
+# which auditwheel excludes from the wheel) resolve at runtime. The CUDA driver
+# (libcuda.so.1) remains a host prerequisite. These wheels target Linux/Windows.
+#
+# Use the UNSUFFIXED names: as of 2026-08-12 they ARE the real CUDA 13 wheels
+# (nvidia-cuda-runtime 13.3.29, nvidia-cublas 13.6.1.10, nvidia-cuda-nvrtc
+# 13.3.33, nvidia-cuda-cupti 13.3.75). The `-cu13`-suffixed names are only 0.0.1
+# placeholder stubs — do NOT use them. `>=13,<14` locks the CUDA 13 major so a
+# future CUDA 14 release under the same rolling name can't be pulled against our
+# CUDA-13-built cdylib.
+dependencies = [
+    "nvidia-cuda-runtime>=13,<14",
+    "nvidia-cublas>=13,<14",       # libcublas + libcublasLt (cuBLASLt MatMul)
+    "nvidia-cuda-nvrtc>=13,<14",   # runtime NVRTC compilation of fused/pointwise kernels
+    "nvidia-cuda-cupti>=13,<14",   # GPU kernel tracing
+]
+
+[project.optional-dependencies]
+# `onnxruntime` is an optional peer used by nxrt_ep_cuda.register().
+onnxruntime = ["onnxruntime>=1.22"]
+
+[project.urls]
+repository = "https://github.com/justinchuby/onnx-genai"
+
+[tool.setuptools]
+zip-safe = false
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+nxrt_ep_cuda = ["*.so", "*.dll", "*.dylib"]
+
+[tool.cibuildwheel]
+# One build per platform: the wheel is py3-none-<platform> (bundled cdylib has
+# no CPython ABI dependency).
+build = "cp310-*"
+skip = "*-musllinux_*"
+# Import-only smoke test: no GPU is present in CI, so we do not construct a
+# session — just assert the bundled cdylib path resolves.
+test-command = 'python -c "import nxrt_ep_cuda, os; p=nxrt_ep_cuda.get_library_path(); assert os.path.exists(p), p; print(\"OK\", p)"'
+
+[tool.cibuildwheel.linux]
+# manylinux container needs libclang (bindgen) + Rust. NO CUDA toolkit is
+# required: onnx-runtime-ep-cuda uses cudarc's `dynamic-loading`, so
+# `cargo build --features cuda` compiles without nvcc/headers and without a GPU
+# (CUDA libs are dlopen'd at runtime). Matches the nxrt-ep-cpu before-all.
+before-all = "dnf install -y clang-devel && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal"
+environment = { PATH = "$HOME/.cargo/bin:$PATH" }

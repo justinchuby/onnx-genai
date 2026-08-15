@@ -1,0 +1,17 @@
+domain: ""
+name: Slice
+since_version: 13
+doc: Select tensor elements by starts, ends, axes, and steps.
+inputs:
+  - { name: data, type_str: T }
+  - { name: starts, type_str: Tind }
+  - { name: ends, type_str: Tind }
+  - { name: axes, type_str: Tind, optional: true }
+  - { name: steps, type_str: Tind, optional: true }
+outputs:
+  - { name: output, type_str: T }
+type_constraints:
+  - type_param: T
+    allowed: [uint8, uint16, uint32, uint64, int8, int16, int32, int64, bfloat16, float16, float32, float64, string, bool, complex64, complex128]
+  - type_param: Tind
+    allowed: [int32, int64]

@@ -1,0 +1,10 @@
+schema_version: v1
+model:
+  attention:
+    type: group_query_attention
+    num_kv_heads: 1
+    num_attention_heads: 2
+    head_dim: 2
+    key_sequence_lengths:
+      scalar_broadcast: unit_batch
+  max_sequence_length: 32

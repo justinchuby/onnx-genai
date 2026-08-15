@@ -1,0 +1,11 @@
+domain: ""
+name: Relu
+since_version: 14
+doc: Rectified linear unit.
+inputs:
+  - { name: X, type_str: T }
+outputs:
+  - { name: Y, type_str: T }
+type_constraints:
+  - type_param: T
+    allowed: [float16, float32, float64, bfloat16]

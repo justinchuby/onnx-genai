@@ -1,0 +1,12 @@
+domain: ""
+name: Tile
+since_version: 13
+doc: Construct a tensor by repeating the input along each dimension.
+inputs:
+  - { name: input, type_str: T }
+  - { name: repeats, type_str: T1 }
+outputs:
+  - { name: output, type_str: T }
+type_constraints:
+  - { type_param: T, allowed: [uint8, uint16, uint32, uint64, int8, int16, int32, int64, bfloat16, float16, float32, float64, string, bool, complex64, complex128] }
+  - { type_param: T1, allowed: [int64] }

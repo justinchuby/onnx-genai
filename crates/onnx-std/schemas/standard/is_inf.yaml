@@ -1,0 +1,12 @@
+domain: ""
+name: IsInf
+since_version: 10
+doc: Test each element for positive or negative infinity.
+attributes:
+  - { name: detect_negative, type: int, default: 1 }
+  - { name: detect_positive, type: int, default: 1 }
+inputs: [{ name: X, type_str: T1 }]
+outputs: [{ name: Y, type_str: T2 }]
+type_constraints:
+  - { type_param: T1, allowed: [bfloat16, float16, float32, float64] }
+  - { type_param: T2, allowed: [bool] }

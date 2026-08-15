@@ -1,0 +1,23 @@
+{
+  "generator": "scripts/build_tiny_gemma4_assistant.py",
+  "seed": 20260713,
+  "vocab_size": 32,
+  "backbone_hidden_size": 16,
+  "kv_heads": 2,
+  "head_dim": 8,
+  "num_target_layers": 2,
+  "shared_kv": [
+    {
+      "name": "sliding_attention",
+      "target_layers": [
+        0
+      ]
+    },
+    {
+      "name": "full_attention",
+      "target_layers": [
+        1
+      ]
+    }
+  ]
+}

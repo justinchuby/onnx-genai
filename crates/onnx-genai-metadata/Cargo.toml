@@ -1,0 +1,22 @@
+[package]
+name = "onnx-genai-metadata"
+description = "Metadata parsing and validation for generative ONNX models"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["onnx", "metadata", "inference", "genai"]
+categories = ["science", "parser-implementations"]
+
+[dependencies]
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+jsonschema = { version = "0.48.2", default-features = false }
+
+[lints]
+workspace = true

@@ -1,0 +1,26 @@
+[package]
+name = "onnx-runtime-virtual-memory"
+description = "Virtually contiguous, physically scattered memory: reserve one address range and map separately-allocated blocks into it, so an operator that requires a flat buffer can read paged storage without a copy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["memory", "virtual", "mmap", "paging", "inference"]
+categories = ["memory-management", "science"]
+
+[dependencies]
+thiserror = { workspace = true }
+onnx-runtime-memory-governor = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true

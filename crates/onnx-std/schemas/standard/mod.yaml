@@ -1,0 +1,13 @@
+domain: ""
+name: Mod
+since_version: 13
+doc: Element-wise modulo with multidirectional broadcasting.
+inputs:
+  - { name: A, type_str: T }
+  - { name: B, type_str: T }
+outputs:
+  - { name: C, type_str: T }
+attributes:
+  - { name: fmod, type: int, default: 0 }
+type_constraints:
+  - { type_param: T, allowed: [float16, float32, float64, bfloat16, int8, int16, int32, int64, uint8, uint16, uint32, uint64] }

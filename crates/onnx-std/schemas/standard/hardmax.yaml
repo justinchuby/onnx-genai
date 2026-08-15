@@ -1,0 +1,10 @@
+domain: ""
+name: Hardmax
+since_version: 13
+doc: Set maximal elements along an axis to one and all others to zero.
+attributes:
+  - { name: axis, type: int, default: -1 }
+inputs: [{ name: input, type_str: T }]
+outputs: [{ name: output, type_str: T }]
+type_constraints:
+  - { type_param: T, allowed: [bfloat16, float16, float32, float64] }

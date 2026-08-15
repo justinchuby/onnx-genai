@@ -1,0 +1,2243 @@
+ir_version: 11
+producer_name: "mobius"
+producer_version: "0.1.0"
+graph {
+  node {
+    input: "fused_hidden"
+    input: "fc.weight_t"
+    output: "v_fc.MatMul_1"
+    name: "fc/MatMul_node_1"
+    op_type: "MatMul"
+    metadata_props {
+      key: "namespace"
+      value: ": Eagle3DraftModel/fc: Linear"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'Eagle3DraftModel\', \'Linear\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'fc\']"
+    }
+  }
+  node {
+    input: "inputs_embeds"
+    input: "input_layernorm.weight"
+    output: "v_input_layernorm.RMSNormalization_3"
+    name: "input_layernorm/RMSNormalization_node_3"
+    op_type: "RMSNormalization"
+    attribute {
+      name: "epsilon"
+      f: 1e-06
+      type: FLOAT
+    }
+    attribute {
+      name: "axis"
+      i: -1
+      type: INT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ": Eagle3DraftModel/input_layernorm: RMSNorm"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'Eagle3DraftModel\', \'RMSNorm\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'input_layernorm\']"
+    }
+  }
+  node {
+    input: "v_fc.MatMul_1"
+    input: "recycled_hidden"
+    input: "hidden_norm.weight"
+    output: "v_hidden_norm.RMSNormalization_4"
+    output: "val_0"
+    output: "val_1"
+    output: "val_2"
+    name: "node_SkipSimplifiedLayerNormalization_1"
+    op_type: "SkipSimplifiedLayerNormalization"
+    attribute {
+      name: "epsilon"
+      f: 1e-06
+      type: FLOAT
+    }
+    domain: "com.microsoft"
+    metadata_props {
+      key: "namespace"
+      value: ": Eagle3DraftModel/hidden_norm: RMSNorm"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'Eagle3DraftModel\', \'RMSNorm\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'hidden_norm\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.rewriter.rule_name"
+      value: "AddRMSNormToSkipNorm"
+    }
+  }
+  node {
+    input: "v_input_layernorm.RMSNormalization_3"
+    input: "v_hidden_norm.RMSNormalization_4"
+    output: "v_Concat_5"
+    name: "Concat_node_5"
+    op_type: "Concat"
+    attribute {
+      name: "axis"
+      i: -1
+      type: INT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ": Eagle3DraftModel"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'Eagle3DraftModel\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\']"
+    }
+  }
+  node {
+    input: "rotary_emb.cos_cache"
+    input: "position_ids"
+    output: "v_rotary_emb.Gather_6"
+    name: "rotary_emb/Gather_node_6"
+    op_type: "Gather"
+    metadata_props {
+      key: "namespace"
+      value: ": Eagle3DraftModel/rotary_emb: DefaultRope"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'Eagle3DraftModel\', \'DefaultRope\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'rotary_emb\']"
+    }
+  }
+  node {
+    input: "rotary_emb.sin_cache"
+    input: "position_ids"
+    output: "v_rotary_emb.Gather_7"
+    name: "rotary_emb/Gather_node_7"
+    op_type: "Gather"
+    metadata_props {
+      key: "namespace"
+      value: ": Eagle3DraftModel/rotary_emb: DefaultRope"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'Eagle3DraftModel\', \'DefaultRope\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'rotary_emb\']"
+    }
+  }
+  node {
+    input: "attention_mask"
+    input: "const_1_i64"
+    output: "v_CumSum_8"
+    name: "CumSum_node_8"
+    op_type: "CumSum"
+    metadata_props {
+      key: "namespace"
+      value: ": Eagle3DraftModel"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'Eagle3DraftModel\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\']"
+    }
+  }
+  node {
+    input: "v_CumSum_8"
+    input: "const_1d_1"
+    output: "v_Unsqueeze_9"
+    name: "Unsqueeze_node_9"
+    op_type: "Unsqueeze"
+    metadata_props {
+      key: "namespace"
+      value: ": Eagle3DraftModel"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'Eagle3DraftModel\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\']"
+    }
+  }
+  node {
+    input: "inputs_embeds"
+    output: "v_Shape_10"
+    name: "Shape_node_10"
+    op_type: "Shape"
+    attribute {
+      name: "end"
+      i: 2
+      type: INT
+    }
+    attribute {
+      name: "start"
+      i: 1
+      type: INT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ": Eagle3DraftModel"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'Eagle3DraftModel\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\']"
+    }
+  }
+  node {
+    input: "attention_mask"
+    output: "v_Shape_11"
+    name: "Shape_node_11"
+    op_type: "Shape"
+    attribute {
+      name: "end"
+      i: 2
+      type: INT
+    }
+    attribute {
+      name: "start"
+      i: 1
+      type: INT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ": Eagle3DraftModel"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'Eagle3DraftModel\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\']"
+    }
+  }
+  node {
+    input: "v_Shape_11"
+    input: "v_Shape_10"
+    output: "v_Sub_12"
+    name: "Sub_node_12"
+    op_type: "Sub"
+    metadata_props {
+      key: "namespace"
+      value: ": Eagle3DraftModel"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'Eagle3DraftModel\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\']"
+    }
+  }
+  node {
+    input: "v_CumSum_8"
+    input: "v_Sub_12"
+    input: "v_Shape_11"
+    input: "const_1d_1"
+    output: "v_Slice_13"
+    name: "Slice_node_13"
+    op_type: "Slice"
+    metadata_props {
+      key: "namespace"
+      value: ": Eagle3DraftModel"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'Eagle3DraftModel\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\']"
+    }
+  }
+  node {
+    input: "v_Slice_13"
+    input: "const_1d_2"
+    output: "v_Unsqueeze_14"
+    name: "Unsqueeze_node_14"
+    op_type: "Unsqueeze"
+    metadata_props {
+      key: "namespace"
+      value: ": Eagle3DraftModel"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'Eagle3DraftModel\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\']"
+    }
+  }
+  node {
+    input: "v_Unsqueeze_14"
+    input: "v_Unsqueeze_9"
+    output: "v_GreaterOrEqual_15"
+    name: "GreaterOrEqual_node_15"
+    op_type: "GreaterOrEqual"
+    metadata_props {
+      key: "namespace"
+      value: ": Eagle3DraftModel"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'Eagle3DraftModel\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\']"
+    }
+  }
+  node {
+    input: "attention_mask"
+    input: "const_1d_1"
+    output: "v_Unsqueeze_16"
+    name: "Unsqueeze_node_16"
+    op_type: "Unsqueeze"
+    metadata_props {
+      key: "namespace"
+      value: ": Eagle3DraftModel"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'Eagle3DraftModel\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\']"
+    }
+  }
+  node {
+    input: "v_Unsqueeze_16"
+    output: "v_Cast_17"
+    name: "Cast_node_17"
+    op_type: "Cast"
+    attribute {
+      name: "to"
+      i: 9
+      type: INT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ": Eagle3DraftModel"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'Eagle3DraftModel\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\']"
+    }
+  }
+  node {
+    input: "v_Cast_17"
+    input: "v_GreaterOrEqual_15"
+    output: "v_And_18"
+    name: "And_node_18"
+    op_type: "And"
+    metadata_props {
+      key: "namespace"
+      value: ": Eagle3DraftModel"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'Eagle3DraftModel\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\']"
+    }
+  }
+  node {
+    input: "v_And_18"
+    input: "const_0.0_f32"
+    input: "const_-3.4028234663852886e+38_f32"
+    output: "v_Where_19"
+    name: "Where_node_19"
+    op_type: "Where"
+    metadata_props {
+      key: "namespace"
+      value: ": Eagle3DraftModel"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'Eagle3DraftModel\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\']"
+    }
+  }
+  node {
+    input: "v_Where_19"
+    input: "const_1d_1"
+    output: "v_Unsqueeze_21"
+    name: "Unsqueeze_node_21"
+    op_type: "Unsqueeze"
+    metadata_props {
+      key: "namespace"
+      value: ": Eagle3DraftModel"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'Eagle3DraftModel\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\']"
+    }
+  }
+  node {
+    input: "v_Concat_5"
+    input: "self_attn.q_proj.weight_t"
+    output: "v_self_attn.q_proj.MatMul_23"
+    name: "self_attn/q_proj/MatMul_node_23"
+    op_type: "MatMul"
+    metadata_props {
+      key: "namespace"
+      value: ": Eagle3DraftModel/self_attn: Eagle3Attention/q_proj: Linear"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'Eagle3DraftModel\', \'Eagle3Attention\', \'Linear\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'self_attn\', \'q_proj\']"
+    }
+  }
+  node {
+    input: "v_Concat_5"
+    input: "self_attn.k_proj.weight_t"
+    output: "v_self_attn.k_proj.MatMul_25"
+    name: "self_attn/k_proj/MatMul_node_25"
+    op_type: "MatMul"
+    metadata_props {
+      key: "namespace"
+      value: ": Eagle3DraftModel/self_attn: Eagle3Attention/k_proj: Linear"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'Eagle3DraftModel\', \'Eagle3Attention\', \'Linear\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'self_attn\', \'k_proj\']"
+    }
+  }
+  node {
+    input: "v_Concat_5"
+    input: "self_attn.v_proj.weight_t"
+    output: "v_self_attn.v_proj.MatMul_27"
+    name: "self_attn/v_proj/MatMul_node_27"
+    op_type: "MatMul"
+    metadata_props {
+      key: "namespace"
+      value: ": Eagle3DraftModel/self_attn: Eagle3Attention/v_proj: Linear"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'Eagle3DraftModel\', \'Eagle3Attention\', \'Linear\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'self_attn\', \'v_proj\']"
+    }
+  }
+  node {
+    input: "v_self_attn.q_proj.MatMul_23"
+    input: "v_rotary_emb.Gather_6"
+    input: "v_rotary_emb.Gather_7"
+    output: "v_self_attn.RotaryEmbedding_28"
+    name: "self_attn/RotaryEmbedding_node_28"
+    op_type: "RotaryEmbedding"
+    attribute {
+      name: "num_heads"
+      i: 2
+      type: INT
+    }
+    attribute {
+      name: "rotary_embedding_dim"
+      i: 0
+      type: INT
+    }
+    attribute {
+      name: "interleaved"
+      i: 0
+      type: INT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ": Eagle3DraftModel/self_attn: Eagle3Attention"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'Eagle3DraftModel\', \'Eagle3Attention\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'self_attn\']"
+    }
+  }
+  node {
+    input: "v_self_attn.k_proj.MatMul_25"
+    input: "v_rotary_emb.Gather_6"
+    input: "v_rotary_emb.Gather_7"
+    output: "v_self_attn.RotaryEmbedding_29"
+    name: "self_attn/RotaryEmbedding_node_29"
+    op_type: "RotaryEmbedding"
+    attribute {
+      name: "num_heads"
+      i: 1
+      type: INT
+    }
+    attribute {
+      name: "rotary_embedding_dim"
+      i: 0
+      type: INT
+    }
+    attribute {
+      name: "interleaved"
+      i: 0
+      type: INT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ": Eagle3DraftModel/self_attn: Eagle3Attention"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'Eagle3DraftModel\', \'Eagle3Attention\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'self_attn\']"
+    }
+  }
+  node {
+    input: "v_self_attn.RotaryEmbedding_28"
+    input: "v_self_attn.RotaryEmbedding_29"
+    input: "v_self_attn.v_proj.MatMul_27"
+    input: "v_Unsqueeze_21"
+    input: "past_key_values.0.key"
+    input: "past_key_values.0.value"
+    output: "v_self_attn.Attention_30_0"
+    output: "present.0.key"
+    output: "present.0.value"
+    name: "self_attn/Attention_node_30"
+    op_type: "Attention"
+    attribute {
+      name: "is_causal"
+      i: 1
+      type: INT
+    }
+    attribute {
+      name: "kv_num_heads"
+      i: 1
+      type: INT
+    }
+    attribute {
+      name: "q_num_heads"
+      i: 2
+      type: INT
+    }
+    attribute {
+      name: "softcap"
+      f: 0.0
+      type: FLOAT
+    }
+    attribute {
+      name: "scale"
+      f: 0.35355338
+      type: FLOAT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ": Eagle3DraftModel/self_attn: Eagle3Attention"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'Eagle3DraftModel\', \'Eagle3Attention\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'self_attn\']"
+    }
+  }
+  node {
+    input: "v_self_attn.Attention_30_0"
+    input: "self_attn.o_proj.weight_t"
+    output: "v_self_attn.o_proj.MatMul_32"
+    name: "self_attn/o_proj/MatMul_node_32"
+    op_type: "MatMul"
+    metadata_props {
+      key: "namespace"
+      value: ": Eagle3DraftModel/self_attn: Eagle3Attention/o_proj: Linear"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'Eagle3DraftModel\', \'Eagle3Attention\', \'Linear\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'self_attn\', \'o_proj\']"
+    }
+  }
+  node {
+    input: "v_self_attn.o_proj.MatMul_32"
+    input: "val_2"
+    input: "post_attention_layernorm.weight"
+    output: "v_post_attention_layernorm.RMSNormalization_34"
+    output: "val_3"
+    output: "val_4"
+    output: "val_5"
+    name: "node_SkipSimplifiedLayerNormalization_2"
+    op_type: "SkipSimplifiedLayerNormalization"
+    attribute {
+      name: "epsilon"
+      f: 1e-06
+      type: FLOAT
+    }
+    domain: "com.microsoft"
+    metadata_props {
+      key: "namespace"
+      value: ": Eagle3DraftModel/post_attention_layernorm: RMSNorm"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'Eagle3DraftModel\', \'RMSNorm\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'post_attention_layernorm\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.rewriter.rule_name"
+      value: "AddRMSNormToSkipNorm"
+    }
+  }
+  node {
+    input: "v_post_attention_layernorm.RMSNormalization_34"
+    input: "mlp.gate_proj.weight_t"
+    output: "v_mlp.gate_proj.MatMul_36"
+    name: "mlp/gate_proj/MatMul_node_36"
+    op_type: "MatMul"
+    metadata_props {
+      key: "namespace"
+      value: ": Eagle3DraftModel/mlp: MLP/gate_proj: Linear"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'Eagle3DraftModel\', \'MLP\', \'Linear\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'mlp\', \'gate_proj\']"
+    }
+  }
+  node {
+    input: "v_mlp.gate_proj.MatMul_36"
+    output: "v_mlp.Sigmoid_37"
+    name: "mlp/Sigmoid_node_37"
+    op_type: "Sigmoid"
+    metadata_props {
+      key: "namespace"
+      value: ": Eagle3DraftModel/mlp: MLP"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'Eagle3DraftModel\', \'MLP\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'mlp\']"
+    }
+  }
+  node {
+    input: "v_mlp.gate_proj.MatMul_36"
+    input: "v_mlp.Sigmoid_37"
+    output: "v_mlp.Mul_38"
+    name: "mlp/Mul_node_38"
+    op_type: "Mul"
+    metadata_props {
+      key: "namespace"
+      value: ": Eagle3DraftModel/mlp: MLP"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'Eagle3DraftModel\', \'MLP\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'mlp\']"
+    }
+  }
+  node {
+    input: "v_post_attention_layernorm.RMSNormalization_34"
+    input: "mlp.up_proj.weight_t"
+    output: "v_mlp.up_proj.MatMul_40"
+    name: "mlp/up_proj/MatMul_node_40"
+    op_type: "MatMul"
+    metadata_props {
+      key: "namespace"
+      value: ": Eagle3DraftModel/mlp: MLP/up_proj: Linear"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'Eagle3DraftModel\', \'MLP\', \'Linear\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'mlp\', \'up_proj\']"
+    }
+  }
+  node {
+    input: "v_mlp.Mul_38"
+    input: "v_mlp.up_proj.MatMul_40"
+    output: "v_mlp.Mul_41"
+    name: "mlp/Mul_node_41"
+    op_type: "Mul"
+    metadata_props {
+      key: "namespace"
+      value: ": Eagle3DraftModel/mlp: MLP"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'Eagle3DraftModel\', \'MLP\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'mlp\']"
+    }
+  }
+  node {
+    input: "v_mlp.Mul_41"
+    input: "mlp.down_proj.weight_t"
+    output: "v_mlp.down_proj.MatMul_43"
+    name: "mlp/down_proj/MatMul_node_43"
+    op_type: "MatMul"
+    metadata_props {
+      key: "namespace"
+      value: ": Eagle3DraftModel/mlp: MLP/down_proj: Linear"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'Eagle3DraftModel\', \'MLP\', \'Linear\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'mlp\', \'down_proj\']"
+    }
+  }
+  node {
+    input: "v_mlp.down_proj.MatMul_43"
+    input: "val_5"
+    output: "next_hidden"
+    name: "Add_node_44"
+    op_type: "Add"
+    metadata_props {
+      key: "namespace"
+      value: ": Eagle3DraftModel"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'Eagle3DraftModel\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\']"
+    }
+  }
+  node {
+    input: "next_hidden"
+    input: "norm.weight"
+    output: "v_norm.RMSNormalization_45"
+    name: "norm/RMSNormalization_node_45"
+    op_type: "RMSNormalization"
+    attribute {
+      name: "epsilon"
+      f: 1e-06
+      type: FLOAT
+    }
+    attribute {
+      name: "axis"
+      i: -1
+      type: INT
+    }
+    metadata_props {
+      key: "namespace"
+      value: ": Eagle3DraftModel/norm: RMSNorm"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'Eagle3DraftModel\', \'RMSNorm\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'norm\']"
+    }
+  }
+  node {
+    input: "v_norm.RMSNormalization_45"
+    input: "lm_head.weight_t"
+    output: "draft_logits"
+    name: "lm_head/MatMul_node_47"
+    op_type: "MatMul"
+    metadata_props {
+      key: "namespace"
+      value: ": Eagle3DraftModel/lm_head: Linear"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[\'Eagle3DraftModel\', \'Linear\']"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[\'\', \'lm_head\']"
+    }
+  }
+  name: "main_graph"
+  initializer {
+    dims: 16
+    data_type: 1
+    name: "input_layernorm.weight"
+    raw_data: "\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?"
+  }
+  initializer {
+    dims: 16
+    data_type: 1
+    name: "hidden_norm.weight"
+    raw_data: "\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?"
+  }
+  initializer {
+    dims: 16
+    dims: 4
+    data_type: 1
+    name: "rotary_emb.cos_cache"
+    raw_data: "\220\270-<\035\366l\273\276\001\277\273\035D\200\274ta\031=\241v\331;\322\221X<\336\373\245\274P\343a\275\367\231\277;\251y_\273\313\\\';\037\270\205;f\033\341\274\334\036\327;\013\214\313\271,\031\316\2744f7\273s\207&\274DhV\274\241!N\274;m\005\275\016\255\001\273\246\203\237\273\224\231 \274i\004U\275\001\202.<J\025\304<\245\350\354\273\023@\361<P\375\310\273\005\310\255;\204\252\n<{\305\375<\035\264\350;\365\273C<\245kP\274\205\326z;\265\236\235;\227\037-<\224\327C=\333\354D\274\331gr\273\020\202\240\273\346=\210:\333\347\350<R\203\224<\371\026a<z\003\034\271D\231&=bf\311;\363\344\255\274\217\274\332<1\336\214;f\363\014=\305*\253<\201\202\374\271u\312D\275W/\360\274\206\331%;\217\371\231<xh\257<\272K\220\274\356\274c\274"
+  }
+  initializer {
+    dims: 16
+    dims: 4
+    data_type: 1
+    name: "rotary_emb.sin_cache"
+    raw_data: "\217,Z;J\362\013\274}}\007\273\206\335\251<\255\300\240\274\267\365\202\274\013f7\275\271\003\217\274+D\216<\246\214A\273>\'\"<$\241\341<\241=A\274\200Y\263;s\371I\271\030\243\276\273\307\236\231\274\2664\016<\346\300\222;\322\241\207;\375\334\210<~\216R\275S\177)8\206\3235\274[t\'\274\246\355\250;\251\255\224\272}\243u\274Ksj\274IS\363\274d\316\232;\016\373\020<\333\356\033\274s\345*<\345\016\325;\302y.;*\020\202\273\331\375?;\211\"\3239!\272\354\272\333\3253<\355\000\201;;\225\216\274\354ip<%:\252\273N\275\301;U]\362\2724\262\313<*\213\320\274\036\334\271<\366Y\2159\006\362-\2745\327\363<\353\226\211;\251T\037=\353\\\230:\221\344\031\274\304\017\336\274\251i\303<\212\341\226\274K\316\205\273P\272@<\304eK\274\033\342\275\273"
+  }
+  initializer {
+    data_type: 7
+    name: "const_1_i64"
+    raw_data: "\000\000\000\000\000\000\000\000"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "const_1d_1"
+    raw_data: "\000\000\000\000\000\000\000\000"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "const_1d_2"
+    raw_data: "\000\000\000\000\000\000\000\000"
+  }
+  initializer {
+    data_type: 1
+    name: "const_0.0_f32"
+    raw_data: "\010H\020\275"
+  }
+  initializer {
+    data_type: 1
+    name: "const_-3.4028234663852886e+38_f32"
+    raw_data: "~}\256<"
+  }
+  initializer {
+    dims: 16
+    data_type: 1
+    name: "post_attention_layernorm.weight"
+    raw_data: "\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?"
+  }
+  initializer {
+    dims: 16
+    data_type: 1
+    name: "norm.weight"
+    raw_data: "\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?"
+  }
+  initializer {
+    dims: 48
+    dims: 16
+    data_type: 1
+    name: "fc.weight_t"
+    raw_data: "\243\010\035<CS\376;\330\224{;K\213\350\274K:\200<\327\370Y\275\202.C<\306\351\026\275toN<f\014\265\273\344,\255\274.6\317\273\233t$\274+\337\216<4H8;\307\344s\274}\214\251\273\357dA\274\177\366\001=&\222\376\272B\351\246\272\214\324\347;\213\375\275\274\262\244\320<\002}\035<\027-r\274\370\313R\275;\013\314<s\307\220\274\325\266=\275\276\334H\274\257;\225;c\264\375\274\233\221\310<\333\'8;\347\332\366\273K\252\252<^/D=\342v[<\345C\330\273\"=\216\274\270\253\317<\302\362G\275\223\332\\;FJ\023\272\241\360f\274)\023\032\275\033\235\313\273\320\006c<\222\317\235\274r\251\245\274~=\245\274e\266\227<t$\000=p\010\350;\330\222\307\273\023\326^\273\023[\224;\\5\277\274t\343\024\275\033\243\215;\316qq\274w1%\274\002\355\n=d]1\275\256\322\304<\325n\034;\222S\371\272X\265\307\273\017N\222<\367-\266<\234\317]\274\006\210\206<t\267\251<\335\221\216\274n)&=\313\312\217;S\033]<\306\3472;+D\226<\245Am\275\010\363\224<\367T2<\205\332z\273\370\253\315\273\266\211\250;g\004\014<\252/\260\274\316\360{<\240\376T\274\007A\244<\374}V\274\333\230\272\274 \212\001=kG\014<w\341-<\353=9=\002\350\013\273\251\332\016<\376L\350\274M\241\214\274\323\241\271;Wa\017\275\030t\275\274\025\177\375<\025\334\322<O\353\271<\273,\206\274\267\272\271;\313\003\311\274jK\231\274\313\345\025<\004\245\326<UP\375\273\th;\274)N\345<p\'\341<*\217\001\274\363\345\304;\027\177\"<al\036\273\236\272\345\274\260\027\"\275t\243b\274\347\025\211\274\024\004\233<\272\254\223\272\010\004\014<\302a\321\272d\221\334\273\367\212\001\2753\032p<X\222\243\274\313\344}\274\311\262\024\275\001M\262<\3000\'\275\270\325\366:\1774 \272IO\337:9*><s1\311\273n\177\321\274\034xB\274\314Hl\274\2333\252<\213d*\274\315\306J\274\t\300S<\331\020\244\274-\3020\267D\212\261<\364\352\013=\257+\356\273\211\226\372\273\200\376I;\220\371\371\273/\311\272;\336\271V\273Sa,<\220\013\217\272biO\2742DI=@\366+<\211]n\274~\251{\274\245\221B\273\357\215\215<IJ(\273rS1\274)\002C;6H)<\301\266\274<\344\030\333\273\2366C<\025\036J\274\302\230\224<a)I<\302E/\274\241\375\'=.\243\3569\024W\364;u$\320\274\345\n\364<\301\326:;\336M6\273\315\356\022<\024\3122\275\201\346j\274\260\013t\274\375\350\241<\371|\021\274f\332\336<|\353\272<A\303\200\274\016?K;\357\313\333<\365\377\314<\317\253T\273\352\307%\275\322\262s<&\262\244;\331\245\374:\211\2751\274\235\214(<\322\217\231\274\241\256I<\356\026\031=\347\327=:\\\276\305\274\3636\017\273\013\335[\274!\331;=\331\375\326:\\\344a\275\300\000\'=e\205\246\273\200F\211<\351\314\306\2749<[<|%\337\274_\025\215\274\351]\216\273|S\335;t\337R\274u>\355<\264\271:\274\335c\031:\322\2575<V\222\201\273l\253\324<\300\017<\273+\345\376;sF,<\362)\224\273\314\336\010\273\333\032\323<\252\314\\<\205U\350;y\031\257\274\304\021\241\273\3769,;\307^\216\274\0237,\273\357xD<I\366\270<\0164\227\274f\310\207\274\231\177\235\274\254z`<\3425\005\275\253\265\n=0\225\224\274\373\220 \274\374\210\010\275.\356Z<\267H\210\274`\241\037<\nk(\275t\"\006\274\362y\211\274\345\333\372<L\217\340<\\\223\261<\351\037\223\272u\261\355\273\014\222\2368\260\353\025\274+#\203\273I\024\005=L\242\207<X\363\270\272\301\027\031\275\2673^;\333\261q\2742ay\274\217*W<\224\212=<\004\030\260\274\256HB:\303\205\376<\023\223\331\274e\356e\273W\241\211\273\327\030\t\275\004v\207<\373rh=}\371K\273\3029\260\274\002\207\230<<Hl9\202\271\"<\324;\006\275!7\007\275\004\035\316\274\216\336A\274\356*\203;@6\'<\314)T\273\327\237\367;5\313\177\274fM\255<\242\\\271\273\225K\277;\216\302O<\036\243\353<\276\250\037\275\025\217\207\273b\321\221\274~\t\274<\233\213\330<wW\300\273\267\267x<\2632\341\273\211\3342\274\222Q\032<\336<\246\274O\367\017\275\017\266\001;R\204\204\272\226\205\202<\313\177\026;6\346\036\273IV\304<\371\213\265<f\033\225\273\341\231\232<I\000\007\2747\200i<\215\014\235:/A\025\274\020[\032\274t\275\007\274\213\244-\272Q\260\223\273{\230\275<)\337\363;\030d\271;T\351\277<;2\314\272\312\254\202\274]\033z;Fua\272{(\036=%4\265<;\255\225<\242\364\211\273\235\242\221<G\354\032;\375\247\253<\032\366\034\275\214\203\334\273\024\200\273;\275@\375\274\037K\026=\356\214*<\213\027=<\306x\302\2732~d=Z\307\224\274\375X\222;YE6\274p\335\260<\330[\332\274e\016\357;\231\326\236<Vb\253<O\351x;N\202\274\274\2522\341<\373J/\274\213~\317<=V\211<\016\007\315<\035\306\360\274\320\247\255<\346(\001=\010~\214\272\256`%;\336\200~\272/\345S:t#Q<I\260\356\274pR\315<}w\240<\202\035\243\273\0164}\274\'A\340<\3737\311\274\346\317\t\274k\236\013\273\212`\304\274\262Xa=\304(;;B>p\274y\230\231\274p\217P\273\230\233\331<j!\251\273uy|\2747\242#;-\333\247;2Tp<\017W(\275\311RU<\362\231\376\272\372\325\221\274\346\210\264\272Q\025\221\273j\311\365<B6\025\274\215\225\243;P\367\224<7\317\236<\374\312\340;\216\r\347<\320\265\224=\371C\003=P\307\225<\022P\235\274\346]\236:\325(\325<`\2059<\255,\267<\216\311\321:\256B\314<f\r\356;n\360P;\200\"r<\3573/\274\315<\"\273\316\371\020\275\352\037\305\274x\247\374\273\372\301\002=\2143v<1\272\014\275\004\315f\274d\312\211\274\010\215\200\274\227\304&<\030F!\273\205\017\020\275j\304\325\274\206\215\034<t\236\277<\215V><\363DT\274xWR;`Li<\006\177N\273nA.=j14<\267\275c\274\273\371\376;\323\334\024=`S`<\013CD;\302\305\223<6\314.\274\220\355 <P4s<rs\036<i\003S\274\320\220\332<\033\000\227\274\231\227\005\274\313\344\340;\256\223\300<\301\255\345\274\363\024K=\222)\312\273\273)z;Q\240\232\272\276x\030\275fZ\022<]\266j\274jAP=9\204\211\273\333+\000\273*\217\347\274p[M;\r\224\t\274\247\224)\274b\033\220\274\3340\317\274\307\327~<;\261\374\273S\325\004\274\341_\221;\250\301\000=\227n\265\273\357\212w<\341\251\216<\204\007\260;\033v\357\273\361\225\032\274\245 1\273\017\211\220\274q{\202<\353/\276<\233\210Z<\212H\023=\263\232\261<\220A\177<\230X\215<\351V8\273J\272Q\273\007\016m<\024\245\\<~u\343\273=\234w=\227e3\274\001\245s:\rp5\275ST\335\274\342\303\242;J)q:\376h]\274\256o\375<\rC\222\272\212E}\274\017X\261\274D\237\337<\254R\035<\213\200\204\273\217~5\273\301\"\'<\315\n\265\273\003h\227\274B)\236;\0161F\274o\340\313<\362F\277\274\211}\261;oO\r<RM\036=W\351\232\274\013L\205\273\216\344\'\275=}\222<\231\306\261;I\266T<\222\247\002<>\207;<02\332<R\036\363<gk\310\274\375\351 \274\331\010\010=\216\361\006\275\022\220G\274\345\353\201;\"\270;\274\267>\337;\'\233\014\275p\340S<\260\366\325:r\252&\273\016o9\273\216*X;:\030\207\272\036\274\321\274\271\003\270<\244\371\242\273\013\365\001\274e\312N\274\324\321\010\274\023\177\2738\347\\\037:\262\020\202;8V\226<\300\354\361\273\376^\311<\331OF<^\365\203<\367P\221\2744\321\367<S\322`<\')\265\274\225\331\035\272\243\245\373<,:\367<\323\302R\274\265\032\271\274\234\245\332\274\004\376\302\273\223\233\246<b$\335\273V\261\025\2734\204R\275_\222\220:\212\321\261\274\227~\n;\227+\001\275\262L\224;\344\220\312\274+o\177<\371\2341\274]\026\263<\330W\321\273G\3625:\260-\373\274[x\375\273|\254\026<A5\017\275\242\375}\274\236!^;\322\346B;]\263};[\010\240\273\227\222\262\274\203d\213<\370\256\204\274sm^<X\0348<\207\020\305\273CY\022\275\333\253\250\273\306\240\032=\031\270\325\273\r\301\242<\367Y<\2740\307\364\272+\215z\274\370^\253;\204UI\274\217%)\275\263\362a\273\222\320\224\274\213x\332\274D\202\004\274\374\245\033<&\307\266\274U\'\356;\353\315f<\353q\023;\320\005\t\273\264`*<\346\210.:\373e\344;\274)\376\274\342kL<\342\311\301;W\310\241<\320i\375\273\230\375)\274\245A+\274]9\302\274\022{\202<\333\216M;\331;\261</4\215<n\270!\273R+\274;*\223.\274\324\343\227<\311\265\201\274\324\307\270\274\207I\232\274\307\0054\274\000O\316\272\002\354 =\036\247\314;\356\251\360<\014\366\334<\336\304\367\273\322\311\330\273\355,\211<\037\'\007=\224\365\250;\024\225\010\273\002\357\327\273\255E\016\2747l\323\274\234\312N;\005\357#\270\007\356?<\237P\023\274o\254\360<PU\241\274\270\034w;\003+\363\274\327\345L\274\005\337Z\274\322)\227<A\003U\275\027\024e\274\376\036p\2744I\206\274\231\310*\274\373\310\334\274\375\253\304<\260\222\016\275F2\225<+\r\355<E\224\253<\206\013\312\274?\204\023\275W\341\002\275\336\302*<^\356\316\2749O\203<\222\364\033\275\330\207\207\274\215x\255<\335\215\332<\207\237\224\274[\024\025=\022\370\234\274s\230\000=lK\\\274Id\323<\327oU\273\313\206\343<}\361;\274\263\000\304<9<\002;\020&-<K\027L\273\002\351\305\272F:\000=\312\327\237\274\227\266\211<s7\036\274I{\t<\030\024\245\2742E\352;\000\361\035=\217j\322\274K\360k\274\216R\260<\005Es\274T\302\235\274\312\206;<u\357^<[\2002\275UPc=W \237\274\334\r\'<\\\3065=#|\235\274\364\332\026\274%\263\344<+*\366\273\370\002\025=\302\330\320<OgL<\246\331\214;\275NR<\270\342\310\274\370\246\306\274\214\302d\274\365w\311<@\241e<ei\360<\023\022\231\274\242\363I\273E^\037\273P\371\325<\222\256\036=0P\220\272\020\370\257<[\277\257\273b\221\262\273\204\\\273\274K\240\230\274\202\264\231\274"
+  }
+  initializer {
+    dims: 32
+    dims: 16
+    data_type: 1
+    name: "self_attn.q_proj.weight_t"
+    raw_data: "9H\027;\206\201\215<Zj\230\274U\0226\273f6\234\273\216\032`\274m\254E<M\236\251<\305\000\\\274\013,\036;T\201\260\274T\331\371;\271\216\361<\307\003\230\274\305\317\365\273\342\357\225\273d\tJ\2744\223\234\274JQ\214\274\35673=0\tM:\022\242)\273\206.\025<\364\316\275;fa\036\273\201\207\316\274\305\032P<\241cp;\354\311\205;\242>d\275\017\307\265\274\265\312F\270B\000\246\274\002W\225<\202\313\306<\233\200\217\274\".\033\2754y\023\275\377\001\002=nVl\274\222\010\267<\376+\323\274\253\222+;\265\334\225<\257m`\274\251\207\300;\227i\307;\014\240\027\274s\376\345\273n\212<\274\363\241\350;f\342\341\273`j\302\273s]!\274eH\200\272,\250\225\274\303\260\017=\202\211\037;\017\276\260\274>S(\274\362\211\361\274b\246\346\273\324\277\261\274\226?\024\273r\023\013=\234J3<\317\307\035=)\365p\275\233\235==\264\177\230\274\320\315\201;\tW\337<\300\241\326\2747\007\275:\030N\241\272\213\363\372<SV\241:D\323T=4 |<\036\207\263\274FmZ\270\351\212\330<\245\210\224\274u.D\275nL\262\273\237\326\006\2745\234|\274\tps<\263\225S<\213\\\357<\024y\373<\025JI\273\345d\245<5\227W<\247\031H\273\313\037A:\277:\204<f\211\351;\365\345\325<\367\342\207\273\352\023\321<e\215l<\267d\317<\272\251\007=\276\352\325\273\324\230\311\273\214\nV\274\'\315\030\274n\310:\273N\314\261\274g!\237\273\346\366\344\274\302}\017<+M\211<\014^\240\274\323a(=\342\014z\274h3\225\274\240C^<\210\350\223\272N%\266\274l\275\000;0\253L<\200d\225<|F\254;\245\206}\274\256\250\242:\201Zg\274\026\250&\273\207d\341<\323\301\340\274|D.<\351&O\273\313&+\274\356\314\230\274j\253j\271\n\0340<J8[\274\301\357]\274\353\357k9\276$A<\200\010y\274Xs\341\274\036\340Q;\245Q-\275#\027\t=\231\237\303\274g\275\313<\265\346M\274\333)\214\273\031A\320<\216~\331<0\240\323:F\222k\274\273\031o\274\305pc\274\024\336C<\014\331\332\274\331\247\247\274\241\245\265\273\206\345\201;\365Y\032=c\013\362<\371\310\314\272\356\002\236\272\237?\001\274\030=\022\274T,6<:\r\006<Y\273\356:\'\360I\274KT\313<\030\220Q<\034~\313;\016\232\242<A+\010\275;AR\274km\222\2732\265\214<\311\361\024<j\327\264<\251\0235:t\016:\275\276Y\265<D\202\305;\301W(;\345\r,\274@\234\224\274.\027\352<L\357\366;\314\350\335;4&\330<\013*\343;\313\203\367\274\346\006><\347\035\003\273\326H\261<A\215j\274\341\277\326<+n\r\273\357_\362<\360\302\373<s{/<\336=\266\272\267\3722\272\362\322\010\272\224]\360\273p\342\001\275\262\214\214\273\214/\334;K\362\245\274\256n\237;K%\005<0`\032=\271\241D\274\276\0257\274\357\325E\274\035\375\236;\270\"\266\273\320\264\363<\224\335\230\273\023\250\206<\r~\232\274\026_%=\351b\177\274_\027\026;bS\256;\331\227\030\274\274\2521\275U\\\213\274j\026-\274\335*\226\274\346\343\345<\266\321\217;L<\346\274l\013\316\272\234\314K<\t\246\300;\251\221\215\273\333\335\010\274\356\203\247:t\267Y<R\357L<\311\245n\274I\014\215<\020\221Z<\000\'K\273+\002\236\274 ?&<$5\013\274\013\332\307<\017\\\317\273\2762\275;\362\025o<m(1\274bG\227<\026K\214<.\353\213\274\2512\342\274-s\204<\251\373\003;\353\037\233\272\221R\036<\273\372\214;J6\343\274\273\327\245<\345Jf\274\331\352\202<\236l\223\273\2755/\274./&\273g\253\360;\014\025a\274x\377\344\274\031\276\026\275l\246|<\316Uw<iR\035<\001\340\316<\207\373\223;\025\032b\273\215\037\261\274\346L\236<2\312\210<c\207\371\272\207\336\221<\333O\261;\374\363\344:\362}p;\300\376\222<F\264\212\274\313\275\021\2749\312i<\215\333\002;\014\321i\274|\242\337\2735d\330\272\271\020\214\274\217\001\213<\244\373\007\275\002\256 <T%\332\273\322\376\026<^\304R\274G\325\030\274+\036\326\273R\245F\274\324\212\007=\326\000\252<I\006\223\274U\242=;\233\232\342;\336g\375;\270\264j8\360\243\365\274x\032\355\274T\2655\274\255\304G\274b\251\337\274I\357I</c\352\274\374\001*<\335\315\n=Rt\376<\265)o<\224\270\013\274\325\340\264\274\342\241\260\273\017P\355<\311\346\031<[0\033<f]\303<^\202)<\336\2356\273\324\002\332:\004\224\271\273\346\376\030<\246\362+\274\336\334\207<\312\2443<\346\205\032\273g\025J=\230\034k;Dx\334<\260o\322\274\275B\256\2740\315F\273\226l\254\274/w\277<\311\216\337<\374\016\333\273\2756\237\273`\312\005\274S\000\261;/$\244\273\367\3346=^a\226\273k\017\\;a\251\310;\240<G<.\014+<kQ\307<\007v\237<y\240\217<E\335\t\275\355\223\231\274\344j \274}h\337<\006s\335;@,\177;9\2251;x\325\233<\351\355\313\273\020\272\216<3 \254<\035\013\002\275\275\373\272\274\2758r\274/b\303\273\315\211-\273@\312f<PF=<\223\2546<\277)\2029\315\267\313;\246H\030<3\037z\274\252\360]<K\'\004\272TLG\273w\257\207;#\320y\274\227`\317\273\247\335\274<\372b\236<\037\325\202\273\337\234\205<0\030\362;\371\312A;x\377R:\253?\200\272\360\363\310<\003\214\002=\2472\305<\231f\214<\033k\323<{\023\014\275W\354\303\274o\241\323\274\2338(\275O\027\277;\004\301\271\274\t\213\203\274\231o\377<\267\016[\274\323^\240<\3008\235\273\273\016\205<\276\033\375\273\351\0012\274KWh<\354\271\201\274\006I\303\274\002\252\001\274\213\t\252<\370\275\027<R\363\331\273\346\301\214\274\357\013\260<\2605\205\274\006i;=\300,*<\216\343\364;Kt\353;2ZW\274)\t\256;@(\356<\256\010^;V\361\r=3G\342<\273\302\014\274*\027X<>\237}<\253\3632<\031X>\274\313\346\217<2\370\250\274F\314\214;\022_\210<b\275\256\274\311\272\253:)\2166=\255\264\274<\331\330\014=\'\324\271</$\024\273\224\241\003\275\206{Z\275\327\220O\274\203%\007\275u\2708<B\rQ;\023\266\270\274Ox\310\274BF\305:\344\021\343<\240\035\204\2743u\235\273\017\036H=xj\300\274\373\335t<\355+\004;\243\363\353<\025\220\377\274\271\307u\273u\3442\272\370\335\023<n^_\274\022a\257\274\034\307.\275\323\300:<\255X\235;d/\273\274\256\366#:$hC;\303\020\234<J\304\024\274\201\363\302;JIJ=\224\271\303<&\227r\274\356p\002<\365\034F\275\2645\345\274<\214~<\252\205:<\317!%\274 p|\273{\351\351\274\207w\332\272R\216\247\274`,c\274Mj\242;R\262\233\274\235P\253<b\231\\;\031`\252\274\327\243\277<\307\251\235\274n\307>=\354\277\026;\365\305\370\273"
+  }
+  initializer {
+    dims: 32
+    dims: 8
+    data_type: 1
+    name: "self_attn.k_proj.weight_t"
+    raw_data: "\262$\3179g\242Z<=\362\204\274\223\321\362;\351m\337<\253\241\267;\303R\3638\313\000U\274T\227\025<8n\315\274\337\376\221\271\262\211\371\273\371\206\200\274d\0077=\255@\021<\257x\221<T\203\352\274\023\226Q<Y\231\300\274\305\232\252<\363\230\001=\035#\313\272\216T\030\274]\032X\274|\3039\274J+#;\t\3025\272W\3434\275\216/8<<\"E\273\357\250@\273\250\013\020\275e]\202\274,\344\331\274\3004\315<\340:)<\220\355\225\273\365iu\274\30074\273\362Q/<\371\233\337\274E\363\232:]By\274\253\317\237<\207@\200\273\206\0319;\227\231\007\274\334\311E\274X\233\243\274\202\\\223\271A\245q\273 < \275\357q\211<\3534@\273\347\343n\2749b\242\274\216\037\262\274\377|\t=4\034\326<Hb\002=\260n\325\273\273\235\271\270d\345\006<\255\262\210\274\0300X\273\234\014:=K\372;\274eA~<=\026\227\274+\253\037\274\347;\252\273\024\226\226\273C\020\356;=6\275<\\\237\200<>\276\352\274\320B3:NE_\274\241\031\270\274X\2411\273O.\375\273\233\216\306\274\346\023\037\273\244\362-\274\221\\\034\275\375q\214\274nWo\274\233\021\032\275\007\207T;d\177\310;\207D\244\273V\333 =\276\262M<\'z\216<`#\364\274\240\363\326\274\004\375L\274\353H\377;X\267\261\272\357\364\211<\024\263\335\272\365BD<\235=\333<\\\0338<\241\037\300\274i\353\256\272A\347d\274\377U\204;\251\355\261\274I/\235\274\254\306\022<\3009\267\273\020\005W<\337d\020=\231U\274\274\304\362\000\275\346#\233:\242+\010;F9\003\274)\360d<\207\372\223;\245\337\210<\230\305};\222\213\202<\014\255l<\374t\206<\334\331\247\274{\033\007<0]\353;\204{\005\274\201\213\362;\227\315\264\272\235\337$\274}Fb\274\220\252\262<\036C\027<}<<\274\000\022\245<\241\017\331:\007\250\206<\336\222\237\271\336\343\304\273k0c<y\2050<l\203p\274\335\316A<\375\200\271\273X\032\352\274\006y\202\273\365\224\"\275jg\222<>O\343\273\235H\212<Y\225s<Q\305\241\274w\001\244\273\021\252\227;C\001\207<\2566*<\"h\242\2744\252\307<\' \302<\371p\353;\235\304\330;kY\306<\007#\261\274F\333\003<\315\214\204\273\354\350\004<K\300\031\273[\337\221<\"2\037=`\234\251\274\213\361\220<\025?\000\275{X\262\274\341\272\341\274\244\335\205<2\244\r\273W\352\375\274h>#=\346\300\032<\216\355\000\273{5\302\273\231\332\230<\360RU\273\342\036F\274\244\214?:{\261\264\274\376[$\273\271\025\246<\262\227\222\274\202\376\037\275l\363\213\274\316\373\334\274\226A <\347\211\270:\023 \273\272G\332\026\274[ =\274[)q<`L\307<\376\265\304\274%9\246\274\300\267\016=\204\004L\274&\'O<\373\001\365\273\2007\307;\233_\344\273ms\267\274\357\356\277\274@W9<{|/=\022\346\n\275G3\2649\263\217\337\274\"\222\200\274\355\315\007\275\3045T\274\355\262\025<\374\005\265:S{\254<y3w\274\212\341\'8\307\0020<\346\r\372<^#\365<\201\276z<]o\337;\215\035\232\273+G\201<\341\357\330\273\013\2732=\304\231\276<S}\177<R~\237;Ne\340\272F\360\366<4L/<\007\010L\274\252\262\216\274a\274\257\274{\037\033\2755l\010\272\217\271\025\274\311Y\252\272[t\233\274 w\034=l\267\331\273\"\226#=\331\244\371;\315[*:\260_\272\274\016I_;\200ZQ\273"
+  }
+  initializer {
+    dims: 32
+    dims: 8
+    data_type: 1
+    name: "self_attn.v_proj.weight_t"
+    raw_data: "7v<\274RM\324\274\003\372v\274#@\241<AKX<\202\r\337\271\247\272\013=6\231\206\2749\304\031\274\205\t\245\273<\203\025<\240\367\003;p\325\265\273R\312\206\274\217\260,\274\036\366\335<w\317(;D\215G\273>\224\352;\374B9<\331\253Z\274\231&\371\274\302\374\262\273\316\250<=\322\312\240\274a{4\274\222\276\013\275\016\201\236\273\370.\312\274\245].\274w\373\370\2744\021\200\274\251r\t\275\306\r*\273\230Jn\274`\223\244</\251\201;&\222\244\273,\352\026<W\324\226\272[\235\017<PnG\274\230\341!<tq\220<\031\333\217<w\215h\273+T\302\274\202\243\203<\211\320\314<b\001\001;\274;\247\274\000\227\210<\300\274X<\256C7<B\277\003\273\020\342f<d\343\255<\362X\367\274\236\355\354:XH\317<\344\033\224<\371\341^\2747\030\007\274\363\253K\273\221Z\t;\273C\323\274\000&\370;\244B>\274\"\010\3409\246\317\252\274-\377\034=s\236\033<\231\036\001<7\220\201\274~A\334\274u\211\233\274sb\336\274\215\354%\274\363\340\341;K\r\216\274R\237W<\367e\336</\023\213\274\222\031y<!z\'=\177\240\214<\026(\237\2744\236Y<\334K\207\274y8\205;\340$\246\274F&\216<\001t\315<\3670\226<K\317\2228\022\005\034<\272\325\032=\230\371\031\274;A6\274\352\242\265\274N\336/<cJq\2734\304[<\375\243\306;\242\276a\274\313\3202\274\370z\233\274\204@7\275\317\277I\274\342%\331\273\375\026W<\001\263O\274\024Y?=\373\177\230<\352(\277\274{lD\274i\334a\274\270\222\273<\3655\276<AXR;\004\031\236<\253\315\316<\227\217\005=s\333\346\270#H\232<j\366S\273f\317\253\274\201\340\371<~\202M\274;~];\370\010;<\335\274\205\274\2444$\273\234\235\322\274\304\255\325\273\203\275\366;\033\222 \274\302\010z\274\000\333[\274V\352\t\271rc;<\367\353\303:s6\031=\200h\225;\033\202\016\274W?\367<\376\301U\274\332\010\234<i_\336<)\372\207<\322\261\347\273\246Y\256<\000w2<\026\232\225<\264\326U\273\033\262f;y\0058<%\335\035\275\211\335\216<F\357\347<\342\007\'<\311\216\037==\312\017=dC8\274r%}<\265EP;Ko\244\2732O\001\275&\312\243<\251\035\315;\256/\360\274I6~<\226\036\230\274\003\202\000=\'\332\240<ok\247\274\234|\247\2741/\014=\235\2517<\235\345h\274|\027\220\274\340y\371\272N`\200\274\367o\361<K\025\370\274\024j\366<;I\307<\207l\360<\013\277\207<\r\242\314<\213\203\313<\366*\245<\026\334\017\275\001,\222\274\005\217\332<Uo\341<\353\265\"<\324\310\237\274\370\001=\275\224\034\017=\204\006<:\030\252\314\273=\230\022\275N\007\t\275\225I\024\274\2769\325\274\365\240;\274Q\213\243<{Sy:Y~=<\006O\366\274\356q\316<\366<\002\271\253\201\032\275\235\'\000=TR\371;\377\373\024\273\317\273\316<t\314\242<\372y\205<7so<t\022\233\274\253\353\036;N&\317\274E&\356\272\304;\256;\370\375\276;\244\021M<\300Z\371;S\232t\274\317^F\274{*\333<\354J\233\2737c\275;\320\177\\<E?p\2748\377\322<\006\205x\274\036\307#\275\345\352\344;N\357\352\272\311k.=\206\337M\274Sde\272\310\307\231:4\3347<7\230\357\273\024\200\226<L\345\216<\232D\026\273U\210h\2747zi\274\022r\215\274\203\223\236:g\311m<9aw\274"
+  }
+  initializer {
+    dims: 16
+    dims: 16
+    data_type: 1
+    name: "self_attn.o_proj.weight_t"
+    raw_data: "\224\211F\274p;\005\275\224\340\300\273 A\021\274\252\241-\275\253\347\357\274t:\002=K\324\334\274m\324\031\274\216\006\220;\276]u\274\305\242\370\274{0\027\274\324q\311\272A4\244<\355\037#\273P:\031<Wn\037;\303\240#\2735\371\3109\017\232\361<=\313\246<E\365\250<\304\327\202<5\345\370<\330\r\203<\255\350\236\274\204\335Y\274\274x\360\274ZJ\016=\020.e\274{\230\326\273.\013\240<)pq\273\244Sf=\344/\025\274%U\350\272\247\333\"\272\n|\231;9\276\364;.\204\035;\213\237\317\273\220\345\225;n\300[:\254}Y\273b\277\312\273\362\030]\274\353\315\217\272\0353T\2746\333\217\273w\356\263<\"\366g<\207\270Q:a\363E=\207\001\227;\247\241\352\271\277o\200\274j\270\335<\254\326r\274Bp-\274\266\327\034=\2175\306\274\317u\276\273\265\021\361<\227R\337<\027\354\"\274\204\007\003<\362\224A\274w\202\232<\031Q\320;\375\332r;U\336c\272\n]\366<F+\337;\2011\003=\303\301h8\267[\306;\370\353\342<\206\336\253\273\255\341\267<q\365\233;\245K;\275$-/\274\263\347\336\274\273\214w;3\377/\274\251\337(<\356\376\273\274\016`\037\274J\304\025<i\320\002\275\225\367 =\016\032\230:\330\234\330<\027\214j<\257\241\341\274wJ\032<\210\303\213\274\004\203L\274\2348/:\375\261#;\2050\026<\334\265\200\273\357\316;\275\370\312&\275P4$\274/\277\016\274P\003p\274w\340\230<\240\016/\274\331\264\030\274\002\341\030<\225(O\273\326\271\036\274{\034\036\274\345\314\341\273&J\233<L\342\342\274\363\341\273<W\016\3279\033\250\020\275=\227A\273\335\022\267;,C]\274EJ\353\274\024\201I\274{+\221\272\227\374\324\274\271\204E\273AB\236\273\322T);p\270\010\274\245Y\270\273\3053\272<\233\310\302\274*\273\035\274lTQ\274>\260H<\304\230\312\274\002\324V<;;\203\273\222\222\025\275\304\335\342\2740\370\256;\031\024\254<}\016v<\226\016\246\274\023i\202=\375>,=n\037\001=2\217]\274\371;O<\334\342_<\022\244\010\272\222c\255\274]\375\210\273\334\323\270\273\331e\361;\035\023\200\274\216\273;\275-\367\022<G\233\224\272\312\264\020<\363\211\250<|\234\335\274\353\345\'\274\356]\222<x\204\220\274\256\017V\275\034L\252\274\022|l\274\221a\t<T\2638:\271\252\203<\373|\000=T\237\233\274\000\300\220;\226\335\221<\327;Q\274\0146\356\274\020\231\307\274\274K\353\273 \247\221:i\315q\274\024}\031=\357\'\357\272O\313\021\275Pj\320<4S\030\275\"\227\232<\367\351\374<i\000\026\272{\325\241<I\262\227\274GE\365\273;\221#\274Ghq\274\333.\324<\217]\306;\020\301g:\014\272\240\272\305\335\361\274\307\324\337;\376\013o<\373e\225\2742\267\351<\367,.\274\005\313\003=\030\356\253<\260\266m\274\252?\222\274\340g\264;\225\256\346\274{\371\037\274\2309\325\274\333vd\273wUV\273\236!\267;\345v\216\274\300a#<RdQ\275\333\371\353;\327`\263;\276\322\271\272\003\254{\274Q\030\227\274\007\201\037<\305J\341<\'\302\001\275U\242\344<G|D<\274\2649\274\313W <\223\331\014=\251\342A<\001*[<\024\024\341;\306\354z<[\245\004;\321\321\235\272\320l\202<\031\310\001\273\322\312\300:\304Y\243\274\302\347\202\274\036,\007\274`S\335\274sTZ<\177A\232;\366Z\006=\276\247\031\273yl#=\227\0359<\230\227\006=\026\330\217\273u\334\031<"
+  }
+  initializer {
+    dims: 16
+    dims: 32
+    data_type: 1
+    name: "mlp.gate_proj.weight_t"
+    raw_data: "\033\250z<\'`\275\272\235\3728\273g\202\250;\224&\265\274\312\367\002=F\243\206\274\222h\014<M\210\024<\277Z\035;,\266\216<\375\342$=\241\313\367<\246\315\213;\004\213a<XR5=\364v\032\274$\245\010\275\022\014|\274x7?<b\034\325\274\334`\245\274\227\336\311<\266w&\275\355\205\233\274\030\023\323;\264\276\342\274\014\367v\273\034a3\275^\325\033=\2003\345\274\320\020\271<9!\210;\364C3\274Kl\032\275D\212\227<\374\036\027=\322\031\r\275^\377i<\342\307<\273\215\353\022\275i#\252<\213\306<<\227\304R=\036\263\226<y\006\3559\253\036\21194\365;<\363\310\017<D\037\317\273&4\020\274\327JH<5\017v<\203\356\204\273\3026\032\274Tv\356\274\"*\037\274^\201\254\274orA;\340N\235<\333\323\032:e(\204\271r\007\375\273\345\2039\274\252\232\277<B\023\206<b\034\266\274N\350\240\272~\022\370<\260@|<R\314\272\274p}\221<\337y\211;\022`\310\274{\'\313\273\306\343\002<\207\340\302;\334a\264\272\376T\320;\206\263\213\274\220\365\003=\013\025\235\274\253\3472<k\341\016<\375\314\030\274I\331\000\275Dd\210\274}\247\236\274\277\000\023=\217Q\251<\311\233\346<\036)L\273\3175\344\274\205\017?\274\362o\263;\006\257[<\341\333,<r\272\200<\225k\022<\306\276\023\274\334g.\274X\226\316\274\207#\354\272\014R\235\273\253JM\274@\265s\274\257\031\332\274.\240\t\275\231\261\242<\201]\000\274T\266\237\274B\013\031<\352e5=\036P\037\275K\027\272\274\357\372\013=\233\334\321<\266S\216; z\267<\312\263-\2747\256(<;Dv\272e!\005\273\013f\313\273\306\354\241\274\301\036\3549\005Y\245\272\360\222a<\240\247\364\273\222\374\257\273\241\274\240<K\\U;\376W\331\274\341\002\340;\353\251\031\275yH.\274O\031k\273\t\204\314\274\205\032\254\274\024\302\332<!\024\226\274\024\220\370;N\347\345\274\3166\2169\014;a\275\331\370\337;\316~9\273\017\002\202<\033\245V:a\323\023\274,\360W\274\241\366,<\360\263\020<\364\233\211=\252\324\220<\367\260\002\275\205d\"<t\222\356:75\224\274\200\314\236\274\005\341\273<\260\025\255\273\n\315\244\274\340&.\273\r\365\242<\223\0067\274\212\232\225\274X2\273<3\032\356<\336\273\330\273\267}\003\274\"\340l<\360\014k\274\200\0133\275\020\347\343<\302\343\363\274\376\312|\274\333:\022\274\375\312Z\274)_\315;l\001\225\273\206\022\r=\030h\345<{U\314<\376w\341;-B\024\274\275$\321\271.\363\256\273=\351B\274\016\325\210;D\260\230<-h\230\274 \261\301<\006\216\307\273Q\302\001=V\357,\275\330]\255\274\364N\275\274\257\214<<\3225\341<\344\345a<\341\266\336\274\254\303\203\275G9\264\274\275\226\267<\346\341\013\273E[\202\274\253\021u<;\323a\271\376\027\250\274u\346\364:7\202\003\275\230\031j\274\006j\'\274a\265\230<\220\332\253\274U~\231:V\013\200\2744\306\237;\034 \235<\035\231;;\202\272\342;\014\365\364\273\034\221q<\324\325\"=\035\301s<4a\240<t\346\227\274\2752;\273W\035\240;9\227-<\031}\322;\006h\017=\241\313\220\274\216}\200<I\201\237\273F.\207<A9\313\273\263W\'=g1\206\274\302\3729<\254\223 \274\005\017\207;rW\"<\270{a<\017K\2268\036\312\264<t(]\275\321V\214\274\247\253]\275f\353,\272e\021\200\273,g\364\274\364}\264\274\212\006z;\022\350[<a\032\261\273m\357\001\274\274d\257<\370,\303;\306R\261\274Oz\367<X{$=\352\231\214\272\367\224\233;GQr\274\335\266_\273}\037\3309\n\276W<\317O:\273\370\016\276\273rfy<\031\325\210<t\006\202\272\234\r\272\274\"i\005=\344\260\250\273\241dY<GD\203<{\311=:\317N.<\301\270\247<\201\221%=\364\037\221\274\366\303\r<\030ma\275gC7\274\0307\231\274\272\224\014\2749O\301:\264\356\314<\340\242\305\2732\243\255\273\346\242\217<\031\364\345\274\"\264\377\272~k\023\274\004\007\016<\325\273m\273o\301\222\274\341$\233\273]\251\207<y\375<;\346\256\314\274\345\0344:^Kv\274OL\315\274o\021D\274\023$\325\274\204\177#<\213O\354\274\364\317q\273\307\352\225\273\317jD\274;\037\024\274\272K\220\274\366\360\026\273\0337\177;\371\207\213;\344\347\216;\371\214E<\342\001\330\273D\234\275<y\367R\273\t\334n<\023:\210<\267w\004\274\342\t\326\273\036\307\326<\356\245\215\275@\022\013\275FlK\274\035\347R<\240\311\325:\304\241f<\016\240\375<+\354\314<\242h0=U]\344;\245Ry\273Y\231j\274V\236\245<\233\201G\274M\007&<$\375\271\274\334\246e9_\371\021\274T\265\013\274\353\0226\273I\260\251<W\013Y\275\200\343\206\274\242:2<\363\010\271<\373{\341\274\031n\255:\\qx\274\002\010B\274!\217\333;\322\244\301:\251\344\010<>\220\305<\265\356\331\273\373\010\214<\276\261\276\273\327\023\314\274u\224\314\273K\262\016\275\205\034\253<\205\033\000\275B\265\000=\327\234\013\274*x\233\274 6`\274\262\365i<}\003\241<\035\372\304;\006\311\237<\352\256\353\274\271&$\274\345\277\345\273\273ZI\274\353\355F\274\340\17739\007T\001<p]\374\273\035\2621<\363\347\340<\341\026}<\267m\216\274\3245~;\355\307\215<\322[n\273`\267D\274\372r\005<u\236t;\302>\331<.\211\237<\336\037\257;\032\370\202\274\344\002\010=\375%\026\273iD@\274\316\333\336\273X\315\354\274\204\212\030\274\262\2063<\231\304\367\274\306\023\373;\2203\021\274\345/\367\274\305\327\335\273\013\345\314\273\322\177 \274\215Y\245\274\231\205\030<\316\021\265<~\222\210<(\373\024\275>\001?\275$\221\321\274\001\010\203\274\320p\350\273\024X\253<\276j\030;L\360z\274\010+\021\275I\266\036<\202\341=;p\3304=K\365*\274\"4\363\271 \327\227<\337.\006\273\005\252O\275\370\002\277<\000\002\240<\324\001\233<y|\230\274\030\243\337<\022\312\031\274V\314\'=X\361\227\274`P\001<\222\342\037<\326\335\237;)\221\305\272J\352|\2745\377G=\2654\326<\325E4<\'\343o\274.\355#\275\330L\324\274\177M\016\275Xw\031<ot\356;\371\353\354<\245J`\274K\211\014\274\320\221P\273\311~\203\274\034v\356\2736\255,<KH\315;\303\206\027<\273\007>;\322Y\246;~\316\343\273.\201\307\274\006\222\034<\313{\002<\016\306H=\330\020\315\273\300\374\243\273B\336)\275\00149\275O\217V\274+\232B\274\2228\236<\252{\365\273\036G\307\273\210*\217\274\335N=<\340\372\371;J\365\244<\030\204\360\274\202\333\357<\352\374\266\274\217D\316\273\r\2078<\035n.;\220\371\036\275.\352\267<d\305Q\2753\030O=\3530}\274\355\340\241<r\022\225<\033\243:\274\014\365\336\274\275\315\271\273;<\355;\352_\265<M\244\214<\213l\351\274))\023<\353\242d\274\354\347\325<\215\3633=t^\275\274\230\345\271<"
+  }
+  initializer {
+    dims: 16
+    dims: 32
+    data_type: 1
+    name: "mlp.up_proj.weight_t"
+    raw_data: "`\264\277\274\241nL\275fx\357;\\\"8\275Sx\220\274\345\376\014=G\246\234\274\355l6\273_`\227\272\266L\n<\2402\n\274M{\t=f\0055<\314\035P\274\000\3356\2733\373a\274\235\374\205\274A\222Z<u\3205=\001-\245:\275\216\250:\331\315\374\274s\270C\274\341\330\232<\212\226M\274\313\025F<G`6;\234\027\003\275\240\002\262\273k\314\367;\260\n\010\272V0\032:\0232\316<8O\306<\'\367\371;\231o\203;\'\237I\273N\020>\2741\274\032\273i\3203=\240\247\334\272\333\222\003\274[p\211\273K\323\236\274i\331\372:k\361\321\274\301\262E\273\246W\275\273\275\377\222<\020Th\274f`\260;\025\235K<\233\344k<9\'\004\275\216;.<\316\007\305<ab\361<u_8\274\3157(=\2255}\2744\377*\274\373\216j<\002\366\206<Z\270\236\274\204\276)\275\3066)\267)H\343\273\236\026A\273\213\345C\275.\244\253<\t$\370\274\370n\262\273\320\222\314<\'\304s\272\223\324:\275\241w\360<y\305\031<\3335\273\274\376Q\241\274\317\010[<\234\311\374<Pf\353\274;[?=\212\341\321;R\267\302<\251\264\366\274\020\266b\273@*\217\273\304l\274;\3627\261\274H\242\030<\266l\003\274\271\244\331\274-\025\305;\274\2279<\345?K<\206_\354<\270J(=o\351T\274f\220\276<!s\221\273\330\245A=o\266\217\274?\034\227<\314Sk\274\034?A<\365\314\373\273u\344\240\274\347\334\214;\304\212\211;\327\'\320\273B\330\315\273\327:\036=\204\tJ\274\304\306\332\274\315\225\304\274\233\233]\274\356\244<\275N\001\232\274\336H\314<[|\371<\327]2\274\242\265\305<\031\246/;\014\026\210\274\302P\027\274\320\003\341<?\274\n\274\262\363.<\2716);\327\324\235\273\305V,<\t\226\304\273\260O\357\274\r\235\310<\271\036\325\273\336\014\367;\246A\033<U\242\234\274A\234y<\242\347\013<\273\0074\274\366`\205<\333\334\n\275RnB<\245\313\325<\376\237\335\271\240!\207\274\333\363C\274+\355\343\274r\233`<4\223\335\274\207\260\221\272\030Y$\275xBQ\274o\335\021=\252\253\n<\234\312>;\376\226<\273\241\256\216\274bs\273;\230\010\305<\213\370&<\227\301\326;\262\031\370\274G\354\274<\004\005Y\274\2468\275\274\371\261\312<\033_\020\273\266\322\007\275\267\261\025<)\027\234;\320k\204\274\375\355f=x\312{<26)\274txm\274\260\006Q< \251:;\256\310Q<\263\0243\274\334\355\307\274\020q\016=\364\203\017\275\363\335\202\274\t9k;1w\227;\271\036\036\274\\\026\017\275T\014\034\275\026%\017\274\211\0210\271\020\'\361<\212\016\360\272\317\375\';\211\256L=P\370\216\272$D\271<M\"<\273\253\307X\275\353\236\320;R\373\267;\217\260\257\274\001\256\213=\205\365\236;\316`\216=\317\371%\274 \271T=jf[<\030\'D\274/\232X\275K\001\201\273\261+ =B\243_<\317\305\262\274\001G\216<\177\317\210\272\344\214\312<oX9<\277T\r\275R\200\254<\322\355\240<\305\237\033=Kj\253;\204\032\232\274.\201@<\241\023\247\274\353\226\224\273P\270\257<\344\351\201;Gy\200\273\r\213\026=\0379\023:Y\3670<+j\367;I\036\266\272K\222[<[\333F<\313PF\274\323\231\215:\013\212x\274\345\020\311\272\320\326\336<\335E\230<$\256\200\272\r\364\024\274\023\000m=[\003\323;\256C\270;\215\216E=\375X\247\274 M\237\274\305eo<\336IS\274 \375\240\273\035\014?;\004\"\227\274\374\360\345\274\275\375\034\275}\243\254\274$~\314<\265\370\270\273d\332\006=\335\332\025<^V\314\273\315\347\250<;\332E\274B\225*\274B\262\031=\tC\013<\356\202\300<\355n\017=\244\3608<\353\225\201;y\233\221<\240\231\210<\233]\210<\327e*;\243\310p;\334 \311<\245\353\210\273\022\311\264\2748y\330<jL\260<\017]-<\2123\342;B\377\'\274\353\010}\274\376\271\305\274\342s0;J;\376\270\271z\017<\306z\212<&\270p\274\312y\326\274\3719\305<J)!\274\233\360\330\273\\\005B<j\257\223;\371\220\217<\303\240\352\274k\200)\274\227K\013\274\235\034\201\273\340P\177\273\241\263*<\253e\324<\314\327N<\277f\017=IA\364:\205\'~<\222\027\356\273\346\007\315\274.Ai\273@\202\026=\272\334\032\274}\245\357<Ctn\275\216\'\202<\027\216\335;^\346u\274\367\013\334\273\322`\207<5E@=j\365\331\2738\356&<\322\225\"<y\'\235;==\317\273w\354X\274\326\355\232\274\340o\035\274Tw\373\273\312Rp<)[_<\202\016\214<\252\006\234<P\273\364\273\007\361\004<1F\217\273\252\034\260<\247L7<< $\274K\005\210\274\244VF\274\374}\337\274d\352\212\271\014Y\352\274+&-84\034\245\274\304\341S\274k\033\233\274\347[R;\200\215z<\030F\326<\237\261\230\274;rt\274\230\233l\273J\310\020\274\217\323\307\274\364\204w<\207\254\257:\"\372\t\275\277\234\202\274{\324\014<\235\235\344\273\336\314\274<\235U\327;\307\346\277\274ap\305<\345\365\302<d\005\265:\374\336.=\2743\'\273\325s\2659\223\376\334<Uh\316<\327\232\236\274\330\032\013=\tX\367;\317\\\025\275\215\253\277;`\035\210<2\202Y\272\227\355\245<\376\025\240;\267;\213<9\'\221\274\241\376\262\274\251\267{\274 \277\010;\030\223\267;V\235*\273pw)\273\3224\"=\364\350\326;}n:<\207\327\221\273\223I\300<J\303\264\272U\246\307<\216Up<\375\340\264\274!\237\3219\034b-;\333@\203\274)\027\022\274\205\203\265\274\324F\342<\023\347\251<\312X\016=8\216\317<\271\322\321<\317\326\033<\323\3758;\211\016\265\273\036\313\375<T\3203=\360\275\353\273R\252\"\275\241\261\210<\373\3378\274o\342\3019\2030\231<\252\270\311\274\231\273\216\272e\365\313\274Wi\210\274o\256B=\210:\203\274\347\360\252<\352;\351;\252\302<<K\rg\2748\t\351<\004X\317\274\354\245\033\274\224\351p<\351\031\241\274\364`\307\274$\346\232\274\334a4\272+\362\207\274\331\354\213<5d\306<\336\014\252<.\353\305\274E\307\037<X\367\356<\334\3726\274\3279\205<\273\206\006\274\271\215o<2\030?<\335Q\035=\033=\326<\001\363\305;4\246\271<t\310\t\273B\362\254<\305\022\376\274\036o\253;0\260\370\274\242}\t\274.RQ\274\260\031\220;w>\232\274\006\305.9Jm\036;\326\232\233\273\024_\245<\027\177\334\274^\3622\274g\313\001<\223\026\364\273S\0035:\013{B<K2\227\274\233\270\013\274\330\376\210<y=\215\274\211\337\304\274\247\317\247\274W\373\265\274\334\215\003\275\230\306\365;\212)\246\273\"(\264\274\"\246q</\361\030<EP}\274o\310\275\274~%\257<\276\007\300;\242Q\213<\357\263\315<\022\266\022<0\177\'<\351J&<\220\206\316\274\323g\n=e5\003\272r(;<\377\355\017\274\307\342\321\273\342\\\213<\311=\361;\376\327\262<\307I\370\274\316\312\335<"
+  }
+  initializer {
+    dims: 32
+    dims: 16
+    data_type: 1
+    name: "mlp.down_proj.weight_t"
+    raw_data: "\217,Z;\333\356\033\274\312\253\027\275\035i\373<,\324u<b\225\251<A\323\233<\351\347\007<\317+\226:\241d\201<\'O\257\274\373\213^\274\207\325M\2721)\024;y\016\204:\324Q\255\274J\362\013\274s\345*<\254:\330\274B\316\326\274W\266\211\274y\246\206<k\005\202\273\370\243\241\274x\232\325\2747j\201;`G\346\273\033N-\275,\210\231;\263.\252\274f\361\311<\302\202b;}}\007\273\345\016\325;\222~\364<\352:;\274\276,\021<a\237\357<\n\216\260\274\342\207_<\206\234r\274\013Q\237;\370\223\023\274\262\n+=a2f;\007\207\246<\211\367<<\245\233\271\274\206\335\251<\302y.;\305u\362;io\332\274\233*\342;\364\232\266\273\345\314p\274\001>\002\275,\367\350<\004\224\010\274r3\240\273J)%<2>\035=O\237\r\274\315K\204:\334\235\t=\255\300\240\274*\020\202\273m\034\006\274\202\207\013=\017\366r\274\t\021O\274w\277\200<\346\002\345<\034\222/\274\202_\322\274y\205s\274%\315><]H\223\274B\365\216\274\231S[<6\301\026=\267\365\202\274\331\375?;\256\370\375\273!\365\354\271\327\3731\2754\265\3619\014\254\027\274\347I\003\275\307\241\355<\313YR<\234\3226<\313\371B=iK\036<f\236\'<:3\003=\262)\r=\013f7\275\211\"\3239\311\364\321<\330\234\260\274e\372\270</\325$\274\"\\\246\273^\361\305\272\364\030\365<i{2<\220\t;<\025M\335\274\236k?\274\325~H\273e\317\323:\0243\246\274\271\003\217\274!\272\354\272}\205\033\275\357P:<\370\227\215<\342(0\275e \234;=D\202\273\356\364\310\2745\353\366\273o\230\320\274\357L\210<i\301\316\273\300Cb\274\202\215T;g\276W\274+D\216<\333\3253<\364\247\351\274{[\032\274\020\236\363;F\354\321;\242.\256< !\022<\217\230\262<\274\022q:X\202q\274\264<\356<\346\266\324\272\356\354\305<\004\'O\273\225\257\371<\246\214A\273\355\000\201;l\234\010= x\254<\373\211\344\273\n\372\221<\345\257o<\",\344;\376+\352;]\323\023\274\327\273\304;\201\357#\2726\036\004:4\356\350\274Q\014\214\273\304\354\341\271>\'\"<;\225\216\274\002\221\032<\227B\207\273\302\375\223\273\271\335\236<\323S\317;;\233\237<x\242\303;\334\027.<.3\371<lp\213\273\373\003\376;\273DP<BN\210<r\0067=$\241\341<\354ip<\177\235\220<\327\030t\274\242\350\217<\257\245O\275\330|(<\344N\324\273\342y\030<\222\240\265;~\'/;\213\'\312<\347\216\315<Z\330\034<f\230\306\273/P\245\273\241=A\274%:\252\273\3511\006<\346l3\274\257\277\343\273\206@\376<\306\217\374<C@\007=\310\220\024\274x\234\2478l\n\026=\375\305\026<\306\021\211\274\305\323\326\274\3415\034\273\242O*\275\200Y\263;N\275\301;\212\3103=\244\333+<y\336Q\274\223\252\246;4\243\246\274\271\304\263\274\334\247I<0\206\020=\026\372\245<\353Y\204;\022\210\016\274K]\207\273\352\367~\274W\374\201<s\371I\271U]\362\272\344\230\326<d1\241\273$\236/<\n\026\357;.\334\344<\367\0162=w\3032<=x\204<\\y\207\274\332\\!;\276\322_\275\333\2435<\234x\273<}\325\330<\030\243\276\2734\262\313<fV\317;\256Z\355<D2\341;\360\\\326\274\376\243A\274K\372p<\304\033\252<\3525\327\273/WI<\347\334\025=\345c\t\275\260\323{;\370h*<\360\312\226\274\307\236\231\274*\213\320\274\353\205$\274\t\243\031<\357e\373;\300\256\347<\335\013t<\262\365\246;l\260\327;P\356\205\274\nU\2639\256\263v\273\271\026\254\273\307\275\355<I\n\2649%(/\274\2664\016<\036\334\271<\260\333\t\273s\372\211\2742;%\275\031\341\330<\327\345\271;Y\017\265\274\277\362\034=C\370\372;3\2119\272\031U\225\274\275\005\';\r\014\010\275E\256\211\274D\313\017<\346\300\222;\366Y\2159\273\237\376;\264\341,=\245L\306<u\303\007\275\366F\242<\025y#\274\270\021E<A\333Q\274\200c\366:\013\322\000;f0-\274X E\274+5:\274?\255\205:\322\241\207;\006\362-\274\301\351\313<\206J\254\274H\314\037\274E\244\201<\030\031q<\217\334?\275\"\352W\274n\265\342\271E\362\307\274\306\340\n<\273\210\323:,\206\372\274~\264\247<\243\'m\272\375\334\210<5\327\363<^\255r\274n\')<\207\204\000=N\310A<;2\235\273\362\310Z<\253%\341\274\022\373\366\274\312_\321\273k\253\007\2743\266\242\273>z\275<.\\\025\274=&\022\275~\216R\275\353\226\211;\373k)<>P\305<\264\'H\275\236~\250\274\030>D\274\007a\353\274s^p\274%\271\364\273\204\316\273\271\020mk<\343\260\242\273\311\233\231<Td\215<5 [\275S\177)8\251T\037=\323Lq<$\361K\274\302e\340\2733\310\202\274fL\262;\321\273\021\274{y\306\274\033~\247\273\345\332\305\274\252eC\273K\305K\274\270\236B\274\320l\230\274\234\240O;\206\3235\274\353\\\230:\002#\240\273\020\357\206<\267\367q\273\000(\013\274,\234\231\274\257\326\"\274\355[\037=\257\007o\274{s\030<9.2\273\n6\303\273\242+\341\274\304\r0\275\375\312\324<[t\'\274\221\344\031\274\337<\217\272\367W\000=\333\026\223<\225\204\202\273$\335\033\273U\010\232;\"~\353;\242\3403\275\346\367\002=\325^\271;\260,\324\274\272S\201;\267B@<\221\366\000\275\246\355\250;\304\017\336\274\\\326\323<]\014\222\274S\235\266\274\200d\303<5E\341;\342#\254\274\274\361\252\271\373\243\230<\007[\307\273\357\n\023<EL\017<\333\257\265\272Os\004\275\300\340\205;\251\255\224\272\251i\303<\322\000\204;]\033\275<2\\\302<\006\237\014\275\252O\201:\2300\005<\016\3118\273\2176z<=\376 \273\245\026-\274\313\324x\274^5F\2744\376t<y\275\275;}\243u\274\212\341\226\274b\2534\274\202\030[\2745\021\335\274\306Q\224;1\275\237;\037/\004=\346N\214\273\001[\355<\356\246n<\\\323\251\274X\317;\274\r\361\203<x\240\324;4\2200=Ksj\274K\316\205\2735\235]\274t9\320\272p\267\220<\316\t\266<\305im\274\325\244M\274\204\274P<j\0300<fL\277\274Pj%<ea\302\272\252x\330<\342$\315<\222\221\"\273IS\363\274P\272@<\202\013\003=\nK0<\205\275j<A\252W<\263\202\355\273\004\023\001;}t\203;\302\223\027<\272\327\027\273\304\225\271<\251\346\031\275\346\213\206\273\357kv\275@)\334\274d\316\232;\304eK\274\236\2104=w\225\312;\031\370\215<\260\271\017\275\254B\320\274\266J\222<\366\211\027\274\235\343]\274du\315<\237\013\206\274XrW\273\275\031\241\273\264P\232<\373\301\020<\016\373\020<\033\342\275\273\264M\006<Vd\231<\027\271\370;%6\272<U@\267<\371\3207\274\"\323\306\2745\007\336;\327t\312<\201E\202:D\223\004\275\304\200\341\273\201zF<]\257s<"
+  }
+  initializer {
+    dims: 16
+    dims: 16
+    data_type: 1
+    name: "lm_head.weight_t"
+    raw_data: ".\004+\274o\231\220:\314j\221<\262L\336\274S\245^;X\244\265\274\306Y\024=i\306h<<\006\200\272=\370\337\273M\330\014\275?\364\026;6\242\216\274\263\350N\274\270\273\273\2738\320\272\274<L]<\275WR;\201\2027<%\304\235\274\274\365\376<\204`\312\274\223\305u\273BA\373\273\242b<\275\323\032\301\272\035\305Q\274\213P\016=\017\313\306\274}\276m<\033\221\317<\014Y\240\274K\311\207<\323\234\263<\022\235\252\273Ld\374;\252\267\363<\212CI8{/\377\273=\255\215<\307\257\376\273i\223\3219\212\261\3349Y|K\274\355\243\026\273\304\275\324\273x\036\006<W\354\236\272\0009\210;[\343\236\274\031\005\204<j\0275\271x%\357\274 \035Q:\207\035N<S\323\025\275\363\357\006;\212\306=\275\304\243\260\274\347(\305\274u\226\205\274\ru&;\322\201\002\274\233\004\302<~\270I\274\311DC<\275\337\001<\343d\n=\241\341Q\274\235\372\267\274\375qV<\260[\301\273f?M\273%w\215<S\364v<0d\357<IN]\272\347\317[<\311\372\217<\230\013\305<`\007\025\273\315\254\243\272\000f =)\023\007\275\007\211\023;\301\227\224\273\231.F: J\264\270\030\305\272\274jF4\2746\350\250\274\241P\315<\306K0<\220}\261\274\353\373\223;w\260\254<\373\355\235\271\022\323\275<\2218\210<\2562\2379N\217\014\274E1\212\2743Q\357<D\2538\274\325.\014=&\326\205:B\"H<\206\353\272<\376\024\363\274\320\252(=8f~\273\016\230\236\273\244\030\265<\316l\346<\362\237\022;\031\001m<\tb\237\274\267\372\342<\033\306\017<P\211O\274}\235}<o\202\207\273\246\326\033=\020\341\355\273\036w\036\274\312\177F\272\267x\321;\270\026\356<\314\037\204\273\364\201\267\274\252$\266<u\000\006\275\227K\227\273\322Ca<&\332\250<\n\0224\274\"\2765<o\321T<\252\r\343\273\3628w\274 \311\301\273.\375\332<r\340\245<\024g\365\274n\236\000=\363E\310\273nG\330\274,\234`<\371p\274<\033\261\257;\213m\331\273S\343\326\274\231\002\204\274 \004\326;?\032\222;\324.\215=\331\214D9.\234\010\274\267\241\265\272>9\341\272\227\307T=F\211\210\273y\214A\274\371\003/<`Rw<\256>\234\273t:\300;\034\026\254\274\344\257\341<\325\203\374<\364\350\003\274\367\207<\274b\376O<\252\301\271<\340m\230;\217d.;\313\234\231\273\025\365\367<\3062G;-j:\273\374Q^:\302\004u<\240v%\274\312\\~<\375\236k<\333\031b\2730\305\234\272Wd\361;~\002\306\273\200\251\224<!\270\216;\230}\006\275k\255\231<]>\331\274M\232$<e\235\245\270m\004\245\2735\202\344<\264\241\270<e\343\354\273c\000\241<\254\374\002\2734\240%\274%6)\275YyT<\265v4\274G\237\024<]\217\007\274\225\205x\274\215\236=<\320\322K<\304\313\272<\265\345\366;O\351\351<\311\342\235<\252\201\223\272]\2110<\235\255\222;\007\037\265:J\311Q<\262\006\361<\273,5\272\360\322\372<\352\302\005\2740a\241\274\345)\357\274\245\306Y<fLT\274&Y\234\274\322\370\363:\260H\323:\016F\324;\300\232\233;\356\304\001<\267g\312\274\307\241c<l\253\376\273\350\205\r<\364\371\316;\241Z\023\273%\036\205;\355[\232\274\375:\343\274\\H9\272\315\255\006\272\313!\247\273-*G\274\354\303\375\273T\025&\275\331\350x\2744U\246\274L7\017\273\216\221\211<\340-/<\370\335\313<\3408(\275"
+  }
+  input {
+    name: "inputs_embeds"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "fused_hidden"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 48
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "recycled_hidden"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "attention_mask"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "past_seq_len + seq_len"
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "position_ids"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "past_key_values.0.key"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "past_sequence_len"
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "past_key_values.0.value"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "past_sequence_len"
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "draft_logits"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "next_hidden"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "present.0.key"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "past_sequence_len + sequence_len"
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "present.0.value"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "past_sequence_len + sequence_len"
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "input_layernorm.weight"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "hidden_norm.weight"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "rotary_emb.cos_cache"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 16
+          }
+          dim {
+            dim_value: 4
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "rotary_emb.sin_cache"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 16
+          }
+          dim {
+            dim_value: 4
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "const_1_i64"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+        }
+      }
+    }
+  }
+  value_info {
+    name: "const_1d_1"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "const_1d_2"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "const_0.0_f32"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+        }
+      }
+    }
+  }
+  value_info {
+    name: "const_-3.4028234663852886e+38_f32"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+        }
+      }
+    }
+  }
+  value_info {
+    name: "post_attention_layernorm.weight"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "norm.weight"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "fc.weight_t"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 48
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "self_attn.q_proj.weight_t"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 32
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "self_attn.k_proj.weight_t"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 32
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "self_attn.v_proj.weight_t"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 32
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "self_attn.o_proj.weight_t"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 16
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "mlp.gate_proj.weight_t"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 16
+          }
+          dim {
+            dim_value: 32
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "mlp.up_proj.weight_t"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 16
+          }
+          dim {
+            dim_value: 32
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "mlp.down_proj.weight_t"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 32
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "lm_head.weight_t"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 16
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_fc.MatMul_1"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_input_layernorm.RMSNormalization_3"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_hidden_norm.RMSNormalization_4"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Concat_5"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 32
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_rotary_emb.Gather_6"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 4
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_rotary_emb.Gather_7"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 4
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_CumSum_8"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "past_seq_len + seq_len"
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Unsqueeze_9"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "past_seq_len + seq_len"
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Shape_10"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+    metadata_props {
+      key: "pkg.onnx_shape_inference.sym_data"
+      value: "[\"sequence_len\"]"
+    }
+  }
+  value_info {
+    name: "v_Shape_11"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+    metadata_props {
+      key: "pkg.onnx_shape_inference.sym_data"
+      value: "[\"past_seq_len + seq_len\"]"
+    }
+  }
+  value_info {
+    name: "v_Sub_12"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+    metadata_props {
+      key: "pkg.onnx_shape_inference.sym_data"
+      value: "[\"past_seq_len + seq_len - sequence_len\"]"
+    }
+  }
+  value_info {
+    name: "v_Slice_13"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "_d0"
+          }
+          dim {
+            dim_param: "_d1"
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Unsqueeze_14"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "_d0"
+          }
+          dim {
+            dim_param: "_d1"
+          }
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_GreaterOrEqual_15"
+    type {
+      tensor_type {
+        elem_type: 9
+        shape {
+          dim {
+            dim_param: "_d0"
+          }
+          dim {
+            dim_param: "_d1"
+          }
+          dim {
+            dim_param: "past_seq_len + seq_len"
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Unsqueeze_16"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "past_seq_len + seq_len"
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Cast_17"
+    type {
+      tensor_type {
+        elem_type: 9
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "past_seq_len + seq_len"
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_And_18"
+    type {
+      tensor_type {
+        elem_type: 9
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "_d1"
+          }
+          dim {
+            dim_param: "past_seq_len + seq_len"
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Where_19"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "_d1"
+          }
+          dim {
+            dim_param: "past_seq_len + seq_len"
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_Unsqueeze_21"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "_d1"
+          }
+          dim {
+            dim_param: "past_seq_len + seq_len"
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_self_attn.q_proj.MatMul_23"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_self_attn.k_proj.MatMul_25"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_self_attn.v_proj.MatMul_27"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_self_attn.RotaryEmbedding_28"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_self_attn.RotaryEmbedding_29"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_self_attn.Attention_30_0"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_self_attn.o_proj.MatMul_32"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_post_attention_layernorm.RMSNormalization_34"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_mlp.gate_proj.MatMul_36"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 32
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_mlp.Sigmoid_37"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 32
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_mlp.Mul_38"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 32
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_mlp.up_proj.MatMul_40"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 32
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_mlp.Mul_41"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 32
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_mlp.down_proj.MatMul_43"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "v_norm.RMSNormalization_45"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "sequence_len"
+          }
+          dim {
+            dim_value: 16
+          }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 24
+}
+opset_import {
+  domain: "com.microsoft"
+  version: 1
+}
+functions {
+  name: "SkipSimplifiedLayerNormalization"
+  input: "input"
+  input: "skip"
+  input: "weight"
+  output: "norm_out"
+  output: "mean"
+  output: "inv_std_var"
+  output: "add_out"
+  node {
+    input: "input"
+    input: "skip"
+    output: "add_out"
+    name: "Add_node_0"
+    op_type: "Add"
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.shape_inference_error"
+      value: "Type of input 0 value input of node Add_node_0 not known"
+    }
+  }
+  node {
+    input: "add_out"
+    input: "weight"
+    output: "norm_out"
+    name: "RMSNormalization_node_1"
+    op_type: "RMSNormalization"
+    attribute {
+      name: "epsilon"
+      type: FLOAT
+      ref_attr_name: "epsilon"
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.shape_inference_error"
+      value: "Type of input 0 value v_Add_0 of node RMSNormalization_node_1 not known"
+    }
+  }
+  node {
+    output: "mean"
+    name: "Constant_node_2"
+    op_type: "Constant"
+    attribute {
+      name: "value_floats"
+      floats: 0.0
+      type: FLOATS
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  node {
+    output: "inv_std_var"
+    name: "Constant_node_3"
+    op_type: "Constant"
+    attribute {
+      name: "value_floats"
+      floats: 0.0
+      type: FLOATS
+    }
+    metadata_props {
+      key: "namespace"
+      value: ""
+    }
+    metadata_props {
+      key: "pkg.onnxscript.class_hierarchy"
+      value: "[]"
+    }
+    metadata_props {
+      key: "pkg.onnxscript.name_scopes"
+      value: "[]"
+    }
+  }
+  opset_import {
+    domain: ""
+    version: 24
+  }
+  domain: "com.microsoft"
+  attribute_proto {
+    name: "epsilon"
+    f: 1e-05
+    type: FLOAT
+  }
+  value_info {
+    name: "mean"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "inv_std_var"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+}

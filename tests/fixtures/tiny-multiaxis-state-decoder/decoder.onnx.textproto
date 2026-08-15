@@ -1,0 +1,667 @@
+ir_version: 8
+producer_name: "onnx-genai WP4 fixture"
+graph {
+  node {
+    input: "position_ids"
+    output: "position_sum_i64"
+    name: "node_ReduceSum_0"
+    op_type: "ReduceSum"
+    attribute {
+      name: "axes"
+      ints: 0
+      type: INTS
+    }
+    attribute {
+      name: "keepdims"
+      i: 0
+      type: INT
+    }
+  }
+  node {
+    input: "position_sum_i64"
+    output: "position_sum"
+    name: "node_Cast_1"
+    op_type: "Cast"
+    attribute {
+      name: "to"
+      i: 1
+      type: INT
+    }
+  }
+  node {
+    input: "state_a.in"
+    output: "state_a_sum"
+    name: "node_ReduceSum_2"
+    op_type: "ReduceSum"
+    attribute {
+      name: "axes"
+      ints: 0
+      ints: 1
+      type: INTS
+    }
+    attribute {
+      name: "keepdims"
+      i: 0
+      type: INT
+    }
+  }
+  node {
+    input: "state_b.in"
+    output: "state_b_sum"
+    name: "node_ReduceSum_3"
+    op_type: "ReduceSum"
+    attribute {
+      name: "axes"
+      ints: 0
+      ints: 1
+      ints: 2
+      type: INTS
+    }
+    attribute {
+      name: "keepdims"
+      i: 0
+      type: INT
+    }
+  }
+  node {
+    input: "state_a_sum"
+    input: "state_b_sum"
+    output: "state_sum"
+    name: "node_Add_4"
+    op_type: "Add"
+  }
+  node {
+    input: "position_sum"
+    input: "state_sum"
+    output: "score"
+    name: "node_Add_5"
+    op_type: "Add"
+  }
+  node {
+    input: "routed_sequence"
+    output: "routed_sum"
+    name: "node_ReduceSum_6"
+    op_type: "ReduceSum"
+    attribute {
+      name: "axes"
+      ints: 0
+      ints: 1
+      ints: 2
+      type: INTS
+    }
+    attribute {
+      name: "keepdims"
+      i: 0
+      type: INT
+    }
+  }
+  node {
+    input: "routed_sum"
+    input: "zero"
+    output: "routed_zero"
+    name: "node_Mul_7"
+    op_type: "Mul"
+  }
+  node {
+    input: "input_ids"
+    output: "token_float"
+    name: "node_Cast_8"
+    op_type: "Cast"
+    attribute {
+      name: "to"
+      i: 1
+      type: INT
+    }
+  }
+  node {
+    input: "token_float"
+    input: "zero"
+    output: "token_zero"
+    name: "node_Mul_9"
+    op_type: "Mul"
+  }
+  node {
+    input: "attention_mask"
+    output: "mask_sum_i64"
+    name: "node_ReduceSum_10"
+    op_type: "ReduceSum"
+    attribute {
+      name: "axes"
+      ints: 0
+      ints: 1
+      type: INTS
+    }
+    attribute {
+      name: "keepdims"
+      i: 0
+      type: INT
+    }
+  }
+  node {
+    input: "mask_sum_i64"
+    output: "mask_sum"
+    name: "node_Cast_11"
+    op_type: "Cast"
+    attribute {
+      name: "to"
+      i: 1
+      type: INT
+    }
+  }
+  node {
+    input: "mask_sum"
+    input: "zero"
+    output: "mask_zero"
+    name: "node_Mul_12"
+    op_type: "Mul"
+  }
+  node {
+    input: "score"
+    input: "routed_zero"
+    output: "score_routed"
+    name: "node_Add_13"
+    op_type: "Add"
+  }
+  node {
+    input: "score_routed"
+    input: "token_zero"
+    output: "score_token"
+    name: "node_Add_14"
+    op_type: "Add"
+  }
+  node {
+    input: "score_token"
+    input: "mask_zero"
+    output: "score_all"
+    name: "node_Add_15"
+    op_type: "Add"
+  }
+  node {
+    input: "score_all"
+    output: "logit_indices"
+    name: "node_Cast_16"
+    op_type: "Cast"
+    attribute {
+      name: "to"
+      i: 7
+      type: INT
+    }
+  }
+  node {
+    input: "logit_indices"
+    input: "vocab_depth"
+    input: "one_hot_values"
+    output: "logits"
+    name: "node_OneHot_17"
+    op_type: "OneHot"
+    attribute {
+      name: "axis"
+      i: -1
+      type: INT
+    }
+  }
+  node {
+    input: "state_a.in"
+    input: "state_a_increment"
+    output: "state_a.out"
+    name: "node_Add_18"
+    op_type: "Add"
+  }
+  node {
+    input: "state_b.in"
+    input: "state_b_increment"
+    output: "state_b.out"
+    name: "node_Add_19"
+    op_type: "Add"
+  }
+  node {
+    input: "token_float"
+    output: "current_kv"
+    name: "node_Unsqueeze_20"
+    op_type: "Unsqueeze"
+    attribute {
+      name: "axes"
+      ints: 1
+      ints: 3
+      type: INTS
+    }
+  }
+  node {
+    input: "current_kv"
+    input: "value_offset_3"
+    output: "current_value_3"
+    name: "node_Add_21"
+    op_type: "Add"
+  }
+  node {
+    input: "past.3.key"
+    input: "current_kv"
+    output: "present.3.key"
+    name: "node_Concat_22"
+    op_type: "Concat"
+    attribute {
+      name: "axis"
+      i: 2
+      type: INT
+    }
+  }
+  node {
+    input: "past.3.value"
+    input: "current_value_3"
+    output: "present.3.value"
+    name: "node_Concat_23"
+    op_type: "Concat"
+    attribute {
+      name: "axis"
+      i: 2
+      type: INT
+    }
+  }
+  node {
+    input: "current_kv"
+    input: "value_offset_11"
+    output: "current_value_11"
+    name: "node_Add_24"
+    op_type: "Add"
+  }
+  node {
+    input: "past.11.key"
+    input: "current_kv"
+    output: "present.11.key"
+    name: "node_Concat_25"
+    op_type: "Concat"
+    attribute {
+      name: "axis"
+      i: 2
+      type: INT
+    }
+  }
+  node {
+    input: "past.11.value"
+    input: "current_value_11"
+    output: "present.11.value"
+    name: "node_Concat_26"
+    op_type: "Concat"
+    attribute {
+      name: "axis"
+      i: 2
+      type: INT
+    }
+  }
+  name: "tiny_multiaxis_state_decoder"
+  initializer {
+    data_type: 1
+    name: "zero"
+    raw_data: "\000\000\000\000"
+  }
+  initializer {
+    data_type: 7
+    name: "vocab_depth"
+    raw_data: " \000\000\000\000\000\000\000"
+  }
+  initializer {
+    dims: 2
+    data_type: 1
+    name: "one_hot_values"
+    raw_data: "\000\000\000\000\000\000\200?"
+  }
+  initializer {
+    data_type: 1
+    name: "state_a_increment"
+    raw_data: "\000\000\200?"
+  }
+  initializer {
+    data_type: 1
+    name: "state_b_increment"
+    raw_data: "\000\000\000@"
+  }
+  initializer {
+    data_type: 1
+    name: "value_offset_3"
+    raw_data: "\000\000@@"
+  }
+  initializer {
+    data_type: 1
+    name: "value_offset_11"
+    raw_data: "\000\0000A"
+  }
+  input {
+    name: "input_ids"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "sequence"
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "routed_sequence"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "routed_sequence_length"
+          }
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "attention_mask"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "attended"
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "position_ids"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 3
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "sequence"
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "past.3.key"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "past_sequence"
+          }
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "past.3.value"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "past_sequence"
+          }
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "past.11.key"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "past_sequence"
+          }
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "past.11.value"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "past_sequence"
+          }
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "state_a.in"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 2
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "state_b.in"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 2
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "logits"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "sequence"
+          }
+          dim {
+            dim_value: 32
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "present.3.key"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "total_sequence"
+          }
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "present.3.value"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "total_sequence"
+          }
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "present.11.key"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "total_sequence"
+          }
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "present.11.value"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "total_sequence"
+          }
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "state_a.out"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 2
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "state_b.out"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 2
+          }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 12
+}

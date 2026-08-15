@@ -1,0 +1,106 @@
+ir_version: 8
+producer_name: "onnx-genai tiny-vlm fixture"
+graph {
+  node {
+    input: "pixel_values"
+    output: "pixels_flat"
+    op_type: "Flatten"
+    attribute {
+      name: "axis"
+      i: 1
+      type: INT
+    }
+  }
+  node {
+    input: "pixels_flat"
+    input: "encoder_w"
+    output: "features_flat"
+    op_type: "MatMul"
+  }
+  node {
+    input: "features_flat"
+    input: "encoder_b"
+    output: "features_biased"
+    op_type: "Add"
+  }
+  node {
+    output: "encoder_axes"
+    name: "encoder_unsqueeze_axes"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        dims: 1
+        data_type: 7
+        name: "encoder_unsqueeze_axes_value"
+        raw_data: "\001\000\000\000\000\000\000\000"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    input: "features_biased"
+    input: "encoder_axes"
+    output: "image_features"
+    op_type: "Unsqueeze"
+  }
+  name: "tiny_vlm_encoder"
+  initializer {
+    dims: 12
+    dims: 4
+    data_type: 1
+    name: "encoder_w"
+    raw_data: "\000\000\000\000\n\327#<\n\327\243<\217\302\365<\n\327#=\315\314L=\217\302u=)\\\217=\n\327\243=\354Q\270=\315\314\314=\256G\341=\217\302\365=\270\036\005>)\\\017>\232\231\031>\n\327#>{\024.>\354Q8>\\\217B>\315\314L>=\nW>\256Ga>\037\205k>\217\302u>\000\000\200>\270\036\205>q=\212>)\\\217>\341z\224>\232\231\231>R\270\236>\n\327\243>\303\365\250>{\024\256>33\263>\354Q\270>\244p\275>\\\217\302>\024\256\307>\315\314\314>\205\353\321>=\n\327>\366(\334>\256G\341>ff\346>\037\205\353>\327\243\360>"
+  }
+  initializer {
+    dims: 4
+    data_type: 1
+    name: "encoder_b"
+    raw_data: "\n\327#<\n\327\243<\217\302\365<\n\327#="
+  }
+  input {
+    name: "pixel_values"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 3
+          }
+          dim {
+            dim_value: 2
+          }
+          dim {
+            dim_value: 2
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "image_features"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 4
+          }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 13
+}

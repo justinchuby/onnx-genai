@@ -1,0 +1,30 @@
+[package]
+name = "mlas-sys"
+version.workspace = true
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/justinchuby/onnx-genai"
+description = "FFI bindings to vendored ONNX Runtime MLAS kernels."
+
+# Builds the vendored MLAS C++/asm sources. Downstream crates can disable their
+# default `mlas` feature for a pure-Rust fallback when no toolchain is present.
+[lints]
+workspace = true
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+rayon = "1"
+
+[[bench]]
+# Keep the executable name free of Windows Installer Detection keywords. In
+# particular, `dispatch` contains `patch`, which can make non-admin CreateProcess
+# fail with ERROR_ELEVATION_REQUIRED before our code runs.
+name = "pool_microbench"
+harness = false
+
+[[example]]
+name = "pool_microbench"
+test = false
+bench = false

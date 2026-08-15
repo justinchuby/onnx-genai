@@ -1,0 +1,460 @@
+ir_version: 8
+producer_name: "onnx-genai-regression"
+graph {
+  node {
+    input: "input_ids"
+    output: "input_ids_f32"
+    name: "prompt_cast"
+    op_type: "Cast"
+    attribute {
+      name: "to"
+      i: 1
+      type: INT
+    }
+  }
+  node {
+    input: "input_ids_f32"
+    output: "prompt_rows"
+    name: "prompt_transpose"
+    op_type: "Transpose"
+    attribute {
+      name: "perm"
+      ints: 1
+      ints: 0
+      type: INTS
+    }
+  }
+  node {
+    input: "prompt_rows"
+    input: "prompt_rows"
+    input: "prompt_rows"
+    input: "prompt_rows"
+    input: "prompt_rows"
+    input: "prompt_rows"
+    input: "prompt_rows"
+    input: "prompt_rows"
+    input: "prompt_rows"
+    input: "prompt_rows"
+    input: "prompt_rows"
+    input: "prompt_rows"
+    input: "prompt_rows"
+    input: "prompt_rows"
+    input: "prompt_rows"
+    input: "prompt_rows"
+    input: "prompt_rows"
+    input: "prompt_rows"
+    input: "prompt_rows"
+    input: "prompt_rows"
+    input: "prompt_rows"
+    input: "prompt_rows"
+    input: "prompt_rows"
+    input: "prompt_rows"
+    input: "prompt_rows"
+    input: "prompt_rows"
+    input: "prompt_rows"
+    input: "prompt_rows"
+    input: "prompt_rows"
+    input: "prompt_rows"
+    input: "prompt_rows"
+    input: "prompt_rows"
+    output: "quant_activation"
+    name: "prompt_to_quant_width"
+    op_type: "Concat"
+    attribute {
+      name: "axis"
+      i: 1
+      type: INT
+    }
+  }
+  node {
+    input: "quant_activation"
+    input: "packed_weight"
+    input: "logit_bias"
+    output: "logits"
+    name: "sub4_logits"
+    op_type: "BlockQuantizedMatMul"
+    attribute {
+      name: "K"
+      i: 32
+      type: INT
+    }
+    attribute {
+      name: "N"
+      i: 2
+      type: INT
+    }
+    attribute {
+      name: "block_layout_version"
+      i: 1
+      type: INT
+    }
+    attribute {
+      name: "format"
+      s: "mxfp4"
+      type: STRING
+    }
+    domain: "pkg.nxrt"
+  }
+  node {
+    input: "attention_mask"
+    output: "mask_f32"
+    name: "mask_cast"
+    op_type: "Cast"
+    attribute {
+      name: "to"
+      i: 1
+      type: INT
+    }
+  }
+  node {
+    input: "mask_f32"
+    output: "current_kv"
+    name: "kv_unsqueeze"
+    op_type: "Unsqueeze"
+    attribute {
+      name: "axes"
+      ints: 1
+      ints: 3
+      type: INTS
+    }
+  }
+  node {
+    input: "current_kv"
+    output: "present.0.key"
+    name: "present_key"
+    op_type: "Identity"
+  }
+  node {
+    input: "current_kv"
+    output: "present.0.value"
+    name: "present_value"
+    op_type: "Identity"
+  }
+  name: "tiny_native_sub4_decoder"
+  initializer {
+    dims: 2
+    dims: 1
+    dims: 17
+    data_type: 2
+    int32_data: 0
+    int32_data: 0
+    int32_data: 0
+    int32_data: 0
+    int32_data: 0
+    int32_data: 0
+    int32_data: 0
+    int32_data: 0
+    int32_data: 0
+    int32_data: 0
+    int32_data: 0
+    int32_data: 0
+    int32_data: 0
+    int32_data: 0
+    int32_data: 0
+    int32_data: 0
+    int32_data: 0
+    int32_data: 0
+    int32_data: 0
+    int32_data: 0
+    int32_data: 0
+    int32_data: 0
+    int32_data: 0
+    int32_data: 0
+    int32_data: 0
+    int32_data: 0
+    int32_data: 0
+    int32_data: 0
+    int32_data: 0
+    int32_data: 0
+    int32_data: 0
+    int32_data: 0
+    int32_data: 0
+    int32_data: 0
+    name: "packed_weight"
+  }
+  initializer {
+    dims: 2
+    data_type: 1
+    float_data: 0.0
+    float_data: 1.0
+    name: "logit_bias"
+  }
+  input {
+    name: "input_ids"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "sequence"
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "attention_mask"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "total"
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "position_ids"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "sequence"
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "past_key_values.0.key"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "past"
+          }
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  input {
+    name: "past_key_values.0.value"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "past"
+          }
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "logits"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "sequence"
+          }
+          dim {
+            dim_value: 2
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "present.0.key"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "total"
+          }
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "present.0.value"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "total"
+          }
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "packed_weight"
+    type {
+      tensor_type {
+        elem_type: 2
+        shape {
+          dim {
+            dim_value: 2
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 17
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "logit_bias"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 2
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "input_ids_f32"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "sequence"
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "prompt_rows"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "sequence"
+          }
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "quant_activation"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "sequence"
+          }
+          dim {
+            dim_value: 32
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "mask_f32"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "total"
+          }
+        }
+      }
+    }
+  }
+  value_info {
+    name: "current_kv"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_value: 1
+          }
+          dim {
+            dim_param: "total"
+          }
+          dim {
+            dim_value: 1
+          }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 11
+}
+opset_import {
+  domain: "pkg.nxrt"
+  version: 1
+}

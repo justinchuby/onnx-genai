@@ -1,0 +1,14 @@
+domain: ""
+name: ArgMin
+since_version: 13
+doc: Indices of minimum elements along one axis.
+attributes:
+  - { name: axis, type: int, default: 0 }
+  - { name: keepdims, type: int, default: 1 }
+  - { name: select_last_index, type: int, default: 0 }
+inputs:
+  - { name: data, type_str: T }
+outputs:
+  - { name: reduced, type_str: "tensor(int64)" }
+type_constraints:
+  - { type_param: T, allowed: [uint8, uint16, uint32, uint64, int8, int16, int32, int64, float16, float32, float64, bfloat16] }

@@ -1,0 +1,28 @@
+[package]
+name = "onnx-runtime-ep-plugin"
+description = "Outbound adapter: projects any nxrt ExecutionProvider through the ORT plugin-EP C ABI so upstream ORT can load it as a real EP"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["onnx", "execution-provider", "plugin", "ffi", "runtime"]
+categories = ["science", "hardware-support"]
+
+[dependencies]
+onnx-runtime-ep-api = { workspace = true }
+onnx-runtime-ir = { workspace = true }
+onnx-genai-ort-sys = { workspace = true }
+
+[dev-dependencies]
+onnx-runtime-ort-testkit = { workspace = true }
+libloading = { workspace = true }
+onnx-runtime-ep-cpu = { workspace = true }
+onnx-runtime-ep-api = { workspace = true }
+onnx-runtime-ir = { workspace = true }
+
+[[test]]
+name = "trait_cabi_parity"
+path = "tests/trait_cabi_parity.rs"
+
+[lints]
+workspace = true

@@ -1,0 +1,290 @@
+# Build and publish the ORT plugin-EP PyPI packages: nxrt-ep-cpu / nxrt-ep-cuda.
+#
+# Each package bundles a compiled ORT plugin-EP cdylib (built with plain cargo,
+# NOT maturin — the cdylib is a C-ABI library, not a PyO3 extension) and exposes
+# it via `get_library_path()` / `register()`. See python/nxrt-ep-cpu and
+# python/nxrt-ep-cuda, and .squad/decisions/inbox/sebastian-nxrt-ep-pypi.md.
+#
+# Publishing uses PyPI Trusted Publishing (OIDC) — no API tokens. The two
+# packages have SEPARATE trusted publishers, and PyPI does not allow registering
+# two pending publishers from the same repo at once. So the `cpu` and `cuda`
+# jobs are fully INDEPENDENT (neither `needs:` the other): nxrt-ep-cpu is
+# published first (its publisher exists), and nxrt-ep-cuda later, once its
+# publisher is registered. The cuda job never touches PyPI unless
+# `publish_cuda=true`.
+#
+# IMPORTANT: this filename (publish-ep-plugins.yml) and the `pypi` environment
+# name are referenced by the PyPI trusted-publisher registration. Do NOT rename
+# them without updating PyPI.
+name: Publish EP plugin PyPI packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_cpu:
+        description: Publish nxrt-ep-cpu to PyPI after building
+        type: boolean
+        default: false
+      publish_cuda:
+        description: Publish nxrt-ep-cuda to PyPI after building (needs its own trusted publisher)
+        type: boolean
+        default: false
+      testpypi:
+        description: Route publishing to TestPyPI instead of PyPI (dry run)
+        type: boolean
+        default: false
+  push:
+    tags:
+      - "nxrt-ep-v*"
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ── nxrt-ep-cpu ────────────────────────────────────────────────────────────
+  cpu:
+    name: nxrt-ep-cpu wheel (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-latest
+            archs: x86_64
+          - name: Windows AMD64
+            os: windows-latest
+            archs: AMD64
+          # macOS is Apple Silicon (arm64) ONLY, mirroring wheels.yml. macos-14
+          # is the GitHub-hosted Apple Silicon runner.
+          - name: macOS arm64
+            os: macos-14
+            archs: arm64
+          # Windows on ARM64: windows-11-arm is the GitHub-hosted Windows 11
+          # ARM64 runner. Official CPython has NO win_arm64 build for 3.10
+          # (ARM64 Windows CPython starts at 3.11), so the global cp310-*
+          # selector would match nothing here. Override to cp311-* for this row
+          # ONLY — the wheel is py3-none-win_arm64 (ABI-less), so any single
+          # CPython >=3.11 is enough to drive the build. setup-python is pinned
+          # to 3.11 for the same reason (no 3.10 arm64 build); cibuildwheel then
+          # provisions its own CPython for the actual wheel build.
+          - name: Windows ARM64
+            os: windows-11-arm
+            archs: ARM64
+            cibw_build: cp311-*
+            python_version: "3.11"
+    runs-on: ${{ matrix.os }}
+    env:
+      CIBW_ARCHS: ${{ matrix.archs }}
+      # Per-row build selector: cp310-* everywhere except the Windows ARM64 row
+      # (cp311-*), because CPython has no win_arm64 build for 3.10.
+      CIBW_BUILD: ${{ matrix.cibw_build || 'cp310-*' }}
+      CIBW_MANYLINUX_X86_64_IMAGE: quay.io/pypa/manylinux_2_28_x86_64:2026.07.25-1
+      # DXCore is a Windows API set resolved by the OS loader, not a DLL to vendor.
+      CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: >-
+        delvewheel repair --exclude ext-ms-win-dxcore-l1-1-0.dll
+        -w {dest_dir} -v {wheel}
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          # 3.10 has no win_arm64 build; the ARM64 row pins 3.11 via the matrix.
+          python-version: ${{ matrix.python_version || '3.10' }}
+      # Keep wheel publishing on Rust stable deliberately: this follows Rust's
+      # stability promise without freezing security fixes. On windows-11-arm
+      # rustup installs the native aarch64-pc-windows-msvc toolchain, so the
+      # plugin is built natively (no cross-compilation).
+      - name: Install Rust stable toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Pull manylinux image with retries
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          image="$CIBW_MANYLINUX_X86_64_IMAGE"
+          for attempt in 1 2 3; do
+            docker pull "$image" && exit 0
+            echo "manylinux image pull attempt $attempt failed"
+            sleep $((attempt * 10))
+          done
+          exit 1
+
+      - name: Build and smoke-test nxrt-ep-cpu wheel
+        uses: pypa/cibuildwheel@v4.1.0
+        with:
+          package-dir: python/nxrt-ep-cpu
+          output-dir: wheelhouse
+
+      - name: Upload nxrt-ep-cpu wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: nxrt-ep-cpu-${{ matrix.os }}-${{ matrix.archs }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  publish-cpu:
+    name: Publish nxrt-ep-cpu
+    # A green build always uploads artifacts (the cpu job); PyPI upload only
+    # happens when publish_cpu=true, or on an nxrt-ep-v* tag push.
+    if: >-
+      startsWith(github.ref, 'refs/tags/nxrt-ep-v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish_cpu)
+    needs: [cpu]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download nxrt-ep-cpu wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: nxrt-ep-cpu-*
+          path: wheelhouse
+          merge-multiple: true
+
+      - name: Publish nxrt-ep-cpu to TestPyPI
+        if: github.event_name == 'workflow_dispatch' && inputs.testpypi
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: wheelhouse
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+
+      - name: Publish nxrt-ep-cpu to PyPI
+        if: "!(github.event_name == 'workflow_dispatch' && inputs.testpypi)"
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: wheelhouse
+          skip-existing: true
+
+  # ── nxrt-ep-cuda (EXPERIMENTAL) ────────────────────────────────────────────
+  # Fully independent of the cpu job. Uses the SAME PyPA manylinux image as the
+  # cpu job (it ships the /opt/python CPython builds cibuildwheel requires — the
+  # plain nvidia/cuda base image does NOT, which is why the earlier cuda build
+  # failed with "'/opt/python/cp310-cp310/bin/python' executable doesn't exist").
+  #
+  # No CUDA toolkit is installed: onnx-runtime-ep-cuda binds CUDA via cudarc's
+  # `dynamic-loading` feature, so `cargo build --features cuda` needs NO nvcc /
+  # toolkit and NO GPU — libcuda / cuBLASLt / nvrtc are dlopen'd at runtime. This
+  # was verified by building the plugin inside this exact manylinux image with no
+  # toolkit present (see .squad/decisions/inbox/sebastian-nxrt-ep-cuda-wheelfix.md).
+  # The before-all (clang-devel + Rust, in pyproject.toml) matches the cpu job.
+  # Gated on publish_cuda for PyPI upload, but the BUILD runs on every
+  # dispatch/tag so the wheel is always exercised.
+  cuda:
+    name: nxrt-ep-cuda wheel (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-latest
+            archs: x86_64
+    runs-on: ${{ matrix.os }}
+    env:
+      CIBW_ARCHS: ${{ matrix.archs }}
+      # Same image as the cpu job: it has the /opt/python CPython toolchains
+      # cibuildwheel needs. auditwheel then repairs the wheel manylinux-compliant.
+      CIBW_MANYLINUX_X86_64_IMAGE: quay.io/pypa/manylinux_2_28_x86_64:2026.07.25-1
+      # Defensive excludes: with cudarc dynamic-loading the built .so links NO
+      # CUDA libraries (verified: its only NEEDED entries are libc/libm/libdl/
+      # libgcc_s/libpthread), so auditwheel finds nothing to vendor and these
+      # never match. They are kept so the wheel stays CUDA-runtime-free even if a
+      # future kernel starts link-time-referencing a CUDA lib — those libs are
+      # provided by the nvidia-*-cu13 pip dependencies at runtime, not bundled.
+      CIBW_REPAIR_WHEEL_COMMAND_LINUX: >-
+        auditwheel repair
+        --exclude libcudart.so.13 --exclude libcublas.so.13
+        --exclude libcublasLt.so.13 --exclude libnvrtc.so.13
+        --exclude libcupti.so.13 --exclude libcuda.so.1
+        -w {dest_dir} {wheel}
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      # Keep wheel publishing on Rust stable deliberately: this follows Rust's
+      # stability promise without freezing security fixes.
+      - name: Install Rust stable toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Pull manylinux image with retries
+        shell: bash
+        run: |
+          image="$CIBW_MANYLINUX_X86_64_IMAGE"
+          for attempt in 1 2 3; do
+            docker pull "$image" && exit 0
+            echo "manylinux image pull attempt $attempt failed"
+            sleep $((attempt * 10))
+          done
+          exit 1
+
+      # The CUDA EP binds CUDA via cudarc dynamic-loading, so compilation needs
+      # neither the CUDA toolkit nor a GPU (libs are dlopen'd at runtime). Release
+      # promotion still requires CUDA-enabled runners to validate the driver and
+      # the nvidia-*-cu13 dependency set end to end (issue #768).
+      - name: Build and import-test nxrt-ep-cuda wheel
+        uses: pypa/cibuildwheel@v4.1.0
+        with:
+          package-dir: python/nxrt-ep-cuda
+          output-dir: wheelhouse
+
+      - name: Upload nxrt-ep-cuda wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: nxrt-ep-cuda-${{ matrix.os }}-${{ matrix.archs }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  publish-cuda:
+    name: Publish nxrt-ep-cuda
+    # NEVER runs unless publish_cuda=true (or an nxrt-ep-v* tag). This lets the
+    # user register the nxrt-ep-cuda trusted publisher LATER, after nxrt-ep-cpu
+    # is live, without this job ever touching PyPI in the meantime.
+    if: >-
+      startsWith(github.ref, 'refs/tags/nxrt-ep-v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish_cuda)
+    needs: [cuda]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download nxrt-ep-cuda wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: nxrt-ep-cuda-*
+          path: wheelhouse
+          merge-multiple: true
+
+      - name: Publish nxrt-ep-cuda to TestPyPI
+        if: github.event_name == 'workflow_dispatch' && inputs.testpypi
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: wheelhouse
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+
+      - name: Publish nxrt-ep-cuda to PyPI
+        if: "!(github.event_name == 'workflow_dispatch' && inputs.testpypi)"
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: wheelhouse
+          skip-existing: true

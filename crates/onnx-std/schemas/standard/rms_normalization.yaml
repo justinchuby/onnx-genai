@@ -1,0 +1,16 @@
+domain: ""
+name: RMSNormalization
+since_version: 23
+doc: Root-mean-square normalization over trailing dimensions.
+attributes:
+  - { name: axis, type: int, default: -1 }
+  - { name: epsilon, type: float, default: 0.00001 }
+  - { name: stash_type, type: int, default: 1 }
+inputs:
+  - { name: X, type_str: T }
+  - { name: scale, type_str: V }
+outputs:
+  - { name: Y, type_str: V }
+type_constraints:
+  - { type_param: T, allowed: [float16, float32, float64, bfloat16] }
+  - { type_param: V, allowed: [float16, float32, float64, bfloat16] }

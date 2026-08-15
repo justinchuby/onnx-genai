@@ -1,0 +1,66 @@
+[package]
+name = "onnx-genai-ort"
+description = "Safe Rust APIs for generative model inference with ONNX Runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["onnx", "runtime", "inference", "ffi"]
+categories = ["api-bindings", "science"]
+
+[features]
+default = ["cuda-13000"]
+# `cuda` pulls in `libloading` so the shared-KV grow path can dynamically load
+# cudart and issue device-to-device copies (see `src/cuda_rt.rs`). It is not
+# linked at build time, keeping non-CUDA builds free of a CUDA toolkit.
+#
+# `cuda` also pulls in cudarc (driver + NVRTC, dynamically loaded — no build-time
+# CUDA toolkit) so the captured greedy decode can keep logits on-device and run
+# an on-device argmax kernel instead of copying the full vocabulary host-side.
+#
+# `cuda` uses the CUDA 13.0 API set by default through this crate's default
+# features. Downstreams that need another API version must disable default
+# features and enable exactly one `cuda-*` feature alongside `cuda`; cudarc's
+# generated bindings cannot compile with multiple CUDA-version features active.
+cuda = ["dep:libloading", "dep:cudarc", "onnx-genai-cuda-version-guard/cuda"]
+# Weak passthroughs keep selecting a CUDA API version from activating the
+# optional cudarc dependency unless `cuda` is also enabled.
+cuda-12060 = ["cudarc?/cuda-12060", "onnx-genai-cuda-version-guard/cuda-12060"]
+cuda-12080 = ["cudarc?/cuda-12080", "onnx-genai-cuda-version-guard/cuda-12080"]
+cuda-12090 = ["cudarc?/cuda-12090", "onnx-genai-cuda-version-guard/cuda-12090"]
+cuda-13000 = ["cudarc?/cuda-13000", "onnx-genai-cuda-version-guard/cuda-13000"]
+
+[dependencies]
+half = { workspace = true, features = ["use-intrinsics"] }
+onnx-runtime-memory-governor = { workspace = true }
+libloading = { workspace = true, optional = true }
+# Only compiled under the `cuda` feature. `dynamic-loading` dlopen's the driver
+# (nvcuda) and NVRTC at runtime, so `cargo build` needs no CUDA toolkit. We use
+# the driver + NVRTC surface only (no cuBLAS/cuDNN). The concrete CUDA API
+# version is selected via this crate's `cuda-*` features (or `CUDARC_CUDA_VERSION`),
+# not pinned here, so downstreams can match their ORT CUDA runtime.
+cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading"], optional = true }
+minijinja = { version = "2", features = ["json"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+onnx-genai-genai-config = { workspace = true }
+onnx-genai-kv = { workspace = true }
+# The shared absolute trace time base, so these spans land on the same timeline
+# as the ones the runtime and its execution providers record.
+onnx-runtime-tracer = { workspace = true }
+onnx-genai-metadata = { workspace = true }
+onnx-genai-runtime-config = { workspace = true }
+onnx-genai-ort-sys = { workspace = true }
+onnx-runtime-loader = { workspace = true }
+onnx-model-package = { workspace = true }
+onnx-std = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokenizers = { workspace = true }
+tracing = { workspace = true }
+
+[build-dependencies]
+onnx-genai-cuda-version-guard = { path = "../onnx-genai-cuda-version-guard", version = "=0.1.0-dev.5" }
+
+[lints]
+workspace = true

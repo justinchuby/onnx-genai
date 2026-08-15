@@ -1,0 +1,14 @@
+domain: ""
+name: Reshape
+since_version: 21
+doc: Reshape a tensor without changing its data.
+attributes:
+  - { name: allowzero, type: int, default: 0 }
+inputs:
+  - { name: data, type_str: T }
+  - { name: shape, type_str: "tensor(int64)" }
+outputs:
+  - { name: reshaped, type_str: T }
+type_constraints:
+  - type_param: T
+    allowed: [uint8, uint16, uint32, uint64, int8, int16, int32, int64, bfloat16, float16, float32, float64, string, bool, complex64, complex128, float8e4m3fn, float8e4m3fnuz, float8e5m2, float8e5m2fnuz, uint4, int4]

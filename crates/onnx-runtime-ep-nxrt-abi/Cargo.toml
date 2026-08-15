@@ -1,0 +1,20 @@
+[package]
+name = "onnx-runtime-ep-nxrt-abi"
+description = "Stable versioned C ABI for native nxrt execution-provider plugins (§524)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["onnx", "execution-provider", "ffi", "abi", "nxrt"]
+categories = ["science", "hardware-support"]
+
+[dependencies]
+onnx-runtime-ep-api = { workspace = true }
+onnx-runtime-ir = { workspace = true }
+
+[dev-dependencies]
+libloading = { workspace = true }
+onnx-runtime-ep-cpu = { workspace = true }
+
+[lints]
+workspace = true

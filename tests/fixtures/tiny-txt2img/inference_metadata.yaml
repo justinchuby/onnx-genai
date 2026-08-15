@@ -1,0 +1,32 @@
+pipeline:
+  models:
+    text_encoder:
+      filename: text_encoder.onnx.textproto
+      type: encoder
+    denoiser:
+      filename: denoiser.onnx.textproto
+      type: denoiser
+    vae:
+      filename: vae.onnx.textproto
+      type: vae
+  dataflow:
+    - from: text_encoder.last_hidden_state
+      to: denoiser.encoder_hidden_states
+      dtype: fp32
+    - from: denoiser.noise_pred
+      to: denoiser.sample
+      dtype: fp32
+    - from: denoiser.noise_pred
+      to: vae.latent
+      dtype: fp32
+  strategy:
+    kind: iterative
+    denoiser: denoiser
+    num_steps: 3
+    guidance_scale: 7.5
+    cfg_conditioning_input: encoder_hidden_states
+  phases:
+    text_encoder:
+      run_on: prompt_only
+    vae:
+      run_on: final_only

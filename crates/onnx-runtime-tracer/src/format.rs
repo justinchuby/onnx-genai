@@ -1,0 +1,133 @@
+//! Trace output [`TraceFormat`] and [`TraceVerbosity`] (§48.2 / §48.3).
+
+use std::fmt;
+
+/// The wire format a trace is serialized to (§48.3).
+///
+/// A [`TraceContext`](crate::TraceContext) carries a default format; individual
+/// export helpers ([`chrome`](crate::chrome), [`jsonl`](crate::jsonl),
+/// [`perfetto`](crate::perfetto)) can also be called directly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TraceFormat {
+    /// Chrome Trace Event Format JSON. The most portable option: both
+    /// <https://ui.perfetto.dev> and `chrome://tracing` load it directly.
+    ChromeJson,
+    /// Perfetto native protobuf (`perfetto.protos.Trace`). Streams better for
+    /// large traces and is the format Perfetto ingests natively. Requires the
+    /// `perfetto` cargo feature to serialize.
+    PerfettoProto,
+    /// JSON Lines — one event object per line. `grep`/`jq`-friendly and
+    /// append-streamable.
+    Jsonl,
+}
+
+impl TraceFormat {
+    /// A short, stable, lowercase name (matches the backend/registry key in
+    /// §48.8.4 and the `--trace-format` CLI value in §48.6).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            TraceFormat::ChromeJson => "chrome",
+            TraceFormat::PerfettoProto => "perfetto",
+            TraceFormat::Jsonl => "jsonl",
+        }
+    }
+
+    /// The conventional file extension for this format.
+    #[must_use]
+    pub const fn extension(self) -> &'static str {
+        match self {
+            TraceFormat::ChromeJson => "json",
+            TraceFormat::PerfettoProto => "perfetto",
+            TraceFormat::Jsonl => "jsonl",
+        }
+    }
+}
+
+impl fmt::Display for TraceFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// How much detail a trace captures (§48.2).
+///
+/// Ordered from least to most detail: `Decisions < Ops < Full`. A higher level
+/// includes everything a lower one would. This drives future event filtering
+/// once the executor is wired in (§48.5); it is stored on the
+/// [`TraceContext`](crate::TraceContext) today so callers can set intent, and
+/// consumers can honor it as instrumentation lands.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TraceVerbosity {
+    /// Only high-level scheduling/placement decisions (cheapest).
+    Decisions,
+    /// Decisions plus per-op execution spans.
+    Ops,
+    /// Everything: ops, transfers, counters, and fine-grained internals.
+    #[default]
+    Full,
+}
+
+impl TraceVerbosity {
+    /// Encode as a small integer, for storing in an atomic.
+    #[must_use]
+    pub fn as_u8(self) -> u8 {
+        match self {
+            TraceVerbosity::Decisions => 0,
+            TraceVerbosity::Ops => 1,
+            TraceVerbosity::Full => 2,
+        }
+    }
+
+    /// Decode from [`as_u8`](TraceVerbosity::as_u8), saturating at the most
+    /// detailed level so an unknown value never silently drops events.
+    #[must_use]
+    pub fn from_u8(value: u8) -> Self {
+        match value {
+            0 => TraceVerbosity::Decisions,
+            1 => TraceVerbosity::Ops,
+            _ => TraceVerbosity::Full,
+        }
+    }
+
+    /// Parse a level name, as accepted on the command line and in the
+    /// environment. Returns `None` for anything unrecognised so the caller can
+    /// report the valid set.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "decisions" => Some(TraceVerbosity::Decisions),
+            "ops" => Some(TraceVerbosity::Ops),
+            "full" => Some(TraceVerbosity::Full),
+            _ => None,
+        }
+    }
+
+    /// Every level, most detailed last — for listing the choices in a message.
+    pub const ALL: [TraceVerbosity; 3] = [
+        TraceVerbosity::Decisions,
+        TraceVerbosity::Ops,
+        TraceVerbosity::Full,
+    ];
+
+    /// Whether a trace at `self` should include events tagged at `other`.
+    ///
+    /// True when `other` is no more detailed than `self` (e.g. a `Full` trace
+    /// includes `Decisions`-level events, but a `Decisions` trace does not
+    /// include `Ops`-level events).
+    #[must_use]
+    pub fn includes(self, other: TraceVerbosity) -> bool {
+        other <= self
+    }
+}
+
+impl fmt::Display for TraceVerbosity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            TraceVerbosity::Decisions => "decisions",
+            TraceVerbosity::Ops => "ops",
+            TraceVerbosity::Full => "full",
+        };
+        f.write_str(s)
+    }
+}

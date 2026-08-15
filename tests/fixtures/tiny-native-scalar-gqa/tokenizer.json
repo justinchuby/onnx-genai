@@ -1,0 +1,124 @@
+{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": {
+    "type": "Whitespace"
+  },
+  "post_processor": {
+    "type": "TemplateProcessing",
+    "single": [
+      {
+        "SpecialToken": {
+          "id": "<bos>",
+          "type_id": 0
+        }
+      },
+      {
+        "Sequence": {
+          "id": "A",
+          "type_id": 0
+        }
+      },
+      {
+        "SpecialToken": {
+          "id": "<eos>",
+          "type_id": 0
+        }
+      }
+    ],
+    "pair": [
+      {
+        "SpecialToken": {
+          "id": "<bos>",
+          "type_id": 0
+        }
+      },
+      {
+        "Sequence": {
+          "id": "A",
+          "type_id": 0
+        }
+      },
+      {
+        "SpecialToken": {
+          "id": "<eos>",
+          "type_id": 0
+        }
+      },
+      {
+        "Sequence": {
+          "id": "B",
+          "type_id": 1
+        }
+      },
+      {
+        "SpecialToken": {
+          "id": "<eos>",
+          "type_id": 1
+        }
+      }
+    ],
+    "special_tokens": {
+      "<bos>": {
+        "id": "<bos>",
+        "ids": [
+          2
+        ],
+        "tokens": [
+          "<bos>"
+        ]
+      },
+      "<eos>": {
+        "id": "<eos>",
+        "ids": [
+          3
+        ],
+        "tokens": [
+          "<eos>"
+        ]
+      }
+    }
+  },
+  "decoder": null,
+  "model": {
+    "type": "WordLevel",
+    "vocab": {
+      "<pad>": 0,
+      "<unk>": 1,
+      "<bos>": 2,
+      "<eos>": 3,
+      "hello": 4,
+      "world": 5,
+      "the": 6,
+      "quick": 7,
+      "brown": 8,
+      "fox": 9,
+      "jumps": 10,
+      "over": 11,
+      "lazy": 12,
+      "dog": 13,
+      ".": 14,
+      ",": 15,
+      "tok16": 16,
+      "tok17": 17,
+      "tok18": 18,
+      "tok19": 19,
+      "tok20": 20,
+      "tok21": 21,
+      "tok22": 22,
+      "tok23": 23,
+      "tok24": 24,
+      "tok25": 25,
+      "tok26": 26,
+      "tok27": 27,
+      "tok28": 28,
+      "tok29": 29,
+      "tok30": 30,
+      "tok31": 31
+    },
+    "unk_token": "<unk>"
+  }
+}

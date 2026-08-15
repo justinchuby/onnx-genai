@@ -1,0 +1,158 @@
+# Zhora — History Archive
+
+## Archived 2026-07-29 (full pre-compaction snapshot)
+
+# Zhora — History
+
+## 2026-07-12: Joined
+Hired as Server Dev to add capacity alongside Rachael on the OpenAI-compatible HTTP surface. Project: onnx-genai, a Rust ONNX Runtime generative-AI inference runtime. Context: server is modularized (routes/driver/sse/types/state/session/metrics/image_input/audio_input); chat/completions/vision/audio/streaming/sessions/observability shipped; open API work includes `/v1/embeddings` (#7) and logprobs server formatting (#8). Handlers stay thin over the batched engine driver.
+
+## 2026-07-13: Landed debug endpoints and queue-depth cap
+Added `/v1/debug/config`, `/v1/debug/sessions`, `/v1/debug/kv`, and `/v1/debug/trace`; renamed the server admission boundary to configurable `max_queue_depth` (`--max-queue-depth` / `ONNX_GENAI_MAX_QUEUE_DEPTH`). Landed as commit `afcf094`.
+
+## 2026-07-13T20:55:00Z — Model lifecycle M1 + /v1/embeddings wiring
+- Implemented issue #9 model lifecycle Milestone 1: extracted ModelHandle + ModelRegistry from AppState (pure refactor). ModelHandle bundles all per-model fields; ModelRegistry wraps HashMap<String, Arc<ModelHandle>> with resolve/insert/ids/default_id. Zero behavior change — single-model fallback preserved. 52 tests green. Commit: 9ab4fa9.
+- Wired POST /v1/embeddings through DriverCommand::Embed (oneshot-reply) to engine embed_with_options. Mean pooling via EmbeddingOptions::default(). Pipeline models return clear error. Double tokenization intentional. dimensions truncation deferred.
+- M2 (real routing), M3 (load/unload), M4 (status field), LRU eviction deferred.
+
+
+## 2026-07-20T00:00:00Z — Model lifecycle M2 + M3 complete
+
+### M2 — Multi-Model Config, Startup Load, Routing, Deterministic Default
+- Commit: b5934c6 | Issue: #9
+- Added `src/models_config.rs`: TOML/JSON config parsing + directory scan.
+- CLI: `--models-config`, `--models-dir`, `--model` (mutually exclusive via `ArgGroup`).
+- `AppState::load_from_specs`: eager-loads all specs at startup.
+- `resolve_model` in `routes.rs`: empty `model` → deterministic default; unknown name → 404.
+- Removed M1 silent fallback from `ModelRegistry::resolve`.
+- Deterministic insertion-order fields (`order`, `default_id`) in `ModelRegistry`.
+- 55 lib + 20 HTTP integration tests; clippy clean.
+- Review: 🟡 Chew — found embeddings routing inconsistency (fixed by Rachael, commit 561ee1a).
+
+### M3 — Runtime Load/Unload, LRU Eviction, Lazy Load, Admin Endpoints
+- Commit: a5106f5 | Issue: #9
+- `ModelRegistry` → cloneable shared handle (`Arc<RwLock<RegistryInner>>`).
+- Lock discipline: `std::sync::RwLock` only; never held across `spawn_blocking`/`.await`.
+- Per-id async load guards prevent double-build of the same lazy model.
+- Unified `build_handle` shared by startup and runtime load paths.
+- LRU eviction: `max_loaded_models` cap; prefers non-default victims; never drops below 1.
+- Admin endpoints (`GET/POST/DELETE /v1/admin/models/*`) gated by `--enable-admin-endpoints`.
+- Default model lazily reloaded after unload on next empty-model request.
+- 66 lib + 20 HTTP integration tests; all M1/M2 tests pass; clippy clean.
+- Review: 🟢 Deckard — all concurrency invariants confirmed.
+
+### Status
+§37 / Issue #9 model lifecycle epic: COMPLETE (M1 + M2 + M3).
+Locked out of embeddings follow-up per reviewer protocol; Rachael delivered fix.
+Next: §34 router epic (R1/R2/R3) has kicked off.
+
+## 2026-07-13T23:15:17Z — §38 KV Connector K1 + K2 + cpu-load fix + prefix-hash fix
+
+### K1 — Pluggable KvCacheConnector abstraction
+- Added `KvCacheConnector` async trait + `NullConnector` in `crates/onnx-genai-kv/src/connector.rs`.
+- Types: `KvCacheKey`, `KvCacheLocation`, `KvStoreEntry`, `FetchedKv`, `ConnectorCapabilities`, `CachePriority`, `CompressionFormat`, `ConnectorHealth`, `ConnectorError`.
+- Chunking: `chunk_tokens`, `TokenChunk`, `hash_tokens` (FNV-1a 64-bit, process-independent). `DEFAULT_CHUNK_SIZE = 256`.
+- Deps added: `async-trait` to workspace + kv crate; `tokio` to kv dev-deps.
+- 55 tests green; clippy clean.
+
+### K2 — LocalTieredConnector
+- Implemented `LocalTieredConnector` in `crates/onnx-genai-kv/src/local_tiered.rs`.
+- Bridges existing `PageTable` (hot/cold tiering) + `PrefixCache` (content-addressed index). Single `std::sync::Mutex` lock; no std guard held across `.await`.
+- Priority-aware eviction (Opportunistic < Session < SystemPrompt); pinning; Fp8 codec.
+- `PrefixCache::remove` primitive added to `src/prefix_cache.rs`.
+- 11 new tests (66 total); clippy clean.
+- Reviewed by Chew (🟡): `cpu_load_ms_per_page` unscaled defect found.
+
+### cpu_load_ms_per_page fix (commit 30ee870)
+- `locate()` now: `estimated_load_ms = pages_needing_upload * cpu_load_ms_per_page`.
+- Added `cpu_load_ms_scales_by_configured_rate` test.
+
+### Prefix-dependent chunk hash fix (commit ac12480)
+- `chunk_tokens` threads cumulative FNV-1a state across chunk boundaries.
+- **Invariant:** equal `KvCacheKey` ⟹ identical token sequence from position 0 through end of chunk.
+- Preserves genuine prefix sharing; defuses K4-materialize landmine flagged by Deckard.
+- Tests: `chunk_hash_is_prefix_dependent`, `chunk_hash_shared_prefix_still_collides`, hardcoded-value stability guard.
+
+### K4-materialize TODO (shared context)
+- `TODO(K3-materialize)` in `connector_bridge.rs`: fetch hit chunks → copy KV into paged cache → shorten prefill.
+- Blocked on `KvTensorRef` needing a real device-tensor handle (currently size-only placeholder).
+- The prefix-dependent-hash invariant is now in place. K4 implementor can trust `KvCacheKey` equality as proof of identical prefix.
+
+
+## 2026-07-14T02:37:00Z — Perfetto trace export #13 merged
+- **Commit:** 8d1bf3d — Reviewed 🟢 Deckard
+- `GET /v1/debug/trace/perfetto` → Chrome Trace Event Format document, gated same as sibling debug routes.
+- No data leak (`&'static str` stage names only), honest empty case, OTLP deferred.
+- Metrics ENDPOINTS extended to 14 entries.
+
+
+## 2026-07-14T20:05:00Z — Upstream ONNX suite review
+Reviewed Fido's `cbourjau/onnx-tests` nxrt adapter and reproduction docs 🟡. The adapter is correct; 158 pass / 1,038 fail / 2 skip across 1,198 cases accurately reflects current CPU EP gaps. Merged as `d61cc97`.
+
+## 2026-07-15T01:52:00Z — Session update
+
+- Closed the weight-streaming soundness gap (`e0c9669`): only producer-less initializers can be borrowed; loader rejects initializer/output reuse.
+
+## 2026-07-15T00:00:00Z — Cross-agent session update
+
+- Consolidated DLPack import hardening and Sum/Mean/LogSoftmax/CastLike coverage; merged in the July 15 DLPack and coverage waves.
+
+### 2026-07-16T00:00:00Z — Performance-and-design wave
+Added Rayon N-range partitioning for native CPU MatMulNBits.
+
+## 2026-07-16T00:00:00Z — onnx-rs upstream text-format test port
+- Expanded `crates/onnx-rs/tests/text_format_port.rs` from 6 to 16 upstream-derived cases in merged commit `23e4995`.
+- Coverage includes attributes, initializers, supported dtypes, node domains, multi-opset models, text round-trips, JSON/TextProto codecs, and malformed input; 89 onnx-rs tests pass.
+- Deliberately omitted unsupported model functions, sequence/optional/sparse types, complex/int2/uint2 dtypes, and typed tensor-payload literals.
+
+## 2026-07-16T14:20:00Z — onnx-rs full-spec serde revision
+- Full-spec serde attempt was 🔴 rejected by Rachael: stale IR10 vendor proto and a base64 sidecar did not meet current ONNX IR13 or authoritative native-text requirements. Locked out; Batty is revising.
+
+- 2026-07-21: Scribe reconciled the perf campaign inbox; key decisions are now consolidated in `.squad/decisions.md` under the 2026-07-21 perf campaign section.
+- 2026-07-21T23:55Z — VLM WP4 initial artifact remains in correction after Gaff rejection/lockout; DeepSeek scope artifact preserved as living research.
+
+### 2026-07-22T14:59:36+0000 — WP-B landed
+Zhora approved Rutger's clippy cleanup; required Clippy and targeted tests passed with scoped API-preserving fixes.
+
+2026-07-22T22:15:00Z — Landed `f8848c9`: f16/bf16 MatMulNBits widening/narrowing and topology-derived tuning; Chew approved with non-blocking coverage follow-ups.
+
+### 2026-07-27 — CLI maintainer-tool backlog queued
+Justin confirmed the onnx-genai CLI is a development/maintainer harness, not a consumer product. P0 CLI work in docs/research/cli/00-backlog.md is queued under that charter: live stats discoverability, structured maintainer output, batch/bench harnesses, explicit dev flags for engine behavior, and help snapshots/REPL help. Remote-client mode is out of scope.
+
+### 2026-07-27T13:10:00-07:00 — CLI backlog now on main
+Scribe note: the CLI dev-tool charter and prioritized backlog from the merged CLI improvement track are now on main at `docs/research/cli/00-backlog.md`. Use that file as the source of truth before picking up queued CLI backlog work.
+
+## 2026-07-27T14:55:00-07:00 — REPL Phase 1 rejection revision
+- Took over PR #289 revision after Gaff's rejection under reviewer lockout.
+- Made REPL command parsing mode-aware: `Plain` preserves `main` piped behavior for `//...` and `/help <arg>`, while `Tty` keeps the new rich affordances.
+- Fixed the post-generation newline decision to depend on whether the current turn actually used live rendering, not on the reusable renderer lifecycle state.
+- Added lib and e2e regressions; local ONNX Runtime mismatch still prevents model-loading e2e verification.
+
+### 2026-07-27T18:46:09-07:00 — generate default stats stdout/stderr contract
+- Text `onnx-genai generate` now follows the REPL default: compact stats are on only when the shared REPL input-mode detector sees stdin and stdout as terminals, and `--no-stats` opts out.
+- The compact stats line is stderr-only and suppressed by `--profile`; piped stdout remains byte-stable generated text.
+- Image/audio `generate` and `transcribe` keep compact token stats off by default; their non-token throughput belongs in `--profile`.
+
+## 2026-07-28T17:40:00+0000
+#364 merged after the implementation was corrected to use prefetch only in eviction-neutral cache regimes.
+
+---
+## ARCHIVED 2026-08-12T09:45:00Z (Scribe compaction — wave Jul-27 and Aug-11)
+
+### 2026-07-27T13:10:00-07:00 — CLI backlog now on main
+Source of truth: `docs/research/cli/00-backlog.md`.
+
+### 2026-07-27T14:55:00-07:00 — REPL Phase 1 rejection revision
+Took over PR #289 after Gaff's rejection. Made REPL command parsing mode-aware (Plain/Tty). Fixed post-generation newline.
+
+### 2026-07-27T18:46:09-07:00 — generate default stats stdout/stderr contract
+Compact stats on only when stdin+stdout are terminals; stderr-only; suppressed by `--profile`; piped stdout byte-stable.
+
+### 2026-07-28T17:40:00+0000
+#364 merged after correction to use prefetch only in eviction-neutral cache regimes.
+
+### 2026-08-11T19:30:00Z — PR #762 documentation accuracy pass (wave note)
+Rewrote PR body; updated 8 stale SHA refs in docs. `CUDA_EP_STATUS.md` accurate, no change.
+
+## 2026-08-11 — PR #762 documentation accuracy pass (commit bb280c0ea)
+PR body completely rewritten: 3 late-breaking blockers documented, 269 EP tests, explicit "What Is NOT Proven" section. 8 stale SHAs → `c1d2556b5`. Gaff confirmed; PR marked ready.

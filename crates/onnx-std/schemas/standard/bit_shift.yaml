@@ -1,0 +1,13 @@
+domain: ""
+name: BitShift
+since_version: 11
+doc: Element-wise bit shift with multidirectional broadcasting.
+attributes:
+  - { name: direction, type: string, required: true }
+inputs:
+  - { name: X, type_str: T }
+  - { name: Y, type_str: T }
+outputs:
+  - { name: Z, type_str: T }
+type_constraints:
+  - { type_param: T, allowed: [uint8, uint16, uint32, uint64] }

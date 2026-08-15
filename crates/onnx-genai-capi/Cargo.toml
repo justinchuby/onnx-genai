@@ -1,0 +1,28 @@
+[package]
+name = "onnx-genai-capi"
+description = "C ABI for onnx-genai: load a model, generate, and plug in a foreign (C) sampler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["onnx", "capi", "ffi", "inference", "sampler"]
+categories = ["science", "api-bindings"]
+
+[lib]
+# `cdylib`/`staticlib` produce the loadable C library; `lib` lets Rust tests and
+# downstream crates link the same surface (e.g. to exercise `ForeignSampler`).
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[features]
+default = []
+# Forward the engine's CUDA feature. This compiles the native CUDA EP crate for
+# shared use, but does not enable the engine's optional `native-backend`, so the
+# C ABI remains on the ORT-backed path unless a separate feature selects native.
+cuda = ["onnx-genai-engine/cuda"]
+
+[dependencies]
+onnx-genai-engine = { workspace = true }
+anyhow = { workspace = true }
+
+[lints]
+workspace = true

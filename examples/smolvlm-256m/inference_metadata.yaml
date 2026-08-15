@@ -1,0 +1,166 @@
+# SmolVLM-256M-Instruct multimodal vision-language pipeline metadata.
+# Obtain the inspected ONNX export from HuggingFaceTB/SmolVLM-256M-Instruct at
+# revision 7e3e67edbbed1bf9888184d9df282b700a323964.
+# This is a METADATA-CONTRACT example: it shows what the schema can DESCRIBE,
+# not a claim that the current engine executes the complete model end to end.
+# See README.md, "Gaps", for the difference between this contract and what runs.
+
+# Top-level metadata contract version. `v1` is the current initial schema.
+schema_version: v1
+
+# Runtime features that must be supported; a runtime must reject the package
+# rather than silently load it when either capability is unavailable.
+required_capabilities:
+  - kv_cache # Decoder carries past/present attention keys and values.
+  - grouped_query_attention # The decoder uses fewer KV heads than query heads.
+
+# Build-time properties baked into the text decoder graph.
+model:
+  # Attention dimensions from the SmolLM2 decoder configuration.
+  attention:
+    type: grouped_query # Valid canonical kinds include multi_head/grouped_query/multi_latent.
+    num_kv_heads: 3 # Number of key/value heads; matches KV tensor axis 1.
+    num_attention_heads: 9 # Number of query heads in each decoder layer.
+    head_dim: 64 # Hidden width of each attention head, in scalar elements.
+  max_sequence_length: 8192 # Maximum total prompt-plus-generation length, in tokens.
+  vocab_size: 49280 # Rows in the token embedding table and decoder logits vocabulary.
+
+# KV-cache storage contract for the autoregressive decoder.
+kv_cache:
+  native_dtype: fp16 # Scalar dtype emitted by the decoder's present KV outputs.
+
+# Special token IDs from the published tokenizer/model configuration.
+tokens:
+  pad_token_id: 2 # Token used to pad shorter sequences in a batch.
+  bos_token_id: 1 # Beginning-of-stream token.
+  eos_token_id: [2] # One or more token IDs that terminate generation.
+  image_token_id: 49190 # Prompt image placeholder token `<image>`.
+
+# Typed image preprocessing program and bindings to real vision graph inputs.
+preprocessing:
+  image:
+    # Ordered transforms; `inputs`/`outputs` are processor-local value names.
+    transforms:
+      - op: decode # Decode encoded image bytes into pixels.
+        outputs: [decoded] # Name the decoded processor-local value.
+      - op: convert_rgb # Convert decoded pixels to three-channel RGB.
+        inputs: [decoded] # Consume the preceding decoded image.
+        outputs: [rgb] # Name the RGB result for later transforms.
+      - op: resize # Resize while using the model's processor-specific mode.
+        inputs: [rgb] # Resize the RGB image.
+        outputs: [resized] # Name the resized pixel value.
+        size: 2048 # Schema scalar size, in pixels; processor interprets it with `mode`.
+        mode: longest_edge # Open-string resize mode from the real processor config.
+        interpolation: lanczos # Open-string interpolation filter used by the processor.
+      - op: rescale # Multiply every pixel channel by the declared scalar.
+        inputs: [resized] # Consume resized pixels.
+        outputs: [rescaled] # Name the floating-point rescaled pixels.
+        scale: 0.00392156862745098 # 1/255, converting byte-range pixels to [0,1].
+      - op: normalize # Apply channel-wise `(value - mean) / std`.
+        inputs: [rescaled] # Consume pixels in [0,1].
+        outputs: [normalized] # Name normalized pixels.
+        mean: [0.5, 0.5, 0.5] # RGB means, one value per channel.
+        std: [0.5, 0.5, 0.5] # RGB standard deviations, one value per channel.
+      - op: tile # Split the normalized image into square local image tensors.
+        inputs: [normalized] # Consume normalized full-image pixels.
+        outputs: [tiles] # Name the tile batch that feeds the vision encoder.
+        tile_size: 512 # Square tile edge length, in pixels.
+        max_tiles: 16 # Maximum number of local tiles before the global thumbnail.
+        include_thumbnail: true # Also emit one global whole-image thumbnail tile.
+        thumbnail_order: append # Place the global thumbnail after all local tiles.
+      - op: emit_validity_mask # Mark which tile pixels contain real image data.
+        inputs: [tiles] # Derive validity from the tiled image layout.
+        outputs: [pixel_attention_mask] # Name the boolean mask value.
+        mask_patch_size: 1 # One mask cell represents one pixel edge.
+    # Bind processor-local outputs to concrete ONNX component ports.
+    outputs:
+      - source: tiles # Processor-local value emitted by the `tile` transform.
+        name: vision_encoder.pixel_values # Matches vision_encoder ONNX input `pixel_values`.
+        content: pixels # Generic content role; valid roles include pixels and validity_mask.
+        dtype: float32 # Matches graph input f32 [batch,num_images,3,512,512].
+      - source: pixel_attention_mask # Processor-local mask emitted above.
+        name: vision_encoder.pixel_attention_mask # Matches the real ONNX mask input.
+        content: validity_mask # Declares that true/false entries identify valid pixels.
+        dtype: bool # Matches graph input bool [batch,num_images,512,512].
+
+# Multi-component ONNX pipeline declaration.
+pipeline:
+  # Named executable components; filenames are relative to the model package root.
+  models:
+    vision_encoder:
+      filename: vision_encoder_q4f16.onnx # Real SigLIP-derived vision graph.
+      type: vision_encoder # Generic component role used by pipeline validation.
+    token_embedding:
+      filename: embed_tokens_fp16.onnx # Real token embedding graph.
+      type: encoder # Single-pass encoder-like component role.
+      io:
+        sequence_source: token_ids # Drive this graph with integer token IDs.
+        kv_ownership: owned # Historical/default ownership; this graph declares no KV pairs.
+        token_input: input_ids # Matches graph input `input_ids` int64 [batch,sequence].
+        hidden_output: inputs_embeds # Matches graph output f32 [batch,sequence,576].
+    decoder:
+      filename: decoder_model_merged_q4f16.onnx # Real 30-layer text decoder graph.
+      type: decoder # Autoregressive decoder component role.
+      tokenizer: tokenizer.json # Tokenizer path relative to the package root.
+      io:
+        sequence_source: inputs_embeds # Decoder is driven by precomputed embeddings.
+        kv_ownership: owned # Decoder consumes its own past KV and emits updated present KV.
+        inputs_embeds_input: inputs_embeds # Real input f32 [batch,sequence,576].
+        attention_mask_input: attention_mask # Real input int64 [batch,total_sequence].
+        position_ids_input: position_ids # Real input int64 [batch,sequence].
+        logits_output: logits # Real output f32 [batch,sequence,49280].
+        # Ordered past-KV ports: key then value for layers 0..29. Positional order
+        # must match `kv_outputs`; each tensor is fp16 [batch,3,past_sequence,64].
+        kv_inputs: [past_key_values.0.key, past_key_values.0.value, past_key_values.1.key, past_key_values.1.value, past_key_values.2.key, past_key_values.2.value, past_key_values.3.key, past_key_values.3.value, past_key_values.4.key, past_key_values.4.value, past_key_values.5.key, past_key_values.5.value, past_key_values.6.key, past_key_values.6.value, past_key_values.7.key, past_key_values.7.value, past_key_values.8.key, past_key_values.8.value, past_key_values.9.key, past_key_values.9.value, past_key_values.10.key, past_key_values.10.value, past_key_values.11.key, past_key_values.11.value, past_key_values.12.key, past_key_values.12.value, past_key_values.13.key, past_key_values.13.value, past_key_values.14.key, past_key_values.14.value, past_key_values.15.key, past_key_values.15.value, past_key_values.16.key, past_key_values.16.value, past_key_values.17.key, past_key_values.17.value, past_key_values.18.key, past_key_values.18.value, past_key_values.19.key, past_key_values.19.value, past_key_values.20.key, past_key_values.20.value, past_key_values.21.key, past_key_values.21.value, past_key_values.22.key, past_key_values.22.value, past_key_values.23.key, past_key_values.23.value, past_key_values.24.key, past_key_values.24.value, past_key_values.25.key, past_key_values.25.value, past_key_values.26.key, past_key_values.26.value, past_key_values.27.key, past_key_values.27.value, past_key_values.28.key, past_key_values.28.value, past_key_values.29.key, past_key_values.29.value]
+        # Ordered present-KV ports paired one-for-one with `kv_inputs`; each is
+        # fp16 [batch,3,total_sequence,64] for the corresponding layer/key/value.
+        kv_outputs: [present.0.key, present.0.value, present.1.key, present.1.value, present.2.key, present.2.value, present.3.key, present.3.value, present.4.key, present.4.value, present.5.key, present.5.value, present.6.key, present.6.value, present.7.key, present.7.value, present.8.key, present.8.value, present.9.key, present.9.value, present.10.key, present.10.value, present.11.key, present.11.value, present.12.key, present.12.value, present.13.key, present.13.value, present.14.key, present.14.value, present.15.key, present.15.value, present.16.key, present.16.value, present.17.key, present.17.value, present.18.key, present.18.value, present.19.key, present.19.value, present.20.key, present.20.value, present.21.key, present.21.value, present.22.key, present.22.value, present.23.key, present.23.value, present.24.key, present.24.value, present.25.key, present.25.value, present.26.key, present.26.value, present.27.key, present.27.value, present.28.key, present.28.value, present.29.key, present.29.value]
+        kv_update: append # Present KV extends the growing past sequence each step.
+
+  # Whole-tensor routes between component ports.
+  dataflow:
+    # Upstream mutates this tensor with indexed vision features before decoding.
+    # This edge only routes the whole embedding tensor; it cannot express that
+    # host-side scatter/replacement, which is the principal gap in README.md.
+    - from: token_embedding.inputs_embeds # Real embedding-graph output endpoint.
+      to: decoder.inputs_embeds # Real decoder graph input endpoint.
+      dtype: float32 # Boundary scalar dtype; both ports are f32.
+
+  # Ordered execution plan composed from nested generic strategies.
+  strategy:
+    kind: composite # Run the following named child stages in order.
+    stages:
+      - name: encode_vision # Human-readable stage name, unique in this composite.
+        strategy:
+          kind: single_pass # Invoke one component once when its phase gate allows.
+          model: vision_encoder # Component name from `pipeline.models`.
+        run_on: prompt_only # Vision features are computed only during prompt prefill.
+      - name: embed_tokens # Stage that turns token IDs into hidden vectors.
+        strategy:
+          kind: single_pass # One embedding graph invocation per pipeline step.
+          model: token_embedding # Component name from `pipeline.models`.
+        run_on: every_step # Runs for prompt tokens and each generated token.
+      - name: decode # Stage that produces logits and advances KV state.
+        strategy:
+          kind: autoregressive # Runtime-managed token-by-token generation loop.
+          decoder: decoder # Decoder component named above.
+        run_on: every_step # Runs during prompt processing and token decoding.
+
+  # Per-component phase gates repeat the execution contract at component level.
+  phases:
+    vision_encoder:
+      run_on: prompt_only # Run only while processing the initial multimodal prompt.
+    token_embedding:
+      run_on: every_step # Run at every pipeline step.
+    decoder:
+      run_on: every_step # Run at every pipeline step.
+
+  # Generic prompt image-placeholder expansion contract.
+  vision:
+    image_placeholder_token_id: 49190 # Token occurrence that marks where expansion happens.
+    image_token_id: 49190 # Token emitted at each expanded image position.
+    tokens_per_tile: 64 # Each vision tile corresponds to 64 image-token positions.
+    token_count_source: per_tile # Derive total count from the number of produced tiles.
+    placeholder_per_image: true # Each placeholder corresponds to one input image.
+    image_correspondence: prompt_order # Pair placeholders and images in encounter order.
+    thumbnail_order: append # Global thumbnail follows local-grid tiles.

@@ -1,0 +1,167 @@
+[package]
+name = "onnx-genai-engine"
+description = "Text generation engine combining ONNX Runtime, scheduling, and KV caching"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["onnx", "llm", "inference", "genai"]
+categories = ["science", "text-processing"]
+
+[[test]]
+name = "qwen35_0_8b_hybrid_native_cuda_e2e"
+required-features = ["cuda", "native-backend"]
+
+[[test]]
+name = "glm_tiny_qmoe_native_cuda_e2e"
+required-features = ["cuda", "native-backend"]
+
+[[test]]
+name = "qwen3_0_6b_native_cuda_e2e"
+required-features = ["cuda", "native-backend"]
+
+[[test]]
+name = "marlin_m_gt_1_e2e"
+required-features = ["cuda", "native-backend"]
+
+[[test]]
+name = "weight_offload_native_cuda_e2e"
+required-features = ["cuda", "native-backend"]
+
+[[test]]
+name = "native_step_component_parity"
+required-features = ["native-backend"]
+
+[[test]]
+name = "native_pipeline_decoder_parity"
+required-features = ["native-backend"]
+
+# Uses PipelineEngine::materialize_published_prefix_kv, which is itself
+# #[cfg(feature = "native-backend")]. Without this the test is built on a
+# default `cargo test --all-targets` and fails to compile; CI only checks this
+# crate with the feature on, so the break is invisible there.
+[[test]]
+name = "native_pipeline_backend_selection_parity"
+required-features = ["native-backend"]
+
+[[test]]
+name = "native_full_pipeline_parity"
+required-features = ["native-backend"]
+
+[[test]]
+name = "deepseek_v2_tiny_qmoe_native_e2e"
+required-features = ["native-backend"]
+
+[[test]]
+name = "native_cuda_pipeline_decoder_parity"
+required-features = ["cuda", "native-backend"]
+
+[[test]]
+name = "native_cuda_routed_pipeline_decoder_parity"
+required-features = ["cuda", "native-backend"]
+
+[[test]]
+name = "native_cuda_captured_step_inputs_parity"
+required-features = ["cuda", "native-backend"]
+
+[[test]]
+name = "gemma4_e2b_native_cuda_pipeline_bench"
+required-features = ["cuda", "native-backend"]
+
+[[test]]
+name = "gemma3n_native_cuda_capture_realmodel"
+required-features = ["cuda", "native-backend"]
+
+[[test]]
+name = "qwen3_0_6b_capture_step_inputs_decline"
+required-features = ["cuda", "native-backend"]
+
+[features]
+default = ["cuda-13000"]
+native-backend = [
+    "dep:onnx-runtime-ep-cpu",
+    "onnx-runtime-ep-cpu/tracing",
+    "dep:onnx-runtime-session",
+    "dep:onnx-runtime-tracer",
+]
+mlas = [
+    "native-backend",
+    "onnx-runtime-ep-cpu/mlas",
+    "onnx-runtime-session/mlas",
+]
+# Runtime EP selection still goes through `ONNX_GENAI_EP`; without
+# `onnx-genai-ort/cuda`, a `cuda` request is rejected at session creation rather
+# than silently falling back to CPU. The CUDA API version is selected by exactly
+# one `cuda-*` feature; this crate defaults to CUDA 13.0.
+cuda = [
+    "onnx-genai-ort/cuda",
+    "onnx-runtime-session?/cuda",
+    "dep:onnx-runtime-ep-cuda",
+]
+# ONNX Runtime CUDA only: enable ONNX Runtime's built-in CUDAExecutionProvider
+# selection and the cudarc GPU sampler in `onnx-genai-ort`, WITHOUT pulling the
+# nxrt-native CUDA kernel crate (`onnx-runtime-ep-cuda`) or the native backend.
+# This is what the ONNX Runtime-backed `onnx-genai` wheel builds with; GPU comes
+# from the `onnxruntime-gpu` runtime wheel (installed via the `[cuda]` extra).
+ort-cuda = ["onnx-genai-ort/cuda"]
+# CUDA API version passthroughs. Use `--no-default-features` and enable exactly
+# one of these when overriding the default CUDA 13.0 binding set.
+cuda-12060 = [
+    "onnx-genai-ort/cuda-12060",
+    "onnx-runtime-session?/cuda-12060",
+    "onnx-runtime-ep-cuda?/cuda-12060",
+]
+cuda-12080 = [
+    "onnx-genai-ort/cuda-12080",
+    "onnx-runtime-session?/cuda-12080",
+    "onnx-runtime-ep-cuda?/cuda-12080",
+]
+cuda-12090 = [
+    "onnx-genai-ort/cuda-12090",
+    "onnx-runtime-session?/cuda-12090",
+    "onnx-runtime-ep-cuda?/cuda-12090",
+]
+cuda-13000 = [
+    "onnx-genai-ort/cuda-13000",
+    "onnx-runtime-session?/cuda-13000",
+    "onnx-runtime-ep-cuda?/cuda-13000",
+]
+
+[dependencies]
+onnx-genai-metadata = { workspace = true }
+onnx-genai-genai-config = { workspace = true }
+onnx-genai-kv = { workspace = true }
+onnx-runtime-memory-governor = { workspace = true }
+onnx-genai-scheduler = { workspace = true }
+onnx-genai-ort = { path = "../onnx-genai-ort", version = "=0.1.0-dev.5", default-features = false }
+onnx-genai-runtime-config = { workspace = true }
+onnx-runtime-ep-cpu = { workspace = true, optional = true }
+onnx-runtime-ep-cuda = { path = "../onnx-runtime-ep-cuda", version = "=0.1.0-dev.5", optional = true, default-features = false }
+onnx-runtime-ep-api = { workspace = true }
+onnx-runtime-ir = { workspace = true }
+onnx-runtime-loader = { workspace = true }
+onnx-std = { workspace = true }
+onnx-runtime-session = { path = "../onnx-runtime-session", version = "=0.1.0-dev.5", optional = true, default-features = false }
+onnx-runtime-tracer = { workspace = true, optional = true }
+prost = { workspace = true }
+memmap2 = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+tokenizers = { workspace = true }
+rand = "0.9.5"
+half = { workspace = true, features = ["use-intrinsics"] }
+llguidance = "1.7.6"
+toktrie_hf_tokenizers = "1.7.6"
+
+[dev-dependencies]
+onnx-genai-preprocess = { workspace = true }
+async-trait = { workspace = true }
+proptest = "1.9"
+
+[lints]
+workspace = true

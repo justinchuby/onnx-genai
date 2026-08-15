@@ -1,0 +1,16 @@
+[package]
+name = "onnx-model-package"
+description = "Pure-Rust parsing, selection, resolution, and validation for ORT model-package directories"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+indexmap = { version = "2", features = ["serde"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,1252 @@
+//! End-to-end loader tests: hand-built `ModelProto` → IR `Graph`.
+//!
+//! Exercises graph construction (edges, SSA, source values), symbolic-dim
+//! interning by name, opset imports, and shape inference over a
+//! MatMul → Add → LayerNormalization chain.
+
+use prost::Message;
+
+use onnx_runtime_ir::{Attribute, DataType, Dim, Graph, WeightRef};
+use onnx_runtime_loader::{LoaderError, proto::onnx};
+
+// --- proto construction helpers ---
+
+enum Dimlike {
+    Static(i64),
+    Param(&'static str),
+}
+
+fn tensor_type(elem_type: i32, dims: &[Dimlike]) -> onnx::TypeProto {
+    use onnx::tensor_shape_proto::{Dimension, dimension::Value as DV};
+    let dim = dims
+        .iter()
+        .map(|d| Dimension {
+            value: Some(match d {
+                Dimlike::Static(n) => DV::DimValue(*n),
+                Dimlike::Param(p) => DV::DimParam(p.to_string()),
+            }),
+            ..Default::default()
+        })
+        .collect();
+    onnx::TypeProto {
+        value: Some(onnx::type_proto::Value::TensorType(
+            onnx::type_proto::Tensor {
+                elem_type,
+                shape: Some(onnx::TensorShapeProto { dim }),
+            },
+        )),
+        ..Default::default()
+    }
+}
+
+fn value_info(name: &str, elem_type: i32, dims: &[Dimlike]) -> onnx::ValueInfoProto {
+    onnx::ValueInfoProto {
+        name: name.to_string(),
+        r#type: Some(tensor_type(elem_type, dims)),
+        ..Default::default()
+    }
+}
+
+fn f32_initializer(name: &str, dims: &[i64]) -> onnx::TensorProto {
+    let numel: i64 = dims.iter().product();
+    onnx::TensorProto {
+        name: name.to_string(),
+        data_type: 1, // FLOAT
+        dims: dims.to_vec(),
+        raw_data: vec![0u8; numel as usize * 4],
+        ..Default::default()
+    }
+}
+
+fn i64_initializer(name: &str, values: &[i64]) -> onnx::TensorProto {
+    let raw: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+    onnx::TensorProto {
+        name: name.to_string(),
+        data_type: 7, // INT64
+        dims: vec![values.len() as i64],
+        raw_data: raw,
+        ..Default::default()
+    }
+}
+
+fn node(op: &str, inputs: &[&str], outputs: &[&str]) -> onnx::NodeProto {
+    onnx::NodeProto {
+        op_type: op.to_string(),
+        input: inputs.iter().map(|s| s.to_string()).collect(),
+        output: outputs.iter().map(|s| s.to_string()).collect(),
+        ..Default::default()
+    }
+}
+
+fn int_attr(name: &str, v: i64) -> onnx::AttributeProto {
+    onnx::AttributeProto {
+        name: name.to_string(),
+        r#type: onnx::attribute_proto::AttributeType::Int as i32,
+        i: v,
+        ..Default::default()
+    }
+}
+
+/// A `GRAPH` (subgraph body) attribute — the control-flow construct the CPU EP
+/// cannot execute.
+fn graph_attr(name: &str, subgraph: onnx::GraphProto) -> onnx::AttributeProto {
+    onnx::AttributeProto {
+        name: name.to_string(),
+        r#type: onnx::attribute_proto::AttributeType::Graph as i32,
+        g: Some(subgraph),
+        ..Default::default()
+    }
+}
+
+fn node_attrs(
+    op: &str,
+    inputs: &[&str],
+    outputs: &[&str],
+    attrs: Vec<onnx::AttributeProto>,
+) -> onnx::NodeProto {
+    let mut n = node(op, inputs, outputs);
+    n.attribute = attrs;
+    n
+}
+
+/// A `Constant` node carrying an inline int64 tensor `value` attribute.
+fn const_i64(out: &str, dims: &[i64], values: &[i64]) -> onnx::NodeProto {
+    let raw: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let t = onnx::TensorProto {
+        data_type: 7, // INT64
+        dims: dims.to_vec(),
+        raw_data: raw,
+        ..Default::default()
+    };
+    let attr = onnx::AttributeProto {
+        name: "value".to_string(),
+        r#type: onnx::attribute_proto::AttributeType::Tensor as i32,
+        t: Some(t),
+        ..Default::default()
+    };
+    node_attrs("Constant", &[], &[out], vec![attr])
+}
+
+fn model(graph: onnx::GraphProto, opset: i64) -> Vec<u8> {
+    let m = onnx::ModelProto {
+        ir_version: 8,
+        opset_import: vec![onnx::OperatorSetIdProto {
+            domain: String::new(),
+            version: opset,
+        }],
+        graph: Some(graph),
+        ..Default::default()
+    };
+    m.encode_to_vec()
+}
+
+fn find(graph: &Graph, name: &str) -> onnx_runtime_ir::ValueId {
+    graph
+        .values
+        .iter()
+        .find(|(_, v)| v.name.as_deref() == Some(name))
+        .map(|(id, _)| id)
+        .unwrap_or_else(|| panic!("value {name} not found"))
+}
+
+// --- tests ---
+
+#[test]
+fn missing_opset_import_is_rejected_before_inference() {
+    let mut sigmoid = node("Sigmoid", &["X"], &["Y"]);
+    sigmoid.name = "missing_default_import".to_string();
+    sigmoid.domain = "com.example".to_string();
+    let graph = onnx::GraphProto {
+        input: vec![value_info("X", 1, &[Dimlike::Static(1)])],
+        output: vec![value_info("Y", 1, &[Dimlike::Static(1)])],
+        node: vec![sigmoid],
+        ..Default::default()
+    };
+    let bytes = onnx::ModelProto {
+        ir_version: 8,
+        opset_import: vec![onnx::OperatorSetIdProto {
+            domain: String::new(),
+            version: 17,
+        }],
+        graph: Some(graph),
+        ..Default::default()
+    }
+    .encode_to_vec();
+
+    let error = onnx_runtime_loader::load_model_bytes(&bytes).unwrap_err();
+    assert!(matches!(
+        &error,
+        LoaderError::MissingOpsetImport {
+            op_type,
+            node,
+            domain,
+        } if op_type == "Sigmoid"
+            && node == "\"missing_default_import\""
+            && domain == "com.example"
+    ));
+    let message = error.to_string();
+    assert!(message.contains("Sigmoid"), "{message}");
+    assert!(message.contains("com.example"), "{message}");
+    assert!(
+        message.contains("if you built this graph programmatically, add it before loading"),
+        "{message}"
+    );
+    assert!(!message.contains("18446744073709551615"), "{message}");
+}
+
+#[test]
+fn default_domain_spellings_share_one_opset_import() {
+    for (node_domain, import_domain) in [("", "ai.onnx"), ("ai.onnx", "")] {
+        let mut identity = node("Identity", &["X"], &["Y"]);
+        identity.domain = node_domain.to_string();
+        let graph = onnx::GraphProto {
+            input: vec![value_info("X", 1, &[Dimlike::Static(1)])],
+            output: vec![value_info("Y", 1, &[Dimlike::Static(1)])],
+            node: vec![identity],
+            ..Default::default()
+        };
+        let bytes = onnx::ModelProto {
+            ir_version: 8,
+            opset_import: vec![onnx::OperatorSetIdProto {
+                domain: import_domain.to_string(),
+                version: 17,
+            }],
+            graph: Some(graph),
+            ..Default::default()
+        }
+        .encode_to_vec();
+
+        onnx_runtime_loader::load_model_bytes(&bytes).unwrap_or_else(|error| {
+            panic!("node domain {node_domain:?}, import {import_domain:?}: {error}")
+        });
+    }
+}
+
+#[test]
+fn matmul_add_layernorm_chain() {
+    // X[batch, 4] -> MatMul(W[4,8]) -> H -> Add(B[8]) -> A -> LayerNorm -> Y
+    let g = onnx::GraphProto {
+        name: "bert_like".into(),
+        input: vec![value_info(
+            "X",
+            1,
+            &[Dimlike::Param("batch"), Dimlike::Static(4)],
+        )],
+        output: vec![value_info(
+            "Y",
+            1,
+            &[Dimlike::Param("batch"), Dimlike::Static(8)],
+        )],
+        initializer: vec![
+            f32_initializer("W", &[4, 8]),
+            f32_initializer("B", &[8]),
+            f32_initializer("Scale", &[8]),
+            f32_initializer("Bias", &[8]),
+        ],
+        node: vec![
+            node("MatMul", &["X", "W"], &["H"]),
+            node("Add", &["H", "B"], &["A"]),
+            node("LayerNormalization", &["A", "Scale", "Bias"], &["Y"]),
+        ],
+        ..Default::default()
+    };
+
+    let bytes = model(g, 17);
+    let graph = onnx_runtime_loader::load_model_bytes(&bytes).expect("load");
+
+    // Opset imports populated.
+    assert_eq!(graph.opset_imports.get(""), Some(&17));
+
+    // Structure: 3 nodes; X is the only graph input; Y the only output.
+    assert_eq!(graph.num_nodes(), 3);
+    assert_eq!(graph.inputs.len(), 1);
+    assert_eq!(graph.outputs.len(), 1);
+
+    // Initializers are source values (no producer) and recorded as weights.
+    let w = find(&graph, "W");
+    assert!(graph.value(w).producer.is_none());
+    assert!(graph.initializers.contains_key(&w));
+    match &graph.initializers[&w] {
+        WeightRef::Inline(t) => {
+            assert_eq!(t.dims, vec![4, 8]);
+            assert_eq!(t.data.len(), 4 * 8 * 4);
+        }
+        _ => panic!("expected inline weight"),
+    }
+
+    // Edge consistency: H is produced by the MatMul node and consumed by Add.
+    let h = find(&graph, "H");
+    let matmul_nid = graph.value(h).producer.expect("H has producer");
+    assert_eq!(graph.node(matmul_nid).op_type, "MatMul");
+    assert_eq!(graph.num_uses(h), 1);
+
+    // X is a graph input with no producer.
+    let x = find(&graph, "X");
+    assert!(graph.value(x).producer.is_none());
+    assert!(graph.inputs.contains(&x));
+
+    // Shape inference: batch is symbolic and shared; feature dim is 8.
+    let y = find(&graph, "Y");
+    let yshape = &graph.value(y).shape;
+    assert_eq!(yshape.len(), 2);
+    assert_eq!(yshape[1], Dim::Static(8));
+    let batch_sym = match graph.value(x).shape[0] {
+        Dim::Symbolic(id) => id,
+        _ => panic!("X batch dim should be symbolic"),
+    };
+    assert_eq!(yshape[0], Dim::Symbolic(batch_sym));
+
+    // H shape propagated to [batch, 8].
+    assert_eq!(
+        graph.value(h).shape,
+        vec![Dim::Symbolic(batch_sym), Dim::Static(8)]
+    );
+
+    // The built graph upholds all structural invariants.
+    graph.validate().expect("graph valid");
+}
+
+#[test]
+fn symbolic_dims_interned_by_name() {
+    // Two inputs share dim_param "seq"; they must resolve to the same SymbolId.
+    let g = onnx::GraphProto {
+        input: vec![
+            value_info("A", 1, &[Dimlike::Param("seq"), Dimlike::Static(2)]),
+            value_info("B", 1, &[Dimlike::Param("seq"), Dimlike::Static(2)]),
+        ],
+        output: vec![value_info(
+            "C",
+            1,
+            &[Dimlike::Param("seq"), Dimlike::Static(2)],
+        )],
+        node: vec![node("Add", &["A", "B"], &["C"])],
+        ..Default::default()
+    };
+    let bytes = model(g, 17);
+    let graph = onnx_runtime_loader::load_model_bytes(&bytes).expect("load");
+
+    let a = find(&graph, "A");
+    let b = find(&graph, "B");
+    let sa = match graph.value(a).shape[0] {
+        Dim::Symbolic(id) => id,
+        _ => panic!("A[0] symbolic"),
+    };
+    let sb = match graph.value(b).shape[0] {
+        Dim::Symbolic(id) => id,
+        _ => panic!("B[0] symbolic"),
+    };
+    assert_eq!(sa, sb, "same dim_param must intern to same SymbolId");
+}
+
+#[test]
+fn reshape_uses_constant_shape_initializer() {
+    // Reshape(X[2,3,4], shape=[-1, 4]) -> [6, 4], shape from a constant init.
+    let g = onnx::GraphProto {
+        input: vec![value_info(
+            "X",
+            1,
+            &[Dimlike::Static(2), Dimlike::Static(3), Dimlike::Static(4)],
+        )],
+        output: vec![value_info(
+            "Y",
+            1,
+            &[Dimlike::Static(6), Dimlike::Static(4)],
+        )],
+        initializer: vec![i64_initializer("shape", &[-1, 4])],
+        node: vec![node("Reshape", &["X", "shape"], &["Y"])],
+        ..Default::default()
+    };
+    let bytes = model(g, 17);
+    let graph = onnx_runtime_loader::load_model_bytes(&bytes).expect("load");
+
+    let y = find(&graph, "Y");
+    assert_eq!(
+        graph.value(y).shape,
+        vec![Dim::Static(6), Dim::Static(4)],
+        "reshape -1 should resolve to 6"
+    );
+}
+
+// ── unknown / unmodeled protobuf enum handling ──────────────────────────────
+
+/// An initializer whose `data_type` is an unknown/unsupported ONNX integer
+/// must produce a clean `LoaderError`, never a panic or a silent Float32.
+#[test]
+fn unknown_initializer_dtype_is_load_error() {
+    for bad in [27i32, 99] {
+        let mut init = f32_initializer("W", &[2, 2]);
+        init.data_type = bad;
+        let g = onnx::GraphProto {
+            input: vec![value_info(
+                "X",
+                1,
+                &[Dimlike::Static(2), Dimlike::Static(2)],
+            )],
+            output: vec![value_info(
+                "Y",
+                1,
+                &[Dimlike::Static(2), Dimlike::Static(2)],
+            )],
+            initializer: vec![init],
+            node: vec![node("Add", &["X", "W"], &["Y"])],
+            ..Default::default()
+        };
+        let bytes = model(g, 17);
+        let err = onnx_runtime_loader::load_model_bytes(&bytes)
+            .expect_err("unknown initializer data_type must be a load error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("data_type") || msg.contains(&bad.to_string()),
+            "error should mention the bad data_type, got: {msg}"
+        );
+    }
+}
+
+/// A value-info (graph input) whose tensor `elem_type` is an unmodeled ONNX
+/// dtype must fail closed with a clean `LoaderError`, never a silent Float32.
+#[test]
+fn unknown_value_info_dtype_is_load_error() {
+    for bad in [27i32, 99] {
+        let g = onnx::GraphProto {
+            input: vec![value_info("X", bad, &[Dimlike::Static(2)])],
+            output: vec![value_info("Y", 1, &[Dimlike::Static(2)])],
+            node: vec![node("Identity", &["X"], &["Y"])],
+            ..Default::default()
+        };
+        let bytes = model(g, 17);
+        let err = onnx_runtime_loader::load_model_bytes(&bytes)
+            .expect_err("unknown value-info elem_type must be a load error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("data_type") && msg.contains("value-info"),
+            "error should flag the value-info dtype, got: {msg}"
+        );
+        assert!(
+            msg.contains(&bad.to_string()),
+            "error should mention the raw dtype {bad}, got: {msg}"
+        );
+    }
+}
+
+/// A `Constant` node's inline tensor `value` attribute whose `data_type` is an
+/// unmodeled ONNX dtype must fail closed, never be silently mislabeled Float32.
+#[test]
+fn unknown_attribute_tensor_dtype_is_load_error() {
+    for bad in [27i32, 99] {
+        let t = onnx::TensorProto {
+            name: "k".to_string(),
+            data_type: bad,
+            dims: vec![1],
+            raw_data: vec![0u8; 8],
+            ..Default::default()
+        };
+        let attr = onnx::AttributeProto {
+            name: "value".to_string(),
+            r#type: onnx::attribute_proto::AttributeType::Tensor as i32,
+            t: Some(t),
+            ..Default::default()
+        };
+        let g = onnx::GraphProto {
+            output: vec![value_info("C", 1, &[Dimlike::Static(1)])],
+            node: vec![node_attrs("Constant", &[], &["C"], vec![attr])],
+            ..Default::default()
+        };
+        let bytes = model(g, 17);
+        let err = onnx_runtime_loader::load_model_bytes(&bytes)
+            .expect_err("unknown attribute-tensor data_type must be a load error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("data_type") && msg.contains("attribute tensor"),
+            "error should flag the attribute tensor dtype, got: {msg}"
+        );
+        assert!(
+            msg.contains(&bad.to_string()),
+            "error should mention the raw dtype {bad}, got: {msg}"
+        );
+    }
+}
+
+/// Tensor-list attributes are preserved rather than silently dropped.
+#[test]
+fn tensor_list_attribute_is_preserved() {
+    let attr = onnx::AttributeProto {
+        name: "vals".to_string(),
+        r#type: onnx::attribute_proto::AttributeType::Tensors as i32,
+        tensors: vec![onnx::TensorProto {
+            data_type: 1,
+            dims: vec![1],
+            raw_data: vec![0u8; 4],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let g = onnx::GraphProto {
+        input: vec![value_info("X", 1, &[Dimlike::Static(2)])],
+        output: vec![value_info("Y", 1, &[Dimlike::Static(2)])],
+        node: vec![node_attrs("Identity", &["X"], &["Y"], vec![attr])],
+        ..Default::default()
+    };
+    let bytes = model(g, 17);
+    let graph = onnx_runtime_loader::load_model_bytes(&bytes).expect("load tensor-list attribute");
+    let node = graph.nodes.values().next().expect("node");
+    assert!(matches!(
+        node.attr("vals"),
+        Some(Attribute::Tensors(tensors))
+            if tensors.len() == 1
+                && tensors[0].dtype == DataType::Float32
+                && tensors[0].dims == [1]
+    ));
+}
+
+#[test]
+fn smoke_load_real_fixture_if_present() {
+    // Repo fixtures live at <workspace>/tests/fixtures/*/model.onnx. They are
+    // model-specific but the loader is generic, so a successful load + validate
+    // is a good real-world smoke check. Skips gracefully if fixtures are absent.
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let root = std::path::Path::new(manifest)
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root");
+    let candidates = [
+        "tests/fixtures/tiny-eagle3/model.onnx.textproto", // external data
+        "tests/fixtures/tiny-whisper/encoder.onnx.textproto", // inline
+    ];
+    let mut loaded_any = false;
+    for rel in candidates {
+        let path = root.join(rel);
+        if !path.exists() {
+            continue;
+        }
+        let graph = onnx_runtime_loader::load_model(&path)
+            .unwrap_or_else(|e| panic!("failed to load {}: {e}", path.display()));
+        graph
+            .validate()
+            .unwrap_or_else(|e| panic!("invalid graph from {}: {e:?}", path.display()));
+        assert!(graph.num_nodes() > 0);
+        loaded_any = true;
+    }
+    if !loaded_any {
+        eprintln!("smoke_load_real_fixture_if_present: no fixtures found, skipping");
+    }
+}
+
+/// Loading a git-friendly `*.onnx.textproto` fixture must yield the same valid
+/// graph as its binary `.onnx` counterpart. Textproto is parsed as ONNX
+/// protobuf TextFormat and converted to binary before the normal decode path,
+/// so this is the nxrt-side end-to-end check for textproto support.
+#[test]
+fn load_textproto_fixture_matches_binary_io() {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let root = std::path::Path::new(manifest)
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root");
+    let path = root.join("tests/fixtures/tiny-whisper/encoder.onnx.textproto");
+    if !path.exists() {
+        eprintln!("load_textproto_fixture_matches_binary_io: fixture absent, skipping");
+        return;
+    }
+
+    assert!(
+        onnx_runtime_loader::is_textproto_path(&path),
+        "expected textproto detection by suffix"
+    );
+
+    let (graph, store) = onnx_runtime_loader::load_model_with_weights(&path)
+        .unwrap_or_else(|e| panic!("failed to load textproto fixture: {e}"));
+    graph
+        .validate()
+        .unwrap_or_else(|e| panic!("invalid graph from textproto fixture: {e:?}"));
+    assert!(graph.num_nodes() > 0, "textproto graph must have nodes");
+
+    // The tiny-whisper encoder takes `input_features` and produces
+    // `encoder_hidden_states`.
+    let input_names: Vec<&str> = graph
+        .inputs
+        .iter()
+        .filter_map(|v| graph.value(*v).name.as_deref())
+        .collect();
+    let output_names: Vec<&str> = graph
+        .outputs
+        .iter()
+        .filter_map(|v| graph.value(*v).name.as_deref())
+        .collect();
+    assert!(
+        input_names.contains(&"input_features"),
+        "inputs were {input_names:?}"
+    );
+    assert!(
+        output_names.contains(&"encoder_hidden_states"),
+        "outputs were {output_names:?}"
+    );
+
+    // Any inline initializer bytes must be retrievable via the weight store.
+    for weight_ref in graph.initializers.values() {
+        assert!(
+            store.bytes(weight_ref).is_some(),
+            "weight bytes must be resolvable for inline textproto fixture"
+        );
+    }
+}
+
+// ── load_*_with_weights: bytes survive after load, work for inline + external ──
+/// Build a tiny model with inline weights and verify that the Arc<WeightStore>
+/// keeps the bytes accessible after `load_model_bytes_with_weights` returns.
+#[test]
+fn load_bytes_with_weights_inline_survives() {
+    let g = onnx::GraphProto {
+        name: "inline_weights".into(),
+        input: vec![value_info(
+            "X",
+            1,
+            &[Dimlike::Static(2), Dimlike::Static(4)],
+        )],
+        output: vec![value_info(
+            "Y",
+            1,
+            &[Dimlike::Static(2), Dimlike::Static(8)],
+        )],
+        initializer: vec![f32_initializer("W", &[4, 8])],
+        node: vec![node("MatMul", &["X", "W"], &["Y"])],
+        ..Default::default()
+    };
+    let bytes = model(g, 17);
+
+    let (graph, store) = onnx_runtime_loader::load_model_bytes_with_weights(&bytes, ".")
+        .expect("load_model_bytes_with_weights");
+
+    // The store must be usable to get bytes for every initializer in the graph.
+    let mut found_inline = false;
+    for weight_ref in graph.initializers.values() {
+        match weight_ref {
+            WeightRef::Inline(_) => {
+                let raw = store.bytes(weight_ref).expect("inline bytes present");
+                // W is [4,8] f32 → 128 bytes of zeros
+                assert_eq!(raw.len(), 4 * 8 * 4, "W byte count");
+                assert!(raw.iter().all(|&b| b == 0), "W should be all-zeros");
+                found_inline = true;
+            }
+            WeightRef::External { .. } => {}
+        }
+    }
+    assert!(found_inline, "expected at least one inline initializer");
+
+    // Drop the graph; the Arc alone must keep bytes valid.
+    drop(graph);
+    // Re-query via a clone of the Arc — bytes still live.
+    let store2 = std::sync::Arc::clone(&store);
+    // We can't re-query without the WeightRef, but we can verify the Arc
+    // has the right ref-count and the store isn't dropped.
+    assert_eq!(std::sync::Arc::strong_count(&store2), 2);
+}
+
+/// Load real converted fixtures (now inlined into `.onnx.textproto`) and verify
+/// that the `Arc<WeightStore>` exposes non-empty byte slices for every
+/// initializer, and that those bytes stay live after the `Graph` is dropped.
+///
+/// External-data (`.onnx.data`) resolution itself is covered independently by
+/// `external_data_paths.rs`; these fixtures inline all weights, so every
+/// `WeightRef` is `Inline` here.
+/// Skips gracefully if the fixtures are absent.
+#[test]
+fn load_with_weights_inlined_fixtures_survive_graph_drop() {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let root = std::path::Path::new(manifest)
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root");
+
+    let candidates = [
+        "tests/fixtures/tiny-eagle3/model.onnx.textproto",
+        "tests/fixtures/tiny-llm/model.onnx.textproto",
+        "tests/fixtures/tiny-llm-scatter/model.onnx.textproto",
+    ];
+
+    let mut tested_any = false;
+    for rel in candidates {
+        let path = root.join(rel);
+        if !path.exists() {
+            continue;
+        }
+
+        let (graph, store) = onnx_runtime_loader::load_model_with_weights(&path)
+            .unwrap_or_else(|e| panic!("load_model_with_weights({rel}): {e}"));
+
+        graph
+            .validate()
+            .unwrap_or_else(|e| panic!("invalid graph from {rel}: {e:?}"));
+
+        // Snapshot every initializer's WeightRef, then drop the graph and verify
+        // the Arc<WeightStore> still yields the (inline) bytes.
+        let weights: Vec<_> = graph.initializers.values().cloned().collect();
+        assert!(
+            !weights.is_empty(),
+            "fixture {rel} is expected to carry initializers"
+        );
+
+        drop(graph); // graph gone — Arc<WeightStore> must keep bytes alive
+
+        for w in &weights {
+            let raw = store.bytes(w).expect("weight bytes live after graph drop");
+            assert!(!raw.is_empty(), "weight bytes must be non-empty");
+            tested_any = true;
+        }
+
+        break; // one fixture is enough
+    }
+
+    if !tested_any {
+        eprintln!(
+            "load_with_weights_inlined_fixtures_survive_graph_drop: no fixture found, skipping"
+        );
+    }
+}
+
+// ── shape inference: Constant / value (shape-data) propagation ─────────────────
+
+#[test]
+fn constant_infers_shape_dtype_and_value() {
+    // A Constant int64 vector must get its shape + dtype from the `value`
+    // attribute, and its concrete value must propagate into a Reshape target.
+    // X[2,3,4] -> Reshape(shape = Constant[-1, 4]) -> [6, 4].
+    let g = onnx::GraphProto {
+        input: vec![value_info(
+            "X",
+            1,
+            &[Dimlike::Static(2), Dimlike::Static(3), Dimlike::Static(4)],
+        )],
+        output: vec![value_info(
+            "Y",
+            1,
+            &[Dimlike::Static(6), Dimlike::Static(4)],
+        )],
+        node: vec![
+            const_i64("shape", &[2], &[-1, 4]),
+            node("Reshape", &["X", "shape"], &["Y"]),
+        ],
+        ..Default::default()
+    };
+    let graph = onnx_runtime_loader::load_model_bytes(&model(g, 12)).expect("load");
+
+    // Constant output: shape [2], dtype Int64.
+    let s = find(&graph, "shape");
+    assert_eq!(graph.value(s).shape, vec![Dim::Static(2)]);
+    assert_eq!(graph.value(s).dtype, DataType::Int64);
+
+    // Its value drove the Reshape target: -1 resolves to 6.
+    let y = find(&graph, "Y");
+    assert_eq!(graph.value(y).shape, vec![Dim::Static(6), Dim::Static(4)]);
+}
+
+#[test]
+fn shape_slice_concat_reshape_int64_chain_folds_to_concrete_dims() {
+    // Classic dynamic-shape subgraph, fully static here so it must fold to
+    // concrete dims:
+    //   Shape(X[2,3,4]) -> s(=[2,3,4])
+    //   Slice(s, [0], [2], axes=[0]) -> s01(=[2,3])
+    //   Concat(s01, Const[24], axis=0) -> target(=[2,3,24])
+    //   Reshape(D[2,72], target) -> [2,3,24]
+    let g = onnx::GraphProto {
+        input: vec![
+            value_info(
+                "X",
+                1,
+                &[Dimlike::Static(2), Dimlike::Static(3), Dimlike::Static(4)],
+            ),
+            value_info("D", 1, &[Dimlike::Static(2), Dimlike::Static(72)]),
+        ],
+        output: vec![value_info(
+            "Y",
+            1,
+            &[Dimlike::Static(2), Dimlike::Static(3), Dimlike::Static(24)],
+        )],
+        node: vec![
+            node("Shape", &["X"], &["s"]),
+            const_i64("starts", &[1], &[0]),
+            const_i64("ends", &[1], &[2]),
+            const_i64("axes", &[1], &[0]),
+            node("Slice", &["s", "starts", "ends", "axes"], &["s01"]),
+            const_i64("tail", &[1], &[24]),
+            node_attrs(
+                "Concat",
+                &["s01", "tail"],
+                &["target"],
+                vec![int_attr("axis", 0)],
+            ),
+            node("Reshape", &["D", "target"], &["Y"]),
+        ],
+        ..Default::default()
+    };
+    let graph = onnx_runtime_loader::load_model_bytes(&model(g, 12)).expect("load");
+
+    // The intermediate shape-vector folded to a concrete int64 [2,3].
+    let s01 = find(&graph, "s01");
+    assert_eq!(graph.value(s01).shape, vec![Dim::Static(2)]);
+    let target = find(&graph, "target");
+    assert_eq!(graph.value(target).shape, vec![Dim::Static(3)]);
+
+    // The Reshape output resolved to fully-concrete dims.
+    let y = find(&graph, "Y");
+    assert_eq!(
+        graph.value(y).shape,
+        vec![Dim::Static(2), Dim::Static(3), Dim::Static(24)]
+    );
+}
+
+#[test]
+fn expand_broadcasts_to_const_target() {
+    // Expand(D[1,3], shape = Constant[2,3]) -> [2,3].
+    let g = onnx::GraphProto {
+        input: vec![value_info(
+            "D",
+            1,
+            &[Dimlike::Static(1), Dimlike::Static(3)],
+        )],
+        output: vec![value_info(
+            "Y",
+            1,
+            &[Dimlike::Static(2), Dimlike::Static(3)],
+        )],
+        node: vec![
+            const_i64("shape", &[2], &[2, 3]),
+            node("Expand", &["D", "shape"], &["Y"]),
+        ],
+        ..Default::default()
+    };
+    let graph = onnx_runtime_loader::load_model_bytes(&model(g, 12)).expect("load");
+    let y = find(&graph, "Y");
+    assert_eq!(graph.value(y).shape, vec![Dim::Static(2), Dim::Static(3)]);
+}
+
+#[test]
+fn data_dependent_slice_stays_symbolic() {
+    // The Slice `ends` come from Shape(ids) where ids has a symbolic dim, so the
+    // sliced extent must stay symbolic — never wrongly folded to a constant.
+    //   Shape(ids[batch]) -> ends(=[batch])
+    //   Slice(data[10], [0], ends, axes=[0]) -> out(=[symbolic])
+    let g = onnx::GraphProto {
+        input: vec![value_info("ids", 7, &[Dimlike::Param("batch")])],
+        output: vec![value_info("out", 7, &[Dimlike::Param("sliced")])],
+        node: vec![
+            const_i64("data", &[10], &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]),
+            node("Shape", &["ids"], &["ends"]),
+            const_i64("starts", &[1], &[0]),
+            const_i64("axes", &[1], &[0]),
+            node("Slice", &["data", "starts", "ends", "axes"], &["out"]),
+        ],
+        ..Default::default()
+    };
+    let graph = onnx_runtime_loader::load_model_bytes(&model(g, 12)).expect("load");
+
+    let out = find(&graph, "out");
+    let shape = &graph.value(out).shape;
+    assert_eq!(shape.len(), 1, "Slice preserves rank");
+    assert!(
+        matches!(shape[0], Dim::Symbolic(_)),
+        "data-dependent slice extent must stay symbolic, got {:?}",
+        shape[0]
+    );
+}
+
+/// Prove the fix on the real Phase-1 driver model: every value must get a
+/// resolved (concrete-or-symbolic) shape, so the session never trips
+/// `UnresolvedShape`. The only values left with an empty (rank-0) shape must be
+/// genuine scalar `Constant`s / graph sources — never a real tensor produced by
+/// a structural op. Skips gracefully when the model is absent (e.g. CI).
+#[test]
+fn bert_toy_optimized_every_value_resolves() {
+    let path = std::env::var("BERT_TOY_MODEL").unwrap_or_else(|_| {
+        "/home/justinchu/ort-build/Release/testdata/bert_toy_optimized.onnx".to_string()
+    });
+    if !std::path::Path::new(&path).exists() {
+        eprintln!("bert_toy_optimized_every_value_resolves: model not present, skipping");
+        return;
+    }
+    let graph = onnx_runtime_loader::load_model(&path).expect("load bert_toy_optimized");
+
+    // Ops that always produce a rank ≥ 1 tensor in this model: none of their
+    // outputs may be left shape-less.
+    let structural = [
+        "Reshape",
+        "Transpose",
+        "MatMul",
+        "Gemm",
+        "Slice",
+        "Expand",
+        "Gather",
+        "Concat",
+        "Softmax",
+        "Add",
+        "Sub",
+        "Mul",
+        "Div",
+        "Pow",
+        "Erf",
+        "Sqrt",
+        "Tanh",
+        "ReduceMean",
+        "LayerNormalization",
+    ];
+
+    for vid in graph.values.keys() {
+        let v = graph.value(vid);
+        let producer_op = v.producer.map(|n| graph.node(n).op_type.clone());
+        if v.shape.is_empty() {
+            // A shape-less value is only acceptable for a genuine scalar
+            // Constant or a graph source — never for a structural-op output.
+            let op = producer_op.as_deref().unwrap_or("<source>");
+            assert!(
+                !structural.contains(&op),
+                "value {:?} (produced by structural op {op}) left shape-less \
+                 — session would hit UnresolvedShape",
+                v.name
+            );
+            assert!(
+                op == "Constant" || op == "<source>",
+                "unexpected shape-less value {:?} produced by {op}",
+                v.name
+            );
+        } else {
+            // Non-empty shapes are made of concrete and/or interned symbolic
+            // dims; both are resolvable by the session.
+            assert!(
+                v.shape
+                    .iter()
+                    .all(|d| matches!(d, Dim::Static(_) | Dim::Symbolic(_))),
+                "value {:?} has an ill-formed shape {:?}",
+                v.name,
+                v.shape
+            );
+        }
+    }
+
+    // Spot-check the folded shape-chain and the data-dependent slice.
+    let concat0 = find(&graph, "concat_shape_0");
+    assert_eq!(graph.value(concat0).dtype, DataType::Int64);
+    assert_eq!(graph.value(concat0).shape, vec![Dim::Static(4)]);
+
+    let from_slice = find(&graph, "from_slice_01");
+    let fs = &graph.value(from_slice).shape;
+    assert_eq!(fs.len(), 2, "position slice keeps rank 2");
+    assert!(
+        fs.iter().all(|d| matches!(d, Dim::Symbolic(_))),
+        "data-dependent position slice must stay symbolic, got {fs:?}"
+    );
+
+    // A reshaped attention head tensor resolved to a mix of symbolic batch/seq
+    // and concrete head dims.
+    let r = find(&graph, "146");
+    assert_eq!(
+        graph.value(r).shape,
+        vec![
+            Dim::Symbolic(onnx_runtime_ir::SymbolId(0)),
+            Dim::Symbolic(onnx_runtime_ir::SymbolId(1)),
+            Dim::Static(4),
+            Dim::Static(8),
+        ]
+    );
+}
+
+#[test]
+fn loop_body_records_formal_io_and_inline_initializer_when_attr_type_is_omitted() {
+    let bias_data: Vec<u8> = [1.5f32, -2.0]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect();
+    let body = onnx::GraphProto {
+        name: "loop_body".to_string(),
+        input: vec![
+            value_info("iteration", 7, &[]),
+            value_info("condition_in", 9, &[]),
+            value_info("carried_in", 1, &[Dimlike::Static(2)]),
+        ],
+        output: vec![
+            value_info("condition_out", 9, &[]),
+            value_info("carried_out", 1, &[Dimlike::Static(2)]),
+        ],
+        initializer: vec![onnx::TensorProto {
+            name: "bias".to_string(),
+            data_type: 1,
+            dims: vec![2],
+            raw_data: bias_data.clone(),
+            ..Default::default()
+        }],
+        node: vec![
+            node("Identity", &["condition_in"], &["condition_out"]),
+            node("Add", &["carried_in", "bias"], &["carried_out"]),
+        ],
+        ..Default::default()
+    };
+    let mut body_attr = graph_attr("body", body);
+    body_attr.r#type = onnx::attribute_proto::AttributeType::Undefined as i32;
+    let graph = onnx::GraphProto {
+        input: vec![
+            value_info("trip_count", 7, &[]),
+            value_info("condition", 9, &[]),
+            value_info("initial", 1, &[Dimlike::Static(2)]),
+        ],
+        output: vec![value_info("final", 1, &[Dimlike::Static(2)])],
+        node: vec![node_attrs(
+            "Loop",
+            &["trip_count", "condition", "initial"],
+            &["final"],
+            vec![body_attr],
+        )],
+        ..Default::default()
+    };
+
+    let loaded = onnx_runtime_loader::load_model_bytes(&model(graph, 17))
+        .expect("load Loop with structural body metadata");
+    let (loop_id, _) = loaded
+        .nodes
+        .iter()
+        .find(|(_, node)| node.op_type == "Loop")
+        .expect("Loop node");
+    let body = loaded
+        .subgraphs
+        .get(&(loop_id, "body".to_string()))
+        .expect("Loop body");
+
+    let input_names: Vec<_> = body
+        .inputs
+        .iter()
+        .map(|&id| body.value(id).name.as_deref().expect("named input"))
+        .collect();
+    assert_eq!(input_names, ["iteration", "condition_in", "carried_in"]);
+    assert_eq!(body.value(body.inputs[0]).dtype, DataType::Int64);
+    assert_eq!(body.value(body.inputs[0]).shape, Vec::<Dim>::new());
+    assert_eq!(body.value(body.inputs[1]).dtype, DataType::Bool);
+    assert_eq!(body.value(body.inputs[2]).dtype, DataType::Float32);
+    assert_eq!(body.value(body.inputs[2]).shape, vec![Dim::Static(2)]);
+
+    let output_names: Vec<_> = body
+        .outputs
+        .iter()
+        .map(|&id| body.value(id).name.as_deref().expect("named output"))
+        .collect();
+    assert_eq!(output_names, ["condition_out", "carried_out"]);
+    assert_eq!(body.value(body.outputs[0]).dtype, DataType::Bool);
+    assert_eq!(body.value(body.outputs[1]).dtype, DataType::Float32);
+    assert_eq!(body.value(body.outputs[1]).shape, vec![Dim::Static(2)]);
+
+    let bias = find(body, "bias");
+    let WeightRef::Inline(tensor) = body.initializers.get(&bias).expect("body initializer") else {
+        panic!("body initializer must be inline");
+    };
+    assert_eq!(tensor.dtype, DataType::Float32);
+    assert_eq!(tensor.dims, vec![2]);
+    assert_eq!(tensor.data, bias_data);
+}
+
+// --- fail-fast load-time validation (RULES #1) ---
+
+/// The implemented subgraph-bearing control-flow ops (`If`/`Loop`/`Scan`) now
+/// load successfully — the executor runs their nested bodies recursively — so
+/// validation must *accept* them rather than reject at load.
+#[test]
+fn implemented_control_flow_ops_load() {
+    for (op, attr) in [("If", "then_branch"), ("Loop", "body"), ("Scan", "body")] {
+        let subgraph = onnx::GraphProto {
+            output: vec![value_info("body_out", 1, &[Dimlike::Static(1)])],
+            node: vec![node("Identity", &["cond"], &["body_out"])],
+            ..Default::default()
+        };
+        let mut attrs = vec![graph_attr(attr, subgraph)];
+        // If needs both branches; give a matching else_branch too.
+        if op == "If" {
+            let else_g = onnx::GraphProto {
+                output: vec![value_info("body_out", 1, &[Dimlike::Static(1)])],
+                node: vec![node("Identity", &["cond"], &["body_out"])],
+                ..Default::default()
+            };
+            attrs.push(graph_attr("else_branch", else_g));
+        }
+        if op == "Scan" {
+            attrs.push(int_attr("num_scan_inputs", 1));
+        }
+        let mut cf_node = node_attrs(op, &["cond"], &["Y"], attrs);
+        cf_node.name = format!("cf_{op}");
+
+        let graph = onnx::GraphProto {
+            input: vec![value_info("cond", 9, &[Dimlike::Static(1)])], // BOOL
+            output: vec![value_info("Y", 1, &[Dimlike::Static(1)])],
+            node: vec![cf_node],
+            ..Default::default()
+        };
+        let bytes = model(graph, 17);
+        // Validation must not reject the implemented control-flow op. (Shape
+        // inference of the body is deferred to execution, so we only assert the
+        // load-time legality gate does not error with UnsupportedControlFlow.)
+        let result = onnx_runtime_loader::load_model_bytes(&bytes);
+        if let Err(LoaderError::UnsupportedControlFlow { op_type, .. }) = &result {
+            panic!("{op_type} must be accepted at load, but was rejected");
+        }
+    }
+}
+
+/// A subgraph-bearing op that is *not* one of the implemented control-flow ops
+/// (here a custom op smuggling a `Graph` attribute) is still rejected at load
+/// with an actionable message naming the node, op, domain, and attribute.
+#[test]
+fn unimplemented_control_flow_subgraph_op_is_rejected_at_load() {
+    let subgraph = onnx::GraphProto {
+        output: vec![value_info("then_out", 1, &[Dimlike::Static(1)])],
+        node: vec![node("Identity", &["cond"], &["then_out"])],
+        ..Default::default()
+    };
+    let mut cf_node = node_attrs(
+        "SequenceMap",
+        &["cond"],
+        &["Y"],
+        vec![graph_attr("body", subgraph)],
+    );
+    cf_node.name = "control_flow_seqmap".to_string();
+
+    let graph = onnx::GraphProto {
+        input: vec![value_info("cond", 9, &[Dimlike::Static(1)])], // BOOL
+        output: vec![value_info("Y", 1, &[Dimlike::Static(1)])],
+        node: vec![cf_node],
+        ..Default::default()
+    };
+    let bytes = model(graph, 17);
+
+    let error = onnx_runtime_loader::load_model_bytes(&bytes).unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            LoaderError::UnsupportedControlFlow { op_type, node, domain, attr }
+                if op_type == "SequenceMap"
+                    && node == "\"control_flow_seqmap\""
+                    && domain == "ai.onnx"
+                    && attr == "body"
+        ),
+        "got {error:?}"
+    );
+    let message = error.to_string();
+    assert!(message.contains("SequenceMap"), "{message}");
+    assert!(message.contains("body"), "{message}");
+    assert!(message.contains("RULES #1"), "{message}");
+    assert!(message.contains("control-flow"), "{message}");
+}
+
+/// A node consuming a tensor that is neither a graph input, an initializer, nor
+/// produced by any upstream node is a dangling reference — rejected at load with
+/// a message naming the node and the missing tensor.
+#[test]
+fn dangling_tensor_reference_is_rejected_at_load() {
+    // Add(X, Z) -> Y, where Z is undefined (no input, initializer, or producer).
+    let mut add = node("Add", &["X", "Z"], &["Y"]);
+    add.name = "dangling_add".to_string();
+    let graph = onnx::GraphProto {
+        input: vec![value_info("X", 1, &[Dimlike::Static(2)])],
+        output: vec![value_info("Y", 1, &[Dimlike::Static(2)])],
+        node: vec![add],
+        ..Default::default()
+    };
+    let bytes = model(graph, 17);
+
+    let error = onnx_runtime_loader::load_model_bytes(&bytes).unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            LoaderError::DanglingTensorRef { op_type, node, tensor, .. }
+                if op_type == "Add" && node == "\"dangling_add\"" && tensor == "Z"
+        ),
+        "got {error:?}"
+    );
+    let message = error.to_string();
+    assert!(message.contains("'Z'"), "{message}");
+    assert!(message.contains("Add"), "{message}");
+    assert!(message.contains("RULES #1"), "{message}");
+    assert!(message.contains("no producer exists"), "{message}");
+}
+
+/// A node output whose name collides with an initializer name reuses the
+/// initializer's `ValueId`, giving that value a producer. Such a graph is
+/// structurally malformed (an initializer must be a constant source) and would
+/// let a kernel write through the read-only weight storage that the
+/// weight-streaming executor borrows zero-copy. It must be rejected cleanly at
+/// load — not crash — with a message naming the tensor and the producing node.
+#[test]
+fn initializer_reused_as_node_output_is_rejected_at_load() {
+    // Identity(X) -> B where B is also an initializer, then Add(B, X) -> Y.
+    // The node output "B" collides with the initializer "B".
+    let mut producer = node("Identity", &["X"], &["B"]);
+    producer.name = "clobbers_initializer".to_string();
+    let graph = onnx::GraphProto {
+        input: vec![value_info("X", 1, &[Dimlike::Static(4)])],
+        output: vec![value_info("Y", 1, &[Dimlike::Static(4)])],
+        initializer: vec![f32_initializer("B", &[4])],
+        node: vec![producer, node("Add", &["B", "X"], &["Y"])],
+        ..Default::default()
+    };
+    let bytes = model(graph, 17);
+
+    let error = onnx_runtime_loader::load_model_bytes(&bytes).unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            LoaderError::InitializerHasProducer { tensor, node }
+                if tensor == "B" && node == "\"clobbers_initializer\""
+        ),
+        "got {error:?}"
+    );
+    let message = error.to_string();
+    assert!(message.contains("'B'"), "{message}");
+    assert!(message.contains("initializer"), "{message}");
+    assert!(message.contains("RULES #1"), "{message}");
+    assert!(message.contains("no producer"), "{message}");
+}
+
+/// An initializer-backed node input is a legitimate source and must NOT be
+/// flagged as a dangling reference (regression guard against false positives:
+/// the dangling check runs only after initializers are attached).
+#[test]
+fn initializer_backed_input_is_not_dangling() {
+    let graph = onnx::GraphProto {
+        input: vec![value_info("X", 1, &[Dimlike::Static(4)])],
+        output: vec![value_info("Y", 1, &[Dimlike::Static(4)])],
+        initializer: vec![f32_initializer("B", &[4])],
+        node: vec![node("Add", &["X", "B"], &["Y"])],
+        ..Default::default()
+    };
+    let bytes = model(graph, 17);
+    onnx_runtime_loader::load_model_bytes(&bytes)
+        .expect("initializer-backed input must load without a dangling-ref error");
+}
+
+/// Node order in an ONNX graph need not be topological. A consumer listed
+/// before its producer is still sourced and must not be flagged as dangling.
+#[test]
+fn out_of_order_dag_input_is_not_dangling() {
+    let graph = onnx::GraphProto {
+        input: vec![value_info("X", 1, &[Dimlike::Static(4)])],
+        output: vec![value_info("Y", 1, &[Dimlike::Static(4)])],
+        node: vec![
+            node("Identity", &["produced_later"], &["Y"]),
+            node("Identity", &["X"], &["produced_later"]),
+        ],
+        ..Default::default()
+    };
+    let bytes = model(graph, 17);
+    onnx_runtime_loader::load_model_bytes(&bytes)
+        .expect("out-of-order DAG must load without a dangling-ref error");
+}
+
+/// An empty input name is ONNX's convention for an omitted optional input. The
+/// graph builder converts it to `None`, so dangling-reference validation must
+/// ignore it.
+#[test]
+fn omitted_optional_input_is_not_dangling() {
+    let graph = onnx::GraphProto {
+        input: vec![value_info("X", 1, &[Dimlike::Static(4)])],
+        output: vec![value_info("Y", 1, &[Dimlike::Static(4)])],
+        initializer: vec![f32_initializer("max", &[])],
+        node: vec![node("Clip", &["X", "", "max"], &["Y"])],
+        ..Default::default()
+    };
+    let bytes = model(graph, 17);
+    onnx_runtime_loader::load_model_bytes(&bytes)
+        .expect("omitted optional input must load without a dangling-ref error");
+}

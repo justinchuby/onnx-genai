@@ -1,0 +1,807 @@
+use super::*;
+
+/// Ops whose owned scratch is reserved by prepare-only planning (§736) so that
+/// capacity refusal surfaces before request admission rather than as a late
+/// device OOM. `BlockQuantizedMoE` (#747) reserves a session-persistent
+/// workspace; `IndexShare` (#751) reserves a session-persistent workspace;
+/// `com.microsoft::Attention` reserves a step-scoped Phase-2a scratch; the
+/// default-domain `Attention` (#736) reserves one route-sized composite covering
+/// its always-materialized f32 score matrix plus dense aliased K/V staging only
+/// when used — step-scoped on the per-call prefill/batched route,
+/// session-persistent on the capture-eligible single-token decode route (both
+/// classes, fixed-capacity append and absent present-output staging charge zero);
+/// `com.microsoft::GroupQueryAttention` (#736) reserves one session-persistent
+/// composite covering packed Q/K/V projection staging, route-required BSH↔BNSH
+/// transpose scratch, and its f32 reference score buffer; and the
+/// cuBLASLt GEMM family shares one session-persistent heuristic-sized peak. All
+/// report their exact bytes via [`Kernel::workspace_requirement`].
+pub(super) fn is_planned_workspace_node(node: &onnx_runtime_ir::Node) -> bool {
+    (node.domain.is_empty() && matches!(node.op_type.as_str(), "MatMul" | "Gemm" | "Attention"))
+        || (node.domain == onnx_runtime_ir::RUNTIME_DOMAIN
+            && matches!(node.op_type.as_str(), "BlockQuantizedMoE" | "IndexShare"))
+        || (node.domain == "com.microsoft"
+            && matches!(
+                node.op_type.as_str(),
+                "Attention"
+                    | "GroupQueryAttention"
+                    | "MatMulNBits"
+                    | "FusedMatMulBias"
+                    | "FusedGemm"
+            ))
+}
+
+/// Merge a per-node workspace requirement into the running peak for its
+/// lifetime class, keeping the largest byte count and the strictest alignment.
+fn merge_workspace_peak(peak: &mut WorkspaceRequirement, requirement: WorkspaceRequirement) {
+    if requirement.bytes > peak.bytes {
+        *peak = requirement;
+    } else if requirement.bytes == peak.bytes {
+        peak.alignment = peak.alignment.max(requirement.alignment);
+    }
+}
+
+impl Executor {
+    pub(crate) fn prepare_mapped_growth(
+        &self,
+        bytes: u64,
+        role: onnx_runtime_memory_governor::MemoryRole,
+    ) -> Result<Option<onnx_runtime_memory_governor::MappedGrowthGrant>> {
+        Ok(self.ep.prepare_mapped_growth(bytes, role)?)
+    }
+
+    pub(crate) fn release_mapped_growth(
+        &self,
+        bytes: u64,
+        role: onnx_runtime_memory_governor::MemoryRole,
+    ) {
+        self.ep.release_mapped_growth(bytes, role);
+    }
+
+    pub(crate) fn workspace_node_locations(&self) -> Vec<String> {
+        fn collect(graph: &Graph, scope: &str, out: &mut Vec<String>) {
+            for (node_id, node) in graph.nodes.iter() {
+                if is_planned_workspace_node(node) {
+                    out.push(format!(
+                        "{scope}node#{} '{}::{}'",
+                        node_id.0, node.domain, node.op_type
+                    ));
+                }
+            }
+            for ((node_id, attribute), child) in &graph.subgraphs {
+                collect(
+                    child,
+                    &format!("{scope}node#{}/{attribute}/", node_id.0),
+                    out,
+                );
+            }
+        }
+        let mut locations = Vec::new();
+        collect(&self.graph, "", &mut locations);
+        locations
+    }
+
+    /// Resolve concrete metadata and reserve kernel workspace without executing
+    /// any graph node.
+    pub(crate) fn prepare_with_device_bindings(
+        &mut self,
+        inputs: &[(&str, &Tensor)],
+        bindings: &mut [DeviceIoBinding],
+    ) -> Result<WorkspaceRequirement> {
+        self.workspace_preparation_required = true;
+        let external = self.prepare_external_bindings(bindings)?;
+        let symbols = self.bind_symbols(inputs, &external)?;
+        let resolved = self.resolve_soft(&symbols);
+        // Track one peak per lifetime class: session-persistent and step-scoped
+        // scratch live in separate executor slots, so a single peak cannot stand
+        // in for both when a graph mixes governed ops (e.g. QMoE + Attention).
+        let mut peak_persistent = WorkspaceRequirement::NONE;
+        let mut peak_step = WorkspaceRequirement::NONE;
+
+        for pi in 0..self.plan.len() {
+            let node_id = self.plan[pi].node_id;
+            let node = self.graph.node(node_id);
+            if !is_planned_workspace_node(node) {
+                continue;
+            }
+            let input_shapes = self.plan[pi]
+                .inputs
+                .iter()
+                .enumerate()
+                .map(|(index, input)| match input {
+                    None => Ok(Vec::new()),
+                    Some(value) => resolved.get(value).cloned().ok_or_else(|| {
+                        let value_name = self
+                            .graph
+                            .value(*value)
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| format!("value#{}", value.0));
+                        SessionError::Internal(format!(
+                            "prepare-only workspace planning cannot resolve input {index} \
+                             '{value_name}' for node {} ('{}::{}'); its shape is runtime-dependent \
+                             and no exact graph-metadata bound is available",
+                            node_id.0, node.domain, node.op_type
+                        ))
+                    }),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let constant_inputs = self.plan[pi]
+                .inputs
+                .iter()
+                .map(|input| {
+                    input.is_some_and(|value| self.graph.initializers.contains_key(&value))
+                })
+                .collect::<Vec<_>>();
+            let opset = effective_opset(&self.graph, node);
+            // Must match what dispatch computes for this node, or prepare-only
+            // planning would key a different kernel than execution uses.
+            let seq_independent =
+                node_capture_seq_independent(&self.graph, node, &self.capture_growing_symbols);
+            let (kernel, key) = self.cache.get_or_create(
+                node_id,
+                node,
+                &input_shapes,
+                &self.plan[pi].input_dtypes,
+                &constant_inputs,
+                opset,
+                seq_independent,
+                self.ep.as_ref(),
+            )?;
+            self.kernel_bindings[pi] = Some(key);
+            let metadata = input_shapes
+                .iter()
+                .zip(&self.plan[pi].input_dtypes)
+                .zip(&self.plan[pi].inputs)
+                .map(|((shape, dtype), input)| TensorMetadata::new(*dtype, shape, input.is_some()))
+                .collect::<Vec<_>>();
+            let requirement = kernel.workspace_requirement(&metadata)?;
+            if requirement.bytes == 0 {
+                continue;
+            }
+            match requirement.role {
+                onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped }
+                    if step_scoped
+                        == matches!(requirement.lifetime, WorkspaceLifetime::StepScoped) => {}
+                _ => {
+                    return Err(SessionError::Internal(format!(
+                        "node {} ('{}::{}') returned an inconsistent workspace role/lifetime",
+                        node_id.0, node.domain, node.op_type
+                    )));
+                }
+            }
+            let peak = match requirement.lifetime {
+                WorkspaceLifetime::SessionPersistent => &mut peak_persistent,
+                WorkspaceLifetime::StepScoped => &mut peak_step,
+            };
+            merge_workspace_peak(peak, requirement);
+        }
+        let child_graphs = self.graph.subgraphs.values().collect::<Vec<_>>();
+        for child in child_graphs {
+            self.collect_nested_workspace_requirement(
+                child,
+                &symbols,
+                "control-flow/",
+                &mut peak_persistent,
+                &mut peak_step,
+            )?;
+        }
+
+        Self::reserve_prepared_workspace(
+            self.ep.as_ref(),
+            &mut self.persistent_workspace,
+            peak_persistent,
+        )?;
+        Self::reserve_prepared_workspace(self.ep.as_ref(), &mut self.step_workspace, peak_step)?;
+
+        // Return the dominant requirement for callers that assert on a single
+        // reserved workspace; the two slots are prepared independently above.
+        Ok(if peak_persistent.bytes >= peak_step.bytes {
+            peak_persistent
+        } else {
+            peak_step
+        })
+    }
+
+    /// Reserve `peak` into `slot` against the device authority, reusing a
+    /// large-enough existing preparation. A zero requirement is a no-op.
+    fn reserve_prepared_workspace(
+        ep: &dyn ExecutionProvider,
+        slot: &mut Option<PreparedWorkspace>,
+        peak: WorkspaceRequirement,
+    ) -> Result<()> {
+        if peak.bytes == 0 {
+            return Ok(());
+        }
+        let bytes = usize::try_from(peak.bytes).map_err(|_| {
+            SessionError::Internal(format!(
+                "workspace requirement {} does not fit usize",
+                peak.bytes
+            ))
+        })?;
+        if slot
+            .as_ref()
+            .is_some_and(|prepared| prepared.bytes >= bytes && prepared.alignment >= peak.alignment)
+        {
+            return Ok(());
+        };
+        if let Some(old) = slot.take() {
+            ep.deallocate(old.buffer)?;
+        }
+        let target_mapped = ep.mapped_bytes_for_allocation(bytes, peak.alignment)?;
+        let mut grant = ep.prepare_mapped_growth(target_mapped, peak.role)?;
+        let lease = match ep.reserve_workspace(peak.bytes, peak.role) {
+            Ok(lease) => lease,
+            Err(error) => {
+                drop(grant);
+                return Err(error.into());
+            }
+        };
+        let fresh = match grant.take() {
+            Some(grant) => ep.allocate_with_mapped_growth(bytes, peak.alignment, grant)?,
+            None => ep.allocate(bytes, peak.alignment)?,
+        };
+        *slot = Some(PreparedWorkspace {
+            buffer: fresh,
+            _lease: lease,
+            bytes,
+            alignment: peak.alignment,
+        });
+        Ok(())
+    }
+
+    fn collect_nested_workspace_requirement(
+        &self,
+        graph: &Graph,
+        symbols: &HashMap<SymbolId, usize>,
+        scope: &str,
+        peak_persistent: &mut WorkspaceRequirement,
+        peak_step: &mut WorkspaceRequirement,
+    ) -> Result<()> {
+        for (node_id, node) in graph.nodes.iter() {
+            if !is_planned_workspace_node(node) {
+                continue;
+            }
+            let input_shapes = node
+                .inputs
+                .iter()
+                .enumerate()
+                .map(|(index, input)| {
+                    match input {
+                    None => Ok(Vec::new()),
+                    Some(value) => substitute(&graph.value(*value).shape, symbols).ok_or_else(|| {
+                        let value_name = graph
+                            .value(*value)
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| format!("value#{}", value.0));
+                        SessionError::Internal(format!(
+                            "prepare-only workspace planning cannot resolve nested input {index} \
+                             '{value_name}' for {scope}node#{} ('{}::{}'); its formal/captured \
+                             shape is runtime-dependent and no exact graph-metadata bound is \
+                             available",
+                            node_id.0, node.domain, node.op_type
+                        ))
+                    }),
+                }
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut kernel =
+                self.ep
+                    .get_kernel(node, &input_shapes, effective_opset(&self.graph, node))?;
+            let constant_inputs = node
+                .inputs
+                .iter()
+                .map(|input| input.is_some_and(|value| graph.initializers.contains_key(&value)))
+                .collect::<Vec<_>>();
+            kernel.set_constant_inputs(&constant_inputs);
+            let metadata = input_shapes
+                .iter()
+                .zip(&node.inputs)
+                .map(|(shape, input)| {
+                    let dtype = input
+                        .map(|value| graph.value(value).dtype)
+                        .unwrap_or(DataType::Undefined);
+                    TensorMetadata::new(dtype, shape, input.is_some())
+                })
+                .collect::<Vec<_>>();
+            let requirement = kernel.workspace_requirement(&metadata)?;
+            if requirement.bytes == 0 {
+                continue;
+            }
+            match requirement.role {
+                onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped }
+                    if step_scoped
+                        == matches!(requirement.lifetime, WorkspaceLifetime::StepScoped) => {}
+                _ => {
+                    return Err(SessionError::Internal(format!(
+                        "{scope}node#{} ('{}::{}') returned an inconsistent workspace role/lifetime",
+                        node_id.0, node.domain, node.op_type
+                    )));
+                }
+            }
+            let peak = match requirement.lifetime {
+                WorkspaceLifetime::SessionPersistent => &mut *peak_persistent,
+                WorkspaceLifetime::StepScoped => &mut *peak_step,
+            };
+            merge_workspace_peak(peak, requirement);
+        }
+        for ((node_id, attribute), child) in &graph.subgraphs {
+            self.collect_nested_workspace_requirement(
+                child,
+                symbols,
+                &format!("{scope}node#{}/{attribute}/", node_id.0),
+                peak_persistent,
+                peak_step,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn release_step_workspace(&mut self) -> Result<()> {
+        if let Some(workspace) = self.step_workspace.take() {
+            self.ep.deallocate(workspace.buffer)?;
+        }
+        Ok(())
+    }
+
+    /// Bind the graph's symbols to concrete sizes from the actual bound-input
+    /// shapes, validating rank and static dims and detecting symbol conflicts.
+    pub(super) fn bind_symbols(
+        &self,
+        inputs: &[(&str, &Tensor)],
+        external: &ExternalBindings,
+    ) -> Result<HashMap<SymbolId, usize>> {
+        let mut bindings: HashMap<SymbolId, usize> = HashMap::new();
+        for (name, tensor) in inputs {
+            let vid = *self
+                .input_index
+                .get(*name)
+                .ok_or_else(|| SessionError::InputNotFound {
+                    name: (*name).to_string(),
+                })?;
+            self.bind_input_shape(name, vid, tensor.dtype, &tensor.shape, &mut bindings)?;
+        }
+        for (&vid, value) in &external.inputs {
+            let name = self.graph.value(vid).name.as_deref().unwrap_or("<unnamed>");
+            self.bind_input_shape(name, vid, value.dtype, &value.shape, &mut bindings)?;
+        }
+        Ok(bindings)
+    }
+
+    pub(super) fn bind_input_shape(
+        &self,
+        name: &str,
+        vid: ValueId,
+        dtype: DataType,
+        shape: &[usize],
+        bindings: &mut HashMap<SymbolId, usize>,
+    ) -> Result<()> {
+        let want_dtype = self.value_dtypes[&vid];
+        if dtype != want_dtype {
+            return Err(SessionError::DtypeMismatch {
+                name: name.to_string(),
+                expected: format!("{want_dtype:?}"),
+                got: format!("{dtype:?}"),
+            });
+        }
+        let decl = &self.value_shapes[&vid];
+        if decl.len() != shape.len() {
+            return Err(SessionError::RankMismatch {
+                name: name.to_string(),
+                expected: decl.len(),
+                got: shape.len(),
+            });
+        }
+        for (dim, &actual) in decl.iter().zip(shape) {
+            match dim {
+                Dim::Static(n) if *n != actual => {
+                    return Err(SessionError::ShapeMismatch {
+                        name: name.to_string(),
+                        expected: as_static_shape(decl).unwrap_or_default(),
+                        got: shape.to_vec(),
+                    });
+                }
+                Dim::Static(_) => {}
+                Dim::Symbolic(s) => {
+                    if let Some(&prev) = bindings.get(s) {
+                        if prev != actual {
+                            let sym = self
+                                .symbol_name(*s)
+                                .unwrap_or_else(|| format!("symbol#{}", s.0));
+                            return Err(SessionError::SymbolConflict {
+                                symbol: sym,
+                                first: prev,
+                                second: actual,
+                            });
+                        }
+                    } else {
+                        bindings.insert(*s, actual);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Human-readable name of a symbol, if the graph recorded one.
+    pub(super) fn symbol_name(&self, s: SymbolId) -> Option<String> {
+        self.graph
+            .symbol_constraints
+            .get(&s)
+            .and_then(|c| c.name.clone())
+    }
+
+    /// Sequential topological executor.
+    pub(crate) fn run(&mut self, inputs: &[(&str, &Tensor)]) -> Result<Vec<Tensor>> {
+        self.run_outputs(inputs)?
+            .into_iter()
+            .map(|output| {
+                match output {
+                    SessionOutput::Tensor(tensor) => Ok(tensor),
+                    SessionOutput::Sequence(_) => Err(SessionError::SequenceOp {
+                        op: "<graph output>".to_string(),
+                        reason: "the tensor-only run API received a Sequence graph output; use InferenceSession::run_outputs to preserve sequence values".to_string(),
+                    }),
+                }
+            })
+            .collect()
+    }
+
+    pub(crate) fn run_outputs(&mut self, inputs: &[(&str, &Tensor)]) -> Result<Vec<SessionOutput>> {
+        let result = self.run_scoped(inputs, &HashMap::new(), &ExternalBindings::default());
+        self.release_step_workspace()?;
+        result?
+            .into_iter()
+            .map(|output| {
+                output.ok_or_else(|| {
+                    SessionError::Internal(
+                        "ordinary run unexpectedly suppressed a bound graph output".into(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn run_with_device_bindings(
+        &mut self,
+        inputs: &[(&str, &Tensor)],
+        bindings: &mut [DeviceIoBinding],
+    ) -> Result<Vec<Option<Tensor>>> {
+        let external = self.prepare_external_bindings(bindings)?;
+        let result = self.run_scoped(inputs, &HashMap::new(), &external);
+        self.release_step_workspace()?;
+        result?
+            .into_iter()
+            .map(|output| match output {
+                None => Ok(None),
+                Some(SessionOutput::Tensor(tensor)) => Ok(Some(tensor)),
+                Some(SessionOutput::Sequence(_)) => Err(SessionError::SequenceOp {
+                    op: "<graph output>".to_string(),
+                    reason: "run_with_device_bindings cannot return an unbound Sequence graph output; use run_outputs without tensor device bindings".to_string(),
+                }),
+            })
+            .collect()
+    }
+
+    pub(crate) fn try_capture_with_device_bindings(
+        &mut self,
+        inputs: &[(&str, &Tensor)],
+        bindings: &mut [DeviceIoBinding],
+    ) -> Result<DeviceGraphCaptureResult> {
+        let external = self.prepare_external_bindings(bindings)?;
+        let result = self.run_scoped_mode(inputs, &HashMap::new(), &external, RunMode::Capture);
+        self.release_step_workspace()?;
+        match result? {
+            ScopedRunResult::Executed(outputs) => {
+                let mut tensors = Vec::with_capacity(outputs.len());
+                for output in outputs {
+                    match output {
+                        None => tensors.push(None),
+                        Some(SessionOutput::Tensor(tensor)) => tensors.push(Some(tensor)),
+                        Some(SessionOutput::Sequence(_)) => {
+                            self.reset_device_graph()?;
+                            return Ok(DeviceGraphCaptureResult::NotCapturable(
+                                CaptureDeclineReport::one(CaptureDecline::graph(
+                                    "device graph capture cannot return a Sequence graph output",
+                                )),
+                            ));
+                        }
+                    }
+                }
+                self.device_graph_signature = Some(Self::binding_signature(bindings));
+                Ok(DeviceGraphCaptureResult::Captured(tensors))
+            }
+            ScopedRunResult::NotCapturable(reason) => {
+                Ok(DeviceGraphCaptureResult::NotCapturable(reason))
+            }
+        }
+    }
+
+    /// Replay the installed device graph for one decode step. Returns `true` when
+    /// the graph remains installed and valid for the next step, or `false` when a
+    /// control-flow branch flip retired it mid-step (the token was still produced
+    /// correctly via an eager fallback) and the caller must re-warm/re-capture.
+    pub(crate) fn replay_device_graph(&mut self, bindings: &mut [DeviceIoBinding]) -> Result<bool> {
+        let external = self.prepare_external_bindings(bindings)?;
+        let signature = Self::binding_signature(bindings);
+        if self.device_graph_signature.as_ref() != Some(&signature) {
+            self.reset_device_graph()?;
+            return Err(SessionError::Internal(
+                "device graph replay bindings changed shape, address, or I/O identity; graph was invalidated"
+                    .into(),
+            ));
+        }
+        // Whole-subgraph capture (a single graph, no eager seams) keeps the
+        // zero-host-work fast path: just relaunch the one installed graph.
+        // Segmented capture must re-establish the run context and interleave
+        // segment replays with eager seam-node execution, so it routes through
+        // the scoped runner in replay mode.
+        let single_graph = self
+            .capture_schedule
+            .as_ref()
+            .is_none_or(CaptureSchedule::is_single_graph);
+        if single_graph {
+            self.ep.replay_device_graph()?;
+            return Ok(true);
+        }
+        let result = self.run_scoped_mode(&[], &HashMap::new(), &external, RunMode::Replay);
+        self.release_step_workspace()?;
+        match result? {
+            // `run_scoped_mode` clears `capture_schedule` when a branch flip
+            // retired the graph this step; report that so the caller re-arms.
+            ScopedRunResult::Executed(_) => Ok(self.capture_schedule.is_some()),
+            ScopedRunResult::NotCapturable(reason) => {
+                self.reset_device_graph()?;
+                Err(SessionError::Internal(format!(
+                    "segmented device graph replay lost its schedule: {reason}"
+                )))
+            }
+        }
+    }
+
+    pub(crate) fn reset_device_graph(&mut self) -> Result<bool> {
+        self.device_graph_signature = None;
+        self.capture_schedule = None;
+        self.capture_cf_shapes.clear();
+        self.capture_warm_seeded.clear();
+        Ok(self.ep.reset_device_graph()?)
+    }
+
+    /// Structured segment-boundary reasons from the most recent capture: one
+    /// entry per non-capturable seam node the CUDA EP ran eagerly between
+    /// captured segments. Empty for a whole-subgraph (single-graph) capture.
+    pub(crate) fn capture_segmentation(&self) -> &[CaptureDecline] {
+        &self.capture_segmentation
+    }
+
+    /// Number of captured device-graph segments installed by the most recent
+    /// capture (1 for a whole-subgraph capture, >=2 when seams split it).
+    pub(crate) fn captured_segment_count(&self) -> usize {
+        self.capture_schedule
+            .as_ref()
+            .map(CaptureSchedule::captured_segments)
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn check_device_capture_error(&self) -> Result<u32> {
+        Ok(self.ep.check_device_capture_error()?)
+    }
+
+    pub(crate) fn device_allocation_counts(&self) -> Option<DeviceAllocationCounts> {
+        self.ep
+            .device_allocation_counts()
+            .map(|(allocations, frees)| DeviceAllocationCounts { allocations, frees })
+    }
+
+    /// Place any long-lived device memory the provider holds under `governor`.
+    /// Whether the memory this executor's provider hands out commits
+    /// physically as it is used. See
+    /// [`DeviceAllocator::commits_on_demand`][d].
+    ///
+    /// [d]: onnx_runtime_memory_governor::DeviceAllocator::commits_on_demand
+    pub(crate) fn commits_on_demand(&self) -> bool {
+        self.ep.commits_on_demand()
+    }
+
+    pub(crate) fn adopt_memory_governor(
+        &self,
+        governor: &dyn onnx_runtime_memory_governor::MemoryGovernor,
+        tier: onnx_runtime_memory_governor::Tier,
+        holder: onnx_runtime_memory_governor::HolderId,
+    ) -> onnx_runtime_ep_api::Result<u64> {
+        self.ep.adopt_memory_governor(governor, tier, holder)
+    }
+
+    pub(crate) fn set_weight_residency_budget(
+        &self,
+        budget_bytes: u64,
+    ) -> onnx_runtime_ep_api::Result<Option<u64>> {
+        self.ep.set_weight_residency_budget(budget_bytes)
+    }
+
+    pub(crate) fn max_lazy_weight_working_set_bytes(&self) -> u64 {
+        self.plan
+            .iter()
+            .map(|node| {
+                node.lazy_weight_inputs
+                    .iter()
+                    .filter_map(|value_id| self.weight_handles.get(value_id))
+                    .filter_map(|handle| handle.as_lazy())
+                    .map(|weight| weight.region_bytes_len() as u64)
+                    .sum()
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub(super) fn binding_signature(bindings: &[DeviceIoBinding]) -> Vec<DeviceBindingSignature> {
+        bindings
+            .iter()
+            .map(|binding| DeviceBindingSignature {
+                input_name: binding.input_name().to_string(),
+                binds_input: binding.binds_input(),
+                output_name: binding.output_name().map(str::to_string),
+                dtype: binding.dtype,
+                physical_shape: binding.physical_shape().to_vec(),
+                device_ptr: binding.device_ptr() as usize,
+            })
+            .collect()
+    }
+
+    pub(super) fn prepare_external_bindings(
+        &self,
+        bindings: &mut [DeviceIoBinding],
+    ) -> Result<ExternalBindings> {
+        let mut external = ExternalBindings::default();
+        for binding in bindings {
+            let input_name = binding.input_name().to_string();
+            let bind_input = binding.binds_input();
+            let output_name = binding.output_name().map(str::to_string);
+            let dtype = binding.dtype;
+            let len = binding.buffer().len();
+            let alignment = binding.buffer().alignment();
+            let device = binding.buffer().device();
+            if device != self.ep.device_id() {
+                return Err(SessionError::Internal(format!(
+                    "device binding '{input_name}' is on {device:?}, session is on {:?}",
+                    self.ep.device_id()
+                )));
+            }
+            let physical_shape = binding.physical_shape();
+            let required = required_binding_bytes(dtype, physical_shape, &input_name)?;
+            if required > len {
+                return Err(SessionError::Internal(format!(
+                    "device binding '{input_name}' needs {required} bytes for {physical_shape:?}, allocation has {len}"
+                )));
+            }
+            let ptr = binding.buffer_mut().as_mut_ptr();
+            if bind_input {
+                let input_vid = *self.input_index.get(&input_name).ok_or_else(|| {
+                    SessionError::InputNotFound {
+                        name: input_name.clone(),
+                    }
+                })?;
+                let value = ExternalValue {
+                    dtype,
+                    shape: binding.kernel_input_shape().to_vec(),
+                    accepts_subshape: false,
+                    ptr,
+                    len,
+                    alignment,
+                    device,
+                };
+                if external.inputs.insert(input_vid, value).is_some() {
+                    return Err(SessionError::Internal(format!(
+                        "duplicate device input binding '{input_name}'"
+                    )));
+                }
+            }
+            if let Some(output_name) = output_name {
+                let output_vid = self
+                    .graph
+                    .outputs
+                    .iter()
+                    .copied()
+                    .find(|&vid| {
+                        self.graph.value(vid).name.as_deref() == Some(output_name.as_str())
+                    })
+                    .ok_or_else(|| {
+                        SessionError::Internal(format!(
+                            "device binding output not found: {output_name}"
+                        ))
+                    })?;
+                if self.sequence_values.contains(&output_vid) {
+                    return Err(SessionError::SequenceOp {
+                        op: "<graph output binding>".to_string(),
+                        reason: format!(
+                            "graph output '{output_name}' is a Sequence value and cannot be bound to tensor device storage"
+                        ),
+                    });
+                }
+                if self.value_dtypes[&output_vid] != dtype {
+                    return Err(SessionError::DtypeMismatch {
+                        name: output_name.clone(),
+                        expected: format!("{:?}", self.value_dtypes[&output_vid]),
+                        got: format!("{dtype:?}"),
+                    });
+                }
+                let value = ExternalValue {
+                    dtype,
+                    shape: binding.physical_shape().to_vec(),
+                    accepts_subshape: bind_input
+                        && binding.logical_shape() != binding.physical_shape(),
+                    ptr,
+                    len,
+                    alignment,
+                    device,
+                };
+                if external.outputs.insert(output_vid, value).is_some() {
+                    return Err(SessionError::Internal(format!(
+                        "duplicate device output binding '{output_name}'"
+                    )));
+                }
+            }
+        }
+        Ok(external)
+    }
+}
+
+pub(super) fn required_binding_bytes(
+    dtype: DataType,
+    physical_shape: &[usize],
+    input_name: &str,
+) -> Result<usize> {
+    onnx_runtime_ir::checked_expected_bytes(dtype, physical_shape).ok_or_else(|| {
+        SessionError::ShapeOverflow {
+            value: format!("device binding '{input_name}'"),
+            dims: physical_shape.to_vec(),
+        }
+    })
+}
+
+#[cfg(test)]
+mod planned_workspace_node_tests {
+    use super::*;
+    use onnx_runtime_ir::{Node, NodeId};
+
+    fn node(domain: &str, op_type: &str) -> Node {
+        let mut node = Node::new(NodeId(0), op_type, Vec::new(), Vec::new());
+        node.domain = domain.into();
+        node
+    }
+
+    #[test]
+    fn centralized_predicate_covers_the_governed_gemm_family() {
+        for (domain, op_type) in [
+            ("", "MatMul"),
+            ("", "Gemm"),
+            ("", "Attention"),
+            ("com.microsoft", "MatMulNBits"),
+            ("com.microsoft", "FusedMatMulBias"),
+            ("com.microsoft", "FusedGemm"),
+            ("com.microsoft", "Attention"),
+            ("com.microsoft", "GroupQueryAttention"),
+        ] {
+            assert!(
+                is_planned_workspace_node(&node(domain, op_type)),
+                "{domain}::{op_type} must be prepared before admission"
+            );
+        }
+        assert!(!is_planned_workspace_node(&node("", "Add")));
+    }
+
+    #[test]
+    fn same_lifetime_gemm_requirements_merge_as_one_peak_not_a_sum() {
+        let requirement = WorkspaceRequirement {
+            bytes: 32 * 1024 * 1024,
+            alignment: 256,
+            lifetime: WorkspaceLifetime::SessionPersistent,
+            role: onnx_runtime_memory_governor::MemoryRole::Workspace { step_scoped: false },
+        };
+        let mut peak = WorkspaceRequirement::NONE;
+        for _ in 0..4 {
+            merge_workspace_peak(&mut peak, requirement);
+        }
+        assert_eq!(peak.bytes, requirement.bytes);
+    }
+}

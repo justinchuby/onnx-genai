@@ -1,0 +1,76 @@
+[package]
+name = "onnx-runtime-ep-cuda"
+description = "CUDA execution provider for the ORT 2.0 runtime (Phase 2a: cudarc + cuBLASLt MatMul; custom fused kernels deferred)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["onnx", "cuda", "execution-provider", "cublaslt", "runtime"]
+categories = ["science", "hardware-support"]
+
+[features]
+default = ["cuda-13000"]
+# Forwarded so the device-memory crate is built for the same target as the
+# kernels that allocate from it.
+cuda = ["onnx-runtime-cuda-memory/cuda"]
+cuda-12060 = [
+    "cudarc/cuda-12060",
+    "onnx-genai-cuda-version-guard/cuda-12060",
+    "onnx-runtime-cuda-memory/cuda-12060",
+]
+cuda-12080 = [
+    "cudarc/cuda-12080",
+    "onnx-genai-cuda-version-guard/cuda-12080",
+    "onnx-runtime-cuda-memory/cuda-12080",
+]
+cuda-12090 = [
+    "cudarc/cuda-12090",
+    "onnx-genai-cuda-version-guard/cuda-12090",
+    "onnx-runtime-cuda-memory/cuda-12090",
+]
+cuda-13000 = [
+    "cudarc/cuda-13000",
+    "onnx-genai-cuda-version-guard/cuda-13000",
+    "onnx-runtime-cuda-memory/cuda-13000",
+]
+# Opt-in for real CUDA integration tests. Without this feature they are reported as ignored.
+gpu-tests = []
+
+[dependencies]
+onnx-runtime-ir = { workspace = true }
+onnx-runtime-ep-api = { workspace = true }
+onnx-runtime-virtual-memory = { workspace = true }
+onnx-runtime-cuda-memory = { path = "../onnx-runtime-cuda-memory", version = "=0.1.0-dev.5", default-features = false }
+onnx-runtime-memory-governor = { workspace = true }
+onnx-runtime-ep-cpu = { workspace = true }
+onnx-runtime-optimizer = { workspace = true }
+onnx-runtime-quantization = { workspace = true }
+thiserror = { workspace = true }
+half = { workspace = true }
+libloading = { workspace = true }
+
+# cudarc: pure-Rust CUDA bindings (docs/architecture/ORT2.md §15.2). `dynamic-loading` means
+# `cargo build` needs NO CUDA toolkit — the driver and cuBLASLt are dlopen'd at
+# runtime. `f16` pulls in `half` for f16/bf16 GEMM. Select exactly one CUDA API
+# version with this crate's `cuda-*` features; the default is CUDA 13.0.
+# `cudnn` adds the library-first softmax/reduce/conv/pool backend; it is also
+# dlopen'd and is not required until a cuDNN-backed op is invoked.
+# `nvrtc` compiles the fused attention softmax kernel from a CUDA-C source
+# string to PTX at runtime (libnvrtc dlopen'd), preserving the no-build-time-
+# toolkit property.
+[dependencies.cudarc]
+version = "0.19"
+default-features = false
+features = ["std", "driver", "cublaslt", "cudnn", "nvrtc", "f16", "dynamic-loading"]
+
+[dev-dependencies]
+onnx-runtime-loader = { workspace = true }
+onnx-runtime-shape-inference = { workspace = true }
+onnx-runtime-cuda-memory = { path = "../onnx-runtime-cuda-memory", version = "=0.1.0-dev.5", default-features = false }
+onnx-runtime-memory-governor = { workspace = true }
+
+[build-dependencies]
+onnx-genai-cuda-version-guard = { path = "../onnx-genai-cuda-version-guard", version = "=0.1.0-dev.5", features = ["cuda"] }
+
+[lints]
+workspace = true

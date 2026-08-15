@@ -1,0 +1,249 @@
+ir_version: 8
+producer_name: "onnx-genai tiny-tts-nested-prefill fixture"
+graph {
+  node {
+    input: "text_ids"
+    output: "text_f"
+    name: "node_Cast_0"
+    op_type: "Cast"
+    attribute {
+      name: "to"
+      i: 1
+      type: INT
+    }
+  }
+  node {
+    output: "sum_axis"
+    name: "node_Constant_1"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        dims: 1
+        data_type: 7
+        name: "sum_axis_value"
+        raw_data: "\001\000\000\000\000\000\000\000"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    input: "text_f"
+    input: "sum_axis"
+    output: "ts"
+    name: "node_ReduceSum_2"
+    op_type: "ReduceSum"
+    attribute {
+      name: "keepdims"
+      i: 1
+      type: INT
+    }
+  }
+  node {
+    input: "text_ids"
+    output: "ids_shape"
+    name: "node_Shape_3"
+    op_type: "Shape"
+  }
+  node {
+    output: "zero_index"
+    name: "node_Constant_4"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        dims: 1
+        data_type: 7
+        name: "zero_index_value"
+        raw_data: "\000\000\000\000\000\000\000\000"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    input: "ids_shape"
+    input: "zero_index"
+    output: "batch_vec"
+    name: "node_Gather_5"
+    op_type: "Gather"
+    attribute {
+      name: "axis"
+      i: 0
+      type: INT
+    }
+  }
+  node {
+    output: "axes_2"
+    name: "node_Constant_6"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        dims: 1
+        data_type: 7
+        name: "axes_2_value"
+        raw_data: "\002\000\000\000\000\000\000\000"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    input: "ts"
+    input: "axes_2"
+    output: "ts_3d"
+    name: "node_Unsqueeze_7"
+    op_type: "Unsqueeze"
+  }
+  node {
+    output: "prefill_p"
+    name: "node_Constant_8"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        dims: 1
+        data_type: 7
+        name: "prefill_p_value"
+        raw_data: "\002\000\000\000\000\000\000\000"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    output: "hidden_dim"
+    name: "node_Constant_9"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        dims: 1
+        data_type: 7
+        name: "hidden_dim_value"
+        raw_data: "\010\000\000\000\000\000\000\000"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    input: "batch_vec"
+    input: "prefill_p"
+    input: "hidden_dim"
+    output: "prefill_shape"
+    name: "node_Concat_10"
+    op_type: "Concat"
+    attribute {
+      name: "axis"
+      i: 0
+      type: INT
+    }
+  }
+  node {
+    input: "ts_3d"
+    input: "prefill_shape"
+    output: "prefill_embeds"
+    name: "node_Expand_11"
+    op_type: "Expand"
+  }
+  node {
+    output: "trailing_t"
+    name: "node_Constant_12"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        dims: 1
+        data_type: 7
+        name: "trailing_t_value"
+        raw_data: "\002\000\000\000\000\000\000\000"
+      }
+      type: TENSOR
+    }
+  }
+  node {
+    input: "batch_vec"
+    input: "trailing_t"
+    input: "hidden_dim"
+    output: "trailing_shape"
+    name: "node_Concat_13"
+    op_type: "Concat"
+    attribute {
+      name: "axis"
+      i: 0
+      type: INT
+    }
+  }
+  node {
+    input: "trailing_const"
+    input: "trailing_shape"
+    output: "trailing_text_embeds"
+    name: "node_Expand_14"
+    op_type: "Expand"
+  }
+  name: "tiny_tts_nested_prefill_prefill_embedder"
+  initializer {
+    dims: 1
+    dims: 2
+    dims: 8
+    data_type: 1
+    name: "trailing_const"
+    raw_data: "\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\200?\000\000\000@\000\000\000@\000\000\000@\000\000\000@\000\000\000@\000\000\000@\000\000\000@\000\000\000@"
+  }
+  input {
+    name: "text_ids"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_param: "text_len"
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "prefill_embeds"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 2
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "trailing_text_embeds"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_param: "batch"
+          }
+          dim {
+            dim_value: 2
+          }
+          dim {
+            dim_value: 8
+          }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 13
+}

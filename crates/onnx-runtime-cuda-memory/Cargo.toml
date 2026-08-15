@@ -1,0 +1,49 @@
+[package]
+name = "onnx-runtime-cuda-memory"
+description = "CUDA device memory for the ORT 2.0 runtime: allocators, virtual memory, and governor accounting, separate from operator implementations"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["onnx", "cuda", "memory", "allocator", "runtime"]
+categories = ["memory-management", "hardware-support"]
+
+[features]
+default = ["cuda-13000"]
+cuda = []
+cuda-12060 = ["cudarc/cuda-12060"]
+cuda-12080 = ["cudarc/cuda-12080"]
+cuda-12090 = ["cudarc/cuda-12090"]
+cuda-13000 = ["cudarc/cuda-13000"]
+# Emit `tracing` events on every granule commit and release, and on arena
+# construction and teardown. Independent of `cuda`: the software backing used
+# by tests emits them too, so the wiring can be tested without a GPU.
+tracing = ["dep:tracing"]
+# Opt-in for real CUDA integration tests. Without this feature they are reported as ignored.
+gpu-tests = []
+
+[dependencies]
+onnx-runtime-memory-governor = { workspace = true }
+onnx-runtime-virtual-memory = { workspace = true }
+thiserror = { workspace = true }
+# Off by default: an arena commit is on the allocation path, and a caller that
+# does not subscribe should pay nothing for an event nobody reads. `--profile`
+# reads the counters instead, which are always on.
+tracing = { workspace = true, optional = true }
+
+# Same dynamic-loading feature set as the execution provider: the driver is
+# dlopen'd, so building this crate needs no CUDA toolkit. `cublaslt`/`cudnn`/
+# `nvrtc` are deliberately absent -- those are operator concerns and this crate
+# has none. Select exactly one CUDA API version with this crate's `cuda-*`
+# features; the default is CUDA 13.0.
+[dependencies.cudarc]
+version = "0.19"
+default-features = false
+features = ["std", "driver", "dynamic-loading"]
+
+[dev-dependencies]
+onnx-runtime-memory-governor = { workspace = true }
+onnx-runtime-ep-api = { workspace = true }
+
+[lints]
+workspace = true

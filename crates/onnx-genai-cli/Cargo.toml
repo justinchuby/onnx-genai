@@ -1,0 +1,122 @@
+# Unified `onnx-genai` command-line tool.
+#
+# Ships as the `onnx-genai-server` wheel (maturin mixed project): `pip install
+# onnx-genai-server` installs a single `onnx-genai` console command exposing
+# `serve`, `generate`, `run`, `show`, `list`, and `version`. It depends on the
+# core `onnx-genai` engine (generation) and `onnx-genai-server` (the
+# OpenAI-compatible server), so it lives in its own crate to avoid a dependency
+# cycle with the core crate.
+#
+# Two build outputs share one code base:
+# - the `onnx-genai` binary (`src/main.rs`) for local development, and
+# - the `_onnx_genai_server` PyO3 extension module (behind the `python` feature)
+#   that the wheel imports. The wheel's Python console entry point loads ONNX
+#   Runtime from the installed `onnxruntime` wheel, then calls into the module —
+#   which is how the wheel-installed command finds ONNX Runtime without bundling
+#   it (a raw binary has no import-time hook to locate the onnxruntime package).
+[package]
+name = "onnx-genai-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Unified onnx-genai command-line interface (serve, generate, run, show, list)"
+publish = false
+
+[lib]
+# `_onnx_genai_server` is the wheel's private extension module (cdylib). `rlib`
+# lets the `onnx-genai` binary reuse the same `run` entry point.
+name = "_onnx_genai_server"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[[bin]]
+name = "onnx-genai"
+path = "src/main.rs"
+
+[features]
+default = ["cuda-13000", "onnx-genai-server/metrics"]
+# Build the PyO3 extension module for the `onnx-genai-server` wheel. maturin adds
+# `pyo3/extension-module` on top of this at wheel-build time.
+python = ["dep:pyo3"]
+# ONNX Runtime CUDA only: enables ORT's built-in CUDAExecutionProvider (CUDA 13)
+# plus the cudarc GPU sampler, WITHOUT the nxrt-native CUDA kernel crate. This
+# is the wheel-compatible path; GPU ONNX Runtime is provided at runtime by the
+# `onnxruntime-gpu` wheel (`onnx-genai-server[cuda]`), and no CUDA code is bundled.
+cuda = ["onnx-genai-server/ort-cuda"]
+# Native decoder execution for models containing native-only operators.
+native-backend = ["onnx-genai-server/native-backend"]
+# Native CUDA path: enables the native backend and our hand-written CUDA EP
+# (`onnx-runtime-ep-cuda`) through `onnx-genai-server/cuda`. Use this, not
+# `cuda`, when you want the native CUDA kernels compiled into the CLI.
+native-cuda = ["native-backend", "onnx-genai-server/cuda", "dep:onnx-runtime-ep-cuda"]
+mlas = ["onnx-genai-server/mlas"]
+cuda-12060 = [
+    "onnx-genai/cuda-12060",
+    "onnx-genai-engine/cuda-12060",
+    "onnx-genai-server/cuda-12060",
+    "onnx-runtime-ep-cuda?/cuda-12060",
+]
+cuda-12080 = [
+    "onnx-genai/cuda-12080",
+    "onnx-genai-engine/cuda-12080",
+    "onnx-genai-server/cuda-12080",
+    "onnx-runtime-ep-cuda?/cuda-12080",
+]
+cuda-12090 = [
+    "onnx-genai/cuda-12090",
+    "onnx-genai-engine/cuda-12090",
+    "onnx-genai-server/cuda-12090",
+    "onnx-runtime-ep-cuda?/cuda-12090",
+]
+cuda-13000 = [
+    "onnx-genai/cuda-13000",
+    "onnx-genai-engine/cuda-13000",
+    "onnx-genai-server/cuda-13000",
+    "onnx-runtime-ep-cuda?/cuda-13000",
+]
+
+[dependencies]
+onnx-genai = { path = "../onnx-genai", version = "=0.1.0-dev.5", default-features = false }
+serde_json = { workspace = true }
+onnx-genai-engine = { path = "../onnx-genai-engine", version = "=0.1.0-dev.5", default-features = false }
+onnx-genai-server = { path = "../onnx-genai-server", version = "=0.1.0-dev.5", default-features = false }
+onnx-runtime-ep-cuda = { path = "../onnx-runtime-ep-cuda", version = "=0.1.0-dev.5", optional = true, default-features = false }
+clap = { workspace = true }
+ctrlc = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }
+reedline = "0.49.0"
+nu-ansi-term = "0.50.3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# getrusage for the peak-RSS probe; Linux reads /proc/self/status instead.
+libc = "0.2"
+
+[dev-dependencies]
+# The CLI e2e tests write a sample PNG and read back the rendered image and WAV.
+image = { workspace = true, features = ["png"] }
+onnx-genai = { workspace = true }
+onnx-genai-metadata = { workspace = true }
+serde_json = { workspace = true }
+# Profile formatting unit tests assert visible alignment widths.
+unicode-width = "0.2.2"
+
+[target.'cfg(unix)'.dev-dependencies]
+# PTY-driven e2e tests: openpty/dup to verify TTY-only rendering branches.
+# nix is already in the dependency tree via ctrlc; no version bump needed.
+# Features: "term" for nix::pty::openpty, "fs" for nix::unistd::dup,
+#            "poll" for nix::poll::poll (used for read timeouts in drain_pty_master).
+nix = { version = "0.31", default-features = false, features = ["term", "fs", "poll"] }
+
+[dependencies.pyo3]
+version = "0.29"
+# `abi3-py310` builds against the limited API (a single cp310-abi3 module usable
+# on CPython 3.10+); the real 3.11 minimum is enforced by the wheel's
+# requires-python and the onnxruntime dependency.
+features = ["abi3-py310"]
+optional = true
+
+[lints]
+workspace = true

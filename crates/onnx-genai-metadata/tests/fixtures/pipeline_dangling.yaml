@@ -1,0 +1,11 @@
+pipeline:
+  models:
+    decoder:
+      filename: decoder.onnx
+      type: decoder
+  dataflow:
+    - from: encoder.hidden
+      to: decoder.encoder_hidden_states
+  strategy:
+    kind: autoregressive
+    decoder: decoder

@@ -1,0 +1,51 @@
+# Tiny text-to-speech (TTS) composite pipeline fixture.
+# Built by scripts/build_tiny_tts.py; exercises the post-decode single_pass
+# stage contract (DESIGN.md §20): an autoregressive decoder that emits audio
+# code tokens, then a `final_only` vocoder stage that turns the collected codes
+# (published as `decoder.output_ids`) into a waveform.
+pipeline:
+  models:
+    decoder:
+      filename: decoder.onnx.textproto
+      type: decoder
+      tokenizer: tokenizer.json
+      io:
+        token_input: decoder_input_ids
+        position_ids_input: position_ids
+        logits_output: logits
+        kv_inputs:
+          - past_key_values.0.key
+          - past_key_values.0.value
+        kv_outputs:
+          - present.0.key
+          - present.0.value
+    vocoder:
+      filename: vocoder.onnx.textproto
+      type: vocoder
+  dataflow:
+    - from: decoder.output_ids
+      to: vocoder.codes
+      dtype: int64
+      device_transfer: false
+  strategy:
+    kind: composite
+    stages:
+      - name: decode_codes
+        strategy:
+          kind: autoregressive
+          decoder: decoder
+          max_tokens: 4
+        run_on: every_step
+      - name: synthesize_waveform
+        strategy:
+          kind: single_pass
+          model: vocoder
+        run_on: final_only
+  phases:
+    decoder:
+      run_on: every_step
+    vocoder:
+      run_on: final_only
+  audio:
+    sample_rate: 16000
+    output: vocoder.audio

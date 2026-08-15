@@ -1,0 +1,13 @@
+preprocessing:
+  image:
+    resize:
+      mode: fixed
+      size: 2
+      interpolation: bicubic
+      crop: none
+    tiling:
+      mode: dynamic_anyres
+      tile_size: 2
+      max_tiles: 4
+      aspect_ratios: [[1, 1], [2, 1], [1, 2], [2, 2]]
+      include_thumbnail: true

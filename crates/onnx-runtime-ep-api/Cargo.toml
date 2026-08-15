@@ -1,0 +1,27 @@
+[package]
+name = "onnx-runtime-ep-api"
+description = "Execution Provider API for the ORT 2.0 runtime: ExecutionProvider and Kernel traits, OpRegistry, and the ORT graph ABI bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["onnx", "execution-provider", "kernel", "inference", "runtime"]
+categories = ["science", "hardware-support"]
+
+[dependencies]
+onnx-runtime-memory-governor = { workspace = true }
+# Maps a model's external weight file once and shares it across every tensor a
+# plugin asks about, instead of re-reading the file per lookup.
+memmap2 = { workspace = true }
+libloading = { workspace = true }
+onnx-genai-ort-sys = { workspace = true }
+onnx-runtime-ir = { workspace = true }
+onnx-runtime-optimizer = { workspace = true }
+onnx-runtime-tracer = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+onnx-runtime-loader = { workspace = true }
+
+[lints]
+workspace = true

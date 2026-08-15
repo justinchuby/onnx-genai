@@ -1,0 +1,6 @@
+{
+  "schema_version": "1.0",
+  "model_file": "model.onnx",
+  "inference_metadata": "inference_metadata.yaml",
+  "tokenizer": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}

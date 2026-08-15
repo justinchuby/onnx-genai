@@ -1,0 +1,12 @@
+domain: ""
+name: EyeLike
+since_version: 22
+doc: Construct a rank-two identity-like tensor.
+attributes:
+  - { name: dtype, type: int }
+  - { name: k, type: int, default: 0 }
+inputs: [{ name: input, type_str: T1 }]
+outputs: [{ name: output, type_str: T2 }]
+type_constraints:
+  - { type_param: T1, allowed: [bfloat16, uint8, uint16, uint32, uint64, int8, int16, int32, int64, float16, float32, float64] }
+  - { type_param: T2, allowed: [bfloat16, uint8, uint16, uint32, uint64, int8, int16, int32, int64, float16, float32, float64] }

@@ -1,0 +1,18 @@
+domain: ""
+name: QuantizeLinear
+since_version: 21
+doc: Linearly quantize a tensor using per-tensor, per-axis, or blocked quantization.
+attributes:
+  - { name: axis, type: int, default: 1 }
+  - { name: saturate, type: int, default: 1 }
+  - { name: block_size, type: int, default: 0 }
+  - { name: output_dtype, type: int, default: 0 }
+inputs:
+  - { name: x, type_str: T1 }
+  - { name: y_scale, type_str: T1 }
+  - { name: y_zero_point, type_str: T2, optional: true }
+outputs:
+  - { name: y, type_str: T2 }
+type_constraints:
+  - { type_param: T1, allowed: [float32, float16, bfloat16, int32] }
+  - { type_param: T2, allowed: [int8, uint8, int16, uint16, float8e4m3fn, float8e4m3fnuz, float8e5m2, float8e5m2fnuz, uint4, int4] }

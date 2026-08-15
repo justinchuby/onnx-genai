@@ -1,0 +1,4 @@
+{
+  "bos_token": "<｜begin▁of▁sentence｜>",
+  "eos_token": "<｜end▁of▁sentence｜>"
+}

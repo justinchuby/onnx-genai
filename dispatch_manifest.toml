@@ -1,0 +1,366 @@
+# Dispatch Manifest — Claimed Optimizations
+#
+# Each [[claim]] declares: "On this platform, this op dispatches to at least
+# this tier, proved by this TEST_HITS counter."
+#
+# The CI lint (scripts/check_dispatch_manifest.py) verifies:
+#   1. The counter exists as a `static ...: Atomic{Usize,U64}` in the declared file.
+#   2. The counter has a paired test (delegated to check_dispatch_reachability.py).
+#
+# A missing row means "no claimed optimization" — the op may run on scalar
+# reference without CI complaint. This is intentional: the manifest guards
+# only what we explicitly claim.
+#
+# Adding a row is a commitment: from that point forward, CI blocks any change
+# that removes the counter or breaks the test. Removing a row is a conscious
+# un-claim — legitimate when an optimization is deprecated or superseded.
+#
+# Tier vocabulary (ordered, highest = most optimized):
+#   tier1 — Hardware-accelerated framework (BNNS, AMX, cuBLAS, Metal MPS)
+#   tier2 — Explicit SIMD / optimized library (NEON GEMV, im2col+cblas, AVX2)
+#   tier3 — Scalar reference (always correct, never fast)
+#
+# "minimum_tier" means "the dispatch MUST reach at least this tier." A claim
+# of tier2 is satisfied by tier1 or tier2, but NOT by tier3.
+#
+# ─── Exclusions ──────────────────────────────────────────────────────────────
+# Use [[exclusion]] to document cases we deliberately do NOT optimize.
+# These are not enforced — they exist to prevent someone from adding a claim
+# row for something we intentionally skip, and to distinguish "not yet done"
+# from "decided against."
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MatMul (f16) — aarch64-apple-darwin
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[[claim]]
+op = "MatMul"
+variant = "f16_m1"
+platform = "aarch64-apple-darwin"
+minimum_tier = "tier2"
+counter = "GEMV_F16_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/matmul.rs"
+description = "M=1 decode uses NEON GEMV, not half_gemm"
+# Proves: fp16_m1_decode_reaches_neon_gemv_not_half_gemm
+
+[[claim]]
+op = "MatMul"
+variant = "f16_m1_colmaj"
+platform = "aarch64-apple-darwin"
+minimum_tier = "tier2"
+counter = "GEMV_F16_COLMAJ_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/matmul.rs"
+description = "M=1 decode with column-major B uses NEON GEMV col-major path"
+
+[[claim]]
+op = "MatMul"
+variant = "f16_m_ge2"
+platform = "aarch64-apple-darwin"
+minimum_tier = "tier1"
+counter = "BNNS_F16_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/matmul.rs"
+description = "M>=2 prefill uses BNNS/AMX"
+# Proves: fp16_m_ge2_prefill_reaches_bnns_not_half_gemm
+
+[[claim]]
+op = "MatMul"
+variant = "f32_thin_m"
+platform = "aarch64-apple-darwin"
+minimum_tier = "tier2"
+counter = "THIN_M_GEMM_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/matmul.rs"
+description = "M=2..16 f32 prefill with large B uses column-parallel NEON, not cblas_sgemm"
+# Proves: f32_thin_m_prefill_reaches_neon_col_parallel
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Conv — aarch64-apple-darwin
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[[claim]]
+op = "Conv"
+variant = "standard"
+platform = "aarch64-apple-darwin"
+minimum_tier = "tier1"
+counter = "CONV_BNNS_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/conv_ref.rs"
+description = "Standard Conv (kernel > 1x1, including 1D promoted to 2D) dispatches to BNNS on Apple Silicon"
+# Tier1=BNNS, Tier2=im2col+cblas_sgemm, Tier3=scalar
+
+[[claim]]
+op = "Conv"
+variant = "non_bnns_fallback"
+platform = "aarch64-apple-darwin"
+minimum_tier = "tier2"
+counter = "CONV_IM2COL_GEMM_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/conv_ref.rs"
+description = "When BNNS rejects (e.g. unsupported dilation), falls to im2col+GEMM not scalar"
+
+[[claim]]
+op = "Conv"
+variant = "pointwise_1x1_gemm"
+platform = "aarch64-apple-darwin"
+minimum_tier = "tier2"
+counter = "CONV_POINTWISE_GEMM_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/conv_ref.rs"
+description = "1x1 pointwise Conv with weight > E-core L1 (64KB) and spatial reuse N <= IC*6 bypasses BNNS for direct cblas_sgemm. Apple-only: there is no BNNS to bypass elsewhere."
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SDPA — aarch64
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[[claim]]
+op = "SDPA"
+variant = "default"
+platform = "aarch64"
+minimum_tier = "tier2"
+counter = "SDPA_NEON_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/sdpa.rs"
+description = "SDPA uses NEON-accelerated dot/axpy on aarch64"
+# Proves: sdpa_dispatcher_reaches_neon_on_aarch64
+
+[[claim]]
+op = "SDPA"
+variant = "accelerate"
+platform = "aarch64-apple-darwin"
+minimum_tier = "tier1"
+counter = "SDPA_ACCELERATE_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/sdpa.rs"
+description = "SDPA uses Accelerate cblas_sgemm (AMX) on macOS for QKT and PV matmuls"
+
+[[claim]]
+op = "SDPA"
+variant = "neon_decode_small"
+platform = "aarch64-apple-darwin"
+minimum_tier = "tier2"
+counter = "SDPA_NEON_DECODE_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/sdpa.rs"
+description = "SDPA decode (q_seq=1) with small per-head work bypasses Accelerate for inline NEON"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Kernel dispatch — all platforms
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[[claim]]
+op = "KernelDispatch"
+variant = "prebind"
+platform = "all"
+minimum_tier = "tier2"
+counter = "PREBIND_FAST_PATH_TEST_HITS"
+file = "crates/onnx-runtime-session/src/executor/kernel_cache.rs"
+description = "Static-shape graphs use pre-bound kernel path, not hash-lookup"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Block-quantized CPU kernels — dense-f32 baseline + cached reuse (#491, #645)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[[claim]]
+op = "BlockQuantizedMatMul"
+variant = "dense_f32_dequant"
+platform = "all"
+minimum_tier = "tier3"
+counter = "BLOCK_QUANTIZED_MATMUL_DENSE_F32_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_matmul.rs"
+description = "CPU BlockQuantizedMatMul preserves packed storage at the op boundary, then dequantizes packed_B to dense f32 and runs dense GEMM; this is not quantized-domain compute"
+
+[[claim]]
+op = "BlockQuantizedMatMul"
+variant = "cached_dense"
+platform = "all"
+minimum_tier = "tier3"
+counter = "BLOCK_QUANT_MATMUL_CACHED_DENSE_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_matmul.rs"
+description = "CPU BlockQuantizedMatMul uses a bounded LRU cache for constant packed weights after the first dense f32 expansion; this is cached-dense reuse, not direct quantized-domain compute"
+
+[[claim]]
+op = "BlockQuantizedMoE"
+variant = "dense_f32_expert_dequant"
+platform = "all"
+minimum_tier = "tier3"
+counter = "BLOCK_QUANTIZED_MOE_DENSE_F32_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_moe.rs"
+description = "CPU BlockQuantizedMoE dequantizes routed experts to dense f32 and runs the dense grouped MoE path; this is not quantized-domain expert compute"
+
+[[claim]]
+op = "BlockQuantizedMoE"
+variant = "cached_dense_expert"
+platform = "all"
+minimum_tier = "tier3"
+counter = "BLOCK_QUANT_MOE_CACHED_DENSE_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_moe.rs"
+description = "CPU BlockQuantizedMoE uses a kernel-local bounded LRU cache for routed constant expert projections after the first dense f32 expansion; this is cached-dense reuse, not direct quantized-domain expert compute"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MaxPool — aarch64-apple-darwin (#324)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[[claim]]
+op = "MaxPool"
+variant = "2d_undilated"
+platform = "aarch64-apple-darwin"
+minimum_tier = "tier1"
+counter = "POOL_BNNS_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/pooling.rs"
+description = "2D undilated MaxPool dispatches to BNNS pooling on Apple Silicon"
+# Was 77–88% of ResNet-18 runtime on scalar reference; now 0.13 ms via BNNS.
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Add — aarch64-apple-darwin (#324)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[[claim]]
+op = "Add"
+variant = "contiguous_f32"
+platform = "aarch64-apple-darwin"
+minimum_tier = "tier2"
+counter = "ADD_VDSP_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/add.rs"
+description = "Contiguous same-shape f32 Add uses vDSP_vadd"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BatchNormalization — fusion elimination (not a dispatch tier)
+# ═══════════════════════════════════════════════════════════════════════════════
+# BatchNorm's optimization is graph-level: the optimizer's Conv+BN fusion pass
+# eliminates it entirely from the executed graph. This is NOT a dispatch tier —
+# it's "this op should not execute at all for standard CNN models."
+#
+# The manifest's (op, platform) → minimum_tier schema cannot express "op should
+# be fused away" without lying about what tier means. A [[fusion]] table is the
+# honest extension, but today it has no enforcement mechanism (no counter that
+# proves fusion fired). Rather than force BatchNorm into [[claim]] with a fake
+# tier, we document it as a known-good-but-unguarded optimization.
+#
+# When the optimizer gains a FUSION_FIRED_TEST_HITS counter for Conv+BN folding,
+# add a [[fusion]] row here and extend the lint to verify it.
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Deliberate exclusions (not optimized — by design)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[[claim]]
+op = "Conv"
+variant = "depthwise_neon_direct"
+platform = "aarch64"
+minimum_tier = "tier2"
+counter = "CONV_NEON_DEPTHWISE_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/conv_ref.rs"
+description = "Depthwise Conv (groups==IC==OC) uses direct NEON kernel, no im2col buffer"
+
+[[claim]]
+op = "Conv"
+variant = "grouped_not_depthwise"
+platform = "all"
+minimum_tier = "tier2"
+counter = "CONV_IM2COL_GEMM_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/conv_ref.rs"
+description = "Grouped-but-not-depthwise Conv dispatches to im2col+GEMM"
+
+[[exclusion]]
+op = "MatMul"
+variant = "bf16_m_ge2"
+platform = "aarch64-apple-darwin"
+reason = "bf16 M>=2 does not use BNNS — BNNS bf16 support is incomplete on current macOS"
+
+[[exclusion]]
+op = "MaxPool"
+variant = "dilated"
+platform = "aarch64-apple-darwin"
+reason = "Dilated pooling deliberately falls to scalar reference — BNNS does not support dilation"
+
+[[exclusion]]
+op = "BatchNormalization"
+variant = "fusion_elimination"
+platform = "all"
+reason = "Optimization is graph-level Conv+BN fusion (elimination), not dispatch tier. Unguarded pending optimizer-level counter."
+
+[[claim]]
+op = "Clip"
+variant = "contiguous_f32"
+platform = "all"
+minimum_tier = "tier1"
+counter = "CLIP_F32_FAST_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/selection.rs"
+description = "Contiguous f32 Clip uses zero-copy NEON SIMD clamp (aarch64) or scalar loop, avoiding allocating to_dense"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Relu — all platforms (#360 audit item)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[[claim]]
+op = "Relu"
+variant = "contiguous_f32"
+platform = "all"
+minimum_tier = "tier2"
+counter = "RELU_F32_FAST_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/relu.rs"
+description = "Contiguous f32 Relu uses zero-copy NEON SIMD max(x,0) (aarch64) or scalar loop, avoiding allocating to_dense"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Native Session KV — incremental prefill (Phase 1)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[[claim]]
+op = "NativeDecodeSession"
+variant = "incremental_prefill"
+platform = "all"
+minimum_tier = "tier2"
+counter = "NATIVE_SESSION_INCREMENTAL_PREFILL_TEST_HITS"
+file = "crates/onnx-genai-engine/src/native_decode/mod.rs"
+description = "Multi-turn session reuses KV cache and prefills only new tokens instead of full context reset"
+# Dense elementwise infrastructure — shared by Relu/Clip/future unary ops
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[[claim]]
+op = "Relu"
+variant = "dense_f16"
+platform = "all"
+minimum_tier = "tier2"
+counter = "DENSE_ELEM_F16_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/dense_elementwise.rs"
+description = "Dense f16 elementwise Relu via NEON widen/narrow (aarch64) or scalar widen/narrow, avoiding full to_dense allocation"
+
+[[claim]]
+op = "Relu"
+variant = "dense_bf16"
+platform = "all"
+minimum_tier = "tier2"
+counter = "DENSE_ELEM_BF16_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/dense_elementwise.rs"
+description = "Dense bf16 elementwise Relu via f32 widen/narrow, avoiding full to_dense allocation"
+
+[[claim]]
+op = "Clip"
+variant = "dense_f16"
+platform = "all"
+minimum_tier = "tier2"
+counter = "DENSE_ELEM_F16_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/dense_elementwise.rs"
+description = "Dense f16 elementwise Clip via NEON widen/narrow (aarch64) or scalar widen/narrow, avoiding full to_dense allocation"
+
+[[claim]]
+op = "Clip"
+variant = "dense_bf16"
+platform = "all"
+minimum_tier = "tier2"
+counter = "DENSE_ELEM_BF16_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/dense_elementwise.rs"
+description = "Dense bf16 elementwise Clip via f32 widen/narrow, avoiding full to_dense allocation"
+# DFT — Accelerate vDSP fast path (macOS/iOS)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[[claim]]
+op = "DFT"
+variant = "vdsp_pow2"
+platform = "aarch64-apple-darwin"
+minimum_tier = "tier1"
+counter = "DFT_VDSP_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/dft.rs"
+description = "Power-of-two DFT uses Accelerate vDSP_DFT_zop for hardware-optimized FFT on macOS/iOS"
+
+[[claim]]
+op = "DFT"
+variant = "radix2_fft"
+platform = "all"
+minimum_tier = "tier2"
+counter = "DFT_FFT_TEST_HITS"
+file = "crates/onnx-runtime-ep-cpu/src/kernels/dft.rs"
+description = "Power-of-two DFT uses Cooley-Tukey radix-2 FFT when vDSP unavailable"

@@ -1,0 +1,10 @@
+domain: ""
+name: Not
+since_version: 1
+doc: Element-wise logical negation.
+inputs:
+  - { name: X, type_str: T }
+outputs:
+  - { name: Y, type_str: T }
+type_constraints:
+  - { type_param: T, allowed: [bool] }

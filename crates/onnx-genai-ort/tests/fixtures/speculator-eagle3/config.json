@@ -1,0 +1,11 @@
+{
+  "architectures": ["EagleModel"],
+  "speculator_config": {
+    "proposal_type": "eagle3",
+    "num_speculative_tokens": 4,
+    "verifier": {
+      "name_or_path": "Qwen/Qwen3-8B",
+      "architectures": ["Qwen3ForCausalLM"]
+    }
+  }
+}

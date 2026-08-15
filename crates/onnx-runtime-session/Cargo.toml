@@ -1,0 +1,45 @@
+[package]
+name = "onnx-runtime-session"
+description = "Session and inference API for the ORT 2.0 runtime: intent-based SessionBuilder and sequential executor (skeleton)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["onnx", "session", "inference", "runtime"]
+categories = ["science", "api-bindings"]
+
+[features]
+default = ["cuda-13000"]
+cuda = ["dep:onnx-runtime-ep-cuda", "onnx-runtime-ep-cuda/cuda"]
+cuda-12060 = ["cudarc/cuda-12060", "onnx-runtime-ep-cuda?/cuda-12060"]
+cuda-12080 = ["cudarc/cuda-12080", "onnx-runtime-ep-cuda?/cuda-12080"]
+cuda-12090 = ["cudarc/cuda-12090", "onnx-runtime-ep-cuda?/cuda-12090"]
+cuda-13000 = ["cudarc/cuda-13000", "onnx-runtime-ep-cuda?/cuda-13000"]
+mlas = ["onnx-runtime-ep-cpu/mlas"]
+
+[dependencies]
+onnx-runtime-memory-governor = { workspace = true }
+onnx-runtime-memory = { workspace = true }
+onnx-genai-runtime-config = { workspace = true }
+onnx-runtime-ir = { workspace = true }
+onnx-runtime-loader = { workspace = true }
+onnx-runtime-shape-inference = { workspace = true }
+onnx-runtime-optimizer = { workspace = true }
+onnx-runtime-ep-api = { workspace = true }
+onnx-runtime-ep-cpu = { workspace = true }
+onnx-runtime-ep-cuda = { path = "../onnx-runtime-ep-cuda", version = "=0.1.0-dev.5", optional = true, default-features = false }
+onnx-runtime-tracer = { workspace = true }
+thiserror = { workspace = true }
+half = { workspace = true }
+
+[dev-dependencies]
+prost = { workspace = true }
+# Test-only: the CUDA driver-path WAR regression test (cuda feature) launches a
+# custom slow-read consumer kernel on the compute stream to open a write-after-
+# read window across double-buffer reuse. Same dynamic-loading spec as
+# onnx-runtime-ep-cuda: no CUDA toolkit is needed at build time. Select exactly
+# one CUDA API version with this crate's `cuda-*` features; the default is 13.0.
+cudarc = { version = "0.19", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading"] }
+
+[lints]
+workspace = true

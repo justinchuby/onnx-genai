@@ -1,0 +1,36 @@
+required_capabilities:
+  - kv_cache
+pipeline:
+  models:
+    vision_encoder:
+      filename: vision_encoder.onnx
+      type: encoder
+      device_preference: gpu
+    decoder:
+      filename: decoder.onnx
+      type: decoder
+      tokenizer: tokenizer.json
+  dataflow:
+    - from: vision_encoder.image_features
+      to: decoder.encoder_hidden_states
+      dtype: fp16
+      device_transfer: false
+  strategy:
+    kind: composite
+    stages:
+      - name: encode_image
+        strategy:
+          kind: single_pass
+          model: vision_encoder
+        run_on: prompt_only
+      - name: decode_text
+        strategy:
+          kind: autoregressive
+          decoder: decoder
+          max_tokens: 128
+        run_on: every_step
+  phases:
+    vision_encoder:
+      run_on: prompt_only
+    decoder:
+      run_on: every_step

@@ -1,0 +1,20 @@
+domain: ""
+name: Conv
+since_version: 11
+doc: N-dimensional convolution.
+attributes:
+  - { name: auto_pad, type: string, default: NOTSET }
+  - { name: dilations, type: ints }
+  - { name: group, type: int, default: 1 }
+  - { name: kernel_shape, type: ints }
+  - { name: pads, type: ints }
+  - { name: strides, type: ints }
+inputs:
+  - { name: X, type_str: T }
+  - { name: W, type_str: T }
+  - { name: B, type_str: T, optional: true }
+outputs:
+  - { name: Y, type_str: T }
+type_constraints:
+  - type_param: T
+    allowed: [float16, float32, float64, bfloat16]

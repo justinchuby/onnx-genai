@@ -1,0 +1,46 @@
+[package]
+name = "onnx-genai-router"
+description = "Lightweight, session-aware router for onnx-genai inference clusters"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["onnx", "llm", "inference", "router", "load-balancing"]
+categories = ["web-programming", "network-programming"]
+
+[[bin]]
+name = "onnx-genai-router"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+anyhow = { workspace = true }
+
+# R3 networking/runtime layer. axum serves the router's own /router/* API and
+# the proxy fallback (matches the inference server, which is also axum). A
+# hyper-util client streams the reverse-proxy and /v1/status polls — chosen over
+# reqwest to honour §34.10 ("hyper + tokio + serde") and keep one client stack.
+axum = { workspace = true }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+# Concurrent fan-out of per-node status polls (join_all over borrowed fetch
+# futures). tokio's JoinSet needs 'static tasks, but the fetch futures borrow
+# the shared fetcher, so we drive them concurrently on one task instead.
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { workspace = true }
+tokio-stream = { workspace = true }
+
+[lints]
+workspace = true

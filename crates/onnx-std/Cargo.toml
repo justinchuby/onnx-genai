@@ -1,0 +1,23 @@
+[package]
+name = "onnx-std"
+description = "Pure-Rust ONNX standard library: model I/O, textual format, and an extensible validator, built on the shared onnx-runtime-ir IR (see docs/architecture/ONNX_RS.md)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["onnx", "protobuf", "validation", "ir"]
+categories = ["science", "parser-implementations"]
+
+[dependencies]
+onnx-runtime-ir = { workspace = true }
+onnx-runtime-loader = { workspace = true }
+onnx-runtime-shape-inference = { workspace = true }
+prost = { workspace = true }
+prost-reflect = { workspace = true, features = ["serde", "text-format"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

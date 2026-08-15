@@ -1,0 +1,11 @@
+domain: ""
+name: LpNormalization
+since_version: 1
+doc: Normalize slices using an Lp norm.
+attributes:
+  - { name: axis, type: int, default: -1 }
+  - { name: p, type: int, default: 2 }
+inputs: [{ name: input, type_str: T }]
+outputs: [{ name: output, type_str: T }]
+type_constraints:
+  - { type_param: T, allowed: [bfloat16, float16, float32, float64] }

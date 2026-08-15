@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "policy": "one-universe-per-assignment",
+  "allow_mixing": false,
+  "spoiler_free": true,
+  "overflow": ["diegetic-expansion", "thematic-promotion", "structural-mirroring"]
+}

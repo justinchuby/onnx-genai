@@ -1,0 +1,13 @@
+domain: ""
+name: Concat
+since_version: 13
+doc: Concatenate tensors along an axis.
+attributes:
+  - { name: axis, type: int, required: true }
+inputs:
+  - { name: inputs, type_str: T, variadic: true, min_arity: 1 }
+outputs:
+  - { name: concat_result, type_str: T }
+type_constraints:
+  - type_param: T
+    allowed: [uint8, uint16, uint32, uint64, int8, int16, int32, int64, bfloat16, float16, float32, float64, string, bool, complex64, complex128]

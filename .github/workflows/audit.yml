@@ -1,0 +1,37 @@
+name: Rust security audit
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # Keep audit on Rust stable deliberately: this follows Rust's stability promise
+      # without freezing security fixes.
+      - name: Install Rust stable toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Check RustSec advisories
+        # Default cargo-audit policy fails on vulnerabilities but allows
+        # informational warnings such as unmaintained transitive crates.
+        run: cargo audit

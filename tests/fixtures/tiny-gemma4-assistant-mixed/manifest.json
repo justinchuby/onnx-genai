@@ -1,0 +1,84 @@
+{
+  "generator": "scripts/build_tiny_gemma4_assistant_mixed.py",
+  "seed": 20260713,
+  "vocab_size": 32,
+  "backbone_hidden_size": 16,
+  "kv_heads": 2,
+  "head_dim_per_layer": {
+    "0": {
+      "group": "sliding_attention",
+      "head_dim": 8
+    },
+    "1": {
+      "group": "full_attention",
+      "head_dim": 16
+    }
+  },
+  "num_target_layers": 2,
+  "shared_kv": [
+    {
+      "name": "sliding_attention",
+      "target_layers": [
+        0
+      ]
+    },
+    {
+      "name": "full_attention",
+      "target_layers": [
+        1
+      ]
+    }
+  ],
+  "kv_output_shapes": {
+    "present.0.key": [
+      "batch",
+      2,
+      "total_seq_len",
+      8
+    ],
+    "present.0.value": [
+      "batch",
+      2,
+      "total_seq_len",
+      8
+    ],
+    "present.1.key": [
+      "batch",
+      2,
+      "total_seq_len",
+      16
+    ],
+    "present.1.value": [
+      "batch",
+      2,
+      "total_seq_len",
+      16
+    ]
+  },
+  "assistant_shared_kv_shapes": {
+    "shared_kv.sliding_attention.key": [
+      "batch",
+      2,
+      "kv_len",
+      8
+    ],
+    "shared_kv.sliding_attention.value": [
+      "batch",
+      2,
+      "kv_len",
+      8
+    ],
+    "shared_kv.full_attention.key": [
+      "batch",
+      2,
+      "kv_len",
+      16
+    ],
+    "shared_kv.full_attention.value": [
+      "batch",
+      2,
+      "kv_len",
+      16
+    ]
+  }
+}
