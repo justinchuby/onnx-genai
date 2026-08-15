@@ -2161,6 +2161,48 @@ mod tests {
     }
 
     #[test]
+    fn to_dense_bytes_honors_a_nonzero_byte_offset() {
+        // The fast path must read from the *element origin*
+        // (`data + byte_offset`), not from the allocation base. `Owned::view`
+        // builds a zero-offset view, so construct the offset view directly.
+        // Both paths route through `data_ptr`, but nothing else here pins that
+        // down for the bulk copy.
+        let backing = Owned::u8(&[6], &[10, 20, 30, 40, 50, 60]);
+        let shape = [3usize];
+        let strides = [1i64];
+        let mut view = TensorView::new(
+            onnx_runtime_ep_api::DevicePtr(backing.bytes.as_ptr() as *const std::ffi::c_void),
+            DataType::Uint8,
+            &shape,
+            &strides,
+            onnx_runtime_ir::DeviceId::cpu(),
+        );
+        view.byte_offset = 2;
+        assert!(view.is_contiguous());
+        assert_eq!(to_dense_bytes(&view).unwrap(), vec![30, 40, 50]);
+        assert_eq!(
+            to_dense_bytes(&view).unwrap(),
+            to_dense_bytes_via_strided_walk(&view)
+        );
+    }
+
+    #[test]
+    fn to_dense_bytes_handles_a_rank_zero_scalar() {
+        // `numel([]) == 1` and `is_contiguous([], [])` is true, so a scalar
+        // takes the fast path with `n * esize == esize`.
+        let owned = Owned::i64(&[], &[-7]);
+        let view = owned.view();
+        assert!(view.is_contiguous());
+        let dense = to_dense_bytes(&view).unwrap();
+        assert_eq!(dense.len(), 8);
+        assert_eq!(dense, to_dense_bytes_via_strided_walk(&view));
+
+        let mut sink = Owned::i64(&[], &[0]);
+        write_dense_bytes(&mut sink.view_mut(), &dense).unwrap();
+        assert_eq!(sink.to_i64(), vec![-7]);
+    }
+
+    #[test]
     fn write_dense_strided_matches_logical_order() {
         // Backing [2,3] row-major exposed as transposed [3,2] with strides
         // [1,3] so the write must scatter through the non-contiguous stride
