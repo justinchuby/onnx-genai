@@ -113,6 +113,15 @@ const GEMV_F16_GENERAL_BS_SPLITK_WIDE_ENTRY: &str = "matmul_nbits_gemv_f16_gener
 /// unchanged). Non-split-K only (used on the wide, occupancy-filled gate_up).
 const GEMV_F16_GENERAL_BS_WIDE_MULTICOL_ENTRY: &str =
     "matmul_nbits_gemv_f16_general_bs_wide_multicol";
+/// cp.async double-buffered counterpart of
+/// [`GEMV_F16_GENERAL_BS_WIDE_MULTICOL_ENTRY`]. Same launch geometry, ABI and
+/// byte-identical output, but each lane's next K-tile of WIDE_NC 128-bit weight
+/// words is prefetched through shared memory with `cp.async.cg` + L2 evict-first
+/// while the current tile computes, to hide the Long-Scoreboard global-load
+/// stall. SM80+ only; opt-in via `ONNX_GENAI_GEMV_CPASYNC=1` (default off — kept
+/// as a reproducible measurement until proven a win).
+const GEMV_F16_GENERAL_BS_WIDE_MULTICOL_CPASYNC_ENTRY: &str =
+    "matmul_nbits_gemv_f16_general_bs_wide_multicol_cpasync";
 /// Output columns each warp emits in the register-blocked wide GEMV. Must match
 /// `#define WIDE_NC` in the CUDA source. A 256-thread CTA (8 warps) therefore
 /// covers `8 * GEMV_F16_WIDE_MULTICOL_NC` columns.
@@ -914,6 +923,44 @@ __device__ __forceinline__ float warp_sum(float value)
     }
     return value;
 }
+
+// ---- cp.async software-pipeline primitives (SM80+) -------------------------
+// `cp.async` streams a 128-bit global weight load straight into shared memory
+// without occupying a destination register while the ~300-cycle HBM transfer is
+// in flight, so a lane can prefetch its NEXT K-tile weights while the current
+// tile's LOP3 dequant + FMA run. This targets the Long-Scoreboard global-load
+// stall that is the top stall reason of the multicol M=1 GEMV. The `.cg` variant
+// bypasses L1, and the `L2::evict_first` cache policy tells L2 to drop these
+// (single-use) weight bytes immediately so the reusable activation vector stays
+// resident (the Marlin `cp_async4_stream` idiom). Emitted only for compute
+// capability >= 8.0; every caller pairs it with a byte-identical `#else`
+// direct-load fallback so the same source still runs on < SM80 (Rule 11).
+#if (__CUDA_ARCH__ >= 800)
+#define ONNX_GENAI_CP_ASYNC 1
+// Async-copy one aligned 16-byte (uint4) weight word global->shared, hinting L2
+// to evict it first (weights are single-use; the activation is what we keep hot).
+__device__ __forceinline__ void cp_async_cg16_evict(unsigned smem_addr, const void* gmem_ptr)
+{
+    asm volatile(
+        "{\n"
+        "  .reg .b64 p;\n"
+        "  createpolicy.fractional.L2::evict_first.b64 p, 1.0;\n"
+        "  cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, p;\n"
+        "}\n" ::"r"(smem_addr),
+        "l"(gmem_ptr));
+}
+// Close the current async-copy group so it can be waited on independently.
+__device__ __forceinline__ void cp_async_commit()
+{
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+// Block until at most `N` (immediate) async-copy groups remain in flight.
+template <int N>
+__device__ __forceinline__ void cp_async_wait()
+{
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
+}
+#endif  // __CUDA_ARCH__ >= 800
 
 // Fp16 GEMV bias epilogue. The fp32 accumulator is always rounded to fp16 for
 // the base output. When a bias is present:
@@ -4143,7 +4190,228 @@ extern "C" __global__ void matmul_nbits_gemv_f16_general_bs_wide_multicol(
     }
 }
 
-// Model-agnostic fp16 int4/int8 prefill GEMM supporting any power-of-two
+// cp.async software-pipelined counterpart of the multicol wide GEMV (int4 only).
+// Keeps the EXACT per-lane depth striding, per-column fp32 accumulation order and
+// dequant arithmetic of `gemv_int4_wide_lane_dot_multicol` — so the output is
+// byte-identical — but double-buffers each lane's WIDE_NC 128-bit weight words
+// through shared memory with `cp.async.cg` + `L2::evict_first`, prefetching the
+// next K-tile while the current tile computes. On < SM80 the `#else` branch is
+// the byte-identical direct-load multicol loop (Rule 11 portability).
+extern "C" __global__ void matmul_nbits_gemv_f16_general_bs_wide_multicol_cpasync(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales,
+    const unsigned char* __restrict__ zero_points,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int scales_fp16,
+    const int bias_post_round,
+    const int bits)
+{
+    (void)bits;  // int4-only entry; dispatch guarantees bits == 4.
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const long col_base = ((long)blockIdx.x * warps_per_block + warp) * (long)WIDE_NC;
+
+    float values[WIDE_NC];
+    bool valid[WIDE_NC];
+    long col_kb[WIDE_NC];
+#pragma unroll
+    for (int c = 0; c < WIDE_NC; ++c) {
+        values[c] = 0.0f;
+        const long column = col_base + c;
+        valid[c] = (column < n);
+        col_kb[c] = column * (long)k_blocks;
+    }
+
+    const int depth0 = lane * 32;
+    const int warp_stride = 32 * 32;  // 1024
+
+#if defined(ONNX_GENAI_CP_ASYNC)
+    // Per-warp double buffer: [stage][WIDE_NC columns][32 lanes] of uint4.
+    // 8 warps * 2 * 4 * 32 * 16B = 32 KiB / CTA. Lane is the fastest index so
+    // each thread owns a distinct 16-byte slot (no bank-conflict cross-talk) and
+    // reads back only its own slot, so cp.async.wait alone orders the copy.
+    __shared__ uint4 wbuf[8][2][WIDE_NC][32];
+
+    // Prefetch a full K-tile (all WIDE_NC weight words for one `depth`) into a
+    // shared-memory slot with cp.async, or fall through when the tile is out of
+    // range for this lane.
+    auto prefetch_tile = [&](int stage, int depth) {
+        if (depth + 32 > k) {
+            return;
+        }
+        const int block = depth / block_size;
+        const int within = depth - block * block_size;
+#pragma unroll
+        for (int c = 0; c < WIDE_NC; ++c) {
+            if (!valid[c]) {
+                continue;
+            }
+            const long base = (col_kb[c] + block) * (long)blob_size;
+            const unsigned smem =
+                (unsigned)__cvta_generic_to_shared(&wbuf[warp][stage][c][lane]);
+            cp_async_cg16_evict(smem, packed + base + (within >> 1));
+        }
+        cp_async_commit();
+    };
+
+    // Prologue: launch the first tile (t = 0).
+    prefetch_tile(0, depth0);
+
+    int depth = depth0;
+    int t = 0;
+    while (depth + 32 <= k) {
+        const int stage = t & 1;
+        const int next_depth = depth + warp_stride;
+        const bool has_next = (next_depth + 32 <= k);
+        if (has_next) {
+            prefetch_tile((t + 1) & 1, next_depth);
+            cp_async_wait<1>();  // keep the just-issued next tile in flight
+        } else {
+            cp_async_wait<0>();  // drain: this is the last in-flight tile
+        }
+        __syncwarp();
+
+        const int block = depth / block_size;
+        float scale[WIDE_NC];
+        unsigned int sub2[WIDE_NC];
+        uint4 w[WIDE_NC];
+#pragma unroll
+        for (int c = 0; c < WIDE_NC; ++c) {
+            if (!valid[c]) {
+                continue;
+            }
+            w[c] = wbuf[warp][stage][c][lane];
+            if (scales_fp16) {
+                scale[c] = __half2float(reinterpret_cast<const __half*>(scales)[col_kb[c] + block]);
+            } else {
+                scale[c] = reinterpret_cast<const float*>(scales)[col_kb[c] + block];
+            }
+            sub2[c] = int4_zero_point_sub2(
+                int4_block_zero_point(zero_points, col_base + c, block, zp_row_bytes));
+        }
+
+        float a8[8];
+#pragma unroll
+        for (int s = 0; s < 4; ++s) {
+            decode_activation8(activation + depth + s * 8, a8);
+#pragma unroll
+            for (int c = 0; c < WIDE_NC; ++c) {
+                if (!valid[c]) {
+                    continue;
+                }
+                const unsigned int word =
+                    (s == 0) ? w[c].x : (s == 1) ? w[c].y : (s == 2) ? w[c].z : w[c].w;
+                values[c] += scale[c] * dot_int4x8_f16_sub_act(word, a8, sub2[c]);
+            }
+        }
+        depth = next_depth;
+        ++t;
+    }
+#else
+    // < SM80: byte-identical direct-load multicol main loop.
+    int depth = depth0;
+    while (depth + 32 <= k) {
+        const int block = depth / block_size;
+        const int within = depth - block * block_size;
+        uint4 w[WIDE_NC];
+        float scale[WIDE_NC];
+        unsigned int sub2[WIDE_NC];
+#pragma unroll
+        for (int c = 0; c < WIDE_NC; ++c) {
+            if (!valid[c]) {
+                continue;
+            }
+            const long base = (col_kb[c] + block) * (long)blob_size;
+            w[c] = *reinterpret_cast<const uint4*>(packed + base + (within >> 1));
+            if (scales_fp16) {
+                scale[c] = __half2float(reinterpret_cast<const __half*>(scales)[col_kb[c] + block]);
+            } else {
+                scale[c] = reinterpret_cast<const float*>(scales)[col_kb[c] + block];
+            }
+            sub2[c] = int4_zero_point_sub2(
+                int4_block_zero_point(zero_points, col_base + c, block, zp_row_bytes));
+        }
+        float a8[8];
+#pragma unroll
+        for (int s = 0; s < 4; ++s) {
+            decode_activation8(activation + depth + s * 8, a8);
+#pragma unroll
+            for (int c = 0; c < WIDE_NC; ++c) {
+                if (!valid[c]) {
+                    continue;
+                }
+                const unsigned int word =
+                    (s == 0) ? w[c].x : (s == 1) ? w[c].y : (s == 2) ? w[c].z : w[c].w;
+                values[c] += scale[c] * dot_int4x8_f16_sub_act(word, a8, sub2[c]);
+            }
+        }
+        depth += warp_stride;
+    }
+#endif  // ONNX_GENAI_CP_ASYNC
+
+    // Partial trailing chunk (`depth < k < depth + 32`): direct-load tail,
+    // identical to the multicol device fn so the K-tail stays byte-identical.
+    if (depth < k) {
+        const int block = depth / block_size;
+#pragma unroll
+        for (int c = 0; c < WIDE_NC; ++c) {
+            if (!valid[c]) {
+                continue;
+            }
+            float scale;
+            if (scales_fp16) {
+                scale = __half2float(reinterpret_cast<const __half*>(scales)[col_kb[c] + block]);
+            } else {
+                scale = reinterpret_cast<const float*>(scales)[col_kb[c] + block];
+            }
+            const int zero_point =
+                int4_block_zero_point(zero_points, col_base + c, block, zp_row_bytes);
+            const unsigned int sub2 = int4_zero_point_sub2(zero_point);
+            const long blob_base = (col_kb[c] + block) * (long)blob_size;
+            for (int off = 0; off < 32 && depth + off < k; off += 8) {
+                const int d = depth + off;
+                const int within = d - block * block_size;
+                const int valid_n = min(8, k - d);
+                const unsigned int packed_word =
+                    *reinterpret_cast<const unsigned int*>(packed + blob_base + (within >> 1));
+                if (valid_n == 8) {
+                    values[c] += scale * dot_int4x8_f16_sub(packed_word, activation + d, sub2);
+                } else {
+                    float partial = 0.0f;
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        if (i < valid_n) {
+                            const int q = (int)((packed_word >> (i * 4)) & 15u) - zero_point;
+                            partial += (float)q * __half2float(activation[d + i]);
+                        }
+                    }
+                    values[c] += partial * scale;
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int c = 0; c < WIDE_NC; ++c) {
+        const float reduced = warp_sum(values[c]);
+        const long column = col_base + c;
+        if (lane == 0 && column < n) {
+            output[column] = fold_bias_f16(reduced, bias, column, bias_post_round);
+        }
+    }
+}
+
+
 // block_size. Identical 16x16 tiling and fp32 accumulation as the tuned
 // block-32 GEMM, but the reduction walks K in fixed 32-wide tiles and derives
 // the block index from the real block_size (block = depth / block_size), so the
@@ -4436,6 +4704,22 @@ fn use_gemv_wide_multicol() -> bool {
             .ok()
             .as_deref(),
         Some("0") | Some("false") | Some("off")
+    )
+}
+
+/// Whether the multicol wide GEMV should take the cp.async double-buffered entry
+/// ([`GEMV_F16_GENERAL_BS_WIDE_MULTICOL_CPASYNC_ENTRY`]) instead of the plain
+/// direct-load multicol entry. `cp.async` is SM80+ only, so on older devices this
+/// always returns false and the byte-identical direct-load kernel is used
+/// (Rule 11). Opt-in and DEFAULT OFF via `ONNX_GENAI_GEMV_CPASYNC=1` — the
+/// prefetch is a reproducible measurement, not yet a proven default-on win.
+fn use_gemv_cpasync(compute_capability: (u32, u32)) -> bool {
+    if compute_capability.0 < 8 {
+        return false;
+    }
+    matches!(
+        std::env::var("ONNX_GENAI_GEMV_CPASYNC").ok().as_deref(),
+        Some("1") | Some("true") | Some("on")
     )
 }
 
@@ -7210,7 +7494,11 @@ impl MatMulNBitsKernel {
                 }
             } else if use_gemv_wideload(self.bits, self.block_size, self.k) {
                 if use_gemv_wide_multicol() {
-                    GEMV_F16_GENERAL_BS_WIDE_MULTICOL_ENTRY
+                    if use_gemv_cpasync(capabilities.compute_capability()) {
+                        GEMV_F16_GENERAL_BS_WIDE_MULTICOL_CPASYNC_ENTRY
+                    } else {
+                        GEMV_F16_GENERAL_BS_WIDE_MULTICOL_ENTRY
+                    }
                 } else {
                     GEMV_F16_GENERAL_BS_WIDE_ENTRY
                 }
@@ -7301,7 +7589,9 @@ impl MatMulNBitsKernel {
                     (threads / 32) as usize / GENERAL_BS_SPLITK
                 } else if use_scales_f16_splitk {
                     (threads / 32) as usize / GEMV_F16_SCALES_F16_ZP_SPLITK
-                } else if entry == GEMV_F16_GENERAL_BS_WIDE_MULTICOL_ENTRY {
+                } else if entry == GEMV_F16_GENERAL_BS_WIDE_MULTICOL_ENTRY
+                    || entry == GEMV_F16_GENERAL_BS_WIDE_MULTICOL_CPASYNC_ENTRY
+                {
                     // Each warp emits WIDE_NC columns, so a `threads/32`-warp CTA
                     // covers `warps * WIDE_NC` output columns; the grid shrinks by
                     // WIDE_NC accordingly.
@@ -7337,6 +7627,7 @@ impl MatMulNBitsKernel {
             || entry == GEMV_F16_GENERAL_BS_WIDE_ENTRY
             || entry == GEMV_F16_GENERAL_BS_SPLITK_WIDE_ENTRY
             || entry == GEMV_F16_GENERAL_BS_WIDE_MULTICOL_ENTRY
+            || entry == GEMV_F16_GENERAL_BS_WIDE_MULTICOL_CPASYNC_ENTRY
         {
             builder.arg(&bits);
         }
