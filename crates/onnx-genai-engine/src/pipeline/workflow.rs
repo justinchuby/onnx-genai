@@ -730,6 +730,21 @@ impl<'a> WorkflowExecutionPlan<'a> {
                             service.row_ids
                         )
                     })?;
+                let request_epochs = values
+                    .get(&service.request_epochs)
+                    .with_context(|| {
+                        format!(
+                            "adapter service request_epochs input '{}' is unavailable",
+                            service.request_epochs
+                        )
+                    })?
+                    .to_vec_i64()
+                    .with_context(|| {
+                        format!(
+                            "adapter service request_epochs input '{}' must be host int64",
+                            service.request_epochs
+                        )
+                    })?;
                 let active_rows = if let Some(active) = &service.active {
                     workflow_bool_rows(&values, active)?
                 } else {
@@ -740,6 +755,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
                     service,
                     &self.adapters,
                     &row_ids,
+                    &request_epochs,
                     &active_rows,
                     &values,
                 )?;
@@ -2262,7 +2278,8 @@ fn workflow_request_value(
         RuntimeInputRole::Media
         | RuntimeInputRole::Constraint
         | RuntimeInputRole::SessionId
-        | RuntimeInputRole::RowIds => Ok(None),
+        | RuntimeInputRole::RowIds
+        | RuntimeInputRole::RequestEpochs => Ok(None),
     }
 }
 

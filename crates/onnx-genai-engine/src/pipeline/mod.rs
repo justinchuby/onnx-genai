@@ -27,7 +27,9 @@ mod adapters;
 mod islands;
 mod workflow;
 
-pub use adapters::{AdapterActivation, AdapterLifecycleDiagnostic, AdapterSelection};
+pub use adapters::{
+    AdapterActivation, AdapterLifecycleDiagnostic, AdapterRowIdentity, AdapterSelection,
+};
 pub use islands::ExecutionIslandDiagnostic;
 pub use onnx_genai_metadata::WorkflowOutputRole;
 pub use workflow::{WorkflowExecutionPlan, WorkflowPerformanceDiagnostic};

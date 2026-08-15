@@ -31,17 +31,30 @@ impl AdapterActivation {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AdapterSelection {
-    /// Immutable adapter composition keyed by semantic row/slot identity.
-    pub rows: BTreeMap<i64, Vec<AdapterActivation>>,
+    /// Immutable composition keyed by semantic slot and its current request epoch.
+    pub rows: BTreeMap<AdapterRowIdentity, Vec<AdapterActivation>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AdapterRowIdentity {
+    pub row_id: i64,
+    pub request_epoch: i64,
 }
 
 impl AdapterSelection {
     pub fn with_row(
         mut self,
         row_id: i64,
+        request_epoch: i64,
         adapters: impl IntoIterator<Item = AdapterActivation>,
     ) -> Self {
-        self.rows.insert(row_id, adapters.into_iter().collect());
+        self.rows.insert(
+            AdapterRowIdentity {
+                row_id,
+                request_epoch,
+            },
+            adapters.into_iter().collect(),
+        );
         self
     }
 }
@@ -98,7 +111,7 @@ pub(super) struct AdapterCache {
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct AdapterRunContext {
-    pub rows: Vec<(i64, Vec<(String, f32)>)>,
+    pub rows: Vec<(AdapterRowIdentity, Vec<(String, f32)>)>,
 }
 
 impl AdapterCache {
@@ -114,9 +127,20 @@ impl AdapterCache {
         service: &AdapterServiceContract,
         selection: &AdapterSelection,
         row_ids: &[i64],
+        request_epochs: &[i64],
         active_rows: &[bool],
         request_inputs: &HashMap<String, Value>,
     ) -> anyhow::Result<AdapterRunContext> {
+        if request_epochs.len() != row_ids.len() {
+            anyhow::bail!(
+                "adapter request_epochs has {} rows but row_ids has {}",
+                request_epochs.len(),
+                row_ids.len()
+            );
+        }
+        if let Some(epoch) = request_epochs.iter().find(|epoch| **epoch < 0) {
+            anyhow::bail!("adapter request epoch {epoch} must be non-negative");
+        }
         if active_rows.len() != row_ids.len() {
             anyhow::bail!(
                 "adapter active mask has {} rows but row_ids has {}",
@@ -131,15 +155,25 @@ impl AdapterCache {
         if request_rows.len() != row_ids.len() {
             anyhow::bail!("adapter semantic row_ids must be unique within a request");
         }
-        let active_request_rows = row_ids
+        let identities = row_ids
             .iter()
+            .copied()
+            .zip(request_epochs.iter().copied())
+            .map(|(row_id, request_epoch)| AdapterRowIdentity {
+                row_id,
+                request_epoch,
+            })
+            .collect::<Vec<_>>();
+        let active_request_rows = identities
+            .iter()
+            .copied()
             .zip(active_rows)
-            .filter_map(|(row_id, active)| active.then_some(*row_id))
+            .filter_map(|(identity, active)| active.then_some(identity))
             .collect::<std::collections::HashSet<_>>();
         let requested = selection
             .rows
             .iter()
-            .filter(|(row_id, _)| active_request_rows.contains(row_id))
+            .filter(|(identity, _)| active_request_rows.contains(identity))
             .flat_map(|(_, activations)| activations)
             .map(|activation| activation.adapter.as_str())
             .collect::<std::collections::HashSet<_>>();
@@ -152,9 +186,9 @@ impl AdapterCache {
         }
         let mut rows = Vec::with_capacity(row_ids.len());
         let mut plan_parts = Vec::with_capacity(row_ids.len());
-        for (physical_row, row_id) in row_ids.iter().copied().enumerate() {
+        for (physical_row, identity) in identities.iter().copied().enumerate() {
             let activations = if active_rows[physical_row] {
-                selection.rows.get(&row_id).cloned().unwrap_or_default()
+                selection.rows.get(&identity).cloned().unwrap_or_default()
             } else {
                 Vec::new()
             };
@@ -168,7 +202,8 @@ impl AdapterCache {
                     anyhow::bail!(
                         "adapter '{}' scale {} for row {row_id} must be finite and within [-16, 16]",
                         activation.adapter,
-                        activation.scale
+                        activation.scale,
+                        row_id = identity.row_id
                     );
                 }
                 let artifact = service
@@ -177,7 +212,8 @@ impl AdapterCache {
                     .with_context(|| {
                         format!(
                             "adapter selection for row {row_id} references undeclared adapter '{}'",
-                            activation.adapter
+                            activation.adapter,
+                            row_id = identity.row_id
                         )
                     })?;
                 self.ensure_loaded(root, service, &activation.adapter, artifact)?;
@@ -201,14 +237,20 @@ impl AdapterCache {
                 if !scale.is_finite() || !(-16.0..=16.0).contains(&scale) {
                     anyhow::bail!(
                         "adapter '{}' effective scale {scale} for row {row_id} must be finite and within [-16, 16]",
-                        activation.adapter
+                        activation.adapter,
+                        row_id = identity.row_id
                     );
                 }
                 row_key.push(format!("{}:{scale:.8}", activation.adapter));
                 resolved.push((activation.adapter, scale));
             }
-            plan_parts.push(format!("{row_id}=[{}]", row_key.join(",")));
-            rows.push((row_id, resolved));
+            plan_parts.push(format!(
+                "{}@{}=[{}]",
+                identity.row_id,
+                identity.request_epoch,
+                row_key.join(",")
+            ));
+            rows.push((identity, resolved));
         }
         let plan_key = plan_parts.join(";");
         if !self.plans.insert(plan_key.clone()) {
@@ -460,6 +502,7 @@ mod tests {
         AdapterServiceContract {
             base_model_fingerprint: "base-sha256".to_string(),
             row_ids: "request.row_ids".to_string(),
+            request_epochs: "request.request_epochs".to_string(),
             active: None,
             application_capability: "onnx-genai.adapters".to_string(),
             portable_fallback: true,
@@ -489,9 +532,10 @@ mod tests {
 
         let service = service_contract(red, blue, 2);
         let selection = AdapterSelection::default()
-            .with_row(10, [AdapterActivation::new("red", 1.0)])
+            .with_row(10, 0, [AdapterActivation::new("red", 1.0)])
             .with_row(
                 30,
+                0,
                 [
                     AdapterActivation::new("red", 0.5),
                     AdapterActivation::new("blue", 1.0),
@@ -504,6 +548,7 @@ mod tests {
                 &service,
                 &selection,
                 &[10, 20, 30],
+                &[0, 0, 0],
                 &[true, true, true],
                 &HashMap::new(),
             )
@@ -531,6 +576,7 @@ mod tests {
                     &service,
                     &selection,
                     &[row_id],
+                    &[0],
                     &[true],
                     &HashMap::new(),
                 )
@@ -543,6 +589,7 @@ mod tests {
 
         let dynamic = AdapterSelection::default().with_row(
             10,
+            0,
             [AdapterActivation::new("red", 1.0).with_scale_input("request.adapter_scale")],
         );
         let dynamic_inputs = HashMap::from([(
@@ -550,7 +597,15 @@ mod tests {
             Value::from_slice_f32(&[0.5], &[1]).expect("dynamic scale"),
         )]);
         let dynamic_context = cache
-            .prepare(&root, &service, &dynamic, &[10], &[true], &dynamic_inputs)
+            .prepare(
+                &root,
+                &service,
+                &dynamic,
+                &[10],
+                &[0],
+                &[true],
+                &dynamic_inputs,
+            )
             .expect("prepare dynamic scale");
         let (dynamic_output, _) = apply_parameter_overlay(
             &cache,
@@ -571,6 +626,7 @@ mod tests {
                 &service,
                 &selection,
                 &[30, 10],
+                &[0, 0],
                 &[true, true],
                 &HashMap::new(),
             )
@@ -594,6 +650,7 @@ mod tests {
                 &service,
                 &selection,
                 &[10],
+                &[0],
                 &[false],
                 &HashMap::new(),
             )
@@ -615,14 +672,18 @@ mod tests {
         let service = service_contract(red, blue, 1);
         let mut cache = AdapterCache::default();
         for (row_id, adapter) in [(1, "red"), (2, "blue"), (3, "red")] {
-            let selection = AdapterSelection::default()
-                .with_row(row_id, [AdapterActivation::new(adapter, 1.0)]);
+            let selection = AdapterSelection::default().with_row(
+                row_id,
+                0,
+                [AdapterActivation::new(adapter, 1.0)],
+            );
             cache
                 .prepare(
                     &root,
                     &service,
                     &selection,
                     &[row_id],
+                    &[0],
                     &[true],
                     &HashMap::new(),
                 )
@@ -649,9 +710,17 @@ mod tests {
         fs::write(root.join("blue.json"), valid).expect("write blue adapter");
         let service = service_contract(valid, valid, 2);
         let selection =
-            AdapterSelection::default().with_row(1, [AdapterActivation::new("red", 1.0)]);
+            AdapterSelection::default().with_row(1, 0, [AdapterActivation::new("red", 1.0)]);
         let error = AdapterCache::default()
-            .prepare(&root, &service, &selection, &[1], &[true], &HashMap::new())
+            .prepare(
+                &root,
+                &service,
+                &selection,
+                &[1],
+                &[0],
+                &[true],
+                &HashMap::new(),
+            )
             .expect_err("checksum mismatch must fail");
         assert!(error.to_string().contains("checksum mismatch"));
 
@@ -659,7 +728,15 @@ mod tests {
         fs::write(root.join("red.json"), malformed).expect("write malformed adapter");
         let service = service_contract(malformed, valid, 2);
         let error = AdapterCache::default()
-            .prepare(&root, &service, &selection, &[1], &[true], &HashMap::new())
+            .prepare(
+                &root,
+                &service,
+                &selection,
+                &[1],
+                &[0],
+                &[true],
+                &HashMap::new(),
+            )
             .expect_err("shape mismatch must fail");
         assert!(error.to_string().contains("shape mismatch"));
         fs::remove_dir_all(root).expect("remove adapter test directory");

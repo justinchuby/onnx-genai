@@ -21,6 +21,7 @@ fn package(metadata: &str, red: &[u8], blue: &[u8]) -> anyhow::Result<PathBuf> {
 fn run(
     engine: &mut PipelineEngine,
     row_ids: &[i64],
+    request_epochs: &[i64],
     values: &[f32],
     selection: AdapterSelection,
 ) -> anyhow::Result<Vec<f32>> {
@@ -30,6 +31,10 @@ fn run(
         options: Default::default(),
     })
     .with_input("request.row_ids", Value::from_slice_i64(row_ids, &[batch])?)
+    .with_input(
+        "request.request_epochs",
+        Value::from_slice_i64(request_epochs, &[batch])?,
+    )
     .with_input("activations", Value::from_slice_f32(values, &[batch, 2])?)
     .with_adapters(selection);
     Ok(engine.run_pipeline(request)?["result"].to_vec_f32()?)
@@ -53,6 +58,10 @@ pipeline:
       request.row_ids:
         contract: {{ dtype: int64, rank: 1, shape: [batch] }}
         role: {{ kind: runtime, version: "1.0", role: row_ids }}
+        source: {{ kind: request }}
+      request.request_epochs:
+        contract: {{ dtype: int64, rank: 1, shape: [batch] }}
+        role: {{ kind: runtime, version: "1.0", role: request_epochs }}
         source: {{ kind: request }}
       activations:
         contract: {{ dtype: float32, rank: 2, shape: [batch, 2] }}
@@ -85,6 +94,7 @@ pipeline:
     adapters:
       base_model_fingerprint: synthetic-base
       row_ids: request.row_ids
+      request_epochs: request.request_epochs
       application_capability: onnx-genai.adapters
       portable_fallback: true
       cache: {{ max_entries: 2, eviction: lru }}
@@ -133,9 +143,10 @@ pipeline:
     let root = package(&metadata, red, blue)?;
     let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
     let selection = AdapterSelection::default()
-        .with_row(10, [AdapterActivation::new("red", 1.0)])
+        .with_row(10, 0, [AdapterActivation::new("red", 1.0)])
         .with_row(
             30,
+            0,
             [
                 AdapterActivation::new("red", 0.5),
                 AdapterActivation::new("blue", 1.0),
@@ -146,6 +157,7 @@ pipeline:
         run(
             &mut engine,
             &[10, 20, 30],
+            &[0, 0, 0],
             &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
             selection.clone(),
         )?,
@@ -157,7 +169,7 @@ pipeline:
         (30, [5.0, 6.0], [25.5, 35.0]),
     ] {
         assert_eq!(
-            run(&mut engine, &[row_id], &input, selection.clone())?,
+            run(&mut engine, &[row_id], &[0], &input, selection.clone())?,
             expected
         );
     }
@@ -165,19 +177,25 @@ pipeline:
         run(
             &mut engine,
             &[30, 10],
+            &[0, 0],
             &[5.0, 6.0, 1.0, 2.0],
             selection.clone(),
         )?,
         vec![25.5, 35.0, 2.0, 4.0]
     );
 
-    let reused = AdapterSelection::default().with_row(10, [AdapterActivation::new("blue", 1.0)]);
+    // Reusing slot 10 at a new epoch cannot inherit its prior adapter selection.
     assert_eq!(
-        run(&mut engine, &[10], &[1.0, 2.0], reused.clone())?,
+        run(&mut engine, &[10], &[1], &[1.0, 2.0], selection.clone(),)?,
+        vec![1.0, 2.0]
+    );
+    let reused = AdapterSelection::default().with_row(10, 1, [AdapterActivation::new("blue", 1.0)]);
+    assert_eq!(
+        run(&mut engine, &[10], &[1], &[1.0, 2.0], reused.clone())?,
         vec![7.0, 10.0]
     );
     assert_eq!(
-        run(&mut engine, &[10], &[1.0, 2.0], reused)?,
+        run(&mut engine, &[10], &[1], &[1.0, 2.0], reused)?,
         vec![7.0, 10.0]
     );
     let diagnostic = engine.adapter_lifecycle_diagnostic();

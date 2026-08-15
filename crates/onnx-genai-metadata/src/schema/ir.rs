@@ -96,6 +96,8 @@ pub struct AdapterServiceContract {
     pub base_model_fingerprint: String,
     /// Request input containing semantic row/slot identities used to resolve selections.
     pub row_ids: String,
+    /// Int64[batch] request generation for each semantic slot; changes on slot reuse.
+    pub request_epochs: String,
     /// Optional bool[batch] input; inactive rows never load or apply adapters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active: Option<String>,
@@ -270,6 +272,7 @@ pub enum RuntimeInputRole {
     Constraint,
     SessionId,
     RowIds,
+    RequestEpochs,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]

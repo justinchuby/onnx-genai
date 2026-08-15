@@ -485,6 +485,25 @@ fn validate_adapter_service(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
             service.row_ids
         )),
     }
+    match workflow.inputs.get(&service.request_epochs) {
+        Some(input)
+            if input.contract.dtype == "int64"
+                && input.contract.rank == 1
+                && input.contract.shape.as_ref().is_some_and(|shape| {
+                    matches!(
+                        shape.as_slice(),
+                        [crate::schema::TensorDimension::Symbol(symbol)] if symbol == "batch"
+                    )
+                }) => {}
+        Some(_) => errors.push(format!(
+            "pipeline.workflow.adapters.request_epochs '{}' must reference an int64[batch] workflow input",
+            service.request_epochs
+        )),
+        None => errors.push(format!(
+            "pipeline.workflow.adapters.request_epochs '{}' references an undeclared workflow input",
+            service.request_epochs
+        )),
+    }
     if let Some(active) = &service.active {
         match workflow.inputs.get(active) {
             Some(input)

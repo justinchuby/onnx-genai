@@ -280,14 +280,15 @@ lookahead, and commit are reusable by any workflow; ONNX components apply masks 
 `workflow.adapters` declares parameter-overlay artifacts and their runtime lifecycle independently
 of workflow control flow. Each artifact pins an identity/version, base-model fingerprint,
 rank/alpha/dtype, checksummed package-relative weights, and generic component/parameter targets.
-The immutable request selection is keyed by semantic `row_ids`; each row may select zero, one, or
-multiple adapters in deterministic order, with static and optional request-tensor scales.
+The immutable request selection is keyed by `(row_ids, request_epochs)`; each semantic slot may
+select zero, one, or multiple adapters in deterministic order, with static and optional
+request-tensor scales. The non-negative epoch changes whenever a slot is reused.
 
 The runtime discovers and verifies artifacts on first activation, caches them with LRU eviction,
 and records plan variants by ordered adapter set. Compaction reorders selections with semantic
-row IDs rather than physical rows. Slot reuse receives a new request selection, inactive rows do
-not activate an adapter when the optional `active` bool tensor is declared, and shared base weights
-are never mutated.
+row identity rather than physical rows. Slot reuse receives a new epoch and immutable selection,
+inactive rows do not activate an adapter when the optional `active` bool tensor is declared, and
+shared base weights are never mutated.
 
 `application_capability` negotiates a native parameter-overlay implementation. Existing ORT GenAI
 adapter APIs already provide load/activate/unload lifecycle primitives; native implementations

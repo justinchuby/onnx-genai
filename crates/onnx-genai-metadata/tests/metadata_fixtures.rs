@@ -14,6 +14,10 @@ pipeline:
         contract: { dtype: int64, rank: 1, shape: [batch] }
         role: { kind: runtime, version: "1.0", role: row_ids }
         source: { kind: request }
+      request.request_epochs:
+        contract: { dtype: int64, rank: 1, shape: [batch] }
+        role: { kind: runtime, version: "1.0", role: request_epochs }
+        source: { kind: request }
     components:
       decoder:
         implementation: { kind: binding }
@@ -39,6 +43,7 @@ pipeline:
     adapters:
       base_model_fingerprint: base-sha256
       row_ids: request.row_ids
+      request_epochs: request.request_epochs
       application_capability: onnx-genai.adapters
       portable_fallback: true
       cache: { max_entries: 2, eviction: lru }
