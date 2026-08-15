@@ -131,6 +131,34 @@ const GEMV_F16_GENERAL_BS_WIDE_MULTICOL_ENTRY: &str =
 /// (error <= ORT vs an f64 oracle), not bit-identity.
 const GEMV_F16_GENERAL_BS_WIDE_MULTICOL_FP16_ENTRY: &str =
     "matmul_nbits_gemv_f16_general_bs_wide_multicol_fp16";
+/// Interleaved + biased (symmetric-only, OPT-IN) counterpart of
+/// [`GEMV_F16_GENERAL_BS_WIDE_MULTICOL_ENTRY`]
+/// (`matmul_nbits_gemv_f16_general_bs_wide_multicol_interleaved`). Same
+/// column-register-blocking wide-load geometry, but consumes offline
+/// nibble-interleaved weights and folds the symmetric `-8` bias into the LOP3
+/// magic-removal constants (TRT-LLM `FastInterleavedAndBiasedNumericArrayConverter`
+/// lever). This drops the per-block zero-point `sub.f16x2` and the `prmt.b32`
+/// activation reorder from the decode inner loop (~14 -> ~9 dequant instrs / 8
+/// values), attacking the instruction/issue-slot limiter of the M=1 decode GEMV.
+/// Byte-identical output to the fp32 multicol kernel on symmetric weights.
+/// Enabled only when [`interleave_dequant_enabled`] is set; the dispatch swaps
+/// the packed pointer for the interleaved cache buffer at the same time.
+const GEMV_F16_GENERAL_BS_WIDE_MULTICOL_INTERLEAVED_ENTRY: &str =
+    "matmul_nbits_gemv_f16_general_bs_wide_multicol_interleaved";
+/// Interleaved + biased (symmetric-only, OPT-IN) counterpart of
+/// [`GEMV_F16_GENERAL_BS_SPLITK_WIDE_ENTRY`]
+/// (`matmul_nbits_gemv_f16_general_bs_splitk_wide_interleaved`). Same split-K
+/// wide-load geometry (K_SPLIT warps/column, shared-memory fp32 partial
+/// reduction), but consumes offline nibble-interleaved weights and folds the
+/// symmetric `-8` bias into the LOP3 converter. Captures the grid-starved
+/// narrow-N projections (glm qkv/down) that take the split-K path, compounding
+/// the multicol lever. Byte-identical to the non-interleaved split-K wide kernel
+/// on symmetric weights. Enabled only when [`interleave_dequant_enabled`] is set.
+const GEMV_F16_GENERAL_BS_SPLITK_WIDE_INTERLEAVED_ENTRY: &str =
+    "matmul_nbits_gemv_f16_general_bs_splitk_wide_interleaved";
+/// Offline int4 nibble-interleave pass entry
+/// (`matmul_nbits_interleave_int4`); runs once per weight into the cache buffer.
+const INTERLEAVE_INT4_ENTRY: &str = "matmul_nbits_interleave_int4";
 /// Output columns each warp emits in the register-blocked wide GEMV. Must match
 /// `#define WIDE_NC` in the CUDA source. A 256-thread CTA (8 warps) therefore
 /// covers `8 * GEMV_F16_WIDE_MULTICOL_NC` columns.
@@ -1496,6 +1524,133 @@ __device__ __forceinline__ float dot_int4x8_f16_sub_act(
 }
 
 // ---------------------------------------------------------------------------
+// TRT-LLM-style interleaved + biased int4 -> fp16 decode (OPT-IN, symmetric).
+//
+// This is the runtime half of the `ONNX_GENAI_INTERLEAVE_DEQUANT` lever. It
+// consumes weights that were **offline-interleaved** (nibbles of each 32-bit
+// word rearranged from natural [e7 e6 e5 e4 | e3 e2 e1 e0] to the TRT-LLM
+// [e7 e5 e3 e1 | e6 e4 e2 e0] order — even elements in the low four nibble
+// slots, odd in the high four) by the host-side interleave pass. Given that
+// layout, the SAME 4x LOP3 unpack that `int4x8_to_half2x4_sub` uses now emits
+// the eight fp16 codes in NATURAL element order `{e0,e1},{e2,e3},{e4,e5},
+// {e6,e7}`, so no `prmt.b32` activation reorder is needed downstream (the
+// activation is consumed straight as contiguous __half2 pairs).
+//
+// It also folds the symmetric `-8` bias directly into the LOP3 magic-removal
+// constants: the even lanes subtract 1032 (0x64086408 = 1024 + 8) and the odd
+// lanes fma by 1/16 then subtract 72 (0xd480 = -(64 + 8)), so the converter
+// yields `(code - 8)` in fp16 with NO trailing `sub.f16x2` loop. Total is
+// 1 shift + 4 LOP3 + 2 sub.f16x2 + 2 fma.f16x2 = 9 instructions / 8 values.
+//
+// Correctness: for symmetric weights the previous path produces `(code - 8)` in
+// fp16 via magic-removal followed by a `- 8` subtract; `(code - 8)` is an exact
+// fp16 integer in [-8, 7], so this single-step form yields the byte-identical
+// fp16 value. Because the eight products are then accumulated in fp32 in the
+// same ascending element order (e0*a0, e1*a1, ..., e7*a7), the dot is
+// BIT-IDENTICAL to `dot_int4x8_f16_sub` with `sub2 == fp16 8.0`.
+__device__ __forceinline__ void int4x8_to_half2x4_interleaved_biased(
+    const unsigned int packed,
+    __half2* values)
+{
+    unsigned int* h = reinterpret_cast<unsigned int*>(values);
+    constexpr unsigned int bottom_mask = 0x000f000f;
+    constexpr unsigned int top_mask = 0x00f000f0;
+    constexpr unsigned int fp16_magic = 0x64006400;
+    constexpr unsigned int lop3_lut = (0xf0 & 0xcc) | 0xaa;
+    const unsigned int top = packed >> 8;
+    asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+                 : "=r"(h[0])
+                 : "r"(packed), "n"(bottom_mask), "n"(fp16_magic), "n"(lop3_lut));
+    asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+                 : "=r"(h[1])
+                 : "r"(packed), "n"(top_mask), "n"(fp16_magic), "n"(lop3_lut));
+    asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+                 : "=r"(h[2])
+                 : "r"(top), "n"(bottom_mask), "n"(fp16_magic), "n"(lop3_lut));
+    asm volatile("lop3.b32 %0, %1, %2, %3, %4;\n"
+                 : "=r"(h[3])
+                 : "r"(top), "n"(top_mask), "n"(fp16_magic), "n"(lop3_lut));
+
+    // Fold the symmetric -8 bias into the magic-removal: even lanes hold
+    // (1024 + code) and subtract 1032; odd lanes hold (1024 + 16*code) and
+    // fma (*1/16 - 72), both yielding (code - 8) directly.
+    constexpr unsigned int fp16_1032 = 0x64086408;
+    constexpr unsigned int fp16_one_sixteenth = 0x2c002c00;
+    constexpr unsigned int fp16_neg72 = 0xd480d480;
+    asm volatile("sub.f16x2 %0, %1, %2;\n"
+                 : "=r"(h[0]) : "r"(h[0]), "r"(fp16_1032));
+    asm volatile("fma.rn.f16x2 %0, %1, %2, %3;\n"
+                 : "=r"(h[1])
+                 : "r"(h[1]), "r"(fp16_one_sixteenth), "r"(fp16_neg72));
+    asm volatile("sub.f16x2 %0, %1, %2;\n"
+                 : "=r"(h[2]) : "r"(h[2]), "r"(fp16_1032));
+    asm volatile("fma.rn.f16x2 %0, %1, %2, %3;\n"
+                 : "=r"(h[3])
+                 : "r"(h[3]), "r"(fp16_one_sixteenth), "r"(fp16_neg72));
+}
+
+// Natural-order activation decode for the interleaved dequant path: the eight
+// contiguous fp16 activations are converted to fp32 in ascending order with no
+// `prmt.b32` reorder (the interleaved converter already emits the weights in
+// natural element order). `a[i] == float(activation[i])`, matching the layout
+// `decode_activation8` produces for the non-interleaved path.
+__device__ __forceinline__ void decode_activation8_natural(
+    const __half* __restrict__ activation,
+    float* __restrict__ a /* [8] */)
+{
+    const uint4 av = *reinterpret_cast<const uint4*>(activation);
+    const float2 a01 = __half22float2(*reinterpret_cast<const __half2*>(&av.x));
+    const float2 a23 = __half22float2(*reinterpret_cast<const __half2*>(&av.y));
+    const float2 a45 = __half22float2(*reinterpret_cast<const __half2*>(&av.z));
+    const float2 a67 = __half22float2(*reinterpret_cast<const __half2*>(&av.w));
+    a[0] = a01.x;
+    a[1] = a01.y;
+    a[2] = a23.x;
+    a[3] = a23.y;
+    a[4] = a45.x;
+    a[5] = a45.y;
+    a[6] = a67.x;
+    a[7] = a67.y;
+}
+
+// Interleaved-weight sibling of `dot_int4x8_f16_sub_act`: the pre-decoded
+// natural-order activation `a[8]` is dotted with the eight `(code - 8)` fp16
+// weights from the biased interleaved converter, accumulated in fp32 in
+// ascending element order. Bit-identical to `dot_int4x8_f16_sub_act` with
+// `sub2 == fp16 8.0` on the non-interleaved layout of the same logical weights.
+__device__ __forceinline__ float dot_int4x8_f16_interleaved_act(
+    const unsigned int packed,
+    const float* __restrict__ a /* [8] */)
+{
+    __half2 q[4];
+    int4x8_to_half2x4_interleaved_biased(packed, q);
+    const float2 q01 = __half22float2(q[0]);
+    const float2 q23 = __half22float2(q[1]);
+    const float2 q45 = __half22float2(q[2]);
+    const float2 q67 = __half22float2(q[3]);
+    float dot = q01.x * a[0];
+    dot += q01.y * a[1];
+    dot += q23.x * a[2];
+    dot += q23.y * a[3];
+    dot += q45.x * a[4];
+    dot += q45.y * a[5];
+    dot += q67.x * a[6];
+    dot += q67.y * a[7];
+    return dot;
+}
+
+// Interleaved-weight sibling of `dot_int4x8_f16_sub` (scalar-tail helper): loads
+// the eight contiguous fp16 activations itself, then dots as above.
+__device__ __forceinline__ float dot_int4x8_f16_interleaved(
+    const unsigned int packed,
+    const __half* __restrict__ activation)
+{
+    float a[8];
+    decode_activation8_natural(activation, a);
+    return dot_int4x8_f16_interleaved_act(packed, a);
+}
+
+// ---------------------------------------------------------------------------
 // High-memory-level-parallelism (wide-load) int4 decode GEMV.
 //
 // The single-warp `..._general_bs` loop loads ONE 32-bit weight word (8 nibbles)
@@ -1530,6 +1685,17 @@ __device__ __forceinline__ float dot_int4x8_f16_sub_act(
 //
 // Returns this lane's fp32 partial (pre warp-reduction) for the weight column
 // `column`, walking chunk starts `depth0, depth0+warp_stride, ...`.
+// Read logical element `i` (0..7) from an INTERLEAVED 32-bit weight word. The
+// offline interleave stores physical nibble slots as [e0,e2,e4,e6,e1,e3,e5,e7],
+// so logical i maps to physical slot (i even ? i/2 : 4 + i/2). Used only by the
+// interleaved GEMV's scalar tail; the main loop reads whole words via the LOP3
+// converter.
+__device__ __forceinline__ int interleaved_nibble(const unsigned int word, const int i)
+{
+    const int slot = (i & 1) ? (4 + (i >> 1)) : (i >> 1);
+    return (int)((word >> (slot * 4)) & 15u);
+}
+
 __device__ __forceinline__ float gemv_int4_wide_lane_dot(
     const __half* __restrict__ activation,
     const unsigned char* __restrict__ packed,
@@ -1624,6 +1790,99 @@ __device__ __forceinline__ float gemv_int4_wide_lane_dot(
         }
     }
     return value;
+}
+
+// Interleaved + biased (symmetric-only) sibling of `gemv_int4_wide_lane_dot`.
+// Single-column wide-load lane dot that consumes offline-interleaved weights and
+// folds the fixed symmetric `-8` bias inside the LOP3 converter (no per-block
+// zero point, no `prmt.b32` activation reorder). The depth-2 software pipeline,
+// the ascending sub-word order (w.x, w.y, w.z, w.w), and the fp32 accumulation
+// order are byte-for-byte identical to `gemv_int4_wide_lane_dot` on symmetric
+// weights, so each lane's fp32 partial is BIT-IDENTICAL. Used by the split-K
+// wide interleaved kernel (the split-K partials therefore reduce to the same
+// value as the non-interleaved split-K wide kernel).
+__device__ __forceinline__ float gemv_int4_wide_lane_dot_interleaved(
+   const __half* __restrict__ activation,
+   const unsigned char* __restrict__ packed,
+   const void* __restrict__ scales,
+   const int k,
+   const int block_size,
+   const int k_blocks,
+   const int blob_size,
+   const int scales_fp16,
+   const long column,
+   const int depth0,
+   const int warp_stride)
+{
+   const long col_kb = column * (long)k_blocks;
+
+   float value = 0.0f;
+   int depth = depth0;
+   bool have = (depth + 32 <= k);
+   uint4 w;
+   if (have) {
+       const int block = depth / block_size;
+       const long blob_base = (col_kb + block) * (long)blob_size;
+       const int within = depth - block * block_size;
+       w = *reinterpret_cast<const uint4*>(packed + blob_base + (within >> 1));
+   }
+   while (have) {
+       const int ndepth = depth + warp_stride;
+       const bool have_next = (ndepth + 32 <= k);
+       uint4 wn;
+       if (have_next) {
+           const int nblock = ndepth / block_size;
+           const long nblob = (col_kb + nblock) * (long)blob_size;
+           const int nwithin = ndepth - nblock * block_size;
+           wn = *reinterpret_cast<const uint4*>(packed + nblob + (nwithin >> 1));
+       }
+       const int block = depth / block_size;
+       float scale;
+       if (scales_fp16) {
+           scale = __half2float(reinterpret_cast<const __half*>(scales)[col_kb + block]);
+       } else {
+           scale = reinterpret_cast<const float*>(scales)[col_kb + block];
+       }
+       value += scale * dot_int4x8_f16_interleaved(w.x, activation + depth);
+       value += scale * dot_int4x8_f16_interleaved(w.y, activation + depth + 8);
+       value += scale * dot_int4x8_f16_interleaved(w.z, activation + depth + 16);
+       value += scale * dot_int4x8_f16_interleaved(w.w, activation + depth + 24);
+       depth = ndepth;
+       w = wn;
+       have = have_next;
+   }
+
+   if (depth < k) {
+       const int block = depth / block_size;
+       float scale;
+       if (scales_fp16) {
+           scale = __half2float(reinterpret_cast<const __half*>(scales)[col_kb + block]);
+       } else {
+           scale = reinterpret_cast<const float*>(scales)[col_kb + block];
+       }
+       const long blob_base = (col_kb + block) * (long)blob_size;
+       for (int off = 0; off < 32 && depth + off < k; off += 8) {
+           const int d = depth + off;
+           const int within = d - block * block_size;
+           const int valid = min(8, k - d);
+           const unsigned int packed_word =
+               *reinterpret_cast<const unsigned int*>(packed + blob_base + (within >> 1));
+           if (valid == 8) {
+               value += scale * dot_int4x8_f16_interleaved(packed_word, activation + d);
+           } else {
+               float partial = 0.0f;
+#pragma unroll
+               for (int i = 0; i < 8; ++i) {
+                   if (i < valid) {
+                       const int q = interleaved_nibble(packed_word, i) - 8;
+                       partial += (float)q * __half2float(activation[d + i]);
+                   }
+               }
+               value += partial * scale;
+           }
+       }
+   }
+   return value;
 }
 
 // Column register-blocked wide lane-dot: one warp accumulates WIDE_NC output
@@ -1746,6 +2005,114 @@ __device__ __forceinline__ void gemv_int4_wide_lane_dot_multicol(
                     for (int i = 0; i < 8; ++i) {
                         if (i < valid_n) {
                             const int q = (int)((packed_word >> (i * 4)) & 15u) - zero_point;
+                            partial += (float)q * __half2float(activation[d + i]);
+                        }
+                    }
+                    values[c] += partial * scale;
+                }
+            }
+        }
+    }
+}
+
+// Interleaved + biased (symmetric-only) sibling of
+// `gemv_int4_wide_lane_dot_multicol`. Consumes offline-interleaved weights and
+// applies the fixed symmetric `-8` bias inside the LOP3 converter, so there is
+// no per-block zero point and no `prmt.b32` activation reorder. Every column's
+// fp32 accumulation order is unchanged (ascending element order, sub-word order
+// w.x, w.y, w.z, w.w), so each column result is BIT-IDENTICAL to
+// `gemv_int4_wide_lane_dot_multicol` on symmetric weights.
+__device__ __forceinline__ void gemv_int4_wide_lane_dot_multicol_interleaved(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales,
+    const int k,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int scales_fp16,
+    const long col_base,
+    const int n,
+    const int depth0,
+    const int warp_stride,
+    float* __restrict__ values /* [WIDE_NC] */)
+{
+    bool valid[WIDE_NC];
+    long col_kb[WIDE_NC];
+#pragma unroll
+    for (int c = 0; c < WIDE_NC; ++c) {
+        values[c] = 0.0f;
+        const long column = col_base + c;
+        valid[c] = (column < n);
+        col_kb[c] = column * (long)k_blocks;
+    }
+
+    int depth = depth0;
+    while (depth + 32 <= k) {
+        const int block = depth / block_size;
+        const int within = depth - block * block_size;
+
+        uint4 w[WIDE_NC];
+        float scale[WIDE_NC];
+#pragma unroll
+        for (int c = 0; c < WIDE_NC; ++c) {
+            if (!valid[c]) {
+                continue;
+            }
+            const long base = (col_kb[c] + block) * (long)blob_size;
+            w[c] = *reinterpret_cast<const uint4*>(packed + base + (within >> 1));
+            if (scales_fp16) {
+                scale[c] = __half2float(reinterpret_cast<const __half*>(scales)[col_kb[c] + block]);
+            } else {
+                scale[c] = reinterpret_cast<const float*>(scales)[col_kb[c] + block];
+            }
+        }
+
+        float a8[8];
+#pragma unroll
+        for (int s = 0; s < 4; ++s) {
+            decode_activation8_natural(activation + depth + s * 8, a8);
+#pragma unroll
+            for (int c = 0; c < WIDE_NC; ++c) {
+                if (!valid[c]) {
+                    continue;
+                }
+                const unsigned int word =
+                    (s == 0) ? w[c].x : (s == 1) ? w[c].y : (s == 2) ? w[c].z : w[c].w;
+                values[c] += scale[c] * dot_int4x8_f16_interleaved_act(word, a8);
+            }
+        }
+        depth += warp_stride;
+    }
+
+    if (depth < k) {
+        const int block = depth / block_size;
+#pragma unroll
+        for (int c = 0; c < WIDE_NC; ++c) {
+            if (!valid[c]) {
+                continue;
+            }
+            float scale;
+            if (scales_fp16) {
+                scale = __half2float(reinterpret_cast<const __half*>(scales)[col_kb[c] + block]);
+            } else {
+                scale = reinterpret_cast<const float*>(scales)[col_kb[c] + block];
+            }
+            const long blob_base = (col_kb[c] + block) * (long)blob_size;
+            for (int off = 0; off < 32 && depth + off < k; off += 8) {
+                const int d = depth + off;
+                const int within = d - block * block_size;
+                const int valid_n = min(8, k - d);
+                const unsigned int packed_word =
+                    *reinterpret_cast<const unsigned int*>(packed + blob_base + (within >> 1));
+                if (valid_n == 8) {
+                    values[c] += scale * dot_int4x8_f16_interleaved(packed_word, activation + d);
+                } else {
+                    float partial = 0.0f;
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        if (i < valid_n) {
+                            const int q = interleaved_nibble(packed_word, i) - 8;
                             partial += (float)q * __half2float(activation[d + i]);
                         }
                     }
@@ -2444,6 +2811,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_zp(
 {
     matmul_nbits_gemv_f16_scales_f16_tpl<true>(activation, packed, scales_raw, zero_points, bias, output, k, n, block_size, k_blocks, blob_size, zp_row_bytes, scales_fp16, bias_post_round);
 }
+
 
 // Split-K int4 GEMV: K_SPLIT warps cooperate on one output column,
 // each reducing a strided subset of the 256-wide K steps, then summing their
@@ -4327,6 +4695,70 @@ extern "C" __global__ void matmul_nbits_gemv_f16_general_bs_splitk_wide(
     }
 }
 
+// Interleaved + biased (symmetric-only, OPT-IN) sibling of
+// `matmul_nbits_gemv_f16_general_bs_splitk_wide`. Identical split-K geometry
+// (K_SPLIT warps per column, shared-memory fp32 partial reduction), but consumes
+// offline-interleaved weights and folds the symmetric -8 bias inside the LOP3
+// converter. Because each lane's fp32 partial is bit-identical to the
+// non-interleaved split-K wide kernel (see `gemv_int4_wide_lane_dot_interleaved`)
+// and the K_SPLIT reduction order is unchanged, the output is byte-identical to
+// `matmul_nbits_gemv_f16_general_bs_splitk_wide` on symmetric weights.
+// `zero_points`/`zp_row_bytes`/`bits` are accepted for launch-signature parity
+// but unused (the dispatch only routes symmetric int4 nodes here).
+extern "C" __global__ void matmul_nbits_gemv_f16_general_bs_splitk_wide_interleaved(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales,
+    const unsigned char* __restrict__ zero_points,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int scales_fp16,
+    const int bias_post_round,
+    const int bits)
+{
+    (void)zero_points;
+    (void)zp_row_bytes;
+    (void)bits;
+    constexpr int K_SPLIT = 4;  // must match Rust GENERAL_BS_SPLITK
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const int cols_per_block = warps_per_block / K_SPLIT;
+    const int col_local = warp / K_SPLIT;
+    const int ks = warp % K_SPLIT;
+    const int column = (int)blockIdx.x * cols_per_block + col_local;
+
+    __shared__ float partials[8][K_SPLIT];
+
+    float value = 0.0f;
+    if (column < n) {
+        value = gemv_int4_wide_lane_dot_interleaved(
+            activation, packed, scales, k, block_size, k_blocks,
+            blob_size, scales_fp16, column, ks * 32 * 32 + lane * 32,
+            K_SPLIT * 32 * 32);
+    }
+    value = warp_sum(value);
+    if (lane == 0) {
+        partials[col_local][ks] = (column < n) ? value : 0.0f;
+    }
+    __syncthreads();
+    if (ks == 0 && lane == 0 && column < n) {
+        float acc = 0.0f;
+#pragma unroll
+        for (int s = 0; s < K_SPLIT; ++s) {
+            acc += partials[col_local][s];
+        }
+        output[column] = fold_bias_f16(acc, bias, column, bias_post_round);
+    }
+}
+
 // Column register-blocked wide-load GEMV (see `gemv_int4_wide_lane_dot_multicol`).
 // Same launch geometry as `matmul_nbits_gemv_f16_general_bs_wide` (256-thread
 // CTA, one warp per group), but every warp emits WIDE_NC output columns, so the
@@ -4371,6 +4803,88 @@ extern "C" __global__ void matmul_nbits_gemv_f16_general_bs_wide_multicol(
             output[column] = fold_bias_f16(reduced, bias, column, bias_post_round);
         }
     }
+}
+
+// Interleaved + biased (symmetric-only, OPT-IN) sibling of
+// `matmul_nbits_gemv_f16_general_bs_wide_multicol`. Identical launch geometry
+// and grid; consumes offline-interleaved weights and folds the symmetric -8
+// bias inside the LOP3 converter, dropping the per-block zero-point subtract and
+// the `prmt.b32` activation reorder. Byte-identical output to the fp32 multicol
+// kernel on symmetric weights (see `gemv_int4_wide_lane_dot_multicol_interleaved`).
+// `zero_points`/`zp_row_bytes` are accepted for launch-signature parity but
+// unused (the dispatch only routes symmetric nodes here).
+extern "C" __global__ void matmul_nbits_gemv_f16_general_bs_wide_multicol_interleaved(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales,
+    const unsigned char* __restrict__ zero_points,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int scales_fp16,
+    const int bias_post_round,
+    const int bits)
+{
+    (void)zero_points;
+    (void)zp_row_bytes;
+    (void)bits;
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const long col_base =
+        ((long)blockIdx.x * warps_per_block + warp) * (long)WIDE_NC;
+
+    float values[WIDE_NC];
+    gemv_int4_wide_lane_dot_multicol_interleaved(
+        activation, packed, scales, k, block_size, k_blocks,
+        blob_size, scales_fp16, col_base, n, lane * 32, 32 * 32,
+        values);
+#pragma unroll
+    for (int c = 0; c < WIDE_NC; ++c) {
+        const float reduced = warp_sum(values[c]);
+        const long column = col_base + c;
+        if (lane == 0 && column < n) {
+            output[column] = fold_bias_f16(reduced, bias, column, bias_post_round);
+        }
+    }
+}
+
+// Offline (once-per-weight) int4 nibble-interleave pass for the
+// `ONNX_GENAI_INTERLEAVE_DEQUANT` lever. Reads the packed weight buffer as
+// 32-bit words and rewrites each word from natural nibble order
+// [e7 e6 e5 e4 | e3 e2 e1 e0] to TRT-LLM order [e7 e5 e3 e1 | e6 e4 e2 e0]
+// (even elements to the low four nibble slots, odd to the high four). This is a
+// pure per-word permutation, independent of block layout, so it applies to any
+// int4 MatMulNBits weight whose byte count is a multiple of 4. Run once into a
+// cached device buffer; the decode GEMV then reads the interleaved buffer.
+extern "C" __global__ void matmul_nbits_interleave_int4(
+    const unsigned int* __restrict__ src,
+    unsigned int* __restrict__ dst,
+    const unsigned long words)
+{
+    const unsigned long idx =
+        (unsigned long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= words) {
+        return;
+    }
+    const unsigned int w = src[idx];
+    const unsigned int e0 = (w >> 0) & 0xfu;
+    const unsigned int e1 = (w >> 4) & 0xfu;
+    const unsigned int e2 = (w >> 8) & 0xfu;
+    const unsigned int e3 = (w >> 12) & 0xfu;
+    const unsigned int e4 = (w >> 16) & 0xfu;
+    const unsigned int e5 = (w >> 20) & 0xfu;
+    const unsigned int e6 = (w >> 24) & 0xfu;
+    const unsigned int e7 = (w >> 28) & 0xfu;
+    // Physical slots [n0..n7] = [e0,e2,e4,e6,e1,e3,e5,e7].
+    dst[idx] = (e0 << 0) | (e2 << 4) | (e4 << 8) | (e6 << 12)
+             | (e1 << 16) | (e3 << 20) | (e5 << 24) | (e7 << 28);
 }
 
 // fp16 mixed-precision sibling of `matmul_nbits_gemv_f16_general_bs_wide_multicol`
@@ -4726,6 +5240,147 @@ fn use_gemv_fp16() -> bool {
         std::env::var("ONNX_GENAI_GEMV_FP16").ok().as_deref(),
         Some("1") | Some("true") | Some("on")
     )
+}
+
+/// Opt-in gate for the TRT-LLM-style interleaved + biased int4 decode dequant
+/// (`ONNX_GENAI_INTERLEAVE_DEQUANT`). Default OFF: the lever bakes an offline
+/// nibble-interleave into the packed weights and folds the symmetric `-8` bias
+/// into the LOP3 converter, dropping the per-block zero-point `sub.f16x2` and the
+/// `prmt.b32` activation reorder from the decode inner loop. Byte-identical to the
+/// fp32 multicol path on symmetric weights, but glm base decode is a knife-edge,
+/// so it stays opt-in and reversible until proven. Only routes symmetric
+/// (no zero-point) block!=32 int4 nodes that already qualify for the wide-load
+/// multicol kernel; every other node is untouched.
+fn interleave_dequant_enabled() -> bool {
+    matches!(
+        std::env::var("ONNX_GENAI_INTERLEAVE_DEQUANT")
+            .ok()
+            .as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
+}
+
+/// Module-global cache of offline nibble-interleaved int4 weights, keyed by the
+/// source (packed) device pointer, byte length, and device ordinal. Mirrors the
+/// Marlin repack cache: weights are immutable initializers, so the device
+/// interleave runs once and every later call — including captured CUDA-graph
+/// replays — reuses the cached buffer with no allocation.
+struct InterleaveEntry {
+    ptr: CUdeviceptr,
+    runtime: Arc<CudaRuntime>,
+}
+
+struct InterleaveCache {
+    map: std::collections::HashMap<(usize, usize, u32), InterleaveEntry>,
+    order: std::collections::VecDeque<(usize, usize, u32)>,
+}
+
+const INTERLEAVE_CACHE_CAP: usize = 4096;
+
+static INTERLEAVE_CACHE: std::sync::OnceLock<Mutex<InterleaveCache>> = std::sync::OnceLock::new();
+
+fn interleave_cache() -> &'static Mutex<InterleaveCache> {
+    INTERLEAVE_CACHE.get_or_init(|| {
+        Mutex::new(InterleaveCache {
+            map: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        })
+    })
+}
+
+/// Launch the once-per-weight int4 nibble-interleave pass over `bytes` bytes
+/// (`bytes` must be a multiple of 4). Reads `src` as 32-bit words and writes the
+/// TRT-LLM interleaved order into `dst`.
+fn launch_interleave_int4(
+    runtime: &CudaRuntime,
+    src: CUdeviceptr,
+    dst: CUdeviceptr,
+    bytes: usize,
+) -> Result<()> {
+    let words = (bytes / 4) as u64;
+    let function = runtime.nvrtc_function(GEMV_F16_MODULE, GEMV_F16_SRC, INTERLEAVE_INT4_ENTRY)?;
+    let src_ptr = cuptr(src as usize as *const c_void);
+    let dst_ptr = cuptr(dst as usize as *const c_void);
+    const THREADS: u32 = 256;
+    let grid = u32::try_from(words.div_ceil(THREADS as u64))
+        .unwrap_or(u32::MAX)
+        .max(1);
+    let mut builder = runtime.stream().launch_builder(&function);
+    builder.arg(&src_ptr).arg(&dst_ptr).arg(&words);
+    // SAFETY: static grid; `src`/`dst` each cover `bytes` bytes and the kernel
+    // bounds-checks the word index against `words`.
+    unsafe {
+        builder.launch(LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        })
+    }
+    .map(|_| ())
+    .map_err(|err| driver_err("launch MatMulNBits int4 interleave", err))
+}
+
+/// Ensure the offline-interleaved copy of the `bytes`-byte packed weight buffer
+/// at `packed` exists on device, running the device interleave once and caching
+/// the result. Returns `(interleaved_ptr, warm)`; `warm == true` means the
+/// buffer was already cached (no allocation / interleave / sync this call, so it
+/// is CUDA-graph capture-safe). A cold miss while capturing is rejected so the
+/// caller falls back to the non-interleaved path rather than allocating inside a
+/// capture.
+fn ensure_interleaved(
+    runtime: &Arc<CudaRuntime>,
+    packed: CUdeviceptr,
+    bytes: usize,
+) -> Result<(CUdeviceptr, bool)> {
+    let key = (packed as usize, bytes, runtime.ordinal());
+    {
+        let cache = interleave_cache()
+            .lock()
+            .map_err(|_| error("interleave cache mutex poisoned"))?;
+        if let Some(entry) = cache.map.get(&key) {
+            return Ok((entry.ptr, true));
+        }
+    }
+    if runtime.is_capturing()? {
+        return Err(error(
+            "int4 interleave cannot allocate during CUDA-graph capture; the weight must be \
+             interleaved during warmup before capture",
+        ));
+    }
+    let out = runtime.alloc_raw(bytes)?;
+    if let Err(e) = launch_interleave_int4(runtime, packed, out, bytes) {
+        // SAFETY: `out` was just allocated here and is otherwise unreferenced.
+        let _ = unsafe { runtime.free_raw(out) };
+        return Err(e);
+    }
+    let mut cache = interleave_cache()
+        .lock()
+        .map_err(|_| error("interleave cache mutex poisoned"))?;
+    // Another thread may have inserted the same key while we interleaved.
+    if let Some(entry) = cache.map.get(&key) {
+        let winner = entry.ptr;
+        drop(cache);
+        // SAFETY: `out` is our just-allocated duplicate; free it once.
+        let _ = unsafe { runtime.free_raw(out) };
+        return Ok((winner, true));
+    }
+    cache.map.insert(
+        key,
+        InterleaveEntry {
+            ptr: out,
+            runtime: runtime.clone(),
+        },
+    );
+    cache.order.push_back(key);
+    while cache.order.len() > INTERLEAVE_CACHE_CAP {
+        if let Some(evict) = cache.order.pop_front()
+            && let Some(entry) = cache.map.remove(&evict)
+        {
+            // SAFETY: exclusively owned by the cache; freed once on eviction.
+            let _ = unsafe { entry.runtime.free_raw(entry.ptr) };
+        }
+    }
+    Ok((out, false))
 }
 
 fn use_f16_symmetric_splitk(
@@ -7551,11 +8206,57 @@ impl MatMulNBitsKernel {
                 F16GemvVariant::General => GEMV_F16_ENTRY,
             }
         };
+        // Opt-in TRT-LLM interleaved + biased dequant lever. Keying off the
+        // ALREADY-selected `entry` (rather than re-deriving the shape predicates)
+        // guarantees each swap is a drop-in with identical launch geometry. The
+        // wide multicol and the grid-starved split-K wide entries (block!=32,
+        // fp32-accum) consume offline nibble-interleaved weights so runtime
+        // dequant drops both the per-block `sub.f16x2` (folded -8 bias) and the
+        // `prmt.b32` activation reorder; they swap the packed pointer for the
+        // cached interleaved buffer AND route to the interleaved sibling kernel.
+        // Byte-identical on symmetric weights.
+        //
+        // The block-32 `scales_f16` fp16-accum family was evaluated (a pure
+        // bias-fold, no weight interleave) and measured a NO-GO: byte-identical
+        // but no decode speedup on qwen2.5-14b-int4 (that kernel is not
+        // issue-slot-bound the way the fp32 wide path is), so it is deliberately
+        // NOT wired here. Any other entry (narrow single-warp, fp16-accum
+        // multicol, asymmetric) is likewise left untouched.
+        let interleaved_entry = if entry == GEMV_F16_GENERAL_BS_WIDE_MULTICOL_ENTRY {
+            Some(GEMV_F16_GENERAL_BS_WIDE_MULTICOL_INTERLEAVED_ENTRY)
+        } else if entry == GEMV_F16_GENERAL_BS_SPLITK_WIDE_ENTRY {
+            Some(GEMV_F16_GENERAL_BS_SPLITK_WIDE_INTERLEAVED_ENTRY)
+        } else {
+            None
+        };
+        let orig_packed_ptr = cuptr(packed.data_ptr::<u8>() as *const c_void);
+        let interleave_on = interleave_dequant_enabled() && self.bits == 4 && zero_points.is_none();
+        let (entry, packed_ptr) = if interleave_on && interleaved_entry.is_some() {
+            let target = interleaved_entry.unwrap();
+            let bytes = self.n.saturating_mul(k_blocks).saturating_mul(blob_size);
+            match ensure_interleaved(&self.runtime, orig_packed_ptr, bytes) {
+                Ok((iptr, warm)) => {
+                    if !warm {
+                        self.last_call_capture_safe.store(false, Ordering::Relaxed);
+                    }
+                    onnx_runtime_ep_api::record_kernel_variant_stage!(
+                        "dequant",
+                        "interleaved_biased",
+                        "TRT-LLM interleaved+biased int4 dequant: offline nibble-interleave + \
+                         folded symmetric -8 bias drops the per-block sub.f16x2 and the prmt.b32 \
+                         activation reorder (byte-identical to the fp32 wide/multicol/split-K path)"
+                    );
+                    (target, iptr)
+                }
+                Err(_) => (entry, orig_packed_ptr),
+            }
+        } else {
+            (entry, orig_packed_ptr)
+        };
         let function = self
             .runtime
             .nvrtc_function(GEMV_F16_MODULE, GEMV_F16_SRC, entry)?;
         let activation_ptr = cuptr(activation.data_ptr::<u8>() as *const c_void);
-        let packed_ptr = cuptr(packed.data_ptr::<u8>() as *const c_void);
         let scales_ptr = cuptr(scales.data_ptr::<u8>() as *const c_void);
         let zero_points_ptr = zero_points
             .map(|tensor| cuptr(tensor.data_ptr::<u8>() as *const c_void))
@@ -7596,6 +8297,7 @@ impl MatMulNBitsKernel {
                     (threads / 32) as usize / GEMV_F16_SCALES_F16_ZP_SPLITK
                 } else if entry == GEMV_F16_GENERAL_BS_WIDE_MULTICOL_ENTRY
                     || entry == GEMV_F16_GENERAL_BS_WIDE_MULTICOL_FP16_ENTRY
+                    || entry == GEMV_F16_GENERAL_BS_WIDE_MULTICOL_INTERLEAVED_ENTRY
                 {
                     // Each warp emits WIDE_NC columns, so a `threads/32`-warp CTA
                     // covers `warps * WIDE_NC` output columns; the grid shrinks by
@@ -7633,6 +8335,8 @@ impl MatMulNBitsKernel {
             || entry == GEMV_F16_GENERAL_BS_SPLITK_WIDE_ENTRY
             || entry == GEMV_F16_GENERAL_BS_WIDE_MULTICOL_ENTRY
             || entry == GEMV_F16_GENERAL_BS_WIDE_MULTICOL_FP16_ENTRY
+            || entry == GEMV_F16_GENERAL_BS_WIDE_MULTICOL_INTERLEAVED_ENTRY
+            || entry == GEMV_F16_GENERAL_BS_SPLITK_WIDE_INTERLEAVED_ENTRY
         {
             builder.arg(&bits);
         }
@@ -8489,6 +9193,10 @@ mod tests {
     use onnx_runtime_ir::{DataType, DeviceId};
 
     use super::*;
+
+    /// Serializes the env-mutating dispatch selection in the interleaved-dequant
+    /// byte-identity test so parallel test threads never observe a half-set flag.
+    static INTERLEAVE_TEST_ENV_LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
 
     // Qwen2.5-0.5B down-projection shape (K=intermediate, N=hidden). Used as a
     // test fixture for the tall-skinny down variant and, transposed, as the
@@ -9643,6 +10351,291 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             max_out = max_out.max(e.abs());
         }
         (worst_abs, worst_rel, max_out, all_finite)
+    }
+
+    /// Raw fp16 output of a symmetric (no zero-point, no bias) int4 decode GEMV
+    /// at an explicit `block_size`, used by the interleaved-dequant byte-identity
+    /// test. `interleave` toggles `ONNX_GENAI_INTERLEAVE_DEQUANT`; the general
+    /// split-K heuristic is pinned OFF so the non-interleaved reference always
+    /// takes the wide-load multicol kernel that the interleaved path replaces.
+    /// Returns `None` when no CUDA device / fp16 NVRTC headers are available.
+    fn run_symmetric_block_raw(
+        k: usize,
+        n: usize,
+        block_size: usize,
+        scales_fp16: bool,
+        interleave: bool,
+        general_splitk: Option<bool>,
+    ) -> Option<Vec<f16>> {
+        let runtime = runtime()?;
+        if runtime
+            .require_nvrtc_half_headers("matmul_nbits_gemv_f16")
+            .is_err()
+        {
+            return None;
+        }
+
+        let k_blocks = k / block_size;
+        let blob_size = block_size / 2;
+
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+
+        let mut activation_f16 = vec![f16::ZERO; k];
+        for dst_h in activation_f16.iter_mut() {
+            *dst_h = f16::from_f32(next());
+        }
+        let mut quant = vec![0u8; n * k];
+        for value in quant.iter_mut() {
+            *value = ((next() * 0.5 + 0.5) * 15.0).round().clamp(0.0, 15.0) as u8;
+        }
+        let mut packed = vec![0u8; n * k_blocks * blob_size];
+        for col in 0..n {
+            for block in 0..k_blocks {
+                for pair in 0..blob_size {
+                    let low = quant[col * k + block * block_size + pair * 2] & 15;
+                    let high = quant[col * k + block * block_size + pair * 2 + 1] & 15;
+                    packed[(col * k_blocks + block) * blob_size + pair] = low | (high << 4);
+                }
+            }
+        }
+        let mut scale_f16 = vec![f16::ZERO; n * k_blocks];
+        let mut scale_f32 = vec![0.0f32; n * k_blocks];
+        for i in 0..n * k_blocks {
+            let raw = 0.015 + 0.01 * (next() * 0.5 + 0.5);
+            if scales_fp16 {
+                scale_f16[i] = f16::from_f32(raw);
+            } else {
+                scale_f32[i] = raw;
+            }
+        }
+
+        let activation_dev = runtime.alloc_raw(activation_f16.len() * 2).unwrap();
+        let packed_dev = runtime.alloc_raw(packed.len()).unwrap();
+        let scales_dev = runtime
+            .alloc_raw(n * k_blocks * if scales_fp16 { 2 } else { 4 })
+            .unwrap();
+        let output_dev = runtime.alloc_raw(n * 2).unwrap();
+        // SAFETY: device buffers were sized to hold each source slice.
+        unsafe {
+            runtime
+                .htod(as_bytes(&activation_f16), activation_dev)
+                .unwrap();
+            runtime.htod(&packed, packed_dev).unwrap();
+            if scales_fp16 {
+                runtime.htod(as_bytes(&scale_f16), scales_dev).unwrap();
+            } else {
+                runtime.htod(as_bytes(&scale_f32), scales_dev).unwrap();
+            }
+        }
+
+        let a_shape = [1usize, k];
+        let a_strides = [k as i64, 1];
+        let b_shape = [n, k_blocks, blob_size];
+        let b_strides = [(k_blocks * blob_size) as i64, blob_size as i64, 1];
+        let scales_shape = [n, k_blocks];
+        let scales_strides = [k_blocks as i64, 1];
+        let y_shape = [1usize, n];
+        let y_strides = [n as i64, 1];
+        let scales_dtype = if scales_fp16 {
+            DataType::Float16
+        } else {
+            DataType::Float32
+        };
+        let device = DeviceId::cuda(0);
+        let inputs = vec![
+            TensorView::new(
+                device_ptr(activation_dev),
+                DataType::Float16,
+                &a_shape,
+                &a_strides,
+                device,
+            ),
+            TensorView::new(
+                device_ptr(packed_dev),
+                DataType::Uint8,
+                &b_shape,
+                &b_strides,
+                device,
+            ),
+            TensorView::new(
+                device_ptr(scales_dev),
+                scales_dtype,
+                &scales_shape,
+                &scales_strides,
+                device,
+            ),
+        ];
+        let mut outputs = [TensorMut::new(
+            device_ptr_mut(output_dev),
+            DataType::Float16,
+            &y_shape,
+            &y_strides,
+            device,
+        )];
+
+        let kernel = MatMulNBitsKernel {
+            runtime: runtime.clone(),
+            k,
+            n,
+            bits: 4,
+            block_size,
+            accuracy_level: 4,
+            accuracy4_workspace: None,
+            fold_bias_post_round: false,
+            gate_up_swiglu: false,
+            decomposed_silu: false,
+            rmsnorm_prologue: false,
+            rmsnorm_epsilon: 1e-5,
+            last_call_capture_safe: AtomicBool::new(false),
+            bf16_scratch: Mutex::new(Bf16Scratch::new(runtime.clone())),
+            bf16_const_cache: Mutex::new(Bf16ConstCache::new(runtime.clone())),
+        };
+
+        // Serialize the env-mutating dispatch selection across the two phases so
+        // parallel test threads never observe a half-set flag. SAFETY: the env
+        // writes are confined to this critical section and restored before the
+        // lock is released.
+        let _guard = INTERLEAVE_TEST_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        unsafe {
+            match general_splitk {
+                Some(true) => std::env::set_var("ONNX_GENAI_GENERAL_SPLITK", "on"),
+                Some(false) => std::env::set_var("ONNX_GENAI_GENERAL_SPLITK", "off"),
+                None => std::env::remove_var("ONNX_GENAI_GENERAL_SPLITK"),
+            }
+            if interleave {
+                std::env::set_var("ONNX_GENAI_INTERLEAVE_DEQUANT", "1");
+            } else {
+                std::env::remove_var("ONNX_GENAI_INTERLEAVE_DEQUANT");
+            }
+        }
+        kernel.run(&inputs, &mut outputs, None).unwrap();
+        runtime.synchronize().unwrap();
+        unsafe {
+            std::env::remove_var("ONNX_GENAI_INTERLEAVE_DEQUANT");
+            std::env::remove_var("ONNX_GENAI_GENERAL_SPLITK");
+        }
+        drop(_guard);
+
+        let mut got_f16 = vec![f16::ZERO; n];
+        // SAFETY: `output_dev` holds `n` fp16 values.
+        unsafe {
+            runtime
+                .dtoh(as_bytes_mut(&mut got_f16), output_dev)
+                .unwrap();
+            runtime.free_raw(activation_dev).unwrap();
+            // NOTE: `packed_dev` is intentionally NOT freed. The interleave cache
+            // is keyed by (source pointer, byte length, ordinal); freeing the
+            // packed buffer would let CUDA reuse its address for a later,
+            // different-content buffer of the same byte length, producing a stale
+            // cache hit in a subsequent interleave run. Production weights are
+            // immutable initializers that are never freed, so this aliasing
+            // cannot occur there; leaking the small test buffer reproduces that
+            // stable-address invariant. (Real allocations are reclaimed on
+            // process exit.)
+            runtime.free_raw(scales_dev).unwrap();
+            runtime.free_raw(output_dev).unwrap();
+        }
+        Some(got_f16)
+    }
+
+    /// The opt-in TRT-LLM interleaved + biased int4 dequant
+    /// (`ONNX_GENAI_INTERLEAVE_DEQUANT`) must be BYTE-IDENTICAL to the fp32
+    /// wide-load multicol decode GEMV it replaces, on symmetric weights. The
+    /// converter yields `(code - 8)` in fp16 exactly as the reference path, the
+    /// eight products accumulate in the same ascending element order, and the
+    /// offline nibble-interleave only changes *how* the codes are decoded, so
+    /// the fp16 outputs must match bit-for-bit. Covers block-128 (glm) and
+    /// block-64, fp16 and fp32 scales, and a ragged N tail.
+    #[test]
+    fn int4_interleaved_dequant_is_bit_identical_to_multicol() {
+        let mut ran = false;
+        for (k, n, block_size, scales_fp16) in [
+            (4096usize, 256usize, 128usize, true),
+            (4096, 256, 128, false),
+            (4096, 70, 128, true),
+            (8192, 512, 128, true),
+            (4096, 256, 64, true),
+        ] {
+            let Some(base) =
+                run_symmetric_block_raw(k, n, block_size, scales_fp16, false, Some(false))
+            else {
+                eprintln!(
+                    "skipping interleaved dequant byte-identity test: CUDA runtime/headers \
+                     unavailable"
+                );
+                return;
+            };
+            let inter =
+                run_symmetric_block_raw(k, n, block_size, scales_fp16, true, Some(false)).unwrap();
+            ran = true;
+            let mismatches = base
+                .iter()
+                .zip(inter.iter())
+                .filter(|(b, i)| b.to_bits() != i.to_bits())
+                .count();
+            assert_eq!(
+                mismatches, 0,
+                "interleaved int4 dequant diverged from multicol at block-{block_size} K={k} \
+                 N={n} scales_fp16={scales_fp16}: {mismatches}/{n} fp16 outputs differ"
+            );
+        }
+        assert!(
+            ran,
+            "interleaved dequant byte-identity test did not execute any case"
+        );
+    }
+
+    /// The opt-in interleaved+biased lever must also be BYTE-IDENTICAL on the
+    /// grid-starved split-K WIDE path (`ONNX_GENAI_GENERAL_SPLITK=on`), which
+    /// serves glm's narrow-N qkv/down projections. The offline nibble-interleave
+    /// leaves each lane's fp32 partial bit-identical to the non-interleaved
+    /// split-K wide kernel, and the K_SPLIT shared-memory reduction order is
+    /// unchanged, so the fp16 outputs must match bit-for-bit.
+    #[test]
+    fn int4_interleaved_dequant_is_bit_identical_to_splitk_wide() {
+        let mut ran = false;
+        for (k, n, block_size, scales_fp16) in [
+            (4096usize, 256usize, 128usize, true),
+            (4096, 256, 128, false),
+            (4096, 70, 128, true),
+            (8192, 128, 128, true),
+        ] {
+            let Some(base) =
+                run_symmetric_block_raw(k, n, block_size, scales_fp16, false, Some(true))
+            else {
+                eprintln!(
+                    "skipping split-K wide interleaved byte-identity test: CUDA runtime/headers \
+                     unavailable"
+                );
+                return;
+            };
+            let inter =
+                run_symmetric_block_raw(k, n, block_size, scales_fp16, true, Some(true)).unwrap();
+            ran = true;
+            let mismatches = base
+                .iter()
+                .zip(inter.iter())
+                .filter(|(b, i)| b.to_bits() != i.to_bits())
+                .count();
+            assert_eq!(
+                mismatches, 0,
+                "interleaved int4 dequant diverged from split-K wide at block-{block_size} K={k} \
+                 N={n} scales_fp16={scales_fp16}: {mismatches}/{n} fp16 outputs differ"
+            );
+        }
+        assert!(
+            ran,
+            "split-K wide interleaved byte-identity test did not execute any case"
+        );
     }
 
     /// Op-level parity + capture-safety for the opt-in Marlin M>1 tensor-core

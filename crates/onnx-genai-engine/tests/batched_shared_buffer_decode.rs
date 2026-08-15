@@ -87,7 +87,7 @@ fn shared_buffer_continuous_batch_matches_individual() -> anyhow::Result<()> {
         eprintln!("skipping shared-buffer continuous-batch parity; no model dir available");
         return Ok(());
     };
-    let probe = match cuda_engine(&model_dir) {
+    let mut probe = match cuda_engine(&model_dir) {
         Ok(engine) => engine,
         Err(error) => {
             eprintln!("skipping shared-buffer continuous-batch parity; CUDA unavailable: {error}");

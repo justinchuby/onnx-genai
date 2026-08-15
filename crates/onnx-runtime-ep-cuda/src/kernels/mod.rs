@@ -42,6 +42,7 @@ pub mod cumprod;
 pub mod cumsum;
 pub mod data_transform;
 pub(crate) mod device_argmax;
+pub(crate) mod device_token_writer;
 pub mod dropout;
 pub mod elementwise;
 mod flash_attention;

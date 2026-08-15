@@ -28,7 +28,7 @@ fn cpu_engine(model_dir: &Path) -> anyhow::Result<Engine> {
 #[test]
 fn static_cache_capability_matches_batched_manager() -> anyhow::Result<()> {
     let fixture = fixture("tiny-llm-scatter")?;
-    let engine = cpu_engine(&fixture)?;
+    let mut engine = cpu_engine(&fixture)?;
 
     let capability = engine.batching_capability();
     assert!(
@@ -59,7 +59,7 @@ fn static_cache_capability_matches_batched_manager() -> anyhow::Result<()> {
 #[test]
 fn past_present_capability_matches_single_sequence_decode() -> anyhow::Result<()> {
     let fixture = fixture("tiny-llm")?;
-    let engine = cpu_engine(&fixture)?;
+    let mut engine = cpu_engine(&fixture)?;
 
     let capability = engine.batching_capability();
     assert!(

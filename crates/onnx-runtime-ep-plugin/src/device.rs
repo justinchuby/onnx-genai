@@ -82,6 +82,11 @@ pub(crate) enum EpRef {
     /// Owned raw pointer — the component will reconstruct and drop the `Box`
     /// on release. Used only for the non-shared (fresh constructor) path.
     Owned(*const dyn ExecutionProvider),
+    /// Non-owning borrow of an EP owned elsewhere. Never freed on drop. Used by
+    /// a sync notification that borrows its parent stream's EP (#982): the
+    /// notification is always released before the stream, so the borrow is
+    /// valid for the notification's whole lifetime.
+    Borrowed(*const dyn ExecutionProvider),
 }
 
 // SAFETY: Both variants are Send+Sync — Arc is inherently so, and the raw
@@ -111,12 +116,22 @@ impl EpRef {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 Ok(f(&**guard))
             }
-            EpRef::Owned(ptr) => {
+            EpRef::Owned(ptr) | EpRef::Borrowed(ptr) => {
                 if ptr.is_null() {
                     return Err("EP pointer is null");
                 }
                 Ok(f(unsafe { &**ptr }))
             }
+        }
+    }
+
+    /// A **non-owning** reference to the same EP, safe to hand to a shorter-lived
+    /// component. `Shared` clones the `Arc` (keeps the EP alive); `Owned`/
+    /// `Borrowed` become a `Borrowed` raw pointer that is never freed on drop.
+    pub(crate) fn borrow(&self) -> EpRef {
+        match self {
+            EpRef::Shared(arc) => EpRef::Shared(Arc::clone(arc)),
+            EpRef::Owned(ptr) | EpRef::Borrowed(ptr) => EpRef::Borrowed(*ptr),
         }
     }
 }
@@ -350,12 +365,23 @@ unsafe impl Send for DeviceSyncStream {}
 unsafe impl Sync for DeviceSyncStream {}
 
 impl DeviceSyncStream {
-    fn vtable() -> ort::OrtSyncStreamImpl {
+    /// Build the stream vtable. `provide_notification` gates `CreateNotification`:
+    /// it is wired only for real **device** EPs, whose interspersed partitions
+    /// make ORT synchronize a producer device stream with a consumer (the #982
+    /// decoder crash). A host/CPU plugin EP creates a null-handle stream whose
+    /// boundaries are host↔host and need no device notification; wiring one there
+    /// drives ORT down a device-sync path that faults, so we leave it null (its
+    /// pre-#982 behavior).
+    fn vtable(provide_notification: bool) -> ort::OrtSyncStreamImpl {
         ort::OrtSyncStreamImpl {
             ort_version_supported: ort::ORT_API_VERSION,
             Release: Some(stream_release),
             GetHandle: Some(stream_get_handle),
-            CreateNotification: None,
+            CreateNotification: if provide_notification {
+                Some(stream_create_notification)
+            } else {
+                None
+            },
             Flush: Some(stream_flush),
             OnSessionRunEnd: Some(stream_on_session_run_end),
         }
@@ -366,8 +392,14 @@ impl DeviceSyncStream {
         shared: Arc<Mutex<Box<dyn ExecutionProvider + Send>>>,
         stream_handle: *mut std::os::raw::c_void,
     ) -> Box<Self> {
+        let provide_notification = {
+            let guard = shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ep_needs_device_notification(&**guard)
+        };
         Box::new(Self {
-            vtable: Self::vtable(),
+            vtable: Self::vtable(provide_notification),
             ep_ref: EpRef::Shared(shared),
             stream_handle,
         })
@@ -382,12 +414,23 @@ impl DeviceSyncStream {
         ep: *const dyn ExecutionProvider,
         stream_handle: *mut std::os::raw::c_void,
     ) -> Box<Self> {
+        let provide_notification = if ep.is_null() {
+            false
+        } else {
+            ep_needs_device_notification(unsafe { &*ep })
+        };
         Box::new(Self {
-            vtable: Self::vtable(),
+            vtable: Self::vtable(provide_notification),
             ep_ref: EpRef::Owned(ep),
             stream_handle,
         })
     }
+}
+
+/// Whether an EP represents a real compute device that needs device-side
+/// cross-stream synchronization notifications. Host/CPU EPs do not.
+fn ep_needs_device_notification(ep: &dyn ExecutionProvider) -> bool {
+    !matches!(ep.device_type(), DeviceType::Cpu)
 }
 
 unsafe extern "C" fn stream_release(this: *mut ort::OrtSyncStreamImpl) {
@@ -432,6 +475,124 @@ unsafe extern "C" fn stream_on_session_run_end(
 ) -> ort::OrtStatusPtr {
     // Flush on session run end as well.
     unsafe { stream_flush(this) }
+}
+
+// ─── Cross-stream synchronization notification (#982) ────────────────────────
+//
+// An interspersed CPU↔device partition makes ORT synchronize a producer stream
+// with a consumer stream (or the host) at every partition boundary. ORT does
+// this by calling `stream->CreateNotification`, then `Activate` on the producer
+// and `WaitOnDevice`/`WaitOnHost` on the consumer. Leaving `CreateNotification`
+// null makes ORT call through a null function pointer (a jump to address 0,
+// observed as a `0xC0000005` access violation in the real decoder while the
+// single-subgraph smoke test — which needs no cross-stream sync — passes).
+//
+// The EP exposes only a full-device `sync()` primitive, so the notification is
+// implemented conservatively: `Activate` is a no-op (work is already submitted
+// to the device), and both waits perform a device `sync()`. This guarantees the
+// producer's work has completed before any consumer proceeds — correct, if not
+// maximally overlapped. Finer-grained event-based overlap is a later
+// optimization and is orthogonal to correctness.
+
+/// Heap notification projecting the EP's `sync()` through ORT's
+/// `OrtSyncNotificationImpl` vtable. Holds a **non-owning** borrow of the
+/// parent stream's EP; ORT releases the notification before the stream.
+#[repr(C)]
+pub struct DeviceSyncNotification {
+    pub vtable: ort::OrtSyncNotificationImpl,
+    ep_ref: EpRef,
+}
+
+// SAFETY: EpRef is Send+Sync; the notification is only touched from ORT callbacks.
+unsafe impl Send for DeviceSyncNotification {}
+unsafe impl Sync for DeviceSyncNotification {}
+
+impl DeviceSyncNotification {
+    fn vtable() -> ort::OrtSyncNotificationImpl {
+        ort::OrtSyncNotificationImpl {
+            ort_version_supported: ort::ORT_API_VERSION,
+            Release: Some(notification_release),
+            Activate: Some(notification_activate),
+            WaitOnDevice: Some(notification_wait_on_device),
+            WaitOnHost: Some(notification_wait_on_host),
+        }
+    }
+}
+
+unsafe extern "C" fn stream_create_notification(
+    this: *mut ort::OrtSyncStreamImpl,
+    out: *mut *mut ort::OrtSyncNotificationImpl,
+) -> ort::OrtStatusPtr {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if this.is_null() || out.is_null() {
+            return fail_status("CreateNotification: null argument");
+        }
+        let stream = unsafe { &*(this.cast::<DeviceSyncStream>()) };
+        let notif = Box::new(DeviceSyncNotification {
+            vtable: DeviceSyncNotification::vtable(),
+            ep_ref: stream.ep_ref.borrow(),
+        });
+        // Hand ownership to ORT; reclaimed in `notification_release`.
+        unsafe { *out = Box::into_raw(notif).cast::<ort::OrtSyncNotificationImpl>() };
+        crate::status::ok_status()
+    }));
+    result.unwrap_or_else(|_| fail_status("CreateNotification: internal panic"))
+}
+
+unsafe extern "C" fn notification_release(this: *mut ort::OrtSyncNotificationImpl) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if this.is_null() {
+            return;
+        }
+        unsafe {
+            drop(Box::from_raw(this.cast::<DeviceSyncNotification>()));
+        }
+    }));
+}
+
+unsafe extern "C" fn notification_activate(
+    this: *mut ort::OrtSyncNotificationImpl,
+) -> ort::OrtStatusPtr {
+    // Producer-side signal. Work is already submitted to the device; the
+    // consumer-side wait performs the actual synchronization, so this is a
+    // no-op beyond validating the pointer.
+    if this.is_null() {
+        return fail_status("Activate: null notification pointer");
+    }
+    crate::status::ok_status()
+}
+
+/// Shared implementation for both wait callbacks: fully synchronize the device
+/// so the producer's submitted work is guaranteed complete.
+unsafe fn notification_sync(
+    this: *mut ort::OrtSyncNotificationImpl,
+    label: &str,
+) -> ort::OrtStatusPtr {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if this.is_null() {
+            return fail_status(&format!("{label}: null notification pointer"));
+        }
+        let notif = unsafe { &*(this.cast::<DeviceSyncNotification>()) };
+        match notif.ep_ref.with_ep(|ep| ep.sync()) {
+            Ok(Ok(())) => crate::status::ok_status(),
+            Ok(Err(e)) => fail_status(&format!("{label}: device sync failed: {e}")),
+            Err(msg) => fail_status(&format!("{label}: {msg}")),
+        }
+    }));
+    result.unwrap_or_else(|_| fail_status(&format!("{label}: internal panic")))
+}
+
+unsafe extern "C" fn notification_wait_on_device(
+    this: *mut ort::OrtSyncNotificationImpl,
+    _consumer_stream: *mut ort::OrtSyncStream,
+) -> ort::OrtStatusPtr {
+    unsafe { notification_sync(this, "WaitOnDevice") }
+}
+
+unsafe extern "C" fn notification_wait_on_host(
+    this: *mut ort::OrtSyncNotificationImpl,
+) -> ort::OrtStatusPtr {
+    unsafe { notification_sync(this, "WaitOnHost") }
 }
 
 // ─── Device enumeration helpers ──────────────────────────────────────────────
@@ -1449,5 +1610,180 @@ mod tests {
 
         // SAFETY: reclaim the allocator created by `zero_hostile_allocator`.
         unsafe { drop(Box::from_raw(alloc_ptr)) };
+    }
+
+    // ─── Sync notification tests (#982) ──────────────────────────────────────
+
+    #[test]
+    fn stream_create_notification_yields_working_notification() {
+        // A stream must be able to create a notification (leaving
+        // CreateNotification null makes ORT jump through a null pointer at every
+        // CPU↔device partition boundary — the #982 decoder crash).
+        let ep: Box<dyn ExecutionProvider + Send> = Box::new(MockGpuEp);
+        let shared = Arc::new(Mutex::new(ep));
+        let stream = DeviceSyncStream::new_shared(shared, ptr::null_mut());
+        let stream_ptr = Box::into_raw(stream);
+
+        let mut notif: *mut ort::OrtSyncNotificationImpl = ptr::null_mut();
+        let status = unsafe { stream_create_notification(stream_ptr.cast(), &mut notif) };
+        assert!(status.is_null(), "CreateNotification must succeed");
+        assert!(!notif.is_null(), "a notification must be produced");
+
+        // Activate (producer side) and both waits (consumer side) succeed.
+        assert!(unsafe { notification_activate(notif) }.is_null());
+        assert!(unsafe { notification_wait_on_device(notif, ptr::null_mut()) }.is_null());
+        assert!(unsafe { notification_wait_on_host(notif) }.is_null());
+
+        unsafe { notification_release(notif) };
+        unsafe { stream_release(stream_ptr.cast()) };
+    }
+
+    #[test]
+    fn stream_create_notification_null_args_fail() {
+        // Null stream or null out-pointer must fail cleanly, never crash.
+        // (In a test binary with no host ORT API, `fail_status` yields a null
+        // status — matching the existing stream null-arg tests — so we assert
+        // no crash and that the out-pointer is left untouched.)
+        let mut notif: *mut ort::OrtSyncNotificationImpl = ptr::null_mut();
+        let _ = unsafe { stream_create_notification(ptr::null_mut(), &mut notif) };
+        assert!(
+            notif.is_null(),
+            "null stream must not write an out-notification"
+        );
+
+        let ep: Box<dyn ExecutionProvider + Send> = Box::new(MockGpuEp);
+        let shared = Arc::new(Mutex::new(ep));
+        let stream = DeviceSyncStream::new_shared(shared, ptr::null_mut());
+        let stream_ptr = Box::into_raw(stream);
+        let _ = unsafe { stream_create_notification(stream_ptr.cast(), ptr::null_mut()) };
+        unsafe { stream_release(stream_ptr.cast()) };
+    }
+
+    #[test]
+    fn notification_callbacks_null_this_are_safe() {
+        // Every notification callback must tolerate a null `this` without
+        // crashing (the returned status is null here only because no host ORT
+        // API is set in the test binary).
+        let _ = unsafe { notification_activate(ptr::null_mut()) };
+        let _ = unsafe { notification_wait_on_device(ptr::null_mut(), ptr::null_mut()) };
+        let _ = unsafe { notification_wait_on_host(ptr::null_mut()) };
+        // Null release must not panic.
+        unsafe { notification_release(ptr::null_mut()) };
+    }
+
+    #[test]
+    fn notification_release_does_not_free_borrowed_ep() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        struct CountingEp;
+        impl Drop for CountingEp {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        impl ExecutionProvider for CountingEp {
+            fn name(&self) -> &str {
+                "counting_ep_notif"
+            }
+            fn device_type(&self) -> DeviceType {
+                DeviceType::Cuda
+            }
+            fn device_id(&self) -> DeviceId {
+                DeviceId::cuda(0)
+            }
+            fn initialize(
+                &mut self,
+                _config: &onnx_runtime_ep_api::provider::EpConfig,
+            ) -> EpResult<()> {
+                Ok(())
+            }
+            fn shutdown(&mut self) -> EpResult<()> {
+                Ok(())
+            }
+            fn supports_op(
+                &self,
+                _op: &Node,
+                _opset: u64,
+                _shapes: &[Shape],
+                _input_dtypes: &[DataType],
+                _layouts: &[TensorLayout],
+            ) -> KernelMatch {
+                KernelMatch::Unsupported {
+                    reason: "counting".into(),
+                }
+            }
+            fn get_kernel(
+                &self,
+                _op: &Node,
+                _shapes: &[Vec<usize>],
+                _opset: u64,
+            ) -> EpResult<Box<dyn Kernel>> {
+                Err(EpError::KernelFailed("counting: no kernel".into()))
+            }
+            fn allocate(
+                &self,
+                _size: usize,
+                _alignment: usize,
+            ) -> EpResult<onnx_runtime_ep_api::provider::DeviceBuffer> {
+                Err(EpError::OutOfMemory {
+                    requested: 0,
+                    available: 0,
+                })
+            }
+            fn deallocate(
+                &self,
+                _buffer: onnx_runtime_ep_api::provider::DeviceBuffer,
+            ) -> EpResult<()> {
+                Ok(())
+            }
+            fn copy(
+                &self,
+                _src: &onnx_runtime_ep_api::provider::DeviceBuffer,
+                _dst: &mut onnx_runtime_ep_api::provider::DeviceBuffer,
+                _size: usize,
+            ) -> EpResult<()> {
+                Ok(())
+            }
+            fn copy_async(
+                &self,
+                _src: &onnx_runtime_ep_api::provider::DeviceBuffer,
+                _dst: &mut onnx_runtime_ep_api::provider::DeviceBuffer,
+                _size: usize,
+            ) -> EpResult<onnx_runtime_ep_api::provider::Fence> {
+                Ok(onnx_runtime_ep_api::provider::Fence::signalled())
+            }
+            fn sync(&self) -> EpResult<()> {
+                Ok(())
+            }
+        }
+
+        DROP_COUNT.store(0, Ordering::SeqCst);
+
+        let ep: Box<dyn ExecutionProvider + Send> = Box::new(CountingEp);
+        let shared = Arc::new(Mutex::new(ep));
+        let stream = DeviceSyncStream::new_shared(shared, ptr::null_mut());
+        let stream_ptr = Box::into_raw(stream);
+
+        let mut notif: *mut ort::OrtSyncNotificationImpl = ptr::null_mut();
+        let status = unsafe { stream_create_notification(stream_ptr.cast(), &mut notif) };
+        assert!(status.is_null());
+
+        // Releasing the notification must NOT drop the EP — it only borrows it.
+        unsafe { notification_release(notif) };
+        assert_eq!(
+            DROP_COUNT.load(Ordering::SeqCst),
+            0,
+            "notification_release must not free the borrowed EP"
+        );
+
+        // The stream still owns its Arc; dropping it here releases the last ref.
+        unsafe { stream_release(stream_ptr.cast()) };
+        assert_eq!(
+            DROP_COUNT.load(Ordering::SeqCst),
+            1,
+            "EP is freed exactly once, when the owning stream/Arc is released"
+        );
     }
 }

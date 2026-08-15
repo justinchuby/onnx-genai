@@ -281,6 +281,14 @@ struct Args {
     /// backfill actually occurs.
     #[arg(long, default_value_t = 2)]
     mid_flight_batch: usize,
+    /// Drive `--mid-flight-solo-equivalence-prompts` through the real
+    /// `ContinuousBatchManager` on the native backend (#750 stage 4) instead of
+    /// the hand-rolled slot driver. This proves the *manager* — not a bespoke
+    /// harness — admits rows mid-flight and reproduces each solo stream, and it
+    /// reports the manager's capture stats and honest logits D2H cost. The gate
+    /// still rejects a run where every row was admitted at step 0.
+    #[arg(long, default_value_t = false)]
+    mid_flight_via_manager: bool,
     /// Speculative decoding mode. `prompt-lookup` enables native n-gram
     /// speculation (exact verification; lossless vs greedy). Only supported on
     /// the single-model native `--steady` path; rejected with `--pipeline`.
@@ -570,6 +578,12 @@ fn print_cuda_observability(
         }
         if let Some(report) = &stats.graph.fallback_report {
             println!("cuda_graph_fallback_report: {report}");
+        }
+        if stats.graph.device_token_loop_k > 0 || stats.graph.device_token_loop_steps > 0 {
+            println!(
+                "device_token_loop: k={} chained_steps={}",
+                stats.graph.device_token_loop_k, stats.graph.device_token_loop_steps
+            );
         }
     }
 }
@@ -2071,6 +2085,332 @@ fn run_native_decode_mid_flight_solo_equivalence(
     Ok(())
 }
 
+/// Stage 4 (#750) mid-flight solo-equivalence gate driven through the **real**
+/// [`onnx_genai_engine::ContinuousBatchManager`] on the native CUDA backend.
+///
+/// The sibling `run_native_decode_mid_flight_solo_equivalence` hand-drives the
+/// native seams (`assign_batch_row`/`deactivate_batch_row`/
+/// `decode_greedy_batch_ragged_logits`) directly, so it proves the seams are
+/// correct but *not* that the manager wires them correctly. This gate closes
+/// that gap: it builds a batch-`K` native engine, calls
+/// `engine.continuous_batch_manager(K)`, submits every prompt as a greedy
+/// `GenerateRequest`, and drives `manager.step()` to completion. The manager —
+/// not this harness — owns admission (`admit_available_rows` → `assign_row`),
+/// sampling (host `[B, 1, vocab]` logits through `BatchStepLogits::HostRows`),
+/// and eviction (`deactivate_row`). Each request's `GenerateResult::token_ids`
+/// must be byte-identical to the same prompt run **alone** at batch 1, and the
+/// manager must admit at least one request at step > 0 (a run where every row
+/// started at step 0 is rejected). Capture stats and the manager's logits D2H
+/// cost are reported so the reader can confirm capture survived admission and
+/// see the honest per-step transfer cost.
+fn run_native_decode_mid_flight_manager_solo_equivalence(
+    model_dir: &Path,
+    device: NativeDecodeDevice,
+    decode_precision: DecodePrecision,
+    tokenizer: &Tokenizer,
+    prompt_spec: &str,
+    batch: usize,
+    gen_tokens: usize,
+) -> Result<()> {
+    use onnx_genai_engine::{ContinuousBatchAdmission, ContinuousBatchEvent, GeneratePrompt};
+
+    let own_pid = std::process::id();
+    report_foreign_compute_apps(own_pid);
+
+    if batch < 2 {
+        bail!("--mid-flight-batch must be at least 2 (a single slot cannot demonstrate backfill)");
+    }
+    if gen_tokens < 2 {
+        bail!("--tokens must be at least 2 for the mid-flight gate");
+    }
+
+    let prompt_texts: Vec<&str> = prompt_spec
+        .split("||")
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .collect();
+    if prompt_texts.len() <= batch {
+        bail!(
+            "--mid-flight-solo-equivalence-prompts needs strictly more than --mid-flight-batch \
+             ({batch}) prompts so a waiting request is actually admitted into a freed slot \
+             mid-flight (got {})",
+            prompt_texts.len()
+        );
+    }
+    let mut prompts: Vec<Vec<u32>> = Vec::with_capacity(prompt_texts.len());
+    for text in &prompt_texts {
+        let tokens = tokenizer
+            .encode(text)
+            .with_context(|| format!("tokenize mid-flight prompt {text:?}"))?;
+        if tokens.is_empty() {
+            bail!("mid-flight prompt {text:?} tokenized to an empty sequence");
+        }
+        prompts.push(tokens);
+    }
+    let requests = prompts.len();
+    // Stagger the per-request generation lengths so rows retire at different
+    // steps and backfill is genuinely mid-flight, matching the hand-driven gate.
+    let gen_targets: Vec<usize> = (0..requests).map(|i| 1 + (i % gen_tokens)).collect();
+    let lens: Vec<usize> = prompts.iter().map(Vec::len).collect();
+    println!(
+        "native_decode_mid_flight_manager_solo_equivalence: own_pid={own_pid} requests={requests} \
+         batch={batch} row_lens={lens:?} gen_targets={gen_targets:?} max_gen_tokens={gen_tokens}"
+    );
+
+    // 1) Solo reference: each prompt alone at batch 1 for its own gen_target,
+    // using the device-argmax path (decode_greedy_batch). Byte-identical to the
+    // hand-driven gate's reference.
+    // SAFETY: single-threaded benchmark setup.
+    unsafe {
+        std::env::set_var("ONNX_GENAI_NATIVE_DECODE_BATCH", "1");
+    }
+    let mut solo_engine = build_governed_batch_engine(model_dir, &device, decode_precision, 1)?;
+    let solo_session = solo_engine
+        .native_decode_session_mut()
+        .expect("batch-1 native session");
+    let mut solo_streams: Vec<Vec<u32>> = Vec::with_capacity(requests);
+    for (req, prompt) in prompts.iter().enumerate() {
+        let stream =
+            drive_uniform_batch(solo_session, std::slice::from_ref(prompt), gen_targets[req])?;
+        let stream = stream.into_iter().next().expect("one solo row");
+        println!(
+            "native_decode_mid_flight_manager_solo_equivalence_solo: req={req} prompt_len={} \
+             gen_target={} stream={stream:?}",
+            prompt.len(),
+            gen_targets[req]
+        );
+        solo_streams.push(stream);
+    }
+    drop(solo_engine);
+
+    // 2) Real manager over a batch-K native engine. The manager owns every
+    // physical decode row: it deactivates all rows at construction, admits from
+    // its FIFO queue into freed slots at the start of every step, samples from
+    // host logits, and evicts finished rows.
+    // SAFETY: single-threaded benchmark setup.
+    unsafe {
+        std::env::set_var("ONNX_GENAI_NATIVE_DECODE_BATCH", batch.to_string());
+    }
+    let mut batch_engine =
+        build_governed_batch_engine(model_dir, &device, decode_precision, batch)?;
+    let mut manager = batch_engine
+        .continuous_batch_manager(batch)
+        .context("build native ContinuousBatchManager (the #750 stage-4 wiring under test)")?;
+
+    // Submit every request as a greedy generation. `temperature = 0.0` and
+    // `greedy = true` force lowest-index argmax (the exact tie-break the native
+    // device argmax uses), and `stop_on_eos = false` makes the manager generate
+    // exactly `gen_target` tokens like `drive_uniform_batch` — so the streams are
+    // compared on equal footing.
+    let mut handle_to_req: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::with_capacity(requests);
+    for (req, prompt) in prompts.iter().enumerate() {
+        let options = GenerateOptions {
+            max_new_tokens: gen_targets[req],
+            temperature: 0.0,
+            greedy: true,
+            stop_on_eos: false,
+            ..GenerateOptions::default()
+        };
+        let request = GenerateRequest {
+            prompt: GeneratePrompt::TokenIds(prompt.clone()),
+            options,
+        };
+        let handle = manager
+            .submit(request)
+            .with_context(|| format!("submit mid-flight request {req} to the manager"))?;
+        if handle_to_req.insert(handle.id, req).is_some() {
+            bail!(
+                "manager returned a duplicate handle id {} for req {req}",
+                handle.id
+            );
+        }
+    }
+
+    let mut admitted_at: Vec<Option<usize>> = vec![None; requests];
+    let mut finished_at: Vec<Option<usize>> = vec![None; requests];
+    let mut completed: Vec<Option<Vec<u32>>> = vec![None; requests];
+    let mut mid_flight_admissions = 0usize;
+
+    let record_admissions = |admissions: Vec<ContinuousBatchAdmission>,
+                             step: usize,
+                             admitted_at: &mut [Option<usize>],
+                             mid_flight_admissions: &mut usize|
+     -> Result<()> {
+        for admission in admissions {
+            match admission {
+                ContinuousBatchAdmission::Assigned { handle } => {
+                    let req = *handle_to_req
+                        .get(&handle.id)
+                        .with_context(|| format!("admission for unknown handle {}", handle.id))?;
+                    if admitted_at[req].is_none() {
+                        admitted_at[req] = Some(step);
+                        if step > 0 {
+                            *mid_flight_admissions += 1;
+                        }
+                    }
+                }
+                ContinuousBatchAdmission::Rejected { handle, error } => {
+                    let req = handle_to_req.get(&handle.id).copied();
+                    bail!("manager rejected admission for req {req:?}: {error:#}");
+                }
+            }
+        }
+        Ok(())
+    };
+
+    // Drain anything queued at submit time (a prompt at the context limit is
+    // admitted + finished during submit). These count as step-0 admissions.
+    record_admissions(
+        manager.poll_admissions(),
+        0,
+        &mut admitted_at,
+        &mut mid_flight_admissions,
+    )?;
+    for event in manager.poll() {
+        if let ContinuousBatchEvent::Finished { handle, result } = event {
+            let req = *handle_to_req
+                .get(&handle.id)
+                .with_context(|| format!("finish for unknown handle {}", handle.id))?;
+            completed[req] = Some(result.token_ids.clone());
+            finished_at[req] = Some(0);
+        }
+    }
+
+    let max_steps = requests * (gen_tokens + 64) + 1024;
+    let mut step = 0usize;
+    while manager.has_pending_work() {
+        if step >= max_steps {
+            bail!(
+                "manager mid-flight gate exceeded {max_steps} steps without draining — likely a \
+                 stuck row"
+            );
+        }
+        manager
+            .step()
+            .with_context(|| format!("manager.step() at step {step}"))?;
+        record_admissions(
+            manager.poll_admissions(),
+            step,
+            &mut admitted_at,
+            &mut mid_flight_admissions,
+        )?;
+        for event in manager.poll() {
+            if let ContinuousBatchEvent::Finished { handle, result } = event {
+                let req = *handle_to_req
+                    .get(&handle.id)
+                    .with_context(|| format!("finish for unknown handle {}", handle.id))?;
+                completed[req] = Some(result.token_ids.clone());
+                finished_at[req] = Some(step);
+            }
+        }
+        step += 1;
+    }
+
+    // Report the manager's honest logits D2H cost (the native host-logits seam
+    // reads `[B, 1, vocab]` each step). `BatchStepLogits::HostRows` is *moved*
+    // into the manager's rows, so the manager adds no copy on top of this read.
+    if let Some(d2h) = manager.logits_d2h_stats() {
+        let d2h_ms = d2h.time.as_secs_f64() * 1000.0;
+        let per_step_kb = if d2h.steps > 0 {
+            (d2h.bytes as f64 / d2h.steps as f64) / 1024.0
+        } else {
+            0.0
+        };
+        println!(
+            "native_decode_mid_flight_manager_solo_equivalence_d2h: steps={} \
+             total_logits_d2h_bytes={} total_d2h_ms={d2h_ms:.3} per_step_logits_kb={per_step_kb:.1} \
+             (manager moves each host row into its slot; no copy on top of this read)",
+            d2h.steps, d2h.bytes
+        );
+    } else {
+        println!(
+            "native_decode_mid_flight_manager_solo_equivalence_d2h: backend reported no logits \
+             D2H (unexpected for the native host-logits seam)"
+        );
+    }
+
+    // Capture must survive mid-flight admission: assign/deactivate are host-side
+    // mask/length writes, so no recapture is forced. Read the stats after the
+    // manager is dropped to release its &mut borrow of the session.
+    drop(manager);
+    let capture = batch_engine
+        .native_decode_session_mut()
+        .and_then(|session| session.cuda_kv_debug_stats())
+        .map(|stats| {
+            (
+                stats.graph.enabled,
+                stats.graph.captures,
+                stats.graph.replays,
+                stats.graph.fallbacks,
+                stats.graph.invalidations,
+            )
+        });
+    if let Some((enabled, captures, replays, fallbacks, invalidations)) = capture {
+        println!(
+            "native_decode_mid_flight_manager_solo_equivalence_capture: graph_enabled={enabled} \
+             captures={captures} replays={replays} fallbacks={fallbacks} \
+             invalidations={invalidations} (assign/deactivate are host-side writes through the \
+             manager; any invalidations are KV-growth boundaries, not admissions)"
+        );
+    }
+    drop(batch_engine);
+    // SAFETY: single-threaded teardown.
+    unsafe {
+        std::env::remove_var("ONNX_GENAI_NATIVE_DECODE_BATCH");
+    }
+
+    // Visibility: prove rows were admitted mid-flight (step > 0), not all at step 0.
+    for req in 0..requests {
+        println!(
+            "native_decode_mid_flight_manager_solo_equivalence_admission: req={req} prompt_len={} \
+             gen_target={} admitted_at_step={:?} finished_at_step={:?}",
+            lens[req], gen_targets[req], admitted_at[req], finished_at[req]
+        );
+    }
+    if mid_flight_admissions == 0 {
+        bail!(
+            "manager mid-flight gate is worthless: every request was admitted at step 0 (no row \
+             was backfilled into a freed slot while peers kept decoding). Increase the prompt \
+             count or reduce --mid-flight-batch."
+        );
+    }
+
+    // Assert every request's manager-produced stream is byte-identical to solo.
+    let mut all_match = true;
+    for req in 0..requests {
+        let solo = &solo_streams[req];
+        let batched = completed[req]
+            .as_ref()
+            .with_context(|| format!("manager mid-flight request {req} never finished"))?;
+        let matches = solo == batched;
+        all_match &= matches;
+        println!(
+            "native_decode_mid_flight_manager_solo_equivalence_row: req={req} prompt_len={} \
+             admitted_at_step={:?} matches_solo={matches} batch_stream={batched:?}",
+            lens[req], admitted_at[req]
+        );
+        if !matches {
+            println!(
+                "native_decode_mid_flight_manager_solo_equivalence_detail: req={req} solo={solo:?} \
+                 batch={batched:?}"
+            );
+        }
+    }
+    println!(
+        "native_decode_mid_flight_manager_solo_equivalence_result: requests={requests} \
+         batch={batch} mid_flight_admissions={mid_flight_admissions} all_rows_match_solo={all_match}"
+    );
+    if !all_match {
+        bail!(
+            "manager mid-flight solo-equivalence FAILED: a row admitted into a recycled slot by \
+             the manager diverged from its solo batch-1 stream — the manager wiring leaked stale \
+             KV, mask, or position across the admission boundary"
+        );
+    }
+    Ok(())
+}
+
 fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Result<()> {
     if args.synthetic {
         bail!("--steady requires a real model directory");
@@ -2535,6 +2875,17 @@ fn main() -> Result<()> {
             .as_deref()
             .expect("validated model argument")
             .to_path_buf();
+        if args.mid_flight_via_manager {
+            return run_native_decode_mid_flight_manager_solo_equivalence(
+                &model_dir,
+                device.clone(),
+                args.decode_precision.into(),
+                &tokenizer,
+                &prompt_spec,
+                args.mid_flight_batch,
+                args.tokens,
+            );
+        }
         return run_native_decode_mid_flight_solo_equivalence(
             &model_dir,
             device.clone(),
