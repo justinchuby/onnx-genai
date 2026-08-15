@@ -12679,15 +12679,27 @@ extern "C" __global__ void ref_silu_mul_f16(
                 );
             }
             // The fused projection matches the three-op sequence. It is normally
-            // bit-identical, EXCEPT the asymmetric int8-zp M=1 case: the three-op
-            // reference's standalone int8 GEMV now routes to the split-K entry
-            // (K % 256 == 0, grid-starved), which reorders the fp32 block-sum
-            // association across K_SPLIT cooperating warps (fp reassociation),
-            // while the fused following kernel keeps the single-warp association.
-            // Both are near-equal valid computations, so that path is validated to
-            // a tight magnitude-relative tolerance instead of byte-identity.
+            // bit-identical, EXCEPT two fp-reassociation sources make it merely
+            // near-equal:
+            //   (1) the asymmetric int8-zp M=1 case, where the three-op
+            //       reference's standalone int8 GEMV routes to the split-K entry
+            //       (K % 256 == 0, grid-starved), reordering the fp32 block-sum
+            //       across K_SPLIT cooperating warps; and
+            //   (2) any decode-shaped norm (num_groups <=
+            //       SKIP_RMSNORM_BLOCK_MAX_GROUPS), where the reference's
+            //       standalone SkipSimplifiedLayerNorm routes to the multi-warp
+            //       `skip_rmsnorm_f16_block_half4` variant, which reduces the
+            //       fp32 sum-of-squares in block-tree order while the fused norm
+            //       prologue keeps the single-warp order.
+            // Both are near-equal valid computations, so those paths are
+            // validated to a tight magnitude-relative tolerance (which still
+            // catches a dropped zero point or fp16 accumulation, both of which
+            // diverge grossly) instead of byte-identity.
             let splitk_path = bits == 8 && explicit_zp && m == 1;
-            if splitk_path {
+            let norm_block_reference =
+                m as u32 <= crate::kernels::normalization::SKIP_RMSNORM_BLOCK_MAX_GROUPS;
+            let near_equal = splitk_path || norm_block_reference;
+            if near_equal {
                 let mut max_abs = 0.0f32;
                 let mut worst = 0.0f32;
                 for index in 0..m * post_n {
@@ -12695,7 +12707,7 @@ extern "C" __global__ void ref_silu_mul_f16(
                     let reference = y_ref_host[index].to_f32();
                     assert!(
                         fused.is_finite(),
-                        "split-K int8-zp GEMV produced a non-finite output at M={m}, \
+                        "near-equal fused int8-zp GEMV produced a non-finite output at M={m}, \
                          following_bias={following_bias}, column={}",
                         index % post_n
                     );
@@ -12705,7 +12717,8 @@ extern "C" __global__ void ref_silu_mul_f16(
                 let bound = (max_abs * 2e-3).max(1e-3);
                 assert!(
                     worst < bound,
-                    "fused norm prologue diverged from split-K skip_rmsnorm + GEMV at \
+                    "fused norm prologue diverged (beyond fp reassociation) from \
+                     skip_rmsnorm + GEMV at \
                      M={m}, following_bias={following_bias}: \
                      max_abs_diff={worst:.3e} bound={bound:.3e}"
                 );
