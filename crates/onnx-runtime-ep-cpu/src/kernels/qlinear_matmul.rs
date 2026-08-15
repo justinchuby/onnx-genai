@@ -7,6 +7,12 @@ use rayon::prelude::*;
 use super::{check_arity, to_dense_bytes, write_dense_bytes};
 use crate::strided::numel;
 
+/// Multiply-accumulate count below which the integer accumulation runs on the
+/// calling thread. A rayon fork costs on the order of microseconds; this is the
+/// point where the accumulation itself is comfortably past that, so the guard
+/// never trades measurable throughput for it.
+const PARALLEL_MIN_WORK: usize = 1 << 16;
+
 pub struct QLinearMatMulKernel;
 pub struct QLinearMatMulFactory;
 
@@ -232,13 +238,25 @@ impl Kernel for QLinearMatMulKernel {
         let (m, k, n) = (geometry.m, geometry.k, geometry.n);
         let mut output = Vec::with_capacity(geometry.result_len);
         let mut batch_index = vec![0; geometry.batch_shape.len()];
+        // Hoisted out of the batch loop: both are re-filled per batch, so a
+        // many-batch call allocates once rather than once per batch.
+        let mut products: Vec<i32> = Vec::new();
+        let mut b_zero_points: Vec<i32> = Vec::new();
         for batch in 0..geometry.batch_count {
             let a_batch = geometry.a_batch_offset(&batch_index);
             let b_batch = geometry.b_batch_offset(&batch_index);
             let a_offset = a_batch * m * k;
             let b_offset = b_batch * k * n;
-            let b_zero_points: Vec<i32> =
-                (0..n).map(|column| b_quant.at(b_batch, column).1).collect();
+            // `n == 0` produces no output for this batch, and both
+            // `par_chunks_mut(0)` and `chunks_exact(0)` panic, so leave early.
+            if n == 0 {
+                if batch + 1 < geometry.batch_count {
+                    next_index(&geometry.batch_shape, &mut batch_index);
+                }
+                continue;
+            }
+            b_zero_points.clear();
+            b_zero_points.extend((0..n).map(|column| b_quant.at(b_batch, column).1));
 
             // Accumulate the integer product with `k` outermost so `B` is read
             // along its rows. The previous order walked `B` down a column with
@@ -254,32 +272,44 @@ impl Kernel for QLinearMatMulKernel {
             // multiply-accumulate over two contiguous slices.
             //
             // Rows are independent, so integer accumulation stays deterministic
-            // under `par_chunks_mut` -- no summation order changes.
-            let mut products = vec![0i32; m * n];
-            products
-                .par_chunks_mut(n)
-                .enumerate()
-                .for_each(|(row, accumulators)| {
-                    let a_zero_point = a_quant.at(a_batch, row).1;
-                    let a_row = &a[a_offset + row * k..a_offset + row * k + k];
-                    let mut a_sum = 0i32;
-                    for (inner, &a_value) in a_row.iter().enumerate() {
-                        let centered = a_value.wrapping_sub(a_zero_point);
-                        a_sum = a_sum.wrapping_add(centered);
-                        if centered == 0 {
-                            continue;
-                        }
-                        let start = b_offset + inner * n;
-                        let b_row = &b[start..start + n];
-                        for (accumulator, &b_value) in accumulators.iter_mut().zip(b_row) {
-                            *accumulator = accumulator.wrapping_add(centered.wrapping_mul(b_value));
-                        }
+            // whether the rows are walked serially or under `par_chunks_mut`:
+            // neither changes a summation order.
+            products.clear();
+            products.resize(m * n, 0);
+            let b_zero_points = &b_zero_points[..];
+            let accumulate_row = |row: usize, accumulators: &mut [i32]| {
+                let a_zero_point = a_quant.at(a_batch, row).1;
+                let a_row = &a[a_offset + row * k..a_offset + row * k + k];
+                let mut a_sum = 0i32;
+                for (inner, &a_value) in a_row.iter().enumerate() {
+                    let centered = a_value.wrapping_sub(a_zero_point);
+                    a_sum = a_sum.wrapping_add(centered);
+                    if centered == 0 {
+                        continue;
                     }
-                    for (accumulator, &b_zero_point) in accumulators.iter_mut().zip(&b_zero_points)
-                    {
-                        *accumulator = accumulator.wrapping_sub(a_sum.wrapping_mul(b_zero_point));
+                    let start = b_offset + inner * n;
+                    let b_row = &b[start..start + n];
+                    for (accumulator, &b_value) in accumulators.iter_mut().zip(b_row) {
+                        *accumulator = accumulator.wrapping_add(centered.wrapping_mul(b_value));
                     }
-                });
+                }
+                for (accumulator, &b_zero_point) in accumulators.iter_mut().zip(b_zero_points) {
+                    *accumulator = accumulator.wrapping_sub(a_sum.wrapping_mul(b_zero_point));
+                }
+            };
+            // One chunk cannot be split, and a fork is pure overhead below the
+            // point where the accumulation dominates it. `m == 1` is the decode
+            // shape, so this is the common case rather than a corner.
+            if m <= 1 || rayon::current_num_threads() <= 1 || m * n * k < PARALLEL_MIN_WORK {
+                for (row, accumulators) in products.chunks_mut(n).enumerate() {
+                    accumulate_row(row, accumulators);
+                }
+            } else {
+                products
+                    .par_chunks_mut(n)
+                    .enumerate()
+                    .for_each(|(row, accumulators)| accumulate_row(row, accumulators));
+            }
 
             for (row, accumulators) in products.chunks_exact(n).enumerate() {
                 let a_scale = a_quant.at(a_batch, row).0;
@@ -861,19 +891,74 @@ mod tests {
         assert!(error.to_string().contains("shapes must match"), "{error}");
     }
 
-    /// The reordered accumulation must be **bit**-identical to the row-at-a-time
-    /// loop it replaces, not merely close: `QLinearMatMul` output is integer, so
-    /// a one-LSB difference is a wrong answer.
+    /// Transcription of the accumulation loop this change replaced, kept as the
+    /// oracle for bit-identity. The shared `reference` helper sums in `f64` and
+    /// so cannot answer "did we reproduce the *previous kernel* exactly", which
+    /// is the property that matters once the `i32` accumulator can wrap.
+    ///
+    /// Mirrors the removed code: per-`(row, column)` accumulation over `k`,
+    /// both zero points subtracted inside the loop, `wrapping_add`, then the
+    /// unchanged scale / `round_ties_even` / clamp epilogue.
+    #[allow(clippy::too_many_arguments)]
+    fn previous_loop_oracle(
+        a: &[i32],
+        b: &[i32],
+        m: usize,
+        k: usize,
+        n: usize,
+        a_scales: &[f32],
+        a_zeros: &[i32],
+        b_scales: &[f32],
+        b_zeros: &[i32],
+        y_scale: f32,
+        y_zero: i32,
+        output_dtype: DataType,
+    ) -> Vec<i64> {
+        let pick = |values: &[f32], index: usize| values[if values.len() > 1 { index } else { 0 }];
+        let pick_zero =
+            |values: &[i32], index: usize| values[if values.len() > 1 { index } else { 0 }];
+        let mut out = Vec::with_capacity(m * n);
+        for row in 0..m {
+            for column in 0..n {
+                let a_scale = pick(a_scales, row);
+                let a_zero_point = pick_zero(a_zeros, row);
+                let b_scale = pick(b_scales, column);
+                let b_zero_point = pick_zero(b_zeros, column);
+                let mut accumulated = 0i32;
+                for inner in 0..k {
+                    let av = a[row * k + inner] - a_zero_point;
+                    let bv = b[inner * n + column] - b_zero_point;
+                    accumulated = accumulated.wrapping_add(av * bv);
+                }
+                let scale = a_scale * b_scale / y_scale;
+                let value =
+                    (accumulated as f32 * scale).round_ties_even() as i64 + i64::from(y_zero);
+                out.push(match output_dtype {
+                    DataType::Int8 => value.clamp(i8::MIN as i64, i8::MAX as i64),
+                    DataType::Uint8 => value.clamp(0, u8::MAX as i64),
+                    _ => unreachable!(),
+                });
+            }
+        }
+        out
+    }
+
+    /// The reordered accumulation must be **bit**-identical to the loop it
+    /// replaces, not merely close: `QLinearMatMul` output is integer, so a
+    /// one-LSB difference is a wrong answer.
     ///
     /// The rewrite lifts the zero points out of the inner loop using
     ///   sum_k (a_k - az) * (b_kn - bz_n)
     ///     = sum_k (a_k - az) * b_kn  -  bz_n * sum_k (a_k - az)
     /// which is an identity over the integers, so under wrapping arithmetic
-    /// (arithmetic mod 2^32) both sides reduce to the same `i32`. This sweeps
-    /// shapes that miss every tile boundary, both dtypes, per-tensor and
-    /// per-axis quantization, and a `K` large enough that the intermediate
-    /// accumulator overflows `i32` -- the case where "algebraically equal" and
-    /// "bit-identical" could plausibly come apart.
+    /// (arithmetic mod 2^32) both sides reduce to the same `i32`.
+    ///
+    /// Compared against a transcription of the previous loop over shapes that
+    /// miss every tile boundary, both dtypes, and per-tensor as well as
+    /// per-axis (per-row `A`, per-column `B`) quantization. Overflow of the
+    /// accumulator is covered separately by
+    /// `qlinear_matmul_overflowing_accumulator_matches_the_previous_loop`,
+    /// which needs a much larger `K` than is practical to sweep here.
     #[test]
     fn qlinear_matmul_reordered_accumulation_is_bit_identical() {
         for &(m, k, n) in &[
@@ -882,44 +967,156 @@ mod tests {
             (3, 64, 16),
             (5, 129, 33),
         ] {
-            let a_values: Vec<u8> = (0..m * k).map(|i| ((i * 37 + 11) % 256) as u8).collect();
-            let b_values: Vec<u8> = (0..k * n).map(|i| ((i * 91 + 7) % 256) as u8).collect();
-            let a = Owned::u8(&[m, k], &a_values);
-            let b = Owned::u8(&[k, n], &b_values);
-            let a_scale = Owned::f32(&[], &[0.02]);
-            let a_zero = Owned::u8(&[], &[128]);
-            let b_scale = Owned::f32(&[], &[0.01]);
-            let b_zero = Owned::u8(&[], &[127]);
-            let y_scale = Owned::f32(&[], &[0.05]);
-            let y_zero = Owned::u8(&[], &[120]);
+            for per_axis in [false, true] {
+                // --- Uint8 ---
+                let a_u8: Vec<u8> = (0..m * k).map(|i| ((i * 37 + 11) % 256) as u8).collect();
+                let b_u8: Vec<u8> = (0..k * n).map(|i| ((i * 91 + 7) % 256) as u8).collect();
+                let (a_scales, a_zeros): (Vec<f32>, Vec<i32>) = if per_axis {
+                    (
+                        (0..m).map(|i| 0.02 + i as f32 * 0.003).collect(),
+                        (0..m).map(|i| ((i * 13) % 256) as i32).collect(),
+                    )
+                } else {
+                    (vec![0.02], vec![128])
+                };
+                let (b_scales, b_zeros): (Vec<f32>, Vec<i32>) = if per_axis {
+                    (
+                        (0..n).map(|i| 0.01 + i as f32 * 0.002).collect(),
+                        (0..n).map(|i| ((i * 29 + 3) % 256) as i32).collect(),
+                    )
+                } else {
+                    (vec![0.01], vec![127])
+                };
+                let axis_shape = |len: usize| if len > 1 { vec![len] } else { Vec::new() };
+                let output = execute(
+                    [
+                        &Owned::u8(&[m, k], &a_u8),
+                        &Owned::f32(&axis_shape(a_scales.len()), &a_scales),
+                        &Owned::u8(
+                            &axis_shape(a_zeros.len()),
+                            &a_zeros.iter().map(|&z| z as u8).collect::<Vec<_>>(),
+                        ),
+                        &Owned::u8(&[k, n], &b_u8),
+                        &Owned::f32(&axis_shape(b_scales.len()), &b_scales),
+                        &Owned::u8(
+                            &axis_shape(b_zeros.len()),
+                            &b_zeros.iter().map(|&z| z as u8).collect::<Vec<_>>(),
+                        ),
+                        &Owned::f32(&[], &[0.05]),
+                        &Owned::u8(&[], &[120]),
+                    ],
+                    DataType::Uint8,
+                    &[m, n],
+                );
+                let a_i32: Vec<i32> = a_u8.iter().map(|&v| i32::from(v)).collect();
+                let b_i32: Vec<i32> = b_u8.iter().map(|&v| i32::from(v)).collect();
+                assert_eq!(
+                    output_values(&output),
+                    previous_loop_oracle(
+                        &a_i32,
+                        &b_i32,
+                        m,
+                        k,
+                        n,
+                        &a_scales,
+                        &a_zeros,
+                        &b_scales,
+                        &b_zeros,
+                        0.05,
+                        120,
+                        DataType::Uint8
+                    ),
+                    "u8 m={m} k={k} n={n} per_axis={per_axis}"
+                );
 
-            let output = execute(
-                [
-                    &a, &a_scale, &a_zero, &b, &b_scale, &b_zero, &y_scale, &y_zero,
-                ],
-                DataType::Uint8,
-                &[m, n],
-            );
-
-            let expected = reference(Reference {
-                a: &a_values.iter().map(|&v| i32::from(v)).collect::<Vec<_>>(),
-                a_shape: &[m, k],
-                a_scales: &[0.02],
-                a_zeros: &[128],
-                b: &b_values.iter().map(|&v| i32::from(v)).collect::<Vec<_>>(),
-                b_shape: &[k, n],
-                b_scales: &[0.01],
-                b_zeros: &[127],
-                y_scale: 0.05,
-                y_zero: 120,
-                output_dtype: DataType::Uint8,
-            });
-            assert_eq!(
-                output_values(&output),
-                expected,
-                "m={m} k={k} n={n}: reordered accumulation disagrees with the reference"
-            );
+                // --- Int8 ---
+                let a_i8: Vec<i8> = (0..m * k)
+                    .map(|i| (((i * 37 + 11) % 256) as i32 - 128) as i8)
+                    .collect();
+                let b_i8: Vec<i8> = (0..k * n)
+                    .map(|i| (((i * 91 + 7) % 256) as i32 - 128) as i8)
+                    .collect();
+                let (a_scales_i, a_zeros_i): (Vec<f32>, Vec<i32>) = if per_axis {
+                    (
+                        (0..m).map(|i| 0.02 + i as f32 * 0.003).collect(),
+                        (0..m).map(|i| ((i * 13) % 256) as i32 - 128).collect(),
+                    )
+                } else {
+                    (vec![0.02], vec![-5])
+                };
+                let (b_scales_i, b_zeros_i): (Vec<f32>, Vec<i32>) = if per_axis {
+                    (
+                        (0..n).map(|i| 0.01 + i as f32 * 0.002).collect(),
+                        (0..n).map(|i| ((i * 29 + 3) % 256) as i32 - 128).collect(),
+                    )
+                } else {
+                    (vec![0.01], vec![7])
+                };
+                let output = execute(
+                    [
+                        &i8(&[m, k], &a_i8),
+                        &Owned::f32(&axis_shape(a_scales_i.len()), &a_scales_i),
+                        &i8(
+                            &axis_shape(a_zeros_i.len()),
+                            &a_zeros_i.iter().map(|&z| z as i8).collect::<Vec<_>>(),
+                        ),
+                        &i8(&[k, n], &b_i8),
+                        &Owned::f32(&axis_shape(b_scales_i.len()), &b_scales_i),
+                        &i8(
+                            &axis_shape(b_zeros_i.len()),
+                            &b_zeros_i.iter().map(|&z| z as i8).collect::<Vec<_>>(),
+                        ),
+                        &Owned::f32(&[], &[0.05]),
+                        &i8(&[], &[-3]),
+                    ],
+                    DataType::Int8,
+                    &[m, n],
+                );
+                let a_i32: Vec<i32> = a_i8.iter().map(|&v| i32::from(v)).collect();
+                let b_i32: Vec<i32> = b_i8.iter().map(|&v| i32::from(v)).collect();
+                assert_eq!(
+                    output_values(&output),
+                    previous_loop_oracle(
+                        &a_i32,
+                        &b_i32,
+                        m,
+                        k,
+                        n,
+                        &a_scales_i,
+                        &a_zeros_i,
+                        &b_scales_i,
+                        &b_zeros_i,
+                        0.05,
+                        -3,
+                        DataType::Int8
+                    ),
+                    "i8 m={m} k={k} n={n} per_axis={per_axis}"
+                );
+            }
         }
+    }
+
+    /// `N == 0` produces an empty output. `par_chunks_mut(0)` and
+    /// `chunks_exact(0)` both panic, so the kernel has to skip the batch
+    /// outright -- the previous `for column in 0..0` loop degenerated
+    /// harmlessly and this must keep doing so.
+    #[test]
+    fn qlinear_matmul_zero_width_output_is_empty_not_a_panic() {
+        let out = execute(
+            [
+                &Owned::u8(&[2, 3], &[1, 2, 3, 4, 5, 6]),
+                &Owned::f32(&[], &[0.5]),
+                &Owned::u8(&[], &[3]),
+                &Owned::u8(&[3, 0], &[]),
+                &Owned::f32(&[], &[0.25]),
+                &Owned::u8(&[], &[2]),
+                &Owned::f32(&[], &[0.125]),
+                &Owned::u8(&[], &[10]),
+            ],
+            DataType::Uint8,
+            &[2, 0],
+        );
+        assert!(output_values(&out).is_empty());
     }
 
     /// `K` large enough that the `i32` accumulator wraps.
@@ -1016,6 +1213,23 @@ mod tests {
         for round in 1..4 {
             let again = output_values(&execute(inputs, DataType::Uint8, &[m, n]));
             assert_eq!(first, again, "round {round} disagreed with the first run");
+        }
+
+        // Vary the pool width so the row partition genuinely changes. Row
+        // accumulation is sequential and integer, so the answer must not depend
+        // on how many workers split the rows -- including the serial path the
+        // single-thread pool takes.
+        for threads in [1usize, 2, 3, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let under_pool =
+                pool.install(|| output_values(&execute(inputs, DataType::Uint8, &[m, n])));
+            assert_eq!(
+                first, under_pool,
+                "a {threads}-thread pool produced a different result"
+            );
         }
     }
 }
