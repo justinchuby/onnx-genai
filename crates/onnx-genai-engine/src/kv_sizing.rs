@@ -77,3 +77,62 @@ pub(crate) fn kv_cache_bytes_for_tensors(
     }
     Ok(total)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kv(name: &str, head_size: u64) -> KvTensorSpec {
+        // [batch, num_kv_heads, context, head_size] — the conventional decoder
+        // KV shape, with the head size varying per tensor.
+        KvTensorSpec {
+            name: name.to_owned(),
+            dtype: KvStorageType::Float16,
+            shape: vec![
+                KvDimension::PerSequenceBatch,
+                KvDimension::Fixed(16),
+                KvDimension::Context,
+                KvDimension::Fixed(head_size),
+            ],
+        }
+    }
+
+    /// MLA (DeepSeek-V2/V3) carries the decoupled-RoPE dim on the key only, so
+    /// key and value head sizes differ: 192 = qk_nope(128) + qk_rope(64) against
+    /// a value of 128. Sizing must sum the two contributions independently — an
+    /// `num_kv_heads * head_size * 2` shortcut is wrong by 64 elements per head
+    /// per token here, and a single scalar `decoder.head_size` cannot express it
+    /// at all (#1012).
+    #[test]
+    fn asymmetric_key_and_value_head_sizes_are_sized_independently() {
+        let tensors = [kv("past.0.key", 192), kv("past.0.value", 128)];
+        let bytes = kv_cache_bytes_for_tensors(&tensors, 1).expect("asymmetric KV sizes");
+        // 16 heads * (192 + 128) * 2 bytes = 10,240 per token.
+        assert_eq!(bytes, 16 * (192 + 128) * 2);
+
+        // And it must scale linearly with context, not quadratically or per-axis.
+        let at_seven = kv_cache_bytes_for_tensors(&tensors, 7).expect("asymmetric KV sizes");
+        assert_eq!(at_seven, bytes * 7);
+    }
+
+    /// The symmetric case must be unchanged by the above: it is the same sum
+    /// with equal terms, not a separate code path.
+    #[test]
+    fn symmetric_head_sizes_still_sum_to_twice_one_side() {
+        let tensors = [kv("past.0.key", 128), kv("past.0.value", 128)];
+        let bytes = kv_cache_bytes_for_tensors(&tensors, 1).expect("symmetric KV sizes");
+        assert_eq!(bytes, 16 * 128 * 2 * 2);
+    }
+
+    /// Two context axes on one tensor mean the runtime cannot tell which grows,
+    /// and a reservation would be a guess. It must refuse rather than pick one.
+    #[test]
+    fn ambiguous_context_axes_are_refused_not_guessed() {
+        let spec = KvTensorSpec {
+            name: "past.0.key".to_owned(),
+            dtype: KvStorageType::Float16,
+            shape: vec![KvDimension::Context, KvDimension::Context],
+        };
+        assert!(kv_cache_bytes_for_tensors(&[spec], 4).is_err());
+    }
+}
