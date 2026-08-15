@@ -672,17 +672,15 @@ mod bf16x {
     /// The running CPU must support `avx2`.
     #[target_feature(enable = "avx2")]
     unsafe fn round_to_bf16_lanes(v: __m256) -> __m256i {
-        unsafe {
-            let bits = _mm256_castps_si256(v);
-            let shifted = _mm256_srli_epi32::<16>(bits);
-            let lsb = _mm256_and_si256(shifted, _mm256_set1_epi32(1));
-            let bias = _mm256_add_epi32(_mm256_set1_epi32(0x7FFF), lsb);
-            let rounded = _mm256_srli_epi32::<16>(_mm256_add_epi32(bits, bias));
-            let quiet_nan = _mm256_or_si256(shifted, _mm256_set1_epi32(0x0040));
-            // `_CMP_UNORD_Q` is true exactly on NaN inputs.
-            let is_nan = _mm256_castps_si256(_mm256_cmp_ps::<_CMP_UNORD_Q>(v, v));
-            _mm256_blendv_epi8(rounded, quiet_nan, is_nan)
-        }
+        let bits = _mm256_castps_si256(v);
+        let shifted = _mm256_srli_epi32::<16>(bits);
+        let lsb = _mm256_and_si256(shifted, _mm256_set1_epi32(1));
+        let bias = _mm256_add_epi32(_mm256_set1_epi32(0x7FFF), lsb);
+        let rounded = _mm256_srli_epi32::<16>(_mm256_add_epi32(bits, bias));
+        let quiet_nan = _mm256_or_si256(shifted, _mm256_set1_epi32(0x0040));
+        // `_CMP_UNORD_Q` is true exactly on NaN inputs.
+        let is_nan = _mm256_castps_si256(_mm256_cmp_ps::<_CMP_UNORD_Q>(v, v));
+        _mm256_blendv_epi8(rounded, quiet_nan, is_nan)
     }
 
     /// Narrow `src.len()` contiguous `f32` values into `dst` as `bf16` bit
