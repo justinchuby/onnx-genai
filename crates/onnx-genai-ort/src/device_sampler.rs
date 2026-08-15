@@ -748,14 +748,12 @@ impl CudaSampler {
             .map_err(|e| OrtError::Cuda(format!("CudaContext::new({ordinal}): {e:?}")))?;
         let stream = ctx.default_stream();
 
-        // Build device code the *driver* can actually load. See
-        // `compile_for_device`: real-architecture SASS when NVRTC can emit it,
-        // otherwise PTX only when this NVRTC's ISA is one the driver can JIT.
+        // Build and load device code the *driver* can actually accept. See
+        // `load_kernels_for_device`: real-architecture SASS when this NVRTC can
+        // emit it and the driver's CUDA major will load it, otherwise PTX when
+        // this NVRTC's ISA is one the driver can JIT.
         let capability = compute_capability(&ctx)?;
-        let image = compile_for_device(ARGMAX_SRC, "argmax", capability)?;
-        let module = ctx
-            .load_module(image)
-            .map_err(|e| OrtError::Cuda(format!("load argmax module: {e:?}")))?;
+        let module = load_kernels_for_device(&ctx, ARGMAX_SRC, "argmax", capability)?;
         let f_f16 = module
             .load_function("argmax_f16")
             .map_err(|e| OrtError::Cuda(format!("load argmax_f16: {e:?}")))?;
@@ -779,10 +777,7 @@ impl CudaSampler {
             .map_err(|e| OrtError::Cuda(format!("load argmax_join: {e:?}")))?;
 
         // Second module: the non-greedy sampling pipeline.
-        let sample_image = compile_for_device(SAMPLE_SRC, "sample", capability)?;
-        let sample_module = ctx
-            .load_module(sample_image)
-            .map_err(|e| OrtError::Cuda(format!("load sample module: {e:?}")))?;
+        let sample_module = load_kernels_for_device(&ctx, SAMPLE_SRC, "sample", capability)?;
         let f_sample_f16 = sample_module
             .load_function("sample_f16")
             .map_err(|e| OrtError::Cuda(format!("load sample_f16: {e:?}")))?;
@@ -1345,7 +1340,13 @@ fn driver_toolkit_version() -> Result<(i32, i32)> {
             "cuDriverGetVersion failed: {status:?}"
         )));
     }
-    Ok((version / 1000, (version % 1000) / 10))
+    Ok(decode_driver_version(version))
+}
+
+/// Decode `cuDriverGetVersion`'s integer into the `(major, minor)` CUDA
+/// toolkit it supports. The driver reports `1000 * major + 10 * minor`.
+fn decode_driver_version(version: i32) -> (i32, i32) {
+    (version / 1000, (version % 1000) / 10)
 }
 
 /// The NVRTC actually loaded into this process, as `(major, minor)`.
@@ -1370,83 +1371,139 @@ enum DeviceCode {
     Ptx,
 }
 
-/// Compile one NVRTC source into device code this driver can load.
+/// Build the kernels in `source` for this device and load them.
 ///
-/// Preference order, and why:
+/// Compilation and loading are one operation because only loading can tell us
+/// that an image this machine happily produced is one its driver refuses. The
+/// candidates are tried in order and every rejection is remembered, so a machine
+/// that can run neither gets a single error naming the device, the NVRTC and the
+/// driver rather than a bare `CUDA_ERROR_*` from whichever step failed:
 ///
-/// 1. **SASS for the device's real architecture.** Nothing is JIT-compiled, so a
-///    newer NVRTC than the driver is harmless — which is the common shape of a
-///    machine with a system CUDA toolkit ahead of its driver.
-/// 2. **PTX for the matching virtual architecture**, but only after checking
-///    that this NVRTC is not newer than the driver's toolkit. Emitting PTX the
-///    driver cannot parse produces `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` at load,
-///    which reads as a mysterious runtime failure far from its cause.
+/// 1. **SASS for the device's real architecture**, when this NVRTC can emit it
+///    and its CUDA major is one the driver loads. Nothing is JIT compiled, so a
+///    newer NVRTC *minor* than the driver is harmless.
+/// 2. **PTX for the matching virtual architecture**, when this NVRTC is not
+///    newer than the driver's toolkit. Emitting PTX the driver cannot parse
+///    produces `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` at load.
 ///
-/// When neither is possible this returns an error naming the device, the NVRTC
-/// and the driver, because the fix is always to change one of those three. It
-/// never silently degrades to a host path: the caller asked for device sampling,
-/// and quietly not doing it would turn a configuration problem into a
+/// It never silently degrades to a host path: the caller asked for device
+/// sampling, and quietly not doing it would turn a configuration problem into a
 /// performance mystery.
-fn compile_for_device(
-    source: &str,
-    name: &str,
-    capability: (i32, i32),
-) -> Result<cudarc::nvrtc::Ptx> {
-    Ok(cudarc::nvrtc::Ptx::from_binary(compile_image_for_device(
-        source, name, capability,
-    )?))
-}
-
-/// As [`compile_for_device`], but returning the raw module image so callers that
-/// drive the driver API directly (the ORT custom op, which must launch on ORT's
-/// own stream) can `cuModuleLoadData` it themselves. PTX images are NUL
-/// terminated because `cuModuleLoadData` reads them as C strings.
-pub(crate) fn compile_image_for_device(
+fn load_kernels_for_device(
+    ctx: &std::sync::Arc<CudaContext>,
     source: &str,
     name: &str,
     (major, minor): (i32, i32),
-) -> Result<Vec<u8>> {
+) -> Result<std::sync::Arc<cudarc::driver::CudaModule>> {
     let nvrtc = nvrtc_version()?;
     let driver = driver_toolkit_version()?;
+    let mut rejected: Vec<String> = Vec::new();
 
-    let cubin_error = match compile_cubin(source, arch_flag(DeviceCode::Cubin, major, minor)) {
-        Ok(cubin) => {
-            tracing::debug!(
-                kernel = name,
-                arch = format!("sm_{major}{minor}"),
-                bytes = cubin.len(),
-                "compiled sampler kernels to real-architecture SASS"
-            );
-            return Ok(cubin);
+    if cubin_supported(nvrtc, driver) {
+        match compile_cubin(source, arch_flag(DeviceCode::Cubin, major, minor)) {
+            Ok(cubin) => {
+                let bytes = cubin.len();
+                match ctx.load_module(cudarc::nvrtc::Ptx::from_binary(cubin)) {
+                    Ok(module) => {
+                        tracing::debug!(
+                            kernel = name,
+                            arch = format!("sm_{major}{minor}"),
+                            bytes,
+                            "compiled sampler kernels to real-architecture SASS"
+                        );
+                        return Ok(module);
+                    }
+                    // Reachable if a compatibility rule this code does not model
+                    // makes the driver reject an image NVRTC accepted. PTX may
+                    // still work, so this is a rejection to record, not an exit.
+                    Err(error) => rejected.push(format!(
+                        "the driver refused the sm_{major}{minor} SASS this NVRTC produced ({error:?})"
+                    )),
+                }
+            }
+            Err(error) => {
+                rejected.push(format!(
+                    "NVRTC could not emit sm_{major}{minor} SASS ({error})"
+                ));
+            }
         }
-        Err(error) => error,
-    };
-
-    if !ptx_jit_supported(nvrtc, driver) {
-        return Err(OrtError::Cuda(format!(
-            "device sampler kernels cannot be built for this machine: NVRTC could not emit SASS              for sm_{major}{minor} ({cubin_error}), and its PTX cannot be used either because              NVRTC {}.{} is newer than the CUDA {}.{} this driver supports, so the driver would              reject the PTX at load. Point the process at an NVRTC no newer than CUDA {}.{} (for              example the nvidia-cuda-nvrtc package matching the driver), install a driver that              supports CUDA {}.{} or newer, or use a CUDA toolkit whose NVRTC emits SASS for              sm_{major}{minor}.",
-            nvrtc.0, nvrtc.1, driver.0, driver.1, driver.0, driver.1, nvrtc.0, nvrtc.1,
-        )));
+    } else if nvrtc < FIRST_NVRTC_WITH_CUBIN {
+        rejected.push(format!(
+            "NVRTC {}.{} predates nvrtcGetCUBIN (CUDA {}.{}) and cannot emit SASS",
+            nvrtc.0, nvrtc.1, FIRST_NVRTC_WITH_CUBIN.0, FIRST_NVRTC_WITH_CUBIN.1
+        ));
+    } else {
+        rejected.push(format!(
+            "NVRTC {}.{} is a newer CUDA major than the CUDA {}.{} this driver supports, so its SASS would be rejected at load",
+            nvrtc.0, nvrtc.1, driver.0, driver.1
+        ));
     }
 
-    let opts = cudarc::nvrtc::CompileOptions {
-        options: vec![arch_flag(DeviceCode::Ptx, major, minor)],
-        ..Default::default()
-    };
-    let ptx = cudarc::nvrtc::compile_ptx_with_opts(source, opts).map_err(|e| {
-        OrtError::Cuda(format!(
-            "NVRTC compile {name} for compute_{major}{minor} failed with NVRTC {}.{} (driver              supports CUDA {}.{}); SASS was unavailable first: {cubin_error}. Original error:              {e:?}",
-            nvrtc.0, nvrtc.1, driver.0, driver.1,
-        ))
-    })?;
-    tracing::debug!(
-        kernel = name,
-        arch = format!("compute_{major}{minor}"),
-        "compiled sampler kernels to PTX; the driver will JIT them"
-    );
-    let mut image = ptx.to_src().into_bytes();
-    image.push(0);
-    Ok(image)
+    if ptx_jit_supported(nvrtc, driver) {
+        let opts = cudarc::nvrtc::CompileOptions {
+            options: vec![arch_flag(DeviceCode::Ptx, major, minor)],
+            ..Default::default()
+        };
+        match cudarc::nvrtc::compile_ptx_with_opts(source, opts) {
+            Ok(ptx) => match ctx.load_module(ptx) {
+                Ok(module) => {
+                    tracing::debug!(
+                        kernel = name,
+                        arch = format!("compute_{major}{minor}"),
+                        "compiled sampler kernels to PTX; the driver JIT compiled them"
+                    );
+                    return Ok(module);
+                }
+                Err(error) => {
+                    rejected.push(format!(
+                        "the driver refused to JIT compile the PTX ({error:?})"
+                    ));
+                }
+            },
+            Err(error) => rejected.push(format!("NVRTC could not emit PTX ({error:?})")),
+        }
+    } else {
+        rejected.push(format!(
+            "PTX cannot be used either, because NVRTC {}.{} is newer than the CUDA {}.{} this driver supports",
+            nvrtc.0, nvrtc.1, driver.0, driver.1
+        ));
+    }
+
+    Err(OrtError::Cuda(format!(
+        "device sampler kernels cannot be built for this machine (kernel {name}, device sm_{major}{minor}, NVRTC {}.{}, driver supports CUDA {}.{}): {}. Point the process at an NVRTC no newer than CUDA {}.{} (for example the nvidia-cuda-nvrtc package matching the driver), install a driver that supports CUDA {}.{} or newer, or use a CUDA toolkit whose NVRTC emits SASS for sm_{major}{minor}.",
+        nvrtc.0,
+        nvrtc.1,
+        driver.0,
+        driver.1,
+        rejected.join("; "),
+        driver.0,
+        driver.1,
+        nvrtc.0,
+        nvrtc.1,
+    )))
+}
+
+/// The first NVRTC that exposes `nvrtcGetCUBIN` / `nvrtcGetCUBINSize`.
+///
+/// Older NVRTCs cannot emit SASS at all. This matters more than a missing
+/// feature usually would: the CUDA bindings resolve NVRTC entry points lazily
+/// by name, and a *missing* symbol aborts the process rather than returning an
+/// error, so calling the cubin entry points against an older NVRTC would turn a
+/// machine that PTX serves perfectly well into a crash.
+const FIRST_NVRTC_WITH_CUBIN: (i32, i32) = (11, 3);
+
+/// Whether asking this NVRTC for SASS can produce something this driver loads.
+///
+/// Two independent constraints, and both must hold before the cubin path is
+/// worth attempting:
+///
+/// 1. `nvrtcGetCUBIN` only exists from CUDA 11.3.
+/// 2. A driver loads cubins from its own CUDA major family or older. CUDA
+///    guarantees *minor* version compatibility, so a 12.8 cubin loads on a 12.0
+///    driver, but a 13.x cubin is rejected by every 12.x driver. Compiling one
+///    anyway would push the failure into `cuModuleLoadData`, far from its cause.
+fn cubin_supported(nvrtc: (i32, i32), driver: (i32, i32)) -> bool {
+    nvrtc >= FIRST_NVRTC_WITH_CUBIN && nvrtc.0 <= driver.0
 }
 
 /// Compile to real-architecture SASS, returning the cubin image.
@@ -1461,7 +1518,7 @@ fn compile_cubin(source: &str, arch: String) -> std::result::Result<Vec<u8>, Str
     let program = result::create_program(&src, None)
         .map_err(|e| format!("nvrtcCreateProgram failed: {e:?}"))?;
     // SAFETY: `program` was just created and is destroyed on every path below.
-    let compiled = unsafe { result::compile_program(program, &[arch.clone()]) };
+    let compiled = unsafe { result::compile_program(program, std::slice::from_ref(&arch)) };
     if let Err(error) = compiled {
         // SAFETY: `program` is live; the log is copied out before it is freed.
         let log = unsafe { result::get_program_log(program) }
@@ -1620,12 +1677,106 @@ mod device_code_selection {
     }
 
     #[test]
+    fn only_an_nvrtc_that_has_the_cubin_entry_points_is_asked_for_sass() {
+        // Asking an older NVRTC for SASS is not a graceful failure: the CUDA
+        // bindings resolve entry points by name and abort on a missing symbol,
+        // so the version gate is what keeps a PTX-capable machine working.
+        let same_major = |nvrtc: (i32, i32)| (nvrtc.0, 9);
+        assert!(!cubin_supported((10, 2), same_major((10, 2))));
+        assert!(!cubin_supported((11, 0), same_major((11, 0))));
+        assert!(!cubin_supported((11, 2), same_major((11, 2))));
+        assert!(cubin_supported(
+            FIRST_NVRTC_WITH_CUBIN,
+            same_major(FIRST_NVRTC_WITH_CUBIN)
+        ));
+        assert!(cubin_supported((11, 8), same_major((11, 8))));
+        assert!(cubin_supported((12, 0), same_major((12, 0))));
+        assert!(cubin_supported((13, 3), same_major((13, 3))));
+    }
+
+    #[test]
+    fn sass_is_not_produced_for_a_driver_of_an_older_cuda_major() {
+        // The reported case: a CUDA 13 NVRTC emits a cubin that no CUDA 12
+        // driver will load. Compiling it anyway moves the failure into
+        // cuModuleLoadData, far from its cause.
+        assert!(!cubin_supported((13, 3), (12, 8)));
+        assert!(!cubin_supported((13, 0), (12, 0)));
+        assert!(!cubin_supported((12, 0), (11, 8)));
+
+        // Minor version compatibility is the whole point of preferring SASS: a
+        // newer NVRTC minor within the driver's major is fine, in both
+        // directions.
+        assert!(cubin_supported((12, 8), (12, 0)));
+        assert!(cubin_supported((12, 0), (12, 8)));
+        assert!(cubin_supported((13, 3), (13, 0)));
+
+        // A driver from a newer major loads an older major's SASS.
+        assert!(cubin_supported((12, 8), (13, 0)));
+        assert!(cubin_supported((11, 3), (13, 3)));
+    }
+
+    #[test]
+    fn the_two_gates_together_always_leave_a_usable_path_or_a_diagnosis() {
+        // Across every neighbouring pair, at least one of SASS or PTX is
+        // offered unless the machine genuinely cannot run either, which is the
+        // case the error message exists for.
+        for nvrtc in [
+            (11, 0),
+            (11, 3),
+            (11, 8),
+            (12, 0),
+            (12, 8),
+            (13, 0),
+            (13, 3),
+        ] {
+            for driver in [
+                (11, 0),
+                (11, 3),
+                (11, 8),
+                (12, 0),
+                (12, 8),
+                (13, 0),
+                (13, 3),
+            ] {
+                let sass = cubin_supported(nvrtc, driver);
+                let ptx = ptx_jit_supported(nvrtc, driver);
+                if nvrtc <= driver {
+                    assert!(
+                        ptx,
+                        "PTX must be offered when NVRTC {nvrtc:?} <= driver {driver:?}"
+                    );
+                }
+                if nvrtc > driver && nvrtc.0 > driver.0 {
+                    assert!(
+                        !sass && !ptx,
+                        "a newer NVRTC major than the driver has no usable path: \
+                         NVRTC {nvrtc:?} driver {driver:?}"
+                    );
+                }
+                // A newer NVRTC minor within the driver's major is exactly the
+                // case SASS exists to serve, and PTX cannot.
+                if nvrtc.0 == driver.0 && nvrtc.1 > driver.1 {
+                    assert!(sass, "SASS must serve NVRTC {nvrtc:?} on driver {driver:?}");
+                    assert!(
+                        !ptx,
+                        "PTX must not be attempted for NVRTC {nvrtc:?} on {driver:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_driver_version_decodes_to_its_toolkit_pair() {
-        // cuDriverGetVersion reports 1000*major + 10*minor.
-        let decode = |version: i32| (version / 1000, (version % 1000) / 10);
-        assert_eq!(decode(13000), (13, 0));
-        assert_eq!(decode(13030), (13, 3));
-        assert_eq!(decode(12080), (12, 8));
+        // Exercise the decoder the driver path actually uses, so a change to
+        // the formula cannot pass this test.
+        assert_eq!(decode_driver_version(13_000), (13, 0));
+        assert_eq!(decode_driver_version(13_030), (13, 3));
+        assert_eq!(decode_driver_version(12_080), (12, 8));
+        assert_eq!(decode_driver_version(11_020), (11, 2));
+        // The gate and the decoder have to agree about what a driver supports.
+        assert!(ptx_jit_supported(decode_driver_version(13_030), (13, 3)));
+        assert!(!ptx_jit_supported((13, 3), decode_driver_version(13_000)));
     }
 }
 
@@ -2731,11 +2882,20 @@ mod split_argmax {
             "vocab={vocab} rows=1: parts={parts} launches=2 grid={parts}x1 block={BLOCK}              scratch={} B",
             parts * 8
         );
-        assert_eq!(parts.min(1), 1, "a decode-width row must split");
-        // Scratch is one (f32, i32) pair per part per row: small, and bounded by
-        // MAX_PARTS regardless of how wide the row is.
+        assert!(
+            parts > 1,
+            "a decode-width row must be split across blocks, got parts={parts}"
+        );
+        // Scratch is one (f32, i32) pair per part per row. State the ceiling as
+        // a concrete number of bytes rather than as `parts <= MAX_PARTS`, which
+        // `argmax_parts` guarantees by construction and so cannot fail.
         for rows in [1usize, 8, 64] {
-            assert!(rows * argmax_parts(vocab) * 8 <= rows * MAX_PARTS * 8);
+            let bytes = rows * parts * 8;
+            assert!(
+                bytes <= 128 * 1024,
+                "a decode-width reduction must not need more than 128 KiB of scratch for \
+                 {rows} rows, needs {bytes} B"
+            );
         }
         println!("sm_count={sm_count} max_threads_per_sm={max_threads_per_sm}");
 
