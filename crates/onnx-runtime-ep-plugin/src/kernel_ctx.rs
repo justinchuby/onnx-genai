@@ -131,6 +131,11 @@ pub(crate) struct OwnedOutput {
     pub dtype: DataType,
     pub shape: Vec<usize>,
     pub strides: Vec<i64>,
+    /// Memory info ORT placed this output on. For a boundary GPU node ORT
+    /// places the output on the device, so this is a *valid device*
+    /// `OrtMemoryInfo` the executor can reuse to allocate staging scratch for
+    /// host-resident inputs (#982). Null if it could not be read.
+    pub mem_info: *const ort::OrtMemoryInfo,
 }
 
 impl OwnedOutput {
@@ -299,12 +304,29 @@ pub(crate) unsafe fn allocate_output(
         ));
     }
 
+    // Best-effort read of the output's memory info. Used to source a valid
+    // device `OrtMemoryInfo` for staging scratch (#982); a null result simply
+    // means this output cannot be used as that source.
+    let mem_info = match api.GetTensorMemoryInfo {
+        Some(get_mem_info) => {
+            let mut mi: *const ort::OrtMemoryInfo = std::ptr::null();
+            let status = unsafe { get_mem_info(value, &mut mi) };
+            if status.is_null() {
+                mi
+            } else {
+                std::ptr::null()
+            }
+        }
+        None => std::ptr::null(),
+    };
+
     let strides = onnx_runtime_ir::compute_contiguous_strides(shape);
     Ok(OwnedOutput {
         data_ptr: data,
         dtype,
         shape: shape.to_vec(),
         strides,
+        mem_info,
     })
 }
 
@@ -335,6 +357,7 @@ mod tests {
             dtype: DataType::Float32,
             shape: vec![2, 3],
             strides: vec![3, 1],
+            mem_info: std::ptr::null(),
         };
         let view = output.view_mut();
         assert_eq!(view.shape, &[2, 3]);
