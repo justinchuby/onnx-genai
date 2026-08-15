@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use onnx_genai_ort_sys as ort;
 use onnx_runtime_ep_api::provider::ExecutionProvider;
-use onnx_runtime_ir::{DataType, ValueId};
+use onnx_runtime_ir::{DataType, NodeIndex, ValueId};
 
 /// How an [`ExportedEp`] holds its backing Rust [`ExecutionProvider`].
 ///
@@ -297,7 +297,18 @@ fn ep_get_capability_inner(
     };
     let view = onnx_runtime_ir::GraphView::new(ir_graph, &cache);
     let ort_view = onnx_runtime_ep_api::abi::OrtGraphView::new(&view);
-    let claims = exported.ep.with(|ep| ort_view.query_capabilities(ep));
+    // Claim-time routability gate (B2): our fused-subgraph compile path
+    // (`build_subgraph_routing`) can only thread a node input that is a graph
+    // input or a prior node's output. A node that consumes a weight
+    // *initializer* (a value with no producer that ORT did not surface as a
+    // graph input) is therefore un-routable. Declining such nodes *here* — at
+    // capability time, before convex partitioning — lets ORT partition around
+    // them and fall back to CPU for those nodes, instead of discovering the
+    // problem at Compile time when ORT has already committed the partition and
+    // can only surface a hard session-creation failure.
+    let claims = exported.ep.with(|ep| {
+        ort_view.query_capabilities_filtered(ep, |node| node_inputs_all_routable(&view, node))
+    });
 
     if claims.is_empty() {
         return ok_status();
@@ -726,6 +737,26 @@ fn ep_compile_inner(
     }
 
     ok_status()
+}
+
+/// Whether every present input of `node` can be routed by the fused-subgraph
+/// compile path (`build_subgraph_routing`).
+///
+/// That path threads a node input only when the value is a graph input or is
+/// produced by another node in the graph. A value with no producer that is not
+/// a graph input is a weight *initializer* (or other constant ORT keeps inside
+/// the subgraph); the routing table has no ORT input index or intermediate
+/// buffer for it and would decline the whole subgraph at Compile time. Gating
+/// such nodes out at capability time keeps them out of every convex claim so
+/// ORT partitions around them and the session still builds.
+///
+/// This intentionally mirrors `build_subgraph_routing`'s per-input decision so
+/// the claim-time predicate and the compile-time router agree by construction.
+fn node_inputs_all_routable(view: &onnx_runtime_ir::GraphView<'_>, node: NodeIndex) -> bool {
+    view.node_inputs(node)
+        .iter()
+        .flatten()
+        .all(|&input| view.producer(input).is_some() || view.value(input).is_graph_input)
 }
 
 /// Build a `SubgraphRouting` table for a multi-node fused subgraph.
@@ -1645,6 +1676,70 @@ mod tests {
         assert!(
             matches!(si, crate::compute::ShapeInference::Declined { .. }),
             "Conv with unknown spatial dims and no kernel_shape attr must Decline; got {si:?}"
+        );
+    }
+
+    /// B2 (claim-time routability gate): a node whose inputs are all either
+    /// graph inputs or produced by another node is routable by the fused
+    /// compile path and must be admitted.
+    #[test]
+    fn routable_when_inputs_are_graph_input_or_produced() {
+        use onnx_runtime_ir::{Graph, GraphView, GraphViewCache, Node, NodeId, Shape};
+        let mut g = Graph::new();
+        let x = g.create_named_value("x", DataType::Float32, Shape::default());
+        g.add_input(x);
+        // producer: p_out = Identity(x)
+        let p_out = g.create_named_value("p_out", DataType::Float32, Shape::default());
+        g.insert_node(Node::new(NodeId(0), "Identity", vec![Some(x)], vec![p_out]));
+        // consumer: y = Add(x, p_out) — both inputs routable
+        let y = g.create_named_value("y", DataType::Float32, Shape::default());
+        g.add_output(y);
+        g.insert_node(Node::new(
+            NodeId(0),
+            "Add",
+            vec![Some(x), Some(p_out)],
+            vec![y],
+        ));
+
+        let cache = GraphViewCache::build(&g).unwrap();
+        let view = GraphView::new(&g, &cache);
+        let add = view
+            .nodes()
+            .find(|&n| view.node(n).op_type == "Add")
+            .expect("Add node present");
+        assert!(
+            super::node_inputs_all_routable(&view, add),
+            "a node consuming only a graph input and a produced value is routable"
+        );
+    }
+
+    /// B2 (claim-time routability gate): a node consuming a weight initializer
+    /// (a value with no producer that is not a graph input) is NOT routable by
+    /// the fused compile path and must be declined at claim time so ORT
+    /// partitions around it — this is what keeps session creation from failing
+    /// at Compile time on real decoders.
+    #[test]
+    fn not_routable_when_input_is_initializer() {
+        use onnx_runtime_ir::{Graph, GraphView, GraphViewCache, Node, NodeId, Shape};
+        let mut g = Graph::new();
+        let x = g.create_named_value("x", DataType::Float32, Shape::default());
+        g.add_input(x);
+        // w is a weight: created, but neither a graph input nor produced by any
+        // node — exactly how the plugin's graph reader represents initializers.
+        let w = g.create_named_value("w", DataType::Float32, Shape::default());
+        let y = g.create_named_value("y", DataType::Float32, Shape::default());
+        g.add_output(y);
+        g.insert_node(Node::new(NodeId(0), "Add", vec![Some(x), Some(w)], vec![y]));
+
+        let cache = GraphViewCache::build(&g).unwrap();
+        let view = GraphView::new(&g, &cache);
+        let add = view
+            .nodes()
+            .find(|&n| view.node(n).op_type == "Add")
+            .expect("Add node present");
+        assert!(
+            !super::node_inputs_all_routable(&view, add),
+            "a node consuming a weight initializer must be declined at claim time"
         );
     }
 }
