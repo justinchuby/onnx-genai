@@ -11535,6 +11535,63 @@ mod tests {
         );
     }
 
+    /// Independent oracle for the dispatch fix, deliberately NOT derived from
+    /// `mlas_sqnbit_owns_fp32_compute`.
+    ///
+    /// [`Int4Acc0RouteProbe::assert_fast_route`] asks the production predicate
+    /// what should have happened, which catches "the code disagrees with its own
+    /// policy" but cannot catch "the policy itself regressed to never choosing
+    /// MLAS". This pins the concrete case the fix exists for: on an x86_64 host
+    /// with the vendored MLAS, a constant-weight symmetric int4
+    /// `accuracy_level = 0` node with the block size every real export uses
+    /// *must* end up on MLAS SQNBit. If someone reintroduces the branch order
+    /// that made that route dead code, this fails even if the predicate is
+    /// changed to agree with it.
+    #[cfg(all(feature = "mlas", target_arch = "x86_64"))]
+    #[test]
+    fn int4_acc0_constant_weight_reaches_mlas_on_x86_64() {
+        let (k, n, block_size) = (256, 32, 32);
+        let a_values: Vec<f32> = (0..k)
+            .map(|i| ((i * 11 % 41) as f32 - 20.0) / 13.0)
+            .collect();
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 23 % 47) as f32 - 19.0) / 12.0)
+            .collect();
+        let (packed, scales, _, _) = quantize(&weights, n, k, block_size, false);
+        let dequantized = dequantize_reference(&packed, &scales, None, n, k, block_size);
+        let mut kernel = test_kernel(k, n, block_size);
+        kernel.set_constant_inputs(&[false, true, true]);
+
+        let a = Owned::f32(&[1, k], &a_values);
+        let b = Owned::u8(&[n, 8, 16], &packed);
+        let scales_tensor = Owned::f32(&[n, 8], &scales);
+        let mut y = Owned::zeros_f32(&[1, n]);
+        kernel
+            .execute(
+                &[a.view(), b.view(), scales_tensor.view()],
+                &mut [y.view_mut()],
+            )
+            .unwrap();
+
+        assert_close(&y.to_f32(), &reference(&a_values, &dequantized, 1, k, n));
+        assert!(
+            kernel
+                .mlas_shards
+                .get()
+                .is_some_and(|shards| shards.is_some())
+                || kernel
+                    .mlas_packed
+                    .get()
+                    .is_some_and(|packed| packed.is_some()),
+            "int4 accuracy_level=0 with constant block-32 weights must reach MLAS SQNBit on x86_64; \
+             the borrowed path's block dot is aarch64-only, so pre-empting MLAS here means a scalar GEMV"
+        );
+        assert!(
+            kernel.weight_nk.get().is_none(),
+            "and it must still never expand the weight to f32 (#979)"
+        );
+    }
+
     /// The ownership predicate must be a pure function of the node's static
     /// shape/quantization plus `can_prepack`, so `execute`'s branch order and
     /// the route assertions in tests cannot disagree.
