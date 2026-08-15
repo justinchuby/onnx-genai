@@ -862,6 +862,7 @@ fn run_static_engine_driver(
                         max_queue_depth,
                         generation_capacity,
                     },
+                    resource_snapshot,
                     PendingGeneration {
                         request: *request,
                         admission,
@@ -891,6 +892,7 @@ fn run_static_batch_until_idle(
     deferred: &mut VecDeque<DriverCommand>,
     max_batch: usize,
     admission: MicrobatchAdmission<'_>,
+    resource_snapshot: &Mutex<Option<GovernorSnapshot>>,
     first: PendingGeneration,
 ) {
     let mut initial = vec![first];
@@ -1107,7 +1109,9 @@ fn run_static_batch_until_idle(
                 // for has been answered, and anything it hands back is parked
                 // until the batch drains.
                 command => {
-                    if let Some(deferred_command) = handle_or_defer_during_batch(engine, command) {
+                    if let Some(deferred_command) =
+                        handle_or_defer_during_batch(resource_snapshot, command)
+                    {
                         deferred.push_back(deferred_command);
                     }
                 }
@@ -1223,14 +1227,27 @@ fn deferred_permit_holder_count(deferred: &VecDeque<DriverCommand>) -> usize {
 /// Commands that *reconfigure* engine state are deferred until the batch drains by design.
 /// Only read-only observability is answered immediately here.
 pub(crate) fn handle_or_defer_during_batch(
-    _engine: &Engine,
+    resource_snapshot: &Mutex<Option<GovernorSnapshot>>,
     command: DriverCommand,
 ) -> Option<DriverCommand> {
     match command {
-        #[cfg(test)]
         DriverCommand::ResourceSnapshot(reply) => {
-            let _ = reply.send(Ok(_engine.resource_snapshot()));
-            None
+            // Served from the mirror, not from `&Engine`: during a batch the
+            // engine is mutably borrowed by the ContinuousBatchManager, and the
+            // point of answering here rather than deferring is that
+            // `/v1/resources` must not appear to hang until every in-flight
+            // generation completes. The mirror is the same value that endpoint
+            // serves elsewhere, refreshed by `refresh_resource_snapshot`.
+            let snapshot = resource_snapshot
+                .lock()
+                .ok()
+                .and_then(|guard| guard.clone());
+            if let Some(snapshot) = snapshot {
+                let _ = reply.send(Ok(snapshot));
+                return None;
+            }
+            // No mirror yet: defer rather than fabricate one.
+            Some(DriverCommand::ResourceSnapshot(reply))
         }
         other => Some(other),
     }

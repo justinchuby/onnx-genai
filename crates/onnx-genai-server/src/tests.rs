@@ -4038,9 +4038,13 @@ async fn resource_snapshots_are_answered_during_a_batch_not_deferred() {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter");
     let engine = Engine::from_dir(&model_dir, EngineConfig::default()).unwrap();
 
+    // The mirror is what the driver refreshes between steps; a batch in flight
+    // holds `&mut Engine`, so the answer has to come from here.
+    let mirror = std::sync::Mutex::new(Some(engine.resource_snapshot()));
+
     let (reply, rx) = tokio::sync::oneshot::channel();
     let deferred = crate::driver::handle_or_defer_during_batch(
-        &engine,
+        &mirror,
         crate::driver::DriverCommand::ResourceSnapshot(reply),
     );
 
@@ -4054,8 +4058,30 @@ async fn resource_snapshots_are_answered_during_a_batch_not_deferred() {
         .expect("the snapshot itself failed");
 }
 
-/// The complement: commands that *reconfigure* the engine must still be parked until the
-/// batch drains. This pins the helper's contract to "answer read-only observability",
+/// Before the driver has ever refreshed the mirror there is nothing truthful to
+/// report, so the snapshot must be deferred rather than answered with a
+/// fabricated or default value.
+#[tokio::test]
+async fn an_empty_snapshot_mirror_defers_rather_than_fabricating() {
+    let mirror: std::sync::Mutex<Option<onnx_genai_engine::GovernorSnapshot>> =
+        std::sync::Mutex::new(None);
+
+    let (reply, _rx) = tokio::sync::oneshot::channel();
+    let deferred = crate::driver::handle_or_defer_during_batch(
+        &mirror,
+        crate::driver::DriverCommand::ResourceSnapshot(reply),
+    );
+
+    assert!(
+        matches!(
+            deferred,
+            Some(crate::driver::DriverCommand::ResourceSnapshot(_))
+        ),
+        "an unpopulated mirror must defer, not invent a snapshot"
+    );
+}
+
+/// The complement: commands that *reconfigure* the engine must still be parked until the/// batch drains. This pins the helper's contract to "answer read-only observability",
 /// not "answer anything".
 #[tokio::test]
 async fn mutating_commands_are_still_deferred() {
@@ -4063,9 +4089,11 @@ async fn mutating_commands_are_still_deferred() {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm-scatter");
     let engine = Engine::from_dir(&model_dir, EngineConfig::default()).unwrap();
 
+    let mirror = std::sync::Mutex::new(Some(engine.resource_snapshot()));
+
     let (reply, _rx) = tokio::sync::oneshot::channel();
     let deferred = crate::driver::handle_or_defer_during_batch(
-        &engine,
+        &mirror,
         crate::driver::DriverCommand::SetVramLimit {
             limit: onnx_genai_engine::ResourceLimit::Auto,
             reply,
