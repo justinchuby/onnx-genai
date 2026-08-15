@@ -30,6 +30,62 @@ pub(super) fn is_planned_workspace_node(node: &onnx_runtime_ir::Node) -> bool {
             ))
 }
 
+/// The justification for an upper bound applied to an otherwise-unresolved
+/// dimension during prepare-only workspace planning. Both variants are a
+/// *provable* ceiling on the dim's real extent, so reserving against them is
+/// correct by construction for a *reservation* (which needs "enough", not
+/// "exact"); a value that cannot be exceeded can never under-reserve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AxisBound {
+    /// The symbol carries an explicit configured maximum (`max_seq_len`-style
+    /// declared ceiling on the axis); the real extent can never exceed it.
+    ConfiguredMax(usize),
+    /// A recognized context/sequence axis bounded by the physically-allocated
+    /// KV capacity established for this prepare call. Even a capacity-padded KV
+    /// tensor cannot exceed its own allocation, so this is a hard ceiling.
+    KvCapacity(usize),
+}
+
+impl AxisBound {
+    pub(super) fn extent(self) -> usize {
+        match self {
+            AxisBound::ConfiguredMax(n) | AxisBound::KvCapacity(n) => n,
+        }
+    }
+}
+
+/// Outcome of resolving one planned-workspace node input shape for prepare-only
+/// reservation. [`Self::Exact`] means every dim resolved by exact substitution
+/// (the ONLY outcome for graphs that already resolved before this change — so
+/// their reservations stay byte-identical). [`Self::Bounded`] means at least one
+/// context/sequence-axis dim was unresolved and reserved against a provable
+/// upper bound; the remaining outcome — unresolved *and* unbounded — is a hard
+/// error, never a silent guess.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum PlannedInputShape {
+    Exact(Vec<usize>),
+    Bounded {
+        dims: Vec<usize>,
+        /// `(axis, symbol, applied bound)` for each over-reserved dim.
+        applied: Vec<(usize, SymbolId, AxisBound)>,
+    },
+}
+
+impl PlannedInputShape {
+    #[cfg(test)]
+    pub(super) fn dims(&self) -> &[usize] {
+        match self {
+            PlannedInputShape::Exact(dims) | PlannedInputShape::Bounded { dims, .. } => dims,
+        }
+    }
+
+    pub(super) fn into_dims(self) -> Vec<usize> {
+        match self {
+            PlannedInputShape::Exact(dims) | PlannedInputShape::Bounded { dims, .. } => dims,
+        }
+    }
+}
+
 /// Merge a per-node workspace requirement into the running peak for its
 /// lifetime class, keeping the largest byte count and the strictest alignment.
 fn merge_workspace_peak(peak: &mut WorkspaceRequirement, requirement: WorkspaceRequirement) {
@@ -80,6 +136,115 @@ impl Executor {
         locations
     }
 
+    /// Derive a *provable* upper bound for an unresolved symbolic axis, or
+    /// `None` when no justifiable ceiling exists (in which case the caller must
+    /// fail rather than guess). A reservation needs "enough", not "exact": any
+    /// value the real extent cannot exceed is correct by construction here.
+    ///
+    /// Two — and only two — ceilings are justifiable:
+    /// 1. A recognized context/sequence axis
+    ///    ([`Self::capture_growing_symbols`]) is bounded by the physically
+    ///    allocated KV capacity established for this prepare call (the max
+    ///    concrete extent bound to any growing symbol). This is the true ceiling
+    ///    even when the KV tensor is capacity-padded beyond the model's declared
+    ///    `max_seq_len`, so it is preferred; if the model *also* declares a
+    ///    larger maximum, the larger of the two is taken to never under-reserve.
+    /// 2. Any axis carrying its own configured maximum
+    ///    ([`SymbolConstraints::max`], the `max_seq_len`-style declared ceiling)
+    ///    is bounded by that maximum.
+    ///
+    /// Anything else — an unbound symbol that is neither a known sequence axis
+    /// nor carries a declared maximum — returns `None`: its extent is genuinely
+    /// unknown, and reserving against a guess would silently under-reserve
+    /// (memory corruption surfacing far from here), which is exactly the class
+    /// of bug this planner must refuse to introduce.
+    fn planned_axis_upper_bound(
+        &self,
+        symbol: SymbolId,
+        symbols: &HashMap<SymbolId, usize>,
+    ) -> Option<AxisBound> {
+        let declared_max = self
+            .graph
+            .symbol_constraints
+            .get(&symbol)
+            .and_then(|c| c.max);
+        if self.capture_growing_symbols.contains(&symbol)
+            && let Some(capacity) = self
+                .capture_growing_symbols
+                .iter()
+                .filter_map(|growing| symbols.get(growing).copied())
+                .max()
+        {
+            return Some(AxisBound::KvCapacity(
+                capacity.max(declared_max.unwrap_or(0)),
+            ));
+        }
+        declared_max.map(AxisBound::ConfiguredMax)
+    }
+
+    /// Resolve a planned-workspace node input shape for prepare-only reservation.
+    /// Prefers exact substitution; where a dim is unresolved *because it is a
+    /// context/sequence axis* (or otherwise carries a configured maximum), binds
+    /// it to a provable upper bound and reports the over-reservation. A dim
+    /// unresolved for any *other* reason is a hard error — there the extent is
+    /// genuinely unknown and a guess would under-reserve.
+    pub(super) fn resolve_planned_workspace_input_shape(
+        &self,
+        value: ValueId,
+        symbols: &HashMap<SymbolId, usize>,
+        node_id: NodeId,
+        node: &Node,
+        index: usize,
+    ) -> Result<PlannedInputShape> {
+        let shape = self.value_shapes.get(&value).ok_or_else(|| {
+            SessionError::Internal(format!(
+                "prepare-only workspace planning has no loader shape for input {index} of \
+                 node {} ('{}::{}')",
+                node_id.0, node.domain, node.op_type
+            ))
+        })?;
+        let mut dims = Vec::with_capacity(shape.len());
+        let mut applied = Vec::new();
+        for (axis, dim) in shape.iter().enumerate() {
+            match dim {
+                Dim::Static(n) => dims.push(*n),
+                Dim::Symbolic(symbol) => {
+                    if let Some(&bound) = symbols.get(symbol) {
+                        dims.push(bound);
+                    } else if let Some(axis_bound) = self.planned_axis_upper_bound(*symbol, symbols)
+                    {
+                        dims.push(axis_bound.extent());
+                        applied.push((axis, *symbol, axis_bound));
+                    } else {
+                        let value_name = self
+                            .graph
+                            .value(value)
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| format!("value#{}", value.0));
+                        let symbol_name = self
+                            .symbol_name(*symbol)
+                            .unwrap_or_else(|| format!("symbol#{}", symbol.0));
+                        return Err(SessionError::Internal(format!(
+                            "prepare-only workspace planning cannot resolve input {index} \
+                             '{value_name}' for node {} ('{}::{}'): axis {axis} is symbolic \
+                             ('{symbol_name}') and unresolved, and is neither a context/sequence \
+                             axis bounded by max_seq_len/KV capacity nor an axis with a configured \
+                             maximum — its extent is genuinely unknown, so reserving against a \
+                             guess would under-reserve",
+                            node_id.0, node.domain, node.op_type
+                        )));
+                    }
+                }
+            }
+        }
+        if applied.is_empty() {
+            Ok(PlannedInputShape::Exact(dims))
+        } else {
+            Ok(PlannedInputShape::Bounded { dims, applied })
+        }
+    }
+
     /// Resolve concrete metadata and reserve kernel workspace without executing
     /// any graph node.
     pub(crate) fn prepare_with_device_bindings(
@@ -90,7 +255,6 @@ impl Executor {
         self.workspace_preparation_required = true;
         let external = self.prepare_external_bindings(bindings)?;
         let symbols = self.bind_symbols(inputs, &external)?;
-        let resolved = self.resolve_soft(&symbols);
         // Track one peak per lifetime class: session-persistent and step-scoped
         // scratch live in separate executor slots, so a single peak cannot stand
         // in for both when a graph mixes governed ops (e.g. QMoE + Attention).
@@ -103,28 +267,32 @@ impl Executor {
             if !is_planned_workspace_node(node) {
                 continue;
             }
-            let input_shapes = self.plan[pi]
+            let planned_shapes = self.plan[pi]
                 .inputs
                 .iter()
                 .enumerate()
                 .map(|(index, input)| match input {
-                    None => Ok(Vec::new()),
-                    Some(value) => resolved.get(value).cloned().ok_or_else(|| {
-                        let value_name = self
-                            .graph
-                            .value(*value)
-                            .name
-                            .clone()
-                            .unwrap_or_else(|| format!("value#{}", value.0));
-                        SessionError::Internal(format!(
-                            "prepare-only workspace planning cannot resolve input {index} \
-                             '{value_name}' for node {} ('{}::{}'); its shape is runtime-dependent \
-                             and no exact graph-metadata bound is available",
-                            node_id.0, node.domain, node.op_type
-                        ))
-                    }),
+                    None => Ok(PlannedInputShape::Exact(Vec::new())),
+                    Some(value) => self.resolve_planned_workspace_input_shape(
+                        *value, &symbols, node_id, node, index,
+                    ),
                 })
                 .collect::<Result<Vec<_>>>()?;
+            if std::env::var("ONNX_GENAI_LOG_WORKSPACE_BOUND").is_ok() {
+                for (index, planned) in planned_shapes.iter().enumerate() {
+                    if let PlannedInputShape::Bounded { dims, applied } = planned {
+                        eprintln!(
+                            "[onnx-genai-workspace] node {} ('{}::{}') input {index} \
+                             over-reserved against bounded axis: dims={dims:?} bounds={applied:?}",
+                            node_id.0, node.domain, node.op_type
+                        );
+                    }
+                }
+            }
+            let input_shapes = planned_shapes
+                .into_iter()
+                .map(PlannedInputShape::into_dims)
+                .collect::<Vec<_>>();
             let constant_inputs = self.plan[pi]
                 .inputs
                 .iter()

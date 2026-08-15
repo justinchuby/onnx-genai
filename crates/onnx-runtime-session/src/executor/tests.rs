@@ -6024,3 +6024,179 @@ fn executor_pin_fixed_capacity_kv_admits_gqa() {
         "after the pin the GQA node must be admitted to capture"
     );
 }
+
+// === #1020: prepare-only workspace planning bounds the MLA context/sequence
+// axis instead of failing on it, while a genuinely unbounded axis still errors.
+// The DeepSeek-V2 MLA fixture is not on this machine, so these exercise the
+// resolution logic directly on synthetic graphs whose `::Attention` input has a
+// runtime-dependent context axis (the reported `v_model.Unsqueeze_16` shape).
+
+fn minimal_workspace_executor() -> Executor {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let a = graph.create_named_value("a", DataType::Float32, static_shape([1]));
+    graph.add_input(a);
+    let out = graph.create_named_value("out", DataType::Float32, static_shape([1]));
+    graph.add_output(out);
+    graph.insert_node(Node::new(NodeId(0), "Identity", vec![Some(a)], vec![out]));
+    Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        auto_detect_cpu_ep().unwrap(),
+    )
+    .unwrap()
+}
+
+// An unresolved dim that IS a recognized context/sequence axis resolves to the
+// physically-allocated KV capacity (the extent bound to another growing symbol
+// this prepare call) — the #1020 fix. Mirrors `v_model.Unsqueeze_16`: an MLA
+// value-path sequence symbol shape inference never unified with the KV axis.
+#[test]
+fn prepare_workspace_binds_unresolved_context_axis_to_kv_capacity() {
+    let mut exec = minimal_workspace_executor();
+    let kv_seq = exec.graph.create_symbol(Some("total_seq".into()));
+    let v_seq = exec.graph.create_symbol(Some("v_seq".into()));
+    exec.capture_growing_symbols.insert(kv_seq);
+    exec.capture_growing_symbols.insert(v_seq);
+    let v = exec.graph.create_named_value(
+        "v_model.Unsqueeze_16",
+        DataType::Float32,
+        vec![
+            Dim::Static(1),
+            Dim::Static(16),
+            Dim::Symbolic(v_seq),
+            Dim::Static(128),
+        ],
+    );
+    exec.value_shapes
+        .insert(v, exec.graph.value(v).shape.clone());
+    // Only the KV axis is bound (to physical capacity 2048); `v_seq` is unbound.
+    let mut symbols = HashMap::new();
+    symbols.insert(kv_seq, 2048usize);
+    let node = Node::new(NodeId(40), "Attention", vec![Some(v)], vec![]);
+    let resolved = exec
+        .resolve_planned_workspace_input_shape(v, &symbols, NodeId(40), &node, 3)
+        .expect("a context/sequence axis must resolve to its bounded extent");
+    match resolved {
+        PlannedInputShape::Bounded { dims, applied } => {
+            assert_eq!(dims, vec![1, 16, 2048, 128]);
+            assert_eq!(applied, vec![(2, v_seq, AxisBound::KvCapacity(2048))]);
+        }
+        other => panic!("expected a bounded over-reservation, got {other:?}"),
+    }
+}
+
+// A context/sequence axis whose model-declared maximum EXCEEDS the currently
+// bound KV capacity is reserved against the LARGER of the two, so a bounded
+// reservation can never under-reserve (the corruption class #945/#947 warns of).
+#[test]
+fn prepare_workspace_context_axis_never_under_reserves_below_declared_max() {
+    let mut exec = minimal_workspace_executor();
+    let kv_seq = exec.graph.create_symbol(Some("total_seq".into()));
+    let v_seq = exec.graph.create_symbol(Some("v_seq".into()));
+    exec.graph.symbol_constraints.get_mut(&v_seq).unwrap().max = Some(8192);
+    exec.capture_growing_symbols.insert(kv_seq);
+    exec.capture_growing_symbols.insert(v_seq);
+    let v = exec.graph.create_named_value(
+        "v",
+        DataType::Float32,
+        vec![Dim::Static(1), Dim::Symbolic(v_seq), Dim::Static(16)],
+    );
+    exec.value_shapes
+        .insert(v, exec.graph.value(v).shape.clone());
+    let mut symbols = HashMap::new();
+    symbols.insert(kv_seq, 2048usize);
+    let node = Node::new(NodeId(1), "Attention", vec![Some(v)], vec![]);
+    let resolved = exec
+        .resolve_planned_workspace_input_shape(v, &symbols, NodeId(1), &node, 0)
+        .unwrap();
+    match resolved {
+        PlannedInputShape::Bounded { dims, applied } => {
+            assert_eq!(dims, vec![1, 8192, 16]);
+            assert_eq!(applied, vec![(1, v_seq, AxisBound::KvCapacity(8192))]);
+        }
+        other => panic!("expected a bounded over-reservation, got {other:?}"),
+    }
+}
+
+// An unresolved dim that carries its own configured maximum (a declared
+// `max_seq_len`-style ceiling) but is not a growing symbol is reserved against
+// that maximum.
+#[test]
+fn prepare_workspace_binds_unresolved_axis_to_configured_max() {
+    let mut exec = minimal_workspace_executor();
+    let seq = exec.graph.create_symbol(Some("seq_len".into()));
+    exec.graph.symbol_constraints.get_mut(&seq).unwrap().max = Some(4096);
+    let v = exec.graph.create_named_value(
+        "bounded_value",
+        DataType::Float32,
+        vec![Dim::Static(2), Dim::Symbolic(seq), Dim::Static(64)],
+    );
+    exec.value_shapes
+        .insert(v, exec.graph.value(v).shape.clone());
+    let symbols = HashMap::new();
+    let node = Node::new(NodeId(9), "Attention", vec![Some(v)], vec![]);
+    let resolved = exec
+        .resolve_planned_workspace_input_shape(v, &symbols, NodeId(9), &node, 1)
+        .unwrap();
+    match resolved {
+        PlannedInputShape::Bounded { dims, applied } => {
+            assert_eq!(dims, vec![2, 4096, 64]);
+            assert_eq!(applied, vec![(1, seq, AxisBound::ConfiguredMax(4096))]);
+        }
+        other => panic!("expected a bounded over-reservation, got {other:?}"),
+    }
+}
+
+// A dim that is unresolved for any OTHER reason — neither a known
+// context/sequence axis nor an axis with a configured maximum — must keep
+// failing. Reserving against a guess there would silently under-reserve.
+#[test]
+fn prepare_workspace_fails_on_unresolved_unbounded_axis() {
+    let mut exec = minimal_workspace_executor();
+    let mystery = exec.graph.create_symbol(Some("data_dependent".into()));
+    let v = exec.graph.create_named_value(
+        "mystery_value",
+        DataType::Float32,
+        vec![Dim::Static(4), Dim::Symbolic(mystery)],
+    );
+    exec.value_shapes
+        .insert(v, exec.graph.value(v).shape.clone());
+    let symbols = HashMap::new();
+    let node = Node::new(NodeId(7), "Attention", vec![Some(v)], vec![]);
+    let err = exec
+        .resolve_planned_workspace_input_shape(v, &symbols, NodeId(7), &node, 0)
+        .expect_err("a genuinely unbounded unresolved dim must still error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("genuinely unknown"),
+        "the error must name the unbounded-guess hazard, got: {msg}"
+    );
+    assert!(
+        msg.contains("data_dependent"),
+        "the error must name the unresolved symbol, got: {msg}"
+    );
+}
+
+// Regression guard: a fully-resolvable input still resolves EXACTLY (never via a
+// bound), so graphs that already resolved keep byte-identical reservations.
+#[test]
+fn prepare_workspace_exact_resolution_is_unchanged() {
+    let mut exec = minimal_workspace_executor();
+    let seq = exec.graph.create_symbol(Some("seq".into()));
+    let v = exec.graph.create_named_value(
+        "exact_value",
+        DataType::Float32,
+        vec![Dim::Static(1), Dim::Symbolic(seq), Dim::Static(8)],
+    );
+    exec.value_shapes
+        .insert(v, exec.graph.value(v).shape.clone());
+    let mut symbols = HashMap::new();
+    symbols.insert(seq, 12usize);
+    let node = Node::new(NodeId(3), "Attention", vec![Some(v)], vec![]);
+    let resolved = exec
+        .resolve_planned_workspace_input_shape(v, &symbols, NodeId(3), &node, 0)
+        .unwrap();
+    assert_eq!(resolved, PlannedInputShape::Exact(vec![1, 12, 8]));
+    assert_eq!(resolved.dims(), &[1, 12, 8]);
+}
