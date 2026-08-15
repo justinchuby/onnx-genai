@@ -92,15 +92,10 @@ pub struct WorkflowSpec {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AdapterServiceContract {
-    /// Fingerprint of the immutable base parameters accepted by every declared adapter.
+    /// `onnx-genai-targeted-base-v1:sha256:<lowercase hex>` compatibility fingerprint.
     pub base_model_fingerprint: String,
-    /// Request input containing semantic row/slot identities used to resolve selections.
-    pub row_ids: String,
-    /// Int64[batch] request generation for each semantic slot; changes on slot reuse.
-    pub request_epochs: String,
-    /// Optional bool[batch] input; inactive rows never load or apply adapters.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active: Option<String>,
+    /// Request-scoped adapter-set inputs. These are immutable SSA inputs for one request.
+    pub selection: AdapterSelectionContract,
     /// Generic application capability required from the runtime or execution provider.
     pub application_capability: String,
     #[serde(default)]
@@ -113,9 +108,31 @@ pub struct AdapterServiceContract {
     pub planning: AdapterPlanningContract,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AdapterSelectionContract {
+    /// Int64[batch] semantic row/slot identities.
+    pub row_ids: String,
+    /// Int64[batch] request generation; changes whenever a slot is reused.
+    pub request_epochs: String,
+    /// Int64[batch,max_adapters] artifact indices in composition order.
+    pub adapter_ids: String,
+    /// Int64[batch] number of valid adapter IDs in each row.
+    pub adapter_counts: String,
+    /// Float32[batch,max_adapters] effective request scales.
+    pub scales: String,
+    /// Optional bool[batch]; inactive rows never load or apply adapters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<String>,
+    /// Fixed second dimension of adapter_ids and scales.
+    pub max_adapters: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AdapterArtifact {
+    /// Stable non-negative wire ID used by selection.adapter_ids.
+    pub index: usize,
     pub identity: String,
     pub version: String,
     pub base_model_fingerprint: String,
@@ -141,7 +158,9 @@ pub struct AdapterWeightArtifact {
     pub format: AdapterWeightFormat,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum AdapterWeightFormat {
     /// Portable JSON tensor bundle used by the reference fallback.
@@ -162,8 +181,18 @@ pub struct AdapterTargetBinding {
     pub parameter: String,
     /// Key used to find this target's A/B tensors in the adapter bundle.
     pub weight_key: String,
+    /// Exact overridable initializer names for ORT `.onnx_adapter` application.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_parameters: Option<AdapterNativeParameterBinding>,
     pub input_features: usize,
     pub output_features: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AdapterNativeParameterBinding {
+    pub a: String,
+    pub b: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
@@ -271,6 +300,10 @@ pub enum RuntimeInputRole {
     SessionId,
     RowIds,
     RequestEpochs,
+    AdapterIds,
+    AdapterCounts,
+    AdapterScales,
+    AdapterActive,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]

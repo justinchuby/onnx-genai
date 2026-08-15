@@ -36,6 +36,13 @@ tokens. Session state is lease-protected. Serving contracts declare generic admi
 compaction, row activity, accepted length, and KV slot values without model-family
 logic.
 
+`workflow.adapters` declares the generic `onnx-genai.adapters@1` artifact catalog and
+request SSA selection tensors. It uses architecture-independent component/initializer
+targets, exact SHA-256 artifact verification, a canonical targeted-base fingerprint,
+and `(row_id, request_epoch)` identity through batching and compaction. The normative
+ABI is specified in
+[WORKFLOW_POLICY_COMPONENTS.md](WORKFLOW_POLICY_COMPONENTS.md#parameter-adapters-lora).
+
 ## Manifest and validation
 
 The required manifest pins IR, ONNX opset, adapter ABI, and capability

@@ -11,7 +11,6 @@ use std::path::Path;
 pub struct AdapterActivation {
     pub adapter: String,
     pub scale: f32,
-    pub scale_input: Option<String>,
 }
 
 impl AdapterActivation {
@@ -19,13 +18,7 @@ impl AdapterActivation {
         Self {
             adapter: adapter.into(),
             scale,
-            scale_input: None,
         }
-    }
-
-    pub fn with_scale_input(mut self, input: impl Into<String>) -> Self {
-        self.scale_input = Some(input.into());
-        self
     }
 }
 
@@ -57,6 +50,110 @@ impl AdapterSelection {
         );
         self
     }
+}
+
+pub(super) fn selection_from_inputs(
+    service: &AdapterServiceContract,
+    values: &HashMap<String, Value>,
+    row_ids: &[i64],
+    request_epochs: &[i64],
+) -> anyhow::Result<AdapterSelection> {
+    let selection = &service.selection;
+    let max_adapters = selection.max_adapters;
+    anyhow::ensure!(
+        request_epochs.len() == row_ids.len(),
+        "adapter request_epochs has {} rows but row_ids has {}",
+        request_epochs.len(),
+        row_ids.len()
+    );
+    let adapter_ids = values
+        .get(&selection.adapter_ids)
+        .with_context(|| format!("adapter IDs input '{}' is absent", selection.adapter_ids))?
+        .to_vec_i64()
+        .with_context(|| {
+            format!(
+                "adapter IDs input '{}' must be int64",
+                selection.adapter_ids
+            )
+        })?;
+    let adapter_counts = values
+        .get(&selection.adapter_counts)
+        .with_context(|| {
+            format!(
+                "adapter counts input '{}' is absent",
+                selection.adapter_counts
+            )
+        })?
+        .to_vec_i64()
+        .with_context(|| {
+            format!(
+                "adapter counts input '{}' must be int64",
+                selection.adapter_counts
+            )
+        })?;
+    let scales = values
+        .get(&selection.scales)
+        .with_context(|| format!("adapter scales input '{}' is absent", selection.scales))?
+        .to_vec_f32()
+        .with_context(|| {
+            format!(
+                "adapter scales input '{}' must be float32",
+                selection.scales
+            )
+        })?;
+    let expected_slots = row_ids
+        .len()
+        .checked_mul(max_adapters)
+        .context("adapter selection shape overflows usize")?;
+    anyhow::ensure!(
+        adapter_ids.len() == expected_slots && scales.len() == expected_slots,
+        "adapter IDs and scales must each contain batch * max_adapters = {expected_slots} values"
+    );
+    anyhow::ensure!(
+        adapter_counts.len() == row_ids.len(),
+        "adapter counts has {} rows but row_ids has {}",
+        adapter_counts.len(),
+        row_ids.len()
+    );
+    let aliases = service
+        .artifacts
+        .iter()
+        .map(|(alias, artifact)| (artifact.index as i64, alias.as_str()))
+        .collect::<HashMap<_, _>>();
+    let mut rows = BTreeMap::new();
+    for physical_row in 0..row_ids.len() {
+        let count = usize::try_from(adapter_counts[physical_row]).with_context(|| {
+            format!("adapter count for row {physical_row} must be non-negative")
+        })?;
+        anyhow::ensure!(
+            count <= max_adapters,
+            "adapter count {count} for row {physical_row} exceeds max_adapters {max_adapters}"
+        );
+        let mut activations = Vec::with_capacity(count);
+        for slot in 0..max_adapters {
+            let offset = physical_row * max_adapters + slot;
+            if slot < count {
+                let id = adapter_ids[offset];
+                let alias = aliases.get(&id).with_context(|| {
+                    format!("adapter ID {id} for row {physical_row} slot {slot} is undeclared")
+                })?;
+                activations.push(AdapterActivation::new(*alias, scales[offset]));
+            } else {
+                anyhow::ensure!(
+                    adapter_ids[offset] == -1 && scales[offset] == 0.0,
+                    "unused adapter slot {slot} for row {physical_row} must be padded with ID -1 and scale 0"
+                );
+            }
+        }
+        rows.insert(
+            AdapterRowIdentity {
+                row_id: row_ids[physical_row],
+                request_epoch: request_epochs[physical_row],
+            },
+            activations,
+        );
+    }
+    Ok(AdapterSelection { rows })
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -114,6 +211,34 @@ pub(super) struct AdapterRunContext {
     pub rows: Vec<(AdapterRowIdentity, Vec<(String, f32)>)>,
 }
 
+impl AdapterRunContext {
+    pub fn reordered(&self, row_ids: &[i64], request_epochs: &[i64]) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            row_ids.len() == request_epochs.len(),
+            "adapter row_ids and request_epochs must have equal length"
+        );
+        let by_identity = self.rows.iter().cloned().collect::<HashMap<_, _>>();
+        let rows = row_ids
+            .iter()
+            .copied()
+            .zip(request_epochs.iter().copied())
+            .map(|(row_id, request_epoch)| {
+                let identity = AdapterRowIdentity {
+                    row_id,
+                    request_epoch,
+                };
+                let activations = by_identity.get(&identity).cloned().with_context(|| {
+                    format!(
+                        "adapter selection has no immutable entry for row {row_id} epoch {request_epoch}"
+                    )
+                })?;
+                Ok((identity, activations))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(Self { rows })
+    }
+}
+
 impl AdapterCache {
     pub fn diagnostic(&self) -> AdapterLifecycleDiagnostic {
         let mut diagnostic = self.diagnostic.clone();
@@ -129,7 +254,6 @@ impl AdapterCache {
         row_ids: &[i64],
         request_epochs: &[i64],
         active_rows: &[bool],
-        request_inputs: &HashMap<String, Value>,
     ) -> anyhow::Result<AdapterRunContext> {
         if request_epochs.len() != row_ids.len() {
             anyhow::bail!(
@@ -226,23 +350,7 @@ impl AdapterCache {
                         )
                     })?;
                 self.ensure_loaded(root, service, &activation.adapter, artifact)?;
-                let dynamic = if let Some(input) = &activation.scale_input {
-                    let scales = request_inputs
-                        .get(input)
-                        .with_context(|| {
-                            format!("adapter dynamic scale input '{input}' is absent")
-                        })?
-                        .to_vec_f32()
-                        .with_context(|| {
-                            format!("adapter dynamic scale input '{input}' must be host float32")
-                        })?;
-                    *scales.get(physical_row).with_context(|| {
-                        format!("adapter dynamic scale input '{input}' has no row {physical_row}")
-                    })?
-                } else {
-                    1.0
-                };
-                let scale = activation.scale * dynamic;
+                let scale = activation.scale;
                 if !scale.is_finite() || !(-16.0..=16.0).contains(&scale) {
                     anyhow::bail!(
                         "adapter '{}' effective scale {scale} for row {row_id} must be finite and within [-16, 16]",
@@ -253,15 +361,14 @@ impl AdapterCache {
                 row_key.push(format!("{}:{scale:.8}", activation.adapter));
                 resolved.push((activation.adapter, scale));
             }
-            plan_parts.push(format!(
-                "{}@{}=[{}]",
-                identity.row_id,
-                identity.request_epoch,
-                row_key.join(",")
-            ));
+            plan_parts.push(format!("[{}]", row_key.join(",")));
             rows.push((identity, resolved));
         }
-        let plan_key = plan_parts.join(";");
+        let plan_key = format!(
+            "{}|{}",
+            service.application_capability,
+            plan_parts.join(";")
+        );
         if !self.plans.insert(plan_key.clone()) {
             self.diagnostic.replayed_plans += 1;
         }
@@ -399,48 +506,55 @@ fn load_adapter(
     artifact: &AdapterArtifact,
     application_capability: &str,
 ) -> anyhow::Result<LoadedAdapter> {
-    let mut bundles = HashMap::new();
-    for weight in &artifact.weights {
-        if weight.format != AdapterWeightFormat::Json {
-            anyhow::bail!(
-                "portable adapter fallback cannot load {:?}; use an execution provider with '{}' support",
-                weight.format,
-                application_capability
-            );
-        }
-        let package_root = root
-            .canonicalize()
-            .with_context(|| format!("failed to resolve package root '{}'", root.display()))?;
-        let path = root
-            .join(&weight.location)
-            .canonicalize()
-            .with_context(|| {
-                format!(
-                    "failed to resolve adapter artifact '{}'",
-                    root.join(&weight.location).display()
-                )
-            })?;
-        if !path.starts_with(&package_root) {
-            anyhow::bail!(
-                "adapter artifact '{}' resolves outside package root '{}'",
-                path.display(),
-                package_root.display()
-            );
-        }
-        let bytes = fs::read(&path)
-            .with_context(|| format!("failed to load adapter artifact '{}'", path.display()))?;
-        let actual = format!("{:x}", Sha256::digest(&bytes));
-        if actual != weight.sha256 {
-            anyhow::bail!(
-                "adapter artifact '{}' checksum mismatch: expected {}, got {actual}",
-                path.display(),
-                weight.sha256
-            );
-        }
-        let bundle: JsonBundle = serde_json::from_slice(&bytes)
-            .with_context(|| format!("adapter artifact '{}' is invalid JSON", path.display()))?;
-        bundles.extend(bundle.targets);
+    anyhow::ensure!(
+        matches!(artifact.dtype.as_str(), "float32" | "fp32"),
+        "portable JSON adapter fallback requires float32, but {}@{} declares {}",
+        artifact.identity,
+        artifact.version,
+        artifact.dtype
+    );
+    let weight = artifact
+        .weights
+        .iter()
+        .find(|weight| weight.format == AdapterWeightFormat::Json)
+        .with_context(|| {
+            format!(
+                "portable adapter fallback has no JSON artifact for {}@{}; use an execution provider with '{}' support",
+                artifact.identity, artifact.version, application_capability
+            )
+        })?;
+    let package_root = root
+        .canonicalize()
+        .with_context(|| format!("failed to resolve package root '{}'", root.display()))?;
+    let path = root
+        .join(&weight.location)
+        .canonicalize()
+        .with_context(|| {
+            format!(
+                "failed to resolve adapter artifact '{}'",
+                root.join(&weight.location).display()
+            )
+        })?;
+    if !path.starts_with(&package_root) {
+        anyhow::bail!(
+            "adapter artifact '{}' resolves outside package root '{}'",
+            path.display(),
+            package_root.display()
+        );
     }
+    let bytes = fs::read(&path)
+        .with_context(|| format!("failed to load adapter artifact '{}'", path.display()))?;
+    let actual = format!("{:x}", Sha256::digest(&bytes));
+    if actual != weight.sha256 {
+        anyhow::bail!(
+            "adapter artifact '{}' checksum mismatch: expected {}, got {actual}",
+            path.display(),
+            weight.sha256
+        );
+    }
+    let bundle: JsonBundle = serde_json::from_slice(&bytes)
+        .with_context(|| format!("adapter artifact '{}' is invalid JSON", path.display()))?;
+    let bundles = bundle.targets;
     let mut targets = HashMap::new();
     for target in &artifact.targets {
         let tensors = bundles.get(&target.weight_key).with_context(|| {
@@ -479,15 +593,19 @@ fn load_adapter(
 mod tests {
     use super::*;
     use onnx_genai_metadata::{
-        AdapterCacheContract, AdapterEvictionPolicy, AdapterPlanningContract, AdapterTargetBinding,
-        AdapterWeightArtifact,
+        AdapterCacheContract, AdapterEvictionPolicy, AdapterPlanningContract,
+        AdapterSelectionContract, AdapterTargetBinding, AdapterWeightArtifact,
     };
 
     fn artifact(name: &str, location: &str, bytes: &[u8]) -> AdapterArtifact {
         AdapterArtifact {
+            index: usize::from(name == "blue"),
             identity: name.to_string(),
             version: "1".to_string(),
-            base_model_fingerprint: "base-sha256".to_string(),
+            base_model_fingerprint: format!(
+                "onnx-genai-targeted-base-v1:sha256:{}",
+                "a".repeat(64)
+            ),
             rank: 1,
             alpha: 1.0,
             dtype: "float32".to_string(),
@@ -500,6 +618,7 @@ mod tests {
                 component: "decoder".to_string(),
                 parameter: "projection".to_string(),
                 weight_key: "projection".to_string(),
+                native_parameters: None,
                 input_features: 2,
                 output_features: 2,
             }],
@@ -509,15 +628,30 @@ mod tests {
 
     fn service_contract(red: &[u8], blue: &[u8], max_entries: usize) -> AdapterServiceContract {
         AdapterServiceContract {
-            base_model_fingerprint: "base-sha256".to_string(),
-            row_ids: "request.row_ids".to_string(),
-            request_epochs: "request.request_epochs".to_string(),
-            active: None,
-            application_capability: "onnx-genai.adapters".to_string(),
+            base_model_fingerprint: format!(
+                "onnx-genai-targeted-base-v1:sha256:{}",
+                "a".repeat(64)
+            ),
+            selection: AdapterSelectionContract {
+                row_ids: "request.row_ids".to_string(),
+                request_epochs: "request.request_epochs".to_string(),
+                adapter_ids: "request.adapter_ids".to_string(),
+                adapter_counts: "request.adapter_counts".to_string(),
+                scales: "request.adapter_scales".to_string(),
+                active: None,
+                max_adapters: 2,
+            },
+            application_capability: "onnx-genai.adapters@1".to_string(),
             portable_fallback: true,
             artifacts: BTreeMap::from([
-                ("red".to_string(), artifact("red", "red.json", red)),
-                ("blue".to_string(), artifact("blue", "blue.json", blue)),
+                (
+                    "red".to_string(),
+                    artifact("red", "adapters/red/adapter.json", red),
+                ),
+                (
+                    "blue".to_string(),
+                    artifact("blue", "adapters/blue/adapter.json", blue),
+                ),
             ]),
             cache: AdapterCacheContract {
                 max_entries,
@@ -533,11 +667,12 @@ mod tests {
             .expect("current directory")
             .join("target")
             .join(format!("adapter-test-{}", std::process::id()));
-        fs::create_dir_all(&root).expect("create adapter test directory");
+        fs::create_dir_all(root.join("adapters/red")).expect("create red adapter test directory");
+        fs::create_dir_all(root.join("adapters/blue")).expect("create blue adapter test directory");
         let red = br#"{"targets":{"projection":{"a":[1.0,0.0],"b":[1.0,2.0]}}}"#;
         let blue = br#"{"targets":{"projection":{"a":[0.0,1.0],"b":[3.0,4.0]}}}"#;
-        fs::write(root.join("red.json"), red).expect("write red adapter");
-        fs::write(root.join("blue.json"), blue).expect("write blue adapter");
+        fs::write(root.join("adapters/red/adapter.json"), red).expect("write red adapter");
+        fs::write(root.join("adapters/blue/adapter.json"), blue).expect("write blue adapter");
 
         let service = service_contract(red, blue, 2);
         let selection = AdapterSelection::default()
@@ -559,7 +694,6 @@ mod tests {
                 &[10, 20, 30],
                 &[0, 0, 0],
                 &[true, true, true],
-                &HashMap::new(),
             )
             .expect("prepare heterogeneous adapters");
         let (output, width) = apply_parameter_overlay(
@@ -580,15 +714,7 @@ mod tests {
             (30, [5.0, 6.0], [25.5, 35.0]),
         ] {
             let single = cache
-                .prepare(
-                    &root,
-                    &service,
-                    &selection,
-                    &[row_id],
-                    &[0],
-                    &[true],
-                    &HashMap::new(),
-                )
+                .prepare(&root, &service, &selection, &[row_id], &[0], &[true])
                 .expect("prepare independent row");
             let (single_output, _) =
                 apply_parameter_overlay(&cache, &single, "decoder", "projection", &row_input, 1, 2)
@@ -596,25 +722,10 @@ mod tests {
             assert_eq!(single_output, expected);
         }
 
-        let dynamic = AdapterSelection::default().with_row(
-            10,
-            0,
-            [AdapterActivation::new("red", 1.0).with_scale_input("request.adapter_scale")],
-        );
-        let dynamic_inputs = HashMap::from([(
-            "request.adapter_scale".to_string(),
-            Value::from_slice_f32(&[0.5], &[1]).expect("dynamic scale"),
-        )]);
+        let dynamic =
+            AdapterSelection::default().with_row(10, 0, [AdapterActivation::new("red", 0.5)]);
         let dynamic_context = cache
-            .prepare(
-                &root,
-                &service,
-                &dynamic,
-                &[10],
-                &[0],
-                &[true],
-                &dynamic_inputs,
-            )
+            .prepare(&root, &service, &dynamic, &[10], &[0], &[true])
             .expect("prepare dynamic scale");
         let (dynamic_output, _) = apply_parameter_overlay(
             &cache,
@@ -637,7 +748,6 @@ mod tests {
                 &[30, 10],
                 &[0, 0],
                 &[true, true],
-                &HashMap::new(),
             )
             .expect("prepare compacted adapters");
         let (compacted_output, _) = apply_parameter_overlay(
@@ -654,15 +764,7 @@ mod tests {
 
         let mut inactive_cache = AdapterCache::default();
         let inactive = inactive_cache
-            .prepare(
-                &root,
-                &service,
-                &selection,
-                &[10],
-                &[0],
-                &[false],
-                &HashMap::new(),
-            )
+            .prepare(&root, &service, &selection, &[10], &[0], &[false])
             .expect("prepare inactive adapter row");
         let (inactive_output, _) = apply_parameter_overlay(
             &inactive_cache,
@@ -686,15 +788,7 @@ mod tests {
             ],
         );
         let error = cache
-            .prepare(
-                &root,
-                &service,
-                &duplicate,
-                &[10],
-                &[0],
-                &[true],
-                &HashMap::new(),
-            )
+            .prepare(&root, &service, &duplicate, &[10], &[0], &[true])
             .expect_err("duplicate row adapter must fail");
         assert!(error.to_string().contains("duplicate adapter"));
 
@@ -708,15 +802,7 @@ mod tests {
                 [AdapterActivation::new(adapter, 1.0)],
             );
             cache
-                .prepare(
-                    &root,
-                    &service,
-                    &selection,
-                    &[row_id],
-                    &[0],
-                    &[true],
-                    &HashMap::new(),
-                )
+                .prepare(&root, &service, &selection, &[row_id], &[0], &[true])
                 .expect("prepare adapter lifecycle request");
         }
         let diagnostic = cache.diagnostic();
@@ -729,44 +815,89 @@ mod tests {
     }
 
     #[test]
+    fn wire_selection_is_strict_ordered_ssa() {
+        let red = br#"{"targets":{"projection":{"a":[1.0,0.0],"b":[1.0,2.0]}}}"#;
+        let blue = br#"{"targets":{"projection":{"a":[0.0,1.0],"b":[3.0,4.0]}}}"#;
+        let service = service_contract(red, blue, 2);
+        let values = HashMap::from([
+            (
+                "request.adapter_ids".to_string(),
+                Value::from_slice_i64(&[0, -1, 1, 0], &[2, 2]).expect("adapter IDs"),
+            ),
+            (
+                "request.adapter_counts".to_string(),
+                Value::from_slice_i64(&[1, 2], &[2]).expect("adapter counts"),
+            ),
+            (
+                "request.adapter_scales".to_string(),
+                Value::from_slice_f32(&[0.5, 0.0, 1.0, -0.25], &[2, 2]).expect("adapter scales"),
+            ),
+        ]);
+        let selection =
+            selection_from_inputs(&service, &values, &[10, 20], &[0, 3]).expect("selection");
+        assert_eq!(
+            selection.rows[&AdapterRowIdentity {
+                row_id: 10,
+                request_epoch: 0
+            }],
+            [AdapterActivation::new("red", 0.5)]
+        );
+        assert_eq!(
+            selection.rows[&AdapterRowIdentity {
+                row_id: 20,
+                request_epoch: 3
+            }],
+            [
+                AdapterActivation::new("blue", 1.0),
+                AdapterActivation::new("red", -0.25),
+            ]
+        );
+
+        let invalid_padding = HashMap::from([
+            (
+                "request.adapter_ids".to_string(),
+                Value::from_slice_i64(&[0, 1], &[1, 2]).expect("adapter IDs"),
+            ),
+            (
+                "request.adapter_counts".to_string(),
+                Value::from_slice_i64(&[1], &[1]).expect("adapter counts"),
+            ),
+            (
+                "request.adapter_scales".to_string(),
+                Value::from_slice_f32(&[1.0, 0.0], &[1, 2]).expect("adapter scales"),
+            ),
+        ]);
+        let error = selection_from_inputs(&service, &invalid_padding, &[10], &[0])
+            .expect_err("non-canonical padding must fail");
+        assert!(error.to_string().contains("must be padded with ID -1"));
+    }
+
+    #[test]
     fn artifact_checksum_and_shape_are_enforced() {
         let root = std::env::current_dir()
             .expect("current directory")
             .join("target")
             .join(format!("adapter-invalid-test-{}", std::process::id()));
-        fs::create_dir_all(&root).expect("create adapter test directory");
+        fs::create_dir_all(root.join("adapters/red")).expect("create red adapter test directory");
+        fs::create_dir_all(root.join("adapters/blue")).expect("create blue adapter test directory");
         let valid = br#"{"targets":{"projection":{"a":[1.0,0.0],"b":[1.0,2.0]}}}"#;
-        fs::write(root.join("red.json"), b"corrupt").expect("write corrupt adapter");
-        fs::write(root.join("blue.json"), valid).expect("write blue adapter");
+        fs::write(root.join("adapters/red/adapter.json"), b"corrupt")
+            .expect("write corrupt adapter");
+        fs::write(root.join("adapters/blue/adapter.json"), valid).expect("write blue adapter");
         let service = service_contract(valid, valid, 2);
         let selection =
             AdapterSelection::default().with_row(1, 0, [AdapterActivation::new("red", 1.0)]);
         let error = AdapterCache::default()
-            .prepare(
-                &root,
-                &service,
-                &selection,
-                &[1],
-                &[0],
-                &[true],
-                &HashMap::new(),
-            )
+            .prepare(&root, &service, &selection, &[1], &[0], &[true])
             .expect_err("checksum mismatch must fail");
         assert!(error.to_string().contains("checksum mismatch"));
 
         let malformed = br#"{"targets":{"projection":{"a":[1.0],"b":[1.0,2.0]}}}"#;
-        fs::write(root.join("red.json"), malformed).expect("write malformed adapter");
+        fs::write(root.join("adapters/red/adapter.json"), malformed)
+            .expect("write malformed adapter");
         let service = service_contract(malformed, valid, 2);
         let error = AdapterCache::default()
-            .prepare(
-                &root,
-                &service,
-                &selection,
-                &[1],
-                &[0],
-                &[true],
-                &HashMap::new(),
-            )
+            .prepare(&root, &service, &selection, &[1], &[0], &[true])
             .expect_err("shape mismatch must fail");
         assert!(error.to_string().contains("shape mismatch"));
         fs::remove_dir_all(root).expect("remove adapter test directory");

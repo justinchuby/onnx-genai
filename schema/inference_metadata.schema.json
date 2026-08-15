@@ -47,6 +47,12 @@
         "identity": {
           "type": "string"
         },
+        "index": {
+          "description": "Stable non-negative wire ID used by selection.adapter_ids.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
         "provenance": {
           "type": [
             "string",
@@ -77,6 +83,7 @@
         }
       },
       "required": [
+        "index",
         "identity",
         "version",
         "base_model_fingerprint",
@@ -108,6 +115,22 @@
       ],
       "type": "string"
     },
+    "AdapterNativeParameterBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "a": {
+          "type": "string"
+        },
+        "b": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "a",
+        "b"
+      ],
+      "type": "object"
+    },
     "AdapterPlanningContract": {
       "additionalProperties": false,
       "properties": {
@@ -126,16 +149,56 @@
       },
       "type": "object"
     },
-    "AdapterServiceContract": {
+    "AdapterSelectionContract": {
       "additionalProperties": false,
       "properties": {
         "active": {
-          "description": "Optional bool[batch] input; inactive rows never load or apply adapters.",
+          "description": "Optional bool[batch]; inactive rows never load or apply adapters.",
           "type": [
             "string",
             "null"
           ]
         },
+        "adapter_counts": {
+          "description": "Int64[batch] number of valid adapter IDs in each row.",
+          "type": "string"
+        },
+        "adapter_ids": {
+          "description": "Int64[batch,max_adapters] artifact indices in composition order.",
+          "type": "string"
+        },
+        "max_adapters": {
+          "description": "Fixed second dimension of adapter_ids and scales.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "request_epochs": {
+          "description": "Int64[batch] request generation; changes whenever a slot is reused.",
+          "type": "string"
+        },
+        "row_ids": {
+          "description": "Int64[batch] semantic row/slot identities.",
+          "type": "string"
+        },
+        "scales": {
+          "description": "Float32[batch,max_adapters] effective request scales.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "row_ids",
+        "request_epochs",
+        "adapter_ids",
+        "adapter_counts",
+        "scales",
+        "max_adapters"
+      ],
+      "type": "object"
+    },
+    "AdapterServiceContract": {
+      "additionalProperties": false,
+      "properties": {
         "application_capability": {
           "description": "Generic application capability required from the runtime or execution provider.",
           "type": "string"
@@ -148,7 +211,7 @@
           "type": "object"
         },
         "base_model_fingerprint": {
-          "description": "Fingerprint of the immutable base parameters accepted by every declared adapter.",
+          "description": "`onnx-genai-targeted-base-v1:sha256:<lowercase hex>` compatibility fingerprint.",
           "type": "string"
         },
         "cache": {
@@ -170,19 +233,14 @@
           "default": false,
           "type": "boolean"
         },
-        "request_epochs": {
-          "description": "Int64[batch] request generation for each semantic slot; changes on slot reuse.",
-          "type": "string"
-        },
-        "row_ids": {
-          "description": "Request input containing semantic row/slot identities used to resolve selections.",
-          "type": "string"
+        "selection": {
+          "$ref": "#/$defs/AdapterSelectionContract",
+          "description": "Request-scoped adapter-set inputs. These are immutable SSA inputs for one request."
         }
       },
       "required": [
         "base_model_fingerprint",
-        "row_ids",
-        "request_epochs",
+        "selection",
         "application_capability"
       ],
       "type": "object"
@@ -198,6 +256,17 @@
           "format": "uint",
           "minimum": 0,
           "type": "integer"
+        },
+        "native_parameters": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AdapterNativeParameterBinding"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Exact overridable initializer names for ORT `.onnx_adapter` application."
         },
         "output_features": {
           "format": "uint",
@@ -2057,7 +2126,11 @@
         "constraint",
         "session_id",
         "row_ids",
-        "request_epochs"
+        "request_epochs",
+        "adapter_ids",
+        "adapter_counts",
+        "adapter_scales",
+        "adapter_active"
       ],
       "type": "string"
     },

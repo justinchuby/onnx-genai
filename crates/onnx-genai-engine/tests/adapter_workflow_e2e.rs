@@ -11,10 +11,11 @@ use sha2::{Digest, Sha256};
 fn package(metadata: &str, red: &[u8], blue: &[u8]) -> anyhow::Result<PathBuf> {
     let root =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-fixtures/adapter-workflow");
-    fs::create_dir_all(&root)?;
+    fs::create_dir_all(root.join("adapters/red"))?;
+    fs::create_dir_all(root.join("adapters/blue"))?;
     fs::write(root.join("inference_metadata.yaml"), metadata)?;
-    fs::write(root.join("red.json"), red)?;
-    fs::write(root.join("blue.json"), blue)?;
+    fs::write(root.join("adapters/red/adapter.json"), red)?;
+    fs::write(root.join("adapters/blue/adapter.json"), blue)?;
     Ok(root)
 }
 
@@ -26,6 +27,26 @@ fn run(
     selection: AdapterSelection,
 ) -> anyhow::Result<Vec<f32>> {
     let batch = i64::try_from(row_ids.len())?;
+    let mut adapter_ids = vec![-1i64; row_ids.len() * 2];
+    let mut adapter_counts = vec![0i64; row_ids.len()];
+    let mut adapter_scales = vec![0.0f32; row_ids.len() * 2];
+    for (row, (&row_id, &request_epoch)) in row_ids.iter().zip(request_epochs).enumerate() {
+        let identity = onnx_genai_engine::AdapterRowIdentity {
+            row_id,
+            request_epoch,
+        };
+        if let Some(activations) = selection.rows.get(&identity) {
+            adapter_counts[row] = i64::try_from(activations.len())?;
+            for (slot, activation) in activations.iter().enumerate() {
+                adapter_ids[row * 2 + slot] = match activation.adapter.as_str() {
+                    "red" => 0,
+                    "blue" => 1,
+                    other => anyhow::bail!("unknown test adapter {other}"),
+                };
+                adapter_scales[row * 2 + slot] = activation.scale;
+            }
+        }
+    }
     let request = PipelineGenerateRequest::new(GenerateRequest {
         prompt: GeneratePrompt::TokenIds(vec![]),
         options: Default::default(),
@@ -35,8 +56,19 @@ fn run(
         "request.request_epochs",
         Value::from_slice_i64(request_epochs, &[batch])?,
     )
-    .with_input("activations", Value::from_slice_f32(values, &[batch, 2])?)
-    .with_adapters(selection);
+    .with_input(
+        "request.adapter_ids",
+        Value::from_slice_i64(&adapter_ids, &[batch, 2])?,
+    )
+    .with_input(
+        "request.adapter_counts",
+        Value::from_slice_i64(&adapter_counts, &[batch])?,
+    )
+    .with_input(
+        "request.adapter_scales",
+        Value::from_slice_f32(&adapter_scales, &[batch, 2])?,
+    )
+    .with_input("activations", Value::from_slice_f32(values, &[batch, 2])?);
     Ok(engine.run_pipeline(request)?["result"].to_vec_f32()?)
 }
 
@@ -62,6 +94,18 @@ pipeline:
       request.request_epochs:
         contract: {{ dtype: int64, rank: 1, shape: [batch] }}
         role: {{ kind: runtime, version: "1.0", role: request_epochs }}
+        source: {{ kind: request }}
+      request.adapter_ids:
+        contract: {{ dtype: int64, rank: 2, shape: [batch, 2] }}
+        role: {{ kind: runtime, version: "1.0", role: adapter_ids }}
+        source: {{ kind: request }}
+      request.adapter_counts:
+        contract: {{ dtype: int64, rank: 1, shape: [batch] }}
+        role: {{ kind: runtime, version: "1.0", role: adapter_counts }}
+        source: {{ kind: request }}
+      request.adapter_scales:
+        contract: {{ dtype: float32, rank: 2, shape: [batch, 2] }}
+        role: {{ kind: runtime, version: "1.0", role: adapter_scales }}
         source: {{ kind: request }}
       activations:
         contract: {{ dtype: float32, rank: 2, shape: [batch, 2] }}
@@ -92,21 +136,27 @@ pipeline:
           bindings: {{ input: input, output: output }}
           parameters: {{ action: apply, component: decoder, parameter: projection }}
     adapters:
-      base_model_fingerprint: synthetic-base
-      row_ids: request.row_ids
-      request_epochs: request.request_epochs
-      application_capability: onnx-genai.adapters
+      base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      selection:
+        row_ids: request.row_ids
+        request_epochs: request.request_epochs
+        adapter_ids: request.adapter_ids
+        adapter_counts: request.adapter_counts
+        scales: request.adapter_scales
+        max_adapters: 2
+      application_capability: onnx-genai.adapters@1
       portable_fallback: true
       cache: {{ max_entries: 2, eviction: lru }}
       artifacts:
         red:
+          index: 0
           identity: red
           version: "1"
-          base_model_fingerprint: synthetic-base
+          base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
           rank: 1
           alpha: 1.0
           dtype: float32
-          weights: [{{ location: red.json, sha256: {red_sha} }}]
+          weights: [{{ location: adapters/red/adapter.json, sha256: {red_sha} }}]
           targets:
             - component: decoder
               parameter: projection
@@ -114,13 +164,14 @@ pipeline:
               input_features: 2
               output_features: 2
         blue:
+          index: 1
           identity: blue
           version: "1"
-          base_model_fingerprint: synthetic-base
+          base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
           rank: 1
           alpha: 1.0
           dtype: float32
-          weights: [{{ location: blue.json, sha256: {blue_sha} }}]
+          weights: [{{ location: adapters/blue/adapter.json, sha256: {blue_sha} }}]
           targets:
             - component: decoder
               parameter: projection

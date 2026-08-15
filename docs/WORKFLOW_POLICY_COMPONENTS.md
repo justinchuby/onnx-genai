@@ -277,30 +277,139 @@ lookahead, and commit are reusable by any workflow; ONNX components apply masks 
 
 ## Parameter adapters (LoRA)
 
-`workflow.adapters` declares parameter-overlay artifacts and their runtime lifecycle independently
-of workflow control flow. Each artifact pins an identity/version, base-model fingerprint,
-rank/alpha/dtype, checksummed package-relative weights, and generic component/parameter targets.
-The immutable request selection is keyed by `(row_ids, request_epochs)`; each semantic slot may
-select zero, one, or multiple adapters in deterministic order, with static and optional
-request-tensor scales. The non-negative epoch changes whenever a slot is reused.
+`workflow.adapters` is the versioned `onnx-genai.adapters@1` ABI. Adapter discovery, verification,
+loading, caching, activation, deactivation, and eviction are runtime lifecycle operations; they
+are never workflow steps or `run_once` nodes.
 
-The runtime discovers and verifies artifacts on first activation, caches them with LRU eviction,
-and records plan variants by ordered adapter set. Compaction reorders selections with semantic
-row identity rather than physical rows. Slot reuse receives a new epoch and immutable selection,
-inactive rows do not activate an adapter when the optional `active` bool tensor is declared, and
-shared base weights are never mutated.
+```yaml
+adapters:
+  base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:<64 lowercase hex>
+  selection:
+    row_ids: request.row_ids                 # int64[batch]
+    request_epochs: request.request_epochs   # int64[batch]
+    adapter_ids: request.adapter_ids         # int64[batch,max_adapters]
+    adapter_counts: request.adapter_counts   # int64[batch]
+    scales: request.adapter_scales           # float32[batch,max_adapters]
+    active: request.active                   # optional bool[batch]
+    max_adapters: 4
+  application_capability: onnx-genai.adapters@1
+  portable_fallback: true
+  cache: { max_entries: 16, eviction: lru }
+  planning:
+    bucket_by_adapter_set: true
+    stable_buffers: true
+    invalidate_capture_on_eviction: true
+  artifacts:
+    summarizer:
+      index: 0
+      identity: example.summarizer
+      version: "1"
+      base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:<same hex>
+      rank: 8
+      alpha: 16.0
+      dtype: float16
+      weights:
+        - { location: adapters/summarizer/adapter.onnx_adapter,
+            sha256: <exact-file sha256>, format: ort_genai }
+        - { location: adapters/summarizer/adapter.json,
+            sha256: <exact-file sha256>, format: json }
+      targets:
+        - component: decoder
+          parameter: layers.0.attention.q_proj.weight
+          weight_key: layers.0.attention.q_proj
+          native_parameters:
+            a: adapters.summarizer.layers.0.attention.q_proj.a
+            b: adapters.summarizer.layers.0.attention.q_proj.b
+          input_features: 4096
+          output_features: 4096
+```
 
-`application_capability` negotiates a native parameter-overlay implementation. Existing ORT GenAI
-adapter APIs already provide load/activate/unload lifecycle primitives; native implementations
-should map this contract onto those APIs. When `portable_fallback: true`, the reference runtime can
-apply float32 low-rank overlays through `onnx-genai.parameter-overlay@1`. Its bindings are `input`
-and `output`, and parameters identify the target `component` and `parameter`. Unsupported formats
-or capabilities return structured, actionable errors rather than selecting model-family code.
+### Artifact and compatibility identity
 
-For CUDA Graph execution, `planning.stable_buffers` and `bucket_by_adapter_set` require stable
-addresses per plan variant. Eviction invalidates affected captures when
-`invalidate_capture_on_eviction` is true; a later activation reloads the artifact and establishes a
-new plan/capture variant.
+Artifact map keys are package-local aliases. `index` is the stable wire ID used in
+`selection.adapter_ids`; indices are unique and contiguous from zero. Each file is beneath
+`adapters/<alias>/`, and at most one file of each format may be declared. `sha256` is lowercase
+SHA-256 of the exact file bytes, checked before parsing or device upload. Paths are package-relative,
+cannot escape the package, and are resolved without following an alternate metadata search path.
+
+The portable JSON artifact is UTF-8 RFC 8785 canonical JSON:
+
+```json
+{"targets":{"<weight_key>":{"a":[...],"b":[...]}}}
+```
+
+`a` has shape `[rank,input_features]`, `b` has shape `[output_features,rank]`, and all values are
+finite float32 values; JSON is the float32 reference fallback. Safetensors uses tensor names `<weight_key>.a` and
+`<weight_key>.b` with the same shapes. `ort_genai` is the upstream ONNX Runtime FlatBuffers
+`.onnx_adapter` format (`TORT`, format version 1); its parameter records use the exact
+`native_parameters.a` and `.b` initializer names. All declared formats for one alias must encode
+the same tensors.
+
+The base fingerprint is computed over the union of declared targets, not unrelated base weights.
+Sort targets by UTF-8 `(component,parameter)`, then build RFC 8785 canonical JSON with schema
+`onnx-genai-targeted-base-v1`. Each target record contains:
+
+- the component and exact initializer name;
+- ONNX tensor dtype number and dimensions;
+- SHA-256 of the initializer's logical contiguous row-major bytes, normalized to little endian
+  after resolving external data; and
+- every direct consumer sorted by graph node ordinal and input ordinal, recording domain
+  (`ai.onnx` for the empty domain), op type, input ordinal, and RFC 8785 canonicalized attributes.
+
+SHA-256 of those canonical JSON bytes is encoded as
+`onnx-genai-targeted-base-v1:sha256:<hex>`. Node names, doc strings, protobuf field order, file
+paths, and external-data chunking are excluded. A runtime must reject a service/artifact mismatch
+and must verify the fingerprint against the loaded component initializers before activation.
+
+Targets are architecture-independent `(component,parameter)` bindings. The parameter must be an
+immutable initializer with the declared input/output dimensions. A target may appear in multiple
+adapters for composition, but its dimensions and native A/B initializer bindings must agree.
+Duplicate targets or weight keys within one adapter, missing parameters, unsupported dtype,
+shape/rank mismatch, and conflicting native bindings are errors.
+
+### Request, composition, and batching
+
+Selection tensors are required request-sourced SSA inputs and are snapshotted immutably for one
+request. For row `r`, entries `[0,adapter_counts[r])` are applied in axis order. Remaining slots
+must be padded with ID `-1` and scale `0`. Counts are in `[0,max_adapters]`; IDs must exist;
+duplicate IDs in one row are rejected. Effective scales must be finite and within `[-16,16]`.
+
+For target input `x`, composition is:
+
+`base(x) + Σ scale[k] * (alpha[k] / rank[k]) * B[k] * (A[k] * x)`
+
+The sum is evaluated in declared order, so floating-point accumulation order is observable.
+Adapters that do not target a parameter contribute zero. Base/shared weights remain immutable.
+
+The selection identity is `(row_id,request_epoch)`. Epochs are non-negative and change on every
+slot reuse. Compaction/reorder applies one permutation to row IDs, epochs, adapter IDs, counts,
+scales, active flags, and all model state. Inactive rows are base-only and neither load adapters
+nor mutate adapter/cache state. A previous epoch can never supply selection to a reused slot.
+
+### Native mapping, planning, and capture
+
+ONNX Runtime GenAI's `OgaAdapters::LoadAdapter`/`UnloadAdapter` and
+`Generator::SetActiveAdapter` map directly to load, reference-counted activation, and release for
+compatible `.onnx_adapter` artifacts. Core ORT supplies parameters through active
+`OrtRunOptions` adapters. Those APIs do not by themselves guarantee heterogeneous per-row
+selection, dynamic scales, duplicate-name composition, or adapter-aware I/O binding. A runtime
+may use them only when its negotiated capability covers the requested batch; otherwise it must
+bucket rows by the complete ordered `(adapter ID,scale)` set, materialize an equivalent combined
+overlay, or use the portable `onnx-genai.parameter-overlay@1` path. There is no model-family or
+custom-operator admission path.
+
+The planner key contains execution capability, concrete shape bucket, and the ordered adapter set
+and scales for each physical row; semantic row IDs and request epochs are not part of the key.
+Captured variants own stable adapter buffers and addresses. Buffers cannot be rebound after
+capture. Shape/capability/adapter-set changes select another variant or recapture. LRU eviction is
+forbidden while an artifact is referenced; eviction invalidates every capture that references its
+buffers when `invalidate_capture_on_eviction` is true, and reload creates new buffers and plans.
+
+If the runtime/EP lacks `onnx-genai.adapters@1`, load fails with a structured capability diagnostic
+unless `portable_fallback: true` and every selected artifact has a supported portable format.
+Diagnostics identify capability, alias/index, artifact path and checksum, target, row/epoch, and
+whether failure occurred during discover, verify, load, plan, activate, execute, deactivate, or
+evict.
 
 ## Compact structural examples
 

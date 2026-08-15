@@ -211,7 +211,6 @@ pub struct WorkflowExecutionPlan<'a> {
     dynamic_symbols: std::collections::HashSet<String>,
     session_id: Option<String>,
     component_overrides: HashMap<String, String>,
-    adapters: super::AdapterSelection,
     max_iterations_only: bool,
 }
 
@@ -595,7 +594,6 @@ impl<'a> WorkflowExecutionPlan<'a> {
             inputs,
             session_id,
             component_overrides,
-            adapters,
         } = request;
         let workflow = &engine.workflow;
         validate_component_overrides(workflow, &component_overrides)?;
@@ -655,7 +653,6 @@ impl<'a> WorkflowExecutionPlan<'a> {
             dynamic_symbols,
             session_id,
             component_overrides,
-            adapters,
             max_iterations_only: !request.options.stop_on_eos,
         })
     }
@@ -716,54 +713,55 @@ impl<'a> WorkflowExecutionPlan<'a> {
                     );
                 }
                 let row_ids = values
-                    .get(&service.row_ids)
+                    .get(&service.selection.row_ids)
                     .with_context(|| {
                         format!(
                             "adapter service row_ids input '{}' is unavailable",
-                            service.row_ids
+                            service.selection.row_ids
                         )
                     })?
                     .to_vec_i64()
                     .with_context(|| {
                         format!(
                             "adapter service row_ids input '{}' must be host int64",
-                            service.row_ids
+                            service.selection.row_ids
                         )
                     })?;
                 let request_epochs = values
-                    .get(&service.request_epochs)
+                    .get(&service.selection.request_epochs)
                     .with_context(|| {
                         format!(
                             "adapter service request_epochs input '{}' is unavailable",
-                            service.request_epochs
+                            service.selection.request_epochs
                         )
                     })?
                     .to_vec_i64()
                     .with_context(|| {
                         format!(
                             "adapter service request_epochs input '{}' must be host int64",
-                            service.request_epochs
+                            service.selection.request_epochs
                         )
                     })?;
-                let active_rows = if let Some(active) = &service.active {
+                let active_rows = if let Some(active) = &service.selection.active {
                     workflow_bool_rows(&values, active)?
                 } else {
                     vec![true; row_ids.len()]
                 };
+                let selection = super::adapters::selection_from_inputs(
+                    service,
+                    &values,
+                    &row_ids,
+                    &request_epochs,
+                )?;
                 let context = engine.adapter_cache.borrow_mut().prepare(
                     &engine.package_root,
                     service,
-                    &self.adapters,
+                    &selection,
                     &row_ids,
                     &request_epochs,
                     &active_rows,
-                    &values,
                 )?;
                 *engine.active_adapter_context.borrow_mut() = Some(context);
-            } else if !self.adapters.rows.is_empty() {
-                anyhow::bail!(
-                    "request selects adapters but the workflow declares no adapter service"
-                );
             }
             Ok(())
         })();
@@ -1791,14 +1789,40 @@ impl PipelineEngine {
         let source = input
             .to_vec_f32()
             .context("portable parameter overlay requires host float32 input")?;
+        let service = self
+            .workflow
+            .adapters
+            .as_ref()
+            .context("parameter overlay executed without an adapter service")?;
+        let row_ids = values
+            .get(&service.selection.row_ids)
+            .with_context(|| {
+                format!(
+                    "adapter row IDs '{}' are unavailable",
+                    service.selection.row_ids
+                )
+            })?
+            .to_vec_i64()
+            .context("adapter row IDs must be host int64")?;
+        let request_epochs = values
+            .get(&service.selection.request_epochs)
+            .with_context(|| {
+                format!(
+                    "adapter request epochs '{}' are unavailable",
+                    service.selection.request_epochs
+                )
+            })?
+            .to_vec_i64()
+            .context("adapter request epochs must be host int64")?;
         let context = self.active_adapter_context.borrow();
         let context = context
             .as_ref()
             .context("parameter overlay executed without a request adapter context")?;
+        let context = context.reordered(&row_ids, &request_epochs)?;
         let cache = self.adapter_cache.borrow();
         let (result, output_features) = super::adapters::apply_parameter_overlay(
             &cache,
-            context,
+            &context,
             target_component,
             target_parameter,
             &source,
@@ -2279,7 +2303,11 @@ fn workflow_request_value(
         | RuntimeInputRole::Constraint
         | RuntimeInputRole::SessionId
         | RuntimeInputRole::RowIds
-        | RuntimeInputRole::RequestEpochs => Ok(None),
+        | RuntimeInputRole::RequestEpochs
+        | RuntimeInputRole::AdapterIds
+        | RuntimeInputRole::AdapterCounts
+        | RuntimeInputRole::AdapterScales
+        | RuntimeInputRole::AdapterActive => Ok(None),
     }
 }
 

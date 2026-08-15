@@ -18,6 +18,18 @@ pipeline:
         contract: { dtype: int64, rank: 1, shape: [batch] }
         role: { kind: runtime, version: "1.0", role: request_epochs }
         source: { kind: request }
+      request.adapter_ids:
+        contract: { dtype: int64, rank: 2, shape: [batch, 2] }
+        role: { kind: runtime, version: "1.0", role: adapter_ids }
+        source: { kind: request }
+      request.adapter_counts:
+        contract: { dtype: int64, rank: 1, shape: [batch] }
+        role: { kind: runtime, version: "1.0", role: adapter_counts }
+        source: { kind: request }
+      request.adapter_scales:
+        contract: { dtype: float32, rank: 2, shape: [batch, 2] }
+        role: { kind: runtime, version: "1.0", role: adapter_scales }
+        source: { kind: request }
     components:
       decoder:
         implementation: { kind: binding }
@@ -41,10 +53,15 @@ pipeline:
             component: decoder
             parameter: projection.weight
     adapters:
-      base_model_fingerprint: base-sha256
-      row_ids: request.row_ids
-      request_epochs: request.request_epochs
-      application_capability: onnx-genai.adapters
+      base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      selection:
+        row_ids: request.row_ids
+        request_epochs: request.request_epochs
+        adapter_ids: request.adapter_ids
+        adapter_counts: request.adapter_counts
+        scales: request.adapter_scales
+        max_adapters: 2
+      application_capability: onnx-genai.adapters@1
       portable_fallback: true
       cache: { max_entries: 2, eviction: lru }
       planning:
@@ -53,15 +70,16 @@ pipeline:
         invalidate_capture_on_eviction: true
       artifacts:
         red:
+          index: 0
           identity: red
           version: "1"
-          base_model_fingerprint: base-sha256
+          base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
           rank: 1
           alpha: 1.0
           dtype: float32
           provenance: synthetic-test
           weights:
-            - location: adapters/red.json
+            - location: adapters/red/adapter.json
               sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
               format: json
           targets:
@@ -109,11 +127,11 @@ fn workflow_custom_op_admission_fields_are_rejected() {
 fn adapter_service_rejects_incompatible_or_unsafe_artifacts() {
     let invalid = ADAPTER_WORKFLOW
         .replace(
-            "base_model_fingerprint: base-sha256\n          rank",
-            "base_model_fingerprint: other\n          rank",
+            "base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n          rank",
+            "base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n          rank",
         )
         .replace(
-            "location: adapters/red.json",
+            "location: adapters/red/adapter.json",
             "location: ../outside/red.json",
         );
     let metadata: InferenceMetadata =
@@ -127,7 +145,36 @@ fn adapter_service_rejects_incompatible_or_unsafe_artifacts() {
     assert!(
         errors
             .iter()
-            .any(|error| error.contains("package-relative path"))
+            .any(|error| error.contains("must be under package path adapters/red/"))
+    );
+}
+
+#[test]
+fn adapter_wire_contract_rejects_ambiguous_selection_and_indices() {
+    let invalid = ADAPTER_WORKFLOW
+        .replace("max_adapters: 2", "max_adapters: 0")
+        .replace("index: 0", "index: 2")
+        .replace(
+            "contract: { dtype: int64, rank: 2, shape: [batch, 2] }\n        role: { kind: runtime, version: \"1.0\", role: adapter_ids }",
+            "contract: { dtype: float32, rank: 2, shape: [batch, 2] }\n        role: { kind: runtime, version: \"1.0\", role: adapter_ids }",
+        );
+    let metadata: InferenceMetadata =
+        serde_yaml::from_str(&invalid).expect("invalid adapter wire contract parses");
+    let errors = validate_metadata(&metadata).expect_err("ambiguous adapter wire must fail");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("max_adapters must be greater than zero"))
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("artifact indices must be contiguous from zero"))
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("selection.adapter_ids"))
     );
 }
 

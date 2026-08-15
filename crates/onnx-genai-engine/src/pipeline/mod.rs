@@ -90,8 +90,6 @@ pub struct PipelineGenerateRequest {
     pub session_id: Option<String>,
     /// Application-selected package components that replace overridable components.
     pub component_overrides: HashMap<String, String>,
-    /// Immutable per-semantic-row adapter composition for this request.
-    pub adapters: AdapterSelection,
 }
 
 impl PipelineGenerateRequest {
@@ -101,13 +99,7 @@ impl PipelineGenerateRequest {
             inputs: HashMap::new(),
             session_id: None,
             component_overrides: HashMap::new(),
-            adapters: AdapterSelection::default(),
         }
-    }
-
-    pub fn with_adapters(mut self, adapters: AdapterSelection) -> Self {
-        self.adapters = adapters;
-        self
     }
 
     pub fn with_input(mut self, name: impl Into<String>, value: Value) -> Self {
