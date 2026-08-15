@@ -59,11 +59,6 @@ thiserror = { workspace = true }
 tokenizers = { workspace = true }
 tracing = { workspace = true }
 
-[dev-dependencies]
-# Only the tests build ONNX models from scratch; the crate itself decodes them
-# through `onnx-runtime-loader`.
-prost = { workspace = true }
-
 [build-dependencies]
 onnx-genai-cuda-version-guard = { path = "../onnx-genai-cuda-version-guard", version = "=0.1.0-dev.5" }
 

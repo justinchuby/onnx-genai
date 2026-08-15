@@ -106,16 +106,10 @@ fn model_from(
     let expected = usize::from(lowering != WideArgReduceLowering::Direct);
     assert_eq!(rewrites.total(), expected, "unexpected lowering outcome");
     let nodes = graph.node.len();
-    let mut opset_import = vec![OperatorSetIdProto {
+    let opset_import = vec![OperatorSetIdProto {
         domain: String::new(),
         version: 17,
     }];
-    if rewrites.fused > 0 {
-        opset_import.push(OperatorSetIdProto {
-            domain: onnx_genai_engine::pipeline::FUSED_ARGMAX_DOMAIN.to_string(),
-            version: 1,
-        });
-    }
     let model = ModelProto {
         ir_version: 8,
         producer_name: "sampler-argmax-bench".into(),
@@ -192,31 +186,6 @@ fn measure(name: &str, model: &[u8], nodes: usize, logits: &[f32]) -> Option<f64
     Some(each)
 }
 
-#[test]
-#[ignore = "requires a CUDA device"]
-fn fused_argmax_beats_the_portable_tiling() {
-    use onnx_genai_engine::pipeline::WideArgReduceLowering;
-    let logits = canonical_logits();
-    let (tiled_model, tiled_nodes) = model_from(source_graph(), WideArgReduceLowering::Tiled);
-    let (fused_model, fused_nodes) = model_from(source_graph(), WideArgReduceLowering::Fused);
-    assert!(
-        fused_nodes < tiled_nodes,
-        "the fused lowering must emit fewer nodes"
-    );
-
-    let Some(tiled) = measure("tiled", &tiled_model, tiled_nodes, &logits) else {
-        eprintln!("skipping: no CUDA session available");
-        return;
-    };
-    let fused = measure("fused", &fused_model, fused_nodes, &logits)
-        .expect("the tiled session built, so the fused one must too");
-    println!("speedup: {:.2}x", tiled / fused);
-    assert!(
-        fused < tiled,
-        "fused {fused:.2} us must beat tiled {tiled:.2} us"
-    );
-}
-
 /// Every lowering of the same source graph, on the same device logits.
 ///
 /// This is the comparison that decides whether the workaround is still needed:
@@ -235,11 +204,7 @@ fn report_every_wide_argmax_lowering() {
         onnx_genai_ort::runtime_capability::loaded_version().unwrap_or_else(|| "unknown".into()),
         onnx_genai_ort::runtime_capability::reduces_wide_last_axis_on_cuda()
     );
-    for lowering in [
-        WideArgReduceLowering::Direct,
-        WideArgReduceLowering::Tiled,
-        WideArgReduceLowering::Fused,
-    ] {
+    for lowering in [WideArgReduceLowering::Direct, WideArgReduceLowering::Tiled] {
         let (model, nodes) = model_from(source_graph(), lowering);
         let name = format!("{lowering:?}").to_lowercase();
         if measure(&name, &model, nodes, &logits).is_none() {
@@ -332,19 +297,15 @@ fn parity_cases(vocab: usize) -> Vec<(&'static str, Vec<f32>, bool)> {
 
 /// Every lowering must select the same token, on whatever runtime is loaded.
 ///
-/// This is the gate for treating the lowerings as interchangeable. It is also
-/// how a runtime whose arg-reduction was rewritten gets checked against the
-/// two lowerings that do not depend on it.
+/// This is the gate for treating the lowerings as interchangeable: it is how a
+/// runtime whose arg-reduction was rewritten gets checked against the portable
+/// tiling, which depends on nothing but standard ONNX ops.
 #[test]
 #[ignore = "requires a CUDA device"]
 fn every_wide_argmax_lowering_selects_the_same_token() {
     use onnx_genai_engine::pipeline::WideArgReduceLowering;
     let vocab = 16_384usize;
-    let lowerings = [
-        WideArgReduceLowering::Direct,
-        WideArgReduceLowering::Tiled,
-        WideArgReduceLowering::Fused,
-    ];
+    let lowerings = [WideArgReduceLowering::Direct, WideArgReduceLowering::Tiled];
     println!(
         "runtime: {}",
         onnx_genai_ort::runtime_capability::loaded_version().unwrap_or_else(|| "unknown".into())
@@ -407,17 +368,11 @@ fn wrap_model(
     graph: GraphProto,
     lowering: onnx_genai_engine::pipeline::WideArgReduceLowering,
 ) -> Vec<u8> {
-    use onnx_genai_engine::pipeline::WideArgReduceLowering;
-    let mut opset_import = vec![OperatorSetIdProto {
+    let _ = lowering;
+    let opset_import = vec![OperatorSetIdProto {
         domain: String::new(),
         version: 17,
     }];
-    if lowering == WideArgReduceLowering::Fused {
-        opset_import.push(OperatorSetIdProto {
-            domain: onnx_genai_engine::pipeline::FUSED_ARGMAX_DOMAIN.to_string(),
-            version: 1,
-        });
-    }
     ModelProto {
         ir_version: 8,
         producer_name: "sampler-argmax-parity".into(),

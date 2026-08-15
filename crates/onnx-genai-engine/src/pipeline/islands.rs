@@ -1832,20 +1832,6 @@ fn hash_file_identity(path: &Path, hasher: &mut impl Hasher) -> anyhow::Result<(
     Ok(())
 }
 
-/// Whether this build can serve a fused last-axis argmax on the CUDA EP.
-///
-/// Compiled out entirely without the `cuda` feature, so a CPU-only build never
-/// emits a node it has no kernel for.
-#[cfg(feature = "cuda")]
-fn fused_argmax_is_available() -> bool {
-    onnx_genai_ort::fused_argmax::available()
-}
-
-#[cfg(not(feature = "cuda"))]
-fn fused_argmax_is_available() -> bool {
-    false
-}
-
 /// How this island should lower a degenerate last-axis arg-reduction.
 ///
 /// The lowering only exists to work around a runtime that reduces a wide last
@@ -1858,9 +1844,6 @@ fn wide_arg_reduce_lowering(cuda: bool) -> super::arg_reduce::WideArgReduceLower
     use super::arg_reduce::WideArgReduceLowering;
     if cuda && onnx_genai_ort::runtime_capability::reduces_wide_last_axis_on_cuda() {
         return WideArgReduceLowering::Direct;
-    }
-    if cuda && fused_argmax_is_available() {
-        return WideArgReduceLowering::Fused;
     }
     WideArgReduceLowering::Tiled
 }
@@ -2093,15 +2076,9 @@ fn link_models(
             island = id,
             ?lowering,
             tiled = arg_reductions.tiled,
-            fused = arg_reductions.fused,
             direct = arg_reductions.direct,
             "lowered degenerate last-axis arg-reductions inside execution island"
         );
-    }
-    if arg_reductions.fused > 0 {
-        // A custom-domain node needs its own opset import or ORT rejects the
-        // model before it ever looks for the kernel.
-        opsets.insert(super::arg_reduce::FUSED_DOMAIN.to_string(), 1);
     }
     model.opset_import = opsets
         .into_iter()

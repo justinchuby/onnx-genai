@@ -50,14 +50,6 @@ const MINIMUM_TILED_EXTENT: i64 = 4_096;
 /// Require the tiled scan length to be a small fraction of the flat scan it replaces.
 const MINIMUM_SCAN_REDUCTION: i64 = 8;
 
-/// Domain of the optional fused CUDA kernel, mirrored from
-/// `onnx_genai_ort::fused_argmax::DOMAIN` so this pass does not depend on the
-/// CUDA feature being enabled to know the name it would emit.
-pub const FUSED_DOMAIN: &str = "com.github.onnx_genai";
-
-/// Op name of the optional fused CUDA kernel.
-pub const FUSED_OP: &str = "ArgMaxLastAxis";
-
 /// How a degenerate last-axis arg-reduction should be lowered.
 ///
 /// This exists because the workaround is only worth its extra nodes while the
@@ -68,9 +60,6 @@ pub enum WideArgReduceLowering {
     /// Leave the node exactly as authored. Correct on any runtime; only fast on
     /// one whose arg-reduction parallelises a wide last axis.
     Direct,
-    /// Replace with the fused CUDA custom op where it is exactly equivalent,
-    /// and with the portable expansion everywhere else.
-    Fused,
     /// Replace with the portable `rows x tile` ONNX expansion, which needs
     /// nothing but standard ops.
     Tiled,
@@ -81,8 +70,6 @@ pub enum WideArgReduceLowering {
 pub struct ArgReduceRewrites {
     /// Nodes replaced by the portable `rows x tile` ONNX expansion.
     pub tiled: usize,
-    /// Nodes replaced by the single fused custom-op node.
-    pub fused: usize,
     /// Degenerate nodes deliberately left as authored because the runtime
     /// reduces them efficiently on its own.
     pub direct: usize,
@@ -91,29 +78,22 @@ pub struct ArgReduceRewrites {
 impl ArgReduceRewrites {
     /// Nodes actually rewritten. `direct` is not a rewrite.
     pub fn total(self) -> usize {
-        self.tiled + self.fused
+        self.tiled
     }
 }
 
 /// Lower every degenerate last-axis arg-reduction in `graph`.
 ///
-/// Under [`WideArgReduceLowering::Fused`] a node the fused CUDA kernel can serve
-/// exactly becomes a single [`FUSED_OP`] node; everything else — `ArgMin`,
-/// `select_last_index=1`, a non-float input, or any graph running without the
-/// kernel — falls back to the portable tiling, which computes the same result
-/// using only standard ONNX ops. Under [`WideArgReduceLowering::Direct`] nothing
-/// is rewritten at all.
+/// Under [`WideArgReduceLowering::Tiled`] each one becomes the portable
+/// `rows x tile` expansion, which computes the same result using only standard
+/// ONNX ops. Under [`WideArgReduceLowering::Direct`] nothing is rewritten at
+/// all, which is what a runtime that reduces a wide last axis efficiently should
+/// be handed.
 pub fn lower_degenerate_arg_reductions(
     graph: &mut GraphProto,
     lowering: WideArgReduceLowering,
 ) -> ArgReduceRewrites {
     let shapes = static_shapes(graph);
-    let fused = lowering == WideArgReduceLowering::Fused;
-    let element_types = if fused {
-        element_types(graph)
-    } else {
-        HashMap::new()
-    };
     let mut rewritten = ArgReduceRewrites::default();
     let mut index = 0;
     while index < graph.node.len() {
@@ -128,123 +108,13 @@ pub fn lower_degenerate_arg_reductions(
             index += 1;
             continue;
         }
-        let replacement = if fused && fusable(&graph.node[index], &element_types) {
-            rewritten.fused += 1;
-            fuse(&graph.node[index], &plan, &mut graph.initializer)
-        } else {
-            rewritten.tiled += 1;
-            expand(&graph.node[index], &plan, &mut graph.initializer)
-        };
+        rewritten.tiled += 1;
+        let replacement = expand(&graph.node[index], &plan, &mut graph.initializer);
         let inserted = replacement.len();
         graph.node.splice(index..=index, replacement);
         index += inserted;
     }
     rewritten
-}
-
-/// Element types the fused kernel implements. `ArgMax` is defined over every
-/// numeric tensor type, but the kernel dispatches only these, and an unsupported
-/// type would fail at the first `Run` rather than at session creation, where the
-/// island has no fallback left. Anything else takes the portable expansion,
-/// which is type agnostic.
-const FUSABLE_ELEMENT_TYPES: [i32; 3] = [
-    tensor_proto::DataType::Float as i32,
-    tensor_proto::DataType::Float16 as i32,
-    tensor_proto::DataType::Bfloat16 as i32,
-];
-
-/// Whether the fused kernel reproduces this node exactly.
-///
-/// The kernel is a maximum reduction over float data that keeps the lowest index
-/// on ties, so `ArgMin`, `select_last_index=1`, a non-float input and an input
-/// whose type the graph does not declare all stay on the portable expansion
-/// rather than being served by something that would answer a different question
-/// or not run at all.
-fn fusable(node: &NodeProto, element_types: &HashMap<String, i32>) -> bool {
-    if node.op_type != "ArgMax" || attribute_int(node, "select_last_index").unwrap_or(0) != 0 {
-        return false;
-    }
-    node.input
-        .first()
-        .and_then(|input| element_types.get(input))
-        .is_some_and(|elem| FUSABLE_ELEMENT_TYPES.contains(elem))
-}
-
-/// Declared element type of every value the graph types.
-///
-/// `Cast` is followed through its `to` attribute rather than its input, because
-/// changing the element type is the whole point of the node; `Identity` keeps
-/// its input's type. A value this cannot type is simply absent, which callers
-/// treat as "not known to be fusable".
-fn element_types(graph: &GraphProto) -> HashMap<String, i32> {
-    let mut types = HashMap::new();
-    for value in graph
-        .input
-        .iter()
-        .chain(&graph.value_info)
-        .chain(&graph.output)
-    {
-        if let Some(type_proto::Value::TensorType(tensor)) =
-            value.r#type.as_ref().and_then(|kind| kind.value.as_ref())
-        {
-            types.insert(value.name.clone(), tensor.elem_type);
-        }
-    }
-    for initializer in &graph.initializer {
-        types.insert(initializer.name.clone(), initializer.data_type);
-    }
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for node in &graph.node {
-            let (Some(input), Some(output)) = (node.input.first(), node.output.first()) else {
-                continue;
-            };
-            if types.contains_key(output) {
-                continue;
-            }
-            let produced = match node.op_type.as_str() {
-                "Cast" => attribute_int(node, "to").map(|to| to as i32),
-                "Identity" => types.get(input).copied(),
-                _ => None,
-            };
-            if let Some(elem) = produced {
-                types.insert(output.clone(), elem);
-                changed = true;
-            }
-        }
-    }
-    types
-}
-
-/// Replace a degenerate `ArgMax` with the fused custom op.
-///
-/// The kernel always drops the reduced axis, so `keepdims=1` keeps its original
-/// shape through a trailing `Reshape` rather than changing the kernel contract.
-fn fuse(node: &NodeProto, plan: &TilePlan, initializers: &mut Vec<TensorProto>) -> Vec<NodeProto> {
-    let base = if node.name.is_empty() {
-        format!("fused_{}_{}", node.op_type, node.output[0])
-    } else {
-        format!("fused_{}", node.name)
-    };
-    let result = node.output[0].clone();
-    if !plan.keepdims {
-        return vec![
-            make_node(FUSED_OP, &[&node.input[0]], &[&result], &base).with_domain(FUSED_DOMAIN),
-        ];
-    }
-    let flat = format!("{base}__flat");
-    let keep_shape = format!("{base}__keep_shape");
-    initializers.push(int64_initializer(&keep_shape, &[0, 1]));
-    vec![
-        make_node(FUSED_OP, &[&node.input[0]], &[&flat], &base).with_domain(FUSED_DOMAIN),
-        make_node(
-            "Reshape",
-            &[&flat, &keep_shape],
-            &[&result],
-            &format!("{base}_keepdims"),
-        ),
-    ]
 }
 
 struct TilePlan {
@@ -691,111 +561,16 @@ mod tests {
     }
 }
 
-/// Behaviour of the optional fused-kernel substitution.
+/// Behaviour when the runtime is trusted to reduce a wide last axis itself.
 #[cfg(test)]
-mod fused {
-    use super::tests::{sampler_graph, tensor_input};
+mod direct {
+    use super::tests::sampler_graph;
     use super::*;
 
     #[test]
-    fn degenerate_argmax_becomes_a_single_custom_node() {
-        let mut graph = sampler_graph(&[None, Some(202_048)], 0);
-        let rewrites = lower_degenerate_arg_reductions(&mut graph, WideArgReduceLowering::Fused);
-        assert_eq!(
-            rewrites,
-            ArgReduceRewrites {
-                tiled: 0,
-                fused: 1,
-                direct: 0,
-            }
-        );
-        assert_eq!(graph.node.len(), 1, "the fused form is one node, not nine");
-        assert_eq!(graph.node[0].op_type, FUSED_OP);
-        assert_eq!(graph.node[0].domain, FUSED_DOMAIN);
-        assert_eq!(graph.node[0].input, vec!["logits".to_string()]);
-        assert_eq!(graph.node[0].output, vec!["token".to_string()]);
-        // The output keeps the original name, so the rest of the island is
-        // untouched by the substitution.
-        assert!(graph.initializer.is_empty());
-    }
-
-    #[test]
-    fn keepdims_is_restored_by_a_reshape() {
-        let mut graph = sampler_graph(&[None, Some(202_048)], 1);
-        assert_eq!(
-            lower_degenerate_arg_reductions(&mut graph, WideArgReduceLowering::Fused).fused,
-            1
-        );
-        let ops = graph
-            .node
-            .iter()
-            .map(|node| node.op_type.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(ops, vec![FUSED_OP, "Reshape"]);
-        assert_eq!(graph.node[1].output, vec!["token".to_string()]);
-        let shape = graph
-            .initializer
-            .iter()
-            .find(|init| init.name.ends_with("__keep_shape"))
-            .expect("keepdims reshape target");
-        assert_eq!(shape.int64_data, vec![0, 1]);
-    }
-
-    #[test]
-    fn argmin_stays_on_the_portable_expansion() {
-        // The kernel is a maximum reduction, so a minimum must not be fused.
-        let mut graph = GraphProto {
-            name: "sampler".to_string(),
-            input: vec![tensor_input("logits", &[None, Some(202_048)])],
-            node: vec![
-                make_node("ArgMin", &["logits"], &["token"], "argmin")
-                    .with_int_attribute("axis", -1)
-                    .with_int_attribute("keepdims", 0),
-            ],
-            ..Default::default()
-        };
-        let rewrites = lower_degenerate_arg_reductions(&mut graph, WideArgReduceLowering::Fused);
-        assert_eq!(
-            rewrites,
-            ArgReduceRewrites {
-                tiled: 1,
-                fused: 0,
-                direct: 0,
-            }
-        );
-        assert!(graph.node.iter().all(|node| node.domain.is_empty()));
-    }
-
-    #[test]
-    fn last_index_tie_breaking_stays_on_the_portable_expansion() {
-        // The kernel keeps the lowest index on ties.
-        let mut graph = GraphProto {
-            name: "sampler".to_string(),
-            input: vec![tensor_input("logits", &[None, Some(202_048)])],
-            node: vec![
-                make_node("ArgMax", &["logits"], &["token"], "argmax")
-                    .with_int_attribute("axis", -1)
-                    .with_int_attribute("keepdims", 0)
-                    .with_int_attribute("select_last_index", 1),
-            ],
-            ..Default::default()
-        };
-        let rewrites = lower_degenerate_arg_reductions(&mut graph, WideArgReduceLowering::Fused);
-        assert_eq!(
-            rewrites,
-            ArgReduceRewrites {
-                tiled: 1,
-                fused: 0,
-                direct: 0,
-            }
-        );
-    }
-
-    #[test]
-    fn a_capable_runtime_gets_the_node_as_authored() {
-        // The lowering is a workaround; a runtime that reduces a wide last axis
-        // efficiently must be handed the graph the producer wrote, with no
-        // extra nodes and no custom domain.
+    fn direct_lowering_leaves_a_degenerate_reduction_as_authored() {
+        // The whole point of Direct: an ORT whose ArgMax parallelises a wide
+        // last axis should be handed the node it was given.
         let mut graph = sampler_graph(&[None, Some(202_048)], 0);
         let before = graph.node.clone();
         let rewrites = lower_degenerate_arg_reductions(&mut graph, WideArgReduceLowering::Direct);
@@ -803,7 +578,6 @@ mod fused {
             rewrites,
             ArgReduceRewrites {
                 tiled: 0,
-                fused: 0,
                 direct: 1,
             }
         );
@@ -819,138 +593,6 @@ mod fused {
         let mut graph = sampler_graph(&[None, Some(1_024)], 0);
         assert_eq!(
             lower_degenerate_arg_reductions(&mut graph, WideArgReduceLowering::Direct),
-            ArgReduceRewrites::default()
-        );
-    }
-
-    #[test]
-    fn narrow_reductions_are_left_alone_either_way() {
-        // Below the tiling threshold ORT's own kernel is not degenerate, so
-        // neither rewrite applies and the graph is untouched.
-        let mut graph = sampler_graph(&[None, Some(1_024)], 0);
-        assert_eq!(
-            lower_degenerate_arg_reductions(&mut graph, WideArgReduceLowering::Fused),
-            ArgReduceRewrites::default()
-        );
-        assert_eq!(graph.node[0].op_type, "ArgMax");
-    }
-}
-
-/// The element types the fused substitution accepts.
-#[cfg(test)]
-mod fused_element_types {
-    use super::tests::tensor_input;
-    use super::*;
-
-    fn graph_with(
-        elem: tensor_proto::DataType,
-        cast_to: Option<tensor_proto::DataType>,
-    ) -> GraphProto {
-        let mut input = tensor_input("raw", &[None, Some(202_048)]);
-        if let Some(type_proto::Value::TensorType(tensor)) =
-            input.r#type.as_mut().and_then(|kind| kind.value.as_mut())
-        {
-            tensor.elem_type = elem as i32;
-        }
-        let mut node = vec![];
-        let reduced = match cast_to {
-            Some(to) => {
-                node.push(
-                    make_node("Cast", &["raw"], &["logits"], "cast")
-                        .with_int_attribute("to", to as i64),
-                );
-                "logits"
-            }
-            None => "raw",
-        };
-        node.push(
-            make_node("ArgMax", &[reduced], &["token"], "argmax")
-                .with_int_attribute("axis", -1)
-                .with_int_attribute("keepdims", 0),
-        );
-        GraphProto {
-            name: "sampler".to_string(),
-            input: vec![input],
-            node,
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn float_inputs_are_fused() {
-        for elem in [
-            tensor_proto::DataType::Float,
-            tensor_proto::DataType::Float16,
-            tensor_proto::DataType::Bfloat16,
-        ] {
-            let mut graph = graph_with(elem, None);
-            assert_eq!(
-                lower_degenerate_arg_reductions(&mut graph, WideArgReduceLowering::Fused).fused,
-                1,
-                "{elem:?} is a type the kernel implements"
-            );
-        }
-    }
-
-    #[test]
-    fn other_numeric_inputs_take_the_portable_expansion() {
-        // ArgMax is defined over every numeric type, but the kernel is not, and
-        // an unsupported type would fail at the first run rather than at
-        // session creation, where the island has no fallback left.
-        for elem in [
-            tensor_proto::DataType::Int32,
-            tensor_proto::DataType::Int64,
-            tensor_proto::DataType::Double,
-            tensor_proto::DataType::Uint8,
-        ] {
-            let mut graph = graph_with(elem, None);
-            assert_eq!(
-                lower_degenerate_arg_reductions(&mut graph, WideArgReduceLowering::Fused),
-                ArgReduceRewrites {
-                    tiled: 1,
-                    fused: 0,
-                    direct: 0,
-                },
-                "{elem:?} must not be fused"
-            );
-        }
-    }
-
-    #[test]
-    fn a_cast_retypes_the_reduction_input() {
-        // The tiling pass deliberately sees through a Cast to find the reduced
-        // shape, so the type check has to follow the Cast's target type rather
-        // than the type it consumed - in both directions.
-        let mut to_float = graph_with(
-            tensor_proto::DataType::Float16,
-            Some(tensor_proto::DataType::Float),
-        );
-        assert_eq!(
-            lower_degenerate_arg_reductions(&mut to_float, WideArgReduceLowering::Fused).fused,
-            1
-        );
-        let mut to_int = graph_with(
-            tensor_proto::DataType::Float,
-            Some(tensor_proto::DataType::Int32),
-        );
-        assert_eq!(
-            lower_degenerate_arg_reductions(&mut to_int, WideArgReduceLowering::Fused),
-            ArgReduceRewrites {
-                tiled: 1,
-                fused: 0,
-                direct: 0,
-            }
-        );
-    }
-
-    #[test]
-    fn an_untyped_input_is_not_fused() {
-        let mut graph = graph_with(tensor_proto::DataType::Float, None);
-        graph.input[0].r#type = None;
-        // Without a declared type the pass cannot know the kernel applies, and
-        // the tiling needs the shape, so nothing is rewritten at all.
-        assert_eq!(
-            lower_degenerate_arg_reductions(&mut graph, WideArgReduceLowering::Fused),
             ArgReduceRewrites::default()
         );
     }
