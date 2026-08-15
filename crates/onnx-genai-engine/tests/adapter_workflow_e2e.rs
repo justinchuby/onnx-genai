@@ -88,12 +88,15 @@ adapters:
     targets:
       - id: projection
         component: decoder
-        parameter: projection
+        initializer: projection
+        layer_index: 0
         node_name: projection
         output_name: projection.output
         activation_dtype: float32
         input_features: 2
         output_features: 2
+        rank: 1
+        alpha: 1.0
   selection:
     slot_ids: request.slot_ids
     request_epochs: request.request_epochs

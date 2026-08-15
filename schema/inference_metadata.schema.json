@@ -1544,6 +1544,14 @@
           "$ref": "#/$defs/TensorDType",
           "description": "Projection activation dtype used by graph-native delta application."
         },
+        "alpha": {
+          "description": "Optional alpha policy for artifacts binding this target.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
         "component": {
           "description": "Workflow component name, or `model` for a bare decoder package.",
           "type": "string"
@@ -1562,10 +1570,23 @@
         "id": {
           "type": "string"
         },
+        "initializer": {
+          "description": "Exact immutable base initializer name.",
+          "type": "string"
+        },
         "input_features": {
           "format": "uint",
           "minimum": 0,
           "type": "integer"
+        },
+        "layer_index": {
+          "description": "Optional producer/importer layer identity retained from Phase-2 manifests.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "node_name": {
           "description": "Exact ONNX projection node name used for load-time manifest validation.",
@@ -1591,15 +1612,20 @@
           ],
           "description": "Resolved child range within a fused output; producer/import tooling owns discovery."
         },
-        "parameter": {
-          "description": "Exact immutable base initializer name.",
-          "type": "string"
+        "rank": {
+          "description": "Optional rank policy for artifacts binding this target.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "required": [
         "id",
         "component",
-        "parameter",
+        "initializer",
         "node_name",
         "output_name",
         "activation_dtype",
@@ -1627,10 +1653,25 @@
     "LoraTargetSlice": {
       "additionalProperties": false,
       "properties": {
+        "alpha": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
         "offset": {
           "format": "uint",
           "minimum": 0,
           "type": "integer"
+        },
+        "rank": {
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "role": {
           "description": "Producer-defined semantic label; runtime execution uses only the resolved range.",

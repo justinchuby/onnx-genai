@@ -584,7 +584,7 @@ fn load_adapter(
             anyhow::bail!(
                 "adapter target '{}.{}' shape mismatch: A has {} values (expected {expected_a}), B has {} values (expected {expected_b})",
                 target.component,
-                target.parameter,
+                target.initializer,
                 tensors.a.len(),
                 tensors.b.len()
             );
@@ -594,7 +594,7 @@ fn load_adapter(
             AdapterScaleEncoding::Baked => 1.0,
         };
         targets.insert(
-            (target.component.clone(), target.parameter.clone()),
+            (target.component.clone(), target.initializer.clone()),
             AdapterTargetWeights {
                 input_features: target.input_features,
                 output_features: target.output_features,
@@ -662,12 +662,15 @@ mod tests {
                 targets: vec![LoraTargetDescriptor {
                     id: "projection".to_string(),
                     component: "decoder".to_string(),
-                    parameter: "projection".to_string(),
+                    initializer: "projection".to_string(),
+                    layer_index: None,
                     node_name: "projection".to_string(),
                     output_name: "projection.output".to_string(),
                     activation_dtype: "float32".to_string(),
                     input_features: 2,
                     output_features: 2,
+                    rank: Some(1),
+                    alpha: Some(1.0),
                     output_slice: None,
                     graph_inputs: None,
                 }],

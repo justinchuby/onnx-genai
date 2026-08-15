@@ -224,7 +224,10 @@ pub struct LoraTargetDescriptor {
     /// Workflow component name, or `model` for a bare decoder package.
     pub component: String,
     /// Exact immutable base initializer name.
-    pub parameter: String,
+    pub initializer: String,
+    /// Optional producer/importer layer identity retained from Phase-2 manifests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer_index: Option<usize>,
     /// Exact ONNX projection node name used for load-time manifest validation.
     pub node_name: String,
     /// Exact graph value produced by the projection.
@@ -234,6 +237,12 @@ pub struct LoraTargetDescriptor {
     pub activation_dtype: String,
     pub input_features: usize,
     pub output_features: usize,
+    /// Optional rank policy for artifacts binding this target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rank: Option<usize>,
+    /// Optional alpha policy for artifacts binding this target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alpha: Option<f64>,
     /// Resolved child range within a fused output; producer/import tooling owns discovery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_slice: Option<LoraTargetSlice>,
@@ -242,13 +251,17 @@ pub struct LoraTargetDescriptor {
     pub graph_inputs: Option<LoraGraphInputBinding>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LoraTargetSlice {
     /// Producer-defined semantic label; runtime execution uses only the resolved range.
     pub role: String,
     pub offset: usize,
     pub width: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rank: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alpha: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]

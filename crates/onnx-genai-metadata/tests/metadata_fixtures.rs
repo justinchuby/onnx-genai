@@ -8,12 +8,21 @@ adapters:
     targets:
       - id: projection
         component: decoder
-        parameter: projection.weight
+        initializer: projection.weight
+        layer_index: 0
         node_name: projection
         output_name: projection.output
         activation_dtype: float32
         input_features: 2
         output_features: 2
+        rank: 1
+        alpha: 1.0
+        output_slice:
+          role: projection
+          offset: 0
+          width: 2
+          rank: 1
+          alpha: 1.0
   selection:
     slot_ids: request.slot_ids
     request_epochs: request.request_epochs
@@ -219,6 +228,25 @@ fn adapter_manifest_and_source_contracts_fail_loud() {
         errors
             .iter()
             .any(|error| error.contains("scale_encoding must be alpha_over_rank"))
+    );
+    let policy_invalid = ADAPTER_WORKFLOW.replacen("        rank: 1", "        rank: 2", 1);
+    let metadata: InferenceMetadata =
+        serde_yaml::from_str(&policy_invalid).expect("invalid target policy parses");
+    let errors = validate_metadata(&metadata).expect_err("target policy mismatch must fail");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("violates target policy"))
+    );
+    let slice_policy_invalid =
+        ADAPTER_WORKFLOW.replacen("          rank: 1", "          rank: 2", 1);
+    let metadata: InferenceMetadata =
+        serde_yaml::from_str(&slice_policy_invalid).expect("invalid slice policy parses");
+    let errors = validate_metadata(&metadata).expect_err("output-slice policy mismatch must fail");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("violates output-slice policy"))
     );
 }
 

@@ -647,12 +647,12 @@ fn validate_adapter_service(
         let path = format!("adapters.target_manifest.targets[{index}]");
         if target.id.trim().is_empty()
             || target.component.trim().is_empty()
-            || target.parameter.trim().is_empty()
+            || target.initializer.trim().is_empty()
             || target.node_name.trim().is_empty()
             || target.output_name.trim().is_empty()
         {
             errors.push(format!(
-                "{path} id, component, parameter, node_name, and output_name must not be empty"
+                "{path} id, component, initializer, node_name, and output_name must not be empty"
             ));
         }
         if manifest_targets.insert(target.id.clone(), target).is_some() {
@@ -660,11 +660,13 @@ fn validate_adapter_service(
         }
         if !resolved_targets.insert((
             target.component.clone(),
-            target.parameter.clone(),
-            target.output_slice.clone(),
+            target.initializer.clone(),
+            target.output_slice.as_ref().map(|slice| slice.role.clone()),
+            target.output_slice.as_ref().map(|slice| slice.offset),
+            target.output_slice.as_ref().map(|slice| slice.width),
         )) {
             errors.push(format!(
-                "{path} duplicates a resolved component/parameter/slice binding"
+                "{path} duplicates a resolved component/initializer/slice binding"
             ));
         }
         if target.input_features == 0 || target.output_features == 0 {
@@ -681,9 +683,26 @@ fn validate_adapter_service(
                 target.activation_dtype
             ));
         }
+        if target.rank == Some(0) {
+            errors.push(format!(
+                "{path}.rank must be greater than zero when present"
+            ));
+        }
+        if target
+            .alpha
+            .is_some_and(|alpha| !alpha.is_finite() || alpha <= 0.0)
+        {
+            errors.push(format!(
+                "{path}.alpha must be finite and greater than zero when present"
+            ));
+        }
         if let Some(slice) = &target.output_slice
             && (slice.role.trim().is_empty()
                 || slice.width == 0
+                || slice.rank == Some(0)
+                || slice
+                    .alpha
+                    .is_some_and(|alpha| !alpha.is_finite() || alpha <= 0.0)
                 || slice
                     .offset
                     .checked_add(slice.width)
@@ -922,6 +941,34 @@ fn validate_adapter_service(
                     "{target_path}.alpha must be finite and greater than zero when present"
                 ));
             }
+            let effective_rank = binding.rank.unwrap_or(artifact.rank);
+            let effective_alpha = binding.alpha.unwrap_or(artifact.alpha);
+            if target.rank.is_some_and(|rank| rank != effective_rank) {
+                errors.push(format!(
+                    "{target_path} effective rank {effective_rank} violates target policy {:?}",
+                    target.rank
+                ));
+            }
+            if target.alpha.is_some_and(|alpha| alpha != effective_alpha) {
+                errors.push(format!(
+                    "{target_path} effective alpha {effective_alpha} violates target policy {:?}",
+                    target.alpha
+                ));
+            }
+            if let Some(slice) = &target.output_slice {
+                if slice.rank.is_some_and(|rank| rank != effective_rank) {
+                    errors.push(format!(
+                        "{target_path} effective rank {effective_rank} violates output-slice policy {:?}",
+                        slice.rank
+                    ));
+                }
+                if slice.alpha.is_some_and(|alpha| alpha != effective_alpha) {
+                    errors.push(format!(
+                        "{target_path} effective alpha {effective_alpha} violates output-slice policy {:?}",
+                        slice.alpha
+                    ));
+                }
+            }
             if !local_targets.insert(binding.target.clone()) {
                 errors.push(format!(
                     "{path} declares duplicate target '{}'",
@@ -972,7 +1019,7 @@ fn validate_adapter_service(
         if let (Some(target_component), Some(target_parameter)) =
             (target_component, target_parameter)
             && !service.target_manifest.targets.iter().any(|target| {
-                target.component == target_component && target.parameter == target_parameter
+                target.component == target_component && target.initializer == target_parameter
             })
         {
             errors.push(format!(

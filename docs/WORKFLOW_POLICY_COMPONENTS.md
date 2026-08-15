@@ -291,12 +291,21 @@ adapters:
     targets:
       - id: decoder.layers.0.q_proj
         component: decoder
-        parameter: layers.0.attention.q_proj.weight
+        initializer: layers.0.attention.q_proj.weight
+        layer_index: 0
         node_name: /model/layers.0/attention/q_proj/MatMul
         output_name: layers.0.attention.q_proj.output
         activation_dtype: float16
         input_features: 4096
         output_features: 4096
+        rank: 8
+        alpha: 16.0
+        output_slice:                # optional resolved fused-output range
+          role: query
+          offset: 0
+          width: 4096
+          rank: 8
+          alpha: 16.0
         graph_inputs:                 # Phase-1 portable graph-native seam
           a: lora.layers.0.q_proj.a
           b: lora.layers.0.q_proj.b
@@ -383,11 +392,13 @@ coexist for one artifact only when they encode the same canonical factors.
 The authoritative manifest contains exact generic graph identities. Producer/import tooling owns
 architecture-specific work such as fused-QKV discovery and lowers it to exact `node_name`,
 `output_name`, and a labeled `output_slice`; execution never branches on a model family.
+Targets and fused slices may retain optional Phase-2 rank/alpha policy, which every artifact
+binding must satisfy after applying its per-binding or artifact defaults.
 `graph_inputs` preserves Phase-1 optional overridable A/B inputs.
 If absent, a capable runtime may apply an immutable parameter overlay or invoke a portable standard
 ONNX delta component. Base initializers are never modified.
 
-The targeted base fingerprint sorts targets by UTF-8 `(component,parameter)` and hashes RFC 8785
+The targeted base fingerprint sorts targets by UTF-8 `(component,initializer)` and hashes RFC 8785
 canonical JSON containing component, exact initializer name, ONNX dtype number, dimensions, SHA-256
 of logical contiguous row-major little-endian initializer bytes, and direct consumers sorted by
 node/input ordinal with normalized domain, op type, input ordinal, and canonical attributes. It is
