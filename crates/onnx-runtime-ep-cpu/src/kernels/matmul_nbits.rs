@@ -1486,10 +1486,18 @@ impl MatMulNBitsKernel {
         // `hand_int8_decode_has_native_dot`). On a host without one they lose to
         // MLAS SQNBit CompInt8 by an order of magnitude, so the short-circuit
         // must not fire there.
+        //
+        // ...unless there is nothing to amortize MLAS's packing against.
+        // Without constant weights (`can_prepack == false`) the packed buffer
+        // cannot be cached in `mlas_shards`/`mlas_packed`, so MLAS would repack
+        // on *every* call -- measured at 55.8 ms for a 6.4 MB int4 weight
+        // (`ONNX_GENAI_PROFILE_MM=1`), against a sub-millisecond decode. Dynamic
+        // weights keep the hand path regardless of ISA; a slow kernel still
+        // beats repacking the whole weight per token.
         let hand_decode_is_fast = self.bits == 4
             && self.accuracy_level == 4
             && !prefer_arm64_mlas_decode
-            && hand_int8_decode_has_native_dot();
+            && (!can_prepack || hand_int8_decode_has_native_dot());
         if m < sqnbit_decode_min() && hand_decode_is_fast {
             return Ok(None);
         }
@@ -12995,6 +13003,11 @@ mod tests {
     /// the hand path is the *wrong* answer -- measured 9.6x slower than letting
     /// MLAS take it -- so `Some(())` below the crossover is the expected result
     /// there, and this test asserts that instead.
+    ///
+    /// Weights are declared constant (`can_prepack = true`) because that is the
+    /// only case where the ISA question is live: dynamic weights always keep the
+    /// hand path (see
+    /// `matmulnbits_accuracy4_dynamic_weight_decode_keeps_hand_path`).
     #[cfg(feature = "mlas")]
     #[test]
     fn matmulnbits_try_mlas_gates_decode_by_m_threshold() {
@@ -13042,7 +13055,7 @@ mod tests {
                     &scales_t.view(),
                     None,
                     None,
-                    false,
+                    true,
                     &a,
                     m,
                     None,
@@ -13079,19 +13092,28 @@ mod tests {
 
     /// The decode-crossover short-circuit must be a claim about the host, not a
     /// constant: it may only fire where the hand int8 kernels have a real int8
-    /// dot product to dispatch to. `selected_dot_kernel` is the same selection
-    /// production code uses, so this stays honest under
-    /// `ONNX_GENAI_CPU_DOT_KERNEL`-style overrides rather than re-deriving CPUID.
+    /// dot product to dispatch to.
+    ///
+    /// The x86_64 arm cross-checks against **CPUID directly** rather than
+    /// against `selected_dot_kernel().uses_vnni_int4_direct()`, which is the
+    /// implementation itself and would be a tautology. Restricted to the default
+    /// selection: an explicit `ONNX_GENAI_CPU_DOT_KERNEL` override may
+    /// legitimately choose a weaker kernel than the hardware supports, and the
+    /// predicate must follow what actually executes, not what CPUID advertises.
     #[cfg(feature = "mlas")]
     #[test]
-    fn hand_int8_decode_native_dot_matches_selected_kernel() {
+    fn hand_int8_decode_native_dot_matches_host_capability() {
         let has_native_dot = hand_int8_decode_has_native_dot();
         #[cfg(target_arch = "x86_64")]
-        assert_eq!(
-            has_native_dot,
-            selected_dot_kernel().uses_vnni_int4_direct(),
-            "x86_64 needs AVX-VNNI/AVX-512-VNNI (vpdpbusd); the AVX2 emulation is not competitive"
-        );
+        if std::env::var_os("ONNX_GENAI_CPU_DOT_KERNEL").is_none() {
+            let host_has_vnni = std::arch::is_x86_feature_detected!("avx512vnni")
+                || std::arch::is_x86_feature_detected!("avxvnni");
+            assert_eq!(
+                has_native_dot, host_has_vnni,
+                "x86_64 needs AVX-VNNI/AVX-512-VNNI (vpdpbusd); the AVX2 vpmaddubsw/vpmaddwd \
+                 emulation is not competitive with MLAS SQNBit CompInt8"
+            );
+        }
         #[cfg(target_arch = "aarch64")]
         assert!(
             has_native_dot,
@@ -13101,6 +13123,58 @@ mod tests {
         assert!(
             !has_native_dot,
             "the scalar DotKernel has no dot product, so MLAS should take the node"
+        );
+    }
+
+    /// The dynamic-weight decline: with non-constant `B` there is no
+    /// session-lifetime cache to amortize MLAS's packing against, so decode must
+    /// stay on the hand path even on a host with no native int8 dot product.
+    /// Repacking a multi-megabyte weight per token is worse than any kernel.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn matmulnbits_accuracy4_dynamic_weight_decode_keeps_hand_path() {
+        let (k, n, block_size) = (128, 16, 32);
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 23 % 47) as f32 - 19.0) / 12.0)
+            .collect();
+        let (packed, scales, _, _) = quantize(&weights, n, k, block_size, false);
+        let scales_t = Owned::f32(&[n, 4], &scales);
+        let b = Owned::u8(&[n, 4, 16], &packed);
+        let kernel = accuracy4_kernel(k, n, block_size);
+
+        let _guard = backend_env_lock().lock().unwrap();
+        let previous = std::env::var("NXRT_CPU_GEMM_BACKEND").ok();
+        // SAFETY: the backend env lock serializes readers/writers of this var.
+        unsafe { std::env::set_var("NXRT_CPU_GEMM_BACKEND", "mlas") };
+
+        let a = pseudo(k, 0.8);
+        let mut result = vec![0.0f32; n];
+        let routed = kernel
+            .try_mlas_sqnbit(
+                &b.view(),
+                &scales_t.view(),
+                None,
+                None,
+                false, // can_prepack = false: dynamic weights
+                &a,
+                1,
+                None,
+                &mut result,
+            )
+            .unwrap();
+
+        // SAFETY: still holding the backend env lock; restore prior value.
+        unsafe {
+            match &previous {
+                Some(value) => std::env::set_var("NXRT_CPU_GEMM_BACKEND", value),
+                None => std::env::remove_var("NXRT_CPU_GEMM_BACKEND"),
+            }
+        }
+
+        assert_eq!(
+            routed, None,
+            "dynamic-weight accuracy-4 decode must keep the hand path: MLAS would repack the \
+             whole weight on every call with no cache to amortize it against"
         );
     }
 
