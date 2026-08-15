@@ -793,26 +793,51 @@ impl Engine {
         // genuinely different-length rows share one fused forward (verified by
         // `profile_native --ragged-solo-equivalence-prompts`).
         //
-        // What is still missing to wire the manager (stage 3b): the native path
-        // returns *device-argmax tokens*, not the host `[B, 1, vocab]` logits the
-        // `ContinuousBatchManager`'s host sampler consumes, and it has no
-        // mid-flight `assign_row`/`deactivate_row` to backfill a finished row with
-        // a freshly-admitted request (the ragged geometry represents rows at
-        // different lengths, but not swapping a row's content while its peers keep
-        // their captured graph). Until the host-logits sampler seam and row
-        // assign/deactivate land, the manager cannot drive native even though the
-        // ragged geometry it needs now exists.
+        // Stage 3b (#750) then built the two seams stage 3a still lacked, on the
+        // native `NativeDecodeSession`/`DecodeCudaState` layer:
+        //   * host logits — `decode_greedy_batch_ragged_logits` reads the full
+        //     `[batch, 1, vocab]` logits back to the host (one `[vocab]` row per
+        //     slot) for a real sampler, without deleting the device-argmax fast
+        //     path that keeps greedy decode cheap; and
+        //   * mid-flight backfill — `assign_batch_row`/`deactivate_batch_row`
+        //     retire a finished row and reset a single slot's cursor + mask window
+        //     to length 0 while its peers keep their captured graph.
+        // Both are validated end-to-end by
+        // `profile_native --mid-flight-solo-equivalence-prompts`: rows admitted
+        // into recycled slots mid-flight are byte-identical to the same prompts
+        // run solo at batch 1, and CUDA-graph capture survives admission
+        // (assign/deactivate are host-side mask/length writes into the already
+        // bound persistent bindings, so they force no recapture).
+        //
+        // What still blocks *wiring the manager onto native* is not the geometry
+        // or the seams but the shape of `BatchedDecodeSession` itself, which is
+        // ORT-`Value`-typed: `step_select`/`step_active` return an
+        // `onnx_genai_ort::Value` that the manager demuxes with
+        // `BatchedStaticCacheDecodeSession::row_logits`, whereas the native seam
+        // returns host `Vec<Vec<f32>>`. Bridging them means either wrapping native
+        // host logits back into an ORT `Value` (pulling ORT into the native
+        // logits path) or generalizing the trait's logits type across both ORT
+        // impls and the manager — a cross-crate refactor beyond stage 3b's scope.
+        // Additionally `continuous_batch_manager(&self)` hands the manager an
+        // immutable borrow, but the native seams require `&mut NativeDecodeSession`
+        // (every decode step mutates device bindings), so a native wiring also
+        // needs a `&mut self` entry point. Until the trait's logits type and the
+        // borrow seam are reconciled, the manager cannot drive native even though
+        // both stage-3b seams it needs now exist and are gated.
         if self.decode_backend == EngineDecodeBackend::Native {
             anyhow::bail!(
                 "continuous batching is unavailable on the native decode backend: the \
-                 ContinuousBatchManager needs a ragged BatchedDecodeSession with host \
-                 `[B, 1, vocab]` logits for its sampler and mid-flight assign_row/deactivate_row \
-                 to backfill finished rows. Stage 3a (#750) generalized the native CUDA batch \
-                 geometry to ragged (per-row length, per-row position, per-row mask via \
-                 `decode_cuda_greedy_batch_ragged`, verified by \
-                 `profile_native --ragged-solo-equivalence-prompts`), but the native path still \
-                 returns device-argmax tokens (not host logits) and has no row assign/deactivate \
-                 backfill, so the sampler and admission seams (stage 3b) are still required."
+                 ContinuousBatchManager consumes an ORT-`Value`-typed BatchedDecodeSession (its \
+                 `step_select`/`step_active` return `onnx_genai_ort::Value`, demuxed by \
+                 `BatchedStaticCacheDecodeSession::row_logits`), and it borrows the engine \
+                 immutably. Stage 3b (#750) landed the two native seams it needs — host \
+                 `[B, 1, vocab]` logits via `decode_greedy_batch_ragged_logits` (device-argmax \
+                 fast path preserved) and mid-flight `assign_batch_row`/`deactivate_batch_row` \
+                 backfill, both verified byte-identical to solo by \
+                 `profile_native --mid-flight-solo-equivalence-prompts` with CUDA-graph capture \
+                 surviving admission — but those seams return host `Vec<Vec<f32>>` and require \
+                 `&mut NativeDecodeSession`, so wiring the manager still needs the trait's logits \
+                 type generalized off ORT `Value` and a `&mut self` manager entry point."
             );
         }
         let session = self

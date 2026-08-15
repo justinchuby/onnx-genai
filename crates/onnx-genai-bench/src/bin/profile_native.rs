@@ -259,6 +259,28 @@ struct Args {
     /// it is visible the lengths really differ.
     #[arg(long)]
     ragged_solo_equivalence_prompts: Option<String>,
+    /// Stage 3b (#750): the **mid-flight** continuous-batch solo-equivalence gate.
+    /// This is the gate for what 3b adds on top of 3a's ragged geometry —
+    /// admitting a fresh request into a freed slot *between steps* while its peers
+    /// keep decoding. Give a `||`-separated list of N prompts (N MUST exceed the
+    /// batch width `--mid-flight-batch` so real backfill happens). The tool runs
+    /// each prompt **alone** at batch 1 as the reference, then drives a continuous
+    /// batch of width K: it seeds the first K prompts, and as rows finish it
+    /// retires them (`deactivate_batch_row`) and admits a waiting prompt into the
+    /// freed slot (`assign_batch_row`) mid-flight, sampling every row from host
+    /// `[B,1,vocab]` logits (`decode_greedy_batch_ragged_logits`, the stage-3b
+    /// host-logits seam). It asserts every admitted row is **byte-identical** to
+    /// its solo stream — if slot reuse leaks stale KV, mask, or position, the
+    /// admitted row diverges. The per-row admission step and lengths are printed
+    /// so it is visible rows were admitted mid-flight, not all at step 0; a gate
+    /// where every row started at step 0 is worthless and is rejected.
+    #[arg(long)]
+    mid_flight_solo_equivalence_prompts: Option<String>,
+    /// Batch width K for `--mid-flight-solo-equivalence-prompts` (physical decode
+    /// rows). Must be at least 2 and strictly less than the number of prompts so
+    /// backfill actually occurs.
+    #[arg(long, default_value_t = 2)]
+    mid_flight_batch: usize,
     /// Speculative decoding mode. `prompt-lookup` enables native n-gram
     /// speculation (exact verification; lossless vs greedy). Only supported on
     /// the single-model native `--steady` path; rejected with `--pipeline`.
@@ -1680,6 +1702,375 @@ fn run_native_decode_ragged_solo_equivalence(
     Ok(())
 }
 
+/// Lowest-index argmax over a host `[vocab]` logits row, matching the native
+/// device-argmax tie-break (ties resolve to the lowest token id). This is used
+/// by the stage-3b mid-flight gate so a host-logits selection is byte-comparable
+/// to the device-argmax solo reference — the cross-check that the host-logits
+/// seam returns the same distribution the device argmax reduces.
+fn host_argmax(logits: &[f32]) -> u32 {
+    let mut best_index = 0usize;
+    let mut best_value = f32::NEG_INFINITY;
+    for (index, &value) in logits.iter().enumerate() {
+        if value > best_value {
+            best_value = value;
+            best_index = index;
+        }
+    }
+    best_index as u32
+}
+
+/// One live sequence occupying a continuous-batch decode slot in the stage-3b
+/// mid-flight driver.
+struct MidFlightJob {
+    /// Index into the original request list (so its stream can be checked
+    /// against the matching solo reference).
+    req_index: usize,
+    prompt: Vec<u32>,
+    /// Logical length of this row (== the `past_len` fed on its next step). This
+    /// mirrors `NativeDecodeSession::batch_row_len(slot)`.
+    cursor: usize,
+    /// Generated tokens produced so far (excludes the prompt).
+    stream: Vec<u32>,
+    /// How many tokens this request generates before it retires.
+    gen_target: usize,
+    /// Global step index at which this request was admitted into its slot. `> 0`
+    /// proves it was backfilled mid-flight rather than seeded at the start.
+    admitted_step: usize,
+}
+
+/// Stage 3b (#750) mid-flight continuous-batch solo-equivalence gate.
+///
+/// Drives a native CUDA batch of width `batch` as a *continuous* batch: it seeds
+/// the first `batch` prompts, samples every row from host `[B,1,vocab]` logits
+/// (the stage-3b host-logits seam), and as rows finish it retires them and
+/// admits a waiting prompt into the freed slot **between steps** while the peers
+/// keep decoding. Every admitted row must reproduce, byte-for-byte, the stream
+/// that prompt produces run alone at batch 1; a stale-KV / stale-mask /
+/// stale-position leak across the slot-reuse boundary would diverge. This is the
+/// direct test of what 3b adds over 3a's ragged geometry.
+fn run_native_decode_mid_flight_solo_equivalence(
+    model_dir: &Path,
+    device: NativeDecodeDevice,
+    decode_precision: DecodePrecision,
+    tokenizer: &Tokenizer,
+    prompt_spec: &str,
+    batch: usize,
+    gen_tokens: usize,
+) -> Result<()> {
+    let own_pid = std::process::id();
+    report_foreign_compute_apps(own_pid);
+
+    if batch < 2 {
+        bail!("--mid-flight-batch must be at least 2 (a single slot cannot demonstrate backfill)");
+    }
+    if gen_tokens < 2 {
+        bail!("--tokens must be at least 2 for the mid-flight gate");
+    }
+
+    let prompt_texts: Vec<&str> = prompt_spec
+        .split("||")
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .collect();
+    if prompt_texts.len() <= batch {
+        bail!(
+            "--mid-flight-solo-equivalence-prompts needs strictly more than --mid-flight-batch \
+             ({batch}) prompts so a waiting request is actually admitted into a freed slot \
+             mid-flight (got {})",
+            prompt_texts.len()
+        );
+    }
+    let mut prompts: Vec<Vec<u32>> = Vec::with_capacity(prompt_texts.len());
+    for text in &prompt_texts {
+        let tokens = tokenizer
+            .encode(text)
+            .with_context(|| format!("tokenize mid-flight prompt {text:?}"))?;
+        if tokens.is_empty() {
+            bail!("mid-flight prompt {text:?} tokenized to an empty sequence");
+        }
+        prompts.push(tokens);
+    }
+    let requests = prompts.len();
+    // Stagger the per-request generation lengths so rows finish at genuinely
+    // different steps — otherwise every row would retire together and backfill
+    // would happen in a single synchronized wave, which proves nothing about
+    // mid-flight admission while peers decode. The lengths cycle in [1, gen_tokens].
+    let gen_targets: Vec<usize> = (0..requests).map(|i| 1 + (i % gen_tokens)).collect();
+    let lens: Vec<usize> = prompts.iter().map(Vec::len).collect();
+    println!(
+        "native_decode_mid_flight_solo_equivalence: own_pid={own_pid} requests={requests} \
+         batch={batch} row_lens={lens:?} gen_targets={gen_targets:?} max_gen_tokens={gen_tokens}"
+    );
+
+    // 1) Solo reference: each prompt alone at batch 1 for its own gen_target.
+    // SAFETY: single-threaded benchmark setup.
+    unsafe {
+        std::env::set_var("ONNX_GENAI_NATIVE_DECODE_BATCH", "1");
+    }
+    let mut solo_engine = build_governed_batch_engine(model_dir, &device, decode_precision, 1)?;
+    let solo_session = solo_engine
+        .native_decode_session_mut()
+        .expect("batch-1 native session");
+    let mut solo_streams: Vec<Vec<u32>> = Vec::with_capacity(requests);
+    for (req, prompt) in prompts.iter().enumerate() {
+        let stream =
+            drive_uniform_batch(solo_session, std::slice::from_ref(prompt), gen_targets[req])?;
+        let stream = stream.into_iter().next().expect("one solo row");
+        println!(
+            "native_decode_mid_flight_solo_equivalence_solo: req={req} prompt_len={} \
+             gen_target={} stream={stream:?}",
+            prompt.len(),
+            gen_targets[req]
+        );
+        solo_streams.push(stream);
+    }
+    drop(solo_engine);
+
+    // 2) Continuous batch of width `batch`: seed the first `batch`, backfill the
+    // rest mid-flight as rows finish.
+    // SAFETY: single-threaded benchmark setup.
+    unsafe {
+        std::env::set_var("ONNX_GENAI_NATIVE_DECODE_BATCH", batch.to_string());
+    }
+    let mut batch_engine =
+        build_governed_batch_engine(model_dir, &device, decode_precision, batch)?;
+    let batch_session = batch_engine
+        .native_decode_session_mut()
+        .expect("batch-K native session");
+    batch_session.reset()?;
+
+    // Start every physical slot inactive, then admit the first `batch` requests —
+    // exercising deactivate_batch_row + assign_batch_row exactly as the
+    // ContinuousBatchManager does at construction and admission.
+    for slot in 0..batch {
+        batch_session.deactivate_batch_row(slot)?;
+    }
+    let mut waiting: std::collections::VecDeque<usize> = (0..requests).collect();
+    let mut slots: Vec<Option<MidFlightJob>> = (0..batch).map(|_| None).collect();
+    let mut completed: Vec<Option<Vec<u32>>> = vec![None; requests];
+    // Per-request admission/finish bookkeeping for the visibility print.
+    let mut admitted_at: Vec<Option<usize>> = vec![None; requests];
+    let mut finished_at: Vec<Option<usize>> = vec![None; requests];
+
+    let admit = |session: &mut NativeDecodeSession,
+                 slots: &mut Vec<Option<MidFlightJob>>,
+                 waiting: &mut std::collections::VecDeque<usize>,
+                 admitted_at: &mut [Option<usize>],
+                 slot: usize,
+                 step: usize|
+     -> Result<()> {
+        if let Some(req) = waiting.pop_front() {
+            session.assign_batch_row(slot)?;
+            admitted_at[req] = Some(step);
+            slots[slot] = Some(MidFlightJob {
+                req_index: req,
+                prompt: prompts[req].clone(),
+                cursor: 0,
+                stream: Vec::new(),
+                gen_target: gen_targets[req],
+                admitted_step: step,
+            });
+        }
+        Ok(())
+    };
+
+    // Initial admission wave (step 0). These necessarily start at step 0; the
+    // gate's proof is that the *remaining* requests are admitted at step > 0.
+    for slot in 0..batch {
+        admit(
+            batch_session,
+            &mut slots,
+            &mut waiting,
+            &mut admitted_at,
+            slot,
+            0,
+        )?;
+    }
+
+    let mut d2h_bytes_total: u128 = 0;
+    let mut d2h_time_total = std::time::Duration::ZERO;
+    let mut d2h_steps: u64 = 0;
+    let mut mid_flight_admissions = 0usize;
+
+    let max_steps = requests * (gen_tokens + 64) + 1024;
+    let mut step = 0usize;
+    while slots.iter().any(Option::is_some) || !waiting.is_empty() {
+        if step >= max_steps {
+            bail!(
+                "mid-flight gate exceeded {max_steps} steps without draining — likely a stuck row"
+            );
+        }
+        // Build the per-row inputs for this fused step. Empty slots are held
+        // (advance=false) so they neither grow nor perturb the active rows.
+        let mut tokens = vec![0u32; batch];
+        let mut past_lens = vec![0usize; batch];
+        let mut advances = vec![false; batch];
+        for (slot, job) in slots.iter().enumerate() {
+            if let Some(job) = job {
+                let token = if job.cursor < job.prompt.len() {
+                    job.prompt[job.cursor]
+                } else {
+                    *job.stream.last().expect("generating row has a last token")
+                };
+                // The row length the session tracks must match our cursor.
+                let session_len = batch_session.batch_row_len(slot)?;
+                if session_len != job.cursor {
+                    bail!(
+                        "mid-flight row {slot} cursor {} disagrees with session row_len {session_len}",
+                        job.cursor
+                    );
+                }
+                tokens[slot] = token;
+                past_lens[slot] = job.cursor;
+                advances[slot] = true;
+            }
+        }
+
+        let result = batch_session
+            .decode_greedy_batch_ragged_logits(&tokens, &past_lens, &advances)
+            .with_context(|| format!("mid-flight host-logits step {step}"))?;
+        d2h_bytes_total += result.d2h_bytes as u128;
+        d2h_time_total += result.d2h_time;
+        d2h_steps += 1;
+        if result.logits.len() != batch {
+            bail!(
+                "mid-flight step {step} returned {} logit rows, expected {batch}",
+                result.logits.len()
+            );
+        }
+
+        // Consume each active row's logits, advance its cursor, record generated
+        // tokens, and retire + backfill finished rows.
+        for slot in 0..batch {
+            let Some(job) = slots[slot].as_mut() else {
+                continue;
+            };
+            let cursor_before = job.cursor;
+            let token = host_argmax(&result.logits[slot]);
+            job.cursor += 1;
+            // Once the row has consumed its whole prompt, each step's logits row
+            // is a genuine next-token prediction (the final prompt step yields the
+            // first generated token, exactly as drive_uniform_batch records it).
+            if cursor_before + 1 >= job.prompt.len() {
+                job.stream.push(token);
+            }
+            if job.stream.len() >= job.gen_target {
+                let req = job.req_index;
+                let admitted_step = job.admitted_step;
+                completed[req] = Some(std::mem::take(&mut job.stream));
+                finished_at[req] = Some(step + 1);
+                if admitted_step > 0 {
+                    mid_flight_admissions += 1;
+                }
+                // Retire the slot, then admit a waiting request into it for the
+                // NEXT step — the mid-flight backfill this gate exists to prove.
+                batch_session.deactivate_batch_row(slot)?;
+                slots[slot] = None;
+                admit(
+                    batch_session,
+                    &mut slots,
+                    &mut waiting,
+                    &mut admitted_at,
+                    slot,
+                    step + 1,
+                )?;
+            }
+        }
+        step += 1;
+    }
+
+    // Capture must survive mid-flight admission: assign/deactivate are host-side
+    // mask/length writes into the already-bound persistent bindings, so no
+    // recapture is forced. Any invalidations here come from KV-bucket growth, not
+    // admission; report the count so the reader can attribute it.
+    let capture = batch_session.cuda_kv_debug_stats().map(|stats| {
+        (
+            stats.graph.enabled,
+            stats.graph.captures,
+            stats.graph.replays,
+            stats.graph.fallbacks,
+            stats.graph.invalidations,
+        )
+    });
+    if let Some((enabled, captures, replays, fallbacks, invalidations)) = capture {
+        println!(
+            "native_decode_mid_flight_solo_equivalence_capture: graph_enabled={enabled} \
+             captures={captures} replays={replays} fallbacks={fallbacks} \
+             invalidations={invalidations} (assign/deactivate are host-side writes; any \
+             invalidations are KV-growth boundaries, not admissions)"
+        );
+    }
+    drop(batch_engine);
+    // SAFETY: single-threaded teardown.
+    unsafe {
+        std::env::remove_var("ONNX_GENAI_NATIVE_DECODE_BATCH");
+    }
+
+    // Report the honest D2H cost of the host-logits seam.
+    let d2h_ms = d2h_time_total.as_secs_f64() * 1000.0;
+    let per_step_kb = if d2h_steps > 0 {
+        (d2h_bytes_total as f64 / d2h_steps as f64) / 1024.0
+    } else {
+        0.0
+    };
+    println!(
+        "native_decode_mid_flight_solo_equivalence_d2h: steps={d2h_steps} \
+         total_logits_d2h_bytes={d2h_bytes_total} total_d2h_ms={d2h_ms:.3} \
+         per_step_logits_kb={per_step_kb:.1} (host [B,1,vocab] logits read each step; this is the \
+         cost the device-argmax fast path avoids)"
+    );
+
+    // Visibility: prove rows were admitted mid-flight (step > 0), not all at step 0.
+    for req in 0..requests {
+        println!(
+            "native_decode_mid_flight_solo_equivalence_admission: req={req} prompt_len={} \
+             gen_target={} admitted_at_step={:?} finished_at_step={:?}",
+            lens[req], gen_targets[req], admitted_at[req], finished_at[req]
+        );
+    }
+    if mid_flight_admissions == 0 {
+        bail!(
+            "mid-flight gate is worthless: every request was admitted at step 0 (no row was \
+             backfilled into a freed slot while peers kept decoding). Increase the prompt count \
+             or reduce --mid-flight-batch."
+        );
+    }
+
+    // Assert every request's continuous-batch stream is byte-identical to solo.
+    let mut all_match = true;
+    for req in 0..requests {
+        let solo = &solo_streams[req];
+        let batched = completed[req]
+            .as_ref()
+            .with_context(|| format!("mid-flight request {req} never completed"))?;
+        let matches = solo == batched;
+        all_match &= matches;
+        println!(
+            "native_decode_mid_flight_solo_equivalence_row: req={req} prompt_len={} \
+             admitted_at_step={:?} matches_solo={matches} batch_stream={batched:?}",
+            lens[req], admitted_at[req]
+        );
+        if !matches {
+            println!(
+                "native_decode_mid_flight_solo_equivalence_detail: req={req} solo={solo:?} \
+                 batch={batched:?}"
+            );
+        }
+    }
+    println!(
+        "native_decode_mid_flight_solo_equivalence_result: requests={requests} batch={batch} \
+         mid_flight_admissions={mid_flight_admissions} all_rows_match_solo={all_match}"
+    );
+    if !all_match {
+        bail!(
+            "mid-flight solo-equivalence FAILED: a row admitted into a recycled slot diverged from \
+             its solo batch-1 stream — slot reuse leaked stale KV, mask, or position across the \
+             admission boundary"
+        );
+    }
+    Ok(())
+}
+
 fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Result<()> {
     if args.synthetic {
         bail!("--steady requires a real model directory");
@@ -2134,6 +2525,23 @@ fn main() -> Result<()> {
             args.decode_precision.into(),
             &tokenizer,
             &prompt_spec,
+            args.tokens,
+        );
+    }
+    if let Some(prompt_spec) = args.mid_flight_solo_equivalence_prompts.clone() {
+        drop(session);
+        let model_dir = args
+            .model
+            .as_deref()
+            .expect("validated model argument")
+            .to_path_buf();
+        return run_native_decode_mid_flight_solo_equivalence(
+            &model_dir,
+            device.clone(),
+            args.decode_precision.into(),
+            &tokenizer,
+            &prompt_spec,
+            args.mid_flight_batch,
             args.tokens,
         );
     }

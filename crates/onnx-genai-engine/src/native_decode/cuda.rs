@@ -527,6 +527,19 @@ enum DecodeCudaGraphPhase {
     Unsupported,
 }
 
+/// Result of a host-logits ragged batch step (stage 3b, #750): one `[vocab]` f32
+/// row per batch slot plus the device→host transfer cost of reading them, so a
+/// caller can report the D2H price of the host-logits sampler seam instead of
+/// hiding it.
+pub struct RaggedLogitsStep {
+    /// Per-row host logits (`logits[r]` is row `r`'s `[vocab]` distribution).
+    pub logits: Vec<Vec<f32>>,
+    /// Bytes transferred device→host for this step's logits read.
+    pub d2h_bytes: usize,
+    /// Wall time of the logits device→host copy.
+    pub d2h_time: std::time::Duration,
+}
+
 pub(crate) struct DecodeCudaState {
     /// Number of sequences the persistent decode bindings are shaped for (KV /
     /// mask / input / position / logits batch axis). **Constructor-fixed to `1`
@@ -551,6 +564,17 @@ pub(crate) struct DecodeCudaState {
     /// for capacity/KV-shape bookkeeping. Length `batch`, reset to `0` on
     /// `rewind(0)`.
     row_lens: Vec<usize>,
+    /// Per-row admission state (stage 3b, #750). `row_active[r]` is `true` while
+    /// row `r` holds a live sequence and `false` once it has been retired by
+    /// [`Self::deactivate_row`] and is available for backfill by
+    /// [`Self::assign_row`]. Every row starts `true` so the uniform/ragged batch
+    /// entry points (which never call assign/deactivate) behave exactly as before
+    /// — the whole batch is active from construction. Only the continuous-batch
+    /// seam toggles this to swap a finished row's occupant mid-flight while its
+    /// peers keep their captured graph. This is host-side bookkeeping; it changes
+    /// no device binding shape, so toggling it never invalidates the captured
+    /// decode graph.
+    row_active: Vec<bool>,
     /// Current physical KV bucket for the native CUDA decode session. The hard
     /// maximum lives in `capacity.max_len`; this bucket grows on demand via the
     /// shared `onnx_genai_kv::kv_capacity_bucket` policy. Growth is a capture
@@ -2008,6 +2032,88 @@ impl NativeDecodeSession {
         past_lens: &[usize],
         advances: &[bool],
     ) -> anyhow::Result<Vec<TokenId>> {
+        let valid_lens = self.run_ragged_forward(tokens, past_lens, advances)?;
+        let state = self
+            .cuda
+            .as_mut()
+            .context("CUDA decode state is not initialized")?;
+        let rows = state.read_greedy_result_batch()?;
+        for (sequence, (_, capture_error)) in rows.iter().enumerate() {
+            if *capture_error != 0 {
+                let _ = state.invalidate_graph(&mut self.session);
+                bail!(
+                    "native CUDA batch decoder aborted: device capture validation violation \
+                     (flags=0x{capture_error:x}) on sequence {sequence} during captured graph \
+                     replay; the produced tokens were rejected before consumption and the decode \
+                     graph was invalidated"
+                );
+            }
+        }
+        self.commit_ragged_advance(&valid_lens, advances)?;
+        Ok(rows.into_iter().map(|(token, _)| token).collect())
+    }
+
+    /// Host-logits ragged batch-N step (stage 3b, #750): identical geometry to
+    /// [`Self::decode_cuda_greedy_batch_ragged`], but instead of the device-argmax
+    /// fast path it reads the full `[batch, 1, vocab]` logits back to the host —
+    /// one `[vocab]` row per batch slot — so a real host sampler (top-k/top-p,
+    /// temperature, penalties) can drive selection. The device-argmax path is
+    /// **not** removed: it stays the default for greedy decode because it never
+    /// pays the D2H of the full logits. This is the seam the
+    /// `ContinuousBatchManager` sampler consumes.
+    ///
+    /// The device capture-error latch is still checked *before* the host logits
+    /// are consumed (detection-before-consumption): the cheap 8-byte-per-row
+    /// argmax read-back doubles as the capture-validation read, and a latched
+    /// violation invalidates the graph and rejects the step. The full-logits D2H
+    /// cost is returned so the caller can report it honestly rather than bury it.
+    pub(crate) fn decode_cuda_greedy_batch_ragged_logits(
+        &mut self,
+        tokens: &[TokenId],
+        past_lens: &[usize],
+        advances: &[bool],
+    ) -> anyhow::Result<RaggedLogitsStep> {
+        let valid_lens = self.run_ragged_forward(tokens, past_lens, advances)?;
+        let state = self
+            .cuda
+            .as_mut()
+            .context("CUDA decode state is not initialized")?;
+        // Detection-before-consumption: read the shared capture-error latch (the
+        // argmax read-back carries it) and reject before touching the logits.
+        let guard = state.read_greedy_result_batch()?;
+        for (sequence, (_, capture_error)) in guard.iter().enumerate() {
+            if *capture_error != 0 {
+                let _ = state.invalidate_graph(&mut self.session);
+                bail!(
+                    "native CUDA batch decoder aborted: device capture validation violation \
+                     (flags=0x{capture_error:x}) on sequence {sequence} during captured graph \
+                     replay; the produced logits were rejected before consumption and the decode \
+                     graph was invalidated"
+                );
+            }
+        }
+        let (logits, d2h_bytes, d2h_time) = state.read_batch_row_logits()?;
+        self.commit_ragged_advance(&valid_lens, advances)?;
+        Ok(RaggedLogitsStep {
+            logits,
+            d2h_bytes,
+            d2h_time,
+        })
+    }
+
+    /// Shared ragged-step preamble: validate the per-row inputs, size the mask
+    /// window and physical extent, ensure KV capacity, write the ragged mask and
+    /// the per-row token/position inputs, and run the fused forward. Returns the
+    /// per-row valid mask widths (`past_lens[r] + 1`) so the caller can advance
+    /// the stepped rows after it has validated/consumed the forward's output.
+    /// Does **not** read results or advance `row_lens` — those differ between the
+    /// device-argmax and host-logits consumers.
+    fn run_ragged_forward(
+        &mut self,
+        tokens: &[TokenId],
+        past_lens: &[usize],
+        advances: &[bool],
+    ) -> anyhow::Result<Vec<usize>> {
         let state = self
             .cuda
             .as_mut()
@@ -2061,19 +2167,21 @@ impl NativeDecodeSession {
                 "native CUDA batch decoder forward pass failed{diagnosis}"
             )));
         }
-        let rows = state.read_greedy_result_batch()?;
-        for (sequence, (_, capture_error)) in rows.iter().enumerate() {
-            if *capture_error != 0 {
-                let _ = state.invalidate_graph(&mut self.session);
-                bail!(
-                    "native CUDA batch decoder aborted: device capture validation violation \
-                     (flags=0x{capture_error:x}) on sequence {sequence} during captured graph \
-                     replay; the produced tokens were rejected before consumption and the decode \
-                     graph was invalidated"
-                );
-            }
-        }
-        // Advance only the rows the caller stepped; a held row keeps its length.
+        Ok(valid_lens)
+    }
+
+    /// Advance the stepped rows' logical lengths after a ragged forward and
+    /// re-derive the shared physical extent. A held row (`advances[r] == false`)
+    /// keeps its length.
+    fn commit_ragged_advance(
+        &mut self,
+        valid_lens: &[usize],
+        advances: &[bool],
+    ) -> anyhow::Result<()> {
+        let state = self
+            .cuda
+            .as_mut()
+            .context("CUDA decode state is not initialized")?;
         for (row, &advance) in advances.iter().enumerate() {
             if advance {
                 state.row_lens[row] = valid_lens[row];
@@ -2082,7 +2190,7 @@ impl NativeDecodeSession {
         let new_max = state.row_lens.iter().copied().max().unwrap_or(0);
         state.set_logical_len(new_max)?;
         self.current_len = new_max;
-        Ok(rows.into_iter().map(|(token, _)| token).collect())
+        Ok(())
     }
 }
 
@@ -3484,6 +3592,7 @@ impl DecodeCudaState {
             batch,
             logical_len: 0,
             row_lens: vec![0; batch],
+            row_active: vec![true; batch],
             max_len,
             bindings,
             base_binding_count,
@@ -3646,6 +3755,100 @@ impl DecodeCudaState {
         }
         self.logical_len = len;
         Ok(())
+    }
+
+    /// Zero the whole attention-mask row for sequence `r` (stage 3b, #750).
+    ///
+    /// The ragged mask writer ([`Self::extend_mask_ragged`]) only (re)writes each
+    /// row's `[0, valid_lens[r])` leading `1`s, and the model derives that row's
+    /// `seqlens_k` from the *count* of `1`s in its window. A row that is being
+    /// recycled for a freshly-admitted sequence would therefore inherit its
+    /// previous occupant's trailing `1`s beyond the new (shorter) window, which
+    /// would inflate the new sequence's key count and let it attend stale KV.
+    /// Wiping the row to all `0`s here means the next `extend_mask_ragged` leaves
+    /// exactly the new sequence's window set — no leakage across the reuse
+    /// boundary. This is a pure data write into the persistent mask binding (the
+    /// same binding every step writes), so it changes no shape and does not
+    /// disturb the captured graph or any peer row.
+    fn zero_mask_row(&mut self, row: usize) -> anyhow::Result<()> {
+        let word = std::mem::size_of::<i64>();
+        let row_stride = self.max_len * word;
+        let zeros = vec![0u8; row_stride];
+        self.bindings[0].write_bytes(row * row_stride, &zeros)?;
+        Ok(())
+    }
+
+    /// Retire row `r`: mark it inactive so its slot may be recycled (stage 3b,
+    /// #750). Host-side only — no device binding shape changes — so a captured
+    /// decode graph is untouched and the peer rows keep replaying. The row's KV
+    /// and mask are left as-is; [`Self::assign_row`] resets them when the slot is
+    /// reused, and until then a deactivated row is simply never stepped
+    /// (`advances[r] == false`).
+    pub(crate) fn deactivate_row(&mut self, row: usize) -> anyhow::Result<()> {
+        if row >= self.batch {
+            bail!(
+                "native CUDA deactivate_row {row} out of range for pinned batch {}",
+                self.batch
+            );
+        }
+        self.row_active[row] = false;
+        Ok(())
+    }
+
+    /// Admit a fresh sequence into row `r` (stage 3b, #750): reset that row's
+    /// cursor to length 0, wipe its mask window so no stale key survives the
+    /// reuse boundary, and mark it active. Peers are untouched — their
+    /// `row_lens`, mask windows and KV are unchanged — and no binding is
+    /// reshaped or reallocated, so the captured decode graph survives (the next
+    /// fused step replays the same graph with the reset row simply sitting at
+    /// length 0). The row's stale KV is progressively overwritten as the new
+    /// sequence prefills (each step writes present KV at its own ascending
+    /// offset before that offset is ever attended), and the zeroed mask means it
+    /// only ever attends keys it has itself just written.
+    pub(crate) fn assign_row(&mut self, row: usize) -> anyhow::Result<()> {
+        if row >= self.batch {
+            bail!(
+                "native CUDA assign_row {row} out of range for pinned batch {}",
+                self.batch
+            );
+        }
+        self.zero_mask_row(row)?;
+        self.row_lens[row] = 0;
+        self.row_active[row] = true;
+        Ok(())
+    }
+
+    /// Active logical rows in ascending order (stage 3b, #750).
+    pub(crate) fn active_rows(&self) -> Vec<usize> {
+        (0..self.batch).filter(|&r| self.row_active[r]).collect()
+    }
+
+    /// Current logical length of row `r`.
+    pub(crate) fn row_len(&self, row: usize) -> anyhow::Result<usize> {
+        self.row_lens
+            .get(row)
+            .copied()
+            .with_context(|| format!("native CUDA row_len {row} out of range"))
+    }
+
+    /// Read the current `[batch, 1, vocab]` logits binding back to the host as
+    /// one `[vocab]` f32 row per batch slot (stage 3b, #750). This is the
+    /// host-logits seam the continuous-batch sampler consumes when a real
+    /// (non-greedy) sampler is attached, in contrast to the device-argmax fast
+    /// path which never round-trips the full logits. Returns the rows plus the
+    /// number of bytes transferred device→host and the wall time of that copy so
+    /// the caller can report the D2H cost honestly (`[B,1,vocab]` at vocab
+    /// 151936 is ~608 KB per row per step in f32).
+    fn read_batch_row_logits(
+        &mut self,
+    ) -> anyhow::Result<(Vec<Vec<f32>>, usize, std::time::Duration)> {
+        let start = std::time::Instant::now();
+        let bytes = self.bindings[self.logits_binding].read_bytes()?;
+        let elapsed = start.elapsed();
+        let transferred = bytes.len();
+        let logits = Tensor::from_raw(self.logits_dtype, self.logits_shape.clone(), &bytes)?;
+        let rows = extract_batch_row_logits(&logits, self.batch)?;
+        Ok((rows, transferred, elapsed))
     }
 
     /// Whether every self-attention KV binding is a rank-4 CUDA cache
