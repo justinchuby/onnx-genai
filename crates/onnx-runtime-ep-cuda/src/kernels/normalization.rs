@@ -2392,11 +2392,9 @@ impl SkipSimplifiedLayerNormKernel {
             "SkipSimplifiedLayerNormalization hidden={norm_size}: native byte-exact bf16 \
              (bf16-rounded residual sum, rmsnorm_bf16 block-tree reduction)"
         );
-        let func = self.runtime.nvrtc_function(
-            SKIP_RMSNORM_MODULE,
-            SKIP_RMSNORM_SRC,
-            bf16_entry,
-        )?;
+        let func =
+            self.runtime
+                .nvrtc_function(SKIP_RMSNORM_MODULE, SKIP_RMSNORM_SRC, bf16_entry)?;
         let stream = self.runtime.stream();
         let mut builder = stream.launch_builder(&func);
         let groups_i = groups_u_i32(groups_u);
@@ -4656,11 +4654,7 @@ mod tests {
             eprintln!("skipping skip-RMSNorm warp-reduce parity test: CUDA unavailable");
             return;
         };
-        for dtype in [
-            DataType::Float16,
-            DataType::BFloat16,
-            DataType::Float32,
-        ] {
+        for dtype in [DataType::Float16, DataType::BFloat16, DataType::Float32] {
             for hidden in [128usize, 256, 512, 2048, 4096] {
                 // SAFETY: single-threaded test; the kernel reads the flag at
                 // launch time, so toggling it between the two runs is sufficient.
