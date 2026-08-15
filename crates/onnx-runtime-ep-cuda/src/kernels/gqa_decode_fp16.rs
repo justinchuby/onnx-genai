@@ -64,9 +64,8 @@ const MERGE_ENTRY: &str = "gqa_decode_attention_f16_merge";
 pub(super) const MAX_HEAD_DIM: usize = 256;
 
 /// Warps grouped into one CTA. Each CTA owns one query head; its warps split-K
-/// the sequence. Four warps (128 threads) is the ORT decode geometry and keeps
-/// the flash merge cheap (a 4-way reduction in shared memory).
-const WARPS_PER_BLOCK: u32 = 4;
+/// the sequence.
+const DEFAULT_WARPS_PER_BLOCK: u32 = 8;
 const WARP_SIZE: u32 = 32;
 pub(super) const MAX_SPLITS: usize = 16;
 const MERGE_DIM_SPLITS: usize = 4;
@@ -76,6 +75,18 @@ const MERGE_DIM_SPLITS: usize = 4;
 /// vectorization requires an even head size).
 pub(super) fn supported(query_seq: usize, head_dim: usize) -> bool {
     query_seq == 1 && head_dim.is_multiple_of(2) && (1..=MAX_HEAD_DIM).contains(&head_dim)
+}
+
+fn warps_per_block() -> u32 {
+    use std::sync::OnceLock;
+    static VALUE: OnceLock<u32> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("ONNX_GENAI_CUDA_GQA_WARPS")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|&value| (1..=8).contains(&value))
+            .unwrap_or(DEFAULT_WARPS_PER_BLOCK)
+    })
 }
 
 const DECODE_SRC: &str = r#"
@@ -481,7 +492,8 @@ pub(super) fn run(
     let split_fill_i = i32::try_from(split_fill).unwrap_or(MAX_SPLITS as i32);
 
     // Dynamic shared: warp_max[warps] + warp_sum[warps] + warp_acc[warps*head].
-    let warps = WARPS_PER_BLOCK as usize;
+    let warps_per_block = warps_per_block();
+    let warps = warps_per_block as usize;
     let shared_floats = warps
         .checked_mul(2)
         .and_then(|base| warps.checked_mul(head_dim).map(|acc| base + acc))
@@ -522,7 +534,7 @@ pub(super) fn run(
     unsafe {
         builder.launch(LaunchConfig {
             grid_dim: (grid_x, 1, 1),
-            block_dim: (WARPS_PER_BLOCK * WARP_SIZE, 1, 1),
+            block_dim: (warps_per_block * WARP_SIZE, 1, 1),
             shared_mem_bytes,
         })
     }
