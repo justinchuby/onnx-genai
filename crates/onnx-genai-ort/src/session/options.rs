@@ -51,6 +51,24 @@ pub struct SessionOptions {
     /// Generic ORT session configuration entries applied through
     /// `AddSessionConfigEntry` before provider append/session creation.
     pub session_config_entries: Vec<(String, String)>,
+    /// Raw `cudaStream_t` every CUDA session should compute on, as a pointer
+    /// value. `None` leaves each session on the per-session stream ORT creates.
+    ///
+    /// Set this whenever one logical step drives more than one CUDA session:
+    /// see [`crate::cuda_rt::CudaComputeStream`]. Upstream ORT GenAI sets it
+    /// on every CUDA session it builds, so matching it is also what makes this
+    /// runtime's session options comparable to that native baseline.
+    /// The CUDA stream every session built from these options computes on.
+    ///
+    /// Owned, so it is destroyed when the last session holding it is dropped
+    /// rather than living until process exit. Cloning these options shares the
+    /// stream deliberately: that is how one pipeline gives all of its sessions
+    /// one ordered timeline. A *different* pipeline must call
+    /// [`SessionOptions::share_cuda_compute_stream`] itself, which always
+    /// installs a fresh stream, so cloning another pipeline's options can never
+    /// silently join its capture timeline.
+    #[cfg(feature = "cuda")]
+    pub cuda_user_compute_stream: Option<std::sync::Arc<crate::cuda_rt::CudaComputeStream>>,
     /// Whether the non-CPU execution provider was auto-selected for this platform
     /// (e.g. the macOS MLX/Metal default) rather than explicitly requested. An
     /// auto-selected provider must fall back to CPU on load failure, even if the
@@ -63,6 +81,79 @@ pub struct SessionOptions {
 pub const USE_ENV_ALLOCATORS: &str = "session.use_env_allocators";
 
 impl SessionOptions {
+    /// Put every CUDA session built from these options on one shared compute
+    /// stream, so a step that drives several sessions keeps a single ordered
+    /// device timeline instead of ping-ponging between per-session ORT streams.
+    ///
+    /// Call this once per pipeline and derive that pipeline's session options
+    /// from the result. Each call creates a distinct stream on purpose: ORT
+    /// captures graphs with `cudaStreamCaptureModeGlobal`, so two independently
+    /// driven pipelines must never share one stream.
+    ///
+    /// A no-op without a CUDA execution provider, and a no-op when the CUDA
+    /// runtime cannot be loaded: the stream is a performance property, not a
+    /// correctness one, so failing to create it must not fail session setup.
+    pub fn share_cuda_compute_stream(&mut self) -> &mut Self {
+        #[cfg(feature = "cuda")]
+        {
+            // Always install a *fresh* stream, even if these options already
+            // carry one. Options are cloned freely, so honouring an inherited
+            // stream here is exactly how a second pipeline would end up sharing
+            // the first pipeline's capture timeline.
+            self.cuda_user_compute_stream = None;
+            let Some(device_id) = self.cuda_device_id() else {
+                return self;
+            };
+            match crate::cuda_rt::CudaComputeStream::new(device_id) {
+                Ok(stream) => self.cuda_user_compute_stream = Some(stream),
+                Err(error) => tracing::warn!(
+                    device_id,
+                    "could not create a shared CUDA compute stream; each session keeps its own: \
+                     {error}"
+                ),
+            }
+        }
+        self
+    }
+
+    /// Drop any shared stream that no longer matches the selected CUDA device.
+    ///
+    /// A stream is only valid on the device it was created on, so changing the
+    /// execution providers after [`Self::share_cuda_compute_stream`] must not
+    /// leave a stream from the old device attached. Callers that change
+    /// providers go through this, and a session built afterwards simply keeps
+    /// ORT's own stream rather than being handed a foreign one.
+    pub fn invalidate_stream_for_device_change(&mut self) -> &mut Self {
+        #[cfg(feature = "cuda")]
+        {
+            let device = self.cuda_device_id();
+            let stale = match (&self.cuda_user_compute_stream, device) {
+                (Some(stream), Some(device_id)) => stream.device_id() != device_id,
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            if stale {
+                tracing::debug!(
+                    "dropping the shared CUDA compute stream: the selected device changed"
+                );
+                self.cuda_user_compute_stream = None;
+            }
+        }
+        self
+    }
+
+    /// CUDA device this session targets, if a CUDA execution provider is selected.
+    #[must_use]
+    pub fn cuda_device_id(&self) -> Option<i32> {
+        self.execution_providers
+            .iter()
+            .find_map(|provider| match &provider.strategy {
+                #[cfg(feature = "cuda")]
+                super::ep_compat::AppendStrategy::CudaTyped { device_id } => Some(*device_id),
+                _ => None,
+            })
+    }
+
     /// Route this session's allocations through allocators registered on the
     /// environment.
     ///
@@ -145,6 +236,8 @@ impl SessionOptions {
             webgpu_disable_validation: false,
             cuda_attention_mode: cuda_attention_mode_from_runtime_config(),
             session_config_entries: runtime_config().session_config_entries.clone(),
+            #[cfg(feature = "cuda")]
+            cuda_user_compute_stream: None,
             auto_selected: false,
         }
     }

@@ -58,27 +58,79 @@ pub(super) fn add_session_config_entry(
     crate::error::check_status(unsafe { add(session_options, key_c.as_ptr(), value_c.as_ptr()) })
 }
 
+/// Append every requested provider, returning the shared CUDA stream that a
+/// provider actually adopted.
+///
+/// The return value is the whole point: a caller that reports "this session
+/// computes on stream X" must report the stream the execution provider was
+/// really given, not the one the options happened to carry. Those differ
+/// whenever the stream belongs to another device, or the session ends up on a
+/// provider that takes no stream at all.
 pub(super) fn append_execution_providers(
     env: &Environment,
     session_options: *mut onnx_genai_ort_sys::OrtSessionOptions,
     options: &SessionOptions,
-) -> Result<()> {
+) -> Result<AdoptedStream> {
     let available = available_execution_providers().unwrap_or_else(|err| {
         tracing::warn!("Could not query available ORT execution providers: {err}");
         Vec::new()
     });
+    #[cfg(feature = "cuda")]
+    let mut adopted: AdoptedStream = None;
+    #[cfg(not(feature = "cuda"))]
+    let adopted: AdoptedStream = ();
     for provider in &options.execution_providers {
+        #[cfg(feature = "cuda")]
+        let stream = shared_stream_for(options, provider);
+        #[cfg(not(feature = "cuda"))]
+        let stream: Option<std::convert::Infallible> = None;
         append_execution_provider(
             env,
             session_options,
             provider,
             options.graph_capture,
             &options.cuda_attention_mode,
+            {
+                #[cfg(feature = "cuda")]
+                {
+                    stream.as_ref().map(|stream| stream.handle())
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    let _ = &stream;
+                    None
+                }
+            },
             &available,
         )?;
+        #[cfg(feature = "cuda")]
+        if stream.is_some() {
+            adopted = stream;
+        }
     }
-    Ok(())
+    Ok(adopted)
 }
+
+/// The shared CUDA stream, if any, that a session using these options adopts.
+#[cfg(feature = "cuda")]
+pub(super) type AdoptedStream = Option<std::sync::Arc<crate::cuda_rt::CudaComputeStream>>;
+
+/// Without CUDA no provider can adopt a stream, so there is nothing to report.
+#[cfg(not(feature = "cuda"))]
+pub(super) type AdoptedStream = ();
+
+/// Copy an [`AdoptedStream`] without naming which of the two types it is.
+///
+/// With CUDA it is an `Option<Arc<_>>` that must be cloned; without CUDA it is
+/// `()`, where a `.clone()` at the call site would be a clippy error. Both
+/// arms live here so callers do not need their own `cfg`.
+#[cfg(feature = "cuda")]
+pub(super) fn clone_adopted(adopted: &AdoptedStream) -> AdoptedStream {
+    adopted.clone()
+}
+
+#[cfg(not(feature = "cuda"))]
+pub(super) fn clone_adopted(_adopted: &AdoptedStream) -> AdoptedStream {}
 
 pub(super) fn append_execution_provider(
     env: &Environment,
@@ -86,6 +138,7 @@ pub(super) fn append_execution_provider(
     provider: &ResolvedEp,
     graph_capture: bool,
     cuda_attention_mode: &CudaAttentionMode,
+    cuda_user_compute_stream: Option<usize>,
     available: &[String],
 ) -> Result<()> {
     use ep_compat::AppendStrategy;
@@ -97,6 +150,7 @@ pub(super) fn append_execution_provider(
             *device_id,
             graph_capture,
             cuda_attention_mode,
+            cuda_user_compute_stream,
             available,
         ),
         #[cfg(not(feature = "cuda"))]
@@ -105,6 +159,7 @@ pub(super) fn append_execution_provider(
                 session_options,
                 graph_capture,
                 cuda_attention_mode,
+                cuda_user_compute_stream,
                 available,
             );
             Err(OrtError::InvalidArgument(
@@ -162,6 +217,33 @@ pub(super) fn parse_hardware_device_type(
         "NPU" => Some(onnx_genai_ort_sys::OrtHardwareDeviceType_NPU),
         _ => None,
     }
+}
+
+/// The shared CUDA stream `provider` adopts, if any.
+///
+/// A stream is only valid on the device it was created on, and a provider that
+/// is not a typed CUDA provider takes no stream at all. `execution_providers`
+/// is public and metadata placement rewrites it, so the device can change after
+/// a stream was attached. Deciding here, per provider, is what keeps the stream
+/// the execution provider receives and the stream the session reports the same
+/// value by construction.
+#[cfg(feature = "cuda")]
+fn shared_stream_for(options: &SessionOptions, provider: &ResolvedEp) -> AdoptedStream {
+    let stream = options.cuda_user_compute_stream.as_ref()?;
+    let ep_compat::AppendStrategy::CudaTyped { device_id } = &provider.strategy else {
+        // A host or plugin provider issues no work on this stream.
+        return None;
+    };
+    if *device_id == stream.device_id() {
+        return Some(std::sync::Arc::clone(stream));
+    }
+    tracing::warn!(
+        stream_device = stream.device_id(),
+        provider_device = *device_id,
+        "ignoring a shared CUDA compute stream created for a different device; this session keeps \
+         the stream ONNX Runtime gives it"
+    );
+    None
 }
 
 fn append_named_execution_provider(
@@ -244,4 +326,91 @@ pub(super) fn provider_is_available(provider_name: &str, available: &[String]) -
                 .strip_suffix("ExecutionProvider")
                 .is_some_and(|short| short.eq_ignore_ascii_case(provider))
     })
+}
+
+#[cfg(test)]
+mod shared_stream_device_guard {
+    use super::*;
+    use crate::session::ep_selection;
+
+    /// A typed CUDA provider for `device_id`, built the way the resolver builds
+    /// one, so the test exercises the real CUDA-vs-CUDA branch rather than a
+    /// selection that resolves to no device at all.
+    #[cfg(feature = "cuda")]
+    fn cuda_provider(device_id: i32) -> ResolvedEp {
+        let mut provider = ep_compat::resolve_execution_provider(&ep_selection("cuda"));
+        provider.strategy = ep_compat::AppendStrategy::CudaTyped { device_id };
+        provider
+    }
+
+    /// The stream reaches a provider on its own device.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn the_owning_device_receives_the_stream() {
+        let mut options = SessionOptions::with_execution_provider(ep_selection("cuda"));
+        options.share_cuda_compute_stream();
+        let Some(stream) = options.cuda_user_compute_stream.clone() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let provider = cuda_provider(stream.device_id());
+        assert_eq!(
+            shared_stream_for(&options, &provider).map(|s| s.handle()),
+            Some(stream.handle()),
+        );
+    }
+
+    /// A *CUDA* provider on a different device must not receive it.
+    ///
+    /// This is the branch that matters: both sides are typed CUDA providers
+    /// with a real device id, which a selection string that fails to resolve
+    /// would never reach.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn another_cuda_device_does_not_receive_the_stream() {
+        let mut options = SessionOptions::with_execution_provider(ep_selection("cuda"));
+        options.share_cuda_compute_stream();
+        let Some(stream) = options.cuda_user_compute_stream.clone() else {
+            eprintln!("skipping: no CUDA device");
+            return;
+        };
+        let other = stream.device_id() + 1;
+        let provider = cuda_provider(other);
+        assert!(
+            shared_stream_for(&options, &provider).is_none(),
+            "a stream from device {} must not be handed to a CUDA provider on device {other}",
+            stream.device_id(),
+        );
+    }
+
+    /// A provider that is not a typed CUDA provider takes no stream, so a
+    /// session that falls back to the host reports none.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn a_host_provider_does_not_receive_the_stream() {
+        let mut options = SessionOptions::with_execution_provider(ep_selection("cuda"));
+        options.share_cuda_compute_stream();
+        if options.cuda_user_compute_stream.is_none() {
+            eprintln!("skipping: no CUDA device");
+            return;
+        }
+        let cpu = ep_compat::resolve_execution_provider(&ep_selection("cpu"));
+        assert!(shared_stream_for(&options, &cpu).is_none());
+    }
+
+    /// Options with no shared stream are unaffected, on every build.
+    #[test]
+    fn no_shared_stream_means_no_handle() {
+        let options = SessionOptions::with_execution_provider(ep_selection("cpu"));
+        let cpu = ep_compat::resolve_execution_provider(&ep_selection("cpu"));
+        #[cfg(feature = "cuda")]
+        assert!(shared_stream_for(&options, &cpu).is_none());
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (&options, &cpu);
+        }
+    }
 }

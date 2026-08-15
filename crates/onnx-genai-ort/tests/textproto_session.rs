@@ -51,3 +51,27 @@ fn loads_and_runs_textproto_fixture() {
     assert_eq!(outputs.len(), 1);
     assert_eq!(outputs[0].shape(), &[1, 4, 4]);
 }
+
+/// A session that adopted no shared stream must report none.
+///
+/// `Session::user_compute_stream()` exists so a caller can order its own work
+/// against the session's runs without a device barrier. A session that reports
+/// a stream it is not computing on would make that ordering a lie, so the
+/// getter has to be `None` whenever no provider adopted one. This runs on CPU,
+/// so it covers the options -> provider -> session threading and the accessor
+/// in a lane with no GPU.
+#[test]
+fn a_session_with_no_shared_stream_reports_none() {
+    let path = tiny_whisper_encoder_textproto();
+    if !path.exists() {
+        eprintln!("a_session_with_no_shared_stream_reports_none: fixture absent, skipping");
+        return;
+    }
+    let session =
+        Session::new(test_environment(), &path, SessionOptions::default()).expect("session loads");
+    assert_eq!(
+        session.user_compute_stream(),
+        None,
+        "no provider adopted a stream, so the session must not claim one"
+    );
+}
