@@ -113,6 +113,19 @@ impl TieGuard {
     }
 }
 
+/// Whether the fused CUDA-graph-captured verify path is enabled
+/// (`ONNX_GENAI_SPEC_CAPTURED_VERIFY=1`). Off by default so the tested eager
+/// verify path stays the default; when on, the driver still degrades to eager on
+/// non-CUDA or non-capturable sessions, so this never affects correctness.
+fn captured_verify_from_env() -> bool {
+    matches!(
+        std::env::var("ONNX_GENAI_SPEC_CAPTURED_VERIFY")
+            .ok()
+            .as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    )
+}
+
 /// Greedy speculative acceptance with an optional numerical near-tie guard.
 ///
 /// `base_logits` is the target distribution for the first uncommitted position
@@ -182,6 +195,11 @@ pub(crate) struct NativeSpeculativeDriver<'a> {
     draft_width: usize,
     /// Numerical near-tie acceptance guard (strict by default; byte-identical).
     tie_guard: TieGuard,
+    /// WP4: run the M=width verify forward through the CUDA-graph-captured fused
+    /// path (base + draft in one replayed graph) instead of the eager verify.
+    /// Env-gated (`ONNX_GENAI_SPEC_CAPTURED_VERIFY=1`) and prompt-lookup only;
+    /// falls back to eager transparently on non-CUDA / non-capturable sessions.
+    captured_verify: bool,
 }
 
 enum NativeProposer<'a> {
@@ -207,6 +225,7 @@ impl<'a> NativeSpeculativeDriver<'a> {
             proposer: NativeProposer::PromptLookup(NgramProposer::new(ngram, max_tokens)?),
             draft_width: draft_width.max(1),
             tie_guard: TieGuard::from_env(),
+            captured_verify: captured_verify_from_env(),
         })
     }
 
@@ -235,6 +254,7 @@ impl<'a> NativeSpeculativeDriver<'a> {
             },
             draft_width: draft_width.max(1),
             tie_guard: TieGuard::from_env(),
+            captured_verify: captured_verify_from_env(),
         })
     }
 
@@ -288,17 +308,10 @@ impl<'a> NativeSpeculativeDriver<'a> {
                 );
             }
 
-            // Fold the trailing committed token(s) into the KV and read the
-            // target's next-token distribution for the first uncommitted position.
+            // Fold the trailing committed token(s) into the KV. In the eager
+            // path this is a separate base forward; in the fused captured path
+            // the base distribution comes from row 0 of the verify forward.
             let past = self.session.current_len();
-            let base_logits = self
-                .session
-                .decode(&pending, past)?
-                .pop()
-                .context("native speculative decode produced no base logits")?;
-            pending.clear();
-            let base = self.session.current_len();
-            debug_assert_eq!(base, context_len);
 
             let remaining_tokens = options.max_new_tokens - state.generated_tokens.len();
             let remaining_context = options
@@ -313,7 +326,106 @@ impl<'a> NativeSpeculativeDriver<'a> {
                 .copied()
                 .chain(state.generated_tokens.iter().copied())
                 .collect();
-            let mut draft = match &mut self.proposer {
+
+            // WP4 fused captured verify: prompt-lookup-only and steady-state-only
+            // (exactly one trailing committed token). It proposes BEFORE the
+            // forward so the base distribution (row 0) and the draft verify rows
+            // fuse into ONE replayed CUDA graph. Every other configuration
+            // (shared-KV, the multi-token prefill step, non-CUDA, capture
+            // disabled) takes the unchanged eager path.
+            let fused_eligible = self.captured_verify
+                && self.session.is_cuda()
+                && pending.len() == 1
+                && matches!(self.proposer, NativeProposer::PromptLookup(_));
+
+            let (base_logits, base, draft, rows) = if fused_eligible {
+                let proposer_context = SpeculativeProposerContext {
+                    width,
+                    context_tokens: &context_tokens,
+                    generated_tokens: &state.generated_tokens,
+                    generated_text: &state.generated_text,
+                    first_step: state.step,
+                    options,
+                    chain,
+                    target_hidden: None,
+                    target_hidden_layers: None,
+                    guaranteed_token: None,
+                    shared_kv_slices: None,
+                };
+                let mut draft = match &mut self.proposer {
+                    NativeProposer::PromptLookup(proposer) => {
+                        proposer.propose(&proposer_context)?.tokens
+                    }
+                    _ => unreachable!("fused verify path is prompt-lookup only"),
+                };
+                draft.truncate(width);
+                let bonus_token = pending[0];
+                if draft.is_empty() {
+                    // No proposal: a single eager greedy step (needs base_logits).
+                    // The eager base forward may reset the shared graph slot, so
+                    // force the retained verify graph to re-warm next step.
+                    let base_logits = self
+                        .session
+                        .decode(&pending, past)?
+                        .pop()
+                        .context("native speculative decode produced no base logits")?;
+                    pending.clear();
+                    self.session.reset_captured_verify();
+                    let token = sample_greedy(&base_logits);
+                    if let Some(reason) = commit_selected_token(
+                        &mut state,
+                        prompt_tokens,
+                        token,
+                        options,
+                        chain,
+                        tokenizer,
+                        callback.as_deref_mut(),
+                    )? {
+                        return finish_result(
+                            tokenizer,
+                            &state.generated_tokens,
+                            reason,
+                            0,
+                            state.logprobs.as_deref(),
+                        );
+                    }
+                    pending.push(token);
+                    continue;
+                }
+                stats.verification_steps += 1;
+                stats.proposed_tokens += draft.len();
+                // Retain the captured verify graph across the per-step rewind so
+                // it replays instead of re-capturing, then run ONE fused forward
+                // over `[bonus ⊕ draft]` padded to the fixed capture width. Row 0
+                // is the base next-token distribution; rows 1..=k are the verify
+                // rows — identical numbers to the eager base + verify forwards.
+                self.session.set_retain_graph_on_rewind(true);
+                let fused_tokens: Vec<TokenId> = std::iter::once(bonus_token)
+                    .chain(draft.iter().copied())
+                    .collect();
+                let fixed_width = 1 + self.draft_width;
+                let mut fused =
+                    self.session
+                        .decode_verify_captured(&fused_tokens, past, fixed_width)?;
+                pending.clear();
+                debug_assert_eq!(fused.len(), draft.len() + 1);
+                let rows = fused.split_off(1);
+                let base_logits = fused
+                    .pop()
+                    .context("native fused verify produced no base logits")?;
+                let base = past + 1;
+                debug_assert_eq!(base, context_len);
+                (base_logits, base, draft, rows)
+            } else {
+                let base_logits = self
+                    .session
+                    .decode(&pending, past)?
+                    .pop()
+                    .context("native speculative decode produced no base logits")?;
+                pending.clear();
+                let base = self.session.current_len();
+                debug_assert_eq!(base, context_len);
+                let mut draft = match &mut self.proposer {
                 NativeProposer::PromptLookup(proposer) => {
                     let proposer_context = SpeculativeProposerContext {
                         width,
@@ -423,6 +535,8 @@ impl<'a> NativeSpeculativeDriver<'a> {
             // Eager M=K verify pass: one target row per draft position (predicts
             // the token AFTER each draft token). current_len advances to base + K.
             let rows = self.session.decode_verify(&draft, base)?;
+                (base_logits, base, draft, rows)
+            };
 
             // Greedy acceptance with the numerical near-tie guard. `base_logits`
             // is the target distribution for position `base`; `rows[i]` predicts

@@ -500,6 +500,9 @@ fn logits_bytes_to_rows(
     }
     Ok(out)
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CudaKvDebugStats {
     pub logical_len: usize,
     pub max_len: usize,
     pub kv_committed_len: usize,
@@ -2198,7 +2201,7 @@ impl NativeDecodeSession {
         if machine.is_ok() {
             match state.bindings[logits_index].read_bytes() {
                 Ok(bytes) => logits_bytes = Some(bytes),
-                Err(error) => machine = Err(error),
+                Err(error) => machine = Err(error.into()),
             }
         }
         let used_ids = std::mem::replace(&mut state.bindings[input_ids_index], orig_ids);
