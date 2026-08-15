@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import hashlib
+import inspect
 import json
 import os
 import statistics
@@ -440,7 +441,18 @@ def _self_test(*, require_numpy: bool = False) -> int:
             print(f"FAIL {name}: must return the tokenizer's own output")
             failures += 1
 
-    checks = len(cases) + len(length_cases) + len(site_cases) + 7
+    # ...and that `main` actually routes through it. Everything above would stay
+    # green if a future edit re-inlined a bare `!=` into `main` and bypassed the
+    # function entirely, so pin the wiring too.
+    main_source = inspect.getsource(main)
+    if "encode_and_verify_prompt(" not in main_source:
+        print("FAIL: main must verify the prompt through encode_and_verify_prompt")
+        failures += 1
+    if "tokenizer.encode(" in main_source:
+        print("FAIL: main must not tokenize the canonical prompt outside encode_and_verify_prompt")
+        failures += 1
+
+    checks = len(cases) + len(length_cases) + len(site_cases) + 9
     if failures:
         print(f"{failures} self-test case(s) failed")
         return 1
