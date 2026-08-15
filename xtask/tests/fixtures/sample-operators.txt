@@ -1,5 +1,0 @@
-# Representative service profile.
-ai.onnx::Conv@21
-MatMul@21
-ai.onnx::Conv@21
-Softmax@13

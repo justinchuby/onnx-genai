@@ -1,9 +1,0 @@
-domain: ""
-name: IsNaN
-since_version: 9
-doc: Test each element for NaN.
-inputs: [{ name: X, type_str: T1 }]
-outputs: [{ name: Y, type_str: T2 }]
-type_constraints:
-  - { type_param: T1, allowed: [bfloat16, float16, float32, float64] }
-  - { type_param: T2, allowed: [bool] }
