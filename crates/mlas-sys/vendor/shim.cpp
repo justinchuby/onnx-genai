@@ -159,6 +159,19 @@ extern "C" void MlasStandaloneParallelFor(
     }
 }
 
+// Non-null `MLAS_THREADPOOL` sentinel enabling MLAS's parallel branches.
+//
+// In the standalone (`BUILD_MLAS_NO_ONNXRUNTIME`) build there is no ORT
+// thread-pool class to instantiate, and MLAS never dereferences this pointer:
+// `MlasGetMaximumThreadCount` ignores it entirely and reports
+// `MlasStandaloneMaxThreads()`, while `MlasTrySimpleParallel` only tests it
+// against null to decide whether to hand the iterations to the registered Rust
+// work-stealing backend (see `MlasStandaloneParallelFor` above). Passing null
+// therefore does not merely skip a thread pool -- it forces MLAS's *serial*
+// fallback loop.
+static MLAS_THREADPOOL* const kMlasParallelSentinel =
+    reinterpret_cast<MLAS_THREADPOOL*>(1);
+
 extern "C" void mlas_sgemm(
     int transA,   // 0 = no-transpose, 1 = transpose
     int transB,
@@ -190,7 +203,7 @@ extern "C" void mlas_sgemm(
         transB ? CblasTrans : CblasNoTrans,
         M, N, K,
         &data, 1,
-        /*ThreadPool=*/nullptr,
+        kMlasParallelSentinel,
         /*BackendKernelSelectorConfig=*/nullptr);
 }
 
@@ -391,7 +404,7 @@ extern "C" void mlas_sgemm_packed(
         transB ? CblasTrans : CblasNoTrans,
         M, N, K,
         &data, 1,
-        /*ThreadPool=*/nullptr,
+        kMlasParallelSentinel,
         /*BackendKernelSelectorConfig=*/nullptr);
 }
 
