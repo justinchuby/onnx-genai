@@ -40,7 +40,7 @@ use cpu::DecodeCpuKvState;
 use cpu::*;
 use cuda::DecodeCudaState;
 use cuda::*;
-pub use cuda::{CudaGraphDebugStats, CudaKvDebugStats};
+pub use cuda::{CudaGraphDebugStats, CudaKvDebugStats, RaggedLogitsStep};
 
 #[cfg(feature = "cuda")]
 pub(crate) fn configured_cuda_kv_max_len() -> anyhow::Result<Option<usize>> {
@@ -928,6 +928,65 @@ impl NativeDecodeSession {
             bail!("native ragged batch greedy decode requires a CUDA decode session");
         }
         self.decode_cuda_greedy_batch_ragged(token_ids, past_lens, advances)
+    }
+
+    /// Host-logits ragged batch-N step (stage 3b, #750). Same per-row geometry as
+    /// [`Self::decode_greedy_batch_ragged`], but returns host `[batch][vocab]`
+    /// logits (one row per batch slot) plus the D2H cost of reading them, instead
+    /// of device-argmax token ids. This is the sampler seam a continuous-batch
+    /// manager consumes when a real (non-greedy) sampler is attached; the
+    /// device-argmax fast path stays the default for greedy decode. Requires a
+    /// CUDA decode session pinned at the same batch extent whose logits binding
+    /// supports the device-argmax fast path (used for the capture-error latch
+    /// read that guards the logits before consumption).
+    pub fn decode_greedy_batch_ragged_logits(
+        &mut self,
+        token_ids: &[TokenId],
+        past_lens: &[usize],
+        advances: &[bool],
+    ) -> anyhow::Result<RaggedLogitsStep> {
+        if self.cuda.is_none() {
+            bail!("native ragged batch host-logits decode requires a CUDA decode session");
+        }
+        self.decode_cuda_greedy_batch_ragged_logits(token_ids, past_lens, advances)
+    }
+
+    /// Retire batch row `row` mid-flight (stage 3b, #750): mark its slot inactive
+    /// so it is no longer stepped and may be recycled by
+    /// [`Self::assign_batch_row`]. Host-side only — the captured decode graph and
+    /// every peer row are untouched.
+    pub fn deactivate_batch_row(&mut self, row: usize) -> anyhow::Result<()> {
+        self.cuda
+            .as_mut()
+            .context("native batch row deactivate requires a CUDA decode session")?
+            .deactivate_row(row)
+    }
+
+    /// Admit a fresh sequence into batch row `row` mid-flight (stage 3b, #750):
+    /// reset that row's cursor to 0 and wipe its mask window so no state leaks
+    /// from the previous occupant, then mark it active. Peers keep their lengths,
+    /// KV, mask and captured graph — this mutates exactly one row between steps.
+    pub fn assign_batch_row(&mut self, row: usize) -> anyhow::Result<()> {
+        self.cuda
+            .as_mut()
+            .context("native batch row assign requires a CUDA decode session")?
+            .assign_row(row)
+    }
+
+    /// Active batch rows in ascending order (stage 3b, #750).
+    pub fn active_batch_rows(&self) -> Vec<usize> {
+        self.cuda
+            .as_ref()
+            .map(DecodeCudaState::active_rows)
+            .unwrap_or_default()
+    }
+
+    /// Current logical length of batch row `row` (stage 3b, #750).
+    pub fn batch_row_len(&self, row: usize) -> anyhow::Result<usize> {
+        self.cuda
+            .as_ref()
+            .context("native batch row length requires a CUDA decode session")?
+            .row_len(row)
     }
 
     /// The pinned persistent-decode batch extent (1 unless
