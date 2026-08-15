@@ -853,9 +853,15 @@ unsafe fn axpy_avx2_fma(dst: &mut [f32], scalar: f32, src: &[f32]) {
     }
 }
 
-/// SIMD-vectorized SDPA — same semantics and control flow as the scalar
-/// reference, but the inner loops go through [`dot_f32`] and [`axpy_f32`],
-/// which dispatch to 4×-unrolled NEON on aarch64 and to AVX2+FMA on x86.
+/// SIMD-vectorized SDPA — same semantics as the scalar reference, but the
+/// inner loops go through [`dot_f32`] and [`axpy_f32`], which dispatch to
+/// unrolled NEON on aarch64 and to AVX2+FMA on x86.
+///
+/// Note this is not merely the scalar reference with wider lanes: the P·V
+/// accumulation here walks V row-major and touches each row once, whereas the
+/// scalar oracle walks it column-major and re-reads V once per output column.
+/// That locality difference is a large part of why this is faster, alongside
+/// the vectorization itself.
 ///
 /// The body is arch-neutral: it was written for aarch64 but contains no
 /// intrinsics, so the only thing that ever kept it off x86 was its `cfg`.
@@ -1943,8 +1949,9 @@ mod tests {
                 max_f64_abs = max_f64_abs.max(f64_abs);
                 max_scalar_rel = max_scalar_rel.max(scalar_abs / scalar.abs().max(1e-4));
             }
-            // The SIMD path uses a 4x-unrolled tree reduction while the scalar
-            // reference is sequential, so exact parity is not expected. The
+            // The SIMD path reduces through independent accumulators while the
+            // scalar reference is a single sequential chain, so exact parity is
+            // not expected. The
             // bound is still tight enough to catch dropped tail lanes, missing
             // max subtraction, and accumulator corruption; guard-break probes
             // for those fail.
@@ -1978,9 +1985,11 @@ mod tests {
             (1, 4, 1, 129, 129, 80, 80),
         ];
         for (bi, &(batch, heads, kv_heads, q_seq, kv_seq, dh, dv)) in shapes.iter().enumerate() {
-            let q = deterministic_values(batch * heads * q_seq * dh, 0x5EED_0 + bi as u64, 0.9);
-            let k = deterministic_values(batch * kv_heads * kv_seq * dh, 0x5EED_1 + bi as u64, 0.9);
-            let v = deterministic_values(batch * kv_heads * kv_seq * dv, 0x5EED_2 + bi as u64, 0.9);
+            let q = deterministic_values(batch * heads * q_seq * dh, 0x0005_EED0 + bi as u64, 0.9);
+            let k =
+                deterministic_values(batch * kv_heads * kv_seq * dh, 0x0005_EED1 + bi as u64, 0.9);
+            let v =
+                deterministic_values(batch * kv_heads * kv_seq * dv, 0x0005_EED2 + bi as u64, 0.9);
             let tensors = SdpaTensors {
                 q: &q,
                 k: &k,
@@ -2026,8 +2035,13 @@ mod tests {
                         "shape {bi} {label}: dispatcher produced non-finite output"
                     );
                     let abs = (got - want).abs();
+                    // Observed worst case on AVX2 is abs=2.7e-7 / rel=1.1e-3
+                    // (the relative figure is dominated by the 1e-4 floor on
+                    // near-zero outputs), so these bounds leave ~75x abs
+                    // headroom while still catching a single dropped KV lane,
+                    // which perturbs an output by ~1e-3.
                     assert!(
-                        abs <= 5e-4 && abs / want.abs().max(1e-4) <= 2e-3,
+                        abs <= 2e-5 && abs / want.abs().max(1e-4) <= 2e-3,
                         "shape {bi} {label}: dispatcher vs scalar oracle abs={abs:e}"
                     );
                 }
@@ -2043,9 +2057,9 @@ mod tests {
     fn qk_capture_stays_bit_identical_to_the_scalar_oracle() {
         let (batch, heads, kv_heads, q_seq, kv_seq, dh) =
             (2usize, 8usize, 2usize, 3usize, 67usize, 64usize);
-        let q = deterministic_values(batch * heads * q_seq * dh, 0xC0FFEE_1, 0.8);
-        let k = deterministic_values(batch * kv_heads * kv_seq * dh, 0xC0FFEE_2, 0.8);
-        let v = deterministic_values(batch * kv_heads * kv_seq * dh, 0xC0FFEE_3, 0.8);
+        let q = deterministic_values(batch * heads * q_seq * dh, 0x00C0_FFE1, 0.8);
+        let k = deterministic_values(batch * kv_heads * kv_seq * dh, 0x00C0_FFE2, 0.8);
+        let v = deterministic_values(batch * kv_heads * kv_seq * dh, 0x00C0_FFE3, 0.8);
         let tensors = SdpaTensors {
             q: &q,
             k: &k,
