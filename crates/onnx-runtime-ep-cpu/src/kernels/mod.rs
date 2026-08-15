@@ -404,6 +404,7 @@ pub mod sdpa;
 pub mod selection;
 pub mod sequence;
 pub mod shape;
+pub mod simd_activations;
 pub mod simd_normalize;
 pub mod simd_quant;
 pub mod simd_sumsq;
