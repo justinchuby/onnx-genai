@@ -2286,17 +2286,55 @@ qwen2.5-0.5b int4, 353 MB on disk:
 Flat with token count, so this is a one-time resident materialisation rather than
 a per-token or prefill-only spike. 8.05× is exactly int4 → f32.
 
-**It is a deliberate trade, not a defect.** `matmul_nbits.rs` already carries
-several packed paths (`packed_int4_weight`, `packed_int4_n16_weight`,
-`packed_kai_qsi4_weight` for ARM SDOT, `packed_u8_weight`, `mlas_packed`), and its
-header documents that symmetric block-32 int4 at `accuracy_level=4` streams packed
-weights straight into VNNI. The f32 cache is the **fallback for shapes those paths
-do not cover**, and it is faster than dequantising per token:
+**Partly a deliberate trade, but the trigger is a coverage gap.** `matmul_nbits.rs`
+carries several packed paths (`packed_int4_weight`, `packed_int4_n16_weight`,
+`packed_kai_qsi4_weight` for ARM SDOT, `packed_u8_weight`, `mlas_packed`), and the
+first branch of the decode dispatch is a **zero-copy borrowed int4 kernel** that
+reads packed weights in place with no expansion at all.
+
+That branch is gated on the **presence of a `zero_points` input**:
+
+```rust
+if self.bits == 4 && self.accuracy_level == 0 && !self.weight_prepacked
+    && group_indices.is_none()
+    && let Some(zero_points) = zero_points     // fails for symmetric models
+```
+
+So **symmetric** int4 — whose zero point is the implicit midpoint and needs no
+input — falls past every packed path into the f32 cache. `borrowed_affine_int4_matmul`
+and its aarch64 NEON-dot sibling are the only borrowed int4 kernels, and there is
+no symmetric variant. The mathematically *simpler* case gets the most expensive
+fallback (#979).
+
+The table below is a comparison of the two code paths as a user meets them, not
+of two quantisation schemes on their merits:
 
 | model | on disk | peak WS | ratio | decode |
 |---|---|---|---|---|
-| qwen05b-q4 (zero-point / asymmetric) | 353 MB | 2,752 MB | 7.80× | **105.4 ms/tok** |
-| qwen2.5-0.5b-q4_0 (symmetric) | 362 MB | **430 MB** | **1.19×** | 248.5 ms/tok |
+| qwen05b-q4 (**symmetric**, 3 inputs) | 353 MB | 2,752 MB | 7.80× | **105.4 ms/tok** |
+| qwen2.5-0.5b-q4_0 (**asymmetric**, 4 inputs) | 362 MB | **430 MB** | **1.19×** | 248.5 ms/tok |
+
+Note the direction: the model that expands 8× is the *symmetric* one. Naming is
+not a reliable guide here — `qwen14b-zp` is symmetric despite the `-zp` suffix.
+
+**The gap is closable losslessly.** Adding a constant `zero_points = 8` tensor —
+a mathematical identity for 4-bit symmetric weights — moves the model onto the
+borrowed path with **byte-identical output over 64 tokens**:
+
+| model | peak WS | ratio |
+|---|---|---|
+| qwen0.5b symmetric, as shipped | 2,753 MB | 7.80× |
+| + constant `zero_points = 8` | **452 MB** | **1.28×** |
+| qwen14b symmetric, as shipped | ~66 GB (pages) | ~8× |
+| + constant `zero_points = 8` | **8.24 GB** | **0.99×** |
+
+Contrast with `accuracy_level = 4`, which reaches a *different* packed path and
+also cuts footprint (2,752 → 1,313 MB) but **diverges** on a long prompt: it is
+int8-activation compute, and this codebase's own comments call ORT's
+int8-activation path "fast-but-wrong". Those two levers are not
+interchangeable — one is lossless, the other buys memory with accuracy. A budget
+may take the first automatically; it must never take the second without the user
+asking.
 
 So the cache buys ~2.4× decode for ~8× footprint.
 
@@ -2322,9 +2360,18 @@ it when the expanded footprint fits the budget, fall back to on-the-fly
 dequantisation when it does not, and report which was chosen — rather than removing
 it (which would cost 2.4× on every model that does fit).
 
-**Workaround available today:** symmetric block-32 int4 rather than zero-point
-quantisation, at 1.19× instead of 7.80×. For a 14B that is roughly 8.3 GB resident
-instead of ~66 GB.
+**Workaround available today:** add a constant `zero_points = 8` tensor to every
+`MatMulNBits` node. It is a mathematical identity for 4-bit symmetric weights, the
+output is byte-identical, and it moves the model onto the borrowed zero-copy path:
+1.28× instead of 7.80× on the 0.5B, and a measured **8.24 GB instead of ~66 GB**
+on the 14B. The cost is the tensor itself, `N × ceil(block_count/2)` bytes per
+node — about 138 MB for the 14B, ~1.6% of the model.
+
+An earlier revision of this section recommended "use symmetric quantisation
+rather than zero-point". That was **wrong and backwards**: it was inferred from
+model directory names rather than from the graphs, and symmetric is the case that
+expands. Corrected here rather than silently edited, because the wrong version was
+acted on.
 
 **Not established:** whether the expansion is f32 for every tensor (8.05× is
 consistent with it, but was derived from a whole-process peak, not per-tensor);
