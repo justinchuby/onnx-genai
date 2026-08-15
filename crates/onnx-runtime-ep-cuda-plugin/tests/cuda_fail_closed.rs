@@ -80,8 +80,22 @@ fn cuda_plugin_always_zeros_out_num_on_failure() {
 /// entirely by this crate, which is what we assert on here.
 #[test]
 fn cuda_plugin_diagnostic_message_is_actionable() {
-    let diagnostic = onnx_runtime_ep_cuda_plugin::fail_closed_diagnostic()
-        .expect("on a GPU-less host the plugin must fail closed with a diagnostic");
+    // This test asserts GPU-*less* fail-closed behaviour. On a host that has a
+    // CUDA device, the cuda-feature build constructs the EP successfully and
+    // therefore does NOT fail closed, so `fail_closed_diagnostic()` returns
+    // `None`. Skip explicitly in that case rather than failing — a test that is
+    // red purely because the host has a GPU trains everyone to ignore the suite.
+    // (The no-cuda build always fails closed, so it never hits this skip.)
+    let diagnostic = match onnx_runtime_ep_cuda_plugin::fail_closed_diagnostic() {
+        Some(d) => d,
+        None => {
+            eprintln!(
+                "skipping cuda_plugin_diagnostic_message_is_actionable: a CUDA device is \
+                 present, so the plugin constructed successfully and did not fail closed"
+            );
+            return;
+        }
+    };
 
     // Common actionability requirement: the diagnostic must name the EP crate
     // so an operator can trace where zero factories came from.

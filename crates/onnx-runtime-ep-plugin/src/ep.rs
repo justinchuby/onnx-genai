@@ -297,17 +297,35 @@ fn ep_get_capability_inner(
     };
     let view = onnx_runtime_ir::GraphView::new(ir_graph, &cache);
     let ort_view = onnx_runtime_ep_api::abi::OrtGraphView::new(&view);
-    // Claim-time routability gate (B2): our fused-subgraph compile path
-    // (`build_subgraph_routing`) can only thread a node input that is a graph
-    // input or a prior node's output. A node that consumes a weight
-    // *initializer* (a value with no producer that ORT did not surface as a
-    // graph input) is therefore un-routable. Declining such nodes *here* — at
+
+    // Is this a non-CPU (GPU) EP? Two capability-time gates below are specific to
+    // the GPU plugin and must not disturb the CPU plugin, whose paths already
+    // work. Determined from the EP's own device type.
+    let is_gpu_ep = exported
+        .ep
+        .with(|ep| ep.device_type() != onnx_runtime_ir::DeviceType::Cpu);
+
+    // Claim-time routability gate (B2), GPU-only: the plugin's *multi-node*
+    // fused-subgraph compile path (`build_subgraph_routing`, invoked only when a
+    // claim has >1 node) can only thread a node input that is a graph input or a
+    // prior node's output. A node that consumes a weight *initializer* (a value
+    // with no producer that ORT did not surface as a graph input) is therefore
+    // un-routable inside a multi-node subgraph. Declining such nodes *here* — at
     // capability time, before convex partitioning — lets ORT partition around
-    // them and fall back to CPU for those nodes, instead of discovering the
-    // problem at Compile time when ORT has already committed the partition and
-    // can only surface a hard session-creation failure.
+    // them instead of discovering the problem at Compile time, when ORT has
+    // already committed the partition and can only surface a hard
+    // session-creation failure (the CUDA decoder load regression).
+    //
+    // This gate is GPU-only. A *single-node* claim never calls
+    // `build_subgraph_routing` and reads its initializer directly, so the CPU
+    // plugin (e.g. `conformance_matmul_initializer_weights`: a lone MatMul with
+    // initializer weights) must keep claiming such nodes — applying the gate to
+    // it would wrongly decline them and break session creation with CPU fallback
+    // disabled.
     let claims = exported.ep.with(|ep| {
-        ort_view.query_capabilities_filtered(ep, |node| node_inputs_all_routable(&view, node))
+        ort_view.query_capabilities_filtered(ep, |node| {
+            !is_gpu_ep || node_inputs_all_routable(&view, node)
+        })
     });
 
     if claims.is_empty() {
@@ -388,6 +406,37 @@ fn ep_get_capability_inner(
 
     if claims.is_empty() {
         return ok_status();
+    }
+
+    // Partial-GPU-claim gate (default OFF) — see #982.
+    //
+    // Executing an interspersed CPU/GPU partition (some claimed nodes on this
+    // GPU EP, the rest on CPU, with tensors crossing the boundary) currently
+    // deadlocks in a synchronous CUDA memcpy (#982). A hang is strictly worse
+    // for a user than main's silent all-CPU fallback, so a non-CPU EP does not
+    // form such a partition by default: unless a partial-claim env flag is set,
+    // it keeps its claims only when they cover the ENTIRE graph — a pure
+    // all-GPU graph (e.g. the smoke test) has no CPU boundary and runs fine.
+    // Otherwise it declines everything and ORT runs the whole graph on CPU,
+    // exactly like main. Setting the flag restores per-node claiming so #982 can
+    // be reproduced and worked on. The gate is GPU-specific (`device_type !=
+    // Cpu`) so the CPU plugin — whose partial claiming works — is unaffected.
+    //
+    // NOTE: on a real decoder the nodes this EP *can* claim are default-domain
+    // elementwise ops (Add/Mul/Sigmoid) that consume only activations; the
+    // `com.microsoft` weight-consuming ops are already declined at claim time by
+    // the routability/GQA gates. So the hang is triggered by any interspersed
+    // partition, not specifically by `com.microsoft` nodes — which is why the
+    // gate is expressed as "whole-graph-or-nothing for GPU EPs" rather than
+    // "don't advertise com.microsoft".
+    if is_gpu_ep && !partial_gpu_claim_enabled() {
+        let total_nodes = view.nodes().count();
+        // Convex claims are disjoint, so summing lengths counts each claimed
+        // node once.
+        let claimed_nodes: usize = claims.iter().map(|c| c.node_ids.len()).sum();
+        if claimed_nodes != total_nodes {
+            return ok_status();
+        }
     }
 
     // Report claims to ORT via EpGraphSupportInfo_AddNodesToFuse.
@@ -757,6 +806,40 @@ fn node_inputs_all_routable(view: &onnx_runtime_ir::GraphView<'_>, node: NodeInd
         .iter()
         .flatten()
         .all(|&input| view.producer(input).is_some() || view.value(input).is_graph_input)
+}
+
+/// Environment variables that opt a GPU EP into partial (interspersed CPU/GPU)
+/// claiming. Off by default because such partitions currently hang (#982).
+///
+/// The second name is the one proposed in the review thread; both are accepted
+/// so either spelling enables the path.
+const PARTIAL_GPU_CLAIM_ENV: [&str; 2] = [
+    "ONNX_GENAI_PLUGIN_PARTIAL_GPU_CLAIM",
+    "ONNX_GENAI_PLUGIN_CLAIM_MS_DOMAIN",
+];
+
+/// Whether partial (interspersed CPU/GPU) claiming is enabled for GPU EPs.
+///
+/// Off by default (see the partial-GPU-claim gate in
+/// [`ep_get_capability_inner`]). Enabled when either environment variable in
+/// [`PARTIAL_GPU_CLAIM_ENV`] is set to a truthy value.
+fn partial_gpu_claim_enabled() -> bool {
+    PARTIAL_GPU_CLAIM_ENV
+        .iter()
+        .any(|k| parse_bool_flag(std::env::var(k).ok().as_deref()))
+}
+
+/// Parse a boolean environment flag: truthy for `1`, `true`, `yes`, or `on`
+/// (case-insensitive, surrounding whitespace ignored); falsy otherwise,
+/// including unset, empty, `0`, and `false`.
+fn parse_bool_flag(value: Option<&str>) -> bool {
+    match value {
+        Some(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        None => false,
+    }
 }
 
 /// Build a `SubgraphRouting` table for a multi-node fused subgraph.
@@ -1741,5 +1824,29 @@ mod tests {
             !super::node_inputs_all_routable(&view, add),
             "a node consuming a weight initializer must be declined at claim time"
         );
+    }
+
+    /// Partial-GPU-claim gate: the flag is OFF unless explicitly set to a truthy
+    /// value, so a GPU EP does not form an interspersed CPU/GPU partition (which
+    /// currently hangs, #982) by default. Both accepted env names enable it.
+    #[test]
+    fn partial_gpu_claim_flag_parsing() {
+        // Off for unset / empty / explicit falsy / unrecognized values.
+        assert!(!super::parse_bool_flag(None), "unset must be off");
+        assert!(!super::parse_bool_flag(Some("")), "empty must be off");
+        assert!(!super::parse_bool_flag(Some("0")), "0 must be off");
+        assert!(!super::parse_bool_flag(Some("false")), "false must be off");
+        assert!(
+            !super::parse_bool_flag(Some("maybe")),
+            "unrecognized must be off"
+        );
+        // On for the accepted truthy spellings, case/space-insensitive.
+        assert!(super::parse_bool_flag(Some("1")));
+        assert!(super::parse_bool_flag(Some("true")));
+        assert!(super::parse_bool_flag(Some("  On ")));
+        assert!(super::parse_bool_flag(Some("YES")));
+        // Both env names are wired into the gate.
+        assert_eq!(super::PARTIAL_GPU_CLAIM_ENV.len(), 2);
+        assert!(super::PARTIAL_GPU_CLAIM_ENV.contains(&"ONNX_GENAI_PLUGIN_CLAIM_MS_DOMAIN"));
     }
 }

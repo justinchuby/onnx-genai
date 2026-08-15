@@ -56,6 +56,13 @@ mod cuda_impl {
     /// Requires the constructed EP's `CudaRuntime`; at factory-construction time
     /// this is available from the already-built `CudaExecutionProvider`
     /// (`ep.runtime()`), so no separate GPU context is needed.
+    ///
+    /// The registry is derived from the real `OpRegistry`, not a hand-maintained
+    /// list, so it cannot drift from the kernels. Advertising the real domains
+    /// is always correct and harmless on its own: whether the EP actually
+    /// *claims* a real decoder's nodes is gated separately at capability time
+    /// (see `onnx-runtime-ep-plugin`'s partial-GPU-claim gate, off by default
+    /// because executing an interspersed CPU/GPU partition currently hits #982).
     pub(crate) fn build_kernel_registry_entries(
         runtime: std::sync::Arc<onnx_runtime_ep_cuda::CudaRuntime>,
     ) -> Vec<KernelRegistryEntry> {
