@@ -164,6 +164,9 @@ impl Engine {
             resolved_vram_bytes,
             residency_ceiling_bytes,
             model_weight_bytes,
+            // ORT backend uses its own kernels, not the CPU EP MatMulNBits f32
+            // decode cache, so there is no #971 expansion to account for here.
+            resident_f32_cache_bytes: 0,
             kv_config: plan_kv_config,
             graph: graph_memory,
             required_device_non_weight_bytes: 0,
@@ -467,6 +470,21 @@ impl Engine {
             native_device,
             crate::native_decode::NativeDecodeDevice::Cuda { .. }
         );
+        // #971: on the native CPU path the MatMulNBits kernel builds a resident
+        // dequantised f32 weight cache for models whose quantisation takes the
+        // f32 decode path. That cache is held for the whole session, so the plan
+        // must account for it as real resident weight bytes. We ask the CPU EP
+        // (which owns the kernel dispatch) how many extra bytes the cache costs,
+        // rather than re-deriving the rule here where it would drift from the
+        // kernel (#947). CUDA decode uses different kernels, so it never applies.
+        let resident_f32_cache_bytes = if native_cuda_load {
+            0
+        } else {
+            match onnx_runtime_loader::load_model(&model_directory.model_path) {
+                Ok(graph) => onnx_runtime_ep_cpu::resident_dequant_f32_cache_bytes(&graph),
+                Err(_) => 0,
+            }
+        };
         let explicit_vram_bytes = matches!(config.limits.vram_limit, ResourceLimit::Bytes(_));
         // #755: managed no-spill VMM is the default on the native CUDA path
         // (unless the legacy allocator opt-out is set). On other backends the
@@ -485,6 +503,7 @@ impl Engine {
             resolved_vram_bytes,
             residency_ceiling_bytes,
             model_weight_bytes,
+            resident_f32_cache_bytes,
             kv_config: governor_kv_config,
             graph: graph_memory,
             required_device_non_weight_bytes,
@@ -508,6 +527,13 @@ impl Engine {
             force_managed_weight_streaming: force_managed_weight_streaming_enabled(),
         });
         log_memory_strategy_plan(&memory_strategy_plan, "single_model_native");
+        // #971: tell the CPU EP whether the governor admitted the resident f32
+        // decode cache. When declined (expanded footprint would not fit the
+        // budget), the kernel dequantises on the fly per call instead of holding
+        // the ~8x cache resident — slower per token but avoids paging.
+        onnx_runtime_ep_cpu::set_resident_dequant_f32_cache_enabled(
+            memory_strategy_plan.f32_weight_cache_admitted,
+        );
         #[cfg(feature = "cuda")]
         let cuda_offload_resolution =
             cuda_offload_resolution_from_plan(&native_device, &memory_strategy_plan);
