@@ -802,6 +802,7 @@ impl Kernel for MatMulNBitsKernel {
             && self.accuracy_level == 0
             && !self.weight_prepacked
             && group_indices.is_none()
+            && !self.mlas_sqnbit_owns_fp32_compute(can_prepack, zero_points.is_some())
             && let Some(packed) = contiguous_host_slice::<u8>(&inputs[1])
             && let Some(scales) = borrowed_scales(&inputs[2])
             && let Some(borrowed_zero_points) = borrow_optional_int4_zero_points(zero_points)
@@ -1337,6 +1338,49 @@ impl MatMulNBitsKernel {
     /// how ORT/onnxruntime-genai run those models. Bias, when present, is added
     /// by MLAS itself, so the caller's post-loop bias add is skipped on this
     /// path.
+    /// Whether MLAS SQNBit's CompFp32 kernels own this `accuracy_level = 0`
+    /// int4 node, so [`Kernel::execute`] must not short-circuit into the
+    /// borrowed hand path first.
+    ///
+    /// The borrowed zero-copy int4 path (#979) fixed a memory regression (it
+    /// avoids the ~8x resident f32 `weight_nk` expansion), but it also became
+    /// the *first* branch in `execute`, which silently made the intended
+    /// `accuracy_level = 0` -> MLAS CompFp32 route unreachable: `try_mlas_sqnbit`
+    /// is only consulted after it. On x86_64 the borrowed path has no SIMD
+    /// kernel at all (the vectorized block dot is `cfg(target_arch = "aarch64")`),
+    /// so every `bits=4, accuracy_level=0` node ran a scalar nibble-unpack GEMV
+    /// -- measured 29x-303x slower than ONNX Runtime's CPU EP on the same graph.
+    ///
+    /// MLAS keeps ownership only when it can pack the weight **once**:
+    /// `can_prepack` means B/scales/zero-points are graph constants, so the
+    /// packed buffer is built on the first call and cached for the session. With
+    /// non-constant (dynamic) weights MLAS would repack on every call, which the
+    /// borrowed path avoids entirely, so ownership stays with the borrowed path
+    /// there. `sqnbit_packed_b_size` is MLAS's own "do I have a kernel for this
+    /// shape on this CPU" probe; when it says no, the borrowed path remains the
+    /// fallback.
+    #[cfg(feature = "mlas")]
+    fn mlas_sqnbit_owns_fp32_compute(&self, can_prepack: bool, has_zero_points: bool) -> bool {
+        mlas_qnbit_enabled()
+            && can_prepack
+            && mlas_sys::sqnbit_packed_b_size(
+                self.n,
+                self.k,
+                self.bits,
+                self.block_size,
+                has_zero_points,
+                self.mlas_compute_type(),
+            )
+            .is_some()
+    }
+
+    /// Without the vendored MLAS there is no SQNBit kernel to defer to, so the
+    /// borrowed int4 path always owns `accuracy_level = 0`.
+    #[cfg(not(feature = "mlas"))]
+    fn mlas_sqnbit_owns_fp32_compute(&self, _can_prepack: bool, _has_zero_points: bool) -> bool {
+        false
+    }
+
     #[cfg(feature = "mlas")]
     #[allow(clippy::too_many_arguments)]
     fn try_mlas_sqnbit(
@@ -7442,6 +7486,87 @@ mod tests {
         prepack_cache_ptr(kernel).is_some()
     }
 
+    /// Route probe for constant-weight `bits = 4, accuracy_level = 0` nodes.
+    ///
+    /// Two invariants are asserted together because they are the two halves of
+    /// the same policy:
+    ///
+    /// * **#979 (memory):** such a node must never expand its weight into the
+    ///   resident f32 `weight_nk` cache (~8x the file size in RAM).
+    /// * **Dispatch:** it must land on the *fastest available* zero/low-copy
+    ///   route for this build -- MLAS SQNBit CompFp32 when the vendored MLAS
+    ///   has a kernel for the shape on this host, otherwise the borrowed
+    ///   zero-copy int4 path.
+    ///
+    /// The expected route is derived from the same predicate production code
+    /// uses ([`MatMulNBitsKernel::mlas_sqnbit_owns_fp32_compute`]), so the
+    /// assertion stays exact on hosts and shapes where MLAS declines instead of
+    /// silently degrading into a tautology.
+    #[derive(Clone, Copy)]
+    struct Int4Acc0RouteProbe {
+        symmetric: usize,
+        asymmetric: usize,
+        #[cfg(feature = "mlas")]
+        mlas: usize,
+    }
+
+    impl Int4Acc0RouteProbe {
+        fn start() -> Self {
+            Self {
+                symmetric: BORROWED_INT4_SYMMETRIC_TEST_CALLS.load(Ordering::Relaxed),
+                asymmetric: BORROWED_INT4_ASYMMETRIC_TEST_CALLS.load(Ordering::Relaxed),
+                #[cfg(feature = "mlas")]
+                mlas: MLAS_SQNBIT_TEST_CALLS.load(Ordering::Relaxed),
+            }
+        }
+
+        /// `symmetric` selects which borrowed counter proves the branch; the
+        /// counters are global and shared with tests running in parallel, hence
+        /// the strict-increase (`>`) comparisons rather than exact deltas.
+        fn assert_fast_route(self, kernel: &MatMulNBitsKernel, symmetric: bool) {
+            assert!(
+                kernel.weight_nk.get().is_none(),
+                "constant-weight int4 accuracy_level=0 must not expand the weight to a resident f32 cache (#979)"
+            );
+            #[cfg_attr(feature = "mlas", allow(unused_variables))]
+            let borrowed_ran = if symmetric {
+                BORROWED_INT4_SYMMETRIC_TEST_CALLS.load(Ordering::Relaxed) > self.symmetric
+            } else {
+                BORROWED_INT4_ASYMMETRIC_TEST_CALLS.load(Ordering::Relaxed) > self.asymmetric
+            };
+            #[cfg(feature = "mlas")]
+            if kernel.mlas_sqnbit_owns_fp32_compute(true, !symmetric) {
+                // Per-kernel state, not the global counters: this is race-free
+                // proof that *this* node's weight was packed by MLAS SQNBit.
+                let mlas_packed_this_node = kernel
+                    .mlas_shards
+                    .get()
+                    .is_some_and(|shards| shards.is_some())
+                    || kernel
+                        .mlas_packed
+                        .get()
+                        .is_some_and(|packed| packed.is_some());
+                assert!(
+                    mlas_packed_this_node,
+                    "constant-weight int4 accuracy_level=0 must reach MLAS SQNBit CompFp32 when MLAS has a kernel for the shape"
+                );
+                assert!(
+                    MLAS_SQNBIT_TEST_CALLS.load(Ordering::Relaxed) > self.mlas,
+                    "the MLAS SQNBit GEMM must actually have run for this node"
+                );
+                return;
+            }
+            assert!(
+                borrowed_ran,
+                "int4 accuracy_level=0 must route into the borrowed zero-copy path when MLAS has no kernel for it"
+            );
+            assert!(
+                !prepack_cache_populated(kernel),
+                "the borrowed path must borrow the packed inputs instead of building a weight cache (#979)"
+            );
+        }
+    }
+
     fn quantize(
         weights_nk: &[f32],
         n: usize,
@@ -11216,10 +11341,12 @@ mod tests {
 
     #[test]
     fn matmulnbits_m1_block32_symmetric_borrows_weight_for_new_activations() {
-        // Post-#979: symmetric int4 (constant B) borrows the packed weight in
-        // place per call instead of building/reusing a resident cache. The
-        // per-activation correctness invariant still holds; the difference is
-        // that no prepack/f32 cache is ever populated.
+        // Post-#979: symmetric int4 (constant B) never expands the weight into
+        // the resident f32 cache. Whichever low-copy route serves it (borrowed
+        // zero-copy, or MLAS SQNBit CompFp32 with its int4-sized packed buffer),
+        // the per-activation correctness invariant must hold: a second call with
+        // different activations must recompute rather than reuse the first
+        // result.
         let (k, n, block_size) = (35, 7, 32);
         let a1_values: Vec<f32> = (0..k)
             .map(|i| ((i * 11 % 41) as f32 - 20.0) / 13.0)
@@ -11241,24 +11368,27 @@ mod tests {
         let scales = Owned::f32(&[n, 2], &scales);
         let a1 = Owned::f32(&[1, k], &a1_values);
         let mut y1 = Owned::zeros_f32(&[1, n]);
+        let probe = Int4Acc0RouteProbe::start();
         kernel
             .execute(&[a1.view(), b.view(), scales.view()], &mut [y1.view_mut()])
             .unwrap();
         assert_close(&y1.to_f32(), &reference(&a1_values, &dequantized, 1, k, n));
+        probe.assert_fast_route(&kernel, true);
 
         let cached_ptr = prepack_cache_ptr(&kernel);
-        assert!(
-            cached_ptr.is_none(),
-            "symmetric M=1 constant B must borrow in place, not populate a weight cache (#979)"
-        );
         let a2 = Owned::f32(&[1, k], &a2_values);
         let mut y2 = Owned::zeros_f32(&[1, n]);
         kernel
             .execute(&[a2.view(), b.view(), scales.view()], &mut [y2.view_mut()])
             .unwrap();
+        assert_eq!(
+            prepack_cache_ptr(&kernel),
+            cached_ptr,
+            "the second activation must reuse the first call's routing decision and cache identity, not build a new one"
+        );
         assert!(
-            !prepack_cache_populated(&kernel),
-            "symmetric decode must stay on the borrowed path across activations (#979)"
+            kernel.weight_nk.get().is_none(),
+            "symmetric decode must never expand the weight to f32 across activations (#979)"
         );
         assert_close(&y2.to_f32(), &reference(&a2_values, &dequantized, 1, k, n));
         assert_ne!(y1.to_f32(), y2.to_f32());
@@ -11285,7 +11415,7 @@ mod tests {
         let scales = Owned::f32(&[n, 2], &scales);
         let zero_points = Owned::u8(&[n, 1], &zero_points);
         let mut y = Owned::zeros_f32(&[1, n]);
-        let asym_before = BORROWED_INT4_ASYMMETRIC_TEST_CALLS.load(Ordering::Relaxed);
+        let probe = Int4Acc0RouteProbe::start();
         kernel
             .execute(
                 &[a.view(), b.view(), scales.view(), zero_points.view()],
@@ -11294,14 +11424,7 @@ mod tests {
             .unwrap();
 
         assert_close(&y.to_f32(), &reference(&a_values, &dequantized, 1, k, n));
-        assert!(
-            BORROWED_INT4_ASYMMETRIC_TEST_CALLS.load(Ordering::Relaxed) > asym_before,
-            "asymmetric INT4 decode must route into the borrowed zero-copy path"
-        );
-        assert!(
-            !prepack_cache_populated(&kernel),
-            "asymmetric INT4 must borrow packed inputs instead of building a weight cache"
-        );
+        probe.assert_fast_route(&kernel, false);
     }
 
     #[test]
@@ -11332,30 +11455,16 @@ mod tests {
         let b = Owned::u8(&[n, 4, 16], &packed);
         let scales = Owned::f32(&[n, 4], &scales);
         let mut y = Owned::zeros_f32(&[1, n]);
-        let sym_before = BORROWED_INT4_SYMMETRIC_TEST_CALLS.load(Ordering::Relaxed);
+        let probe = Int4Acc0RouteProbe::start();
         kernel
             .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
             .unwrap();
 
         assert_close(&y.to_f32(), &reference(&a_values, &dequantized, 1, k, n));
-        // Positive proof the *symmetric borrowed* branch is the one that ran.
-        // The symmetric counter is bumped only by `borrowed_zero_points.is_none()`,
-        // so a strict increase across this symmetric-only `execute` attributes the
-        // route to that branch (`>` not `==` because the global counter is shared
-        // with other tests running in parallel).
-        assert!(
-            BORROWED_INT4_SYMMETRIC_TEST_CALLS.load(Ordering::Relaxed) > sym_before,
-            "symmetric INT4 decode must route into the borrowed zero-copy path (#979)"
-        );
-        // ...and negative proof no resident f32 / prepack cache was ever built.
-        assert!(
-            kernel.weight_nk.get().is_none(),
-            "symmetric INT4 must not expand the weight to a resident f32 cache (#979)"
-        );
-        assert!(
-            !prepack_cache_populated(&kernel),
-            "symmetric INT4 must borrow packed inputs instead of building any weight cache (#979)"
-        );
+        // Positive proof the intended fast branch ran (borrowed zero-copy, or
+        // MLAS SQNBit CompFp32 when the vendored MLAS has a kernel), plus
+        // negative proof no resident f32 `weight_nk` expansion was ever built.
+        probe.assert_fast_route(&kernel, true);
     }
 
     #[test]
@@ -11382,6 +11491,71 @@ mod tests {
         assert!(
             kernel.weight_nk.get().is_none(),
             "dynamic B must use the fallback rather than populate the prepack cache"
+        );
+    }
+
+    /// Dynamic (non-constant) `B` must stay on the borrowed zero-copy path even
+    /// when the vendored MLAS *does* have a SQNBit kernel for the shape: MLAS
+    /// would have to repack the weight on every single call, and there is no
+    /// session-lifetime cache to amortize it against. This is the explicit
+    /// decline half of the dispatch policy; the win half is covered by
+    /// [`Int4Acc0RouteProbe::assert_fast_route`] on constant weights.
+    #[test]
+    fn matmulnbits_int4_acc0_dynamic_weight_keeps_borrowed_path() {
+        let (k, n, block_size) = (128, 16, 32);
+        let a_values: Vec<f32> = (0..k)
+            .map(|i| ((i * 11 % 41) as f32 - 20.0) / 13.0)
+            .collect();
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 23 % 47) as f32 - 19.0) / 12.0)
+            .collect();
+        let (packed, scales, _, _) = quantize(&weights, n, k, block_size, false);
+        let dequantized = dequantize_reference(&packed, &scales, None, n, k, block_size);
+        let mut kernel = test_kernel(k, n, block_size);
+        // B is *not* a graph constant: `can_prepack` is false.
+        kernel.set_constant_inputs(&[false, false, true]);
+
+        let a = Owned::f32(&[1, k], &a_values);
+        let b = Owned::u8(&[n, 4, 16], &packed);
+        let scales = Owned::f32(&[n, 4], &scales);
+        let mut y = Owned::zeros_f32(&[1, n]);
+        let sym_before = BORROWED_INT4_SYMMETRIC_TEST_CALLS.load(Ordering::Relaxed);
+        kernel
+            .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
+            .unwrap();
+
+        assert_close(&y.to_f32(), &reference(&a_values, &dequantized, 1, k, n));
+        assert!(
+            BORROWED_INT4_SYMMETRIC_TEST_CALLS.load(Ordering::Relaxed) > sym_before,
+            "dynamic-weight int4 accuracy_level=0 must keep the borrowed zero-copy path (MLAS would repack every call)"
+        );
+        assert!(
+            !prepack_cache_populated(&kernel),
+            "dynamic-weight int4 must not build any per-call weight cache"
+        );
+    }
+
+    /// The ownership predicate must be a pure function of the node's static
+    /// shape/quantization plus `can_prepack`, so `execute`'s branch order and
+    /// the route assertions in tests cannot disagree.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn mlas_sqnbit_ownership_requires_constant_weights() {
+        let kernel = test_kernel(128, 16, 32);
+        assert!(
+            !kernel.mlas_sqnbit_owns_fp32_compute(false, false),
+            "dynamic weights must never be handed to MLAS SQNBit on the accuracy_level=0 route"
+        );
+        assert!(
+            !kernel.mlas_sqnbit_owns_fp32_compute(false, true),
+            "dynamic asymmetric weights must never be handed to MLAS SQNBit either"
+        );
+        // A block size MLAS has no SQNBit kernel for must be declined even with
+        // constant weights, so the borrowed path stays reachable as the fallback.
+        let unsupported = test_kernel(128, 16, 8);
+        assert!(
+            !unsupported.mlas_sqnbit_owns_fp32_compute(true, false),
+            "block_size=8 has no MLAS SQNBit kernel and must fall back to the borrowed path"
         );
     }
 
