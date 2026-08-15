@@ -956,7 +956,6 @@ impl NativeDecodeSession {
         token_input: &str,
         position_input: Option<&str>,
         error_context: &str,
-        preserve_graph: bool,
     ) -> anyhow::Result<Vec<Vec<f32>>> {
         let ids = token_ids
             .iter()
@@ -971,7 +970,7 @@ impl NativeDecodeSession {
                 self.build_step_positions(past_len, total_len)?,
             ));
         }
-        self.run_cuda_eager_rows_owned(owned, total_len, error_context, preserve_graph)
+        self.run_cuda_eager_rows_owned(owned, total_len, error_context)
     }
 
     /// Shared eager (uncaptured) device forward body: bind the caller-provided
@@ -987,15 +986,12 @@ impl NativeDecodeSession {
         owned: Vec<(String, Tensor)>,
         total_len: usize,
         error_context: &str,
-        preserve_graph: bool,
     ) -> anyhow::Result<Vec<Vec<f32>>> {
         let state = self
             .cuda
             .as_mut()
             .context("CUDA decode state is not initialized")?;
-        if !preserve_graph {
-            state.invalidate_graph(&mut self.session)?;
-        }
+        state.invalidate_graph(&mut self.session)?;
         let bindings = owned
             .iter()
             .map(|(name, tensor)| (name.as_str(), tensor))
@@ -1668,7 +1664,6 @@ impl NativeDecodeSession {
             &token_input,
             position_input.as_deref(),
             "decoder",
-            false,
         )
     }
 
@@ -1802,7 +1797,7 @@ impl NativeDecodeSession {
         // eager token forward) rather than freezing to physical capacity.
         state.extend_mask(if grew { 0 } else { past_len }, total_len, total_len)?;
 
-        self.run_cuda_eager_rows_owned(owned, total_len, "decoder", false)
+        self.run_cuda_eager_rows_owned(owned, total_len, "decoder")
     }
 
     /// Build the owned per-step upload set for the eager CUDA path from every
@@ -1945,81 +1940,6 @@ impl NativeDecodeSession {
             return <Self as DecodeBackend>::decode(self, tokens, past);
         }
         self.run_verify_captured_cuda(tokens, past, width)
-    }
-
-    /// Single-token (M=1) eager base forward that **preserves** any installed
-    /// captured verify graph. Used by the fused speculative driver for empty-draft
-    /// steps (a prompt-lookup miss): those steps must degrade to plain M=1 cost —
-    /// NOT the width-W verify cost — while keeping the retained width-W verify
-    /// graph installed so the next lookup *hit* replays it instead of re-warming.
-    ///
-    /// It runs in normal (non-capture) mode over the persistent M=1 device
-    /// bindings, so it neither captures nor invalidates the device graph slot,
-    /// leaving the verify graph's signature intact for the next `replay`.
-    pub fn decode_base_eager_keep_verify_graph(
-        &mut self,
-        token: TokenId,
-        past: usize,
-    ) -> anyhow::Result<Vec<f32>> {
-        if past != self.current_len {
-            bail!(
-                "native decode_base_eager_keep_verify_graph past length mismatch: caller supplied {past}, adapter holds {}",
-                self.current_len
-            );
-        }
-        if self.cuda.is_none() {
-            return <Self as DecodeBackend>::decode(self, &[token], past)?
-                .pop()
-                .context("native base eager forward produced no logits");
-        }
-        let token_input = self
-            .step_input_name(NativeStepInputSource::TokenIds)
-            .context("native CUDA decoder has no token input binding")?
-            .to_owned();
-        let position_input = self
-            .step_input_name(NativeStepInputSource::PositionIds)
-            .map(str::to_owned);
-        let total_len = past
-            .checked_add(1)
-            .context("native base eager context length overflow")?;
-        let state = self
-            .cuda
-            .as_mut()
-            .context("CUDA decode state is not initialized")?;
-        if total_len > state.capacity.max_len {
-            bail!("{}", state.capacity_exceeded_error(total_len));
-        }
-        let grew = state.ensure_capacity(&mut self.session, total_len)?;
-        if grew {
-            // A KV bucket grow moves device addresses, so any retained verify
-            // graph is already invalid; drop it and re-expose the full mask.
-            state.invalidate_graph(&mut self.session)?;
-            if let Some(capture) = state.verify_capture.as_mut() {
-                capture.phase = DecodeCudaGraphPhase::NeedsWarmup;
-            }
-        }
-        state.extend_mask(if grew { 0 } else { past }, total_len, total_len)?;
-        let rows = self.run_cuda_eager_rows(
-            std::slice::from_ref(&token),
-            past,
-            total_len,
-            &token_input,
-            position_input.as_deref(),
-            "base",
-            false,
-        )?;
-        // The eager forward invalidated the device graph slot, so any retained
-        // verify graph is gone; force it to re-warm on the next lookup hit.
-        if let Some(capture) = self
-            .cuda
-            .as_mut()
-            .and_then(|state| state.verify_capture.as_mut())
-        {
-            capture.phase = DecodeCudaGraphPhase::NeedsWarmup;
-        }
-        rows.into_iter()
-            .next()
-            .context("native base eager forward produced no logits row")
     }
 
     /// CUDA body of [`Self::decode_verify_captured`]: drive the persistent padded
@@ -2375,7 +2295,6 @@ impl NativeDecodeSession {
             &token_input,
             position_input.as_deref(),
             "verify",
-            false,
         )
     }
 

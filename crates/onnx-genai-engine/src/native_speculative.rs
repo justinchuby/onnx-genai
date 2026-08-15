@@ -126,6 +126,93 @@ fn captured_verify_from_env() -> bool {
     )
 }
 
+/// Adaptive hit-density gate for the fused captured-verify path.
+///
+/// The prompt-lookup proposal is a cheap CPU-side n-gram search, but the width-W
+/// captured verify forward only pays off when the warmed device graph is
+/// *replayed* across consecutive steps. An isolated lookup hit surrounded by
+/// misses re-warms the graph (a fresh capture, not a replay) and commits only
+/// B tokens for ~W× the M=1 cost — a net loss. That is the generic-prose
+/// regression: sparse hits never amortize their warmup. The gate only engages
+/// the width-W verify once recent would-hit density predicts the graph will
+/// replay; below the threshold the driver runs a plain M=1 decode step (never
+/// worse than baseline) and re-engages the moment hits cluster.
+///
+/// Both branches — captured verify and plain M=1 decode — are independently
+/// byte-identical to plain greedy, so gating between them cannot change output;
+/// it only trades speculative throughput for a guaranteed non-regression floor.
+struct HitDensityGate {
+    /// Trailing would-hit bits (bit 0 = most recent), masked to `window` bits.
+    bits: u32,
+    /// Number of trailing steps to consider (1..=32).
+    window: u32,
+    /// Minimum would-hits within the window required to engage the width-W path.
+    min_hits: u32,
+    /// When false the gate is disabled: engage on every hit (A/B baseline).
+    enabled: bool,
+}
+
+impl HitDensityGate {
+    /// Resolve the gate from the environment. Enabled by default so the fused
+    /// captured path never regresses below plain decode on low-acceptance
+    /// prompts. `ONNX_GENAI_SPEC_GATE=0` restores the always-engage behavior
+    /// (for A/B), `ONNX_GENAI_SPEC_GATE_WINDOW` / `_MIN_HITS` tune the threshold.
+    fn from_env() -> HitDensityGate {
+        let enabled = !matches!(
+            std::env::var("ONNX_GENAI_SPEC_GATE").ok().as_deref(),
+            Some("0") | Some("false") | Some("no")
+        );
+        let window = std::env::var("ONNX_GENAI_SPEC_GATE_WINDOW")
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .filter(|value| (1..=32).contains(value))
+            .unwrap_or(16);
+        let min_hits = std::env::var("ONNX_GENAI_SPEC_GATE_MIN_HITS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .filter(|value| *value >= 1)
+            .unwrap_or(window.div_ceil(2))
+            .min(window);
+        HitDensityGate {
+            bits: 0,
+            window,
+            min_hits,
+            enabled,
+        }
+    }
+
+    #[inline]
+    fn window_mask(&self) -> u32 {
+        if self.window >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << self.window) - 1
+        }
+    }
+
+    /// Record whether the current step produced a non-empty draft (a would-hit).
+    fn record(&mut self, would_hit: bool) {
+        self.bits = ((self.bits << 1) | u32::from(would_hit)) & self.window_mask();
+    }
+
+    /// Would-hits within the trailing window (after `record`).
+    fn density(&self) -> u32 {
+        self.bits.count_ones()
+    }
+
+    /// Whether to engage the width-W captured verify this step. `would_hit` must
+    /// be the current step's proposal outcome, already passed to `record`.
+    fn should_engage(&self, would_hit: bool) -> bool {
+        if !would_hit {
+            return false;
+        }
+        if !self.enabled {
+            return true;
+        }
+        self.density() >= self.min_hits
+    }
+}
+
 /// Greedy speculative acceptance with an optional numerical near-tie guard.
 ///
 /// `base_logits` is the target distribution for the first uncommitted position
@@ -200,6 +287,10 @@ pub(crate) struct NativeSpeculativeDriver<'a> {
     /// Env-gated (`ONNX_GENAI_SPEC_CAPTURED_VERIFY=1`) and prompt-lookup only;
     /// falls back to eager transparently on non-CUDA / non-capturable sessions.
     captured_verify: bool,
+    /// Adaptive gate that only engages the width-W captured verify when recent
+    /// would-hit density predicts the warmed graph will replay, so sparse-hit
+    /// prompts degrade to plain decode instead of paying repeated graph warmup.
+    hit_gate: HitDensityGate,
 }
 
 enum NativeProposer<'a> {
@@ -226,6 +317,7 @@ impl<'a> NativeSpeculativeDriver<'a> {
             draft_width: draft_width.max(1),
             tie_guard: TieGuard::from_env(),
             captured_verify: captured_verify_from_env(),
+            hit_gate: HitDensityGate::from_env(),
         })
     }
 
@@ -255,6 +347,7 @@ impl<'a> NativeSpeculativeDriver<'a> {
             draft_width: draft_width.max(1),
             tie_guard: TieGuard::from_env(),
             captured_verify: captured_verify_from_env(),
+            hit_gate: HitDensityGate::from_env(),
         })
     }
 
@@ -360,22 +453,38 @@ impl<'a> NativeSpeculativeDriver<'a> {
                 };
                 draft.truncate(width);
                 let bonus_token = pending[0];
+                // Cheap CPU-side proposal outcome. Engage the width-W captured
+                // verify only when recent would-hit density predicts the warmed
+                // graph will REPLAY; otherwise degrade to a plain M=1 decode step
+                // so sparse-hit prompts never pay repeated graph warmup (the
+                // generic-prose regression). Both branches are byte-identical to
+                // plain greedy, so this only trades throughput, never output.
+                let would_hit = !draft.is_empty();
+                self.hit_gate.record(would_hit);
+                let engage = self.hit_gate.should_engage(would_hit);
                 // Keep the retained verify graph alive across the per-step rewind
                 // (sticky for both arms below) so a lookup hit REPLAYS the width-W
                 // graph instead of re-capturing it.
                 self.session.set_retain_graph_on_rewind(true);
-                if draft.is_empty() {
-                    // Lookup miss: run a CHEAP M=1 base forward that preserves the
-                    // installed width-W verify graph (no width-W cost, no graph-slot
-                    // stomp). This is the critical throughput guard — on realistic
-                    // prompts most steps miss, and paying the ~2.2x width-W verify
-                    // cost to commit a single token would tank decode below plain
-                    // greedy. Degrades to exactly a plain greedy step (accepted=0).
+                if !engage {
+                    // Lookup miss OR gated-out (sparse would-hit density): run the
+                    // normal M=1 CAPTURED decode (device-graph replay = full plain
+                    // baseline speed), NOT an eager forward. `decode` invalidates
+                    // the graph slot on signature mismatch *before* launching any
+                    // kernel, so it is safe even while a stale width-W verify graph
+                    // is installed; we then reset the verify phase so the next
+                    // engaged step re-warms the width-W graph instead of replaying
+                    // an invalidated one. Degrades to exactly a plain greedy step
+                    // (accepted=0) at baseline throughput — this is the guard that
+                    // keeps sparse-hit prompts from regressing below plain decode.
                     let base_logits = self
                         .session
-                        .decode_base_eager_keep_verify_graph(bonus_token, past)?;
+                        .decode(&pending, past)?
+                        .pop()
+                        .context("native gated decode produced no base logits")?;
                     pending.clear();
-                    let base = past + 1;
+                    self.session.reset_captured_verify();
+                    let base = self.session.current_len();
                     debug_assert_eq!(base, context_len);
                     (base_logits, base, Vec::new(), Vec::new())
                 } else {
@@ -708,5 +817,102 @@ mod accept_tests {
         assert_eq!(out.accepted, 0);
         assert_eq!(out.bonus, 5);
         assert_eq!(out.near_tie_rejections, 0);
+    }
+}
+
+#[cfg(test)]
+mod hit_gate_tests {
+    use super::HitDensityGate;
+
+    fn gate(window: u32, min_hits: u32) -> HitDensityGate {
+        HitDensityGate {
+            bits: 0,
+            window,
+            min_hits,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn never_engages_without_a_would_hit() {
+        // Even with a saturated window, a miss (empty draft) cannot engage:
+        // there is nothing to verify.
+        let mut g = gate(4, 1);
+        for _ in 0..8 {
+            g.record(true);
+        }
+        assert!(g.should_engage(true));
+        assert!(!g.should_engage(false));
+    }
+
+    #[test]
+    fn engages_only_after_hits_cluster() {
+        // window=8, min_hits=4: a fresh gate must see 4 would-hits accumulate in
+        // the window before it engages the width-W path.
+        let mut g = gate(8, 4);
+        let mut engaged_at = None;
+        for step in 1..=6 {
+            g.record(true);
+            if g.should_engage(true) {
+                engaged_at = Some(step);
+                break;
+            }
+        }
+        assert_eq!(engaged_at, Some(4), "should engage exactly at the 4th hit");
+    }
+
+    #[test]
+    fn isolated_hits_below_threshold_do_not_engage() {
+        // Hits separated by misses keep density under the threshold, so the gate
+        // stays on the plain-decode floor (the generic-prose non-regression).
+        let mut g = gate(8, 5);
+        for _ in 0..8 {
+            g.record(true);
+            assert!(!g.should_engage(true), "isolated hit must not engage");
+            g.record(false);
+        }
+    }
+
+    #[test]
+    fn window_slides_and_disengages_when_hits_age_out() {
+        // Once the window fills with hits it engages; a run of misses slides the
+        // hits out and it disengages again (returns to the non-regression floor).
+        let mut g = gate(4, 3);
+        for _ in 0..4 {
+            g.record(true);
+        }
+        assert!(g.should_engage(true));
+        // Four misses evict every hit from the 4-wide window.
+        for _ in 0..4 {
+            g.record(false);
+        }
+        assert_eq!(g.density(), 0);
+        g.record(true);
+        assert!(
+            !g.should_engage(true),
+            "a lone hit after the window drained must not re-engage"
+        );
+    }
+
+    #[test]
+    fn disabled_gate_engages_on_every_hit() {
+        let mut g = gate(16, 8);
+        g.enabled = false;
+        // No recorded history at all, yet a single would-hit engages: this is the
+        // always-engage A/B baseline (ONNX_GENAI_SPEC_GATE=0).
+        g.record(true);
+        assert!(g.should_engage(true));
+        assert!(!g.should_engage(false), "still needs a draft to verify");
+    }
+
+    #[test]
+    fn window_mask_saturates_at_32_bits() {
+        // window=32 must not overflow the 1<<window shift; the mask is all-ones.
+        let mut g = gate(32, 32);
+        for _ in 0..64 {
+            g.record(true);
+        }
+        assert_eq!(g.density(), 32);
+        assert!(g.should_engage(true));
     }
 }

@@ -125,6 +125,16 @@ fn native_prompt_lookup_matches_plain_greedy_cuda() -> anyhow::Result<()> {
         eprintln!("skipping CUDA smoke; set ONNX_GENAI_RUN_CUDA_SMOKE=1 to run");
         return Ok(());
     }
+    // This smoke test exercises the captured-verify ENGAGE path on a short (6
+    // token) repetitive fixture. Disable the adaptive hit-density gate so it
+    // engages immediately instead of waiting for the density window to fill;
+    // the gate only chooses between two byte-identical paths, so disabling it
+    // does not weaken the token-identity assertion below.
+    // SAFETY: set before the driver is constructed; the smoke test is invoked
+    // single-threaded (guarded behind ONNX_GENAI_RUN_CUDA_SMOKE).
+    unsafe {
+        std::env::set_var("ONNX_GENAI_SPEC_GATE", "0");
+    }
     let model_dir = std::env::var_os("ONNX_GENAI_NATIVE_SPEC_MODEL")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/home/justinchu/qwen2.5-0.5b-int4-onnx"));
