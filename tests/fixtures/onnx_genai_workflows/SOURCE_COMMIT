@@ -1,3 +1,4 @@
 Repository: https://github.com/onnxruntime/mobius.git
 Base workflow fixtures: 903a0579bd2db2b391218741a97774bf71ebf974
 Adapter fixture: be5d7d146866b6e228220df5bfc0b70409019ae4
+Adapter producer validation: 417c3cf6ec7e52a5e1dd828044ba192d59dfe4e0
