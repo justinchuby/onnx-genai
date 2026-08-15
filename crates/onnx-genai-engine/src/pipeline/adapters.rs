@@ -706,6 +706,68 @@ mod tests {
     }
 
     #[test]
+    fn one_artifact_supports_heterogeneous_target_rank_and_alpha() {
+        let root = std::env::current_dir()
+            .expect("current directory")
+            .join("target")
+            .join(format!("adapter-heterogeneous-rank-{}", std::process::id()));
+        fs::create_dir_all(root.join("adapters/red")).expect("create adapter test directory");
+        let red = br#"{"targets":{"projection":{"a":[1.0,0.0],"b":[1.0,2.0]},"projection_2":{"a":[1.0,0.0,0.0,1.0],"b":[1.0,0.0,0.0,1.0]}}}"#;
+        let blue = br#"{"targets":{"projection":{"a":[0.0,1.0],"b":[3.0,4.0]}}}"#;
+        fs::write(root.join("adapters/red/adapter.json"), red).expect("write adapter");
+
+        let mut service = service_contract(red, blue, 1);
+        service.target_manifest.targets[0].alpha = Some(2.0);
+        service.target_manifest.targets.push(LoraTargetDescriptor {
+            id: "projection_2".to_string(),
+            component: "decoder".to_string(),
+            initializer: "projection_2".to_string(),
+            layer_index: Some(1),
+            node_name: "projection_2".to_string(),
+            output_name: "projection_2.output".to_string(),
+            activation_dtype: "float32".to_string(),
+            input_features: 2,
+            output_features: 2,
+            rank: Some(2),
+            alpha: Some(6.0),
+            output_slice: None,
+            graph_inputs: None,
+        });
+        let artifact = service.artifacts.get_mut("red").expect("red artifact");
+        artifact.bindings[0].alpha = Some(2.0);
+        artifact.bindings.push(AdapterTargetBinding {
+            target: "projection_2".to_string(),
+            weight_key: "projection_2".to_string(),
+            rank: Some(2),
+            alpha: Some(6.0),
+        });
+
+        let selection =
+            AdapterSelection::default().with_slot(10, 0, [AdapterActivation::new("red", 1.0)]);
+        let mut cache = AdapterCache::default();
+        let context = cache
+            .prepare(&root, &service, &selection, &[10], &[0], &[true])
+            .expect("load heterogeneous-rank artifact under one alias");
+        let (rank_one, _) =
+            apply_parameter_overlay(&cache, &context, "decoder", "projection", &[1.0, 2.0], 1, 2)
+                .expect("apply rank-one target");
+        let (rank_two, _) = apply_parameter_overlay(
+            &cache,
+            &context,
+            "decoder",
+            "projection_2",
+            &[1.0, 2.0],
+            1,
+            2,
+        )
+        .expect("apply rank-two target");
+        assert_eq!(rank_one, vec![3.0, 6.0]);
+        assert_eq!(rank_two, vec![4.0, 8.0]);
+
+        fs::remove_dir_all(root).expect("remove adapter test directory");
+    }
+
+    #[test]
     fn heterogeneous_composition_compaction_and_cache_lifecycle() {
         let root = std::env::current_dir()
             .expect("current directory")
