@@ -275,6 +275,32 @@ manifest. Their optional `contract` supplies semantic bindings and parameters.
 Stateful adapters declare semantic state cells and an external effect domain. Grammar clone,
 lookahead, and commit are reusable by any workflow; ONNX components apply masks and sample.
 
+## Parameter adapters (LoRA)
+
+`workflow.adapters` declares parameter-overlay artifacts and their runtime lifecycle independently
+of workflow control flow. Each artifact pins an identity/version, base-model fingerprint,
+rank/alpha/dtype, checksummed package-relative weights, and generic component/parameter targets.
+The immutable request selection is keyed by semantic `row_ids`; each row may select zero, one, or
+multiple adapters in deterministic order, with static and optional request-tensor scales.
+
+The runtime discovers and verifies artifacts on first activation, caches them with LRU eviction,
+and records plan variants by ordered adapter set. Compaction reorders selections with semantic
+row IDs rather than physical rows. Slot reuse receives a new request selection, inactive rows do
+not activate an adapter when the optional `active` bool tensor is declared, and shared base weights
+are never mutated.
+
+`application_capability` negotiates a native parameter-overlay implementation. Existing ORT GenAI
+adapter APIs already provide load/activate/unload lifecycle primitives; native implementations
+should map this contract onto those APIs. When `portable_fallback: true`, the reference runtime can
+apply float32 low-rank overlays through `onnx-genai.parameter-overlay@1`. Its bindings are `input`
+and `output`, and parameters identify the target `component` and `parameter`. Unsupported formats
+or capabilities return structured, actionable errors rather than selecting model-family code.
+
+For CUDA Graph execution, `planning.stable_buffers` and `bucket_by_adapter_set` require stable
+addresses per plan variant. Eviction invalidates affected captures when
+`invalidate_capture_on_eviction` is true; a later activation reloads the artifact and establishes a
+new plan/capture variant.
+
 ## Compact structural examples
 
 ### Decoder

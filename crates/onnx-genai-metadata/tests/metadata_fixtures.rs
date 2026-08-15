@@ -1,5 +1,111 @@
 use onnx_genai_metadata::{InferenceMetadata, WorkflowNode, compile_workflow, validate_metadata};
 
+const ADAPTER_WORKFLOW: &str = r#"
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      ir_version: "1.0"
+      onnx_opsets: { ai.onnx: 24 }
+      adapter_abis: { onnx-genai.parameter-overlay: "1" }
+      capabilities: [workflow_ssa, parameter_adapters, heterogeneous_adapter_batching]
+    inputs:
+      request.row_ids:
+        contract: { dtype: int64, rank: 1, shape: [batch] }
+        role: { kind: runtime, version: "1.0", role: row_ids }
+        source: { kind: request }
+    components:
+      decoder:
+        implementation: { kind: binding }
+        ports: {}
+      overlay:
+        implementation:
+          kind: adapter
+          abi: onnx-genai.parameter-overlay
+          version: "1"
+        ports:
+          inputs:
+            input: { dtype: float32, rank: 2, shape: [batch, 2] }
+          outputs:
+            output: { dtype: float32, rank: 2, shape: [batch, 2] }
+        contract:
+          id: onnx-genai.parameter-overlay
+          version: "1"
+          bindings: { input: input, output: output }
+          parameters:
+            action: apply
+            component: decoder
+            parameter: projection.weight
+    adapters:
+      base_model_fingerprint: base-sha256
+      row_ids: request.row_ids
+      application_capability: onnx-genai.adapters
+      portable_fallback: true
+      cache: { max_entries: 2, eviction: lru }
+      planning:
+        bucket_by_adapter_set: true
+        stable_buffers: true
+        invalidate_capture_on_eviction: true
+      artifacts:
+        red:
+          identity: red
+          version: "1"
+          base_model_fingerprint: base-sha256
+          rank: 1
+          alpha: 1.0
+          dtype: float32
+          provenance: synthetic-test
+          weights:
+            - location: adapters/red.json
+              sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+              format: json
+          targets:
+            - component: decoder
+              parameter: projection.weight
+              weight_key: projection
+              input_features: 2
+              output_features: 2
+    steps:
+      - kind: invoke
+        component: decoder
+"#;
+
+#[test]
+fn adapter_service_contract_is_valid_and_derives_capabilities() {
+    let metadata: InferenceMetadata =
+        serde_yaml::from_str(ADAPTER_WORKFLOW).expect("adapter workflow parses");
+    validate_metadata(&metadata).expect("adapter workflow validates");
+    let capabilities = onnx_genai_metadata::derived_capabilities(&metadata);
+    assert!(capabilities.contains("parameter_adapters"));
+    assert!(capabilities.contains("heterogeneous_adapter_batching"));
+}
+
+#[test]
+fn adapter_service_rejects_incompatible_or_unsafe_artifacts() {
+    let invalid = ADAPTER_WORKFLOW
+        .replace(
+            "base_model_fingerprint: base-sha256\n          rank",
+            "base_model_fingerprint: other\n          rank",
+        )
+        .replace(
+            "location: adapters/red.json",
+            "location: ../outside/red.json",
+        );
+    let metadata: InferenceMetadata =
+        serde_yaml::from_str(&invalid).expect("invalid adapter workflow parses");
+    let errors = validate_metadata(&metadata).expect_err("invalid adapter workflow must fail");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("does not match service fingerprint"))
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("package-relative path"))
+    );
+}
+
 #[test]
 fn minimal_workflow_document_is_valid() {
     let metadata: InferenceMetadata = serde_yaml::from_str(

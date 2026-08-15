@@ -23,9 +23,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
+mod adapters;
 mod islands;
 mod workflow;
 
+pub use adapters::{AdapterActivation, AdapterLifecycleDiagnostic, AdapterSelection};
 pub use islands::ExecutionIslandDiagnostic;
 pub use onnx_genai_metadata::WorkflowOutputRole;
 pub use workflow::{WorkflowExecutionPlan, WorkflowPerformanceDiagnostic};
@@ -84,6 +86,8 @@ pub struct PipelineGenerateRequest {
     pub session_id: Option<String>,
     /// Application-selected package components that replace overridable components.
     pub component_overrides: HashMap<String, String>,
+    /// Immutable per-semantic-row adapter composition for this request.
+    pub adapters: AdapterSelection,
 }
 
 impl PipelineGenerateRequest {
@@ -93,7 +97,13 @@ impl PipelineGenerateRequest {
             inputs: HashMap::new(),
             session_id: None,
             component_overrides: HashMap::new(),
+            adapters: AdapterSelection::default(),
         }
+    }
+
+    pub fn with_adapters(mut self, adapters: AdapterSelection) -> Self {
+        self.adapters = adapters;
+        self
     }
 
     pub fn with_input(mut self, name: impl Into<String>, value: Value) -> Self {
@@ -125,6 +135,7 @@ impl From<GenerateRequest> for PipelineGenerateRequest {
 
 /// Engine for packages expressed exclusively with `pipeline.workflow`.
 pub struct PipelineEngine {
+    package_root: std::path::PathBuf,
     models: PipelineModels,
     resource_governor: EngineResourceGovernor,
     memory_strategy_plan: MemoryStrategyPlan,
@@ -141,6 +152,8 @@ pub struct PipelineEngine {
     workflow_performance: RefCell<workflow::WorkflowPerformanceCounters>,
     workflow_execution_generation: Cell<u64>,
     workflow_session_state: RefCell<HashMap<(String, String), Value>>,
+    adapter_cache: RefCell<adapters::AdapterCache>,
+    active_adapter_context: RefCell<Option<adapters::AdapterRunContext>>,
     preprocessing: Option<PreprocessingSpec>,
 }
 
@@ -339,6 +352,7 @@ impl PipelineEngine {
         let device_bridge_components =
             workflow::compile_device_bridge_components(&bridge_graph, &island_components);
         Ok(Self {
+            package_root: directory.root.clone(),
             models,
             resource_governor,
             memory_strategy_plan,
@@ -354,6 +368,8 @@ impl PipelineEngine {
             workflow_performance: RefCell::new(workflow::WorkflowPerformanceCounters::default()),
             workflow_execution_generation: Cell::new(0),
             workflow_session_state: RefCell::new(HashMap::new()),
+            adapter_cache: RefCell::new(adapters::AdapterCache::default()),
+            active_adapter_context: RefCell::new(None),
             preprocessing: directory.preprocessing,
         })
     }
@@ -372,6 +388,10 @@ impl PipelineEngine {
 
     pub fn models(&self) -> &PipelineModels {
         &self.models
+    }
+
+    pub fn adapter_lifecycle_diagnostic(&self) -> AdapterLifecycleDiagnostic {
+        self.adapter_cache.borrow().diagnostic()
     }
 
     pub fn device_authority(&self) -> crate::memory_authority::DeviceMemoryAuthority {

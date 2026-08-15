@@ -14,6 +14,16 @@ type ResolvedComponentInvocation<'a> = (
     std::collections::BTreeMap<String, String>,
 );
 
+struct ActiveAdapterContextGuard<'a>(
+    &'a std::cell::RefCell<Option<super::adapters::AdapterRunContext>>,
+);
+
+impl Drop for ActiveAdapterContextGuard<'_> {
+    fn drop(&mut self) {
+        self.0.borrow_mut().take();
+    }
+}
+
 pub(crate) fn compile_device_bridge_components(
     graph: &WorkflowNode,
     island_components: &HashSet<String>,
@@ -201,6 +211,7 @@ pub struct WorkflowExecutionPlan<'a> {
     dynamic_symbols: std::collections::HashSet<String>,
     session_id: Option<String>,
     component_overrides: HashMap<String, String>,
+    adapters: super::AdapterSelection,
     max_iterations_only: bool,
 }
 
@@ -255,6 +266,10 @@ fn workflow_adapter_registry()
             (
                 ("onnx-genai.telemetry", "1"),
                 PipelineEngine::run_telemetry_adapter as WorkflowAdapterExecutor,
+            ),
+            (
+                ("onnx-genai.parameter-overlay", "1"),
+                PipelineEngine::run_parameter_overlay_adapter as WorkflowAdapterExecutor,
             ),
         ])
     });
@@ -580,6 +595,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
             inputs,
             session_id,
             component_overrides,
+            adapters,
         } = request;
         let workflow = &engine.workflow;
         validate_component_overrides(workflow, &component_overrides)?;
@@ -639,6 +655,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
             dynamic_symbols,
             session_id,
             component_overrides,
+            adapters,
             max_iterations_only: !request.options.stop_on_eos,
         })
     }
@@ -690,6 +707,55 @@ impl<'a> WorkflowExecutionPlan<'a> {
         }
         let workflow = &engine.workflow;
         let mut values = std::mem::take(&mut self.values);
+        let prepare_adapters = (|| -> anyhow::Result<()> {
+            if let Some(service) = &workflow.adapters {
+                if !service.portable_fallback {
+                    anyhow::bail!(
+                        "adapter capability '{}' is unavailable in the portable workflow runtime and portable_fallback is disabled",
+                        service.application_capability
+                    );
+                }
+                let row_ids = values
+                    .get(&service.row_ids)
+                    .with_context(|| {
+                        format!(
+                            "adapter service row_ids input '{}' is unavailable",
+                            service.row_ids
+                        )
+                    })?
+                    .to_vec_i64()
+                    .with_context(|| {
+                        format!(
+                            "adapter service row_ids input '{}' must be host int64",
+                            service.row_ids
+                        )
+                    })?;
+                let active_rows = if let Some(active) = &service.active {
+                    workflow_bool_rows(&values, active)?
+                } else {
+                    vec![true; row_ids.len()]
+                };
+                let context = engine.adapter_cache.borrow_mut().prepare(
+                    &engine.package_root,
+                    service,
+                    &self.adapters,
+                    &row_ids,
+                    &active_rows,
+                    &values,
+                )?;
+                *engine.active_adapter_context.borrow_mut() = Some(context);
+            } else if !self.adapters.rows.is_empty() {
+                anyhow::bail!(
+                    "request selects adapters but the workflow declares no adapter service"
+                );
+            }
+            Ok(())
+        })();
+        if let Err(error) = prepare_adapters {
+            self.retain_inputs(&mut values);
+            return Err(error);
+        }
+        let _adapter_context_guard = ActiveAdapterContextGuard(&engine.active_adapter_context);
         for (cell, state) in &workflow.state {
             if state.scope != onnx_genai_metadata::WorkflowStateScope::Session {
                 continue;
@@ -1665,6 +1731,74 @@ impl PipelineEngine {
         Ok(produced)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "matches the shared workflow adapter executor ABI"
+    )]
+    fn run_parameter_overlay_adapter(
+        &self,
+        component: &str,
+        inputs: &BTreeMap<String, String>,
+        outputs: &BTreeMap<String, String>,
+        declaration: &onnx_genai_metadata::WorkflowComponent,
+        values: &mut PipelineTensors,
+        _symbols: &HashMap<String, i64>,
+        _component_symbols: &mut HashMap<String, i64>,
+    ) -> anyhow::Result<()> {
+        let contract = declaration
+            .contract
+            .as_ref()
+            .filter(|contract| contract.id == "onnx-genai.parameter-overlay")
+            .context("parameter overlay adapter is missing its versioned contract")?;
+        let input_port = workflow_contract_binding(contract, "input")?;
+        let output_port = workflow_contract_binding(contract, "output")?;
+        let target_component = workflow_contract_parameter(contract, "component")?;
+        let target_parameter = workflow_contract_parameter(contract, "parameter")?;
+        let input_name = inputs.get(input_port).with_context(|| {
+            format!("parameter overlay '{component}' has no input binding '{input_port}'")
+        })?;
+        let output_name = outputs.get(output_port).with_context(|| {
+            format!("parameter overlay '{component}' has no output binding '{output_port}'")
+        })?;
+        let input = values
+            .get(input_name)
+            .with_context(|| format!("parameter overlay input '{input_name}' is unavailable"))?;
+        let shape = input.shape();
+        if shape.len() != 2 {
+            anyhow::bail!(
+                "parameter overlay input '{input_name}' must have rank 2 [batch, features], got {shape:?}"
+            );
+        }
+        let batch = usize::try_from(shape[0]).context("adapter batch is negative")?;
+        let input_features =
+            usize::try_from(shape[1]).context("adapter feature dimension is negative")?;
+        let source = input
+            .to_vec_f32()
+            .context("portable parameter overlay requires host float32 input")?;
+        let context = self.active_adapter_context.borrow();
+        let context = context
+            .as_ref()
+            .context("parameter overlay executed without a request adapter context")?;
+        let cache = self.adapter_cache.borrow();
+        let (result, output_features) = super::adapters::apply_parameter_overlay(
+            &cache,
+            context,
+            target_component,
+            target_parameter,
+            &source,
+            batch,
+            input_features,
+        )?;
+        values.insert(
+            output_name.clone(),
+            Value::from_slice_f32(
+                &result,
+                &[i64::try_from(batch)?, i64::try_from(output_features)?],
+            )?,
+        );
+        Ok(())
+    }
+
     fn run_image_preprocess_adapter(
         &self,
         component: &str,
@@ -2125,9 +2259,10 @@ fn workflow_request_value(
         RuntimeInputRole::SamplingTopK => scalar_i64(request.options.top_k as i64).map(Some),
         RuntimeInputRole::SamplingTopP => scalar_f32(request.options.top_p).map(Some),
         RuntimeInputRole::SamplingMinP => scalar_f32(request.options.min_p).map(Some),
-        RuntimeInputRole::Media | RuntimeInputRole::Constraint | RuntimeInputRole::SessionId => {
-            Ok(None)
-        }
+        RuntimeInputRole::Media
+        | RuntimeInputRole::Constraint
+        | RuntimeInputRole::SessionId
+        | RuntimeInputRole::RowIds => Ok(None),
     }
 }
 

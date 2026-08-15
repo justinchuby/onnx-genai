@@ -82,7 +82,136 @@ pub struct WorkflowSpec {
     pub state: BTreeMap<String, WorkflowStateCell>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serving: Option<ServingServiceContract>,
+    /// Runtime-managed parameter adapters. Loading and caching are lifecycle operations,
+    /// independent of workflow control flow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapters: Option<AdapterServiceContract>,
     pub steps: Vec<WorkflowStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AdapterServiceContract {
+    /// Fingerprint of the immutable base parameters accepted by every declared adapter.
+    pub base_model_fingerprint: String,
+    /// Request input containing semantic row/slot identities used to resolve selections.
+    pub row_ids: String,
+    /// Optional bool[batch] input; inactive rows never load or apply adapters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<String>,
+    /// Generic application capability required from the runtime or execution provider.
+    pub application_capability: String,
+    #[serde(default)]
+    pub portable_fallback: bool,
+    #[serde(default)]
+    pub artifacts: BTreeMap<String, AdapterArtifact>,
+    #[serde(default)]
+    pub cache: AdapterCacheContract,
+    #[serde(default)]
+    pub planning: AdapterPlanningContract,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AdapterArtifact {
+    pub identity: String,
+    pub version: String,
+    pub base_model_fingerprint: String,
+    pub rank: usize,
+    pub alpha: f64,
+    #[schemars(with = "schema_vocabulary::TensorDType")]
+    pub dtype: String,
+    #[serde(default)]
+    pub weights: Vec<AdapterWeightArtifact>,
+    #[serde(default)]
+    pub targets: Vec<AdapterTargetBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AdapterWeightArtifact {
+    pub location: String,
+    /// Lowercase SHA-256 of the exact external artifact bytes.
+    pub sha256: String,
+    #[serde(default)]
+    pub format: AdapterWeightFormat,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AdapterWeightFormat {
+    /// Portable JSON tensor bundle used by the reference fallback.
+    #[default]
+    Json,
+    /// Native ONNX Runtime GenAI adapter bundle.
+    OrtGenai,
+    /// Safetensors parameter bundle.
+    Safetensors,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AdapterTargetBinding {
+    /// Workflow component whose immutable base parameter is overlaid.
+    pub component: String,
+    /// Exact parameter name within the component artifact.
+    pub parameter: String,
+    /// Key used to find this target's A/B tensors in the adapter bundle.
+    pub weight_key: String,
+    pub input_features: usize,
+    pub output_features: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AdapterCacheContract {
+    #[serde(default = "default_adapter_cache_entries")]
+    pub max_entries: usize,
+    #[serde(default)]
+    pub eviction: AdapterEvictionPolicy,
+}
+
+impl Default for AdapterCacheContract {
+    fn default() -> Self {
+        Self {
+            max_entries: default_adapter_cache_entries(),
+            eviction: AdapterEvictionPolicy::default(),
+        }
+    }
+}
+
+fn default_adapter_cache_entries() -> usize {
+    16
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AdapterEvictionPolicy {
+    #[default]
+    Lru,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AdapterPlanningContract {
+    #[serde(default = "default_true")]
+    pub bucket_by_adapter_set: bool,
+    #[serde(default = "default_true")]
+    pub stable_buffers: bool,
+    #[serde(default = "default_true")]
+    pub invalidate_capture_on_eviction: bool,
+}
+
+impl Default for AdapterPlanningContract {
+    fn default() -> Self {
+        Self {
+            bucket_by_adapter_set: true,
+            stable_buffers: true,
+            invalidate_capture_on_eviction: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
@@ -140,6 +269,7 @@ pub enum RuntimeInputRole {
     SamplingMinP,
     Constraint,
     SessionId,
+    RowIds,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]

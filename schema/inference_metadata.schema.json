@@ -31,6 +31,232 @@
       ],
       "type": "object"
     },
+    "AdapterArtifact": {
+      "additionalProperties": false,
+      "properties": {
+        "alpha": {
+          "format": "double",
+          "type": "number"
+        },
+        "base_model_fingerprint": {
+          "type": "string"
+        },
+        "dtype": {
+          "$ref": "#/$defs/TensorDType"
+        },
+        "identity": {
+          "type": "string"
+        },
+        "provenance": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rank": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "targets": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/AdapterTargetBinding"
+          },
+          "type": "array"
+        },
+        "version": {
+          "type": "string"
+        },
+        "weights": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/AdapterWeightArtifact"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "identity",
+        "version",
+        "base_model_fingerprint",
+        "rank",
+        "alpha",
+        "dtype"
+      ],
+      "type": "object"
+    },
+    "AdapterCacheContract": {
+      "additionalProperties": false,
+      "properties": {
+        "eviction": {
+          "$ref": "#/$defs/AdapterEvictionPolicy",
+          "default": "lru"
+        },
+        "max_entries": {
+          "default": 16,
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "AdapterEvictionPolicy": {
+      "enum": [
+        "lru"
+      ],
+      "type": "string"
+    },
+    "AdapterPlanningContract": {
+      "additionalProperties": false,
+      "properties": {
+        "bucket_by_adapter_set": {
+          "default": true,
+          "type": "boolean"
+        },
+        "invalidate_capture_on_eviction": {
+          "default": true,
+          "type": "boolean"
+        },
+        "stable_buffers": {
+          "default": true,
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "AdapterServiceContract": {
+      "additionalProperties": false,
+      "properties": {
+        "active": {
+          "description": "Optional bool[batch] input; inactive rows never load or apply adapters.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "application_capability": {
+          "description": "Generic application capability required from the runtime or execution provider.",
+          "type": "string"
+        },
+        "artifacts": {
+          "additionalProperties": {
+            "$ref": "#/$defs/AdapterArtifact"
+          },
+          "default": {},
+          "type": "object"
+        },
+        "base_model_fingerprint": {
+          "description": "Fingerprint of the immutable base parameters accepted by every declared adapter.",
+          "type": "string"
+        },
+        "cache": {
+          "$ref": "#/$defs/AdapterCacheContract",
+          "default": {
+            "eviction": "lru",
+            "max_entries": 16
+          }
+        },
+        "planning": {
+          "$ref": "#/$defs/AdapterPlanningContract",
+          "default": {
+            "bucket_by_adapter_set": true,
+            "invalidate_capture_on_eviction": true,
+            "stable_buffers": true
+          }
+        },
+        "portable_fallback": {
+          "default": false,
+          "type": "boolean"
+        },
+        "row_ids": {
+          "description": "Request input containing semantic row/slot identities used to resolve selections.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "base_model_fingerprint",
+        "row_ids",
+        "application_capability"
+      ],
+      "type": "object"
+    },
+    "AdapterTargetBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "component": {
+          "description": "Workflow component whose immutable base parameter is overlaid.",
+          "type": "string"
+        },
+        "input_features": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "output_features": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "parameter": {
+          "description": "Exact parameter name within the component artifact.",
+          "type": "string"
+        },
+        "weight_key": {
+          "description": "Key used to find this target's A/B tensors in the adapter bundle.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "component",
+        "parameter",
+        "weight_key",
+        "input_features",
+        "output_features"
+      ],
+      "type": "object"
+    },
+    "AdapterWeightArtifact": {
+      "additionalProperties": false,
+      "properties": {
+        "format": {
+          "$ref": "#/$defs/AdapterWeightFormat",
+          "default": "json"
+        },
+        "location": {
+          "type": "string"
+        },
+        "sha256": {
+          "description": "Lowercase SHA-256 of the exact external artifact bytes.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "location",
+        "sha256"
+      ],
+      "type": "object"
+    },
+    "AdapterWeightFormat": {
+      "oneOf": [
+        {
+          "const": "json",
+          "description": "Portable JSON tensor bundle used by the reference fallback.",
+          "type": "string"
+        },
+        {
+          "const": "ort_genai",
+          "description": "Native ONNX Runtime GenAI adapter bundle.",
+          "type": "string"
+        },
+        {
+          "const": "safetensors",
+          "description": "Safetensors parameter bundle.",
+          "type": "string"
+        }
+      ]
+    },
     "AttentionConfig": {
       "description": "Build-time attention architecture and dimensions.",
       "properties": {
@@ -1831,7 +2057,8 @@
         "sampling_top_p",
         "sampling_min_p",
         "constraint",
-        "session_id"
+        "session_id",
+        "row_ids"
       ],
       "type": "string"
     },
@@ -2572,6 +2799,17 @@
       "additionalProperties": false,
       "description": "Sound, component-centric workflow IR. Tensor math lives in invoked components.",
       "properties": {
+        "adapters": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AdapterServiceContract"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Runtime-managed parameter adapters. Loading and caching are lifecycle operations,\nindependent of workflow control flow."
+        },
         "components": {
           "additionalProperties": {
             "$ref": "#/$defs/WorkflowComponent"
