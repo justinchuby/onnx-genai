@@ -201,32 +201,31 @@ impl Kernel for SkipSimplifiedLayerNormKernel {
         // the per-row `skip` base is maintained without any division.
         let mut group_coords = vec![0usize; group_shape.len()];
         let mut skip_base = 0usize;
+        // When `skip` broadcasts along the normalized axis there is one scalar
+        // per row. Materializing it into a row lets every path in this kernel
+        // share one reduction, so a broadcast `skip` and its expansion agree
+        // bit-for-bit on every ISA.
+        let mut broadcast_skip_row = if skip_last_stride == 0 {
+            vec![0.0f32; hidden]
+        } else {
+            Vec::new()
+        };
         for group in 0..groups {
             let input_row = &input[group * hidden..group * hidden + hidden];
             let sum_base = group * sum_stride;
             let sum_row = &mut sum_scratch[sum_base..sum_base + hidden];
-            let square_sum = if skip_last_stride == 1 {
-                let skip_row = &skip[skip_base..skip_base + hidden];
-                crate::kernels::simd_sumsq::assemble_and_sum_of_squares(
-                    input_row,
-                    skip_row,
-                    bias.as_deref(),
-                    sum_row,
-                )
+            let skip_row = if skip_last_stride == 1 {
+                &skip[skip_base..skip_base + hidden]
             } else {
-                // `skip` broadcasts along the normalized axis: one scalar per row.
-                // Assemble first, then reduce with the shared helper, so this
-                // branch keeps the same lane-parallel accumulation order (and so
-                // the same rounding) as every other path in this kernel.
-                let skip_value = skip[skip_base];
-                for (element, (slot, &value)) in
-                    sum_row.iter_mut().zip(input_row.iter()).enumerate()
-                {
-                    *slot =
-                        value + skip_value + bias.as_ref().map_or(0.0, |values| values[element]);
-                }
-                crate::kernels::simd_sumsq::sum_of_squares(sum_row)
+                broadcast_skip_row.fill(skip[skip_base]);
+                &broadcast_skip_row
             };
+            let square_sum = crate::kernels::simd_sumsq::assemble_and_sum_of_squares(
+                input_row,
+                skip_row,
+                bias.as_deref(),
+                sum_row,
+            );
             let variance = square_sum / hidden as f32;
             let inv_std_var = 1.0 / (variance + self.epsilon).sqrt();
             if let Some(values) = inv_std_vars.as_mut() {
