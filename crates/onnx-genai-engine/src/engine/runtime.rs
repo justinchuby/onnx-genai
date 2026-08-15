@@ -17,23 +17,20 @@ fn generation_budget_cap(cap: ScheduledBudgetCap) -> GenerationBudgetCap {
 }
 
 #[cfg(feature = "native-backend")]
+/// Prepare only the prompt-shaped prefill workspace before generation starts.
+/// Speculative verify can have a wider query shape than the prompt, but that
+/// workspace must be reserved at the verify call site after the decode buffers
+/// have their M=1 shape restored. Pre-widening the cold prefill reservation to
+/// W leaked a width-dependent GQA workspace layout into subsequent M=1 decode on
+/// qwen (W >= 7), changing the plain greedy stream even when no draft was
+/// proposed.
 fn native_workspace_query_rows(
     prompt_rows: usize,
-    plan: Option<&NativeSpeculationPlan>,
-    effective_max_new_tokens: usize,
-    max_context: Option<usize>,
+    _plan: Option<&NativeSpeculationPlan>,
+    _effective_max_new_tokens: usize,
+    _max_context: Option<usize>,
 ) -> usize {
-    let remaining_context = max_context
-        .map(|limit| limit.saturating_sub(prompt_rows))
-        .unwrap_or(effective_max_new_tokens);
-    let verify_rows = plan.map_or(0, |plan| {
-        crate::native_speculative::verification_width(
-            plan.width,
-            effective_max_new_tokens,
-            remaining_context,
-        )
-    });
-    prompt_rows.max(verify_rows)
+    prompt_rows
 }
 
 fn metadata_eos_token_ids(metadata: &InferenceMetadata) -> Vec<TokenId> {
@@ -2335,7 +2332,7 @@ mod tests {
             ..GenerateOptions::default()
         };
         let plan = native_speculation_plan(&options, &chain).unwrap();
-        assert_eq!(native_workspace_query_rows(1, Some(&plan), 8, None), 4);
+        assert_eq!(native_workspace_query_rows(1, Some(&plan), 8, None), 1);
         assert_eq!(native_workspace_query_rows(8, Some(&plan), 8, None), 8);
 
         options.num_speculative_tokens = Some(1024);
@@ -2344,12 +2341,11 @@ mod tests {
         assert_eq!(native_workspace_query_rows(1, Some(&widened), 1, None), 1);
         assert_eq!(
             native_workspace_query_rows(1, Some(&widened), 8, Some(3)),
-            2
+            1
         );
-        let runtime_width = crate::native_speculative::verification_width(widened.width, 5, 3);
         assert_eq!(
             native_workspace_query_rows(1, Some(&widened), 5, Some(4)),
-            1usize.max(runtime_width)
+            1
         );
 
         options.num_speculative_tokens = None;
@@ -2366,7 +2362,7 @@ mod tests {
         ));
         let shared_kv = native_speculation_plan(&options, &chain).unwrap();
         assert_eq!(shared_kv.width, 4);
-        assert_eq!(native_workspace_query_rows(1, Some(&shared_kv), 8, None), 4);
+        assert_eq!(native_workspace_query_rows(1, Some(&shared_kv), 8, None), 1);
 
         assert_eq!(native_workspace_query_rows(3, None, 8, None), 3);
     }

@@ -207,6 +207,41 @@ impl NativeDecodeSession {
         self.current_len
     }
 
+    /// Whether this session has a CUDA decode state (captured verify is only
+    /// available — and only worth arming — on the CUDA execution provider).
+    pub fn is_cuda(&self) -> bool {
+        self.cuda.is_some()
+    }
+
+    /// Force the retained captured-verify graph to re-warm on its next call.
+    /// No-op on non-CUDA sessions or before the first captured verify.
+    pub fn reset_captured_verify(&mut self) {
+        if let Some(state) = self.cuda.as_mut() {
+            state.reset_verify_capture_phase();
+        }
+    }
+
+    /// Speculative graph-slot mode switch (BUG1 fix, #984 re-review).
+    ///
+    /// The M=1 base-decode graph and the M=width captured-verify graph share the
+    /// session's single device-graph slot. When the speculative driver switches
+    /// which one it will replay next (engage↔miss transition, or a row-0 near-tie
+    /// fallback), the currently installed graph must be dropped so the incoming
+    /// path re-warms its own graph instead of replaying a foreign/stale one — the
+    /// replay of a stale verify graph from an M=1 decode is exactly the
+    /// "invalidated graph replay" / `CUDA_ERROR_ILLEGAL_ADDRESS` hazard Gaff
+    /// found. This invalidates the EP graph slot and resets BOTH the M=1 decode
+    /// graph phase and the retained verify phase to `NeedsWarmup` (the verify
+    /// bindings stay allocated), restoring the invariant `NeedsWarmup ⇔ slot
+    /// empty`. No-op on non-CUDA sessions.
+    pub fn invalidate_graph_for_mode_switch(&mut self) -> anyhow::Result<()> {
+        if let Some(state) = self.cuda.as_mut() {
+            state.invalidate_graph(&mut self.session)?;
+            state.reset_verify_capture_phase();
+        }
+        Ok(())
+    }
+
     pub fn kv_layer_count(&self) -> usize {
         self.kv_inputs.len() / 2
     }
@@ -856,12 +891,14 @@ impl NativeDecodeSession {
         }
     }
 
-    /// Toggle the option (c) "rewind retains the captured graph" guard directly.
-    /// Dormant: bring-up / correctness tests only.
-    #[cfg(test)]
-    pub(crate) fn set_retain_graph_on_rewind(&mut self, retain: bool) {
+    /// WP4 speculative driver switch: retain the captured M=width verify graph
+    /// across the per-step `rewind` (option (c) contents-only mutation) instead
+    /// of invalidating it (the eager default). Only the captured-verify
+    /// speculative path (and correctness tests) flip this on; a no-op on non-CUDA
+    /// sessions.
+    pub fn set_retain_graph_on_rewind(&mut self, retain: bool) {
         if let Some(state) = self.cuda.as_mut() {
-            state.set_retain_graph_on_rewind(retain);
+            state.retain_graph_on_rewind = retain;
         }
     }
 

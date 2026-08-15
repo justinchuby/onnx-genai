@@ -504,6 +504,14 @@ pub struct SpeculativeStats {
     pub proposed_tokens: usize,
     pub accepted_tokens: usize,
     pub multi_token_accepts: usize,
+    /// Draft positions rejected where the draft token was a numerical *near-tie*
+    /// co-winner of the target argmax (its logit within the configured tie
+    /// margin of the row maximum). Pure diagnostic by default: commits stay the
+    /// strict argmax, so the token stream is byte-identical to plain greedy. A
+    /// non-zero count on an otherwise well-accepting prompt flags a model whose
+    /// logits carry genuine ties (e.g. block-32 qwen), where acceptance — not
+    /// correctness — is being lost to nondeterministic reduction order.
+    pub near_tie_rejections: usize,
 }
 
 /// Candidate tokens proposed for a target-model verification pass.

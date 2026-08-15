@@ -317,7 +317,16 @@ fn leverb_phase0_capture_probe() -> anyhow::Result<()> {
         let past = sess.current_len();
         sess.decode(&[1], past)?;
     }
-    let d_mk = sess.leverb_increment0_capture_attempt(K_MAX, REPLAYS)?;
+    // Leon: measure the DECISIVE captured M=K replay wall through the batched
+    // byte-identical verify GEMV path (not the raw portable prefill GEMM that
+    // declares KernelCaptureUnsupported and segments the graph). Gated so the
+    // default probe run is unchanged.
+    let d_mk = {
+        #[cfg(feature = "cuda")]
+        let _batched = std::env::var_os("ONNX_GENAI_LEVERB_BATCHED")
+            .map(|_| onnx_runtime_ep_cuda::BatchedVerifyGuard::new());
+        sess.leverb_increment0_capture_attempt(K_MAX, REPLAYS)?
+    };
     drop(sess);
 
     let mut sess = load(&model_dir, true, KV_MAX);

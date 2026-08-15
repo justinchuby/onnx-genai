@@ -112,6 +112,10 @@ pub use kernels::group_query_attention::{
 };
 pub use kernels::index_share::INDEX_SHARE_CAPTURE_ERROR_INDEX;
 pub use kernels::indexing::SCATTER_CAPTURE_ERROR_INDEX;
+pub use kernels::marlin_gemm::{
+    BatchedVerifyGuard, MarlinSuppressionGuard, PerRowVerifyGuard, batched_verify_enabled,
+    marlin_m_gt_1_enabled, marlin_m_gt_1_suppressed, per_row_verify_enabled,
+};
 pub use kernels::reduce::REDUCE_CAPTURE_ERROR_AXES;
 pub use kernels::{
     CUDA_COVERED_OPS, CudaOpDescriptor, build_cuda_registry, build_cuda_registry_descriptors,

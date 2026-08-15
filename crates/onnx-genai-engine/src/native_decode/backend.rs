@@ -70,8 +70,16 @@ impl NativeDecodeSession {
             // the single fixed-topology M=maxK graph and rewinds contents only —
             // `state.rewind` mutates just the mask tail + KV logical length, the
             // same data-driven mutation the captured graph already tolerates.
-            if !state.retain_graph_on_rewind {
+            //
+            // A full rewind to 0 (generation boundary / session reuse) always
+            // tears the graph down and drops the WP4 padded verify bindings, even
+            // under `retain_graph_on_rewind`: the next generation re-warms and the
+            // captured graph must not outlive the buffers it recorded addresses of.
+            if !state.retain_graph_on_rewind || target_len == 0 {
                 state.invalidate_graph(&mut self.session)?;
+            }
+            if target_len == 0 {
+                state.verify_capture = None;
             }
             state.rewind(target_len)?;
             self.current_len = target_len;

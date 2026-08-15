@@ -106,10 +106,162 @@ pub fn device_supports_marlin(compute_capability: (u32, u32)) -> bool {
 /// `ONNX_GENAI_MARLIN_M_GT_1=1` (or `true`/`on`).
 #[must_use]
 pub fn marlin_m_gt_1_enabled() -> bool {
+    // A thread-scoped suppression wins over the env gate. The captured
+    // speculative-verify forward sets it (see `MarlinSuppressionGuard`) so every
+    // M=W verify row runs on the portable fp32-accumulate tiled GEMM and is
+    // byte-identical to the M=1 GEMV greedy argmax. Marlin's fp16-accumulate
+    // tensor-core GEMM systematically disagrees at these tiny M — even at
+    // large logit margins, not just near-ties — which broke the greedy
+    // byte-identity contract (Leon Phase 1 diagnosis on qwen2.5-14b / glm-4-9b).
+    if marlin_m_gt_1_suppressed() {
+        return false;
+    }
     matches!(
         std::env::var("ONNX_GENAI_MARLIN_M_GT_1").ok().as_deref(),
         Some("1") | Some("true") | Some("on")
     )
+}
+
+thread_local! {
+    /// When `true`, [`marlin_m_gt_1_enabled`] returns `false` on this thread
+    /// regardless of the env gate. Toggled only by [`MarlinSuppressionGuard`].
+    static SUPPRESS_MARLIN_M_GT_1: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether Marlin M>1 is thread-locally suppressed on the current thread.
+#[must_use]
+pub fn marlin_m_gt_1_suppressed() -> bool {
+    SUPPRESS_MARLIN_M_GT_1.with(std::cell::Cell::get)
+}
+
+/// RAII guard that suppresses the Marlin M>1 path on the current thread for its
+/// lifetime, restoring the previous state on drop. The captured speculative
+/// verify wraps its warmup + capture forward in one of these so the fp16
+/// tensor-core GEMM never enters the verify graph (it would break the greedy
+/// byte-identity contract); prefill and the M=1 decode graph — which are driven
+/// on the same thread but outside this guard — keep Marlin.
+#[must_use = "the guard must be held for the duration of the suppressed region"]
+pub struct MarlinSuppressionGuard {
+    previous: bool,
+}
+
+impl MarlinSuppressionGuard {
+    /// Enter a Marlin-M>1-suppressed region on the current thread.
+    pub fn new() -> Self {
+        let previous = SUPPRESS_MARLIN_M_GT_1.with(|cell| cell.replace(true));
+        Self { previous }
+    }
+}
+
+impl Default for MarlinSuppressionGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for MarlinSuppressionGuard {
+    fn drop(&mut self) {
+        SUPPRESS_MARLIN_M_GT_1.with(|cell| cell.set(self.previous));
+    }
+}
+
+thread_local! {
+    /// When `true`, the `MatMulNBits` fp16 M>1 path decomposes into one M=1 GEMV
+    /// launch per row (see `matmul_nbits::MatMulNBits::run_f16`). Toggled only by
+    /// [`PerRowVerifyGuard`].
+    static PER_ROW_VERIFY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the per-row M=1 GEMV decomposition of the M>1 path is active on the
+/// current thread.
+#[must_use]
+pub fn per_row_verify_enabled() -> bool {
+    PER_ROW_VERIFY.with(std::cell::Cell::get)
+}
+
+/// RAII guard that makes the `MatMulNBits` fp16 M>1 path run each of the M rows
+/// through the exact M=1 GEMV kernel greedy decode uses, byte-for-byte. The
+/// captured speculative verify wraps its forward in one of these so every verify
+/// row's logits are byte-identical to plain M=1 greedy *by construction* — the
+/// batched M=W GEMMs (Marlin fp16-accumulate, or even the portable tiled
+/// fp32-accumulate GEMM) reassociate the K reduction differently from the M=1
+/// GEMV and flip the greedy argmax at sensitive positions (Leon Phase 1
+/// diagnosis on qwen2.5-14b / glm-4-9b). Each per-row GEMV is a static-grid
+/// capture-safe launch, so the whole verify graph still captures and replays.
+/// Prefill runs outside this guard and keeps its batched throughput.
+#[must_use = "the guard must be held for the duration of the per-row verify region"]
+pub struct PerRowVerifyGuard {
+    previous: bool,
+}
+
+impl PerRowVerifyGuard {
+    /// Enter a per-row M=1 GEMV verify region on the current thread.
+    pub fn new() -> Self {
+        let previous = PER_ROW_VERIFY.with(|cell| cell.replace(true));
+        Self { previous }
+    }
+}
+
+impl Default for PerRowVerifyGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for PerRowVerifyGuard {
+    fn drop(&mut self) {
+        PER_ROW_VERIFY.with(|cell| cell.set(self.previous));
+    }
+}
+
+thread_local! {
+    /// When `true`, the `MatMulNBits` fp16 M>1 path routes each eligible op
+    /// through the batched byte-identical verify GEMV (one launch, weights read
+    /// once, per-row-identical reduction), falling back to the per-row M=1 GEMV
+    /// oracle for ops it does not yet cover. Toggled only by [`BatchedVerifyGuard`].
+    static BATCHED_VERIFY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the batched byte-identical verify path is active on the current thread.
+#[must_use]
+pub fn batched_verify_enabled() -> bool {
+    BATCHED_VERIFY.with(std::cell::Cell::get)
+}
+
+/// RAII guard that makes the `MatMulNBits` fp16 M>1 path run the captured
+/// speculative verify through the *batched* byte-identical GEMV: a single
+/// kernel launch computes all M draft rows for each output column, reading each
+/// int4 weight exactly once while keeping every row's K reduction the identical
+/// op sequence the M=1 GEMV greedy uses — so the verify logits are byte-identical
+/// to plain M=1 greedy *by construction* AND the speculative speedup is preserved
+/// (the per-row oracle, [`PerRowVerifyGuard`], is byte-identical too but re-reads
+/// the weights M times and is ~6x slower). Ops the batched kernels do not yet
+/// cover fall back to the per-row oracle, so byte-identity holds regardless of
+/// coverage. Every batched launch is static-grid capture-safe, so the verify
+/// graph still captures and replays.
+#[must_use = "the guard must be held for the duration of the batched verify region"]
+pub struct BatchedVerifyGuard {
+    previous: bool,
+}
+
+impl BatchedVerifyGuard {
+    /// Enter a batched byte-identical verify region on the current thread.
+    pub fn new() -> Self {
+        let previous = BATCHED_VERIFY.with(|cell| cell.replace(true));
+        Self { previous }
+    }
+}
+
+impl Default for BatchedVerifyGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for BatchedVerifyGuard {
+    fn drop(&mut self) {
+        BATCHED_VERIFY.with(|cell| cell.set(self.previous));
+    }
 }
 
 /// Gate for split-K within the Marlin M>1 path. Split-K partitions the K/group
