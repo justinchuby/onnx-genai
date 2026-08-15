@@ -33,6 +33,19 @@ cuda = ["onnx-genai-engine/cuda", "onnx-runtime-session/cuda"]
 # 13.0) via the `cudarc?/cuda-*` mappings below, so it never build-depends on a
 # toolkit — the driver is dlopen'd at runtime like the CUDA EP.
 transfer-probe = ["dep:cudarc"]
+# CPU int4 GEMV roofline probe (`roofline_gemv` bin). Drives the real symmetric
+# int4 MatMulNBits decode kernel (the #979 borrowed zero-copy path) at lm_head
+# shape to measure its effective memory bandwidth against the STREAM ceiling for
+# #994's placement criterion. CPU-only and lean: it pulls in just the CPU EP,
+# the EP API tensor types, and the IR — no CUDA, no engine — so it builds fast
+# and measures the same kernel the runtime decodes with. `mlas` is deliberately
+# NOT enabled: symmetric int4 accuracy_level=0 returns on the borrowed path
+# before the MLAS SQNBit interception, so the measured path is identical.
+gemv-probe = [
+    "dep:onnx-runtime-ep-cpu",
+    "dep:onnx-runtime-ep-api",
+    "dep:onnx-runtime-ir",
+]
 # Device-sampler-only CUDA: enables the ORT built-in CUDA EP path plus the
 # on-device argmax/sampler in `onnx-genai-ort` WITHOUT the pure-Rust
 # `onnx-runtime-ep-cuda`. Use this to benchmark the captured decode / device
@@ -84,6 +97,7 @@ onnx-genai-kv = { workspace = true }
 onnx-genai-ort = { path = "../onnx-genai-ort", version = "=0.1.0-dev.5", default-features = false, optional = true }
 onnx-genai-runtime-config = { workspace = true }
 onnx-runtime-ep-cpu = { workspace = true, optional = true }
+onnx-runtime-ep-api = { workspace = true, optional = true }
 onnx-runtime-ep-cuda = { path = "../onnx-runtime-ep-cuda", version = "=0.1.0-dev.5", optional = true, default-features = false }
 onnx-runtime-ir = { workspace = true, optional = true }
 onnx-runtime-loader = { workspace = true }
@@ -154,6 +168,10 @@ required-features = ["bench-native", "cuda"]
 [[bin]]
 name = "roofline_transfer"
 required-features = ["transfer-probe"]
+
+[[bin]]
+name = "roofline_gemv"
+required-features = ["gemv-probe"]
 
 [lints]
 workspace = true
