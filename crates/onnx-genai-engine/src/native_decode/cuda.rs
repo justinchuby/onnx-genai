@@ -4371,6 +4371,13 @@ impl DecodeCudaState {
         self.batch
     }
 
+    /// The hard physical KV capacity (`max_len`) ceiling this decode state can
+    /// grow to. Used by the continuous-batch manager to clamp per-request context
+    /// limits to what the persistent bindings can actually hold.
+    pub(crate) fn hard_max_len(&self) -> usize {
+        self.capacity.max_len
+    }
+
     /// Run the batched device argmax over the `[batch, 1, vocab]` logits binding
     /// and read back the `batch` selected token ids paired with the shared
     /// device capture-error word (stage 2b-impl-3, #750). Row `i` of the returned

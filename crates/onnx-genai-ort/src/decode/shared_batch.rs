@@ -579,16 +579,22 @@ impl<'a> BatchedDecodeSession<'a> for BatchedSharedBufferDecodeSession<'a> {
         next_token_ids: &[i64],
         position_ids: &[i64],
         advance_rows: &[bool],
-    ) -> Result<Value> {
+    ) -> Result<crate::decode::BatchStepLogits> {
         BatchedSharedBufferDecodeSession::step_select(
             self,
             next_token_ids,
             position_ids,
             advance_rows,
         )
+        .map(crate::decode::BatchStepLogits::Ort)
     }
-    fn step_active(&mut self, next_token_ids: &[i64], position_ids: &[i64]) -> Result<Value> {
+    fn step_active(
+        &mut self,
+        next_token_ids: &[i64],
+        position_ids: &[i64],
+    ) -> Result<crate::decode::BatchStepLogits> {
         BatchedSharedBufferDecodeSession::step_active(self, next_token_ids, position_ids)
+            .map(crate::decode::BatchStepLogits::Ort)
     }
 }
 
