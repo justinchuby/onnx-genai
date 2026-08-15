@@ -143,11 +143,17 @@ impl Kernel for FastGeluKernel {
         // activation rather than materialising `x + bias`, so the op stays at
         // one read and one write of the tensor. See `kernels::simd_activations`.
         match (bias.as_deref(), width) {
-            (Some(bias), Some(width)) if width != 0 => {
-                simd_activations::write_mapped("FastGelu", &mut outputs[0], &x, |x, y| {
-                    simd_activations::tanh_gelu_bias_f32_slice(x, bias, width, y)
-                })
-            }
+            // The fused kernel re-reads `bias` for every row, and when the bias
+            // tensor is contiguous f32 that slice borrows its storage — so it
+            // has to be declared as a read range too, or a direct write could
+            // clobber it mid-kernel.
+            (Some(bias), Some(width)) if width != 0 => simd_activations::write_mapped_reading(
+                "FastGelu",
+                &mut outputs[0],
+                &x,
+                &[crate::dtype::slice_byte_range(bias)],
+                |x, y| simd_activations::tanh_gelu_bias_f32_slice(x, bias, width, y),
+            ),
             _ => simd_activations::write_mapped("FastGelu", &mut outputs[0], &x, |x, y| {
                 simd_activations::tanh_gelu_f32_slice(x, y)
             }),

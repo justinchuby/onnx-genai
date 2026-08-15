@@ -71,15 +71,48 @@ pub(crate) fn write_mapped<F>(op: &str, out: &mut TensorMut, x: &[f32], f: F) ->
 where
     F: FnOnce(&[f32], &mut [f32]),
 {
+    write_mapped_reading(op, out, x, &[], f)
+}
+
+/// [`write_mapped`] for closures that read a slice *besides* `x`.
+///
+/// The disjointness check has to cover every buffer the closure still reads
+/// once we start writing, not just the primary input. FastGelu's bias is the
+/// motivating case: it is a `Cow::Borrowed` view of the bias tensor whenever
+/// that tensor is contiguous `f32`, so it is live borrowed storage, and the
+/// fused kernel re-reads it for every row. Were it ever handed to us aliasing
+/// the output, writing row 0 would corrupt the bias that every later row still
+/// depends on — and we would be holding `&mut` and `&` over the same bytes.
+/// Callers declare those extra ranges here and the direct-write arm is skipped
+/// when any of them overlaps the output.
+pub(crate) fn write_mapped_reading<F>(
+    op: &str,
+    out: &mut TensorMut,
+    x: &[f32],
+    also_read: &[core::ops::Range<usize>],
+    f: F,
+) -> Result<()>
+where
+    F: FnOnce(&[f32], &mut [f32]),
+{
     let n = x.len();
-    if output_direct_write_eligible(out, n, &[slice_byte_range(x)]) {
+    let eligible = if also_read.is_empty() {
+        output_direct_write_eligible(out, n, &[slice_byte_range(x)])
+    } else {
+        let mut reads = Vec::with_capacity(1 + also_read.len());
+        reads.push(slice_byte_range(x));
+        reads.extend_from_slice(also_read);
+        output_direct_write_eligible(out, n, &reads)
+    };
+    if eligible {
         out.validate()?;
         if n == 0 {
             return Ok(());
         }
         // SAFETY: `output_direct_write_eligible` confirmed a validated,
         // contiguous, host-accessible Float32 tensor holding exactly `n`
-        // elements, and that its bytes are disjoint from `x`.
+        // elements, and that its bytes are disjoint from every slice the
+        // closure still reads (`x` plus `also_read`).
         let dst = unsafe { std::slice::from_raw_parts_mut(out.data_ptr_mut::<f32>(), n) };
         f(x, dst);
         return Ok(());
@@ -220,9 +253,11 @@ pub(crate) fn quick_gelu_f32_slice(input: &[f32], output: &mut [f32], alpha: f32
 /// one write of `y`, and repeated reads of a `width`-element bias row that stays
 /// resident in L1.
 ///
-/// `width` must be non-zero and must divide `input.len()`; `bias.len()` must
-/// equal `width`. Results are bit-identical to folding first, because the
-/// in-register add is the same IEEE `f32` addition in the same order.
+/// `width` must be non-zero and `bias.len()` must equal `width`. A trailing
+/// partial row is written too, consuming the matching prefix of the bias, which
+/// is what ONNX's `bias[i % width]` broadcast means. Results are bit-identical
+/// to folding `x + bias` first and mapping over it, because the in-register add
+/// is the same IEEE `f32` addition in the same order.
 pub(crate) fn tanh_gelu_bias_f32_slice(
     input: &[f32],
     bias: &[f32],
@@ -231,7 +266,7 @@ pub(crate) fn tanh_gelu_bias_f32_slice(
 ) {
     debug_assert_eq!(input.len(), output.len());
     debug_assert_eq!(bias.len(), width);
-    debug_assert!(width != 0 && input.len().is_multiple_of(width));
+    debug_assert!(width != 0);
     #[cfg(target_arch = "x86_64")]
     {
         // Gated on total length, exactly as `tanh_gelu_f32_slice` is: whether a
@@ -465,14 +500,16 @@ mod avx2 {
         kernel: impl Fn(__m256) -> __m256,
     ) {
         unsafe {
-            let body = width & !7;
-            let rem = width - body;
-            let mask = if rem != 0 { Some(tail_mask(rem)) } else { None };
             let bptr = bias.as_ptr();
-            for (row_in, row_out) in input
-                .chunks_exact(width)
-                .zip(output.chunks_exact_mut(width))
-            {
+            // `chunks`, not `chunks_exact`: a tensor that is not a whole number
+            // of rows must still get every element written. ONNX broadcasts the
+            // bias as `bias[i % width]`, so a short final row consumes the
+            // matching prefix of the bias — which is what the shorter row length
+            // produces here.
+            for (row_in, row_out) in input.chunks(width).zip(output.chunks_mut(width)) {
+                let len = row_in.len();
+                let body = len & !7;
+                let rem = len - body;
                 let src = row_in.as_ptr();
                 let dst = row_out.as_mut_ptr();
                 let mut i = 0;
@@ -482,7 +519,8 @@ mod avx2 {
                     _mm256_storeu_ps(dst.add(i), kernel(v));
                     i += 8;
                 }
-                if let Some(mask) = mask {
+                if rem != 0 {
+                    let mask = tail_mask(rem);
                     let v = _mm256_add_ps(
                         _mm256_maskload_ps(src.add(body), mask),
                         _mm256_maskload_ps(bptr.add(body), mask),
@@ -1127,5 +1165,75 @@ mod tests {
         assert!(got[2].is_nan());
         assert!(got[3].is_nan());
         assert_eq!(got[4], f32::INFINITY);
+    }
+
+    /// A bias that aliases the output must force the scratch arm. Writing the
+    /// first row through would otherwise corrupt the bias that every later row
+    /// still needs, so this is a data-corruption regression test.
+    #[test]
+    fn write_mapped_reading_rejects_an_aliasing_extra_read() {
+        let width = 40;
+        let n = width * 4;
+        let x: Vec<f32> = (0..n).map(|i| (i as f32) * 0.01 - 8.0).collect();
+        let bias: Vec<f32> = (0..width).map(|i| (i as f32) * 0.05 - 1.0).collect();
+
+        let mut want = vec![0.0f32; n];
+        tanh_gelu_bias_f32_slice(&x, &bias, width, &mut want);
+
+        // Place the bias inside the output buffer itself.
+        let mut seeded = vec![0.0f32; n];
+        seeded[..width].copy_from_slice(&bias);
+        let mut out = Owned::f32(&[n], &seeded);
+        {
+            let mut view = out.view_mut();
+            // SAFETY: `view` addresses `n` contiguous f32, the first `width` of
+            // which hold the bias. This is exactly the overlap that the extra
+            // read range must make `write_mapped_reading` detect.
+            let aliased: &[f32] =
+                unsafe { std::slice::from_raw_parts(view.data_ptr_mut::<f32>(), width) };
+            let aliased: &[f32] = unsafe { std::mem::transmute(aliased) };
+            write_mapped_reading(
+                "FastGelu",
+                &mut view,
+                &x,
+                &[crate::dtype::slice_byte_range(aliased)],
+                |x, y| tanh_gelu_bias_f32_slice(x, aliased, width, y),
+            )
+            .unwrap();
+        }
+        assert_eq!(out.to_f32(), want);
+    }
+
+    /// A tensor whose length is not a whole number of bias rows must still have
+    /// every element written, with the bias broadcast as `bias[i % width]`.
+    #[test]
+    fn bias_fusion_writes_a_trailing_partial_row() {
+        let width = 48;
+        for n in [1usize, width + 1, width * 2 + 7, width * 3 - 1] {
+            let x: Vec<f32> = (0..n).map(|i| (i as f32) * 0.03 - 5.0).collect();
+            let bias: Vec<f32> = (0..width).map(|i| (i as f32) * 0.02 - 0.4).collect();
+
+            let mut want = vec![f32::NAN; n];
+            for (row_in, row_out) in x.chunks(width).zip(want.chunks_mut(width)) {
+                let folded: Vec<f32> = row_in.iter().zip(&bias).map(|(v, b)| v + b).collect();
+                tanh_gelu_f32_slice(&folded, row_out);
+            }
+
+            let mut got = vec![f32::NAN; n];
+            tanh_gelu_bias_f32_slice(&x, &bias, width, &mut got);
+
+            for (i, g) in got.iter().enumerate() {
+                assert!(!g.is_nan(), "n={n} i={i}: element never written");
+            }
+            // A short final row can land on the other side of the length
+            // threshold from the reference, so bound rather than bit-compare.
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                let scale = x[i].abs().max(1.0);
+                assert!(
+                    f64::from((g - w).abs()) / f64::from(scale) <= GELU_BOUND,
+                    "n={n} i={i}: {g} vs {w}"
+                );
+            }
+        }
     }
 }
