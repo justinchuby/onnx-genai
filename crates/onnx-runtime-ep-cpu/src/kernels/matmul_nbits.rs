@@ -7270,36 +7270,54 @@ mod tests {
 
         for &accuracy_level in &[0i64, 4] {
             for &asymmetric in &[false, true] {
-                let (b, scales_t, a_t, zp_t) =
-                    cache_probe_inputs(&weights, &a, n, k, block_size, asymmetric);
-                let mut kernel = MatMulNBitsKernel {
-                    accuracy_level,
-                    ..test_kernel(k, n, block_size)
-                };
-                kernel.set_constant_inputs(&[true; 5]);
-                let mut inputs = vec![a_t.view(), b.view(), scales_t.view()];
-                if let Some(zp) = &zp_t {
-                    inputs.push(zp.view());
-                }
-                let mut y = Owned::zeros_f32(&[1, n]);
-                kernel.execute(&inputs, &mut [y.view_mut()]).unwrap();
+                for &has_g_idx in &[false, true] {
+                    let (b, scales_t, a_t, zp_t) =
+                        cache_probe_inputs(&weights, &a, n, k, block_size, asymmetric);
+                    let mut kernel = MatMulNBitsKernel {
+                        accuracy_level,
+                        ..test_kernel(k, n, block_size)
+                    };
+                    kernel.set_constant_inputs(&[true; 5]);
+                    // Natural per-block group indices: in range and identity, but
+                    // present, which forces the resident `weight_nk` cache — the
+                    // one config family that still caches after #979.
+                    let g_idx_t = has_g_idx.then(|| {
+                        let indices: Vec<i32> =
+                            (0..k).map(|depth| (depth / block_size) as i32).collect();
+                        Owned::i32(&[k], &indices)
+                    });
+                    let mut inputs = vec![a_t.view(), b.view(), scales_t.view()];
+                    match (&zp_t, &g_idx_t) {
+                        (Some(zp), _) => inputs.push(zp.view()),
+                        // g_idx sits at input 4, so a symmetric config must fill
+                        // input 3 with an explicit absent placeholder.
+                        (None, Some(_)) => inputs.push(TensorView::absent(DataType::Uint8)),
+                        (None, None) => {}
+                    }
+                    if let Some(g_idx) = &g_idx_t {
+                        inputs.push(g_idx.view());
+                    }
+                    let mut y = Owned::zeros_f32(&[1, n]);
+                    kernel.execute(&inputs, &mut [y.view_mut()]).unwrap();
 
-                let predicted = matmul_nbits_decode_caches_dequant_f32(
-                    4,
-                    block_size,
-                    accuracy_level,
-                    n,
-                    k,
-                    asymmetric,
-                    false,
-                    false,
-                );
-                assert_eq!(
-                    predicted,
-                    kernel.weight_nk.get().is_some(),
-                    "predictor disagreed with actual weight_nk residency \
-                     (accuracy_level={accuracy_level}, asymmetric={asymmetric})",
-                );
+                    let predicted = matmul_nbits_decode_caches_dequant_f32(
+                        4,
+                        block_size,
+                        accuracy_level,
+                        n,
+                        k,
+                        asymmetric,
+                        has_g_idx,
+                        false,
+                    );
+                    assert_eq!(
+                        predicted,
+                        kernel.weight_nk.get().is_some(),
+                        "predictor disagreed with actual weight_nk residency \
+                         (accuracy_level={accuracy_level}, asymmetric={asymmetric}, \
+                         has_g_idx={has_g_idx})",
+                    );
+                }
             }
         }
     }
@@ -7319,21 +7337,38 @@ mod tests {
         let a: Vec<f32> = (0..k)
             .map(|i| ((i * 17 % 43) as f32 - 21.0) / 13.0)
             .collect();
-        // bits=4, accuracy_level=0, symmetric -> the generic weight_nk path.
+        // bits=4, accuracy_level=0 with a constant `g_idx` reaches the generic
+        // `weight_nk` path. Symmetric int4 with no g_idx no longer caches after
+        // #979 (the borrowed midpoint-8 path), so `has_g_idx` is what now forces
+        // the resident cache: every earlier branch in `execute` (borrowed int4,
+        // 2-bit, accuracy_level==4, 8-bit) is gated on `group_indices.is_none()`,
+        // so a present g_idx falls through to the `m == 1` `weight_nk` cache.
         assert!(
-            matmul_nbits_decode_caches_dequant_f32(4, block_size, 0, n, k, false, false, false),
+            matmul_nbits_decode_caches_dequant_f32(4, block_size, 0, n, k, false, true, false),
             "test premise: this config must be a caching config",
         );
+        // Natural per-block group indices ([0,0,..,1,1,..]): in range 0..k_blocks
+        // and semantically identity, but their mere presence forces the cache.
+        let g_idx: Vec<i32> = (0..k).map(|depth| (depth / block_size) as i32).collect();
 
         let run = |enabled: bool| {
             set_resident_dequant_f32_cache_enabled(enabled);
             let (b, scales_t, a_t, _) = cache_probe_inputs(&weights, &a, n, k, block_size, false);
+            let g_idx_t = Owned::i32(&[k], &g_idx);
             let mut kernel = test_kernel(k, n, block_size);
             kernel.set_constant_inputs(&[true; 5]);
             let mut y = Owned::zeros_f32(&[1, n]);
             kernel
                 .execute(
-                    &[a_t.view(), b.view(), scales_t.view()],
+                    &[
+                        a_t.view(),
+                        b.view(),
+                        scales_t.view(),
+                        // Symmetric: no zero_points, but g_idx sits at input 4,
+                        // so input 3 must be an explicit absent placeholder.
+                        TensorView::absent(DataType::Uint8),
+                        g_idx_t.view(),
+                    ],
                     &mut [y.view_mut()],
                 )
                 .unwrap();
