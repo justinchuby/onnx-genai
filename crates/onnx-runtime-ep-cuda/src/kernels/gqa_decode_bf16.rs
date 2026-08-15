@@ -358,21 +358,17 @@ extern "C" __global__ void gqa_decode_attention_bf16_merge(
     const int h2 = head_size >> 1;
     const long q_base = (long)row * (long)head_size;
     __nv_bfloat162* out2 = reinterpret_cast<__nv_bfloat162*>(output + q_base);
-#pragma unroll
-    for (int i = 0; i < GQA_MAX_H2PL; ++i) {
-        const int j = lane + i * GQA_WARP_SIZE;
-        if (j < h2) {
-            float ox = 0.0f;
-            float oy = 0.0f;
-            for (int split = 0; split < active_splits; ++split) {
-                const float* state = gqa_split_scratch
-                    + (row * GQA_MAX_SPLITS + split) * GQA_SCRATCH_STRIDE;
-                const float weight = expf(state[0] - global_max);
-                ox += state[2 + 2 * j] * weight;
-                oy += state[2 + 2 * j + 1] * weight;
-            }
-            out2[j] = __floats2bfloat162_rn(ox * inverse_sum, oy * inverse_sum);
+    for (int j = lane; j < h2; j += blockDim.x) {
+        float ox = 0.0f;
+        float oy = 0.0f;
+        for (int split = 0; split < active_splits; ++split) {
+            const float* state = gqa_split_scratch
+                + (row * GQA_MAX_SPLITS + split) * GQA_SCRATCH_STRIDE;
+            const float weight = expf(state[0] - global_max);
+            ox += state[2 + 2 * j] * weight;
+            oy += state[2 + 2 * j + 1] * weight;
         }
+        out2[j] = __floats2bfloat162_rn(ox * inverse_sum, oy * inverse_sum);
     }
 }
 "#;
@@ -451,15 +447,15 @@ pub(super) fn run(
     // per (query row, active split); with a single query token the row count is
     // just `batch * num_heads`, far below the multiprocessor count, so without
     // splitting the kernel is grid-starved (well under one wave) and its
-    // dependent-load latency is fully exposed. Aim for roughly two waves of
+    // dependent-load latency is fully exposed. Aim for multiple waves of
     // concurrent CTAs across the device, then let the device-side per-split key
-    // floor trim this back on short sequences. This is a launch-time constant,
-    // so both launches below (and their graph replays) agree on it while the
-    // valid length stays device-resident.
-    const TARGET_WAVES: usize = 2;
+    // floor trim this back on short sequences. Four waves mirrors the fp16
+    // tuning and keeps the same rollback knob for bf16 decode.
+    const TARGET_WAVES: usize = 4;
     let multiprocessors = runtime.capabilities().multiprocessor_count().max(1) as usize;
     let target_blocks = multiprocessors.saturating_mul(TARGET_WAVES);
-    let split_fill = target_blocks.div_ceil(rows.max(1)).clamp(1, MAX_SPLITS);
+    let split_fill = super::gqa_decode::split_fill_override(MAX_SPLITS)
+        .unwrap_or_else(|| target_blocks.div_ceil(rows.max(1)).clamp(1, MAX_SPLITS));
     let split_fill_i = i32::try_from(split_fill).unwrap_or(MAX_SPLITS as i32);
 
     // Dynamic shared: warp_max[warps] + warp_sum[warps] + warp_acc[warps*head].
@@ -528,7 +524,7 @@ pub(super) fn run(
     unsafe {
         merge_builder.launch(LaunchConfig {
             grid_dim: (merge_grid_x, 1, 1),
-            block_dim: (WARP_SIZE, 1, 1),
+            block_dim: (WARP_SIZE * 2, 1, 1),
             shared_mem_bytes: 0,
         })
     }
