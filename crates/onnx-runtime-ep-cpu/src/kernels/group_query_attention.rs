@@ -148,6 +148,20 @@ fn group_fusion_saturates_pool(fused_tasks: usize, worker_count: usize) -> bool 
 /// rescaled by worker count.
 const GROUP_FUSED_MIN_KV_BYTES: usize = 8 << 20;
 
+/// KV tokens a decode step actually streams per head.
+///
+/// `local_window_size` caps the attended window independently of how long the
+/// cache is, so the traffic gate must see this rather than
+/// `total_sequence_length`: a sliding-window model at long context reads a
+/// short window out of a long cache and belongs on the per-head path.
+fn fused_attended_window(total_sequence_length: usize, local_window_size: i64) -> usize {
+    if local_window_size > 0 {
+        total_sequence_length.min(local_window_size as usize)
+    } else {
+        total_sequence_length
+    }
+}
+
 /// Whether the attended window is long enough for the fusion's traffic saving
 /// to beat its overhead. See [`GROUP_FUSED_MIN_KV_BYTES`].
 fn group_fusion_pays_for_traffic(window: usize, k_dim: usize, v_dim: usize) -> bool {
@@ -1132,10 +1146,11 @@ impl Kernel for GroupQueryAttentionKernel {
         // repeat reads are cheap, so the saving does not pay for the fused
         // path's score-buffer traffic. Both conditions must hold; see
         // `group_fusion_saturates_pool` and `group_fusion_pays_for_traffic`.
+        let attended_window = fused_attended_window(total_sequence_length, self.local_window_size);
         let group_fused = q.seq == 1
             && group > 1
             && group_fusion_saturates_pool(q.batch * self.kv_num_heads, worker_count)
-            && group_fusion_pays_for_traffic(total_sequence_length, cache_dim, v.dim)
+            && group_fusion_pays_for_traffic(attended_window, cache_dim, v.dim)
             && group_fusion_enabled();
         let compute_group = |b: usize, kvh: usize, out_block: &mut [f32], scores: &mut Vec<f32>| {
             let causal_limit = query_starts[b];
@@ -1269,6 +1284,13 @@ impl Kernel for GroupQueryAttentionKernel {
             let group_rows = q.batch * self.kv_num_heads;
             GROUP_FUSED_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if group_rows > 1 && attention_work >= MIN_PARALLEL_ATTENTION_WORK {
+                // One `group * window` score buffer per *worker*, not per task:
+                // the closure runs once per group, so allocating inside it
+                // would put a multi-hundred-KiB malloc in the decode hot loop.
+                thread_local! {
+                    static GROUP_SCORES: std::cell::RefCell<Vec<f32>> =
+                        const { std::cell::RefCell::new(Vec::new()) };
+                }
                 crate::kernels::matmul_nbits::decode_parallel_output_row_blocks(
                     &mut y_bhsd,
                     group * v.dim,
@@ -1276,8 +1298,9 @@ impl Kernel for GroupQueryAttentionKernel {
                     |row_index, out_block| {
                         let b = row_index / self.kv_num_heads;
                         let kvh = row_index % self.kv_num_heads;
-                        let mut scores = Vec::new();
-                        compute_group(b, kvh, out_block, &mut scores);
+                        GROUP_SCORES.with(|scores| {
+                            compute_group(b, kvh, out_block, &mut scores.borrow_mut());
+                        });
                     },
                 );
             } else {
@@ -3304,7 +3327,7 @@ mod tests {
             let mut present_value =
                 Owned::zeros_f32(&[1, KEY_VALUE_HEAD_COUNT, TOTAL_SEQUENCE_LENGTH, HEAD_WIDTH]);
             let kernel_attrs = [
-                ("local_window_size", Attribute::Int(6_000)),
+                ("local_window_size", Attribute::Int(8_192)),
                 ("softcap", Attribute::Float(30.0)),
             ];
             rayon::ThreadPoolBuilder::new()
@@ -3403,6 +3426,31 @@ mod tests {
         // Degenerate inputs must not overflow into a spurious open gate.
         assert!(!group_fusion_pays_for_traffic(0, 128, 128));
         assert!(group_fusion_pays_for_traffic(usize::MAX, 128, 128));
+    }
+
+    /// A sliding-window model streams its window, not its cache, so the traffic
+    /// gate must be fed the attended window — otherwise a long cache opens the
+    /// gate for a short window that is well below the crossover.
+    #[test]
+    fn fused_traffic_gate_sees_the_local_window_not_the_cache_length() {
+        // No local window: the whole cache is attended.
+        assert_eq!(fused_attended_window(8_192, 0), 8_192);
+        assert_eq!(fused_attended_window(8_192, -1), 8_192);
+        // A short sliding window over a long cache caps the attended tokens...
+        assert_eq!(fused_attended_window(32_768, 4_096), 4_096);
+        // ...and that is what closes the gate.
+        assert!(group_fusion_pays_for_traffic(
+            fused_attended_window(32_768, 0),
+            128,
+            128
+        ));
+        assert!(!group_fusion_pays_for_traffic(
+            fused_attended_window(32_768, 4_096),
+            128,
+            128
+        ));
+        // A window longer than the cache cannot attend past the cache.
+        assert_eq!(fused_attended_window(512, 4_096), 512);
     }
 
     #[test]
