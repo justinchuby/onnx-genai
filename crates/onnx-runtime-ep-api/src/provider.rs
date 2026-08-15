@@ -343,6 +343,28 @@ impl StructuralCaptureDecline {
     }
 }
 
+/// Uploads host bytes into a raw device address for a device EP.
+///
+/// This is the narrow capability the plugin's fused-subgraph executor needs to
+/// stage a host-resident boundary input into device memory when ORT runs an
+/// interspersed CPU→device partition and never inserts the host→device copy
+/// itself (issue #982). It is deliberately smaller than the full
+/// [`ExecutionProvider`] surface — a device address and a length — so it can be
+/// captured once at compile time and stored on the executor without holding an
+/// EP reference (which would change EP teardown semantics).
+///
+/// Implementations must perform a **synchronous** upload: on return the bytes
+/// are resident at `dst`, so the caller may launch a kernel that reads them.
+pub trait HostToDeviceCopier: Send + Sync {
+    /// Copy `src` host bytes into device destination `dst`.
+    ///
+    /// # Safety
+    ///
+    /// `dst` must point to a live device allocation, on this copier's device,
+    /// of at least `src.len()` bytes.
+    unsafe fn copy_host_to_device(&self, src: &[u8], dst: *mut c_void) -> Result<()>;
+}
+
 /// The core EP interface. Every backend crate implements this (§4.1).
 pub trait ExecutionProvider: Send + Sync {
     /// EP identifier (snake_case, e.g. `"cpu_ep"`, `"cuda_ep"`).
@@ -350,6 +372,26 @@ pub trait ExecutionProvider: Send + Sync {
 
     fn device_type(&self) -> DeviceType;
     fn device_id(&self) -> DeviceId;
+
+    /// PCI vendor id of this EP's device memory (0 = generic/host). Used by the
+    /// plugin executor to reconstruct the device `OrtMemoryInfo` ORT registered
+    /// the device allocator against, as a fallback for staging host-resident
+    /// boundary inputs when no device-resident `OrtValue` is otherwise visible
+    /// (issue #982). Host EPs keep the default.
+    fn memory_vendor_id(&self) -> u32 {
+        0
+    }
+
+    /// A synchronous host→device uploader, or `None` for host EPs.
+    ///
+    /// Device EPs return a small [`HostToDeviceCopier`] the plugin's fused
+    /// executor captures at compile time and uses to stage host-resident
+    /// boundary inputs into device scratch before launching a device kernel
+    /// (issue #982). Returning `None` (the default) opts an EP out of staging
+    /// entirely: its inputs are used verbatim, exactly as before.
+    fn host_to_device_copier(&self) -> Option<std::sync::Arc<dyn HostToDeviceCopier>> {
+        None
+    }
 
     /// Optional executor-to-EP capabilities. Stock EPs advertise none and
     /// continue receiving resident [`crate::TensorView`] inputs.
