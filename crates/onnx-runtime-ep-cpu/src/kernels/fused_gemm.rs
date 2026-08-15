@@ -146,7 +146,7 @@ mod tests {
         }
         let biased_owned = Owned::f32(&[2, 3], &biased);
         let mut expect = Owned::zeros_f32(&[2, 3]);
-        ReluKernel
+        ReluKernel::default()
             .execute(&[biased_owned.view()], &mut [expect.view_mut()])
             .unwrap();
 

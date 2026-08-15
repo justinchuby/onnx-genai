@@ -48,7 +48,7 @@ pub use kernel::{
     CAT_KERNEL_WORKER, CaptureSupport, Cost, Kernel, KernelInput, KernelMatch,
     KernelVariantSelection, TensorMetadata, ViewOutput, WorkspaceLifetime, WorkspaceRequirement,
     WorkspaceView, kernel_variant_tracing_enabled, kernel_worker_span, record_kernel_metrics,
-    record_kernel_variant_selection, record_kernel_variant_stage_selection,
+    record_kernel_variant_selection, record_kernel_variant_stage_selection, structural_input_bytes,
 };
 pub use onnx_runtime_optimizer::OptimizationPass as OptimizerPass;
 pub use provider::{

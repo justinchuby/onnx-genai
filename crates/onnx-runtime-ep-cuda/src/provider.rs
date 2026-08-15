@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 
 use onnx_runtime_ep_api::{
     Cost, DeviceBuffer, EpConfig, EpError, ExecutionProvider, ExecutionProviderCapabilities, Fence,
-    Kernel, KernelMatch, LazyWeight, OpRegistry, PagedWeight, Result, deny,
+    Kernel, KernelMatch, LazyWeight, OpRegistry, PagedWeight, Result, deny, structural_input_bytes,
 };
 use onnx_runtime_ir::{DataType, DeviceId, DeviceType, Node, Shape, TensorLayout};
 
@@ -802,20 +802,18 @@ impl ExecutionProvider for CudaExecutionProvider {
             return KernelMatch::unsupported(reason);
         }
         let output_layouts = vec![TensorLayout::contiguous(); op.outputs.len()];
-        let elems: u64 = shapes
-            .iter()
-            .map(|s| {
-                s.iter()
-                    .map(|d| d.as_static().unwrap_or(1) as u64)
-                    .product::<u64>()
-            })
-            .sum();
-        // GPU compute is cheap per element but launch latency is high; bias the
-        // rough estimate accordingly so tiny ops still prefer the CPU EP. The
-        // real cost model lands in Phase 2.
-        let cost = Cost::new(elems as f64 * 0.01, elems as f64 * 0.01, 0.0)
-            .with_launch_us(10.0)
-            .with_bytes_moved(elems.saturating_mul(4));
+        // Report *structure only*, never a machine rate (issue #995). The old
+        // `Cost::new(elems*0.01, elems*0.01, 0.0).with_launch_us(10.0)
+        // .with_bytes_moved(elems*4)` fabricated three machine constants — a
+        // GPU-is-100×-faster-per-element ratio, a 10 µs launch latency, and an
+        // f32 byte count (wrong by 8× for the int4 weights that dominate
+        // decode) — none of which an EP can know portably. The EP knows only
+        // the honest byte traffic from the real dtypes and shapes; the host's
+        // bandwidth, FLOP/s, and launch latency are supplied by the placement
+        // cost model (`onnx-runtime-cost-model`) from measured rates. Time
+        // components are therefore left zero here.
+        let bytes_moved = structural_input_bytes(shapes, input_dtypes);
+        let cost = Cost::ZERO.with_bytes_moved(bytes_moved);
         KernelMatch::Supported {
             cost,
             required_input_layouts: None,

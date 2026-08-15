@@ -2029,6 +2029,7 @@ dependencies = [
  "anyhow",
  "clap",
  "criterion",
+ "cudarc",
  "onnx-genai-engine",
  "onnx-genai-kv",
  "onnx-genai-metadata",
@@ -2322,6 +2323,16 @@ dependencies = [
  "async-trait",
  "half",
  "onnx-runtime-protocol-trace",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "onnx-runtime-cost-model"
+version = "0.1.0-dev.5"
+dependencies = [
+ "onnx-runtime-ir",
+ "serde",
+ "serde_json",
  "thiserror 2.0.19",
 ]
 

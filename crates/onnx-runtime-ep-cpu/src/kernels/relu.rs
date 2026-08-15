@@ -55,15 +55,23 @@ pub(crate) fn relu_in_place(data: &mut [f32]) {
     }
 }
 
-/// Stateless f32 ReLU kernel.
-pub struct ReluKernel;
+/// Stateless f32 ReLU kernel. Carries the static output element count (when
+/// known) purely so it can report structural FLOPs (issue #995).
+#[derive(Default)]
+pub struct ReluKernel {
+    /// Output element count, if statically known at build time. `None` means the
+    /// shape was dynamic and FLOPs are not knowable (never fabricated).
+    flops: Option<u64>,
+}
 
 /// Factory for [`ReluKernel`] (no attributes).
 pub struct ReluFactory;
 
 impl KernelFactory for ReluFactory {
-    fn create(&self, _node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        Ok(Box::new(ReluKernel))
+    fn create(&self, _node: &Node, input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        // Relu is one comparison per element; FLOPs == output element count.
+        let flops = input_shapes.first().map(|s| super::flops::numel(s));
+        Ok(Box::new(ReluKernel { flops }))
     }
 }
 
@@ -88,7 +96,7 @@ impl Kernel for ReluKernel {
     }
 
     fn estimated_flops(&self) -> Option<u64> {
-        None
+        self.flops
     }
 }
 
@@ -149,7 +157,7 @@ mod tests {
         let mut out = Owned::zeros_f32(&[2, 2]);
         let inputs = [a.view()];
         let mut outs = [out.view_mut()];
-        ReluKernel.execute(&inputs, &mut outs).unwrap();
+        ReluKernel::default().execute(&inputs, &mut outs).unwrap();
         assert_eq!(out.to_f32(), vec![0.0, 2.0, 0.0, 4.0]);
     }
 
@@ -167,7 +175,7 @@ mod tests {
     fn relu_bf16_matches_widened_f32_reference_and_preserves_nan() {
         let x = Owned::bf16(&[5], &[f32::NAN, -80., -0., 1., 80.]);
         let mut out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[5]);
-        ReluKernel
+        ReluKernel::default()
             .execute(&[x.view()], &mut [out.view_mut()])
             .unwrap();
         let result = out.to_bf16_as_f32();
@@ -239,7 +247,7 @@ mod tests {
             // Fast path
             let a = Owned::f32(&[len], &data);
             let mut out = Owned::zeros_f32(&[len]);
-            ReluKernel
+            ReluKernel::default()
                 .execute(&[a.view()], &mut [out.view_mut()])
                 .unwrap();
             let result = out.to_f32();
@@ -308,7 +316,7 @@ mod tests {
         let before = DENSE_ELEM_F16_HITS.load(Ordering::Relaxed);
         let a = Owned::f16(&[8], &[f32::NAN, -1.0, 0.0, 1.0, -0.5, 2.0, -3.0, 0.5]);
         let mut out = Owned::zeros(onnx_runtime_ir::DataType::Float16, &[8]);
-        ReluKernel
+        ReluKernel::default()
             .execute(&[a.view()], &mut [out.view_mut()])
             .unwrap();
         let after = DENSE_ELEM_F16_HITS.load(Ordering::Relaxed);
@@ -330,7 +338,7 @@ mod tests {
         let before = DENSE_ELEM_BF16_HITS.load(Ordering::Relaxed);
         let a = Owned::bf16(&[4], &[f32::NAN, -1.0, 0.0, 1.0]);
         let mut out = Owned::zeros(onnx_runtime_ir::DataType::BFloat16, &[4]);
-        ReluKernel
+        ReluKernel::default()
             .execute(&[a.view()], &mut [out.view_mut()])
             .unwrap();
         let after = DENSE_ELEM_BF16_HITS.load(Ordering::Relaxed);
