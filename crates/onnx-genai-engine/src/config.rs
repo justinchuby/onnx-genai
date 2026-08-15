@@ -650,6 +650,15 @@ pub struct MemoryStrategyPlan {
     pub inferred_strategy: MemoryStrategy,
     pub weight_access_pattern: WeightAccessPattern,
     pub total_weight_bytes: u64,
+    /// Resident dequantized-f32 decode-cache bytes folded into
+    /// [`Self::total_weight_bytes`] when the cache is admitted (#971). Zero on
+    /// backends/models that never take the native CPU f32 decode path.
+    pub resident_f32_cache_bytes: u64,
+    /// Whether the plan admitted the resident f32 decode cache. When `false` the
+    /// runtime declined it (expanded footprint over budget) and the kernels
+    /// dequantize on the fly instead of holding the ~8x expansion (#971). Always
+    /// `true` when [`Self::resident_f32_cache_bytes`] is zero.
+    pub f32_weight_cache_admitted: bool,
     pub kv_bytes_per_token: Option<u64>,
     pub per_layer_weight_bytes: Vec<LayerWeightBytes>,
     pub resolved_device_budget_bytes: Option<u64>,
@@ -672,6 +681,8 @@ impl MemoryStrategyPlan {
             inferred_strategy: MemoryStrategy::Unknown,
             weight_access_pattern: WeightAccessPattern::Unknown,
             total_weight_bytes,
+            resident_f32_cache_bytes: 0,
+            f32_weight_cache_admitted: true,
             kv_bytes_per_token,
             per_layer_weight_bytes: Vec::new(),
             resolved_device_budget_bytes: None,

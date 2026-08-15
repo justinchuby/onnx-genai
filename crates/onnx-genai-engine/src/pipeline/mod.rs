@@ -924,6 +924,30 @@ impl PipelineEngine {
             );
         #[cfg(not(all(feature = "cuda", feature = "native-backend")))]
         let native_cuda_plan = false;
+        // #971: on the native CPU pipeline path each component's MatMulNBits
+        // kernel may build a resident dequantised f32 weight cache held for the
+        // session. Ask the CPU EP (which owns kernel dispatch) how many extra
+        // bytes each component's cache costs, summed, so the plan accounts for
+        // the real resident footprint instead of the on-disk size (#947). CUDA
+        // and ORT use different kernels, so it never applies there.
+        #[cfg(feature = "native-backend")]
+        let pipeline_resident_f32_cache_bytes = if backend == PipelineBackend::Native
+            && !native_cuda_plan
+        {
+            directory
+                .model_paths
+                .values()
+                .map(|path| {
+                    onnx_runtime_loader::load_model(path)
+                        .map(|graph| onnx_runtime_ep_cpu::resident_dequant_f32_cache_bytes(&graph))
+                        .unwrap_or(0)
+                })
+                .fold(0_u64, |total, bytes| total.saturating_add(bytes))
+        } else {
+            0
+        };
+        #[cfg(not(feature = "native-backend"))]
+        let pipeline_resident_f32_cache_bytes = 0_u64;
         // #755: managed no-spill VMM is the default on the native CUDA pipeline
         // path unless the legacy allocator opt-out is set. Other backends keep
         // the pre-#755 explicit-byte-limit trigger.
@@ -941,6 +965,7 @@ impl PipelineEngine {
             resolved_vram_bytes,
             residency_ceiling_bytes,
             model_weight_bytes: model_weights_bytes,
+            resident_f32_cache_bytes: pipeline_resident_f32_cache_bytes,
             kv_config: memory_strategy_kv_config,
             graph: graph_memory,
             required_device_non_weight_bytes: 0,
@@ -961,6 +986,13 @@ impl PipelineEngine {
             force_managed_weight_streaming: crate::engine::force_managed_weight_streaming_enabled(),
         });
         log_memory_strategy_plan(&memory_strategy_plan, "pipeline");
+        // #971: tell the CPU EP whether the governor admitted the resident f32
+        // decode cache for the native pipeline path (no-op for ORT/CUDA, which
+        // pass 0 bytes and thus always report admitted).
+        #[cfg(feature = "native-backend")]
+        onnx_runtime_ep_cpu::set_resident_dequant_f32_cache_enabled(
+            memory_strategy_plan.f32_weight_cache_admitted,
+        );
         #[cfg(all(feature = "cuda", feature = "native-backend"))]
         let authority_domain = if backend == PipelineBackend::Native {
             match native_decoder_device(config.native_device.as_ref()) {
