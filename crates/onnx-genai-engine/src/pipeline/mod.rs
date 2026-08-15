@@ -29,7 +29,7 @@ mod islands;
 mod workflow;
 
 pub use adapters::{
-    AdapterActivation, AdapterLifecycleDiagnostic, AdapterRowIdentity, AdapterSelection,
+    AdapterActivation, AdapterLifecycleDiagnostic, AdapterSelection, AdapterSlotIdentity,
 };
 pub use arg_reduce::{ArgReduceRewrites, WideArgReduceLowering, lower_degenerate_arg_reductions};
 pub use islands::ExecutionIslandDiagnostic;
@@ -148,6 +148,7 @@ pub struct PipelineEngine {
     workflow_performance: RefCell<workflow::WorkflowPerformanceCounters>,
     workflow_execution_generation: Cell<u64>,
     workflow_session_state: RefCell<HashMap<(String, String), Value>>,
+    adapter_service: Option<onnx_genai_metadata::AdapterServiceContract>,
     adapter_cache: RefCell<adapters::AdapterCache>,
     active_adapter_context: RefCell<Option<adapters::AdapterRunContext>>,
     preprocessing: Option<PreprocessingSpec>,
@@ -364,6 +365,7 @@ impl PipelineEngine {
             workflow_performance: RefCell::new(workflow::WorkflowPerformanceCounters::default()),
             workflow_execution_generation: Cell::new(0),
             workflow_session_state: RefCell::new(HashMap::new()),
+            adapter_service: directory.adapters,
             adapter_cache: RefCell::new(adapters::AdapterCache::default()),
             active_adapter_context: RefCell::new(None),
             preprocessing: directory.preprocessing,

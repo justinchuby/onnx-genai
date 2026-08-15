@@ -82,10 +82,6 @@ pub struct WorkflowSpec {
     pub state: BTreeMap<String, WorkflowStateCell>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serving: Option<ServingServiceContract>,
-    /// Runtime-managed parameter adapters. Loading and caching are lifecycle operations,
-    /// independent of workflow control flow.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub adapters: Option<AdapterServiceContract>,
     pub steps: Vec<WorkflowStep>,
 }
 
@@ -94,6 +90,11 @@ pub struct WorkflowSpec {
 pub struct AdapterServiceContract {
     /// `onnx-genai-targeted-base-v1:sha256:<lowercase hex>` compatibility fingerprint.
     pub base_model_fingerprint: String,
+    /// Authoritative, architecture-neutral bindings resolved by producer/import tooling.
+    pub target_manifest: LoraTargetManifest,
+    /// Explicit load-time tooling fallback. Runtime execution never guesses targets.
+    #[serde(default)]
+    pub discovery_fallback: AdapterDiscoveryFallback,
     /// Request-scoped adapter-set inputs. These are immutable SSA inputs for one request.
     pub selection: AdapterSelectionContract,
     /// Generic application capability required from the runtime or execution provider.
@@ -112,11 +113,11 @@ pub struct AdapterServiceContract {
 #[serde(deny_unknown_fields)]
 pub struct AdapterSelectionContract {
     /// Int64[batch] semantic row/slot identities.
-    pub row_ids: String,
+    pub slot_ids: String,
     /// Int64[batch] request generation; changes whenever a slot is reused.
     pub request_epochs: String,
-    /// Int64[batch,max_adapters] artifact indices in composition order.
-    pub adapter_ids: String,
+    /// Int64[batch,max_adapters] Phase-2-compatible segment IDs in composition order.
+    pub segments: String,
     /// Int64[batch] number of valid adapter IDs in each row.
     pub adapter_counts: String,
     /// Float32[batch,max_adapters] effective request scales.
@@ -124,14 +125,14 @@ pub struct AdapterSelectionContract {
     /// Optional bool[batch]; inactive rows never load or apply adapters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active: Option<String>,
-    /// Fixed second dimension of adapter_ids and scales.
+    /// Fixed second dimension of segments and scales.
     pub max_adapters: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AdapterArtifact {
-    /// Stable non-negative wire ID used by selection.adapter_ids.
+    /// Stable non-negative wire ID used by selection.segments.
     pub index: usize,
     pub identity: String,
     pub version: String,
@@ -143,7 +144,7 @@ pub struct AdapterArtifact {
     #[serde(default)]
     pub weights: Vec<AdapterWeightArtifact>,
     #[serde(default)]
-    pub targets: Vec<AdapterTargetBinding>,
+    pub bindings: Vec<AdapterTargetBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<String>,
 }
@@ -152,8 +153,16 @@ pub struct AdapterArtifact {
 #[serde(deny_unknown_fields)]
 pub struct AdapterWeightArtifact {
     pub location: String,
+    /// Loader capability required to normalize this source into the canonical artifact.
+    pub loader_capability: String,
     /// Lowercase SHA-256 of the exact external artifact bytes.
     pub sha256: String,
+    /// PEFT `adapter_config.json` paired with the safetensors file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_location: Option<String>,
+    /// Lowercase SHA-256 of the exact PEFT config bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_sha256: Option<String>,
     #[serde(default)]
     pub format: AdapterWeightFormat,
 }
@@ -168,31 +177,83 @@ pub enum AdapterWeightFormat {
     Json,
     /// Native ONNX Runtime GenAI adapter bundle.
     OrtGenai,
-    /// Safetensors parameter bundle.
+    /// Hugging Face PEFT `adapter_config.json` plus safetensors.
+    HfPeft,
+    /// Manifest-keyed safetensors parameter bundle.
     Safetensors,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AdapterTargetBinding {
-    /// Workflow component whose immutable base parameter is overlaid.
-    pub component: String,
-    /// Exact parameter name within the component artifact.
-    pub parameter: String,
+    /// Stable target ID declared by the authoritative target manifest.
+    pub target: String,
     /// Key used to find this target's A/B tensors in the adapter bundle.
     pub weight_key: String,
-    /// Exact overridable initializer names for ORT `.onnx_adapter` application.
+    /// Per-target rank override; absent uses the artifact rank.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub native_parameters: Option<AdapterNativeParameterBinding>,
+    pub rank: Option<usize>,
+    /// Per-target alpha override; absent uses the artifact alpha.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alpha: Option<f64>,
+}
+
+/// Authoritative generic target map migrated from Phase-2 `LoraTargetManifest`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LoraTargetManifest {
+    pub targets: Vec<LoraTargetDescriptor>,
+}
+
+/// One resolved base projection. Fused-QKV knowledge is lowered to an optional slice.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LoraTargetDescriptor {
+    pub id: String,
+    /// Workflow component name, or `model` for a bare decoder package.
+    pub component: String,
+    /// Exact immutable base initializer name.
+    pub parameter: String,
+    /// Exact graph value produced by the projection, when graph-native lowering needs it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_value: Option<String>,
+    /// Projection activation dtype used by graph-native delta application.
+    #[schemars(with = "schema_vocabulary::TensorDType")]
+    pub activation_dtype: String,
     pub input_features: usize,
     pub output_features: usize,
+    /// Resolved child range within a fused output; producer/import tooling owns discovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_slice: Option<LoraTargetSlice>,
+    /// Phase-1 graph-native optional A/B inputs. Base-only omits both and is bit-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_inputs: Option<LoraGraphInputBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LoraTargetSlice {
+    pub offset: usize,
+    pub width: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct AdapterNativeParameterBinding {
+pub struct LoraGraphInputBinding {
     pub a: String,
     pub b: String,
+    /// Optional graph input for request scale; otherwise scale is folded into stable factors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AdapterDiscoveryFallback {
+    #[default]
+    Disabled,
+    /// Tooling/load-time graph discovery may produce a resolved manifest; execution may not guess.
+    ToolingOnly,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
@@ -300,7 +361,7 @@ pub enum RuntimeInputRole {
     SessionId,
     RowIds,
     RequestEpochs,
-    AdapterIds,
+    AdapterSegments,
     AdapterCounts,
     AdapterScales,
     AdapterActive,

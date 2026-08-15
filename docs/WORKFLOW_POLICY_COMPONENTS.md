@@ -277,20 +277,37 @@ lookahead, and commit are reusable by any workflow; ONNX components apply masks 
 
 ## Parameter adapters (LoRA)
 
-`workflow.adapters` is the versioned `onnx-genai.adapters@1` ABI. Adapter discovery, verification,
-loading, caching, activation, deactivation, and eviction are runtime lifecycle operations; they
-are never workflow steps or `run_once` nodes.
+Top-level `adapters` is the migrated, versioned `onnx-genai.adapters@1` ABI. It replaces the
+earlier `InferenceMetadata.adapters` capability list and the short-lived `workflow.adapters`
+prototype; there is one catalog for bare and composite packages. Adapter discovery, verification,
+loading, caching, activation, deactivation, and eviction are runtime lifecycle operations, never
+workflow steps or `run_once` nodes. Composite packages reference request SSA inputs declared by
+`pipeline.workflow`.
 
 ```yaml
 adapters:
   base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:<64 lowercase hex>
+  target_manifest:
+    targets:
+      - id: decoder.layers.0.q_proj
+        component: decoder
+        parameter: layers.0.attention.q_proj.weight
+        output_value: layers.0.attention.q_proj.output
+        activation_dtype: float16
+        input_features: 4096
+        output_features: 4096
+        graph_inputs:                 # Phase-1 portable graph-native seam
+          a: lora.layers.0.q_proj.a
+          b: lora.layers.0.q_proj.b
+          scale: lora.layers.0.q_proj.scale # optional dynamic scale
+  discovery_fallback: disabled        # or tooling_only; execution never guesses
   selection:
-    row_ids: request.row_ids                 # int64[batch]
-    request_epochs: request.request_epochs   # int64[batch]
-    adapter_ids: request.adapter_ids         # int64[batch,max_adapters]
-    adapter_counts: request.adapter_counts   # int64[batch]
-    scales: request.adapter_scales           # float32[batch,max_adapters]
-    active: request.active                   # optional bool[batch]
+    slot_ids: request.slot_ids          # int64[batch]
+    request_epochs: request.epochs     # int64[batch]
+    segments: request.lora_segments    # int64[batch,max_adapters]
+    adapter_counts: request.lora_counts # int64[batch]
+    scales: request.lora_scales        # float32[batch,max_adapters]
+    active: request.active              # optional bool[batch]
     max_adapters: 4
   application_capability: onnx-genai.adapters@1
   portable_fallback: true
@@ -309,107 +326,95 @@ adapters:
       alpha: 16.0
       dtype: float16
       weights:
-        - { location: adapters/summarizer/adapter.onnx_adapter,
-            sha256: <exact-file sha256>, format: ort_genai }
-        - { location: adapters/summarizer/adapter.json,
-            sha256: <exact-file sha256>, format: json }
-      targets:
-        - component: decoder
-          parameter: layers.0.attention.q_proj.weight
+        - format: hf_peft
+          loader_capability: onnx-genai.adapters.hf-peft@1
+          location: adapters/summarizer/adapter_model.safetensors
+          sha256: <exact-safetensors sha256>
+          config_location: adapters/summarizer/adapter_config.json
+          config_sha256: <exact-config sha256>
+        - format: ort_genai
+          loader_capability: onnxruntime.lora-adapter@1
+          location: adapters/summarizer/adapter.onnx_adapter
+          sha256: <exact-file sha256>
+      bindings:
+        - target: decoder.layers.0.q_proj
           weight_key: layers.0.attention.q_proj
-          native_parameters:
-            a: adapters.summarizer.layers.0.attention.q_proj.a
-            b: adapters.summarizer.layers.0.attention.q_proj.b
-          input_features: 4096
-          output_features: 4096
 ```
 
-### Artifact and compatibility identity
+### Durable contract integrated from PRs #318 and #374
 
-Artifact map keys are package-local aliases. `index` is the stable wire ID used in
-`selection.adapter_ids`; indices are unique and contiguous from zero. Each file is beneath
-`adapters/<alias>/`, and at most one file of each format may be declared. `sha256` is lowercase
-SHA-256 of the exact file bytes, checked before parsing or device upload. Paths are package-relative,
-cannot escape the package, and are resolved without following an alternate metadata search path.
+This matrix audits Phase 1 at `813a9b53` and Phase 2 at `326fddcf`.
 
-The portable JSON artifact is UTF-8 RFC 8785 canonical JSON:
+| Prior surface | Exact prior location/type | v1 disposition | Current location/type |
+|---|---|---|---|
+| Top-level adapter metadata | #318/#374 `schema/adapters.rs::LoraCapabilities`, `InferenceMetadata.adapters` | **Adapt** | `schema/mod.rs::InferenceMetadata.adapters` now carries `AdapterServiceContract`; no parallel `workflow.adapters` |
+| Declared target map | #374 `schema/adapters.rs::LoraTargetManifest`, `LoraTargetDescriptor`, `LoraTargetSlice` | **Adapt** | `schema/ir.rs::LoraTargetManifest`, `LoraTargetDescriptor`, `LoraTargetSlice`; semantic module/layer and Qwen-specific discovery are lowered to generic component/parameter/value/slice bindings |
+| PEFT loader contract | #318 `engine/lora/format.rs::load_peft_adapter` | **Reuse ABI, separate implementation** | `AdapterWeightFormat::HfPeft` declares config+safetensors and loader capability; loader implementation belongs in a main-targeted runtime PR |
+| ORT FlatBuffer loader | #374 `engine/lora/format.rs::load_onnx_adapter` and `adapter_schema.fbs` | **Reuse ABI, separate implementation** | `AdapterWeightFormat::OrtGenai` maps to upstream `TORT` version 1; Mobius may emit PEFT instead |
+| Canonical loaded artifact | #318/#374 `engine/lora/format.rs::LoadedAdapter`, `LoadedAdapterModule` | **Adapt** | all declared source formats normalize to `AdapterArtifact` + manifest-keyed `AdapterTargetBinding`; format-specific names never reach execution planning |
+| Phase-1 delta branch | #318 `runtime-session/lora_inject.rs::inject`, `LoraInjection`, `OverrideFeed` | **Reuse** | manifest `graph_inputs.a/b` identifies overridable optional inputs; base-only binds neither input and remains bit-identical |
+| Graph discovery | #318 `build_manifest`; #374 declared-primary `build_manifest(..., declared_manifest)` | **Adapt** | `target_manifest` is authoritative; `discovery_fallback: tooling_only` permits importer/load tooling to produce it, never runtime execution guessing |
+| Per-row routing | #374 `GroupedLoraInjection.segments_input`, `NativeBatchedDecodeSession::set_lora_routes` | **Adapt** | `selection.segments[B,K]` is the Phase-2 segment ID generalized to ordered K-way composition and carried with semantic slot ID+epoch |
+| Adapter/module alignment | #374 `inject_grouped_multi` / `AdapterModuleSetMismatch` | **Reuse invariant** | artifacts bind stable target IDs from one manifest; missing targets contribute zero, duplicate target bindings fail, and every referenced target must resolve |
+| Paged pool and budget | #374 `LoraWeightPool`, `BudgetedLoraPool`, shared `ByteBudget`, `LoraPoolRegistration` | **Reuse, separate implementation** | metadata keeps cache/budget-independent lifecycle policy; pool, registry teardown, and device residency remain generic runtime PR surfaces |
+| Grouped custom op | #374 `pkg.nxrt::GroupedLoraDelta` CPU/CUDA kernels | **Retire as metadata ABI** | no custom-op requirement or admission field; use graph-native standard ONNX, existing EP kernel dispatch, or a separately justified LoRA EP capability |
+| Capture seam | #318 eager capture rejection; #374 persistent pool seam | **Adapt** | stable buffers plus plan variants keyed by capability, shape, ordered adapter sets, and scales; no address rebinding after capture |
+| Legacy CLI/manager | #318/#374 `LoraManager`, `AdapterId`, CLI `--adapter` | **Retire from metadata** | application APIs resolve stable artifact indices into immutable request SSA; lifecycle manager implementation remains outside metadata |
 
-```json
-{"targets":{"<weight_key>":{"a":[...],"b":[...]}}}
-```
+### Artifact, manifest, and compatibility identity
 
-`a` has shape `[rank,input_features]`, `b` has shape `[output_features,rank]`, and all values are
-finite float32 values; JSON is the float32 reference fallback. Safetensors uses tensor names `<weight_key>.a` and
-`<weight_key>.b` with the same shapes. `ort_genai` is the upstream ONNX Runtime FlatBuffers
-`.onnx_adapter` format (`TORT`, format version 1); its parameter records use the exact
-`native_parameters.a` and `.b` initializer names. All declared formats for one alias must encode
-the same tensors.
+Artifact map keys are package-local aliases and `index` is the stable segment ID. Indices are
+unique and contiguous from zero. Every source file is beneath `adapters/<alias>/`; SHA-256 is over
+exact bytes and is checked before parsing or upload. `hf_peft` pairs `adapter_config.json` with
+safetensors. `ort_genai` is upstream `.onnx_adapter` (`TORT`, format version 1). `json` is the
+float32 RFC 8785 reference bundle `{"targets":{"<weight_key>":{"a":[...],"b":[...]}}}`. A
+manifest-keyed safetensors source uses `<weight_key>.a` and `<weight_key>.b`. Source formats may
+coexist for one artifact only when they encode the same canonical factors.
 
-The base fingerprint is computed over the union of declared targets, not unrelated base weights.
-Sort targets by UTF-8 `(component,parameter)`, then build RFC 8785 canonical JSON with schema
-`onnx-genai-targeted-base-v1`. Each target record contains:
+The authoritative manifest contains exact generic graph identities. Producer/import tooling owns
+architecture-specific work such as fused-QKV discovery and lowers it to `output_slice`; execution
+never branches on a model family. `graph_inputs` preserves Phase-1 optional overridable A/B inputs.
+If absent, a capable runtime may apply an immutable parameter overlay or invoke a portable standard
+ONNX delta component. Base initializers are never modified.
 
-- the component and exact initializer name;
-- ONNX tensor dtype number and dimensions;
-- SHA-256 of the initializer's logical contiguous row-major bytes, normalized to little endian
-  after resolving external data; and
-- every direct consumer sorted by graph node ordinal and input ordinal, recording domain
-  (`ai.onnx` for the empty domain), op type, input ordinal, and RFC 8785 canonicalized attributes.
+The targeted base fingerprint sorts targets by UTF-8 `(component,parameter)` and hashes RFC 8785
+canonical JSON containing component, exact initializer name, ONNX dtype number, dimensions, SHA-256
+of logical contiguous row-major little-endian initializer bytes, and direct consumers sorted by
+node/input ordinal with normalized domain, op type, input ordinal, and canonical attributes. It is
+also records the resolved output value, activation dtype, output slice, and graph-input binding.
+It is encoded as `onnx-genai-targeted-base-v1:sha256:<hex>`. Names used only for debugging,
+protobuf field order, paths, and external-data chunking are excluded.
 
-SHA-256 of those canonical JSON bytes is encoded as
-`onnx-genai-targeted-base-v1:sha256:<hex>`. Node names, doc strings, protobuf field order, file
-paths, and external-data chunking are excluded. A runtime must reject a service/artifact mismatch
-and must verify the fingerprint against the loaded component initializers before activation.
+### Request routing, composition, and batching
 
-Targets are architecture-independent `(component,parameter)` bindings. The parameter must be an
-immutable initializer with the declared input/output dimensions. A target may appear in multiple
-adapters for composition, but its dimensions and native A/B initializer bindings must agree.
-Duplicate targets or weight keys within one adapter, missing parameters, unsupported dtype,
-shape/rank mismatch, and conflicting native bindings are errors.
-
-### Request, composition, and batching
-
-Selection tensors are required request-sourced SSA inputs and are snapshotted immutably for one
-request. For row `r`, entries `[0,adapter_counts[r])` are applied in axis order. Remaining slots
-must be padded with ID `-1` and scale `0`. Counts are in `[0,max_adapters]`; IDs must exist;
-duplicate IDs in one row are rejected. Effective scales must be finite and within `[-16,16]`.
-
-For target input `x`, composition is:
+`segments[B,K]` generalizes Phase-2's one `segments[B]` route. For row `r`, slots
+`[0,adapter_counts[r])` contain contiguous artifact indices in deterministic composition order; all
+remaining slots are exactly segment `-1` and scale `0`. Unknown IDs and duplicates fail loud.
+Scales are finite and within `[-16,16]`. A K=1 lowering feeds the Phase-2 grouped route directly.
+For K>1, a planner either repeats the graph-native delta branch in axis order or builds an
+equivalent grouped plan; both must preserve the same accumulation order:
 
 `base(x) + Σ scale[k] * (alpha[k] / rank[k]) * B[k] * (A[k] * x)`
 
-The sum is evaluated in declared order, so floating-point accumulation order is observable.
-Adapters that do not target a parameter contribute zero. Base/shared weights remain immutable.
+Per-binding rank/alpha override artifact defaults. Adapters missing a manifest target contribute
+zero. The immutable routing identity is `(slot_id,request_epoch)`. Compaction applies one
+permutation to slot IDs, epochs, segments, counts, scales, active flags, and model state. Epochs
+change on slot reuse. Inactive rows are base-only and do not load or mutate adapter state.
 
-The selection identity is `(row_id,request_epoch)`. Epochs are non-negative and change on every
-slot reuse. Compaction/reorder applies one permutation to row IDs, epochs, adapter IDs, counts,
-scales, active flags, and all model state. Inactive rows are base-only and neither load adapters
-nor mutate adapter/cache state. A previous epoch can never supply selection to a reused slot.
+### Lifecycle, capability, and capture
 
-### Native mapping, planning, and capture
+Existing ORT GenAI load/activate/unload APIs are reused when negotiated capability covers the full
+batch. They do not alone guarantee heterogeneous rows, composition, dynamic scales, or I/O binding,
+so the planner may bucket rows by complete ordered adapter set, materialize an equivalent overlay,
+or invoke the portable graph branch. Unknown IDs, fingerprint/checksum mismatch, missing targets,
+shape/dtype/rank mismatch, conflicting bindings, nonfinite scales, and unsupported loader or
+application capabilities are structured errors.
 
-ONNX Runtime GenAI's `OgaAdapters::LoadAdapter`/`UnloadAdapter` and
-`Generator::SetActiveAdapter` map directly to load, reference-counted activation, and release for
-compatible `.onnx_adapter` artifacts. Core ORT supplies parameters through active
-`OrtRunOptions` adapters. Those APIs do not by themselves guarantee heterogeneous per-row
-selection, dynamic scales, duplicate-name composition, or adapter-aware I/O binding. A runtime
-may use them only when its negotiated capability covers the requested batch; otherwise it must
-bucket rows by the complete ordered `(adapter ID,scale)` set, materialize an equivalent combined
-overlay, or use the portable `onnx-genai.parameter-overlay@1` path. There is no model-family or
-custom-operator admission path.
-
-The planner key contains execution capability, concrete shape bucket, and the ordered adapter set
-and scales for each physical row; semantic row IDs and request epochs are not part of the key.
-Captured variants own stable adapter buffers and addresses. Buffers cannot be rebound after
-capture. Shape/capability/adapter-set changes select another variant or recapture. LRU eviction is
-forbidden while an artifact is referenced; eviction invalidates every capture that references its
-buffers when `invalidate_capture_on_eviction` is true, and reload creates new buffers and plans.
-
-If the runtime/EP lacks `onnx-genai.adapters@1`, load fails with a structured capability diagnostic
-unless `portable_fallback: true` and every selected artifact has a supported portable format.
-Diagnostics identify capability, alias/index, artifact path and checksum, target, row/epoch, and
-whether failure occurred during discover, verify, load, plan, activate, execute, deactivate, or
-evict.
+Pool entries are reference-counted and cannot be evicted while active. Registry teardown releases
+all registrations. Captured variants own stable adapter buffers and addresses; no rebinding is
+allowed after capture. Shape, capability, ordered adapter set, or scale-bucket changes select a new
+plan or recapture. Eviction invalidates captures that reference evicted buffers. Generic pool,
+kernel, and allocator improvements are intentionally separate from this metadata PR.
 
 ## Compact structural examples
 

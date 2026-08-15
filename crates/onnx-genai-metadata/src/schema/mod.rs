@@ -71,6 +71,15 @@ pub struct InferenceMetadata {
     #[serde(default)]
     pub pipeline: Option<PipelineSpec>,
 
+    /// Runtime-managed LoRA adapters for bare or composite model packages.
+    ///
+    /// This is the migrated `InferenceMetadata.adapters` contract from native
+    /// LoRA phases 1 and 2. Composite execution references workflow SSA inputs,
+    /// but artifact identity, target resolution, and lifecycle remain package
+    /// metadata rather than workflow control-flow nodes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapters: Option<AdapterServiceContract>,
+
     /// Minimum and beneficial hardware capabilities used for distribution matching.
     #[serde(default)]
     pub hardware_requirements: Option<HardwareRequirements>,

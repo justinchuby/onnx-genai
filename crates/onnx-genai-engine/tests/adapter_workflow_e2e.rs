@@ -21,24 +21,24 @@ fn package(metadata: &str, red: &[u8], blue: &[u8]) -> anyhow::Result<PathBuf> {
 
 fn run(
     engine: &mut PipelineEngine,
-    row_ids: &[i64],
+    slot_ids: &[i64],
     request_epochs: &[i64],
     values: &[f32],
     selection: AdapterSelection,
 ) -> anyhow::Result<Vec<f32>> {
-    let batch = i64::try_from(row_ids.len())?;
-    let mut adapter_ids = vec![-1i64; row_ids.len() * 2];
-    let mut adapter_counts = vec![0i64; row_ids.len()];
-    let mut adapter_scales = vec![0.0f32; row_ids.len() * 2];
-    for (row, (&row_id, &request_epoch)) in row_ids.iter().zip(request_epochs).enumerate() {
-        let identity = onnx_genai_engine::AdapterRowIdentity {
-            row_id,
+    let batch = i64::try_from(slot_ids.len())?;
+    let mut segments = vec![-1i64; slot_ids.len() * 2];
+    let mut adapter_counts = vec![0i64; slot_ids.len()];
+    let mut adapter_scales = vec![0.0f32; slot_ids.len() * 2];
+    for (row, (&slot_id, &request_epoch)) in slot_ids.iter().zip(request_epochs).enumerate() {
+        let identity = onnx_genai_engine::AdapterSlotIdentity {
+            slot_id,
             request_epoch,
         };
         if let Some(activations) = selection.rows.get(&identity) {
             adapter_counts[row] = i64::try_from(activations.len())?;
             for (slot, activation) in activations.iter().enumerate() {
-                adapter_ids[row * 2 + slot] = match activation.adapter.as_str() {
+                segments[row * 2 + slot] = match activation.adapter.as_str() {
                     "red" => 0,
                     "blue" => 1,
                     other => anyhow::bail!("unknown test adapter {other}"),
@@ -51,14 +51,17 @@ fn run(
         prompt: GeneratePrompt::TokenIds(vec![]),
         options: Default::default(),
     })
-    .with_input("request.row_ids", Value::from_slice_i64(row_ids, &[batch])?)
+    .with_input(
+        "request.slot_ids",
+        Value::from_slice_i64(slot_ids, &[batch])?,
+    )
     .with_input(
         "request.request_epochs",
         Value::from_slice_i64(request_epochs, &[batch])?,
     )
     .with_input(
-        "request.adapter_ids",
-        Value::from_slice_i64(&adapter_ids, &[batch, 2])?,
+        "request.adapter_segments",
+        Value::from_slice_i64(&segments, &[batch, 2])?,
     )
     .with_input(
         "request.adapter_counts",
@@ -79,6 +82,53 @@ fn heterogeneous_parameter_adapters_match_independent_rows_and_compaction() -> a
     let metadata = format!(
         r#"
 schema_version: v1
+adapters:
+  base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  target_manifest:
+    targets:
+      - id: projection
+        component: decoder
+        parameter: projection
+        activation_dtype: float32
+        input_features: 2
+        output_features: 2
+  selection:
+    slot_ids: request.slot_ids
+    request_epochs: request.request_epochs
+    segments: request.adapter_segments
+    adapter_counts: request.adapter_counts
+    scales: request.adapter_scales
+    max_adapters: 2
+  application_capability: onnx-genai.adapters@1
+  portable_fallback: true
+  cache: {{ max_entries: 2, eviction: lru }}
+  artifacts:
+    red:
+      index: 0
+      identity: red
+      version: "1"
+      base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      rank: 1
+      alpha: 1.0
+      dtype: float32
+      weights:
+        - {{ location: adapters/red/adapter.json, loader_capability: onnx-genai.adapters.json@1,
+             sha256: {red_sha} }}
+      bindings:
+        - {{ target: projection, weight_key: projection }}
+    blue:
+      index: 1
+      identity: blue
+      version: "1"
+      base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      rank: 1
+      alpha: 1.0
+      dtype: float32
+      weights:
+        - {{ location: adapters/blue/adapter.json, loader_capability: onnx-genai.adapters.json@1,
+             sha256: {blue_sha} }}
+      bindings:
+        - {{ target: projection, weight_key: projection }}
 pipeline:
   workflow:
     manifest:
@@ -87,17 +137,17 @@ pipeline:
       adapter_abis: {{ onnx-genai.parameter-overlay: "1" }}
       capabilities: [workflow_ssa, typed_emit, parameter_adapters, heterogeneous_adapter_batching]
     inputs:
-      request.row_ids:
+      request.slot_ids:
         contract: {{ dtype: int64, rank: 1, shape: [batch] }}
-        role: {{ kind: runtime, version: "1.0", role: row_ids }}
-        source: {{ kind: request }}
+        role: {{ kind: opaque }}
+        source: {{ kind: application, name: serving.slot_ids }}
       request.request_epochs:
         contract: {{ dtype: int64, rank: 1, shape: [batch] }}
         role: {{ kind: runtime, version: "1.0", role: request_epochs }}
         source: {{ kind: request }}
-      request.adapter_ids:
+      request.adapter_segments:
         contract: {{ dtype: int64, rank: 2, shape: [batch, 2] }}
-        role: {{ kind: runtime, version: "1.0", role: adapter_ids }}
+        role: {{ kind: runtime, version: "1.0", role: adapter_segments }}
         source: {{ kind: request }}
       request.adapter_counts:
         contract: {{ dtype: int64, rank: 1, shape: [batch] }}
@@ -135,49 +185,6 @@ pipeline:
           version: "1"
           bindings: {{ input: input, output: output }}
           parameters: {{ action: apply, component: decoder, parameter: projection }}
-    adapters:
-      base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-      selection:
-        row_ids: request.row_ids
-        request_epochs: request.request_epochs
-        adapter_ids: request.adapter_ids
-        adapter_counts: request.adapter_counts
-        scales: request.adapter_scales
-        max_adapters: 2
-      application_capability: onnx-genai.adapters@1
-      portable_fallback: true
-      cache: {{ max_entries: 2, eviction: lru }}
-      artifacts:
-        red:
-          index: 0
-          identity: red
-          version: "1"
-          base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-          rank: 1
-          alpha: 1.0
-          dtype: float32
-          weights: [{{ location: adapters/red/adapter.json, sha256: {red_sha} }}]
-          targets:
-            - component: decoder
-              parameter: projection
-              weight_key: projection
-              input_features: 2
-              output_features: 2
-        blue:
-          index: 1
-          identity: blue
-          version: "1"
-          base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-          rank: 1
-          alpha: 1.0
-          dtype: float32
-          weights: [{{ location: adapters/blue/adapter.json, sha256: {blue_sha} }}]
-          targets:
-            - component: decoder
-              parameter: projection
-              weight_key: projection
-              input_features: 2
-              output_features: 2
     steps:
       - kind: invoke
         component: overlay
@@ -194,8 +201,8 @@ pipeline:
     let root = package(&metadata, red, blue)?;
     let mut engine = Engine::from_pipeline_dir(&root, EngineConfig::default())?;
     let selection = AdapterSelection::default()
-        .with_row(10, 0, [AdapterActivation::new("red", 1.0)])
-        .with_row(
+        .with_slot(10, 0, [AdapterActivation::new("red", 1.0)])
+        .with_slot(
             30,
             0,
             [
@@ -214,13 +221,13 @@ pipeline:
         )?,
         vec![2.0, 4.0, 3.0, 4.0, 25.5, 35.0]
     );
-    for (row_id, input, expected) in [
+    for (slot_id, input, expected) in [
         (10, [1.0, 2.0], [2.0, 4.0]),
         (20, [3.0, 4.0], [3.0, 4.0]),
         (30, [5.0, 6.0], [25.5, 35.0]),
     ] {
         assert_eq!(
-            run(&mut engine, &[row_id], &[0], &input, selection.clone())?,
+            run(&mut engine, &[slot_id], &[0], &input, selection.clone())?,
             expected
         );
     }
@@ -240,7 +247,8 @@ pipeline:
         run(&mut engine, &[10], &[1], &[1.0, 2.0], selection.clone(),)?,
         vec![1.0, 2.0]
     );
-    let reused = AdapterSelection::default().with_row(10, 1, [AdapterActivation::new("blue", 1.0)]);
+    let reused =
+        AdapterSelection::default().with_slot(10, 1, [AdapterActivation::new("blue", 1.0)]);
     assert_eq!(
         run(&mut engine, &[10], &[1], &[1.0, 2.0], reused.clone())?,
         vec![7.0, 10.0]

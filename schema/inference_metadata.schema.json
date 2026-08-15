@@ -41,6 +41,13 @@
         "base_model_fingerprint": {
           "type": "string"
         },
+        "bindings": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/AdapterTargetBinding"
+          },
+          "type": "array"
+        },
         "dtype": {
           "$ref": "#/$defs/TensorDType"
         },
@@ -48,7 +55,7 @@
           "type": "string"
         },
         "index": {
-          "description": "Stable non-negative wire ID used by selection.adapter_ids.",
+          "description": "Stable non-negative wire ID used by selection.segments.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"
@@ -63,13 +70,6 @@
           "format": "uint",
           "minimum": 0,
           "type": "integer"
-        },
-        "targets": {
-          "default": [],
-          "items": {
-            "$ref": "#/$defs/AdapterTargetBinding"
-          },
-          "type": "array"
         },
         "version": {
           "type": "string"
@@ -109,27 +109,26 @@
       },
       "type": "object"
     },
+    "AdapterDiscoveryFallback": {
+      "oneOf": [
+        {
+          "enum": [
+            "disabled"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "tooling_only",
+          "description": "Tooling/load-time graph discovery may produce a resolved manifest; execution may not guess.",
+          "type": "string"
+        }
+      ]
+    },
     "AdapterEvictionPolicy": {
       "enum": [
         "lru"
       ],
       "type": "string"
-    },
-    "AdapterNativeParameterBinding": {
-      "additionalProperties": false,
-      "properties": {
-        "a": {
-          "type": "string"
-        },
-        "b": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "a",
-        "b"
-      ],
-      "type": "object"
     },
     "AdapterPlanningContract": {
       "additionalProperties": false,
@@ -163,12 +162,8 @@
           "description": "Int64[batch] number of valid adapter IDs in each row.",
           "type": "string"
         },
-        "adapter_ids": {
-          "description": "Int64[batch,max_adapters] artifact indices in composition order.",
-          "type": "string"
-        },
         "max_adapters": {
-          "description": "Fixed second dimension of adapter_ids and scales.",
+          "description": "Fixed second dimension of segments and scales.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"
@@ -177,19 +172,23 @@
           "description": "Int64[batch] request generation; changes whenever a slot is reused.",
           "type": "string"
         },
-        "row_ids": {
-          "description": "Int64[batch] semantic row/slot identities.",
-          "type": "string"
-        },
         "scales": {
           "description": "Float32[batch,max_adapters] effective request scales.",
+          "type": "string"
+        },
+        "segments": {
+          "description": "Int64[batch,max_adapters] Phase-2-compatible segment IDs in composition order.",
+          "type": "string"
+        },
+        "slot_ids": {
+          "description": "Int64[batch] semantic row/slot identities.",
           "type": "string"
         }
       },
       "required": [
-        "row_ids",
+        "slot_ids",
         "request_epochs",
-        "adapter_ids",
+        "segments",
         "adapter_counts",
         "scales",
         "max_adapters"
@@ -221,6 +220,11 @@
             "max_entries": 16
           }
         },
+        "discovery_fallback": {
+          "$ref": "#/$defs/AdapterDiscoveryFallback",
+          "default": "disabled",
+          "description": "Explicit load-time tooling fallback. Runtime execution never guesses targets."
+        },
         "planning": {
           "$ref": "#/$defs/AdapterPlanningContract",
           "default": {
@@ -236,10 +240,15 @@
         "selection": {
           "$ref": "#/$defs/AdapterSelectionContract",
           "description": "Request-scoped adapter-set inputs. These are immutable SSA inputs for one request."
+        },
+        "target_manifest": {
+          "$ref": "#/$defs/LoraTargetManifest",
+          "description": "Authoritative, architecture-neutral bindings resolved by producer/import tooling."
         }
       },
       "required": [
         "base_model_fingerprint",
+        "target_manifest",
         "selection",
         "application_capability"
       ],
@@ -248,33 +257,25 @@
     "AdapterTargetBinding": {
       "additionalProperties": false,
       "properties": {
-        "component": {
-          "description": "Workflow component whose immutable base parameter is overlaid.",
-          "type": "string"
+        "alpha": {
+          "description": "Per-target alpha override; absent uses the artifact alpha.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
         },
-        "input_features": {
+        "rank": {
+          "description": "Per-target rank override; absent uses the artifact rank.",
           "format": "uint",
           "minimum": 0,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
-        "native_parameters": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/AdapterNativeParameterBinding"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Exact overridable initializer names for ORT `.onnx_adapter` application."
-        },
-        "output_features": {
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "parameter": {
-          "description": "Exact parameter name within the component artifact.",
+        "target": {
+          "description": "Stable target ID declared by the authoritative target manifest.",
           "type": "string"
         },
         "weight_key": {
@@ -283,20 +284,35 @@
         }
       },
       "required": [
-        "component",
-        "parameter",
-        "weight_key",
-        "input_features",
-        "output_features"
+        "target",
+        "weight_key"
       ],
       "type": "object"
     },
     "AdapterWeightArtifact": {
       "additionalProperties": false,
       "properties": {
+        "config_location": {
+          "description": "PEFT `adapter_config.json` paired with the safetensors file.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "config_sha256": {
+          "description": "Lowercase SHA-256 of the exact PEFT config bytes.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "format": {
           "$ref": "#/$defs/AdapterWeightFormat",
           "default": "json"
+        },
+        "loader_capability": {
+          "description": "Loader capability required to normalize this source into the canonical artifact.",
+          "type": "string"
         },
         "location": {
           "type": "string"
@@ -308,6 +324,7 @@
       },
       "required": [
         "location",
+        "loader_capability",
         "sha256"
       ],
       "type": "object"
@@ -325,8 +342,13 @@
           "type": "string"
         },
         {
+          "const": "hf_peft",
+          "description": "Hugging Face PEFT `adapter_config.json` plus safetensors.",
+          "type": "string"
+        },
+        {
           "const": "safetensors",
-          "description": "Safetensors parameter bundle.",
+          "description": "Manifest-keyed safetensors parameter bundle.",
           "type": "string"
         }
       ]
@@ -1441,6 +1463,134 @@
       ],
       "type": "object"
     },
+    "LoraGraphInputBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "a": {
+          "type": "string"
+        },
+        "b": {
+          "type": "string"
+        },
+        "scale": {
+          "description": "Optional graph input for request scale; otherwise scale is folded into stable factors.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "a",
+        "b"
+      ],
+      "type": "object"
+    },
+    "LoraTargetDescriptor": {
+      "additionalProperties": false,
+      "description": "One resolved base projection. Fused-QKV knowledge is lowered to an optional slice.",
+      "properties": {
+        "activation_dtype": {
+          "$ref": "#/$defs/TensorDType",
+          "description": "Projection activation dtype used by graph-native delta application."
+        },
+        "component": {
+          "description": "Workflow component name, or `model` for a bare decoder package.",
+          "type": "string"
+        },
+        "graph_inputs": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LoraGraphInputBinding"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Phase-1 graph-native optional A/B inputs. Base-only omits both and is bit-identical."
+        },
+        "id": {
+          "type": "string"
+        },
+        "input_features": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "output_features": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "output_slice": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LoraTargetSlice"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Resolved child range within a fused output; producer/import tooling owns discovery."
+        },
+        "output_value": {
+          "description": "Exact graph value produced by the projection, when graph-native lowering needs it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parameter": {
+          "description": "Exact immutable base initializer name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "component",
+        "parameter",
+        "activation_dtype",
+        "input_features",
+        "output_features"
+      ],
+      "type": "object"
+    },
+    "LoraTargetManifest": {
+      "additionalProperties": false,
+      "description": "Authoritative generic target map migrated from Phase-2 `LoraTargetManifest`.",
+      "properties": {
+        "targets": {
+          "items": {
+            "$ref": "#/$defs/LoraTargetDescriptor"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "targets"
+      ],
+      "type": "object"
+    },
+    "LoraTargetSlice": {
+      "additionalProperties": false,
+      "properties": {
+        "offset": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "width": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "offset",
+        "width"
+      ],
+      "type": "object"
+    },
     "MixtureOfExpertsSpec": {
       "description": "Explicit sparse mixture-of-experts structure and graph representation.",
       "properties": {
@@ -2127,7 +2277,7 @@
         "session_id",
         "row_ids",
         "request_epochs",
-        "adapter_ids",
+        "adapter_segments",
         "adapter_counts",
         "adapter_scales",
         "adapter_active"
@@ -2864,17 +3014,6 @@
       "additionalProperties": false,
       "description": "Sound, component-centric workflow IR. Tensor math lives in invoked components.",
       "properties": {
-        "adapters": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/AdapterServiceContract"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Runtime-managed parameter adapters. Loading and caching are lifecycle operations,\nindependent of workflow control flow."
-        },
         "components": {
           "additionalProperties": {
             "$ref": "#/$defs/WorkflowComponent"
@@ -3205,6 +3344,17 @@
   ],
   "description": "Portable, runtime-agnostic inference metadata for ONNX generative models. The v1 top-level surface is closed; executable composite packages use pipeline.workflow.",
   "properties": {
+    "adapters": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AdapterServiceContract"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Runtime-managed LoRA adapters for bare or composite model packages.\n\nThis is the migrated `InferenceMetadata.adapters` contract from native\nLoRA phases 1 and 2. Composite execution references workflow SSA inputs,\nbut artifact identity, target resolution, and lifecycle remain package\nmetadata rather than workflow control-flow nodes."
+    },
     "hardware_requirements": {
       "anyOf": [
         {

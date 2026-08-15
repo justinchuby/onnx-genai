@@ -2,6 +2,48 @@ use onnx_genai_metadata::{InferenceMetadata, WorkflowNode, compile_workflow, val
 
 const ADAPTER_WORKFLOW: &str = r#"
 schema_version: v1
+adapters:
+  base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  target_manifest:
+    targets:
+      - id: projection
+        component: decoder
+        parameter: projection.weight
+        activation_dtype: float32
+        input_features: 2
+        output_features: 2
+  selection:
+    slot_ids: request.slot_ids
+    request_epochs: request.request_epochs
+    segments: request.adapter_segments
+    adapter_counts: request.adapter_counts
+    scales: request.adapter_scales
+    max_adapters: 2
+  application_capability: onnx-genai.adapters@1
+  portable_fallback: true
+  cache: { max_entries: 2, eviction: lru }
+  planning:
+    bucket_by_adapter_set: true
+    stable_buffers: true
+    invalidate_capture_on_eviction: true
+  artifacts:
+    red:
+      index: 0
+      identity: red
+      version: "1"
+      base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      rank: 1
+      alpha: 1.0
+      dtype: float32
+      provenance: synthetic-test
+      weights:
+        - location: adapters/red/adapter.json
+          loader_capability: onnx-genai.adapters.json@1
+          sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+          format: json
+      bindings:
+        - target: projection
+          weight_key: projection
 pipeline:
   workflow:
     manifest:
@@ -10,7 +52,7 @@ pipeline:
       adapter_abis: { onnx-genai.parameter-overlay: "1" }
       capabilities: [workflow_ssa, parameter_adapters, heterogeneous_adapter_batching]
     inputs:
-      request.row_ids:
+      request.slot_ids:
         contract: { dtype: int64, rank: 1, shape: [batch] }
         role: { kind: runtime, version: "1.0", role: row_ids }
         source: { kind: request }
@@ -18,9 +60,9 @@ pipeline:
         contract: { dtype: int64, rank: 1, shape: [batch] }
         role: { kind: runtime, version: "1.0", role: request_epochs }
         source: { kind: request }
-      request.adapter_ids:
+      request.adapter_segments:
         contract: { dtype: int64, rank: 2, shape: [batch, 2] }
-        role: { kind: runtime, version: "1.0", role: adapter_ids }
+        role: { kind: runtime, version: "1.0", role: adapter_segments }
         source: { kind: request }
       request.adapter_counts:
         contract: { dtype: int64, rank: 1, shape: [batch] }
@@ -52,42 +94,6 @@ pipeline:
             action: apply
             component: decoder
             parameter: projection.weight
-    adapters:
-      base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-      selection:
-        row_ids: request.row_ids
-        request_epochs: request.request_epochs
-        adapter_ids: request.adapter_ids
-        adapter_counts: request.adapter_counts
-        scales: request.adapter_scales
-        max_adapters: 2
-      application_capability: onnx-genai.adapters@1
-      portable_fallback: true
-      cache: { max_entries: 2, eviction: lru }
-      planning:
-        bucket_by_adapter_set: true
-        stable_buffers: true
-        invalidate_capture_on_eviction: true
-      artifacts:
-        red:
-          index: 0
-          identity: red
-          version: "1"
-          base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-          rank: 1
-          alpha: 1.0
-          dtype: float32
-          provenance: synthetic-test
-          weights:
-            - location: adapters/red/adapter.json
-              sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-              format: json
-          targets:
-            - component: decoder
-              parameter: projection.weight
-              weight_key: projection
-              input_features: 2
-              output_features: 2
     steps:
       - kind: invoke
         component: decoder
@@ -127,8 +133,8 @@ fn workflow_custom_op_admission_fields_are_rejected() {
 fn adapter_service_rejects_incompatible_or_unsafe_artifacts() {
     let invalid = ADAPTER_WORKFLOW
         .replace(
-            "base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n          rank",
-            "base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n          rank",
+            "base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n      rank",
+            "base_model_fingerprint: onnx-genai-targeted-base-v1:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n      rank",
         )
         .replace(
             "location: adapters/red/adapter.json",
@@ -155,8 +161,8 @@ fn adapter_wire_contract_rejects_ambiguous_selection_and_indices() {
         .replace("max_adapters: 2", "max_adapters: 0")
         .replace("index: 0", "index: 2")
         .replace(
-            "contract: { dtype: int64, rank: 2, shape: [batch, 2] }\n        role: { kind: runtime, version: \"1.0\", role: adapter_ids }",
-            "contract: { dtype: float32, rank: 2, shape: [batch, 2] }\n        role: { kind: runtime, version: \"1.0\", role: adapter_ids }",
+            "contract: { dtype: int64, rank: 2, shape: [batch, 2] }\n        role: { kind: runtime, version: \"1.0\", role: adapter_segments }",
+            "contract: { dtype: float32, rank: 2, shape: [batch, 2] }\n        role: { kind: runtime, version: \"1.0\", role: adapter_segments }",
         );
     let metadata: InferenceMetadata =
         serde_yaml::from_str(&invalid).expect("invalid adapter wire contract parses");
@@ -174,7 +180,36 @@ fn adapter_wire_contract_rejects_ambiguous_selection_and_indices() {
     assert!(
         errors
             .iter()
-            .any(|error| error.contains("selection.adapter_ids"))
+            .any(|error| error.contains("selection.segments"))
+    );
+}
+
+#[test]
+fn adapter_manifest_and_source_contracts_fail_loud() {
+    let invalid = ADAPTER_WORKFLOW
+        .replace("target: projection", "target: missing")
+        .replace(
+            "loader_capability: onnx-genai.adapters.json@1",
+            "loader_capability: onnxruntime.lora-adapter@1",
+        )
+        .replace("format: json", "format: hf_peft");
+    let metadata: InferenceMetadata =
+        serde_yaml::from_str(&invalid).expect("invalid adapter contracts parse");
+    let errors = validate_metadata(&metadata).expect_err("invalid adapter contracts must fail");
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("absent from adapters.target_manifest"))
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("loader_capability must be"))
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("hf_peft requires config_location"))
     );
 }
 

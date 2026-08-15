@@ -77,6 +77,15 @@ fn generated_schema_preserves_all_root_constraints() {
     assert!(serialized.contains("\"sampling_min_p\""));
     assert!(!serialized.contains("\"custom_op_versions\""));
     assert!(!serialized.contains("\"custom_ops\""));
+    assert!(schema["properties"]["adapters"].is_object());
+    assert!(
+        schema["$defs"]["WorkflowSpec"]["properties"]["adapters"].is_null(),
+        "adapter catalog must have one top-level source of truth"
+    );
+    assert!(serialized.contains("\"LoraTargetManifest\""));
+    assert!(serialized.contains("\"hf_peft\""));
+    assert!(serialized.contains("\"segments\""));
+    assert!(!serialized.contains("\"adapter_ids\""));
 }
 
 fn schema_path() -> PathBuf {

@@ -406,7 +406,54 @@ pub fn load_metadata_package(path: &Path) -> Result<InferenceMetadata, crate::Me
         &pipeline.workflow,
         metadata_path.parent().unwrap_or_else(|| Path::new(".")),
     )?;
+    if let Some(adapters) = &metadata.adapters {
+        validate_adapter_artifacts(
+            adapters,
+            metadata_path.parent().unwrap_or_else(|| Path::new(".")),
+        )?;
+    }
     Ok(metadata)
+}
+
+fn validate_adapter_artifacts(
+    service: &crate::schema::AdapterServiceContract,
+    root: &Path,
+) -> Result<(), crate::MetadataError> {
+    use sha2::{Digest, Sha256};
+
+    let root = root.canonicalize().map_err(crate::MetadataError::Io)?;
+    for (alias, artifact) in &service.artifacts {
+        for (index, source) in artifact.weights.iter().enumerate() {
+            let mut files = vec![("weights", source.location.as_str(), source.sha256.as_str())];
+            if let (Some(location), Some(checksum)) =
+                (&source.config_location, &source.config_sha256)
+            {
+                files.push(("config", location.as_str(), checksum.as_str()));
+            }
+            for (kind, location, expected) in files {
+                let candidate = root.join(location);
+                let resolved = candidate.canonicalize().map_err(|error| {
+                    crate::MetadataError::Parse(format!(
+                        "adapter '{alias}' source {index} {kind} artifact '{}' cannot be opened: {error}",
+                        candidate.display()
+                    ))
+                })?;
+                if !resolved.starts_with(&root) || !resolved.is_file() {
+                    return Err(crate::MetadataError::Parse(format!(
+                        "adapter '{alias}' source {index} {kind} artifact '{location}' is not a package file"
+                    )));
+                }
+                let bytes = std::fs::read(&resolved).map_err(crate::MetadataError::Io)?;
+                let actual = format!("{:x}", Sha256::digest(&bytes));
+                if actual != expected {
+                    return Err(crate::MetadataError::Parse(format!(
+                        "adapter '{alias}' source {index} {kind} checksum mismatch: expected {expected}, got {actual}"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_package_artifacts(

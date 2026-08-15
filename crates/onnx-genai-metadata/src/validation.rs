@@ -115,7 +115,7 @@ pub fn derived_capabilities(metadata: &InferenceMetadata) -> BTreeSet<String> {
     if workflow.serving.is_some() {
         capabilities.insert("serving_service_contract".to_string());
     }
-    if workflow.adapters.is_some() {
+    if metadata.adapters.is_some() {
         capabilities.insert("parameter_adapters".to_string());
         capabilities.insert("heterogeneous_adapter_batching".to_string());
     }
@@ -231,6 +231,13 @@ pub fn validate_metadata(metadata: &InferenceMetadata) -> Result<(), Vec<String>
         && let Err(error) = validate_pipeline_spec(pipeline)
     {
         errors.extend(error.errors);
+    }
+    if let Some(service) = &metadata.adapters {
+        validate_adapter_service(
+            service,
+            metadata.pipeline.as_ref().map(|p| &p.workflow),
+            &mut errors,
+        );
     }
     validate_preprocessing_workflow(metadata, &mut errors);
 
@@ -469,7 +476,7 @@ fn validate_adapter_selection_input(
     dtype: &str,
     rank: usize,
     second_dimension: Option<usize>,
-    expected_role: crate::schema::RuntimeInputRole,
+    expected_role: Option<crate::schema::RuntimeInputRole>,
     field: &str,
     errors: &mut Vec<String>,
 ) {
@@ -490,132 +497,229 @@ fn validate_adapter_selection_input(
         Some(input)
             if input.contract.dtype == dtype
                 && input.contract.rank == rank
-                && input
-                    .contract
-                    .shape
-                    .as_deref()
-                    .is_some_and(expected_shape)
+                && input.contract.shape.as_deref().is_some_and(expected_shape)
                 && input.required
-                && input.source == crate::schema::WorkflowInputSource::Request
                 && matches!(
-                    &input.role,
-                    crate::schema::SemanticInputRole::Runtime { version, role }
-                        if version == "1.0" && role == &expected_role
-                ) => {}
+                    &input.source,
+                    crate::schema::WorkflowInputSource::Request
+                        | crate::schema::WorkflowInputSource::Application { .. }
+                )
+                && expected_role.as_ref().is_none_or(|expected_role| {
+                    matches!(
+                        &input.role,
+                        crate::schema::SemanticInputRole::Runtime { version, role }
+                            if version == "1.0" && role == expected_role
+                    )
+                }) => {}
         Some(_) => errors.push(format!(
-            "pipeline.workflow.adapters.selection.{field} '{name}' must reference a required \
-             request-sourced {dtype}{} workflow input with runtime role {:?}@1.0",
+            "adapters.selection.{field} '{name}' must reference a required \
+             request/application-sourced {dtype}{} workflow input{}",
             if let Some(extent) = second_dimension {
                 format!("[batch,{extent}]")
             } else {
                 "[batch]".to_string()
             },
             expected_role
+                .map(|role| format!(" with runtime role {role:?}@1.0"))
+                .unwrap_or_default()
         )),
         None => errors.push(format!(
-            "pipeline.workflow.adapters.selection.{field} '{name}' references an undeclared workflow input"
+            "adapters.selection.{field} '{name}' references an undeclared workflow input"
         )),
     }
 }
 
-fn validate_adapter_service(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
-    let Some(service) = &workflow.adapters else {
-        return;
-    };
+fn validate_adapter_service(
+    service: &crate::schema::AdapterServiceContract,
+    workflow: Option<&WorkflowSpec>,
+    errors: &mut Vec<String>,
+) {
     if !valid_adapter_base_fingerprint(&service.base_model_fingerprint) {
         errors.push(
-            "pipeline.workflow.adapters.base_model_fingerprint must be \
+            "adapters.base_model_fingerprint must be \
              onnx-genai-targeted-base-v1:sha256:<64 lowercase hexadecimal characters>"
                 .into(),
         );
     }
     if service.application_capability.trim().is_empty() {
-        errors.push("pipeline.workflow.adapters.application_capability must not be empty".into());
+        errors.push("adapters.application_capability must not be empty".into());
     } else if service.application_capability != "onnx-genai.adapters@1" {
-        errors.push(
-            "pipeline.workflow.adapters.application_capability must be onnx-genai.adapters@1"
-                .into(),
-        );
+        errors.push("adapters.application_capability must be onnx-genai.adapters@1".into());
     }
     if service.cache.max_entries == 0 {
-        errors
-            .push("pipeline.workflow.adapters.cache.max_entries must be greater than zero".into());
+        errors.push("adapters.cache.max_entries must be greater than zero".into());
     }
     if service.selection.max_adapters == 0 {
-        errors.push(
-            "pipeline.workflow.adapters.selection.max_adapters must be greater than zero".into(),
-        );
+        errors.push("adapters.selection.max_adapters must be greater than zero".into());
     }
     if service.artifacts.is_empty() {
-        errors.push("pipeline.workflow.adapters.artifacts must not be empty".into());
+        errors.push("adapters.artifacts must not be empty".into());
     }
-    validate_adapter_selection_input(
-        workflow,
-        &service.selection.row_ids,
-        "int64",
-        1,
-        None,
-        crate::schema::RuntimeInputRole::RowIds,
-        "row_ids",
-        errors,
-    );
-    validate_adapter_selection_input(
-        workflow,
-        &service.selection.request_epochs,
-        "int64",
-        1,
-        None,
-        crate::schema::RuntimeInputRole::RequestEpochs,
-        "request_epochs",
-        errors,
-    );
-    validate_adapter_selection_input(
-        workflow,
-        &service.selection.adapter_ids,
-        "int64",
-        2,
-        Some(service.selection.max_adapters),
-        crate::schema::RuntimeInputRole::AdapterIds,
-        "adapter_ids",
-        errors,
-    );
-    validate_adapter_selection_input(
-        workflow,
-        &service.selection.adapter_counts,
-        "int64",
-        1,
-        None,
-        crate::schema::RuntimeInputRole::AdapterCounts,
-        "adapter_counts",
-        errors,
-    );
-    validate_adapter_selection_input(
-        workflow,
-        &service.selection.scales,
-        "float32",
-        2,
-        Some(service.selection.max_adapters),
-        crate::schema::RuntimeInputRole::AdapterScales,
-        "scales",
-        errors,
-    );
-    if let Some(active) = &service.selection.active {
+    if let Some(workflow) = workflow {
+        if let Some(serving) = &workflow.serving
+            && service.selection.slot_ids != serving.slot_ids
+        {
+            errors.push(format!(
+                "adapters.selection.slot_ids must reference serving slot_ids '{}'",
+                serving.slot_ids
+            ));
+        }
         validate_adapter_selection_input(
             workflow,
-            active,
-            "bool",
+            &service.selection.slot_ids,
+            "int64",
             1,
             None,
-            crate::schema::RuntimeInputRole::AdapterActive,
-            "active",
+            None,
+            "slot_ids",
             errors,
         );
+        validate_adapter_selection_input(
+            workflow,
+            &service.selection.request_epochs,
+            "int64",
+            1,
+            None,
+            Some(crate::schema::RuntimeInputRole::RequestEpochs),
+            "request_epochs",
+            errors,
+        );
+        validate_adapter_selection_input(
+            workflow,
+            &service.selection.segments,
+            "int64",
+            2,
+            Some(service.selection.max_adapters),
+            Some(crate::schema::RuntimeInputRole::AdapterSegments),
+            "segments",
+            errors,
+        );
+        validate_adapter_selection_input(
+            workflow,
+            &service.selection.adapter_counts,
+            "int64",
+            1,
+            None,
+            Some(crate::schema::RuntimeInputRole::AdapterCounts),
+            "adapter_counts",
+            errors,
+        );
+        validate_adapter_selection_input(
+            workflow,
+            &service.selection.scales,
+            "float32",
+            2,
+            Some(service.selection.max_adapters),
+            Some(crate::schema::RuntimeInputRole::AdapterScales),
+            "scales",
+            errors,
+        );
+        if let Some(active) = &service.selection.active {
+            validate_adapter_selection_input(
+                workflow,
+                active,
+                "bool",
+                1,
+                None,
+                Some(crate::schema::RuntimeInputRole::AdapterActive),
+                "active",
+                errors,
+            );
+        }
+    } else {
+        for (field, value) in [
+            ("slot_ids", service.selection.slot_ids.as_str()),
+            ("request_epochs", service.selection.request_epochs.as_str()),
+            ("segments", service.selection.segments.as_str()),
+            ("adapter_counts", service.selection.adapter_counts.as_str()),
+            ("scales", service.selection.scales.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                errors.push(format!("adapters.selection.{field} must not be empty"));
+            }
+        }
     }
     let mut identities = BTreeSet::new();
     let mut indices = BTreeSet::new();
-    let mut target_owners = BTreeMap::<(String, String), String>::new();
+    let mut manifest_targets = BTreeMap::new();
+    let mut resolved_targets = BTreeSet::new();
+    for (index, target) in service.target_manifest.targets.iter().enumerate() {
+        let path = format!("adapters.target_manifest.targets[{index}]");
+        if target.id.trim().is_empty()
+            || target.component.trim().is_empty()
+            || target.parameter.trim().is_empty()
+        {
+            errors.push(format!(
+                "{path} id, component, and parameter must not be empty"
+            ));
+        }
+        if manifest_targets.insert(target.id.clone(), target).is_some() {
+            errors.push(format!("{path}.id '{}' is duplicated", target.id));
+        }
+        if !resolved_targets.insert((
+            target.component.clone(),
+            target.parameter.clone(),
+            target.output_slice.clone(),
+        )) {
+            errors.push(format!(
+                "{path} duplicates a resolved component/parameter/slice binding"
+            ));
+        }
+        if target.input_features == 0 || target.output_features == 0 {
+            errors.push(format!(
+                "{path} input_features and output_features must be greater than zero"
+            ));
+        }
+        if !matches!(
+            target.activation_dtype.as_str(),
+            "float16" | "fp16" | "float32" | "fp32" | "bfloat16" | "bf16"
+        ) {
+            errors.push(format!(
+                "{path}.activation_dtype '{}' must be a floating-point tensor dtype",
+                target.activation_dtype
+            ));
+        }
+        if let Some(slice) = &target.output_slice
+            && (slice.width == 0
+                || slice
+                    .offset
+                    .checked_add(slice.width)
+                    .is_none_or(|end| end > target.output_features))
+        {
+            errors.push(format!(
+                "{path}.output_slice must be non-empty and within output_features"
+            ));
+        }
+        if let Some(native) = &target.graph_inputs
+            && (native.a.trim().is_empty()
+                || native.b.trim().is_empty()
+                || native.a == native.b
+                || native.scale.as_ref().is_some_and(|scale| {
+                    scale.trim().is_empty() || scale == &native.a || scale == &native.b
+                }))
+        {
+            errors.push(format!(
+                "{path}.graph_inputs must contain distinct non-empty a/b/optional-scale input names"
+            ));
+        }
+        match workflow {
+            Some(workflow) if !workflow.components.contains_key(&target.component) => {
+                errors.push(format!(
+                    "{path}.component '{}' is undeclared",
+                    target.component
+                ));
+            }
+            None if target.component != "model" => errors.push(format!(
+                "{path}.component must be 'model' for bare-model metadata"
+            )),
+            _ => {}
+        }
+    }
+    if service.target_manifest.targets.is_empty() {
+        errors.push("adapters.target_manifest.targets must not be empty".into());
+    }
     for (name, artifact) in &service.artifacts {
-        let path = format!("pipeline.workflow.adapters.artifacts.{name}");
+        let path = format!("adapters.artifacts.{name}");
         if artifact.identity.trim().is_empty() || artifact.version.trim().is_empty() {
             errors.push(format!("{path} identity and version must not be empty"));
         }
@@ -677,6 +781,25 @@ fn validate_adapter_service(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
                     "{path}.weights[{index}].location must be under package path adapters/{name}/"
                 ));
             }
+            if weight.loader_capability.trim().is_empty() {
+                errors.push(format!(
+                    "{path}.weights[{index}].loader_capability must not be empty"
+                ));
+            }
+            let expected_loader = match weight.format {
+                crate::schema::AdapterWeightFormat::Json => "onnx-genai.adapters.json@1",
+                crate::schema::AdapterWeightFormat::OrtGenai => "onnxruntime.lora-adapter@1",
+                crate::schema::AdapterWeightFormat::HfPeft => "onnx-genai.adapters.hf-peft@1",
+                crate::schema::AdapterWeightFormat::Safetensors => {
+                    "onnx-genai.adapters.safetensors@1"
+                }
+            };
+            if weight.loader_capability != expected_loader {
+                errors.push(format!(
+                    "{path}.weights[{index}].loader_capability must be {expected_loader} for format {:?}",
+                    weight.format
+                ));
+            }
             if weight.sha256.len() != 64
                 || !weight
                     .sha256
@@ -687,9 +810,36 @@ fn validate_adapter_service(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
                     "{path}.weights[{index}].sha256 must be 64 lowercase hexadecimal characters"
                 ));
             }
+            let peft = weight.format == crate::schema::AdapterWeightFormat::HfPeft;
+            if peft != weight.config_location.is_some() || peft != weight.config_sha256.is_some() {
+                errors.push(format!(
+                    "{path}.weights[{index}] hf_peft requires config_location and config_sha256; other formats forbid them"
+                ));
+            }
+            if let Some(config_location) = &weight.config_location
+                && (std::path::Path::new(config_location).is_absolute()
+                    || !config_location.starts_with(&format!("adapters/{name}/"))
+                    || config_location
+                        .split(['/', '\\'])
+                        .any(|segment| segment == ".."))
+            {
+                errors.push(format!(
+                    "{path}.weights[{index}].config_location must be under package path adapters/{name}/"
+                ));
+            }
+            if let Some(config_sha256) = &weight.config_sha256
+                && (config_sha256.len() != 64
+                    || !config_sha256
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()))
+            {
+                errors.push(format!(
+                    "{path}.weights[{index}].config_sha256 must be 64 lowercase hexadecimal characters"
+                ));
+            }
         }
-        if artifact.targets.is_empty() {
-            errors.push(format!("{path}.targets must not be empty"));
+        if artifact.bindings.is_empty() {
+            errors.push(format!("{path}.bindings must not be empty"));
         }
         let mut local_targets = BTreeSet::new();
         let mut local_weight_keys = BTreeSet::new();
@@ -697,76 +847,50 @@ fn validate_adapter_service(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
             .weights
             .iter()
             .any(|weight| weight.format == crate::schema::AdapterWeightFormat::OrtGenai);
-        for (index, target) in artifact.targets.iter().enumerate() {
-            let target_path = format!("{path}.targets[{index}]");
-            if !workflow.components.contains_key(&target.component) {
+        for (index, binding) in artifact.bindings.iter().enumerate() {
+            let target_path = format!("{path}.bindings[{index}]");
+            if binding.target.trim().is_empty() || binding.weight_key.trim().is_empty() {
                 errors.push(format!(
-                    "{target_path}.component '{}' is undeclared",
-                    target.component
+                    "{target_path} target and weight_key must not be empty"
                 ));
             }
-            if target.parameter.trim().is_empty() || target.weight_key.trim().is_empty() {
-                errors.push(format!(
-                    "{target_path} parameter and weight_key must not be empty"
-                ));
-            }
-            if !local_weight_keys.insert(target.weight_key.clone()) {
+            if !local_weight_keys.insert(binding.weight_key.clone()) {
                 errors.push(format!(
                     "{path} declares duplicate weight_key '{}'",
-                    target.weight_key
+                    binding.weight_key
                 ));
             }
-            match &target.native_parameters {
-                Some(native)
-                    if native.a.trim().is_empty()
-                        || native.b.trim().is_empty()
-                        || native.a == native.b =>
-                {
-                    errors.push(format!(
-                        "{target_path}.native_parameters must contain distinct non-empty a and b initializer names"
-                    ));
-                }
-                None if has_ort_bundle => errors.push(format!(
-                    "{target_path}.native_parameters is required for an ort_genai weight artifact"
-                )),
-                _ => {}
-            }
-            if target.input_features == 0 || target.output_features == 0 {
+            let Some(target) = manifest_targets.get(&binding.target) else {
                 errors.push(format!(
-                    "{target_path} input_features and output_features must be greater than zero"
+                    "{target_path}.target '{}' is absent from adapters.target_manifest",
+                    binding.target
                 ));
-            }
-            let key = (target.component.clone(), target.parameter.clone());
-            if !local_targets.insert(key.clone()) {
+                continue;
+            };
+            if has_ort_bundle && target.graph_inputs.is_none() {
                 errors.push(format!(
-                    "{path} declares duplicate target '{}.{}'",
-                    target.component, target.parameter
+                    "{target_path}.target '{}' requires graph_inputs for an ort_genai weight artifact",
+                    binding.target
                 ));
             }
-            if let Some(owner) = target_owners.insert(key, name.clone())
-                && owner != *name
+            if binding.rank == Some(0) {
+                errors.push(format!(
+                    "{target_path}.rank must be greater than zero when present"
+                ));
+            }
+            if binding
+                .alpha
+                .is_some_and(|alpha| !alpha.is_finite() || alpha <= 0.0)
             {
-                // Multiple adapters may compose on one target, but the target dimensions must
-                // remain identical. The cross-artifact check below enforces that contract.
-                let owner_target = service
-                    .artifacts
-                    .get(&owner)
-                    .into_iter()
-                    .flat_map(|artifact| &artifact.targets)
-                    .find(|candidate| {
-                        candidate.component == target.component
-                            && candidate.parameter == target.parameter
-                    });
-                if owner_target.is_some_and(|owner_target| {
-                    owner_target.input_features != target.input_features
-                        || owner_target.output_features != target.output_features
-                        || owner_target.native_parameters != target.native_parameters
-                }) {
-                    errors.push(format!(
-                        "{target_path} conflicts with adapter '{owner}' binding for '{}.{}'",
-                        target.component, target.parameter
-                    ));
-                }
+                errors.push(format!(
+                    "{target_path}.alpha must be finite and greater than zero when present"
+                ));
+            }
+            if !local_targets.insert(binding.target.clone()) {
+                errors.push(format!(
+                    "{path} declares duplicate target '{}'",
+                    binding.target
+                ));
             }
         }
     }
@@ -777,9 +901,12 @@ fn validate_adapter_service(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
         .any(|(expected, actual)| expected != actual)
     {
         errors.push(format!(
-            "pipeline.workflow.adapters artifact indices must be contiguous from zero; found {indices:?}"
+            "adapters artifact indices must be contiguous from zero; found {indices:?}"
         ));
     }
+    let Some(workflow) = workflow else {
+        return;
+    };
     for (name, component) in &workflow.components {
         let Some(contract) = component
             .contract
@@ -808,8 +935,9 @@ fn validate_adapter_service(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
         }
         if let (Some(target_component), Some(target_parameter)) =
             (target_component, target_parameter)
-            && !target_owners
-                .contains_key(&(target_component.to_string(), target_parameter.to_string()))
+            && !service.target_manifest.targets.iter().any(|target| {
+                target.component == target_component && target.parameter == target_parameter
+            })
         {
             errors.push(format!(
                 "workflow parameter overlay component '{name}' targets undeclared adapter parameter '{target_component}.{target_parameter}'"
@@ -835,7 +963,6 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
     if workflow.manifest.onnx_opsets.is_empty() {
         errors.push("pipeline.workflow.manifest.onnx_opsets must not be empty".to_string());
     }
-    validate_adapter_service(workflow, errors);
     for (domain, version) in &workflow.manifest.onnx_opsets {
         if domain.trim().is_empty() || *version == 0 {
             errors.push(format!(

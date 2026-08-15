@@ -705,26 +705,26 @@ impl<'a> WorkflowExecutionPlan<'a> {
         let workflow = &engine.workflow;
         let mut values = std::mem::take(&mut self.values);
         let prepare_adapters = (|| -> anyhow::Result<()> {
-            if let Some(service) = &workflow.adapters {
+            if let Some(service) = &engine.adapter_service {
                 if !service.portable_fallback {
                     anyhow::bail!(
                         "adapter capability '{}' is unavailable in the portable workflow runtime and portable_fallback is disabled",
                         service.application_capability
                     );
                 }
-                let row_ids = values
-                    .get(&service.selection.row_ids)
+                let slot_ids = values
+                    .get(&service.selection.slot_ids)
                     .with_context(|| {
                         format!(
-                            "adapter service row_ids input '{}' is unavailable",
-                            service.selection.row_ids
+                            "adapter service slot_ids input '{}' is unavailable",
+                            service.selection.slot_ids
                         )
                     })?
                     .to_vec_i64()
                     .with_context(|| {
                         format!(
-                            "adapter service row_ids input '{}' must be host int64",
-                            service.selection.row_ids
+                            "adapter service slot_ids input '{}' must be host int64",
+                            service.selection.slot_ids
                         )
                     })?;
                 let request_epochs = values
@@ -745,19 +745,19 @@ impl<'a> WorkflowExecutionPlan<'a> {
                 let active_rows = if let Some(active) = &service.selection.active {
                     workflow_bool_rows(&values, active)?
                 } else {
-                    vec![true; row_ids.len()]
+                    vec![true; slot_ids.len()]
                 };
                 let selection = super::adapters::selection_from_inputs(
                     service,
                     &values,
-                    &row_ids,
+                    &slot_ids,
                     &request_epochs,
                 )?;
                 let context = engine.adapter_cache.borrow_mut().prepare(
                     &engine.package_root,
                     service,
                     &selection,
-                    &row_ids,
+                    &slot_ids,
                     &request_epochs,
                     &active_rows,
                 )?;
@@ -1790,20 +1790,19 @@ impl PipelineEngine {
             .to_vec_f32()
             .context("portable parameter overlay requires host float32 input")?;
         let service = self
-            .workflow
-            .adapters
+            .adapter_service
             .as_ref()
             .context("parameter overlay executed without an adapter service")?;
-        let row_ids = values
-            .get(&service.selection.row_ids)
+        let slot_ids = values
+            .get(&service.selection.slot_ids)
             .with_context(|| {
                 format!(
-                    "adapter row IDs '{}' are unavailable",
-                    service.selection.row_ids
+                    "adapter slot IDs '{}' are unavailable",
+                    service.selection.slot_ids
                 )
             })?
             .to_vec_i64()
-            .context("adapter row IDs must be host int64")?;
+            .context("adapter slot IDs must be host int64")?;
         let request_epochs = values
             .get(&service.selection.request_epochs)
             .with_context(|| {
@@ -1818,7 +1817,7 @@ impl PipelineEngine {
         let context = context
             .as_ref()
             .context("parameter overlay executed without a request adapter context")?;
-        let context = context.reordered(&row_ids, &request_epochs)?;
+        let context = context.reordered(&slot_ids, &request_epochs)?;
         let cache = self.adapter_cache.borrow();
         let (result, output_features) = super::adapters::apply_parameter_overlay(
             &cache,
@@ -2304,7 +2303,7 @@ fn workflow_request_value(
         | RuntimeInputRole::SessionId
         | RuntimeInputRole::RowIds
         | RuntimeInputRole::RequestEpochs
-        | RuntimeInputRole::AdapterIds
+        | RuntimeInputRole::AdapterSegments
         | RuntimeInputRole::AdapterCounts
         | RuntimeInputRole::AdapterScales
         | RuntimeInputRole::AdapterActive => Ok(None),

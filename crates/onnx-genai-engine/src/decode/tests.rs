@@ -88,6 +88,7 @@ fn empty_metadata() -> InferenceMetadata {
         quantization: None,
         preprocessing: None,
         pipeline: None,
+        adapters: None,
         hardware_requirements: None,
     }
 }

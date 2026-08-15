@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use onnx_genai_metadata::{PipelineSpec, PreprocessingSpec, load_metadata, load_pipeline_spec};
+use onnx_genai_metadata::{PipelineSpec, PreprocessingSpec, load_metadata};
 use onnx_model_package::{ModelPackage, SelectionRequest, is_model_package_directory};
 
 use crate::{
@@ -260,15 +260,8 @@ pub struct PipelineModelDirectory {
     /// leave this unset rather than mislabeling `genai_config.json` as native metadata.
     pub metadata_path: Option<PathBuf>,
     pub spec: PipelineSpec,
-    /// The package's parsed inference metadata, when it ships one.
-    ///
-    /// Resolving the directory already reads and validates this file, so every
-    /// setting it declares -- context length, chunked prefill, EOS ids,
-    /// sampling defaults -- is served from here rather than re-read. A reader
-    /// that re-opened the file could disagree with the spec built beside it,
-    /// and a reader that swallowed the parse error would silently see a model
-    /// that declares nothing.
-    pub metadata: Option<InferenceMetadata>,
+    /// Package-level adapter catalog and request-selection ABI.
+    pub adapters: Option<onnx_genai_metadata::AdapterServiceContract>,
     /// Typed preprocessing synthesized from compatibility config or loaded natively.
     pub preprocessing: Option<PreprocessingSpec>,
     pub model_paths: BTreeMap<String, PathBuf>,
@@ -328,11 +321,15 @@ impl PipelineModelDirectory {
                 root.display()
             ))
         })?;
-        let spec = load_pipeline_spec(&metadata_path)
+        let metadata = load_metadata(&metadata_path)
             .map_err(|err| OrtError::InvalidArgument(err.to_string()))?;
-        let preprocessing = load_metadata(&metadata_path)
-            .map_err(|err| OrtError::InvalidArgument(err.to_string()))?
-            .preprocessing;
+        let spec = metadata.pipeline.clone().ok_or_else(|| {
+            OrtError::InvalidArgument("metadata has no pipeline section".to_string())
+        })?;
+        onnx_genai_metadata::validate_metadata(&metadata)
+            .map_err(|errors| OrtError::InvalidArgument(errors.join("; ")))?;
+        let preprocessing = metadata.preprocessing;
+        let adapters = metadata.adapters;
 
         let mut model_paths = BTreeMap::new();
         for (name, component) in &spec.workflow.components {
@@ -368,7 +365,7 @@ impl PipelineModelDirectory {
             root: root.to_path_buf(),
             metadata_path: Some(metadata_path),
             spec,
-            metadata,
+            adapters,
             preprocessing,
             model_paths,
             tokenizer_paths,
