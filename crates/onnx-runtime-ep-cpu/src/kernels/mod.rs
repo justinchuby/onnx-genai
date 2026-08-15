@@ -1592,6 +1592,26 @@ pub fn to_dense_bytes(view: &TensorView) -> Result<Vec<u8>> {
     }
     // Byte origin of the element at logical index 0 (applies `byte_offset`).
     let origin = view.data_ptr::<u8>();
+    if view.is_contiguous() {
+        // Contiguous row-major: the byte origin addresses `n * esize`
+        // consecutive bytes, so one bulk copy replaces the per-element strided
+        // walk. The walk below costs an `elem_offset` dot product, a
+        // one-element `copy_nonoverlapping`, and a `next_index` carry chain per
+        // element, which dominates whole-tensor reads of large weights -- a
+        // 3584x3584 `Uint8` operand is 12.8M iterations of that loop. This
+        // mirrors the fast paths `to_dense_f32` and `write_dense_bytes` already
+        // have; `to_dense_bytes` was the one whole-tensor mover missing it.
+        //
+        // SAFETY: identical read assumptions to the strided loop below -- the
+        // validated view describes `n * esize` readable, contiguous bytes
+        // starting at `origin`, bounds-checked against the backing allocation by
+        // the owning EP (ep-api safety invariant #1). `u8` has no invalid bit
+        // patterns and `out` is a fresh, uniquely-owned buffer of the same
+        // length, so the regions cannot overlap.
+        let src = unsafe { std::slice::from_raw_parts(origin, n * esize) };
+        out.copy_from_slice(src);
+        return Ok(out);
+    }
     let mut idx = vec![0usize; view.shape.len()];
     let mut w = 0usize;
     loop {
@@ -1631,6 +1651,23 @@ pub fn write_dense_bytes(out: &mut TensorMut, data: &[u8]) -> Result<()> {
         return Ok(());
     }
     let origin = out.data_ptr_mut::<u8>();
+    if out.is_contiguous() {
+        // Contiguous row-major output: write `n * esize` consecutive bytes in
+        // one bulk copy instead of the per-element strided walk below, which
+        // costs an `elem_offset` dot product, a one-element
+        // `copy_nonoverlapping`, and a `next_index` carry chain per element.
+        // Counterpart to the fast path in `to_dense_bytes`.
+        //
+        // SAFETY: identical write assumptions to the strided loop below -- the
+        // validated output view describes `n * esize` writable, contiguous bytes
+        // starting at `origin`, bounds-checked against the backing allocation by
+        // the owning EP (ep-api safety invariant #1). `data.len()` was checked to
+        // equal `n * esize` above, so every byte is written exactly once, and
+        // `data` is a caller-owned buffer distinct from the output allocation.
+        let dst = unsafe { std::slice::from_raw_parts_mut(origin, n * esize) };
+        dst.copy_from_slice(data);
+        return Ok(());
+    }
     let strides = out.strides;
     let shape = out.shape;
     let mut idx = vec![0usize; shape.len()];
@@ -2005,6 +2042,122 @@ mod tests {
         let mut out = backing.view_mut();
         write_dense_f32(&mut out, &[1., 2., 3., 4., 5., 6.]).unwrap();
         assert_eq!(backing.to_f32(), vec![1., 2., 3., 4., 5., 6.]);
+    }
+
+    /// Transcription of the pre-bulk-copy `to_dense_bytes` body: the
+    /// per-element strided walk with no contiguity fast path. This is the
+    /// oracle the bulk-copy path must reproduce byte for byte.
+    fn to_dense_bytes_via_strided_walk(view: &TensorView) -> Vec<u8> {
+        let esize = elem_size(view.dtype).unwrap();
+        let n = numel(view.shape);
+        let mut out = vec![0u8; n * esize];
+        if n == 0 {
+            return out;
+        }
+        let origin = view.data_ptr::<u8>();
+        let mut idx = vec![0usize; view.shape.len()];
+        let mut w = 0usize;
+        loop {
+            let byte_off = elem_offset(view.strides, &idx) * esize as isize;
+            // SAFETY: same in-shape, in-bounds read as the production walk.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    origin.offset(byte_off),
+                    out.as_mut_ptr().add(w),
+                    esize,
+                );
+            }
+            w += esize;
+            if !next_index(view.shape, &mut idx) {
+                break;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn to_dense_bytes_bulk_copy_matches_the_strided_walk() {
+        // The contiguous fast path must be byte-identical to the walk it
+        // replaces. Odd dimensions and a rank-3 shape exercise the carry chain;
+        // the payload spans the full `u8` range so a truncation or sign bug
+        // could not hide.
+        for shape in [
+            vec![7usize],
+            vec![3, 5],
+            vec![2, 3, 7],
+            vec![1, 41],
+            vec![41, 1],
+        ] {
+            let n: usize = shape.iter().product();
+            let data: Vec<u8> = (0..n).map(|i| (i.wrapping_mul(37) % 256) as u8).collect();
+            let owned = Owned::u8(&shape, &data);
+            let view = owned.view();
+            assert!(view.is_contiguous(), "{shape:?} should be contiguous");
+            assert_eq!(
+                to_dense_bytes(&view).unwrap(),
+                to_dense_bytes_via_strided_walk(&view),
+                "bulk copy diverged from the strided walk for {shape:?}"
+            );
+            assert_eq!(to_dense_bytes(&view).unwrap(), data, "payload changed");
+        }
+    }
+
+    #[test]
+    fn to_dense_bytes_still_gathers_a_strided_view() {
+        // Backing [2,3] row-major exposed as transposed [3,2] with strides
+        // [1,3]: not contiguous, so the fast path must be skipped and the
+        // gather must still apply the strides. Without this the fast path could
+        // be reached unconditionally and every test above would still pass.
+        let owned = Owned::u8(&[2, 3], &[1, 2, 3, 4, 5, 6]).with_view(&[3, 2], &[1, 3]);
+        let view = owned.view();
+        assert!(!view.is_contiguous());
+        assert_eq!(to_dense_bytes(&view).unwrap(), vec![1, 4, 2, 5, 3, 6]);
+        assert_eq!(
+            to_dense_bytes(&view).unwrap(),
+            to_dense_bytes_via_strided_walk(&view)
+        );
+    }
+
+    #[test]
+    fn to_dense_bytes_reads_multi_byte_elements_whole() {
+        // `esize > 1` is where a byte/element unit mix-up in the bulk copy
+        // shows up: it must copy `n * esize` bytes, not `n`.
+        let data: Vec<i64> = vec![-1, 0, i64::MAX, i64::MIN, 7, -9];
+        let owned = Owned::i64(&[2, 3], &data);
+        let view = owned.view();
+        let dense = to_dense_bytes(&view).unwrap();
+        assert_eq!(dense.len(), 6 * 8);
+        assert_eq!(dense, to_dense_bytes_via_strided_walk(&view));
+        assert_eq!(dense, owned.bytes);
+    }
+
+    #[test]
+    fn write_dense_bytes_bulk_copy_and_scatter_agree_with_their_layouts() {
+        // The same payload written through a contiguous output (fast path) and
+        // through a transposed output (strided scatter) must land in storage
+        // the way each layout dictates, so the fast path cannot be taken
+        // unconditionally.
+        let payload: Vec<u8> = (1..=6u8).collect();
+
+        let mut contiguous = Owned::u8(&[2, 3], &[0; 6]);
+        write_dense_bytes(&mut contiguous.view_mut(), &payload).unwrap();
+        assert_eq!(contiguous.bytes, payload);
+
+        let mut strided = Owned::u8(&[2, 3], &[0; 6]).with_view(&[3, 2], &[1, 3]);
+        write_dense_bytes(&mut strided.view_mut(), &payload).unwrap();
+        assert_eq!(strided.bytes, vec![1, 3, 5, 2, 4, 6]);
+    }
+
+    #[test]
+    fn write_dense_bytes_round_trips_multi_byte_elements() {
+        let data: Vec<i64> = vec![-1, 0, i64::MAX, i64::MIN, 7, -9];
+        let source = Owned::i64(&[2, 3], &data);
+        let dense = to_dense_bytes(&source.view()).unwrap();
+
+        let mut sink = Owned::i64(&[2, 3], &[0; 6]);
+        write_dense_bytes(&mut sink.view_mut(), &dense).unwrap();
+        assert_eq!(sink.to_i64(), data);
+        assert_eq!(sink.bytes, source.bytes);
     }
 
     #[test]
