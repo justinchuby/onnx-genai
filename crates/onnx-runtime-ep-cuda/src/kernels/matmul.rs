@@ -34,6 +34,14 @@ use crate::runtime::{CudaRuntime, cuptr};
 /// NVRTC module/entry for the dense decode GEMVs.
 const GEMV_F16_MODULE: &str = "matmul_dense_gemv_f16";
 const GEMV_F16_ENTRY: &str = "matmul_dense_gemv_f16";
+/// Upper bound on the number of distinct dense `(dtype, M, K, N)` cuBLASLt plans
+/// a single `MatMul` node keeps warm simultaneously. A node realistically sees a
+/// small, fixed set — decode `M==1`, a handful of prefill widths, and any
+/// speculative verify width — so 8 covers the hot working set while capping the
+/// per-node workspace footprint. Eviction is LRU and only runs off the
+/// (non-capturing) creation path, so the MRU decode plan baked into a live
+/// captured graph is never freed.
+const DENSE_PLAN_CACHE_CAP: usize = 8;
 /// Threads per block for the dense fp16 GEMV. One thread owns one output
 /// column, so a warp reads 32 consecutive `B[k, col]` fp16 values — a fully
 /// coalesced 64-byte transaction per step. 256 gives good occupancy without
@@ -94,7 +102,7 @@ impl KernelFactory for MatMulFactory {
         Ok(Box::new(MatMulKernel {
             runtime: self.runtime.clone(),
             f32_gemv: Mutex::new(None),
-            dense_plan: Mutex::new(None),
+            dense_plans: Mutex::new(Vec::new()),
             last_call_capture_safe: AtomicBool::new(false),
         }))
     }
@@ -108,12 +116,14 @@ pub struct MatMulKernel {
     /// Reusing the exact algorithm preserves bitwise parity with the old path
     /// while eliminating all capture-time setup and device allocation.
     f32_gemv: Mutex<Option<F32GemvPlan>>,
-    /// cuBLASLt plan + persistent workspace preselected for the current 2-D
-    /// (`batch == 1`) dense M>1 shape. Reusing the algorithm keeps bitwise
-    /// parity with the per-call [`governed_gemm`](crate::blas::governed_gemm)
-    /// path while making the plain-`MatMul` M>1 path (e.g. the logits projection
-    /// at a speculative M=K verify width) CUDA-graph capturable.
-    dense_plan: Mutex<Option<DenseGemmPlan>>,
+    /// cuBLASLt plans + persistent workspaces keyed by the 2-D (`batch == 1`)
+    /// dense shape `(dtype, M, K, N)`. Each distinct shape the node runs keeps
+    /// its own preselected algorithm, so alternating shapes — prefill `M>1`,
+    /// decode `M==1`, and a speculative `M=K` verify width — all replay without
+    /// a per-call heuristic query, keeping the plain-`MatMul` path (e.g. the
+    /// logits projection `lm_head`) CUDA-graph capturable across shape changes.
+    /// MRU-ordered (front = most recent); bounded by [`DENSE_PLAN_CACHE_CAP`].
+    dense_plans: Mutex<Vec<DenseGemmPlan>>,
     /// Set after every [`execute`](Kernel::execute) to record whether the call
     /// took the allocation- and sync-free GEMV fast path (capture-safe) or the
     /// cuBLASLt path (per-call workspace + heuristic, not capturable). Mirrors
@@ -274,7 +284,7 @@ struct DenseGemmPlan {
 }
 
 // SAFETY: the plan holds only context-independent cuBLASLt host handles and a
-// device workspace pointer; launches are serialized by `MatMulKernel::dense_plan`.
+// device workspace pointer; launches are serialized by `MatMulKernel::launch_dense_capturable`.
 unsafe impl Send for DenseGemmPlan {}
 
 impl Drop for DenseGemmPlan {
@@ -501,10 +511,16 @@ fn uses_dense_gemv(plan: &MatMulPlan, dtype: GemmDtype) -> bool {
         && matches!(dtype, GemmDtype::F16 | GemmDtype::F32)
 }
 
+/// Whether the M==1 fp16 `lm_head` decode MatMul takes the capturable cuBLASLt
+/// plan path (default) instead of the hand fp16 GEMV. Default-ON: cuBLASLt is
+/// ~1.5x faster on the dense logits projection and, with the shape-keyed plan
+/// cache ([`MatMulKernel::launch_dense_capturable`]), is CUDA-graph capturable
+/// across prefill/decode/verify shapes. Set `ONNX_GENAI_LMHEAD_CUBLASLT` to
+/// `0`/`false`/`off` to fall back to the hand GEMV (the OFF escape hatch).
 fn lmhead_cublaslt_enabled() -> bool {
-    matches!(
+    !matches!(
         std::env::var("ONNX_GENAI_LMHEAD_CUBLASLT").ok().as_deref(),
-        Some("1") | Some("true") | Some("on")
+        Some("0") | Some("false") | Some("off")
     )
 }
 
@@ -802,33 +818,41 @@ impl MatMulKernel {
         c_ptr: u64,
     ) -> Result<()> {
         let capturing = self.runtime.is_capturing()?;
-        let mut cached = self.dense_plan.lock().map_err(|_| {
+        let mut cached = self.dense_plans.lock().map_err(|_| {
             EpError::KernelFailed("cuda_ep MatMul: dense GEMM plan lock poisoned".into())
         })?;
-        if cached
-            .as_ref()
-            .is_some_and(|plan| !plan.matches(dtype, m, k, n))
-        {
-            if capturing {
-                let plan = cached.as_ref().unwrap();
-                return Err(EpError::KernelFailed(format!(
-                    "cuda_ep MatMul: dense GEMM signature changed during capture \
-                     (warmed dtype={:?} M={} K={} N={}; current dtype={dtype:?} M={m} K={k} N={n})",
-                    plan.dtype, plan.m, plan.k, plan.n,
-                )));
+        // Shape-keyed lookup: every distinct (dtype, M, K, N) the node runs keeps
+        // its own warm cuBLASLt plan + workspace, so alternating shapes (prefill
+        // M>1, decode M==1, a speculative verify width) all replay a preselected
+        // algorithm with no per-call heuristic query. A hit is promoted to MRU so
+        // the hot decode shape is never the LRU eviction victim.
+        if let Some(idx) = cached.iter().position(|plan| plan.matches(dtype, m, k, n)) {
+            if idx != 0 {
+                let plan = cached.remove(idx);
+                cached.insert(0, plan);
             }
-            *cached = None;
+            return cached[0].launch(a_ptr, b_ptr, c_ptr);
         }
-        if cached.is_none() {
-            if capturing {
-                return Err(EpError::KernelFailed(format!(
-                    "cuda_ep MatMul: dense GEMM dtype={dtype:?} M={m} K={k} N={n} \
-                     was not warmed before capture"
-                )));
-            }
-            *cached = Some(DenseGemmPlan::new(self.runtime.clone(), dtype, m, k, n)?);
+        // Cold miss. During capture we must not create a plan (the heuristic
+        // query, allocation, and the cache mutation are all illegal inside a
+        // captured region), so require the shape to have been warmed by a
+        // preceding non-capturing pass — the same contract the single-shape
+        // path enforced, now per shape.
+        if capturing {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep MatMul: dense GEMM dtype={dtype:?} M={m} K={k} N={n} \
+                 was not warmed before capture"
+            )));
         }
-        cached.as_ref().unwrap().launch(a_ptr, b_ptr, c_ptr)
+        let plan = DenseGemmPlan::new(self.runtime.clone(), dtype, m, k, n)?;
+        cached.insert(0, plan);
+        // Bound the cache. Eviction only ever runs on this non-capturing path, so
+        // a plan baked into a live captured graph (always the MRU decode shape,
+        // kept at the front) is never freed out from under a replay.
+        if cached.len() > DENSE_PLAN_CACHE_CAP {
+            cached.truncate(DENSE_PLAN_CACHE_CAP);
+        }
+        cached[0].launch(a_ptr, b_ptr, c_ptr)
     }
 }
 
