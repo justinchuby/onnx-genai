@@ -61,10 +61,11 @@ pub use binding::IoBinding;
 pub use chat_template::{ChatMessage, ChatRole, ChatTemplate};
 pub use component::{OrtComponentSession, OrtComponentSessionRef};
 pub use decode::{
-    BatchedDecodeSession, BatchedSharedBufferDecodeSession, BatchedStaticCacheDecodeSession,
-    DecodeKvMode, DecodeSession, DecodeSessionOptions, DeviceSampleParams,
-    SharedBufferBatchOptions, StaticCacheBindingMode, StaticCacheBufferInfo,
-    StaticCacheDecodeOptions, StaticCacheDecodeSession, StaticCacheSignature,
+    BatchStepLogits, BatchedDecodeSession, BatchedSharedBufferDecodeSession,
+    BatchedStaticCacheDecodeSession, DecodeKvMode, DecodeSession, DecodeSessionOptions,
+    DeviceSampleParams, LogitsD2hStats, SharedBufferBatchOptions, StaticCacheBindingMode,
+    StaticCacheBufferInfo, StaticCacheDecodeOptions, StaticCacheDecodeSession,
+    StaticCacheSignature,
 };
 pub use eagle3::{
     Eagle3DecodeOptions, Eagle3DecodeSession, Eagle3DraftKvMode, Eagle3HeadSignature,

@@ -19,8 +19,10 @@ use onnx_runtime_ir::{Attribute, DataType, Node};
 
 use super::add::{broadcast_apply, require_same_dtype};
 use super::check_arity;
+use super::simd_activations;
 use crate::dtype::{
-    ComputeDomain, FloatElem, NumericElem, to_dense, to_dense_float, write_dense, write_dense_float,
+    ComputeDomain, FloatElem, NumericElem, to_dense, to_dense_f32_widen, to_dense_float,
+    write_dense, write_dense_float,
 };
 use crate::strided::numel;
 use crate::{dispatch_arith, dispatch_float};
@@ -527,6 +529,16 @@ impl Kernel for UnaryKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity(self.op.name(), inputs, outputs, 1, 1, 1)?;
         let op = self.op;
+        // Vectorised f32-domain fast path. `Float64` is excluded because it
+        // would round-trip through f32 and lose precision; `Sqrt` and `Erf`
+        // keep their exact scalar forms (see `kernels::simd_activations` for
+        // why `Erf` is deliberately not approximated).
+        if matches!(op, UnOp::Tanh) && inputs[0].dtype != DataType::Float64 {
+            let x = to_dense_f32_widen(op.name(), &inputs[0])?;
+            return simd_activations::write_mapped(op.name(), &mut outputs[0], &x, |x, y| {
+                simd_activations::tanh_f32_slice(x, y)
+            });
+        }
         dispatch_float!(inputs[0].dtype, op.name(), T => unary_typed::<T>(op, inputs, outputs))
     }
 

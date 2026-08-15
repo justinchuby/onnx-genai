@@ -84,6 +84,10 @@ name = "kernels"
 harness = false
 
 [[bench]]
+name = "activation_bench"
+harness = false
+
+[[bench]]
 name = "gqa_decode"
 harness = false
 
