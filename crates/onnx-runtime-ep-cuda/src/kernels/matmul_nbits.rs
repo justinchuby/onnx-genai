@@ -100,6 +100,22 @@ const GEMV_F16_GENERAL_BS_SPLITK_ENTRY: &str = "matmul_nbits_gemv_f16_general_bs
 /// latency-hiding target), which measured fastest (+9.7% decode vs single-warp);
 /// K_SPLIT=8 saturated.
 const GENERAL_BS_SPLITK: usize = 4;
+/// cp.async software-pipelined counterpart of [`GEMV_F16_GENERAL_BS_ENTRY`]
+/// (int4 only). Byte-identical accumulation to the single-warp entry — it keeps
+/// the exact per-lane depth assignment and fp32 product order — but stages each
+/// lane's next int4 weight word into a shared ring buffer with `cp.async`
+/// (SM80+). Intended to hide the Long-Scoreboard global-load latency, but
+/// measured a NO-GO (see [`use_gemv_cpasync`]): default OFF, opt-in via
+/// `ONNX_GENAI_GEMV_CPASYNC=1` for reproducibility. On < SM80 the same source
+/// compiles (via `#if __CUDA_ARCH__`) to the byte-identical direct-load loop.
+const GEMV_F16_GENERAL_BS_CPASYNC_ENTRY: &str = "matmul_nbits_gemv_f16_general_bs_cpasync";
+/// cp.async software-pipelined counterpart of [`GEMV_F16_GENERAL_BS_SPLITK_ENTRY`]
+/// (int4 only): the same `K_SPLIT`-warp grid-fill split-K, with each warp's
+/// weight loads staged through `cp.async`. Byte-identical to the non-cpasync
+/// split-K entry (same partial-sum association); it only reschedules the loads.
+/// Also a measured NO-GO — default OFF, opt-in via `ONNX_GENAI_GEMV_CPASYNC=1`.
+const GEMV_F16_GENERAL_BS_SPLITK_CPASYNC_ENTRY: &str =
+    "matmul_nbits_gemv_f16_general_bs_splitk_cpasync";
 /// Model-agnostic fp16 int4/int8 prefill GEMM for any power-of-two `block_size`.
 /// Mirrors [`GEMM_F16_ENTRY`] but walks `K` in fixed 32-wide tiles and computes
 /// `block = depth / block_size`, decoupling the tile width from the block width.
@@ -888,6 +904,48 @@ __device__ __forceinline__ float warp_sum(float value)
     }
     return value;
 }
+
+// ---- cp.async software-pipeline primitives (SM80+) -------------------------
+// `cp.async` streams a global load straight into shared memory without holding
+// a destination register while the transfer is in flight, so a lane can
+// prefetch its NEXT int4 weight word while the current word's LOP3 dequant + FMA
+// run. That hides the Long-Scoreboard global-load latency that dominates the
+// M=1 decode GEMV (loads are ~61% of stalls on glm block-128) without the
+// register pressure that made a plain `#pragma unroll` regress occupancy. The
+// primitives are only emitted for compute capability >= 8.0; every caller pairs
+// them with a byte-identical `#else` direct-load fallback so the same source
+// still compiles and runs correctly on < SM80 devices (Rule 11 portability).
+// cp.async pipeline geometry. Each lane prefetches its weight words a full tile
+// (GEMV_CPASYNC_BATCH iterations) at a time under a SINGLE async-copy group, and
+// keeps GEMV_CPASYNC_DEPTH tiles in flight — so the `commit_group`/`wait_group`
+// bookkeeping is paid once per BATCH iterations, not once per (tiny) 8-element
+// dot. That is what makes cp.async a net win here: a per-iteration commit/wait
+// was overhead-bound. Shared ring = WARPS*DEPTH*BATCH*32*4 bytes (16 KiB at
+// 8/2/8), well under the 48 KiB portable limit; lane is the fastest index so
+// each thread owns a distinct bank (conflict-free).
+#define GEMV_CPASYNC_WARPS 8
+#define GEMV_CPASYNC_BATCH 8
+#define GEMV_CPASYNC_DEPTH 2
+#if (__CUDA_ARCH__ >= 800)
+#define ONNX_GENAI_CP_ASYNC 1
+// Async-copy one aligned 4-byte int4 weight word from global into shared.
+__device__ __forceinline__ void cp_async_ca4(unsigned smem_addr, const void* gmem_ptr)
+{
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::
+                 "r"(smem_addr), "l"(gmem_ptr));
+}
+// Close the current async-copy group so it can be waited on independently.
+__device__ __forceinline__ void cp_async_commit()
+{
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+// Block until at most `N` (immediate) async-copy groups remain in flight.
+template <int N>
+__device__ __forceinline__ void cp_async_wait()
+{
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+}
+#endif  // __CUDA_ARCH__ >= 800
 
 // Fp16 GEMV bias epilogue. The fp32 accumulator is always rounded to fp16 for
 // the base output. When a bias is present:
@@ -3653,6 +3711,347 @@ extern "C" __global__ void matmul_nbits_gemv_f16_general_bs_splitk(
     }
 }
 
+// cp.async software-pipelined counterpart of `matmul_nbits_gemv_f16_general_bs`
+// (int4 only). Keeps the EXACT per-lane depth assignment and ascending fp32
+// product order of the single-warp kernel — so its output is byte-identical —
+// but stages each lane's next int4 weight word into a shared ring buffer with
+// `cp.async` (SM80+). The register-free prefetch hides the Long-Scoreboard
+// global-load latency that dominates the M=1 decode GEMV without the register
+// pressure that made a plain K-loop unroll regress occupancy. On < SM80 the
+// `#else` branch compiles to the byte-identical direct-load loop (Rule 11).
+extern "C" __global__ void matmul_nbits_gemv_f16_general_bs_cpasync(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales,
+    const unsigned char* __restrict__ zero_points,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int scales_fp16,
+    const int bias_post_round,
+    const int bits)
+{
+    (void)bits;  // int4-only entry; dispatch guarantees bits == 4.
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int columns_per_block = (int)blockDim.x >> 5;
+    const int column = (int)blockIdx.x * columns_per_block + warp;
+
+    float value = 0.0f;
+    if (column < n) {
+#if defined(ONNX_GENAI_CP_ASYNC)
+        // Double-buffered tile pipeline: prefetch GEMV_CPASYNC_BATCH weight
+        // words per async-copy group, GEMV_CPASYNC_DEPTH groups in flight.
+        __shared__ unsigned int
+            wbuf[GEMV_CPASYNC_WARPS][GEMV_CPASYNC_DEPTH][GEMV_CPASYNC_BATCH][32];
+        const int base = lane * 8;
+        const int tile_span = GEMV_CPASYNC_BATCH * 256;
+        // Prologue: launch the first GEMV_CPASYNC_DEPTH tiles.
+#pragma unroll
+        for (int p = 0; p < GEMV_CPASYNC_DEPTH; ++p) {
+#pragma unroll
+            for (int j = 0; j < GEMV_CPASYNC_BATCH; ++j) {
+                const int depth = base + (p * GEMV_CPASYNC_BATCH + j) * 256;
+                if (depth < k) {
+                    const int block = depth / block_size;
+                    const int within = depth - block * block_size;
+                    const long blob_base = ((long)column * k_blocks + block) * blob_size;
+                    const unsigned smem =
+                        (unsigned)__cvta_generic_to_shared(&wbuf[warp][p][j][lane]);
+                    cp_async_ca4(smem, packed + blob_base + (within >> 1));
+                }
+            }
+            cp_async_commit();
+        }
+        for (int t = 0; base + t * tile_span < k; ++t) {
+            const int slot = t % GEMV_CPASYNC_DEPTH;
+            // Wait until this tile (the oldest in-flight group) has landed.
+            cp_async_wait<GEMV_CPASYNC_DEPTH - 1>();
+#pragma unroll
+            for (int j = 0; j < GEMV_CPASYNC_BATCH; ++j) {
+                const int depth = base + (t * GEMV_CPASYNC_BATCH + j) * 256;
+                if (depth < k) {
+                    const unsigned int packed_word = wbuf[warp][slot][j][lane];
+                    const int block = depth / block_size;
+                    const int within = depth - block * block_size;
+                    float scale;
+                    if (scales_fp16) {
+                        scale = __half2float(reinterpret_cast<const __half*>(
+                            scales)[(long)column * k_blocks + block]);
+                    } else {
+                        scale = reinterpret_cast<const float*>(
+                            scales)[(long)column * k_blocks + block];
+                    }
+                    const int valid = min(8, k - depth);
+                    int zero_point = 8;
+                    if (zero_points) {
+                        const unsigned char zp =
+                            zero_points[(long)column * zp_row_bytes + (block >> 1)];
+                        zero_point = (block & 1) ? (zp >> 4) : (zp & 15);
+                    }
+                    float partial;
+                    if (valid == 8) {
+                        const unsigned int sub2 = int4_zero_point_sub2(zero_point);
+                        partial = dot_int4x8_f16_sub(packed_word, activation + depth, sub2);
+                    } else {
+                        partial = 0.0f;
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            if (i < valid) {
+                                const int q =
+                                    (int)((packed_word >> (i * 4)) & 15u) - zero_point;
+                                partial += (float)q * __half2float(activation[depth + i]);
+                            }
+                        }
+                    }
+                    value += partial * scale;
+                }
+            }
+            // Refill this slot with the tile GEMV_CPASYNC_DEPTH ahead; commit one
+            // group per tile so the wait-group depth stays consistent (an empty
+            // commit keeps the accounting balanced once the tail is exhausted).
+            const int tnext = t + GEMV_CPASYNC_DEPTH;
+#pragma unroll
+            for (int j = 0; j < GEMV_CPASYNC_BATCH; ++j) {
+                const int depth = base + (tnext * GEMV_CPASYNC_BATCH + j) * 256;
+                if (depth < k) {
+                    const int block = depth / block_size;
+                    const int within = depth - block * block_size;
+                    const long blob_base = ((long)column * k_blocks + block) * blob_size;
+                    const unsigned smem =
+                        (unsigned)__cvta_generic_to_shared(&wbuf[warp][slot][j][lane]);
+                    cp_async_ca4(smem, packed + blob_base + (within >> 1));
+                }
+            }
+            cp_async_commit();
+        }
+#else
+        // Byte-identical < SM80 fallback: the merged direct-load int4 loop.
+        for (int depth = lane * 8; depth < k; depth += 256) {
+            const int block = depth / block_size;
+            const int within = depth - block * block_size;
+            const long blob_base = ((long)column * k_blocks + block) * blob_size;
+            float scale;
+            if (scales_fp16) {
+                scale = __half2float(
+                    reinterpret_cast<const __half*>(scales)[(long)column * k_blocks + block]);
+            } else {
+                scale =
+                    reinterpret_cast<const float*>(scales)[(long)column * k_blocks + block];
+            }
+            const int valid = min(8, k - depth);
+            int zero_point = 8;
+            if (zero_points) {
+                const unsigned char zp =
+                    zero_points[(long)column * zp_row_bytes + (block >> 1)];
+                zero_point = (block & 1) ? (zp >> 4) : (zp & 15);
+            }
+            const unsigned int packed_word =
+                *reinterpret_cast<const unsigned int*>(packed + blob_base + (within >> 1));
+            float partial;
+            if (valid == 8) {
+                const unsigned int sub2 = int4_zero_point_sub2(zero_point);
+                partial = dot_int4x8_f16_sub(packed_word, activation + depth, sub2);
+            } else {
+                partial = 0.0f;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    if (i < valid) {
+                        const int q = (int)((packed_word >> (i * 4)) & 15u) - zero_point;
+                        partial += (float)q * __half2float(activation[depth + i]);
+                    }
+                }
+            }
+            value += partial * scale;
+        }
+#endif  // ONNX_GENAI_CP_ASYNC
+    }
+
+    value = warp_sum(value);
+    if (lane == 0 && column < n) {
+        output[column] = fold_bias_f16(value, bias, column, bias_post_round);
+    }
+}
+
+// cp.async software-pipelined counterpart of the general_bs split-K GEMV (int4
+// only). Same K_SPLIT-warp grid-fill and shared-memory fp32 partial reduction
+// as `matmul_nbits_gemv_f16_general_bs_splitk` — byte-identical to it, only the
+// per-warp weight loads are staged through `cp.async` (SM80+). The `#else`
+// branch is the byte-identical direct-load split-K loop for < SM80.
+extern "C" __global__ void matmul_nbits_gemv_f16_general_bs_splitk_cpasync(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales,
+    const unsigned char* __restrict__ zero_points,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int scales_fp16,
+    const int bias_post_round,
+    const int bits)
+{
+    (void)bits;  // int4-only entry; dispatch guarantees bits == 4.
+    constexpr int K_SPLIT = 4;  // must match Rust GENERAL_BS_SPLITK
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const int cols_per_block = warps_per_block / K_SPLIT;
+    const int col_local = warp / K_SPLIT;
+    const int ks = warp % K_SPLIT;
+    const int column = (int)blockIdx.x * cols_per_block + col_local;
+
+    __shared__ float partials[8][K_SPLIT];
+
+    float value = 0.0f;
+    if (column < n) {
+        const int base = ks * 256 + lane * 8;
+        const int stride = K_SPLIT * 256;
+#if defined(ONNX_GENAI_CP_ASYNC)
+        __shared__ unsigned int
+            wbuf[GEMV_CPASYNC_WARPS][GEMV_CPASYNC_DEPTH][GEMV_CPASYNC_BATCH][32];
+        const int tile_span = GEMV_CPASYNC_BATCH * stride;
+#pragma unroll
+        for (int p = 0; p < GEMV_CPASYNC_DEPTH; ++p) {
+#pragma unroll
+            for (int j = 0; j < GEMV_CPASYNC_BATCH; ++j) {
+                const int depth = base + (p * GEMV_CPASYNC_BATCH + j) * stride;
+                if (depth < k) {
+                    const int block = depth / block_size;
+                    const int within = depth - block * block_size;
+                    const long blob_base = ((long)column * k_blocks + block) * blob_size;
+                    const unsigned smem =
+                        (unsigned)__cvta_generic_to_shared(&wbuf[warp][p][j][lane]);
+                    cp_async_ca4(smem, packed + blob_base + (within >> 1));
+                }
+            }
+            cp_async_commit();
+        }
+        for (int t = 0; base + t * tile_span < k; ++t) {
+            const int slot = t % GEMV_CPASYNC_DEPTH;
+            cp_async_wait<GEMV_CPASYNC_DEPTH - 1>();
+#pragma unroll
+            for (int j = 0; j < GEMV_CPASYNC_BATCH; ++j) {
+                const int depth = base + (t * GEMV_CPASYNC_BATCH + j) * stride;
+                if (depth < k) {
+                    const unsigned int packed_word = wbuf[warp][slot][j][lane];
+                    const int block = depth / block_size;
+                    const int within = depth - block * block_size;
+                    float scale;
+                    if (scales_fp16) {
+                        scale = __half2float(reinterpret_cast<const __half*>(
+                            scales)[(long)column * k_blocks + block]);
+                    } else {
+                        scale = reinterpret_cast<const float*>(
+                            scales)[(long)column * k_blocks + block];
+                    }
+                    const int valid = min(8, k - depth);
+                    int zero_point = 8;
+                    if (zero_points) {
+                        const unsigned char zp =
+                            zero_points[(long)column * zp_row_bytes + (block >> 1)];
+                        zero_point = (block & 1) ? (zp >> 4) : (zp & 15);
+                    }
+                    float partial;
+                    if (valid == 8) {
+                        const unsigned int sub2 = int4_zero_point_sub2(zero_point);
+                        partial = dot_int4x8_f16_sub(packed_word, activation + depth, sub2);
+                    } else {
+                        partial = 0.0f;
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) {
+                            if (i < valid) {
+                                const int q =
+                                    (int)((packed_word >> (i * 4)) & 15u) - zero_point;
+                                partial += (float)q * __half2float(activation[depth + i]);
+                            }
+                        }
+                    }
+                    value += partial * scale;
+                }
+            }
+            const int tnext = t + GEMV_CPASYNC_DEPTH;
+#pragma unroll
+            for (int j = 0; j < GEMV_CPASYNC_BATCH; ++j) {
+                const int depth = base + (tnext * GEMV_CPASYNC_BATCH + j) * stride;
+                if (depth < k) {
+                    const int block = depth / block_size;
+                    const int within = depth - block * block_size;
+                    const long blob_base = ((long)column * k_blocks + block) * blob_size;
+                    const unsigned smem =
+                        (unsigned)__cvta_generic_to_shared(&wbuf[warp][slot][j][lane]);
+                    cp_async_ca4(smem, packed + blob_base + (within >> 1));
+                }
+            }
+            cp_async_commit();
+        }
+#else
+        for (int depth = base; depth < k; depth += stride) {
+            const int block = depth / block_size;
+            const int within = depth - block * block_size;
+            const long blob_base = ((long)column * k_blocks + block) * blob_size;
+            float scale;
+            if (scales_fp16) {
+                scale = __half2float(
+                    reinterpret_cast<const __half*>(scales)[(long)column * k_blocks + block]);
+            } else {
+                scale =
+                    reinterpret_cast<const float*>(scales)[(long)column * k_blocks + block];
+            }
+            const int valid = min(8, k - depth);
+            int zero_point = 8;
+            if (zero_points) {
+                const unsigned char zp =
+                    zero_points[(long)column * zp_row_bytes + (block >> 1)];
+                zero_point = (block & 1) ? (zp >> 4) : (zp & 15);
+            }
+            const unsigned int packed_word =
+                *reinterpret_cast<const unsigned int*>(packed + blob_base + (within >> 1));
+            float partial;
+            if (valid == 8) {
+                const unsigned int sub2 = int4_zero_point_sub2(zero_point);
+                partial = dot_int4x8_f16_sub(packed_word, activation + depth, sub2);
+            } else {
+                partial = 0.0f;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    if (i < valid) {
+                        const int q = (int)((packed_word >> (i * 4)) & 15u) - zero_point;
+                        partial += (float)q * __half2float(activation[depth + i]);
+                    }
+                }
+            }
+            value += partial * scale;
+        }
+#endif  // ONNX_GENAI_CP_ASYNC
+    }
+
+    value = warp_sum(value);
+    if (lane == 0) {
+        partials[col_local][ks] = (column < n) ? value : 0.0f;
+    }
+    __syncthreads();
+    if (ks == 0 && lane == 0 && column < n) {
+        float acc = 0.0f;
+#pragma unroll
+        for (int s = 0; s < K_SPLIT; ++s) {
+            acc += partials[col_local][s];
+        }
+        output[column] = fold_bias_f16(acc, bias, column, bias_post_round);
+    }
+}
+
 // Model-agnostic fp16 int4/int8 prefill GEMM supporting any power-of-two
 // block_size. Identical 16x16 tiling and fp32 accumulation as the tuned
 // block-32 GEMM, but the reduction walks K in fixed 32-wide tiles and derives
@@ -3904,6 +4303,42 @@ fn general_bs_splitk_override() -> Option<bool> {
         Some("0") | Some("false") | Some("off") => Some(false),
         _ => None,
     }
+}
+
+/// Developer override for the cp.async software-pipelined int4 decode GEMV:
+/// `1`/`true`/`on` forces the cp.async entries on (still requires SM80+),
+/// `0`/`false`/`off` forces the direct-load entries, and any other/unset value
+/// defers to the default (on for SM80+). Primarily for A/B measurement.
+fn gemv_cpasync_override() -> Option<bool> {
+    match std::env::var("ONNX_GENAI_GEMV_CPASYNC").ok().as_deref() {
+        Some("1") | Some("true") | Some("on") => Some(true),
+        Some("0") | Some("false") | Some("off") => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether to route the block!=32 int4 decode GEMV through the cp.async
+/// software-pipelined entries. cp.async (`cp.async.*`) is SM80+, so the path is
+/// arch-gated; the entries carry a byte-identical `#else` fallback compiled for
+/// < SM80. int8 keeps the direct-load entries (the cp.async entries are
+/// int4-only).
+///
+/// DEFAULT OFF — measured NO-GO. Staging the int4 weight words through
+/// `cp.async` regressed glm-4-9b decode on every configuration tried (single-
+/// warp 102.6→88.3 tok/s, split-K 112.4→89.7, per-iteration and batched
+/// pipelines alike), while greedy tokens stayed byte-identical. The M=1 GEMV
+/// does ~8 FMAs per loaded word, so there is no independent compute to overlap
+/// the prefetch against (unlike Marlin's mma tiles), and the shared-memory ring
+/// *reduces* the occupancy that the merged split-K win relies on to hide the
+/// same latency. The kernels + `ONNX_GENAI_GEMV_CPASYNC=1` opt-in are retained
+/// so the negative result stays reproducible, but the merged direct-load path
+/// remains the default (byte-identical, no regression). See the decision drop
+/// `.squad/decisions/inbox/deckard-int4-gemv-cpasync.md`.
+fn use_gemv_cpasync(compute_capability: (u32, u32), bits: usize) -> bool {
+    if bits != 4 || compute_capability.0 < 8 {
+        return false;
+    }
+    gemv_cpasync_override().unwrap_or(false)
 }
 
 fn use_f16_symmetric_splitk(
@@ -6661,6 +7096,11 @@ impl MatMulNBitsKernel {
                 self.bits,
                 self.runtime.capabilities().multiprocessor_count(),
             );
+        // cp.async software-pipelined int4 GEMV: stacks on the LOP3 + split-K
+        // path, staging weight loads through shared to hide the Long-Scoreboard
+        // latency. SM80+ + int4 only; byte-identical to the direct-load entry.
+        let use_cpasync = self.block_size != 32
+            && use_gemv_cpasync(self.runtime.capabilities().compute_capability(), self.bits);
         let entry = if self.block_size != 32 {
             // Any non-block-32 layout uses the model-agnostic general kernel; the
             // tuned DownProjection / scales_f16 / general entries bake in the
@@ -6670,7 +7110,13 @@ impl MatMulNBitsKernel {
             // dequantizes an optional asymmetric zero point per block, so it is
             // correct for both symmetric (zp==8) and asymmetric layouts.
             if use_general_splitk {
-                GEMV_F16_GENERAL_BS_SPLITK_ENTRY
+                if use_cpasync {
+                    GEMV_F16_GENERAL_BS_SPLITK_CPASYNC_ENTRY
+                } else {
+                    GEMV_F16_GENERAL_BS_SPLITK_ENTRY
+                }
+            } else if use_cpasync {
+                GEMV_F16_GENERAL_BS_CPASYNC_ENTRY
             } else {
                 GEMV_F16_GENERAL_BS_ENTRY
             }
@@ -6784,7 +7230,11 @@ impl MatMulNBitsKernel {
         // scalar (`bits`) to select the packed int4/int8 layout for any block
         // width; the tuned block-32 entries bake in their bit width and take none.
         // The general_bs split-K entry shares the same trailing `bits` ABI.
-        if entry == GEMV_F16_GENERAL_BS_ENTRY || entry == GEMV_F16_GENERAL_BS_SPLITK_ENTRY {
+        if entry == GEMV_F16_GENERAL_BS_ENTRY
+            || entry == GEMV_F16_GENERAL_BS_SPLITK_ENTRY
+            || entry == GEMV_F16_GENERAL_BS_CPASYNC_ENTRY
+            || entry == GEMV_F16_GENERAL_BS_SPLITK_CPASYNC_ENTRY
+        {
             builder.arg(&bits);
         }
         // SAFETY: M=1 fp16 inputs; all tensors were dtype/shape/contiguity
