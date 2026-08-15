@@ -415,6 +415,58 @@ fused forward read each weight once for `N` tokens, measured at `1/N` with a
 ceiling of `N_max ~ 19 @ 2048 ctx` (#884/#891). It is not a faster transfer; it
 is the same transfer doing `N` times the work.
 
+### Placement: move the computation to the data
+
+Batching is not the only remaining lever for dense models. There is a second one,
+and it is on a different axis from everything above: instead of asking how to move
+weights more cleverly, ask **whether a given operation should run where its
+weights already are.**
+
+The extreme case is the embedding lookup. It is a gather: one row of `hidden`
+values per token, and essentially no arithmetic. Running it on the device with
+non-resident weights means moving the whole table — 389,283,840 B on the 14B, the
+same tensor isolated as key 919 in #945 — to produce about 10 KB of output. At
+the ~5 GB/s seen in streaming runs that is ~78 ms per token to do no work. No
+prefetch, admission policy or residency scheme improves it, because the transfer
+*is* the cost. The only correct answer is not to move the weights.
+
+The general rule, which is the per-operation form of the bandwidth floor above:
+
+> Place an operation where its weights already live when its arithmetic intensity
+> is low enough that moving the weights costs more than computing on the slower
+> device.
+
+For weight bytes `W`, work `F`, link bandwidth `B_link` and device rates
+`C_fast` / `C_slow`, prefer the slow device when
+
+```
+F / C_slow  <  W / B_link  +  F / C_fast
+```
+
+A gather has `F ~ 0`, so the condition holds whenever the weights are not
+resident. A `lm_head` GEMV on the 14B is `2 x 5120 x 152064 ~ 1.557 GFLOP`
+against 389 MB, which is close enough to the boundary that it must be measured
+rather than argued. Anything compute-dense — attention, an MLP over many tokens —
+fails the condition, and its weights should move.
+
+Two consequences worth stating:
+
+1. **This is the lever dense models still have.** Streaming has nothing to exploit
+   there (`reads_per_step = 1.000` on all 867 keys) and lost to the OS by 30x when
+   tried. Placement does not depend on reuse existing.
+2. **It changes what the EP partition is for.** Today a graph is split between EPs
+   by *op support*. This says the split should also consider *weight residency and
+   arithmetic intensity* — which needs a per-op residency report added to the
+   capability table in "What the EP must report".
+
+**Unproven, and on the critical path:** interspersed CPU/GPU partitions are
+exactly what this requires, and as of today the plugin-EP path hangs when it has
+them (#982), which is why whole-graph-or-nothing claiming is the current default.
+Placement also crosses a captured region — CUDA graph capture is load-bearing here
+(#854/#867), and a per-token excursion to another device may break it. That
+interaction is unknown and should be checked before anything is built, because it
+could invalidate the approach on the native path entirely. Tracked in #994.
+
 **Unmeasured:** every figure above comes from discrete GPUs — WDDM on an
 RTX 4060 and Linux on an H200. True unified memory (Apple Silicon, an APU with
 no discrete pool) has **not** been measured, so this subsection is a prediction
@@ -476,6 +528,7 @@ names the measurement that established the need.
 | **Virtual-memory capability and granule** | Flat VMM vs blocks-plus-table vs static contiguous | 2 MiB CUDA granule; committed/useful ratio drives the choice | Known to the allocator, not reported |
 | **Resident vs host read bandwidth for the access pattern** | How much residency is worth, and therefore hot-set sizing | Sequential proxy 11.41 GB/s vs real strided GEMV ~5.6 GB/s — a 2x error in the sizing input (#877 → #880) | Absent |
 | **Budget enforcement** — does this EP apply a memory limit, or only observe one | Whether `--vram-limit` is a bound or a suggestion, and whether the runtime may report it as binding | ORT accepts a limit and reports weights at 258.6% of it with no action, while native CUDA honours the same request (#955) | Absent; silently `advisory_only` on ORT |
+| **Per-op weight residency** — where each operation's weights currently live | Whether an op should run here at all, or on the device its weights are already on (see "Placement: move the computation to the data") | An embedding gather moves 389 MB to produce ~10 KB; the transfer is the entire cost (#994) | Absent; placement is by op support only |
 | **KV layout preference as a stride descriptor** | Which physical KV form to bind | EPs differ; a growing enum imposed by the runtime cannot express it (#783) | A runtime-side enum |
 | **Reclaim capability** | Whether an EP-side holder can answer pressure at all (C5) | — | Absent; no pressure path into the EP |
 
