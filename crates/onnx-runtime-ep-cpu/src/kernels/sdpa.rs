@@ -245,8 +245,11 @@ pub struct QkCapture<'a> {
     pub stage: QkCaptureStage,
 }
 
-#[cfg(all(test, target_arch = "aarch64"))]
-static SDPA_NEON_TEST_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(all(
+    test,
+    any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+))]
+static SDPA_SIMD_TEST_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Test counter: incremented when the Accelerate (cblas_sgemm/AMX) SDPA fast
 /// path fires on macOS/iOS.
@@ -343,19 +346,25 @@ pub fn sdpa_f32(
             if t.q_seq == 1 && per_head_elements <= 8192 {
                 #[cfg(all(test, target_arch = "aarch64"))]
                 SDPA_NEON_DECODE_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                sdpa_f32_neon(t, cfg, bias, mask, y);
+                sdpa_f32_simd(t, cfg, bias, mask, y);
                 return;
             }
             sdpa_f32_accelerate(t, cfg, bias, mask, y);
             return;
         }
     }
-    // NEON-vectorized path for aarch64: uses dot_f32 and axpy_f32 which
-    // dispatch to 4×-unrolled NEON intrinsics. Same semantics as the scalar
-    // reference, just faster inner loops.
+    // SIMD path: same semantics as the scalar reference, but `dot_f32` and
+    // `axpy_f32` use 4×-unrolled NEON on aarch64 and AVX2+FMA on x86. A
+    // `QkCapture` still goes to the scalar reference so captured logits stay
+    // bit-identical to the oracle the goldens pin.
     #[cfg(target_arch = "aarch64")]
     if qk.is_none() {
-        sdpa_f32_neon(t, cfg, bias, mask, y);
+        sdpa_f32_simd(t, cfg, bias, mask, y);
+        return;
+    }
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if qk.is_none() && crate::backend::has_simd_x86() {
+        sdpa_f32_simd(t, cfg, bias, mask, y);
         return;
     }
     sdpa_f32_scalar(t, cfg, bias, mask, y, qk);
@@ -844,13 +853,16 @@ unsafe fn axpy_avx2_fma(dst: &mut [f32], scalar: f32, src: &[f32]) {
     }
 }
 
-/// NEON-vectorized SDPA for aarch64 — same semantics as the scalar reference
-/// but uses 4×-unrolled NEON dot product and AXPY for the inner loops.
+/// SIMD-vectorized SDPA — same semantics and control flow as the scalar
+/// reference, but the inner loops go through [`dot_f32`] and [`axpy_f32`],
+/// which dispatch to 4×-unrolled NEON on aarch64 and to AVX2+FMA on x86.
 ///
-/// Handles all features (GQA, causal, softcap, bias, mask) with identical
-/// control flow to the scalar reference, just faster inner math.
-#[cfg(target_arch = "aarch64")]
-fn sdpa_f32_neon(
+/// The body is arch-neutral: it was written for aarch64 but contains no
+/// intrinsics, so the only thing that ever kept it off x86 was its `cfg`.
+///
+/// Handles all features (GQA, causal, softcap, bias, mask).
+#[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
+fn sdpa_f32_simd(
     t: &SdpaTensors,
     cfg: &SdpaConfig,
     bias: &dyn AttnBias,
@@ -858,7 +870,7 @@ fn sdpa_f32_neon(
     y: &mut [f32],
 ) {
     #[cfg(test)]
-    SDPA_NEON_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    SDPA_SIMD_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let SdpaTensors {
         q,
@@ -1656,7 +1668,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
     fn deterministic_values(n: usize, seed: u64, magnitude: f32) -> Vec<f32> {
         let mut s = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
         (0..n)
@@ -1670,13 +1682,13 @@ mod tests {
             .collect()
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
     struct PatternBias {
         q_seq: usize,
         kv_seq: usize,
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
     impl AttnBias for PatternBias {
         fn at(&self, b: usize, head: usize, i: usize, j: usize) -> f32 {
             let idx = (((b * 17 + head * 13 + i) * self.kv_seq + j) % 19) as f32;
@@ -1685,14 +1697,14 @@ mod tests {
         }
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
     struct PatternMask {
         q_seq: usize,
         kv_seq: usize,
         fully_masked_query: Option<usize>,
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
     impl KeyMask for PatternMask {
         fn at(&self, b: usize, i: usize, j: usize) -> f32 {
             debug_assert!(i < self.q_seq && j < self.kv_seq);
@@ -1712,7 +1724,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
     fn sdpa_f64_reference(
         t: &SdpaTensors,
         cfg: &SdpaConfig,
@@ -1795,9 +1807,12 @@ mod tests {
         y
     }
 
-    #[cfg(target_arch = "aarch64")]
+    /// The SIMD SDPA path must agree with the scalar oracle (and with an f64
+    /// reference) across GQA / causal / softcap / bias / mask / fully-masked
+    /// cases. Runs on aarch64 *and* x86, since both dispatch to `sdpa_f32_simd`.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
     #[test]
-    fn sdpa_neon_matches_scalar_and_f64_reference_on_decode_shapes() {
+    fn sdpa_simd_matches_scalar_and_f64_reference_on_decode_shapes() {
         struct Case {
             name: &'static str,
             batch: usize,
@@ -1912,15 +1927,15 @@ mod tests {
             let bias_ref: &dyn AttnBias = if case.use_bias { &bias } else { &NoBias };
             let mask_ref: &dyn KeyMask = if case.use_mask { &mask } else { &NoMask };
             let mut scalar = vec![f32::NAN; y_len];
-            let mut neon = vec![f32::NAN; y_len];
+            let mut simd = vec![f32::NAN; y_len];
             sdpa_f32_scalar(&tensors, &case.cfg, bias_ref, mask_ref, &mut scalar, None);
-            sdpa_f32_neon(&tensors, &case.cfg, bias_ref, mask_ref, &mut neon);
+            sdpa_f32_simd(&tensors, &case.cfg, bias_ref, mask_ref, &mut simd);
             let f64_ref = sdpa_f64_reference(&tensors, &case.cfg, bias_ref, mask_ref);
 
             let mut max_scalar_abs = 0.0f32;
             let mut max_f64_abs = 0.0f32;
             let mut max_scalar_rel = 0.0f32;
-            for ((&got, &scalar), &f64_value) in neon.iter().zip(&scalar).zip(&f64_ref) {
+            for ((&got, &scalar), &f64_value) in simd.iter().zip(&scalar).zip(&f64_ref) {
                 assert!(got.is_finite(), "{} produced non-finite output", case.name);
                 let scalar_abs = (got - scalar).abs();
                 let f64_abs = (got - f64_value).abs();
@@ -1928,27 +1943,196 @@ mod tests {
                 max_f64_abs = max_f64_abs.max(f64_abs);
                 max_scalar_rel = max_scalar_rel.max(scalar_abs / scalar.abs().max(1e-4));
             }
-            // NEON uses a 4x-unrolled tree reduction while the scalar reference
-            // is sequential, so exact parity is not expected. The bound is still
-            // tight enough to catch dropped tail lanes, missing max subtraction,
-            // and accumulator corruption; guard-break probes for those fail.
+            // The SIMD path uses a 4x-unrolled tree reduction while the scalar
+            // reference is sequential, so exact parity is not expected. The
+            // bound is still tight enough to catch dropped tail lanes, missing
+            // max subtraction, and accumulator corruption; guard-break probes
+            // for those fail.
             assert!(
                 max_scalar_abs <= 5e-4 && max_scalar_rel <= 2e-3,
-                "{}: NEON vs scalar max_abs={max_scalar_abs:e} max_rel={max_scalar_rel:e}",
+                "{}: simd vs scalar max_abs={max_scalar_abs:e} max_rel={max_scalar_rel:e}",
                 case.name
             );
             assert!(
                 max_f64_abs <= 1e-3,
-                "{}: NEON vs f64 max_abs={max_f64_abs:e}",
+                "{}: simd vs f64 max_abs={max_f64_abs:e}",
                 case.name
             );
         }
     }
 
-    #[cfg(all(target_arch = "aarch64", not(feature = "mlas")))]
+    /// The *dispatcher* (not the vectorised body called directly) must stay
+    /// within tolerance of the scalar oracle for batched, grouped, causal and
+    /// softcapped shapes. This is the entry point `Attention`,
+    /// `MultiHeadAttention`, `com.microsoft.Attention` and `VarLenAttention`
+    /// actually call, so it is what production numerics depend on.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
     #[test]
-    fn sdpa_dispatcher_reaches_neon_on_aarch64() {
+    fn sdpa_dispatch_matches_scalar_oracle_across_shapes() {
+        // (batch, heads, kv_heads, q_seq, kv_seq, head_size, v_head_size)
+        let shapes = [
+            (2usize, 8usize, 8usize, 1usize, 1usize, 64usize, 64usize),
+            (2, 12, 4, 1, 513, 64, 64),
+            (1, 32, 8, 1, 2049, 128, 128),
+            (3, 6, 3, 7, 71, 33, 17),
+            (1, 4, 1, 129, 129, 80, 80),
+        ];
+        for (bi, &(batch, heads, kv_heads, q_seq, kv_seq, dh, dv)) in shapes.iter().enumerate() {
+            let q = deterministic_values(batch * heads * q_seq * dh, 0x5EED_0 + bi as u64, 0.9);
+            let k = deterministic_values(batch * kv_heads * kv_seq * dh, 0x5EED_1 + bi as u64, 0.9);
+            let v = deterministic_values(batch * kv_heads * kv_seq * dv, 0x5EED_2 + bi as u64, 0.9);
+            let tensors = SdpaTensors {
+                q: &q,
+                k: &k,
+                v: &v,
+                batch,
+                num_heads: heads,
+                num_kv_heads: kv_heads,
+                q_seq,
+                kv_seq,
+                head_size: dh,
+                v_head_size: dv,
+            };
+            for (label, cfg) in [
+                (
+                    "plain",
+                    SdpaConfig {
+                        scale: ScaleMode::PostDot(1.0 / (dh as f32).sqrt()),
+                        softcap: None,
+                        causal: false,
+                        past_seq: 0,
+                        causal_fill: f32::NEG_INFINITY,
+                    },
+                ),
+                (
+                    "causal-softcap",
+                    SdpaConfig {
+                        scale: ScaleMode::SplitSqrt(1.0 / (dh as f32).sqrt().sqrt()),
+                        softcap: Some(30.0),
+                        causal: true,
+                        past_seq: kv_seq.saturating_sub(q_seq),
+                        causal_fill: f32::MIN,
+                    },
+                ),
+            ] {
+                let y_len = batch * heads * q_seq * dv;
+                let mut dispatched = vec![f32::NAN; y_len];
+                let mut oracle = vec![f32::NAN; y_len];
+                sdpa_f32(&tensors, &cfg, &NoBias, &NoMask, &mut dispatched, None);
+                sdpa_f32_scalar(&tensors, &cfg, &NoBias, &NoMask, &mut oracle, None);
+                for (&got, &want) in dispatched.iter().zip(&oracle) {
+                    assert!(
+                        got.is_finite(),
+                        "shape {bi} {label}: dispatcher produced non-finite output"
+                    );
+                    let abs = (got - want).abs();
+                    assert!(
+                        abs <= 5e-4 && abs / want.abs().max(1e-4) <= 2e-3,
+                        "shape {bi} {label}: dispatcher vs scalar oracle abs={abs:e}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A `QkCapture` request must keep taking the scalar reference on every
+    /// architecture: the captured logits are the oracle the parity goldens pin,
+    /// so they have to stay bit-identical to `sdpa_f32_scalar`.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn qk_capture_stays_bit_identical_to_the_scalar_oracle() {
+        let (batch, heads, kv_heads, q_seq, kv_seq, dh) =
+            (2usize, 8usize, 2usize, 3usize, 67usize, 64usize);
+        let q = deterministic_values(batch * heads * q_seq * dh, 0xC0FFEE_1, 0.8);
+        let k = deterministic_values(batch * kv_heads * kv_seq * dh, 0xC0FFEE_2, 0.8);
+        let v = deterministic_values(batch * kv_heads * kv_seq * dh, 0xC0FFEE_3, 0.8);
+        let tensors = SdpaTensors {
+            q: &q,
+            k: &k,
+            v: &v,
+            batch,
+            num_heads: heads,
+            num_kv_heads: kv_heads,
+            q_seq,
+            kv_seq,
+            head_size: dh,
+            v_head_size: dh,
+        };
+        let cfg = SdpaConfig {
+            scale: ScaleMode::PostDot(1.0 / (dh as f32).sqrt()),
+            softcap: None,
+            causal: true,
+            past_seq: kv_seq - q_seq,
+            causal_fill: f32::NEG_INFINITY,
+        };
+        let y_len = batch * heads * q_seq * dh;
+        let score_len = batch * heads * q_seq * kv_seq;
+        for stage in [QkCaptureStage::PreSoftmax, QkCaptureStage::PostSoftmax] {
+            let mut y_dispatch = vec![f32::NAN; y_len];
+            let mut y_oracle = vec![f32::NAN; y_len];
+            let mut scores_dispatch = vec![f32::NAN; score_len];
+            let mut scores_oracle = vec![f32::NAN; score_len];
+            sdpa_f32(
+                &tensors,
+                &cfg,
+                &NoBias,
+                &NoMask,
+                &mut y_dispatch,
+                Some(QkCapture {
+                    scores: &mut scores_dispatch,
+                    stage,
+                }),
+            );
+            sdpa_f32_scalar(
+                &tensors,
+                &cfg,
+                &NoBias,
+                &NoMask,
+                &mut y_oracle,
+                Some(QkCapture {
+                    scores: &mut scores_oracle,
+                    stage,
+                }),
+            );
+            assert_eq!(
+                scores_dispatch.to_bits_vec(),
+                scores_oracle.to_bits_vec(),
+                "captured scores diverged from the scalar oracle"
+            );
+            assert_eq!(
+                y_dispatch.to_bits_vec(),
+                y_oracle.to_bits_vec(),
+                "capture-path output diverged from the scalar oracle"
+            );
+        }
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
+    trait ToBitsVec {
+        fn to_bits_vec(&self) -> Vec<u32>;
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
+    impl ToBitsVec for [f32] {
+        fn to_bits_vec(&self) -> Vec<u32> {
+            self.iter().map(|value| value.to_bits()).collect()
+        }
+    }
+
+    #[cfg(all(
+        any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"),
+        not(feature = "mlas")
+    ))]
+    #[test]
+    fn sdpa_dispatcher_reaches_simd_path() {
         use std::sync::atomic::Ordering;
+
+        // On x86 the SIMD path is runtime-detected; a pre-AVX2 host legitimately
+        // stays on the scalar reference.
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if !crate::backend::has_simd_x86() {
+            return;
+        }
 
         // Use q_seq > 1 so the Accelerate path fires on macOS (the NEON decode
         // bypass only applies when q_seq == 1 with small per-head work).
@@ -1978,21 +2162,21 @@ mod tests {
         };
         // On macOS/iOS without MLAS, the Accelerate path fires instead of NEON.
         // On other aarch64 (Linux), the NEON path fires.
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios")))]
         let before = SDPA_ACCELERATE_TEST_HITS.load(Ordering::Relaxed);
-        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-        let before = SDPA_NEON_TEST_HITS.load(Ordering::Relaxed);
+        #[cfg(not(all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios"))))]
+        let before = SDPA_SIMD_TEST_HITS.load(Ordering::Relaxed);
 
         let mut y = vec![f32::NAN; batch * num_heads * q_seq * dv];
         sdpa_f32(&tensors, &cfg, &NoBias, &NoMask, &mut y, None);
 
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios")))]
         let after = SDPA_ACCELERATE_TEST_HITS.load(Ordering::Relaxed);
-        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-        let after = SDPA_NEON_TEST_HITS.load(Ordering::Relaxed);
+        #[cfg(not(all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios"))))]
+        let after = SDPA_SIMD_TEST_HITS.load(Ordering::Relaxed);
         assert!(
             after > before,
-            "sdpa_f32 dispatcher did not execute accelerated path on aarch64"
+            "sdpa_f32 dispatcher did not execute the accelerated path"
         );
         assert!(y.iter().all(|value| value.is_finite()));
     }
