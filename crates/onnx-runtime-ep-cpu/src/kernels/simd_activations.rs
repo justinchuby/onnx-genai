@@ -125,6 +125,11 @@ where
 /// Smallest slice length for which the vector path is worth its dispatch
 /// overhead. Below this the scalar loop wins (measured: crossover sits between
 /// 8 and 32 elements; 32 is the conservative side of it).
+///
+/// Only the `x86_64` dispatch arms consult this, but the tests below use it as
+/// a length unit on every architecture, so it stays compiled rather than
+/// `cfg`-gated.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) const SIMD_MIN_LEN: usize = 32;
 
 // ---------------------------------------------------------------------------
@@ -132,6 +137,11 @@ pub(crate) const SIMD_MIN_LEN: usize = 32;
 // ---------------------------------------------------------------------------
 
 /// `MlasTanhConstants`, `onnxruntime/core/mlas/lib/tanh.cpp`.
+///
+/// Consumed exclusively by the AVX2 module below, so it follows that module's
+/// gating: on a non-`x86_64` target these would be unreferenced constants, and
+/// CI builds with `-D warnings`.
+#[cfg(target_arch = "x86_64")]
 mod tanh_c {
     pub(super) const LOWER: f32 = -9.0;
     pub(super) const UPPER: f32 = 9.0;
@@ -149,6 +159,9 @@ mod tanh_c {
 }
 
 /// `MlasLogisticConstants`, `onnxruntime/core/mlas/lib/logistic.cpp`.
+///
+/// `x86_64`-only for the same reason as [`tanh_c`].
+#[cfg(target_arch = "x86_64")]
 mod logistic_c {
     pub(super) const LOWER: f32 = -18.0;
     pub(super) const UPPER: f32 = 18.0;
@@ -175,6 +188,11 @@ const GELU_C: f32 = 0.044715;
 // ---------------------------------------------------------------------------
 
 /// Returns `true` when the AVX2+FMA vector kernels in this module are live.
+///
+/// Deliberately answers on every architecture (`false` off `x86_64`) so tests
+/// can branch on it portably; only the `x86_64` dispatch arms call it, hence
+/// the conditional `dead_code` allowance.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 #[inline]
 pub(crate) fn vector_path_available() -> bool {
     #[cfg(target_arch = "x86_64")]

@@ -23,6 +23,28 @@
 # overhead.  On macOS (local dev) this is a genuine cross-compile; see the
 # host-detection logic below for scope limitations.
 #
+# The architecture dimension
+# --------------------------
+# The Linux target above pins target_arch = "x86_64", which is the SAME arch
+# the x86_64 CI lanes already build.  So it cannot catch the mirror-image
+# mistake: an item that is only referenced from inside a
+# cfg(target_arch = "x86_64") block becomes dead code on aarch64, and CI
+# builds with -D warnings.  #1037 proved this gap — it vectorised the
+# activation family on AVX2+FMA and left `SIMD_MIN_LEN`,
+# `vector_path_available` and 26 MLAS polynomial constants referenced only
+# from x86_64-gated code, which broke BOTH ARM64 lanes at the compile step
+# while every x86_64 job stayed green.
+#
+# So this script now runs a second pass:
+#
+#   Target: aarch64-unknown-linux-gnu
+#   Effect: target_arch = "aarch64", target_os = "linux"
+#
+# Between the two passes, every crate is compiled with target_arch and
+# target_os each differing from the x86_64-Linux lanes at least once.  The
+# ARM64 lanes stay the execution signal; this is only the compile gate, and it
+# costs seconds on the quality lane instead of minutes on a scarce ARM runner.
+#
 # Known gaps
 # ----------
 # 1. Cannot catch RUNTIME dispatch errors (e.g. a backend enum arm that
@@ -34,6 +56,9 @@
 #    set.
 # 3. Windows-specific cfg issues (target_os = "windows") are not exercised.
 #    The portable test matrix covers Windows; this script covers "not macOS."
+# 4. onnx-runtime-cpuinfo is excluded from the aarch64 pass: its cmake build
+#    script compiles C for the target and so needs a cross gcc that neither
+#    ubuntu-latest nor a macOS host has.  It contains no arch-gated Rust.
 #
 # Exit codes
 # ----------
@@ -44,6 +69,7 @@
 set -euo pipefail
 
 TARGET="x86_64-unknown-linux-gnu"
+ARCH_TARGET="aarch64-unknown-linux-gnu"
 
 # The full offline crate set from CI — every crate whose normal+dev dependency
 # tree contains no ort-sys/CUDA dependency that needs a native toolchain.
@@ -113,14 +139,16 @@ CRATES_NO_FFI=(
 
 # ─── Target installation ───────────────────────────────────────────────────
 
-if ! rustup target list --installed | grep -q "$TARGET"; then
-    echo "▶ Installing cross-target $TARGET (one-time setup)..."
-    if ! rustup target add "$TARGET" 2>/dev/null; then
-        echo "✗ Failed to install target $TARGET." >&2
-        echo "  Run: rustup target add $TARGET" >&2
-        exit 2
+for t in "$TARGET" "$ARCH_TARGET"; do
+    if ! rustup target list --installed | grep -q "^$t\$"; then
+        echo "▶ Installing cross-target $t (one-time setup)..."
+        if ! rustup target add "$t" 2>/dev/null; then
+            echo "✗ Failed to install target $t." >&2
+            echo "  Run: rustup target add $t" >&2
+            exit 2
+        fi
     fi
-fi
+done
 
 # ─── Host detection and scope selection ────────────────────────────────────
 
@@ -131,6 +159,15 @@ if [ "$HOST_OS" = "Linux" ]; then
     # sysroot.  Use the full set.
     CRATES=("${CRATES_FULL[@]}")
     SCOPE_NOTE="full offline set (native target)"
+    # Same-OS cross, so no foreign sysroot is needed and every crate that is
+    # pure Rust (or whose build script only generates Rust) still checks.  Only
+    # cpuinfo, which compiles C for the target, needs a cross gcc.
+    ARCH_CRATES=()
+    for crate in "${CRATES_FULL[@]}"; do
+        [ "$crate" = "onnx-runtime-cpuinfo" ] && continue
+        ARCH_CRATES+=("$crate")
+    done
+    ARCH_SCOPE_NOTE="full offline set minus onnx-runtime-cpuinfo (needs a cross gcc)"
 else
     # On macOS (or other non-Linux hosts), ort-sys and cpuinfo need Linux
     # system headers that are unavailable without a cross-sysroot.  Fall back
@@ -138,6 +175,8 @@ else
     # optimizer, and loader crates — and CI (Linux) covers the rest.
     CRATES=("${CRATES_NO_FFI[@]}")
     SCOPE_NOTE="FFI-free subset (ort-sys/cpuinfo excluded — CI covers the full set)"
+    ARCH_CRATES=("${CRATES_NO_FFI[@]}")
+    ARCH_SCOPE_NOTE="$SCOPE_NOTE"
     echo "⚠  Running on $HOST_OS — scoping to crates without FFI build scripts."
     echo "   To check onnx-runtime-ep-cpu locally, install a Linux sysroot or"
     echo "   rely on CI (ubuntu-latest) where this script runs the full set."
@@ -149,6 +188,11 @@ fi
 PKGS=()
 for crate in "${CRATES[@]}"; do
     PKGS+=("-p" "$crate")
+done
+
+ARCH_PKGS=()
+for crate in "${ARCH_CRATES[@]}"; do
+    ARCH_PKGS+=("-p" "$crate")
 done
 
 # ─── Run the check ────────────────────────────────────────────────────────
@@ -177,4 +221,37 @@ if ! cargo clippy --locked --target "$TARGET" --all-targets "${PKGS[@]}" -- -D w
 fi
 
 echo ""
-echo "✓ Cross-compile check passed ($SCOPE_NOTE)"
+echo "✓ OS-dimension check passed ($SCOPE_NOTE)"
+
+# ─── Run the architecture check ───────────────────────────────────────────
+
+echo ""
+echo "▶ Cross-arch check (target: $ARCH_TARGET, scope: $ARCH_SCOPE_NOTE)"
+echo "  Command: cargo clippy --target $ARCH_TARGET --all-targets ${ARCH_PKGS[*]} -- -D warnings"
+echo ""
+
+if ! cargo clippy --locked --target "$ARCH_TARGET" --all-targets "${ARCH_PKGS[@]}" -- -D warnings; then
+    echo "" >&2
+    echo "✗ Cross-arch check FAILED." >&2
+    echo "" >&2
+    echo "  One or more crates do not compile for $ARCH_TARGET." >&2
+    echo "" >&2
+    echo "  WHY THIS CHECK EXISTS:" >&2
+    echo "  Every other blocking lane builds target_arch = \"x86_64\", so an item" >&2
+    echo "  referenced ONLY from inside a cfg(target_arch = \"x86_64\") block looks" >&2
+    echo "  used everywhere it is checked — and is dead code on ARM64, which CI" >&2
+    echo "  builds with -D warnings.  #1037 proved this: simd_activations.rs left" >&2
+    echo "  SIMD_MIN_LEN, vector_path_available and 26 MLAS polynomial constants" >&2
+    echo "  reachable only from x86_64 code, breaking both ARM64 lanes at the" >&2
+    echo "  compile step while every x86_64 job stayed green." >&2
+    echo "" >&2
+    echo "  FIX: gate x86-only items with cfg(target_arch = ...) alongside their" >&2
+    echo "  only consumer, or — when portable tests still need them — mark them" >&2
+    echo "  #[cfg_attr(not(target_arch = \"x86_64\"), allow(dead_code))]." >&2
+    exit 1
+fi
+
+echo ""
+echo "✓ Cross-arch check passed ($ARCH_SCOPE_NOTE)"
+echo ""
+echo "✓ Cross-compile check passed (target_os and target_arch dimensions)"
