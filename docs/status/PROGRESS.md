@@ -85,7 +85,101 @@ _Last updated: 2026-08-13T14:45:00Z_
 
 ---
 
-## Recent milestones (2026-07-28 → 2026-08-13) — newest first
+## Recent milestones (2026-07-28 → 2026-08-15) — newest first
+
+### 2026-08-15 — The memory line's numbers were not what they claimed: fabricated capacity, an 8× hidden weight footprint, and a budget that did nothing
+
+A day spent finding out that several load-bearing numbers in the memory line were
+either invented or measuring the wrong thing. Every item below is a case of a value
+that existed, was consumed as if measured, and corresponded to nothing.
+
+- **#947/#952 — stop fabricating device and host capacity.** `PROVISIONAL_VRAM_CAPACITY_BYTES
+  = 8 GiB` (plus 16 GiB host RAM and disk) were invented constants, and the default
+  `0.90` fraction multiplied them. A user on a Windows ARM laptop with unified memory and
+  no NVIDIA GPU was shown a VRAM budget of exactly **7,730,940,928 bytes** for a device
+  that does not exist. A second, independent copy in `onnx-genai-server/src/state.rs`
+  capped the server at ~7.2 GiB on any machine including an H200. Replaced with real
+  platform queries (`GlobalMemoryStatusEx`, `/proc/meminfo`, `sysctlbyname`, `statvfs`);
+  a fraction of an unknown capacity now resolves to `None`, not a manufactured number.
+  Reproduced on a CPU-only run with no GPU involved, so this was never laptop-specific.
+
+- **#979 — symmetric int4 had no zero-copy CPU kernel and paid 8× RAM.** The first branch
+  of the CPU `MatMulNBits` decode dispatch reads packed int4 in place, but it is gated on
+  the *presence of a `zero_points` input*. Symmetric models have none, so they fell past
+  every packed path into a resident f32 dequantisation cache. Measured `qwen14b-zp`
+  (symmetric despite the name): **~66 GB resident, paging, 561 s for 2 tokens**. After the
+  fix: **7.80 GB, 0.96× of its int4 weight bytes**, output byte-identical. On the 0.5B,
+  2,752 MB → 434 MB. The mathematically simpler case had been getting the most expensive
+  fallback.
+
+- **#971/#987 — the memory plan accounted for the file, not the residency, and the budget
+  changed nothing.** `total_weight_bytes` reported on-disk int4 size while the session
+  resided at ~8× that, so every fit verdict and the KV budget derived from
+  "capacity − weights" used a number 8× too small. The plan now reports
+  `resident_f32_cache_bytes` and `f32_weight_cache_admitted`, and the cache became a
+  governed decision: taken when the expanded footprint fits, declined when it does not.
+  Verified at the boundary — no budget and 4 GiB admit (2.20 GB fits), 2 GiB declines —
+  and the decline is **lossless** (byte-identical over 64 tokens). Deliberately *not*
+  wired to `accuracy_level = 4`, which also cuts footprint but diverges: a budget may
+  never buy memory with accuracy.
+
+- **#955 — `advisory_only` made visible.** A user passed `--vram-limit`, was shown
+  "model weights 7.8 GiB **258.6%**", and nothing happened. The plan was computed, logged,
+  rendered as a percentage of itself, and consumed by nothing. The runtime now warns when
+  it reports a budget it will not apply *and* the weights exceed it. The design rule is
+  recorded: an EP either enforces a budget or declares that it cannot, and the runtime
+  reports which, before the run.
+
+- **#959/#970 — native CPU load was serial, not expensive.** 43 s/GB before the first
+  token, which made an 8 GB model take minutes to start. The instinct was that we did
+  extra work; the CPU-time column said the opposite — we burn ~9.6 CPU-seconds against
+  ORT's ~15.7 and still took 2.2× the wall time, at 1.27 cores against ORT's 4.5. One
+  serial phase (`dequant-kn`) explained all of it. Parallelised: 6.4 s → 3.5 s, now
+  matching ORT exactly.
+
+- **#750 stage 3a (#968) — ragged batch geometry on native CUDA.** Per-row length,
+  position and mask in one fused forward, so a batch no longer needs uniform lengths.
+  Gate: three prompts at lengths 1/5/14, `per_row_past_lens=[0, 4, 13]`, every row
+  byte-identical to that prompt run solo, and CUDA graph capture survived
+  (`captures=1 replays=23 fallbacks=0 invalidations=0`). Batching is the only lever that
+  changes weight bytes per token (`1/N`), so keeping capture mattered.
+
+- **#956 (#969, #973) — the CUDA EP as an ORT plugin: mechanism works, coverage did not.**
+  The plugin loads, is discovered and executes — but claimed **0 of 585 nodes** on a real
+  decoder, because it advertised every kernel under domain `""` while 61% of the graph is
+  `com.microsoft`. The kernels existed; they were advertised in the wrong domain. Fixed by
+  deriving the registry from the real `OpRegistry`. Interspersed CPU/GPU partitions then
+  hang (#982), so claiming is whole-graph-or-nothing by default — no user is worse off
+  than before, and the hang is tracked rather than hidden.
+
+- **Two hypotheses for #982 tested and ruled out.** Both were real bugs, both fixed,
+  neither was the cause: the plugin advertised the laptop's **Intel iGPU** as a `cuda_ep`
+  device (`DeviceSupport.vendor_id` existed and was never read), and
+  `transfer_full_copy_tensors` classified an unknown memory device as CPU — a guess that
+  would produce exactly this hang if it ever fired. Recorded on the issue so the next
+  investigation does not re-test them.
+
+- **#994/#995 — placement, and the cost model that would decide it.** Streaming's leverage
+  is MoE, not dense: all 867 dense weight keys measure `reads_per_step = 1.000` and our
+  managed streaming lost to WDDM by 30×. The lever dense models still have is *placement* —
+  run an op where its weights already live. An embedding gather moves 389 MB to produce
+  ~10 KB; the transfer is the entire cost. The `Cost` reporting hook already exists on
+  `KernelMatch::Supported`, but the values are fabricated (CPU hardcoded at exactly 100×
+  CUDA per element, `bytes_moved` assuming f32). Recorded the separation that makes it
+  portable and offline-computable: the EP reports *structure* (bytes, FLOPs), the runtime
+  supplies *rates* (measured or loaded). First real rate measured: host DRAM read
+  bandwidth 10.07 / 26.50 / 37.46 / **49.28 GB/s** at 1 / 4 / 8 / 20 threads — a 5× spread
+  that a scalar `memory_bandwidth` field cannot express.
+
+**A note on method, because it was the day's actual lesson.** Every one of the above was
+found by checking a number against an independent source, and several of my own
+intermediate conclusions were wrong and had to be retracted publicly: a "clean" validation
+run that was clean because the knob never engaged; a load/decode split contaminated by a
+cold file cache; a workaround recommended from model *directory names* instead of the
+graphs, which was exactly backwards; and a footprint lever (`accuracy_level = 4`) that
+looked free on a short prompt and diverged on a long one. The checks that caught these were
+cheap — read the graph, warm the cache, run 64 tokens instead of 4, print the counter that
+proves the path executed.
 
 ### 2026-08-13 — Over-budget models on Windows: ~100× from *not* streaming, and the memory line's accounting corrected
 

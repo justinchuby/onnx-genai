@@ -806,3 +806,143 @@ fn current_path_matches_f64_oracle_projection_shapes() {
     );
     assert!(overall.all_finite);
 }
+
+// ---------------------------------------------------------------------------
+// GPU gate: the opt-in fp16 (ORT-matching) wide GEMV (ONNX_GENAI_GEMV_FP16=1)
+// ---------------------------------------------------------------------------
+
+/// glm's real block-128 decode (M=1) projection shapes. block-128 is the group
+/// size where the wide multicol GEMV (and its fp16 sibling) is active; the KV
+/// projection (N=256) is excluded because it can route through the split-K
+/// entry, not the wide/fp16 entry this gate targets.
+const GLM_DECODE_SHAPES: &[(&str, usize, usize)] = &[
+    ("glm4-attn-qkv", 4096, 4096),
+    ("glm4-attn-o", 4096, 4096),
+    ("glm4-mlp-gate-up", 4096, 13696),
+    ("glm4-mlp-down", 13696, 4096),
+];
+
+/// **Accuracy gate for the opt-in fp16 (ORT-matching) wide GEMV.**
+///
+/// The fp16 kernel (`matmul_nbits_gemv_f16_general_bs_wide_multicol_fp16`,
+/// selected by `ONNX_GENAI_GEMV_FP16=1`) runs the per-chunk MAC in fp16
+/// `__hfma2` and keeps the *entire per-lane K reduction* in fp16 `__half2`
+/// accumulators — exactly matching ORT's `MatMulFloat4BitsKernelM1` (the
+/// equal-conditions fp16-vs-fp16 path); fp32 is used ONLY in the final
+/// cross-lane warp-shuffle reduction. Because each lane strides K by 32 and
+/// folds only a handful of chunks, the fp16 accumulation is a wide, shallow tree
+/// (depth ~tens, not K=4096..13696), so almost no mantissa is lost. It is
+/// **not** byte-identical to the fp32 path by construction, so it ships opt-in
+/// gated on *this* accuracy bound rather than bit-identity.
+///
+/// The bar is deliberately the **same justified [`Envelope`]** the reviewed fp32
+/// int4 path must satisfy (`current_path_matches_f64_oracle_*`): the fp16 path is
+/// held to the identical numeric tolerance — no weakening — on glm's real
+/// block-128 decode shapes with both symmetric and asymmetric zero points and
+/// both scale dtypes. For transparency the test also runs the fp32 path on the
+/// same problems and reports the fp16-vs-fp32 oracle-error ratio, and asserts the
+/// fp16 output actually diverges from fp32 (proving the fp16 kernel — not the
+/// fp32 fallback — was exercised).
+///
+/// `ONNX_GENAI_GENERAL_SPLITK=0` pins the wide/multicol entry so the selection is
+/// deterministic regardless of the device's SM count.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn fp16_mixed_gemv_matches_f64_oracle_glm_decode() {
+    let Some(ep) = maybe_cuda() else {
+        eprintln!("[marlin-numerics] skipping: CUDA runtime unavailable");
+        return;
+    };
+    // Pin the wide/multicol entry (not split-K) so both the fp32 reference and
+    // the fp16 candidate route through the same wide GEMV family on every GPU.
+    // SAFETY: single-threaded test body; restored before returning.
+    unsafe { std::env::set_var("ONNX_GENAI_GENERAL_SPLITK", "0") };
+
+    let mut fp16_overall = ParityReport {
+        all_finite: true,
+        ..Default::default()
+    };
+    let mut fp32_overall = ParityReport {
+        all_finite: true,
+        ..Default::default()
+    };
+    let mut worst_ratio = 0.0f64;
+    let mut any_fp16_divergence = false;
+    let mut seed = 0xF16A_0000u64;
+    for &(name, k, n) in GLM_DECODE_SHAPES {
+        for &asymmetric in &[false, true] {
+            for &scales_fp16 in &[false, true] {
+                seed = seed.wrapping_add(0x9E37_79B9);
+                // glm decode: block-128, M=1.
+                let p = Int4Problem::new(1, k, n, 128, scales_fp16, asymmetric, seed);
+
+                // fp32 multicol reference (env off) — the precise int4 kernel.
+                unsafe { std::env::remove_var("ONNX_GENAI_GEMV_FP16") };
+                let fp32 = run_matmul_nbits_f16(&ep, &p);
+                let fp32_report = p.parity(&fp32);
+
+                // fp16 mixed candidate (env on).
+                unsafe { std::env::set_var("ONNX_GENAI_GEMV_FP16", "1") };
+                let fp16 = run_matmul_nbits_f16(&ep, &p);
+                unsafe { std::env::remove_var("ONNX_GENAI_GEMV_FP16") };
+                let fp16_report = p.parity(&fp16);
+
+                // Sentinel: the fp16 kernel must actually have been selected —
+                // its reordered/hfma2 arithmetic differs from fp32 in the low
+                // bits. If the outputs were bit-identical the fp16 entry was not
+                // exercised and the gate would be vacuous.
+                if fp16
+                    .iter()
+                    .zip(&fp32)
+                    .any(|(a, b)| a.to_bits() != b.to_bits())
+                {
+                    any_fp16_divergence = true;
+                }
+
+                let label = format!(
+                    "fp16 {name} M=1 K={k} N={n} bs=128 {}zp {} scales",
+                    if asymmetric { "asym-" } else { "sym-" },
+                    if scales_fp16 { "fp16" } else { "fp32" }
+                );
+                // HARD GATE: fp16 must satisfy the SAME reviewed envelope as fp32.
+                fp16_report.assert_within(&label);
+
+                let ratio = fp16_report.max_rel / fp32_report.max_rel.max(1e-12);
+                worst_ratio = worst_ratio.max(ratio);
+                eprintln!(
+                    "[marlin-numerics] {label}: fp16 max_rel={:.3e} vs fp32-path \
+                     max_rel={:.3e} (ratio {:.2}x)",
+                    fp16_report.max_rel, fp32_report.max_rel, ratio
+                );
+                fp16_overall.merge(&fp16_report);
+                fp32_overall.merge(&fp32_report);
+            }
+        }
+    }
+    unsafe { std::env::remove_var("ONNX_GENAI_GENERAL_SPLITK") };
+
+    eprintln!(
+        "[marlin-numerics] FP16-MIXED GLM DECODE (block-128, M=1): \
+         fp16 max_abs={:.3e} max_rel={:.3e} | fp32-path max_abs={:.3e} max_rel={:.3e} | \
+         max_out={:.3e} | worst fp16/fp32 rel-error ratio={:.2}x",
+        fp16_overall.max_abs,
+        fp16_overall.max_rel,
+        fp32_overall.max_abs,
+        fp32_overall.max_rel,
+        fp16_overall.max_out,
+        worst_ratio
+    );
+    assert!(
+        fp16_overall.all_finite,
+        "fp16 candidate produced non-finite output"
+    );
+    assert!(
+        any_fp16_divergence,
+        "fp16 output was bit-identical to fp32 on every shape — the fp16 kernel \
+         was not exercised (dispatch did not select the fp16 entry); the gate \
+         would be vacuous"
+    );
+}

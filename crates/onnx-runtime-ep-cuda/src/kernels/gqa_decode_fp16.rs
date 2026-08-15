@@ -69,6 +69,7 @@ pub(super) const MAX_HEAD_DIM: usize = 256;
 const WARPS_PER_BLOCK: u32 = 4;
 const WARP_SIZE: u32 = 32;
 pub(super) const MAX_SPLITS: usize = 16;
+const MERGE_DIM_SPLITS: usize = 4;
 
 /// Whether the fp16 flash-decode kernel handles this shape. Single query token
 /// (`Sq=1`) with an **even** `head_dim` within [`MAX_HEAD_DIM`] (the `half2`
@@ -84,8 +85,10 @@ const DECODE_SRC: &str = r#"
 #define GQA_MAX_H2PL 4   // half2 slots per lane; head_dim <= 2 * 4 * 32 == 256
 #define GQA_MAX_HEAD_SIZE 256
 #define GQA_MAX_SPLITS 16
+#define GQA_MERGE_DIM_SPLITS 4
 #define GQA_MAX_SCRATCH_ROWS 256
 #define GQA_SCRATCH_STRIDE (GQA_MAX_HEAD_SIZE + 2)
+#define GQA_RCP_LN2 1.4426950408889634f
 
 // Module globals are allocated when the NVRTC module is loaded, before graph
 // capture. All GQA layers share the same stream and therefore reuse this
@@ -229,8 +232,8 @@ extern "C" __global__ void gqa_decode_attention_f16(
         }
 
         const float new_max = fmaxf(running_max, score);
-        const float correction = expf(running_max - new_max);
-        const float probability = expf(score - new_max);
+        const float correction = exp2f((running_max - new_max) * GQA_RCP_LN2);
+        const float probability = exp2f((score - new_max) * GQA_RCP_LN2);
         running_sum = running_sum * correction + probability;
         const half2* v2 = reinterpret_cast<const half2*>(value + kv_off);
 #pragma unroll
@@ -268,7 +271,7 @@ extern "C" __global__ void gqa_decode_attention_f16(
     }
     float denom = 0.0f;
     for (int w = 0; w < warps_per_block; ++w) {
-        denom += warp_sum[w] * expf(warp_max[w] - global_max);
+        denom += warp_sum[w] * exp2f((warp_max[w] - global_max) * GQA_RCP_LN2);
     }
     // Rows beyond the bounded module scratch retain the original one-CTA
     // implementation, preserving the supported() contract for unusual shapes.
@@ -298,7 +301,7 @@ extern "C" __global__ void gqa_decode_attention_f16(
             float ox = 0.0f;
             float oy = 0.0f;
             for (int w = 0; w < warps_per_block; ++w) {
-                const float weight = expf(warp_max[w] - global_max);
+                const float weight = exp2f((warp_max[w] - global_max) * GQA_RCP_LN2);
                 ox += warp_acc[w * head_size + 2 * j] * weight;
                 oy += warp_acc[w * head_size + 2 * j + 1] * weight;
             }
@@ -323,7 +326,11 @@ extern "C" __global__ void gqa_decode_attention_f16_merge(
     const int single_split_direct,
     const int split_fill)
 {
-    const int row = blockIdx.x;
+    __shared__ float split_weight[GQA_MAX_SPLITS];
+    __shared__ float inverse_sum_shared;
+
+    const int row = blockIdx.x / GQA_MERGE_DIM_SPLITS;
+    const int dim_split = blockIdx.x % GQA_MERGE_DIM_SPLITS;
     const int rows = batch * query_heads * query_seq;
     if (row >= rows || row >= GQA_MAX_SCRATCH_ROWS) return;
 
@@ -341,38 +348,43 @@ extern "C" __global__ void gqa_decode_attention_f16_merge(
     // Single-split rows were finalized in-place by the decode kernel.
     if (single_split_direct != 0 && active_splits <= 1) return;
 
-    float global_max = __int_as_float(0xff800000);
-    for (int split = 0; split < active_splits; ++split) {
-        const float* state = gqa_split_scratch
-            + (row * GQA_MAX_SPLITS + split) * GQA_SCRATCH_STRIDE;
-        global_max = fmaxf(global_max, state[0]);
+    if (lane == 0) {
+        float global_max = __int_as_float(0xff800000);
+        for (int split = 0; split < active_splits; ++split) {
+            const float* state = gqa_split_scratch
+                + (row * GQA_MAX_SPLITS + split) * GQA_SCRATCH_STRIDE;
+            global_max = fmaxf(global_max, state[0]);
+        }
+        float denom = 0.0f;
+        for (int split = 0; split < active_splits; ++split) {
+            const float* state = gqa_split_scratch
+                + (row * GQA_MAX_SPLITS + split) * GQA_SCRATCH_STRIDE;
+            const float weight = exp2f((state[0] - global_max) * GQA_RCP_LN2);
+            split_weight[split] = weight;
+            denom += state[1] * weight;
+        }
+        inverse_sum_shared = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
     }
-    float denom = 0.0f;
-    for (int split = 0; split < active_splits; ++split) {
-        const float* state = gqa_split_scratch
-            + (row * GQA_MAX_SPLITS + split) * GQA_SCRATCH_STRIDE;
-        denom += state[1] * expf(state[0] - global_max);
-    }
-    const float inverse_sum = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
+    __syncthreads();
+    const float inverse_sum = inverse_sum_shared;
 
     const int h2 = head_size >> 1;
+    const int h2_per_split = (h2 + GQA_MERGE_DIM_SPLITS - 1) / GQA_MERGE_DIM_SPLITS;
+    const int h2_start = dim_split * h2_per_split;
+    const int h2_end = min(h2, h2_start + h2_per_split);
     const long q_base = (long)row * (long)head_size;
     half2* out2 = reinterpret_cast<half2*>(output + q_base);
-#pragma unroll
-    for (int i = 0; i < GQA_MAX_H2PL; ++i) {
-        const int j = lane + i * GQA_WARP_SIZE;
-        if (j < h2) {
-            float ox = 0.0f;
-            float oy = 0.0f;
-            for (int split = 0; split < active_splits; ++split) {
-                const float* state = gqa_split_scratch
-                    + (row * GQA_MAX_SPLITS + split) * GQA_SCRATCH_STRIDE;
-                const float weight = expf(state[0] - global_max);
-                ox += state[2 + 2 * j] * weight;
-                oy += state[2 + 2 * j + 1] * weight;
-            }
-            out2[j] = __floats2half2_rn(ox * inverse_sum, oy * inverse_sum);
+    for (int j = h2_start + lane; j < h2_end; j += blockDim.x) {
+        float ox = 0.0f;
+        float oy = 0.0f;
+        for (int split = 0; split < active_splits; ++split) {
+            const float* state = gqa_split_scratch
+                + (row * GQA_MAX_SPLITS + split) * GQA_SCRATCH_STRIDE;
+            const float weight = split_weight[split];
+            ox += state[2 + 2 * j] * weight;
+            oy += state[2 + 2 * j + 1] * weight;
         }
+        out2[j] = __floats2half2_rn(ox * inverse_sum, oy * inverse_sum);
     }
 }
 "#;
@@ -441,9 +453,12 @@ pub(super) fn run(
             "cuda_ep GQA fp16 decode: {partial_blocks} split blocks exceed CUDA grid.x"
         ))
     })?;
-    let merge_grid_x = u32::try_from(rows.max(1)).map_err(|_| {
+    let merge_blocks = rows.checked_mul(MERGE_DIM_SPLITS).ok_or_else(|| {
+        EpError::KernelFailed("cuda_ep GQA fp16 decode: merge grid overflow".into())
+    })?;
+    let merge_grid_x = u32::try_from(merge_blocks.max(1)).map_err(|_| {
         EpError::KernelFailed(format!(
-            "cuda_ep GQA fp16 decode: {rows} rows exceed CUDA grid.x"
+            "cuda_ep GQA fp16 decode: {merge_blocks} merge blocks exceed CUDA grid.x"
         ))
     })?;
 
@@ -451,15 +466,18 @@ pub(super) fn run(
     // per (query row, active split); with a single query token the row count is
     // just `batch * num_heads`, far below the multiprocessor count, so without
     // splitting the kernel is grid-starved (well under one wave) and its
-    // dependent-load latency is fully exposed. Aim for roughly two waves of
+    // dependent-load latency is fully exposed. Aim for multiple waves of
     // concurrent CTAs across the device, then let the device-side per-split key
-    // floor trim this back on short sequences. This is a launch-time constant,
-    // so both launches below (and their graph replays) agree on it while the
-    // valid length stays device-resident.
-    const TARGET_WAVES: usize = 2;
+    // floor trim this back on short sequences. Four waves fills H200 better for
+    // long-context glm decode (where attention is otherwise under-parallelized)
+    // while the env override below remains an A/B rollback knob. This is a
+    // launch-time constant, so both launches below (and their graph replays)
+    // agree on it while the valid length stays device-resident.
+    const TARGET_WAVES: usize = 4;
     let multiprocessors = runtime.capabilities().multiprocessor_count().max(1) as usize;
     let target_blocks = multiprocessors.saturating_mul(TARGET_WAVES);
-    let split_fill = target_blocks.div_ceil(rows.max(1)).clamp(1, MAX_SPLITS);
+    let split_fill = super::gqa_decode::split_fill_override(MAX_SPLITS)
+        .unwrap_or_else(|| target_blocks.div_ceil(rows.max(1)).clamp(1, MAX_SPLITS));
     let split_fill_i = i32::try_from(split_fill).unwrap_or(MAX_SPLITS as i32);
 
     // Dynamic shared: warp_max[warps] + warp_sum[warps] + warp_acc[warps*head].
@@ -528,7 +546,7 @@ pub(super) fn run(
     unsafe {
         merge_builder.launch(LaunchConfig {
             grid_dim: (merge_grid_x, 1, 1),
-            block_dim: (WARP_SIZE, 1, 1),
+            block_dim: (WARP_SIZE * 2, 1, 1),
             shared_mem_bytes: 0,
         })
     }
