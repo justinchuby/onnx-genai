@@ -1683,13 +1683,23 @@ mod tests {
         // as an output approaches zero, so a zeroed tile covering
         // small-magnitude outputs could slip through. `sum |a*b|` is the
         // quantity f32 rounding actually accumulates over.
+        //
+        // The constant is the standard forward error bound for a length-`k`
+        // dot product, `gamma_k = k*u / (1 - k*u)` with `u = EPSILON/2`,
+        // rounded up to `k * EPSILON`. Deliberately not tighter: MLAS is free
+        // to reassociate the sum (blocked accumulation, FMA contraction,
+        // different vector widths per ISA), so a bound derived from one host's
+        // accumulation order would be flaky elsewhere. It is still ~5 orders
+        // of magnitude below the value itself, so a zeroed or torn tile is
+        // caught.
+        let tol_scale = k as f32 * f32::EPSILON;
         for i in 0..m {
             for j in 0..n {
                 let mut sum_abs = 0.0f32;
                 for p in 0..k {
                     sum_abs += (a[i * k + p] * b[p * n + j]).abs();
                 }
-                let tol = 8.0 * f32::EPSILON * sum_abs.max(f32::MIN_POSITIVE);
+                let tol = tol_scale * sum_abs.max(f32::MIN_POSITIVE);
                 let (g, w) = (got[i * n + j], want[i * n + j]);
                 assert!(
                     (g - w).abs() <= tol,

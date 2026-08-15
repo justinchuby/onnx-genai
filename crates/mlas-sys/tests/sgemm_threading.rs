@@ -28,6 +28,15 @@ fn seq(n: usize, seed: f32) -> Vec<f32> {
 /// backend is never entered and `parallel_for_calls` stays flat.
 #[test]
 fn sgemm_nn_drives_the_registered_parallel_backend() {
+    // This binary contains only this test, and the pool is a `OnceLock`
+    // initialised on first use, so setting this before the first MLAS call
+    // deterministically gives a degree of parallelism above one. Without it
+    // the assertion would silently degrade to a no-op on a single-core CI
+    // runner, which is exactly where a threading regression would hide.
+    //
+    // SAFETY: single-threaded, before any other MLAS entry point runs.
+    unsafe { std::env::set_var("ONNX_GENAI_MLAS_THREADPOOL_THREADS", "4") };
+
     let (m, n, k) = (256usize, 512usize, 256usize);
     let a = seq(m * k, 0.25);
     let b = seq(k * n, 0.75);
@@ -35,10 +44,12 @@ fn sgemm_nn_drives_the_registered_parallel_backend() {
 
     // Establish the pool and MLAS platform init before sampling.
     sgemm_nn(m, n, k, &a, &b, &mut c);
-    if mlas_threading_degree() < 2 {
-        eprintln!("skipped: MLAS threading degree is 1 on this host");
-        return;
-    }
+    assert!(
+        mlas_threading_degree() >= 2,
+        "expected a multi-threaded MLAS pool after forcing \
+         ONNX_GENAI_MLAS_THREADPOOL_THREADS=4, got {}",
+        mlas_threading_degree()
+    );
 
     let before = mlas_threading_stats().parallel_for_calls;
     sgemm_nn(m, n, k, &a, &b, &mut c);
