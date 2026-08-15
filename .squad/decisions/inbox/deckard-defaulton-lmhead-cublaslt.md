@@ -53,22 +53,48 @@ bounded by `DENSE_PLAN_CACHE_CAP = 8`.
   plan is **withdrawn**. Out-of-box GEMV stays fp32 (byte-identical). fp16
   remains available via `ONNX_GENAI_GEMV_FP16=1` for users who opt in.
 
-## Measured (glm-4-9b-int4, H200 GPU3, graph-on, median)
+## Capture guard: which path (Gaff's #991 caveat)
+
+**Path (a): implemented a shape-keyed multi-shape plan cache.** #991 already had
+a warm-once / reject-cold-miss-during-capture contract, but for a SINGLE cached
+shape — a shape switch evicted + re-ran the heuristic search. This PR generalizes
+it to a `Vec<DenseGemmPlan>` keyed by `(dtype,M,K,N)` so every shape warms exactly
+once (on its first eager, non-capturing touch) and all later touches — including
+every KV-bucket-growth recapture — HIT the cache with no heuristic query inside
+the captured region.
+
+**Measured shape-transition proof** (temporary `DENSE_PLAN_SEARCH` counter on
+`DenseGemmPlan::new`, glm KV2048 run = prompt->decode->8 bucket-growth
+recaptures, 8623 replays):
+- **exactly 2 plan searches for the WHOLE run** — `M=3 K=4096 N=151552` (prefill,
+  once) + `M=1 K=4096 N=151552` (decode, once). Each distinct shape searched
+  exactly once, both on the non-capturing path.
+- **0 plan searches** during the 8623 replays or any of the 8 recaptures — the
+  M=1 decode plan stays warm; every recapture hits it.
+- **fallbacks=0** across all 8 captures/recaptures (a cold-miss-inside-capture
+  would surface as a fallback; none did). This is the specific "no per-transition
+  plan search, not just steady-state" guarantee. Counter reverted (not committed).
+
+## Measured (glm-4-9b-int4, H200, graph-on, median, no env flags)
 
 | config | short tok/s | KV2048 tok/s | fallbacks |
 |---|---|---|---|
-| **default-on (no flags)** | **207.72** | **171.69** | **0** |
+| **default-on (no flags)** | **~206-208** | **~166-172** | **0** |
 | explicit `=1` | 207.31 | — | 0 |
 | escape-hatch `=0` (hand GEMV) | 202.24 | — | 0 |
 
+(short 207.72 on GPU3 / 206.44 on GPU4; KV2048 171.69 / 168.06 / 165.59 across
+GPU3/6/4 — cross-GPU + shared-host variance; all fallbacks=0. Post-rebase onto
+main `ad141370` unchanged, since #996's added fp16 GEMV is opt-in and OFF here.)
+
 - KV2048 default-on: fallbacks=0 across **8623 replays / 8 bucket-growth
   recaptures** — the multi-shape cache holds through prompt->decode->bucket
-  growth. This is the capture-guard proof.
+  growth. This is the capture-guard proof (see plan-search breakdown above).
 - **Byte-identity:** cuBLASLt lm_head (default) vs hand-GEMV (off) top-40
   token-0 logprobs are **byte-identical** (both select token 315).
 - **qwen no regression:** 152.16 (on) vs 153.60 (off), within noise, fallbacks=0.
 
-## Note on the 232 number (out-of-box is ~208, and that is final)
+## Note on the 232 number (out-of-box is ~206-208, and that is final)
 
 The ~232 combined number (deckard-combined-stack-measurement) required #996's
 fp16 GEMV **opt-in ON**. Since fp16 GEMV now ships **permanently opt-in** (Chew
