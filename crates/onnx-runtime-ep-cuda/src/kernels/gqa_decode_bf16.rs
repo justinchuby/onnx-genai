@@ -69,6 +69,7 @@ pub(super) const MAX_HEAD_DIM: usize = 256;
 const WARPS_PER_BLOCK: u32 = 4;
 const WARP_SIZE: u32 = 32;
 pub(super) const MAX_SPLITS: usize = 16;
+const MERGE_DIM_SPLITS: usize = 4;
 
 /// Whether the bf16 flash-decode kernel handles this shape. Single query token
 /// (`Sq=1`) with an **even** `head_dim` within [`MAX_HEAD_DIM`] (the `__nv_bfloat162`
@@ -84,6 +85,7 @@ const DECODE_SRC: &str = r#"
 #define GQA_MAX_H2PL 4   // __nv_bfloat162 slots per lane; head_dim <= 2 * 4 * 32 == 256
 #define GQA_MAX_HEAD_SIZE 256
 #define GQA_MAX_SPLITS 16
+#define GQA_MERGE_DIM_SPLITS 4
 #define GQA_MAX_SCRATCH_ROWS 256
 #define GQA_SCRATCH_STRIDE (GQA_MAX_HEAD_SIZE + 2)
 
@@ -323,7 +325,11 @@ extern "C" __global__ void gqa_decode_attention_bf16_merge(
     const int single_split_direct,
     const int split_fill)
 {
-    const int row = blockIdx.x;
+    __shared__ float split_weight[GQA_MAX_SPLITS];
+    __shared__ float inverse_sum_shared;
+
+    const int row = blockIdx.x / GQA_MERGE_DIM_SPLITS;
+    const int dim_split = blockIdx.x % GQA_MERGE_DIM_SPLITS;
     const int rows = batch * query_heads * query_seq;
     if (row >= rows || row >= GQA_MAX_SCRATCH_ROWS) return;
 
@@ -341,30 +347,39 @@ extern "C" __global__ void gqa_decode_attention_bf16_merge(
     // Single-split rows were finalized in-place by the decode kernel.
     if (single_split_direct != 0 && active_splits <= 1) return;
 
-    float global_max = __int_as_float(0xff800000);
-    for (int split = 0; split < active_splits; ++split) {
-        const float* state = gqa_split_scratch
-            + (row * GQA_MAX_SPLITS + split) * GQA_SCRATCH_STRIDE;
-        global_max = fmaxf(global_max, state[0]);
+    if (lane == 0) {
+        float global_max = __int_as_float(0xff800000);
+        for (int split = 0; split < active_splits; ++split) {
+            const float* state = gqa_split_scratch
+                + (row * GQA_MAX_SPLITS + split) * GQA_SCRATCH_STRIDE;
+            global_max = fmaxf(global_max, state[0]);
+        }
+        float denom = 0.0f;
+        for (int split = 0; split < active_splits; ++split) {
+            const float* state = gqa_split_scratch
+                + (row * GQA_MAX_SPLITS + split) * GQA_SCRATCH_STRIDE;
+            const float weight = expf(state[0] - global_max);
+            split_weight[split] = weight;
+            denom += state[1] * weight;
+        }
+        inverse_sum_shared = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
     }
-    float denom = 0.0f;
-    for (int split = 0; split < active_splits; ++split) {
-        const float* state = gqa_split_scratch
-            + (row * GQA_MAX_SPLITS + split) * GQA_SCRATCH_STRIDE;
-        denom += state[1] * expf(state[0] - global_max);
-    }
-    const float inverse_sum = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
+    __syncthreads();
+    const float inverse_sum = inverse_sum_shared;
 
     const int h2 = head_size >> 1;
+    const int h2_per_split = (h2 + GQA_MERGE_DIM_SPLITS - 1) / GQA_MERGE_DIM_SPLITS;
+    const int h2_start = dim_split * h2_per_split;
+    const int h2_end = min(h2, h2_start + h2_per_split);
     const long q_base = (long)row * (long)head_size;
     __nv_bfloat162* out2 = reinterpret_cast<__nv_bfloat162*>(output + q_base);
-    for (int j = lane; j < h2; j += blockDim.x) {
+    for (int j = h2_start + lane; j < h2_end; j += blockDim.x) {
         float ox = 0.0f;
         float oy = 0.0f;
         for (int split = 0; split < active_splits; ++split) {
             const float* state = gqa_split_scratch
                 + (row * GQA_MAX_SPLITS + split) * GQA_SCRATCH_STRIDE;
-            const float weight = expf(state[0] - global_max);
+            const float weight = split_weight[split];
             ox += state[2 + 2 * j] * weight;
             oy += state[2 + 2 * j + 1] * weight;
         }
@@ -437,9 +452,12 @@ pub(super) fn run(
             "cuda_ep GQA bf16 decode: {partial_blocks} split blocks exceed CUDA grid.x"
         ))
     })?;
-    let merge_grid_x = u32::try_from(rows.max(1)).map_err(|_| {
+    let merge_blocks = rows.checked_mul(MERGE_DIM_SPLITS).ok_or_else(|| {
+        EpError::KernelFailed("cuda_ep GQA bf16 decode: merge grid overflow".into())
+    })?;
+    let merge_grid_x = u32::try_from(merge_blocks.max(1)).map_err(|_| {
         EpError::KernelFailed(format!(
-            "cuda_ep GQA bf16 decode: {rows} rows exceed CUDA grid.x"
+            "cuda_ep GQA bf16 decode: {merge_blocks} merge blocks exceed CUDA grid.x"
         ))
     })?;
 
