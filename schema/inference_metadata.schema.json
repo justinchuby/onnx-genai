@@ -458,13 +458,6 @@
                 "null"
               ]
             },
-            "custom_ops": {
-              "additionalProperties": {
-                "type": "string"
-              },
-              "default": {},
-              "type": "object"
-            },
             "kind": {
               "const": "adapter",
               "type": "string"
@@ -2744,13 +2737,6 @@
           },
           "type": "array",
           "uniqueItems": true
-        },
-        "custom_op_versions": {
-          "additionalProperties": {
-            "type": "string"
-          },
-          "default": {},
-          "type": "object"
         },
         "ir_version": {
           "type": "string"

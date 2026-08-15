@@ -38,7 +38,7 @@ logic.
 
 ## Manifest and validation
 
-The required manifest pins IR, ONNX opset, adapter ABI, custom-op, and capability
+The required manifest pins IR, ONNX opset, adapter ABI, and capability
 versions. Capabilities are derived from used features and checked at load. Unknown,
 unsupported, unresolved, unordered, or ill-typed documents fail before execution.
 

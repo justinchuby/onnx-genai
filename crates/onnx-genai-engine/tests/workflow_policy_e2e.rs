@@ -666,7 +666,6 @@ pipeline:
       ir_version: "1.0"
       onnx_opsets: { ai.onnx: 13 }
       adapter_abis: { onnx-genai.image-preprocess: "1" }
-      custom_op_versions: {}
       capabilities: [workflow_ssa, typed_emit]
     inputs:
       request.batch_anchor:
@@ -857,7 +856,6 @@ pipeline:
       ir_version: "1.0"
       onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
-      custom_op_versions: {}
       capabilities: [workflow_ssa, typed_emit]
     inputs:
       logits:
@@ -1029,7 +1027,6 @@ pipeline:
       ir_version: "1.0"
       onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
-      custom_op_versions: {}
       capabilities: [workflow_ssa, typed_emit, nested_control_flow]
     inputs:
       initial_cache:
@@ -1136,7 +1133,6 @@ pipeline:
       ir_version: "1.0"
       onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
-      custom_op_versions: {}
       capabilities: [workflow_ssa, typed_emit]
     inputs:
       logits:
@@ -1301,7 +1297,6 @@ pipeline:
       ir_version: "1.0"
       onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
-      custom_op_versions: {}
       capabilities: [workflow_ssa, typed_emit]
     inputs:
       logits:
@@ -1394,7 +1389,6 @@ pipeline:
       ir_version: "1.0"
       onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
-      custom_op_versions: {}
       capabilities: [workflow_ssa, typed_emit]
     inputs:
       logits.raw:
@@ -1465,7 +1459,6 @@ pipeline:
       ir_version: "1.0"
       onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
-      custom_op_versions: {}
       capabilities: [workflow_ssa, typed_emit]
     inputs:
       eos:
@@ -1505,7 +1498,6 @@ pipeline:
       ir_version: "1.0"
       onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
-      custom_op_versions: {}
       capabilities: [workflow_ssa, typed_emit]
     inputs:
       prompt:
@@ -1569,7 +1561,6 @@ pipeline:
       ir_version: "1.0"
       onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
-      custom_op_versions: {}
       capabilities: [workflow_ssa, typed_emit, bounded_state_growth]
     inputs:
       prompt:
@@ -1651,7 +1642,6 @@ pipeline:
       ir_version: "1.0"
       onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
-      custom_op_versions: {}
       capabilities: [workflow_ssa, typed_emit, nested_control_flow]
     inputs:
       logits: { contract: { dtype: float32, rank: 2, shape: [batch, vocabulary] },
@@ -1838,7 +1828,6 @@ pipeline:
       ir_version: "1.0"
       onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
-      custom_op_versions: {}
       capabilities: [workflow_ssa, typed_emit, nested_control_flow,
                      loop_induction_values]
     inputs:
@@ -1961,7 +1950,6 @@ pipeline:
       ir_version: "1.0"
       onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
-      custom_op_versions: {}
       capabilities: [workflow_ssa, typed_emit, nested_control_flow,
                      loop_induction_values]
     inputs:
@@ -2031,7 +2019,6 @@ pipeline:
       ir_version: "1.0"
       onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
-      custom_op_versions: {}
       capabilities: [workflow_ssa, typed_emit]
     inputs:
       current: { contract: { dtype: int64, rank: 2, shape: [batch, sequence] }, role: { kind: opaque },
@@ -2103,7 +2090,6 @@ pipeline:
       ir_version: "1.0"
       onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
-      custom_op_versions: {}
       capabilities: [workflow_ssa, typed_emit, emit_valid_length, emit_row_identity]
     inputs:
       target: { contract: { dtype: float32, rank: 3, shape: [batch, draft, vocabulary] }, role: { kind: opaque },
@@ -2200,7 +2186,6 @@ pipeline:
       ir_version: "1.0"
       onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
-      custom_op_versions: {}
       capabilities:
         [workflow_ssa, typed_emit, nested_control_flow,
          bounded_state_recurrence]
@@ -2334,7 +2319,6 @@ pipeline:
       ir_version: "1.0"
       onnx_opsets: { ai.onnx: 13 }
       adapter_abis: { onnx-genai.grammar-guidance: "1" }
-      custom_op_versions: {}
       capabilities:
         [workflow_ssa, typed_emit, emit_valid_length, emit_row_identity,
          nested_control_flow, grammar_guidance_adapter, adaptive_proposal_budget,
@@ -2766,7 +2750,6 @@ pipeline:
       ir_version: "1.0"
       onnx_opsets: { ai.onnx: 13 }
       adapter_abis: { onnx-genai.telemetry: "1" }
-      custom_op_versions: {}
       capabilities: [workflow_ssa, typed_emit, telemetry_adapter]
     inputs: {}
     outputs:
@@ -2832,7 +2815,6 @@ pipeline:
       ir_version: "1.0"
       onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
-      custom_op_versions: {}
       capabilities:
         [workflow_ssa, typed_emit, streaming_emit,
          nested_control_flow, session_state_lease]
@@ -3062,7 +3044,6 @@ pipeline:
       ir_version: "1.0"
       onnx_opsets: { ai.onnx: 13 }
       adapter_abis: {}
-      custom_op_versions: {}
       capabilities:
         [workflow_ssa, typed_emit, streaming_emit,
          nested_control_flow, session_state_lease, advisory_state]
@@ -3298,7 +3279,6 @@ pipeline:
       ir_version: "1.0"
       onnx_opsets: { ai.onnx: 24 }
       adapter_abis: {}
-      custom_op_versions: {}
       capabilities: [workflow_ssa, typed_emit, streaming_emit, nested_control_flow]
     inputs:
       accept:

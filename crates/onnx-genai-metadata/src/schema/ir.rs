@@ -225,8 +225,6 @@ pub struct WorkflowManifest {
     #[serde(default)]
     pub adapter_abis: BTreeMap<String, String>,
     #[serde(default)]
-    pub custom_op_versions: BTreeMap<String, String>,
-    #[serde(default)]
     pub capabilities: BTreeSet<String>,
 }
 
@@ -351,8 +349,6 @@ pub enum ComponentImplementation {
         version: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         artifact: Option<String>,
-        #[serde(default)]
-        custom_ops: BTreeMap<String, String>,
     },
     Binding,
 }

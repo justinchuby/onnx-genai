@@ -24,12 +24,14 @@ use std::path::Path;
 use std::sync::Arc;
 
 mod adapters;
+mod arg_reduce;
 mod islands;
 mod workflow;
 
 pub use adapters::{
     AdapterActivation, AdapterLifecycleDiagnostic, AdapterRowIdentity, AdapterSelection,
 };
+pub use arg_reduce::{ArgReduceRewrites, WideArgReduceLowering, lower_degenerate_arg_reductions};
 pub use islands::ExecutionIslandDiagnostic;
 pub use onnx_genai_metadata::WorkflowOutputRole;
 pub use workflow::{WorkflowExecutionPlan, WorkflowPerformanceDiagnostic};

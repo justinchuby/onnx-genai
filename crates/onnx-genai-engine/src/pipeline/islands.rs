@@ -1243,7 +1243,13 @@ fn build_execution_island(
         })
         .cloned()
         .collect::<HashSet<_>>();
-    let linked = link_models(id, &invocations, models, &boundary_outputs)?;
+    let linked = link_models(
+        id,
+        &invocations,
+        models,
+        &boundary_outputs,
+        device.starts_with("cuda:"),
+    )?;
     let mut options = models.session_options();
     let capture_requested = options.graph_capture;
     if !linked.external_files.is_empty() && !(device.starts_with("cuda:") && capture_requested) {
@@ -1552,11 +1558,28 @@ fn hash_file_identity(path: &Path, hasher: &mut impl Hasher) -> anyhow::Result<(
     Ok(())
 }
 
+/// Select the standard-ONNX lowering for a wide last-axis arg-reduction.
+///
+/// Direct execution is valid only on CUDA runtimes known to include the
+/// upstream parallel reduction. All other and unknown runtimes use the
+/// portable tiled graph.
+fn wide_arg_reduce_lowering(
+    cuda: bool,
+    runtime_supports_direct: bool,
+) -> super::arg_reduce::WideArgReduceLowering {
+    use super::arg_reduce::WideArgReduceLowering;
+    if cuda && runtime_supports_direct {
+        return WideArgReduceLowering::Direct;
+    }
+    WideArgReduceLowering::Tiled
+}
+
 fn link_models(
     id: usize,
     invocations: &[IslandInvocation],
     models: &onnx_genai_ort::PipelineModels,
     boundary_outputs: &HashSet<String>,
+    cuda: bool,
 ) -> anyhow::Result<LinkedModel> {
     let mut model = ModelProto {
         ir_version: 8,
@@ -1770,6 +1793,20 @@ fn link_models(
         graph.value_info.extend(source_graph.value_info);
     }
     graph.input.extend(graph_inputs.into_values());
+    let lowering = wide_arg_reduce_lowering(
+        cuda,
+        onnx_genai_ort::runtime_capability::reduces_wide_last_axis_on_cuda(),
+    );
+    let arg_reductions = super::arg_reduce::lower_degenerate_arg_reductions(graph, lowering);
+    if arg_reductions.total() > 0 || arg_reductions.direct > 0 {
+        tracing::debug!(
+            island = id,
+            ?lowering,
+            tiled = arg_reductions.tiled,
+            direct = arg_reductions.direct,
+            "planned degenerate last-axis arg-reductions inside execution island"
+        );
+    }
     model.opset_import = opsets
         .into_iter()
         .map(
@@ -2009,6 +2046,27 @@ mod tests {
     use super::*;
     use onnx_genai_metadata::ComponentPorts;
 
+    #[test]
+    fn cuda_runtime_capability_selects_direct_wide_argmax() {
+        assert_eq!(
+            wide_arg_reduce_lowering(true, true),
+            super::super::arg_reduce::WideArgReduceLowering::Direct
+        );
+    }
+
+    #[test]
+    fn unknown_or_non_cuda_runtime_selects_portable_tiling() {
+        use super::super::arg_reduce::WideArgReduceLowering;
+        assert_eq!(
+            wide_arg_reduce_lowering(true, false),
+            WideArgReduceLowering::Tiled
+        );
+        assert_eq!(
+            wide_arg_reduce_lowering(false, true),
+            WideArgReduceLowering::Tiled
+        );
+    }
+
     fn symbolic_tensor(name: &str, symbol: &str) -> ValueInfoProto {
         ValueInfoProto {
             name: name.to_string(),
@@ -2224,7 +2282,6 @@ mod tests {
             abi: "onnx-genai.grammar-guidance".into(),
             version: "1".into(),
             artifact: None,
-            custom_ops: BTreeMap::new(),
         });
         assert!(!is_fusible_component(&adapter));
     }

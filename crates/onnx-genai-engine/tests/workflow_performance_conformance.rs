@@ -312,7 +312,6 @@ pipeline:
       ir_version: "1.0"
       onnx_opsets: {{ ai.onnx: 13 }}
       adapter_abis: {{}}
-      custom_op_versions: {{}}
       capabilities: [workflow_ssa, typed_emit]
     inputs:
       logits:

@@ -86,6 +86,26 @@ fn adapter_service_contract_is_valid_and_derives_capabilities() {
 }
 
 #[test]
+fn workflow_custom_op_admission_fields_are_rejected() {
+    let manifest_field = ADAPTER_WORKFLOW.replace(
+        "adapter_abis: { onnx-genai.parameter-overlay: \"1\" }",
+        "adapter_abis: { onnx-genai.parameter-overlay: \"1\" }\n      \
+         custom_op_versions: { com.example: \"1\" }",
+    );
+    let error = serde_yaml::from_str::<InferenceMetadata>(&manifest_field)
+        .expect_err("custom-op manifest field must be rejected");
+    assert!(error.to_string().contains("custom_op_versions"));
+
+    let component_field = ADAPTER_WORKFLOW.replace(
+        "version: \"1\"\n        ports:",
+        "version: \"1\"\n          custom_ops: { com.example: \"1\" }\n        ports:",
+    );
+    let error = serde_yaml::from_str::<InferenceMetadata>(&component_field)
+        .expect_err("custom-op component field must be rejected");
+    assert!(error.to_string().contains("custom_ops"));
+}
+
+#[test]
 fn adapter_service_rejects_incompatible_or_unsafe_artifacts() {
     let invalid = ADAPTER_WORKFLOW
         .replace(

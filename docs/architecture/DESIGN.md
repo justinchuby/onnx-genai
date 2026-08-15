@@ -27,8 +27,12 @@ intra-component typing; metadata unifies cross-component symbols and checks boun
 state growth. Branch phi contracts must unify. Loop induction values are lexical.
 Linear effect tokens order state and output effects.
 
-The manifest pins IR, opset, adapter ABI, custom-op, and capability versions. Required
+The manifest pins IR, opset, adapter ABI, and capability versions. Required
 capabilities are deterministically derived and checked before sessions are created.
+Policy graphs use only standard ONNX operators. Wide last-axis `ArgMax`/`ArgMin`
+nodes run directly when the loaded CUDA runtime includes the upstream parallel
+reduction capability; older or unknown runtimes receive an equivalent tiled
+standard-ONNX lowering. Native execution-provider sampling remains independent.
 
 ## Runtime services
 

@@ -75,6 +75,8 @@ fn generated_schema_preserves_all_root_constraints() {
     assert!(!serialized.contains("\"kind\":{\"const\":\"execution_island\""));
     assert!(serialized.contains("\"application_overridable\""));
     assert!(serialized.contains("\"sampling_min_p\""));
+    assert!(!serialized.contains("\"custom_op_versions\""));
+    assert!(!serialized.contains("\"custom_ops\""));
 }
 
 fn schema_path() -> PathBuf {

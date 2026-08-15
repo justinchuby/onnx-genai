@@ -846,24 +846,13 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
                 abi,
                 version,
                 artifact: _,
-                custom_ops,
-            } => {
-                match workflow.manifest.adapter_abis.get(abi) {
-                    Some(pinned) if pinned == version => {}
-                    _ => errors.push(format!(
-                        "workflow component '{name}' requires adapter ABI {abi}@{version}, \
+            } => match workflow.manifest.adapter_abis.get(abi) {
+                Some(pinned) if pinned == version => {}
+                _ => errors.push(format!(
+                    "workflow component '{name}' requires adapter ABI {abi}@{version}, \
                          but the manifest does not pin that exact version"
-                    )),
-                }
-                for (domain, version) in custom_ops {
-                    if workflow.manifest.custom_op_versions.get(domain) != Some(version) {
-                        errors.push(format!(
-                            "workflow component '{name}' requires custom-op domain \
-                             {domain}@{version}, but the manifest does not pin it"
-                        ));
-                    }
-                }
-            }
+                )),
+            },
             crate::schema::ComponentImplementation::Binding => {}
         }
         for (port, contract) in &component.ports.inputs {
