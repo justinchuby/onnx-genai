@@ -5302,7 +5302,9 @@ fn launch_interleave_int4(
     let src_ptr = cuptr(src as usize as *const c_void);
     let dst_ptr = cuptr(dst as usize as *const c_void);
     const THREADS: u32 = 256;
-    let grid = u32::try_from(words.div_ceil(THREADS as u64)).unwrap_or(u32::MAX).max(1);
+    let grid = u32::try_from(words.div_ceil(THREADS as u64))
+        .unwrap_or(u32::MAX)
+        .max(1);
     let mut builder = runtime.stream().launch_builder(&function);
     builder.arg(&src_ptr).arg(&dst_ptr).arg(&words);
     // SAFETY: static grid; `src`/`dst` each cover `bytes` bytes and the kernel
@@ -8228,8 +8230,7 @@ impl MatMulNBitsKernel {
             None
         };
         let orig_packed_ptr = cuptr(packed.data_ptr::<u8>() as *const c_void);
-        let interleave_on =
-            interleave_dequant_enabled() && self.bits == 4 && zero_points.is_none();
+        let interleave_on = interleave_dequant_enabled() && self.bits == 4 && zero_points.is_none();
         let (entry, packed_ptr) = if interleave_on && interleaved_entry.is_some() {
             let target = interleaved_entry.unwrap();
             let bytes = self.n.saturating_mul(k_blocks).saturating_mul(blob_size);
@@ -10527,7 +10528,9 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         let mut got_f16 = vec![f16::ZERO; n];
         // SAFETY: `output_dev` holds `n` fp16 values.
         unsafe {
-            runtime.dtoh(as_bytes_mut(&mut got_f16), output_dev).unwrap();
+            runtime
+                .dtoh(as_bytes_mut(&mut got_f16), output_dev)
+                .unwrap();
             runtime.free_raw(activation_dev).unwrap();
             // NOTE: `packed_dev` is intentionally NOT freed. The interleave cache
             // is keyed by (source pointer, byte length, ordinal); freeing the
@@ -10562,7 +10565,8 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             (8192, 512, 128, true),
             (4096, 256, 64, true),
         ] {
-            let Some(base) = run_symmetric_block_raw(k, n, block_size, scales_fp16, false, Some(false))
+            let Some(base) =
+                run_symmetric_block_raw(k, n, block_size, scales_fp16, false, Some(false))
             else {
                 eprintln!(
                     "skipping interleaved dequant byte-identity test: CUDA runtime/headers \

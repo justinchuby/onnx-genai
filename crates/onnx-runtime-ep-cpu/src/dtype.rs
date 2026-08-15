@@ -562,6 +562,162 @@ mod f16c {
     }
 }
 
+/// AVX2 bulk `bf16` ⇄ `f32` conversion.
+///
+/// BF16 is literally the top 16 bits of an IEEE `f32`, so neither direction
+/// needs a floating-point conversion instruction — both are integer shifts —
+/// and neither needs `f16c` or any AVX-512 extension. Plain AVX2 suffices, which
+/// is why this exists as its own module rather than riding along with [`f16c`].
+///
+/// The scalar fallbacks below are the `half` crate calls, and the vector paths
+/// are asserted bit-identical to them over exhaustive and randomised sweeps —
+/// bf16 is used for weights and activations that also flow through the CUDA EP,
+/// so a rounding difference here would be a cross-EP divergence, not just a
+/// tolerance question.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+mod bf16x {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    #[inline]
+    pub fn available() -> bool {
+        std::arch::is_x86_feature_detected!("avx2")
+    }
+
+    /// Widen `src.len()` contiguous `bf16` bit patterns into `dst` as `f32` by
+    /// raw shift: `f32::from_bits((b as u32) << 16)`.
+    ///
+    /// Bit-exact for every input, and it leaves a signalling NaN signalling.
+    /// That is *not* what `half::bf16::to_f32` does — see [`widen_quieting`].
+    ///
+    /// # Safety
+    /// The running CPU must support `avx2` (see [`available`]);
+    /// `src.len() == dst.len()`.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn widen(src: &[u16], dst: &mut [f32]) {
+        debug_assert_eq!(src.len(), dst.len());
+        let n = src.len();
+        let sp = src.as_ptr();
+        let dp = dst.as_mut_ptr();
+        unsafe {
+            let mut i = 0;
+            while i + 8 <= n {
+                let h = _mm_loadu_si128(sp.add(i) as *const __m128i);
+                let w = _mm256_slli_epi32::<16>(_mm256_cvtepu16_epi32(h));
+                _mm256_storeu_ps(dp.add(i), _mm256_castsi256_ps(w));
+                i += 8;
+            }
+            while i < n {
+                *dp.add(i) = f32::from_bits((*sp.add(i) as u32) << 16);
+                i += 1;
+            }
+        }
+    }
+
+    /// Widen `bf16` bit patterns into `f32` exactly as `half::bf16::to_f32`
+    /// does, which sets the quiet bit on NaN inputs: `(b | 0x40) << 16` when
+    /// `b & 0x7FFF > 0x7F80`, and a plain shift otherwise.
+    ///
+    /// The two spellings differ on exactly one class of input — signalling NaN,
+    /// where the raw shift produces an sNaN and `half` produces a qNaN — and the
+    /// repository already contains both. `widen_bf16_slice_into` is documented
+    /// as the raw shift and has a caller relying on it; `to_dense_f32_widen`
+    /// reached `half::bf16::to_f32` through `dispatch_float!`. A bulk path that
+    /// replaces the latter has to quiet, or it would silently change what every
+    /// bf16 kernel sees for sNaN inputs.
+    ///
+    /// # Safety
+    /// The running CPU must support `avx2` (see [`available`]);
+    /// `src.len() == dst.len()`.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn widen_quieting(src: &[u16], dst: &mut [f32]) {
+        debug_assert_eq!(src.len(), dst.len());
+        let n = src.len();
+        let sp = src.as_ptr();
+        let dp = dst.as_mut_ptr();
+        unsafe {
+            let exp_mask = _mm256_set1_epi32(0x7FFF);
+            let inf = _mm256_set1_epi32(0x7F80);
+            let quiet = _mm256_set1_epi32(0x0040);
+            let mut i = 0;
+            while i + 8 <= n {
+                let v = _mm256_cvtepu16_epi32(_mm_loadu_si128(sp.add(i) as *const __m128i));
+                // Zero-extended, so every lane is a small non-negative integer
+                // and the signed compare is the unsigned one.
+                let is_nan = _mm256_cmpgt_epi32(_mm256_and_si256(v, exp_mask), inf);
+                let q = _mm256_blendv_epi8(v, _mm256_or_si256(v, quiet), is_nan);
+                _mm256_storeu_ps(dp.add(i), _mm256_castsi256_ps(_mm256_slli_epi32::<16>(q)));
+                i += 8;
+            }
+            while i < n {
+                *dp.add(i) = half::bf16::from_bits(*sp.add(i)).to_f32();
+                i += 1;
+            }
+        }
+    }
+
+    /// Round 8 `f32` lanes to `bf16`, leaving each result in the low 16 bits of
+    /// its 32-bit lane.
+    ///
+    /// Reproduces `half::bf16::from_f32` exactly. That function rounds up when
+    /// `(x & 0x8000) != 0 && (x & 0x1_7FFF) != 0` — round-to-nearest-even — which
+    /// is the same predicate as adding `0x7FFF + lsb` and truncating, where
+    /// `lsb` is bit 16 of the input: a carry into bit 16 happens precisely when
+    /// `(x & 0xFFFF) + lsb >= 0x8001`. NaN takes the separate `(x >> 16) | 0x40`
+    /// path, which quiets the result while keeping the payload's high bits.
+    ///
+    /// # Safety
+    /// The running CPU must support `avx2`.
+    #[target_feature(enable = "avx2")]
+    unsafe fn round_to_bf16_lanes(v: __m256) -> __m256i {
+        unsafe {
+            let bits = _mm256_castps_si256(v);
+            let shifted = _mm256_srli_epi32::<16>(bits);
+            let lsb = _mm256_and_si256(shifted, _mm256_set1_epi32(1));
+            let bias = _mm256_add_epi32(_mm256_set1_epi32(0x7FFF), lsb);
+            let rounded = _mm256_srli_epi32::<16>(_mm256_add_epi32(bits, bias));
+            let quiet_nan = _mm256_or_si256(shifted, _mm256_set1_epi32(0x0040));
+            // `_CMP_UNORD_Q` is true exactly on NaN inputs.
+            let is_nan = _mm256_castps_si256(_mm256_cmp_ps::<_CMP_UNORD_Q>(v, v));
+            _mm256_blendv_epi8(rounded, quiet_nan, is_nan)
+        }
+    }
+
+    /// Narrow `src.len()` contiguous `f32` values into `dst` as `bf16` bit
+    /// patterns, rounding to nearest-even.
+    ///
+    /// # Safety
+    /// The running CPU must support `avx2` (see [`available`]);
+    /// `src.len() == dst.len()`.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn narrow(src: &[f32], dst: &mut [u16]) {
+        debug_assert_eq!(src.len(), dst.len());
+        let n = src.len();
+        let sp = src.as_ptr();
+        let dp = dst.as_mut_ptr();
+        unsafe {
+            let mut i = 0;
+            while i + 16 <= n {
+                let a = round_to_bf16_lanes(_mm256_loadu_ps(sp.add(i)));
+                let b = round_to_bf16_lanes(_mm256_loadu_ps(sp.add(i + 8)));
+                // Every lane already holds a value in `0..=0xFFFF`, so the
+                // unsigned saturation in `packus` never actually saturates.
+                // `packus` works per 128-bit half, so undo its interleave.
+                let packed = _mm256_packus_epi32(a, b);
+                let ordered = _mm256_permute4x64_epi64::<0b11_01_10_00>(packed);
+                _mm256_storeu_si256(dp.add(i) as *mut __m256i, ordered);
+                i += 16;
+            }
+            while i < n {
+                *dp.add(i) = half::bf16::from_f32(*sp.add(i)).to_bits();
+                i += 1;
+            }
+        }
+    }
+}
+
 /// Widen a contiguous `f16` slice (as raw `u16` bit patterns) into an equal-length
 /// `f32` slice, using the [`f16c`] hardware path when available and falling back
 /// to the scalar [`half`] conversion otherwise. `src.len()` must equal `dst.len()`.
@@ -588,8 +744,30 @@ pub fn widen_f16_slice_into(src: &[u16], dst: &mut [f32]) {
 /// floating-point conversion or rounding.
 pub fn widen_bf16_slice_into(src: &[u16], dst: &mut [f32]) {
     debug_assert_eq!(src.len(), dst.len());
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if bf16x::available() {
+        // SAFETY: `bf16x::available()` confirmed `avx2`; lengths match.
+        unsafe { bf16x::widen(src, dst) };
+        return;
+    }
     for (d, &s) in dst.iter_mut().zip(src) {
         *d = f32::from_bits((s as u32) << 16);
+    }
+}
+
+/// Narrow contiguous `f32` values into `bf16` bit patterns, rounding to
+/// nearest-even. Counterpart to [`widen_bf16_slice_into`], and bit-identical to
+/// `half::bf16::from_f32` on every input.
+pub fn narrow_bf16_slice_into(src: &[f32], dst: &mut [u16]) {
+    debug_assert_eq!(src.len(), dst.len());
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if bf16x::available() {
+        // SAFETY: `bf16x::available()` confirmed `avx2`; lengths match.
+        unsafe { bf16x::narrow(src, dst) };
+        return;
+    }
+    for (d, &s) in dst.iter_mut().zip(src) {
+        *d = half::bf16::from_f32(s).to_bits();
     }
 }
 
@@ -624,6 +802,28 @@ pub fn to_dense_f32_widen<'a>(op: &str, view: &'a TensorView<'_>) -> Result<Cow<
         let mut dst = vec![0.0f32; len];
         // SAFETY: `f16c::available()` confirmed `f16c` + `avx2`; lengths match.
         unsafe { f16c::widen(src, &mut dst) };
+        return Ok(Cow::Owned(dst));
+    }
+    // Bulk widen for a contiguous bf16 tensor. Unlike f16 this needs no
+    // conversion instruction at all — bf16 is the top half of an f32 — so the
+    // scalar `dispatch_float!` arm below was paying two allocations and a
+    // per-element call for what is one shift.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if view.dtype == DataType::BFloat16 && view.is_contiguous() && bf16x::available() {
+        view.validate()?;
+        let len = view.numel();
+        if len == 0 {
+            return Ok(Cow::Borrowed(&[]));
+        }
+        // SAFETY: a validated contiguous BFloat16 view addresses exactly `len`
+        // 2-byte elements; `half::bf16` is `repr(transparent)` over `u16`, so
+        // the same storage reads soundly as `u16` bit patterns.
+        let src = unsafe { std::slice::from_raw_parts(view.data_ptr::<u16>(), len) };
+        let mut dst = vec![0.0f32; len];
+        // SAFETY: `bf16x::available()` confirmed `avx2`; lengths match.
+        // `widen_quieting`, not `widen`: this replaces a `half::bf16::to_f32`
+        // call, which quiets signalling NaN.
+        unsafe { bf16x::widen_quieting(src, &mut dst) };
         return Ok(Cow::Owned(dst));
     }
     // NEON bulk widen for contiguous f16 tensors on aarch64.
@@ -674,6 +874,28 @@ pub fn write_dense_f32_narrow(op: &str, out: &mut TensorMut, data: &[f32]) -> Re
         let dst = unsafe { std::slice::from_raw_parts_mut(out.data_ptr_mut::<u16>(), n) };
         // SAFETY: `f16c::available()` confirmed `f16c` + `avx2`; lengths match.
         unsafe { f16c::narrow(data, dst) };
+        return Ok(());
+    }
+    // Bulk narrow for a contiguous bf16 output; counterpart to the widen above.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if out.dtype == DataType::BFloat16 && out.is_contiguous() && bf16x::available() {
+        out.validate()?;
+        let n = out.numel();
+        if data.len() != n {
+            return Err(EpError::KernelFailed(format!(
+                "output element count {n} does not match produced {}",
+                data.len()
+            )));
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        // SAFETY: a validated contiguous BFloat16 output addresses exactly `n`
+        // 2-byte elements; `half::bf16` is `repr(transparent)` over `u16`, so
+        // the storage is written soundly as `u16` bit patterns.
+        let dst = unsafe { std::slice::from_raw_parts_mut(out.data_ptr_mut::<u16>(), n) };
+        // SAFETY: `bf16x::available()` confirmed `avx2`; lengths match.
+        unsafe { bf16x::narrow(data, dst) };
         return Ok(());
     }
     // NEON bulk narrow for contiguous f16 output on aarch64.
@@ -1006,5 +1228,163 @@ mod tests {
         assert_eq!(r.end - r.start, 16);
         assert!(byte_ranges_overlap(&(0..10), &(5..15)));
         assert!(!byte_ranges_overlap(&(0..10), &(10..20)));
+    }
+
+    // ── bulk bf16 ⇄ f32 conversion ────────────────────────────────────────
+
+    /// Every one of the 65 536 bf16 bit patterns must widen to exactly what
+    /// `half` produces. This is exhaustive, so there is no input it can miss:
+    /// all NaN payloads, both infinities, both zeros and every subnormal.
+    #[test]
+    fn bf16_widen_is_exhaustively_bit_identical_to_half() {
+        use crate::kernels::testutil::Owned;
+        let src: Vec<u16> = (0..=u16::MAX).collect();
+        let n = src.len();
+        let tensor = Owned::bf16_bits(&[n], &src);
+        let view = tensor.view();
+        let got = to_dense_f32_widen("test", &view).unwrap();
+        for (i, (&g, &b)) in got.iter().zip(&src).enumerate() {
+            let want = half::bf16::from_bits(b).to_f32();
+            assert_eq!(
+                g.to_bits(),
+                want.to_bits(),
+                "bits {b:#06x} at {i}: {:#010x} != {:#010x}",
+                g.to_bits(),
+                want.to_bits()
+            );
+        }
+    }
+
+    /// `widen_bf16_slice_into` is documented as the *raw* shift and has a caller
+    /// (`group_query_attention`) that depends on it. Signalling NaN is the only
+    /// input where that differs from `half`, so pin it explicitly — otherwise a
+    /// later "simplification" to `half::bf16::to_f32` would look harmless.
+    #[test]
+    fn bf16_raw_widen_keeps_signalling_nan_signalling() {
+        let src: Vec<u16> = (0..=u16::MAX).collect();
+        let mut got = vec![0.0f32; src.len()];
+        widen_bf16_slice_into(&src, &mut got);
+        for (&g, &b) in got.iter().zip(&src) {
+            assert_eq!(
+                g.to_bits(),
+                (b as u32) << 16,
+                "bits {b:#06x}: raw widen must not alter any bit"
+            );
+        }
+        // And the two contracts really do diverge, on sNaN only.
+        assert_ne!(
+            f32::from_bits((0x7F81u32) << 16).to_bits(),
+            half::bf16::from_bits(0x7F81).to_f32().to_bits()
+        );
+    }
+
+    /// The narrow direction cannot be swept exhaustively over 2^32 inputs in a
+    /// unit test, so cover it three ways: every value that is *exactly* a
+    /// rounding tie (the only place the even-rounding rule is observable),
+    /// every special value, and a wide deterministic sweep of ordinary ones.
+    #[test]
+    fn bf16_narrow_is_bit_identical_to_half() {
+        let mut src: Vec<f32> = Vec::new();
+
+        // Exact ties: low 16 bits = 0x8000 selects half-way between two bf16.
+        // Both parities of the result LSB appear, so round-half-to-even is
+        // actually exercised in both directions.
+        for hi in (0u32..=0xFFFF).step_by(37) {
+            src.push(f32::from_bits((hi << 16) | 0x8000));
+        }
+        // Just above and just below a tie — must round away from / toward it.
+        for hi in (0u32..=0xFFFF).step_by(53) {
+            src.push(f32::from_bits((hi << 16) | 0x8001));
+            src.push(f32::from_bits((hi << 16) | 0x7FFF));
+        }
+        // Specials, including NaNs whose payload lives in bits that survive and
+        // NaNs whose payload lives only in bits that are discarded.
+        src.extend_from_slice(&[
+            0.0,
+            -0.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            -f32::NAN,
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            f32::from_bits(0x0000_0001), // smallest subnormal
+            f32::from_bits(0x8000_0001),
+            f32::from_bits(0x7F7F_FFFF), // max finite: rounds up to +inf in bf16
+            f32::from_bits(0xFF7F_FFFF), // rounds down to -inf
+            f32::from_bits(0x7F80_0001), // NaN, payload only in discarded bits
+            f32::from_bits(0xFF80_0001),
+            f32::from_bits(0x7FC0_0000), // quiet NaN
+        ]);
+        // Ordinary values across many magnitudes.
+        let mut state = 0x243F_6A88u32;
+        for _ in 0..20_000 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            src.push(f32::from_bits(state));
+        }
+
+        let mut got = vec![0u16; src.len()];
+        narrow_bf16_slice_into(&src, &mut got);
+        for (i, (&g, &v)) in got.iter().zip(&src).enumerate() {
+            let want = half::bf16::from_f32(v).to_bits();
+            assert_eq!(
+                g,
+                want,
+                "index {i}, input bits {:#010x}: got {g:#06x} want {want:#06x}",
+                v.to_bits()
+            );
+        }
+    }
+
+    /// The vector body handles 8 (widen) and 16 (narrow) elements at a time, so
+    /// every length class around those strides has to be checked — a tail bug
+    /// is invisible at any single convenient length.
+    #[test]
+    fn bf16_bulk_conversion_handles_every_tail_length() {
+        for n in 0..80usize {
+            let bits: Vec<u16> = (0..n).map(|i| (i as u16).wrapping_mul(2477)).collect();
+            let mut wide = vec![f32::NAN; n];
+            widen_bf16_slice_into(&bits, &mut wide);
+            for (i, (&w, &b)) in wide.iter().zip(&bits).enumerate() {
+                assert_eq!(
+                    w.to_bits(),
+                    half::bf16::from_bits(b).to_f32().to_bits(),
+                    "widen n={n} i={i}"
+                );
+            }
+
+            let vals: Vec<f32> = (0..n).map(|i| (i as f32) * 0.37 - 7.0).collect();
+            let mut narrow = vec![0u16; n];
+            narrow_bf16_slice_into(&vals, &mut narrow);
+            for (i, (&g, &v)) in narrow.iter().zip(&vals).enumerate() {
+                assert_eq!(g, half::bf16::from_f32(v).to_bits(), "narrow n={n} i={i}");
+            }
+        }
+    }
+
+    /// Round-tripping through the tensor-level entry points must agree with the
+    /// slice helpers, which is what proves the `to_dense_f32_widen` /
+    /// `write_dense_f32_narrow` hooks are wired to the right dtype.
+    #[test]
+    fn bf16_tensor_round_trip_matches_scalar_reference() {
+        use crate::kernels::testutil::Owned;
+        let n = 133;
+        let vals: Vec<f32> = (0..n).map(|i| (i as f32) * 0.013 - 0.9).collect();
+        let src = Owned::bf16(&[n], &vals);
+        let view = src.view();
+        let widened = to_dense_f32_widen("test", &view).unwrap();
+        for (i, (&g, &v)) in widened.iter().zip(&vals).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                half::bf16::from_f32(v).to_f32().to_bits(),
+                "i={i}"
+            );
+        }
+
+        let mut out = Owned::bf16(&[n], &vec![0.0f32; n]);
+        write_dense_f32_narrow("test", &mut out.view_mut(), &widened).unwrap();
+        for (i, (&g, &v)) in out.to_u16_bits().iter().zip(widened.iter()).enumerate() {
+            assert_eq!(g, half::bf16::from_f32(v).to_bits(), "i={i}");
+        }
     }
 }
