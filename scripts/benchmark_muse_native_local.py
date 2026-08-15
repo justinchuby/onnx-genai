@@ -227,15 +227,27 @@ def _run_once(
     }
 
 
-def check_prompt_ids(encoded: Any, canonical: Any) -> None:
-    """Raise if the tokenizer disagrees with the canonical prompt IDs.
+def encode_and_verify_prompt(
+    tokenizer: Any, prompt: str, canonical_ids: Any, expected_tokens: Any
+) -> Any:
+    """Tokenize `prompt` and verify it against the canonical prompt IDs.
 
-    The comparison lives behind a function so that `--self-test` can exercise the
-    call site itself. Testing `prompt_ids_match` in isolation would still pass if
-    this site were rewritten back to a bare `!=`, which is the original defect.
+    This is the production sequence, in a function so that `--self-test` runs
+    exactly this code with a stub tokenizer. Testing `prompt_ids_match` on its
+    own would not catch this sequence being rewritten back to a bare `!=` on the
+    tokenizer's output, which is the defect the harness exists to prevent: for a
+    numpy array that raises `ValueError`, and the prompt is never actually
+    checked.
     """
-    if not prompt_ids_match(encoded, canonical):
+    encoded = tokenizer.encode(prompt)
+    if not prompt_ids_match(encoded, canonical_ids):
         raise RuntimeError("native tokenizer output differs from the canonical prompt IDs")
+    prompt_tokens = len(encoded)
+    if prompt_tokens != int(expected_tokens):
+        raise RuntimeError(
+            f"prompt token count mismatch: {prompt_tokens} != {expected_tokens}"
+        )
+    return encoded
 
 
 def prompt_ids_match(encoded: Any, canonical: Any) -> bool:
@@ -368,28 +380,54 @@ def _self_test(*, require_numpy: bool = False) -> int:
         print("FAIL: parity against a differing reference must be reported as false")
         failures += 1
 
-    # The call site, not only the helper. A bare `!=` here raises ValueError on a
-    # numpy array, and an inverted condition would accept a mismatched prompt.
-    site_cases: list[tuple[str, Any, Any, bool]] = [
-        ("call site accepts a matching list", [1, 2, 3], [1, 2, 3], True),
-        ("call site rejects a mismatched list", [1, 2, 4], [1, 2, 3], False),
+    # The production sequence itself, driven through a stub tokenizer. A bare
+    # `!=` inside `encode_and_verify_prompt` raises ValueError on a numpy array,
+    # and an inverted condition would accept a prompt that does not match.
+    class _StubTokenizer:
+        def __init__(self, encoded: Any) -> None:
+            self._encoded = encoded
+
+        def encode(self, prompt: str) -> Any:
+            del prompt
+            return self._encoded
+
+    site_cases: list[tuple[str, Any, Any, Any, bool]] = [
+        ("production path accepts a matching list", [1, 2, 3], [1, 2, 3], 3, True),
+        ("production path rejects a mismatched list", [1, 2, 4], [1, 2, 3], 3, False),
+        ("production path rejects a wrong token count", [1, 2, 3], [1, 2, 3], 4, False),
     ]
     if np is not None:
         site_cases += [
-            ("call site accepts a matching numpy array", np.array([1, 2, 3]), [1, 2, 3], True),
-            ("call site rejects a mismatched numpy array", np.array([1, 2, 4]), [1, 2, 3], False),
             (
-                "call site rejects a numpy array differing only in the last position",
+                "production path accepts a matching numpy array",
+                np.array([1, 2, 3]),
+                [1, 2, 3],
+                3,
+                True,
+            ),
+            (
+                "production path rejects a mismatched numpy array",
+                np.array([1, 2, 4]),
+                [1, 2, 3],
+                3,
+                False,
+            ),
+            (
+                "production path rejects a numpy array differing only in the last position",
                 np.array([1, 2, 3, 9]),
                 [1, 2, 3, 4],
+                4,
                 False,
             ),
         ]
-    for name, encoded, canonical, should_accept in site_cases:
+    for name, encoded, canonical, expected_tokens, should_accept in site_cases:
         try:
-            check_prompt_ids(encoded, canonical)
+            returned = encode_and_verify_prompt(
+                _StubTokenizer(encoded), "prompt", canonical, expected_tokens
+            )
             accepted = True
         except RuntimeError:
+            returned = None
             accepted = False
         except Exception as error:  # noqa: BLE001 - the defect raises ValueError
             print(f"FAIL {name}: raised {type(error).__name__}: {error}")
@@ -397,6 +435,9 @@ def _self_test(*, require_numpy: bool = False) -> int:
             continue
         if accepted is not should_accept:
             print(f"FAIL {name}: expected accept={should_accept}, got {accepted}")
+            failures += 1
+        elif accepted and returned is not encoded:
+            print(f"FAIL {name}: must return the tokenizer's own output")
             failures += 1
 
     checks = len(cases) + len(length_cases) + len(site_cases) + 7
@@ -508,14 +549,11 @@ def main() -> int:
     # a property of the *tokenizer* and pin the text; the sequence the generator
     # actually starts from is the processor's expansion, which for an image
     # prompt is much longer.
-    encoded_prompt = tokenizer.encode(prompt)
     prompt_ids = json.loads(Path(workload["prompt_ids_file"]).read_text())
-    check_prompt_ids(encoded_prompt, prompt_ids)
+    encoded_prompt = encode_and_verify_prompt(
+        tokenizer, prompt, prompt_ids, workload["prompt_tokens"]
+    )
     prompt_tokens = len(encoded_prompt)
-    if prompt_tokens != int(workload["prompt_tokens"]):
-        raise RuntimeError(
-            f"prompt token count mismatch: {prompt_tokens} != {workload['prompt_tokens']}"
-        )
 
     for _ in range(int(workload["warmups"])):
         _run_once(
