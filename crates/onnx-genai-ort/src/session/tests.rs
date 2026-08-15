@@ -363,3 +363,170 @@ fn cuda_request_requires_compile_time_feature() {
             .contains("CUDA support not compiled in; rebuild with --features cuda")
     );
 }
+
+/// The stream `Session::user_compute_stream` reports must be the stream the
+/// CUDA EP actually computes on.
+///
+/// The getter exists so a caller can order its own device work against the
+/// session's runs without a device-wide barrier. A session that reported a
+/// stream it was not computing on would turn every such ordering into a silent
+/// race, so this test proves agreement by *executing* rather than by inspecting
+/// fields:
+///
+/// 1. The input buffer is filled with `0xFF` bytes - `f32::NAN` - on the
+///    reported stream, then a long chain of device-to-device copies is queued
+///    behind it to push the real input far back in that stream's timeline.
+/// 2. The real input is queued on the same stream, and the session runs with
+///    **no** device synchronization in between.
+/// 3. The output is read back with a stream-ordered copy on the reported
+///    stream, synchronizing only that stream.
+///
+/// If the EP ran on a stream of its own, step 2 would read the poison that step
+/// 1 left behind while the real input was still queued, and the encoder would
+/// emit NaN. Ordering is the only thing that makes this deterministic, so the
+/// assertion on finite output is an assertion about which stream ran the model.
+///
+/// Graph capture is on because that is the configuration in which a stream the
+/// session did not adopt fails at run time rather than merely running slowly.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires a CUDA device"]
+fn cuda_session_computes_on_the_stream_it_reports() {
+    use crate::binding::IoBinding;
+    use crate::cuda_rt::CudaComputeStream;
+    use crate::value::{DataType, Value};
+
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/tiny-whisper/encoder.onnx.textproto");
+    assert!(path.exists(), "fixture missing: {}", path.display());
+
+    // Two skips, and only two. Both are proven by asking the system directly
+    // before anything is built, never by pattern-matching a later error: the
+    // driver must give us a stream, and the linked ONNX Runtime must report the
+    // CUDA provider. Every failure past this point is a real failure.
+    let Ok(probe) = CudaComputeStream::new(0) else {
+        eprintln!("cuda_session_computes_on_the_stream_it_reports: no CUDA device, skipping");
+        return;
+    };
+    drop(probe);
+    let providers = super::options::available_execution_providers().expect("provider list");
+    if !provider_is_available("CUDAExecutionProvider", &providers) {
+        eprintln!(
+            "cuda_session_computes_on_the_stream_it_reports: linked ONNX Runtime reports \
+             {providers:?}, no CUDA provider, skipping"
+        );
+        return;
+    }
+
+    let environment = Environment::new("shared-stream-execution-test").expect("environment");
+    let mut options = SessionOptions::with_execution_provider(ep_selection("cuda"));
+    options.graph_capture = true;
+    options.share_cuda_compute_stream();
+    let stream = options
+        .cuda_user_compute_stream
+        .clone()
+        .expect("a CUDA device is present, so the pipeline stream must have been created");
+    let handle = stream.handle();
+
+    // Session creation fails loudly if ONNX Runtime did not record the stream,
+    // so no error here is a skip.
+    let session =
+        Session::new(&environment, &path, options).expect("CUDA session with shared stream");
+    assert_eq!(
+        session.user_compute_stream(),
+        Some(handle),
+        "the session must report exactly the stream its provider adopted"
+    );
+
+    // Device-resident I/O: CUDA graph capture requires it, and it is what lets
+    // the test address the input buffer directly.
+    let allocator = session
+        .device_kv_allocator()
+        .expect("device allocator query")
+        .expect("the CUDA EP is attached, so a device allocator must exist");
+
+    const FRAMES: usize = 8;
+    const MELS: usize = 80;
+    let input = Value::empty_in(
+        &[1, MELS as i64, FRAMES as i64],
+        DataType::Float32,
+        &allocator,
+    )
+    .expect("device input");
+    let input_ptr = input.data_ptr_addr().expect("device input address");
+    let input_bytes = MELS * FRAMES * std::mem::size_of::<f32>();
+
+    let output = Value::empty_in(&[1, 4, 4], DataType::Float32, &allocator).expect("device output");
+    let output_ptr = output.data_ptr_addr().expect("device output address");
+    let output_len = 4 * 4;
+
+    let mut binding = IoBinding::new(&session).expect("binding");
+    binding
+        .bind_input("input_features", &input)
+        .expect("bind input");
+    binding
+        .bind_output("encoder_hidden_states", &output)
+        .expect("bind output");
+
+    // Scratch for the delay chain. 16 MiB copied 64 times is ~1 GiB of traffic,
+    // which is hundreds of microseconds of stream time - long enough that a run
+    // on any other stream would reach the input first.
+    const SCRATCH: usize = 16 * 1024 * 1024;
+    let scratch =
+        Value::empty_in(&[SCRATCH as i64], DataType::Uint8, &allocator).expect("scratch a");
+    let scratch_b =
+        Value::empty_in(&[SCRATCH as i64], DataType::Uint8, &allocator).expect("scratch b");
+    let scratch_ptr = scratch.data_ptr_addr().expect("scratch a address");
+    let scratch_b_ptr = scratch_b.data_ptr_addr().expect("scratch b address");
+    stream
+        .memset_async(scratch_ptr, 0, SCRATCH)
+        .expect("prime scratch");
+
+    let host_input = vec![0u8; input_bytes];
+    let mut host_output = vec![0u8; output_len * std::mem::size_of::<f32>()];
+
+    // Three runs: the first captures the graph for annotation 0 and the rest
+    // replay it. The replays are the discriminating ones - capture itself
+    // involves enough extra synchronization to hide a wrong stream, whereas a
+    // replay is lean and races. Verified by handing ONNX Runtime a decoy stream
+    // while the session still reported this one: pass 0 passed and pass 1 came
+    // back all-NaN.
+    for pass in 0..3 {
+        // Poison, delay, then the real input - all on the reported stream, with
+        // no device-wide barrier anywhere in this block.
+        stream
+            .memset_async(input_ptr, 0xFF, input_bytes)
+            .expect("poison the input");
+        for _ in 0..64 {
+            stream
+                .memcpy_device_to_device_async(scratch_b_ptr, scratch_ptr, SCRATCH)
+                .expect("delay chain");
+        }
+        stream
+            .memcpy_host_to_device_async(input_ptr, &host_input)
+            .expect("queue the real input");
+
+        session
+            .run_with_binding_graph(&binding, 0)
+            .unwrap_or_else(|error| panic!("run {pass} on the shared stream: {error}"));
+
+        stream
+            .memcpy_device_to_host_async(&mut host_output, output_ptr)
+            .expect("stream-ordered readback");
+        stream
+            .synchronize()
+            .expect("only this stream is synchronized");
+
+        let values: Vec<f32> = host_output
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            .collect();
+        assert_eq!(values.len(), output_len);
+        assert!(
+            values.iter().all(|value| value.is_finite()),
+            "run {pass} produced {values:?}; a non-finite value means the model read the \
+             poison this test queued ahead of the real input, so the CUDA EP did not run on \
+             the stream the session reports"
+        );
+    }
+}

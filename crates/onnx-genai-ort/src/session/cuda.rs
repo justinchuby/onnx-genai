@@ -81,14 +81,14 @@ pub(super) fn append_cuda_execution_provider(
             )
         })?;
         if let Some(stream) = user_compute_stream {
-            // The typed entry point is authoritative and must run *after* every
-            // string update. It sets both fields directly
-            // (`provider_bridge_ort.cc`: `has_user_compute_stream = 1;
-            // user_compute_stream = value;`), whereas a string update reparses
-            // the whole option set and can reset the flag. Passing the pointer
-            // as text alone is not enough on every ORT, and a session that
-            // half-adopts the stream aborts ORT-managed graph capture with
-            // `operation not permitted when stream is capturing`.
+            // Second of the two mechanisms, kept because it does not depend on
+            // ONNX Runtime parsing a pointer out of text: it assigns both
+            // fields directly (`provider_bridge_ort.cc`:
+            // `has_user_compute_stream = 1; user_compute_stream = value;`).
+            // It is written last so it is the final writer, but correctness no
+            // longer rests on that ordering - the string map above carries both
+            // keys and is self-sufficient on its own. Nothing here is trusted
+            // either way; the readback below is what decides.
             let update_value =
                 api.UpdateCUDAProviderOptionsWithValue
                     .ok_or(OrtError::ApiUnavailable(
@@ -103,35 +103,40 @@ pub(super) fn append_cuda_execution_provider(
                 update_value(cuda_options, key.as_ptr(), stream as *mut std::ffi::c_void)
             })?;
         }
-        // The invariant this function exists to hold, checked rather than
-        // commented: ORT must believe it has a user compute stream exactly when
-        // we gave it one, so that `Session::user_compute_stream` cannot report
-        // a stream the provider is not using.
+        // The invariant, checked rather than asserted in a comment: ONNX
+        // Runtime must believe it has a user compute stream exactly when we
+        // gave it one, so `Session::user_compute_stream` can never name a
+        // stream the provider is not computing on.
         //
-        // What the readback does and does not prove. It checks the *net*
-        // recorded state after every update above, so it fires whenever that
-        // state is wrong - a stream that was never configured, or a later
-        // string update whose map omits the stream keys, which
-        // `UpdateProviderOptions` answers by recomputing
-        // `has_user_compute_stream` from a null pointer and clearing the flag.
-        // It cannot prove that the typed update specifically ran, because the
-        // string map above is already self-sufficient: ORT parses
-        // `user_compute_stream` into the pointer, copies it because the
-        // `has_user_compute_stream` key is present, and then sets the flag from
-        // `user_compute_stream != nullptr`. The typed call is an authoritative
-        // last write over a value the string path also sets, not the only
-        // mechanism that sets it, and dropping it would be correct rather than
-        // a regression. What must never happen is the two disagreeing, and that
-        // is what is checked here.
+        // This deliberately verifies the *net* recorded state rather than any
+        // one call, because no single call is the invariant. Both mechanisms
+        // above independently suffice on ORT 1.28 - `UpdateProviderOptions`
+        // parses `user_compute_stream` from the map, copies it because the
+        // `has_user_compute_stream` key is present, then derives the flag from
+        // `user_compute_stream != nullptr` - so ordering between them is
+        // discipline, not correctness, and dropping either one would not be a
+        // regression on its own. What must never happen is the options and the
+        // getter disagreeing. Reading the options back is how that is settled,
+        // and it fires on the cases that matter: a stream that was never
+        // configured, and a later string update whose map omits the stream keys
+        // and therefore clears the flag.
+        //
+        // The end-to-end counterpart is
+        // `session::tests::cuda_session_computes_on_the_stream_it_reports`,
+        // which proves the same agreement by execution: it queues poison, a
+        // delay, and then the real input on the reported stream and requires the
+        // model to have read the input. Handing ONNX Runtime a decoy stream
+        // makes that test return NaN.
         if let Some(stream) = user_compute_stream
             && !records_user_compute_stream(cuda_options, stream)?
         {
             return Err(OrtError::SessionCreation(
                 "ONNX Runtime did not record the shared CUDA compute stream (it must report \
                  both has_user_compute_stream=1 and the exact stream address). Every string \
-                 update reparses the whole option set and overwrites has_user_compute_stream, \
-                 so the stream keys must be present in that set and the typed \
-                 UpdateCUDAProviderOptionsWithValue must run after it."
+                 update reparses the whole option set and recomputes \
+                 has_user_compute_stream, so any update that omits the stream keys clears \
+                 it; keep both keys in every provider-option map and leave the typed \
+                 UpdateCUDAProviderOptionsWithValue as the last writer."
                     .into(),
             ));
         }

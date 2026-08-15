@@ -37,6 +37,9 @@ const CUDA_MEMCPY_DEVICE_TO_HOST: i32 = 2;
 const CUDA_MEMCPY_DEVICE_TO_DEVICE: i32 = 3;
 
 type CudaMemcpyFn = unsafe extern "C" fn(*mut c_void, *const c_void, usize, i32) -> i32;
+type CudaMemcpyAsyncFn =
+    unsafe extern "C" fn(*mut c_void, *const c_void, usize, i32, *mut c_void) -> i32;
+type CudaMemsetAsyncFn = unsafe extern "C" fn(*mut c_void, i32, usize, *mut c_void) -> i32;
 type CudaMemsetFn = unsafe extern "C" fn(*mut c_void, i32, usize) -> i32;
 type CudaDeviceSynchronizeFn = unsafe extern "C" fn() -> i32;
 type CudaSetDeviceFn = unsafe extern "C" fn(i32) -> i32;
@@ -51,7 +54,9 @@ struct CudaRt {
     // directly after construction.
     _lib: Library,
     memcpy: CudaMemcpyFn,
+    memcpy_async: CudaMemcpyAsyncFn,
     memset: CudaMemsetFn,
+    memset_async: CudaMemsetAsyncFn,
     device_synchronize: CudaDeviceSynchronizeFn,
     set_device: CudaSetDeviceFn,
     get_device: CudaGetDeviceFn,
@@ -95,7 +100,9 @@ fn load() -> std::result::Result<CudaRt, String> {
         };
         // SAFETY: the symbol signatures match the documented `cudart` ABI.
         let memcpy = unsafe { lib.get::<CudaMemcpyFn>(b"cudaMemcpy\0") };
+        let memcpy_async = unsafe { lib.get::<CudaMemcpyAsyncFn>(b"cudaMemcpyAsync\0") };
         let memset = unsafe { lib.get::<CudaMemsetFn>(b"cudaMemset\0") };
+        let memset_async = unsafe { lib.get::<CudaMemsetAsyncFn>(b"cudaMemsetAsync\0") };
         let device_synchronize =
             unsafe { lib.get::<CudaDeviceSynchronizeFn>(b"cudaDeviceSynchronize\0") };
         let set_device = unsafe { lib.get::<CudaSetDeviceFn>(b"cudaSetDevice\0") };
@@ -107,7 +114,9 @@ fn load() -> std::result::Result<CudaRt, String> {
             unsafe { lib.get::<CudaStreamSynchronizeFn>(b"cudaStreamSynchronize\0") };
         match (
             memcpy,
+            memcpy_async,
             memset,
+            memset_async,
             device_synchronize,
             set_device,
             get_device,
@@ -118,7 +127,9 @@ fn load() -> std::result::Result<CudaRt, String> {
         ) {
             (
                 Ok(memcpy),
+                Ok(memcpy_async),
                 Ok(memset),
+                Ok(memset_async),
                 Ok(device_synchronize),
                 Ok(set_device),
                 Ok(get_device),
@@ -130,7 +141,9 @@ fn load() -> std::result::Result<CudaRt, String> {
                 // Copy the function pointers out before `lib` is moved into the
                 // struct; the borrows on `lib` end here.
                 let memcpy = *memcpy;
+                let memcpy_async = *memcpy_async;
                 let memset = *memset;
+                let memset_async = *memset_async;
                 let device_synchronize = *device_synchronize;
                 let set_device = *set_device;
                 let get_device = *get_device;
@@ -141,7 +154,9 @@ fn load() -> std::result::Result<CudaRt, String> {
                 return Ok(CudaRt {
                     _lib: lib,
                     memcpy,
+                    memcpy_async,
                     memset,
+                    memset_async,
                     device_synchronize,
                     set_device,
                     get_device,
@@ -153,12 +168,21 @@ fn load() -> std::result::Result<CudaRt, String> {
             }
             _ => {
                 last_err = format!(
-                    "{name}: missing cudaMemcpy/cudaMemset/cudaDeviceSynchronize/cudaSetDevice/cudaGetDevice/cudaMemGetInfo/cudaStreamCreate/cudaStreamDestroy/cudaStreamSynchronize symbol"
+                    "{name}: missing cudaMemcpy/cudaMemcpyAsync/cudaMemset/cudaMemsetAsync/cudaDeviceSynchronize/cudaSetDevice/cudaGetDevice/cudaMemGetInfo/cudaStreamCreate/cudaStreamDestroy/cudaStreamSynchronize symbol"
                 );
             }
         }
     }
     Err(format!("could not load CUDA runtime (cudart): {last_err}"))
+}
+
+fn check_cuda(code: i32, call: &str) -> Result<()> {
+    if code != 0 {
+        return Err(OrtError::InvalidArgument(format!(
+            "{call} failed with CUDA error code {code}"
+        )));
+    }
+    Ok(())
 }
 
 fn runtime() -> Result<&'static CudaRt> {
@@ -255,6 +279,112 @@ impl CudaComputeStream {
     #[must_use]
     pub fn device_id(&self) -> i32 {
         self.device_id
+    }
+
+    /// Enqueue a host-to-device copy on this stream.
+    ///
+    /// WHY THIS EXISTS: [`memcpy_host_to_device`] issues its copy on cudart's
+    /// default stream, which does not order against the non-blocking stream ORT
+    /// creates per session, so callers have to follow it with a device-wide
+    /// barrier to make the bytes visible to the next run. Once every session in
+    /// a pipeline shares *this* stream, the same refresh becomes a stream-ordered
+    /// copy: the run that follows it on the same stream cannot start before the
+    /// copy retires, and no other work on the device is stalled. That is the
+    /// point of sharing a compute stream, so the primitive belongs to the type
+    /// that owns it.
+    ///
+    /// The copy is asynchronous with respect to the host. `src` must stay valid
+    /// until the stream reaches it, which for pageable memory means until
+    /// [`Self::synchronize`] returns.
+    pub fn memcpy_host_to_device_async(&self, dst: usize, src: &[u8]) -> Result<()> {
+        if src.is_empty() {
+            return Ok(());
+        }
+        let _guard = DeviceGuard::set(self.device_id)?;
+        let rt = runtime()?;
+        // SAFETY: `dst` is a device address with at least `src.len()` bytes of
+        // capacity, `src` is a live host slice, and the handle is owned by
+        // `self`. The signature matches the documented `cudart` ABI.
+        let code = unsafe {
+            (rt.memcpy_async)(
+                dst as *mut c_void,
+                src.as_ptr().cast(),
+                src.len(),
+                CUDA_MEMCPY_HOST_TO_DEVICE,
+                self.handle.as_ptr(),
+            )
+        };
+        check_cuda(code, "cudaMemcpyAsync(HostToDevice)")
+    }
+
+    /// Enqueue a device-to-host copy on this stream.
+    ///
+    /// Lets a caller read a session's device output back after only
+    /// [`Self::synchronize`], rather than a device-wide barrier: the copy is
+    /// queued behind the run that produced the data on the same stream.
+    pub fn memcpy_device_to_host_async(&self, dst: &mut [u8], src: usize) -> Result<()> {
+        if dst.is_empty() {
+            return Ok(());
+        }
+        let _guard = DeviceGuard::set(self.device_id)?;
+        let rt = runtime()?;
+        // SAFETY: `src` is a device address with at least `dst.len()` bytes of
+        // valid data and `dst` is a live host slice of that length.
+        let code = unsafe {
+            (rt.memcpy_async)(
+                dst.as_mut_ptr().cast(),
+                src as *const c_void,
+                dst.len(),
+                CUDA_MEMCPY_DEVICE_TO_HOST,
+                self.handle.as_ptr(),
+            )
+        };
+        check_cuda(code, "cudaMemcpyAsync(DeviceToHost)")
+    }
+
+    /// Enqueue a device-to-device copy on this stream.
+    pub fn memcpy_device_to_device_async(
+        &self,
+        dst: usize,
+        src: usize,
+        bytes: usize,
+    ) -> Result<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let _guard = DeviceGuard::set(self.device_id)?;
+        let rt = runtime()?;
+        // SAFETY: both addresses are device pointers with at least `bytes` of
+        // capacity on this stream's device.
+        let code = unsafe {
+            (rt.memcpy_async)(
+                dst as *mut c_void,
+                src as *const c_void,
+                bytes,
+                CUDA_MEMCPY_DEVICE_TO_DEVICE,
+                self.handle.as_ptr(),
+            )
+        };
+        check_cuda(code, "cudaMemcpyAsync(DeviceToDevice)")
+    }
+
+    /// Enqueue a byte fill of device memory on this stream.
+    pub fn memset_async(&self, dst: usize, value: u8, bytes: usize) -> Result<()> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let _guard = DeviceGuard::set(self.device_id)?;
+        let rt = runtime()?;
+        // SAFETY: `dst` is a device address with at least `bytes` of capacity.
+        let code = unsafe {
+            (rt.memset_async)(
+                dst as *mut c_void,
+                i32::from(value),
+                bytes,
+                self.handle.as_ptr(),
+            )
+        };
+        check_cuda(code, "cudaMemsetAsync")
     }
 
     /// Block until everything queued on this stream has finished.
