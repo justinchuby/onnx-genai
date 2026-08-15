@@ -7,7 +7,6 @@ name: Squad Heartbeat (Ralph)
 # Run 'squad upgrade' to sync installed copies from source templates.
 
 on:
-  # React to completed pull request work
   pull_request:
     types: [closed]
 
