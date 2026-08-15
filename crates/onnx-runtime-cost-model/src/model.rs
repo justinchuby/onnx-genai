@@ -113,8 +113,11 @@ impl PlacementCostModel {
     /// Returns `None` when memory bandwidth at the requested parallelism is
     /// unknown for the device — the memory term is the load-bearing one for
     /// decode, so without it there is no defensible estimate. When FLOPs or the
-    /// dtype throughput are unknown, the returned cost is **memory-bound only**
-    /// and is therefore a lower bound.
+    /// dtype throughput are unknown the compute term is omitted, and when
+    /// `launch_overhead` is unmeasured the launch term is omitted; in either
+    /// case the returned [`Cost`] is a **lower bound** ([`Cost::is_lower_bound`]
+    /// is set) rather than a point estimate, because both omissions are
+    /// optimistic (the true time can only be larger).
     pub fn op_cost(
         &self,
         structure: &KernelStructure,
@@ -134,13 +137,21 @@ impl PlacementCostModel {
         };
 
         let mut seconds = compute_time.map_or(memory_time, |ct| ct.max(memory_time));
+        // The compute term is omitted whenever FLOPs / dtype throughput were
+        // unknown; the launch term is omitted whenever launch latency was never
+        // measured. Both omissions only ever *lower* the estimate, so a cost
+        // missing either is a lower bound, not a point estimate.
+        let compute_omitted = compute_time.is_none();
+        let launch_omitted = profile.launch_overhead.is_none();
         if let Some(launch) = profile.launch_overhead {
             seconds += launch.as_secs_f64() * structure.launch_count.max(1) as f64;
         }
 
-        Some(Cost {
-            time: Duration::from_secs_f64(seconds),
-            memory_bytes: structure.bytes_moved,
+        let time = Duration::from_secs_f64(seconds);
+        Some(if compute_omitted || launch_omitted {
+            Cost::lower_bound(time, structure.bytes_moved)
+        } else {
+            Cost::estimate(time, structure.bytes_moved)
         })
     }
 
@@ -151,6 +162,20 @@ impl PlacementCostModel {
     /// zero-cost for a same-device "transfer" (a structural fact), and `None`
     /// when the link, or the requested host-memory kind's bandwidth, was never
     /// measured.
+    ///
+    /// # `latency_base` is an optimistic omission, made explicit
+    ///
+    /// Bandwidth is refused when unknown (that is the load-bearing term), but
+    /// `latency_base` is only an *additive refinement*, so rather than reject the
+    /// whole estimate over it, an unmeasured latency is treated as zero. That
+    /// substitution is **optimistic** — it under-states transfer cost — and this
+    /// is exactly the wrong direction to be silently wrong in: under-pricing a
+    /// transfer biases a placement search toward moving data, which is the defect
+    /// #994 exists to fix. The optimism is therefore not silent: when
+    /// `latency_base` was unmeasured the returned [`Cost`] is flagged
+    /// [`Cost::is_lower_bound`], so a reader cannot mistake it for a point
+    /// estimate or use it to justify a move. When latency *was* measured the
+    /// result is a full point estimate.
     pub fn transfer_cost(
         &self,
         bytes: u64,
@@ -163,11 +188,16 @@ impl PlacementCostModel {
         }
         let profile = self.transfer_matrix.get(src, dst)?;
         let bandwidth = profile.bandwidth(host)?;
+        // Unmeasured latency is treated as zero (an additive lower-bound term),
+        // but the resulting cost is flagged as a lower bound so the optimism is
+        // visible to the caller rather than silent.
         let latency = profile.latency_base.unwrap_or(Duration::ZERO);
         let seconds = latency.as_secs_f64() + bytes as f64 / bandwidth;
-        Some(Cost {
-            time: Duration::from_secs_f64(seconds),
-            memory_bytes: bytes,
+        let time = Duration::from_secs_f64(seconds);
+        Some(if profile.latency_base.is_some() {
+            Cost::estimate(time, bytes)
+        } else {
+            Cost::lower_bound(time, bytes)
         })
     }
 
@@ -242,6 +272,7 @@ impl PlacementCostModel {
 mod tests {
     use super::*;
     use crate::profile::MemoryBandwidth;
+    use crate::transfer::MeasuredLinkState;
 
     fn cuda_profile() -> DeviceProfile {
         let mut p = DeviceProfile::new("test-gpu");
@@ -328,6 +359,7 @@ mod tests {
                 pinned_bandwidth: Some(10.0e9),
                 pageable_bandwidth: None,
                 is_async_capable: true,
+                measured_link_state: MeasuredLinkState::Active,
             },
         );
         let pinned = model.transfer_cost(
@@ -345,5 +377,82 @@ mod tests {
             HostMemoryKind::Pageable,
         );
         assert!(pageable.is_none());
+    }
+
+    #[test]
+    fn transfer_cost_is_point_estimate_when_latency_measured() {
+        let mut model = PlacementCostModel::new();
+        model.set_transfer_profile(
+            DeviceKey::cpu(),
+            DeviceKey::cuda(0),
+            TransferProfile {
+                latency_base: Some(Duration::from_micros(12)),
+                pinned_bandwidth: Some(11.7e9),
+                pageable_bandwidth: None,
+                is_async_capable: true,
+                measured_link_state: MeasuredLinkState::Active,
+            },
+        );
+        let cost = model
+            .transfer_cost(
+                1_000_000_000,
+                &DeviceKey::cpu(),
+                &DeviceKey::cuda(0),
+                HostMemoryKind::Pinned,
+            )
+            .unwrap();
+        assert!(!cost.is_lower_bound, "{cost:?}");
+    }
+
+    #[test]
+    fn transfer_cost_is_lower_bound_when_latency_unmeasured() {
+        let mut model = PlacementCostModel::new();
+        model.set_transfer_profile(
+            DeviceKey::cpu(),
+            DeviceKey::cuda(0),
+            TransferProfile {
+                latency_base: None,
+                pinned_bandwidth: Some(11.7e9),
+                pageable_bandwidth: None,
+                is_async_capable: true,
+                measured_link_state: MeasuredLinkState::Active,
+            },
+        );
+        let cost = model
+            .transfer_cost(
+                1_000_000_000,
+                &DeviceKey::cpu(),
+                &DeviceKey::cuda(0),
+                HostMemoryKind::Pinned,
+            )
+            .unwrap();
+        // latency_base was never measured — the omission (treated as zero) is
+        // optimistic, so the cost must announce itself as a lower bound.
+        assert!(cost.is_lower_bound, "{cost:?}");
+    }
+
+    #[test]
+    fn op_cost_is_lower_bound_when_compute_term_omitted() {
+        let mut model = PlacementCostModel::new();
+        model.set_device_profile(DeviceKey::cuda(0), cuda_profile());
+        // FLOPs unknown → compute term omitted → lower bound.
+        let s = KernelStructure::from_bytes(1_000_000_000);
+        let cost = model.op_cost(&s, &DeviceKey::cuda(0), 1).unwrap();
+        assert!(cost.is_lower_bound, "{cost:?}");
+    }
+
+    #[test]
+    fn op_cost_is_point_estimate_when_fully_known() {
+        let mut model = PlacementCostModel::new();
+        model.set_device_profile(DeviceKey::cuda(0), cuda_profile());
+        // FLOPs + dtype throughput + launch overhead all known → point estimate.
+        let s = KernelStructure {
+            bytes_moved: 8,
+            flops: Some(1_000_000),
+            compute_dtype: Some(DataType::Float16),
+            launch_count: 1,
+        };
+        let cost = model.op_cost(&s, &DeviceKey::cuda(0), 1).unwrap();
+        assert!(!cost.is_lower_bound, "{cost:?}");
     }
 }

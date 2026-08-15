@@ -52,7 +52,9 @@ pub use device::DeviceKey;
 pub use model::{CostModelError, PlacementCostModel};
 pub use profile::{ComputeThroughput, DeviceProfile, MemoryBandwidth};
 pub use structure::{Cost, KernelStructure};
-pub use transfer::{HostMemoryKind, TransferCostMatrix, TransferKey, TransferProfile};
+pub use transfer::{
+    HostMemoryKind, MeasuredLinkState, TransferCostMatrix, TransferKey, TransferProfile,
+};
 
 #[cfg(test)]
 mod integration_tests {
@@ -61,7 +63,6 @@ mod integration_tests {
         TransferDirection, TransferFit, apply_memory_bandwidth, apply_transfer_fits,
     };
     use std::time::Duration;
-
     /// End-to-end: calibrate a model purely from probe measurements, save it,
     /// reload it, and confirm the reloaded model prices ops and transfers
     /// identically — and still returns `None` for what was never measured.
@@ -102,6 +103,7 @@ mod integration_tests {
                 },
             ],
             true,
+            MeasuredLinkState::Active,
         );
 
         // Price the CPU lm_head GEMV read (389,283,840 B) at 20-thread DRAM.

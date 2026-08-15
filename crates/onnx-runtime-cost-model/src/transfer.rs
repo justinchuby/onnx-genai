@@ -32,12 +32,57 @@ pub enum HostMemoryKind {
     Pinned,
 }
 
+/// The device power/activity state a link's bandwidth was **measured under**.
+///
+/// A host<->device bandwidth is not a device constant — it is a rate that
+/// depends on the power state of the link at the moment it was sampled. On the
+/// #995 box (RTX 4060 Laptop, PCIe Gen4) a probe taken while the GPU had dropped
+/// to NVIDIA pstate **P8** (210 MHz SM, 6.5 W) read a flat **~1.6 GB/s** H2D
+/// pinned, versus **~11.7 GB/s** for the identical binary with the GPU active —
+/// a ~7× swing from power state alone, because a parked laptop GPU downclocks
+/// the PCIe link (Gen4→Gen1). During decode the GPU is *not* parked, so a
+/// `Parked` measurement systematically **under-states** the decode-time link and
+/// must not be trusted as the rate that applies to real inference traffic.
+///
+/// This is recorded in the profile — not just in prose — so a consumer can tell
+/// whether a rate is representative of the regime it is about to price. Unknown
+/// is the honest default: a probe that did not record the power state leaves it
+/// `Unknown` rather than claiming the number is trustworthy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum MeasuredLinkState {
+    /// The device was in an active/high-power state (representative of a busy
+    /// decode loop) when the bandwidth was measured. Trustworthy for placement.
+    Active,
+    /// The device was parked in a low-power state (e.g. NVIDIA P8) when the
+    /// bandwidth was measured. The link was downclocked, so the number
+    /// under-states the decode-time rate and must not drive placement.
+    Parked,
+    /// The power state at measurement time was not recorded.
+    #[default]
+    Unknown,
+}
+
+impl MeasuredLinkState {
+    /// Whether a rate measured in this state is representative of the active
+    /// decode regime. Only [`Active`](Self::Active) qualifies; both `Parked`
+    /// (known-unrepresentative) and `Unknown` (unverified) do not.
+    pub fn is_decode_representative(self) -> bool {
+        matches!(self, MeasuredLinkState::Active)
+    }
+}
+
 /// Sustained transfer rate for one ordered `(src, dst)` device pair.
 ///
 /// `time = latency_base + bytes / bandwidth`, the exact two-parameter roofline
 /// the `roofline_transfer` probe fits. Both fields are `Option`: a probe that
 /// only measured bandwidth (e.g. a single large size) leaves `latency_base`
 /// unknown rather than pretending it is zero.
+///
+/// `measured_link_state` records the device power state the bandwidths were
+/// sampled under (see [`MeasuredLinkState`]); a `Parked` measurement is a known
+/// under-estimate of the decode-time link and a consumer can consult
+/// [`is_decode_representative`](TransferProfile::is_decode_representative) before
+/// trusting the rate for placement.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TransferProfile {
     /// Fixed per-transfer latency, or `None` if unmeasured.
@@ -49,6 +94,10 @@ pub struct TransferProfile {
     pub pageable_bandwidth: Option<f64>,
     /// Whether the link can overlap this copy with compute (async DMA).
     pub is_async_capable: bool,
+    /// The device power state these bandwidths were measured under. Defaults to
+    /// [`MeasuredLinkState::Unknown`].
+    #[serde(default)]
+    pub measured_link_state: MeasuredLinkState,
 }
 
 impl TransferProfile {
@@ -69,6 +118,14 @@ impl TransferProfile {
     /// Whether either bandwidth is known.
     pub fn is_known(&self) -> bool {
         self.pinned_bandwidth.is_some() || self.pageable_bandwidth.is_some()
+    }
+
+    /// Whether these rates were measured in a state representative of the active
+    /// decode regime (see [`MeasuredLinkState`]). A `false` here means the rate
+    /// is either a known under-estimate (measured while the device was parked)
+    /// or unverified — a consumer should not use it to justify moving data.
+    pub fn is_decode_representative(&self) -> bool {
+        self.measured_link_state.is_decode_representative()
     }
 }
 
@@ -157,12 +214,31 @@ mod tests {
                 pinned_bandwidth: Some(11.7e9),
                 pageable_bandwidth: Some(6.0e9),
                 is_async_capable: true,
+                measured_link_state: MeasuredLinkState::Active,
             },
         );
         let p = m.get(&DeviceKey::cpu(), &DeviceKey::cuda(0)).unwrap();
         assert_eq!(p.bandwidth(HostMemoryKind::Pinned), Some(11.7e9));
         assert_eq!(p.bandwidth(HostMemoryKind::Pageable), Some(6.0e9));
+        assert!(p.is_decode_representative());
         // The reverse direction was not recorded — unknown, not mirrored.
         assert!(m.get(&DeviceKey::cuda(0), &DeviceKey::cpu()).is_none());
+    }
+
+    #[test]
+    fn measured_link_state_gates_decode_trust() {
+        // Unknown is the default and is not decode-representative.
+        assert!(!MeasuredLinkState::default().is_decode_representative());
+        assert!(!TransferProfile::unknown().is_decode_representative());
+        // A parked measurement is a known under-estimate — not trustworthy.
+        let parked = TransferProfile {
+            pinned_bandwidth: Some(1.6e9),
+            measured_link_state: MeasuredLinkState::Parked,
+            ..TransferProfile::unknown()
+        };
+        assert!(parked.is_known());
+        assert!(!parked.is_decode_representative());
+        // Only an active measurement qualifies.
+        assert!(MeasuredLinkState::Active.is_decode_representative());
     }
 }

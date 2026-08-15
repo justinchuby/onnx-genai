@@ -91,20 +91,66 @@ mod opt_dtype_serde {
 /// combining a [`KernelStructure`] with a device's rates, so it never contains
 /// a fabricated constant — if a rate is missing the model returns `None` and no
 /// `Cost` is produced at all.
+///
+/// # Lower bound vs. point estimate
+///
+/// `time` is **not always a point estimate**. Some formulas legitimately omit a
+/// term the model could not price without inventing a constant — an unmeasured
+/// transfer `latency_base` (treated as zero), or the compute term of an op whose
+/// FLOPs or dtype throughput are unknown (leaving a memory-bound-only figure).
+/// In those cases the true cost is **≥** `time`, and [`is_lower_bound`] is set.
+///
+/// This distinction is load-bearing for placement, not cosmetic. The omitted
+/// terms are all *optimistic*: a lower-bound transfer time under-states the cost
+/// of moving data, which biases a placement search toward moving it. Issue #994
+/// exists precisely because we move data we should not (an embedding gather that
+/// ships 389 MB to produce 10 KB), so a consumer that treats a lower bound as an
+/// estimate can "confirm" a move the real cost would have rejected. A reader of a
+/// [`Cost`] must therefore be unable to mistake the two: check [`is_lower_bound`]
+/// before using a cost to justify moving data.
+///
+/// [`is_lower_bound`]: Cost::is_lower_bound
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Cost {
-    /// Estimated wall time.
+    /// Estimated wall time. A point estimate when `is_lower_bound` is `false`;
+    /// otherwise a lower bound (the true time is `>=` this).
     pub time: Duration,
     /// Bytes of memory traffic this cost accounts for.
     pub memory_bytes: u64,
+    /// Whether `time` is a lower bound rather than a point estimate, because the
+    /// formula omitted an unpriceable (and optimistic) term. See the type-level
+    /// docs. Never use a lower-bound cost to justify moving data.
+    pub is_lower_bound: bool,
 }
 
 impl Cost {
-    /// The zero cost (a free op / same-device transfer).
+    /// The zero cost (a free op / same-device transfer). Exact, not a bound.
     pub fn zero() -> Self {
         Self {
             time: Duration::ZERO,
             memory_bytes: 0,
+            is_lower_bound: false,
+        }
+    }
+
+    /// A point-estimate cost: every term the formula needs was priced from a
+    /// measured rate.
+    pub fn estimate(time: Duration, memory_bytes: u64) -> Self {
+        Self {
+            time,
+            memory_bytes,
+            is_lower_bound: false,
+        }
+    }
+
+    /// A lower-bound cost: an unpriceable, optimistic term was omitted (e.g. an
+    /// unmeasured transfer latency, or a missing compute term). The true cost is
+    /// `>=` `time`; callers must not treat it as a point estimate.
+    pub fn lower_bound(time: Duration, memory_bytes: u64) -> Self {
+        Self {
+            time,
+            memory_bytes,
+            is_lower_bound: true,
         }
     }
 }
