@@ -763,17 +763,23 @@ impl Kernel for MatMulNBitsKernel {
             && self.accuracy_level == 0
             && !self.weight_prepacked
             && group_indices.is_none()
-            && let Some(zero_points) = zero_points
             && let Some(packed) = contiguous_host_slice::<u8>(&inputs[1])
             && let Some(scales) = borrowed_scales(&inputs[2])
-            && let Some(zero_points) = contiguous_host_slice::<u8>(zero_points)
+            && let Some(borrowed_zero_points) = borrow_optional_int4_zero_points(zero_points)
         {
+            // Gate on *symmetry* explicitly, not on "a zero_points input happens
+            // to exist". Symmetric int4 (no zero_points) has the implicit
+            // midpoint 8 and is mathematically simpler than the asymmetric case,
+            // yet it used to fall past this zero-copy path all the way to the
+            // resident f32 `weight_nk` cache (~8x the file size in RAM). It now
+            // borrows the packed int4 in place like the asymmetric case, using
+            // `None` zero points to mean the implicit midpoint (see #979).
             with_decode_pool(|| {
                 borrowed_affine_int4_matmul(
                     &activations,
                     packed,
                     scales,
-                    zero_points,
+                    borrowed_zero_points,
                     bias.as_deref(),
                     result,
                     m,
@@ -4960,6 +4966,24 @@ fn packed_nbits_output_row(
     }
 }
 
+/// Borrow the optional int4 zero-point tensor for the zero-copy decode path.
+///
+/// Returns `Some(None)` for a symmetric model (no zero_points input) — the
+/// borrowed kernel then uses the implicit midpoint 8. Returns `Some(Some(zp))`
+/// when an asymmetric uint8 zero_points input is present and host-contiguous.
+/// Returns `None` only when a zero_points input exists but cannot be borrowed
+/// in place, so the caller must fall through to another path. Gating on this
+/// (rather than on "a zero_points input happens to exist") is what lets
+/// symmetric int4 take the borrowed path instead of the resident f32 cache.
+fn borrow_optional_int4_zero_points<'a>(
+    zero_points: Option<&TensorView<'a>>,
+) -> Option<Option<&'a [u8]>> {
+    match zero_points {
+        None => Some(None),
+        Some(view) => contiguous_host_slice::<u8>(view).map(Some),
+    }
+}
+
 fn contiguous_host_slice<'a, T>(view: &TensorView<'a>) -> Option<&'a [T]> {
     if !view.device.is_host_accessible() || !view.is_contiguous() {
         return None;
@@ -4983,7 +5007,7 @@ fn borrowed_affine_int4_matmul(
     activations: &[f32],
     packed: &[u8],
     scales: BorrowedScales<'_>,
-    zero_points: &[u8],
+    zero_points: Option<&[u8]>,
     bias: Option<&[f32]>,
     result: &mut [f32],
     m: usize,
@@ -5030,8 +5054,10 @@ fn borrowed_affine_int4_matmul(
                 let output_index = output_start + offset;
                 let packed_row =
                     &packed[output_index * packed_row_size..(output_index + 1) * packed_row_size];
-                let zp_row = &zero_points
-                    [output_index * zero_point_row_size..(output_index + 1) * zero_point_row_size];
+                let zp_row = zero_points.map(|zp| {
+                    &zp[output_index * zero_point_row_size
+                        ..(output_index + 1) * zero_point_row_size]
+                });
                 let mut sum = bias.map_or(0.0, |values| values[output_index]);
                 for block in 0..block_count {
                     let depth_start = block * block_size;
@@ -5039,7 +5065,7 @@ fn borrowed_affine_int4_matmul(
                     let block_values = &packed_row[block * layout.packed_block_size()
                         ..(block + 1) * layout.packed_block_size()];
                     let scale = scales.get(output_index * block_count + block);
-                    let zero_point = layout.zero_point(Some(zp_row), block) as f32;
+                    let zero_point = layout.zero_point(zp_row, block) as f32;
                     let mut dot;
                     #[cfg(target_arch = "aarch64")]
                     if valid == 32 && block_size == 32 {
@@ -5078,7 +5104,7 @@ fn borrowed_affine_int4_matmul_m1_neon_dot(
     activation: &[f32],
     packed: &[u8],
     scales: &BorrowedScales<'_>,
-    zero_points: &[u8],
+    zero_points: Option<&[u8]>,
     bias: Option<&[f32]>,
     result: &mut [f32],
     k: usize,
@@ -5103,8 +5129,9 @@ fn borrowed_affine_int4_matmul_m1_neon_dot(
             let output_index = output_start + offset;
             let packed_row =
                 &packed[output_index * packed_row_size..(output_index + 1) * packed_row_size];
-            let zp_row = &zero_points
-                [output_index * zero_point_row_size..(output_index + 1) * zero_point_row_size];
+            let zp_row = zero_points.map(|zp| {
+                &zp[output_index * zero_point_row_size..(output_index + 1) * zero_point_row_size]
+            });
             let mut sum = bias.map_or(0.0, |values| values[output_index]);
             for block in 0..block_count {
                 let packed_block = &packed_row[block * 16..(block + 1) * 16];
@@ -5112,7 +5139,7 @@ fn borrowed_affine_int4_matmul_m1_neon_dot(
                 // SAFETY: runtime dispatch selected FEAT_DotProd and both slices
                 // contain exactly one block32 payload.
                 let dot = unsafe { affine_int4_block32_sdot_neon(activation_block, packed_block) };
-                let zero_point = layout.zero_point(Some(zp_row), block) as i32;
+                let zero_point = layout.zero_point(zp_row, block) as i32;
                 let correction = (8 - zero_point) * activation_sums[block];
                 sum += (dot + correction) as f32
                     * (activation_scales[block] * scales.get(output_index * block_count + block));
@@ -10793,7 +10820,11 @@ mod tests {
     }
 
     #[test]
-    fn matmulnbits_prepacked_m1_block32_symmetric_reuses_weight_for_new_activations() {
+    fn matmulnbits_m1_block32_symmetric_borrows_weight_for_new_activations() {
+        // Post-#979: symmetric int4 (constant B) borrows the packed weight in
+        // place per call instead of building/reusing a resident cache. The
+        // per-activation correctness invariant still holds; the difference is
+        // that no prepack/f32 cache is ever populated.
         let (k, n, block_size) = (35, 7, 32);
         let a1_values: Vec<f32> = (0..k)
             .map(|i| ((i * 11 % 41) as f32 - 20.0) / 13.0)
@@ -10822,18 +10853,17 @@ mod tests {
 
         let cached_ptr = prepack_cache_ptr(&kernel);
         assert!(
-            cached_ptr.is_some(),
-            "M=1 constant B must populate a prepacked weight cache"
+            cached_ptr.is_none(),
+            "symmetric M=1 constant B must borrow in place, not populate a weight cache (#979)"
         );
         let a2 = Owned::f32(&[1, k], &a2_values);
         let mut y2 = Owned::zeros_f32(&[1, n]);
         kernel
             .execute(&[a2.view(), b.view(), scales.view()], &mut [y2.view_mut()])
             .unwrap();
-        assert_eq!(
-            prepack_cache_ptr(&kernel),
-            cached_ptr,
-            "prepacked weight cache must be reused (stable) across activations"
+        assert!(
+            !prepack_cache_populated(&kernel),
+            "symmetric decode must stay on the borrowed path across activations (#979)"
         );
         assert_close(&y2.to_f32(), &reference(&a2_values, &dequantized, 1, k, n));
         assert_ne!(y1.to_f32(), y2.to_f32());
@@ -10871,6 +10901,49 @@ mod tests {
         assert!(
             !prepack_cache_populated(&kernel),
             "asymmetric INT4 must borrow packed inputs instead of building a weight cache"
+        );
+    }
+
+    #[test]
+    fn matmulnbits_symmetric_m1_borrows_instead_of_building_f32_cache() {
+        // Regression for #979: symmetric int4 (no zero_points input) must take
+        // the zero-copy borrowed decode path using the implicit midpoint 8, and
+        // must NOT fall through to the resident f32 `weight_nk` cache (~8x the
+        // file size in RAM). With constant B/scales, the pre-#979 code populated
+        // `weight_nk`; the borrowed path returns before any cache is built, so
+        // `!prepack_cache_populated` is a *positive* proof the branch changed.
+        let (k, n, block_size) = (128, 7, 32);
+        let a_values: Vec<f32> = (0..k)
+            .map(|i| ((i * 11 % 41) as f32 - 20.0) / 13.0)
+            .collect();
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 23 % 47) as f32 - 19.0) / 12.0)
+            .collect();
+        let (packed, scales, zero_points, _) = quantize(&weights, n, k, block_size, false);
+        assert!(
+            zero_points.is_none(),
+            "symmetric quantize must omit the zero_points tensor"
+        );
+        let dequantized = dequantize_reference(&packed, &scales, None, n, k, block_size);
+        let mut kernel = test_kernel(k, n, block_size);
+        kernel.set_constant_inputs(&[false, true, true]);
+
+        let a = Owned::f32(&[1, k], &a_values);
+        let b = Owned::u8(&[n, 4, 16], &packed);
+        let scales = Owned::f32(&[n, 4], &scales);
+        let mut y = Owned::zeros_f32(&[1, n]);
+        kernel
+            .execute(&[a.view(), b.view(), scales.view()], &mut [y.view_mut()])
+            .unwrap();
+
+        assert_close(&y.to_f32(), &reference(&a_values, &dequantized, 1, k, n));
+        assert!(
+            kernel.weight_nk.get().is_none(),
+            "symmetric INT4 must not expand the weight to a resident f32 cache (#979)"
+        );
+        assert!(
+            !prepack_cache_populated(&kernel),
+            "symmetric INT4 must borrow packed inputs instead of building any weight cache (#979)"
         );
     }
 
