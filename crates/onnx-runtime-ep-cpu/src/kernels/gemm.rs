@@ -585,6 +585,39 @@ mod tests {
         }
     }
 
+    /// Structural proof that `Gemm` delegates to the shared backend, with no
+    /// timing involved.
+    ///
+    /// With `alpha = 1`, no bias and no transposes, `Gemm` is exactly
+    /// `matmul::gemm` plus buffer plumbing, so its output must be **bit**
+    /// identical to calling that backend directly. A scalar re-implementation
+    /// would have to reproduce the blocked, register-tiled, rayon-partitioned
+    /// summation order of `gemm_generic`/`x86_sgemm` float-for-float to pass
+    /// this, which is precisely the property the removed triple loop lacked:
+    /// it accumulated row-at-a-time and rounded differently.
+    ///
+    /// This runs in CI on every platform, unlike the timing guard below.
+    #[test]
+    fn gemm_output_is_bit_identical_to_the_shared_backend() {
+        let (m, k, n) = (7usize, 96usize, 48usize);
+        let a_values = pseudo(m * k, 0.4);
+        let b_values = pseudo(k * n, 0.8);
+
+        let mut expected = vec![0.0f32; m * n];
+        matmul::gemm(&a_values, &b_values, &mut expected, m, k, n).unwrap();
+
+        let a = Owned::f32(&[m, k], &a_values);
+        let b = Owned::f32(&[k, n], &b_values);
+        let mut out = Owned::zeros_f32(&[m, n]);
+        gemm(1.0, 1.0, false, false, &a, &b, None, &mut out);
+
+        assert_eq!(
+            out.to_f32(),
+            expected,
+            "Gemm is no longer computing its f32 product with matmul::gemm"
+        );
+    }
+
     /// Performance regression guard, not a benchmark.
     ///
     /// The defect this file's rewrite fixes was structural: `Gemm` computed its
