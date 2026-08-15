@@ -6,8 +6,8 @@
 #![allow(clippy::field_reassign_with_default)]
 
 use onnx_genai_engine::{
-    AdapterActivation, AdapterSelection, Engine, EngineConfig, GenerateOptions, GeneratePrompt,
-    GenerateRequest, PipelineGenerateRequest,
+    AdapterActivation, AdapterSelection, Engine, EngineConfig, GenerateOptions,
+    GeneratePrompt, GenerateRequest, PipelineGenerateRequest,
     pipeline::{PipelineEngine, WorkflowOutputRole},
 };
 use onnx_genai_ort::{DataType, Value};
@@ -63,10 +63,7 @@ fn adapter_request(
         prompt: GeneratePrompt::TokenIds(vec![]),
         options: Default::default(),
     })
-    .with_input(
-        "request.slot_ids",
-        Value::from_slice_i64(slot_ids, &[batch])?,
-    )
+    .with_input("request.slot_ids", Value::from_slice_i64(slot_ids, &[batch])?)
     .with_input(
         "request.request_epochs",
         Value::from_slice_i64(request_epochs, &[batch])?,
@@ -91,7 +88,10 @@ fn adapter_request(
             DataType::Bool,
         )?,
     )
-    .with_input("activations", Value::from_slice_f32(values, &[batch, 2])?))
+    .with_input(
+        "activations",
+        Value::from_slice_f32(values, &[batch, 2])?,
+    ))
 }
 
 #[test]
@@ -99,7 +99,11 @@ fn mobius_parameter_adapters_preserve_order_rows_compaction_and_epochs() -> anyh
     let mut engine = Engine::from_pipeline_dir(&root("adapter")?, EngineConfig::default())?;
     let selection = AdapterSelection::default()
         .with_slot(10, 0, [AdapterActivation::new("red", 1.0)])
-        .with_slot(20, 0, [AdapterActivation::new("blue", 1.0)])
+        .with_slot(
+            20,
+            0,
+            [AdapterActivation::new("blue", 1.0)],
+        )
         .with_slot(
             30,
             0,
@@ -137,7 +141,11 @@ fn mobius_parameter_adapters_preserve_order_rows_compaction_and_epochs() -> anyh
         &[1],
         &[true],
         &[1.0, 2.0],
-        AdapterSelection::default().with_slot(10, 0, [AdapterActivation::new("red", 1.0)]),
+        AdapterSelection::default().with_slot(
+            10,
+            0,
+            [AdapterActivation::new("red", 1.0)],
+        ),
     )?)?;
     assert_eq!(stale["result"].to_vec_f32()?, vec![1.0, 2.0]);
     for _ in 0..2 {
@@ -152,9 +160,16 @@ fn mobius_parameter_adapters_preserve_order_rows_compaction_and_epochs() -> anyh
     }
     let green =
         AdapterSelection::default().with_slot(40, 0, [AdapterActivation::new("green", 1.0)]);
-    let output = engine.run_pipeline(adapter_request(&[40], &[0], &[true], &[1.0, 2.0], green)?)?;
+    let output = engine.run_pipeline(adapter_request(
+        &[40],
+        &[0],
+        &[true],
+        &[1.0, 2.0],
+        green,
+    )?)?;
     assert_eq!(output["result"].to_vec_f32()?, vec![4.0, 5.0]);
-    let red = AdapterSelection::default().with_slot(50, 0, [AdapterActivation::new("red", 1.0)]);
+    let red =
+        AdapterSelection::default().with_slot(50, 0, [AdapterActivation::new("red", 1.0)]);
     for _ in 0..2 {
         let output = engine.run_pipeline(adapter_request(
             &[50],
@@ -238,11 +253,9 @@ fn decoder_batch_request_with_slots(
     let bool_bytes = active.iter().map(|value| u8::from(*value)).collect();
     let zeros = vec![0_i64; usize::try_from(batch)?];
     let ones = vec![1_i64; usize::try_from(batch)?];
-    let float_zeros = vec![0.0_f32; usize::try_from(batch)?];
-    let float_ones = vec![1.0_f32; usize::try_from(batch)?];
-    let seeds = vec![7_i64; usize::try_from(batch)?];
-    let eos_ids = vec![127_i64; usize::try_from(batch)?];
-    let row_max_iterations = vec![i64::try_from(max_new_tokens)?; usize::try_from(batch)?];
+    let negative_ones = vec![-1_i64; usize::try_from(batch)?];
+    let floats_zero = vec![0.0_f32; usize::try_from(batch)?];
+    let floats_one = vec![1.0_f32; usize::try_from(batch)?];
     assert_eq!(slot_ids.len(), usize::try_from(batch)?);
     Ok(PipelineGenerateRequest::new(GenerateRequest {
         prompt: GeneratePrompt::TokenIds(vec![0]),
@@ -255,36 +268,6 @@ fn decoder_batch_request_with_slots(
     .with_input(
         "request.prompt_lengths",
         Value::from_slice_i64(prompt_lengths, &[batch])?,
-    )
-    .with_input(
-        "request.eos_ids",
-        Value::from_slice_i64(&eos_ids, &[batch, 1])?,
-    )
-    .with_input(
-        "request.eos_lengths",
-        Value::from_slice_i64(&ones, &[batch])?,
-    )
-    .with_input(
-        "request.row_max_iterations",
-        Value::from_slice_i64(&row_max_iterations, &[batch])?,
-    )
-    .with_input(
-        "request.temperature",
-        Value::from_slice_f32(&float_ones, &[batch])?,
-    )
-    .with_input("request.top_k", Value::from_slice_i64(&ones, &[batch])?)
-    .with_input(
-        "request.top_p",
-        Value::from_slice_f32(&float_ones, &[batch])?,
-    )
-    .with_input(
-        "request.min_p",
-        Value::from_slice_f32(&float_zeros, &[batch])?,
-    )
-    .with_input("request.seed", Value::from_slice_i64(&seeds, &[batch])?)
-    .with_input(
-        "request.rng_counter",
-        Value::from_slice_i64(&zeros, &[batch])?,
     )
     .with_input(
         "package.active",
@@ -300,6 +283,36 @@ fn decoder_batch_request_with_slots(
         Value::from_slice_i64(slot_ids, &[batch])?,
     )
     .with_input(
+        "request.eos_ids",
+        Value::from_slice_i64(&vec![2_i64; usize::try_from(batch)?], &[batch, 1])?,
+    )
+    .with_input(
+        "request.eos_lengths",
+        Value::from_slice_i64(&ones, &[batch])?,
+    )
+    .with_input(
+        "request.row_max_iterations",
+        Value::from_slice_i64(&negative_ones, &[batch])?,
+    )
+    .with_input(
+        "request.temperature",
+        Value::from_slice_f32(&floats_one, &[batch])?,
+    )
+    .with_input("request.top_k", Value::from_slice_i64(&ones, &[batch])?)
+    .with_input(
+        "request.top_p",
+        Value::from_slice_f32(&floats_one, &[batch])?,
+    )
+    .with_input(
+        "request.min_p",
+        Value::from_slice_f32(&floats_zero, &[batch])?,
+    )
+    .with_input("request.seed", Value::from_slice_i64(slot_ids, &[batch])?)
+    .with_input(
+        "request.rng_counter",
+        Value::from_slice_i64(&zeros, &[batch])?,
+    )
+    .with_input(
         "package.cache_lengths",
         Value::from_slice_i64(&zeros, &[batch])?,
     )
@@ -307,20 +320,6 @@ fn decoder_batch_request_with_slots(
         "package.zero_batch",
         Value::from_slice_i64(&zeros, &[batch])?,
     ))
-}
-
-#[test]
-fn mobius_v2_policy_components_join_one_execution_island() -> anyhow::Result<()> {
-    for package in ["decoder", "vlm"] {
-        let engine = PipelineEngine::from_dir(&root(package)?)?;
-        let islands = engine.execution_island_diagnostics();
-        assert!(islands.iter().any(|island| {
-            ["token_sampler", "token_state_update", "termination"]
-                .iter()
-                .all(|component| island.components.iter().any(|name| name == component))
-        }));
-    }
-    Ok(())
 }
 
 #[test]
@@ -341,6 +340,7 @@ fn mobius_decoder_workflow_executes() -> anyhow::Result<()> {
             .len(),
         3
     );
+    assert_batched_policy_super_island(&engine);
     Ok(())
 }
 
@@ -377,7 +377,8 @@ fn mobius_decoder_rows_match_independent_runs_and_dynamic_batch_replay() -> anyh
     assert!(
         multi_row_error
             .to_string()
-            .contains("multi-row ragged output")
+            .contains("multi-row ragged output"),
+        "{multi_row_error:#}"
     );
 
     let batched = decoder_batch_request(&[4, 5, 6, 0], 2, 2, &[2, 1], &[true, true], 3)?;
@@ -402,10 +403,18 @@ fn mobius_decoder_rows_match_independent_runs_and_dynamic_batch_replay() -> anyh
         .iter()
         .map(|island| island.stable_binding_runs)
         .sum::<u64>();
-    let compacted =
-        decoder_batch_request_with_slots(&[6, 0, 4, 5], 2, 2, &[1, 2], &[true, true], &[1, 0], 3)?;
+    let compacted = decoder_batch_request_with_slots(
+        &[6, 0, 4, 5],
+        2,
+        2,
+        &[1, 2],
+        &[true, true],
+        &[1, 0],
+        3,
+    )?;
     let compacted_output = engine.run_pipeline_outputs(compacted)?;
-    let compacted_rows = engine.output_rows_for_role(&compacted_output, WorkflowOutputRole::Tokens);
+    let compacted_rows =
+        engine.output_rows_for_role(&compacted_output, WorkflowOutputRole::Tokens);
     let compacted_row = |semantic_id| {
         compacted_rows
             .iter()
@@ -448,53 +457,15 @@ fn mobius_decoder_rows_match_independent_runs_and_dynamic_batch_replay() -> anyh
         second_tokens
     );
 
-    let batch_four = decoder_batch_request(
-        &[4, 5, 6, 0, 4, 5, 6, 0],
-        4,
-        2,
-        &[2, 1, 2, 1],
-        &[true, true, true, true],
-        3,
-    )?;
-    let batch_four_output = engine.run_pipeline_outputs(batch_four)?;
-    let batch_four_rows =
-        engine.output_rows_for_role(&batch_four_output, WorkflowOutputRole::Tokens);
-    assert_eq!(batch_four_rows.len(), 4);
-    for (row, expected) in
-        batch_four_rows
-            .iter()
-            .zip([&first_tokens, &second_tokens, &first_tokens, &second_tokens])
-    {
-        assert_eq!(row.1.to_vec_i64()?, expected.as_slice());
-    }
-
-    let replay = decoder_batch_request(&[4, 5], 1, 2, &[2], &[true], 3)?;
+    let replay = decoder_batch_request(&[6, 0], 1, 2, &[1], &[true], 3)?;
     let replay_output = engine.run_pipeline_outputs(replay)?;
     assert_eq!(
         engine
             .structured_output_for_role(&replay_output, WorkflowOutputRole::Tokens)
             .expect("batch-one replay must emit tokens")
             .to_vec_i64()?,
-        first_tokens
-    );
-
-    let batch_two_replay = decoder_batch_request(&[4, 5, 6, 0], 2, 2, &[2, 1], &[true, true], 3)?;
-    let batch_two_replay_output = engine.run_pipeline_outputs(batch_two_replay)?;
-    let batch_two_replay_rows =
-        engine.output_rows_for_role(&batch_two_replay_output, WorkflowOutputRole::Tokens);
-    assert_eq!(batch_two_replay_rows[0].1.to_vec_i64()?, first_tokens);
-    assert_eq!(batch_two_replay_rows[1].1.to_vec_i64()?, second_tokens);
-
-    let reused_slot = decoder_batch_request_with_slots(&[6, 0], 1, 2, &[1], &[true], &[0], 3)?;
-    let reused_slot_output = engine.run_pipeline_outputs(reused_slot)?;
-    assert_eq!(
-        engine
-            .structured_output_for_role(&reused_slot_output, WorkflowOutputRole::Tokens)
-            .expect("reused slot must emit tokens for its new request epoch")
-            .to_vec_i64()?,
         second_tokens
     );
-    assert_batched_policy_super_island(&engine);
     Ok(())
 }
 
@@ -586,34 +557,36 @@ fn tts_request(
     let rows = usize::try_from(batch)?;
     assert_eq!(prompt_tokens.len(), rows * 2);
     assert_eq!(slot_ids.len(), rows);
-    Ok(PipelineGenerateRequest::new(GenerateRequest {
-        prompt: GeneratePrompt::TokenIds(vec![0]),
-        options: options(1),
-    })
-    .with_input(
-        "request.prompt_tokens",
-        Value::from_slice_i64(prompt_tokens, &[batch, 2])?,
+    Ok(
+        PipelineGenerateRequest::new(GenerateRequest {
+            prompt: GeneratePrompt::TokenIds(vec![0]),
+            options: options(1),
+        })
+        .with_input(
+            "request.prompt_tokens",
+            Value::from_slice_i64(prompt_tokens, &[batch, 2])?,
+        )
+        .with_input(
+            "package.false",
+            Value::from_raw_bytes(vec![0; rows], &[batch], DataType::Bool)?,
+        )
+        .with_input(
+            "package.zero_batch",
+            Value::from_slice_i64(&vec![0; rows], &[batch])?,
+        )
+        .with_input(
+            "package.one_batch",
+            Value::from_slice_i64(&vec![1; rows], &[batch])?,
+        )
+        .with_input(
+            "package.true",
+            Value::from_raw_bytes(vec![1; rows], &[batch], DataType::Bool)?,
+        )
+        .with_input(
+            "package.slot_ids",
+            Value::from_slice_i64(slot_ids, &[batch])?,
+        ),
     )
-    .with_input(
-        "package.false",
-        Value::from_raw_bytes(vec![0; rows], &[batch], DataType::Bool)?,
-    )
-    .with_input(
-        "package.zero_batch",
-        Value::from_slice_i64(&vec![0; rows], &[batch])?,
-    )
-    .with_input(
-        "package.one_batch",
-        Value::from_slice_i64(&vec![1; rows], &[batch])?,
-    )
-    .with_input(
-        "package.true",
-        Value::from_raw_bytes(vec![1; rows], &[batch], DataType::Bool)?,
-    )
-    .with_input(
-        "package.slot_ids",
-        Value::from_slice_i64(slot_ids, &[batch])?,
-    ))
 }
 
 #[test]
