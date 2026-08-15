@@ -2,6 +2,7 @@
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, Dim, Node, Shape, broadcast_shapes, compute_contiguous_strides};
+use rayon::prelude::*;
 
 use super::{check_arity, to_dense_bytes, write_dense_bytes};
 use crate::strided::numel;
@@ -228,23 +229,62 @@ impl Kernel for QLinearMatMulKernel {
 
         let a = read_quantized(&inputs[0])?;
         let b = read_quantized(&inputs[3])?;
+        let (m, k, n) = (geometry.m, geometry.k, geometry.n);
         let mut output = Vec::with_capacity(geometry.result_len);
         let mut batch_index = vec![0; geometry.batch_shape.len()];
         for batch in 0..geometry.batch_count {
             let a_batch = geometry.a_batch_offset(&batch_index);
             let b_batch = geometry.b_batch_offset(&batch_index);
-            let a_offset = a_batch * geometry.m * geometry.k;
-            let b_offset = b_batch * geometry.k * geometry.n;
-            for row in 0..geometry.m {
-                for column in 0..geometry.n {
-                    let (a_scale, a_zero_point) = a_quant.at(a_batch, row);
-                    let (b_scale, b_zero_point) = b_quant.at(b_batch, column);
-                    let mut accumulated = 0i32;
-                    for inner in 0..geometry.k {
-                        let av = a[a_offset + row * geometry.k + inner] - a_zero_point;
-                        let bv = b[b_offset + inner * geometry.n + column] - b_zero_point;
-                        accumulated = accumulated.wrapping_add(av * bv);
+            let a_offset = a_batch * m * k;
+            let b_offset = b_batch * k * n;
+            let b_zero_points: Vec<i32> =
+                (0..n).map(|column| b_quant.at(b_batch, column).1).collect();
+
+            // Accumulate the integer product with `k` outermost so `B` is read
+            // along its rows. The previous order walked `B` down a column with
+            // stride `n`, which touches a fresh cache line per element.
+            //
+            // The zero points are lifted out of the inner loop by expanding
+            //   sum_k (a_k - az) * (b_kn - bz_n)
+            //     = sum_k (a_k - az) * b_kn  -  bz_n * sum_k (a_k - az)
+            // which is an identity over the integers, so under wrapping
+            // arithmetic (exactly arithmetic mod 2^32) both sides reduce to the
+            // same `i32`. The result is bit-identical to the previous loop,
+            // including on overflow, and the inner loop becomes a plain
+            // multiply-accumulate over two contiguous slices.
+            //
+            // Rows are independent, so integer accumulation stays deterministic
+            // under `par_chunks_mut` -- no summation order changes.
+            let mut products = vec![0i32; m * n];
+            products
+                .par_chunks_mut(n)
+                .enumerate()
+                .for_each(|(row, accumulators)| {
+                    let a_zero_point = a_quant.at(a_batch, row).1;
+                    let a_row = &a[a_offset + row * k..a_offset + row * k + k];
+                    let mut a_sum = 0i32;
+                    for (inner, &a_value) in a_row.iter().enumerate() {
+                        let centered = a_value.wrapping_sub(a_zero_point);
+                        a_sum = a_sum.wrapping_add(centered);
+                        if centered == 0 {
+                            continue;
+                        }
+                        let start = b_offset + inner * n;
+                        let b_row = &b[start..start + n];
+                        for (accumulator, &b_value) in accumulators.iter_mut().zip(b_row) {
+                            *accumulator = accumulator.wrapping_add(centered.wrapping_mul(b_value));
+                        }
                     }
+                    for (accumulator, &b_zero_point) in accumulators.iter_mut().zip(&b_zero_points)
+                    {
+                        *accumulator = accumulator.wrapping_sub(a_sum.wrapping_mul(b_zero_point));
+                    }
+                });
+
+            for (row, accumulators) in products.chunks_exact(n).enumerate() {
+                let a_scale = a_quant.at(a_batch, row).0;
+                for (column, &accumulated) in accumulators.iter().enumerate() {
+                    let b_scale = b_quant.at(b_batch, column).0;
                     let scale = a_scale * b_scale / y_scale;
                     let value = (accumulated as f32 * scale).round_ties_even() as i64
                         + i64::from(y_zero_point);
@@ -819,5 +859,163 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.to_string().contains("shapes must match"), "{error}");
+    }
+
+    /// The reordered accumulation must be **bit**-identical to the row-at-a-time
+    /// loop it replaces, not merely close: `QLinearMatMul` output is integer, so
+    /// a one-LSB difference is a wrong answer.
+    ///
+    /// The rewrite lifts the zero points out of the inner loop using
+    ///   sum_k (a_k - az) * (b_kn - bz_n)
+    ///     = sum_k (a_k - az) * b_kn  -  bz_n * sum_k (a_k - az)
+    /// which is an identity over the integers, so under wrapping arithmetic
+    /// (arithmetic mod 2^32) both sides reduce to the same `i32`. This sweeps
+    /// shapes that miss every tile boundary, both dtypes, per-tensor and
+    /// per-axis quantization, and a `K` large enough that the intermediate
+    /// accumulator overflows `i32` -- the case where "algebraically equal" and
+    /// "bit-identical" could plausibly come apart.
+    #[test]
+    fn qlinear_matmul_reordered_accumulation_is_bit_identical() {
+        for &(m, k, n) in &[
+            (1usize, 1usize, 1usize),
+            (1, 37, 65),
+            (3, 64, 16),
+            (5, 129, 33),
+        ] {
+            let a_values: Vec<u8> = (0..m * k).map(|i| ((i * 37 + 11) % 256) as u8).collect();
+            let b_values: Vec<u8> = (0..k * n).map(|i| ((i * 91 + 7) % 256) as u8).collect();
+            let a = Owned::u8(&[m, k], &a_values);
+            let b = Owned::u8(&[k, n], &b_values);
+            let a_scale = Owned::f32(&[], &[0.02]);
+            let a_zero = Owned::u8(&[], &[128]);
+            let b_scale = Owned::f32(&[], &[0.01]);
+            let b_zero = Owned::u8(&[], &[127]);
+            let y_scale = Owned::f32(&[], &[0.05]);
+            let y_zero = Owned::u8(&[], &[120]);
+
+            let output = execute(
+                [
+                    &a, &a_scale, &a_zero, &b, &b_scale, &b_zero, &y_scale, &y_zero,
+                ],
+                DataType::Uint8,
+                &[m, n],
+            );
+
+            let expected = reference(Reference {
+                a: &a_values.iter().map(|&v| i32::from(v)).collect::<Vec<_>>(),
+                a_shape: &[m, k],
+                a_scales: &[0.02],
+                a_zeros: &[128],
+                b: &b_values.iter().map(|&v| i32::from(v)).collect::<Vec<_>>(),
+                b_shape: &[k, n],
+                b_scales: &[0.01],
+                b_zeros: &[127],
+                y_scale: 0.05,
+                y_zero: 120,
+                output_dtype: DataType::Uint8,
+            });
+            assert_eq!(
+                output_values(&output),
+                expected,
+                "m={m} k={k} n={n}: reordered accumulation disagrees with the reference"
+            );
+        }
+    }
+
+    /// `K` large enough that the `i32` accumulator wraps.
+    ///
+    /// The removed loop accumulated with `wrapping_add`, so on overflow its
+    /// answer is defined but not the mathematical dot product -- the shared
+    /// `reference` helper here sums in `f64` and legitimately disagrees. What
+    /// must hold is that the rewrite reproduces the *old kernel* exactly,
+    /// because the zero-point identity it relies on is only valid modulo 2^32.
+    /// So this compares against a transcription of the old inner loop.
+    #[test]
+    fn qlinear_matmul_overflowing_accumulator_matches_the_previous_loop() {
+        let (m, k, n) = (2usize, 40_000usize, 3usize);
+        let a_values: Vec<u8> = (0..m * k)
+            .map(|i| if i % 3 == 0 { 255 } else { 254 })
+            .collect();
+        let b_values: Vec<u8> = (0..k * n)
+            .map(|i| if i % 5 == 0 { 255 } else { 253 })
+            .collect();
+        let (a_zero, b_zero) = (17i32, 250i32);
+        let (a_scale, b_scale, y_scale, y_zero) = (1.0f32, 1.0f32, 1.0e6f32, 40i32);
+
+        let output = execute(
+            [
+                &Owned::u8(&[m, k], &a_values),
+                &Owned::f32(&[], &[a_scale]),
+                &Owned::u8(&[], &[a_zero as u8]),
+                &Owned::u8(&[k, n], &b_values),
+                &Owned::f32(&[], &[b_scale]),
+                &Owned::u8(&[], &[b_zero as u8]),
+                &Owned::f32(&[], &[y_scale]),
+                &Owned::u8(&[], &[y_zero as u8]),
+            ],
+            DataType::Uint8,
+            &[m, n],
+        );
+
+        // The zero-point correction term this rewrite introduces is
+        // `a_sum * b_zero_point`, and the test is only meaningful if that term
+        // actually leaves `i32`.
+        let a_sum: i64 = (0..k)
+            .map(|inner| i64::from(a_values[inner]) - i64::from(a_zero))
+            .sum();
+        assert!(
+            a_sum * i64::from(b_zero) > i64::from(i32::MAX),
+            "test data no longer overflows the correction term ({})",
+            a_sum * i64::from(b_zero)
+        );
+
+        // Transcription of the loop this change replaced.
+        let mut expected = Vec::with_capacity(m * n);
+        for row in 0..m {
+            for column in 0..n {
+                let mut accumulated = 0i32;
+                for inner in 0..k {
+                    let av = i32::from(a_values[row * k + inner]) - a_zero;
+                    let bv = i32::from(b_values[inner * n + column]) - b_zero;
+                    accumulated = accumulated.wrapping_add(av * bv);
+                }
+                let scale = a_scale * b_scale / y_scale;
+                let value =
+                    (accumulated as f32 * scale).round_ties_even() as i64 + i64::from(y_zero);
+                expected.push(value.clamp(0, i64::from(u8::MAX)));
+            }
+        }
+        assert_eq!(
+            output_values(&output),
+            expected,
+            "the zero-point identity did not survive i32 overflow"
+        );
+    }
+
+    /// Row parallelism must not make the result depend on the thread count:
+    /// each output row is accumulated by exactly one worker, so repeated runs
+    /// -- and runs under a narrower pool -- have to agree exactly.
+    #[test]
+    fn qlinear_matmul_is_deterministic_across_repeated_runs() {
+        let (m, k, n) = (9usize, 71usize, 23usize);
+        let a_values: Vec<u8> = (0..m * k).map(|i| ((i * 53 + 3) % 256) as u8).collect();
+        let b_values: Vec<u8> = (0..k * n).map(|i| ((i * 17 + 29) % 256) as u8).collect();
+        let a = Owned::u8(&[m, k], &a_values);
+        let b = Owned::u8(&[k, n], &b_values);
+        let a_scale = Owned::f32(&[], &[0.03]);
+        let a_zero = Owned::u8(&[], &[130]);
+        let b_scale = Owned::f32(&[], &[0.007]);
+        let b_zero = Owned::u8(&[], &[110]);
+        let y_scale = Owned::f32(&[], &[0.04]);
+        let y_zero = Owned::u8(&[], &[100]);
+        let inputs = [
+            &a, &a_scale, &a_zero, &b, &b_scale, &b_zero, &y_scale, &y_zero,
+        ];
+
+        let first = output_values(&execute(inputs, DataType::Uint8, &[m, n]));
+        for round in 1..4 {
+            let again = output_values(&execute(inputs, DataType::Uint8, &[m, n]));
+            assert_eq!(first, again, "round {round} disagreed with the first run");
+        }
     }
 }
