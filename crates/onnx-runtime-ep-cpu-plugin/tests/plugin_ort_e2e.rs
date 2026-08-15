@@ -30,6 +30,21 @@
 //!
 //! No env vars required — the test resolves ORT from the ort-sys build output.
 //! Skips loudly if ORT or the EP cdylib is absent.
+//!
+//! # Serialization across the whole file
+//!
+//! Every `#[test]` here loads the same on-disk `onnxruntime` shared library,
+//! either indirectly (full register→session→run→unregister cycles) or
+//! directly (`ort_api_sanity`, `diag_ort_ep_api_nullcheck` dlopen their own
+//! handle just to read the `OrtApi`/`OrtEpApi` vtables). `cargo test` runs the
+//! `#[test]` functions in this binary concurrently on a thread pool by
+//! default, so without serialization one thread's dlopen/dlclose of the
+//! library, or one thread's register/session/run activity, can interleave
+//! with another thread's in-flight calls into the *same* loaded library. That
+//! interleaving was the source of an intermittent, run-varying
+//! `STATUS_ACCESS_VIOLATION (0xC0000005)` crash in this test binary on
+//! Windows. All tests therefore take `ORT_EP_LOCK` before touching ORT, so
+//! only one thread ever drives the shared library at a time.
 
 mod cdylib_resolve;
 use onnx_runtime_ort_testkit as ort_path;
@@ -41,11 +56,21 @@ use std::sync::{Mutex, MutexGuard};
 
 use onnx_genai_ort_sys as ort;
 
-/// Serialises all tests that load our EP plugin.
+/// Serialises all tests that touch ORT — including tests that merely dlopen
+/// the shared library to read vtables (`ort_api_sanity`,
+/// `diag_ort_ep_api_nullcheck`), not just the register/run/unregister tests.
 ///
 /// ORT's per-process EP device state is corrupted after ≥6 register+Run+unregister
 /// cycles (factory.rs bug — Nabil).  The lock ensures tests run one at a time so
 /// the cycle count stays below the failure threshold for the default test suite.
+///
+/// It also prevents a second, independent hazard: two tests concurrently
+/// opening/closing their own handle to the same on-disk `onnxruntime` shared
+/// library while another thread has in-flight calls into it. That race was
+/// observed to cause an intermittent, run-varying
+/// `STATUS_ACCESS_VIOLATION (0xC0000005)` that took down the whole test
+/// binary on Windows — every test in this file must hold this lock while
+/// interacting with ORT in any way.
 static ORT_EP_LOCK: Mutex<()> = Mutex::new(());
 
 /// Acquire `ORT_EP_LOCK`, recovering from poisoning so that one test's panic
@@ -151,6 +176,16 @@ unsafe fn check_status(api: *const ort::OrtApi, status: *mut ort::OrtStatus, sta
 /// This is a prerequisite for all other L3 tests.
 #[test]
 fn ort_api_sanity() {
+    // Serialize with every other test in this binary: this test dlopen()s/
+    // closes its own handle to the *same* onnxruntime shared library that
+    // other (locked) tests concurrently drive through full
+    // register→session→run→unregister cycles. Without this lock, cargo's
+    // default multi-threaded test runner can interleave this handle's
+    // open/close with in-flight ORT calls on another thread, which has been
+    // observed to manifest as an intermittent STATUS_ACCESS_VIOLATION at a
+    // different call site each run (see issue: cpu-plugin plugin_ort_e2e
+    // intermittent 0xC0000005).
+    let _lock = lock_ort_ep();
     let ort_lib_dir = skip_if_missing!(
         find_ort_lib_dir(),
         "ort_api_sanity: ORT not found; run `cargo build -p onnx-genai-ort-sys` first"
@@ -578,6 +613,11 @@ fn ort_unsupported_op_declines_not_crashes() {
 /// Diagnostic: print which ORT EP API function pointers are non-null.
 #[test]
 fn diag_ort_ep_api_nullcheck() {
+    // See the comment on `ort_api_sanity`'s lock acquisition: this test also
+    // dlopen()s/closes its own handle to the shared `onnxruntime` library and
+    // must not run concurrently with other tests driving that same library
+    // through register→session→run→unregister cycles.
+    let _lock = lock_ort_ep();
     let ort_lib_dir = skip_if_missing!(
         find_ort_lib_dir(),
         "diag_ort_ep_api_nullcheck: ORT not found"
