@@ -2300,10 +2300,11 @@ impl NativeDecodeSession {
         let used_positions = orig_positions
             .map(|(index, original)| std::mem::replace(&mut state.bindings[index], original));
         if std::env::var_os("ONNX_GENAI_SPEC_DEBUG").is_some() {
+            let segments = self.session.captured_graph_segment_count();
             eprintln!(
                 "spec_capture: width={width_in} phase {phase_in:?}->{phase_out:?} \
                  fallback={fallback_out} captures={captures} replays={replays} \
-                 past={past_len} total={total_len} ok={}",
+                 segments={segments} past={past_len} total={total_len} ok={}",
                 machine.is_ok()
             );
         }
