@@ -80,6 +80,7 @@ pub(crate) struct AcceptOutcome {
 pub(crate) struct TieGuard {
     pub(crate) eps: f32,
     pub(crate) tolerant: bool,
+    pub(crate) accept_margin_eps: f32,
 }
 
 impl TieGuard {
@@ -88,6 +89,7 @@ impl TieGuard {
     pub(crate) const STRICT: TieGuard = TieGuard {
         eps: 0.0,
         tolerant: false,
+        accept_margin_eps: 0.0,
     };
 
     /// Resolve the guard from the environment (`ONNX_GENAI_SPEC_TIE_EPS`,
@@ -99,9 +101,16 @@ impl TieGuard {
             .and_then(|value| value.trim().parse::<f32>().ok())
             .filter(|value| value.is_finite() && *value > 0.0)
             .unwrap_or(0.0);
+        let accept_margin_eps = std::env::var("ONNX_GENAI_SPEC_ACCEPT_MARGIN_EPS")
+            .ok()
+            .and_then(|value| value.trim().parse::<f32>().ok())
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .unwrap_or(0.0);
         if eps == 0.0 {
-            // No margin configured ⇒ strict argmax, byte-identical to plain greedy.
-            return TieGuard::STRICT;
+            return TieGuard {
+                accept_margin_eps,
+                ..TieGuard::STRICT
+            };
         }
         let tolerant = matches!(
             std::env::var("ONNX_GENAI_SPEC_TIE_TOLERANT")
@@ -109,7 +118,11 @@ impl TieGuard {
                 .as_deref(),
             Some("1") | Some("true") | Some("yes")
         );
-        TieGuard { eps, tolerant }
+        TieGuard {
+            eps,
+            tolerant,
+            accept_margin_eps,
+        }
     }
 }
 
@@ -126,37 +139,7 @@ fn captured_verify_from_env() -> bool {
     )
 }
 
-/// Resolve the row-0 near-tie margin for the captured-verify base-token contract
-/// guard (`ONNX_GENAI_SPEC_ROW0_TIE_EPS`).
-///
-/// In the fused captured path row 0 (the base next-token distribution) is
-/// produced by the Marlin M=W kernel, whereas plain greedy — the byte-identity
-/// reference the reviewers made binding — selects the base token from the M=1
-/// GEMV. The two kernels reassociate partial sums differently, so at a *genuine*
-/// logit near-tie their argmax can flip (Chew/Gaff #984, the qwen one-token
-/// divergence). Whenever the base row's top-1/top-2 margin is within this eps we
-/// fall the base token back to a fresh M=1 GEMV decode, so the committed base
-/// token is always exactly what plain greedy would pick. A generous default is
-/// safe: the flip only occurs when the margin is below the (much smaller) kernel
-/// delta, and confident positions (favorable/repetitive prompts) sit far above
-/// eps, so they never fall back and keep the speculative win. `0` disables the
-/// guard (only for A/B measurement — the default MUST stay on for the contract).
-fn row0_tie_eps_from_env() -> f32 {
-    const DEFAULT_ROW0_TIE_EPS: f32 = 1.0;
-    std::env::var("ONNX_GENAI_SPEC_ROW0_TIE_EPS")
-        .ok()
-        .and_then(|value| value.trim().parse::<f32>().ok())
-        .filter(|value| value.is_finite() && *value >= 0.0)
-        .unwrap_or(DEFAULT_ROW0_TIE_EPS)
-}
-
-/// Whether the base row's greedy choice is a numerical near-tie: the gap between
-/// the largest and second-largest logit is within `eps`. Returns `false` for
-/// `eps == 0` (guard disabled) or degenerate rows (<2 logits).
-fn row0_is_near_tie(logits: &[f32], eps: f32) -> bool {
-    if eps <= 0.0 || logits.len() < 2 {
-        return false;
-    }
+fn top2_margin(logits: &[f32]) -> f32 {
     let mut top1 = f32::NEG_INFINITY;
     let mut top2 = f32::NEG_INFINITY;
     for &v in logits {
@@ -167,7 +150,7 @@ fn row0_is_near_tie(logits: &[f32], eps: f32) -> bool {
             top2 = v;
         }
     }
-    top1 - top2 <= eps
+    top1 - top2
 }
 
 /// Adaptive hit-density gate for the fused captured-verify path.
@@ -283,6 +266,9 @@ pub(crate) fn greedy_accept(
     while accepted < draft.len() {
         let logits = row(accepted);
         if sample_greedy(logits) == draft[accepted] {
+            if guard.accept_margin_eps > 0.0 && top2_margin(logits) <= guard.accept_margin_eps {
+                break;
+            }
             accepted += 1;
             continue;
         }
@@ -335,13 +321,6 @@ pub(crate) struct NativeSpeculativeDriver<'a> {
     /// would-hit density predicts the warmed graph will replay, so sparse-hit
     /// prompts degrade to plain decode instead of paying repeated graph warmup.
     hit_gate: HitDensityGate,
-    /// Row-0 (base-token) near-tie margin for the captured-verify contract guard.
-    /// The fused path's row 0 comes from the Marlin M=W kernel; plain greedy uses
-    /// the M=1 GEMV. When the base row's top-1/top-2 margin is within this eps we
-    /// recompute the base token from the M=1 GEMV so the committed base token is
-    /// byte-identical to plain greedy (Chew's binding contract). `0` disables it
-    /// (A/B only).
-    row0_tie_eps: f32,
 }
 
 enum NativeProposer<'a> {
@@ -369,7 +348,6 @@ impl<'a> NativeSpeculativeDriver<'a> {
             tie_guard: TieGuard::from_env(),
             captured_verify: captured_verify_from_env(),
             hit_gate: HitDensityGate::from_env(),
-            row0_tie_eps: row0_tie_eps_from_env(),
         })
     }
 
@@ -400,7 +378,6 @@ impl<'a> NativeSpeculativeDriver<'a> {
             tie_guard: TieGuard::from_env(),
             captured_verify: captured_verify_from_env(),
             hit_gate: HitDensityGate::from_env(),
-            row0_tie_eps: row0_tie_eps_from_env(),
         })
     }
 
@@ -559,59 +536,32 @@ impl<'a> NativeSpeculativeDriver<'a> {
                     prev_engaged = false;
                     (base_logits, base, Vec::new(), Vec::new())
                 } else {
-                    // Run ONE fused forward over `[bonus ⊕ draft]` padded to the
-                    // fixed capture width. Row 0 is the base next-token
-                    // distribution; rows 1..=k are the verify rows — identical
-                    // numbers to the eager base + verify forwards. The fixed width
-                    // keeps a single constant-signature graph in the slot so it
-                    // replays across steps.
                     let fused_tokens: Vec<TokenId> = std::iter::once(bonus_token)
                         .chain(draft.iter().copied())
                         .collect();
-                    let fixed_width = 1 + self.draft_width;
-                    let mut fused =
-                        self.session
-                            .decode_verify_captured(&fused_tokens, past, fixed_width)?;
-                    debug_assert_eq!(fused.len(), draft.len() + 1);
-                    let rows = fused.split_off(1);
-                    let base_logits = fused
-                        .pop()
-                        .context("native fused verify produced no base logits")?;
-
-                    // CONTRACT (Chew, binding): speculative output MUST equal plain
-                    // greedy, which sources the base token from the M=1 GEMV — not
-                    // "greedy-under-Marlin". Row 0 here is the Marlin M=W kernel; at
-                    // a genuine logit near-tie its argmax can flip vs the M=1 GEMV
-                    // (the qwen one-token #984 divergence). If the base row is a
-                    // near-tie, undo the fused fold and recompute the base token
-                    // from a fresh M=1 GEMV decode so the committed base token is
-                    // byte-identical to plain greedy. Rare on confident prompts, so
-                    // negligible cost; on degenerate near-tie loops it simply
-                    // parks on the (correct) plain-decode floor.
-                    if row0_is_near_tie(&base_logits, self.row0_tie_eps) {
-                        // Undo the width-W KV fold, switch the graph slot back to
-                        // the M=1 base, and recompute row 0 from the M=1 GEMV.
-                        self.session.rewind(past)?;
-                        self.session.invalidate_graph_for_mode_switch()?;
-                        let base_logits = self
-                            .session
-                            .decode(&[bonus_token], past)?
-                            .pop()
-                            .context("native row-0 tie fallback produced no base logits")?;
-                        pending.clear();
-                        let base = self.session.current_len();
-                        debug_assert_eq!(base, context_len);
-                        prev_engaged = false;
-                        (base_logits, base, Vec::new(), Vec::new())
-                    } else {
-                        stats.verification_steps += 1;
-                        stats.proposed_tokens += draft.len();
-                        pending.clear();
-                        let base = past + 1;
-                        debug_assert_eq!(base, context_len);
-                        prev_engaged = true;
-                        (base_logits, base, draft, rows)
+                    self.session.invalidate_graph_for_mode_switch()?;
+                    let mut corrected = Vec::with_capacity(fused_tokens.len());
+                    for (offset, token) in fused_tokens.iter().copied().enumerate() {
+                        corrected.push(
+                            self.session
+                                .decode(&[token], past + offset)?
+                                .pop()
+                                .context(
+                                    "native captured contract M=1 verify produced no logits",
+                                )?,
+                        );
                     }
+                    let rows = corrected.split_off(1);
+                    let base_logits = corrected
+                        .pop()
+                        .context("native captured contract M=1 verify produced no base logits")?;
+                    stats.verification_steps += 1;
+                    stats.proposed_tokens += draft.len();
+                    pending.clear();
+                    let base = past + 1;
+                    debug_assert_eq!(base, context_len);
+                    prev_engaged = false;
+                    (base_logits, base, draft, rows)
                 }
             } else {
                 // Eager / non-fused path (multi-token prefill step, shared-KV, or
@@ -871,6 +821,7 @@ mod accept_tests {
         let guard = TieGuard {
             eps: 0.1,
             tolerant: false,
+            ..TieGuard::STRICT
         };
         let out = greedy_accept(&base, &rows, &draft, guard);
         // Strict: rejected at the near-tie, but the near-tie is DIAGNOSED.
@@ -890,6 +841,7 @@ mod accept_tests {
         let guard = TieGuard {
             eps: 0.1,
             tolerant: true,
+            ..TieGuard::STRICT
         };
         let out = greedy_accept(&base, &rows, &draft, guard);
         // Tolerant: the near-tie draft (9) is accepted, then row1 predicts 7 == draft.
@@ -908,6 +860,7 @@ mod accept_tests {
         let guard = TieGuard {
             eps: 0.5,
             tolerant: true,
+            ..TieGuard::STRICT
         };
         let out = greedy_accept(&base, &rows, &draft, guard);
         assert_eq!(out.accepted, 1);
@@ -924,60 +877,6 @@ mod accept_tests {
         assert_eq!(out.accepted, 0);
         assert_eq!(out.bonus, 5);
         assert_eq!(out.near_tie_rejections, 0);
-    }
-}
-
-#[cfg(test)]
-mod row0_tie_tests {
-    use super::row0_is_near_tie;
-
-    #[test]
-    fn confident_row_is_not_a_tie() {
-        // top1=10 at index 3, top2=1 elsewhere: margin 9 ≫ eps ⇒ not a tie.
-        let mut logits = vec![1.0f32; 32];
-        logits[3] = 10.0;
-        assert!(!row0_is_near_tie(&logits, 1.0));
-    }
-
-    #[test]
-    fn near_tie_within_eps_is_detected() {
-        // Two co-leaders 5.0 / 4.6: margin 0.4 ≤ eps 1.0 ⇒ tie ⇒ fall back to M=1.
-        let mut logits = vec![0.0f32; 32];
-        logits[7] = 5.0;
-        logits[11] = 4.6;
-        assert!(row0_is_near_tie(&logits, 1.0));
-        // A tighter eps than the margin classifies it as confident.
-        assert!(!row0_is_near_tie(&logits, 0.2));
-    }
-
-    #[test]
-    fn margin_exactly_eps_counts_as_tie() {
-        let mut logits = vec![0.0f32; 8];
-        logits[0] = 2.0;
-        logits[1] = 1.0;
-        // margin == eps ⇒ inclusive ⇒ tie (conservative: prefer the M=1 fallback).
-        assert!(row0_is_near_tie(&logits, 1.0));
-    }
-
-    #[test]
-    fn zero_eps_disables_the_guard() {
-        let mut logits = vec![0.0f32; 8];
-        logits[0] = 1.0;
-        logits[1] = 1.0; // genuine exact tie
-        assert!(!row0_is_near_tie(&logits, 0.0));
-    }
-
-    #[test]
-    fn degenerate_rows_are_never_ties() {
-        assert!(!row0_is_near_tie(&[], 1.0));
-        assert!(!row0_is_near_tie(&[3.0], 1.0));
-    }
-
-    #[test]
-    fn duplicate_max_is_a_tie() {
-        // Two identical maxima ⇒ margin 0 ⇒ tie for any positive eps.
-        let logits = vec![4.0f32, 4.0, 1.0, 0.0];
-        assert!(row0_is_near_tie(&logits, 0.001));
     }
 }
 

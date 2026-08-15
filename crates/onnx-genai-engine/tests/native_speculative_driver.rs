@@ -402,3 +402,135 @@ fn native_captured_verify_qwen_w7_w9_match_plain_greedy_cuda() -> anyhow::Result
     }
     Ok(())
 }
+
+#[test]
+fn native_captured_verify_qwen_w5_to_w9_accept_path_matches_plain_greedy_cuda() -> anyhow::Result<()>
+{
+    if std::env::var_os("ONNX_GENAI_RUN_CUDA_SMOKE").is_none() {
+        eprintln!("skipping CUDA smoke; set ONNX_GENAI_RUN_CUDA_SMOKE=1 to run");
+        return Ok(());
+    }
+    unsafe {
+        std::env::set_var("ONNX_GENAI_SPEC_CAPTURED_VERIFY", "1");
+        std::env::set_var("ONNX_GENAI_MARLIN_M_GT_1", "1");
+        std::env::set_var("ONNX_GENAI_SPEC_GATE", "0");
+    }
+    let model_dir = std::env::var_os("ONNX_GENAI_NATIVE_SPEC_QWEN_MODEL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from("/home/justinchu/shared-models/qwen2.5-14b-instruct-int4-zp-onnx")
+        });
+    if !model_dir.join("model.onnx").is_file() {
+        eprintln!(
+            "skipping CUDA smoke; qwen model is not installed at {}",
+            model_dir.display()
+        );
+        return Ok(());
+    }
+
+    let prompts = [
+        ("degenerate", "哈哈哈哈哈哈哈哈哈哈哈哈哈哈哈哈哈哈哈哈"),
+        (
+            "normal",
+            "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox",
+        ),
+    ];
+    let device = Some(NativeDecodeDevice::Cuda { index: Some(0) });
+    for (label, prompt) in prompts {
+        let mut baseline = native_engine(&model_dir, device.clone())?;
+        let expected = baseline.generate(greedy_request(
+            GeneratePrompt::Text(prompt.to_string()),
+            160,
+        ))?;
+        for spec_tokens in [4, 5, 6, 7, 8] {
+            let mut speculative = native_engine(&model_dir, device.clone())?;
+            let actual = speculative.generate(with_prompt_lookup(
+                greedy_request(GeneratePrompt::Text(prompt.to_string()), 160),
+                1,
+                spec_tokens,
+            ))?;
+            let stats = speculative.last_speculative_stats();
+            assert!(
+                stats.accepted_tokens > 0,
+                "qwen {label} W={} did not exercise accept path: {stats:?}",
+                spec_tokens + 1
+            );
+            assert_eq!(
+                actual.token_ids,
+                expected.token_ids,
+                "qwen {label} captured-spec W={} diverged from plain greedy: stats={stats:?}",
+                spec_tokens + 1
+            );
+            eprintln!(
+                "qwen {label} W={} captured-spec: proposed={} accepted={} steps={}",
+                spec_tokens + 1,
+                stats.proposed_tokens,
+                stats.accepted_tokens,
+                stats.verification_steps
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn native_captured_verify_glm_w6_accept_path_matches_plain_greedy_cuda() -> anyhow::Result<()> {
+    if std::env::var_os("ONNX_GENAI_RUN_CUDA_SMOKE").is_none() {
+        eprintln!("skipping CUDA smoke; set ONNX_GENAI_RUN_CUDA_SMOKE=1 to run");
+        return Ok(());
+    }
+    unsafe {
+        std::env::set_var("ONNX_GENAI_SPEC_CAPTURED_VERIFY", "1");
+        std::env::set_var("ONNX_GENAI_MARLIN_M_GT_1", "1");
+        std::env::set_var("ONNX_GENAI_SPEC_GATE", "0");
+    }
+    let model_dir = std::env::var_os("ONNX_GENAI_NATIVE_SPEC_GLM_MODEL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/home/justinchu/glm-e2e-artifacts/glm-4-9b-int4-cuda"));
+    if !model_dir.join("model.onnx").is_file() {
+        eprintln!(
+            "skipping CUDA smoke; glm model is not installed at {}",
+            model_dir.display()
+        );
+        return Ok(());
+    }
+
+    let prompts = [
+        (
+            "generic",
+            "Write a short note about deterministic GPU inference. Deterministic GPU inference needs careful kernels and tests.",
+        ),
+        (
+            "repetitive",
+            "red blue green red blue green red blue green red blue green",
+        ),
+    ];
+    let device = Some(NativeDecodeDevice::Cuda { index: Some(0) });
+    for (label, prompt) in prompts {
+        let mut baseline = native_engine(&model_dir, device.clone())?;
+        let expected = baseline.generate(greedy_request(
+            GeneratePrompt::Text(prompt.to_string()),
+            128,
+        ))?;
+        let mut speculative = native_engine(&model_dir, device.clone())?;
+        let actual = speculative.generate(with_prompt_lookup(
+            greedy_request(GeneratePrompt::Text(prompt.to_string()), 128),
+            1,
+            5,
+        ))?;
+        let stats = speculative.last_speculative_stats();
+        assert!(
+            stats.accepted_tokens > 0,
+            "glm {label} W=6 did not exercise accept path: {stats:?}"
+        );
+        assert_eq!(
+            actual.token_ids, expected.token_ids,
+            "glm {label} captured-spec W=6 diverged from plain greedy: stats={stats:?}"
+        );
+        eprintln!(
+            "glm {label} W=6 captured-spec: proposed={} accepted={} steps={}",
+            stats.proposed_tokens, stats.accepted_tokens, stats.verification_steps
+        );
+    }
+    Ok(())
+}
