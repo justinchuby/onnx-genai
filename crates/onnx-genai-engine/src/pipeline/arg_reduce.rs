@@ -396,8 +396,6 @@ fn arg_node(
 
 trait WithIntAttribute {
     fn with_int_attribute(self, name: &str, value: i64) -> Self;
-    /// Place the node in a non-default operator domain.
-    fn with_domain(self, domain: &str) -> Self;
 }
 
 impl WithIntAttribute for NodeProto {
@@ -410,11 +408,6 @@ impl WithIntAttribute for NodeProto {
                 i: value,
                 ..Default::default()
             });
-        self
-    }
-
-    fn with_domain(mut self, domain: &str) -> Self {
-        self.domain = domain.to_string();
         self
     }
 }
