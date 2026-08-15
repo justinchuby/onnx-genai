@@ -1276,6 +1276,35 @@ impl ExecutionProvider for CudaExecutionProvider {
         crate::kernels::device_argmax::launch(&self.runtime, logits, elements, batch, dtype, result)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn device_token_writer(
+        &self,
+        result: &DeviceBuffer,
+        input_ids: &DeviceBuffer,
+        position_ids: &DeviceBuffer,
+        attention_mask: &DeviceBuffer,
+        scratch: &DeviceBuffer,
+        capacity: usize,
+        next_position: i64,
+        mask_len: usize,
+        write_position: bool,
+        step: u32,
+    ) -> Result<()> {
+        crate::kernels::device_token_writer::launch(
+            &self.runtime,
+            result,
+            input_ids,
+            position_ids,
+            attention_mask,
+            scratch,
+            capacity,
+            next_position,
+            mask_len,
+            write_position,
+            step,
+        )
+    }
+
     fn copy_from_host(&self, src: &[u8], dst: &mut DeviceBuffer) -> Result<()> {
         assert_eq!(
             dst.device(),

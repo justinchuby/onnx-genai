@@ -707,6 +707,36 @@ pub trait ExecutionProvider: Send + Sync {
         )))
     }
 
+    /// Fold the just-selected greedy token (from a prior [`device_argmax`],
+    /// `result[0]`) into the persistent decode bindings device-to-device, for
+    /// the native CUDA device-token-loop: write the token as an `i64` into
+    /// `input_ids`, write `next_position` into `position_ids`, set the mask `1`
+    /// at `next_position` (guarded by `mask_len`), append the token to
+    /// `scratch[step]`, and OR the shared capture-error word (`result[1]`) into
+    /// `scratch[capacity]`. No host sync — the caller drains `scratch` once per
+    /// chain. EPs without device kernels reject the request.
+    ///
+    /// [`device_argmax`]: ExecutionProvider::device_argmax
+    #[allow(clippy::too_many_arguments)]
+    fn device_token_writer(
+        &self,
+        _result: &DeviceBuffer,
+        _input_ids: &DeviceBuffer,
+        _position_ids: &DeviceBuffer,
+        _attention_mask: &DeviceBuffer,
+        _scratch: &DeviceBuffer,
+        _capacity: usize,
+        _next_position: i64,
+        _mask_len: usize,
+        _write_position: bool,
+        _step: u32,
+    ) -> Result<()> {
+        Err(EpError::KernelFailed(format!(
+            "{}: device token writer is not supported",
+            self.name()
+        )))
+    }
+
     /// Begin recording the supplied, already-compiled kernel sequence into a
     /// device graph. EPs without graph support reject the request.
     fn begin_device_graph_capture(&self, _kernels: &[&dyn Kernel]) -> Result<()> {
