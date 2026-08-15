@@ -133,6 +133,12 @@ pub(crate) struct NativeLoopAdapter<'a> {
     pub(crate) session: &'a mut NativeDecodeSession,
     pub(crate) prompt_tokens: Vec<TokenId>,
     pub(crate) pending_tokens: Vec<TokenId>,
+    /// Device-token-loop chain depth (`0` = disabled). When `>= 2`, a greedy
+    /// step runs a device-resident chained replay that returns several tokens at
+    /// once; `lookahead` buffers the tokens beyond the one returned to the loop
+    /// so the shared loop keeps its per-token EOS / stop / callback semantics.
+    pub(crate) device_loop_k: usize,
+    pub(crate) lookahead: std::collections::VecDeque<TokenId>,
 }
 
 impl DecodeLoopBackend for NativeLoopAdapter<'_> {
@@ -168,6 +174,24 @@ impl DecodeLoopBackend for NativeLoopAdapter<'_> {
                 .session
                 .decode_argmax(&self.pending_tokens, past_len)?
                 .context("native decoder did not return an argmax token");
+        }
+        // Serve buffered tokens from a prior device-token-loop chain first; the
+        // device already advanced past them, so no forward is run here.
+        if let Some(token) = self.lookahead.pop_front() {
+            return Ok(token);
+        }
+        if self.device_loop_k >= 2 {
+            let past_len = self.session.current_len();
+            let seed = self.pending_tokens[0];
+            let mut tokens =
+                self.session
+                    .decode_cuda_greedy_loop(seed, past_len, self.device_loop_k)?;
+            if tokens.is_empty() {
+                bail!("native device token loop returned no tokens");
+            }
+            let first = tokens.remove(0);
+            self.lookahead.extend(tokens);
+            return Ok(first);
         }
         let past_len = self.session.current_len();
         self.session
