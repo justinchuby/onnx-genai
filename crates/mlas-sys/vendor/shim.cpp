@@ -169,6 +169,12 @@ extern "C" void MlasStandaloneParallelFor(
 // work-stealing backend (see `MlasStandaloneParallelFor` above). Passing null
 // therefore does not merely skip a thread pool -- it forces MLAS's *serial*
 // fallback loop.
+//
+// Caveat inherited from the backend: `WorkStealingThreadPool::parallel_for`
+// takes a dispatch lock, so calling one of these GEMM entry points from
+// *inside* a work item already running on that pool would deadlock. No call
+// site does this today (MLAS drives the pool, never the reverse), but a future
+// caller that nests GEMMs must route the inner call around the pool.
 static MLAS_THREADPOOL* const kMlasParallelSentinel =
     reinterpret_cast<MLAS_THREADPOOL*>(1);
 

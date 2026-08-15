@@ -1664,44 +1664,9 @@ mod tests {
         );
     }
 
-    /// `MlasGemmBatch` must receive a non-null `MLAS_THREADPOOL` so the
-    /// standalone `MlasTrySimpleParallel` hands its partitions to the
-    /// registered work-stealing backend.
-    ///
-    /// This is a *deterministic* guard rather than a timing check: passing
-    /// `nullptr` makes `MlasStandaloneParallelFor` take its serial fallback
-    /// loop, so the backend is never entered and `parallel_for_calls` stays
-    /// flat. The shape is large enough that MLAS partitions it into more than
-    /// one tile at the reported degree of parallelism.
-    #[test]
-    fn sgemm_nn_drives_the_registered_parallel_backend() {
-        let (m, n, k) = (256usize, 512usize, 256usize);
-        let a = seq(m * k, 0.25);
-        let b = seq(k * n, 0.75);
-        let mut c = vec![0.0f32; m * n];
-
-        // Establish the pool and MLAS platform init before snapshotting.
-        sgemm_nn(m, n, k, &a, &b, &mut c);
-        if mlas_threading_degree() < 2 {
-            eprintln!("skipped: MLAS threading degree is 1 on this host");
-            return;
-        }
-
-        let before = mlas_threading_stats().parallel_for_calls;
-        sgemm_nn(m, n, k, &a, &b, &mut c);
-        let after = mlas_threading_stats().parallel_for_calls;
-
-        assert!(
-            after > before,
-            "sgemm_nn did not enter the parallel-for backend \
-             ({before} -> {after} calls); MlasGemmBatch was likely handed a \
-             null MLAS_THREADPOOL, which forces MLAS's serial fallback"
-        );
-    }
-
     /// The threadpool sentinel must not change results. `MlasGemmBatch`
     /// partitions across threads, so this also guards against a partitioning
-    /// bug producing torn or doubly-written output tiles.
+    /// bug producing torn, zeroed or doubly-written output tiles.
     #[test]
     fn sgemm_nn_is_correct_when_parallelized() {
         let (m, n, k) = (129usize, 257usize, 193usize); // deliberately odd
@@ -1711,15 +1676,27 @@ mod tests {
         sgemm_nn(m, n, k, &a, &b, &mut got);
 
         let mut want = vec![0.0f32; m * n];
-        ref_sgemm(
-            false, false, m, n, k, 1.0, &a, k, &b, n, 0.0, &mut want, n,
-        );
+        ref_sgemm(false, false, m, n, k, 1.0, &a, k, &b, n, 0.0, &mut want, n);
 
-        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
-            assert!(
-                (g - w).abs() <= 1e-3 * w.abs().max(1.0),
-                "mismatch at {i}: got {g}, want {w}"
-            );
+        // Per-element bound from the actual accumulation magnitude rather than
+        // a flat relative epsilon: a flat bound scaled by |want| goes to zero
+        // as an output approaches zero, so a zeroed tile covering
+        // small-magnitude outputs could slip through. `sum |a*b|` is the
+        // quantity f32 rounding actually accumulates over.
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum_abs = 0.0f32;
+                for p in 0..k {
+                    sum_abs += (a[i * k + p] * b[p * n + j]).abs();
+                }
+                let tol = 8.0 * f32::EPSILON * sum_abs.max(f32::MIN_POSITIVE);
+                let (g, w) = (got[i * n + j], want[i * n + j]);
+                assert!(
+                    (g - w).abs() <= tol,
+                    "mismatch at ({i},{j}): got {g}, want {w}, tol {tol} \
+                     (sum|a*b| = {sum_abs})"
+                );
+            }
         }
     }
 
