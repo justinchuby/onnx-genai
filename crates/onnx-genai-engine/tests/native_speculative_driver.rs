@@ -188,3 +188,153 @@ fn native_prompt_lookup_matches_plain_greedy_cuda() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// BUG1 regression (#984 re-review, Gaff): the M=1 base-decode graph and the
+/// M=width captured-verify graph share the session's single device-graph slot.
+/// An engage→miss→re-engage alternation must NEVER let an M=1 decode replay a
+/// stale width-W verify graph (the "invalidated graph replay" / illegal-address
+/// hazard). This drives the captured-verify path with the adaptive gate ON over
+/// a mixed prompt so hit density fluctuates and the driver crosses the
+/// engage↔miss boundary repeatedly, asserting (a) no error is returned and
+/// (b) the stream stays byte-identical to plain greedy across every transition.
+///
+/// Enabled with `ONNX_GENAI_RUN_CUDA_SMOKE=1`; requires a real int4 CUDA
+/// package. Sized to stay inside the runtime's numerically coherent window (see
+/// the note on `native_prompt_lookup_matches_plain_greedy_cuda`).
+#[test]
+fn native_captured_verify_engage_miss_reengage_no_stale_replay_cuda() -> anyhow::Result<()> {
+    if std::env::var_os("ONNX_GENAI_RUN_CUDA_SMOKE").is_none() {
+        eprintln!("skipping CUDA smoke; set ONNX_GENAI_RUN_CUDA_SMOKE=1 to run");
+        return Ok(());
+    }
+    // SAFETY: set before any engine/driver construction; the CUDA smoke suite is
+    // invoked single-threaded (guarded behind ONNX_GENAI_RUN_CUDA_SMOKE).
+    unsafe {
+        std::env::set_var("ONNX_GENAI_SPEC_CAPTURED_VERIFY", "1");
+        std::env::set_var("ONNX_GENAI_MARLIN_M_GT_1", "1");
+        // Keep the adaptive hit-density gate ON (default) with a small window so
+        // the engage↔miss boundary is crossed several times over a short run —
+        // this is exactly the mode-transition the BUG1 fix guards.
+        std::env::remove_var("ONNX_GENAI_SPEC_GATE");
+        std::env::set_var("ONNX_GENAI_SPEC_GATE_WINDOW", "4");
+        std::env::set_var("ONNX_GENAI_SPEC_GATE_MIN_HITS", "2");
+    }
+    let model_dir = std::env::var_os("ONNX_GENAI_NATIVE_SPEC_MODEL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/home/justinchu/qwen2.5-0.5b-int4-onnx"));
+    if !model_dir.join("model.onnx").is_file() {
+        eprintln!(
+            "skipping CUDA smoke; native model is not installed at {}",
+            model_dir.display()
+        );
+        return Ok(());
+    }
+
+    let device = Some(NativeDecodeDevice::Cuda { index: Some(0) });
+    let mut baseline = native_engine(&model_dir, device.clone())?;
+    let mut speculative = native_engine(&model_dir, device)?;
+
+    // A repetitive prompt so prompt-lookup reliably ENGAGES (proven by
+    // `native_prompt_lookup_matches_plain_greedy_cuda`), with a small gate window
+    // so the adaptive gate warms up MISSED (density below threshold) before it
+    // ENGAGES once hits cluster — that miss→engage→… boundary is exactly the
+    // shared graph-slot transition BUG1 guards. Sized (~16 prompt + 12 generated
+    // ≈ position 28) to stay inside the runtime's numerically coherent window.
+    let prompt = "The cat sat on the mat. The cat sat on the mat.";
+    let request = greedy_request(GeneratePrompt::Text(prompt.to_string()), 12);
+
+    let expected = baseline.generate(request.clone())?;
+    // If BUG1 regressed, this call fails with an invalidated-replay /
+    // CUDA_ERROR_ILLEGAL_ADDRESS error instead of returning.
+    let actual = speculative.generate(with_prompt_lookup(request, 2, 4))?;
+    let stats = speculative.last_speculative_stats();
+
+    assert_eq!(
+        actual.token_ids, expected.token_ids,
+        "captured-verify engage/miss alternation diverged from plain greedy: stats={stats:?}"
+    );
+    assert_eq!(actual.finish_reason, expected.finish_reason);
+    // The gate must have crossed into the engaged (captured verify) mode at least
+    // once — otherwise the miss↔engage transition (and its slot invalidation) is
+    // never exercised.
+    assert!(
+        stats.verification_steps > 0,
+        "engage/miss regression never engaged the captured verify: {stats:?}"
+    );
+    eprintln!(
+        "engage/miss/re-engage CUDA: proposed={} accepted={} steps={}",
+        stats.proposed_tokens, stats.accepted_tokens, stats.verification_steps
+    );
+    Ok(())
+}
+
+/// BUG2 regression (#984 re-review, Chew): the persistent GroupQueryAttention
+/// workspace is sized by the query width and prepared once at prefill for
+/// `q_seq = prompt_len`. When the prompt is SHORTER than the captured verify
+/// width `W`, the width-W verify needs a larger workspace than prefill reserved;
+/// before the fix the executor rejected it ("GroupQueryAttention workspace
+/// invariant mismatch: requires N, prepared M") and the run crashed. With the
+/// fix `run_verify_captured_cuda` reserves the workspace for `q_seq = W` before
+/// warming, so a short repetitive prompt must run to completion under both gates
+/// ON. The critical assertion is *no crash* over a multi-step run.
+///
+/// Enabled with `ONNX_GENAI_RUN_CUDA_SMOKE=1`; requires a real int4 CUDA package.
+#[test]
+fn native_captured_verify_short_prompt_grows_gqa_workspace_cuda() -> anyhow::Result<()> {
+    if std::env::var_os("ONNX_GENAI_RUN_CUDA_SMOKE").is_none() {
+        eprintln!("skipping CUDA smoke; set ONNX_GENAI_RUN_CUDA_SMOKE=1 to run");
+        return Ok(());
+    }
+    // SAFETY: set before any engine/driver construction; single-threaded suite.
+    unsafe {
+        std::env::set_var("ONNX_GENAI_SPEC_CAPTURED_VERIFY", "1");
+        std::env::set_var("ONNX_GENAI_MARLIN_M_GT_1", "1");
+        // Force immediate engage so the width-W verify (and its larger workspace)
+        // is exercised from the first steady-state step.
+        std::env::set_var("ONNX_GENAI_SPEC_GATE", "0");
+    }
+    let model_dir = std::env::var_os("ONNX_GENAI_NATIVE_SPEC_QWEN_MODEL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from("/home/justinchu/shared-models/qwen2.5-14b-instruct-int4-zp-onnx")
+        });
+    if !model_dir.join("model.onnx").is_file() {
+        eprintln!(
+            "skipping CUDA smoke; qwen model is not installed at {}",
+            model_dir.display()
+        );
+        return Ok(());
+    }
+
+    let device = Some(NativeDecodeDevice::Cuda { index: Some(0) });
+    let mut speculative = native_engine(&model_dir, device)?;
+
+    // A SHORT, highly repetitive prompt (degenerate-repetition class): its token
+    // count is below the verify width W = 1 + draft_width, so prefill reserves a
+    // smaller GQA workspace than the width-W verify requires. ngram=1 so the
+    // repeated token is always proposed and the verify engages every step.
+    let prompt = "哈哈哈哈";
+    // ≥160 generated tokens: the crash surfaces on the first engaged verify, but
+    // a long run also proves the reserved workspace stays valid across replays.
+    let request = greedy_request(GeneratePrompt::Text(prompt.to_string()), 160);
+
+    // The assertion IS that this returns Ok — before the fix it errors with the
+    // GQA workspace invariant mismatch on the first engaged verify.
+    let actual = speculative.generate(with_prompt_lookup(request, 1, 4))?;
+    let stats = speculative.last_speculative_stats();
+    assert!(
+        stats.verification_steps > 0,
+        "workspace-growth test never engaged the captured verify: {stats:?}"
+    );
+    assert!(
+        !actual.token_ids.is_empty(),
+        "workspace-growth test produced no tokens: {stats:?}"
+    );
+    eprintln!(
+        "short-prompt GQA-workspace CUDA: generated={} verify_steps={} accepted={}",
+        actual.token_ids.len(),
+        stats.verification_steps,
+        stats.accepted_tokens
+    );
+    Ok(())
+}

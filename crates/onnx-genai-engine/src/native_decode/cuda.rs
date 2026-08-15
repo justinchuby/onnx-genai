@@ -2059,6 +2059,38 @@ impl NativeDecodeSession {
         }
         state.extend_mask(if grew { 0 } else { past_len }, total_len, total_len)?;
 
+        // BUG2 (#984 re-review, Chew): the persistent GroupQueryAttention
+        // workspace is sized by the query width (q_seq) and prepared only ONCE at
+        // prefill for `q_seq = prompt_len`. The captured verify always runs at the
+        // fixed width `W = 1 + draft_width`. On a short degenerate-repetition
+        // prompt (`prompt_len < W`, e.g. the qwen 哈×20 → 8-token prompt with
+        // W=9) the verify enters execution with an undersized prepared workspace
+        // and the session executor correctly rejects before launch ("com.microsoft
+        // ::GroupQueryAttention workspace invariant mismatch: requires N,
+        // prepared M"). Reserve/grow the persistent workspace for `q_seq = W`
+        // BEFORE the graph is warmed/captured, so the (possibly larger)
+        // reservation is baked into the captured graph and every replay is valid.
+        // Only needed while (re)warming — a replayed graph already carries the
+        // reservation, and `reserve_prepared_workspace` is a cheap no-op once the
+        // buffer is large enough.
+        let needs_workspace_prep = state
+            .verify_capture
+            .as_ref()
+            .map(|capture| capture.phase == DecodeCudaGraphPhase::NeedsWarmup)
+            .unwrap_or(false);
+        if needs_workspace_prep {
+            let last = tokens[tokens.len() - 1];
+            let prep_tokens: Vec<TokenId> = (0..width)
+                .map(|i| if i < tokens.len() { tokens[i] } else { last })
+                .collect();
+            self.prepare_cuda_prefill_workspace_with_step_inputs(&prep_tokens, past_len, &[])
+                .context("reserve captured-verify GQA workspace at fixed verify width")?;
+        }
+        let state = self
+            .cuda
+            .as_mut()
+            .context("CUDA decode state is not initialized")?;
+
         // Write the padded token ids + positions into the persistent verify
         // buffers. Padding rows repeat the last real token (value is irrelevant —
         // those rows are never read and their KV is dropped by the driver rewind).

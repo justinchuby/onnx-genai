@@ -221,6 +221,27 @@ impl NativeDecodeSession {
         }
     }
 
+    /// Speculative graph-slot mode switch (BUG1 fix, #984 re-review).
+    ///
+    /// The M=1 base-decode graph and the M=width captured-verify graph share the
+    /// session's single device-graph slot. When the speculative driver switches
+    /// which one it will replay next (engage↔miss transition, or a row-0 near-tie
+    /// fallback), the currently installed graph must be dropped so the incoming
+    /// path re-warms its own graph instead of replaying a foreign/stale one — the
+    /// replay of a stale verify graph from an M=1 decode is exactly the
+    /// "invalidated graph replay" / `CUDA_ERROR_ILLEGAL_ADDRESS` hazard Gaff
+    /// found. This invalidates the EP graph slot and resets BOTH the M=1 decode
+    /// graph phase and the retained verify phase to `NeedsWarmup` (the verify
+    /// bindings stay allocated), restoring the invariant `NeedsWarmup ⇔ slot
+    /// empty`. No-op on non-CUDA sessions.
+    pub fn invalidate_graph_for_mode_switch(&mut self) -> anyhow::Result<()> {
+        if let Some(state) = self.cuda.as_mut() {
+            state.invalidate_graph(&mut self.session)?;
+            state.reset_verify_capture_phase();
+        }
+        Ok(())
+    }
+
     pub fn kv_layer_count(&self) -> usize {
         self.kv_inputs.len() / 2
     }
