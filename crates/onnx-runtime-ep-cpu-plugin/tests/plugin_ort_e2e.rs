@@ -636,13 +636,43 @@ fn diag_ort_ep_api_nullcheck() {
 /// # Safety
 /// All ORT API calls are unsafe; caller must drive teardown:
 ///   ReleaseSession, ReleaseSessionOptions, UnregisterExecutionProviderLibrary, ReleaseEnv.
+/// The process-wide `onnxruntime` handle, loaded once and never unloaded.
+///
+/// Each test used to `dlopen` its own handle and drop it at test end, which
+/// `dlclose`s the library. That is what made this binary crash with an
+/// intermittent `STATUS_ACCESS_VIOLATION` at a run-varying location: our plugin
+/// cdylib stays resident and caches the host `OrtApi` in a process-global
+/// (`status.rs::HOST_ORT_API`, set from `CreateEpFactories`), so unloading and
+/// reloading ORT underneath it leaves that pointer describing a library that is
+/// no longer mapped where it was.
+///
+/// Evidence for that reading, measured on this binary:
+///
+/// * every test passes in isolation, but the suite crashes after 10-16 of them;
+/// * the crash lands on a *different* test each run (shape_f32, matmul_2d,
+///   matmul_batched_nd), so it is cumulative rather than test-specific;
+/// * `--test-threads=1` crashes 4/4, so it is not a data race — which also means
+///   adding more locking cannot fix it;
+/// * `stress_register_run_unregister_cycles` drives **25** full
+///   CreateEnv/register/session/run/unregister/ReleaseEnv cycles and passes,
+///   because it deliberately holds one library handle for its whole duration.
+///   Cycle count is therefore not the variable; library load/unload is.
+///
+/// ORT is a process singleton in real use, so holding one handle for the test
+/// binary's lifetime matches production and removes the reload entirely.
+fn shared_ort_library(path: &std::path::Path) -> Option<&'static libloading::Library> {
+    static LIB: std::sync::OnceLock<Option<libloading::Library>> = std::sync::OnceLock::new();
+    LIB.get_or_init(|| unsafe { libloading::Library::new(path) }.ok())
+        .as_ref()
+}
+
 #[allow(clippy::type_complexity)]
 unsafe fn conformance_setup(
     reg_name: &str,
     model_path: &std::path::Path,
     disable_fallback: bool,
 ) -> Option<(
-    libloading::Library,
+    &'static libloading::Library,
     *const ort::OrtApi,
     *mut ort::OrtEnv,
     *mut ort::OrtSessionOptions,
@@ -688,23 +718,23 @@ unsafe fn conformance_setup(
     }
 
     let ort_lib_path = ort_lib_dir.join(ort_discovery::ort_lib_name());
-    let lib = match unsafe { libloading::Library::new(&ort_lib_path) } {
-        Ok(l) => l,
-        Err(e) => {
+    let lib = match shared_ort_library(&ort_lib_path) {
+        Some(l) => l,
+        None => {
             if std::env::var("NXRT_REQUIRE_ORT_TESTS").as_deref() == Ok("1") {
                 panic!(
-                    "NXRT_REQUIRE_ORT_TESTS=1 but dlopen failed for {}: {e}",
+                    "NXRT_REQUIRE_ORT_TESTS=1 but dlopen failed for {}",
                     ort_lib_path.display()
                 );
             }
             eprintln!(
-                "*** SKIPPED: dlopen failed for {}: {e} ***",
+                "*** SKIPPED: dlopen failed for {} ***",
                 ort_lib_path.display()
             );
             return None;
         }
     };
-    let api = unsafe { get_ort_api(&lib) };
+    let api = unsafe { get_ort_api(lib) };
 
     // Env
     let mut env: *mut ort::OrtEnv = ptr::null_mut();
