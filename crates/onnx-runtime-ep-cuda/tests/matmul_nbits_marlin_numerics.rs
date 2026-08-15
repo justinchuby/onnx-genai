@@ -808,7 +808,7 @@ fn current_path_matches_f64_oracle_projection_shapes() {
 }
 
 // ---------------------------------------------------------------------------
-// GPU gate: the opt-in fp16 mixed-precision wide GEMV (ONNX_GENAI_GEMV_FP16=1)
+// GPU gate: the opt-in fp16 (ORT-matching) wide GEMV (ONNX_GENAI_GEMV_FP16=1)
 // ---------------------------------------------------------------------------
 
 /// glm's real block-128 decode (M=1) projection shapes. block-128 is the group
@@ -822,15 +822,18 @@ const GLM_DECODE_SHAPES: &[(&str, usize, usize)] = &[
     ("glm4-mlp-down", 13696, 4096),
 ];
 
-/// **Accuracy gate for the opt-in fp16 mixed-precision wide GEMV.**
+/// **Accuracy gate for the opt-in fp16 (ORT-matching) wide GEMV.**
 ///
 /// The fp16 kernel (`matmul_nbits_gemv_f16_general_bs_wide_multicol_fp16`,
 /// selected by `ONNX_GENAI_GEMV_FP16=1`) runs the per-chunk MAC in fp16
-/// `__hfma2` — matching ORT's fp16 arithmetic (the equal-conditions fp16-vs-fp16
-/// path) — then reduces to fp32, scales, and accumulates *across* chunks in fp32
-/// so the K=4096..13696 reduction never loses mantissa. It is **not**
-/// byte-identical to the fp32 path by construction, so it ships opt-in gated on
-/// *this* accuracy bound rather than bit-identity.
+/// `__hfma2` and keeps the *entire per-lane K reduction* in fp16 `__half2`
+/// accumulators — exactly matching ORT's `MatMulFloat4BitsKernelM1` (the
+/// equal-conditions fp16-vs-fp16 path); fp32 is used ONLY in the final
+/// cross-lane warp-shuffle reduction. Because each lane strides K by 32 and
+/// folds only a handful of chunks, the fp16 accumulation is a wide, shallow tree
+/// (depth ~tens, not K=4096..13696), so almost no mantissa is lost. It is
+/// **not** byte-identical to the fp32 path by construction, so it ships opt-in
+/// gated on *this* accuracy bound rather than bit-identity.
 ///
 /// The bar is deliberately the **same justified [`Envelope`]** the reviewed fp32
 /// int4 path must satisfy (`current_path_matches_f64_oracle_*`): the fp16 path is

@@ -119,11 +119,16 @@ const GEMV_F16_GENERAL_BS_WIDE_MULTICOL_ENTRY: &str =
 /// column-register-blocking, but the per-chunk MAC runs in fp16 `__hfma2` (two
 /// fused MACs/instruction) to cut the dequant/MAC ALU that limits the fp32
 /// multicol kernel — the fp16-vs-fp16 equal-conditions path against ORT's fp16
-/// `MatMulFloatInt4Kernel`. Each 32-product quant chunk is summed in fp16 then
-/// reduced to fp32 and accumulated across chunks in fp32 (the K reduction stays
-/// fp32; NOT a full-fp16 K accumulate). NOT byte-identical to the fp32 path —
-/// opt-in via [`use_gemv_fp16`] and gated on accuracy (error <= ORT vs an f64
-/// oracle), not bit-identity.
+/// `MatMulFloatInt4Kernel`. The entire per-lane K reduction runs in fp16
+/// `__half2` accumulators (each 32-product chunk summed in fp16, its per-block
+/// scale folded in with `__hfma2`), exactly mirroring ORT's
+/// `MatMulFloat4BitsKernelM1`; fp32 is used ONLY in the final cross-lane
+/// warp-shuffle reduction. This is safe (no token-flipping mantissa loss)
+/// because each lane strides K by 32 and folds only a handful of chunks, so the
+/// fp16 accumulation is a wide, shallow tree of depth ~tens, not K. Because the
+/// arithmetic mirrors ORT's it lands in ORT's own error class — NOT byte-identical
+/// to the fp32 path, so it is opt-in via [`use_gemv_fp16`] and gated on accuracy
+/// (error <= ORT vs an f64 oracle), not bit-identity.
 const GEMV_F16_GENERAL_BS_WIDE_MULTICOL_FP16_ENTRY: &str =
     "matmul_nbits_gemv_f16_general_bs_wide_multicol_fp16";
 /// Output columns each warp emits in the register-blocked wide GEMV. Must match
