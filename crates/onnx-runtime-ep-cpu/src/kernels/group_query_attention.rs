@@ -116,7 +116,13 @@ pub fn group_fused_count() -> usize {
 /// | 28/4/128  | 4 | 0.59x – 0.75x (1.7x slower) |
 /// | 32/8/128  | 8 | 0.89x – 2.05x (length dependent) |
 ///
-/// so the gate is simply "the fused task count still covers the workers".
+/// Repeating the sweep on a 16-worker pool (the width this host actually
+/// resolves for decode) reproduces the same shape: half-covered pools
+/// (8 fused tasks against 16 workers) lose 0.64x – 0.87x on short caches, while
+/// fully-covered pools (16 fused tasks) win 1.24x – 2.76x. Half coverage does
+/// recover on very long caches, but the sign is not stable across pool widths —
+/// it lost at every length measured on the 8-worker pool — so the gate stays at
+/// full coverage: "the fused task count still covers the workers".
 /// A single-worker scope (`worker_count <= 1`) has no parallelism to lose, so
 /// the traffic saving is taken unconditionally there.
 fn group_fusion_saturates_pool(fused_tasks: usize, worker_count: usize) -> bool {
@@ -142,10 +148,18 @@ fn group_fusion_saturates_pool(fused_tasks: usize, worker_count: usize) -> bool 
 /// | 16 MiB (kv 16384)| 1.49x | 1.68x | 2.05x | 1.61x | 1.56x |
 ///
 /// Below 8 MiB the sign of the effect flips with geometry and does not
-/// reproduce across runs; at and above it every geometry measured is a win. The
-/// threshold is therefore empirical, calibrated on that host — the decode pool
-/// is capped at 8 workers (`MAX_TOPOLOGY_DECODE_THREADS`), so it is not
-/// rescaled by worker count.
+/// reproduce across runs; at and above it every geometry measured is a win.
+///
+/// The threshold is a fixed per-KV-head figure rather than a per-worker share
+/// of the LLC. A 16-worker sweep (16 fused tasks, `head_size = 128`) wins
+/// 1.25x – 2.45x at 8 MiB and 1.40x – 2.76x at 16 MiB, so the threshold is
+/// still safe there; it also wins 1.24x – 1.56x at 4 MiB, which this gate
+/// deliberately declines. That is a known conservative miss: making the
+/// threshold `llc_bytes / worker_count` would capture it, but the EP has no LLC
+/// query (`onnx-runtime-cpuinfo` is a cmake+bindgen FFI crate that nothing in
+/// the EP depends on), and a hard-coded 64 MiB aggregate would open too early
+/// on large-L3 parts. The gate errs toward declining wins, never toward
+/// admitting measured regressions.
 const GROUP_FUSED_MIN_KV_BYTES: usize = 8 << 20;
 
 /// KV tokens a decode step actually streams per head.
@@ -1146,6 +1160,15 @@ impl Kernel for GroupQueryAttentionKernel {
         // repeat reads are cheap, so the saving does not pay for the fused
         // path's score-buffer traffic. Both conditions must hold; see
         // `group_fusion_saturates_pool` and `group_fusion_pays_for_traffic`.
+        //
+        // Measured end to end on Qwen3-0.6B-int4 at ~11.8k context with
+        // `ONNX_GENAI_CPU_DECODE_THREADS=8` (the only batch-1 configuration on a
+        // 16-core host where both gates open): 151 ms/token fused vs 200
+        // ms/token per-head, 4 interleaved trials, token output identical.
+        // Note this does not beat the *default* 16-worker per-head config
+        // (129 ms/token) — narrowing the pool to reach the gate costs more than
+        // the fusion returns at batch 1. It is a win within a given decode
+        // width, not a new best configuration.
         let attended_window = fused_attended_window(total_sequence_length, self.local_window_size);
         let group_fused = q.seq == 1
             && group > 1
