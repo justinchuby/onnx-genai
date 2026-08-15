@@ -42,30 +42,51 @@ mod cuda_impl {
     /// NVIDIA vendor ID (PCI).
     const NVIDIA_VENDOR_ID: u32 = 0x10DE;
 
-    /// Build kernel registry entries from the CUDA EP's covered op list.
-    pub(crate) fn build_kernel_registry_entries() -> Vec<KernelRegistryEntry> {
-        use onnx_runtime_ep_cuda::CUDA_COVERED_OPS;
-        use onnx_runtime_ir::DataType;
-
-        /// Dtypes the CUDA EP genuinely handles via cuBLASLt + custom kernels.
-        static CUDA_DTYPES: &[DataType] =
-            &[DataType::Float32, DataType::Float16, DataType::BFloat16];
-
-        CUDA_COVERED_OPS
-            .iter()
-            .map(|&op_type| KernelRegistryEntry {
-                op_type,
-                domain: "",
-                since_version: 1,
+    /// Build kernel registry entries from the CUDA EP's **real** registry.
+    ///
+    /// Each entry's `(op_type, domain, since_version)` is derived from the same
+    /// `OpRegistry` the EP dispatches on — via
+    /// `build_cuda_registry_descriptors` — so a `com.microsoft` kernel is
+    /// advertised in `com.microsoft` and a default-domain kernel in `""`. This
+    /// replaces the previous flat `CUDA_COVERED_OPS` name list that advertised
+    /// *every* kernel under the default domain, which meant no `com.microsoft`
+    /// node (MatMulNBits, GroupQueryAttention, SkipSimplifiedLayerNormalization,
+    /// GatherBlockQuantized — 61% of a real decoder) could ever match.
+    ///
+    /// Requires the constructed EP's `CudaRuntime`; at factory-construction time
+    /// this is available from the already-built `CudaExecutionProvider`
+    /// (`ep.runtime()`), so no separate GPU context is needed.
+    ///
+    /// The registry is derived from the real `OpRegistry`, not a hand-maintained
+    /// list, so it cannot drift from the kernels. Advertising the real domains
+    /// is always correct and harmless on its own: whether the EP actually
+    /// *claims* a real decoder's nodes is gated separately at capability time
+    /// (see `onnx-runtime-ep-plugin`'s partial-GPU-claim gate, off by default
+    /// because executing an interspersed CPU/GPU partition currently hits #982).
+    pub(crate) fn build_kernel_registry_entries(
+        runtime: std::sync::Arc<onnx_runtime_ep_cuda::CudaRuntime>,
+    ) -> Vec<KernelRegistryEntry> {
+        onnx_runtime_ep_cuda::build_cuda_registry_descriptors(runtime)
+            .into_iter()
+            .map(|d| KernelRegistryEntry {
+                op_type: leak_str(&d.op_type),
+                domain: leak_str(&d.domain),
+                since_version: d.since_version as i32,
                 // i32::MAX: our CUDA kernels are version-agnostic — they dispatch
                 // on dtype/shape via the IR `Node` abstraction, not on opset-specific
                 // attributes. The schema version only affects how ORT parses the model
                 // into the IR; by the time we see a Node, versioned differences are
                 // already resolved. This matches the CPU EP's fix for the same issue.
                 end_version: i32::MAX,
-                supported_dtypes: CUDA_DTYPES,
+                supported_dtypes: d.supported_dtypes,
             })
             .collect()
+    }
+
+    /// Leak a string to get a `&'static str` (entries must live for the EP
+    /// lifetime; mirrors the CPU plugin's `leak_str`).
+    fn leak_str(s: &str) -> &'static str {
+        Box::leak(s.to_owned().into_boxed_str())
     }
 
     /// Device support for the CUDA EP: GPU, stream-aware, device-only memory.
@@ -75,11 +96,15 @@ mod cuda_impl {
 
     /// Construct the CUDA EP and extract the native stream handle.
     ///
-    /// Returns `(ep, stream_handle)` or an error if no GPU is available.
+    /// Returns `(ep, stream_handle, entries)` or an error if no GPU is
+    /// available. The kernel-registry entries are derived from the constructed
+    /// EP's real registry so the caller advertises each kernel under its true
+    /// domain.
     pub(crate) fn construct_ep_with_stream() -> Result<
         (
             Box<dyn onnx_runtime_ep_api::provider::ExecutionProvider + Send>,
             *mut std::os::raw::c_void,
+            Vec<KernelRegistryEntry>,
         ),
         String,
     > {
@@ -87,7 +112,8 @@ mod cuda_impl {
             format!("CUDA EP construction failed (no GPU or driver unavailable): {e}")
         })?;
         let stream_handle = ep.runtime().stream_ptr() as *mut std::os::raw::c_void;
-        Ok((Box::new(ep), stream_handle))
+        let entries = build_kernel_registry_entries(ep.runtime().clone());
+        Ok((Box::new(ep), stream_handle, entries))
     }
 }
 
@@ -150,8 +176,8 @@ pub unsafe extern "C" fn CreateEpFactories(
         {
             // Attempt to construct the CUDA EP. If no GPU is available, fail
             // closed with an actionable error.
-            let (ep, stream_handle) = match cuda_impl::construct_ep_with_stream() {
-                Ok(pair) => pair,
+            let (ep, stream_handle, entries) = match cuda_impl::construct_ep_with_stream() {
+                Ok(tuple) => tuple,
                 Err(msg) => {
                     unsafe {
                         if !out_num_raw.is_null() {
@@ -165,7 +191,6 @@ pub unsafe extern "C" fn CreateEpFactories(
             };
 
             let ep_name = ep.name().to_string();
-            let entries = cuda_impl::build_kernel_registry_entries();
             let support = cuda_impl::device_support();
             let shared_ep = std::sync::Arc::new(std::sync::Mutex::new(ep));
 

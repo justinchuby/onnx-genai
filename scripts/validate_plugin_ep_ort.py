@@ -2,17 +2,27 @@
 
 Builds a tiny ONNX model (Add -> Mul), registers the plugin-EP library with ORT
 via register_execution_provider_library, selects the `cuda_ep` device on a chosen
-H200, runs the model, and checks the numeric result. This confirms the ORT
-plugin-load path specifically (the full 30B run exercises the kernels).
+H200, runs the model, checks the numeric result, AND — critically — counts how
+many nodes each execution provider actually executed by reading the ORT profile.
+
+Historically this script printed PASS after checking only the numeric output and
+`get_providers()`. Both are satisfied by *total silent CPU fallback*: ORT lists
+`cuda_ep` in the session providers merely because it was registered, and the
+numbers are correct because CPU produced them. Issue #956 hid behind exactly
+that gap. A PASS here now REQUIRES that `cuda_ep` executed at least one node.
 """
 
 import os
 import sys
+import tempfile
 
 import numpy as np
 import onnx
 from onnx import TensorProto, helper
 import onnxruntime as ort
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _ep_profile import count_nodes_by_provider, format_counts  # noqa: E402
 
 
 def build_model() -> bytes:
@@ -46,8 +56,11 @@ def main() -> int:
     # Select one H200 (device_index-th GPU device advertised by the plugin).
     chosen = [ep_devices[min(device_index, len(ep_devices) - 1)]]
 
+    profile_prefix = os.path.join(tempfile.mkdtemp(prefix="nxrt_prof_"), "smoke")
     so = ort.SessionOptions()
     so.add_provider_for_devices(chosen, {})
+    so.enable_profiling = True
+    so.profile_file_prefix = profile_prefix
 
     sess = ort.InferenceSession(build_model(), sess_options=so)
     eps = sess.get_providers()
@@ -59,13 +72,31 @@ def main() -> int:
     x = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
     y = np.array([10.0, 20.0, 30.0, 40.0], dtype=np.float32)
     (out,) = sess.run(None, {"x": x, "y": y})
+    profile_path = sess.end_profiling()
     expected = (x + y) * y
     print(f"input x={x.tolist()} y={y.tolist()}")
     print(f"output={out.tolist()} expected={expected.tolist()}")
     if not np.allclose(out, expected, rtol=1e-5, atol=1e-5):
         print("FAIL: numeric mismatch")
         return 1
-    print("PASS: plugin-EP registered, selected on H200, and executed correctly")
+
+    counts = count_nodes_by_provider(profile_path)
+    print("per-provider executed node counts:")
+    print(format_counts(counts))
+
+    cuda_nodes = sum(n for p, n in counts.items() if "cuda" in p.lower())
+    if cuda_nodes == 0:
+        print(
+            "FAIL: cuda_ep executed ZERO nodes — the EP was registered and "
+            "selected but every node silently fell back to another provider. "
+            "This is the exact failure mode #956 documents."
+        )
+        return 1
+
+    print(
+        f"PASS: plugin-EP registered, selected on H200, executed correctly, "
+        f"and claimed {cuda_nodes} node(s) on cuda_ep"
+    )
     return 0
 
 

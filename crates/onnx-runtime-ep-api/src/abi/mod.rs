@@ -409,10 +409,34 @@ impl<'view, 'graph> OrtGraphView<'view, 'graph> {
     /// break convexity split the region into several claims, preserving ORT's
     /// `GetCapability` schedulability contract rather than flattening by EP.
     pub fn query_capabilities(&self, ep: &dyn ExecutionProvider) -> Vec<SubgraphClaim> {
+        self.query_capabilities_filtered(ep, |_| true)
+    }
+
+    /// Like [`Self::query_capabilities`], but additionally requires every claimed
+    /// node to satisfy `node_admissible`.
+    ///
+    /// The predicate is applied *before* convex partitioning, so a rejected node
+    /// is excluded from the supported set and ORT partitions *around* it — the
+    /// rest of the graph can still be claimed. This is the correct granularity
+    /// for graph-level admissibility constraints that a per-op `supports_op`
+    /// cannot express (e.g. a plugin whose compile path cannot route a node's
+    /// weight-initializer inputs): declining the node here keeps it out of every
+    /// convex claim rather than dropping a whole partition after the fact.
+    pub fn query_capabilities_filtered<F>(
+        &self,
+        ep: &dyn ExecutionProvider,
+        node_admissible: F,
+    ) -> Vec<SubgraphClaim>
+    where
+        F: Fn(NodeIndex) -> bool,
+    {
         let supported: Vec<_> = self
             .view
             .nodes()
             .filter(|&node| {
+                if !node_admissible(node) {
+                    return false;
+                }
                 let opset = self
                     .view
                     .graph()

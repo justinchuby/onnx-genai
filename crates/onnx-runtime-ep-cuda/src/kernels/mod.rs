@@ -336,6 +336,280 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "LinearAttention",
 ];
 
+// ─── Kernel-registry descriptor derivation (plugin-EP advertisement) ──────────
+//
+// The ORT plugin cdylib must advertise each kernel to ORT under its *real*
+// `(op_type, domain)` — a `com.microsoft` node can never match a kernel
+// advertised in the default (`""`) domain. Rather than hand-maintain a second
+// flat list that can drift from the kernels (the `CUDA_COVERED_OPS` names carry
+// no domain), the descriptors below are derived from the same `OpRegistry` the
+// EP dispatches on, so the advertised `(op_type, domain, since_version)` is the
+// registration by construction. Mirrors the CPU EP's
+// `build_cpu_registry_with_descriptors` pattern.
+
+use onnx_runtime_ir::DataType;
+
+/// Descriptor of one registered CUDA op for plugin kernel-registry
+/// advertisement. Derived from the real [`OpRegistry`] registration keys — not
+/// hand-maintained.
+#[derive(Clone, Debug)]
+pub struct CudaOpDescriptor {
+    pub op_type: String,
+    pub domain: String,
+    pub since_version: u64,
+    /// Element types advertised for the op's type constraints. The plugin's
+    /// claim filter checks *every* input and output dtype against this set, so
+    /// it must be the union of all element types the kernel legitimately
+    /// receives — including quantized weights (`Uint8` for `MatMulNBits`) and
+    /// integer auxiliary inputs (`Int32` seqlens for `GroupQueryAttention`).
+    /// Fail closed to the float compute set for unknown ops.
+    pub supported_dtypes: &'static [DataType],
+}
+
+/// Float compute types the CUDA kernels handle (cuBLASLt + custom kernels).
+static CUDA_FLOAT_DTYPES: &[DataType] = &[DataType::Float32, DataType::Float16, DataType::BFloat16];
+
+/// Every element type the CUDA EP can move byte-for-byte through a structural
+/// op (Reshape, Transpose, Gather, Concat, Cast, Shape, …). These kernels do
+/// not compute on the values, so they accept the full dtype set. Matches the
+/// CPU EP's `ALL_DTYPES` category.
+static CUDA_ALL_DTYPES: &[DataType] = &[
+    DataType::Float32,
+    DataType::Float16,
+    DataType::BFloat16,
+    DataType::Int8,
+    DataType::Int16,
+    DataType::Int32,
+    DataType::Int64,
+    DataType::Uint8,
+    DataType::Uint16,
+    DataType::Uint32,
+    DataType::Uint64,
+    DataType::Bool,
+];
+
+/// Element types the CUDA arithmetic/elementwise kernels handle: the float
+/// compute set plus the integer types (`Add`, `Sub`, `Mul`, reductions on
+/// integer tensors, comparisons). Matches the CPU EP's `ARITH_DTYPES`.
+static CUDA_ARITH_DTYPES: &[DataType] = &[
+    DataType::Float32,
+    DataType::Float16,
+    DataType::BFloat16,
+    DataType::Int8,
+    DataType::Int16,
+    DataType::Int32,
+    DataType::Int64,
+    DataType::Uint8,
+    DataType::Uint16,
+    DataType::Uint32,
+    DataType::Uint64,
+];
+
+/// Integer element types for bitwise ops.
+static CUDA_BITWISE_DTYPES: &[DataType] = &[
+    DataType::Int8,
+    DataType::Int16,
+    DataType::Int32,
+    DataType::Int64,
+    DataType::Uint8,
+    DataType::Uint16,
+    DataType::Uint32,
+    DataType::Uint64,
+];
+
+/// Boolean element type for logical ops.
+static CUDA_BOOL_DTYPES: &[DataType] = &[DataType::Bool];
+
+/// Float activations plus the quantized-weight and index types a block-quantized
+/// GEMM receives: `MatMulNBits`/`QMoE` take an f16/f32 activation, a `Uint8`
+/// packed-int4 weight, f16/f32 scales, and (optionally) `Int8`/`Int32` zero
+/// points. Without the integer types in the set the claim filter rejects the
+/// node on its weight input.
+static CUDA_QUANT_MATMUL_DTYPES: &[DataType] = &[
+    DataType::Float32,
+    DataType::Float16,
+    DataType::BFloat16,
+    DataType::Uint8,
+    DataType::Int8,
+    DataType::Int32,
+];
+
+/// Float activations plus the integer index/scale types a
+/// `GatherBlockQuantized` receives: `Uint8` packed data, `Int64`/`Int32`
+/// indices, f16/f32 scales.
+static CUDA_GATHER_QUANT_DTYPES: &[DataType] = &[
+    DataType::Float32,
+    DataType::Float16,
+    DataType::BFloat16,
+    DataType::Uint8,
+    DataType::Int8,
+    DataType::Int32,
+    DataType::Int64,
+];
+
+/// Float compute plus the integer auxiliary inputs an attention op receives:
+/// `GroupQueryAttention`/`Attention` take `Int32` `seqlens_k` /
+/// `total_sequence_length` (and some variants `Int64`) alongside f16/bf16 Q/K/V.
+static CUDA_ATTENTION_DTYPES: &[DataType] = &[
+    DataType::Float32,
+    DataType::Float16,
+    DataType::BFloat16,
+    DataType::Int32,
+    DataType::Int64,
+];
+
+/// Element types the CUDA EP advertises for `(op_type, domain)`.
+///
+/// The plugin's claim filter checks *every* input and output dtype of *every*
+/// node in a (convex) claim, and drops the whole claim if any node fails — so
+/// this advertisement must match, for each registered op, the union of element
+/// types the kernel legitimately receives. A set narrower than what the EP's
+/// registry actually claims (e.g. float-only for an integer `Cast`/`Shape`)
+/// silently sinks the entire partition it lands in. The categories mirror the
+/// CPU EP's `supported_dtypes_for_op`, widened for CUDA's quantized/attention
+/// kernels. Fail closed to the float compute set for unrecognised ops.
+pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataType] {
+    match (op_type, domain) {
+        // Block-quantized GEMM / MoE: f16/f32 activation + Uint8 packed weight.
+        ("MatMulNBits", "com.microsoft")
+        | ("QMoE", "com.microsoft")
+        | ("BlockQuantizedMatMul", _)
+        | ("BlockQuantizedMoE", _)
+        | ("QLinearMatMul", _)
+        | ("QuantizeLinear", _)
+        | ("DequantizeLinear", _)
+        | ("DynamicQuantizeLinear", _) => CUDA_QUANT_MATMUL_DTYPES,
+
+        // Quantized gather: Uint8 data + Int64/Int32 indices + f16 scales.
+        ("GatherBlockQuantized", _) => CUDA_GATHER_QUANT_DTYPES,
+
+        // Attention family: f16/bf16 Q/K/V + Int32 seqlens.
+        ("Attention", _)
+        | ("GroupQueryAttention", _)
+        | ("MultiHeadAttention", _)
+        | ("PackedMultiHeadAttention", _)
+        | ("PackedVarlenAttention", _)
+        | ("VarlenAttention", _)
+        | ("CompressedSparseAttention", _)
+        | ("SparseKvGather", _)
+        | ("LinearAttention", _) => CUDA_ATTENTION_DTYPES,
+
+        // Byte-mover / structural ops: dtype-agnostic (copy/select, no
+        // arithmetic on the values). Must advertise the full set so an integer
+        // `Cast`/`Gather`/`Shape` in a partition does not sink it.
+        ("Identity", _)
+        | ("Reshape", _)
+        | ("Flatten", _)
+        | ("Squeeze", _)
+        | ("Unsqueeze", _)
+        | ("Expand", _)
+        | ("Concat", _)
+        | ("Slice", _)
+        | ("Split", _)
+        | ("Transpose", _)
+        | ("Gather", _)
+        | ("GatherElements", _)
+        | ("GatherND", _)
+        | ("ScatterElements", _)
+        | ("ScatterND", _)
+        | ("Shape", _)
+        | ("Size", _)
+        | ("Pad", _)
+        | ("ConstantOfShape", _)
+        | ("Constant", _)
+        | ("Tile", _)
+        | ("Compress", _)
+        | ("Trilu", _)
+        | ("OneHot", _)
+        | ("Dropout", _)
+        | ("NonZero", _)
+        | ("Where", _)
+        | ("Cast", _)
+        | ("CastLike", _)
+        | ("TopK", _)
+        | ("Range", _)
+        | ("EyeLike", _) => CUDA_ALL_DTYPES,
+
+        // Logical ops: boolean.
+        ("And", _) | ("Or", _) | ("Xor", _) | ("Not", _) => CUDA_BOOL_DTYPES,
+
+        // Bitwise ops: integer.
+        ("BitwiseAnd", _)
+        | ("BitwiseOr", _)
+        | ("BitwiseXor", _)
+        | ("BitwiseNot", _)
+        | ("BitShift", _) => CUDA_BITWISE_DTYPES,
+
+        // Arithmetic / elementwise / comparison / reduction: float compute plus
+        // integer element types (e.g. i64 `Sub`/`ReduceSum` index math).
+        ("Add", _)
+        | ("Sub", _)
+        | ("Mul", _)
+        | ("Div", _)
+        | ("Mod", _)
+        | ("Pow", _)
+        | ("Min", _)
+        | ("Max", _)
+        | ("Sum", _)
+        | ("Mean", _)
+        | ("Equal", _)
+        | ("Greater", _)
+        | ("Less", _)
+        | ("GreaterOrEqual", _)
+        | ("LessOrEqual", _)
+        | ("Clip", _)
+        | ("ArgMax", _)
+        | ("ArgMin", _)
+        | ("CumSum", _)
+        | ("CumProd", _)
+        | ("ReduceSum", _)
+        | ("ReduceMean", _)
+        | ("ReduceMax", _)
+        | ("ReduceMin", _)
+        | ("ReduceProd", _)
+        | ("ReduceSumSquare", _)
+        | ("ReduceL1", _)
+        | ("ReduceL2", _)
+        | ("ReduceLogSum", _)
+        | ("ReduceLogSumExp", _) => CUDA_ARITH_DTYPES,
+
+        // Everything else (transcendental math, norms, softmax, gelu, conv,
+        // pool, matmul/gemm, elementwise float activations): fail closed to the
+        // float compute set — matches the EP's real compute dtypes.
+        _ => CUDA_FLOAT_DTYPES,
+    }
+}
+
+/// Derive plugin kernel-registry descriptors from the real CUDA [`OpRegistry`].
+///
+/// One descriptor per registered `(op_type, domain, since_version)` key, with
+/// the domain taken verbatim from the registry (so `com.microsoft` kernels are
+/// advertised in `com.microsoft`, not the default domain) and dtypes from
+/// [`cuda_supported_dtypes_for_op`]. Building the registry only constructs
+/// factory structs holding `Arc` clones of `runtime` — no cuBLASLt/NVRTC work —
+/// so this is cheap to call once at factory construction.
+pub fn build_cuda_registry_descriptors(runtime: Arc<CudaRuntime>) -> Vec<CudaOpDescriptor> {
+    let registry = build_cuda_registry(runtime);
+    let mut descriptors: Vec<CudaOpDescriptor> = registry
+        .keys()
+        .map(|key| CudaOpDescriptor {
+            op_type: key.op_type.clone(),
+            domain: key.domain.clone(),
+            since_version: key.since_version,
+            supported_dtypes: cuda_supported_dtypes_for_op(&key.op_type, &key.domain),
+        })
+        .collect();
+    // Deterministic order so the advertisement is stable across runs.
+    descriptors.sort_by(|a, b| {
+        (a.domain.as_str(), a.op_type.as_str(), a.since_version).cmp(&(
+            b.domain.as_str(),
+            b.op_type.as_str(),
+            b.since_version,
+        ))
+    });
+    descriptors
+}
+
 /// Build an [`OpRegistry`] populated with the CUDA kernel factories.
 ///
 /// The shared [`CudaRuntime`] (context + stream + cuBLASLt handle) is threaded
