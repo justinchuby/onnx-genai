@@ -227,6 +227,17 @@ def _run_once(
     }
 
 
+def check_prompt_ids(encoded: Any, canonical: Any) -> None:
+    """Raise if the tokenizer disagrees with the canonical prompt IDs.
+
+    The comparison lives behind a function so that `--self-test` can exercise the
+    call site itself. Testing `prompt_ids_match` in isolation would still pass if
+    this site were rewritten back to a bare `!=`, which is the original defect.
+    """
+    if not prompt_ids_match(encoded, canonical):
+        raise RuntimeError("native tokenizer output differs from the canonical prompt IDs")
+
+
 def prompt_ids_match(encoded: Any, canonical: Any) -> bool:
     """Whether two token-ID sequences are exactly equal, element by element.
 
@@ -357,7 +368,38 @@ def _self_test(*, require_numpy: bool = False) -> int:
         print("FAIL: parity against a differing reference must be reported as false")
         failures += 1
 
-    checks = len(cases) + len(length_cases) + 7
+    # The call site, not only the helper. A bare `!=` here raises ValueError on a
+    # numpy array, and an inverted condition would accept a mismatched prompt.
+    site_cases: list[tuple[str, Any, Any, bool]] = [
+        ("call site accepts a matching list", [1, 2, 3], [1, 2, 3], True),
+        ("call site rejects a mismatched list", [1, 2, 4], [1, 2, 3], False),
+    ]
+    if np is not None:
+        site_cases += [
+            ("call site accepts a matching numpy array", np.array([1, 2, 3]), [1, 2, 3], True),
+            ("call site rejects a mismatched numpy array", np.array([1, 2, 4]), [1, 2, 3], False),
+            (
+                "call site rejects a numpy array differing only in the last position",
+                np.array([1, 2, 3, 9]),
+                [1, 2, 3, 4],
+                False,
+            ),
+        ]
+    for name, encoded, canonical, should_accept in site_cases:
+        try:
+            check_prompt_ids(encoded, canonical)
+            accepted = True
+        except RuntimeError:
+            accepted = False
+        except Exception as error:  # noqa: BLE001 - the defect raises ValueError
+            print(f"FAIL {name}: raised {type(error).__name__}: {error}")
+            failures += 1
+            continue
+        if accepted is not should_accept:
+            print(f"FAIL {name}: expected accept={should_accept}, got {accepted}")
+            failures += 1
+
+    checks = len(cases) + len(length_cases) + len(site_cases) + 7
     if failures:
         print(f"{failures} self-test case(s) failed")
         return 1
@@ -468,8 +510,7 @@ def main() -> int:
     # prompt is much longer.
     encoded_prompt = tokenizer.encode(prompt)
     prompt_ids = json.loads(Path(workload["prompt_ids_file"]).read_text())
-    if not prompt_ids_match(encoded_prompt, prompt_ids):
-        raise RuntimeError("native tokenizer output differs from the canonical prompt IDs")
+    check_prompt_ids(encoded_prompt, prompt_ids)
     prompt_tokens = len(encoded_prompt)
     if prompt_tokens != int(workload["prompt_tokens"]):
         raise RuntimeError(
