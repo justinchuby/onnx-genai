@@ -1,5 +1,0 @@
-required_capabilities:
-  - kv_cache
-model:
-  attention:
-    type: [grouped_query

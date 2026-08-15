@@ -1,3 +1,0 @@
-required_capabilities: kv_cache
-model:
-  max_sequence_length: not-a-number
