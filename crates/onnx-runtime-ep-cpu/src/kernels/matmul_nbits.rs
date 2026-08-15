@@ -311,6 +311,9 @@ pub struct MatMulNBitsKernel {
     bits: usize,
     block_size: usize,
     accuracy_level: i64,
+    /// Structural FLOPs (`2*rows*N*K`) when the activation's leading dims were
+    /// static at build time; `None` otherwise (issue #995 — never fabricated).
+    flops: Option<u64>,
     weight_prepacked: bool,
     constant_inputs: [bool; 5],
     weight_nk: OnceLock<Vec<f32>>,
@@ -596,7 +599,7 @@ struct PackedU8Weight {
 pub struct MatMulNBitsFactory;
 
 impl KernelFactory for MatMulNBitsFactory {
-    fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+    fn create(&self, node: &Node, input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let k = required_positive_attr(node, "K")?;
         let n = required_positive_attr(node, "N")?;
         let bits = optional_int_attr(node, "bits")?.unwrap_or(4);
@@ -631,12 +634,22 @@ impl KernelFactory for MatMulNBitsFactory {
             .and_then(|value| value.as_int())
             .unwrap_or(0);
 
+        // Structural FLOPs: the activation `A` is `[..leading.., K]`; the GEMM
+        // does `2*rows*N*K` multiply-adds where `rows` is the product of the
+        // leading dims. When the shape is dynamic we report `None` rather than
+        // guess a token count (issue #995 constraint 2).
+        let rows = input_shapes
+            .first()
+            .and_then(|a| super::flops::leading_rows(a));
+        let flops = super::flops::matmul_nbits_flops(rows, n as u64, k as u64);
+
         Ok(Box::new(MatMulNBitsKernel {
             k,
             n,
             bits: bits as usize,
             block_size,
             accuracy_level,
+            flops,
             weight_prepacked: weight_prepacked == 1,
             constant_inputs: [false; 5],
             weight_nk: OnceLock::new(),
@@ -1281,6 +1294,10 @@ impl Kernel for MatMulNBitsKernel {
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         true
+    }
+
+    fn estimated_flops(&self) -> Option<u64> {
+        self.flops
     }
 }
 
@@ -2450,10 +2467,18 @@ pub fn matmul_nbits_decode_caches_dequant_f32(
     }
     let dot_kernel = selected_dot_kernel();
     // (A) borrowed_affine_int4 on-the-fly path: bits==4, accuracy_level==0,
-    // asymmetric (zero-points present), no g_idx. Dequantizes per call, no
-    // resident cache. Constant initializers are contiguous host slices, so the
-    // runtime slice guards this path also checks always hold here.
-    if bits == 4 && accuracy_level == 0 && !has_g_idx && has_zero_points {
+    // no g_idx, symmetric OR asymmetric. Dequantizes per call, no resident
+    // cache. Constant initializers are contiguous host slices, so the runtime
+    // slice guards this path also checks always hold here.
+    //
+    // Symmetry is deliberately NOT part of this condition. #979 extended the
+    // borrowed path to symmetric int4 (implicit midpoint 8, no zero_points
+    // input); before that, symmetric fell through to the resident f32 cache and
+    // paid ~8x the file size in RAM. This predictor must track the kernel's gate
+    // exactly — when it did not, it over-reported `resident_f32_cache_bytes` for
+    // symmetric models and the governed cache decision (#987) would have
+    // declined a cache that was never going to be built.
+    if bits == 4 && accuracy_level == 0 && !has_g_idx {
         return false;
     }
     // (B) MLAS SQNBit path (feature-gated). When present and the shape is
@@ -7172,6 +7197,7 @@ mod tests {
             bits: 4,
             block_size,
             accuracy_level: 0,
+            flops: None,
             weight_prepacked: false,
             constant_inputs: [false; 5],
             weight_nk: OnceLock::new(),

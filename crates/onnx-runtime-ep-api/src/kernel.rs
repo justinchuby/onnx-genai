@@ -77,6 +77,38 @@ impl Cost {
     }
 }
 
+/// Structural memory-traffic estimate (bytes) for a node's inputs, honest about
+/// the real element type and sub-byte packing.
+///
+/// This is the *machine-independent* half of a kernel's cost (issue #995): a
+/// property of the shapes and dtypes, not of the host. It replaces the old
+/// `elems * 4` fabrication, which assumed every tensor was f32 and was wrong by
+/// 8× for the int4 weights that dominate decode. Each input's element count is
+/// multiplied by its own dtype's *storage* size via
+/// [`DataType::checked_storage_bytes`], so a packed int4 weight counts as
+/// `ceil(numel/2)` bytes, an f16 tensor as `2*numel`, and so on.
+///
+/// Symbolic (dynamic) dimensions are treated as extent 1 so the estimate stays
+/// finite and monotonic in the statically-known problem size; it is a lower
+/// bound when a dimension is unknown, never an invented larger number. Absent
+/// inputs (dtype/shape length mismatch) contribute nothing.
+pub fn structural_input_bytes(
+    shapes: &[onnx_runtime_ir::Shape],
+    input_dtypes: &[onnx_runtime_ir::DataType],
+) -> u64 {
+    shapes
+        .iter()
+        .zip(input_dtypes.iter())
+        .map(|(shape, &dtype)| {
+            let numel: usize = shape
+                .iter()
+                .map(|d| d.as_static().unwrap_or(1))
+                .product::<usize>();
+            dtype.checked_storage_bytes(numel).unwrap_or(usize::MAX) as u64
+        })
+        .fold(0_u64, u64::saturating_add)
+}
+
 /// Result of [`crate::ExecutionProvider::supports_op`].
 ///
 /// A decline reason travels with the decision that produced it. EPs must not

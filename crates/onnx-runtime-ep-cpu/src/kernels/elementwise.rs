@@ -76,6 +76,10 @@ impl BinOp {
 /// A stateless binary/variadic elementwise kernel.
 pub struct BinaryKernel {
     op: BinOp,
+    /// Structural FLOPs (one op per broadcast output element) when the input
+    /// shapes were static at build time; `None` otherwise (issue #995 — never
+    /// fabricated).
+    flops: Option<u64>,
 }
 
 macro_rules! binary_factory {
@@ -83,8 +87,11 @@ macro_rules! binary_factory {
         /// Factory (no attributes).
         pub struct $factory;
         impl KernelFactory for $factory {
-            fn create(&self, _node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-                Ok(Box::new(BinaryKernel { op: $variant }))
+            fn create(&self, _node: &Node, shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+                Ok(Box::new(BinaryKernel {
+                    op: $variant,
+                    flops: super::flops::elementwise_flops(shapes),
+                }))
             }
         }
     };
@@ -266,6 +273,10 @@ impl Kernel for BinaryKernel {
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         true
+    }
+
+    fn estimated_flops(&self) -> Option<u64> {
+        self.flops
     }
 }
 
@@ -488,6 +499,9 @@ impl UnOp {
 /// A stateless unary elementwise kernel.
 pub struct UnaryKernel {
     op: UnOp,
+    /// Structural FLOPs (one op per element) when the input shape was static at
+    /// build time; `None` otherwise (issue #995 — never fabricated).
+    flops: Option<u64>,
 }
 
 macro_rules! unary_factory {
@@ -495,8 +509,11 @@ macro_rules! unary_factory {
         /// Factory (no attributes).
         pub struct $factory;
         impl KernelFactory for $factory {
-            fn create(&self, _node: &Node, _shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-                Ok(Box::new(UnaryKernel { op: $variant }))
+            fn create(&self, _node: &Node, shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+                Ok(Box::new(UnaryKernel {
+                    op: $variant,
+                    flops: super::flops::elementwise_flops(shapes),
+                }))
             }
         }
     };
@@ -519,6 +536,10 @@ impl Kernel for UnaryKernel {
 
     fn can_run_in_place(&self, input_index: usize) -> bool {
         input_index == 0
+    }
+
+    fn estimated_flops(&self) -> Option<u64> {
+        self.flops
     }
 }
 
@@ -559,7 +580,7 @@ mod tests {
     use crate::kernels::testutil::Owned;
 
     fn run_bin(f: BinOp, a: &Owned, b: &Owned, out: &mut Owned) {
-        BinaryKernel { op: f }
+        BinaryKernel { op: f, flops: None }
             .execute(&[a.view(), b.view()], &mut [out.view_mut()])
             .unwrap();
     }
@@ -723,17 +744,23 @@ mod tests {
         let base = Owned::f32(&[2], &[2., 3.]);
         let exponent = Owned::i64(&[2], &[3, 2]);
         let mut out = Owned::zeros_f32(&[2]);
-        BinaryKernel { op: BinOp::Pow }
-            .execute(&[base.view(), exponent.view()], &mut [out.view_mut()])
-            .unwrap();
+        BinaryKernel {
+            op: BinOp::Pow,
+            flops: None,
+        }
+        .execute(&[base.view(), exponent.view()], &mut [out.view_mut()])
+        .unwrap();
         assert_eq!(out.to_f32(), vec![8., 9.]);
 
         let base = Owned::i32(&[2], &[2, 3]);
         let exponent = Owned::f32(&[2], &[3., 2.]);
         let mut out = Owned::zeros(DataType::Int32, &[2]);
-        BinaryKernel { op: BinOp::Pow }
-            .execute(&[base.view(), exponent.view()], &mut [out.view_mut()])
-            .unwrap();
+        BinaryKernel {
+            op: BinOp::Pow,
+            flops: None,
+        }
+        .execute(&[base.view(), exponent.view()], &mut [out.view_mut()])
+        .unwrap();
         assert_eq!(out.to_i32(), vec![8, 9]);
     }
 
@@ -742,17 +769,23 @@ mod tests {
         let base = Owned::i32(&[2], &[2, 3]);
         let exponent = Owned::i32(&[2], &[3, 2]);
         let mut out = Owned::zeros(DataType::Int32, &[2]);
-        BinaryKernel { op: BinOp::Pow }
-            .execute(&[base.view(), exponent.view()], &mut [out.view_mut()])
-            .unwrap();
+        BinaryKernel {
+            op: BinOp::Pow,
+            flops: None,
+        }
+        .execute(&[base.view(), exponent.view()], &mut [out.view_mut()])
+        .unwrap();
         assert_eq!(out.to_i32(), vec![8, 9]);
 
         let base = Owned::i64(&[3], &[2, -3, 4]);
         let exponent = Owned::i64(&[3], &[3, 2, 0]);
         let mut out = Owned::zeros(DataType::Int64, &[3]);
-        BinaryKernel { op: BinOp::Pow }
-            .execute(&[base.view(), exponent.view()], &mut [out.view_mut()])
-            .unwrap();
+        BinaryKernel {
+            op: BinOp::Pow,
+            flops: None,
+        }
+        .execute(&[base.view(), exponent.view()], &mut [out.view_mut()])
+        .unwrap();
         assert_eq!(out.to_i64(), vec![8, 9, 1]);
     }
 
@@ -761,9 +794,12 @@ mod tests {
         let base = Owned::i64(&[2], &[2, 3]);
         let exponent = Owned::f32(&[2], &[3., 2.]);
         let mut out = Owned::zeros(DataType::Int64, &[2]);
-        BinaryKernel { op: BinOp::Pow }
-            .execute(&[base.view(), exponent.view()], &mut [out.view_mut()])
-            .unwrap();
+        BinaryKernel {
+            op: BinOp::Pow,
+            flops: None,
+        }
+        .execute(&[base.view(), exponent.view()], &mut [out.view_mut()])
+        .unwrap();
         assert_eq!(out.to_i64(), vec![8, 9]);
     }
 
@@ -773,9 +809,12 @@ mod tests {
         let b = Owned::f32(&[2, 2], &[3., 3., 3., 3.]);
         let c = Owned::f32(&[1], &[4.]); // broadcast scalar-ish
         let mut out = Owned::zeros_f32(&[2, 2]);
-        BinaryKernel { op: BinOp::Min }
-            .execute(&[a.view(), b.view(), c.view()], &mut [out.view_mut()])
-            .unwrap();
+        BinaryKernel {
+            op: BinOp::Min,
+            flops: None,
+        }
+        .execute(&[a.view(), b.view(), c.view()], &mut [out.view_mut()])
+        .unwrap();
         // min(a,3,4) elementwise: min(5,3,4)=3, min(1,3,4)=1, min(8,3,4)=3, min(2,3,4)=2
         assert_eq!(out.to_f32(), vec![3., 1., 3., 2.]);
     }
@@ -813,9 +852,12 @@ mod tests {
         let b = Owned::f32(&[2, 2], &[3., 3., 3., 3.]);
         let c = Owned::f32(&[1], &[4.]);
         let mut out = Owned::zeros_f32(&[2, 2]);
-        BinaryKernel { op: BinOp::Max }
-            .execute(&[a.view(), b.view(), c.view()], &mut [out.view_mut()])
-            .unwrap();
+        BinaryKernel {
+            op: BinOp::Max,
+            flops: None,
+        }
+        .execute(&[a.view(), b.view(), c.view()], &mut [out.view_mut()])
+        .unwrap();
         // max(a,3,4): max(5,3,4)=5, max(1,3,4)=4, max(8,3,4)=8, max(2,3,4)=4
         assert_eq!(out.to_f32(), vec![5., 4., 8., 4.]);
     }
@@ -826,12 +868,15 @@ mod tests {
         let vector = Owned::f32(&[3], &[10., 20., 30.]);
         let scalar = Owned::f32(&[], &[100.]);
         let mut out = Owned::zeros_f32(&[2, 3]);
-        BinaryKernel { op: BinOp::Sum }
-            .execute(
-                &[matrix.view(), vector.view(), scalar.view()],
-                &mut [out.view_mut()],
-            )
-            .unwrap();
+        BinaryKernel {
+            op: BinOp::Sum,
+            flops: None,
+        }
+        .execute(
+            &[matrix.view(), vector.view(), scalar.view()],
+            &mut [out.view_mut()],
+        )
+        .unwrap();
         assert_eq!(out.to_f32(), vec![111., 122., 133., 114., 125., 136.]);
     }
 
@@ -841,12 +886,15 @@ mod tests {
         let vector = Owned::f32(&[3], &[10., 20., 30.]);
         let scalar = Owned::f32(&[], &[100.]);
         let mut out = Owned::zeros_f32(&[2, 3]);
-        BinaryKernel { op: BinOp::Mean }
-            .execute(
-                &[matrix.view(), vector.view(), scalar.view()],
-                &mut [out.view_mut()],
-            )
-            .unwrap();
+        BinaryKernel {
+            op: BinOp::Mean,
+            flops: None,
+        }
+        .execute(
+            &[matrix.view(), vector.view(), scalar.view()],
+            &mut [out.view_mut()],
+        )
+        .unwrap();
         assert_eq!(
             out.to_f32(),
             vec![37., 40.666_668, 44.333_332, 38., 41.666_668, 45.333_332]
@@ -857,9 +905,12 @@ mod tests {
     fn sum_rejects_integer_input() {
         let input = Owned::i32(&[2], &[1, 2]);
         let mut out = Owned::zeros(DataType::Int32, &[2]);
-        let error = BinaryKernel { op: BinOp::Sum }
-            .execute(&[input.view()], &mut [out.view_mut()])
-            .unwrap_err();
+        let error = BinaryKernel {
+            op: BinOp::Sum,
+            flops: None,
+        }
+        .execute(&[input.view()], &mut [out.view_mut()])
+        .unwrap_err();
         assert!(
             error
                 .to_string()
@@ -871,15 +922,21 @@ mod tests {
     fn sqrt_unary() {
         let a = Owned::f32(&[3], &[4., 9., 16.]);
         let mut out = Owned::zeros_f32(&[3]);
-        UnaryKernel { op: UnOp::Sqrt }
-            .execute(&[a.view()], &mut [out.view_mut()])
-            .unwrap();
+        UnaryKernel {
+            op: UnOp::Sqrt,
+            flops: None,
+        }
+        .execute(&[a.view()], &mut [out.view_mut()])
+        .unwrap();
         assert_eq!(out.to_f32(), vec![2., 3., 4.]);
     }
 
     #[test]
     fn unary_advertises_safe_in_place_input() {
-        let kernel = UnaryKernel { op: UnOp::Tanh };
+        let kernel = UnaryKernel {
+            op: UnOp::Tanh,
+            flops: None,
+        };
         assert!(kernel.can_run_in_place(0));
         assert!(!kernel.can_run_in_place(1));
     }
@@ -888,9 +945,12 @@ mod tests {
     fn tanh_known_values() {
         let a = Owned::f32(&[3], &[0., 1., -1.]);
         let mut out = Owned::zeros_f32(&[3]);
-        UnaryKernel { op: UnOp::Tanh }
-            .execute(&[a.view()], &mut [out.view_mut()])
-            .unwrap();
+        UnaryKernel {
+            op: UnOp::Tanh,
+            flops: None,
+        }
+        .execute(&[a.view()], &mut [out.view_mut()])
+        .unwrap();
         let r = out.to_f32();
         assert!((r[0] - 0.0).abs() < 1e-6);
         assert!((r[1] - 0.761_594_2).abs() < 1e-6);
@@ -902,9 +962,12 @@ mod tests {
         // erf(0)=0, erf(1)=0.8427007929, erf(-1)=-0.8427007929, erf(2)=0.9953222650
         let a = Owned::f32(&[4], &[0., 1., -1., 2.]);
         let mut out = Owned::zeros_f32(&[4]);
-        UnaryKernel { op: UnOp::Erf }
-            .execute(&[a.view()], &mut [out.view_mut()])
-            .unwrap();
+        UnaryKernel {
+            op: UnOp::Erf,
+            flops: None,
+        }
+        .execute(&[a.view()], &mut [out.view_mut()])
+        .unwrap();
         let r = out.to_f32();
         assert!((r[0] - 0.0).abs() < 1e-6);
         assert!((r[1] - 0.842_700_8).abs() < 1e-6);
@@ -949,9 +1012,12 @@ mod tests {
         let a = Owned::f16(&[3, 1], &[1., 2., 3.]);
         let b = Owned::f16(&[1, 4], &[10., 20., 30., 40.]);
         let mut out = Owned::zeros(DataType::Float16, &[3, 4]);
-        BinaryKernel { op: BinOp::Mul }
-            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
-            .unwrap();
+        BinaryKernel {
+            op: BinOp::Mul,
+            flops: None,
+        }
+        .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+        .unwrap();
         assert_eq!(
             out.to_f16_as_f32(),
             vec![10., 20., 30., 40., 20., 40., 60., 80., 30., 60., 90., 120.]
@@ -963,9 +1029,12 @@ mod tests {
         let a = Owned::bf16(&[2, 2], &[10., 20., 30., 40.]);
         let b = Owned::bf16(&[2, 2], &[1., 2., 3., 4.]);
         let mut out = Owned::zeros(DataType::BFloat16, &[2, 2]);
-        BinaryKernel { op: BinOp::Sub }
-            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
-            .unwrap();
+        BinaryKernel {
+            op: BinOp::Sub,
+            flops: None,
+        }
+        .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+        .unwrap();
         assert_eq!(out.to_bf16_as_f32(), vec![9., 18., 27., 36.]);
     }
 
@@ -981,9 +1050,12 @@ mod tests {
         let a = Owned::f16(&[61], &lhs);
         let b = Owned::f16(&[61], &rhs);
         let mut fast = Owned::zeros(DataType::Float16, &[61]);
-        BinaryKernel { op: BinOp::Mul }
-            .execute(&[a.view(), b.view()], &mut [fast.view_mut()])
-            .unwrap();
+        BinaryKernel {
+            op: BinOp::Mul,
+            flops: None,
+        }
+        .execute(&[a.view(), b.view()], &mut [fast.view_mut()])
+        .unwrap();
         // Reference: reproduce the general per-element f16 compute directly.
         let want: Vec<f32> = lhs
             .iter()
@@ -1004,24 +1076,30 @@ mod tests {
         let a_col = Owned::f16(&[61, 1], &lhs);
         let b_scalar = Owned::f16(&[1, 1], &[rhs[0]]);
         let mut broadcast = Owned::zeros(DataType::Float16, &[61, 1]);
-        BinaryKernel { op: BinOp::Mul }
-            .execute(
-                &[a_col.view(), b_scalar.view()],
-                &mut [broadcast.view_mut()],
-            )
-            .unwrap();
+        BinaryKernel {
+            op: BinOp::Mul,
+            flops: None,
+        }
+        .execute(
+            &[a_col.view(), b_scalar.view()],
+            &mut [broadcast.view_mut()],
+        )
+        .unwrap();
         // Recompute the fast path with the same scalar multiplier as a full
         // [61] contiguous op, then compare raw bits against the broadcast result.
         let rhs_scalar = vec![rhs[0]; 61];
         let a_flat = Owned::f16(&[61], &lhs);
         let b_flat = Owned::f16(&[61], &rhs_scalar);
         let mut fast_scalar = Owned::zeros(DataType::Float16, &[61]);
-        BinaryKernel { op: BinOp::Mul }
-            .execute(
-                &[a_flat.view(), b_flat.view()],
-                &mut [fast_scalar.view_mut()],
-            )
-            .unwrap();
+        BinaryKernel {
+            op: BinOp::Mul,
+            flops: None,
+        }
+        .execute(
+            &[a_flat.view(), b_flat.view()],
+            &mut [fast_scalar.view_mut()],
+        )
+        .unwrap();
         assert_eq!(
             fast_scalar.to_u16_bits(),
             broadcast.to_u16_bits(),
@@ -1040,7 +1118,7 @@ mod tests {
             let a = Owned::f16(&[53], &lhs);
             let b = Owned::f16(&[53], &rhs);
             let mut fast = Owned::zeros(DataType::Float16, &[53]);
-            BinaryKernel { op }
+            BinaryKernel { op, flops: None }
                 .execute(&[a.view(), b.view()], &mut [fast.view_mut()])
                 .unwrap();
 
@@ -1048,7 +1126,7 @@ mod tests {
             let a_col = Owned::f16(&[53, 1], &lhs);
             let b_scalar = Owned::f16(&[1, 1], &[rhs[0]]);
             let mut broadcast = Owned::zeros(DataType::Float16, &[53, 1]);
-            BinaryKernel { op }
+            BinaryKernel { op, flops: None }
                 .execute(
                     &[a_col.view(), b_scalar.view()],
                     &mut [broadcast.view_mut()],
@@ -1058,7 +1136,7 @@ mod tests {
             let b_flat = Owned::f16(&[53], &rhs_scalar);
             let a_flat = Owned::f16(&[53], &lhs);
             let mut fast_scalar = Owned::zeros(DataType::Float16, &[53]);
-            BinaryKernel { op }
+            BinaryKernel { op, flops: None }
                 .execute(
                     &[a_flat.view(), b_flat.view()],
                     &mut [fast_scalar.view_mut()],
@@ -1078,9 +1156,12 @@ mod tests {
         let a = Owned::i32(&[3], &[7, -7, 5]);
         let b = Owned::i32(&[3], &[2, 2, 0]);
         let mut out = Owned::zeros(DataType::Int32, &[3]);
-        BinaryKernel { op: BinOp::Div }
-            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
-            .unwrap();
+        BinaryKernel {
+            op: BinOp::Div,
+            flops: None,
+        }
+        .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+        .unwrap();
         assert_eq!(out.to_i32(), vec![3, -3, 0]);
     }
 
@@ -1091,12 +1172,18 @@ mod tests {
         let b = Owned::f16(&[2], &[1.0, 5.0]);
         let mut mn = Owned::zeros(DataType::Float16, &[2]);
         let mut mx = Owned::zeros(DataType::Float16, &[2]);
-        BinaryKernel { op: BinOp::Min }
-            .execute(&[a.view(), b.view()], &mut [mn.view_mut()])
-            .unwrap();
-        BinaryKernel { op: BinOp::Max }
-            .execute(&[a.view(), b.view()], &mut [mx.view_mut()])
-            .unwrap();
+        BinaryKernel {
+            op: BinOp::Min,
+            flops: None,
+        }
+        .execute(&[a.view(), b.view()], &mut [mn.view_mut()])
+        .unwrap();
+        BinaryKernel {
+            op: BinOp::Max,
+            flops: None,
+        }
+        .execute(&[a.view(), b.view()], &mut [mx.view_mut()])
+        .unwrap();
         // Position 0 is NaN in both.
         assert_eq!(mn.to_u16_bits()[0] & 0x7C00, 0x7C00);
         assert_ne!(mn.to_u16_bits()[0] & 0x03FF, 0);
@@ -1108,16 +1195,22 @@ mod tests {
     fn sqrt_f16_and_bf16() {
         let a16 = Owned::f16(&[3], &[4., 9., 16.]);
         let mut o16 = Owned::zeros(DataType::Float16, &[3]);
-        UnaryKernel { op: UnOp::Sqrt }
-            .execute(&[a16.view()], &mut [o16.view_mut()])
-            .unwrap();
+        UnaryKernel {
+            op: UnOp::Sqrt,
+            flops: None,
+        }
+        .execute(&[a16.view()], &mut [o16.view_mut()])
+        .unwrap();
         assert_eq!(o16.to_f16_as_f32(), vec![2., 3., 4.]);
 
         let ab = Owned::bf16(&[3], &[4., 9., 16.]);
         let mut ob = Owned::zeros(DataType::BFloat16, &[3]);
-        UnaryKernel { op: UnOp::Sqrt }
-            .execute(&[ab.view()], &mut [ob.view_mut()])
-            .unwrap();
+        UnaryKernel {
+            op: UnOp::Sqrt,
+            flops: None,
+        }
+        .execute(&[ab.view()], &mut [ob.view_mut()])
+        .unwrap();
         assert_eq!(ob.to_bf16_as_f32(), vec![2., 3., 4.]);
     }
 
@@ -1125,9 +1218,12 @@ mod tests {
     fn tanh_f16_matches_f32_within_tolerance() {
         let a = Owned::f16(&[3], &[0., 1., -1.]);
         let mut out = Owned::zeros(DataType::Float16, &[3]);
-        UnaryKernel { op: UnOp::Tanh }
-            .execute(&[a.view()], &mut [out.view_mut()])
-            .unwrap();
+        UnaryKernel {
+            op: UnOp::Tanh,
+            flops: None,
+        }
+        .execute(&[a.view()], &mut [out.view_mut()])
+        .unwrap();
         let r = out.to_f16_as_f32();
         assert!(r[0].abs() < 1e-2);
         assert!((r[1] - 0.7616).abs() < 1e-2);
@@ -1139,9 +1235,12 @@ mod tests {
         // Erf's numeric formula is unchanged; the dtype dispatch simply widens.
         let a = Owned::bf16(&[2], &[0., 1.]);
         let mut out = Owned::zeros(DataType::BFloat16, &[2]);
-        UnaryKernel { op: UnOp::Erf }
-            .execute(&[a.view()], &mut [out.view_mut()])
-            .unwrap();
+        UnaryKernel {
+            op: UnOp::Erf,
+            flops: None,
+        }
+        .execute(&[a.view()], &mut [out.view_mut()])
+        .unwrap();
         let r = out.to_bf16_as_f32();
         assert!(r[0].abs() < 1e-2);
         assert!((r[1] - 0.8427).abs() < 5e-2); // bf16 has ~3 significant digits
@@ -1151,9 +1250,12 @@ mod tests {
     fn sqrt_rejects_integer_dtype_with_rule1() {
         let a = Owned::i32(&[2], &[4, 9]);
         let mut out = Owned::zeros(DataType::Int32, &[2]);
-        let err = UnaryKernel { op: UnOp::Sqrt }
-            .execute(&[a.view()], &mut [out.view_mut()])
-            .unwrap_err();
+        let err = UnaryKernel {
+            op: UnOp::Sqrt,
+            flops: None,
+        }
+        .execute(&[a.view()], &mut [out.view_mut()])
+        .unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("WHAT") && msg.contains("HOW"));
     }

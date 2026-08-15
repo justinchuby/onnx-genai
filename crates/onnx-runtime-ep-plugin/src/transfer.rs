@@ -147,6 +147,31 @@ fn is_same_device(
     src_id == dst_id
 }
 
+/// Best-effort device-id read for the #982 transfer trace. Returns -1 when the
+/// id cannot be resolved (null device or missing accessor) so the trace never
+/// itself dereferences a bad pointer.
+fn memory_device_id(ep_api: &ort::OrtEpApi, dev: *const ort::OrtMemoryDevice) -> i64 {
+    if dev.is_null() {
+        return -1;
+    }
+    match ep_api.MemoryDevice_GetDeviceId {
+        Some(f) => unsafe { f(dev) as i64 },
+        None => -1,
+    }
+}
+
+/// `true` when `ONNX_GENAI_PLUGIN_TRANSFER_TRACE=1` asks every boundary copy to
+/// print its classified direction, endpoint device types/ids, byte length and
+/// stream presence *before* the copy is issued. Off by default, read once.
+///
+/// This trace exists for #982: an interspersed CPU/GPU partition hangs inside a
+/// synchronous driver memcpy, and the only way to name the exact hanging call is
+/// to print the call's parameters on the host before control enters the driver.
+fn transfer_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ONNX_GENAI_PLUGIN_TRANSFER_TRACE").as_deref() == Ok("1"))
+}
+
 // ─── ORT data-transfer adapter ───────────────────────────────────────────────
 
 /// Heap-allocated data-transfer adapter projecting an EP's copy methods through
@@ -506,7 +531,17 @@ unsafe extern "C" fn transfer_full_can_copy(
         );
 
         let direction = CopyDirection::classify(src_is_cpu, dst_is_cpu, same_device);
-        direction.is_supported()
+        let supported = direction.is_supported();
+        if transfer_trace_enabled() {
+            let src_id = memory_device_id(ep_api, src_memory_device);
+            let dst_id = memory_device_id(ep_api, dst_memory_device);
+            eprintln!(
+                "[plugin/transfer #982] CanCopy dir={direction:?} \
+                 src(type={src_type},id={src_id}) dst(type={dst_type},id={dst_id}) \
+                 -> supported={supported}"
+            );
+        }
+        supported
     }));
     result.unwrap_or(false)
 }
@@ -720,6 +755,26 @@ unsafe extern "C" fn transfer_full_copy_tensors(
 
             if byte_len == 0 {
                 continue;
+            }
+
+            // #982 diagnostic: emit the exact shape of every boundary copy
+            // *before* it is issued, so the last line printed before a hang names
+            // the call that hung. Gated on ONNX_GENAI_PLUGIN_TRANSFER_TRACE=1 and
+            // off by default. stderr is unbuffered in Rust, so the pre-copy line
+            // survives even when the driver copy never returns.
+            if transfer_trace_enabled() {
+                let has_stream = !streams.is_null() && {
+                    let s = unsafe { *streams.add(i) };
+                    !s.is_null()
+                };
+                let src_dev_id = memory_device_id(ep_api, src_mem_device);
+                let dst_dev_id = memory_device_id(ep_api, dst_mem_device);
+                eprintln!(
+                    "[plugin/transfer #982] i={i} dir={direction:?} \
+                     src(type={src_type},id={src_dev_id},ptr={src_data:p}) \
+                     dst(type={dst_type},id={dst_dev_id},ptr={dst_data:p}) \
+                     byte_len={byte_len} has_stream={has_stream}"
+                );
             }
 
             // B3 fix: dispatch by classified direction.

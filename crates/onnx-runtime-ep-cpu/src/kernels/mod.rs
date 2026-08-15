@@ -355,6 +355,7 @@ pub mod dropout;
 pub mod elementwise;
 pub mod expand;
 pub mod eye_like;
+pub(crate) mod flops;
 pub mod fused_attention;
 pub mod fused_gemm;
 pub mod fused_matmul_bias;

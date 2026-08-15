@@ -1216,6 +1216,19 @@ impl Kernel for GroupQueryAttentionKernel {
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
         true
     }
+
+    /// GQA FLOPs are `4 * head_size * batch * num_heads * seq_q * seq_k`
+    /// (see [`crate::kernels::flops::gqa_flops`]). We deliberately return `None`:
+    /// the dominant factor `seq_k` is the KV-cache occupancy, which the op
+    /// receives as the runtime **value** inputs `seqlens_k` (input 5) and
+    /// `total_sequence_length` (input 6), not as a static tensor shape. It
+    /// therefore cannot be known at kernel-build time. Per issue #995 the honest
+    /// representation of an unmeasurable quantity is `None`, never a fabricated
+    /// number; the cost model computes the real figure via `gqa_flops` once the
+    /// KV length is known at placement/runtime.
+    fn estimated_flops(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Normalize the one exporter layout that is unambiguous: a rank-zero
