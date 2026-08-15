@@ -600,16 +600,32 @@ unsafe extern "C" fn transfer_full_copy_tensors(
             let src_mem_device = unsafe { value_get_mem_device(src_value) };
             let dst_mem_device = unsafe { value_get_mem_device(dst_value as *const ort::OrtValue) };
 
-            let src_type = if src_mem_device.is_null() {
-                ort::OrtMemoryInfoDeviceType_CPU // assume CPU if unknown
-            } else {
-                unsafe { get_dev_type(src_mem_device) }
-            };
-            let dst_type = if dst_mem_device.is_null() {
-                ort::OrtMemoryInfoDeviceType_CPU
-            } else {
-                unsafe { get_dev_type(dst_mem_device) }
-            };
+            // Do NOT assume CPU when the memory device is unknown. Classifying a
+            // device tensor as host memory sends a device pointer into
+            // `copy_from_host`, which reads it as a host byte slice and hands it
+            // to a synchronous H2D copy — consistent with the hang in #982, where
+            // the process spins inside `cuMemcpyHtoD_v2` and never returns.
+            //
+            // An unreported capability must degrade to its most conservative
+            // reading, never its most convenient one (see the EP capability rules
+            // in docs/memory/MEMORY_MANAGEMENT_MODEL_DESIGN.md). Here the
+            // conservative reading is "refuse", because guessing wrong is not a
+            // slow path, it is an unbounded one.
+            if src_mem_device.is_null() {
+                return fail_status(&format!(
+                    "CopyTensors: source memory device is unknown at index {i}; refusing to \
+                     guess host-vs-device. Copying with a wrong classification hangs in a \
+                     synchronous driver memcpy rather than failing (#982)."
+                ));
+            }
+            if dst_mem_device.is_null() {
+                return fail_status(&format!(
+                    "CopyTensors: destination memory device is unknown at index {i}; refusing \
+                     to guess host-vs-device (#982)."
+                ));
+            }
+            let src_type = unsafe { get_dev_type(src_mem_device) };
+            let dst_type = unsafe { get_dev_type(dst_mem_device) };
 
             let src_is_cpu = src_type == ort::OrtMemoryInfoDeviceType_CPU;
             let dst_is_cpu = dst_type == ort::OrtMemoryInfoDeviceType_CPU;
