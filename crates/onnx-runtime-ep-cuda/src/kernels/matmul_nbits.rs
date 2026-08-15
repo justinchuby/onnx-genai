@@ -104,6 +104,19 @@ const GEMV_F16_GENERAL_BS_WIDE_ENTRY: &str = "matmul_nbits_gemv_f16_general_bs_w
 /// [`GEMV_F16_GENERAL_BS_WIDE_ENTRY`]): `K_SPLIT` warps each walk a
 /// `32 * K_SPLIT`-strided set of 32-nibble chunks with pipelined `uint4` loads.
 const GEMV_F16_GENERAL_BS_SPLITK_WIDE_ENTRY: &str = "matmul_nbits_gemv_f16_general_bs_splitk_wide";
+/// Column register-blocked wide-load GEMV
+/// (`matmul_nbits_gemv_f16_general_bs_wide_multicol`): each warp emits
+/// [`GEMV_F16_WIDE_MULTICOL_NC`] output columns, decoding each activation
+/// sub-word once and reusing it across the columns. Attacks the L1/TEX-throughput
+/// limiter of [`GEMV_F16_GENERAL_BS_WIDE_ENTRY`] (redundant per-column activation
+/// re-reads) while staying byte-identical (per-column fp32 accumulation order
+/// unchanged). Non-split-K only (used on the wide, occupancy-filled gate_up).
+const GEMV_F16_GENERAL_BS_WIDE_MULTICOL_ENTRY: &str =
+    "matmul_nbits_gemv_f16_general_bs_wide_multicol";
+/// Output columns each warp emits in the register-blocked wide GEMV. Must match
+/// `#define WIDE_NC` in the CUDA source. A 256-thread CTA (8 warps) therefore
+/// covers `8 * GEMV_F16_WIDE_MULTICOL_NC` columns.
+const GEMV_F16_WIDE_MULTICOL_NC: usize = 4;
 /// Warps cooperating per output column in the block!=32 general_bs split-K GEMV.
 /// Must match `constexpr int K_SPLIT` in `matmul_nbits_gemv_f16_general_bs_splitk`.
 /// A block keeps its `blockDim.x / 32` warps but now covers `warps / K_SPLIT`
@@ -1402,6 +1415,68 @@ __device__ __forceinline__ float dot_int4x8_f16_sub(
     return dot;
 }
 
+// Split of `dot_int4x8_f16_sub` into an activation-decode half and a
+// weight-dot half so the decoded activation can be REUSED across several output
+// columns (column register-blocking). `decode_activation8` converts the eight
+// contiguous fp16 activations at `activation` into fp32, laid out in the exact
+// summation order `dot_int4x8_f16_sub` consumes them (a04.x, a15.x, a26.x,
+// a37.x, a04.y, a15.y, a26.y, a37.y). `dot_int4x8_f16_sub_act` then reproduces
+// the identical 8-term fp32 dot for one weight sub-word. Because the fp16->fp32
+// conversions and the add order are unchanged, the result is BIT-IDENTICAL to
+// `dot_int4x8_f16_sub`; the only difference is the activation is decoded once
+// and shared by all columns instead of re-loaded per column.
+__device__ __forceinline__ void decode_activation8(
+    const __half* __restrict__ activation,
+    float* __restrict__ a /* [8] */)
+{
+    const uint4 av = *reinterpret_cast<const uint4*>(activation);
+    constexpr unsigned int low_halves = 0x5410;
+    constexpr unsigned int high_halves = 0x7632;
+    uint4 permuted;
+    asm volatile("prmt.b32 %0, %1, %2, %3;\n"
+                 : "=r"(permuted.x) : "r"(av.x), "r"(av.z), "r"(low_halves));
+    asm volatile("prmt.b32 %0, %1, %2, %3;\n"
+                 : "=r"(permuted.y) : "r"(av.x), "r"(av.z), "r"(high_halves));
+    asm volatile("prmt.b32 %0, %1, %2, %3;\n"
+                 : "=r"(permuted.z) : "r"(av.y), "r"(av.w), "r"(low_halves));
+    asm volatile("prmt.b32 %0, %1, %2, %3;\n"
+                 : "=r"(permuted.w) : "r"(av.y), "r"(av.w), "r"(high_halves));
+    const float2 a04 = __half22float2(*reinterpret_cast<const __half2*>(&permuted.x));
+    const float2 a15 = __half22float2(*reinterpret_cast<const __half2*>(&permuted.y));
+    const float2 a26 = __half22float2(*reinterpret_cast<const __half2*>(&permuted.z));
+    const float2 a37 = __half22float2(*reinterpret_cast<const __half2*>(&permuted.w));
+    a[0] = a04.x;
+    a[1] = a15.x;
+    a[2] = a26.x;
+    a[3] = a37.x;
+    a[4] = a04.y;
+    a[5] = a15.y;
+    a[6] = a26.y;
+    a[7] = a37.y;
+}
+
+__device__ __forceinline__ float dot_int4x8_f16_sub_act(
+    const unsigned int packed,
+    const float* __restrict__ a /* [8] */,
+    const unsigned int sub2)
+{
+    __half2 q[4];
+    int4x8_to_half2x4_sub(packed, q, sub2);
+    const float2 q04 = __half22float2(q[0]);
+    const float2 q15 = __half22float2(q[1]);
+    const float2 q26 = __half22float2(q[2]);
+    const float2 q37 = __half22float2(q[3]);
+    float dot = q04.x * a[0];
+    dot += q15.x * a[1];
+    dot += q26.x * a[2];
+    dot += q37.x * a[3];
+    dot += q04.y * a[4];
+    dot += q15.y * a[5];
+    dot += q26.y * a[6];
+    dot += q37.y * a[7];
+    return dot;
+}
+
 // ---------------------------------------------------------------------------
 // High-memory-level-parallelism (wide-load) int4 decode GEMV.
 //
@@ -1531,6 +1606,136 @@ __device__ __forceinline__ float gemv_int4_wide_lane_dot(
         }
     }
     return value;
+}
+
+// Column register-blocked wide lane-dot: one warp accumulates WIDE_NC output
+// columns at once. Each 8-element activation sub-word is decoded to fp32 ONCE
+// (`decode_activation8`) and reused across all WIDE_NC columns, cutting the
+// redundant activation L1 traffic (the head-to-head ncu limiter on the wide
+// gate_up kernel was L1/TEX throughput, not DRAM) by ~WIDE_NC x, while the
+// WIDE_NC independent 128-bit weight loads per chunk supply the memory-level
+// parallelism that hides the Long-Scoreboard latency (replacing the depth-2
+// software pipeline of the single-column `gemv_int4_wide_lane_dot`). The
+// per-column `values[c] += scale * dot(sub-word)` sequence is byte-for-byte the
+// same order as `gemv_int4_wide_lane_dot`, so each column's fp32 result is
+// BIT-IDENTICAL to the single-column wide kernel (hence to the narrow kernel it
+// already matches). `col_base` is this warp's first column; columns
+// `col_base + c` beyond `n` are skipped.
+#define WIDE_NC 4
+__device__ __forceinline__ void gemv_int4_wide_lane_dot_multicol(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales,
+    const unsigned char* __restrict__ zero_points,
+    const int k,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int scales_fp16,
+    const long col_base,
+    const int n,
+    const int depth0,
+    const int warp_stride,
+    float* __restrict__ values /* [WIDE_NC] */)
+{
+    bool valid[WIDE_NC];
+    long col_kb[WIDE_NC];
+#pragma unroll
+    for (int c = 0; c < WIDE_NC; ++c) {
+        values[c] = 0.0f;
+        const long column = col_base + c;
+        valid[c] = (column < n);
+        col_kb[c] = column * (long)k_blocks;
+    }
+
+    int depth = depth0;
+    while (depth + 32 <= k) {
+        const int block = depth / block_size;
+        const int within = depth - block * block_size;
+
+        // Issue all WIDE_NC independent 128-bit weight loads up front so they are
+        // in flight together (the load-level parallelism that hides load latency).
+        uint4 w[WIDE_NC];
+        float scale[WIDE_NC];
+        unsigned int sub2[WIDE_NC];
+#pragma unroll
+        for (int c = 0; c < WIDE_NC; ++c) {
+            if (!valid[c]) {
+                continue;
+            }
+            const long base = (col_kb[c] + block) * (long)blob_size;
+            w[c] = *reinterpret_cast<const uint4*>(packed + base + (within >> 1));
+            if (scales_fp16) {
+                scale[c] = __half2float(reinterpret_cast<const __half*>(scales)[col_kb[c] + block]);
+            } else {
+                scale[c] = reinterpret_cast<const float*>(scales)[col_kb[c] + block];
+            }
+            sub2[c] = int4_zero_point_sub2(
+                int4_block_zero_point(zero_points, col_base + c, block, zp_row_bytes));
+        }
+
+        // Decode each 8-element activation sub-word once, reuse across columns.
+        // Sub-word order 0..3 preserves the ascending-K accumulation of the
+        // single-column kernel (w.x, w.y, w.z, w.w).
+        float a8[8];
+#pragma unroll
+        for (int s = 0; s < 4; ++s) {
+            decode_activation8(activation + depth + s * 8, a8);
+#pragma unroll
+            for (int c = 0; c < WIDE_NC; ++c) {
+                if (!valid[c]) {
+                    continue;
+                }
+                const unsigned int word =
+                    (s == 0) ? w[c].x : (s == 1) ? w[c].y : (s == 2) ? w[c].z : w[c].w;
+                values[c] += scale[c] * dot_int4x8_f16_sub_act(word, a8, sub2[c]);
+            }
+        }
+        depth += warp_stride;
+    }
+
+    // Partial trailing chunk (`depth < k < depth + 32`): replicate the
+    // single-column tail arithmetic per column.
+    if (depth < k) {
+        const int block = depth / block_size;
+#pragma unroll
+        for (int c = 0; c < WIDE_NC; ++c) {
+            if (!valid[c]) {
+                continue;
+            }
+            float scale;
+            if (scales_fp16) {
+                scale = __half2float(reinterpret_cast<const __half*>(scales)[col_kb[c] + block]);
+            } else {
+                scale = reinterpret_cast<const float*>(scales)[col_kb[c] + block];
+            }
+            const int zero_point =
+                int4_block_zero_point(zero_points, col_base + c, block, zp_row_bytes);
+            const unsigned int sub2 = int4_zero_point_sub2(zero_point);
+            const long blob_base = (col_kb[c] + block) * (long)blob_size;
+            for (int off = 0; off < 32 && depth + off < k; off += 8) {
+                const int d = depth + off;
+                const int within = d - block * block_size;
+                const int valid_n = min(8, k - d);
+                const unsigned int packed_word =
+                    *reinterpret_cast<const unsigned int*>(packed + blob_base + (within >> 1));
+                if (valid_n == 8) {
+                    values[c] += scale * dot_int4x8_f16_sub(packed_word, activation + d, sub2);
+                } else {
+                    float partial = 0.0f;
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        if (i < valid_n) {
+                            const int q = (int)((packed_word >> (i * 4)) & 15u) - zero_point;
+                            partial += (float)q * __half2float(activation[d + i]);
+                        }
+                    }
+                    values[c] += partial * scale;
+                }
+            }
+        }
+    }
 }
 
 __device__ __forceinline__ uint4 permute_activation_f16x8(
@@ -3892,6 +4097,52 @@ extern "C" __global__ void matmul_nbits_gemv_f16_general_bs_splitk_wide(
     }
 }
 
+// Column register-blocked wide-load GEMV (see `gemv_int4_wide_lane_dot_multicol`).
+// Same launch geometry as `matmul_nbits_gemv_f16_general_bs_wide` (256-thread
+// CTA, one warp per group), but every warp emits WIDE_NC output columns, so the
+// grid covers `columns_per_block = 8 * WIDE_NC` columns per block. Decoding each
+// activation sub-word once and reusing it across WIDE_NC columns relieves the
+// L1/TEX-throughput limiter of the single-column wide kernel while staying
+// byte-identical (per-column fp32 accumulation order unchanged).
+extern "C" __global__ void matmul_nbits_gemv_f16_general_bs_wide_multicol(
+    const __half* __restrict__ activation,
+    const unsigned char* __restrict__ packed,
+    const void* __restrict__ scales,
+    const unsigned char* __restrict__ zero_points,
+    const __half* __restrict__ bias,
+    __half* __restrict__ output,
+    const int k,
+    const int n,
+    const int block_size,
+    const int k_blocks,
+    const int blob_size,
+    const int zp_row_bytes,
+    const int scales_fp16,
+    const int bias_post_round,
+    const int bits)
+{
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int warps_per_block = (int)blockDim.x >> 5;
+    const long col_base =
+        ((long)blockIdx.x * warps_per_block + warp) * (long)WIDE_NC;
+
+    float values[WIDE_NC];
+    gemv_int4_wide_lane_dot_multicol(
+        activation, packed, scales, zero_points, k, block_size, k_blocks,
+        blob_size, zp_row_bytes, scales_fp16, col_base, n, lane * 32, 32 * 32,
+        values);
+#pragma unroll
+    for (int c = 0; c < WIDE_NC; ++c) {
+        const float reduced = warp_sum(values[c]);
+        const long column = col_base + c;
+        if (lane == 0 && column < n) {
+            output[column] = fold_bias_f16(reduced, bias, column, bias_post_round);
+        }
+    }
+}
+
 // Model-agnostic fp16 int4/int8 prefill GEMM supporting any power-of-two
 // block_size. Identical 16x16 tiling and fp32 accumulation as the tuned
 // block-32 GEMM, but the reduction walks K in fixed 32-wide tiles and derives
@@ -4165,6 +4416,25 @@ fn use_gemv_wideload(bits: usize, block_size: usize, k: usize) -> bool {
     }
     !matches!(
         std::env::var("ONNX_GENAI_GEMV_WIDELOAD").ok().as_deref(),
+        Some("0") | Some("false") | Some("off")
+    )
+}
+
+/// Whether the non-split-K wide GEMV should take the column register-blocked
+/// entry ([`GEMV_F16_GENERAL_BS_WIDE_MULTICOL_ENTRY`]) instead of the
+/// single-column [`GEMV_F16_GENERAL_BS_WIDE_ENTRY`]. Only consulted once
+/// wide-load is already in effect (same int4 / `block_size % 32 == 0` /
+/// `k % 32 == 0` preconditions, checked by the caller via [`use_gemv_wideload`]).
+/// The multicol kernel decodes each activation sub-word once and reuses it
+/// across [`GEMV_F16_WIDE_MULTICOL_NC`] columns; out-of-range columns are skipped
+/// in-kernel, so any `n` is safe, and the result is byte-identical to the
+/// single-column wide entry. `ONNX_GENAI_GEMV_WIDE_MULTICOL=0` forces the
+/// single-column wide entry for A/B measurement.
+fn use_gemv_wide_multicol() -> bool {
+    !matches!(
+        std::env::var("ONNX_GENAI_GEMV_WIDE_MULTICOL")
+            .ok()
+            .as_deref(),
         Some("0") | Some("false") | Some("off")
     )
 }
@@ -6939,7 +7209,11 @@ impl MatMulNBitsKernel {
                     GEMV_F16_GENERAL_BS_SPLITK_ENTRY
                 }
             } else if use_gemv_wideload(self.bits, self.block_size, self.k) {
-                GEMV_F16_GENERAL_BS_WIDE_ENTRY
+                if use_gemv_wide_multicol() {
+                    GEMV_F16_GENERAL_BS_WIDE_MULTICOL_ENTRY
+                } else {
+                    GEMV_F16_GENERAL_BS_WIDE_ENTRY
+                }
             } else {
                 GEMV_F16_GENERAL_BS_ENTRY
             }
@@ -7027,6 +7301,11 @@ impl MatMulNBitsKernel {
                     (threads / 32) as usize / GENERAL_BS_SPLITK
                 } else if use_scales_f16_splitk {
                     (threads / 32) as usize / GEMV_F16_SCALES_F16_ZP_SPLITK
+                } else if entry == GEMV_F16_GENERAL_BS_WIDE_MULTICOL_ENTRY {
+                    // Each warp emits WIDE_NC columns, so a `threads/32`-warp CTA
+                    // covers `warps * WIDE_NC` output columns; the grid shrinks by
+                    // WIDE_NC accordingly.
+                    (threads / 32) as usize * GEMV_F16_WIDE_MULTICOL_NC
                 } else {
                     (threads / 32) as usize
                 };
@@ -7057,6 +7336,7 @@ impl MatMulNBitsKernel {
             || entry == GEMV_F16_GENERAL_BS_SPLITK_ENTRY
             || entry == GEMV_F16_GENERAL_BS_WIDE_ENTRY
             || entry == GEMV_F16_GENERAL_BS_SPLITK_WIDE_ENTRY
+            || entry == GEMV_F16_GENERAL_BS_WIDE_MULTICOL_ENTRY
         {
             builder.arg(&bits);
         }
