@@ -66,6 +66,38 @@ impl Default for CpuExecutionProvider {
     }
 }
 
+/// The allocator every CPU EP uses unless a caller installs another.
+///
+/// # Why this is not `HostAllocator`
+///
+/// Graph outputs are handed to the caller by *moving* the produced buffer out of
+/// the executor, which is zero-copy but forfeits that value's cross-run buffer
+/// reuse: the next run allocates the output afresh. For an output large enough
+/// that glibc serves it with `mmap` — every attention activation and every
+/// present-KV tensor in a real model — that means a fresh, demand-zeroed mapping
+/// per run, so each page traps and is zeroed by the kernel before the first
+/// store to it can retire. Measured on a Whisper cross-attention graph with a
+/// 180 MB output, this was exactly one `mmap`/`munmap` pair and 511 minor faults
+/// **per run**, against an ONNX Runtime arm that pays neither because its CPU
+/// allocator reuses memory it already owns.
+///
+/// [`LargeAllocCache`] recycles exactly that band and delegates everything
+/// smaller to `HostAllocator` untouched, so the small-allocation path this
+/// project already measured as best-served-by-the-system-allocator is unchanged.
+///
+/// Set `ONNX_GENAI_HOST_ALLOC_CACHE_BYTES=0` to get the old behaviour back.
+///
+/// # Why one cache per EP rather than one per process
+///
+/// The executor allocates a moved-out output through its own EP and hands that
+/// same EP to the resulting tensor, so the matching free comes back to the EP
+/// that made the allocation. Scoping the cache to the EP therefore loses no
+/// reuse, and it bounds retention by the session's life instead of the
+/// process's.
+fn default_cpu_memory() -> std::sync::Arc<dyn onnx_runtime_memory_governor::DeviceAllocator> {
+    std::sync::Arc::new(onnx_runtime_memory_governor::LargeAllocCache::default())
+}
+
 impl CpuExecutionProvider {
     /// Construct a CPU EP bound to `CPU:0` with all Phase-1 kernels registered.
     pub fn new() -> Self {
@@ -73,7 +105,7 @@ impl CpuExecutionProvider {
             device: DeviceId::cpu(),
             initialized: false,
             registry: build_cpu_registry(),
-            memory: std::sync::Arc::new(onnx_runtime_memory_governor::HostAllocator),
+            memory: default_cpu_memory(),
         }
     }
 
@@ -83,7 +115,7 @@ impl CpuExecutionProvider {
             device: DeviceId::cpu(),
             initialized: false,
             registry: build_cpu_registry_with_weight_offload_cache(host_cache),
-            memory: std::sync::Arc::new(onnx_runtime_memory_governor::HostAllocator),
+            memory: default_cpu_memory(),
         }
     }
 
