@@ -96,6 +96,7 @@ pub fn governs(op: &Node) -> bool {
     matches!(
         (op.domain.as_str(), op.op_type.as_str()),
         ("" | "ai.onnx", "Tanh" | "Sigmoid" | "Gelu" | "Sqrt" | "Erf")
+            | ("" | "ai.onnx", "Exp" | "Log" | "Softplus")
             | (
                 "" | "ai.onnx",
                 "Neg" | "Abs" | "Sign" | "Floor" | "Ceil" | "Round" | "Reciprocal" | "Softsign",
@@ -261,6 +262,10 @@ pub fn claim_preference(
     };
 
     if let Some(preference) = exact_unary_preference(op, shapes, dtype) {
+        return preference;
+    }
+
+    if let Some(preference) = vectorised_but_slower_unary_preference(op, dtype) {
         return preference;
     }
 
@@ -595,6 +600,103 @@ fn exact_unary_preference(op: &Node, shapes: &[Shape], dtype: DataType) -> Optio
     let preference = match dtype {
         DataType::Float32 => size_gated_claim(op, shapes, f32_min, "float32"),
         DataType::Float16 => size_gated_claim(op, shapes, f16_min, "float16"),
+        _ => ClaimPreference::Claim,
+    };
+    Some(preference)
+}
+
+/// The elementwise unary ops this EP vectorizes and *still* loses with.
+///
+/// `Exp`, `Log`, `Relu` and `Softplus` are the remainder of the ONNX
+/// elementwise unary family: everything reachable from the CPU plugin EP that
+/// [`exact_unary_preference`] does not cover and that is not already governed
+/// as an activation. All four were claimed unconditionally before this
+/// function existed, and all four measured slower than ORT's own CPU kernel.
+///
+/// # What was measured
+///
+/// Session-level A/B on one AMD EPYC 9V74 at one intra-op thread, ORT 1.28.0,
+/// graph optimizations disabled so no fusion hides the node, 13-21 interleaved
+/// repetitions. Ratios are ORT's p50 over this EP's p50, so above `1.0` means
+/// this EP is faster.
+///
+/// | op         | dtype | 1024  | 4096  | 65536 | 1M    |
+/// |------------|-------|------:|------:|------:|------:|
+/// | `Exp`      | f32   | 0.74x | 0.75x | 0.88x | 0.92x |
+/// | `Exp`      | f16   | 0.84x | 0.84x | 0.77x | 0.22x |
+/// | `Log`      | f32   | 0.68x | 0.60x | 0.60x | 0.64x |
+/// | `Log`      | f16   | 0.75x | 0.66x | 0.60x | 0.59x |
+/// | `Relu`     | f32   | 0.76x | 0.76x | 0.87x | 1.03x |
+/// | `Relu`     | f16   | 0.89x | 0.87x | 0.98x | 1.03x |
+/// | `Softplus` | f32   | 1.03x | 1.13x | 0.96x | 0.92x |
+/// | `Softplus` | f16   | 1.05x | 1.13x | 0.95x | 0.90x |
+///
+/// The `Exp` row is *after* this PR vectorized it. Before, float32 `Exp` ran
+/// 0.50x/0.30x/0.14x/0.14x across those same four sizes, so the polynomial is
+/// worth 6.3x at 1 M elements — it just does not close the last 8%.
+///
+/// # Why none of them gets a size gate
+///
+/// Unlike the eight ops in [`exact_unary_preference`], no cell here clears the
+/// 5% bar in a way a threshold could capture:
+///
+/// - `Exp` and `Log` never win in either dtype at any measured size.
+/// - `Softplus` wins 1.13x at exactly 4096 but loses on both sides of it
+///   (1.03x at 1024, 0.96x at 65536). A single non-monotonic cell surrounded by
+///   losses is a measurement artifact to leave alone, not a dispatch range.
+///
+/// # `Relu` was measured here and deliberately left claimed
+///
+/// `Relu` belongs in the table above on the numbers — 0.76x/0.76x/0.87x/1.03x
+/// in float32, never a win, its kernel already SIMD so the whole deficit is
+/// this EP's ~1.2 us node boundary. Deferring it was implemented, and it broke
+/// `MatMul+Bias+Relu -> FusedGemm`: the plugin E2E assignment test caught the
+/// chain splitting into `Gemm` on this EP and `Relu` on ORT's. A standalone
+/// `Relu` node is worth about 1.2 us; a lost `Gemm` epilogue is worth an extra
+/// full pass over the output tensor on every such node in the graph, which is
+/// the larger number in any model that has one. `Relu` is the only op in this
+/// family that anchors a fusion (`fusion/mod.rs` and the Conv/NCHWc activation
+/// paths), so it is the only one carved out — and `Exp`, `Log` and `Softplus`
+/// were each checked against the same fusion tables before being deferred.
+///
+/// # Declining is a clean handover, and it was probed
+///
+/// With a plugin built to decline all four, read back from ORT's own profile:
+/// float32 leaves a single `Exp`/`Log`/`Relu`/`Softplus` node on
+/// `CPUExecutionProvider`; float16 cast-wraps into `Cast`/op/`Cast`, and all
+/// three of those nodes also land on `CPUExecutionProvider` — this EP does not
+/// reclaim the fragments. Re-measured end-to-end in that configuration, every
+/// cell is between 1.00x and 1.14x, i.e. declining costs nothing anywhere and
+/// recovers the whole deficit.
+///
+/// # Everything else keeps the claim
+///
+/// bfloat16 is a capability claim: ORT's CPU EP has no bfloat16 kernel for any
+/// of these four, so declining would fail the session rather than hand it over.
+/// `Relu`'s integer dtypes are unmeasured and are left alone for the same
+/// reason [`exact_unary_preference`] leaves `Neg`/`Abs`/`Sign`'s alone.
+fn vectorised_but_slower_unary_preference(op: &Node, dtype: DataType) -> Option<ClaimPreference> {
+    let reason: &str = match op.op_type.as_str() {
+        "Exp" => {
+            "ORT's float CPU `Exp` is measured faster at every size (0.74-0.92x float32, \
+             0.22-0.84x float16) even after this EP vectorized it, and declining leaves the \
+             node on ORT's CPU EP at 1.00-1.14x"
+        }
+        "Log" => {
+            "this EP's `Log` is still a scalar `libm` loop and measures 0.59-0.75x of ORT's \
+             vectorized CPU kernel at every size and dtype"
+        }
+        "Softplus" => {
+            "`Softplus` measures 0.90-1.13x with the only win at a single non-monotonic 4096 \
+             cell, which is not a dispatch range"
+        }
+        _ => return None,
+    };
+
+    let preference = match dtype {
+        DataType::Float32 | DataType::Float16 => ClaimPreference::defer(reason),
+        // No ORT bfloat16 kernel exists for these; declining would fail the
+        // session instead of handing it over. Integer `Relu` is unmeasured.
         _ => ClaimPreference::Claim,
     };
     Some(preference)
@@ -1877,5 +1979,140 @@ mod exact_unary_policy_tests {
                 );
             }
         }
+    }
+}
+
+/// `Exp`/`Log`/`Relu`/`Softplus`: vectorizing was not enough, so the claim goes.
+#[cfg(test)]
+mod vectorised_but_slower_unary_tests {
+    use super::tests::{dynamic_shape, node, shape};
+    use super::*;
+
+    const OPS: [&str; 3] = ["Exp", "Log", "Softplus"];
+
+    #[test]
+    fn all_three_are_governed() {
+        for op in OPS {
+            assert!(governs(&node(op, &[])), "{op} must be governed");
+        }
+    }
+
+    /// Every measured cell lost, so there is no element count that claims.
+    /// A size gate reintroduced later fails here.
+    #[test]
+    fn float32_and_float16_defer_at_every_shape() {
+        for op in OPS {
+            for shp in [
+                shape(&[1, 1]),
+                shape(&[1, 1024]),
+                shape(&[1, 4096]),
+                shape(&[1, 65536]),
+                shape(&[1, 1_048_576]),
+                shape(&[8, 4_000_000]),
+                dynamic_shape(),
+            ] {
+                for dt in [DataType::Float32, DataType::Float16] {
+                    let pref =
+                        claim_preference(&node(op, &[]), 22, std::slice::from_ref(&shp), &[dt]);
+                    assert!(
+                        !pref.is_claim(),
+                        "{op} must defer in {dt:?} at {shp:?} — it lost every measured cell"
+                    );
+                }
+            }
+        }
+    }
+
+    /// ORT's CPU EP has no bfloat16 kernel for any of these, so deferring would
+    /// turn a working session into a load failure rather than a handover.
+    #[test]
+    fn bfloat16_keeps_the_claim() {
+        for op in OPS {
+            assert!(
+                claim_preference(
+                    &node(op, &[]),
+                    22,
+                    &[shape(&[1, 4096])],
+                    &[DataType::BFloat16]
+                )
+                .is_claim(),
+                "{op} bfloat16 has no ORT kernel and must keep the claim"
+            );
+        }
+    }
+
+    /// `Relu` measures exactly like the three deferred ops and is still
+    /// claimed at every dtype and size, because deferring it split
+    /// `MatMul+Bias+Relu -> FusedGemm` across the EP boundary. A future change
+    /// that "completes" this family by adding `Relu` fails here.
+    #[test]
+    fn relu_stays_claimed_because_it_anchors_a_fusion() {
+        assert!(!governs(&node("Relu", &[])), "Relu must stay ungoverned");
+        for dt in [
+            DataType::Float32,
+            DataType::Float16,
+            DataType::BFloat16,
+            DataType::Int32,
+        ] {
+            for n in [1usize, 4096, 1_048_576] {
+                assert!(
+                    claim_preference(&node("Relu", &[]), 22, &[shape(&[1, n])], &[dt]).is_claim(),
+                    "Relu in {dt:?} at {n} must keep its claim — it anchors a fusion"
+                );
+            }
+        }
+    }
+
+    /// The rest of the scalar unary family measured at parity with ORT (`Sin`,
+    /// `Cos`, `Tan` and `Atan` all sat within 1% at every size), so they are
+    /// deliberately left ungoverned. This pins that they were considered.
+    #[test]
+    fn parity_unary_ops_are_left_alone() {
+        for op in ["Sin", "Cos", "Tan", "Atan"] {
+            assert!(
+                !governs(&node(op, &[])),
+                "{op} measured at parity, leave it"
+            );
+            assert!(
+                claim_preference(
+                    &node(op, &[]),
+                    22,
+                    &[shape(&[1, 4096])],
+                    &[DataType::Float32]
+                )
+                .is_claim()
+            );
+        }
+    }
+
+    /// Adding four ops must not perturb any pre-existing answer.
+    #[test]
+    fn previously_governed_ops_are_unchanged() {
+        for op in ["Tanh", "Sigmoid", "Gelu", "Sqrt", "Erf"] {
+            assert!(governs(&node(op, &[])), "{op} must stay governed");
+        }
+        for op in ["Neg", "Abs", "Sign", "Floor", "Ceil", "Round"] {
+            assert!(governs(&node(op, &[])), "{op} must stay governed");
+        }
+        // `Sign` still claims float32 above its crossover.
+        assert!(
+            claim_preference(
+                &node("Sign", &[]),
+                22,
+                &[shape(&[1, 4096])],
+                &[DataType::Float32]
+            )
+            .is_claim()
+        );
+        // `Round` still claims float16 above its crossover.
+        assert!(
+            claim_preference(
+                &node("Round", &[]),
+                22,
+                &[shape(&[1, 4096])],
+                &[DataType::Float16]
+            )
+            .is_claim()
+        );
     }
 }

@@ -274,6 +274,46 @@ mod erf_c {
     pub(super) const EXP_C: f32 = 1.25829120e7;
 }
 
+/// `MlasExpConstants` (`onnxruntime/core/mlas/lib/compute.cpp`), the parameter
+/// set behind `MlasComputeExp`.
+///
+/// These are *not* the `erf_c::EXP_*` values above. `erf_c`'s copy is the older
+/// polynomial extracted from `MlasErfConstants`, valid only on
+/// `[-88.376, 0]` — enough for `erf`'s big branch, which never sees a positive
+/// argument. A standalone `Exp` operator has to cover the whole `f32` line, so
+/// MLAS uses a separately refined polynomial plus XNNPACK's two-piece exponent
+/// reconstruction, which extends the representable output range down to
+/// `-103.972` (subnormal results) and up to `88.776` (overflow to `+Inf`).
+#[cfg(target_arch = "x86_64")]
+mod exp_c {
+    /// Below this every result is `0`; `-Inf` clamps here.
+    pub(super) const LOWER_RANGE: f32 = -103.9720840454;
+    /// Above this every result overflows `f32`; `+Inf` clamps here and the
+    /// reconstruction below still evaluates to `+Inf`.
+    pub(super) const UPPER_RANGE: f32 = 88.7762626647950;
+    /// `1.5 · 2^23`, the round-to-nearest-integer magic constant. Also reused
+    /// as the raw bit source for the exponent reconstruction.
+    pub(super) const ROUNDING_BIAS: f32 = 1.25829120e7;
+    pub(super) const LOG2_RECIPROCAL: f32 = std::f32::consts::LOG2_E;
+    pub(super) const LOG2_HIGH: f32 = -6.93145752e-1;
+    pub(super) const LOG2_LOW: f32 = -1.42860677e-6;
+    pub(super) const P0: f32 = f32::from_bits(0x3AB4_A000);
+    pub(super) const P1: f32 = f32::from_bits(0x3C09_2F6E);
+    pub(super) const P2: f32 = f32::from_bits(0x3D2A_ADAD);
+    pub(super) const P3: f32 = f32::from_bits(0x3E2A_AA28);
+    pub(super) const P4: f32 = f32::from_bits(0x3EFF_FFFB);
+    /// MLAS stores a single `poly_56` field because the degree-5 and degree-6
+    /// coefficients are both exactly `1.0`. In `MlasComputeExpVector` — the
+    /// variant ported here — only one of them appears in the Horner chain; the
+    /// other is merged into the overflow-exponent multiply/add below, following
+    /// XNNPACK. (The reduced-range helper further down `compute.cpp` instead
+    /// applies `poly_56` twice, because it has no overflow term to fold into.)
+    pub(super) const P56: f32 = 1.0;
+    /// Exponent field clamps for the two-piece `2^m` reconstruction.
+    pub(super) const MINIMUM_EXPONENT: i32 = 0xC100_0000u32 as i32;
+    pub(super) const MAXIMUM_EXPONENT: i32 = 0x3F80_0000;
+}
+
 /// `√(2/π)` and the cubic coefficient of the tanh GELU approximation, rounded
 /// to `f32`. Matches ORT's `contrib_ops/cpu/bert/fast_gelu.cc`.
 const GELU_B: f32 = 0.7978845608028654;
@@ -358,6 +398,28 @@ pub(crate) fn sqrt_f32_slice(input: &[f32], output: &mut [f32]) {
 /// `y = 1 / (1 + e^-x)`.
 pub(crate) fn sigmoid_f32_slice(input: &[f32], output: &mut [f32]) {
     dispatch!(input, output, sigmoid_scalar, sigmoid_avx2);
+}
+
+/// `y = e^x`.
+///
+/// The vector path is a port of `MlasComputeExpVector`
+/// (`onnxruntime/core/mlas/lib/compute.cpp`), the same polynomial MLAS uses
+/// inside its own softmax and logistic kernels. The scalar fallback is
+/// `f32::exp`, which is correctly rounded, so — exactly as for [`erf_f32_slice`]
+/// — a value can differ by ~1 ulp depending on whether the tensor was long
+/// enough to reach [`SIMD_MIN_LEN`]. `Exp` has no bit-exactness contract in
+/// ONNX and ORT's own CPU kernel is a different (Eigen) approximation again, so
+/// this seam is a documented accuracy property, not a correctness bug. Over a
+/// 65536-point sweep of `[-110, 89]` the worst observed error against an `f64`
+/// reference is **1 ulp**, including through the subnormal range.
+///
+/// Special values match `f32::exp` and ORT: `NaN` in gives `NaN` out (see
+/// [`avx2::exp_full_ps`] — it falls out of the clamp's operand order rather
+/// than a mask), `+Inf` gives `+Inf`, `-Inf` gives `+0`, arguments above
+/// `88.7762626647950` overflow to `+Inf`, and arguments below
+/// `-103.9720840454` flush to `+0` through the subnormal range.
+pub(crate) fn exp_f32_slice(input: &[f32], output: &mut [f32]) {
+    dispatch!(input, output, f32::exp, exp_avx2);
 }
 
 /// `y = erf(x)`, the Gauss error function.
@@ -660,7 +722,7 @@ fn quick_gelu_scalar(x: f32, alpha: f32) -> f32 {
 
 #[cfg(target_arch = "x86_64")]
 mod avx2 {
-    use super::{GELU_B, GELU_C, erf_c, logistic_c, tanh_c};
+    use super::{GELU_B, GELU_C, erf_c, exp_c, logistic_c, tanh_c};
     use core::arch::x86_64::*;
 
     /// `[-1; 7] ++ [0; 8]`. Loading 8 lanes at offset `7 - rem` yields a mask
@@ -918,6 +980,76 @@ mod avx2 {
         }
     }
 
+    /// Full-range `exp` over 8 lanes: a port of `MlasComputeExpVector`.
+    ///
+    /// Unlike [`exp_ps`], which the `erf` big branch calls with arguments that
+    /// are already clamped to `[-88.376, 0]`, this covers the entire `f32`
+    /// line. Two differences buy that:
+    ///
+    /// * `2^m` is reconstructed in **two** pieces (XNNPACK's refinement). One
+    ///   exponent field cannot express the full `[-150, 128]` range a
+    ///   general-purpose `exp` needs, so the biased exponent is split into a
+    ///   clamped `normal` part and an `overflow` remainder, and the two are
+    ///   applied at different points in the Horner chain. This is what lets
+    ///   subnormal results come out right instead of flushing early.
+    /// # `NaN` survives without a mask, and the clamp's operand order is why
+    ///
+    /// The reconstruction reinterprets `biased` as an integer, and for a `NaN`
+    /// argument that integer is meaningless — so it is worth being explicit
+    /// about why a `NaN` cannot come out finite. `MINPS`/`MAXPS` return their
+    /// **second** operand when either input is unordered. Both clamp steps put
+    /// the value being clamped second (`min(UPPER, x)`, then `max(LOWER, v)`),
+    /// so a `NaN` argument passes through the clamp unchanged; the first
+    /// polynomial `fmadd(P0, v, P1)` then carries it into `p`, and every later
+    /// step multiplies or adds `p`, so the `NaN` reaches the result. It holds
+    /// for every payload and both signs, quiet and signalling alike, because
+    /// `NaN * anything` is `NaN` — including `NaN * 0` and `NaN * Inf`, the two
+    /// values the integer path can produce.
+    ///
+    /// **The operand order in the clamp is therefore load-bearing.** Rewriting
+    /// `min(UPPER, x)` as `min(x, UPPER)` would silently replace every `NaN`
+    /// with `UPPER_RANGE` and turn `exp(NaN)` into `+Inf`.
+    /// [`exp_tests::nan_propagates_instead_of_becoming_finite`] pins this.
+    ///
+    /// An explicit `_CMP_UNORD_Q` compare plus `blendv` was measured as the
+    /// alternative and cost about 10% of throughput at 256 K elements for no
+    /// behavioural difference.
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn exp_full_ps(x: __m256) -> __m256 {
+        let mut v = _mm256_min_ps(_mm256_set1_ps(exp_c::UPPER_RANGE), x);
+        v = _mm256_max_ps(_mm256_set1_ps(exp_c::LOWER_RANGE), v);
+
+        let bias = _mm256_set1_ps(exp_c::ROUNDING_BIAS);
+        let biased = _mm256_fmadd_ps(v, _mm256_set1_ps(exp_c::LOG2_RECIPROCAL), bias);
+        let m = _mm256_sub_ps(biased, bias);
+
+        v = _mm256_fmadd_ps(m, _mm256_set1_ps(exp_c::LOG2_HIGH), v);
+        v = _mm256_fmadd_ps(m, _mm256_set1_ps(exp_c::LOG2_LOW), v);
+
+        let max_exp = _mm256_set1_epi32(exp_c::MAXIMUM_EXPONENT);
+        let min_exp = _mm256_set1_epi32(exp_c::MINIMUM_EXPONENT);
+        let raw = _mm256_slli_epi32::<23>(_mm256_castps_si256(biased));
+        let normal = _mm256_max_epi32(_mm256_min_epi32(raw, max_exp), min_exp);
+        let overflow = _mm256_add_epi32(_mm256_sub_epi32(raw, normal), max_exp);
+        let normal = _mm256_add_epi32(normal, max_exp);
+        let overflow = _mm256_castsi256_ps(overflow);
+        let normal = _mm256_castsi256_ps(normal);
+
+        let mut p = _mm256_set1_ps(exp_c::P0);
+        p = _mm256_fmadd_ps(p, v, _mm256_set1_ps(exp_c::P1));
+        p = _mm256_fmadd_ps(p, v, _mm256_set1_ps(exp_c::P2));
+        p = _mm256_fmadd_ps(p, v, _mm256_set1_ps(exp_c::P3));
+        p = _mm256_fmadd_ps(p, v, _mm256_set1_ps(exp_c::P4));
+        p = _mm256_fmadd_ps(p, v, _mm256_set1_ps(exp_c::P56));
+
+        v = _mm256_mul_ps(v, overflow);
+        p = _mm256_fmadd_ps(p, v, overflow);
+        p = _mm256_mul_ps(p, normal);
+
+        p
+    }
+
     /// `2^k` for integer-valued `k`, built by biasing and shifting into the
     /// exponent field (`MlasPowerOf2Float32x4`).
     #[inline]
@@ -1026,6 +1158,12 @@ unsafe fn tanh_avx2(input: &[f32], output: &mut [f32]) {
 #[target_feature(enable = "avx2,fma")]
 unsafe fn sigmoid_avx2(input: &[f32], output: &mut [f32]) {
     unsafe { avx2::map_ps(input, output, |v| avx2::sigmoid_ps(v)) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn exp_avx2(input: &[f32], output: &mut [f32]) {
+    unsafe { avx2::map_ps(input, output, |v| avx2::exp_full_ps(v)) }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2384,6 +2522,183 @@ mod exact_tests {
                     long.len()
                 );
             }
+        }
+    }
+}
+
+/// `Exp`'s vector path is a different approximation from `f32::exp`, so its
+/// tests are error-bounded and special-value-pinned rather than bit-exact.
+#[cfg(test)]
+mod exp_tests {
+    use super::*;
+
+    /// Long enough to reach the vector path on every host that has one.
+    const N: usize = 4096;
+
+    fn vector_exp(values: &[f32]) -> Vec<f32> {
+        assert!(
+            values.len() >= SIMD_MIN_LEN,
+            "input must be long enough to reach the vector path"
+        );
+        let mut out = vec![0.0f32; values.len()];
+        exp_f32_slice(values, &mut out);
+        out
+    }
+
+    /// Error against an `f64` reference over a dense sweep of the whole
+    /// argument range, measured in ulp rather than relative error.
+    ///
+    /// Relative error is the wrong metric near the bottom of the range: below
+    /// about `-87` the result is subnormal and carries only a handful of
+    /// significand bits, so a *correctly rounded* answer can already be tens of
+    /// percent away from the real value. Comparing representations counts what
+    /// actually matters — how many representable `f32` steps separate us from
+    /// the best possible answer — and stays meaningful through the subnormal
+    /// range and at the overflow boundary.
+    #[test]
+    fn dense_sweep_stays_within_two_ulp_of_a_f64_reference() {
+        let mut x = Vec::with_capacity(1 << 16);
+        let (lo, hi) = (-110.0f64, 89.0f64);
+        for i in 0..(1 << 16) {
+            x.push((lo + (hi - lo) * (i as f64) / ((1 << 16) as f64 - 1.0)) as f32);
+        }
+        let got = vector_exp(&x);
+
+        let mut worst = 0i64;
+        let mut worst_at = 0.0f32;
+        for (&v, &g) in x.iter().zip(&got) {
+            let want = f64::from(v).exp() as f32;
+            // Both are non-negative, so the bit patterns are monotonic in value
+            // and their difference is exactly the number of representable steps
+            // between them — including across the subnormal/normal boundary.
+            let ulp = i64::from(g.to_bits()) - i64::from(want.to_bits());
+            if ulp.abs() > worst {
+                worst = ulp.abs();
+                worst_at = v;
+            }
+        }
+        assert!(
+            worst <= 2,
+            "worst error {worst} ulp at x={worst_at} (exp = {})",
+            f64::from(worst_at).exp()
+        );
+    }
+
+    /// The seam between the vector path and the correctly-rounded scalar
+    /// fallback is allowed to move a result by a bounded amount, never more.
+    #[test]
+    fn vector_and_scalar_paths_agree_to_two_ulp() {
+        let mut x = Vec::with_capacity(N);
+        let mut state = 0x1234_5678u32;
+        for _ in 0..N {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            x.push((state >> 8) as f32 / (1 << 24) as f32 * 60.0 - 30.0);
+        }
+        let vector = vector_exp(&x);
+        for (&v, &g) in x.iter().zip(&vector) {
+            let want = v.exp();
+            let rel = ((f64::from(g) - f64::from(want)) / f64::from(want)).abs();
+            assert!(
+                rel <= 2.0 * f64::from(f32::EPSILON),
+                "exp({v}): vector {g} vs scalar {want} (rel {rel:e})"
+            );
+        }
+    }
+
+    /// The reconstruction reads the biased exponent as an integer, so every
+    /// saturating and non-finite argument has to be pinned explicitly. These
+    /// answers were read off ORT 1.28.0's own CPU `Exp` kernel.
+    #[test]
+    fn special_values_match_ort() {
+        let cases: [(f32, f32); 12] = [
+            (f32::INFINITY, f32::INFINITY),
+            (f32::NEG_INFINITY, 0.0),
+            (100.0, f32::INFINITY),
+            (89.0, f32::INFINITY),
+            (88.7762626647950, f32::INFINITY),
+            (88.3762626647949, 2.4061436e38),
+            (-87.0, 1.6458115e-38),
+            (-200.0, 0.0),
+            (0.0, 1.0),
+            (-0.0, 1.0),
+            (1.0, std::f32::consts::E),
+            (-1.0, 0.36787945),
+        ];
+        let mut x = vec![0.0f32; N];
+        for (i, slot) in x.iter_mut().enumerate() {
+            *slot = cases[i % cases.len()].0;
+        }
+        let got = vector_exp(&x);
+        for (i, &g) in got.iter().enumerate() {
+            let (arg, want) = cases[i % cases.len()];
+            if want.is_infinite() || want == 0.0 || want == 1.0 {
+                assert_eq!(g, want, "exp({arg}) = {g}, expected {want}");
+            } else {
+                let rel = ((f64::from(g) - f64::from(want)) / f64::from(want)).abs();
+                assert!(
+                    rel <= 2.0 * f64::from(f32::EPSILON),
+                    "exp({arg}) = {g}, expected {want}"
+                );
+            }
+        }
+    }
+
+    /// `NaN` survives the exponent reconstruction only because of the clamp's
+    /// operand order — see [`avx2::exp_full_ps`]. Nothing in the arithmetic
+    /// makes that obvious, so it gets its own test, across both signs and both
+    /// quiet and signalling payloads.
+    #[test]
+    fn nan_propagates_instead_of_becoming_finite() {
+        let payloads = [
+            f32::NAN.to_bits(),
+            0x7FC0_1234,
+            0xFFC0_1234,
+            0x7F80_0001, // signalling
+        ];
+        let mut x = vec![0.0f32; N];
+        for (i, slot) in x.iter_mut().enumerate() {
+            *slot = f32::from_bits(payloads[i % payloads.len()]);
+        }
+        let got = vector_exp(&x);
+        for (i, &g) in got.iter().enumerate() {
+            assert!(
+                g.is_nan(),
+                "exp(NaN 0x{:08X}) at {i} produced {g}",
+                payloads[i % payloads.len()]
+            );
+        }
+    }
+
+    /// The tail is processed through the same kernel via a masked load, so a
+    /// non-multiple-of-8 length must not change any answer.
+    #[test]
+    fn tail_lengths_are_computed_identically() {
+        let base: Vec<f32> = (0..(SIMD_MIN_LEN + 8))
+            .map(|i| (i as f32) * 0.37 - 6.0)
+            .collect();
+        let full = vector_exp(&base);
+        for n in SIMD_MIN_LEN..base.len() {
+            let mut out = vec![0.0f32; n];
+            exp_f32_slice(&base[..n], &mut out);
+            for (i, (&g, &f)) in out.iter().zip(&full).enumerate() {
+                assert_eq!(g.to_bits(), f.to_bits(), "n={n} i={i}");
+            }
+        }
+    }
+
+    /// `y = exp(y)` is a legal graph; the kernel must tolerate one buffer.
+    #[test]
+    fn aliased_input_and_output_are_supported_by_the_slice_form() {
+        let mut buf: Vec<f32> = (0..N).map(|i| (i as f32) * 0.001 - 2.0).collect();
+        let want: Vec<f32> = {
+            let mut o = vec![0.0f32; N];
+            exp_f32_slice(&buf, &mut o);
+            o
+        };
+        let copy = buf.clone();
+        exp_f32_slice(&copy, &mut buf);
+        for (i, (&g, &w)) in buf.iter().zip(&want).enumerate() {
+            assert_eq!(g.to_bits(), w.to_bits(), "i={i}");
         }
     }
 }
