@@ -256,7 +256,10 @@ fn last_level_cache_bytes() -> usize {
 fn probe_last_level_cache_bytes() -> Option<usize> {
     let mut best = None;
     for entry in std::fs::read_dir("/sys/devices/system/cpu/cpu0/cache").ok()? {
-        let path = entry.ok()?.path().join("size");
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path().join("size");
         let Ok(raw) = std::fs::read_to_string(&path) else {
             continue;
         };
@@ -305,6 +308,16 @@ fn group_fused_min_kv_bytes_override() -> Option<usize> {
 /// (`bytes_per_head * fused_tasks`) still fits LLC, the repeat traffic is served
 /// at cache bandwidth, the fusion's saving is worth little, and its extra
 /// score-buffer traffic makes it a net loss. That is the topology term.
+///
+/// `fused_tasks` is `batch * kv_num_heads`, an *upper* bound on the KV heads
+/// whose working sets are live at once: the pool only runs `worker_count` of
+/// them concurrently, and `group_fusion_saturates_pool` guarantees
+/// `fused_tasks >= worker_count`. Dividing by the larger number yields a
+/// smaller - looser - topology term than the aggregate model strictly implies.
+/// That is deliberate: the floor is what makes this safe, not the model, and
+/// the measurements at `worker_count = 1` (0.85x - 0.94x at 8-32 MiB per head)
+/// are a win that the tighter `min(fused_tasks, worker_count)` divisor would
+/// have declined.
 ///
 /// It is a `max`, not a replacement, and that asymmetry is deliberate. The
 /// 8 MiB figure is measured; the topology term is a *model*. Taking the larger
@@ -366,7 +379,15 @@ fn group_fused_min_kv_bytes(fused_tasks: usize) -> usize {
     if let Some(bytes) = group_fused_min_kv_bytes_override() {
         return bytes;
     }
-    (last_level_cache_bytes() / fused_tasks.max(1)).max(GROUP_FUSED_CALIBRATED_MIN_KV_BYTES)
+    min_kv_bytes_for(last_level_cache_bytes(), fused_tasks)
+}
+
+/// The threshold computation itself, split out from the environment and cache
+/// probe so it can be exercised with a synthetic cache size. On the calibration
+/// host the topology term is inert (4 MiB, below the floor), so testing it
+/// through [`group_fused_min_kv_bytes`] alone would prove nothing.
+fn min_kv_bytes_for(last_level_cache_bytes: usize, fused_tasks: usize) -> usize {
+    (last_level_cache_bytes / fused_tasks.max(1)).max(GROUP_FUSED_CALIBRATED_MIN_KV_BYTES)
 }
 
 /// KV tokens a decode step actually streams per head.
@@ -3679,39 +3700,28 @@ mod tests {
         let _unpinned = FusedTrafficThresholdPin::bytes_per_head(0);
         let per_head = group_fused_min_kv_bytes(TASKS);
         // head_size 128 streams 1 KiB of K+V per attended token.
-        let crossover_tokens = per_head / 1024;
+        // Round the two sides independently so the assertions stay exact even
+        // if a host reports a cache size that is not a whole number of KiB per
+        // fused task.
+        let open_tokens = per_head.div_ceil(1024);
+        let closed_tokens = (per_head - 1) / 1024;
         assert!(!group_fusion_pays_for_traffic(
-            crossover_tokens - 1,
+            closed_tokens,
             128,
             128,
             TASKS
         ));
-        assert!(group_fusion_pays_for_traffic(
-            crossover_tokens,
-            128,
-            128,
-            TASKS
-        ));
+        assert!(group_fusion_pays_for_traffic(open_tokens, 128, 128, TASKS));
         // head_size 64 needs twice the window for the same bytes.
-        assert!(!group_fusion_pays_for_traffic(
-            crossover_tokens,
-            64,
-            64,
-            TASKS
-        ));
+        assert!(!group_fusion_pays_for_traffic(closed_tokens, 64, 64, TASKS));
         assert!(group_fusion_pays_for_traffic(
-            2 * crossover_tokens,
+            2 * open_tokens,
             64,
             64,
             TASKS
         ));
         // Asymmetric K/V head widths count both.
-        assert!(group_fusion_pays_for_traffic(
-            crossover_tokens,
-            128,
-            192,
-            TASKS
-        ));
+        assert!(group_fusion_pays_for_traffic(open_tokens, 128, 192, TASKS));
         // Degenerate inputs must not overflow into a spurious open gate.
         assert!(!group_fusion_pays_for_traffic(0, 128, 128, TASKS));
         assert!(group_fusion_pays_for_traffic(usize::MAX, 128, 128, TASKS));
@@ -3731,6 +3741,15 @@ mod tests {
                 threshold >= GROUP_FUSED_CALIBRATED_MIN_KV_BYTES,
                 "tasks={tasks} produced {threshold}, looser than the calibration"
             );
+            // ...independent of whatever this host reports, including caches
+            // far larger and far smaller than any real part.
+            for llc in [0usize, 1, 16 << 10, 32 << 20, 256 << 20, usize::MAX] {
+                let threshold = min_kv_bytes_for(llc, tasks);
+                assert!(
+                    threshold >= GROUP_FUSED_CALIBRATED_MIN_KV_BYTES,
+                    "llc={llc} tasks={tasks} produced {threshold}"
+                );
+            }
         }
         // Monotone in the task count: more concurrent heads never demands a
         // *larger* per-head working set.
@@ -3742,21 +3761,69 @@ mod tests {
         }
     }
 
-    /// Falsifier for the losing side. On a large last-level cache the fixed
+    /// Falsifier for the losing side, driven through the real computation
+    /// rather than only the test pin. On a large last-level cache the fixed
     /// 8 MiB constant opened the gate while the aggregate KV still fit cache -
-    /// the regime the kernel sweep measures at 0.64x - 0.9x. The topology term
-    /// exists to keep it shut there, so pin a large-cache threshold and assert
-    /// that a working set inside that cache is declined.
+    /// the regime the kernel sweep measures at 0.64x - 0.9x - and the topology
+    /// term exists to keep it shut there.
+    ///
+    /// The calibration host's own term is inert (32 MiB / 8 tasks = 4 MiB,
+    /// below the floor), so a synthetic cache size is the only way to exercise
+    /// it. Deleting the topology term makes this test fail.
     #[test]
     fn a_large_last_level_cache_keeps_the_gate_shut_inside_cache() {
-        // 256 MiB LLC / 8 fused tasks = 32 MiB per head.
-        let _pin = FusedTrafficThresholdPin::bytes_per_head((256 << 20) / 8);
+        const HUGE_LLC: usize = 256 << 20;
+        // 256 MiB LLC / 8 fused tasks = 32 MiB per head, four times the floor.
+        assert_eq!(min_kv_bytes_for(HUGE_LLC, 8), 32 << 20);
+        // 16 MiB per head still fits that cache in aggregate, so the fusion
+        // must be declined even though it clears the calibrated 8 MiB...
+        assert!(16 << 20 >= min_kv_bytes_for(0, 8));
+        assert!(16 << 20 < min_kv_bytes_for(HUGE_LLC, 8));
+        // ...and 32 MiB per head no longer fits, so it is admitted.
+        assert!(32 << 20 >= min_kv_bytes_for(HUGE_LLC, 8));
+
+        // The same statement end to end through the gate.
+        let _pin = FusedTrafficThresholdPin::bytes_per_head(min_kv_bytes_for(HUGE_LLC, 8));
         // 16 MiB per head (16384 tokens at head_size 128) still fits that
         // cache in aggregate, so the fusion must decline even though it clears
         // the calibrated 8 MiB.
         assert!(!group_fusion_pays_for_traffic(16_384, 128, 128, 8));
         // 32 MiB per head no longer fits, so it opens.
         assert!(group_fusion_pays_for_traffic(32_768, 128, 128, 8));
+    }
+
+    /// The topology term must halve when the concurrent task count doubles and
+    /// must be inert whenever it lands below the measured floor. Checked
+    /// against synthetic cache sizes so the result does not depend on the
+    /// runner's own topology.
+    #[test]
+    fn the_topology_term_scales_with_tasks_and_never_goes_below_the_floor() {
+        const HUGE_LLC: usize = 256 << 20;
+        assert_eq!(min_kv_bytes_for(HUGE_LLC, 4), 64 << 20);
+        assert_eq!(min_kv_bytes_for(HUGE_LLC, 8), 32 << 20);
+        assert_eq!(min_kv_bytes_for(HUGE_LLC, 16), 16 << 20);
+        // 256 / 32 = 8 MiB, exactly the floor; beyond that the floor wins.
+        assert_eq!(
+            min_kv_bytes_for(HUGE_LLC, 32),
+            GROUP_FUSED_CALIBRATED_MIN_KV_BYTES
+        );
+        assert_eq!(
+            min_kv_bytes_for(HUGE_LLC, 64),
+            GROUP_FUSED_CALIBRATED_MIN_KV_BYTES
+        );
+        // The calibration host: 32 MiB shared per CCX, 8 fused tasks for a
+        // batch-1 8-KV-head decode. The term is 4 MiB, so the floor holds and
+        // the measured behaviour is unchanged - the claim this PR rests on.
+        assert_eq!(
+            min_kv_bytes_for(32 << 20, 8),
+            GROUP_FUSED_CALIBRATED_MIN_KV_BYTES
+        );
+        // Degenerate inputs must not divide by zero or wrap.
+        assert_eq!(min_kv_bytes_for(HUGE_LLC, 0), HUGE_LLC);
+        assert_eq!(
+            min_kv_bytes_for(usize::MAX, usize::MAX),
+            GROUP_FUSED_CALIBRATED_MIN_KV_BYTES
+        );
     }
 
     /// The threshold has to be reproducible from the host's reported topology,
@@ -3773,12 +3840,20 @@ mod tests {
         assert_eq!(parse_cache_size("K"), None);
         assert_eq!(parse_cache_size("12X"), None);
         assert_eq!(parse_cache_size("99999999999999999999K"), None);
-        // Whatever the host reports, it must be a plausible cache size: at
-        // least an L1 and no larger than a terabyte.
+        // Whatever the host reports, it must either be the documented
+        // "unreadable" sentinel - macOS, Windows and restricted containers have
+        // no `/sys/devices/system/cpu` at all - or a plausible cache size
+        // between an L1 and a terabyte. Asserting only the latter would fail
+        // CI on every non-Linux runner.
         let llc = last_level_cache_bytes();
         assert!(
-            (16 << 10..=1 << 40).contains(&llc),
+            llc == DEFAULT_LAST_LEVEL_CACHE_BYTES || (16 << 10..=1 << 40).contains(&llc),
             "implausible last-level cache {llc}"
+        );
+        // The sentinel must collapse to exactly the calibrated constant.
+        assert_eq!(
+            min_kv_bytes_for(DEFAULT_LAST_LEVEL_CACHE_BYTES, 8),
+            GROUP_FUSED_CALIBRATED_MIN_KV_BYTES
         );
     }
 
