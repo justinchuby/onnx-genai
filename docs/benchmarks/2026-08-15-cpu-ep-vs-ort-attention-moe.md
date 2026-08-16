@@ -668,10 +668,12 @@ Only step 2 is avoidable — the attention core genuinely needs f32 K/V — but 
 the expensive one. It is a **write** across `2 · B · H_kv · S · D` elements that
 dirties the entire cache footprint every token, fed by an equally large f32 read.
 
-A test on `main` had even pinned the gap in place:
+A test on the pre-#1083 base had even pinned the gap in place:
 `detect_inplace_kv_gate_rejects_f16_cache` asserted the rejection, with a comment
 explaining that "the append path only supports contiguous f32". It was describing
-a limitation, not a requirement.
+a limitation, not a requirement. (#1083 keeps the test — the *f32* gate must
+still decline half-precision — and rewords the comment to point at
+`detect_inplace_kv_half`.)
 
 ### What shipped
 
@@ -693,10 +695,11 @@ every half-precision model runs on `main`.
 | qwen2.5-0.5b | 2 × 64 | 0.870 | 0.890 | 0.983 † | 0.945 † |
 | qwen3-0.6b | 8 × 128 | 0.761 | **0.504** | 0.669 | **0.600** |
 | llama-3.1-8b | 8 × 128 | 0.777 † | **0.554** | 0.692 | 0.684 |
-| qwen2.5-7b | 4 × 128 | 0.799 | 0.917 † | 0.787 | 0.789 |
+| qwen2.5-7b | 4 × 128 | 0.799 | 0.917 | 0.787 | 0.789 |
 
-† per-run ratio range touches or crosses 1.0 across the 4 sweeps — read these as
-"no regression", not as a gain. Absolute medians and full dispersion are in
+† per-run ratio range reaches or crosses 1.0 across the 4 sweeps (0.91–1.03,
+0.92–1.06 and 0.77–1.03 respectively) — read these three as "no regression", not
+as a gain. Every other cell's range stays strictly below 1.0. Absolute medians and full dispersion are in
 PR #1083; all 16 cells are reported there, none omitted.
 
 The pattern is what the mechanism predicts: the win tracks cache size. The three
@@ -731,7 +734,9 @@ Models that build their cache with a plain `Concat(past, new)` instead cannot do
 this, and the reason is not a missing optimisation — it is the binding ABI:
 
 * `ExternalValue` (`crates/onnx-runtime-session/src/executor/state.rs:638-646`)
-  carries `dtype, shape, ptr, len, alignment, device`. **There is no strides
+  carries `dtype, shape, accepts_subshape, ptr, len, alignment, device`. The one
+  knob that looks like it might help — `accepts_subshape` — is a bounded per-dim
+  `valid ≤ capacity` check (`accepts_output`), not strides. **There is no strides
   field.** A device-bound value is always dense.
 * `DeviceIoBinding` (`crates/onnx-runtime-session/src/tensor.rs:316`) does carry
   `physical_shape` (capacity) and `logical_shape` (valid prefix), and
@@ -772,9 +777,13 @@ result in §8: no win in any of 15 cells and a non-overlapping regression at
   is also not evidence about ORT.
 * Criterion runs arms sequentially within a sweep. The interleaving here comes
   from repeating the whole sweep four times under varying host load, not from
-  alternating arms inside one pass. On a contended host that matters: a single
-  sweep showed two `qwen2.5-0.5b` cells *regressing* by 8–28%, and the 4-sweep
-  medians falsified both.
+  alternating arms inside one pass. On a contended host that matters: a
+  **preliminary** sweep — taken before the four reported above and not part of
+  their dispersion — showed two `qwen2.5-0.5b` cells *regressing* (ratios 1.285
+  at kv=4096 and 1.080 at kv=16384). The 4-sweep medians falsified both, and
+  neither regression is reproducible within the reported 0.81–0.93 and 0.92–1.06
+  ranges. The raw preliminary CSV no longer exists, so that pair of numbers is
+  recorded as provenance for why four sweeps are used, not as a result.
 * Phase 4 requirements 2–5 (grouped MoE GEMM, fused transpose-with-consumer,
   the Softmax fusion-anchor session A/B, allocator-independent cache thresholds)
   are not addressed here and remain open.
