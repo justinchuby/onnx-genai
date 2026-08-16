@@ -102,6 +102,13 @@ impl Kernel for AddKernel {
             ADD_VDSP_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(());
         }
+        // Shared with Sub/Mul/Div so there is exactly one dense binary walk in
+        // the EP; covers same-shape and suffix-broadcast (including a scalar)
+        // operands. Without it even a same-shape f32 Add fell to `add_typed`,
+        // which allocates a whole-tensor accumulator and walks it three times.
+        if super::elementwise::add_dense_fast_path(inputs, &mut outputs[0]) {
+            return Ok(());
+        }
         ADD_SCALAR_TEST_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         dispatch_arith!(inputs[0].dtype, "Add", T => add_typed::<T>(inputs, outputs))
     }
@@ -390,8 +397,34 @@ mod tests {
         assert_eq!(out.to_f32(), vec![11., 22., 33., 44., 55., 66.]);
     }
 
+    /// An **interior** size-1 axis is not a right-aligned suffix, so it cannot
+    /// be expressed as a repeat of a contiguous block and must still reach the
+    /// general strided fallback. This is what keeps `add_dense_fast_path` from
+    /// being applied unconditionally.
     #[test]
-    fn add_broadcast_uses_scalar_fallback() {
+    fn add_interior_broadcast_uses_scalar_fallback() {
+        use std::sync::atomic::Ordering;
+        let before = super::ADD_SCALAR_TEST_HITS.load(Ordering::Relaxed);
+        let a = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let b = Owned::f32(&[2, 1], &[10., 20.]);
+        let mut out = Owned::zeros_f32(&[2, 3]);
+        AddKernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+        let after = super::ADD_SCALAR_TEST_HITS.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "Interior-axis broadcasting Add did not reach the scalar fallback"
+        );
+        assert_eq!(out.to_f32(), vec![11., 12., 13., 24., 25., 26.]);
+    }
+
+    /// A right-aligned suffix broadcast (`[2, 3] <- [2, 3] + [3]`) now takes the
+    /// shared dense path instead of the strided walk, and must produce exactly
+    /// the same values. The previous version of this test asserted the opposite
+    /// dispatch; the values it never checked are asserted here.
+    #[test]
+    fn add_suffix_broadcast_uses_the_dense_fast_path() {
         use std::sync::atomic::Ordering;
         let before = super::ADD_SCALAR_TEST_HITS.load(Ordering::Relaxed);
         let a = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
@@ -400,10 +433,36 @@ mod tests {
         AddKernel
             .execute(&[a.view(), b.view()], &mut [out.view_mut()])
             .unwrap();
-        let after = super::ADD_SCALAR_TEST_HITS.load(Ordering::Relaxed);
-        assert!(
-            after > before,
-            "Broadcasting Add did not reach scalar fallback"
+        assert_eq!(
+            super::ADD_SCALAR_TEST_HITS.load(Ordering::Relaxed),
+            before,
+            "suffix-broadcast Add fell through to the strided fallback"
         );
+        assert_eq!(out.to_f32(), vec![11., 22., 33., 14., 25., 36.]);
+    }
+
+    /// Scalar operand on either side, which is what an inlined ONNX activation
+    /// function emits.
+    #[test]
+    fn add_scalar_broadcast_uses_the_dense_fast_path() {
+        use std::sync::atomic::Ordering;
+        let a = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]);
+        let k = Owned::f32(&[], &[0.5]);
+        for (l, r, want) in [
+            (&a, &k, vec![1.5, 2.5, 3.5, 4.5, 5.5, 6.5]),
+            (&k, &a, vec![1.5, 2.5, 3.5, 4.5, 5.5, 6.5]),
+        ] {
+            let before = super::ADD_SCALAR_TEST_HITS.load(Ordering::Relaxed);
+            let mut out = Owned::zeros_f32(&[2, 3]);
+            AddKernel
+                .execute(&[l.view(), r.view()], &mut [out.view_mut()])
+                .unwrap();
+            assert_eq!(
+                super::ADD_SCALAR_TEST_HITS.load(Ordering::Relaxed),
+                before,
+                "scalar-broadcast Add fell through to the strided fallback"
+            );
+            assert_eq!(out.to_f32(), want);
+        }
     }
 }
