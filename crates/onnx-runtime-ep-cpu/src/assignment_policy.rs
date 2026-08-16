@@ -132,11 +132,24 @@ const MEASURED_MIN_WEIGHTS: usize = 1 << 20;
 /// | `MatMulNBits` int4 M=1     | 1.00 | 1.52 | 1.74 | 2.23 | 2.21 | 4.28 |
 ///
 /// So these are not slow kernels — they are kernels that realise roughly half
-/// of ORT's parallel speedup. Fixing that is a threadpool/partitioning problem
-/// (#1054 removed one cause, the 8-worker cap on the standalone MLAS pool), not
-/// a kernel-tuning one, and until it is fixed the honest answer at capability
-/// time is to let ORT run these nodes. The thread count is not visible here, so
-/// a claim would have to hold at *every* count; none of these do.
+/// of ORT's parallel speedup.
+///
+/// It is **not the threadpool**, which is what this note used to claim. #1054
+/// removed one real cause (the 8-worker cap on the standalone MLAS pool), but
+/// driving MLAS's packed GEMM directly through this crate's work-stealing pool
+/// at `K = N = 3584`, `M = 512` gives 99.9 ms at one thread, 14.3 ms at eight
+/// and 13.6 ms at sixteen — a 7.0-7.4x speedup, about what ORT achieves — and
+/// `mlas_threading_stats()` shows MLAS requesting and receiving exactly
+/// `pool_threads` partitions per call at every count. The primitive scales.
+///
+/// What does not scale is the serial per-call work *around* the primitive:
+/// densifying activations, allocating and zeroing accumulators, requantizing,
+/// and the executor's own tensor handling. That is roughly constant in the
+/// thread count, so its share grows as the GEMM shrinks — Amdahl, not
+/// scheduling. Shrinking it is the open work; until it is done the honest
+/// answer at capability time is to let ORT run these nodes. The thread count is
+/// not visible here, so a claim would have to hold at *every* count; none of
+/// these do.
 const DECODE_PARALLEL_NOTE: &str = "measured slower than ORT's CPU kernel at every thread count \
      from 2 to 16 on x86-64 AVX2 (this EP realises about half of ORT's parallel speedup; at one \
      thread it is at parity)";
