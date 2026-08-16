@@ -3838,7 +3838,15 @@ impl DotKernel {
     fn uses_vnni_int4_direct(self) -> bool {
         #[cfg(target_arch = "x86_64")]
         {
-            matches!(self, DotKernel::AvxVnni | DotKernel::Avx512Vnni)
+            // `is_runnable_here` rather than `clamped_to_host`: the int4-direct
+            // route is layout-coupled (the VNNI kernels consume the
+            // deinterleaved activation of `deinterleave_activation_int4`, the
+            // others natural order), so substituting a different kernel *inside*
+            // `int4_dot_row` would silently mis-decode. Refusing the route
+            // instead sends an unrunnable request down the int8 path, which
+            // builds its own layout and is bit-exact -- a degrade that is
+            // correct rather than merely safe.
+            matches!(self, DotKernel::AvxVnni | DotKernel::Avx512Vnni) && self.is_runnable_here()
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
@@ -5633,7 +5641,11 @@ fn borrowed_int4_block_dot_x86(
         // path can be diffed against it in the same binary (issue #994).
         return None;
     }
-    match dot_kernel {
+    // Both arms consume the *same* natural-order activation, so unlike
+    // `int4_dot_row` this dispatcher is layout-agnostic and a clamp is directly
+    // correct: an unrunnable request is answered by the host's own kernel (or
+    // by `None`, the scalar reference) instead of faulting.
+    match dot_kernel.clamped_to_host() {
         // AVX-512F is a superset of AVX2; `Avx512Vnni` is selected only after
         // `avx512f` was runtime-detected. Use the 512-bit f32 kernel.
         DotKernel::Avx512Vnni => {
@@ -5842,6 +5854,17 @@ fn int4_dot_row(
     block_size: usize,
     _kernel: DotKernel,
 ) -> f32 {
+    // This dispatcher cannot clamp: the caller has already laid the activation
+    // out for `_kernel` specifically, so answering with a different kernel would
+    // decode the wrong layout. `uses_vnni_int4_direct` -- the only gate that
+    // routes anything here -- already requires `is_runnable_here`, so an
+    // unrunnable kernel never reaches this function; assert that rather than
+    // leave it to provenance. This is a per-row check on a K-length dot: a
+    // cached relaxed load and a bit test.
+    debug_assert!(
+        _kernel.is_runnable_here(),
+        "int4_dot_row reached with a kernel this host cannot execute"
+    );
     #[cfg(target_arch = "x86_64")]
     {
         match _kernel {
@@ -7005,6 +7028,16 @@ fn gemv_nk_u8(
 /// The int8 SDOT routes above already gate on `accuracy_level == 4`. The
 /// int16-activation GEMV is more accurate than those but still short of fp32,
 /// so it lands at `>= 2` rather than being unconditional.
+///
+/// To be precise about *why* `>= 2` and not `== 4`: the justification is not
+/// "int16 is at least as accurate as the fp16 that level 2 names". It is not,
+/// necessarily -- int16 here is per-block *fixed point* whose scale is set by
+/// the block maximum, so for a block with one outlier it can resolve the small
+/// values worse than fp16's floating point would. The justification is that
+/// levels 2/3/4 are the levels at which the model has explicitly given up fp32,
+/// and int16 is strictly more accurate than the int8 that level 4 already
+/// permits. Level 0/1 is where the guarantee actually matters, and there the
+/// answer is unambiguous: fp32.
 ///
 /// # Why this is not a free 12%
 ///
@@ -10088,7 +10121,12 @@ mod tests {
         // activation quantization. Scale the bound to the operand magnitudes
         // rather than hard-coding a constant that a future shape change would
         // silently loosen.
-        let bound = 2e-3 * (k as f32).sqrt();
+        // Tight enough to catch the int16 path itself, not just the falsifier
+        // below: at this shape fp32 lands ~5e-4 and int16 ~9.4e-3, so a bound
+        // between them makes the end-to-end assertion the real guard. Scaled by
+        // sqrt(k) because the reduction's own f32 error grows that way, so a
+        // future K change loosens it honestly rather than silently.
+        let bound = 6e-5 * (k as f32).sqrt();
         assert!(
             fp32_error <= bound,
             "accuracy_level=0 must reduce in fp32: max abs error {fp32_error} > {bound}"
