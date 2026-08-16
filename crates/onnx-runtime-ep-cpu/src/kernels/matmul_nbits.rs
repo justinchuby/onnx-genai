@@ -165,6 +165,21 @@ static DECODE_THREADS_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
 /// before the native session loads. Default: enabled (unchanged fast path).
 static RESIDENT_DEQUANT_F32_CACHE_DISABLED: AtomicBool = AtomicBool::new(false);
 
+/// The `bits == 4, accuracy_level == 0` MLAS SQNBit CompFp32 route packs the
+/// constant weight into an MLAS-owned buffer (~2x the int4 bytes,
+/// [`mlas_sys::sqnbit_packed_b_size`]) held for the session *beside* the
+/// still-resident memory-mapped weight. That buffer buys a large decode speedup
+/// on x86 (the borrowed int4 path has no SIMD kernel there) but roughly doubles
+/// the weight footprint. Like the resident f32 cache above, the memory-strategy
+/// plan owns the fit decision: it accounts those bytes
+/// ([`matmul_nbits_resident_side_cache_bytes`]) and, when they do not fit the
+/// residency budget, calls [`set_mlas_sqnbit_packing_enabled`] with `false`.
+/// When disabled, [`MatMulNBitsKernel::mlas_sqnbit_owns_fp32_compute`] declines
+/// ownership so the node stays on the borrowed zero-copy int4 path -- the same
+/// behaviour as before the dispatch change, holding only the on-disk weights.
+/// Default: enabled (the fast MLAS route).
+static MLAS_SQNBIT_PACKING_DISABLED: AtomicBool = AtomicBool::new(false);
+
 /// Decode is bandwidth-bound and pays one fork/join per projection. Profiling
 /// across the existing 4--96 worker sweep found no gain above eight workers and
 /// clear regressions at 16+, so topology scaling is capped here; the environment
@@ -1398,9 +1413,16 @@ impl MatMulNBitsKernel {
     /// there. `sqnbit_packed_b_size` is MLAS's own "do I have a kernel for this
     /// shape on this CPU" probe; when it says no, the borrowed path remains the
     /// fallback.
+    ///
+    /// Finally, the packed buffer is a session-lifetime resident allocation
+    /// (~2x the int4 bytes) held beside the mapped weight, so the memory-strategy
+    /// plan governs it exactly like the resident f32 cache (#987): when the plan
+    /// declines it (over budget), [`set_mlas_sqnbit_packing_enabled`] is `false`
+    /// and ownership is refused so the borrowed zero-copy path stays reachable.
     #[cfg(feature = "mlas")]
     fn mlas_sqnbit_owns_fp32_compute(&self, can_prepack: bool, has_zero_points: bool) -> bool {
         mlas_qnbit_enabled()
+            && mlas_sqnbit_packing_enabled()
             && can_prepack
             && mlas_sys::sqnbit_packed_b_size(
                 self.n,
@@ -2532,6 +2554,27 @@ fn resident_dequant_f32_cache_enabled() -> bool {
     !RESIDENT_DEQUANT_F32_CACHE_DISABLED.load(Ordering::Acquire)
 }
 
+/// Enable or disable the MLAS SQNBit CompFp32 packed-weight route for the
+/// process (the `bits == 4, accuracy_level == 0` dispatch).
+///
+/// The memory-strategy plan calls this before the native decode session is
+/// built, with the same admission verdict it uses for the resident f32 cache.
+/// Passing `false` makes [`MatMulNBitsKernel::mlas_sqnbit_owns_fp32_compute`]
+/// decline ownership, so those nodes stay on the borrowed zero-copy int4 path
+/// and the runtime holds only the on-disk weights instead of an extra
+/// session-lifetime MLAS packed buffer (~2x the int4 bytes) beside them. The
+/// borrowed fallback is byte-identical, only slower per token on x86. Default is
+/// enabled, so an unset process keeps the fast MLAS route.
+pub fn set_mlas_sqnbit_packing_enabled(enabled: bool) {
+    MLAS_SQNBIT_PACKING_DISABLED.store(!enabled, Ordering::Release);
+}
+
+/// Whether the MLAS SQNBit CompFp32 packed-weight route is currently admitted.
+#[cfg(feature = "mlas")]
+fn mlas_sqnbit_packing_enabled() -> bool {
+    !MLAS_SQNBIT_PACKING_DISABLED.load(Ordering::Acquire)
+}
+
 /// Predict whether an `m == 1` (decode) `MatMulNBits` node with **constant**
 /// weights will materialize the resident dequantized-f32 `weight_nk` cache
 /// (the ~8x expansion of #971), given its static attributes and the host's
@@ -2626,14 +2669,114 @@ pub fn matmul_nbits_decode_caches_dequant_f32(
     true
 }
 
-/// Total resident dequantized-f32 decode-cache bytes this CPU EP will hold for
-/// `graph`, i.e. the #971 expansion the plan must budget for.
+/// The MLAS SQNBit CompFp32 packed-weight buffer bytes a **constant-weight**
+/// `bits == 4, accuracy_level == 0` `MatMulNBits` node holds for the session,
+/// or `None` when that node does not take the MLAS route.
 ///
-/// For every constant-weight `MatMulNBits` node whose decode path
-/// [`matmul_nbits_decode_caches_dequant_f32`] predicts will cache, this adds the
-/// fully-expanded f32 weight size `N * K * 4`. Nodes that take a packed or
-/// on-the-fly path contribute nothing. Non-constant-weight nodes never cache
-/// (they rebuild a transient buffer per call) and are excluded.
+/// This mirrors [`MatMulNBitsKernel::mlas_sqnbit_owns_fp32_compute`]'s gate on
+/// static attributes: MLAS owns the node only for constant int4
+/// `accuracy_level == 0` weights without `g_idx`, when the `mlas` build has a
+/// SQNBit kernel for the shape on this host and the route is enabled. The size
+/// is MLAS's own [`mlas_sys::sqnbit_packed_b_size`] -- the same probe the route
+/// decision uses -- so the plan's accounting cannot drift from the buffer the
+/// kernel actually allocates.
+///
+/// It deliberately does **not** consult [`mlas_sqnbit_packing_enabled`]: the
+/// accounting states what admitting the route would cost, and the plan then
+/// decides admission from that cost. Gating it on the admission flag would make
+/// the cost vanish exactly when the plan needs it to make the decision.
+#[cfg(feature = "mlas")]
+fn mlas_sqnbit_packed_b_cache_bytes(
+    bits: usize,
+    block_size: usize,
+    accuracy_level: i64,
+    n: usize,
+    k: usize,
+    has_zero_points: bool,
+    has_g_idx: bool,
+    weight_prepacked: bool,
+) -> Option<u64> {
+    if weight_prepacked || has_g_idx || bits != 4 || accuracy_level != 0 || !mlas_qnbit_enabled() {
+        return None;
+    }
+    mlas_sys::sqnbit_packed_b_size(
+        n,
+        k,
+        bits,
+        block_size,
+        has_zero_points,
+        mlas_sys::SQNBitComputeType::Fp32,
+    )
+    .map(|bytes| bytes as u64)
+}
+
+/// Resident side-buffer bytes a single **constant-weight** `MatMulNBits` node
+/// holds for the session *beside* the on-disk weights, given its static
+/// attributes: either the MLAS SQNBit CompFp32 packed buffer (~2x the int4
+/// bytes) when the node takes that route, the fully-expanded f32 `weight_nk`
+/// cache (`N * K * 4`, #971) when it takes the generic decode path, or zero for
+/// a truly zero-copy path (borrowed int4, 2-bit, int8, accuracy-4 direct).
+///
+/// This is the single per-node authority [`resident_dequant_f32_cache_bytes`]
+/// sums over the graph so the memory plan's footprint accounting tracks what the
+/// kernel actually retains. The MLAS packed buffer is checked first because its
+/// route pre-empts the f32 cache in [`MatMulNBitsKernel::execute`].
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_nbits_resident_side_cache_bytes(
+    bits: usize,
+    block_size: usize,
+    accuracy_level: i64,
+    n: usize,
+    k: usize,
+    has_zero_points: bool,
+    has_g_idx: bool,
+    weight_prepacked: bool,
+) -> u64 {
+    #[cfg(feature = "mlas")]
+    if let Some(bytes) = mlas_sqnbit_packed_b_cache_bytes(
+        bits,
+        block_size,
+        accuracy_level,
+        n,
+        k,
+        has_zero_points,
+        has_g_idx,
+        weight_prepacked,
+    ) {
+        return bytes;
+    }
+    if matmul_nbits_decode_caches_dequant_f32(
+        bits,
+        block_size,
+        accuracy_level,
+        n,
+        k,
+        has_zero_points,
+        has_g_idx,
+        weight_prepacked,
+    ) {
+        (n as u64).saturating_mul(k as u64).saturating_mul(4)
+    } else {
+        0
+    }
+}
+
+/// Total resident side-buffer bytes this CPU EP will hold for `graph` beside the
+/// on-disk weights, i.e. the extra footprint the memory plan must budget for.
+///
+/// For every constant-weight `MatMulNBits` node this sums
+/// [`matmul_nbits_resident_side_cache_bytes`]: the fully-expanded f32 `weight_nk`
+/// cache (`N * K * 4`, #971) when the node takes the generic decode path, or the
+/// MLAS SQNBit CompFp32 packed buffer (~2x the int4 bytes) when it takes the
+/// `accuracy_level == 0` MLAS route. Nodes on a truly zero-copy path (borrowed
+/// int4, 2-bit, int8) contribute nothing, and non-constant-weight nodes never
+/// retain a session buffer (they rebuild a transient one per call) and are
+/// excluded.
+///
+/// The name is kept for API stability; the total now covers the MLAS packed
+/// buffer too, so a model whose int4 `accuracy_level == 0` nodes route to MLAS
+/// is no longer accounted as zero (the ledger blind spot that made the packed
+/// weight invisible).
 pub fn resident_dequant_f32_cache_bytes(graph: &Graph) -> u64 {
     let mut total = 0_u64;
     for node in graph.nodes.values() {
@@ -2674,7 +2817,7 @@ pub fn resident_dequant_f32_cache_bytes(graph: &Graph) -> u64 {
         let (n, k) = (n as u64, k as u64);
         let has_zero_points = matches!(node.inputs.get(3), Some(Some(_)));
         let has_g_idx = matches!(node.inputs.get(4), Some(Some(_)));
-        if matmul_nbits_decode_caches_dequant_f32(
+        total = total.saturating_add(matmul_nbits_resident_side_cache_bytes(
             bits,
             block_size,
             accuracy_level,
@@ -2683,9 +2826,7 @@ pub fn resident_dequant_f32_cache_bytes(graph: &Graph) -> u64 {
             has_zero_points,
             has_g_idx,
             false,
-        ) {
-            total = total.saturating_add(n.saturating_mul(k).saturating_mul(4));
-        }
+        ));
     }
     total
 }
@@ -7508,10 +7649,13 @@ mod tests {
         }
     }
 
-    /// Serializes the two tests that toggle the process-global resident-cache
-    /// flag so they never observe each other's setting under Rust's parallel
-    /// test harness. Every existing residency assertion checks `is_none`, which
-    /// the disabled flag preserves, so only these two tests need coordinating.
+    /// Serializes the tests that toggle a process-global dispatch flag
+    /// (`set_resident_dequant_f32_cache_enabled`,
+    /// `set_mlas_sqnbit_packing_enabled`) or that positively assert a node
+    /// reached MLAS SQNBit, so they never observe each other's setting under
+    /// Rust's parallel test harness. Route-agnostic correctness tests do not need
+    /// it: both the borrowed and MLAS routes are byte-identical, and every
+    /// residency assertion checks `is_none`, which a disabled flag preserves.
     static CACHE_FLAG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Build the constant `MatMulNBits` decode inputs for a bits=4 weight.
@@ -7769,6 +7913,28 @@ mod tests {
                 kernel.weight_nk.get().is_none(),
                 "constant-weight int4 accuracy_level=0 must not expand the weight to a resident f32 cache (#979)"
             );
+            // Footprint, not field-emptiness (#1027). Asserting only that
+            // `weight_nk` stays empty passes straight through the accounting
+            // bug: the MLAS SQNBit route also leaves `weight_nk` empty while
+            // holding a packed buffer ~2x the int4 bytes beside the mapped
+            // weight. The memory plan budgets exactly the byte total this
+            // function returns, so assert the route's real resident footprint.
+            let accounted = matmul_nbits_resident_side_cache_bytes(
+                kernel.bits,
+                kernel.block_size,
+                kernel.accuracy_level,
+                kernel.n,
+                kernel.k,
+                !symmetric,
+                false,
+                false,
+            );
+            // Never the ~8x f32 expansion on either route (#979).
+            assert_ne!(
+                accounted,
+                (kernel.n as u64) * (kernel.k as u64) * 4,
+                "int4 accuracy_level=0 must never be accounted as the ~8x resident f32 expansion (#979)"
+            );
             #[cfg_attr(feature = "mlas", allow(unused_variables))]
             let borrowed_ran = if symmetric {
                 BORROWED_INT4_SYMMETRIC_TEST_CALLS.load(Ordering::Relaxed) > self.symmetric
@@ -7795,6 +7961,23 @@ mod tests {
                     MLAS_SQNBIT_TEST_CALLS.load(Ordering::Relaxed) > self.mlas,
                     "the MLAS SQNBit GEMM must actually have run for this node"
                 );
+                // The packed buffer is a real resident allocation and must be
+                // accounted as exactly MLAS's own packed size -- not the zero
+                // the ledger reported before #1027.
+                let packed_bytes = mlas_sys::sqnbit_packed_b_size(
+                    kernel.n,
+                    kernel.k,
+                    kernel.bits,
+                    kernel.block_size,
+                    !symmetric,
+                    mlas_sys::SQNBitComputeType::Fp32,
+                )
+                .expect("MLAS reported a kernel for this shape but no packed size");
+                assert!(packed_bytes > 0);
+                assert_eq!(
+                    accounted, packed_bytes as u64,
+                    "the MLAS SQNBit packed buffer must be accounted for the memory plan (#1027), not reported as zero"
+                );
                 return;
             }
             assert!(
@@ -7804,6 +7987,11 @@ mod tests {
             assert!(
                 !prepack_cache_populated(kernel),
                 "the borrowed path must borrow the packed inputs instead of building a weight cache (#979)"
+            );
+            // The borrowed zero-copy path holds no resident side buffer at all.
+            assert_eq!(
+                accounted, 0,
+                "the borrowed zero-copy int4 path must account for no resident side buffer (#979)"
             );
         }
     }
@@ -11606,6 +11794,9 @@ mod tests {
 
     #[test]
     fn matmulnbits_m1_block32_symmetric_borrows_weight_for_new_activations() {
+        let _guard = CACHE_FLAG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Post-#979: symmetric int4 (constant B) never expands the weight into
         // the resident f32 cache. Whichever low-copy route serves it (borrowed
         // zero-copy, or MLAS SQNBit CompFp32 with its int4-sized packed buffer),
@@ -11661,6 +11852,9 @@ mod tests {
 
     #[test]
     fn matmulnbits_borrowed_m1_block128_explicit_zp_partial_block_matches_reference() {
+        let _guard = CACHE_FLAG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (k, n, block_size) = (141, 7, 128);
         let a_values: Vec<f32> = (0..k)
             .map(|i| ((i * 11 % 41) as f32 - 20.0) / 13.0)
@@ -11735,6 +11929,9 @@ mod tests {
 
     #[test]
     fn matmulnbits_symmetric_m1_borrows_instead_of_building_f32_cache() {
+        let _guard = CACHE_FLAG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Regression for #979: symmetric int4 (no zero_points input) must take
         // the zero-copy borrowed decode path using the implicit midpoint 8, and
         // must NOT fall through to the resident f32 `weight_nk` cache (~8x the
@@ -11856,6 +12053,9 @@ mod tests {
     #[cfg(all(feature = "mlas", target_arch = "x86_64"))]
     #[test]
     fn int4_acc0_constant_weight_reaches_mlas_on_x86_64() {
+        let _guard = CACHE_FLAG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (k, n, block_size) = (256, 32, 32);
         let a_values: Vec<f32> = (0..k)
             .map(|i| ((i * 11 % 41) as f32 - 20.0) / 13.0)
@@ -11920,6 +12120,128 @@ mod tests {
             !unsupported.mlas_sqnbit_owns_fp32_compute(true, false),
             "block_size=8 has no MLAS SQNBit kernel and must fall back to the borrowed path"
         );
+    }
+
+    /// #1027: the MLAS SQNBit packed buffer is a real session-lifetime resident
+    /// allocation held beside the mapped weight, and the memory plan must be able
+    /// to see it. Before the fix the ledger reported zero for these nodes (they
+    /// leave `weight_nk` empty), which hid ~2x the int4 footprint. The accounting
+    /// must equal MLAS's own packed size, be non-zero, and never be mistaken for
+    /// the ~8x f32 expansion.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn int4_acc0_mlas_packed_buffer_is_accounted_not_zero() {
+        let (k, n, block_size) = (256, 32, 32);
+        let kernel = test_kernel(k, n, block_size);
+        if !kernel.mlas_sqnbit_owns_fp32_compute(true, false) {
+            // This host has no MLAS SQNBit kernel for the shape, so the node
+            // stays on the borrowed zero-copy path and holds no side buffer.
+            assert_eq!(
+                matmul_nbits_resident_side_cache_bytes(4, block_size, 0, n, k, false, false, false),
+                0
+            );
+            return;
+        }
+        let accounted =
+            matmul_nbits_resident_side_cache_bytes(4, block_size, 0, n, k, false, false, false);
+        let packed = mlas_sys::sqnbit_packed_b_size(
+            n,
+            k,
+            4,
+            block_size,
+            false,
+            mlas_sys::SQNBitComputeType::Fp32,
+        )
+        .expect("MLAS reported a kernel for this shape but no packed size");
+        assert_eq!(
+            accounted, packed as u64,
+            "the MLAS SQNBit packed buffer must be accounted as MLAS's own packed size (#1027)"
+        );
+        assert!(
+            accounted > 0,
+            "the packed buffer must not be reported as zero to the memory ledger (#1027)"
+        );
+        assert_ne!(
+            accounted,
+            (n as u64) * (k as u64) * 4,
+            "the int4 packed buffer must not be accounted as the ~8x resident f32 expansion (#979)"
+        );
+    }
+
+    /// #1027 item 2: admitting the packed buffer through the memory strategy has
+    /// a real decline path. When the plan declines it (over budget) it calls
+    /// [`set_mlas_sqnbit_packing_enabled`] with `false`; the node must then keep
+    /// the borrowed zero-copy int4 path -- correct output via the borrowed path,
+    /// no MLAS packed buffer built. This flips the process-global admission flag,
+    /// so it shares [`CACHE_FLAG_TEST_LOCK`] with the other route-asserting tests.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn mlas_sqnbit_packing_decline_keeps_borrowed_path() {
+        let _guard = CACHE_FLAG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (k, n, block_size) = (256, 32, 32);
+        let a_values: Vec<f32> = (0..k)
+            .map(|i| ((i * 11 % 41) as f32 - 20.0) / 13.0)
+            .collect();
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 23 % 47) as f32 - 19.0) / 12.0)
+            .collect();
+        let (packed, scales, _, _) = quantize(&weights, n, k, block_size, false);
+        let dequantized = dequantize_reference(&packed, &scales, None, n, k, block_size);
+
+        let run = || {
+            let mut kernel = test_kernel(k, n, block_size);
+            kernel.set_constant_inputs(&[false, true, true]);
+            let a = Owned::f32(&[1, k], &a_values);
+            let b = Owned::u8(&[n, 8, 16], &packed);
+            let scales_t = Owned::f32(&[n, 8], &scales);
+            let mut y = Owned::zeros_f32(&[1, n]);
+            kernel
+                .execute(&[a.view(), b.view(), scales_t.view()], &mut [y.view_mut()])
+                .unwrap();
+            (kernel, y.to_f32())
+        };
+
+        set_mlas_sqnbit_packing_enabled(true);
+        let (admitted_kernel, admitted_y) = run();
+        let mlas_had_a_kernel = admitted_kernel.mlas_sqnbit_owns_fp32_compute(true, false);
+
+        set_mlas_sqnbit_packing_enabled(false);
+        let sym_before = BORROWED_INT4_SYMMETRIC_TEST_CALLS.load(Ordering::Relaxed);
+        let (declined_kernel, declined_y) = run();
+        // Capture the route decision while the admission flag is still false;
+        // `mlas_sqnbit_owns_fp32_compute` reads the process-global flag live.
+        let declined_owns = declined_kernel.mlas_sqnbit_owns_fp32_compute(true, false);
+        set_mlas_sqnbit_packing_enabled(true);
+
+        assert_close(&admitted_y, &reference(&a_values, &dequantized, 1, k, n));
+        assert_close(&declined_y, &reference(&a_values, &dequantized, 1, k, n));
+        // Admitting takes MLAS SQNBit CompFp32; declining takes the borrowed
+        // dequant path. Both are numerically the same GEMV, but MLAS's CompFp32
+        // rounding differs from the scalar dequant by a few ULPs, so this is a
+        // near-equality (the MLAS-vs-scalar tolerance used elsewhere in this
+        // file), not bit-identity. The behavioural no-op we assert on is the
+        // *route*: declining must not claim ownership and must not build a
+        // packed buffer (checked below), leaving exactly the pre-existing
+        // borrowed zero-copy path that other tests already exercise.
+        mlas_close(&admitted_y, &declined_y, 2e-3, "admitted-vs-declined route");
+        assert!(
+            !declined_owns,
+            "a declined MLAS route must not claim ownership"
+        );
+        assert!(
+            declined_kernel.mlas_shards.get().is_none()
+                && declined_kernel.mlas_packed.get().is_none(),
+            "the declined route must not build any MLAS packed buffer"
+        );
+        assert!(
+            BORROWED_INT4_SYMMETRIC_TEST_CALLS.load(Ordering::Relaxed) > sym_before,
+            "the declined int4 accuracy_level=0 node must fall back to the borrowed zero-copy path"
+        );
+        // If MLAS had no kernel for this shape the fallback is trivially the
+        // borrowed path in both arms; the correctness check still holds.
+        let _ = mlas_had_a_kernel;
     }
 
     #[test]

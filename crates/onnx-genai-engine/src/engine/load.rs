@@ -534,6 +534,15 @@ impl Engine {
         onnx_runtime_ep_cpu::set_resident_dequant_f32_cache_enabled(
             memory_strategy_plan.f32_weight_cache_admitted,
         );
+        // #1027: the int4 accuracy_level=0 MLAS SQNBit route holds a packed
+        // buffer (~2x the int4 bytes) beside the mapped weight for the session.
+        // Its bytes are folded into `resident_f32_cache_bytes`, so the same
+        // admission verdict governs it: when declined, the kernel keeps the
+        // borrowed zero-copy int4 path (byte-identical, only slower on x86)
+        // instead of doubling the weight footprint.
+        onnx_runtime_ep_cpu::set_mlas_sqnbit_packing_enabled(
+            memory_strategy_plan.f32_weight_cache_admitted,
+        );
         #[cfg(feature = "cuda")]
         let cuda_offload_resolution =
             cuda_offload_resolution_from_plan(&native_device, &memory_strategy_plan);

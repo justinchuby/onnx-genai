@@ -194,16 +194,19 @@ pub(crate) fn build_memory_strategy_plan(input: MemoryStrategyPlanInput<'_>) -> 
     // still has its weights demonstrably resident in host RAM, and whether they
     // fit there is knowable. #947 must stop us fabricating a device size; it
     // must not stop us stating a residency we can measure.
-    // #971: the native CPU `MatMulNBits` generic decode path holds a resident
-    // f32 dequant cache ~8x the packed weight for the whole session. That trade
-    // buys ~2.4x decode throughput when it fits and collapses to paging (~50x
-    // slower) when it does not. `resident_f32_cache_bytes` is the predicted
-    // expansion (0 on backends/models that never take the path). The plan
-    // governs the trade here: admit the cache only when the *expanded* footprint
-    // fits the residency budget, else decline it -- the kernels then dequantize
-    // on the fly, so the runtime holds only the on-disk weights. The reported
-    // weight figure follows the decision so it states what the runtime will
-    // actually hold, not an on-disk number ~8x too small.
+    // #971/#1027: the native CPU `MatMulNBits` decode kernels may hold a resident
+    // side buffer beside the on-disk weights for the whole session -- either the
+    // generic f32 dequant cache (~8x the packed weight, #971) or the int4
+    // accuracy_level=0 MLAS SQNBit packed buffer (~2x the int4 bytes, #1027).
+    // Either trade buys a large decode speedup when it fits and collapses to
+    // paging when it does not. `resident_f32_cache_bytes` is the predicted total
+    // of those buffers (0 on backends/models that take neither path). The plan
+    // governs the trade here: admit only when the *expanded* footprint fits the
+    // residency budget, else decline -- the f32 kernels then dequantize on the
+    // fly and the MLAS int4 route falls back to the borrowed zero-copy path, so
+    // the runtime holds only the on-disk weights. The reported weight figure
+    // follows the decision so it states what the runtime will actually hold, not
+    // an on-disk number that omits the resident side buffer.
     let on_disk_weight_bytes = input.model_weight_bytes;
     let expanded_weight_bytes = on_disk_weight_bytes.saturating_add(input.resident_f32_cache_bytes);
     let f32_weight_cache_admitted = if input.resident_f32_cache_bytes == 0 {

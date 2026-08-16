@@ -72,6 +72,7 @@ pub use kernels::matmul_nbits::bound_process_to_decode_budget;
 pub use kernels::matmul_nbits::set_decode_thread_budget;
 pub use kernels::matmul_nbits::with_decode_pool_scope;
 pub use kernels::matmul_nbits::{
-    matmul_nbits_decode_caches_dequant_f32, resident_dequant_f32_cache_bytes,
+    matmul_nbits_decode_caches_dequant_f32, matmul_nbits_resident_side_cache_bytes,
+    resident_dequant_f32_cache_bytes, set_mlas_sqnbit_packing_enabled,
     set_resident_dequant_f32_cache_enabled,
 };
