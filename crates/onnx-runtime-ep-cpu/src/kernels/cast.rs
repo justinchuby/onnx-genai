@@ -403,6 +403,22 @@ fn cast_contiguous(input: &TensorView, output: &mut TensorMut, to: DataType) -> 
         return Ok(false);
     };
 
+    // Resolve lane eligibility once, before any work. `elem_size` succeeds for
+    // several dtypes this path has no lane for (`Uint64`, `Complex64/128`, the
+    // `Float8*` family), so without this the loop below would decode a whole
+    // batch only to discover the target is unsupported. Hoisting it also makes
+    // the invariant explicit: past this point both `with_lane!` sites are
+    // `Some`, so the loop cannot bail after writing to `dst`.
+    let src_lane = with_lane!(input.dtype, S, <S as DecodeLane>::SIZE);
+    let dst_lane = with_lane!(to, D, <D as EncodeLane>::SIZE);
+    let (Some(src_lane), Some(dst_lane)) = (src_lane, dst_lane) else {
+        return Ok(false);
+    };
+    // The staging loop slices by `elem_size` but each lane decodes/encodes
+    // `SIZE` bytes; they must agree or the walk would shear.
+    debug_assert_eq!(src_lane, src_esize);
+    debug_assert_eq!(dst_lane, dst_esize);
+
     // The generic path materialises the whole result before touching the
     // output, so it tolerates an aliasing in-place Cast; this one writes as it
     // reads. No current caller aliases (`can_run_in_place` is false for Cast),
@@ -431,7 +447,9 @@ fn cast_contiguous(input: &TensorView, output: &mut TensorMut, to: DataType) -> 
     let mut done = 0usize;
     while done < n {
         let len = CAST_STAGE_CHUNK.min(n - done);
-        let decoded = with_lane!(
+        // Both unwraps are guarded by the eligibility check above; the dtype
+        // pair is invariant for the whole call.
+        with_lane!(
             input.dtype,
             S,
             decode_run::<S>(
@@ -439,11 +457,9 @@ fn cast_contiguous(input: &TensorView, output: &mut TensorMut, to: DataType) -> 
                 &mut stage,
                 len
             )
-        );
-        if decoded.is_none() {
-            return Ok(false);
-        }
-        let encoded = with_lane!(
+        )
+        .expect("source lane eligibility is checked before the staging loop");
+        with_lane!(
             to,
             D,
             encode_run::<D>(
@@ -451,10 +467,8 @@ fn cast_contiguous(input: &TensorView, output: &mut TensorMut, to: DataType) -> 
                 &mut dst[done * dst_esize..(done + len) * dst_esize],
                 len
             )
-        );
-        if encoded.is_none() {
-            return Ok(false);
-        }
+        )
+        .expect("target lane eligibility is checked before the staging loop");
         done += len;
     }
     Ok(true)
@@ -481,10 +495,23 @@ fn cast_contiguous_simd(
         use crate::dtype::{bf16x, f16c};
         // SAFETY (all four arms): `src`/`dst` were built above from validated
         // contiguous views holding exactly `n` elements of the stated dtype, so
-        // reinterpreting their bytes as `n` `u16`/`f32` lanes is in bounds and
-        // correctly aligned for the unaligned loads these helpers use.
+        // reinterpreting their bytes as `n` `u16`/`f32` lanes is in bounds.
+        //
+        // On alignment: the helpers themselves issue *unaligned* loads and
+        // stores, but `from_raw_parts` requires the slice *reference* to be
+        // aligned regardless. `validate_view` only pins `byte_offset % esize`,
+        // so this rests on the tensor base pointer being at least 4-byte
+        // aligned -- which every allocator in the path provides (ORT's arena
+        // and the system allocator both return >= 16-byte-aligned blocks). The
+        // `debug_assert`s below trip in debug builds if that ever stops holding.
+        // This is the same assumption already made by `dense_elementwise`,
+        // `add`, `elementwise` and `activations`; it is not introduced here.
         match (from, to) {
             (DataType::Float16, DataType::Float32) if f16c::available() => {
+                debug_assert_eq!(src.as_ptr().align_offset(align_of::<u16>()), 0);
+                debug_assert_eq!(dst.as_ptr().align_offset(align_of::<f32>()), 0);
+                debug_assert_eq!(src.as_ptr().align_offset(align_of::<u16>()), 0);
+                debug_assert_eq!(dst.as_ptr().align_offset(align_of::<f32>()), 0);
                 let s = unsafe { std::slice::from_raw_parts(src.as_ptr().cast::<u16>(), n) };
                 let d =
                     unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<f32>(), n) };
@@ -492,6 +519,10 @@ fn cast_contiguous_simd(
                 true
             }
             (DataType::Float32, DataType::Float16) if f16c::available() => {
+                debug_assert_eq!(src.as_ptr().align_offset(align_of::<f32>()), 0);
+                debug_assert_eq!(dst.as_ptr().align_offset(align_of::<u16>()), 0);
+                debug_assert_eq!(src.as_ptr().align_offset(align_of::<f32>()), 0);
+                debug_assert_eq!(dst.as_ptr().align_offset(align_of::<u16>()), 0);
                 let s = unsafe { std::slice::from_raw_parts(src.as_ptr().cast::<f32>(), n) };
                 let d =
                     unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u16>(), n) };
