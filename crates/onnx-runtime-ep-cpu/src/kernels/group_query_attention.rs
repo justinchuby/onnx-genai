@@ -49,6 +49,34 @@ const MIN_PARALLEL_ATTENTION_WORK: usize = 160 * 1024;
 // 256 KiB per worker the fan-out loses, at 1 MiB it wins by 1.3x-1.4x.
 const MIN_PARALLEL_PRESENT_BYTES_PER_WORKER: usize = 512 * 1024;
 
+/// Counts fills that took the pooled arm, so a test can prove the fan-out ran
+/// rather than silently falling back to the serial loop.
+#[cfg(test)]
+static PRESENT_POOLED_FILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Test-only override of [`MIN_PARALLEL_PRESENT_BYTES_PER_WORKER`], so the
+/// fan-out can be exercised at a cache size that is cheap to build and to
+/// compare exhaustively. `usize::MAX` means "use the production constant".
+#[cfg(test)]
+static PRESENT_PARALLEL_BYTES_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+#[cfg(test)]
+fn min_parallel_present_bytes_per_worker() -> usize {
+    let override_value = PRESENT_PARALLEL_BYTES_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if override_value == usize::MAX {
+        MIN_PARALLEL_PRESENT_BYTES_PER_WORKER
+    } else {
+        override_value
+    }
+}
+
+#[cfg(not(test))]
+#[inline]
+fn min_parallel_present_bytes_per_worker() -> usize {
+    MIN_PARALLEL_PRESENT_BYTES_PER_WORKER
+}
+
 // Flash-decoding (split-KV) engages only when a single head's attended KV window
 // is at least this long: below it the per-head path already parallelizes well
 // enough that the split's extra fork-join, per-call scratch allocation, and
@@ -188,6 +216,37 @@ impl PresentScratchOverride {
 impl Drop for PresentScratchOverride {
     fn drop(&mut self) {
         PRESENT_DIRECT_OVERRIDE.store(-1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Number of present fills that used the pooled arm (tests only).
+#[cfg(test)]
+fn pooled_fill_count() -> u64 {
+    PRESENT_POOLED_FILLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Lowers the fan-out gate for the lifetime of the guard so a test can drive
+/// the pooled fill at a cache size small enough to compare exhaustively.
+#[cfg(test)]
+struct PresentParallelOverride {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl PresentParallelOverride {
+    fn bytes_per_worker(bytes: usize) -> Self {
+        let guard = PRESENT_DIRECT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        PRESENT_PARALLEL_BYTES_OVERRIDE.store(bytes, std::sync::atomic::Ordering::Relaxed);
+        Self { _guard: guard }
+    }
+}
+
+#[cfg(test)]
+impl Drop for PresentParallelOverride {
+    fn drop(&mut self) {
+        PRESENT_PARALLEL_BYTES_OVERRIDE.store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -926,6 +985,23 @@ impl GroupQueryAttentionKernel {
         if overlaps(k_span, v_span) {
             return false;
         }
+        // The attention output is written *after* the present buffers on this
+        // path, the reverse of the owned-scratch order, so an aliased
+        // `outputs[0]` would change which write wins. Decline instead.
+        if !outputs[0].is_absent() {
+            let attn_bytes = outputs[0].numel() * outputs[0].dtype.byte_size().max(1);
+            let attn_base =
+                (outputs[0].data.0 as *const u8).wrapping_add(outputs[0].byte_offset) as usize;
+            let attn_span = (attn_base, attn_base.saturating_add(attn_bytes));
+            let attn_alloc = outputs[0].data.0 as usize;
+            if attn_alloc == outputs[1].data.0 as usize
+                || attn_alloc == outputs[2].data.0 as usize
+                || overlaps(k_span, attn_span)
+                || overlaps(v_span, attn_span)
+            {
+                return false;
+            }
+        }
         let k_alloc = outputs[1].data.0 as usize;
         let v_alloc = outputs[2].data.0 as usize;
         for view in inputs.iter().take(5) {
@@ -1004,7 +1080,9 @@ impl GroupQueryAttentionKernel {
         // threshold a single-threaded pass is both faster and cheaper.
         let workers = crate::kernels::matmul_nbits::active_decode_worker_count().max(1);
         let per_worker_bytes = row_len * size_of::<f32>() * rows.div_ceil(workers.min(rows.max(1)));
-        if rows > 1 && workers > 1 && per_worker_bytes >= MIN_PARALLEL_PRESENT_BYTES_PER_WORKER {
+        if rows > 1 && workers > 1 && per_worker_bytes >= min_parallel_present_bytes_per_worker() {
+            #[cfg(test)]
+            PRESENT_POOLED_FILLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             crate::kernels::matmul_nbits::decode_parallel_output_row_blocks(
                 present_k,
                 row_len,
@@ -4505,6 +4583,23 @@ mod tests {
             }
         }
 
+        /// Same geometry, but each batch carries its own `seqlens_k`, so the
+        /// attended prefix and the zeroed tail differ from row to row.
+        fn with_seqlens(
+            heads: usize,
+            kv_heads: usize,
+            dim: usize,
+            capacity: usize,
+            seqlens: &[i32],
+        ) -> Self {
+            let batch = seqlens.len();
+            let total = seqlens.iter().copied().max().unwrap_or(0) + 1;
+            let mut case = Self::new(batch, heads, kv_heads, dim, total as usize - 1, capacity);
+            case.seqlens_k = seqlens.to_vec();
+            case.total = total;
+            case
+        }
+
         fn run(&self, kernel: &dyn Kernel) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
             let mut out = Owned::zeros_f32(&self.out_shape);
             let mut present_key = Owned::zeros_f32(&self.present_shape);
@@ -4529,6 +4624,99 @@ mod tests {
                 .unwrap();
             (out.to_f32(), present_key.to_f32(), present_value.to_f32())
         }
+    }
+
+    /// The pooled fill must produce exactly the bytes the single-threaded fill
+    /// does. The gate is lowered rather than the cache enlarged so the whole
+    /// present tensor stays small enough to compare element by element, and the
+    /// geometry uses per-batch-differing `seqlens_k` so every row has a
+    /// different attended length and a different zeroed tail — an off-by-one in
+    /// the `row_index -> (batch, kv-head)` mapping cannot survive it.
+    #[test]
+    fn pooled_present_fill_is_bit_identical_to_the_serial_fill() {
+        let kernel = gqa_kernel_with_heads(8, 4, &[]);
+        // 4 batches x 4 kv-heads = 16 disjoint rows, capacity 24, dim 8.
+        let case = PresentCase::with_seqlens(8, 4, 8, 24, &[3, 11, 23, 17]);
+
+        let serial = {
+            let _gate = PresentParallelOverride::bytes_per_worker(usize::MAX - 1);
+            case.run(kernel.as_ref())
+        };
+        let serial_fills = pooled_fill_count();
+        let pooled = {
+            let _gate = PresentParallelOverride::bytes_per_worker(1);
+            case.run(kernel.as_ref())
+        };
+
+        assert_eq!(serial.0, pooled.0, "attention output diverged");
+        assert_eq!(serial.1, pooled.1, "present_key diverged");
+        assert_eq!(serial.2, pooled.2, "present_value diverged");
+
+        // Falsifier for the gate itself: on any host with more than one decode
+        // worker the lowered threshold must actually have engaged the pooled
+        // arm, so the two arms above are not both the serial code path.
+        if crate::kernels::matmul_nbits::active_decode_worker_count() > 1 {
+            assert!(
+                pooled_fill_count() > serial_fills,
+                "lowered gate did not engage the pooled fill"
+            );
+        }
+    }
+
+    /// A half-precision past cache widened straight into f32 graph outputs is
+    /// the layout real models use, and it exercises `widen_run` on the direct
+    /// arm. It must still match the owned-scratch arm bit for bit, including
+    /// the per-batch tails.
+    #[test]
+    fn direct_present_matches_scratch_with_an_f16_past_cache() {
+        let kernel = gqa_kernel_with_heads(4, 2, &[]);
+        let (batch, heads, kv_heads, dim, capacity) = (2usize, 4usize, 2usize, 8usize, 12usize);
+        let seqlens: [i32; 2] = [4, 9];
+        let total = seqlens.iter().copied().max().unwrap() + 1;
+        let past_bits: Vec<u16> = (0..batch * kv_heads * capacity * dim)
+            .map(|i| ((i * 37 + 11) % 30000) as u16)
+            .collect();
+        let make = |n: usize, salt: u64| -> Vec<f32> {
+            (0..n).map(|i| mixed_scale_value(i, salt)).collect()
+        };
+        let query = make(batch * heads * dim, 0x71);
+        let key = make(batch * kv_heads * dim, 0x72);
+        let value = make(batch * kv_heads * dim, 0x73);
+        let present_shape = [batch, kv_heads, capacity.max(total as usize), dim];
+
+        let run = || {
+            let mut out = Owned::zeros_f32(&[batch, 1, heads * dim]);
+            let mut present_key = Owned::zeros_f32(&present_shape);
+            let mut present_value = Owned::zeros_f32(&present_shape);
+            kernel
+                .execute(
+                    &[
+                        Owned::f32(&[batch, 1, heads * dim], &query).view(),
+                        Owned::f32(&[batch, 1, kv_heads * dim], &key).view(),
+                        Owned::f32(&[batch, 1, kv_heads * dim], &value).view(),
+                        Owned::f16_bits(&[batch, kv_heads, capacity, dim], &past_bits).view(),
+                        Owned::f16_bits(&[batch, kv_heads, capacity, dim], &past_bits).view(),
+                        Owned::i32(&[batch], &seqlens).view(),
+                        Owned::i32(&[], &[total]).view(),
+                    ],
+                    &mut [
+                        out.view_mut(),
+                        present_key.view_mut(),
+                        present_value.view_mut(),
+                    ],
+                )
+                .unwrap();
+            (out.to_f32(), present_key.to_f32(), present_value.to_f32())
+        };
+
+        let scratch = {
+            let _forced = PresentScratchOverride::forced();
+            run()
+        };
+        let direct = run();
+        assert_eq!(scratch.0, direct.0, "attention output diverged");
+        assert_eq!(scratch.1, direct.1, "present_key diverged");
+        assert_eq!(scratch.2, direct.2, "present_value diverged");
     }
 
     /// Building the present cache inside the graph outputs must produce the
