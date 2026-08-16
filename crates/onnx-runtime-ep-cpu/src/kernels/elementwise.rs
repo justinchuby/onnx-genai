@@ -391,8 +391,10 @@ fn binary_contiguous_typed<T: NumericElem>(
 }
 
 /// Elements converted per staged pass when a 16-bit float binary op runs
-/// through the `f32` compute domain. Three `f32` buffers of this length are
-/// 12 KiB total, so a pass stays resident in L1 next to the 16-bit chunks.
+/// through the `f32` compute domain. The two `f32` staging buffers of this
+/// length are 8 KiB total, so a pass stays resident in L1 next to the 16-bit
+/// chunks. Matches `F16_STAGE_CHUNK` in `dense_elementwise`, which stages the
+/// unary paths the same way.
 const HALF_STAGE_CHUNK: usize = 1024;
 
 /// The two 16-bit float storages whose `NumericElem::Acc` is `f32`.
