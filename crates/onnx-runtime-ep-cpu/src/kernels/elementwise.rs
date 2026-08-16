@@ -395,6 +395,10 @@ fn binary_contiguous_typed<T: NumericElem>(
 /// length are 8 KiB total, so a pass stays resident in L1 next to the 16-bit
 /// chunks. Matches `F16_STAGE_CHUNK` in `dense_elementwise`, which stages the
 /// unary paths the same way.
+///
+/// Only the x86 staging path consumes this; on other targets `try_half_binary`
+/// declines unconditionally and the constant would be dead code.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 const HALF_STAGE_CHUNK: usize = 1024;
 
 /// The two 16-bit float storages whose `NumericElem::Acc` is `f32`.
