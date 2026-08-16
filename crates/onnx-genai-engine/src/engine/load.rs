@@ -566,12 +566,18 @@ impl Engine {
         );
         #[cfg(feature = "cuda")]
         tracing::info!(
+            // The device actually resolved, not the compiled-in feature. This
+            // line used to say "CUDA" on every run of a CUDA-enabled build,
+            // including ones that resolved to the CPU because the model declared
+            // no execution provider -- which reads as confirmation that you are
+            // on the GPU when you are not (#1064).
+            device = ?native_device,
             managed_no_spill = cuda_offload_resolution
                 .is_some_and(|resolution| resolution.policy.managed_no_spill),
             dynamic_lending = dynamic_lending_enabled(),
             governed_physical_pool,
             weight_reservation_bytes,
-            "resolved CUDA device-memory strategy before governor creation"
+            "resolved device-memory strategy before governor creation"
         );
         #[cfg(not(feature = "cuda"))]
         let weight_reservation_bytes = device_weight_reservation_for(
