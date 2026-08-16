@@ -21,7 +21,9 @@
 //! Stability: each reduction slice subtracts its max before `exp`, so large
 //! logits (e.g. masked-attention `-inf`/`1e9` fills) never overflow.
 
-use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
+use crate::dtype::{
+    output_direct_write_eligible, slice_byte_range, to_dense_f32_widen, write_dense_f32_narrow,
+};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
 use onnx_runtime_ir::Node;
 
@@ -62,6 +64,116 @@ impl KernelFactory for SoftmaxLegacyFactory {
     }
 }
 
+/// Rows below which the row-major softmax stays on one thread. A row is at
+/// least a few hundred bytes of streaming work, so the crossover is set by the
+/// pool's wake-up cost rather than by cache residency; 64 rows of any realistic
+/// width clears it comfortably.
+const MIN_PARALLEL_SOFTMAX_ROWS: usize = 64;
+
+/// Elements below which the row-major softmax stays on one thread, so that a
+/// tall-and-very-thin tensor (many rows of 2) does not pay for a fan-out that
+/// buys nothing.
+const MIN_PARALLEL_SOFTMAX_ELEMENTS: usize = 16 * 1024;
+
+/// Numerically stable row-major softmax of `n` contiguous rows of `d` elements,
+/// in place.
+///
+/// This is the shape every attention score matrix has, and the reason the
+/// operator is worth vectorising at all: the scalar form costs one `f32::exp`
+/// libm call per element. With `mlas` this hands each row to `MlasComputeSoftmax`
+/// — the *same* primitive ONNX Runtime's own `Softmax` and attention kernels
+/// use, which finds the row max, evaluates `exp` through a polynomial on 8
+/// lanes at a time and normalizes, in one pass over the row.
+///
+/// Rows are independent, so the outer loop fans out across the shared Rayon
+/// pool once the tensor is large enough to pay for it. ORT parallelizes the
+/// identical loop; leaving it serial is what made this kernel lose by a factor
+/// that *grew* with the thread count.
+pub(crate) fn softmax_rows_in_place(data: &mut [f32], n: usize, d: usize) {
+    debug_assert_eq!(data.len(), n * d);
+    if d == 0 || n == 0 {
+        return;
+    }
+    if let Some(rows_per_task) = parallel_rows_per_task(n, d) {
+        use rayon::prelude::*;
+        data.par_chunks_mut(rows_per_task * d).for_each(|chunk| {
+            softmax_rows_serial(chunk, chunk.len() / d, d);
+        });
+    } else {
+        softmax_rows_serial(data, n, d);
+    }
+}
+
+/// Out-of-place row-major softmax: `src` and `dst` are `n × d` and disjoint.
+///
+/// The copy is done *inside* the fan-out rather than as a separate pass, so a
+/// tall score matrix is touched once per worker instead of once serially and
+/// then again in parallel.
+pub(crate) fn softmax_rows(src: &[f32], dst: &mut [f32], n: usize, d: usize) {
+    debug_assert_eq!(src.len(), n * d);
+    debug_assert_eq!(dst.len(), n * d);
+    if d == 0 || n == 0 {
+        return;
+    }
+    if let Some(rows_per_task) = parallel_rows_per_task(n, d) {
+        use rayon::prelude::*;
+        let block = rows_per_task * d;
+        dst.par_chunks_mut(block)
+            .zip(src.par_chunks(block))
+            .for_each(|(out, inp)| {
+                out.copy_from_slice(inp);
+                softmax_rows_serial(out, out.len() / d, d);
+            });
+    } else {
+        dst.copy_from_slice(src);
+        softmax_rows_serial(dst, n, d);
+    }
+}
+
+/// `Some(rows_per_task)` when a fan-out is worth it, `None` to stay serial.
+fn parallel_rows_per_task(n: usize, d: usize) -> Option<usize> {
+    if n < MIN_PARALLEL_SOFTMAX_ROWS || n.saturating_mul(d) < MIN_PARALLEL_SOFTMAX_ELEMENTS {
+        return None;
+    }
+    let workers = rayon::current_num_threads().max(1);
+    if workers < 2 {
+        return None;
+    }
+    // Whole rows per task, so each chunk is a valid `n' × d` sub-matrix and
+    // MLAS is invoked once per chunk rather than once per row.
+    Some(n.div_ceil(workers).max(1))
+}
+
+#[cfg(feature = "mlas")]
+fn softmax_rows_serial(data: &mut [f32], n: usize, d: usize) {
+    mlas_sys::compute_softmax_in_place(data, n, d);
+}
+
+/// Portable fallback with the same semantics: subtract the row max, `exp`,
+/// normalize. Kept exact against the MLAS path by the parity tests below.
+#[cfg(not(feature = "mlas"))]
+fn softmax_rows_serial(data: &mut [f32], n: usize, d: usize) {
+    for row in data.chunks_mut(d) {
+        let mut max = f32::NEG_INFINITY;
+        for &v in row.iter() {
+            if v > max {
+                max = v;
+            }
+        }
+        let mut sum = 0.0f32;
+        for v in row.iter_mut() {
+            let e = (*v - max).exp();
+            *v = e;
+            sum += e;
+        }
+        let inv = 1.0 / sum;
+        for v in row.iter_mut() {
+            *v *= inv;
+        }
+    }
+    let _ = n;
+}
+
 /// Softmax `n` independent contiguous rows of `axis_dim` elements each over the
 /// stride-`inner` interleaving: element `a` of slice `(o, i)` lives at
 /// `o·axis_dim·inner + a·inner + i`. With `inner == 1` this is a plain
@@ -71,6 +183,11 @@ impl KernelFactory for SoftmaxLegacyFactory {
 /// softmaxes the last axis of the scaled/masked scores as its middle stage —
 /// reusing this single numerically-stable implementation instead of duplicating
 /// the max-subtract/exp/normalize loop.
+///
+/// `inner == 1` is the overwhelmingly common case (softmax over the last axis)
+/// and is routed to [`softmax_rows_in_place`]; only a genuine interior-axis
+/// reduction takes the strided loop, where the gather makes vectorisation
+/// unprofitable anyway.
 pub(crate) fn softmax_slices(
     x: &[f32],
     out: &mut [f32],
@@ -78,6 +195,11 @@ pub(crate) fn softmax_slices(
     axis_dim: usize,
     inner: usize,
 ) {
+    if inner == 1 {
+        let len = outer * axis_dim;
+        softmax_rows(&x[..len], &mut out[..len], outer, axis_dim);
+        return;
+    }
     for o in 0..outer {
         for i in 0..inner {
             let base = o * axis_dim * inner + i;
@@ -138,23 +260,46 @@ impl Kernel for SoftmaxKernel {
                 .saturating_add(slices)
         });
 
-        let mut out = vec![0.0f32; numel(shape)];
+        let len = numel(shape);
+        // Softmax reads every input element before writing the corresponding
+        // output, so a f32 output buffer that does not alias the widened input
+        // can be written straight through - saving a full-tensor scratch
+        // allocation and copy on the dominant f32 path. When `x` borrows the
+        // input (no widening happened) the ranges can genuinely overlap, which
+        // is why the disjointness is checked rather than assumed.
+        let read_ranges = [slice_byte_range(x.as_ref())];
+        let direct = output_direct_write_eligible(&mut outputs[0], len, &read_ranges);
+        let mut owned;
+        let out: &mut [f32] = if direct {
+            // SAFETY: `output_direct_write_eligible` proved the buffer is a
+            // host-accessible contiguous Float32 tensor of exactly `len`
+            // elements whose byte range is disjoint from the input we read.
+            unsafe { std::slice::from_raw_parts_mut(outputs[0].data_ptr_mut::<f32>(), len) }
+        } else {
+            owned = vec![0.0f32; len];
+            &mut owned
+        };
+
         if self.coerce_2d {
             // opset ≤ 12: coerce to 2D `[d_0·…·d_{axis-1}, d_axis·…·d_{n-1}]`
             // and softmax each row over the whole flattened trailing block.
             let rows: usize = shape[..axis].iter().product();
             let cols: usize = shape[axis..].iter().product();
             // Trailing block is contiguous, so `inner == 1`.
-            softmax_slices(&x, &mut out, rows, cols, 1);
+            softmax_slices(&x, out, rows, cols, 1);
         } else {
             // opset ≥ 13: normalize over the single `axis`, viewing the tensor
             // as `[outer, axis_dim, inner]`.
             let axis_dim = shape[axis];
             let outer: usize = shape[..axis].iter().product();
             let inner: usize = shape[axis + 1..].iter().product();
-            softmax_slices(&x, &mut out, outer, axis_dim, inner);
+            softmax_slices(&x, out, outer, axis_dim, inner);
         }
-        write_dense_f32_narrow("Softmax", &mut outputs[0], &out)
+        if direct {
+            Ok(())
+        } else {
+            write_dense_f32_narrow("Softmax", &mut outputs[0], out)
+        }
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {
@@ -333,6 +478,225 @@ mod tests {
             .collect();
         for (got, want) in out.to_bf16_as_f32().into_iter().zip(expected) {
             assert!(got == want || (got.is_nan() && want.is_nan()));
+        }
+    }
+}
+
+#[cfg(test)]
+mod vectorized_tests {
+    use super::*;
+    use crate::kernels::testutil::Owned;
+
+    /// Independent scalar oracle, deliberately written the naive way: the
+    /// implementation under test is allowed to use MLAS, a fan-out, or both.
+    fn reference_rows(src: &[f32], n: usize, d: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; n * d];
+        for r in 0..n {
+            let row = &src[r * d..(r + 1) * d];
+            let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut sum = 0.0f32;
+            for (i, &v) in row.iter().enumerate() {
+                let e = (v - max).exp();
+                out[r * d + i] = e;
+                sum += e;
+            }
+            for i in 0..d {
+                out[r * d + i] /= sum;
+            }
+        }
+        out
+    }
+
+    fn synthetic(n: usize, d: usize, seed: u32) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(2654435761).wrapping_add(1);
+        (0..n * d)
+            .map(|_| {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                ((state >> 8) as f32 / (1u32 << 24) as f32) * 20.0 - 10.0
+            })
+            .collect()
+    }
+
+    /// The fan-out must not change a single bit relative to the serial path:
+    /// rows are independent, so chunking cannot legitimately alter any result.
+    /// Sizes straddle `MIN_PARALLEL_SOFTMAX_ROWS` and
+    /// `MIN_PARALLEL_SOFTMAX_ELEMENTS` in both directions.
+    #[test]
+    fn the_parallel_fan_out_is_bit_identical_to_the_serial_path() {
+        for (n, d) in [
+            (1usize, 1usize),
+            (1, 4096),
+            (63, 512),   // below the row floor
+            (64, 8),     // clears rows, below the element floor
+            (64, 256),   // clears both
+            (4096, 128), // comfortably parallel
+            (129, 1000), // rows not divisible by any worker count
+        ] {
+            let src = synthetic(n, d, (n * 31 + d) as u32);
+            let mut serial = src.clone();
+            softmax_rows_serial(&mut serial, n, d);
+
+            let mut fanned = src.clone();
+            softmax_rows_in_place(&mut fanned, n, d);
+            assert_eq!(serial, fanned, "in-place n={n} d={d}");
+
+            let mut out_of_place = vec![f32::NAN; n * d];
+            softmax_rows(&src, &mut out_of_place, n, d);
+            assert_eq!(serial, out_of_place, "out-of-place n={n} d={d}");
+        }
+    }
+
+    /// ...and the serial path itself must still be a softmax.
+    #[test]
+    fn vectorized_rows_match_the_scalar_reference() {
+        for (n, d) in [(1usize, 1usize), (3, 7), (64, 256), (200, 33)] {
+            let src = synthetic(n, d, (n + d) as u32);
+            let expect = reference_rows(&src, n, d);
+            let mut got = src.clone();
+            softmax_rows_in_place(&mut got, n, d);
+            for (i, (g, e)) in got.iter().zip(&expect).enumerate() {
+                assert!(
+                    (g - e).abs() <= 1e-6,
+                    "n={n} d={d} idx={i}: {g} vs {e} (vectorized exp differs from libm)"
+                );
+            }
+            // Every row must still sum to one.
+            for r in 0..n {
+                let sum: f32 = got[r * d..(r + 1) * d].iter().sum();
+                assert!(
+                    (sum - 1.0).abs() <= 1e-5,
+                    "n={n} d={d} row {r} sums to {sum}"
+                );
+            }
+        }
+    }
+
+    /// Degenerate extents must be no-ops rather than panics or divisions by
+    /// zero - a zero-length axis reaches the kernel through dynamic shapes.
+    #[test]
+    fn empty_extents_are_a_no_op() {
+        let mut empty: Vec<f32> = Vec::new();
+        softmax_rows_in_place(&mut empty, 0, 8);
+        softmax_rows_in_place(&mut empty, 8, 0);
+        softmax_rows(&[], &mut [], 0, 8);
+        softmax_rows(&[], &mut [], 8, 0);
+        assert!(empty.is_empty());
+    }
+
+    /// A row of very large logits must not overflow (the max is subtracted
+    /// first), and `-inf` entries - how masked attention positions arrive -
+    /// must produce exact zeros rather than NaN, as long as the row is not
+    /// entirely masked.
+    #[test]
+    fn large_and_masked_logits_stay_finite() {
+        let n = 96; // over the row floor, so this runs through the fan-out
+        let d = 256;
+        let mut src = vec![0.0f32; n * d];
+        for r in 0..n {
+            for c in 0..d {
+                src[r * d + c] = if c % 3 == 0 { f32::NEG_INFINITY } else { 1e30 };
+            }
+        }
+        let mut got = src.clone();
+        softmax_rows_in_place(&mut got, n, d);
+        for r in 0..n {
+            let row = &got[r * d..(r + 1) * d];
+            let sum: f32 = row.iter().sum();
+            assert!((sum - 1.0).abs() <= 1e-5, "row {r} sums to {sum}");
+            for (c, &v) in row.iter().enumerate() {
+                assert!(v.is_finite(), "row {r} col {c} is {v}");
+                if c % 3 == 0 {
+                    assert_eq!(v, 0.0, "masked position must be exactly zero");
+                }
+            }
+        }
+    }
+
+    /// A *fully* masked row has no finite maximum, so `x - max` is `-inf -
+    /// -inf = NaN` for every element. That is what the scalar loop produced
+    /// before this change and what ORT's own MLAS-backed Softmax produces, so
+    /// the behaviour is pinned rather than "fixed": silently substituting a
+    /// uniform distribution here would diverge from the reference runtime.
+    #[test]
+    fn a_fully_masked_row_reproduces_the_reference_runtimes_nan() {
+        for n in [1usize, 96] {
+            let d = 256;
+            let src = vec![f32::NEG_INFINITY; n * d];
+            let mut got = src.clone();
+            softmax_rows_in_place(&mut got, n, d);
+            assert!(
+                got.iter().all(|v| v.is_nan()),
+                "n={n}: fully masked row must stay NaN, not become uniform"
+            );
+            // The scalar oracle agrees, so this is not an MLAS artefact.
+            assert!(reference_rows(&src, n, d).iter().all(|v| v.is_nan()));
+        }
+    }
+
+    /// The direct-write path and the owned-scratch path must agree exactly.
+    /// The kernel picks between them on an aliasing check the caller cannot
+    /// see, so both have to be exercised: a strided input forces the widen to
+    /// allocate, which is the owned arm.
+    #[test]
+    fn direct_write_and_owned_scratch_agree() {
+        let rows = 80;
+        let cols = 256;
+        let src = synthetic(rows, cols, 7);
+
+        let x = Owned::f32(&[rows, cols], &src);
+        let mut direct = Owned::zeros_f32(&[rows, cols]);
+        SoftmaxKernel {
+            axis: -1,
+            coerce_2d: false,
+        }
+        .execute(&[x.view()], &mut [direct.view_mut()])
+        .unwrap();
+
+        // A stride-2 view over a doubled buffer is not contiguous, so
+        // `to_dense_f32_widen` must copy and the output check still holds -
+        // this is the arm that also covers non-f32 outputs.
+        let mut doubled = vec![0.0f32; rows * cols * 2];
+        for (i, v) in src.iter().enumerate() {
+            doubled[i * 2] = *v;
+        }
+        let strided = Owned::f32(&[rows, cols * 2], &doubled)
+            .with_view(&[rows, cols], &[(cols * 2) as i64, 2]);
+        let mut owned = Owned::zeros_f32(&[rows, cols]);
+        SoftmaxKernel {
+            axis: -1,
+            coerce_2d: false,
+        }
+        .execute(&[strided.view()], &mut [owned.view_mut()])
+        .unwrap();
+
+        assert_eq!(direct.to_f32(), owned.to_f32());
+        let expect = reference_rows(&src, rows, cols);
+        for (g, e) in direct.to_f32().iter().zip(&expect) {
+            assert!((g - e).abs() <= 1e-6, "{g} vs {e}");
+        }
+    }
+
+    /// An interior-axis reduction (`inner > 1`) must not be routed to the
+    /// row-major fast path, which would silently softmax the wrong elements.
+    #[test]
+    fn interior_axis_still_reduces_along_that_axis() {
+        // [2, 3, 4]: axis 1 has inner = 4.
+        let data: Vec<f32> = (0..24).map(|i| (i % 5) as f32 - 2.0).collect();
+        let x = Owned::f32(&[2, 3, 4], &data);
+        let mut out = Owned::zeros_f32(&[2, 3, 4]);
+        SoftmaxKernel {
+            axis: 1,
+            coerce_2d: false,
+        }
+        .execute(&[x.view()], &mut [out.view_mut()])
+        .unwrap();
+        // Each (outer, inner) column of 3 must sum to one.
+        for o in 0..2 {
+            for i in 0..4 {
+                let got = out.to_f32();
+                let sum: f32 = (0..3).map(|a| got[o * 12 + a * 4 + i]).sum();
+                assert!((sum - 1.0).abs() <= 1e-6, "o={o} i={i} sums to {sum}");
+            }
         }
     }
 }
