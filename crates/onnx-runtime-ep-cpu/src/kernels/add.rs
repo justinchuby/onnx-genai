@@ -24,21 +24,15 @@ impl KernelFactory for AddFactory {
     }
 }
 
-/// Broadcast a dense row-major `src` of `src_shape` onto `out_shape`, calling
-/// `f` with `(flat_out_index, src_value)` for every output element.
+/// Effective stride of each `out_shape` axis into a dense row-major `src_shape`
+/// buffer, with 0 on every broadcast axis.
 ///
-/// Implements numpy broadcasting: `src_shape` is right-aligned to `out_shape`
-/// and any axis of extent 1 (or missing) contributes stride 0. Generic over the
-/// element type `T` so every arithmetic kernel shares one broadcast walk.
-pub fn broadcast_apply<T: Copy>(
-    src: &[T],
-    src_shape: &[usize],
-    out_shape: &[usize],
-    mut f: impl FnMut(usize, T),
-) -> Result<()> {
+/// Factored out of [`broadcast_apply`] so kernels that fuse a broadcast into a
+/// larger parallel pass — rather than walking the output element by element —
+/// share exactly the same numpy right-alignment and compatibility checks.
+pub fn broadcast_effective_strides(src_shape: &[usize], out_shape: &[usize]) -> Result<Vec<i64>> {
     let out_rank = out_shape.len();
     let src_strides = compute_contiguous_strides(src_shape);
-    // Effective stride of each output axis into `src` (0 where broadcast).
     let mut eff = vec![0i64; out_rank];
     for axis in 0..out_rank {
         // Corresponding axis in src (right-aligned); absent => broadcast.
@@ -61,6 +55,23 @@ pub fn broadcast_apply<T: Copy>(
             ));
         }
     }
+    Ok(eff)
+}
+
+/// Broadcast a dense row-major `src` of `src_shape` onto `out_shape`, calling
+/// `f` with `(flat_out_index, src_value)` for every output element.
+///
+/// Implements numpy broadcasting: `src_shape` is right-aligned to `out_shape`
+/// and any axis of extent 1 (or missing) contributes stride 0. Generic over the
+/// element type `T` so every arithmetic kernel shares one broadcast walk.
+pub fn broadcast_apply<T: Copy>(
+    src: &[T],
+    src_shape: &[usize],
+    out_shape: &[usize],
+    mut f: impl FnMut(usize, T),
+) -> Result<()> {
+    let eff = broadcast_effective_strides(src_shape, out_shape)?;
+    let out_rank = out_shape.len();
     let n = numel(out_shape);
     if n == 0 {
         return Ok(());

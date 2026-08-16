@@ -89,18 +89,130 @@ const MIN_PARALLEL_SOFTMAX_ELEMENTS: usize = 16 * 1024;
 /// pool once the tensor is large enough to pay for it. ORT parallelizes the
 /// identical loop; leaving it serial is what made this kernel lose by a factor
 /// that *grew* with the thread count.
+#[cfg(test)]
 pub(crate) fn softmax_rows_in_place(data: &mut [f32], n: usize, d: usize) {
-    debug_assert_eq!(data.len(), n * d);
-    if d == 0 || n == 0 {
+    scale_mask_softmax_rows(data, n, d, 1.0, None);
+}
+
+/// Broadcast plan for the additive attention mask, resolved once per run.
+///
+/// Holds the dense mask together with the effective stride of every score axis
+/// into it (0 on broadcast axes), so a worker can locate any score row's mask
+/// row from the row index alone — no shared cursor, no serial walk.
+#[derive(Clone, Copy)]
+pub(crate) struct MaskPlan<'a> {
+    pub(crate) values: &'a [f32],
+    pub(crate) eff: &'a [i64],
+    pub(crate) scores_shape: &'a [usize],
+}
+
+impl MaskPlan<'_> {
+    /// `(base, step)`: flat index of score row `row`'s first mask element, and
+    /// the mask step per score column (0 when the mask broadcasts along the
+    /// key axis, 1 when it is contiguous there).
+    fn row_offset(&self, row: usize) -> (usize, usize) {
+        let rank = self.scores_shape.len();
+        if rank == 0 {
+            return (0, 0);
+        }
+        let mut base = 0i64;
+        let mut rem = row;
+        // The row index is row-major over every axis but the last, so peel the
+        // innermost leading axis first and work outward.
+        for axis in (0..rank - 1).rev() {
+            let dim = self.scores_shape[axis].max(1);
+            base += self.eff[axis] * (rem % dim) as i64;
+            rem /= dim;
+        }
+        (base as usize, self.eff[rank - 1].max(0) as usize)
+    }
+}
+
+/// Rows are processed in tiles of about this many bytes so a tile stays in a
+/// core's private cache between the scale/mask write and the softmax's two
+/// reads, while still handing MLAS several rows per call.
+const ROW_TILE_BYTES: usize = 32 * 1024;
+
+/// `softmax(scores * scale + mask)` over the last axis, in place and in one
+/// parallel pass.
+pub(crate) fn scale_mask_softmax_rows(
+    data: &mut [f32],
+    outer: usize,
+    d: usize,
+    scale: f32,
+    mask: Option<MaskPlan<'_>>,
+) {
+    if d == 0 || outer == 0 {
         return;
     }
-    if let Some(rows_per_task) = parallel_rows_per_task(n, d) {
-        use rayon::prelude::*;
-        data.par_chunks_mut(rows_per_task * d).for_each(|chunk| {
-            softmax_rows_serial(chunk, chunk.len() / d, d);
-        });
-    } else {
-        softmax_rows_serial(data, n, d);
+    debug_assert_eq!(data.len(), outer * d);
+    match parallel_rows_per_task(outer, d) {
+        Some(rows_per_task) => {
+            use rayon::prelude::*;
+            data.par_chunks_mut(rows_per_task * d)
+                .enumerate()
+                .for_each(|(chunk, rows)| {
+                    scale_mask_softmax_serial(rows, chunk * rows_per_task, d, scale, mask);
+                });
+        }
+        None => scale_mask_softmax_serial(data, 0, d, scale, mask),
+    }
+}
+
+/// Serial worker for one contiguous run of rows starting at global row
+/// `first_row` (needed only to index the mask).
+fn scale_mask_softmax_serial(
+    data: &mut [f32],
+    first_row: usize,
+    d: usize,
+    scale: f32,
+    mask: Option<MaskPlan<'_>>,
+) {
+    let rows = data.len() / d;
+    if rows == 0 {
+        return;
+    }
+    let rows_per_tile = (ROW_TILE_BYTES / (d * size_of::<f32>())).clamp(1, rows);
+    let mut row0 = 0usize;
+    while row0 < rows {
+        let tile_rows = rows_per_tile.min(rows - row0);
+        let tile = &mut data[row0 * d..(row0 + tile_rows) * d];
+        match mask {
+            Some(plan) => {
+                for (i, row) in tile.chunks_mut(d).enumerate() {
+                    let (base, step) = plan.row_offset(first_row + row0 + i);
+                    match step {
+                        // Mask broadcasts along the key axis: one value per row.
+                        0 => {
+                            let m = plan.values[base];
+                            for v in row.iter_mut() {
+                                *v = *v * scale + m;
+                            }
+                        }
+                        // The common case — a contiguous mask row, which
+                        // auto-vectorizes as a fused multiply-add.
+                        1 => {
+                            for (v, &m) in row.iter_mut().zip(&plan.values[base..base + d]) {
+                                *v = *v * scale + m;
+                            }
+                        }
+                        step => {
+                            for (j, v) in row.iter_mut().enumerate() {
+                                *v = *v * scale + plan.values[base + j * step];
+                            }
+                        }
+                    }
+                }
+            }
+            None if scale != 1.0 => {
+                for v in tile.iter_mut() {
+                    *v *= scale;
+                }
+            }
+            None => {}
+        }
+        softmax_rows_serial(tile, tile_rows, d);
+        row0 += tile_rows;
     }
 }
 
@@ -179,13 +291,13 @@ fn softmax_rows_serial(data: &mut [f32], n: usize, d: usize) {
 /// `o·axis_dim·inner + a·inner + i`. With `inner == 1` this is a plain
 /// row-major softmax; with `inner > 1` it reduces along an interior axis.
 ///
-/// Shared with the `FusedAttention` kernel (`kernels::fused_attention`), which
-/// softmaxes the last axis of the scaled/masked scores as its middle stage —
-/// reusing this single numerically-stable implementation instead of duplicating
-/// the max-subtract/exp/normalize loop.
+/// The `FusedAttention` kernel (`kernels::fused_attention`) shares the same
+/// numerically-stable reducer through [`scale_mask_softmax_rows`], which folds
+/// its scale and mask into this module's parallel row driver instead of
+/// duplicating the max-subtract/exp/normalize loop.
 ///
 /// `inner == 1` is the overwhelmingly common case (softmax over the last axis)
-/// and is routed to [`softmax_rows_in_place`]; only a genuine interior-axis
+/// and is routed to [`softmax_rows`]; only a genuine interior-axis
 /// reduction takes the strided loop, where the gather makes vectorisation
 /// unprofitable anyway.
 pub(crate) fn softmax_slices(
