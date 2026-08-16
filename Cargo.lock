@@ -2618,6 +2618,7 @@ dependencies = [
  "onnx-runtime-shape-inference",
  "onnx-runtime-tracer",
  "prost",
+ "rayon",
  "thiserror 2.0.19",
 ]
 
