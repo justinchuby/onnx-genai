@@ -650,13 +650,16 @@ pub struct MemoryStrategyPlan {
     pub inferred_strategy: MemoryStrategy,
     pub weight_access_pattern: WeightAccessPattern,
     pub total_weight_bytes: u64,
-    /// Resident dequantized-f32 decode-cache bytes folded into
-    /// [`Self::total_weight_bytes`] when the cache is admitted (#971). Zero on
-    /// backends/models that never take the native CPU f32 decode path.
+    /// Resident side-buffer bytes folded into [`Self::total_weight_bytes`] when
+    /// admitted: the dequantized-f32 decode cache (#971) and/or the int4
+    /// `accuracy_level == 0` MLAS SQNBit packed buffer (#1027), both held for the
+    /// session beside the on-disk weights. Zero on backends/models that take
+    /// neither native CPU path.
     pub resident_f32_cache_bytes: u64,
-    /// Whether the plan admitted the resident f32 decode cache. When `false` the
-    /// runtime declined it (expanded footprint over budget) and the kernels
-    /// dequantize on the fly instead of holding the ~8x expansion (#971). Always
+    /// Whether the plan admitted the resident side buffers above. When `false`
+    /// the runtime declined them (expanded footprint over budget): the f32 cache
+    /// dequantizes on the fly and the MLAS int4 route falls back to the borrowed
+    /// zero-copy path, so only the on-disk weights are held (#971, #1027). Always
     /// `true` when [`Self::resident_f32_cache_bytes`] is zero.
     pub f32_weight_cache_admitted: bool,
     pub kv_bytes_per_token: Option<u64>,
