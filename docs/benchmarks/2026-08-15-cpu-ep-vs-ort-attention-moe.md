@@ -810,11 +810,16 @@ the fused region, not a proxy for it.
 
 Against a real ORT CPU session on identical graphs, options and thread counts —
 3 geometries × 3 phases × mask/nomask × {1,8,16} threads = 54 cells — the fused
-region lost in **50 of 54 cells**, by up to **21.6x**. Only 4 cells were ≥5%
-faster, all at 1 thread and all unmasked.
+region lost in **48 of 54 cells**, by up to **22.8x**. Only 5 cells were ≥5%
+faster, all at 1 thread and all unmasked. (These are the `base` arm of the
+same-session A/B tabulated below, so they are directly comparable to the `new`
+column. An earlier single-arm session on the same graphs independently gave
+50 of 54 and 21.6x; the two agree, but only the same-session figures are quoted
+as results, because cross-session absolutes on this host drift >4x.)
 
-The shape of the loss was the clue: masked cells lost 3.2–21.6x while unmasked
-cells lost only 1.09–4.4x. The mask was costing more than the attention.
+The shape of the loss was the clue: masked cells lost **1.07–22.8x** while
+unmasked cells spanned **0.91–12.6x**, and every one of the nine worst cells was
+masked. The mask was costing more than the attention.
 
 ### Cause
 
@@ -843,15 +848,23 @@ base**, both arms scored against ORT in the same process. 10 warmups, 30 runs,
 3 interleaved trials, medians. Cross-session absolutes on this host drift >4x,
 so only paired same-session ratios are reported.
 
-The **27 unmasked cells are a negative control**: the change only moves a scale
-multiply into the fan-out there, so their spread is this host's noise floor.
+The **27 unmasked cells are a negative control**: without a mask the change only
+folds a scale multiply into the parallel fan-out and adds row tiling, neither of
+which should alter the cost, so their spread is this host's noise floor. (This
+is slightly weaker than a true no-op control — the tiling does change cache
+behaviour and parallel granularity on that path too — but empirically it did not
+move the median.)
 
 | group | cells | median | band |
 |---|---:|---:|---|
 | **control** (unmasked) | 27 | **1.00x** | 0.76x .. 1.10x |
 | masked | 27 | **1.26x** | 0.72x .. 8.44x |
 
-**25 of 27 masked cells improve beyond the control's best case.**
+**25 of 27 masked cells improve beyond the control's best case (1.10x).** That
+threshold is a deliberately conservative empirical bound, not a confidence
+interval — with 27 control samples the observed maximum overstates the true
+noise ceiling. The separation here (median 1.26x vs 1.00x, with individual
+cells at 8x) is far too large for a more formal test to change the conclusion.
 
 Full matrix, all 54 cells, `native ÷ ORT` (lower is better, 1.00 = parity):
 
@@ -914,10 +927,11 @@ Full matrix, all 54 cells, `native ÷ ORT` (lower is better, 1.00 = parity):
 ### Second answer: still decline it
 
 The fix is large — up to **8.44x** — and masked single-thread decode now beats
-ORT outright (0.889–1.009x, was 1.073–1.400x). It is not enough. **47 of 54
-cells still lose**, by up to 15x at 16 threads, because the remaining time is in
-the QK and PV GEMMs and their thread scaling, not in the scale/mask/softmax
-stage that #1094 fixed.
+ORT outright (0.889–1.009x, was 1.073–1.400x). It is not enough. **44 of 54
+cells are still slower than ORT**, 41 of them by ≥5%, and only 7 are ≥5% faster
+(base: 5). The worst remaining cells are **15.0x at 8 threads** and **12.7x at
+16 threads**, because the remaining time is in the QK and PV GEMMs and their
+thread scaling, not in the scale/mask/softmax stage that #1094 fixed.
 
 So the honest answer to requirement 4 is the one it anticipated: **the fused
 region does not clear the ≥5% bar, and should be declined to ORT wherever the
@@ -967,9 +981,9 @@ Measured, cache ÷ system allocator (two independent sweeps):
 | 1 MiB | 1.490 µs | 1.520 µs | 1.020 | 1.011 | neutral–2% slower |
 | 4 MiB | 7.547 µs | 7.453 µs | 0.987 | 1.016 | neutral |
 | 16 MiB | 29.69 µs | 30.10 µs | 1.014 | 1.000 | neutral |
-| 32 MiB | 2.736 ms | 60.39 µs | 0.022 | 0.022 | **45.7x faster** |
-| 64 MiB | 3.951 ms | 122.2 µs | 0.031 | 0.031 | **32.5x faster** |
-| 192 MiB | 12.71 ms | 389.3 µs | 0.031 | 0.029 | **33.4x faster** |
+| 32 MiB | 2.736 ms | 60.39 µs | 0.022 | 0.022 | **45.3x faster** |
+| 64 MiB | 3.951 ms | 122.2 µs | 0.031 | 0.031 | **32.3x faster** |
+| 192 MiB | 12.71 ms | 389.3 µs | 0.031 | 0.029 | **32.6x faster** |
 
 Interleaved (4 live sizes): 1 MiB 0.997/1.013, 16 MiB 1.008/1.009, 64 MiB
 0.033/0.034. Eight threads: 256 KiB 0.978/1.022, 4 MiB 0.982/1.013, 64 MiB
@@ -997,8 +1011,8 @@ never allow.
 
 ## 17. Phase 4 limitations
 
-* §15's remaining 3–15x gap at 8/16 threads is in the QK/PV GEMMs. #1094 does
-  not touch them.
+* §15's remaining gap — up to 15.0x at 8 threads and 12.7x at 16 — is in the
+  QK/PV GEMMs. #1094 does not touch them.
 * §15 recommends declining the fused region in the Plugin EP but **does not
   implement it**, because `claim_preference` is per-node and the fragmentation
   cost of deferring `Softmax` alone is unmeasured. Implementing the decline
