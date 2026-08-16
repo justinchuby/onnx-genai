@@ -374,6 +374,31 @@ fn ep_get_capability_inner(
         return ok_status();
     }
 
+    // Fail-closed routing filter: drop any multi-node claim that
+    // `build_subgraph_routing` would refuse to route, so we decline it here
+    // (ORT then runs those nodes itself) instead of failing `Compile`, which
+    // ORT surfaces as a hard session-creation error rather than a fallback.
+    //
+    // The one shape it cannot route is a value that is *both* an output of the
+    // fused subgraph and consumed by a later node inside it: the producing slot
+    // gets a `NodeOutputSink::Ort`, so no intermediate buffer is recorded, and
+    // the internal consumer has nowhere to read it from. Found by
+    // `com.microsoft::FastGelu` in float16, which ORT inlines as a function
+    // body; once one node of that body is declined, `X_bias` becomes an output
+    // of the remaining partition while three later `Mul`s still consume it.
+    //
+    // This is not a routing-preference artefact — any decline (dtype filter,
+    // shape-inference filter, another EP) can produce the same partition. The
+    // filter is therefore unconditional and applies to every EP.
+    let claims: Vec<_> = claims
+        .into_iter()
+        .filter(|claim| !claim_has_unroutable_internal_output(ir_graph, &claim.node_ids))
+        .collect();
+
+    if claims.is_empty() {
+        return ok_status();
+    }
+
     // Fail-closed filter: remove any claim containing a node whose shape
     // inference returns `Declined`. This prevents over-claiming ops we cannot
     // correctly execute (e.g. NonZero with data-dependent output shape).
@@ -879,6 +904,55 @@ fn node_inputs_all_routable(view: &onnx_runtime_ir::GraphView<'_>, node: NodeInd
         .iter()
         .flatten()
         .all(|&input| view.producer(input).is_some() || view.value(input).is_graph_input)
+}
+
+/// Whether a multi-node claim contains a value that
+/// [`build_subgraph_routing`] cannot route, namely one that is both an output
+/// of the fused subgraph and consumed by another node inside it.
+///
+/// ORT surfaces such a value as a fused-node output, so the producing slot is
+/// assigned a [`crate::compute::NodeOutputSink::Ort`] and no intermediate
+/// buffer is recorded — leaving the internal consumer with nothing to read.
+/// The router declines at Compile time, which ORT reports as a session-creation
+/// failure instead of falling back, so we must catch it here while declining is
+/// still free.
+///
+/// A value is an output of the subgraph when it is a graph output or is
+/// consumed by a node outside the claim. Single-node claims are never routed
+/// and are always accepted.
+fn claim_has_unroutable_internal_output(
+    graph: &onnx_runtime_ir::Graph,
+    node_ids: &[onnx_runtime_ir::NodeId],
+) -> bool {
+    if node_ids.len() < 2 {
+        return false;
+    }
+    let claimed: std::collections::HashSet<_> = node_ids.iter().copied().collect();
+    let graph_outputs: std::collections::HashSet<_> = graph.outputs.iter().copied().collect();
+
+    for &nid in node_ids {
+        let Some(node) = graph.nodes.get(nid) else {
+            return true;
+        };
+        for &produced in &node.outputs {
+            let mut consumed_inside = false;
+            let mut consumed_outside = graph_outputs.contains(&produced);
+            for (other_id, other) in graph.nodes.iter() {
+                if !other.inputs.iter().flatten().any(|&v| v == produced) {
+                    continue;
+                }
+                if claimed.contains(&other_id) {
+                    consumed_inside |= other_id != nid;
+                } else {
+                    consumed_outside = true;
+                }
+            }
+            if consumed_inside && consumed_outside {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Environment variables that opt a GPU EP into partial (interspersed CPU/GPU)
@@ -1896,6 +1970,73 @@ mod tests {
         assert!(
             !super::node_inputs_all_routable(&view, add),
             "a node consuming a weight initializer must be declined at claim time"
+        );
+    }
+
+    /// Routing filter: a claim is unroutable when one of its values is both an
+    /// output of the fused subgraph (consumed outside the claim) and an input
+    /// to a later node inside it. This is the `com.microsoft::FastGelu`
+    /// float16 shape — `X_bias` feeds both the declined `Tanh` chain and three
+    /// `Mul`s we keep — and `build_subgraph_routing` fails Compile on it, which
+    /// ORT reports as a session-creation error rather than falling back.
+    #[test]
+    fn claim_with_internally_reused_subgraph_output_is_unroutable() {
+        use onnx_runtime_ir::{Graph, Node, NodeId, Shape};
+        let mut g = Graph::new();
+        let x = g.create_named_value("x", DataType::Float32, Shape::default());
+        g.add_input(x);
+        let bias = g.create_named_value("bias", DataType::Float32, Shape::default());
+        let t = g.create_named_value("t", DataType::Float32, Shape::default());
+        let y = g.create_named_value("y", DataType::Float32, Shape::default());
+        g.add_output(y);
+
+        // bias = Identity(x)   ← claimed
+        let n_id = g.insert_node(Node::new(NodeId(0), "Identity", vec![Some(x)], vec![bias]));
+        // t = Tanh(bias)       ← NOT claimed (declined; runs on the host)
+        g.insert_node(Node::new(NodeId(0), "Tanh", vec![Some(bias)], vec![t]));
+        // y = Mul(bias, t)     ← claimed, and re-reads `bias` from inside
+        let n_mul = g.insert_node(Node::new(
+            NodeId(0),
+            "Mul",
+            vec![Some(bias), Some(t)],
+            vec![y],
+        ));
+
+        assert!(
+            super::claim_has_unroutable_internal_output(&g, &[n_id, n_mul]),
+            "a value that is both a subgraph output and an internal input must be declined"
+        );
+        // A single-node claim is never routed, so it is always accepted.
+        assert!(
+            !super::claim_has_unroutable_internal_output(&g, &[n_id]),
+            "single-node claims are not routed and must not be filtered"
+        );
+    }
+
+    /// The routing filter must not fire on ordinary fusions: a purely internal
+    /// intermediate gets a buffer, and a terminal subgraph output has no
+    /// internal consumer. Both are routable, so a `MatMul`+`Add`+`Relu` chain
+    /// (including one reading an initializer) keeps its fusion.
+    #[test]
+    fn ordinary_fusion_is_not_filtered() {
+        use onnx_runtime_ir::{Graph, Node, NodeId, Shape};
+        let mut g = Graph::new();
+        let x = g.create_named_value("x", DataType::Float32, Shape::default());
+        g.add_input(x);
+        let w = g.create_named_value("w", DataType::Float32, Shape::default());
+        let m = g.create_named_value("m", DataType::Float32, Shape::default());
+        let y = g.create_named_value("y", DataType::Float32, Shape::default());
+        g.add_output(y);
+        let n_mm = g.insert_node(Node::new(
+            NodeId(0),
+            "MatMul",
+            vec![Some(x), Some(w)],
+            vec![m],
+        ));
+        let n_relu = g.insert_node(Node::new(NodeId(0), "Relu", vec![Some(m)], vec![y]));
+        assert!(
+            !super::claim_has_unroutable_internal_output(&g, &[n_mm, n_relu]),
+            "an ordinary chain with an internal-only intermediate must keep its fusion"
         );
     }
 

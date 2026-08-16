@@ -3373,3 +3373,176 @@ fn assignment_policy_yields_when_cpu_fallback_is_disabled() {
     }
     eprintln!("\n✅ assignment_policy_yields_when_cpu_fallback_is_disabled: PASSED");
 }
+
+// ─── Falsifier: an inlined contrib function must still build a session ────────
+
+/// Decode a float16 bit-pattern to `f32` (finite, normal/subnormal, no NaN
+/// payload preservation — sufficient for the tolerance checks below).
+fn f16_bits_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 1) as u32;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let man = (bits & 0x3ff) as u32;
+    let f = match exp {
+        0 if man == 0 => sign << 31,
+        0 => {
+            // Subnormal: normalise.
+            let mut e = -1i32;
+            let mut m = man;
+            while m & 0x400 == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            let m = m & 0x3ff;
+            (sign << 31) | (((127 - 15 + 1 + e) as u32) << 23) | (m << 13)
+        }
+        0x1f => (sign << 31) | (0xff << 23) | (man << 13),
+        _ => (sign << 31) | ((exp + 127 - 15) << 23) | (man << 13),
+    };
+    f32::from_bits(f)
+}
+
+/// Encode `f32` as a float16 bit-pattern (round-to-nearest-even, finite input).
+fn f32_to_f16_bits(x: f32) -> u16 {
+    let b = x.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let mut val = (b & 0x7fff_ffff) as i32;
+    if val >= 0x4780_0000 {
+        return sign | 0x7c00; // overflow → inf
+    }
+    if val < 0x3880_0000 {
+        // Subnormal or zero.
+        let scaled = f32::from_bits(val as u32) / 2f32.powi(-24);
+        return sign | (scaled.round() as u16);
+    }
+    val -= 0x3800_0000;
+    let mant = ((val >> 13) & 0x7fff) as u16;
+    let round = (val & 0x1fff) as u32;
+    let mut out = mant;
+    if round > 0x1000 || (round == 0x1000 && (out & 1) == 1) {
+        out += 1;
+    }
+    sign | out
+}
+
+/// Regression falsifier for a hard session-creation failure.
+///
+/// ORT has no float16 kernel for `com.microsoft::FastGelu`, so it inlines the
+/// contrib op into its function body (`Identity`/`Mul`/`Add`/`Tanh`/…). The
+/// routing preference then defers the float16 `Tanh` inside that body, which
+/// splits the remainder into a partition where `_inlfunc_FastGelu_X_bias` is
+/// both an output of our fused subgraph and an input to three later `Mul`s.
+/// `build_subgraph_routing` cannot route that shape, and failing at Compile is
+/// *not* a graceful decline — ORT surfaces it as
+/// `FAIL : Compile: multi-node subgraph has unroutable graph`, turning a model
+/// that used to load into one that does not.
+///
+/// The claim-time routing filter in `ep.rs` catches such partitions while
+/// declining is still free. This test fails without it.
+#[test]
+fn unroutable_partition_is_declined_not_fatal() {
+    let _lock = lock_ort_ep();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let model_path = PathBuf::from(manifest_dir)
+        .join("tests/fixtures/fastgelu_assignment_f16/model.onnx.textproto");
+
+    let Some((_lib, api, env, opts, session)) =
+        (unsafe { conformance_setup("cpu_ep_fastgelu_f16", &model_path, false) })
+    else {
+        eprintln!(
+            "*** SKIPPED: unroutable_partition_is_declined_not_fatal — \
+             ORT or EP cdylib not found ***"
+        );
+        return;
+    };
+
+    unsafe {
+        let xs: [f32; 8] = [-4.0, -1.5, -0.5, 0.0, 0.5, 1.5, 3.0, 6.0];
+        let mut x_data: [u16; 8] = std::array::from_fn(|i| f32_to_f16_bits(xs[i]));
+        let shape: [i64; 2] = [1, 8];
+        let x_val = make_float16_tensor(api, &mut x_data, &shape);
+
+        let input_names = [c"X".as_ptr()];
+        let output_names = [c"Z".as_ptr()];
+        let inputs: [*const ort::OrtValue; 1] = [x_val];
+        let mut output: *mut ort::OrtValue = ptr::null_mut();
+
+        let status = ((*api).Run.unwrap())(
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs.as_ptr(),
+            1,
+            output_names.as_ptr(),
+            1,
+            &mut output,
+        );
+        check_status(api, status, "Run(float16 FastGelu)");
+        assert!(!output.is_null());
+
+        let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
+        let status = ((*api).GetTensorMutableData.unwrap())(output, &mut data_ptr);
+        check_status(api, status, "GetTensorMutableData(float16 FastGelu)");
+        let result = std::slice::from_raw_parts(data_ptr as *const u16, 8);
+
+        for (i, &x) in xs.iter().enumerate() {
+            let inner = 0.797_884_6_f32 * (x + 0.044_715 * x * x * x);
+            let want = 0.5 * x * (1.0 + inner.tanh());
+            let got = f16_bits_to_f32(result[i]);
+            assert!(
+                (got - want).abs() <= 2e-2 * want.abs().max(1.0),
+                "FastGelu(f16) output[{i}] for x={x}: got {got}, want {want}"
+            );
+        }
+
+        ((*api).ReleaseValue.unwrap())(output);
+        ((*api).ReleaseValue.unwrap())(x_val);
+        conformance_teardown(api, env, opts, session, "cpu_ep_fastgelu_f16");
+    }
+    eprintln!("\n✅ unroutable_partition_is_declined_not_fatal: PASSED");
+}
+
+/// Exact (`approximate="none"`) float16 `Gelu` is claimed for the same reason
+/// the tanh variant is: ORT has no float16 `Gelu` kernel, so deferring makes it
+/// inline the function into `Cast`/`Pow`/`Sum`/`Mul`/`Erf`, and we then claim
+/// the ungoverned pieces at a far worse rate than ORT runs the whole node.
+#[test]
+fn assignment_policy_claims_exact_float16_gelu() {
+    let _lock = lock_ort_ep();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let model_path = PathBuf::from(manifest_dir)
+        .join("tests/fixtures/gelu_assignment_f16_exact/model.onnx.textproto");
+
+    let Some((_lib, api, env, opts, session)) =
+        (unsafe { conformance_setup("cpu_ep_gelu_exact_f16", &model_path, false) })
+    else {
+        eprintln!(
+            "*** SKIPPED: assignment_policy_claims_exact_float16_gelu — \
+             ORT or EP cdylib not found ***"
+        );
+        return;
+    };
+
+    unsafe {
+        let info = query_ep_assignment(api, session);
+        let ours = info.ops_on_our_ep();
+        eprintln!(
+            "  [gelu_f16_exact] ours={ours:?}, others={:?}",
+            info.ops_not_on_our_ep()
+        );
+        assert!(
+            ours.contains(&"Gelu"),
+            "exact float16 Gelu must be claimed — ORT has no float16 Gelu kernel, \
+             so deferring inlines the function; got: {:?}",
+            info.assignments
+        );
+        for artefact in ["Pow", "Sum", "Erf"] {
+            assert!(
+                !ours.contains(&artefact) && !info.ops_not_on_our_ep().contains(&artefact),
+                "exact float16 Gelu was inlined ('{artefact}' appeared); got: {:?}",
+                info.assignments
+            );
+        }
+        conformance_teardown(api, env, opts, session, "cpu_ep_gelu_exact_f16");
+    }
+    eprintln!("\n✅ assignment_policy_claims_exact_float16_gelu: PASSED");
+}
