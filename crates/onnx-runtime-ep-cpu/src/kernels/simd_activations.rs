@@ -25,8 +25,10 @@
 //!   substituting the exact limit outside the band. On this host the two
 //!   agree bit-for-bit everywhere they were probed, `±Inf` included: the
 //!   vendored `MlasComputeLogistic` returns exactly `0.0` for `sigmoid(-Inf)`
-//!   and for every `x <= -18`, because the rational underflows to zero at the
-//!   clamp point. Saturation is therefore an *equivalent* formulation that
+//!   and for every `x <= -18`. That is not an underflow: at the clamp point
+//!   the rational evaluates to `-5.96e-8`, and `logistic.cpp`'s own *output*
+//!   clamp (`std::clamp((p / q) + 0.5f, 0.0f, 1.0f)`) pins that negative
+//!   value to `0.0`. Saturation is therefore an *equivalent* formulation that
 //!   makes the endpoints exact by construction rather than by that accident —
 //!   it is not a correctness win, and earlier revisions of this comment
 //!   wrongly claimed clamping leaked `1.5e-8` at `-Inf`. It is still the
