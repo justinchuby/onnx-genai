@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 
 use super::check_arity;
 use super::gelu::tanh_gelu;
+#[cfg(not(feature = "mlas"))]
 use super::matmul::gemm;
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 
@@ -241,7 +242,7 @@ impl Kernel for MoEKernel {
             require_exact_shape("fc3_experts_weights", view.shape, &[experts, inter, hidden])?;
             validate_bias("fc3_experts_bias", inputs, 7, experts, inter)?;
             (
-                Some(to_dense_f32_widen("MoE", view)?.into_owned()),
+                Some(to_dense_f32_widen("MoE", view)?),
                 optional_dense(inputs, 7)?,
             )
         } else {
@@ -258,10 +259,16 @@ impl Kernel for MoEKernel {
             (None, None)
         };
 
-        let x = to_dense_f32_widen("MoE", &inputs[0])?.into_owned();
-        let router = to_dense_f32_widen("MoE", &inputs[1])?.into_owned();
-        let fc1 = to_dense_f32_widen("MoE", &inputs[2])?.into_owned();
-        let fc2 = to_dense_f32_widen("MoE", &inputs[4])?.into_owned();
+        // Borrow rather than `into_owned()`. Expert weights are the largest
+        // tensors in the graph - a Mixtral-shaped `fc1` + `fc2` pair is 352 MiB
+        // - and they are contiguous f32 initializers in every real model, so
+        // owning them copied a third of a gigabyte on every single forward.
+        // `to_dense_f32_widen` still allocates for half-precision or strided
+        // sources, which is the only case that actually needs a copy.
+        let x = to_dense_f32_widen("MoE", &inputs[0])?;
+        let router = to_dense_f32_widen("MoE", &inputs[1])?;
+        let fc1 = to_dense_f32_widen("MoE", &inputs[2])?;
+        let fc2 = to_dense_f32_widen("MoE", &inputs[4])?;
         let mut output = vec![0.0f32; rows * hidden];
 
         let mut tasks = BTreeMap::<usize, Vec<(usize, f32)>>::new();
@@ -336,6 +343,11 @@ impl MoeAttributes {
     }
 }
 
+/// Portable single-token reference expert: plain scalar dot products, no GEMM,
+/// no transposes. Production now routes every row count through
+/// [`run_expert_grouped`]; this is kept as the oracle the tests compare
+/// against.
+#[cfg(test)]
 pub(super) fn run_expert(
     input: &[f32],
     fc1_weights: &[f32],
@@ -421,21 +433,11 @@ pub(super) fn run_expert_grouped(
     inter: usize,
     attributes: &MoeAttributes,
 ) -> Result<Vec<f32>> {
-    if rows == 1 {
-        return Ok(run_expert(
-            input,
-            fc1_weights,
-            fc1_bias,
-            fc2_weights,
-            fc2_bias,
-            fc3_weights,
-            fc3_bias,
-            fc1_size,
-            hidden,
-            inter,
-            attributes,
-        ));
-    }
+    // A single routed token used to fall through to `run_expert`'s scalar dot
+    // loop. That loop is ~50x slower per MAC than the GEMM, and decode - one
+    // token, top-k experts - is the shape that matters most, so the grouped
+    // path now serves `rows == 1` too. `run_expert` is retained as the
+    // portable reference the tests compare against.
     let mut fc1_out = linear_grouped(input, rows, fc1_weights, fc1_bias, fc1_size, hidden)?;
     let activated = match attributes.activation {
         Activation::Swiglu => {
@@ -499,6 +501,14 @@ pub(super) fn run_expert_grouped(
     linear_grouped(&activated, rows, fc2_weights, fc2_bias, hidden, inter)
 }
 
+/// `output[rows, out_features] = input[rows, in_features] * weightsᵀ (+ bias)`.
+///
+/// Expert weights arrive as `[out_features, in_features]`, i.e. already
+/// transposed relative to what a plain `A*B` GEMM wants. MLAS takes `transB`
+/// directly, so the fast path hands it the weights as they are. The portable
+/// path still has to materialize `[in_features, out_features]`, which for a
+/// Mixtral-sized expert is a 29 MiB strided scatter per call - the single
+/// largest term in the whole operator before this.
 fn linear_grouped(
     input: &[f32],
     rows: usize,
@@ -507,22 +517,45 @@ fn linear_grouped(
     out_features: usize,
     in_features: usize,
 ) -> Result<Vec<f32>> {
-    let mut weights_kn = vec![0.0f32; weights_nk.len()];
-    for output in 0..out_features {
-        for input_feature in 0..in_features {
-            weights_kn[input_feature * out_features + output] =
-                weights_nk[output * in_features + input_feature];
+    let mut output = vec![0.0f32; rows * out_features];
+    #[cfg(feature = "mlas")]
+    {
+        if rows > 0 && out_features > 0 && in_features > 0 {
+            mlas_sys::sgemm(
+                false,
+                true,
+                rows,
+                out_features,
+                in_features,
+                1.0,
+                input,
+                in_features,
+                weights_nk,
+                in_features,
+                0.0,
+                &mut output,
+                out_features,
+            );
         }
     }
-    let mut output = vec![0.0f32; rows * out_features];
-    gemm(
-        input,
-        &weights_kn,
-        &mut output,
-        rows,
-        in_features,
-        out_features,
-    )?;
+    #[cfg(not(feature = "mlas"))]
+    {
+        let mut weights_kn = vec![0.0f32; weights_nk.len()];
+        for output_feature in 0..out_features {
+            for input_feature in 0..in_features {
+                weights_kn[input_feature * out_features + output_feature] =
+                    weights_nk[output_feature * in_features + input_feature];
+            }
+        }
+        gemm(
+            input,
+            &weights_kn,
+            &mut output,
+            rows,
+            in_features,
+            out_features,
+        )?;
+    }
     if let Some(bias) = bias {
         for row in output.chunks_exact_mut(out_features) {
             for (value, bias) in row.iter_mut().zip(bias) {
@@ -533,6 +566,7 @@ fn linear_grouped(
     Ok(output)
 }
 
+#[cfg(test)]
 fn linear(
     input: &[f32],
     weights: &[f32],
@@ -1234,5 +1268,360 @@ mod tests {
             )
             .unwrap();
         assert_close(&y.to_f32(), &[0.5 * (6.0 * sigmoid(6.0) * 8.0)]);
+    }
+
+    /// Reference MoE forward built entirely out of [`run_expert`]'s scalar dot
+    /// products - no GEMM, no grouping, no transposes.
+    #[allow(clippy::too_many_arguments)]
+    fn reference_moe(
+        rows: usize,
+        hidden: usize,
+        inter: usize,
+        experts: usize,
+        k: usize,
+        fc1_size: usize,
+        input: &[f32],
+        router: &[f32],
+        fc1: &[f32],
+        fc2: &[f32],
+        fc3: Option<&[f32]>,
+        fc1_bias: Option<&[f32]>,
+        fc2_bias: Option<&[f32]>,
+        fc3_bias: Option<&[f32]>,
+        attributes: &MoeAttributes,
+    ) -> Vec<f32> {
+        let mut dense = vec![0.0f32; rows * hidden];
+        for row in 0..rows {
+            for (expert, weight) in routing_weights(
+                &router[row * experts..(row + 1) * experts],
+                None,
+                k,
+                attributes.normalize_routing_weights,
+            ) {
+                let expert_output = run_expert(
+                    &input[row * hidden..(row + 1) * hidden],
+                    &fc1[expert * fc1_size * hidden..(expert + 1) * fc1_size * hidden],
+                    fc1_bias.map(|bias| &bias[expert * fc1_size..(expert + 1) * fc1_size]),
+                    &fc2[expert * hidden * inter..(expert + 1) * hidden * inter],
+                    fc2_bias.map(|bias| &bias[expert * hidden..(expert + 1) * hidden]),
+                    fc3.map(|fc3| &fc3[expert * inter * hidden..(expert + 1) * inter * hidden]),
+                    fc3_bias.map(|bias| &bias[expert * inter..(expert + 1) * inter]),
+                    fc1_size,
+                    hidden,
+                    inter,
+                    attributes,
+                );
+                for feature in 0..hidden {
+                    dense[row * hidden + feature] += weight * expert_output[feature];
+                }
+            }
+        }
+        dense
+    }
+
+    fn ramp(len: usize, modulus: usize, offset: f32, scale: f32) -> Vec<f32> {
+        (0..len)
+            .map(|index| ((index * 7 + 3) % modulus) as f32 * scale - offset)
+            .collect()
+    }
+
+    /// `rows == 1` used to short-circuit into the scalar `run_expert` path.
+    /// Decode is exactly that shape, so the grouped GEMM now serves it and has
+    /// to stay numerically indistinguishable from the reference.
+    #[test]
+    fn single_token_decode_matches_the_scalar_reference() {
+        const ROWS: usize = 1;
+        const HIDDEN: usize = 8;
+        const INTER: usize = 12;
+        const EXPERTS: usize = 4;
+        let shapes = [
+            Some(&[ROWS, HIDDEN][..]),
+            Some(&[ROWS, EXPERTS]),
+            Some(&[EXPERTS, INTER, HIDDEN]),
+            None,
+            Some(&[EXPERTS, HIDDEN, INTER]),
+        ];
+        let attrs = [
+            ("k", Attribute::Int(2)),
+            ("activation_type", Attribute::String(b"silu".to_vec())),
+            ("normalize_routing_weights", Attribute::Int(1)),
+        ];
+        let (graph, node) = model_node(&shapes, &[ROWS, HIDDEN], &attrs);
+        let input = ramp(ROWS * HIDDEN, 23, 0.4, 0.05);
+        let router = ramp(ROWS * EXPERTS, 13, 5.0, 1.0);
+        let fc1 = ramp(EXPERTS * INTER * HIDDEN, 29, 0.3, 0.02);
+        let fc2 = ramp(EXPERTS * HIDDEN * INTER, 31, 0.3, 0.02);
+
+        let x = Owned::f32(&[ROWS, HIDDEN], &input);
+        let router_tensor = Owned::f32(&[ROWS, EXPERTS], &router);
+        let fc1_tensor = Owned::f32(&[EXPERTS, INTER, HIDDEN], &fc1);
+        let fc2_tensor = Owned::f32(&[EXPERTS, HIDDEN, INTER], &fc2);
+        let mut got = Owned::zeros_f32(&[ROWS, HIDDEN]);
+        kernel(&graph, node)
+            .execute(
+                &[
+                    x.view(),
+                    router_tensor.view(),
+                    fc1_tensor.view(),
+                    TensorView::absent(DataType::Float32),
+                    fc2_tensor.view(),
+                ],
+                &mut [got.view_mut()],
+            )
+            .unwrap();
+
+        let attributes = MoeAttributes::from_node(graph.node(node)).unwrap();
+        let want = reference_moe(
+            ROWS,
+            HIDDEN,
+            INTER,
+            EXPERTS,
+            2,
+            INTER,
+            &input,
+            &router,
+            &fc1,
+            &fc2,
+            None,
+            None,
+            None,
+            None,
+            &attributes,
+        );
+        assert_close(&got.to_f32(), &want);
+    }
+
+    /// All three swiglu layouts (unfused fc3, interleaved, split) go through
+    /// the same grouped GEMM, with and without biases, and at both a decode
+    /// row count and a prefill row count. Each combination has to match the
+    /// scalar reference.
+    #[test]
+    fn every_swiglu_fusion_mode_matches_the_scalar_reference() {
+        const HIDDEN: usize = 6;
+        const INTER: usize = 4;
+        const EXPERTS: usize = 4;
+        for rows in [1usize, 5] {
+            for fusion in [0i64, 1, 2] {
+                for biased in [false, true] {
+                    let fc1_size = if fusion == 0 { INTER } else { 2 * INTER };
+                    let mut shapes = vec![
+                        Some(vec![rows, HIDDEN]),
+                        Some(vec![rows, EXPERTS]),
+                        Some(vec![EXPERTS, fc1_size, HIDDEN]),
+                        biased.then(|| vec![EXPERTS, fc1_size]),
+                        Some(vec![EXPERTS, HIDDEN, INTER]),
+                    ];
+                    if fusion == 0 || biased {
+                        shapes.push(biased.then(|| vec![EXPERTS, HIDDEN]));
+                    }
+                    if fusion == 0 {
+                        shapes.push(Some(vec![EXPERTS, INTER, HIDDEN]));
+                        shapes.push(biased.then(|| vec![EXPERTS, INTER]));
+                    }
+                    let shape_refs: Vec<Option<&[usize]>> =
+                        shapes.iter().map(|s| s.as_deref()).collect();
+                    let attrs = [
+                        ("k", Attribute::Int(2)),
+                        ("activation_type", Attribute::String(b"swiglu".to_vec())),
+                        ("normalize_routing_weights", Attribute::Int(1)),
+                        ("swiglu_fusion", Attribute::Int(fusion)),
+                    ];
+                    let (graph, node) = model_node(&shape_refs, &[rows, HIDDEN], &attrs);
+                    let input = ramp(rows * HIDDEN, 19, 0.3, 0.04);
+                    let router = ramp(rows * EXPERTS, 17, 6.0, 1.0);
+                    let fc1 = ramp(EXPERTS * fc1_size * HIDDEN, 23, 0.25, 0.02);
+                    let fc2 = ramp(EXPERTS * HIDDEN * INTER, 29, 0.25, 0.02);
+                    let fc3 = ramp(EXPERTS * INTER * HIDDEN, 31, 0.25, 0.02);
+                    let fc1_bias = ramp(EXPERTS * fc1_size, 13, 0.2, 0.05);
+                    let fc2_bias = ramp(EXPERTS * HIDDEN, 11, 0.2, 0.05);
+                    let fc3_bias = ramp(EXPERTS * INTER, 7, 0.2, 0.05);
+
+                    let x = Owned::f32(&[rows, HIDDEN], &input);
+                    let router_tensor = Owned::f32(&[rows, EXPERTS], &router);
+                    let fc1_tensor = Owned::f32(&[EXPERTS, fc1_size, HIDDEN], &fc1);
+                    let fc2_tensor = Owned::f32(&[EXPERTS, HIDDEN, INTER], &fc2);
+                    let fc3_tensor = Owned::f32(&[EXPERTS, INTER, HIDDEN], &fc3);
+                    let fc1_bias_tensor = Owned::f32(&[EXPERTS, fc1_size], &fc1_bias);
+                    let fc2_bias_tensor = Owned::f32(&[EXPERTS, HIDDEN], &fc2_bias);
+                    let fc3_bias_tensor = Owned::f32(&[EXPERTS, INTER], &fc3_bias);
+                    let absent = TensorView::absent(DataType::Float32);
+                    let mut got = Owned::zeros_f32(&[rows, HIDDEN]);
+                    let mut views = vec![
+                        x.view(),
+                        router_tensor.view(),
+                        fc1_tensor.view(),
+                        if biased {
+                            fc1_bias_tensor.view()
+                        } else {
+                            absent
+                        },
+                        fc2_tensor.view(),
+                    ];
+                    if fusion == 0 || biased {
+                        views.push(if biased {
+                            fc2_bias_tensor.view()
+                        } else {
+                            absent
+                        });
+                    }
+                    if fusion == 0 {
+                        views.push(fc3_tensor.view());
+                        views.push(if biased {
+                            fc3_bias_tensor.view()
+                        } else {
+                            absent
+                        });
+                    }
+                    kernel(&graph, node)
+                        .execute(&views, &mut [got.view_mut()])
+                        .unwrap();
+
+                    let attributes = MoeAttributes::from_node(graph.node(node)).unwrap();
+                    let want = reference_moe(
+                        rows,
+                        HIDDEN,
+                        INTER,
+                        EXPERTS,
+                        2,
+                        fc1_size,
+                        &input,
+                        &router,
+                        &fc1,
+                        &fc2,
+                        (fusion == 0).then_some(&fc3[..]),
+                        biased.then_some(&fc1_bias[..]),
+                        biased.then_some(&fc2_bias[..]),
+                        (fusion == 0 && biased).then_some(&fc3_bias[..]),
+                        &attributes,
+                    );
+                    let got = got.to_f32();
+                    assert_eq!(got.len(), want.len());
+                    for (index, (&got, &want)) in got.iter().zip(&want).enumerate() {
+                        assert!(
+                            (got - want).abs() <= 1e-5,
+                            "rows={rows} swiglu_fusion={fusion} biased={biased} \
+                             index {index}: got {got}, want {want}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Expert weights are borrowed when they are contiguous and copied
+    /// otherwise. A strided view takes the copying branch, and both branches
+    /// have to produce bit-identical results.
+    #[test]
+    fn borrowed_and_copied_expert_weights_agree() {
+        const ROWS: usize = 3;
+        const HIDDEN: usize = 4;
+        const INTER: usize = 6;
+        const EXPERTS: usize = 4;
+        let shapes = [
+            Some(&[ROWS, HIDDEN][..]),
+            Some(&[ROWS, EXPERTS]),
+            Some(&[EXPERTS, INTER, HIDDEN]),
+            None,
+            Some(&[EXPERTS, HIDDEN, INTER]),
+        ];
+        let attrs = [
+            ("k", Attribute::Int(2)),
+            ("activation_type", Attribute::String(b"silu".to_vec())),
+            ("normalize_routing_weights", Attribute::Int(1)),
+        ];
+        let (graph, node) = model_node(&shapes, &[ROWS, HIDDEN], &attrs);
+        let input = ramp(ROWS * HIDDEN, 19, 0.3, 0.0625);
+        let router = ramp(ROWS * EXPERTS, 13, 5.0, 1.0);
+        let fc1 = ramp(EXPERTS * INTER * HIDDEN, 23, 0.25, 0.0625);
+        let fc2 = ramp(EXPERTS * HIDDEN * INTER, 29, 0.25, 0.0625);
+
+        // The same values laid out with a gap after every element, exposed
+        // through a stride-2 view. Identical logical tensor, non-contiguous
+        // storage, so `to_dense_f32_widen` has to materialize it.
+        let spread = |values: &[f32]| -> Vec<f32> {
+            let mut out = vec![0.0f32; values.len() * 2];
+            for (index, &value) in values.iter().enumerate() {
+                out[index * 2] = value;
+            }
+            out
+        };
+
+        let x = Owned::f32(&[ROWS, HIDDEN], &input);
+        let router_tensor = Owned::f32(&[ROWS, EXPERTS], &router);
+        let fc1_contiguous = Owned::f32(&[EXPERTS, INTER, HIDDEN], &fc1);
+        let fc2_contiguous = Owned::f32(&[EXPERTS, HIDDEN, INTER], &fc2);
+        let fc1_strided = Owned::f32(&[EXPERTS * INTER * HIDDEN * 2], &spread(&fc1)).with_view(
+            &[EXPERTS, INTER, HIDDEN],
+            &[(INTER * HIDDEN * 2) as i64, (HIDDEN * 2) as i64, 2],
+        );
+        let fc2_strided = Owned::f32(&[EXPERTS * HIDDEN * INTER * 2], &spread(&fc2)).with_view(
+            &[EXPERTS, HIDDEN, INTER],
+            &[(HIDDEN * INTER * 2) as i64, (INTER * 2) as i64, 2],
+        );
+
+        let mut borrowed = Owned::zeros_f32(&[ROWS, HIDDEN]);
+        kernel(&graph, node)
+            .execute(
+                &[
+                    x.view(),
+                    router_tensor.view(),
+                    fc1_contiguous.view(),
+                    TensorView::absent(DataType::Float32),
+                    fc2_contiguous.view(),
+                ],
+                &mut [borrowed.view_mut()],
+            )
+            .unwrap();
+        let mut copied = Owned::zeros_f32(&[ROWS, HIDDEN]);
+        kernel(&graph, node)
+            .execute(
+                &[
+                    x.view(),
+                    router_tensor.view(),
+                    fc1_strided.view(),
+                    TensorView::absent(DataType::Float32),
+                    fc2_strided.view(),
+                ],
+                &mut [copied.view_mut()],
+            )
+            .unwrap();
+        assert_eq!(borrowed.to_f32(), copied.to_f32());
+    }
+
+    /// `linear_grouped` hands MLAS a `transB` GEMM instead of materializing
+    /// `[in, out]`. Pin it against a hand-rolled transposed multiply.
+    #[test]
+    fn linear_grouped_matches_a_hand_rolled_transposed_gemm() {
+        const ROWS: usize = 5;
+        const IN: usize = 7;
+        const OUT: usize = 9;
+        let input = ramp(ROWS * IN, 23, 0.3, 0.05);
+        let weights_nk = ramp(OUT * IN, 29, 0.3, 0.05);
+        let bias = ramp(OUT, 11, 0.2, 0.1);
+        for bias in [None, Some(&bias[..])] {
+            let got = linear_grouped(&input, ROWS, &weights_nk, bias, OUT, IN).unwrap();
+            let mut want = vec![0.0f32; ROWS * OUT];
+            for row in 0..ROWS {
+                for out in 0..OUT {
+                    let mut acc = bias.map_or(0.0, |bias| bias[out]);
+                    for k in 0..IN {
+                        acc += input[row * IN + k] * weights_nk[out * IN + k];
+                    }
+                    want[row * OUT + out] = acc;
+                }
+            }
+            assert_close(&got, &want);
+        }
+    }
+
+    /// The zero-extent guard in front of the GEMM has to leave a correctly
+    /// sized (empty) result rather than, say, panicking on the slice maths.
+    /// MLAS itself also tolerates `M == 0`, so this pins the wrapper's
+    /// contract, not MLAS's.
+    #[test]
+    fn linear_grouped_returns_an_empty_result_for_zero_rows() {
+        let weights_nk = ramp(4 * 3, 13, 0.2, 0.05);
+        let got = linear_grouped(&[], 0, &weights_nk, None, 4, 3).unwrap();
+        assert!(got.is_empty());
     }
 }
