@@ -329,6 +329,305 @@ claimed, and the 1–4 MiB crossover is unresolved below the ±9% dispersion.
 5. MHA (3.9×–16×), qwen3-moe (1.47–2.37×), mixtral prefill (1.22–1.62×),
    Softmax (1.29–9.28×), RoPE (2.53–17.38×), standalone `Transpose`
    (13.8–120.8×) and KV-cache `Concat` (2.6–13.2×) all remain behind ORT and
-   are not fixed here.
+   are not fixed here. **`Transpose` is addressed in Phase 3 below**
+   (13.2–110.7× → 0.91–9.46×); the rest are re-measured there and remain
+   behind.
 6. The §2 MHA grid and the §3 MHA control disagree by ~3× on the same graph
    across sessions. Only within-session comparisons are load-bearing.
+
+---
+
+# Phase 3 — the executor, not the kernels
+
+Everything above measures kernels. Phase 3 started from the observation that the
+worst-losing areas in the table — standalone `Transpose` at 13.8–120.8× and
+`Concat` at 2.6–13.2× — were losing in code that *is not a kernel at all*, and
+that no amount of kernel work would move them.
+
+Same host as every measurement above: AMD EPYC 9V74, 16C/32T, 1 NUMA node,
+32 MiB shared L3, AVX2+FMA (no AVX-512). Same harness (`scripts/ort_ab/ab.py`),
+same interleaving discipline, same rule that only paired ratios from a single
+driver invocation are publishable.
+
+**Every table in this section is complete.** No row is omitted, including the
+rows where the change did nothing and the rows where it lost.
+
+## 6. Per-run `mmap`/`munmap` on graph outputs (#1075, merged `c49418452`)
+
+`try_move_host_output` moves an output's buffer into the returned `Tensor` and
+then does `buffer_shapes.remove(&vid)` — commented "force a fresh allocation next
+run". `HostAllocator` is plain `std::alloc`, and glibc `mmap`s anything at or
+above `M_MMAP_THRESHOLD` and `munmap`s it on free, so every run re-faulted and
+the kernel re-zeroed the pages.
+
+Measured on `sm_whisper_cross` with `strace -c` and `/usr/bin/time -v`:
+
+| | runs=5 | runs=45 | per run |
+|---|--:|--:|--:|
+| `munmap` before | 24 | 64 | 1.0 |
+| `munmap` after | 16 | 17 | 0.025 |
+| minor faults before | 12082 | 32521 | 511 |
+| minor faults after | 9016 | 9950 | 23 |
+
+`LargeAllocCache` is a per-EP free list keyed on the exact `(bytes, align)` pair
+(Rust requires the originating `Layout` at `dealloc`, so exact match keeps the
+layout an invariant of the block), 8 shards, band `[256 KiB, 1 GiB]`, 2 GiB
+default budget enforced *before* insertion, `0xA5` poison-fill of recycled blocks
+under `debug_assertions`. `ONNX_GENAI_HOST_ALLOC_CACHE_BYTES=0` disables it.
+
+The poison-fill is itself the falsifier for the one thing that could have gone
+wrong: no kernel in the tree depends on a freshly allocated output buffer being
+zero. 1224 lib tests pass with recycled blocks filled with `0xA5`.
+
+57 interleaved cells, `nocache` vs `cache`, same binary. Full result:
+
+| model | t | nocache (ms) | cache (ms) | change |
+|---|--:|--:|--:|--:|
+| kvcat_llama3_p1023 | 1 | 4.835 | 1.841 | **−61.9%** |
+| kvcat_llama3_p1023 | 8 | 14.244 | 5.553 | **−61.0%** |
+| kvcat_llama3_p8191 | 16 | 8.415 | 5.056 | **−39.9%** |
+| kvcat_llama3_b8_p2047 | 16 | 7.651 | 4.489 | **−41.3%** |
+| sm_prefill_h32_s512 | 1 | 2.476 | 1.755 | **−29.1%** |
+| sm_whisper_cross | 1 | 2.209 | 1.732 | **−21.6%** |
+| tr_bert_b8_s128 | 1 | — | — | +25.0% (dispersion 51–109) |
+| tr_whisper_s1500 | 1 | — | — | +12.5% (dispersion 51–109) |
+| rope_llama3_s512 | 8 | — | — | +21.0% (dispersion 51–109) |
+| *(remaining 48 cells)* | | | | within noise |
+
+The three cells that moved the wrong way all sit in the `Transpose`-dominated
+models whose per-trial dispersion at the time reached 51–109; the harness could
+not resolve them. They are reported as neutral, not as wins.
+
+## 7. View graph outputs: three full copies (#1076, merged `fdc5007e8`)
+
+I rewrote the `Transpose` kernel first. It moved `tr_bert_b8_s128` from 6.87 ms
+to 6.45 ms — **essentially nothing**. The reason is that
+`TransposeKernel::view_outputs` returns a zero-copy strided `ViewOutput`, so for
+a graph-output transpose **the kernel never runs**. All the time was in the
+executor:
+
+1. `contiguous_bytes` staged `vec![0u8; buf.len()]` and `copy_to_host`d the
+   *whole source* into it before gathering a byte, even when the buffer was
+   already host-resident.
+2. `gather_view` walked a scalar odometer recomputing a full rank-length dot
+   product **per element**, one element at a time, single-threaded.
+3. The resulting `Vec` went to `Tensor::from_raw`, which allocated the same bytes
+   a *second* time and memcpyd between them.
+
+Fixed by reading host buffers in place, collapsing the view geometry (drop
+size-1 axes, then fuse axis `i` into `i+1` exactly when
+`strides[i] == strides[i+1] * shape[i+1]`), copying the largest contiguous run
+the collapsed geometry allows, advancing an incremental odometer, fanning out
+across rayon above 256 KiB, and gathering straight into the output tensor's own
+allocation via `Tensor::from_host_fill`.
+
+Interleaved, same binary pair, 5 trials × 9 runs × 3 warmups, ratio = ours/ORT
+p50 (lower is better), **all 9 cells**:
+
+| model | t | before | after | change | native before | native after |
+|---|--:|--:|--:|--:|--:|--:|
+| tr_bert_b8_s128 | 1 | 26.59 | **0.91** | **29.2×** | 10.53 ms | 0.249 ms |
+| tr_bert_b8_s128 | 8 | 49.71 | **2.46** | **20.2×** | 7.22 ms | 0.341 ms |
+| tr_bert_b8_s128 | 16 | 64.38 | **4.10** | **15.7×** | 10.34 ms | 0.547 ms |
+| tr_llama3_s512 | 1 | 13.21 | **1.12** | **11.8×** | 14.00 ms | 0.966 ms |
+| tr_llama3_s512 | 8 | 71.37 | **5.39** | **13.2×** | 14.48 ms | 0.695 ms |
+| tr_llama3_s512 | 16 | 110.70 | **9.46** | **11.7×** | 22.16 ms | 0.930 ms |
+| tr_whisper_s1500 | 1 | 20.55 | **1.46** | **14.1×** | 16.10 ms | 0.901 ms |
+| tr_whisper_s1500 | 8 | 68.83 | **5.56** | **12.4×** | 16.13 ms | 0.703 ms |
+| tr_whisper_s1500 | 16 | 90.09 | **9.21** | **9.8×** | 23.04 ms | 1.010 ms |
+
+240/240 cells parity PASS. `tr_bert_b8_s128` at t=1 now **beats ORT** (0.91×).
+
+We still lose at 8 and 16 threads. Sweeping `RAYON_NUM_THREADS` over 1/4/8/16/32
+on `tr_bert_b8_s128` moves native p50 only between 0.53 and 0.63 ms, so more
+workers is not the missing lever: the residue is ORT reading and writing less,
+which needs a fused permute-with-consumer, not a faster gather.
+
+## 8. KV-cache `Concat` — negative result, not shipped
+
+`ConcatKernel` already bulk-memcpys per slab but is explicitly single-threaded
+while ORT parallelizes; the arena A/B showed exactly that signature (our time
+flat as ORT scaled with threads). I parallelized it across output rows.
+
+**All 15 cells**, ratio = ours/ORT p50:
+
+| model | t | before | after |
+|---|--:|--:|--:|
+| kvcat_llama3_p1023 | 1 | 1.84 | 1.93 |
+| kvcat_llama3_p1023 | 8 | 6.08 | 5.64 |
+| kvcat_llama3_p1023 | 16 | 6.21 | **8.85** |
+| kvcat_llama3_p2047 | 1 | 1.85 | 1.85 |
+| kvcat_llama3_p2047 | 8 | 4.30 | 4.31 |
+| kvcat_llama3_p2047 | 16 | 5.90 | 5.55 |
+| kvcat_llama3_p4095 | 1 | 1.88 | 1.93 |
+| kvcat_llama3_p4095 | 8 | 5.32 | 5.17 |
+| kvcat_llama3_p4095 | 16 | 5.21 | 5.11 |
+| kvcat_llama3_p8191 | 1 | 1.93 | 1.91 |
+| kvcat_llama3_p8191 | 8 | 4.83 | 4.37 |
+| kvcat_llama3_p8191 | 16 | 5.82 | 5.06 |
+| kvcat_llama3_b8_p2047 | 1 | 1.89 | 1.88 |
+| kvcat_llama3_b8_p2047 | 8 | 4.36 | 4.16 |
+| kvcat_llama3_b8_p2047 | 16 | 4.59 | 4.39 |
+
+No win anywhere, and a clear regression at `p1023` t=16 (bands `[5.32–7.08]` vs
+`[7.82–9.62]`, non-overlapping). The KV concat inputs are not all contiguous, so
+the fan-out mostly declines to the serial gather and only adds threshold
+overhead. **The change was discarded.** The real fix is an appendable/paged KV
+cache that never re-copies history, which is not a `Concat` change at all.
+
+## 9. What Phase 3 did to the rest of the table
+
+Same-binary-pair A/B, Phase 2 head (`ab6cb0168`) vs Phase 3 head, ratio =
+ours/ORT p50. **All measured cells**, including every unchanged one.
+
+### Softmax (18 cells)
+
+| model | t | Phase 2 | Phase 3 |
+|---|--:|--:|--:|
+| sm_decode_h32_kv1024 | 1 | 1.27 | 1.28 |
+| sm_decode_h32_kv1024 | 8 | 2.38 | **2.05** |
+| sm_decode_h32_kv1024 | 16 | 2.37 | **2.11** |
+| sm_decode_h32_kv4096 | 1 | 1.40 | 1.34 |
+| sm_decode_h32_kv4096 | 8 | 4.98 | 5.06 |
+| sm_decode_h32_kv4096 | 16 | 4.67 | 4.60 |
+| sm_decode_h32_kv8192 | 1 | 1.34 | 1.32 |
+| sm_decode_h32_kv8192 | 8 | 6.61 | 6.99 |
+| sm_decode_h32_kv8192 | 16 | 6.97 | 7.02 |
+| sm_prefill_h32_s512 | 1 | 2.52 | **1.76** |
+| sm_prefill_h32_s512 | 8 | 5.80 | **5.08** |
+| sm_prefill_h32_s512 | 16 | 5.77 | **4.58** |
+| sm_bert_b8_s128 | 1 | 1.53 | 1.56 |
+| sm_bert_b8_s128 | 8 | 5.15 | 4.89 |
+| sm_bert_b8_s128 | 16 | 9.29 | 8.83 |
+| sm_whisper_cross | 1 | 2.21 | **1.73** |
+| sm_whisper_cross | 8 | 5.10 | 5.17 |
+| sm_whisper_cross | 16 | 5.19 | **4.67** |
+
+The wins are exactly the allocation-bound cells the arena helps
+(`sm_prefill_h32_s512` native 11.16 → 7.60 ms, `sm_whisper_cross` 59.05 →
+46.10 ms at t=1). Decode-shaped softmaxes are unchanged — they allocate almost
+nothing. **Every cell still loses to ORT.**
+
+### RotaryEmbedding (12 cells)
+
+| model | t | Phase 2 | Phase 3 |
+|---|--:|--:|--:|
+| rope_llama3_s1 | 1 | 9.83 | 9.70 |
+| rope_llama3_s1 | 8 | 9.23 | **6.93** |
+| rope_llama3_s1 | 16 | 6.97 | 6.89 |
+| rope_llama3_b8_s1 | 1 | 5.82 | 5.90 |
+| rope_llama3_b8_s1 | 8 | 5.75 | 5.77 |
+| rope_llama3_b8_s1 | 16 | 4.24 | **3.95** |
+| rope_llama3_s128 | 1 | 2.66 | 2.79 |
+| rope_llama3_s128 | 8 | 12.35 | 12.59 |
+| rope_llama3_s128 | 16 | 17.90 | 17.21 |
+| rope_llama3_s512 | 1 | 2.05 | **1.53** |
+| rope_llama3_s512 | 8 | 6.21 | **5.78** |
+| rope_llama3_s512 | 16 | 8.62 | 8.83 |
+
+**Every cell still loses to ORT**, which is why float32 `RotaryEmbedding` now
+defers to the host in the plugin EP (#1078).
+
+### MHA / SDPA (15 cells)
+
+| model | t | Phase 2 | Phase 3 | native before | native after |
+|---|--:|--:|--:|--:|--:|
+| mha_bert_base_s128 | 1 | 3.15 | **2.70** | 2.62 ms | 2.26 ms |
+| mha_bert_base_s128 | 8 | 10.49 | **8.89** | 7.22 ms | 6.04 ms |
+| mha_bert_base_s128 | 16 | 10.58 | 9.84 | 7.66 ms | 7.34 ms |
+| mha_bert_base_b8_s128 | 1 | 2.49 | **2.20** | 17.30 ms | 15.31 ms |
+| mha_bert_base_b8_s128 | 8 | 4.00 | 3.94 | 17.70 ms | 14.96 ms |
+| mha_bert_base_b8_s128 | 16 | 4.74 | **4.07** | 22.65 ms | 23.85 ms |
+| mha_vit_b16_s197 | 1 | 2.34 | **2.02** | 4.50 ms | 3.89 ms |
+| mha_vit_b16_s197 | 8 | 8.63 | 8.92 | 8.99 ms | 7.73 ms |
+| mha_vit_b16_s197 | 16 | 8.38 | 7.88 | 9.33 ms | 8.87 ms |
+| mha_clip_l14_s257 | 1 | 2.00 | **1.77** | 8.52 ms | 7.54 ms |
+| mha_clip_l14_s257 | 8 | 5.27 | 5.21 | 10.35 ms | 9.43 ms |
+| mha_clip_l14_s257 | 16 | 6.93 | **6.29** | 13.15 ms | 11.82 ms |
+| mha_whisper_cross_s1500 | 1 | 1.27 | 1.26 | 37.71 ms | 37.28 ms |
+| mha_whisper_cross_s1500 | 8 | 3.07 | **2.65** | 25.61 ms | 24.65 ms |
+| mha_whisper_cross_s1500 | 16 | 3.35 | 3.12 | 26.29 ms | 25.89 ms |
+
+Phase 3 bought MHA a **5–16% end-to-end improvement**, entirely from the arena
+and the view-materialization path — no MHA kernel was touched. Native time falls
+in 14 of 15 cells. **Every cell still loses**, best 1.26×, worst 9.84×.
+
+### MoE (15 cells)
+
+| model | t | Phase 2 | Phase 3 |
+|---|--:|--:|--:|
+| moe_qwen3moe_e16_t1 | 1 | 1.02 | 1.02 |
+| moe_qwen3moe_e16_t1 | 8 | 1.78 | **1.57** |
+| moe_qwen3moe_e16_t1 | 16 | 1.27 | 1.25 |
+| moe_qwen3moe_e16_t32 | 1 | 1.02 | 1.02 |
+| moe_qwen3moe_e16_t32 | 8 | 2.00 | 2.00 |
+| moe_qwen3moe_e16_t32 | 16 | 1.51 | **1.30** |
+| moe_qwen3moe_e16_t512 | 1 | 1.05 | 1.04 |
+| moe_qwen3moe_e16_t512 | 8 | 2.09 | 2.32 |
+| moe_qwen3moe_e16_t512 | 16 | 1.52 | **1.12** |
+| moe_mixtral_e8_t32 | 1 | 1.02 | 1.02 |
+| moe_mixtral_e8_t32 | 8 | 2.15 | 2.15 |
+| moe_mixtral_e8_t32 | 16 | 1.27 | 1.59 |
+| moe_mixtral_e8_t512 | 1 | 1.09 | 1.08 |
+| moe_mixtral_e8_t512 | 8 | 2.05 | 2.42 |
+| moe_mixtral_e8_t512 | 16 | 1.55 | 1.80 |
+
+MoE is unchanged by Phase 3, as expected — it allocates once and transposes
+nothing. Note these ratios are much closer to parity than §2's MoE grid
+suggested (1.02–2.42 vs 0.65–2.37 there); the two grids were measured in
+different sessions and, per the standing caveat, only within-session comparisons
+are load-bearing. Within *this* session MoE is at parity at t=1 and loses
+1.1–2.4× at 8 and 16 threads, where ORT's expert loop threads better than ours.
+
+## 10. Assignment matrix after Phase 3
+
+What the **plugin** EP asks ORT to hand over. This does not affect a native
+`InferenceSession`, which has no host to defer to and runs every kernel.
+
+| op | dtype | claim | evidence |
+|---|---|---|---|
+| `Tanh`/`Sigmoid`/`Gelu`/`Sqrt`/`Erf` | float32 | defer | 0.02–0.87× |
+| same | float16 | defer | 0.59–0.96× |
+| same | bfloat16 | **claim** | ORT has no kernel — capability, not perf |
+| `Gelu` | non-float32 | **claim** | ORT inlines the function; deferring measured 0.014× |
+| `MatMul`/`Gemm` | float32 ≥1 M weights | defer | slower at every thread count 2–16 |
+| `MatMul` | float16 | defer | 2.5× @1T, 5.3–7.8× @2–32T |
+| `QLinearMatMul` | any | defer | 2.2–22× |
+| `MatMulNBits` int4 | decode | defer | 1.78–2.41× @8T |
+| `MatMulNBits` int8 | ≥256 static rows | defer | 1.15–1.41× |
+| **`RotaryEmbedding`** | **float32** | **defer (new, #1078)** | **12/12 cells lose, 1.53–17.21×** |
+| `RotaryEmbedding` | non-float32 | claim | unmeasured |
+| `Softmax` | any | **claim** | loses 1.28–8.83× standalone, but anchors attention fusion — see below |
+| `Transpose` | any | claim | 0.91× at t=1; view path is zero-copy, deferring would force materialization |
+| `Concat` | any | claim | loses 1.85–5.5×, but is the KV-cache path; deferring breaks view chaining |
+| GQA / MHA / MoE | any | claim | no ORT-superior standalone alternative in the plugin path |
+
+**Why `Softmax` is not deferred despite losing every cell.** It is the anchor of
+this repo's own attention fusion: `MatMul → (Mul|Div) → [Add(mask)] → Softmax →
+MatMul` collapses into a fused SDPA kernel in `onnx-runtime-optimizer`'s fusion
+pass (`fusion/mod.rs:207,528`), which runs on plugin-claimed subgraphs via
+`ep.custom_passes()`. Deferring the standalone node removes the anchor and
+fragments the SDPA core across the EP boundary — claim QKᵀ, hand the scores to
+ORT, claim the PV matmul. The 18-cell grid above was measured on **isolated
+single-op graphs under `ORT_DISABLE_ALL`**, which cannot see that effect, so it
+does not support deferral. A future deferral needs a fused-graph measurement.
+
+## 11. Phase 3 limitations
+
+1. Still one host, one microarchitecture, AVX2 without AVX-512, no ARM.
+2. The 256 KiB allocation-cache floor and parallel-gather threshold are **glibc**
+   numbers, chosen to sit above `M_MMAP_THRESHOLD`. Untested on musl and Windows.
+3. Native p50 rises with `ONNX_GENAI_CPU_DECODE_THREADS` on the transform models
+   (0.204 → 0.557 ms on `tr_bert_b8_s128`) even though the gather does not read
+   that variable. Isolated to the co-resident ORT thread pool: with
+   `--native-threads 1` fixed and ORT's pool swept 1/8/16, native stays at
+   0.203–0.242 ms. Both arms see it identically, so before/after comparisons are
+   unaffected, but the absolute t=8/16 numbers are pessimistic for both sides.
+4. `Transpose` at 8/16 threads (2.5–9.5×), MHA (1.26–9.84×), Softmax
+   (1.28–8.83×), RoPE (1.53–17.21×), `Concat` (1.85–5.55×) and MoE at 8/16
+   threads (1.1–2.4×) all still lose to ORT and are **not** fixed here.
+5. No appendable/paged KV cache. `Concat` re-copies the full history every token;
+   that is the single largest remaining structural gap.
+6. MoE grouped/batched GEMM was not attempted. The measured MoE gap in this
+   session (1.1–2.4× at 8/16 threads) is a threading-granularity gap, not an
+   arithmetic one.

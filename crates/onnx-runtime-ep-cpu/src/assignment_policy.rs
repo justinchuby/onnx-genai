@@ -97,7 +97,7 @@ pub fn governs(op: &Node) -> bool {
         (op.domain.as_str(), op.op_type.as_str()),
         ("" | "ai.onnx", "Tanh" | "Sigmoid" | "Gelu" | "Sqrt" | "Erf")
             | ("" | "ai.onnx", "MatMul" | "Gemm" | "QLinearMatMul")
-            | ("com.microsoft", "MatMulNBits")
+            | ("com.microsoft", "MatMulNBits" | "RotaryEmbedding")
             | ("com.microsoft", "FastGelu" | "QuickGelu" | "BiasGelu")
     )
 }
@@ -259,6 +259,57 @@ pub fn claim_preference(
                  {other:?}, and an unmeasured claim risks a silent latency regression",
                 op.op_type
             )),
+        };
+    }
+
+    // `com.microsoft::RotaryEmbedding` loses to ORT's CPU contrib kernel in
+    // **every** cell of a session-level grid. Interleaved A/B, AMD EPYC 9V74
+    // 16C/32T AVX2+FMA, 5 trials x 9 runs x 3 warmups, ratio = ours/ORT p50
+    // (lower is better for us):
+    //
+    // | model             | t=1  | t=8   | t=16  |
+    // |-------------------|-----:|------:|------:|
+    // | rope_llama3_s1    | 9.70 |  6.93 |  6.89 |
+    // | rope_llama3_b8_s1 | 5.90 |  5.77 |  3.95 |
+    // | rope_llama3_s128  | 2.79 | 12.59 | 17.21 |
+    // | rope_llama3_s512  | 1.53 |  5.78 |  8.83 |
+    //
+    // That is *after* this crate's own RoPE vectorization and parallelization,
+    // which took the worst cell from 83.75x to 17.21x, and after the host
+    // large-allocation cache. The best cell is still 1.53x against us, so under
+    // this module's ">= 5% win at every measured thread count" rule there is no
+    // size and no thread count at which the claim survives.
+    //
+    // Deferring is a real handover here, not the `Gelu` inlining trap: ORT's
+    // CPU EP has a genuine `com.microsoft::RotaryEmbedding` contrib kernel
+    // (`contrib_ops/cpu/bert/rotary_embedding.cc`), and the node stays a single
+    // node afterwards. `input_dtypes.first()` is input 0, the float data --
+    // `position_ids` is input 1 and int64, so it cannot be mistaken for the
+    // governing dtype. Only float32 defers; float16 and bfloat16 are unmeasured
+    // here and keep the claim, which is also what keeps a bfloat16 session
+    // loading at all.
+    //
+    // `Softmax` was measured the same way and loses just as badly (1.28x-8.83x
+    // across the same grid), but is deliberately **not** governed. It is the
+    // anchor of this repo's own attention fusion --
+    // `MatMul -> (Mul|Div) -> [Add(mask)] -> Softmax -> MatMul` collapses into a
+    // fused SDPA kernel in `onnx-runtime-optimizer`'s fusion pass, which runs on
+    // plugin-claimed subgraphs. Deferring the standalone node would remove the
+    // anchor and fragment the SDPA core across the EP boundary (claim QK^T,
+    // hand the scores to ORT, claim the PV matmul), which is worse than either
+    // the fused kernel or deferring the whole block. The grid above was measured
+    // on isolated single-op graphs under `ORT_DISABLE_ALL`, so it does not
+    // predict that case, and a claim to defer it needs a fused-graph
+    // measurement this module does not have.
+    if op.op_type == "RotaryEmbedding" {
+        return if dtype == DataType::Float32 {
+            ClaimPreference::defer(
+                "measured slower than ORT's float32 CPU contrib kernel in every cell of a \
+                 session-level A/B grid (1.53-17.2x ours/ORT across 1/8/16 threads, decode and \
+                 prefill shapes); ORT has a float32 kernel for this op to defer to",
+            )
+        } else {
+            ClaimPreference::Claim
         };
     }
 
@@ -1212,6 +1263,117 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+    fn ms_node(op_type: &str) -> Node {
+        let mut n = Node::new(NodeId(0), op_type, vec![], vec![]);
+        n.domain = "com.microsoft".to_string();
+        n
+    }
+
+    /// RoPE lost every cell of the measured grid, so no shape may keep the
+    /// float32 claim. A size gate reintroduced later fails here.
+    #[test]
+    fn float32_rope_defers_at_every_shape() {
+        let n = ms_node("RotaryEmbedding");
+        for shp in [
+            shape(&[1, 1, 32, 128]),
+            shape(&[8, 1, 32, 128]),
+            shape(&[1, 512, 32, 128]),
+            shape(&[1, 4_000_000]),
+            dynamic_shape(),
+        ] {
+            let pref = claim_preference(&n, 22, std::slice::from_ref(&shp), &[DataType::Float32]);
+            assert!(
+                !pref.is_claim(),
+                "float32 RotaryEmbedding must defer at {shp:?} — it lost every measured cell"
+            );
+        }
+    }
+
+    /// The deferral is a performance bet and only float32 was measured.
+    /// bfloat16 additionally has no ORT kernel in some builds, so deferring it
+    /// could turn a working session into a load failure.
+    #[test]
+    fn non_float32_rope_keeps_the_claim() {
+        for dt in [DataType::BFloat16, DataType::Float16, DataType::Float64] {
+            let pref = claim_preference(
+                &ms_node("RotaryEmbedding"),
+                22,
+                &[shape(&[1, 512, 32, 128])],
+                &[dt],
+            );
+            assert!(
+                pref.is_claim(),
+                "RotaryEmbedding in {dt:?} is unmeasured against ORT and must keep the claim"
+            );
+        }
+    }
+
+    /// `RotaryEmbedding` is governed only in the `com.microsoft` domain; a
+    /// same-named op elsewhere is a different operator.
+    #[test]
+    fn rope_outside_the_microsoft_domain_is_not_governed() {
+        let n = Node::new(NodeId(0), "RotaryEmbedding", vec![], vec![]);
+        assert!(!governs(&n));
+        assert!(
+            claim_preference(&n, 22, &[shape(&[1, 512, 32, 128])], &[DataType::Float32]).is_claim()
+        );
+    }
+
+    /// `Softmax` measured just as badly as RoPE but is deliberately left
+    /// ungoverned: it anchors this repo's attention fusion, and deferring the
+    /// standalone node would fragment the fused SDPA core across the EP
+    /// boundary. This test is the reason a future "Softmax loses, defer it"
+    /// change has to argue with a fused-graph measurement first.
+    #[test]
+    fn softmax_stays_claimed_because_it_anchors_attention_fusion() {
+        assert!(!governs(&node("Softmax", &[])));
+        for dt in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+            assert!(
+                claim_preference(
+                    &node("Softmax", &[]),
+                    22,
+                    &[shape(&[1, 32, 1, 4096])],
+                    &[dt]
+                )
+                .is_claim(),
+                "Softmax must keep its claim in {dt:?} — it is the attention-fusion anchor"
+            );
+        }
+    }
+
+    /// Adding `RotaryEmbedding` must not perturb any pre-existing answer,
+    /// including the whole matmul family this module also governs.
+    #[test]
+    fn previously_governed_ops_are_unchanged_by_the_rope_addition() {
+        for op in [
+            "Tanh",
+            "Sigmoid",
+            "Gelu",
+            "Sqrt",
+            "Erf",
+            "MatMul",
+            "Gemm",
+            "QLinearMatMul",
+        ] {
+            assert!(governs(&node(op, &[])), "{op} must stay governed");
+        }
+        assert!(
+            governs(&ms_node("MatMulNBits")),
+            "MatMulNBits must stay governed"
+        );
+        for op in ["Tanh", "Sigmoid", "Gelu", "Sqrt", "Erf"] {
+            assert!(
+                claim_preference(
+                    &node(op, &[]),
+                    22,
+                    &[shape(&[1, 1024])],
+                    &[DataType::BFloat16]
+                )
+                .is_claim(),
+                "{op} bfloat16 answer changed"
+            );
         }
     }
 }

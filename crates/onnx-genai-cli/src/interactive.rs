@@ -404,27 +404,6 @@ impl SessionSettings {
         }
     }
 
-    /// The providers a session built from these settings actually runs on, in
-    /// priority order.
-    ///
-    /// Resolved rather than echoed back: with no explicit choice the provider
-    /// comes from the environment *or* from platform auto-selection (Metal on
-    /// Apple Silicon), and reporting the request instead of the result would
-    /// name CPU for a session running on the GPU.
-    pub(super) fn resolved_providers(&self) -> String {
-        let options = self.to_session_options();
-        let names = options
-            .execution_providers
-            .iter()
-            .map(|provider| provider.selection.name.as_str())
-            .collect::<Vec<_>>();
-        if names.is_empty() {
-            "cpu".to_string()
-        } else {
-            names.join(", ")
-        }
-    }
-
     pub(super) fn backend_name(&self) -> &'static str {
         decode_backend_name(self.decode_backend)
     }
@@ -452,6 +431,7 @@ impl SessionUsage {
 /// diagnostics without echoing conversation content.
 pub(super) struct SessionSummary<'a> {
     pub(super) settings: &'a SessionSettings,
+    pub(super) execution_provider: String,
     pub(super) resolved_decode_backend: EngineDecodeBackend,
     /// The sampling policy resolved for the current backend — the *same* value a
     /// generated turn uses, produced by [`resolve_session_sampling`]. Held
@@ -506,7 +486,7 @@ impl fmt::Display for SessionSummary<'_> {
         writeln!(
             formatter,
             "  execution provider: {}",
-            self.settings.resolved_providers()
+            self.execution_provider
         )?;
         writeln!(
             formatter,
@@ -669,6 +649,15 @@ impl Backend {
         match self {
             Self::Text(engine) => engine.decode_backend(),
             Self::Pipeline(pipeline) => pipeline.engine.decode_backend(),
+        }
+    }
+
+    /// Execution-provider placement reported by the loaded model, not by the
+    /// requested settings.
+    pub(super) fn execution_provider_status(&self) -> String {
+        match self {
+            Self::Text(engine) => engine.execution_provider_status(),
+            Self::Pipeline(pipeline) => pipeline.engine.execution_provider_status(),
         }
     }
 
@@ -1200,6 +1189,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                         "{}",
                         SessionSummary {
                             settings: &settings,
+                            execution_provider: backend.execution_provider_status(),
                             resolved_decode_backend: backend.decode_backend(),
                             sampling: resolve_session_sampling(
                                 &sampling_options,
@@ -1218,6 +1208,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                     "{}",
                     SessionSummary {
                         settings: &settings,
+                        execution_provider: backend.execution_provider_status(),
                         resolved_decode_backend: backend.decode_backend(),
                         sampling: resolve_session_sampling(
                             &sampling_options,
@@ -1262,7 +1253,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                     }
                     None => println!(
                         "execution provider {} (available: {})",
-                        settings.resolved_providers(),
+                        backend.execution_provider_status(),
                         available_execution_providers().join(", ")
                     ),
                 }
@@ -1293,6 +1284,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
                         "{}",
                         SessionSummary {
                             settings: &settings,
+                            execution_provider: backend.execution_provider_status(),
                             resolved_decode_backend: backend.decode_backend(),
                             sampling: resolve_session_sampling(
                                 &sampling_options,
@@ -1432,7 +1424,7 @@ pub(super) fn run_repl(args: RunArgs, profiling: &ProfileArgs) -> anyhow::Result
         };
 
         let mut profile = RunProfile::new(model_dir.display().to_string());
-        profile.execution_provider = settings.resolved_providers();
+        profile.execution_provider = backend.execution_provider_status();
         profile.decode_backend = Some(decode_backend_name(backend.decode_backend()).to_string());
         profile.phase("model load", load_elapsed);
         profile.prompt_tokens = Some(prompt_tokens);

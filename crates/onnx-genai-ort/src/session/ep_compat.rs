@@ -121,12 +121,16 @@ pub(crate) enum AppendStrategy {
         options: Vec<(String, String)>,
         device: Option<String>,
     },
-    /// ORT built-in appended by name (WebGPU/CoreML transitional, plus any
-    /// unrecognized name attempted by-name with conservative capabilities).
+    /// ORT built-in appended by name (WebGPU/CoreML transitional).
     NamedGeneric {
         ort_name: String,
         provider_name: String,
     },
+    /// A requested provider name that this compatibility table does not know.
+    UnsupportedName { name: String },
+    /// A provider entry that could not be resolved because its configuration is
+    /// incomplete or contradictory.
+    InvalidConfiguration { message: String },
 }
 
 /// An [`EpSelection`] resolved into capabilities plus an append strategy.
@@ -144,6 +148,7 @@ pub struct ResolvedEp {
 impl ResolvedEp {
     /// A strict provider must NOT silently fall back to CPU on load failure.
     /// Explicit CUDA and self-registering plugin EPs are strict.
+    #[cfg(test)]
     pub(crate) fn is_strict(&self) -> bool {
         #[cfg(feature = "cuda")]
         {
@@ -159,6 +164,13 @@ impl ResolvedEp {
                 AppendStrategy::CudaUnavailable | AppendStrategy::PluginLibrary { .. }
             )
         }
+    }
+
+    pub(crate) fn is_unsupported_name(&self) -> bool {
+        matches!(
+            self.strategy,
+            AppendStrategy::UnsupportedName { .. } | AppendStrategy::InvalidConfiguration { .. }
+        )
     }
 
     /// Native-runtime plugin bridge metadata, when this EP is backed by an
@@ -200,8 +212,8 @@ pub struct NativePluginBridge {
 /// needs its plugin library configured, so a machine with neither is not
 /// offered a provider that would fail to load.
 ///
-/// Other names still work — the table falls back to appending them to ONNX
-/// Runtime by name — so this is a menu, not a whitelist.
+/// This table is intentionally a whitelist. Unsupported provider names fail
+/// clearly; provider-specific extensions should use the explicit plugin path.
 #[must_use]
 pub fn selectable_execution_providers() -> Vec<&'static str> {
     let mut names = vec!["cpu"];
@@ -224,6 +236,11 @@ pub fn selectable_execution_providers() -> Vec<&'static str> {
         names.push("qnn");
     }
     names
+}
+
+#[must_use]
+pub(crate) fn known_execution_provider_values() -> &'static str {
+    "cpu, cuda, webgpu (aliases: web-gpu, web_gpu), coreml (aliases: core-ml, core_ml), metal, qnn (aliases: qnn-htp, qnn_htp), plugin:<library>|name=<registration>|device=<CPU|GPU|NPU>|opt.<key>=<value>"
 }
 
 /// Resolve an [`EpSelection`] into capabilities and an append strategy.
@@ -360,29 +377,15 @@ pub fn resolve_execution_provider(selection: &EpSelection) -> ResolvedEp {
             graph_capture_env: false,
             transitional_webgpu: false,
         },
-        // Any other name: no plugin library env is configured, so attempt an
-        // ORT built-in append by name with conservative capabilities.
-        other => {
-            tracing::warn!(
-                "Unrecognized ONNX_GENAI_EP={other}; attempting to append it to ONNX Runtime by name with conservative capabilities (no device-resident KV/sampling, no graph capture, no fixed-capacity present binding)"
-            );
-            ResolvedEp {
-                selection: selection.clone(),
-                caps: EpCapabilities::new(
-                    selection.name.clone(),
-                    HardwareKind::Other,
-                    None,
-                    None,
-                    &[],
-                ),
-                strategy: AppendStrategy::NamedGeneric {
-                    ort_name: selection.name.clone(),
-                    provider_name: format!("{other}ExecutionProvider"),
-                },
-                graph_capture_env: false,
-                transitional_webgpu: false,
-            }
-        }
+        other => ResolvedEp {
+            selection: selection.clone(),
+            caps: EpCapabilities::new(selection.name.clone(), HardwareKind::Other, None, None, &[]),
+            strategy: AppendStrategy::UnsupportedName {
+                name: other.to_string(),
+            },
+            graph_capture_env: false,
+            transitional_webgpu: false,
+        },
     }
 }
 
