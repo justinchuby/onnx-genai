@@ -194,21 +194,33 @@ static PRESENT_DIRECT_OVERRIDE: std::sync::atomic::AtomicI8 = std::sync::atomic:
 #[cfg(test)]
 static PRESENT_DIRECT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Held for the whole body of any test that overrides a present-path knob or
+/// asserts on the direct/scratch/pooled counters. The knobs are process-wide
+/// statics, so a test that only locked while *forcing* an override would still
+/// race with a concurrent test's unforced arm - which is exactly the arm those
+/// tests assert took the default path.
+#[cfg(test)]
+struct PresentTestGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+#[cfg(test)]
+fn present_test_guard() -> PresentTestGuard {
+    PresentTestGuard(
+        PRESENT_DIRECT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    )
+}
+
 /// Forces the owned-scratch present path for the lifetime of the guard, so a
 /// test can A/B it against the direct-write path on identical inputs.
 #[cfg(test)]
-struct PresentScratchOverride {
-    _guard: std::sync::MutexGuard<'static, ()>,
-}
+struct PresentScratchOverride;
 
 #[cfg(test)]
 impl PresentScratchOverride {
-    fn forced() -> Self {
-        let guard = PRESENT_DIRECT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fn forced(_serialised: &PresentTestGuard) -> Self {
         PRESENT_DIRECT_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
-        Self { _guard: guard }
+        Self
     }
 }
 
@@ -228,18 +240,13 @@ fn pooled_fill_count() -> u64 {
 /// Lowers the fan-out gate for the lifetime of the guard so a test can drive
 /// the pooled fill at a cache size small enough to compare exhaustively.
 #[cfg(test)]
-struct PresentParallelOverride {
-    _guard: std::sync::MutexGuard<'static, ()>,
-}
+struct PresentParallelOverride;
 
 #[cfg(test)]
 impl PresentParallelOverride {
-    fn bytes_per_worker(bytes: usize) -> Self {
-        let guard = PRESENT_DIRECT_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fn bytes_per_worker(_serialised: &PresentTestGuard, bytes: usize) -> Self {
         PRESENT_PARALLEL_BYTES_OVERRIDE.store(bytes, std::sync::atomic::Ordering::Relaxed);
-        Self { _guard: guard }
+        Self
     }
 }
 
@@ -4634,17 +4641,18 @@ mod tests {
     /// the `row_index -> (batch, kv-head)` mapping cannot survive it.
     #[test]
     fn pooled_present_fill_is_bit_identical_to_the_serial_fill() {
+        let serialised = present_test_guard();
         let kernel = gqa_kernel_with_heads(8, 4, &[]);
         // 4 batches x 4 kv-heads = 16 disjoint rows, capacity 24, dim 8.
         let case = PresentCase::with_seqlens(8, 4, 8, 24, &[3, 11, 23, 17]);
 
         let serial = {
-            let _gate = PresentParallelOverride::bytes_per_worker(usize::MAX - 1);
+            let _gate = PresentParallelOverride::bytes_per_worker(&serialised, usize::MAX - 1);
             case.run(kernel.as_ref())
         };
         let serial_fills = pooled_fill_count();
         let pooled = {
-            let _gate = PresentParallelOverride::bytes_per_worker(1);
+            let _gate = PresentParallelOverride::bytes_per_worker(&serialised, 1);
             case.run(kernel.as_ref())
         };
 
@@ -4669,6 +4677,7 @@ mod tests {
     /// the per-batch tails.
     #[test]
     fn direct_present_matches_scratch_with_an_f16_past_cache() {
+        let serialised = present_test_guard();
         let kernel = gqa_kernel_with_heads(4, 2, &[]);
         let (batch, heads, kv_heads, dim, capacity) = (2usize, 4usize, 2usize, 8usize, 12usize);
         let seqlens: [i32; 2] = [4, 9];
@@ -4710,7 +4719,7 @@ mod tests {
         };
 
         let scratch = {
-            let _forced = PresentScratchOverride::forced();
+            let _forced = PresentScratchOverride::forced(&serialised);
             run()
         };
         let direct = run();
@@ -4724,11 +4733,12 @@ mod tests {
     /// and both present tensors. Covers the no-tail decode geometry.
     #[test]
     fn direct_present_is_bit_identical_to_owned_scratch() {
+        let serialised = present_test_guard();
         let kernel = gqa_kernel_with_heads(8, 2, &[]);
         let case = PresentCase::new(2, 8, 2, 16, 5, 6);
 
         let scratch = {
-            let _forced = PresentScratchOverride::forced();
+            let _forced = PresentScratchOverride::forced(&serialised);
             let before = present_scratch_count();
             let result = case.run(kernel.as_ref());
             assert!(
@@ -4759,6 +4769,7 @@ mod tests {
     /// really is zero and the prefix is untouched.
     #[test]
     fn direct_present_zeroes_only_the_unattended_tail() {
+        let serialised = present_test_guard();
         const BATCH: usize = 1;
         const KV_HEADS: usize = 2;
         const DIM: usize = 8;
@@ -4768,7 +4779,7 @@ mod tests {
         let case = PresentCase::new(BATCH, 4, KV_HEADS, DIM, PAST, CAPACITY);
 
         let scratch = {
-            let _forced = PresentScratchOverride::forced();
+            let _forced = PresentScratchOverride::forced(&serialised);
             case.run(kernel.as_ref())
         };
         let direct = case.run(kernel.as_ref());
@@ -4804,6 +4815,7 @@ mod tests {
     /// to decline to the owned-scratch path.
     #[test]
     fn direct_present_declines_on_dtype_size_arity_and_aliasing() {
+        let _serialised = present_test_guard();
         const KV_HEADS: usize = 2;
         const DIM: usize = 4;
         const SEQ: usize = 3;
