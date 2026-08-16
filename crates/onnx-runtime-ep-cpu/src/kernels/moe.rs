@@ -1285,6 +1285,9 @@ mod tests {
         fc1: &[f32],
         fc2: &[f32],
         fc3: Option<&[f32]>,
+        fc1_bias: Option<&[f32]>,
+        fc2_bias: Option<&[f32]>,
+        fc3_bias: Option<&[f32]>,
         attributes: &MoeAttributes,
     ) -> Vec<f32> {
         let mut dense = vec![0.0f32; rows * hidden];
@@ -1298,11 +1301,11 @@ mod tests {
                 let expert_output = run_expert(
                     &input[row * hidden..(row + 1) * hidden],
                     &fc1[expert * fc1_size * hidden..(expert + 1) * fc1_size * hidden],
-                    None,
+                    fc1_bias.map(|bias| &bias[expert * fc1_size..(expert + 1) * fc1_size]),
                     &fc2[expert * hidden * inter..(expert + 1) * hidden * inter],
-                    None,
+                    fc2_bias.map(|bias| &bias[expert * hidden..(expert + 1) * hidden]),
                     fc3.map(|fc3| &fc3[expert * inter * hidden..(expert + 1) * inter * hidden]),
-                    None,
+                    fc3_bias.map(|bias| &bias[expert * inter..(expert + 1) * inter]),
                     fc1_size,
                     hidden,
                     inter,
@@ -1380,89 +1383,127 @@ mod tests {
             &fc1,
             &fc2,
             None,
+            None,
+            None,
+            None,
             &attributes,
         );
         assert_close(&got.to_f32(), &want);
     }
 
     /// All three swiglu layouts (unfused fc3, interleaved, split) go through
-    /// the same grouped GEMM; each has to match the scalar reference.
+    /// the same grouped GEMM, with and without biases, and at both a decode
+    /// row count and a prefill row count. Each combination has to match the
+    /// scalar reference.
     #[test]
     fn every_swiglu_fusion_mode_matches_the_scalar_reference() {
-        const ROWS: usize = 5;
         const HIDDEN: usize = 6;
         const INTER: usize = 4;
         const EXPERTS: usize = 4;
-        for fusion in [0i64, 1, 2] {
-            let fc1_size = if fusion == 0 { INTER } else { 2 * INTER };
-            let mut shapes = vec![
-                Some(vec![ROWS, HIDDEN]),
-                Some(vec![ROWS, EXPERTS]),
-                Some(vec![EXPERTS, fc1_size, HIDDEN]),
-                None,
-                Some(vec![EXPERTS, HIDDEN, INTER]),
-            ];
-            if fusion == 0 {
-                shapes.push(None);
-                shapes.push(Some(vec![EXPERTS, INTER, HIDDEN]));
-            }
-            let shape_refs: Vec<Option<&[usize]>> = shapes.iter().map(|s| s.as_deref()).collect();
-            let attrs = [
-                ("k", Attribute::Int(2)),
-                ("activation_type", Attribute::String(b"swiglu".to_vec())),
-                ("normalize_routing_weights", Attribute::Int(1)),
-                ("swiglu_fusion", Attribute::Int(fusion)),
-            ];
-            let (graph, node) = model_node(&shape_refs, &[ROWS, HIDDEN], &attrs);
-            let input = ramp(ROWS * HIDDEN, 19, 0.3, 0.04);
-            let router = ramp(ROWS * EXPERTS, 17, 6.0, 1.0);
-            let fc1 = ramp(EXPERTS * fc1_size * HIDDEN, 23, 0.25, 0.02);
-            let fc2 = ramp(EXPERTS * HIDDEN * INTER, 29, 0.25, 0.02);
-            let fc3 = ramp(EXPERTS * INTER * HIDDEN, 31, 0.25, 0.02);
+        for rows in [1usize, 5] {
+            for fusion in [0i64, 1, 2] {
+                for biased in [false, true] {
+                    let fc1_size = if fusion == 0 { INTER } else { 2 * INTER };
+                    let mut shapes = vec![
+                        Some(vec![rows, HIDDEN]),
+                        Some(vec![rows, EXPERTS]),
+                        Some(vec![EXPERTS, fc1_size, HIDDEN]),
+                        biased.then(|| vec![EXPERTS, fc1_size]),
+                        Some(vec![EXPERTS, HIDDEN, INTER]),
+                    ];
+                    if fusion == 0 || biased {
+                        shapes.push(biased.then(|| vec![EXPERTS, HIDDEN]));
+                    }
+                    if fusion == 0 {
+                        shapes.push(Some(vec![EXPERTS, INTER, HIDDEN]));
+                        shapes.push(biased.then(|| vec![EXPERTS, INTER]));
+                    }
+                    let shape_refs: Vec<Option<&[usize]>> =
+                        shapes.iter().map(|s| s.as_deref()).collect();
+                    let attrs = [
+                        ("k", Attribute::Int(2)),
+                        ("activation_type", Attribute::String(b"swiglu".to_vec())),
+                        ("normalize_routing_weights", Attribute::Int(1)),
+                        ("swiglu_fusion", Attribute::Int(fusion)),
+                    ];
+                    let (graph, node) = model_node(&shape_refs, &[rows, HIDDEN], &attrs);
+                    let input = ramp(rows * HIDDEN, 19, 0.3, 0.04);
+                    let router = ramp(rows * EXPERTS, 17, 6.0, 1.0);
+                    let fc1 = ramp(EXPERTS * fc1_size * HIDDEN, 23, 0.25, 0.02);
+                    let fc2 = ramp(EXPERTS * HIDDEN * INTER, 29, 0.25, 0.02);
+                    let fc3 = ramp(EXPERTS * INTER * HIDDEN, 31, 0.25, 0.02);
+                    let fc1_bias = ramp(EXPERTS * fc1_size, 13, 0.2, 0.05);
+                    let fc2_bias = ramp(EXPERTS * HIDDEN, 11, 0.2, 0.05);
+                    let fc3_bias = ramp(EXPERTS * INTER, 7, 0.2, 0.05);
 
-            let x = Owned::f32(&[ROWS, HIDDEN], &input);
-            let router_tensor = Owned::f32(&[ROWS, EXPERTS], &router);
-            let fc1_tensor = Owned::f32(&[EXPERTS, fc1_size, HIDDEN], &fc1);
-            let fc2_tensor = Owned::f32(&[EXPERTS, HIDDEN, INTER], &fc2);
-            let fc3_tensor = Owned::f32(&[EXPERTS, INTER, HIDDEN], &fc3);
-            let mut got = Owned::zeros_f32(&[ROWS, HIDDEN]);
-            let mut views = vec![
-                x.view(),
-                router_tensor.view(),
-                fc1_tensor.view(),
-                TensorView::absent(DataType::Float32),
-                fc2_tensor.view(),
-            ];
-            if fusion == 0 {
-                views.push(TensorView::absent(DataType::Float32));
-                views.push(fc3_tensor.view());
-            }
-            kernel(&graph, node)
-                .execute(&views, &mut [got.view_mut()])
-                .unwrap();
+                    let x = Owned::f32(&[rows, HIDDEN], &input);
+                    let router_tensor = Owned::f32(&[rows, EXPERTS], &router);
+                    let fc1_tensor = Owned::f32(&[EXPERTS, fc1_size, HIDDEN], &fc1);
+                    let fc2_tensor = Owned::f32(&[EXPERTS, HIDDEN, INTER], &fc2);
+                    let fc3_tensor = Owned::f32(&[EXPERTS, INTER, HIDDEN], &fc3);
+                    let fc1_bias_tensor = Owned::f32(&[EXPERTS, fc1_size], &fc1_bias);
+                    let fc2_bias_tensor = Owned::f32(&[EXPERTS, HIDDEN], &fc2_bias);
+                    let fc3_bias_tensor = Owned::f32(&[EXPERTS, INTER], &fc3_bias);
+                    let absent = TensorView::absent(DataType::Float32);
+                    let mut got = Owned::zeros_f32(&[rows, HIDDEN]);
+                    let mut views = vec![
+                        x.view(),
+                        router_tensor.view(),
+                        fc1_tensor.view(),
+                        if biased {
+                            fc1_bias_tensor.view()
+                        } else {
+                            absent
+                        },
+                        fc2_tensor.view(),
+                    ];
+                    if fusion == 0 || biased {
+                        views.push(if biased {
+                            fc2_bias_tensor.view()
+                        } else {
+                            absent
+                        });
+                    }
+                    if fusion == 0 {
+                        views.push(fc3_tensor.view());
+                        views.push(if biased {
+                            fc3_bias_tensor.view()
+                        } else {
+                            absent
+                        });
+                    }
+                    kernel(&graph, node)
+                        .execute(&views, &mut [got.view_mut()])
+                        .unwrap();
 
-            let attributes = MoeAttributes::from_node(graph.node(node)).unwrap();
-            let want = reference_moe(
-                ROWS,
-                HIDDEN,
-                INTER,
-                EXPERTS,
-                2,
-                fc1_size,
-                &input,
-                &router,
-                &fc1,
-                &fc2,
-                if fusion == 0 { Some(&fc3) } else { None },
-                &attributes,
-            );
-            let got = got.to_f32();
-            assert_eq!(got.len(), want.len());
-            for (index, (&got, &want)) in got.iter().zip(&want).enumerate() {
-                assert!(
-                    (got - want).abs() <= 1e-5,
-                    "swiglu_fusion={fusion} index {index}: got {got}, want {want}"
-                );
+                    let attributes = MoeAttributes::from_node(graph.node(node)).unwrap();
+                    let want = reference_moe(
+                        rows,
+                        HIDDEN,
+                        INTER,
+                        EXPERTS,
+                        2,
+                        fc1_size,
+                        &input,
+                        &router,
+                        &fc1,
+                        &fc2,
+                        (fusion == 0).then_some(&fc3[..]),
+                        biased.then_some(&fc1_bias[..]),
+                        biased.then_some(&fc2_bias[..]),
+                        (fusion == 0 && biased).then_some(&fc3_bias[..]),
+                        &attributes,
+                    );
+                    let got = got.to_f32();
+                    assert_eq!(got.len(), want.len());
+                    for (index, (&got, &want)) in got.iter().zip(&want).enumerate() {
+                        assert!(
+                            (got - want).abs() <= 1e-5,
+                            "rows={rows} swiglu_fusion={fusion} biased={biased} \
+                             index {index}: got {got}, want {want}"
+                        );
+                    }
+                }
             }
         }
     }
@@ -1573,10 +1614,12 @@ mod tests {
         }
     }
 
-    /// Zero-row experts are reachable whenever a batch routes nothing to an
-    /// expert; the GEMM must tolerate the empty extent.
+    /// The zero-extent guard in front of the GEMM has to leave a correctly
+    /// sized (empty) result rather than, say, panicking on the slice maths.
+    /// MLAS itself also tolerates `M == 0`, so this pins the wrapper's
+    /// contract, not MLAS's.
     #[test]
-    fn linear_grouped_tolerates_zero_rows() {
+    fn linear_grouped_returns_an_empty_result_for_zero_rows() {
         let weights_nk = ramp(4 * 3, 13, 0.2, 0.05);
         let got = linear_grouped(&[], 0, &weights_nk, None, 4, 3).unwrap();
         assert!(got.is_empty());
