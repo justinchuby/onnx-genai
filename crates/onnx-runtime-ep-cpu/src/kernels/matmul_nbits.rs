@@ -1137,7 +1137,10 @@ impl Kernel for MatMulNBitsKernel {
             // previously had no `accuracy_level` gate at all while
             // `arm64_kai_sdot_direct_enabled` defaults *on* for non-Apple
             // aarch64, so `accuracy_level = 0` 8-bit decode silently ran
-            // CompInt8 there. Only the final `else` keeps activations in f32.
+            // CompInt8 there. The final `else` does not quantize the
+            // activations to int8: it keeps them at f32 or, when
+            // `eight_bit_int16_activation()` is on, at int16, which stays
+            // within the fp32 oracle's 1e-5 tolerance and so is not CompInt8.
             let int8_compute_allowed = self.accuracy_level == 4;
             if int8_compute_allowed && dot_kernel.uses_kai_sdot_direct(self.bits, self.block_size) {
                 let owned_weight;
