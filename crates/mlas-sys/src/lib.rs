@@ -1399,8 +1399,10 @@ impl SQNBitPackedB {
     }
 
     fn account_alloc(&self) {
-        SQNBIT_PACKED_LIVE_BYTES
-            .fetch_add(self.owned_heap_bytes(), std::sync::atomic::Ordering::Relaxed);
+        SQNBIT_PACKED_LIVE_BYTES.fetch_add(
+            self.owned_heap_bytes(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// Pack a blockwise-quantized B weight, returning `None` when MLAS reports
@@ -1509,8 +1511,10 @@ impl SQNBitPackedB {
 
 impl Drop for SQNBitPackedB {
     fn drop(&mut self) {
-        SQNBIT_PACKED_LIVE_BYTES
-            .fetch_sub(self.owned_heap_bytes(), std::sync::atomic::Ordering::Relaxed);
+        SQNBIT_PACKED_LIVE_BYTES.fetch_sub(
+            self.owned_heap_bytes(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         unsafe { std::alloc::dealloc(self.ptr, self.layout) };
     }
 }
@@ -1831,7 +1835,6 @@ mod tests {
             );
         }
     }
-
 
     #[test]
     fn packed_b_is_send_sync() {

@@ -3009,7 +3009,6 @@ pub fn mlas_sqnbit_packed_live_bytes() -> u64 {
     }
 }
 
-
 /// should be built with, given the explicit decode budget.
 ///
 /// Only an *explicit* budget bounds the global pool: the process-local override
@@ -7831,7 +7830,12 @@ mod tests {
     use crate::CpuExecutionProvider;
     use crate::kernels::testutil::Owned;
     use onnx_runtime_ep_api::ExecutionProvider;
-    use onnx_runtime_ir::{Attribute, Graph, NodeId, TensorData, WeightRef, static_shape};
+    use onnx_runtime_ir::{Attribute, Graph, NodeId, static_shape};
+    // Only the MLAS-gated packed-buffer accounting tests build a graph with an
+    // inline initializer, so these are unused (and `-D warnings` fatal) in the
+    // portable configuration.
+    #[cfg(feature = "mlas")]
+    use onnx_runtime_ir::{TensorData, WeightRef};
     use onnx_runtime_loader::{Model, encode_model_proto};
 
     fn model_node(
@@ -13014,7 +13018,9 @@ mod tests {
         // shards exactly as the decode runtime does, then return the kernel so
         // its actual retained bytes can be read back.
         let run = |m: usize| -> MatMulNBitsKernel {
-            let a_values: Vec<f32> = (0..m * k).map(|i| ((i * 11 % 41) as f32 - 20.0) / 13.0).collect();
+            let a_values: Vec<f32> = (0..m * k)
+                .map(|i| ((i * 11 % 41) as f32 - 20.0) / 13.0)
+                .collect();
             let mut kernel = test_kernel(k, n, block_size);
             kernel.set_constant_inputs(&[false, true, true]);
             let a = Owned::f32(&[m, k], &a_values);
@@ -13038,7 +13044,10 @@ mod tests {
                 .expect("MLAS route was asserted available for this shape");
         let prefill_actual = mlas_shards_owned_bytes(&prefill);
         let decode_actual = mlas_shards_owned_bytes(&decode);
-        assert!(prefill_actual > 0, "the prefill instance must have packed MLAS shards");
+        assert!(
+            prefill_actual > 0,
+            "the prefill instance must have packed MLAS shards"
+        );
         assert_eq!(
             prefill_actual, per_copy_predicted,
             "per-copy predictor must equal the packed + scale/zp bytes one instance actually holds"
@@ -13091,7 +13100,10 @@ mod tests {
         );
 
         // #979 direction: non-zero, and never the ~8x f32 expansion.
-        assert!(node_predicted > 0, "the packed buffer must not be accounted as zero (#1027)");
+        assert!(
+            node_predicted > 0,
+            "the packed buffer must not be accounted as zero (#1027)"
+        );
         assert_ne!(
             node_predicted,
             (n as u64) * (k as u64) * 4,
