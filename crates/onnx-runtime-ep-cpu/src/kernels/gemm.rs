@@ -823,13 +823,14 @@ mod tests {
         };
 
         // Declined: this weight's transpose must not be resident afterward.
-        // Probe the exact `(addr, k, n)` key rather than a global byte total, so
-        // a concurrent test caching an unrelated weight cannot mask a leak.
+        // Probe the exact `(addr, n, k)` key the kernel installs (it calls
+        // `transposed_b(&b, n, k)`) rather than a global byte total, so a
+        // concurrent test caching an unrelated weight cannot mask a leak.
         let declined = {
             let _decline = crate::kernels::weight_transpose::CacheEnabledScope::new(false);
             let out = run();
             assert!(
-                !crate::kernels::weight_transpose::f32_cache_contains(b_ptr, k, n),
+                !crate::kernels::weight_transpose::f32_cache_contains(b_ptr, n, k),
                 "a declined transpose cache must retain nothing for this weight"
             );
             out
@@ -842,7 +843,7 @@ mod tests {
             let _admit = crate::kernels::weight_transpose::CacheEnabledScope::new(true);
             let out = run();
             assert!(
-                crate::kernels::weight_transpose::f32_cache_contains(b_ptr, k, n),
+                crate::kernels::weight_transpose::f32_cache_contains(b_ptr, n, k),
                 "an admitted transpose cache must retain this weight"
             );
             out
