@@ -1,25 +1,30 @@
-# CPU matmul assignment matrix vs ONNX Runtime
+# CPU matmul performance vs ONNX Runtime
 
-Which of `MatMul` / `Gemm` / `MatMulNBits` / `QLinearMatMul` this EP should take from a plugin host,
-and which it should leave to ONNX Runtime's own CPU kernels.
+Measured `MatMul` / `Gemm` / `MatMulNBits` / `QLinearMatMul` ratios against ONNX Runtime's own CPU
+kernels.
 
-The policy is **encoded**, not just documented: `crates/onnx-runtime-ep-cpu/src/assignment_policy.rs`
-is the source of truth and this file is its evidence. Every row below is asserted by a test in that
-module.
+## What this file is now
+
+It used to be the evidence behind an assignment policy: ranges this EP measured slower than ORT
+were declined at `GetCapability` so ORT's CPU EP ran them instead, and every row below was asserted
+by a test in `crates/onnx-runtime-ep-cpu/src/assignment_policy.rs`.
+
+**That policy is gone.** When this EP is selected it claims every node it supports and never hands
+one to ORT's CPU EP. Splitting a graph across an EP boundary costs a partition, and it forfeits the
+fusion, prepack and buffer reuse that only hold inside one partition — so a range where this EP is
+slower is a kernel to optimize, not a node to give away.
+
+So the ratios below are no longer thresholds. They are a **work list**: every row under 1.00 is an
+open gap, and closing it is the only way it stops being one.
 
 ## Rule
 
-A range is claimed only if it has a **>= 5% repeatable win beyond noise at every measured thread
-count**, or a correctness reason (the host has no kernel at all). Losing ranges, and ranges we have
-not measured but can size, defer to the host. Unmeasured-and-unsizable ranges keep the historical
-claim, because deferring on no evidence is a guess in the other direction.
+None, at assignment time. Everything supported is claimed.
 
-Deferral is only safe when the host actually has a kernel. Under
-`session.disable_cpu_ep_fallback=1` it does not, and the plugin switches this gate off entirely
-(`onnx-runtime-ep-plugin`'s `ExportedEp::host_fallback_available`). **The native-only runtime is
-unaffected**: `supports_op` still answers "yes" for everything implemented, so declining to
-*advertise* a kernel never makes it unreachable when this crate is the whole runtime. A deferred
-range is therefore never advertised as faster, but it is still there when there is nothing else.
+The bar for calling a gap *closed* is unchanged and still deliberately strict: a **>= 5% repeatable
+win beyond noise at every measured thread count**. Anything inside the noise band is not a win, and
+a win at one thread count that inverts at another is not a win either — `Sqrt` is the standing
+example, at 1.9x single-threaded and 0.30x at sixteen threads.
 
 ## Method
 
@@ -39,23 +44,23 @@ under test.
 
 ## Matrix
 
-| op | dtype / bits | M | K, N | threads | p50 | p90 | assignment |
+| op | dtype / bits | M | K, N | threads | p50 | p90 | status |
 |---|---|---|---|---|---|---|---|
-| `MatMulNBits` | 8-bit, block 32 | 1 | 3584 | 1 | **0.15** | 0.15 | **claim** |
-| `MatMulNBits` | 8-bit, block 32 | 1 | 3584 | 2 | **0.36** | 0.36 | **claim** |
-| `MatMulNBits` | 8-bit, block 32 | 1 | 3584 | 4 | **0.25** | 0.32 | **claim** |
-| `MatMulNBits` | 8-bit, block 32 | 1 | 3584 | 8 | **0.25** | 0.30 | **claim** |
-| `MatMulNBits` | 8-bit, block 32 | 1 | 3584 | 16 | **0.23** | 0.23 | **claim** |
-| `MatMulNBits` | 8-bit, block 32 | 1 | 4096 | 8 | **0.23** | 0.24 | **claim** |
-| `MatMulNBits` | 8-bit, block 32 | 128 | 3584 | 2 | **0.90** | 0.91 | **claim** |
-| `MatMulNBits` | 8-bit, block 32 | 128 | 3584 | 4 | **0.87** | 0.87 | **claim** |
-| `MatMulNBits` | 8-bit, block 32 | 128 | 3584 | 8 | **0.94** | 1.06 | **claim** |
-| `MatMulNBits` | 8-bit, block 32 | 256 | 3584 | 2 | 1.17 | 1.18 | defer (static M) |
-| `MatMulNBits` | 8-bit, block 32 | 256 | 3584 | 4 | 1.15 | 1.16 | defer (static M) |
-| `MatMulNBits` | 8-bit, block 32 | 256 | 3584 | 8 | 0.99 | 1.05 | defer (static M) |
-| `MatMulNBits` | 8-bit, block 32 | 512 | 3584 | 2 | 1.41 | 1.42 | defer (static M) |
-| `MatMulNBits` | 8-bit, block 32 | 512 | 3584 | 4 | 1.39 | 1.39 | defer (static M) |
-| `MatMulNBits` | 8-bit, block 32 | 512 | 3584 | 8 | 1.25 | 1.32 | defer (static M) |
+| `MatMulNBits` | 8-bit, block 32 | 1 | 3584 | 1 | **0.15** | 0.15 | **win** |
+| `MatMulNBits` | 8-bit, block 32 | 1 | 3584 | 2 | **0.36** | 0.36 | **win** |
+| `MatMulNBits` | 8-bit, block 32 | 1 | 3584 | 4 | **0.25** | 0.32 | **win** |
+| `MatMulNBits` | 8-bit, block 32 | 1 | 3584 | 8 | **0.25** | 0.30 | **win** |
+| `MatMulNBits` | 8-bit, block 32 | 1 | 3584 | 16 | **0.23** | 0.23 | **win** |
+| `MatMulNBits` | 8-bit, block 32 | 1 | 4096 | 8 | **0.23** | 0.24 | **win** |
+| `MatMulNBits` | 8-bit, block 32 | 128 | 3584 | 2 | **0.90** | 0.91 | **win** |
+| `MatMulNBits` | 8-bit, block 32 | 128 | 3584 | 4 | **0.87** | 0.87 | **win** |
+| `MatMulNBits` | 8-bit, block 32 | 128 | 3584 | 8 | **0.94** | 1.06 | **win** |
+| `MatMulNBits` | 8-bit, block 32 | 256 | 3584 | 2 | 1.17 | 1.18 | gap (static M) |
+| `MatMulNBits` | 8-bit, block 32 | 256 | 3584 | 4 | 1.15 | 1.16 | gap (static M) |
+| `MatMulNBits` | 8-bit, block 32 | 256 | 3584 | 8 | 0.99 | 1.05 | gap (static M) |
+| `MatMulNBits` | 8-bit, block 32 | 512 | 3584 | 2 | 1.41 | 1.42 | gap (static M) |
+| `MatMulNBits` | 8-bit, block 32 | 512 | 3584 | 4 | 1.39 | 1.39 | gap (static M) |
+| `MatMulNBits` | 8-bit, block 32 | 512 | 3584 | 8 | 1.25 | 1.32 | gap (static M) |
 
 ### The 8-bit win is bounded by row count
 
@@ -64,32 +69,27 @@ between 128 and 256 -- and the crossover rows are the *low*-dispersion measureme
 document (spread 0.01-0.04), so it is not a contended-host artefact.
 
 A node whose row count is **statically** >= 256 is pure prefill: there is no decode traffic on it to
-amortise the loss against, so it defers to the host.
+amortise the loss against, so this is the shape where the gap is felt undiluted, and the one to
+optimize first.
 
-A **dynamic** row count is the LLM case, where a single node serves both phases and the choice
-cannot be split. Claiming is correct there by a wide margin: at 8 threads decode saves **6.06 ms per
-token** (1.78 ms ours vs 7.84 ms ORT) while a 512-row prefill costs **7.69 ms once** (38.58 vs
-30.89). The *second* generated token has already repaid the entire prefill loss.
+A **dynamic** row count is the LLM case, where a single node serves both phases. There the loss is
+already repaid in practice: at 8 threads decode saves **6.06 ms per token** (1.78 ms ours vs 7.84 ms
+ORT) while a 512-row prefill costs **7.69 ms once** (38.58 vs 30.89). The *second* generated token
+has repaid the entire prefill loss.
 
-### Block sizes ORT cannot build stay claimed
+### Block sizes ORT cannot build at all
 
-This EP accepts any power-of-two `block_size >= 16`; ORT's CPU `MatMulNBits` `ORT_ENFORCE`s
-`block_size` in {16, 32, 64, 128, 256}, and that check throws at *kernel construction*. Deferring a
-512-wide block would therefore turn a working session into a load failure, so those keep the claim
-regardless of the measured ratio -- the same safety rule the dense arm applies to dtypes ORT has no
-kernel for.
+Worth recording because it shows a handover was never universally available even when the policy
+wanted one. This EP accepts any power-of-two `block_size >= 16`; ORT's CPU `MatMulNBits`
+`ORT_ENFORCE`s `block_size` in {16, 32, 64, 128, 256}, and that check throws at *kernel
+construction*. Giving a 512-wide block back would turn a working session into a load failure, not a
+slow one. `bits` needs no equivalent note -- both runtimes accept exactly {2, 4, 8}.
 
-This gate is evaluated **before every** `MatMulNBits` deferral, not only the 4-bit one. An 8-bit
-node that is statically wide *and* carries a block size ORT cannot build would otherwise escape
-through the row gate above and fail `ORT_ENFORCE` on the host;
-`wide_eight_bit_with_a_block_size_ort_rejects_stays_claimed` pins that ordering. `bits` needs no
-equivalent guard -- both runtimes accept exactly {2, 4, 8}.
-
-### 2-bit is deferred by extrapolation, and says so
+### 2-bit was never measured
 
 Only 4-bit and 8-bit `MatMulNBits` were measured. 2-bit is a valid contrib value that shares the
-dequant-then-GEMM structure and the threadpool with 4-bit, so it defers -- but its deferral reason
-states that it is extrapolated rather than borrowing 4-bit's numbers.
+dequant-then-GEMM structure and the threadpool with 4-bit, so its behaviour is extrapolated rather
+than measured, and no row below should be read as covering it.
 
 ### Rows are folded, not read from one dimension
 
@@ -97,57 +97,56 @@ The row count of `[.., M, K]` is the product of every dimension but the last, so
 batched `[4, 100, 3584]` is 400 rows and lands in the wide-prefill region even though no single
 dimension reaches 256. Any symbolic dimension anywhere in the batch makes the whole count unknown,
 which is the decode case and stays claimed.
-| `MatMulNBits` | 4-bit, acc 0 | 1 | 3584 | 1 | 1.00 | 1.03 | defer |
-| `MatMulNBits` | 4-bit, acc 0 | 1 | 3584 | 2 | 1.52 | 1.56 | defer |
-| `MatMulNBits` | 4-bit, acc 0 | 1 | 3584 | 4 | 1.74 | 1.82 | defer |
-| `MatMulNBits` | 4-bit, acc 0 | 1 | 3584 | 8 | 2.23 | 2.31 | defer |
-| `MatMulNBits` | 4-bit, acc 0 | 1 | 3584 | 16 | 2.21 | 3.28 | defer |
-| `MatMulNBits` | 4-bit, acc 0 | 1 | 3584 | 32 | 4.28 | 4.71 | defer |
-| `MatMulNBits` | 4-bit, acc 0 | 128 | 3584 | 1 | 0.99 | 1.07 | defer |
-| `MatMulNBits` | 4-bit, acc 0 | 128 | 3584 | 4 | 2.35 | 2.63 | defer |
-| `MatMulNBits` | 4-bit, acc 0 | 128 | 3584 | 8 | 2.41 | 2.63 | defer |
-| `MatMulNBits` | 4-bit, acc 0 | 128 | 3584 | 32 | 3.79 | 4.36 | defer |
-| `MatMulNBits` | 4-bit, acc 4 | 1 | 3584 | 8 | 1.78 | 1.97 | defer |
-| `MatMulNBits` | 4-bit, acc 4 | 128 | 3584 | 8 | 2.11 | 2.37 | defer |
-| `MatMul` | f32 | 1 | 3584 | 1 | 1.00 | 1.00 | defer |
-| `MatMul` | f32 | 1 | 3584 | 8 | 2.52 | 4.51 | defer (noisy) |
-| `MatMul` | f32 | 1 | 3584 | 32 | 0.57 | 0.71 | defer |
-| `MatMul` | f32 | 128 | 3584 | 1 | 0.97 | 1.03 | defer |
-| `MatMul` | f32 | 128 | 3584 | 2 | 2.11 | 2.35 | defer |
-| `MatMul` | f32 | 128 | 3584 | 4 | 1.77 | 1.79 | defer |
-| `MatMul` | f32 | 128 | 3584 | 8 | 1.38 | 2.49 | defer |
-| `MatMul` | f32 | 128 | 3584 | 16 | 1.65 | 1.73 | defer |
-| `MatMul` | f32 | 128 | 3584 | 32 | 0.67 | 0.88 | defer |
-| `MatMul` | f16 | 1 | 3584 | 8 | 2.04 | 2.16 | defer |
-| `MatMul` | f16 | 128 | 3584 | 1 | 2.47 | 2.48 | defer |
-| `MatMul` | f16 | 128 | 3584 | 2 | 5.38 | 5.43 | defer |
-| `MatMul` | f16 | 128 | 3584 | 4 | 6.57 | 6.78 | defer |
-| `MatMul` | f16 | 128 | 3584 | 8 | 7.77 | 8.77 | defer (noisy) |
-| `MatMul` | f16 | 128 | 3584 | 16 | 7.10 | 7.46 | defer |
-| `MatMul` | f16 | 128 | 3584 | 32 | 5.34 | 6.24 | defer |
-| `QLinearMatMul` | u8 x u8 | 1 | 3584 | 1 | 1.13 | 1.18 | defer |
-| `QLinearMatMul` | u8 x u8 | 1 | 3584 | 8 | 2.33 | 2.77 | defer |
-| `QLinearMatMul` | u8 x u8 | 1 | 3584 | 16 | 2.34 | 2.58 | defer |
-| `QLinearMatMul` | u8 x u8 | 128 | 3584 | 1 | 1.20 | 1.21 | defer |
-| `QLinearMatMul` | u8 x u8 | 128 | 3584 | 8 | 2.43 | 2.80 | defer |
-| `QLinearMatMul` | u8 x u8 | 128 | 3584 | 16 | 2.65 | 3.42 | defer |
-| `QLinearMatMul` | u8 x u8 | 512 | 3584 | 1 | 1.20 | 1.21 | defer |
-| `QLinearMatMul` | u8 x u8 | 512 | 3584 | 8 | 2.12 | 2.22 | defer |
-| `QLinearMatMul` | u8 x u8 | 512 | 3584 | 16 | 2.08 | 2.18 | defer |
-| `QLinearMatMul` | i8 x i8 | 1 | 3584 | 1 | **0.03** | 0.03 | **claim** |
-| `QLinearMatMul` | i8 x i8 | 1 | 3584 | 8 | **0.09** | 0.09 | **claim** |
-| `QLinearMatMul` | i8 x i8 | 1 | 3584 | 16 | **0.10** | 0.10 | **claim** |
-| `QLinearMatMul` | i8 x i8 | 128 | 3584 | 1 | **0.25** | 0.25 | **claim** |
-| `QLinearMatMul` | i8 x i8 | 128 | 3584 | 8 | **0.47** | 0.53 | **claim** |
-| `QLinearMatMul` | i8 x i8 | 128 | 3584 | 16 | **0.60** | 0.69 | **claim** |
-| `QLinearMatMul` | i8 x i8 | 512 | 3584 | 1 | **0.26** | 0.26 | **claim** |
-| `QLinearMatMul` | i8 x i8 | 512 | 3584 | 8 | **0.42** | 0.43 | **claim** |
-| `QLinearMatMul` | i8 x i8 | 512 | 3584 | 16 | **0.42** | 0.47 | **claim** |
+| `MatMulNBits` | 4-bit, acc 0 | 1 | 3584 | 1 | 1.00 | 1.03 | gap |
+| `MatMulNBits` | 4-bit, acc 0 | 1 | 3584 | 2 | 1.52 | 1.56 | gap |
+| `MatMulNBits` | 4-bit, acc 0 | 1 | 3584 | 4 | 1.74 | 1.82 | gap |
+| `MatMulNBits` | 4-bit, acc 0 | 1 | 3584 | 8 | 2.23 | 2.31 | gap |
+| `MatMulNBits` | 4-bit, acc 0 | 1 | 3584 | 16 | 2.21 | 3.28 | gap |
+| `MatMulNBits` | 4-bit, acc 0 | 1 | 3584 | 32 | 4.28 | 4.71 | gap |
+| `MatMulNBits` | 4-bit, acc 0 | 128 | 3584 | 1 | 0.99 | 1.07 | gap |
+| `MatMulNBits` | 4-bit, acc 0 | 128 | 3584 | 4 | 2.35 | 2.63 | gap |
+| `MatMulNBits` | 4-bit, acc 0 | 128 | 3584 | 8 | 2.41 | 2.63 | gap |
+| `MatMulNBits` | 4-bit, acc 0 | 128 | 3584 | 32 | 3.79 | 4.36 | gap |
+| `MatMulNBits` | 4-bit, acc 4 | 1 | 3584 | 8 | 1.78 | 1.97 | gap |
+| `MatMulNBits` | 4-bit, acc 4 | 128 | 3584 | 8 | 2.11 | 2.37 | gap |
+| `MatMul` | f32 | 1 | 3584 | 1 | 1.00 | 1.00 | gap |
+| `MatMul` | f32 | 1 | 3584 | 8 | 2.52 | 4.51 | gap (noisy) |
+| `MatMul` | f32 | 1 | 3584 | 32 | 0.57 | 0.71 | gap |
+| `MatMul` | f32 | 128 | 3584 | 1 | 0.97 | 1.03 | gap |
+| `MatMul` | f32 | 128 | 3584 | 2 | 2.11 | 2.35 | gap |
+| `MatMul` | f32 | 128 | 3584 | 4 | 1.77 | 1.79 | gap |
+| `MatMul` | f32 | 128 | 3584 | 8 | 1.38 | 2.49 | gap |
+| `MatMul` | f32 | 128 | 3584 | 16 | 1.65 | 1.73 | gap |
+| `MatMul` | f32 | 128 | 3584 | 32 | 0.67 | 0.88 | gap |
+| `MatMul` | f16 | 1 | 3584 | 8 | 2.04 | 2.16 | gap |
+| `MatMul` | f16 | 128 | 3584 | 1 | 2.47 | 2.48 | gap |
+| `MatMul` | f16 | 128 | 3584 | 2 | 5.38 | 5.43 | gap |
+| `MatMul` | f16 | 128 | 3584 | 4 | 6.57 | 6.78 | gap |
+| `MatMul` | f16 | 128 | 3584 | 8 | 7.77 | 8.77 | gap (noisy) |
+| `MatMul` | f16 | 128 | 3584 | 16 | 7.10 | 7.46 | gap |
+| `MatMul` | f16 | 128 | 3584 | 32 | 5.34 | 6.24 | gap |
+| `QLinearMatMul` | u8 x u8 | 1 | 3584 | 1 | 1.13 | 1.18 | gap |
+| `QLinearMatMul` | u8 x u8 | 1 | 3584 | 8 | 2.33 | 2.77 | gap |
+| `QLinearMatMul` | u8 x u8 | 1 | 3584 | 16 | 2.34 | 2.58 | gap |
+| `QLinearMatMul` | u8 x u8 | 128 | 3584 | 1 | 1.20 | 1.21 | gap |
+| `QLinearMatMul` | u8 x u8 | 128 | 3584 | 8 | 2.43 | 2.80 | gap |
+| `QLinearMatMul` | u8 x u8 | 128 | 3584 | 16 | 2.65 | 3.42 | gap |
+| `QLinearMatMul` | u8 x u8 | 512 | 3584 | 1 | 1.20 | 1.21 | gap |
+| `QLinearMatMul` | u8 x u8 | 512 | 3584 | 8 | 2.12 | 2.22 | gap |
+| `QLinearMatMul` | u8 x u8 | 512 | 3584 | 16 | 2.08 | 2.18 | gap |
+| `QLinearMatMul` | i8 x i8 | 1 | 3584 | 1 | **0.03** | 0.03 | **win** |
+| `QLinearMatMul` | i8 x i8 | 1 | 3584 | 8 | **0.09** | 0.09 | **win** |
+| `QLinearMatMul` | i8 x i8 | 1 | 3584 | 16 | **0.10** | 0.10 | **win** |
+| `QLinearMatMul` | i8 x i8 | 128 | 3584 | 1 | **0.25** | 0.25 | **win** |
+| `QLinearMatMul` | i8 x i8 | 128 | 3584 | 8 | **0.47** | 0.53 | **win** |
+| `QLinearMatMul` | i8 x i8 | 128 | 3584 | 16 | **0.60** | 0.69 | **win** |
+| `QLinearMatMul` | i8 x i8 | 512 | 3584 | 1 | **0.26** | 0.26 | **win** |
+| `QLinearMatMul` | i8 x i8 | 512 | 3584 | 8 | **0.42** | 0.43 | **win** |
+| `QLinearMatMul` | i8 x i8 | 512 | 3584 | 16 | **0.42** | 0.47 | **win** |
 
-Ranges **outside** the measured region keep the historical claim, and the code says so explicitly:
-`K * N < 2^20`, symbolic/dynamic weight shapes, and dense dtypes other than f32/f16 (where a
-deferral could be a load failure rather than a slow session, because ORT's CPU EP may have no kernel
-at all).
+Ranges **outside** the measured region — `K * N < 2^20`, symbolic/dynamic weight shapes, and dense
+dtypes other than f32/f16 — are simply unmeasured. They are claimed like everything else; the note
+is only that no row above characterises them.
 
 ## Root causes
 
@@ -241,24 +240,23 @@ those combinations to a scalar loop, the offending operand is now *translated* i
 domain: `XOR 0x80` on its bytes and `+128` on its zero point. Since the kernel computes
 `sum_k (a_k - za)(b_k - zb)`, shifting an operand and its zero point by the same constant leaves
 every `i32` accumulator bit-identical, and the call lands on the `u8 x u8` kernel. i8 activations
-went from 5.5x slower than ORT to **1.7x-33x faster**, and are now claimed.
+went from 5.5x slower than ORT to **1.7x-33x faster**.
 
 What is left for u8 x u8 is thread scaling, not packing: 1.13-1.20x at one thread, widening to
 2.08-2.65x at sixteen — the same root cause as [parallel efficiency](#1-parallel-efficiency-not-kernel-quality--f32-dense-and-int4-matmulnbits).
 
 Both `QLinearMatMul` rules were measured on **x86-64 AVX2 only** and are applied on every
 architecture, which is the same convention the rest of this table uses. aarch64 has native `i8 x i8`
-kernels (SDOT/SMMLA) that need no translation at all, so the claim there is if anything
-conservative — but its *speed* is unmeasured here and is not claimed to be measured. Correctness on
+kernels (SDOT/SMMLA) that need no translation at all, so it is if anything
+better placed there — but its *speed* is unmeasured here and is not claimed to be measured. Correctness on
 that lane is covered unconditionally by `qgemm_i32_matches_the_integer_oracle_for_every_signedness`.
 
-Mixed signedness (`u8 x i8`, `i8 x u8`) was not measured either way. It follows the u8 rule rather
-than borrowing the signed win: deferred in the measured region, claimed below it like every other
-unmeasured shape here.
+Mixed signedness (`u8 x i8`, `i8 x u8`) was not measured either way, and should be assumed to track
+the u8 gap rather than the signed win until someone measures it.
 
 The `i8 x i8` "before" ratios above (5.20/4.97/5.22 at 8 threads) were re-measured against ONNX
 Runtime 1.27.0 for this round on the same host. An earlier round recorded 2.23-3.07 for the same
-declined scalar path; the kernel side did not change between the two, so the difference is the
+scalar path; the kernel side did not change between the two, so the difference is the
 baseline and the harness, not a regression.
 
 ## Precision
