@@ -510,6 +510,21 @@ static INT4_DIRECT_M1_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 static N16_SDOT_M1_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(test)]
 static KAI_SDOT_M1_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
+/// Serialises every test that reads a dispatch-probe counter against every
+/// test that can increment one.
+///
+/// The probe counters above are process-global while `cargo test` runs test
+/// functions on parallel threads, so a reachability test can otherwise observe
+/// *another* test's dispatch between its own before/after reads and conclude
+/// its kernel took a route it never took. That is not hypothetical: several
+/// tests call `kai_sdot_matmul_m1` directly, bypassing the route gate that
+/// makes the counter meaningful, and on lanes where the route is enabled a
+/// plain `execute` reaches it too.
+///
+/// Poisoning is deliberately ignored: a panic in one probe test must surface
+/// as that test's own failure, not as a cascade of unrelated lock errors.
+#[cfg(test)]
+static DISPATCH_PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(all(test, feature = "mlas"))]
 static MLAS_SQNBIT_TEST_CALLS: AtomicUsize = AtomicUsize::new(0);
 /// Positive-proof counters for the zero-copy borrowed int4 decode path (#979).
@@ -7827,6 +7842,191 @@ fn error(message: impl Into<String>) -> EpError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Take the dispatch-probe lock for the duration of a test that reads or
+    /// perturbs a `*_TEST_CALLS` counter. See `DISPATCH_PROBE_LOCK`.
+    fn lock_dispatch_probe() -> std::sync::MutexGuard<'static, ()> {
+        DISPATCH_PROBE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Keeps the lock complete as tests are added.
+    ///
+    /// A `Mutex` only serialises threads that take it, so locking the
+    /// *observers* is worthless unless every concurrent *perturber* locks too.
+    /// Auditing that by hand is exactly the kind of thing that rots: the
+    /// original failure was on a lane where `arm64_kai_sdot_direct_enabled()`
+    /// is on, so tests that merely call `execute` reach a probed route without
+    /// naming it.
+    ///
+    /// This walks this module's own source and requires every `#[test]` that
+    /// can move a probe counter -- directly, or through a helper that does --
+    /// to take the lock. It is pure text analysis, so it holds on every target
+    /// including the aarch64 lanes this host cannot execute.
+    #[test]
+    fn every_probe_perturbing_test_takes_the_dispatch_lock() {
+        const SOURCE: &str = include_str!("matmul_nbits.rs");
+        const PERTURBS: [&str; 3] = [".execute(", "kai_sdot_matmul_m1(", "try_mlas_sqnbit("];
+
+        // (name, is_test, body) for every fn declared in the tests module.
+        let tests_module = SOURCE
+            .split_once("\nmod tests {")
+            .expect("this module defines `mod tests`")
+            .1;
+        let mut functions: Vec<(String, bool, String)> = Vec::new();
+        let mut pending_test_attr = false;
+        let mut current: Option<(String, bool, String)> = None;
+        for line in tests_module.lines() {
+            if let Some(rest) = line.trim_start().strip_prefix("fn ")
+                && line.starts_with("    fn ")
+            {
+                if let Some(done) = current.take() {
+                    functions.push(done);
+                }
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                current = Some((name, pending_test_attr, String::new()));
+                pending_test_attr = false;
+                continue;
+            }
+            if line.trim() == "#[test]" {
+                pending_test_attr = true;
+            }
+            if let Some((_, _, body)) = current.as_mut() {
+                body.push_str(line);
+                body.push('\n');
+            }
+        }
+        if let Some(done) = current.take() {
+            functions.push(done);
+        }
+        assert!(
+            functions.len() > 100,
+            "source walk found only {} functions, so the parser is broken and this test proves \
+             nothing",
+            functions.len()
+        );
+
+        // Match on code only: a body that merely *mentions* `.execute(` in a
+        // comment moves no counter, and forcing it to lock would make this
+        // check obstruct unrelated work.
+        let code_of = |body: &str| -> String {
+            body.lines()
+                .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let bodies: Vec<(String, bool, String)> = functions
+            .iter()
+            .map(|(name, is_test, body)| (name.clone(), *is_test, code_of(body)))
+            .collect();
+
+        let perturbs = |body: &str| PERTURBS.iter().any(|pattern| body.contains(pattern));
+        // Helpers reach counters through helpers too, so close the set rather
+        // than looking one level deep -- a two-level chain would otherwise slip
+        // through exactly the check that is supposed to prevent it.
+        let mut perturbing_helpers: Vec<&str> = bodies
+            .iter()
+            .filter(|(_, is_test, body)| !is_test && perturbs(body))
+            .map(|(name, _, _)| name.as_str())
+            .collect();
+        loop {
+            let grown: Vec<&str> = bodies
+                .iter()
+                .filter(|(name, is_test, body)| {
+                    !is_test
+                        && !perturbing_helpers.contains(&name.as_str())
+                        && perturbing_helpers
+                            .iter()
+                            .any(|helper| body.contains(&format!("{helper}(")))
+                })
+                .map(|(name, _, _)| name.as_str())
+                .collect();
+            if grown.is_empty() {
+                break;
+            }
+            perturbing_helpers.extend(grown);
+        }
+        assert!(
+            !perturbing_helpers.is_empty(),
+            "no perturbing helpers found, so the helper arm of this check is vacuous"
+        );
+
+        let mut unlocked: Vec<&str> = Vec::new();
+        let mut checked = 0usize;
+        for (name, is_test, body) in &bodies {
+            if !is_test {
+                continue;
+            }
+            let reaches = perturbs(body)
+                || perturbing_helpers
+                    .iter()
+                    .any(|helper| body.contains(&format!("{helper}(")));
+            if !reaches {
+                continue;
+            }
+            checked += 1;
+            if !body.contains("lock_dispatch_probe()") {
+                unlocked.push(name);
+            }
+        }
+        assert!(
+            checked > 20,
+            "only {checked} perturbing tests found; the detector has stopped matching"
+        );
+        assert!(
+            unlocked.is_empty(),
+            "these tests can move a dispatch-probe counter without holding \
+             DISPATCH_PROBE_LOCK, so a concurrent reachability test can be handed their \
+             dispatch: {unlocked:?}"
+        );
+    }
+
+    /// The bug this lock exists for, reproduced without needing the hardware
+    /// that exposed it.
+    ///
+    /// `matmulnbits_arm64_kai_qsi8_asymmetric_qwen_shape_is_reachable` reads a
+    /// process-global counter before and after its own call and concludes from
+    /// the delta which route its kernel took. Several *other* tests call
+    /// `kai_sdot_matmul_m1` directly, so on a parallel test runner the delta
+    /// could include a dispatch the observing test never made -- which is
+    /// exactly how it reported that an `accuracy_level = 0` kernel had reached
+    /// the activation-quantizing KAI route it is gated out of.
+    ///
+    /// Observers that hold the lock must see only their own dispatches. This
+    /// fails without the lock and is deterministic with it: every thread
+    /// asserts an exact delta, so any interleaving at all is caught.
+    #[test]
+    fn dispatch_probe_lock_hides_other_threads_dispatches() {
+        const OBSERVERS: usize = 8;
+        const DISPATCHES: usize = 32;
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..OBSERVERS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let _probe = lock_dispatch_probe();
+                        let before = KAI_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed);
+                        for _ in 0..DISPATCHES {
+                            KAI_SDOT_M1_TEST_CALLS.fetch_add(1, Ordering::Relaxed);
+                            std::thread::yield_now();
+                        }
+                        let observed = KAI_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed) - before;
+                        assert_eq!(
+                            observed, DISPATCHES,
+                            "an observer saw {observed} dispatches but \
+                             made {DISPATCHES}: another thread's route was attributed to it"
+                        );
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().expect("probe observer must not panic");
+            }
+        });
+    }
     use crate::CpuExecutionProvider;
     use crate::kernels::testutil::Owned;
     use onnx_runtime_ep_api::ExecutionProvider;
@@ -7955,6 +8155,7 @@ mod tests {
     /// drift from the kernel (#947).
     #[test]
     fn predictor_matches_actual_resident_cache() {
+        let _probe = lock_dispatch_probe();
         let _guard = CACHE_FLAG_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -8026,6 +8227,7 @@ mod tests {
     /// per-call dequant runs the same math, just without retaining it.
     #[test]
     fn declining_resident_cache_is_byte_identical_and_holds_no_expansion() {
+        let _probe = lock_dispatch_probe();
         let _guard = CACHE_FLAG_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -8652,11 +8854,13 @@ mod tests {
 
     #[test]
     fn matmulnbits_accuracy4_block32_partial_k_m1_matches_fp32_reference() {
+        let _probe = lock_dispatch_probe();
         run_accuracy4_case(1, 45, 9, 32);
     }
 
     #[test]
     fn matmulnbits_accuracy4_block128_partial_k_batched_matches_fp32_reference() {
+        let _probe = lock_dispatch_probe();
         run_accuracy4_case(3, 141, 7, 128);
     }
 
@@ -8670,6 +8874,7 @@ mod tests {
     /// borrow shortcut changed numerics.
     #[test]
     fn matmulnbits_activation_borrow_matches_strided_copy_bit_exact() {
+        let _probe = lock_dispatch_probe();
         for &(m, k, n, block_size) in &[(1usize, 128usize, 16usize, 32usize), (4, 96, 8, 32)] {
             let a_values: Vec<f32> = (0..m * k)
                 .map(|i| ((i * 17 % 43) as f32 - 21.0) / 13.0)
@@ -8739,6 +8944,7 @@ mod tests {
     /// garbage on AVX2 CI runners while passing on our AVX-512 dev hosts.
     #[test]
     fn matmulnbits_accuracy4_m1_asymmetric_matches_fp32_reference() {
+        let _probe = lock_dispatch_probe();
         for &(k, n, block_size) in &[(256usize, 96usize, 32usize), (256, 64, 64), (128, 8, 128)] {
             let m = 1;
             let a_values: Vec<f32> = (0..m * k)
@@ -8788,6 +8994,7 @@ mod tests {
 
     #[test]
     fn matmulnbits_fp32_activation_is_more_accurate_than_accuracy4() {
+        let _probe = lock_dispatch_probe();
         let (k, n, block_size) = (16, 2, 16);
         let mut weights_nk = vec![0i8; n * k];
         weights_nk[0] = 1;
@@ -8850,6 +9057,7 @@ mod tests {
 
     #[test]
     fn matmulnbits_accuracy4_prepack_reuses_selected_weight_format() {
+        let _probe = lock_dispatch_probe();
         let (k, n, block_size) = (45, 5, 32);
         let activations: Vec<f32> = (0..k)
             .map(|i| ((i * 11 % 37) as f32 - 18.0) / 9.0)
@@ -8927,6 +9135,7 @@ mod tests {
     ))]
     #[test]
     fn matmulnbits_arm64_mlas_qnbit_reaches_qwen_decode_bits4_and_bits8() {
+        let _probe = lock_dispatch_probe();
         let (k, n) = (128usize, 256usize);
         let activations: Vec<f32> = (0..k)
             .map(|i| ((i * 17 % 127) as f32 - 63.0) / 50.0)
@@ -9017,6 +9226,7 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn matmulnbits_arm64_kai_qsi4_block128_qwen_shapes_match_reference() {
+        let _probe = lock_dispatch_probe();
         #[cfg(feature = "mlas")]
         let _guard = backend_env_lock().lock().unwrap();
         if !std::arch::is_aarch64_feature_detected!("dotprod") {
@@ -9207,6 +9417,7 @@ mod tests {
 
     #[test]
     fn kai_sdot_qsi4_block128_asymmetric_qwen_shapes_match_reference() {
+        let _probe = lock_dispatch_probe();
         for &(k, n) in &[
             (1024usize, 1024usize),
             (1024, 3072),
@@ -9295,6 +9506,7 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn matmulnbits_arm64_kai_qsi4_asymmetric_qwen_shape_is_reachable() {
+        let _probe = lock_dispatch_probe();
         if !std::arch::is_aarch64_feature_detected!("dotprod") {
             return;
         }
@@ -10110,6 +10322,7 @@ mod tests {
 
     #[test]
     fn kai_sdot_qsi8_block128_asymmetric_qwen_shapes_match_reference() {
+        let _probe = lock_dispatch_probe();
         for &(k, n) in &[
             (1024usize, 1024usize),
             (1024, 3072),
@@ -10195,6 +10408,7 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn matmulnbits_arm64_kai_qsi8_asymmetric_qwen_shape_is_reachable() {
+        let _probe = lock_dispatch_probe();
         if !std::arch::is_aarch64_feature_detected!("dotprod") {
             return;
         }
@@ -10446,6 +10660,7 @@ mod tests {
     /// from a float64 oracle, i.e. ~50x worse, while buying 12%.
     #[test]
     fn eight_bit_decode_keeps_fp32_activations_unless_the_model_allows_less() {
+        let _probe = lock_dispatch_probe();
         let (n, k, block_size) = (32usize, 2048usize, 128usize);
         let fp32_error = bits8_m1_max_abs_error_at(0, n, k, block_size);
         let level1_error = bits8_m1_max_abs_error_at(1, n, k, block_size);
@@ -10504,6 +10719,7 @@ mod tests {
     /// native-vs-ORT token mismatch this path is meant to prevent.
     #[test]
     fn matmulnbits_8bit_block128_execute_matches_dequant_f32_oracle() {
+        let _probe = lock_dispatch_probe();
         let (n, k, block_size) = (48usize, 256usize, 128usize);
         let weights_nk: Vec<f32> = (0..n * k)
             .map(|i| (i as f32 * 0.013).sin() * 1.3 + (i as f32 * 0.0007).cos() * 0.4)
@@ -10558,6 +10774,7 @@ mod tests {
     /// silently changes prefill outputs is caught here.
     #[test]
     fn matmulnbits_8bit_prefill_batched_matches_dequant_f32_oracle() {
+        let _probe = lock_dispatch_probe();
         let (n, k, block_size) = (96usize, 384usize, 128usize);
         let weights_nk: Vec<f32> = (0..n * k)
             .map(|i| (i as f32 * 0.011).sin() * 1.1 + (i as f32 * 0.0005).cos() * 0.5)
@@ -10598,6 +10815,7 @@ mod tests {
     /// production kernel never reverses the oracle's argmax.
     #[test]
     fn matmulnbits_8bit_block128_argmax_matches_dequant_f32_oracle_at_near_tie() {
+        let _probe = lock_dispatch_probe();
         let (n, k, block_size) = (2usize, 128usize, 128usize);
         let mut checked = 0usize;
         for seed in 1..=400u32 {
@@ -12258,6 +12476,7 @@ mod tests {
 
     #[test]
     fn matmulnbits_symmetric_block32_matches_independent_dequantization() {
+        let _probe = lock_dispatch_probe();
         let (m, k, n, block_size) = (3, 64, 8, 32);
         let a: Vec<f32> = (0..m * k)
             .map(|i| ((i * 17 % 29) as f32 - 14.0) / 11.0)
@@ -12292,6 +12511,7 @@ mod tests {
 
     #[test]
     fn matmulnbits_f16_bf16_inputs_match_widened_f32_for_decode_and_prefill() {
+        let _probe = lock_dispatch_probe();
         let (k, n, block_size) = (64usize, 9usize, 32usize);
         let weights: Vec<f32> = (0..n * k)
             .map(|i| ((i * 13 % 31) as f32 - 15.0) / 9.0)
@@ -12393,18 +12613,21 @@ mod tests {
 
     #[test]
     fn matmulnbits_direct_2bit_gemv_matches_dequantized_reference() {
+        let _probe = lock_dispatch_probe();
         run_direct_2bit_parity_case(1, 32, 5, 16, false, DataType::Float32);
         run_direct_2bit_parity_case(1, 81, 4, 16, true, DataType::Float16);
     }
 
     #[test]
     fn matmulnbits_direct_2bit_gemm_matches_dequantized_reference() {
+        let _probe = lock_dispatch_probe();
         run_direct_2bit_parity_case(4, 45, 7, 32, true, DataType::Float32);
         run_direct_2bit_parity_case(3, 64, 6, 32, false, DataType::Float16);
     }
 
     #[test]
     fn matmulnbits_2bit_unpacks_low_bits_first() {
+        let _probe = lock_dispatch_probe();
         let k = 32;
         let (graph, node) = model_node(&[1, k], &[1, 1, 8], &[1], None, &[1, 1], k, 1, 32);
         let mut graph = graph;
@@ -12432,6 +12655,7 @@ mod tests {
 
     #[test]
     fn matmulnbits_asymmetric_block16_batched_non_square() {
+        let _probe = lock_dispatch_probe();
         let (m, k, n, block_size) = (6, 48, 5, 16);
         let a: Vec<f32> = (0..m * k)
             .map(|i| ((i * 7 % 23) as f32 - 5.0) / 8.0)
@@ -12462,6 +12686,7 @@ mod tests {
 
     #[test]
     fn matmulnbits_bf16_asymmetric_decode_keeps_int4_packed() {
+        let _probe = lock_dispatch_probe();
         let (m, k, n, block_size) = (1, 64, 7, 32);
         let a_values: Vec<f32> = (0..k)
             .map(|i| ((i * 17 % 41) as f32 - 20.0) / 13.0)
@@ -12515,6 +12740,7 @@ mod tests {
 
     #[test]
     fn matmulnbits_m1_block32_symmetric_borrows_weight_for_new_activations() {
+        let _probe = lock_dispatch_probe();
         let _guard = CACHE_FLAG_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -12573,6 +12799,7 @@ mod tests {
 
     #[test]
     fn matmulnbits_borrowed_m1_block128_explicit_zp_partial_block_matches_reference() {
+        let _probe = lock_dispatch_probe();
         let _guard = CACHE_FLAG_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -12650,6 +12877,7 @@ mod tests {
 
     #[test]
     fn matmulnbits_symmetric_m1_borrows_instead_of_building_f32_cache() {
+        let _probe = lock_dispatch_probe();
         let _guard = CACHE_FLAG_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -12693,6 +12921,7 @@ mod tests {
 
     #[test]
     fn matmulnbits_m1_dynamic_b_falls_back_without_populating_prepack_cache() {
+        let _probe = lock_dispatch_probe();
         let (k, n, block_size) = (35, 5, 32);
         let a_values: Vec<f32> = (0..k).map(|i| ((i * 5 % 29) as f32 - 14.0) / 9.0).collect();
         let weights: Vec<f32> = (0..n * k)
@@ -12726,6 +12955,7 @@ mod tests {
     /// [`Int4Acc0RouteProbe::assert_fast_route`] on constant weights.
     #[test]
     fn matmulnbits_int4_acc0_dynamic_weight_keeps_borrowed_path() {
+        let _probe = lock_dispatch_probe();
         let (k, n, block_size) = (128, 16, 32);
         let a_values: Vec<f32> = (0..k)
             .map(|i| ((i * 11 % 41) as f32 - 20.0) / 13.0)
@@ -12784,6 +13014,7 @@ mod tests {
     /// encoding which kernel happens to be selected here.
     #[test]
     fn matmulnbits_acc0_m1_block32_matches_fp32_oracle_on_every_arch() {
+        let _probe = lock_dispatch_probe();
         for &(k, n) in &[(32usize, 8usize), (35, 7), (256, 48), (129, 33)] {
             let block_size = 32usize;
             let activations: Vec<f32> = (0..k)
@@ -12878,6 +13109,7 @@ mod tests {
     #[cfg(all(feature = "mlas", target_arch = "x86_64"))]
     #[test]
     fn int4_acc0_constant_weight_reaches_mlas_on_x86_64() {
+        let _probe = lock_dispatch_probe();
         let _guard = CACHE_FLAG_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -12992,6 +13224,7 @@ mod tests {
     #[cfg(feature = "mlas")]
     #[test]
     fn int4_acc0_mlas_packed_accounting_equals_actual_allocated() {
+        let _probe = lock_dispatch_probe();
         let _guard = CACHE_FLAG_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -13123,6 +13356,7 @@ mod tests {
     #[cfg(feature = "mlas")]
     #[test]
     fn mlas_sqnbit_packing_decline_keeps_borrowed_path() {
+        let _probe = lock_dispatch_probe();
         let _guard = CACHE_FLAG_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -13192,6 +13426,7 @@ mod tests {
 
     #[test]
     fn matmulnbits_unpacks_low_nibble_before_high_nibble() {
+        let _probe = lock_dispatch_probe();
         let k = 16;
         let (graph, node) = model_node(&[1, k], &[1, 1, 8], &[1], None, &[1, 1], k, 1, 16);
         let model = Model::new(&graph);
@@ -13215,6 +13450,7 @@ mod tests {
 
     #[test]
     fn matmulnbits_honors_non_contiguous_group_indices() {
+        let _probe = lock_dispatch_probe();
         let k = 32;
         let mut graph = Graph::new();
         graph.opset_imports.insert("com.microsoft".into(), 1);
@@ -13302,6 +13538,7 @@ mod tests {
 
     #[test]
     fn matmulnbits_defaults_missing_bits_to_int4() {
+        let _probe = lock_dispatch_probe();
         let k = 16;
         let (graph, node) = model_node(&[1, k], &[1, 1, 8], &[1], None, &[1, 1], k, 1, 16);
         let mut graph = graph;
@@ -13382,6 +13619,7 @@ mod tests {
     #[cfg(feature = "mlas")]
     #[test]
     fn matmulnbits_mlas_prepacked_matches_standard_layout() {
+        let _probe = lock_dispatch_probe();
         let mut tested = 0;
         for &(m, n, k, block_size) in &[(3usize, 32usize, 96usize, 32usize), (5, 48, 192, 64)] {
             let k_blocks = k.div_ceil(block_size);
@@ -13579,6 +13817,7 @@ mod tests {
     #[cfg(feature = "mlas")]
     #[test]
     fn matmulnbits_try_mlas_falls_back_for_gidx_and_bits2() {
+        let _probe = lock_dispatch_probe();
         let (n, k, block_size) = (2usize, 32usize, 32usize);
         let k_blocks = k.div_ceil(block_size);
         let a = vec![0.5f32; k];
@@ -14037,6 +14276,7 @@ mod tests {
     #[cfg(feature = "mlas")]
     #[test]
     fn mlas_sharded_decode_parity_subprocess() {
+        let _probe = lock_dispatch_probe();
         if std::env::var(MLAS_SHARD_PARITY_CHILD_ENV).is_err() {
             return;
         }
@@ -14277,6 +14517,7 @@ mod tests {
     #[cfg(feature = "mlas")]
     #[test]
     fn mlas_prefill_dispatch_parity_subprocess() {
+        let _probe = lock_dispatch_probe();
         if std::env::var(MLAS_PREFILL_PARITY_CHILD_ENV).is_err() {
             return;
         }
@@ -14773,6 +15014,7 @@ mod tests {
     #[cfg(feature = "mlas")]
     #[test]
     fn matmulnbits_try_mlas_gates_decode_by_m_threshold() {
+        let _probe = lock_dispatch_probe();
         let (n, k, block_size) = (32usize, 64usize, 32usize);
         let k_blocks = k.div_ceil(block_size);
         let blob = block_size / 2;
@@ -14895,6 +15137,7 @@ mod tests {
     #[cfg(feature = "mlas")]
     #[test]
     fn matmulnbits_accuracy4_dynamic_weight_decode_keeps_hand_path() {
+        let _probe = lock_dispatch_probe();
         let (k, n, block_size) = (128, 16, 32);
         let weights: Vec<f32> = (0..n * k)
             .map(|i| ((i * 23 % 47) as f32 - 19.0) / 12.0)
@@ -14949,6 +15192,7 @@ mod tests {
     #[cfg(feature = "mlas")]
     #[test]
     fn matmulnbits_try_mlas_serves_slow_dequant_decode() {
+        let _probe = lock_dispatch_probe();
         let (n, k, block_size) = (32usize, 64usize, 32usize);
         let k_blocks = k.div_ceil(block_size);
         let blob = block_size / 2;
@@ -15028,6 +15272,7 @@ mod tests {
     #[cfg(feature = "mlas")]
     #[test]
     fn matmulnbits_try_mlas_routes_acclevel0_without_mlas_backend() {
+        let _probe = lock_dispatch_probe();
         let (n, k, block_size) = (32usize, 64usize, 32usize);
         let k_blocks = k.div_ceil(block_size);
         let blob = block_size / 2;

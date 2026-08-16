@@ -6,7 +6,6 @@ use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, Ten
 use onnx_runtime_ir::{DataType, Node};
 
 use super::check_arity;
-use super::gelu::exact_gelu;
 use super::layernorm::layer_norm_dense;
 use super::rmsnorm::rms_norm_dense;
 use super::simd_activations;
@@ -103,12 +102,21 @@ impl Kernel for BiasGeluKernel {
         let x = to_dense_f32_widen("BiasGelu", &inputs[0])?;
         let bias = to_dense_f32_widen("BiasGelu", &inputs[1])?;
         let width = last_dim_bias(inputs[0].shape, &bias, "BiasGelu")?;
-        let y = x
-            .iter()
-            .enumerate()
-            .map(|(i, &v)| exact_gelu(v + bias[i % width]))
-            .collect::<Vec<_>>();
-        write_dense_f32_narrow("BiasGelu", &mut outputs[0], &y)
+        if width == 0 {
+            // A zero last dimension means the tensor is empty, so there is
+            // nothing to compute and no bias row to broadcast.
+            return write_dense_f32_narrow("BiasGelu", &mut outputs[0], &[]);
+        }
+        // Bias folded in-register, exactly as `FastGelu` does — see
+        // `kernels::simd_activations::erf_gelu_bias_f32_slice`. `bias` may
+        // borrow the input tensor's storage, so it is declared as a read range.
+        simd_activations::write_mapped_reading(
+            "BiasGelu",
+            &mut outputs[0],
+            &x,
+            &[crate::dtype::slice_byte_range(&bias)],
+            |x, y| simd_activations::erf_gelu_bias_f32_slice(x, &bias, width, y),
+        )
     }
 
     fn supports_strided_input(&self, _input_idx: usize) -> bool {

@@ -29,6 +29,10 @@ onnx-runtime-ep-api = { workspace = true }
 onnx-runtime-ep-cpu = { workspace = true }
 onnx-runtime-ep-cuda = { path = "../onnx-runtime-ep-cuda", version = "=0.1.0-dev.5", optional = true, default-features = false }
 onnx-runtime-tracer = { workspace = true }
+# Shared with `onnx-runtime-ep-cpu`, which already depends on it: the view
+# materialization in `executor/geometry.rs` is a bulk memory move on the
+# graph-output path and has to scale with cores the way the kernels do.
+rayon = "1"
 thiserror = { workspace = true }
 half = { workspace = true }
 

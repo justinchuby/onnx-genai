@@ -26,13 +26,16 @@ pub use options::{
     SessionOptions, USE_ENV_ALLOCATORS, available_execution_providers, ep_selection,
 };
 
+#[cfg(test)]
+use env_config::requested_strict_provider;
 use env_config::{
     cuda_device_id_from_env, device_kv_enabled_from_env, effective_intra_op_threads,
     fixed_capacity_present_binding_supported, is_textproto_path, requested_non_cpu_provider,
-    requested_strict_provider, shared_kv_present_binding_opt_in_from_env,
+    shared_kv_present_binding_opt_in_from_env,
 };
 use providers::{
-    add_session_config_entry, append_execution_providers, apply_webgpu_provider_options,
+    ExecutionProviderAppendError, add_session_config_entry, append_execution_providers,
+    apply_webgpu_provider_options,
 };
 
 #[cfg(all(test, feature = "cuda"))]
@@ -139,6 +142,173 @@ impl GraphIo for Session {
     }
 }
 
+fn cpu_fallback_allowed(options: &SessionOptions) -> bool {
+    options.allow_cpu_fallback
+        && requested_non_cpu_provider(options)
+        && !options
+            .execution_providers
+            .iter()
+            .any(ResolvedEp::is_unsupported_name)
+}
+
+fn cpu_provider() -> ResolvedEp {
+    resolve_execution_provider(&ep_selection("cpu"))
+}
+
+fn implicit_cpu_ep_fallback_disabled(options: &SessionOptions) -> bool {
+    requested_non_cpu_provider(options)
+        && !options.allow_cpu_fallback
+        && !options.has_session_config("session.disable_cpu_ep_fallback")
+}
+
+#[derive(Clone)]
+struct ExecutionProviderCandidate {
+    providers: Vec<ResolvedEp>,
+    allow_cpu_nodes: bool,
+    whole_session_cpu_fallback: bool,
+}
+
+fn execution_provider_candidates(options: &SessionOptions) -> Vec<ExecutionProviderCandidate> {
+    let providers = &options.execution_providers;
+    if providers.is_empty() {
+        return vec![ExecutionProviderCandidate {
+            providers: vec![cpu_provider()],
+            allow_cpu_nodes: false,
+            whole_session_cpu_fallback: false,
+        }];
+    }
+
+    let first_cpu = providers
+        .iter()
+        .position(|provider| provider.caps.is_host())
+        .unwrap_or(providers.len());
+    let mut candidates = Vec::new();
+    let cpu_permitted = first_cpu < providers.len() || cpu_fallback_allowed(options);
+    for start in 0..first_cpu {
+        let accelerator_suffix = providers[start..first_cpu].to_vec();
+        candidates.push(ExecutionProviderCandidate {
+            providers: accelerator_suffix.clone(),
+            allow_cpu_nodes: false,
+            whole_session_cpu_fallback: false,
+        });
+        if cpu_permitted {
+            candidates.push(ExecutionProviderCandidate {
+                providers: accelerator_suffix,
+                allow_cpu_nodes: true,
+                whole_session_cpu_fallback: false,
+            });
+        }
+    }
+
+    if first_cpu < providers.len() {
+        candidates.push(ExecutionProviderCandidate {
+            providers: vec![providers[first_cpu].clone()],
+            allow_cpu_nodes: false,
+            whole_session_cpu_fallback: first_cpu > 0,
+        });
+    } else if cpu_fallback_allowed(options) {
+        candidates.push(ExecutionProviderCandidate {
+            providers: vec![cpu_provider()],
+            allow_cpu_nodes: false,
+            whole_session_cpu_fallback: true,
+        });
+    } else if candidates.is_empty() {
+        candidates.push(ExecutionProviderCandidate {
+            providers: vec![providers[0].clone()],
+            allow_cpu_nodes: false,
+            whole_session_cpu_fallback: false,
+        });
+    }
+
+    candidates
+}
+
+fn provider_names(providers: &[ResolvedEp]) -> String {
+    providers
+        .iter()
+        .map(|provider| provider.selection.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn prune_failed_provider_from_candidates(
+    candidates: &mut [ExecutionProviderCandidate],
+    provider_name: &str,
+) {
+    for candidate in candidates {
+        candidate
+            .providers
+            .retain(|provider| provider.selection.name != provider_name);
+    }
+}
+
+fn query_node_cpu_fallback_used(
+    _session: NonNull<onnx_genai_ort_sys::OrtSession>,
+    allowed: bool,
+) -> Option<bool> {
+    if !allowed {
+        return Some(false);
+    }
+    // ORT's stable C API reports available providers and lets us disable CPU EP
+    // fallback, but it does not expose finalized per-node EP assignment for a
+    // loaded session. Keep "allowed" and "used" distinct: callers can see that
+    // CPU node fallback was permitted, but must not treat that as proof that CPU
+    // executed nodes. A provider-specific runner with placement telemetry can
+    // fill this in later.
+    None
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedExecutionProvider {
+    pub name: String,
+    pub reason: String,
+}
+
+/// Queryable execution-provider placement selected for a loaded session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionProviderStatus {
+    pub active: Vec<String>,
+    pub skipped: Vec<SkippedExecutionProvider>,
+    pub whole_session_cpu_fallback: bool,
+    pub node_cpu_fallback_allowed: bool,
+    /// Whether CPU actually executed graph nodes through ORT's internal
+    /// per-node fallback. `None` means the linked ORT C API does not expose
+    /// enough placement metadata to distinguish "allowed" from "used".
+    pub node_cpu_fallback_used: Option<bool>,
+}
+
+impl ExecutionProviderStatus {
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let mut summary = if self.active.is_empty() {
+            "cpu".to_string()
+        } else {
+            self.active.join(", ")
+        };
+        match self.node_cpu_fallback_used {
+            Some(true) => summary.push_str(" (CPU node fallback used)"),
+            Some(false) => {}
+            None if self.node_cpu_fallback_allowed => {
+                summary.push_str(" (CPU node fallback allowed; actual placement unavailable)")
+            }
+            None => {}
+        }
+        if self.whole_session_cpu_fallback {
+            summary.push_str(" (CPU session fallback)");
+        }
+        if !self.skipped.is_empty() {
+            let skipped = self
+                .skipped
+                .iter()
+                .map(|provider| provider.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            summary.push_str(&format!("; skipped: {skipped}"));
+        }
+        summary
+    }
+}
+
 /// A run failure tagged with whether the model was actually invoked.
 #[derive(Debug)]
 pub enum RunPhaseError {
@@ -154,6 +324,27 @@ impl RunPhaseError {
     }
 }
 
+#[derive(Debug)]
+enum SessionAttemptError {
+    ProviderAppend(ExecutionProviderAppendError),
+    Other(OrtError),
+}
+
+impl SessionAttemptError {
+    fn into_ort_error(self) -> OrtError {
+        match self {
+            Self::ProviderAppend(err) => err.source,
+            Self::Other(err) => err,
+        }
+    }
+}
+
+impl From<OrtError> for SessionAttemptError {
+    fn from(value: OrtError) -> Self {
+        Self::Other(value)
+    }
+}
+
 /// An ORT inference session (a loaded model).
 pub struct Session {
     ptr: NonNull<onnx_genai_ort_sys::OrtSession>,
@@ -162,13 +353,22 @@ pub struct Session {
     output_names: Vec<String>,
     inputs: Vec<TensorInfo>,
     outputs: Vec<TensorInfo>,
-    /// Execution providers requested for this session (priority order). Used to
+    /// Execution providers active for this session (priority order). Used to
     /// decide whether device-resident KV buffers can be allocated.
     execution_providers: Vec<ResolvedEp>,
     /// Whether the session was created with EP graph capture enabled
     /// (CUDA `enable_cuda_graph=1`). Decode runners use this to drive the
     /// static-shape captured-graph replay path.
     graph_capture: bool,
+    /// Whether session creation explicitly retried on CPU after a requested
+    /// non-CPU provider failed.
+    cpu_fallback_used: bool,
+    /// Providers that were tried before the active provider and rejected.
+    skipped_providers: Vec<SkippedExecutionProvider>,
+    /// ORT's internal per-node CPU fallback is allowed for this session.
+    node_cpu_fallback_allowed: bool,
+    /// Whether ORT actually placed nodes on CPU through internal fallback.
+    node_cpu_fallback_used: Option<bool>,
 }
 
 impl Session {
@@ -216,66 +416,160 @@ impl Session {
         // files. Both steps can fail for a requested non-CPU provider, so keep
         // them together behind one closure that can be retried with CPU-only
         // options.
-        let create_session =
-            |opts: &SessionOptions| -> Result<*mut onnx_genai_ort_sys::OrtSession> {
-                let session_options = RawSessionOptions::new(env, opts)?;
-                let mut ptr = std::ptr::null_mut();
-                match &model_bytes {
-                    Some(bytes) => {
-                        let create = api
-                            .CreateSessionFromArray
-                            .ok_or(OrtError::ApiUnavailable("CreateSessionFromArray"))?;
-                        // SAFETY: `env` and `session_options` are valid ORT handles,
-                        // `bytes` outlives the call, and `ptr` is an out-param.
-                        crate::error::check_status(unsafe {
-                            create(
-                                env.as_ptr(),
-                                bytes.as_ptr() as *const std::ffi::c_void,
-                                bytes.len(),
-                                session_options.as_ptr(),
-                                &mut ptr,
-                            )
-                        })?;
-                    }
-                    None => {
-                        let create = api
-                            .CreateSession
-                            .ok_or(OrtError::ApiUnavailable("CreateSession"))?;
-                        // SAFETY: `env` and `session_options` are valid ORT handles,
-                        // `path_c` is NUL-terminated for the call, and `ptr` is an
-                        // out-param.
-                        crate::error::check_status(unsafe {
-                            create(
-                                env.as_ptr(),
-                                path_c.as_ptr(),
-                                session_options.as_ptr(),
-                                &mut ptr,
-                            )
-                        })?;
-                    }
+        let create_session = |opts: &SessionOptions| -> std::result::Result<
+            *mut onnx_genai_ort_sys::OrtSession,
+            SessionAttemptError,
+        > {
+            let session_options = RawSessionOptions::new(env, opts)?;
+            let mut ptr = std::ptr::null_mut();
+            match &model_bytes {
+                Some(bytes) => {
+                    let create = api
+                        .CreateSessionFromArray
+                        .ok_or(OrtError::ApiUnavailable("CreateSessionFromArray"))?;
+                    // SAFETY: `env` and `session_options` are valid ORT handles,
+                    // `bytes` outlives the call, and `ptr` is an out-param.
+                    crate::error::check_status(unsafe {
+                        create(
+                            env.as_ptr(),
+                            bytes.as_ptr() as *const std::ffi::c_void,
+                            bytes.len(),
+                            session_options.as_ptr(),
+                            &mut ptr,
+                        )
+                    })?;
                 }
-                Ok(ptr)
-            };
-
-        // Auto-selected providers (e.g. the macOS MLX default) always fall back
-        // to CPU; explicitly requested strict providers (CUDA and plugin EPs)
-        // fail rather than silently changing the requested device.
-        let allow_cpu_fallback = options.auto_selected
-            || (requested_non_cpu_provider(&options) && !requested_strict_provider(&options));
-
-        let (ptr, effective_providers) = match create_session(&options) {
-            Ok(ptr) => (ptr, options.execution_providers.clone()),
-            Err(err) if allow_cpu_fallback => {
-                tracing::warn!(
-                    "ORT session creation failed with requested execution provider(s): {err}; retrying with CPU"
-                );
-                let cpu_options = SessionOptions::cpu();
-                let ptr = create_session(&cpu_options)?;
-                (ptr, cpu_options.execution_providers)
+                None => {
+                    let create = api
+                        .CreateSession
+                        .ok_or(OrtError::ApiUnavailable("CreateSession"))?;
+                    // SAFETY: `env` and `session_options` are valid ORT handles,
+                    // `path_c` is NUL-terminated for the call, and `ptr` is an
+                    // out-param.
+                    crate::error::check_status(unsafe {
+                        create(
+                            env.as_ptr(),
+                            path_c.as_ptr(),
+                            session_options.as_ptr(),
+                            &mut ptr,
+                        )
+                    })?;
+                }
             }
-            Err(err) => return Err(err),
+            Ok(ptr)
         };
+
+        let mut candidates = execution_provider_candidates(&options);
+        let mut skipped_providers: Vec<SkippedExecutionProvider> = Vec::new();
+        let mut last_error = None;
+        let mut loaded = None;
+        let mut index = 0;
+
+        while index < candidates.len() {
+            if candidates[index].providers.is_empty() {
+                index += 1;
+                continue;
+            }
+            let candidate_plan = candidates[index].clone();
+            let candidate = options.for_execution_providers(
+                candidate_plan.providers.clone(),
+                candidate_plan.allow_cpu_nodes,
+            );
+            match create_session(&candidate) {
+                Ok(ptr) => {
+                    loaded = Some((ptr, candidate, candidate_plan.whole_session_cpu_fallback));
+                    break;
+                }
+                Err(err)
+                    if candidate_plan
+                        .providers
+                        .iter()
+                        .any(ResolvedEp::is_unsupported_name) =>
+                {
+                    return Err(err.into_ort_error());
+                }
+                Err(SessionAttemptError::ProviderAppend(append_error)) => {
+                    let failed_provider = append_error.provider_name.clone();
+                    let failed_position = append_error.provider_index + 1;
+                    let reason = append_error.source.to_string();
+                    tracing::warn!(
+                        "ORT session creation failed while appending execution provider {failed_provider} (position {failed_position}) in requested chain {}; removing only that provider and retrying the remaining explicitly requested alternatives: {}",
+                        provider_names(&candidate_plan.providers),
+                        reason
+                    );
+                    if !skipped_providers
+                        .iter()
+                        .any(|provider| provider.name == failed_provider)
+                    {
+                        skipped_providers.push(SkippedExecutionProvider {
+                            name: failed_provider.clone(),
+                            reason: reason.clone(),
+                        });
+                    }
+                    prune_failed_provider_from_candidates(
+                        &mut candidates[index..],
+                        &failed_provider,
+                    );
+                    if candidates[index].providers.is_empty() {
+                        index += 1;
+                    }
+                    last_error = Some(append_error.source);
+                }
+                Err(err)
+                    if candidates[index + 1..]
+                        .iter()
+                        .any(|plan| !plan.providers.is_empty()) =>
+                {
+                    let err = err.into_ort_error();
+                    let current_first = candidate_plan
+                        .providers
+                        .first()
+                        .map(|provider| provider.selection.name.as_str());
+                    let next_first = candidates[index + 1..]
+                        .iter()
+                        .find(|plan| !plan.providers.is_empty())
+                        .and_then(|plan| {
+                            plan.providers
+                                .first()
+                                .map(|provider| provider.selection.name.as_str())
+                        });
+                    tracing::warn!(
+                        "ORT session creation failed for requested execution provider chain {}; trying the next explicitly requested provider alternative: {err}",
+                        provider_names(&candidate_plan.providers)
+                    );
+                    if current_first != next_first
+                        && let Some(skipped) = current_first
+                        && !skipped_providers
+                            .iter()
+                            .any(|provider| provider.name == skipped)
+                    {
+                        skipped_providers.push(SkippedExecutionProvider {
+                            name: skipped.to_string(),
+                            reason: err.to_string(),
+                        });
+                    }
+                    last_error = Some(err);
+                    index += 1;
+                }
+                Err(err) => {
+                    last_error = Some(err.into_ort_error());
+                    break;
+                }
+            }
+        }
+
+        let (ptr, effective_options, cpu_fallback_used) = if let Some(loaded) = loaded {
+            loaded
+        } else {
+            return Err(last_error.unwrap_or_else(|| {
+                OrtError::InvalidArgument("no execution provider was available to try".into())
+            }));
+        };
+        let node_cpu_fallback_allowed =
+            requested_non_cpu_provider(&effective_options) && effective_options.allow_cpu_fallback;
+        let effective_providers = effective_options.execution_providers.clone();
         let ptr = NonNull::new(ptr).ok_or(OrtError::NullPointer)?;
+        let node_cpu_fallback_used = query_node_cpu_fallback_used(ptr, node_cpu_fallback_allowed);
         let inputs = query_io(ptr.as_ptr(), IoKind::Input)?;
         let outputs = query_io(ptr.as_ptr(), IoKind::Output)?;
         let input_names = inputs.iter().map(|info| info.name.clone()).collect();
@@ -291,7 +585,11 @@ impl Session {
             inputs,
             outputs,
             execution_providers: effective_providers,
-            graph_capture: options.graph_capture,
+            graph_capture: effective_options.graph_capture,
+            cpu_fallback_used,
+            skipped_providers,
+            node_cpu_fallback_allowed,
+            node_cpu_fallback_used,
         })
     }
 
@@ -369,7 +667,52 @@ impl Session {
         self.graph_capture
     }
 
-    /// The CUDA device id this session runs on, if a CUDA EP was requested.
+    /// Execution providers this session actually runs on, in priority order.
+    pub fn execution_providers(&self) -> &[ResolvedEp] {
+        &self.execution_providers
+    }
+
+    /// Whether session creation explicitly retried on CPU after a non-CPU EP
+    /// failed. Benchmark harnesses should reject results when this is true.
+    pub fn cpu_fallback_used(&self) -> bool {
+        self.cpu_fallback_used
+    }
+
+    /// Providers skipped before choosing the active provider.
+    pub fn skipped_execution_providers(&self) -> &[SkippedExecutionProvider] {
+        &self.skipped_providers
+    }
+
+    /// Whether ORT's internal per-node CPU fallback was left allowed for this
+    /// session because the caller explicitly requested fallback semantics.
+    pub fn node_cpu_fallback_allowed(&self) -> bool {
+        self.node_cpu_fallback_allowed
+    }
+
+    /// Whether ORT actually placed nodes on CPU through internal fallback.
+    ///
+    /// `None` means the linked ORT C API does not expose per-node placement
+    /// metadata for this session, so callers must not treat "allowed" as "used".
+    pub fn node_cpu_fallback_used(&self) -> Option<bool> {
+        self.node_cpu_fallback_used
+    }
+
+    /// Queryable placement summary for status and benchmark harnesses.
+    pub fn execution_provider_status(&self) -> ExecutionProviderStatus {
+        ExecutionProviderStatus {
+            active: self
+                .execution_providers
+                .iter()
+                .map(|provider| provider.selection.name.clone())
+                .collect(),
+            skipped: self.skipped_providers.clone(),
+            whole_session_cpu_fallback: self.cpu_fallback_used,
+            node_cpu_fallback_allowed: self.node_cpu_fallback_allowed,
+            node_cpu_fallback_used: self.node_cpu_fallback_used,
+        }
+    }
+
+    /// The CUDA device id this session runs on, if CUDA is active.
     pub fn cuda_device_id(&self) -> Option<i32> {
         self.execution_providers.iter().find_map(|ep| {
             if ep.caps.is_nvidia() && ep.caps.is_gpu() {
@@ -707,7 +1050,10 @@ struct RawSessionOptions {
 }
 
 impl RawSessionOptions {
-    fn new(env: &Environment, options: &SessionOptions) -> Result<Self> {
+    fn new(
+        env: &Environment,
+        options: &SessionOptions,
+    ) -> std::result::Result<Self, SessionAttemptError> {
         let api = crate::error::api()?;
         let create = api
             .CreateSessionOptions
@@ -750,8 +1096,12 @@ impl RawSessionOptions {
         for (key, value) in &options.session_config_entries {
             add_session_config_entry(this.ptr.as_ptr(), key, value)?;
         }
+        if implicit_cpu_ep_fallback_disabled(options) {
+            add_session_config_entry(this.ptr.as_ptr(), "session.disable_cpu_ep_fallback", "1")?;
+        }
 
-        append_execution_providers(env, this.ptr.as_ptr(), options)?;
+        append_execution_providers(env, this.ptr.as_ptr(), options)
+            .map_err(SessionAttemptError::ProviderAppend)?;
         apply_webgpu_provider_options(this.ptr.as_ptr(), options)?;
 
         Ok(this)

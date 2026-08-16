@@ -9,6 +9,13 @@ use super::ep_compat::{self, ResolvedEp};
 use super::options::{SessionOptions, available_execution_providers};
 use super::plugin::append_plugin_execution_provider;
 
+#[derive(Debug)]
+pub(super) struct ExecutionProviderAppendError {
+    pub provider_index: usize,
+    pub provider_name: String,
+    pub source: OrtError,
+}
+
 /// Apply WebGPU EP provider options via session config entries.
 ///
 /// The WebGPU EP reads these from the merged `ConfigOptions` (see ORT
@@ -62,12 +69,12 @@ pub(super) fn append_execution_providers(
     env: &Environment,
     session_options: *mut onnx_genai_ort_sys::OrtSessionOptions,
     options: &SessionOptions,
-) -> Result<()> {
+) -> std::result::Result<(), ExecutionProviderAppendError> {
     let available = available_execution_providers().unwrap_or_else(|err| {
         tracing::warn!("Could not query available ORT execution providers: {err}");
         Vec::new()
     });
-    for provider in &options.execution_providers {
+    for (provider_index, provider) in options.execution_providers.iter().enumerate() {
         append_execution_provider(
             env,
             session_options,
@@ -75,7 +82,12 @@ pub(super) fn append_execution_providers(
             options.graph_capture,
             &options.cuda_attention_mode,
             &available,
-        )?;
+        )
+        .map_err(|source| ExecutionProviderAppendError {
+            provider_index,
+            provider_name: provider.selection.name.clone(),
+            source,
+        })?;
     }
     Ok(())
 }
@@ -137,6 +149,15 @@ pub(super) fn append_execution_provider(
                 available,
             )
         }
+        AppendStrategy::UnsupportedName { name } => Err(OrtError::InvalidArgument(format!(
+            "Unrecognized ONNX_GENAI_EP value '{name}'. Known values are: {}. \
+             To use an EP outside this table, configure it as an explicit plugin \
+             with ONNX_GENAI_EP=plugin:<library>|name=<registration>|device=<CPU|GPU|NPU>|opt.<key>=<value>.",
+            ep_compat::known_execution_provider_values()
+        ))),
+        AppendStrategy::InvalidConfiguration { message } => {
+            Err(OrtError::InvalidArgument(message.clone()))
+        }
     }
 }
 
@@ -172,11 +193,11 @@ fn append_named_execution_provider(
     available: &[String],
 ) -> Result<()> {
     if !provider_is_available(provider_name, available) {
-        tracing::warn!(
-            "Requested ONNX Runtime execution provider {api_name} is unavailable in this build; falling back to CPU. Available providers: {:?}",
-            available
-        );
-        return Ok(());
+        return Err(named_provider_unavailable_error(
+            api_name,
+            provider_name,
+            available,
+        ));
     }
 
     let api = crate::error::api()?;
@@ -185,7 +206,7 @@ fn append_named_execution_provider(
         .ok_or(OrtError::ApiUnavailable(
             "SessionOptionsAppendExecutionProvider",
         ))?;
-    let api_name = CString::new(api_name)
+    let api_name_c = CString::new(api_name)
         .map_err(|_| OrtError::InvalidArgument("execution provider name contains NUL".into()))?;
     let option_keys = provider_options
         .iter()
@@ -215,7 +236,7 @@ fn append_named_execution_provider(
     match crate::error::check_status(unsafe {
         append(
             session_options,
-            api_name.as_ptr(),
+            api_name_c.as_ptr(),
             option_key_ptrs.as_ptr(),
             option_value_ptrs.as_ptr(),
             provider_options.len(),
@@ -225,13 +246,27 @@ fn append_named_execution_provider(
             tracing::info!("Enabled ONNX Runtime execution provider {provider_name}");
             Ok(())
         }
-        Err(err) => {
-            tracing::warn!(
-                "Failed to enable ONNX Runtime execution provider {provider_name}: {err}; falling back to CPU"
-            );
-            Ok(())
-        }
+        Err(err) => Err(OrtError::SessionCreation(format!(
+            "failed to initialize requested ONNX Runtime execution provider {provider_name} \
+             ({api_name}): {err}. Available providers: {available:?}. \
+             To intentionally run on CPU, request it explicitly with ONNX_GENAI_EP=cpu; \
+             to opt into a visible CPU retry for this request, set ONNX_GENAI_EP_FALLBACK=1"
+        ))),
     }
+}
+
+fn named_provider_unavailable_error(
+    api_name: &str,
+    provider_name: &str,
+    available: &[String],
+) -> OrtError {
+    OrtError::SessionCreation(format!(
+        "ONNX Runtime execution provider {provider_name} ({api_name}) was requested, \
+         but the linked ONNX Runtime build does not report it. Available providers: {available:?}. \
+         Install or load an ONNX Runtime build that includes {provider_name}; \
+         to intentionally run on CPU, request it explicitly with ONNX_GENAI_EP=cpu; \
+         to opt into a visible CPU retry for this request, set ONNX_GENAI_EP_FALLBACK=1"
+    ))
 }
 
 pub(super) fn provider_is_available(provider_name: &str, available: &[String]) -> bool {

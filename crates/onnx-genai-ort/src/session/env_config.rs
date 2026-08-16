@@ -1,45 +1,59 @@
 use std::path::Path;
 
 use onnx_genai_runtime_config::{
-    CudaDevice, ExecutionProviderEntry, IntraOpThreads, runtime_config,
+    CudaDevice, ExecutionProviderEntry, IntraOpThreads, RuntimeConfig, runtime_config,
 };
 
 use super::CudaAttentionMode;
 use super::ep_compat::{ResolvedEp, capability, resolve_execution_provider};
 use super::options::SessionOptions;
 use super::plugin::{
-    plugin_registration_name_from_path, resolve_inline_plugin, resolve_plugin_selection,
+    invalid_plugin_configuration, plugin_registration_name_from_path, resolve_inline_plugin,
+    resolve_plugin_selection,
 };
 
 pub(super) fn execution_providers_from_env() -> Option<Vec<ResolvedEp>> {
-    let entries = &runtime_config().execution_providers;
+    let config = runtime_config();
+    let entries = &config.execution_providers;
     if entries.is_empty() {
         return None;
     }
     let providers = entries
         .iter()
-        .filter_map(|entry| match entry {
-            ExecutionProviderEntry::Builtin(selection) if selection.name == "plugin" => {
-                let config = runtime_config();
-                let library = config.ep_library.clone()?;
-                Some(resolve_plugin_selection(
-                    selection.clone(),
-                    library.clone(),
-                    config
-                        .ep_registration_name
-                        .clone()
-                        .unwrap_or_else(|| plugin_registration_name_from_path(&library)),
-                    config.ep_options.clone(),
-                    config.ep_device.clone(),
-                ))
-            }
-            ExecutionProviderEntry::Builtin(selection) => {
-                Some(resolve_execution_provider(selection))
-            }
-            ExecutionProviderEntry::Plugin(spec) => resolve_inline_plugin(spec),
-        })
+        .map(|entry| resolve_execution_provider_entry(entry, config))
         .collect::<Vec<_>>();
     (!providers.is_empty()).then_some(providers)
+}
+
+pub(super) fn resolve_execution_provider_entry(
+    entry: &ExecutionProviderEntry,
+    config: &RuntimeConfig,
+) -> ResolvedEp {
+    match entry {
+        ExecutionProviderEntry::Builtin(selection) if selection.name == "plugin" => {
+            match config.ep_library.clone() {
+                Some(library) => {
+                    let registration_name = config
+                        .ep_registration_name
+                        .clone()
+                        .unwrap_or_else(|| plugin_registration_name_from_path(&library));
+                    resolve_plugin_selection(
+                        selection.clone(),
+                        library,
+                        registration_name,
+                        config.ep_options.clone(),
+                        config.ep_device.clone(),
+                    )
+                }
+                None => invalid_plugin_configuration(
+                    selection.clone(),
+                    "Invalid ONNX_GENAI_EP=plugin request: ONNX_GENAI_EP_LIBRARY must name a non-empty plugin library path",
+                ),
+            }
+        }
+        ExecutionProviderEntry::Builtin(selection) => resolve_execution_provider(selection),
+        ExecutionProviderEntry::Plugin(spec) => resolve_inline_plugin(spec),
+    }
 }
 
 pub(super) fn requested_non_cpu_provider(options: &SessionOptions) -> bool {
@@ -58,6 +72,7 @@ pub(super) fn is_textproto_path(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("textproto"))
 }
 
+#[cfg(test)]
 pub(super) fn requested_strict_provider(options: &SessionOptions) -> bool {
     options
         .execution_providers

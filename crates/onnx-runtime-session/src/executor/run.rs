@@ -687,11 +687,9 @@ impl Executor {
                 results.push(Some(SessionOutput::Tensor(tensor)));
                 continue;
             }
-            let bytes = self.contiguous_bytes(vid, &shape, dtype)?;
-            host_output_bytes += bytes.len();
-            results.push(Some(SessionOutput::Tensor(Tensor::from_raw(
-                dtype, shape, &bytes,
-            )?)));
+            let (tensor, bytes) = self.contiguous_output_tensor(vid, &shape, dtype)?;
+            host_output_bytes += bytes;
+            results.push(Some(SessionOutput::Tensor(tensor)));
         }
         // Attribution aid: at the top level, the number of graph-output bytes
         // materialized to host each run is the per-step cost of *not* keeping

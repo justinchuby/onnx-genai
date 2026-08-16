@@ -71,11 +71,16 @@
 //! a budget. Live state is never taken to make room.
 
 pub mod allocator;
+pub mod large_alloc_cache;
 pub mod shareability;
 
 pub use allocator::{
     AllocationCommitRange, DeviceAllocator, DeviceKey, HostAllocator, MappedAllocation,
     SharedDevicePrefix, SharedPrefixCommitInfo,
+};
+pub use large_alloc_cache::{
+    DEFAULT_CACHE_BUDGET_BYTES, LargeAllocCache, LargeAllocCacheStats, MAX_CACHED_BYTES,
+    MIN_CACHED_BYTES,
 };
 pub use shareability::{
     KvFragmentation, ModelKvGeometry, PrefixShareability, evaluate_geometry_shareability,
