@@ -234,6 +234,17 @@ type MlasParallelForFn = unsafe extern "C" fn(
 type MlasMaxThreadsFn = unsafe extern "C" fn(rust_ctx: *mut c_void) -> c_int;
 
 const MLAS_WORK_STEALING_THREADS_ENV: &str = "ONNX_GENAI_MLAS_THREADPOOL_THREADS";
+/// The CPU EP's thread-budget knob. `mlas-sys` sits *below* the EP and cannot
+/// depend on it, so the name is duplicated here; keep it in sync with
+/// `onnx_runtime_ep_cpu::kernels::matmul_nbits::DECODE_THREADS_ENV`.
+///
+/// Without this, an embedder that asked the CPU EP for N threads still got a
+/// standalone-MLAS pool sized by [`default_mlas_thread_count`]'s own default,
+/// so the request was silently ignored for every `MlasGemmBatch` call.
+const CPU_DECODE_THREADS_ENV: &str = "ONNX_GENAI_CPU_DECODE_THREADS";
+/// Upper bound on the standalone pool, matching the previous `n.min(64)` cap on
+/// the explicit override.
+const MAX_MLAS_POOL_THREADS: usize = 64;
 
 static MLAS_PARALLEL_FOR_CALLS: AtomicUsize = AtomicUsize::new(0);
 static MLAS_PARALLEL_FOR_ITERATIONS: AtomicUsize = AtomicUsize::new(0);
@@ -357,19 +368,61 @@ pub fn sqnbit_mlas_partitioning(
     }
 }
 
+/// Worker count for the standalone MLAS work-stealing pool.
+///
+/// Precedence: the MLAS-specific override, then the CPU EP's thread budget,
+/// then [`resolve_default_mlas_threads`].
 fn default_mlas_thread_count() -> usize {
-    if let Ok(raw) = std::env::var(MLAS_WORK_STEALING_THREADS_ENV) {
-        if let Ok(n) = raw.trim().parse::<usize>() {
-            if n > 0 {
-                return n.min(64);
-            }
-        }
+    if let Some(threads) = thread_count_env(MLAS_WORK_STEALING_THREADS_ENV) {
+        return threads;
+    }
+    if let Some(threads) = thread_count_env(CPU_DECODE_THREADS_ENV) {
+        return threads;
     }
 
-    std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1)
-        .clamp(1, 8)
+    resolve_default_mlas_threads(
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1),
+    )
+}
+
+fn thread_count_env(name: &str) -> Option<usize> {
+    let raw = std::env::var(name).ok()?;
+    let threads = raw.trim().parse::<usize>().ok()?;
+    (threads > 0).then(|| threads.min(MAX_MLAS_POOL_THREADS))
+}
+
+/// Default pool size: half the logical CPUs, but never fewer than the previous
+/// eight-worker ceiling allowed.
+///
+/// The old rule was `available.clamp(1, 8)`. That eight-worker cap belongs to
+/// the CPU EP's *flat Rayon* pool, whose per-op fork/join regresses past eight
+/// workers -- it does not apply here. This pool is persistent and work-stealing,
+/// so like the EP's persistent SPMD pool it keeps scaling with cores until the
+/// memory-bandwidth knee, measured at about half the logical CPUs.
+///
+/// Measured on a 32-vCPU/16-core EPYC 9V74 (f32 MatMul K=3584 N=3584 M=128,
+/// `native_min` over 15 runs after 5 warmups, ours/ORT at matched threads):
+///
+/// | requested threads | pool capped at 8 | pool sized to the request |
+/// |---|---|---|
+/// | 1--8 | 1.00--1.73x | unchanged (cap not binding) |
+/// | 16 | 2.08--2.48x slower | 1.24--1.44x slower |
+/// | 32 | 1.76--2.38x slower | **0.65--0.82x, i.e. faster than ORT** |
+///
+/// and with no thread flags at all: 1.85--2.64x slower at the old default
+/// versus 0.92--1.30x with this one.
+///
+/// `max` with `available.min(8)` keeps the rule monotone: no host ever gets
+/// *fewer* workers than the old default gave it, so small machines are
+/// unaffected and only hosts above 16 logical CPUs change.
+fn resolve_default_mlas_threads(available: usize) -> usize {
+    let available = available.max(1);
+    available
+        .div_ceil(2)
+        .max(available.min(8))
+        .min(MAX_MLAS_POOL_THREADS)
 }
 
 fn global_mlas_pool() -> Option<&'static WorkStealingThreadPool> {
@@ -3089,5 +3142,81 @@ mod tests {
 
             assert_eq!(back, input, "round-trip mismatch for channels={channels}");
         }
+    }
+
+    /// The standalone pool's default sizing rule must never hand a host *fewer*
+    /// workers than the previous `available.clamp(1, 8)` rule did, and must
+    /// scale past eight on hosts that have the cores.
+    ///
+    /// The old cap was inherited from the CPU EP's flat Rayon pool, whose per-op
+    /// fork/join regresses past eight workers. This pool is persistent and
+    /// work-stealing, so the cap only starved it: on a 32-vCPU host it left f32
+    /// MatMul 1.85--2.64x slower than ORT out of the box, versus 0.92--1.30x
+    /// once the pool is allowed half the machine.
+    #[test]
+    fn default_pool_size_is_monotone_against_the_old_eight_worker_rule() {
+        for available in 1..=256usize {
+            let old = available.clamp(1, 8);
+            let new = resolve_default_mlas_threads(available);
+            assert!(
+                new >= old,
+                "available={available}: new default {new} regresses below the old default {old}"
+            );
+            assert!(
+                new <= available.max(1),
+                "available={available}: new default {new} oversubscribes the host"
+            );
+            assert!(
+                new <= MAX_MLAS_POOL_THREADS,
+                "available={available}: new default {new} exceeds the pool cap"
+            );
+        }
+        // Pin the interesting points so a future edit cannot silently drift.
+        assert_eq!(resolve_default_mlas_threads(0), 1, "degenerate host");
+        assert_eq!(resolve_default_mlas_threads(1), 1);
+        assert_eq!(resolve_default_mlas_threads(4), 4, "small host unchanged");
+        assert_eq!(resolve_default_mlas_threads(8), 8, "old ceiling unchanged");
+        assert_eq!(resolve_default_mlas_threads(16), 8, "old ceiling unchanged");
+        assert_eq!(
+            resolve_default_mlas_threads(32),
+            16,
+            "half of a 32-vCPU host"
+        );
+        assert_eq!(resolve_default_mlas_threads(256), 64, "capped");
+    }
+
+    /// `ONNX_GENAI_CPU_DECODE_THREADS` is the CPU EP's thread-budget knob. The
+    /// standalone MLAS pool used to ignore it entirely, so asking the EP for N
+    /// threads left every `MlasGemmBatch` call on a differently-sized pool.
+    #[test]
+    fn thread_count_env_parses_and_clamps() {
+        // SAFETY: single-threaded test process section; the vars are restored
+        // before returning and no other test reads them.
+        unsafe {
+            std::env::set_var("ONNX_GENAI_MLAS_TEST_THREADS", "12");
+            assert_eq!(thread_count_env("ONNX_GENAI_MLAS_TEST_THREADS"), Some(12));
+            std::env::set_var("ONNX_GENAI_MLAS_TEST_THREADS", "  7  ");
+            assert_eq!(
+                thread_count_env("ONNX_GENAI_MLAS_TEST_THREADS"),
+                Some(7),
+                "surrounding whitespace must be tolerated"
+            );
+            std::env::set_var("ONNX_GENAI_MLAS_TEST_THREADS", "9999");
+            assert_eq!(
+                thread_count_env("ONNX_GENAI_MLAS_TEST_THREADS"),
+                Some(MAX_MLAS_POOL_THREADS),
+                "an absurd request must clamp, not oversubscribe"
+            );
+            for bad in ["0", "", "abc", "-4"] {
+                std::env::set_var("ONNX_GENAI_MLAS_TEST_THREADS", bad);
+                assert_eq!(
+                    thread_count_env("ONNX_GENAI_MLAS_TEST_THREADS"),
+                    None,
+                    "{bad:?} must fall through to the next precedence level"
+                );
+            }
+            std::env::remove_var("ONNX_GENAI_MLAS_TEST_THREADS");
+        }
+        assert_eq!(thread_count_env("ONNX_GENAI_MLAS_TEST_THREADS"), None);
     }
 }
