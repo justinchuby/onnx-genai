@@ -1124,11 +1124,22 @@ impl Kernel for MatMulNBitsKernel {
             }
         } else if self.bits == 8 && m == 1 && group_indices.is_none() {
             // 8-bit decode GEMV: keep the weight at one byte per element and
-            // dequantize on the fly against f32 activations, instead of
-            // pre-expanding it to f32 (4x the memory traffic) as the generic
-            // `weight_nk` path below does. Activations stay f32 so the result is
-            // full-precision (unlike int8-activation kernels).
-            if dot_kernel.uses_kai_sdot_direct(self.bits, self.block_size) {
+            // dequantize on the fly, instead of pre-expanding it to f32 (4x the
+            // memory traffic) as the generic `weight_nk` path below does.
+            //
+            // Precision gate: the two SDOT routes below are *not* full
+            // precision -- `kai_sdot_matmul_m1` quantizes the activations via
+            // `quantize_activation_qai8dxp` and `n16_sdot_u8_i16_matmul_m1` via
+            // `quantize_activation_signed`, both int8, costing ~1e-3 relative
+            // RMSE. That is ONNX CompInt8, so both are gated on
+            // `accuracy_level == 4`, matching the 4-bit SDOT routes above and
+            // the 0/1 == fp32 convention used throughout this kernel. They
+            // previously had no `accuracy_level` gate at all while
+            // `arm64_kai_sdot_direct_enabled` defaults *on* for non-Apple
+            // aarch64, so `accuracy_level = 0` 8-bit decode silently ran
+            // CompInt8 there. Only the final `else` keeps activations in f32.
+            let int8_compute_allowed = self.accuracy_level == 4;
+            if int8_compute_allowed && dot_kernel.uses_kai_sdot_direct(self.bits, self.block_size) {
                 let owned_weight;
                 let packed_weight = if can_prepack {
                     if let Some(weight) = self.packed_kai_qsi8_weight.get() {
@@ -1159,7 +1170,8 @@ impl Kernel for MatMulNBitsKernel {
                         dot_kernel,
                     );
                 })?;
-            } else if dot_kernel.uses_n16_sdot_direct()
+            } else if int8_compute_allowed
+                && dot_kernel.uses_n16_sdot_direct()
                 && self.block_size == 128
                 && activation_quant_group() == 32
             {
@@ -3740,53 +3752,53 @@ impl DotKernel {
         }
     }
 
+    /// Whether the aarch64 N16 SDOT direct int4 kernels are enabled.
+    ///
+    /// These kernels quantize the f32 activations to int8
+    /// ([`quantize_activation_signed`]), so they are *not* numerically
+    /// equivalent to the fp32 reference and must stay opt-in. The body used to
+    /// be `#[cfg(test)] { true }` in front of a `#[cfg(not(test))]` production
+    /// policy, which meant every test silently ran this opt-in,
+    /// precision-reducing kernel while the shipped binary did not. Tests now
+    /// observe the same default the shipped binary uses.
     #[cfg(target_arch = "aarch64")]
     fn arm64_int4_direct_enabled() -> bool {
-        #[cfg(test)]
-        {
-            true
-        }
-        #[cfg(not(test))]
-        {
-            // The asymmetric N16 SDOT kernels are correctness-locked, but the
-            // first full-model Qwen3 measurement regressed decode throughput.
-            // Keep them opt-in while the microkernel is tightened.
-            //
-            // Resolved once: this gate is read from the per-token decode path,
-            // where `std::env::var` would take the process-wide environment
-            // lock and allocate on every generated token.
-            static ENABLED: OnceLock<bool> = OnceLock::new();
-            *ENABLED.get_or_init(|| {
-                std::env::var("ONNX_GENAI_CPU_ARM64_INT4_DIRECT").is_ok_and(|value| {
-                    let value = value.trim();
-                    !value.is_empty() && value != "0"
-                })
+        // The asymmetric N16 SDOT kernels are correctness-locked, but the
+        // first full-model Qwen3 measurement regressed decode throughput.
+        // Keep them opt-in while the microkernel is tightened.
+        //
+        // Resolved once: this gate is read from the per-token decode path,
+        // where `std::env::var` would take the process-wide environment
+        // lock and allocate on every generated token.
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("ONNX_GENAI_CPU_ARM64_INT4_DIRECT").is_ok_and(|value| {
+                let value = value.trim();
+                !value.is_empty() && value != "0"
             })
-        }
+        })
     }
 
+    /// Whether the aarch64 KleidiAI SDOT direct kernels are enabled.
+    ///
+    /// Same test-fidelity fix as [`DotKernel::arm64_int4_direct_enabled`]: the
+    /// previous `#[cfg(test)] { true }` forced this on under test even on
+    /// macOS/iOS, where production defaults it off.
     #[cfg(target_arch = "aarch64")]
     fn arm64_kai_sdot_direct_enabled() -> bool {
-        #[cfg(test)]
-        {
-            true
-        }
-        #[cfg(not(test))]
-        {
-            // Resolved once: see the note in `arm64_int4_direct_enabled`.
-            static ENABLED: OnceLock<bool> = OnceLock::new();
-            *ENABLED.get_or_init(|| {
-                if let Ok(value) = std::env::var("ONNX_GENAI_CPU_ARM64_INT4_DIRECT") {
-                    let value = value.trim();
-                    return !value.is_empty() && value != "0";
-                }
-                // Validated against the f32 reference for the asymmetric block128
-                // shapes Qwen3 actually emits, so this path is on by default.
-                // Apple silicon keeps the existing route pending its own
-                // measurement pass.
-                !cfg!(any(target_os = "macos", target_os = "ios"))
-            })
-        }
+        // Resolved once: see the note in `arm64_int4_direct_enabled`.
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            if let Ok(value) = std::env::var("ONNX_GENAI_CPU_ARM64_INT4_DIRECT") {
+                let value = value.trim();
+                return !value.is_empty() && value != "0";
+            }
+            // Validated against the f32 reference for the asymmetric block128
+            // shapes Qwen3 actually emits, so this path is on by default.
+            // Apple silicon keeps the existing route pending its own
+            // measurement pass.
+            !cfg!(any(target_os = "macos", target_os = "ios"))
+        })
     }
 }
 
@@ -5342,10 +5354,20 @@ fn borrowed_affine_int4_matmul(
 ) {
     debug_assert_eq!(activations.len(), m * k);
     debug_assert_eq!(result.len(), m * n);
-    // `dot_kernel` drives the SIMD fast paths below: the `aarch64` NEON route
-    // and the `x86_64` AVX2/AVX-512 f32 route. On other targets it is unused, so
-    // discard it there to avoid an unused-variable error under `-D warnings`.
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    // Precision contract: this helper is reached only from the
+    // `accuracy_level == 0` borrowed int4 route, i.e. ONNX CompFp32. Every
+    // path below therefore has to keep the activations in f32. It must never
+    // dispatch an int8-activation kernel (`quantize_activation_signed` /
+    // `quantize_activation_qai8dxp`) -- that is CompInt8, and delivering it
+    // where CompFp32 was requested costs ~1e-3 relative error. An `aarch64`
+    // `m == 1, block_size == 32` NEON-SDOT diversion used to sit here and did
+    // exactly that; it was removed rather than gated, because acc0 is its only
+    // caller and so it had no semantically valid use.
+    //
+    // `dot_kernel` drives the `x86_64` AVX2/AVX-512 f32 fast path below, which
+    // keeps full precision (`_mm512_fmadd_ps`). On other targets it is unused,
+    // so discard it there to avoid an unused-variable error under `-D warnings`.
+    #[cfg(not(target_arch = "x86_64"))]
     let _ = dot_kernel;
     let bits = 4usize;
     let layout = NBitsLayout { bits, block_size };
@@ -5353,23 +5375,6 @@ fn borrowed_affine_int4_matmul(
     let packed_row_size = block_count * layout.packed_block_size();
     let zero_point_row_size = layout.zero_point_row_size(block_count);
     for (activation, output_row) in activations.chunks_exact(k).zip(result.chunks_exact_mut(n)) {
-        #[cfg(target_arch = "aarch64")]
-        if m == 1
-            && block_size == 32
-            && matches!(dot_kernel, DotKernel::NeonDot)
-            && DotKernel::arm64_int4_direct_enabled()
-        {
-            borrowed_affine_int4_matmul_m1_neon_dot(
-                activation,
-                packed,
-                &scales,
-                zero_points,
-                bias,
-                output_row,
-                k,
-            );
-            continue;
-        }
         let activation_sums = activation
             .chunks(block_size)
             .map(|block| block.iter().sum::<f32>())
@@ -5447,21 +5452,13 @@ fn borrowed_affine_int4_matmul(
 /// path never takes the process-wide env lock or allocates.
 #[cfg(target_arch = "x86_64")]
 fn int4_borrowed_simd_enabled() -> bool {
-    #[cfg(test)]
-    {
-        // Tests exercise the SIMD path directly; the escape hatch is not read.
-        true
-    }
-    #[cfg(not(test))]
-    {
-        static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| {
-            std::env::var("ONNX_GENAI_CPU_DISABLE_INT4_SIMD").map_or(true, |value| {
-                let value = value.trim();
-                value.is_empty() || value == "0"
-            })
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("ONNX_GENAI_CPU_DISABLE_INT4_SIMD").map_or(true, |value| {
+            let value = value.trim();
+            value.is_empty() || value == "0"
         })
-    }
+    })
 }
 
 /// Dispatch one int4 borrowed-path block dot (`sum(activation[j] * nibble[j])`,
@@ -5605,79 +5602,6 @@ unsafe fn borrowed_int4_block_dot_avx512(activation: &[f32], packed: &[u8]) -> f
         acc = _mm512_fmadd_ps(a_hi, w_hi, acc);
     }
     _mm512_reduce_add_ps(acc)
-}
-
-#[cfg(target_arch = "aarch64")]
-#[allow(clippy::too_many_arguments)]
-fn borrowed_affine_int4_matmul_m1_neon_dot(
-    activation: &[f32],
-    packed: &[u8],
-    scales: &BorrowedScales<'_>,
-    zero_points: Option<&[u8]>,
-    bias: Option<&[f32]>,
-    result: &mut [f32],
-    k: usize,
-) {
-    let block_size = 32usize;
-    let block_count = k.div_ceil(block_size);
-    let padded_k = block_count * block_size;
-    let packed_row_size = block_count * (block_size / 2);
-    let zero_point_row_size = block_count.div_ceil(2);
-    let (activation, activation_scales) =
-        quantize_activation_signed(activation, padded_k, block_size);
-    let activation_sums = activation
-        .chunks_exact(block_size)
-        .map(|block| block.iter().map(|&value| value as i32).sum::<i32>())
-        .collect::<Vec<_>>();
-    let layout = NBitsLayout {
-        bits: 4,
-        block_size,
-    };
-    let compute = |output_start: usize, outputs: &mut [f32]| {
-        for (offset, output) in outputs.iter_mut().enumerate() {
-            let output_index = output_start + offset;
-            let packed_row =
-                &packed[output_index * packed_row_size..(output_index + 1) * packed_row_size];
-            let zp_row = zero_points.map(|zp| {
-                &zp[output_index * zero_point_row_size..(output_index + 1) * zero_point_row_size]
-            });
-            let mut sum = bias.map_or(0.0, |values| values[output_index]);
-            for block in 0..block_count {
-                let packed_block = &packed_row[block * 16..(block + 1) * 16];
-                let activation_block = &activation[block * block_size..(block + 1) * block_size];
-                // SAFETY: runtime dispatch selected FEAT_DotProd and both slices
-                // contain exactly one block32 payload.
-                let dot = unsafe { affine_int4_block32_sdot_neon(activation_block, packed_block) };
-                let zero_point = layout.zero_point(zp_row, block) as i32;
-                let correction = (8 - zero_point) * activation_sums[block];
-                sum += (dot + correction) as f32
-                    * (activation_scales[block] * scales.get(output_index * block_count + block));
-            }
-            *output = sum;
-        }
-    };
-    parallel_output_rows(result, padded_k, compute);
-}
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "dotprod")]
-unsafe fn affine_int4_block32_sdot_neon(activation: &[i8], packed: &[u8]) -> i32 {
-    use std::arch::aarch64::*;
-
-    debug_assert_eq!(activation.len(), 32);
-    debug_assert_eq!(packed.len(), 16);
-    let bytes = unsafe { vld1q_u8(packed.as_ptr()) };
-    let low = vandq_u8(bytes, vdupq_n_u8(0x0f));
-    let high = vshrq_n_u8::<4>(bytes);
-    let midpoint = vdupq_n_s8(8);
-    let weights0 = vsubq_s8(vreinterpretq_s8_u8(vzip1q_u8(low, high)), midpoint);
-    let weights1 = vsubq_s8(vreinterpretq_s8_u8(vzip2q_u8(low, high)), midpoint);
-    let acts0 = unsafe { vld1q_s8(activation.as_ptr()) };
-    let acts1 = unsafe { vld1q_s8(activation.as_ptr().add(16)) };
-    let mut acc = vdupq_n_s32(0);
-    acc = unsafe { sdot_i8x16(acc, acts0, weights0) };
-    acc = unsafe { sdot_i8x16(acc, acts1, weights1) };
-    vaddvq_s32(acc)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -9510,8 +9434,30 @@ mod tests {
         output
     }
 
-    fn bits8_n16_sdot_active_for_test() -> bool {
-        selected_dot_kernel().uses_n16_sdot_direct() && activation_quant_group() == 32
+    /// Whether the executed 8-bit `m == 1` route quantizes the activations to
+    /// int8, and therefore cannot be held to the fp32 oracle's tolerance.
+    ///
+    /// Both the KleidiAI SDOT route (`kai_sdot_matmul_m1` ->
+    /// `quantize_activation_qai8dxp`) and the N16 SDOT route
+    /// (`n16_sdot_u8_i16_matmul_m1` -> `quantize_activation_signed`) do this,
+    /// and the KAI route is tried *first*. The predicate used to name only the
+    /// N16 route; that was latent because the dispatch gates were hard-wired
+    /// `true` under `cfg(test)`, so whenever KAI was active N16 was too. With
+    /// the gates now inheriting the production default the two can differ, so
+    /// the predicate has to mirror the real dispatch order.
+    ///
+    /// `accuracy_level` mirrors the production gate: int8 activation compute is
+    /// ONNX CompInt8 and is only reachable at `accuracy_level == 4`, so at
+    /// every other level this returns `false` and the fp32 tolerance applies.
+    fn bits8_int8_activation_active_for_test(accuracy_level: i64, block_size: usize) -> bool {
+        if accuracy_level != 4 {
+            return false;
+        }
+        let dot_kernel = selected_dot_kernel();
+        dot_kernel.uses_kai_sdot_direct(8, block_size)
+            || (dot_kernel.uses_n16_sdot_direct()
+                && block_size == 128
+                && activation_quant_group() == 32)
     }
 
     #[test]
@@ -9660,6 +9606,17 @@ mod tests {
         }
     }
 
+    /// The KleidiAI SDOT int8 route must be reachable for the real Qwen
+    /// bits=8/block128/asymmetric decode shape -- but only at
+    /// `accuracy_level = 4`.
+    ///
+    /// `kai_sdot_matmul_m1` quantizes the activations via
+    /// `quantize_activation_qai8dxp`, i.e. it is ONNX CompInt8. This test used
+    /// to build the node with no `accuracy_level` attribute (so 0 == CompFp32)
+    /// and assert the int8 route was taken anyway, with the loose
+    /// `assert_qai8dxp_close` tolerance -- encoding the precision bug as an
+    /// expectation. It now asserts both halves of the real contract: acc4
+    /// reaches KAI, and acc0 does *not*.
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn matmulnbits_arm64_kai_qsi8_asymmetric_qwen_shape_is_reachable() {
@@ -9676,43 +9633,83 @@ mod tests {
             quantize_8bit(&weights_nk, n, k, block_size, true);
         let zero_points = zero_points.expect("asymmetric bits8 emits qzeros");
         let expected = reference(&activations, &dequantized, 1, k, n);
-        let (mut graph, node) = model_node(
-            &[1, k],
-            &[n, blocks, block_size],
-            &[n, blocks],
-            Some(&[n, blocks]),
-            &[1, n],
-            k,
-            n,
-            block_size,
-        );
-        graph
-            .node_mut(node)
-            .attributes
-            .insert("bits".into(), Attribute::Int(8));
-        let model = Model::new(&graph);
-        let kernel = CpuExecutionProvider::new()
-            .get_kernel(model.graph.node(node), &[], 1)
-            .unwrap();
-        let a = Owned::f32(&[1, k], &activations);
-        let b = Owned::u8(&[n, blocks, block_size], &packed);
-        let scales = Owned::f32(&[n, blocks], &scales);
-        let zps = Owned::u8(&[n, blocks], &zero_points);
-        let mut y = Owned::zeros_f32(&[1, n]);
-        let before = KAI_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed);
-        kernel
-            .execute(
-                &[a.view(), b.view(), scales.view(), zps.view()],
-                &mut [y.view_mut()],
-            )
-            .unwrap();
+
+        let run = |accuracy_level: i64| -> (Vec<f32>, bool) {
+            let (mut graph, node) = model_node(
+                &[1, k],
+                &[n, blocks, block_size],
+                &[n, blocks],
+                Some(&[n, blocks]),
+                &[1, n],
+                k,
+                n,
+                block_size,
+            );
+            graph
+                .node_mut(node)
+                .attributes
+                .insert("bits".into(), Attribute::Int(8));
+            graph
+                .node_mut(node)
+                .attributes
+                .insert("accuracy_level".into(), Attribute::Int(accuracy_level));
+            let model = Model::new(&graph);
+            let kernel = CpuExecutionProvider::new()
+                .get_kernel(model.graph.node(node), &[], 1)
+                .unwrap();
+            let a = Owned::f32(&[1, k], &activations);
+            let b = Owned::u8(&[n, blocks, block_size], &packed);
+            let scales = Owned::f32(&[n, blocks], &scales);
+            let zps = Owned::u8(&[n, blocks], &zero_points);
+            let mut y = Owned::zeros_f32(&[1, n]);
+            let before = KAI_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed);
+            kernel
+                .execute(
+                    &[a.view(), b.view(), scales.view(), zps.view()],
+                    &mut [y.view_mut()],
+                )
+                .unwrap();
+            let reached_kai = KAI_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed) > before;
+            (y.to_f32(), reached_kai)
+        };
+
+        // accuracy_level = 4 (CompInt8): the int8 route is licensed, so it must
+        // be reached and is held to the qai8dxp tolerance.
+        let (acc4, acc4_reached_kai) = run(4);
         assert!(
-            KAI_SDOT_M1_TEST_CALLS.load(Ordering::Relaxed) > before,
-            "real Qwen bits=8/block128/asymmetric shape did not reach KAI SDOT"
+            acc4_reached_kai,
+            "real Qwen bits=8/block128/asymmetric shape did not reach KAI SDOT at accuracy_level=4"
         );
         // Downcast to the concrete kernel type is not available through the EP
         // trait object; the counter above is the dispatch proof.
-        assert_qai8dxp_close(&y.to_f32(), &expected);
+        assert_qai8dxp_close(&acc4, &expected);
+
+        // accuracy_level = 0 (CompFp32): the int8 route must be declined, and
+        // the fp32 fallback must hold the tight oracle tolerance. Before the
+        // gate this shape ran CompInt8 here, because
+        // `arm64_kai_sdot_direct_enabled` defaults *on* for non-Apple aarch64.
+        let (acc0, acc0_reached_kai) = run(0);
+        assert!(
+            !acc0_reached_kai,
+            "accuracy_level=0 is CompFp32 and must not reach the activation-quantizing KAI SDOT route"
+        );
+        // `assert_close`'s absolute 1e-5 does not scale with K, and this shape
+        // accumulates K=1024 products, so compare relative RMSE against the
+        // oracle instead. fp32 reassociation lands around 1e-6 relative; the
+        // int8 route lands around 1e-3, so 1e-5 cleanly separates them.
+        let oracle_rms = rmse(&expected, &vec![0.0; expected.len()]).max(1e-6);
+        let acc0_rel = rmse(&acc0, &expected) / oracle_rms;
+        let acc4_rel = rmse(&acc4, &expected) / oracle_rms;
+        assert!(
+            acc0_rel <= 1e-5,
+            "accuracy_level=0 must reconstruct the fp32 oracle: relative RMSE {acc0_rel} exceeds 1e-5"
+        );
+        // Self-calibrating: whatever this host's absolute error happens to be,
+        // the CompFp32 route must be strictly more accurate than CompInt8.
+        assert!(
+            acc0_rel < acc4_rel,
+            "accuracy_level=0 (relative RMSE {acc0_rel}) must be more accurate than accuracy_level=4 (relative RMSE {acc4_rel})"
+        );
     }
 
     /// Run the real end-to-end `MatMulNBits` kernel (`execute`) for an 8-bit,
@@ -9794,7 +9791,13 @@ mod tests {
                     run_8bit_execute(n, k, block_size, m, asymmetric, &activations, &weights_nk);
                 let oracle_rms = rmse(&oracle, &vec![0.0; oracle.len()]).max(1e-6);
                 let rel = rmse(&out, &oracle) / oracle_rms;
-                let tolerance = if m == 1 && bits8_n16_sdot_active_for_test() {
+                // `model_node` sets no `accuracy_level` attribute, so this runs
+                // at the default 0 == CompFp32. The int8-activation SDOT routes
+                // are gated off there, so the fp32 tolerance must hold on every
+                // architecture -- including aarch64, where
+                // `arm64_kai_sdot_direct_enabled` is on by default and used to
+                // drag this case to ~1e-3.
+                let tolerance = if m == 1 && bits8_int8_activation_active_for_test(0, block_size) {
                     1e-3
                 } else {
                     1e-5
@@ -11841,8 +11844,112 @@ mod tests {
         );
     }
 
-    /// Independent oracle for the dispatch fix, deliberately NOT derived from
-    /// `mlas_sqnbit_owns_fp32_compute`.
+    /// `accuracy_level = 0` means fp32 compute, on every architecture.
+    ///
+    /// Regression guard for the aarch64 dispatch bug: with `dotprod` present,
+    /// `borrowed_affine_int4_matmul` diverted `m == 1, block_size == 32` into an
+    /// `m1_neon_dot` kernel that quantized the activations to int8 via
+    /// `quantize_activation_signed`. That is CompInt8 accuracy delivered where
+    /// CompFp32 was requested: it moved results by ~1e-3 relative, far outside
+    /// f32 reassociation. It only reached CI because
+    /// `DotKernel::arm64_int4_direct_enabled` was hard-wired `true` under
+    /// `cfg(test)` while production defaults it *off*, so every test ran an
+    /// opt-in, precision-reducing kernel that no shipped binary would pick.
+    ///
+    /// The fix is structural, not a tolerance bump: the diversion was deleted
+    /// (acc0 was its only caller, so it had no semantically valid use), so
+    /// `ONNX_GENAI_CPU_ARM64_INT4_DIRECT=1` can no longer reduce acc0 precision.
+    /// The 8-bit sibling of this invariant is covered by
+    /// [`matmulnbits_8bit_block128_execute_matches_dequant_f32_oracle`], whose
+    /// SDOT routes are now gated on `accuracy_level == 4`.
+    ///
+    /// This test is deliberately architecture-independent: it states the
+    /// invariant ("acc0 reconstructs the f32 dequantize-then-GEMM oracle") and
+    /// so fails on any host whose acc0 route silently quantizes, rather than
+    /// encoding which kernel happens to be selected here.
+    #[test]
+    fn matmulnbits_acc0_m1_block32_matches_fp32_oracle_on_every_arch() {
+        for &(k, n) in &[(32usize, 8usize), (35, 7), (256, 48), (129, 33)] {
+            let block_size = 32usize;
+            let activations: Vec<f32> = (0..k)
+                .map(|i| (i as f32 * 0.019 + 0.11).cos() * 1.7)
+                .collect();
+            let weights: Vec<f32> = (0..n * k)
+                .map(|i| (i as f32 * 0.0131).sin() * 1.3 + (i as f32 * 0.0007).cos() * 0.4)
+                .collect();
+            let (packed, scales, _, _) = quantize(&weights, n, k, block_size, false);
+            let dequantized = dequantize_reference(&packed, &scales, None, n, k, block_size);
+            let expected = reference(&activations, &dequantized, 1, k, n);
+
+            let mut kernel = test_kernel(k, n, block_size);
+            kernel.set_constant_inputs(&[false, true, true]);
+            let block_count = k.div_ceil(block_size);
+            let b = Owned::u8(&[n, block_count, block_size / 2], &packed);
+            let scale_tensor = Owned::f32(&[n, block_count], &scales);
+            let a = Owned::f32(&[1, k], &activations);
+            let mut y = Owned::zeros_f32(&[1, n]);
+            kernel
+                .execute(
+                    &[a.view(), b.view(), scale_tensor.view()],
+                    &mut [y.view_mut()],
+                )
+                .unwrap();
+
+            // Bound the f32 dot product itself (gamma_k ~ k * EPSILON) instead of
+            // a flat epsilon, so the assertion stays valid for any legitimate
+            // SIMD reassociation while still rejecting int8 activation
+            // quantization, which is ~1e-3 relative -- orders of magnitude larger.
+            for (index, (&actual, &want)) in y.to_f32().iter().zip(&expected).enumerate() {
+                let magnitude: f32 = (0..k)
+                    .map(|j| (activations[j] * dequantized[index * k + j]).abs())
+                    .sum();
+                let tolerance = (k as f32) * f32::EPSILON * magnitude.max(1.0);
+                assert!(
+                    (actual - want).abs() <= tolerance,
+                    "k={k} n={n} index={index}: acc0 must be fp32-exact, \
+                     actual={actual} want={want} tolerance={tolerance}"
+                );
+            }
+        }
+    }
+
+    /// The dispatch gates must report the *production* policy under `cfg(test)`.
+    ///
+    /// Pins the defect class directly: a `#[cfg(test)] { true }` in front of a
+    /// `#[cfg(not(test))]` policy body makes the whole suite exercise a
+    /// configuration no shipped binary uses, and silently disables any test of
+    /// the default. Re-introducing that pattern flips these assertions.
+    #[test]
+    fn dispatch_gates_report_production_policy_under_cfg_test() {
+        #[cfg(target_arch = "aarch64")]
+        {
+            // Opt-in via ONNX_GENAI_CPU_ARM64_INT4_DIRECT; unset in CI. These
+            // kernels quantize activations to int8, so defaulting them on would
+            // silently reduce accuracy_level=0 precision.
+            if std::env::var_os("ONNX_GENAI_CPU_ARM64_INT4_DIRECT").is_none() {
+                assert!(
+                    !DotKernel::arm64_int4_direct_enabled(),
+                    "the aarch64 N16 SDOT direct kernels are opt-in and must stay off by default under test"
+                );
+                assert_eq!(
+                    DotKernel::arm64_kai_sdot_direct_enabled(),
+                    !cfg!(any(target_os = "macos", target_os = "ios")),
+                    "the KleidiAI SDOT gate must match its documented per-OS production default"
+                );
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            // Mirror image: on by default, disabled via the escape hatch.
+            if std::env::var_os("ONNX_GENAI_CPU_DISABLE_INT4_SIMD").is_none() {
+                assert!(
+                    int4_borrowed_simd_enabled(),
+                    "the x86 borrowed int4 SIMD path is on by default"
+                );
+            }
+        }
+    }
+
     ///
     /// [`Int4Acc0RouteProbe::assert_fast_route`] asks the production predicate
     /// what should have happened, which catches "the code disagrees with its own
