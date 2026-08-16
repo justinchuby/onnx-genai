@@ -274,8 +274,39 @@ replaced on its own.
 | **Accounting and arbitration** | `HostGovernor` / `DeviceMemoryAuthority` inside `ProcessMemoryManager` | Says whether capacity may be taken and by whom, keeps the ledger, issues pressure tickets. | Take bytes directly — see I6. It never chooses a victim. |
 | **Policy** | the **holders**: `ModelResidency`, `StateBundle` / `KvPageStore`, arenas | Decides what is hot, warm or cold; picks victims under pressure; calls the mechanism to map or release. | Assume it can have capacity without a grant. |
 
-**Offloading is a holder concern.** For weights it belongs to `ModelResidency`:
-which tensors are pinned, which are streamed, which are evicted, and in what
+**Kernels are holders too, and this is where the model kept leaking.** A kernel
+that keeps a derived copy of a weight for the session — a dequantised expansion, a
+packed buffer, a transpose — is a residency policy, whether or not it was written
+as one. Three such buffers were found in the CPU path in a single day, all of them
+invisible to the ledger:
+
+| buffer | size | found in |
+|---|---|---|
+| resident f32 dequant cache | ~8× the packed weight | #971 / #979, governed since #987 |
+| MLAS SQNBit packed buffer | ~2× the int4 bytes | #1027, governed by #1051 |
+| weight transpose cache | 1× the f32 weight | #1035 widened its use; #1056 |
+
+The rule, filed as #1056: **any allocation that outlives a single kernel call and
+scales with weight size must be declared to the plan before it is allocated, in the
+bytes actually allocated, and must be declinable.** Three consequences worth
+stating separately, because each was learned by getting it wrong:
+
+- **Declare, don't discover.** The plan admits or declines up front; declining must
+  fall back to a path that works. For all three the fallback already existed
+  (on-the-fly dequant, borrowed zero-copy int4, transpose-per-call), which is why
+  governing them cost nothing in capability.
+- **Account the bytes actually allocated, not a model of them.** Where prediction
+  and allocation are separate pieces of code, a test must pin them to each other in
+  one run. #1051's first attempt reported 40% of the truth because it modelled the
+  allocation; the missing factors were an owned scale copy and the shape-keyed
+  `KernelCache` instantiating prefill and decode separately. **Under-reporting is
+  worse than not reporting** — zero is obviously blind and gets caught, 40% passes
+  the admission check and then overruns the budget.
+- **Test against footprint, never a proxy.** "This field stayed empty" is not "the
+  process did not grow"; #1027 argued its invariant held that way while peak RSS
+  tripled.
+
+**Offloading is a holder concern.** For weights it belongs to `ModelResidency`:which tensors are pinned, which are streamed, which are evicted, and in what
 order. The authority says "give me N bytes back" and leaves the choice of victim
 to the holder. The allocator maps what it is told to map. A third party can
 substitute its own residency policy while leaving the ledger and the VMM layer
