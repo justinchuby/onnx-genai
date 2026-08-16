@@ -639,6 +639,8 @@ mod geometry;
 use dynamic_shapes::*;
 use geometry::*;
 mod bindings;
+#[cfg(test)]
+use bindings::{AxisBound, PlannedInputShape};
 mod build;
 mod capture;
 mod control_flow;
