@@ -13,6 +13,7 @@ use std::borrow::Cow;
 use super::add::broadcast_apply;
 use super::check_arity;
 use super::half_gemm::{self, HalfFormat, MatrixLayout};
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use super::half_gemv;
 use super::matmul::{self, MatMulPrepack};
 use super::weight_transpose::transpose_row_major;
@@ -101,7 +102,12 @@ impl GemmKernel {
             )
         }
         #[cfg(not(feature = "mlas"))]
-        Ok(None)
+        {
+            // Off x86 the decode GEMV above is compiled out too, so without
+            // MLAS neither fast path exists and the dimensions go unread.
+            let _ = (m, k, n);
+            Ok(None)
+        }
     }
 }
 
@@ -462,9 +468,12 @@ mod tests {
             .map(|i| ((i * 13 % 31) as f32 - 15.0) / 16.0)
             .collect();
         let (out, packed) = run_half_gemm(m, k, n, &a, &b, false);
-        assert!(
+        // `execute` resolves its backend by auto-detection, and only MLAS has a
+        // pack to build; elsewhere the blocked path serves the call correctly.
+        assert_eq!(
             packed,
-            "a constant f16 B at M>1 must be widened and packed once"
+            crate::backend::CpuBackend::auto_detect() == crate::backend::CpuBackend::Mlas,
+            "a constant f16 B at M>1 must be widened and packed once on MLAS"
         );
         for (actual, want) in out.iter().zip(reference_matmul(&a, &b, m, k, n).iter()) {
             assert!(

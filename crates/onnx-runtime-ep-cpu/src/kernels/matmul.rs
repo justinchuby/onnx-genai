@@ -2739,9 +2739,13 @@ mod tests {
             .execute(&[a.view(), b.view()], &mut [out.view_mut()])
             .unwrap();
 
-        assert!(
+        // `execute` resolves its backend by auto-detection, and only MLAS has a
+        // pack to build; elsewhere the blocked path serves the call correctly.
+        assert_eq!(
             kernel.prepack.packed_b_from_half.get().is_some(),
-            "a constant f16 B at M>1 must be widened and packed once, not repacked per call"
+            crate::backend::CpuBackend::auto_detect() == crate::backend::CpuBackend::Mlas,
+            "a constant f16 B at M>1 must be widened and packed once on MLAS, \
+             not repacked per call"
         );
         for (actual, want) in out.to_f32().iter().zip(expected.iter()) {
             assert!(
@@ -2762,38 +2766,32 @@ mod tests {
         let b_data: Vec<f32> = (0..k * n).map(|i| ((i % 7) as f32 - 3.0) / 8.0).collect();
         let a = Owned::f16(&[m, k], &a_data);
         let b = Owned::f16(&[k, n], &b_data);
-        let mut kernel = MatMulKernel::default();
-        kernel.set_constant_inputs(&[false, true]);
+        let mut prepack = MatMulPrepack::default();
+        prepack.set_constant_inputs(&[false, true]);
+        // Forced dispatch: whether the pack is reused is a property of the
+        // memo, not of which backend auto-detection happens to pick here.
+        let backend = crate::backend::CpuBackend::Mlas;
 
-        let mut first = Owned::zeros_f32(&[m, n]);
-        kernel
-            .execute(&[a.view(), b.view()], &mut [first.view_mut()])
-            .unwrap();
-        let packed_before = kernel
-            .prepack
+        let first = try_packed_half_prefill(&prepack, backend, &a.view(), &b.view(), m, k, n)
+            .unwrap()
+            .expect("a constant f16 B at M>1 must take the packed route");
+        let packed_before = prepack
             .packed_b_from_half
             .get()
-            .expect("first execute must populate the pack")
+            .expect("the first call must populate the pack")
             .as_ref()
             .expect("a constant B must pack") as *const _;
 
-        let mut second = Owned::zeros_f32(&[m, n]);
-        kernel
-            .execute(&[a.view(), b.view()], &mut [second.view_mut()])
-            .unwrap();
-        let packed_after = kernel
-            .prepack
-            .packed_b_from_half
-            .get()
+        let second = try_packed_half_prefill(&prepack, backend, &a.view(), &b.view(), m, k, n)
             .unwrap()
-            .as_ref()
-            .unwrap() as *const _;
+            .expect("the second call must also take the packed route");
+        let packed_after = prepack.packed_b_from_half.get().unwrap().as_ref().unwrap() as *const _;
 
         assert_eq!(
             packed_before, packed_after,
-            "the MLAS pack was rebuilt on the second execute"
+            "the MLAS pack was rebuilt on the second call"
         );
-        assert_eq!(first.to_f32(), second.to_f32(), "repeated calls diverged");
+        assert_eq!(first, second, "repeated calls diverged");
     }
 
     /// An activation B must never be packed: the pack is only valid because a
@@ -2855,7 +2853,9 @@ mod tests {
         let mut prepack = MatMulPrepack::default();
         prepack.set_constant_inputs(&[false, true]);
 
-        let backend = crate::backend::CpuBackend::auto_detect();
+        // Forced dispatch: the guard is hardware-independent, so assert it on
+        // every target rather than only where auto-detection picks MLAS.
+        let backend = crate::backend::CpuBackend::Mlas;
         let served =
             try_packed_half_prefill(&prepack, backend, &a.view(), &b_first.view(), m, k, n)
                 .unwrap()
@@ -2898,7 +2898,7 @@ mod tests {
         prepack.set_constant_inputs(&[false, true]);
         let single_row = try_packed_half_prefill(
             &prepack,
-            crate::backend::CpuBackend::auto_detect(),
+            crate::backend::CpuBackend::Mlas,
             &a.view(),
             &b.view(),
             1,
@@ -2923,7 +2923,7 @@ mod tests {
         );
         let two_rows = try_packed_half_prefill(
             &prepack,
-            crate::backend::CpuBackend::auto_detect(),
+            crate::backend::CpuBackend::Mlas,
             &a2.view(),
             &b.view(),
             2,
