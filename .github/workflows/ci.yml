@@ -651,8 +651,21 @@ jobs:
       # required-features = ["cuda", "native-backend"] and are not selected here.
       - name: Test onnx-genai-engine native backend
         run: cargo test --locked -p onnx-genai-engine --features native-backend
+      # `!cancelled()` rather than the implicit `success()`: this is the only
+      # job that sets `NXRT_REQUIRE_ORT_TESTS=1` with ORT present, so it is the
+      # only place the EP-assignment falsifiers run fail-closed rather than
+      # skipping themselves. (Other jobs do compile and run this crate, but
+      # without ORT those tests skip internally.) An unrelated failure in an
+      # earlier step would otherwise skip this one and leave the plugin's ORT
+      # interop unverified for that run. The job still fails if either step
+      # fails, so no gate is weakened.
+      #
+      # Tradeoff: this also runs after a *setup* failure — if the ORT download
+      # in `Build onnx-genai-cli` fails, this step now goes red for that
+      # reason rather than being skipped. It cannot false-green, so the cost is
+      # an extra red on an already-red job.
       - name: Test onnx-runtime-ep-cpu-plugin (ORT gate)
-        if: runner.os == 'Linux'
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
         run: cargo test --locked --no-fail-fast -p onnx-runtime-ep-cpu-plugin
       - name: Upload CLI ORT coverage to Codecov
         if: always()
