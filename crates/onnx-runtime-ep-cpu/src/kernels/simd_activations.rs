@@ -2276,6 +2276,79 @@ mod exact_tests {
     /// The exact group must not have the `SIMD_MIN_LEN` accuracy seam the
     /// approximations do: a value's result cannot depend on how many elements
     /// share the tensor with it.
+    /// Signalling NaN is the one input class where the scalar and AVX2 paths
+    /// are **not** bit-identical, so it is deliberately excluded from
+    /// [`adversarial`] and pinned here instead.
+    ///
+    /// The divergence is structural: `_mm256_round_ps`, `_mm256_div_ps` and
+    /// the FMA in `softsign` are IEEE arithmetic and quiet a signalling NaN,
+    /// while Rust's `f32::ceil`/`floor`/`round_ties_even` return the operand
+    /// untouched. Neither is wrong -- ONNX does not specify NaN payload
+    /// propagation -- and ORT is itself inconsistent across exactly the same
+    /// split. Measured against ORT 1.28.0 CPU with input `0x7f801234`:
+    ///
+    /// | op | ORT | our scalar | our AVX2 |
+    /// |----|-----|------------|----------|
+    /// | `Ceil`       | quiets   | preserves | quiets    |
+    /// | `Floor`      | quiets   | preserves | quiets    |
+    /// | `Reciprocal` | quiets   | quiets    | quiets    |
+    /// | `Softsign`   | quiets   | quiets    | quiets    |
+    /// | `Round`      | preserves| preserves | quiets    |
+    /// | `Sign`       | preserves| preserves | preserves |
+    /// | `Neg`        | preserves| preserves | preserves |
+    /// | `Abs`        | preserves| preserves | preserves |
+    ///
+    /// So on the vector path this EP matches ORT everywhere except `Round`,
+    /// and on the scalar path it matches everywhere except `Ceil`/`Floor`.
+    /// Closing the gap would need a per-element payload check that would cost
+    /// the entire measured win, for an input class that does not occur in
+    /// inference. This test exists so the behaviour cannot drift unnoticed.
+    #[test]
+    fn signalling_nan_behaviour_is_pinned() {
+        const SNAN: u32 = 0x7f80_1234;
+        const QUIETED: u32 = 0x7fc0_1234;
+        let input = vec![f32::from_bits(SNAN); SIMD_MIN_LEN * 2];
+
+        // Sign-bit-only kernels never touch the payload, on either path.
+        for (name, kernel) in [
+            ("sign", sign_f32_slice as fn(&[f32], &mut [f32])),
+            ("neg", neg_f32_slice),
+            ("abs", abs_f32_slice),
+        ] {
+            let mut out = vec![0.0; input.len()];
+            kernel(&input, &mut out);
+            assert_eq!(
+                out[0].to_bits() & 0x7fff_ffff,
+                SNAN,
+                "{name} must leave a signalling NaN payload untouched",
+            );
+        }
+
+        // Arithmetic kernels quiet it. Asserting this pins the behaviour that
+        // `adversarial` cannot cover.
+        for (name, kernel) in [
+            ("ceil", ceil_f32_slice as fn(&[f32], &mut [f32])),
+            ("floor", floor_f32_slice),
+            ("round_ties_even", round_ties_even_f32_slice),
+            ("reciprocal", reciprocal_f32_slice),
+            ("softsign", softsign_f32_slice),
+        ] {
+            let mut out = vec![0.0; input.len()];
+            kernel(&input, &mut out);
+            assert!(
+                out[0].is_nan(),
+                "{name} of a signalling NaN must still be NaN",
+            );
+            if vector_path_available() {
+                assert_eq!(
+                    out[0].to_bits(),
+                    QUIETED,
+                    "{name} on the vector path is expected to quiet a signalling NaN",
+                );
+            }
+        }
+    }
+
     #[test]
     fn exact_kernels_have_no_length_seam() {
         let values = adversarial();

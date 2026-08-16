@@ -459,8 +459,16 @@ fn matmul_weight_elements(op: &Node, shapes: &[Shape]) -> Option<usize> {
 /// do not go through the float path this PR vectorized, so they are left alone.
 fn exact_unary_preference(op: &Node, shapes: &[Shape], dtype: DataType) -> Option<ClaimPreference> {
     // float32 minimum element count for a >= 5% repeatable win, `None` = never.
-    // Each value is the next measured point at or beyond the crossover, so the
-    // claimed region starts at 1.07-1.19x rather than at exactly 1.05x.
+    //
+    // Each threshold is one measured step *beyond* the first point that clears
+    // the 5% bar, not the crossover itself: `Sign` crosses at 1536 and is gated
+    // at 2048, `Ceil` at 6144 -> 8192, `Floor` at 8192 -> 12288, `Round` at
+    // 12288 -> 16384, `Reciprocal` and `Softsign` at 16384 -> 24576. That costs
+    // a little of the win band on this machine and buys margin against the
+    // thresholds having been tuned to it -- these numbers come from one EPYC
+    // 9V74 at one thread, and a machine with a different cache hierarchy or a
+    // cheaper ORT node boundary would move every crossover right. The claimed
+    // region therefore starts at 1.14-1.19x measured here, not at 1.05x.
     let f32_min: Option<usize> = match op.op_type.as_str() {
         "Neg" | "Abs" => None,
         "Sign" => Some(2048),
@@ -476,6 +484,11 @@ fn exact_unary_preference(op: &Node, shapes: &[Shape], dtype: DataType) -> Optio
     // path at every size, `Sign` loses to a real ORT float16 kernel, and
     // `Reciprocal`/`Softsign` never rise above a tie, so none of those five is
     // worth a node boundary at any size. `Round` is the outlier the other way.
+    //
+    // These three sit *at* their crossover rather than one step beyond it,
+    // because the float16 measurements are spaced by powers of two and the next
+    // step would give away a much larger band than in float32. The narrowest
+    // claimed cell here is `Ceil` at 1.091x, still comfortably past the bar.
     let f16_min: Option<usize> = match op.op_type.as_str() {
         "Round" => Some(1024),
         "Ceil" => Some(8192),
