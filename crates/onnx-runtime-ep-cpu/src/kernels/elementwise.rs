@@ -379,6 +379,9 @@ fn binary_contiguous_typed<T: NumericElem>(
     let lhs = unsafe { std::slice::from_raw_parts(inputs[0].data_ptr::<T>(), n) };
     let rhs = unsafe { std::slice::from_raw_parts(inputs[1].data_ptr::<T>(), n) };
     let out = unsafe { std::slice::from_raw_parts_mut(output.data_ptr_mut::<T>(), n) };
+    if try_half_binary::<T>(op, lhs, rhs, out) {
+        return;
+    }
     // Same reason as `binary_broadcast_typed`: resolve the combiner once so the
     // element loop is a single arithmetic op and can vectorise.
     dispatch_binop!(op, fold => {
@@ -386,6 +389,254 @@ fn binary_contiguous_typed<T: NumericElem>(
             *out = T::from_acc(fold(lhs.to_acc(), rhs.to_acc()));
         }
     });
+}
+
+/// Elements converted per staged pass when a 16-bit float binary op runs
+/// through the `f32` compute domain. The two `f32` staging buffers of this
+/// length are 8 KiB total, so a pass stays resident in L1 next to the 16-bit
+/// chunks. Matches `F16_STAGE_CHUNK` in `dense_elementwise`, which stages the
+/// unary paths the same way.
+///
+/// Only the x86 staging path consumes this; on other targets `try_half_binary`
+/// declines unconditionally and the constant would be dead code.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+const HALF_STAGE_CHUNK: usize = 1024;
+
+/// The two 16-bit float storages whose `NumericElem::Acc` is `f32`.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HalfKind {
+    F16,
+    Bf16,
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+impl HalfKind {
+    fn available(self) -> bool {
+        match self {
+            HalfKind::F16 => crate::dtype::f16c::available(),
+            HalfKind::Bf16 => crate::dtype::bf16x::available(),
+        }
+    }
+
+    /// Bulk equivalent of `NumericElem::to_acc` (`<half>::to_f32`).
+    ///
+    /// # Safety
+    /// [`HalfKind::available`] must hold for `self`; `src.len() == dst.len()`.
+    #[inline]
+    unsafe fn widen(self, src: &[u16], dst: &mut [f32]) {
+        debug_assert_eq!(src.len(), dst.len());
+        unsafe {
+            match self {
+                HalfKind::F16 => crate::dtype::f16c::widen(src, dst),
+                // `widen_quieting`, not `widen`: `to_acc` is `bf16::to_f32`,
+                // which quiets a signalling NaN, and the fallback this replaces
+                // would too.
+                HalfKind::Bf16 => crate::dtype::bf16x::widen_quieting(src, dst),
+            }
+        }
+    }
+
+    /// Bulk equivalent of `NumericElem::from_acc` (`<half>::from_f32`).
+    ///
+    /// # Safety
+    /// [`HalfKind::available`] must hold for `self`; `src.len() == dst.len()`.
+    #[inline]
+    unsafe fn narrow(self, src: &[f32], dst: &mut [u16]) {
+        debug_assert_eq!(src.len(), dst.len());
+        unsafe {
+            match self {
+                HalfKind::F16 => crate::dtype::f16c::narrow(src, dst),
+                HalfKind::Bf16 => crate::dtype::bf16x::narrow(src, dst),
+            }
+        }
+    }
+}
+
+/// How one operand of a staged 16-bit binary op maps onto the output.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+enum HalfSide<'a> {
+    /// One element per output element, in output order; widened per chunk.
+    Full(&'a [u16]),
+    /// A single value, widened once and splatted.
+    Splat(f32),
+    /// A block repeated over the output, widened once up front so the repeat
+    /// costs an `f32` copy per pass instead of a re-conversion.
+    Block(Vec<f32>),
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+impl HalfSide<'_> {
+    /// # Safety
+    /// [`HalfKind::available`] must hold for `kind`.
+    unsafe fn new(kind: HalfKind, src: &[u16], n: usize) -> HalfSide<'_> {
+        if src.len() == n {
+            HalfSide::Full(src)
+        } else if src.len() == 1 {
+            let mut v = [0.0f32];
+            unsafe { kind.widen(src, &mut v) };
+            HalfSide::Splat(v[0])
+        } else {
+            let mut block = vec![0.0f32; src.len()];
+            unsafe { kind.widen(src, &mut block) };
+            HalfSide::Block(block)
+        }
+    }
+
+    /// Materialize `dst.len()` `f32` operand values starting at output element
+    /// `offset`. Mirrors the `i % len` indexing of [`broadcast_loops`].
+    ///
+    /// # Safety
+    /// [`HalfKind::available`] must hold for `kind`.
+    #[inline]
+    unsafe fn stage(&self, kind: HalfKind, offset: usize, dst: &mut [f32]) {
+        match self {
+            HalfSide::Full(src) => unsafe { kind.widen(&src[offset..offset + dst.len()], dst) },
+            HalfSide::Splat(v) => dst.fill(*v),
+            HalfSide::Block(block) => {
+                let mut pos = offset % block.len();
+                let mut written = 0;
+                while written < dst.len() {
+                    let take = (block.len() - pos).min(dst.len() - written);
+                    dst[written..written + take].copy_from_slice(&block[pos..pos + take]);
+                    written += take;
+                    pos = 0;
+                }
+            }
+        }
+    }
+}
+
+/// Run a 16-bit float binary op by widening both operands to `f32` in bulk,
+/// folding in the `f32` domain, and narrowing back.
+///
+/// This is not an approximation: `NumericElem::Acc` for `f16`/`bf16` is already
+/// `f32`, so the scalar path this replaces computes exactly the same
+/// `from_acc(fold(to_acc(a), to_acc(b)))`. The only change is that the two
+/// conversions become vector instructions instead of the `half` crate's
+/// software conversion, which is what made every 16-bit binary op ~12x slower
+/// than ORT even after the dense walk was in place.
+///
+/// # Safety
+/// [`HalfKind::available`] must hold for `kind`, and each of `lhs`/`rhs` must
+/// have length `out.len()`, `1`, or a length that divides the output the same
+/// way [`broadcast_loops`] assumes.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+unsafe fn binary_half<T: NumericElem<Acc = f32>>(
+    op: BinOp,
+    kind: HalfKind,
+    lhs: &[u16],
+    rhs: &[u16],
+    out: &mut [u16],
+) {
+    let n = out.len();
+    let (lhs, rhs) = unsafe { (HalfSide::new(kind, lhs, n), HalfSide::new(kind, rhs, n)) };
+    // Two buffers, not three: the fold writes back over the left staging
+    // buffer, so a pass touches 8 KiB instead of 12 KiB.
+    let mut lbuf = [0.0f32; HALF_STAGE_CHUNK];
+    let mut rbuf = [0.0f32; HALF_STAGE_CHUNK];
+    dispatch_binop!(op, fold => {
+        let mut offset = 0;
+        while offset < n {
+            let len = HALF_STAGE_CHUNK.min(n - offset);
+            let lbuf = &mut lbuf[..len];
+            match (&lhs, &rhs) {
+                // `x op scalar` and `scalar op x`: the operand is a register
+                // constant, so the pass is one widen, one arithmetic op and one
+                // narrow with no second staging buffer touched at all. This is
+                // the shape an inlined ONNX activation function emits.
+                (HalfSide::Full(src), HalfSide::Splat(v)) => {
+                    unsafe { kind.widen(&src[offset..offset + len], lbuf) };
+                    let v = *v;
+                    for a in lbuf.iter_mut() {
+                        *a = fold(*a, v);
+                    }
+                }
+                (HalfSide::Splat(v), HalfSide::Full(src)) => {
+                    unsafe { kind.widen(&src[offset..offset + len], lbuf) };
+                    let v = *v;
+                    for b in lbuf.iter_mut() {
+                        *b = fold(v, *b);
+                    }
+                }
+                _ => {
+                    let rbuf = &mut rbuf[..len];
+                    unsafe {
+                        lhs.stage(kind, offset, lbuf);
+                        rhs.stage(kind, offset, rbuf);
+                    }
+                    for (a, &b) in lbuf.iter_mut().zip(rbuf.iter()) {
+                        *a = fold(*a, b);
+                    }
+                }
+            }
+            unsafe { kind.narrow(lbuf, &mut out[offset..offset + len]) };
+            offset += len;
+        }
+    });
+}
+
+/// If `T` is a 16-bit float and the host has the bulk converters, run the op
+/// through [`binary_half`] and report that it was handled.
+///
+/// Declines (returning `false`, leaving `out` untouched) for every other dtype
+/// and on hosts without `f16c`/`avx2`, so the scalar loops below stay the
+/// portable fallback.
+#[inline]
+fn try_half_binary<T: NumericElem>(op: BinOp, lhs: &[T], rhs: &[T], out: &mut [T]) -> bool {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        try_half_binary_x86::<T>(op, lhs, rhs, out)
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        let _ = (op, lhs, rhs, out);
+        false
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline]
+fn try_half_binary_x86<T: NumericElem>(op: BinOp, lhs: &[T], rhs: &[T], out: &mut [T]) -> bool {
+    {
+        let kind = match T::DTYPE {
+            DataType::Float16 => HalfKind::F16,
+            DataType::BFloat16 => HalfKind::Bf16,
+            _ => return false,
+        };
+        if !kind.available() {
+            return false;
+        }
+        // A zero-length operand against a non-empty output would make the
+        // repeat modulo in `HalfSide::stage` divide by zero. `dense_operand`
+        // cannot produce that (a zero extent in an operand is a zero extent in
+        // the output), but decline rather than rely on it.
+        if (lhs.is_empty() || rhs.is_empty()) && !out.is_empty() {
+            return false;
+        }
+        debug_assert_eq!(std::mem::size_of::<T>(), std::mem::size_of::<u16>());
+        debug_assert_eq!(std::mem::align_of::<T>(), std::mem::align_of::<u16>());
+        // SAFETY: `T::DTYPE` pinned `T` to `half::f16`/`half::bf16`, each a
+        // `#[repr(transparent)]` newtype over `u16`, so the reinterpretation is
+        // layout-preserving and length-preserving. The three slices came from
+        // the caller and keep their provenance and exclusivity here.
+        let (lhs, rhs, out) = unsafe {
+            (
+                std::slice::from_raw_parts(lhs.as_ptr().cast::<u16>(), lhs.len()),
+                std::slice::from_raw_parts(rhs.as_ptr().cast::<u16>(), rhs.len()),
+                std::slice::from_raw_parts_mut(out.as_mut_ptr().cast::<u16>(), out.len()),
+            )
+        };
+        // SAFETY: `available()` was just checked, and the operand lengths are
+        // whatever the caller already proved valid for the scalar loops.
+        unsafe {
+            match kind {
+                HalfKind::F16 => binary_half::<half::f16>(op, kind, lhs, rhs, out),
+                HalfKind::Bf16 => binary_half::<half::bf16>(op, kind, lhs, rhs, out),
+            }
+        }
+        true
+    }
 }
 
 /// How a dense operand maps onto the output in [`binary_broadcast_contiguous`].
@@ -498,6 +749,9 @@ fn binary_broadcast_typed<T: NumericElem>(
     let lhs = unsafe { std::slice::from_raw_parts(inputs[0].data_ptr::<T>(), lhs_len) };
     let rhs = unsafe { std::slice::from_raw_parts(inputs[1].data_ptr::<T>(), rhs_len) };
     let out = unsafe { std::slice::from_raw_parts_mut(output.data_ptr_mut::<T>(), n) };
+    if try_half_binary::<T>(op, lhs, rhs, out) {
+        return;
+    }
 
     // `BinOp::apply` matches on a runtime value. Left inside the element loop
     // that match is re-evaluated per element and blocks auto-vectorisation
@@ -1725,5 +1979,382 @@ mod dense_broadcast_equivalence_tests {
         assert!(dense_operand(&r.view(), &[2, 3]).is_none());
         let r = Owned::f32(&[2, 3, 4], &[0.; 24]);
         assert!(dense_operand(&r.view(), &[3, 4]).is_none());
+    }
+}
+
+/// The staged f16/bf16 binary path must be a pure speed-up of the scalar loop
+/// it replaces: same `to_acc`, same combiner, same `from_acc`, therefore the
+/// same *bits*. These compare against that scalar formula directly rather than
+/// against approximate expectations, and use adversarial inputs (signed zero,
+/// ±inf, quiet and signalling NaN, both subnormal edges, f16 overflow, and
+/// values engineered to land on an f16 rounding tie) so a rounding or
+/// NaN-handling difference cannot hide behind float equality.
+#[cfg(all(test, any(target_arch = "x86", target_arch = "x86_64")))]
+mod half_binary_staging_tests {
+    use super::*;
+
+    const OPS: [BinOp; 6] = [
+        BinOp::Sub,
+        BinOp::Mul,
+        BinOp::Div,
+        BinOp::Min,
+        BinOp::Max,
+        BinOp::Sum,
+    ];
+
+    /// Deterministic xorshift so the sweep is reproducible in CI.
+    struct Rng(u32);
+    impl Rng {
+        fn next(&mut self) -> u32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 17;
+            self.0 ^= self.0 << 5;
+            self.0
+        }
+    }
+
+    /// f32 values chosen to stress every part of the 16-bit round trip.
+    fn adversarial_f32(count: usize) -> Vec<f32> {
+        let mut v = vec![
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            -f32::NAN,
+            f32::from_bits(0x7f80_0001), // signalling NaN
+            f32::from_bits(0xff80_0001), // negative signalling NaN
+            65504.0,                     // f16::MAX
+            -65504.0,
+            65520.0,                     // rounds to f16 infinity
+            6.097e-5,                    // f16 smallest normal
+            f32::from_bits(0x3380_0000), // 2^-24: f16 smallest subnormal
+            f32::from_bits(0x3300_0000), // 2^-25: an exact tie to zero
+            f32::from_bits(0x33c0_0000), // 1.5 * 2^-24: an exact tie away from zero
+            3.4028235e38,
+            -3.4028235e38,
+            1.1754944e-38, // f32 smallest normal
+            1e-45,         // f32 subnormal
+        ];
+        let mut rng = Rng(0x9e37_79b9);
+        while v.len() < count {
+            // Mostly in-range magnitudes so the arithmetic itself is meaningful,
+            // with a slice of raw bit patterns for the pathological tail.
+            let r = rng.next();
+            v.push(if r.is_multiple_of(8) {
+                f32::from_bits(rng.next())
+            } else {
+                ((r as f64 / u32::MAX as f64) as f32 - 0.5) * 128.0
+            });
+        }
+        v.truncate(count);
+        v
+    }
+
+    /// Bit-exact reference: exactly what `binary_contiguous_typed` /
+    /// `broadcast_loops` compute element by element.
+    fn reference<T: NumericElem<Acc = f32>>(op: BinOp, lhs: &[T], rhs: &[T], n: usize) -> Vec<u16> {
+        (0..n)
+            .map(|i| {
+                let a = lhs[i % lhs.len()].to_acc();
+                let b = rhs[i % rhs.len()].to_acc();
+                T::from_acc(op.apply(a, b))
+            })
+            .map(|t| {
+                // `T` is a `repr(transparent)` newtype over `u16`.
+                let mut bits = 0u16;
+                // SAFETY: `size_of::<T>() == size_of::<u16>()`, asserted below.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        std::ptr::from_ref(&t).cast::<u16>(),
+                        &mut bits,
+                        1,
+                    )
+                };
+                bits
+            })
+            .collect()
+    }
+
+    fn bits_of<T>(v: &[T]) -> &[u16] {
+        assert_eq!(std::mem::size_of::<T>(), 2);
+        // SAFETY: caller only passes `half::f16`/`half::bf16`.
+        unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u16>(), v.len()) }
+    }
+
+    fn check<T: NumericElem<Acc = f32> + Copy>(label: &str, lhs: &[T], rhs: &[T], n: usize) {
+        for op in OPS {
+            let want = reference::<T>(op, lhs, rhs, n);
+            let mut got = vec![T::from_acc(0.0); n];
+            assert!(
+                try_half_binary::<T>(op, lhs, rhs, &mut got),
+                "{label}: staged 16-bit path declined {}",
+                op.name()
+            );
+            let got_bits = bits_of(&got);
+            for i in 0..n {
+                let (a, b) = (lhs[i % lhs.len()].to_acc(), rhs[i % rhs.len()].to_acc());
+                if a.is_nan() && b.is_nan() {
+                    // Which NaN payload survives is not fixed: see
+                    // `nan_payload_choice_only_differs_when_both_operands_are_nan`.
+                    assert!(
+                        got[i].to_acc().is_nan(),
+                        "{label}: {} lost NaN at i={i}",
+                        op.name()
+                    );
+                    continue;
+                }
+                assert_eq!(
+                    got_bits[i],
+                    want[i],
+                    "{label}: {} diverged at i={i} (n={n}, |lhs|={}, |rhs|={}): \
+                     lhs={:#06x} rhs={:#06x} got={:#06x} want={:#06x}",
+                    op.name(),
+                    lhs.len(),
+                    rhs.len(),
+                    bits_of(lhs)[i % lhs.len()],
+                    bits_of(rhs)[i % rhs.len()],
+                    got_bits[i],
+                    want[i]
+                );
+            }
+        }
+    }
+
+    /// Lengths that straddle `HALF_STAGE_CHUNK` in both directions, plus repeat
+    /// blocks that do not divide the chunk so `HalfSide::stage`'s wrap-around
+    /// is exercised on a boundary rather than only at offset 0.
+    const LENS: [usize; 9] = [1, 2, 7, 1023, 1024, 1025, 2048, 3000, 4097];
+    const REPEATS: [usize; 6] = [1, 3, 7, 512, 1000, 1024];
+
+    #[test]
+    fn f16_staged_binary_matches_the_scalar_path_bitwise() {
+        if !HalfKind::F16.available() {
+            return;
+        }
+        for n in LENS {
+            let src = adversarial_f32(n * 2);
+            let a: Vec<half::f16> = src[..n].iter().map(|&f| half::f16::from_f32(f)).collect();
+            let b: Vec<half::f16> = src[n..].iter().map(|&f| half::f16::from_f32(f)).collect();
+            check("f16 same-shape", &a, &b, n);
+            check("f16 scalar rhs", &a, &b[..1], n);
+            check("f16 scalar lhs", &a[..1], &b, n);
+            for r in REPEATS {
+                if r > n {
+                    continue;
+                }
+                check("f16 suffix rhs", &a, &b[..r], n);
+                check("f16 suffix lhs", &a[..r], &b, n);
+            }
+            // Both operands repeat: the modulo arm of `broadcast_loops`.
+            if n >= 7 {
+                check("f16 both repeat", &a[..7], &b[..3], n);
+            }
+        }
+    }
+
+    #[test]
+    fn bf16_staged_binary_matches_the_scalar_path_bitwise() {
+        if !HalfKind::Bf16.available() {
+            return;
+        }
+        for n in LENS {
+            let src = adversarial_f32(n * 2);
+            let a: Vec<half::bf16> = src[..n].iter().map(|&f| half::bf16::from_f32(f)).collect();
+            let b: Vec<half::bf16> = src[n..].iter().map(|&f| half::bf16::from_f32(f)).collect();
+            check("bf16 same-shape", &a, &b, n);
+            check("bf16 scalar rhs", &a, &b[..1], n);
+            check("bf16 scalar lhs", &a[..1], &b, n);
+            for r in REPEATS {
+                if r > n {
+                    continue;
+                }
+                check("bf16 suffix rhs", &a, &b[..r], n);
+            }
+            if n >= 7 {
+                check("bf16 both repeat", &a[..7], &b[..3], n);
+            }
+        }
+    }
+
+    /// Every bf16 bit pattern on the left against a fixed adversarial right
+    /// operand — including signalling NaNs, which is what pins
+    /// `widen_quieting` rather than the raw shift widen.
+    #[test]
+    fn bf16_exhaustive_left_operand_matches_the_scalar_path() {
+        if !HalfKind::Bf16.available() {
+            return;
+        }
+        let a: Vec<half::bf16> = (0..=u16::MAX).map(half::bf16::from_bits).collect();
+        let n = a.len();
+        let src = adversarial_f32(n);
+        let b: Vec<half::bf16> = src.iter().map(|&f| half::bf16::from_f32(f)).collect();
+        check("bf16 exhaustive", &a, &b, n);
+        check("bf16 exhaustive scalar rhs", &a, &b[..1], n);
+    }
+
+    /// Same sweep for f16.
+    #[test]
+    fn f16_exhaustive_left_operand_matches_the_scalar_path() {
+        if !HalfKind::F16.available() {
+            return;
+        }
+        let a: Vec<half::f16> = (0..=u16::MAX).map(half::f16::from_bits).collect();
+        let n = a.len();
+        let src = adversarial_f32(n);
+        let b: Vec<half::f16> = src.iter().map(|&f| half::f16::from_f32(f)).collect();
+        check("f16 exhaustive", &a, &b, n);
+        check("f16 exhaustive scalar rhs", &a, &b[..1], n);
+    }
+
+    /// Non-16-bit dtypes must not be diverted, and the output must be left
+    /// untouched when the path declines.
+    #[test]
+    fn wider_dtypes_are_declined_untouched() {
+        let a = [1.0f32, 2.0, 3.0];
+        let b = [4.0f32, 5.0, 6.0];
+        let mut out = [f32::NAN; 3];
+        assert!(!try_half_binary::<f32>(BinOp::Mul, &a, &b, &mut out));
+        assert!(out.iter().all(|v| v.is_nan()));
+
+        let a = [1.0f64, 2.0];
+        let b = [4.0f64, 5.0];
+        let mut out = [f64::NAN; 2];
+        assert!(!try_half_binary::<f64>(BinOp::Mul, &a, &b, &mut out));
+        assert!(out.iter().all(|v| v.is_nan()));
+    }
+
+    /// A zero-length operand against a non-empty output is declined rather than
+    /// dividing by zero in the repeat modulo.
+    #[test]
+    fn empty_operand_against_non_empty_output_is_declined() {
+        let a: [half::f16; 0] = [];
+        let b = [half::f16::from_f32(1.0)];
+        let mut out = [half::f16::ZERO; 4];
+        assert!(!try_half_binary::<half::f16>(BinOp::Mul, &a, &b, &mut out));
+        // Empty output is fine either way; it must not panic.
+        let mut empty: [half::f16; 0] = [];
+        let _ = try_half_binary::<half::f16>(BinOp::Mul, &a, &a, &mut empty);
+    }
+
+    /// End-to-end through the kernel, so the staged path is proven reachable
+    /// from `BinaryKernel`/`AddKernel` and not just callable in isolation.
+    #[test]
+    fn kernel_level_f16_broadcast_matches_the_reference() {
+        use crate::kernels::testutil::Owned;
+        let n = 4096usize;
+        let src = adversarial_f32(n);
+        let a = Owned::f16(&[n], &src);
+        let k = Owned::f16(&[], &[0.75]);
+        let a_h: Vec<half::f16> = src.iter().map(|&f| half::f16::from_f32(f)).collect();
+        let k_h = [half::f16::from_f32(0.75)];
+
+        for op in [BinOp::Mul, BinOp::Sub, BinOp::Div] {
+            let kernel = BinaryKernel { op, flops: None };
+            let mut out = Owned::zeros(DataType::Float16, &[n]);
+            kernel
+                .execute(&[a.view(), k.view()], &mut [out.view_mut()])
+                .unwrap();
+            assert_eq!(
+                out.to_u16_bits(),
+                reference::<half::f16>(op, &a_h, &k_h, n),
+                "{} f16 scalar broadcast diverged end to end",
+                op.name()
+            );
+        }
+    }
+
+    /// The one place the staged path is *not* bit-identical to a naive scalar
+    /// loop, pinned rather than papered over.
+    ///
+    /// Vectorising a commutative fold lets the compiler pick either operand
+    /// order, and x86 multiply/add returns the **first** NaN operand quieted, so
+    /// when *both* operands are NaN the surviving payload can be the right one
+    /// instead of the left one. IEEE-754 and ONNX both leave NaN payload
+    /// propagation unspecified, and the already-merged `f32` dense loop has
+    /// exactly the same property, so this is shared behaviour of the dense
+    /// paths, not something the 16-bit staging introduces.
+    ///
+    /// The test asserts the two halves of that claim: (1) for `f16` the
+    /// divergence happens **only** when both operands are NaN, for the two
+    /// commutative ops, and the result is always still NaN; (2) the `f32` dense
+    /// path already commutes NaN operands the same way.
+    #[test]
+    fn nan_payload_choice_only_differs_when_both_operands_are_nan() {
+        if !HalfKind::F16.available() {
+            return;
+        }
+        let lhs: Vec<half::f16> = (0..=u16::MAX).map(half::f16::from_bits).collect();
+        let mut rng = Rng(0x1234_5678);
+        let rhs: Vec<half::f16> = (0..=u16::MAX)
+            .map(|_| half::f16::from_bits((rng.next() >> 8) as u16))
+            .collect();
+        let n = lhs.len();
+        for op in OPS {
+            let mut got = vec![half::f16::ZERO; n];
+            assert!(try_half_binary::<half::f16>(op, &lhs, &rhs, &mut got));
+            let want = reference::<half::f16>(op, &lhs, &rhs, n);
+            let mut both_nan_diffs = 0;
+            for i in 0..n {
+                if got[i].to_bits() == want[i] {
+                    continue;
+                }
+                assert!(
+                    lhs[i].is_nan() && rhs[i].is_nan(),
+                    "{} diverged at i={i} without two NaN operands: lhs={:#06x} rhs={:#06x}",
+                    op.name(),
+                    lhs[i].to_bits(),
+                    rhs[i].to_bits()
+                );
+                assert!(
+                    got[i].is_nan(),
+                    "{} turned NaN op NaN into a number",
+                    op.name()
+                );
+                both_nan_diffs += 1;
+            }
+            // Only the commutative folds can be reassociated this way.
+            if !matches!(op, BinOp::Mul | BinOp::Sum) {
+                assert_eq!(
+                    both_nan_diffs,
+                    0,
+                    "{} is not commutative and must be bit-exact everywhere",
+                    op.name()
+                );
+            }
+        }
+    }
+
+    /// Half of the claim above: the `f32` dense path, which is already on
+    /// `main`, is subject to exactly the same NaN-payload freedom. Which
+    /// payload survives depends on whether the loop was vectorised (it is in
+    /// release, is not in debug), so the assertion is the *contract* — the
+    /// result is a NaN carrying one of the two operand payloads, quieted —
+    /// rather than a specific bit pattern.
+    #[test]
+    fn f32_dense_path_propagates_one_of_the_two_nan_payloads() {
+        use crate::kernels::testutil::Owned;
+        let x = f32::from_bits(0xffc0_0003);
+        let y = f32::from_bits(0xff80_0007);
+        let a = Owned::f32(&[8], &[x; 8]);
+        let b = Owned::f32(&[8], &[y; 8]);
+        let mut out = Owned::zeros_f32(&[8]);
+        BinaryKernel {
+            op: BinOp::Mul,
+            flops: None,
+        }
+        .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+        .unwrap();
+        for got in out.to_f32() {
+            assert!(got.is_nan(), "f32 dense Mul turned NaN * NaN into a number");
+            let bits = got.to_bits();
+            // Quieted x, or quieted y.
+            assert!(
+                bits == x.to_bits() | 0x0040_0000 || bits == y.to_bits() | 0x0040_0000,
+                "f32 dense Mul invented a NaN payload: {bits:#010x}"
+            );
+        }
     }
 }

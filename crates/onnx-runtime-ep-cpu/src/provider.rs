@@ -163,10 +163,11 @@ impl ExecutionProvider for CpuExecutionProvider {
     ///
     /// The default [`ExecutionProvider::claim_preference_node`] deep-clones
     /// every input [`Shape`] before it can ask, and it runs for every node in
-    /// the graph. This policy governs five elementwise ops; a transformer graph
-    /// is overwhelmingly not those, so the cheap `(domain, op_type)` test comes
-    /// first and the allocation only happens when the answer can differ from
-    /// [`ClaimPreference::Claim`].
+    /// the graph. This policy governs five elementwise ops and the four
+    /// matmul-family ops; a transformer graph is mostly neither, so the cheap
+    /// `(domain, op_type)` test comes first and the allocation only happens
+    /// when the answer can differ from [`ClaimPreference::Claim`]. The matmul
+    /// ops do pay the clone, but only once per node at capability time.
     fn claim_preference_node(
         &self,
         view: &onnx_runtime_ir::GraphView<'_>,
