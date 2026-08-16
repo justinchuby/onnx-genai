@@ -225,7 +225,7 @@ pub(crate) struct MatMulPrepack {
     /// and dropped, so this costs one packed panel rather than the packed panel
     /// plus a permanent 4*K*N dense copy the way `dense[1]` + `packed_b` would.
     #[cfg(feature = "mlas")]
-    packed_b_from_half: OnceLock<Option<mlas_sys::PackedB>>,
+    packed_b_from_half: OnceLock<Option<(WeightTransposeKey, mlas_sys::PackedB)>>,
     /// Lazily-computed transpose of the B weight matrix for the Accelerate
     /// column-parallel GEMV path, with the key it was computed for. Only
     /// populated for constant (model weight) inputs.
@@ -456,19 +456,29 @@ impl MatMulPrepack {
         if !self.constant_inputs[1] {
             return Ok(None);
         }
+        // Defence in depth, mirroring `transposed_b`: a memo is only served
+        // back for the exact weight it was built from. Today the executor's
+        // kernel cache keys on node and input shapes and a constant input is a
+        // graph initializer whose address is stable, so the key can only ever
+        // match; the check exists so that broadening "constant" later fails
+        // loudly instead of silently returning another tensor's pack.
+        let key = WeightTransposeKey::new(view.data_ptr::<u16>(), k, n);
         if let Some(cached) = self.packed_b_from_half.get() {
-            return Ok(cached.as_ref());
+            return Ok(cached
+                .as_ref()
+                .and_then(|(cached_key, packed)| (*cached_key == key).then_some(packed)));
         }
         let widened = to_dense_f32_widen("MatMul", view)?;
-        if widened.len() != k.saturating_mul(n) {
+        if key.numel() != Some(widened.len()) {
             return Ok(None);
         }
         let packed = mlas_sys::PackedB::new(n, k, &widened);
         drop(widened);
         Ok(self
             .packed_b_from_half
-            .get_or_init(|| Some(packed))
-            .as_ref())
+            .get_or_init(|| Some((key, packed)))
+            .as_ref()
+            .and_then(|(cached_key, packed)| (*cached_key == key).then_some(packed)))
     }
 
     /// Whether the once-widened MLAS pack for a constant f16 B has been built.
@@ -2824,6 +2834,106 @@ mod tests {
     /// M=1 keeps the GEMV. Packing needs row reuse to pay for itself, and the
     /// decode GEMV is memory-bound and already at parity with ORT, so building
     /// a pack there would add cost and win nothing.
+    /// A second, different weight at the same `[k, n]` must never be served
+    /// the first weight's pack.
+    ///
+    /// The executor keys its kernel cache on node and input shapes and a
+    /// constant input is a graph initializer with a stable address, so this
+    /// cannot happen today. The guard is defence in depth: it makes any future
+    /// broadening of "constant" degrade to the slow-but-correct blocked path
+    /// rather than silently returning another tensor's product.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn a_different_weight_is_never_served_the_cached_pack() {
+        let (m, k, n) = (3usize, 12usize, 4usize);
+        let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 5) as f32 - 2.0) / 8.0).collect();
+        let first: Vec<f32> = (0..k * n).map(|i| ((i % 7) as f32 - 3.0) / 8.0).collect();
+        let second: Vec<f32> = first.iter().map(|value| value + 1.0).collect();
+        let a = Owned::f16(&[m, k], &a_data);
+        let b_first = Owned::f16(&[k, n], &first);
+        let b_second = Owned::f16(&[k, n], &second);
+        let mut prepack = MatMulPrepack::default();
+        prepack.set_constant_inputs(&[false, true]);
+
+        let backend = crate::backend::CpuBackend::auto_detect();
+        let served =
+            try_packed_half_prefill(&prepack, backend, &a.view(), &b_first.view(), m, k, n)
+                .unwrap()
+                .expect("the first weight builds and uses the pack");
+        let want_first = naive_matmul(&a_data, &first, m, k, n);
+        for (actual, want) in served.iter().zip(want_first.iter()) {
+            assert!((actual - want).abs() <= 1e-3, "first weight disagreed");
+        }
+
+        let reused =
+            try_packed_half_prefill(&prepack, backend, &a.view(), &b_second.view(), m, k, n)
+                .unwrap();
+        assert!(
+            reused.is_none(),
+            "a weight the pack was not built for must be declined, not served \
+             the cached pack; got a result that would be the first weight's"
+        );
+    }
+
+    /// Calls the shared helper directly at `M = 1`, bypassing the decode GEMV
+    /// that both kernels try first.
+    ///
+    /// `f16_decode_does_not_build_the_prefill_pack` and its `Gemm` twin only
+    /// fail under a compound injection, because at `M = 1` the GEMV returns
+    /// before the helper is ever reached. This one falsifies the `m <= 1` gate
+    /// on its own: remove it and the assertion below sees `Some`.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn the_packed_prefill_helper_declines_a_single_row() {
+        let (k, n) = (24usize, 8usize);
+        let a = Owned::f16(
+            &[1, k],
+            &(0..k).map(|i| (i % 5) as f32 / 8.0).collect::<Vec<_>>(),
+        );
+        let b = Owned::f16(
+            &[k, n],
+            &(0..k * n).map(|i| (i % 7) as f32 / 8.0).collect::<Vec<_>>(),
+        );
+        let mut prepack = MatMulPrepack::default();
+        prepack.set_constant_inputs(&[false, true]);
+        let single_row = try_packed_half_prefill(
+            &prepack,
+            crate::backend::CpuBackend::auto_detect(),
+            &a.view(),
+            &b.view(),
+            1,
+            k,
+            n,
+        )
+        .unwrap();
+        assert!(
+            single_row.is_none(),
+            "packing needs row reuse to pay for itself, so M=1 must be declined"
+        );
+        assert!(
+            !prepack.half_pack_is_built(),
+            "a declined call must not leave a pack behind"
+        );
+
+        // The same weight at M=2 is accepted, so the decline above is the row
+        // count and not some unrelated rejection.
+        let a2 = Owned::f16(
+            &[2, k],
+            &(0..2 * k).map(|i| (i % 5) as f32 / 8.0).collect::<Vec<_>>(),
+        );
+        let two_rows = try_packed_half_prefill(
+            &prepack,
+            crate::backend::CpuBackend::auto_detect(),
+            &a2.view(),
+            &b.view(),
+            2,
+            k,
+            n,
+        )
+        .unwrap();
+        assert!(two_rows.is_some(), "M=2 must take the packed route");
+    }
+
     #[cfg(feature = "mlas")]
     #[test]
     fn f16_decode_does_not_build_the_prefill_pack() {
