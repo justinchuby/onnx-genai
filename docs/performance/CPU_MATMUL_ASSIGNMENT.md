@@ -157,11 +157,34 @@ At **one thread this EP is at parity** (f32 1.00 / 0.97, int4 1.00 / 0.99). The 
 are added and closes again only at 32, where ORT's own scaling saturates. We realise roughly **half**
 of ORT's parallel speedup.
 
-That is a threadpool/partitioning problem, not a kernel problem. #1054 removed one cause — the
-standalone MLAS pool was clamped to `min(available, 8)` workers and never saw the EP's requested
-thread count, which cost 2.16x -> 1.61x at 32 vCPU — but the residual 1.4-2.4x at 2-16 threads is
-still open. Because the thread count is **not visible at capability time**, a claim would have to
-hold at every count, and none of these do.
+#1054 removed one cause — the standalone MLAS pool was clamped to `min(available, 8)` workers and
+never saw the EP's requested thread count, which cost 2.16x -> 1.61x at 32 vCPU. The residual
+1.4-2.4x at 2-16 threads is still open.
+
+**It is not the pool, and it is not MLAS's partitioning.** Driving MLAS's packed integer GEMM
+directly through this crate's work-stealing pool, `K = N = 3584`, `M = 512`, warmed, on the same
+host:
+
+| pool threads | 1 | 2 | 4 | 8 | 16 | 32 |
+|---|---:|---:|---:|---:|---:|---:|
+| MLAS GEMM only | 99.9 ms | 60.3 ms | 26.9 ms | 14.3 ms | 13.6 ms | 11.0 ms |
+| speedup vs 1 thread | 1.0x | 1.7x | 3.7x | **7.0x** | **7.4x** | 9.1x |
+
+MLAS requests exactly `pool_threads` partitions per call and every one of them is dispatched
+(`mlas_threading_stats().scheduled_iterations / parallel_for_calls` is exactly the pool width at
+every count above), so the primitive itself scales about as well as ORT does. What does not scale is
+the **per-call work around** the primitive — densifying the activation, allocating and zeroing the
+`i32` accumulator buffer, requantizing, and the executor's own tensor handling. At `M = 512` that is
+about 2 ms at one thread against a 100 ms GEMM (2%), and the same 2 ms against a 14 ms GEMM at eight
+(14%). Amdahl, not the threadpool.
+
+`qlinear_phase_report` (`#[ignore]`d, in `kernels/qlinear_matmul.rs`) reproduces the split. Note this
+host is shared and heavily contended: the GEMM and requantize columns are repeatable, the
+"unattributed" remainder varies by 3x run to run, so it is reported as a bound rather than a
+breakdown.
+
+Because the thread count is **not visible at capability time**, a claim would have to hold at every
+count, and none of these do.
 
 ### 2. A kernel gap — f16 dense
 

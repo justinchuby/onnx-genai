@@ -1708,6 +1708,124 @@ mod tests {
         assert_eq!(second.bytes, reference.bytes, "reused packed call");
     }
 
+    /// Splits a steady-state call into "inside MLAS" and "everything else", so
+    /// a thread-scaling gap can be attributed rather than guessed at.
+    ///
+    /// `#[ignore]`; run with
+    /// `ONNX_GENAI_MLAS_THREADPOOL_THREADS=8 cargo test --release --features mlas \
+    ///  qlinear_phase_report -- --ignored --nocapture`.
+    #[cfg(feature = "mlas")]
+    #[test]
+    #[ignore = "reports timings; not a pass/fail assertion"]
+    fn qlinear_phase_report() {
+        let (k, n) = (3584usize, 3584usize);
+        for m in [1usize, 128, 512] {
+            let fixture = pack_fixture(m, k, n, 1);
+            let mut kernel = QLinearMatMulKernel::default();
+            kernel.set_constant_inputs(&[false, false, false, true, false, false, false, false]);
+            let reps = if m == 1 { 100 } else { 10 };
+            for _ in 0..3 {
+                let _ = run_with(&kernel, &fixture);
+            }
+            let start = std::time::Instant::now();
+            for _ in 0..reps {
+                let _ = run_with(&kernel, &fixture);
+            }
+            let whole = start.elapsed() / reps;
+
+            let a_bytes = fixture.a.bytes.clone();
+            let packed = kernel
+                .pack_lookup(
+                    kernel
+                        .pack_key(
+                            &fixture.b.view(),
+                            &Geometry::new(&[m, k], &[k, n]).unwrap(),
+                            &QgemmPlan::select(
+                                &quant_params(false, 128, 1),
+                                false,
+                                false,
+                                &Geometry::new(&[m, k], &[k, n]).unwrap(),
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap(),
+                )
+                .unwrap();
+            let zeros = vec![127u8; n];
+            let mut products = vec![0i32; m * n];
+            for _ in 0..3 {
+                mlas_sys::qgemm_i32_packed(
+                    m,
+                    n,
+                    k,
+                    &a_bytes,
+                    false,
+                    128,
+                    packed,
+                    mlas_sys::QgemmZeroPoints::PerColumn(&zeros),
+                    &mut products,
+                );
+            }
+            let start = std::time::Instant::now();
+            for _ in 0..reps {
+                mlas_sys::qgemm_i32_packed(
+                    m,
+                    n,
+                    k,
+                    &a_bytes,
+                    false,
+                    128,
+                    packed,
+                    mlas_sys::QgemmZeroPoints::PerColumn(&zeros),
+                    &mut products,
+                );
+            }
+            let gemm = start.elapsed() / reps;
+
+            let a_quant = quant_params(false, 128, 1);
+            let b_scales = vec![0.01f32; n];
+            let mut output = Vec::new();
+            let start = std::time::Instant::now();
+            for _ in 0..reps {
+                output.clear();
+                requantize_rows(
+                    &products,
+                    &a_quant,
+                    0,
+                    &b_scales,
+                    n,
+                    0.05,
+                    120,
+                    DataType::Uint8,
+                    &mut output,
+                )
+                .unwrap();
+            }
+            let requant = start.elapsed() / reps;
+
+            let start = std::time::Instant::now();
+            for _ in 0..reps {
+                // Deliberately the same `clear` + `resize` shape the kernel
+                // uses, so this measures what the kernel pays.
+                let mut scratch: Vec<i32> = Vec::new();
+                scratch.clear();
+                scratch.resize(m * n, 0);
+                std::hint::black_box(&scratch);
+            }
+            let alloc = start.elapsed() / reps;
+
+            println!(
+                "m={m} threads={}: whole={whole:?} gemm={gemm:?} requant={requant:?} \
+                 products-alloc={alloc:?} unattributed={:?}",
+                mlas_sys::mlas_threading_stats().pool_threads,
+                whole
+                    .saturating_sub(gemm)
+                    .saturating_sub(requant)
+                    .saturating_sub(alloc),
+            );
+        }
+    }
+
     /// Reports the one-time cost of the pack against a steady-state call, at a
     /// real decode shape, because the benchmark harness runs a parity check
     /// before it starts timing and therefore never sees a first call.
