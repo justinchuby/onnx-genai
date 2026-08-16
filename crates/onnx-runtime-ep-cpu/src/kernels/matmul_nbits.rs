@@ -166,14 +166,20 @@ static DECODE_THREADS_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
 static RESIDENT_DEQUANT_F32_CACHE_DISABLED: AtomicBool = AtomicBool::new(false);
 
 /// The `bits == 4, accuracy_level == 0` MLAS SQNBit CompFp32 route packs the
-/// constant weight into an MLAS-owned buffer (~2x the int4 bytes,
-/// [`mlas_sys::sqnbit_packed_b_size`]) held for the session *beside* the
-/// still-resident memory-mapped weight. That buffer buys a large decode speedup
-/// on x86 (the borrowed int4 path has no SIMD kernel there) but roughly doubles
-/// the weight footprint. Like the resident f32 cache above, the memory-strategy
-/// plan owns the fit decision: it accounts those bytes
-/// ([`matmul_nbits_resident_side_cache_bytes`]) and, when they do not fit the
-/// residency budget, calls [`set_mlas_sqnbit_packing_enabled`] with `false`.
+/// constant weight into an MLAS-owned buffer ([`mlas_sys::sqnbit_packed_b_size`],
+/// which for CompFp32 is `N * K / 2` -- the same size as the on-disk int4
+/// bytes) held for the session *beside* the still-resident memory-mapped weight.
+/// Each packed buffer also retains its own `f32` scale (and, when asymmetric,
+/// `u8` zero-point) copy, and the shape-keyed kernel cache materializes one such
+/// buffer per activation shape -- a prefill (`m > 1`) and a decode (`m == 1`)
+/// instance -- so the resident footprint is roughly `2 * 1.25` the int4 bytes
+/// (measured on `qwen05b-symzp`: ~604 MB against 367 MB of int4 weights, with
+/// the mapped weight still resident). That buffer buys a large decode speedup on
+/// x86 (the borrowed int4 path has no SIMD kernel there). Like the resident f32
+/// cache above, the memory-strategy plan owns the fit decision: it accounts
+/// those bytes ([`matmul_nbits_resident_side_cache_bytes`], which counts the
+/// scales and both instantiations) and, when they do not fit the residency
+/// budget, calls [`set_mlas_sqnbit_packing_enabled`] with `false`.
 /// When disabled, [`MatMulNBitsKernel::mlas_sqnbit_owns_fp32_compute`] declines
 /// ownership so the node stays on the borrowed zero-copy int4 path -- the same
 /// behaviour as before the dispatch change, holding only the on-disk weights.
@@ -2045,6 +2051,25 @@ impl MatMulNBitsKernel {
                 None => return Ok(None),
             }
         }
+        if mm_profile::enabled() {
+            eprintln!(
+                "[mlas_pack] kind=shards n={} k={} block_size={} shards={} \
+                 packed_b_size={:?} live_total={}",
+                self.n,
+                self.k,
+                self.block_size,
+                shards.iter().filter(|s| s.is_some()).count(),
+                mlas_sys::sqnbit_packed_b_size(
+                    self.n,
+                    self.k,
+                    self.bits,
+                    self.block_size,
+                    zero_points.is_some(),
+                    comp,
+                ),
+                mlas_sys::sqnbit_packed_live_bytes(),
+            );
+        }
         Ok(Some(shards))
     }
 
@@ -2669,17 +2694,79 @@ pub fn matmul_nbits_decode_caches_dequant_f32(
     true
 }
 
-/// The MLAS SQNBit CompFp32 packed-weight buffer bytes a **constant-weight**
-/// `bits == 4, accuracy_level == 0` `MatMulNBits` node holds for the session,
-/// or `None` when that node does not take the MLAS route.
+/// How many times the CPU decode runtime materializes each MLAS SQNBit packed
+/// buffer over a session -- the multiplier that the earlier accounting missed.
+///
+/// The executor's kernel cache is **shape-keyed** (`KernelKey { node, shapes }`
+/// in `onnx-runtime-session/src/executor/kernel_cache.rs`): a `MatMulNBits`
+/// kernel is compiled and cached *per distinct resolved activation shape*. An
+/// autoregressive decoder presents exactly two activation shapes to each such
+/// node -- the prefill shape (`m == prompt_len`) and the decode shape
+/// (`m == 1`) -- so it compiles **two** kernel instances, and each instance
+/// packs its own full copy of the weight into its own `mlas_shards`
+/// `OnceLock`. Both copies stay resident for the whole session.
+///
+/// This was measured directly on `qwen05b-symzp` (169 weight boundaries): a
+/// 1-token run packs 169 buffers, a multi-token run packs 338 = 2x169, and
+/// [`mlas_sys::sqnbit_packed_live_bytes`] holds both copies for the entire
+/// decode phase (it does not fall until process exit). Accounting a single copy
+/// therefore under-reports the resident footprint by 2x -- the dangerous
+/// (under-reporting) direction for an admission gate.
+///
+/// It is a fixed upper bound for the autoregressive decode workload: a
+/// prefill-only run (no `m == 1` step) materializes one copy, so accounting two
+/// over-estimates, which only makes the gate decline sooner (safe). MLAS packs
+/// in *both* the prefill and decode instances (unlike the generic f32
+/// `weight_nk` cache, which is a decode-only `m == 1` materialization and is
+/// held once), so this multiplier applies to the MLAS packed buffer alone.
+#[cfg(feature = "mlas")]
+const MLAS_PACKED_DECODE_INSTANTIATIONS: u64 = 2;
+
+/// Bytes the owned scale (and optional zero-point) copies retained by a single
+/// [`mlas_sys::SQNBitPackedB`] add on top of the packed buffer.
+///
+/// MLAS's `Fp32` pack keeps its own `f32` scale copy and, for an asymmetric
+/// weight, a `u8` zero-point copy, so the durable heap of one packed buffer is
+/// `packed + scales (+ zero_points)`, not `packed` alone. The layout matches the
+/// ONNX initializer shapes the kernel feeds `SQNBitPackedB::new`: scales are
+/// `[N, ceil(K / block_size)]` `f32`, and int4 zero points are
+/// `[N, ceil(ceil(K / block_size) / 2)]` `u8`. Summed over the N-sharded packs
+/// this is exact (the shards split on whole N rows), so it equals
+/// [`mlas_sys::SQNBitPackedB::owned_heap_bytes`] minus the packed size.
+#[cfg(feature = "mlas")]
+fn mlas_sqnbit_scale_zp_bytes(block_size: usize, n: usize, k: usize, has_zero_points: bool) -> u64 {
+    if block_size == 0 {
+        return 0;
+    }
+    let blocks = k.div_ceil(block_size) as u64;
+    let n = n as u64;
+    let scale_bytes = n
+        .saturating_mul(blocks)
+        .saturating_mul(std::mem::size_of::<f32>() as u64);
+    let zp_bytes = if has_zero_points {
+        n.saturating_mul(blocks.div_ceil(2))
+    } else {
+        0
+    };
+    scale_bytes.saturating_add(zp_bytes)
+}
+
+/// The durable heap bytes a **constant-weight** `bits == 4, accuracy_level == 0`
+/// `MatMulNBits` node holds for the session on the MLAS SQNBit CompFp32 route --
+/// **one packed copy** -- or `None` when that node does not take the MLAS route.
 ///
 /// This mirrors [`MatMulNBitsKernel::mlas_sqnbit_owns_fp32_compute`]'s gate on
 /// static attributes: MLAS owns the node only for constant int4
 /// `accuracy_level == 0` weights without `g_idx`, when the `mlas` build has a
-/// SQNBit kernel for the shape on this host and the route is enabled. The size
-/// is MLAS's own [`mlas_sys::sqnbit_packed_b_size`] -- the same probe the route
-/// decision uses -- so the plan's accounting cannot drift from the buffer the
-/// kernel actually allocates.
+/// SQNBit kernel for the shape on this host and the route is enabled.
+///
+/// The value is MLAS's own [`mlas_sys::sqnbit_packed_b_size`] -- the same probe
+/// the route decision uses -- **plus** the scale and zero-point copies a
+/// [`mlas_sys::SQNBitPackedB`] retains ([`mlas_sqnbit_scale_zp_bytes`]), so it
+/// equals the buffer the kernel actually allocates for one instance and cannot
+/// drift from it. It is the *per-copy* figure; the session holds
+/// [`MLAS_PACKED_DECODE_INSTANTIATIONS`] of these (see
+/// [`matmul_nbits_resident_side_cache_bytes`]).
 ///
 /// It deliberately does **not** consult [`mlas_sqnbit_packing_enabled`]: the
 /// accounting states what admitting the route would cost, and the plan then
@@ -2707,15 +2794,31 @@ fn mlas_sqnbit_packed_b_cache_bytes(
         has_zero_points,
         mlas_sys::SQNBitComputeType::Fp32,
     )
-    .map(|bytes| bytes as u64)
+    .map(|packed| {
+        (packed as u64).saturating_add(mlas_sqnbit_scale_zp_bytes(
+            block_size,
+            n,
+            k,
+            has_zero_points,
+        ))
+    })
 }
 
 /// Resident side-buffer bytes a single **constant-weight** `MatMulNBits` node
 /// holds for the session *beside* the on-disk weights, given its static
-/// attributes: either the MLAS SQNBit CompFp32 packed buffer (~2x the int4
-/// bytes) when the node takes that route, the fully-expanded f32 `weight_nk`
-/// cache (`N * K * 4`, #971) when it takes the generic decode path, or zero for
-/// a truly zero-copy path (borrowed int4, 2-bit, int8, accuracy-4 direct).
+/// attributes: either the MLAS SQNBit CompFp32 packed buffers (the packed
+/// weight plus its retained scale/zero-point copies, held once per compiled
+/// kernel instance) when the node takes that route, the fully-expanded f32
+/// `weight_nk` cache (`N * K * 4`, #971) when it takes the generic decode path,
+/// or zero for a truly zero-copy path (borrowed int4, 2-bit, int8, accuracy-4
+/// direct).
+///
+/// For the MLAS route the figure is [`MLAS_PACKED_DECODE_INSTANTIATIONS`] times
+/// the per-copy cost, because the shape-keyed kernel cache compiles a separate
+/// `MatMulNBits` instance for the prefill (`m > 1`) and decode (`m == 1`)
+/// activation shapes and each packs its own copy (see the constant's docs). The
+/// generic f32 `weight_nk` cache is a decode-only (`m == 1`) materialization and
+/// is held once, so no multiplier applies there.
 ///
 /// This is the single per-node authority [`resident_dequant_f32_cache_bytes`]
 /// sums over the graph so the memory plan's footprint accounting tracks what the
@@ -2733,7 +2836,7 @@ pub fn matmul_nbits_resident_side_cache_bytes(
     weight_prepacked: bool,
 ) -> u64 {
     #[cfg(feature = "mlas")]
-    if let Some(bytes) = mlas_sqnbit_packed_b_cache_bytes(
+    if let Some(per_copy) = mlas_sqnbit_packed_b_cache_bytes(
         bits,
         block_size,
         accuracy_level,
@@ -2743,7 +2846,7 @@ pub fn matmul_nbits_resident_side_cache_bytes(
         has_g_idx,
         weight_prepacked,
     ) {
-        return bytes;
+        return per_copy.saturating_mul(MLAS_PACKED_DECODE_INSTANTIATIONS);
     }
     if matmul_nbits_decode_caches_dequant_f32(
         bits,
@@ -2767,11 +2870,13 @@ pub fn matmul_nbits_resident_side_cache_bytes(
 /// For every constant-weight `MatMulNBits` node this sums
 /// [`matmul_nbits_resident_side_cache_bytes`]: the fully-expanded f32 `weight_nk`
 /// cache (`N * K * 4`, #971) when the node takes the generic decode path, or the
-/// MLAS SQNBit CompFp32 packed buffer (~2x the int4 bytes) when it takes the
-/// `accuracy_level == 0` MLAS route. Nodes on a truly zero-copy path (borrowed
-/// int4, 2-bit, int8) contribute nothing, and non-constant-weight nodes never
-/// retain a session buffer (they rebuild a transient one per call) and are
-/// excluded.
+/// MLAS SQNBit CompFp32 packed buffers when it takes the `accuracy_level == 0`
+/// MLAS route -- the packed weight plus its retained scale/zero-point copies,
+/// counted [`MLAS_PACKED_DECODE_INSTANTIATIONS`] times because the shape-keyed
+/// kernel cache packs a copy for the prefill and decode activation shapes alike.
+/// Nodes on a truly zero-copy path (borrowed int4, 2-bit, int8) contribute
+/// nothing, and non-constant-weight nodes never retain a session buffer (they
+/// rebuild a transient one per call) and are excluded.
 ///
 /// The name is kept for API stability; the total now covers the MLAS packed
 /// buffer too, so a model whose int4 `accuracy_level == 0` nodes route to MLAS
@@ -2831,7 +2936,25 @@ pub fn resident_dequant_f32_cache_bytes(graph: &Graph) -> u64 {
     total
 }
 
-/// prefill and every MLAS GEMM through the `mlas-sys` parallel-for backend)
+/// The heap bytes all live MLAS SQNBit packed weights currently retain: the
+/// packed buffers plus their owned scale and zero-point copies, summed across
+/// every kernel instance (so an autoregressive session's prefill and decode
+/// copies are both counted). This is the *actual* runtime figure that
+/// [`resident_dequant_f32_cache_bytes`]'s *prediction* must equal; the
+/// `matmul_nbits` accounting tests compare the two directly. Zero on a build
+/// without the `mlas` feature.
+pub fn mlas_sqnbit_packed_live_bytes() -> u64 {
+    #[cfg(feature = "mlas")]
+    {
+        mlas_sys::sqnbit_packed_live_bytes() as u64
+    }
+    #[cfg(not(feature = "mlas"))]
+    {
+        0
+    }
+}
+
+
 /// should be built with, given the explicit decode budget.
 ///
 /// Only an *explicit* budget bounds the global pool: the process-local override
@@ -7565,7 +7688,7 @@ mod tests {
     use crate::CpuExecutionProvider;
     use crate::kernels::testutil::Owned;
     use onnx_runtime_ep_api::ExecutionProvider;
-    use onnx_runtime_ir::{Attribute, Graph, NodeId, static_shape};
+    use onnx_runtime_ir::{Attribute, Graph, NodeId, TensorData, WeightRef, static_shape};
     use onnx_runtime_loader::{Model, encode_model_proto};
 
     fn model_node(
@@ -7961,9 +8084,13 @@ mod tests {
                     MLAS_SQNBIT_TEST_CALLS.load(Ordering::Relaxed) > self.mlas,
                     "the MLAS SQNBit GEMM must actually have run for this node"
                 );
-                // The packed buffer is a real resident allocation and must be
-                // accounted as exactly MLAS's own packed size -- not the zero
-                // the ledger reported before #1027.
+                // The packed buffer is a real resident allocation. The memory
+                // plan budgets the byte total this function returns, which must
+                // equal what the kernels actually hold across the session: the
+                // per-copy packed + scale/zp bytes, materialized once per
+                // shape-keyed kernel instance (prefill + decode). Not zero (the
+                // pre-#1027 blind spot), and not a bare single packed buffer (the
+                // #1051 2x under-report this test now guards).
                 let packed_bytes = mlas_sys::sqnbit_packed_b_size(
                     kernel.n,
                     kernel.k,
@@ -7974,9 +8101,25 @@ mod tests {
                 )
                 .expect("MLAS reported a kernel for this shape but no packed size");
                 assert!(packed_bytes > 0);
+                let per_copy = mlas_sqnbit_packed_b_cache_bytes(
+                    kernel.bits,
+                    kernel.block_size,
+                    kernel.accuracy_level,
+                    kernel.n,
+                    kernel.k,
+                    !symmetric,
+                    false,
+                    false,
+                )
+                .expect("MLAS route was asserted available for this shape");
                 assert_eq!(
-                    accounted, packed_bytes as u64,
-                    "the MLAS SQNBit packed buffer must be accounted for the memory plan (#1027), not reported as zero"
+                    accounted,
+                    per_copy.saturating_mul(MLAS_PACKED_DECODE_INSTANTIATIONS),
+                    "the MLAS SQNBit packed buffer must be accounted for the memory plan (#1027) as the per-copy footprint times the prefill+decode instantiations (#1051)"
+                );
+                assert!(
+                    accounted > packed_bytes as u64,
+                    "the accounted footprint must exceed a single bare packed buffer (it includes the retained scales and both kernel instantiations)"
                 );
                 return;
             }
@@ -12122,18 +12265,58 @@ mod tests {
         );
     }
 
-    /// #1027: the MLAS SQNBit packed buffer is a real session-lifetime resident
-    /// allocation held beside the mapped weight, and the memory plan must be able
-    /// to see it. Before the fix the ledger reported zero for these nodes (they
-    /// leave `weight_nk` empty), which hid ~2x the int4 footprint. The accounting
-    /// must equal MLAS's own packed size, be non-zero, and never be mistaken for
+    /// Sum the heap bytes the MLAS SQNBit shards a kernel packed actually hold
+    /// (packed buffer + retained scale/zero-point copies), reading each shard's
+    /// real [`mlas_sys::SQNBitPackedB::owned_heap_bytes`]. This is the *actual*
+    /// footprint one compiled kernel instance retains, read back deterministically
+    /// from that kernel (not the process-global counter, so parallel tests cannot
+    /// perturb it).
+    #[cfg(feature = "mlas")]
+    fn mlas_shards_owned_bytes(kernel: &MatMulNBitsKernel) -> u64 {
+        kernel
+            .mlas_shards
+            .get()
+            .and_then(Option::as_ref)
+            .map(|shards| {
+                shards
+                    .iter()
+                    .flatten()
+                    .map(|s| s.prepared.packed.owned_heap_bytes() as u64)
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    /// #1027/#1051: the accounting the memory plan reads must equal the MLAS
+    /// packed bytes the kernels *actually* allocate -- predicted == actual, so an
+    /// admission gate is never fed an underestimate.
+    ///
+    /// This asserts the tie at all three levels, against the real allocated
+    /// bytes rather than re-deriving `sqnbit_packed_b_size` (which would only
+    /// prove the predictor calls the same function it did before, the tautology
+    /// that let the 2x under-report through):
+    ///
+    ///   1. the per-copy predictor equals the packed + scale/zp bytes one
+    ///      executed kernel instance retains;
+    ///   2. the per-node predictor equals the bytes **two** instances retain,
+    ///      because the shape-keyed kernel cache compiles a prefill (`m > 1`) and
+    ///      a decode (`m == 1`) instance and each packs its own copy;
+    ///   3. the graph walker the plan calls
+    ///      ([`resident_dequant_f32_cache_bytes`]) equals that same actual
+    ///      session footprint.
+    ///
+    /// It also guards the #979 direction: the total must be non-zero and never
     /// the ~8x f32 expansion.
     #[cfg(feature = "mlas")]
     #[test]
-    fn int4_acc0_mlas_packed_buffer_is_accounted_not_zero() {
-        let (k, n, block_size) = (256, 32, 32);
-        let kernel = test_kernel(k, n, block_size);
-        if !kernel.mlas_sqnbit_owns_fp32_compute(true, false) {
+    fn int4_acc0_mlas_packed_accounting_equals_actual_allocated() {
+        let _guard = CACHE_FLAG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (k, n, block_size) = (256usize, 32usize, 32usize);
+        let blocks = k.div_ceil(block_size);
+
+        if !test_kernel(k, n, block_size).mlas_sqnbit_owns_fp32_compute(true, false) {
             // This host has no MLAS SQNBit kernel for the shape, so the node
             // stays on the borrowed zero-copy path and holds no side buffer.
             assert_eq!(
@@ -12142,30 +12325,103 @@ mod tests {
             );
             return;
         }
-        let accounted =
-            matmul_nbits_resident_side_cache_bytes(4, block_size, 0, n, k, false, false, false);
-        let packed = mlas_sys::sqnbit_packed_b_size(
-            n,
-            k,
-            4,
-            block_size,
-            false,
-            mlas_sys::SQNBitComputeType::Fp32,
-        )
-        .expect("MLAS reported a kernel for this shape but no packed size");
+
+        set_mlas_sqnbit_packing_enabled(true);
+        let weights: Vec<f32> = (0..n * k)
+            .map(|i| ((i * 23 % 47) as f32 - 19.0) / 12.0)
+            .collect();
+        let (packed, scales, _, _) = quantize(&weights, n, k, block_size, false);
+
+        // Execute one kernel instance at row count `m` so it packs its MLAS
+        // shards exactly as the decode runtime does, then return the kernel so
+        // its actual retained bytes can be read back.
+        let run = |m: usize| -> MatMulNBitsKernel {
+            let a_values: Vec<f32> = (0..m * k).map(|i| ((i * 11 % 41) as f32 - 20.0) / 13.0).collect();
+            let mut kernel = test_kernel(k, n, block_size);
+            kernel.set_constant_inputs(&[false, true, true]);
+            let a = Owned::f32(&[m, k], &a_values);
+            let b = Owned::u8(&[n, blocks, block_size / 2], &packed);
+            let scales_t = Owned::f32(&[n, blocks], &scales);
+            let mut y = Owned::zeros_f32(&[m, n]);
+            kernel
+                .execute(&[a.view(), b.view(), scales_t.view()], &mut [y.view_mut()])
+                .unwrap();
+            kernel
+        };
+
+        // Two distinct activation shapes -> two compiled kernel instances, the
+        // exact duplication the shape-keyed kernel cache produces in a real
+        // autoregressive session (prefill `m > 1`, decode `m == 1`).
+        let prefill = run(3);
+        let decode = run(1);
+
+        let per_copy_predicted =
+            mlas_sqnbit_packed_b_cache_bytes(4, block_size, 0, n, k, false, false, false)
+                .expect("MLAS route was asserted available for this shape");
+        let prefill_actual = mlas_shards_owned_bytes(&prefill);
+        let decode_actual = mlas_shards_owned_bytes(&decode);
+        assert!(prefill_actual > 0, "the prefill instance must have packed MLAS shards");
         assert_eq!(
-            accounted, packed as u64,
-            "the MLAS SQNBit packed buffer must be accounted as MLAS's own packed size (#1027)"
+            prefill_actual, per_copy_predicted,
+            "per-copy predictor must equal the packed + scale/zp bytes one instance actually holds"
         );
-        assert!(
-            accounted > 0,
-            "the packed buffer must not be reported as zero to the memory ledger (#1027)"
+        assert_eq!(
+            decode_actual, per_copy_predicted,
+            "the decode instance holds the same per-copy bytes as the prefill instance"
         );
+
+        // Per-node accounting must equal the bytes BOTH instances retain.
+        let session_actual = prefill_actual + decode_actual;
+        let node_predicted =
+            matmul_nbits_resident_side_cache_bytes(4, block_size, 0, n, k, false, false, false);
+        assert_eq!(
+            node_predicted, session_actual,
+            "per-node accounting must equal the two instances' actual packed bytes (the missed 2x)"
+        );
+
+        // The graph walker the memory plan actually calls must equal the same
+        // actual session footprint, for a graph whose weight is a constant
+        // initializer (the only case that caches).
+        let (mut graph, node_id) = model_node(
+            &[1, k],
+            &[n, blocks, block_size / 2],
+            &[n, blocks],
+            None,
+            &[1, n],
+            k,
+            n,
+            block_size,
+        );
+        let b_value = graph
+            .node(node_id)
+            .inputs
+            .get(1)
+            .and_then(|v| *v)
+            .expect("MatMulNBits B input");
+        graph.set_initializer(
+            b_value,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Uint8,
+                vec![n, blocks, block_size / 2],
+                vec![0u8; n * blocks * (block_size / 2)],
+            )),
+        );
+        assert_eq!(
+            resident_dequant_f32_cache_bytes(&graph),
+            session_actual,
+            "the memory plan's graph accounting must equal the actual session footprint"
+        );
+
+        // #979 direction: non-zero, and never the ~8x f32 expansion.
+        assert!(node_predicted > 0, "the packed buffer must not be accounted as zero (#1027)");
         assert_ne!(
-            accounted,
+            node_predicted,
             (n as u64) * (k as u64) * 4,
             "the int4 packed buffer must not be accounted as the ~8x resident f32 expansion (#979)"
         );
+
+        drop(prefill);
+        drop(decode);
     }
 
     /// #1027 item 2: admitting the packed buffer through the memory strategy has

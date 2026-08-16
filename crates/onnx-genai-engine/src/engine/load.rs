@@ -535,8 +535,11 @@ impl Engine {
             memory_strategy_plan.f32_weight_cache_admitted,
         );
         // #1027: the int4 accuracy_level=0 MLAS SQNBit route holds a packed
-        // buffer (~2x the int4 bytes) beside the mapped weight for the session.
-        // Its bytes are folded into `resident_f32_cache_bytes`, so the same
+        // buffer (CompFp32 packs to ~1x the int4 bytes) plus its retained scale
+        // copy, and the shape-keyed kernel cache materializes one per prefill
+        // and decode activation shape -- ~2.5x the int4 bytes beside the mapped
+        // weight for the session (#1051 corrected the earlier per-copy under-
+        // count). Its bytes are folded into `resident_f32_cache_bytes`, so the
         // admission verdict governs it: when declined, the kernel keeps the
         // borrowed zero-copy int4 path (byte-identical, only slower on x86)
         // instead of doubling the weight footprint.

@@ -197,7 +197,8 @@ pub(crate) fn build_memory_strategy_plan(input: MemoryStrategyPlanInput<'_>) -> 
     // #971/#1027: the native CPU `MatMulNBits` decode kernels may hold a resident
     // side buffer beside the on-disk weights for the whole session -- either the
     // generic f32 dequant cache (~8x the packed weight, #971) or the int4
-    // accuracy_level=0 MLAS SQNBit packed buffer (~2x the int4 bytes, #1027).
+    // accuracy_level=0 MLAS SQNBit packed buffer (~2.5x the int4 bytes across
+    // the prefill+decode instances and retained scales, #1027/#1051).
     // Either trade buys a large decode speedup when it fits and collapses to
     // paging when it does not. `resident_f32_cache_bytes` is the predicted total
     // of those buffers (0 on backends/models that take neither path). The plan
