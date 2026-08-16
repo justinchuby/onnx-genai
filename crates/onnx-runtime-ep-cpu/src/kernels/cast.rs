@@ -162,6 +162,16 @@ fn cast_to(op: &str, input: &TensorView, output: &mut TensorMut, to: DataType) -
         )));
     }
 
+    // Fast path first: both views row-major contiguous and non-overlapping.
+    // The generic path below costs an `elem_offset` dot product, a `next_index`
+    // carry chain, a 16-byte `Num` pushed to a heap `Vec`, a per-element
+    // `DataType` match and a per-element `Vec<u8>` extend -- about 9 ns per
+    // element, which made `Cast` two orders of magnitude slower than ORT and
+    // dominated every mixed-precision graph. See `cast_contiguous`.
+    if cast_contiguous(input, output, to)? {
+        return Ok(());
+    }
+
     let src = read_src(input)?;
     let out_esize = elem_size(to)?;
     let mut bytes = Vec::with_capacity(src.len() * out_esize);
@@ -169,6 +179,347 @@ fn cast_to(op: &str, input: &TensorView, output: &mut TensorMut, to: DataType) -
         write_num(&mut bytes, n, to)?;
     }
     super::write_dense_bytes(output, &bytes)
+}
+
+/// Number of elements converted per staging batch. Sized so the `Num` staging
+/// buffer (16 B/element) stays inside L1 alongside the source and destination
+/// windows, the same shape of trade-off as `dense_elementwise::F16_STAGE_CHUNK`.
+const CAST_STAGE_CHUNK: usize = 1024;
+
+/// Marker types naming an ONNX element type for the monomorphised conversion
+/// loops. Distinct markers are needed because `Bool` and `Uint8` share `u8` as
+/// their storage type but decode differently (`b != 0` vs `b as i64`).
+mod lane {
+    pub struct F32;
+    pub struct F64;
+    pub struct F16;
+    pub struct BF16;
+    pub struct I64;
+    pub struct I32;
+    pub struct I16;
+    pub struct I8;
+    pub struct U8;
+    pub struct U16;
+    pub struct U32;
+    pub struct Bool;
+}
+
+/// Decode a contiguous run of one element type into the `Num` lane.
+///
+/// Every implementation must be **exactly** the corresponding arm of
+/// [`decode`]; `contiguous_cast_matches_strided_reference` pins that.
+trait DecodeLane {
+    const SIZE: usize;
+    fn decode(bytes: &[u8]) -> Num;
+}
+
+/// Encode the `Num` lane into a contiguous run of one element type.
+///
+/// Every implementation must be **exactly** the corresponding arm of
+/// [`write_num`].
+trait EncodeLane {
+    const SIZE: usize;
+    fn encode(n: Num, out: &mut [u8]);
+}
+
+macro_rules! impl_lane {
+    ($marker:ty, $size:literal, $dec:expr, $enc:expr) => {
+        impl DecodeLane for $marker {
+            const SIZE: usize = $size;
+            #[inline(always)]
+            fn decode(bytes: &[u8]) -> Num {
+                let f: fn(&[u8]) -> Num = $dec;
+                f(bytes)
+            }
+        }
+        impl EncodeLane for $marker {
+            const SIZE: usize = $size;
+            #[inline(always)]
+            fn encode(n: Num, out: &mut [u8]) {
+                let f: fn(Num, &mut [u8]) = $enc;
+                f(n, out)
+            }
+        }
+    };
+}
+
+impl_lane!(
+    lane::F32,
+    4,
+    |b| Num::F(f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64),
+    |n, o| o.copy_from_slice(&(n.to_f64() as f32).to_le_bytes())
+);
+impl_lane!(
+    lane::F64,
+    8,
+    |b| Num::F(f64::from_le_bytes([
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]
+    ])),
+    |n, o| o.copy_from_slice(&n.to_f64().to_le_bytes())
+);
+impl_lane!(
+    lane::F16,
+    2,
+    |b| Num::F(half::f16::from_le_bytes([b[0], b[1]]).to_f64()),
+    |n, o| o.copy_from_slice(&half::f16::from_f32(n.to_f64() as f32).to_le_bytes())
+);
+impl_lane!(
+    lane::BF16,
+    2,
+    |b| Num::F(half::bf16::from_le_bytes([b[0], b[1]]).to_f64()),
+    |n, o| o.copy_from_slice(&half::bf16::from_f32(n.to_f64() as f32).to_le_bytes())
+);
+impl_lane!(
+    lane::I64,
+    8,
+    |b| Num::I(i64::from_le_bytes([
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]
+    ])),
+    |n, o| o.copy_from_slice(&n.to_i64().to_le_bytes())
+);
+impl_lane!(
+    lane::I32,
+    4,
+    |b| Num::I(i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64),
+    |n, o| o.copy_from_slice(&n.to_i32().to_le_bytes())
+);
+impl_lane!(
+    lane::I16,
+    2,
+    |b| Num::I(i16::from_le_bytes([b[0], b[1]]) as i64),
+    |n, o| o.copy_from_slice(&n.to_i16().to_le_bytes())
+);
+impl_lane!(lane::I8, 1, |b| Num::I(b[0] as i8 as i64), |n, o| o[0] =
+    n.to_i8() as u8);
+impl_lane!(lane::U8, 1, |b| Num::I(b[0] as i64), |n, o| o[0] =
+    n.to_u8());
+impl_lane!(
+    lane::U16,
+    2,
+    |b| Num::I(u16::from_le_bytes([b[0], b[1]]) as i64),
+    |n, o| o.copy_from_slice(&n.to_u16().to_le_bytes())
+);
+impl_lane!(
+    lane::U32,
+    4,
+    |b| Num::I(u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64),
+    |n, o| o.copy_from_slice(&n.to_u32().to_le_bytes())
+);
+impl_lane!(lane::Bool, 1, |b| Num::I((b[0] != 0) as i64), |n, o| o[0] =
+    n.is_nonzero() as u8);
+
+/// Run `$body` with `$L` bound to the marker for `$dt`, or evaluate to `None`
+/// when the dtype has no fixed-width lane (`String`, sub-byte types, ...).
+macro_rules! with_lane {
+    ($dt:expr, $L:ident, $body:expr) => {
+        match $dt {
+            DataType::Float32 => {
+                type $L = lane::F32;
+                Some($body)
+            }
+            DataType::Float64 => {
+                type $L = lane::F64;
+                Some($body)
+            }
+            DataType::Float16 => {
+                type $L = lane::F16;
+                Some($body)
+            }
+            DataType::BFloat16 => {
+                type $L = lane::BF16;
+                Some($body)
+            }
+            DataType::Int64 => {
+                type $L = lane::I64;
+                Some($body)
+            }
+            DataType::Int32 => {
+                type $L = lane::I32;
+                Some($body)
+            }
+            DataType::Int16 => {
+                type $L = lane::I16;
+                Some($body)
+            }
+            DataType::Int8 => {
+                type $L = lane::I8;
+                Some($body)
+            }
+            DataType::Uint8 => {
+                type $L = lane::U8;
+                Some($body)
+            }
+            DataType::Uint16 => {
+                type $L = lane::U16;
+                Some($body)
+            }
+            DataType::Uint32 => {
+                type $L = lane::U32;
+                Some($body)
+            }
+            DataType::Bool => {
+                type $L = lane::Bool;
+                Some($body)
+            }
+            _ => None,
+        }
+    };
+}
+
+/// Decode `n` contiguous `S` elements into `stage`, hoisting the source dtype
+/// match out of the loop.
+fn decode_run<S: DecodeLane>(src: &[u8], stage: &mut [Num], n: usize) {
+    for (k, slot) in stage.iter_mut().enumerate().take(n) {
+        *slot = S::decode(&src[k * S::SIZE..(k + 1) * S::SIZE]);
+    }
+}
+
+/// Encode `n` staged `Num`s into contiguous `D` elements.
+fn encode_run<D: EncodeLane>(stage: &[Num], dst: &mut [u8], n: usize) {
+    for (k, &v) in stage.iter().enumerate().take(n) {
+        D::encode(v, &mut dst[k * D::SIZE..(k + 1) * D::SIZE]);
+    }
+}
+
+/// Contiguous, non-aliasing `Cast`. Returns `Ok(false)` when the layout or
+/// dtype pair is not eligible so the caller runs the generic strided path.
+///
+/// Staging through a fixed-size `Num` batch keeps this at 12 + 12 = 24
+/// monomorphised loops instead of the 144 a fully fused `S x D` loop would
+/// need, while still paying the `DataType` match once per batch rather than
+/// once per element. The staging buffer is 16 KiB and L1-resident.
+fn cast_contiguous(input: &TensorView, output: &mut TensorMut, to: DataType) -> Result<bool> {
+    if !input.is_contiguous() || !output.is_contiguous() {
+        return Ok(false);
+    }
+    let n = numel(input.shape);
+    if n != numel(output.shape) {
+        return Ok(false);
+    }
+    if n == 0 {
+        return Ok(true);
+    }
+    let (Ok(src_esize), Ok(dst_esize)) = (elem_size(input.dtype), elem_size(to)) else {
+        return Ok(false);
+    };
+
+    // The generic path materialises the whole result before touching the
+    // output, so it tolerates an aliasing in-place Cast; this one writes as it
+    // reads. No current caller aliases (`can_run_in_place` is false for Cast),
+    // but fall back rather than depend on that.
+    let src_start = input.data_ptr::<u8>() as usize;
+    let dst_start = output.data_ptr_mut::<u8>() as usize;
+    if src_start < dst_start.saturating_add(n * dst_esize)
+        && dst_start < src_start.saturating_add(n * src_esize)
+    {
+        return Ok(false);
+    }
+
+    // SAFETY: both views are validated and row-major contiguous, so they
+    // describe exactly `n * esize` readable/writable bytes from their origins
+    // (ep-api safety invariant #1). The overlap check above proves the two byte
+    // ranges are disjoint, so the shared borrow and the unique borrow cannot
+    // alias.
+    let src = unsafe { std::slice::from_raw_parts(input.data_ptr::<u8>(), n * src_esize) };
+    let dst = unsafe { std::slice::from_raw_parts_mut(output.data_ptr_mut::<u8>(), n * dst_esize) };
+
+    if cast_contiguous_simd(input.dtype, to, src, dst, n) {
+        return Ok(true);
+    }
+
+    let mut stage = [Num::I(0); CAST_STAGE_CHUNK];
+    let mut done = 0usize;
+    while done < n {
+        let len = CAST_STAGE_CHUNK.min(n - done);
+        let decoded = with_lane!(
+            input.dtype,
+            S,
+            decode_run::<S>(
+                &src[done * src_esize..(done + len) * src_esize],
+                &mut stage,
+                len
+            )
+        );
+        if decoded.is_none() {
+            return Ok(false);
+        }
+        let encoded = with_lane!(
+            to,
+            D,
+            encode_run::<D>(
+                &stage,
+                &mut dst[done * dst_esize..(done + len) * dst_esize],
+                len
+            )
+        );
+        if encoded.is_none() {
+            return Ok(false);
+        }
+        done += len;
+    }
+    Ok(true)
+}
+
+/// Vector conversions for the float-to-float pairs that dominate transformer
+/// graphs, where an inlined mixed-precision function turns into a `Cast` on
+/// either side of every arithmetic node.
+///
+/// Each is bit-identical to the [`decode`]/[`write_num`] pair it replaces:
+/// `_mm256_cvtph_ps` is exact for every f16, `_mm256_cvtps_ph` under
+/// `_MM_FROUND_TO_NEAREST_INT` matches `half::f16::from_f32`, and the bf16
+/// helpers match `half::bf16`'s round-to-nearest-even and sNaN quieting. The
+/// exhaustive tests below pin all four against the generic path.
+fn cast_contiguous_simd(
+    from: DataType,
+    to: DataType,
+    src: &[u8],
+    dst: &mut [u8],
+    n: usize,
+) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use crate::dtype::{bf16x, f16c};
+        // SAFETY (all four arms): `src`/`dst` were built above from validated
+        // contiguous views holding exactly `n` elements of the stated dtype, so
+        // reinterpreting their bytes as `n` `u16`/`f32` lanes is in bounds and
+        // correctly aligned for the unaligned loads these helpers use.
+        match (from, to) {
+            (DataType::Float16, DataType::Float32) if f16c::available() => {
+                let s = unsafe { std::slice::from_raw_parts(src.as_ptr().cast::<u16>(), n) };
+                let d =
+                    unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<f32>(), n) };
+                unsafe { f16c::widen(s, d) };
+                true
+            }
+            (DataType::Float32, DataType::Float16) if f16c::available() => {
+                let s = unsafe { std::slice::from_raw_parts(src.as_ptr().cast::<f32>(), n) };
+                let d =
+                    unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u16>(), n) };
+                unsafe { f16c::narrow(s, d) };
+                true
+            }
+            (DataType::BFloat16, DataType::Float32) if bf16x::available() => {
+                let s = unsafe { std::slice::from_raw_parts(src.as_ptr().cast::<u16>(), n) };
+                let d =
+                    unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<f32>(), n) };
+                unsafe { bf16x::widen_quieting(s, d) };
+                true
+            }
+            (DataType::Float32, DataType::BFloat16) if bf16x::available() => {
+                let s = unsafe { std::slice::from_raw_parts(src.as_ptr().cast::<f32>(), n) };
+                let d =
+                    unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u16>(), n) };
+                unsafe { bf16x::narrow(s, d) };
+                true
+            }
+            _ => false,
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (from, to, src, dst, n);
+        false
+    }
 }
 
 /// Read a (possibly strided) view into a dense row-major `Vec<Num>`.
@@ -411,5 +762,269 @@ mod tests {
         .execute(&[a.view()], &mut [out.view_mut()]);
         let msg = format!("{}", err.unwrap_err());
         assert!(msg.contains("string conversion"), "message was: {msg}");
+    }
+}
+
+/// Bit-exactness of the contiguous fast path against the generic strided path.
+///
+/// `cast_contiguous` (and its SIMD arms) must be a pure optimisation: for every
+/// input bit pattern it has to produce byte-for-byte what `read_src` +
+/// `write_num` produced before it existed. NaN payloads, signed zeros,
+/// subnormals and float->int saturation all round-trip through raw bytes here,
+/// so a payload or rounding-mode difference cannot hide behind `==` on floats.
+#[cfg(test)]
+mod contiguous_fast_path_tests {
+    use super::*;
+    use crate::kernels::testutil::Owned;
+
+    /// The per-element computation the generic path performs, extracted so the
+    /// fast path can be diffed against it directly.
+    fn reference_bytes(from: DataType, to: DataType, src: &[u8]) -> Vec<u8> {
+        let esize = elem_size(from).unwrap();
+        let mut out = Vec::with_capacity(src.len() / esize * elem_size(to).unwrap());
+        for chunk in src.chunks_exact(esize) {
+            let mut buf = [0u8; 8];
+            buf[..esize].copy_from_slice(chunk);
+            write_num(&mut out, decode(from, &buf).unwrap(), to).unwrap();
+        }
+        out
+    }
+
+    fn run_kernel(from: DataType, to: DataType, src: &[u8]) -> Vec<u8> {
+        let n = src.len() / elem_size(from).unwrap();
+        let mut input = Owned::zeros(from, &[n]);
+        input.bytes.copy_from_slice(src);
+        let mut output = Owned::zeros(to, &[n]);
+        CastKernel { to: Some(to) }
+            .execute(&[input.view()], &mut [output.view_mut()])
+            .unwrap();
+        output.bytes
+    }
+
+    const TARGETS: [DataType; 12] = [
+        DataType::Float32,
+        DataType::Float64,
+        DataType::Float16,
+        DataType::BFloat16,
+        DataType::Int64,
+        DataType::Int32,
+        DataType::Int16,
+        DataType::Int8,
+        DataType::Uint8,
+        DataType::Uint16,
+        DataType::Uint32,
+        DataType::Bool,
+    ];
+
+    fn all_16_bit_patterns() -> Vec<u8> {
+        let mut v = Vec::with_capacity(1 << 17);
+        for bits in 0..=u16::MAX {
+            v.extend_from_slice(&bits.to_le_bytes());
+        }
+        v
+    }
+
+    /// Every one of the 65536 f16 encodings -- both zeros, all subnormals, both
+    /// infinities and every quiet and **signalling** NaN payload -- converted to
+    /// all 12 fixed-width targets. This is what pins the F16C `widen` arm and
+    /// the float->int saturation rules.
+    #[test]
+    fn every_float16_pattern_matches_the_generic_path() {
+        let src = all_16_bit_patterns();
+        for to in TARGETS {
+            let got = run_kernel(DataType::Float16, to, &src);
+            let want = reference_bytes(DataType::Float16, to, &src);
+            assert_eq!(
+                got, want,
+                "float16 -> {to:?} diverged from the generic path"
+            );
+        }
+    }
+
+    /// Same exhaustive sweep for bfloat16, pinning the AVX2 `widen_quieting`
+    /// arm including its signalling-NaN quieting.
+    #[test]
+    fn every_bfloat16_pattern_matches_the_generic_path() {
+        let src = all_16_bit_patterns();
+        for to in TARGETS {
+            let got = run_kernel(DataType::BFloat16, to, &src);
+            let want = reference_bytes(DataType::BFloat16, to, &src);
+            assert_eq!(
+                got, want,
+                "bfloat16 -> {to:?} diverged from the generic path"
+            );
+        }
+    }
+
+    /// f32 sources over an adversarial value set, into every target. Covers the
+    /// `narrow` arms (round-to-nearest-even, overflow to infinity, subnormal
+    /// flush behaviour) and float->integer saturation at every width.
+    #[test]
+    fn adversarial_float32_values_match_the_generic_path() {
+        let mut vals: Vec<f32> = vec![
+            0.0,
+            -0.0,
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            f32::from_bits(1),
+            f32::from_bits(0x8000_0001),
+            1.0,
+            -1.0,
+            0.5,
+            -0.5,
+            1.5,
+            2.5,
+            -1.5,
+            -2.5,
+            65504.0,
+            -65504.0,
+            65520.0,
+            65536.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::MAX,
+            f32::MIN,
+            i8::MAX as f32,
+            i8::MIN as f32,
+            u8::MAX as f32,
+            i16::MAX as f32,
+            i16::MIN as f32,
+            u16::MAX as f32,
+            i32::MAX as f32,
+            i32::MIN as f32,
+            u32::MAX as f32,
+            i64::MAX as f32,
+            i64::MIN as f32,
+            1e30,
+            -1e30,
+            6.1e-5,
+            -6.1e-5,
+            5.96e-8,
+        ];
+        // Quiet and signalling NaNs of both signs, plus a few payloads.
+        for bits in [
+            0x7FC0_0000u32,
+            0xFFC0_0000,
+            0x7F80_0001,
+            0xFF80_0001,
+            0x7FFF_FFFF,
+        ] {
+            vals.push(f32::from_bits(bits));
+        }
+        // A dense ramp so ordinary values are covered too, and so the run spans
+        // several staging chunks and ends on a partial one.
+        for i in 0..5000 {
+            vals.push((i as f32 - 2500.0) * 0.37);
+        }
+        let mut src = Vec::with_capacity(vals.len() * 4);
+        for v in &vals {
+            src.extend_from_slice(&v.to_le_bytes());
+        }
+        for to in TARGETS {
+            let got = run_kernel(DataType::Float32, to, &src);
+            let want = reference_bytes(DataType::Float32, to, &src);
+            assert_eq!(
+                got, want,
+                "float32 -> {to:?} diverged from the generic path"
+            );
+        }
+    }
+
+    /// Integer and bool sources, including the values where float->int and
+    /// int->int differ (wrap vs saturate) and where i64 -> f32 double-rounds
+    /// through f64.
+    #[test]
+    fn integer_sources_match_the_generic_path() {
+        let ints: Vec<i64> = vec![
+            0,
+            1,
+            -1,
+            127,
+            128,
+            -128,
+            255,
+            256,
+            32767,
+            -32768,
+            65535,
+            i32::MAX as i64,
+            i32::MIN as i64,
+            u32::MAX as i64,
+            i64::MAX,
+            i64::MIN,
+            (1i64 << 53) + 1,
+            -((1i64 << 53) + 1),
+            (1i64 << 62) + 12345,
+        ];
+        for (from, esize) in [
+            (DataType::Int64, 8usize),
+            (DataType::Int32, 4),
+            (DataType::Int16, 2),
+            (DataType::Int8, 1),
+            (DataType::Uint8, 1),
+            (DataType::Uint16, 2),
+            (DataType::Uint32, 4),
+            (DataType::Bool, 1),
+        ] {
+            let mut src = Vec::new();
+            for v in &ints {
+                src.extend_from_slice(&v.to_le_bytes()[..esize]);
+            }
+            for to in TARGETS {
+                let got = run_kernel(from, to, &src);
+                let want = reference_bytes(from, to, &src);
+                assert_eq!(
+                    got, want,
+                    "{from:?} -> {to:?} diverged from the generic path"
+                );
+            }
+        }
+    }
+
+    /// Lengths around the staging-chunk boundary and the 8-wide vector width,
+    /// so a tail bug in either the staged loop or the SIMD arms cannot hide
+    /// behind a large aligned run.
+    #[test]
+    fn chunk_and_vector_boundary_lengths_match_the_generic_path() {
+        let mut lengths: Vec<usize> = (0..20).collect();
+        for base in [CAST_STAGE_CHUNK, 2 * CAST_STAGE_CHUNK] {
+            for delta in 0..=8 {
+                lengths.push(base + delta);
+                lengths.push(base - delta);
+            }
+        }
+        for n in lengths {
+            for (from, to) in [
+                (DataType::Float16, DataType::Float32),
+                (DataType::Float32, DataType::Float16),
+                (DataType::BFloat16, DataType::Float32),
+                (DataType::Float32, DataType::BFloat16),
+                (DataType::Float32, DataType::Uint8),
+                (DataType::Int64, DataType::Float32),
+            ] {
+                let esize = elem_size(from).unwrap();
+                let src: Vec<u8> = (0..n * esize).map(|i| (i * 37 + 11) as u8).collect();
+                let got = run_kernel(from, to, &src);
+                let want = reference_bytes(from, to, &src);
+                assert_eq!(got, want, "{from:?} -> {to:?} diverged at n={n}");
+            }
+        }
+    }
+
+    /// A non-row-major input must still go through the generic strided walk and
+    /// produce the transposed reading, so the fast path cannot be taken
+    /// unconditionally.
+    #[test]
+    fn strided_input_still_uses_the_generic_path() {
+        let input =
+            Owned::f32(&[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).with_view(&[3, 2], &[1, 3]);
+        assert!(!input.view().is_contiguous());
+        let mut output = Owned::zeros(DataType::Float32, &[3, 2]);
+        CastKernel {
+            to: Some(DataType::Float32),
+        }
+        .execute(&[input.view()], &mut [output.view_mut()])
+        .unwrap();
+        assert_eq!(output.to_f32(), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
     }
 }
