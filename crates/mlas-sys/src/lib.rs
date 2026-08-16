@@ -1664,6 +1664,52 @@ mod tests {
         );
     }
 
+    /// The threadpool sentinel must not change results. `MlasGemmBatch`
+    /// partitions across threads, so this also guards against a partitioning
+    /// bug producing torn, zeroed or doubly-written output tiles.
+    #[test]
+    fn sgemm_nn_is_correct_when_parallelized() {
+        let (m, n, k) = (129usize, 257usize, 193usize); // deliberately odd
+        let a = seq(m * k, 0.5);
+        let b = seq(k * n, 1.5);
+        let mut got = vec![0.0f32; m * n];
+        sgemm_nn(m, n, k, &a, &b, &mut got);
+
+        let mut want = vec![0.0f32; m * n];
+        ref_sgemm(false, false, m, n, k, 1.0, &a, k, &b, n, 0.0, &mut want, n);
+
+        // Per-element bound from the actual accumulation magnitude rather than
+        // a flat relative epsilon: a flat bound scaled by |want| goes to zero
+        // as an output approaches zero, so a zeroed tile covering
+        // small-magnitude outputs could slip through. `sum |a*b|` is the
+        // quantity f32 rounding actually accumulates over.
+        //
+        // The constant is the standard forward error bound for a length-`k`
+        // dot product, `gamma_k = k*u / (1 - k*u)` with `u = EPSILON/2`,
+        // rounded up to `k * EPSILON`. Deliberately not tighter: MLAS is free
+        // to reassociate the sum (blocked accumulation, FMA contraction,
+        // different vector widths per ISA), so a bound derived from one host's
+        // accumulation order would be flaky elsewhere. It is still ~5 orders
+        // of magnitude below the value itself, so a zeroed or torn tile is
+        // caught.
+        let tol_scale = k as f32 * f32::EPSILON;
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum_abs = 0.0f32;
+                for p in 0..k {
+                    sum_abs += (a[i * k + p] * b[p * n + j]).abs();
+                }
+                let tol = tol_scale * sum_abs.max(f32::MIN_POSITIVE);
+                let (g, w) = (got[i * n + j], want[i * n + j]);
+                assert!(
+                    (g - w).abs() <= tol,
+                    "mismatch at ({i},{j}): got {g}, want {w}, tol {tol} \
+                     (sum|a*b| = {sum_abs})"
+                );
+            }
+        }
+    }
+
     /// Single-thread performance probe for the medium f32 MatMul shape
     /// (32x512x512) recorded in docs/performance/KERNEL_PERF.md. Ignored by default; run
     /// with:

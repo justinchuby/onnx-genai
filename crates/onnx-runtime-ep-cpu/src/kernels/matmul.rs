@@ -34,6 +34,8 @@ use rayon::prelude::*;
 
 use super::check_arity;
 use super::half_gemm::{self, HalfFormat, MatrixLayout};
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use super::half_gemv;
 use super::weight_transpose::{self, WeightTransposeKey};
 use crate::backend::CpuBackend;
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
@@ -761,6 +763,45 @@ impl MatMulKernel {
                     geom.k,
                     geom.n,
                 );
+                return write_dense_f32_narrow("MatMul", &mut outputs[0], &result);
+            }
+        }
+
+        // x86 FP16 storage GEMV: the mirror of the Accelerate path above.
+        // `try_matmul_half` packs both operands into cache-sized panels, which
+        // pays for itself only when a panel of B is reused across several rows
+        // of A. At M=1 there is no reuse, so the packing is pure overhead on a
+        // memory-bound problem. Must precede `try_matmul_half` for the same
+        // reason the Accelerate block does.
+        //
+        // B is read in place, in its stored [K, N] order — deliberately *not*
+        // through `transposed_b_f16`. `try_matmul_half` allocates no weight
+        // copy, so a transpose cache here would add a permanent 2*K*N bytes
+        // (272 MB for a 896x151936 lm_head) that the path it replaces never
+        // paid. Reading in place also keeps this available for a
+        // non-constant B, which a prepacked transpose could not serve.
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if geom.m == 1
+            && numel(&geom.batch_shape) <= 1
+            && geom.b_promoted_rank == 2
+            && inputs[0].dtype == onnx_runtime_ir::DataType::Float16
+            && inputs[1].dtype == onnx_runtime_ir::DataType::Float16
+            && inputs[1].is_contiguous()
+            && inputs[1].numel() == geom.k.saturating_mul(geom.n)
+            && half_gemv::simd_available()
+        {
+            inputs[1].validate()?;
+            let a_dense = self.prepack.dense(0, &inputs[0])?;
+            if a_dense.len() == geom.k {
+                // SAFETY: `inputs[1]` was just validated as a contiguous
+                // Float16 view whose element count equals `k * n`. `f16` is
+                // transparent over `u16`, so reading its storage as raw bit
+                // patterns is sound, and the view outlives this call.
+                let b_bits = unsafe {
+                    std::slice::from_raw_parts(inputs[1].data_ptr::<u16>(), geom.k * geom.n)
+                };
+                let mut result = vec![0.0f32; geom.n];
+                half_gemv::gemv_f16_kn(&a_dense, b_bits, &mut result, geom.k, geom.n);
                 return write_dense_f32_narrow("MatMul", &mut outputs[0], &result);
             }
         }
@@ -2527,6 +2568,165 @@ mod tests {
             ptr_before,
             "dense[1] cache was reallocated on the second execute"
         );
+    }
+
+    /// The x86 f16 decode GEMV must produce the same values as the blocked
+    /// half GEMM it now preempts.
+    ///
+    /// `N = 5` is below the kernel's 8-lane SIMD step, so the whole stripe
+    /// runs through the scalar tail; `K = 137` is a long odd contraction.
+    /// Together they exercise the edges the blocked kernel never sees.
+    #[test]
+    fn f16_decode_gemv_agrees_with_the_blocked_half_gemm() {
+        let k = 137usize;
+        let n = 5usize;
+        // Multiples of 1/16 are exact in f16, so any mismatch is the kernel's
+        // rather than the operands' rounding.
+        let a_data: Vec<f32> = (0..k)
+            .map(|i| ((i * 7 % 23) as f32 - 11.0) / 16.0)
+            .collect();
+        let b_data: Vec<f32> = (0..k * n)
+            .map(|i| ((i * 13 % 31) as f32 - 15.0) / 16.0)
+            .collect();
+
+        let expected = naive_matmul(&a_data, &b_data, 1, k, n);
+
+        let a = Owned::f16(&[1, k], &a_data);
+        let b = Owned::f16(&[k, n], &b_data);
+        let mut out = Owned::zeros_f32(&[1, n]);
+        let mut kernel = MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, true]);
+        kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+
+        for (actual, want) in out.to_f32().iter().zip(expected.iter()) {
+            assert!(
+                (actual - want).abs() <= 1e-3,
+                "f16 decode GEMV disagreed: got {actual}, want {want}"
+            );
+        }
+    }
+
+    /// A non-constant f16 B must still be handled correctly. Unlike the
+    /// Accelerate GEMV, this kernel reads B in place rather than through a
+    /// weight cache, so an activation B is a *supported* input here, not a
+    /// fallthrough — and it must never be memoised as a weight.
+    #[test]
+    fn f16_decode_with_a_non_constant_weight_is_correct_and_uncached() {
+        let k = 40usize;
+        let n = 3usize;
+        let a_data: Vec<f32> = (0..k).map(|i| ((i % 9) as f32 - 4.0) / 8.0).collect();
+        let b_data: Vec<f32> = (0..k * n).map(|i| ((i % 7) as f32 - 3.0) / 8.0).collect();
+        let expected = naive_matmul(&a_data, &b_data, 1, k, n);
+
+        let a = Owned::f16(&[1, k], &a_data);
+        let b = Owned::f16(&[k, n], &b_data);
+        let mut out = Owned::zeros_f32(&[1, n]);
+        let mut kernel = MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, false]);
+        kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+
+        assert!(
+            kernel.prepack.transposed_b_f16.get().is_none(),
+            "an activation B must never be memoised as a weight transpose"
+        );
+        assert!(
+            kernel.prepack.dense[1].get().is_none(),
+            "an activation B must never be memoised as a dense weight"
+        );
+        for (actual, want) in out.to_f32().iter().zip(expected.iter()) {
+            assert!((actual - want).abs() <= 1e-3, "got {actual}, want {want}");
+        }
+    }
+
+    /// A non-contiguous B must be declined by the dispatch guard: the kernel
+    /// reads `B` as a flat `k * n` slice, so a strided view would be read with
+    /// the wrong layout. Pinned as a negative test because the guard is the
+    /// only thing standing between a strided weight and a silently wrong
+    /// answer.
+    #[test]
+    fn f16_decode_declines_a_non_contiguous_weight_and_stays_correct() {
+        let k = 6usize;
+        let n = 4usize;
+        // Build B as the transpose of a [n, k] buffer so the [k, n] view is
+        // genuinely strided rather than merely offset.
+        let mut bt_data = vec![0.0f32; n * k];
+        let mut b_data = vec![0.0f32; k * n];
+        for p in 0..k {
+            for j in 0..n {
+                let v = ((p * n + j) % 9) as f32 / 8.0 - 0.5;
+                b_data[p * n + j] = v;
+                bt_data[j * k + p] = v;
+            }
+        }
+        let a_data: Vec<f32> = (0..k).map(|i| (i % 5) as f32 / 4.0 - 0.5).collect();
+        let expected = naive_matmul(&a_data, &b_data, 1, k, n);
+
+        let a = Owned::f16(&[1, k], &a_data);
+        let bt = Owned::f16(&[n, k], &bt_data);
+        let mut b_view = bt.view();
+        let shape = [k, n];
+        let strided = [1i64, k as i64];
+        b_view.shape = &shape;
+        b_view.strides = &strided;
+        assert!(
+            !b_view.is_contiguous(),
+            "test must present a genuinely strided B"
+        );
+
+        let mut out = Owned::zeros_f32(&[1, n]);
+        let mut kernel = MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, true]);
+        kernel
+            .execute(&[a.view(), b_view], &mut [out.view_mut()])
+            .unwrap();
+
+        for (actual, want) in out.to_f32().iter().zip(expected.iter()) {
+            assert!(
+                (actual - want).abs() <= 1e-3,
+                "strided B gave {actual}, want {want}"
+            );
+        }
+    }
+
+    /// The GEMV must not allocate a weight copy: it reads B straight from the
+    /// stored `[K, N]` layout. Pinned because a transposed variant would cost
+    /// a permanent `2 * K * N` bytes that `try_matmul_half` never paid.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn f16_decode_gemv_does_not_cache_a_copy_of_the_weight() {
+        let k = 64usize;
+        let n = 8usize;
+        let a_data: Vec<f32> = (0..k).map(|i| ((i % 5) as f32 - 2.0) / 4.0).collect();
+        let b_data: Vec<f32> = (0..k * n).map(|i| ((i % 11) as f32 - 5.0) / 8.0).collect();
+
+        let a = Owned::f16(&[1, k], &a_data);
+        let b = Owned::f16(&[k, n], &b_data);
+        let mut out = Owned::zeros_f32(&[1, n]);
+        let mut kernel = MatMulKernel::default();
+        // B *is* a constant here: even so, no weight copy may be materialised.
+        kernel.set_constant_inputs(&[false, true]);
+        kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+
+        let expected = naive_matmul(&a_data, &b_data, 1, k, n);
+        for (actual, want) in out.to_f32().iter().zip(expected.iter()) {
+            assert!((actual - want).abs() <= 1e-3, "got {actual}, want {want}");
+        }
+        if half_gemv::simd_available() {
+            assert!(
+                kernel.prepack.transposed_b_f16.get().is_none(),
+                "the GEMV must read B in place, not through a transpose cache"
+            );
+            assert!(
+                kernel.prepack.dense[1].get().is_none(),
+                "the GEMV must not widen B to f32"
+            );
+        }
     }
 
     // --- Direct f32 output path (Option A) --------------------------------
