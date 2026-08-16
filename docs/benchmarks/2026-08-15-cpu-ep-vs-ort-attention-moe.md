@@ -818,8 +818,8 @@ column. An earlier single-arm session on the same graphs independently gave
 as results, because cross-session absolutes on this host drift >4x.)
 
 The shape of the loss was the clue: masked cells lost **1.07–22.8x** while
-unmasked cells spanned **0.91–12.6x**, and every one of the nine worst cells was
-masked. The mask was costing more than the attention.
+unmasked cells spanned **0.91–12.6x**, and the **seven worst cells were all
+masked**. The mask was costing more than the attention.
 
 ### Cause
 
