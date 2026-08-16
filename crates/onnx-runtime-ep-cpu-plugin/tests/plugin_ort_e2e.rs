@@ -3536,6 +3536,108 @@ fn float16_fastgelu_is_claimed_as_a_single_node() {
     eprintln!("\n✅ float16_fastgelu_is_claimed_as_a_single_node: PASSED");
 }
 
+/// float16 `com.microsoft::QuickGelu` must be claimed as one node — the
+/// knowingly-sub-1.0 assignment in this family, and therefore the one most in
+/// need of a falsifier.
+///
+/// Claimed, we run this at 1.06x (512 elements) falling to 0.81x (1M). That is
+/// below ORT-alone, and normally the policy would decline. It does not here
+/// because the deferred alternative is not 1.0x: ORT inlines the function into
+/// `Cast`/`Sigmoid`/`Cast`/`Mul`, this EP claims *two* fragments of the body,
+/// and the session measures **0.093-0.220x**. Claiming is the better of two
+/// losing options, exactly as for float16 exact `Gelu`.
+///
+/// That reasoning is only valid while ORT keeps inlining it. If a future ORT
+/// registers a float16 `QuickGelu` kernel — or stops inlining and cast-wraps it
+/// the way it already does for `BiasGelu` — the deferred column becomes ~1.0x
+/// and this claim turns into exactly the dishonest assignment the policy
+/// exists to prevent. This test does not detect that on its own, so it asserts
+/// the invariant it *can* check cheaply: the node reaches us whole, with none
+/// of the inlining artefacts present. The accompanying comment in
+/// `assignment_policy::contrib_activation` records the measurement to re-run.
+#[test]
+fn float16_quickgelu_is_claimed_as_a_single_node() {
+    let _lock = lock_ort_ep();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let model_path = PathBuf::from(manifest_dir)
+        .join("tests/fixtures/quickgelu_assignment_f16/model.onnx.textproto");
+
+    let Some((_lib, api, env, opts, session)) =
+        (unsafe { conformance_setup("cpu_ep_quickgelu_f16", &model_path, false) })
+    else {
+        eprintln!(
+            "*** SKIPPED: float16_quickgelu_is_claimed_as_a_single_node — \
+             ORT or EP cdylib not found ***"
+        );
+        return;
+    };
+
+    unsafe {
+        let info = query_ep_assignment(api, session);
+        let ours = info.ops_on_our_ep();
+        eprintln!(
+            "  [quickgelu_f16] ours={ours:?}, others={:?}",
+            info.ops_not_on_our_ep()
+        );
+        assert!(
+            ours.contains(&"QuickGelu"),
+            "float16 com.microsoft::QuickGelu must be claimed whole — deferring makes ORT \
+             inline it and we end up owning two fragments at ~0.10x; got: {:?}",
+            info.assignments
+        );
+        for artefact in ["Cast", "Sigmoid", "Mul"] {
+            assert!(
+                !ours.contains(&artefact) && !info.ops_not_on_our_ep().contains(&artefact),
+                "float16 QuickGelu was inlined into its function body ('{artefact}' appeared) \
+                 — the whole-node claim did not hold; got: {:?}",
+                info.assignments
+            );
+        }
+
+        let xs: [f32; 8] = [-4.0, -1.5, -0.5, 0.0, 0.5, 1.5, 3.0, 6.0];
+        let mut x_data: [u16; 8] = std::array::from_fn(|i| f32_to_f16_bits(xs[i]));
+        let shape: [i64; 2] = [1, 8];
+        let x_val = make_float16_tensor(api, &mut x_data, &shape);
+
+        let input_names = [c"X".as_ptr()];
+        let output_names = [c"Z".as_ptr()];
+        let inputs: [*const ort::OrtValue; 1] = [x_val];
+        let mut output: *mut ort::OrtValue = ptr::null_mut();
+
+        let status = ((*api).Run.unwrap())(
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs.as_ptr(),
+            1,
+            output_names.as_ptr(),
+            1,
+            &mut output,
+        );
+        check_status(api, status, "Run(float16 QuickGelu)");
+        assert!(!output.is_null());
+
+        let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
+        let status = ((*api).GetTensorMutableData.unwrap())(output, &mut data_ptr);
+        check_status(api, status, "GetTensorMutableData(float16 QuickGelu)");
+        let result = std::slice::from_raw_parts(data_ptr as *const u16, 8);
+
+        for (i, &x) in xs.iter().enumerate() {
+            let want = x / (1.0 + (-1.702_f32 * x).exp());
+            let got = f16_bits_to_f32(result[i]);
+            assert!(
+                (got - want).abs() <= 2e-2 * want.abs().max(1.0),
+                "QuickGelu(f16) output[{i}] for x={x}: got {got}, want {want}"
+            );
+        }
+
+        ((*api).ReleaseValue.unwrap())(output);
+        ((*api).ReleaseValue.unwrap())(x_val);
+        conformance_teardown(api, env, opts, session, "cpu_ep_quickgelu_f16");
+    }
+    eprintln!("\n✅ float16_quickgelu_is_claimed_as_a_single_node: PASSED");
+}
+
 /// float32 `com.microsoft::FastGelu` must be **declined**, and ORT must keep it
 /// as one node on its own CPU EP.
 ///
@@ -3633,12 +3735,16 @@ fn float32_fastgelu_is_deferred_to_ort_as_a_single_node() {
 /// float16 `com.microsoft::BiasGelu` must be **declined** even though its
 /// siblings `FastGelu`/`QuickGelu` are claimed in the same dtype.
 ///
-/// `BiasGelu` is the one contrib activation for which ORT registers a real
-/// float16 CPU kernel, so declining leaves a whole node rather than an inlined
-/// body — and that kernel beats ours (measured 1.03/0.96/0.98x deferred versus
-/// 0.79/0.70/0.68x claimed, at 3072/65536/1048576 elements). A blanket
-/// "float16 contrib activations are ours" rule would be dishonest here; this
-/// test is what stops that simplification.
+/// The differentiator is *not* kernel availability — ORT's CPU registry lists
+/// `tensor(float)` only for all three. It is whether ORT **inlines** the contrib
+/// function when the node goes unclaimed. `BiasGelu` it does not: the node
+/// survives whole and is cast-wrapped onto ORT's float32 kernel
+/// (`Cast`/`Cast`/`BiasGelu`/`Cast`, all on `CPUExecutionProvider`), which beats
+/// us (measured 1.03/0.96/0.98x deferred versus 0.79/0.70/0.68x claimed, at
+/// 3072/65536/1048576 elements). `FastGelu` and `QuickGelu` *are* inlined, which
+/// is why they go the other way. A blanket "float16 contrib activations are
+/// ours" rule would be dishonest here; this test is what stops that
+/// simplification.
 #[test]
 fn float16_biasgelu_is_deferred_to_ort() {
     let _lock = lock_ort_ep();
@@ -3664,7 +3770,8 @@ fn float16_biasgelu_is_deferred_to_ort() {
         assert!(
             !ours.contains(&"BiasGelu"),
             "float16 com.microsoft::BiasGelu must be deferred — unlike FastGelu/QuickGelu, \
-             ORT has a real float16 kernel for it and that kernel is faster; got: {:?}",
+             ORT keeps it whole instead of inlining it, and that whole node is faster than \
+             ours; got: {:?}",
             info.assignments
         );
         assert!(

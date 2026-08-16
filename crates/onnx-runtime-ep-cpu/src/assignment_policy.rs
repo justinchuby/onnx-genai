@@ -112,12 +112,22 @@ pub fn governs(op: &Node) -> bool {
 /// claim on them was dropped *after* `supports_op` said yes and after this
 /// module said `Claim`. The EP simply never ran them under ORT.
 ///
-/// The consequence was not neutral. ORT has no float16 CPU kernel for
-/// `FastGelu`, so an unclaimed node is inlined into
-/// `Identity`/`Cast`/`Mul`/`Add`/`Tanh`, and this EP then claimed a fragment of
-/// the inlined body — measured at **0.115-0.464x** of ORT for the unbiased form
-/// and **0.131-0.239x** for the biased one. Making the node claimable turns
-/// those into 1.18-1.53x and 0.97-1.39x.
+/// The consequence was not neutral. **None** of these three has a float16 CPU
+/// kernel in ORT — the registry lists `tensor(float)` only for all of them — so
+/// what happens to an unclaimed float16 node is decided by something else
+/// entirely: whether ORT *inlines* the contrib function body. Verified from
+/// ORT's own node-level profile with this plugin loaded:
+///
+/// * `FastGelu` -> inlined into `Identity`/`Cast`/`Mul`/`Add`/`Tanh`; this EP
+///   claims a fragment of that body at **0.115-0.464x** of plain ORT.
+/// * `QuickGelu` -> inlined into `Cast`/`Sigmoid`/`Cast`/`Mul`; this EP claims
+///   *two* fragments, at **0.093-0.220x**.
+/// * `BiasGelu` -> **not** inlined. It stays one node that ORT cast-wraps onto
+///   its float32 kernel (`Cast`/`Cast`/`BiasGelu`/`Cast`, all on
+///   `CPUExecutionProvider`) and runs at 0.96-1.03x of us.
+///
+/// So the rule is not "claim what ORT cannot run". It is **claim what ORT would
+/// otherwise shred into fragments we end up owning anyway**.
 ///
 /// Measured session ratios (ORT ns / ours, >1 = we win), one thread, AVX2,
 /// interleaved A/B, reps>=9, 3072 / 65536 / 1048576 elements:
@@ -130,11 +140,10 @@ pub fn governs(op: &Node) -> bool {
 /// | `BiasGelu`           | 0.72 / 0.74 / 0.74 | 0.79 / 0.70 / 0.68 | **1.03 / 0.96 / 0.98** |
 ///
 /// \* `QuickGelu` float16 is 1.057 at 512 elements and falls below 1.0 above
-/// ~3072. It is claimed anyway because the alternative column is 0.09-0.22x:
-/// ORT has no float16 `QuickGelu` kernel either, so declining inlines it.
-/// `BiasGelu` is the one op in this family ORT *does* have a float16 kernel
-/// for, and it beats ours — so that is the one this module declines in float16
-/// as well as float32.
+/// ~3072. It is claimed anyway because the honest comparison is against the
+/// *deferred* column — 0.09-0.22x — not against 1.0. `BiasGelu` is the one op
+/// here whose deferred column is a real handover, so it is the one this module
+/// declines in float16 as well as float32.
 fn contrib_activation(op: &Node) -> bool {
     op.domain == "com.microsoft"
         && matches!(op.op_type.as_str(), "FastGelu" | "QuickGelu" | "BiasGelu")
@@ -236,13 +245,14 @@ pub fn claim_preference(
                  on x86-64 AVX2 (0.57-0.75x for FastGelu, 0.72-0.74x for BiasGelu, 0.75-1.02x \
                  for QuickGelu), and declining leaves the node intact on ORT's CPU EP",
             ),
-            // The one float16 op in this family ORT has a real kernel for.
+            // The one float16 op in this family ORT does not inline.
             DataType::Float16 if op.op_type == "BiasGelu" => ClaimPreference::defer(
-                "ORT has a float16 BiasGelu CPU kernel and it is measured faster (we run \
-                 0.68-0.79x); declining leaves the node intact rather than inlining it",
+                "ORT does not inline float16 BiasGelu — it stays one node cast-wrapped onto \
+                 ORT's float32 kernel and runs 1.27-1.47x faster than this EP does, so \
+                 declining is a real handover rather than a fragmentation",
             ),
-            // No host kernel exists, so declining inlines the function body and
-            // this EP picks up slower ungoverned constituents at 0.09-0.24x.
+            // ORT inlines these two instead, and this EP then owns slower
+            // ungoverned constituents of the function body at 0.09-0.24x.
             DataType::Float16 | DataType::BFloat16 => ClaimPreference::Claim,
             other => ClaimPreference::defer(format!(
                 "this EP has no measured evidence that it beats ORT's CPU kernel for {} in \
@@ -1038,10 +1048,10 @@ mod tests {
             }
         }
 
-        // float16: ORT has no `FastGelu`/`QuickGelu` kernel, so declining
-        // inlines the function body and this EP picks up the slower pieces at
-        // 0.09-0.24x. `BiasGelu` is the exception — ORT does have a float16
-        // kernel and it wins.
+        // float16: no op here has a float16 ORT kernel, but ORT *inlines*
+        // `FastGelu`/`QuickGelu` when they go unclaimed, and this EP then picks
+        // up the slower pieces at 0.09-0.24x. `BiasGelu` is the exception — ORT
+        // keeps it whole (cast-wrapped onto its float32 kernel) and wins.
         for op in ["FastGelu", "QuickGelu"] {
             let mut n = node(op, &[]);
             n.domain = "com.microsoft".to_string();
@@ -1058,7 +1068,7 @@ mod tests {
         assert!(
             !claim_preference(&bias_gelu, 1, &[shape(&[1, 65536])], &[DataType::Float16])
                 .is_claim(),
-            "float16 BiasGelu must defer — ORT's kernel is 1.3-1.5x ours"
+            "float16 BiasGelu must defer — ORT keeps it whole and runs it 1.27-1.47x faster"
         );
     }
 
