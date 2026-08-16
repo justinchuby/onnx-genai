@@ -7910,12 +7910,46 @@ mod tests {
             functions.len()
         );
 
+        // Match on code only: a body that merely *mentions* `.execute(` in a
+        // comment moves no counter, and forcing it to lock would make this
+        // check obstruct unrelated work.
+        let code_of = |body: &str| -> String {
+            body.lines()
+                .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let bodies: Vec<(String, bool, String)> = functions
+            .iter()
+            .map(|(name, is_test, body)| (name.clone(), *is_test, code_of(body)))
+            .collect();
+
         let perturbs = |body: &str| PERTURBS.iter().any(|pattern| body.contains(pattern));
-        let perturbing_helpers: Vec<&str> = functions
+        // Helpers reach counters through helpers too, so close the set rather
+        // than looking one level deep -- a two-level chain would otherwise slip
+        // through exactly the check that is supposed to prevent it.
+        let mut perturbing_helpers: Vec<&str> = bodies
             .iter()
             .filter(|(_, is_test, body)| !is_test && perturbs(body))
             .map(|(name, _, _)| name.as_str())
             .collect();
+        loop {
+            let grown: Vec<&str> = bodies
+                .iter()
+                .filter(|(name, is_test, body)| {
+                    !is_test
+                        && !perturbing_helpers.contains(&name.as_str())
+                        && perturbing_helpers
+                            .iter()
+                            .any(|helper| body.contains(&format!("{helper}(")))
+                })
+                .map(|(name, _, _)| name.as_str())
+                .collect();
+            if grown.is_empty() {
+                break;
+            }
+            perturbing_helpers.extend(grown);
+        }
         assert!(
             !perturbing_helpers.is_empty(),
             "no perturbing helpers found, so the helper arm of this check is vacuous"
@@ -7923,7 +7957,7 @@ mod tests {
 
         let mut unlocked: Vec<&str> = Vec::new();
         let mut checked = 0usize;
-        for (name, is_test, body) in &functions {
+        for (name, is_test, body) in &bodies {
             if !is_test {
                 continue;
             }
