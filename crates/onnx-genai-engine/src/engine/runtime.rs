@@ -1369,6 +1369,8 @@ impl Engine {
             || "native".to_string(),
             |session| session.execution_provider_status().summary(),
         )
+    }
+
     /// Latest native activation-memory planner measurement, if the current
     /// backend is native and has executed far enough to resolve concrete shapes.
     pub fn activation_memory_plan_stats(&self) -> Option<crate::ActivationMemoryPlanSummary> {
