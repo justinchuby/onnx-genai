@@ -188,6 +188,7 @@ impl UnaryMathKernel {
         // `match` was the entire cost (`Neg` measured 0.049x of ORT).
         simd_activations::write_mapped(name, &mut outputs[0], &x, |x, y| match op {
             MathOp::Sigmoid => simd_activations::sigmoid_f32_slice(x, y),
+            MathOp::Exp => simd_activations::exp_f32_slice(x, y),
             MathOp::Neg => simd_activations::neg_f32_slice(x, y),
             MathOp::Abs => simd_activations::abs_f32_slice(x, y),
             MathOp::Reciprocal => simd_activations::reciprocal_f32_slice(x, y),

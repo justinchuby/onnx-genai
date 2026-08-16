@@ -4222,3 +4222,117 @@ fn dynamic_shapes_are_not_assigned() {
         "the declined dynamic node must still be runnable by ORT (others={theirs:?})",
     );
 }
+
+/// `Exp` is the one op in this family whose kernel was actually rewritten —
+/// 0.14x to 0.92x of ORT at 1 M float32 elements — and it *still* must not be
+/// assigned, because 0.92x is a loss. A vectorization that improves a kernel
+/// without overtaking ORT does not earn the node back.
+#[test]
+fn float32_exp_is_not_assigned_even_after_being_vectorised() {
+    let Some((ours, theirs)) = unary_assignment("exp_assignment_f32_large", "cpu_ep_exp_f32")
+    else {
+        return;
+    };
+    assert!(
+        !ours.iter().any(|op| op == "Exp"),
+        "float32 Exp measures 0.92x at 1 M and must be left to ORT, got ours={ours:?}"
+    );
+    assert!(
+        theirs.iter().any(|op| op == "Exp"),
+        "ORT must be the one running Exp, got others={theirs:?}"
+    );
+}
+
+/// float16 `Exp` is the worst cell in the family (0.22x at 1 M). Declining it
+/// cast-wraps the node; this pins that ORT — not this EP — ends up with every
+/// resulting node, which is what makes the deferral a handover rather than a
+/// fragmentation.
+#[test]
+fn float16_exp_is_not_assigned_and_its_casts_are_not_reclaimed() {
+    let Some((ours, theirs)) = unary_assignment("exp_assignment_f16_large", "cpu_ep_exp_f16")
+    else {
+        return;
+    };
+    assert!(
+        ours.is_empty(),
+        "declining float16 Exp must hand ORT the whole subgraph including its Casts, \
+         got ours={ours:?}"
+    );
+    assert!(
+        theirs.iter().any(|op| op == "Exp"),
+        "ORT must be running Exp, got others={theirs:?}"
+    );
+}
+
+/// bfloat16 has no ORT CPU kernel for these ops, so the claim is a capability
+/// claim and must survive. This is the counterweight that stops the deferral
+/// from being widened into "never claim Exp".
+#[test]
+fn bfloat16_exp_is_still_assigned_because_ort_has_no_kernel() {
+    let Some((ours, _theirs)) = unary_assignment("exp_assignment_bf16_large", "cpu_ep_exp_bf16")
+    else {
+        return;
+    };
+    assert!(
+        ours.iter().any(|op| op == "Exp"),
+        "bfloat16 Exp has no ORT CPU kernel and must stay claimed, got ours={ours:?}"
+    );
+}
+
+/// `Log` is still a scalar loop at 0.59-0.75x of ORT in both float dtypes, so
+/// it must not be assigned.
+#[test]
+fn float32_log_is_not_assigned() {
+    let Some((ours, theirs)) = unary_assignment("log_assignment_f32_large", "cpu_ep_log_f32")
+    else {
+        return;
+    };
+    assert!(
+        !ours.iter().any(|o| o == "Log"),
+        "Log measures below ORT at every size and must be left to ORT, got ours={ours:?}"
+    );
+    assert!(
+        theirs.iter().any(|o| o == "Log"),
+        "ORT must be running Log, got others={theirs:?}"
+    );
+}
+
+/// `Relu` measures exactly like the deferred ops (0.76-1.03x, never a win) and
+/// is nevertheless still claimed, because deferring it splits
+/// `MatMul+Bias+Relu -> FusedGemm` across the EP boundary. This is the
+/// counterweight to `initializer_chain_still_fuses_into_one_claim`: that test
+/// proves the fusion survives, this one pins *why* the obvious deferral was not
+/// applied, so a future "Relu loses, defer it" change has to argue with a
+/// fused-graph measurement first.
+#[test]
+fn float32_relu_stays_claimed_because_it_anchors_a_fusion() {
+    let Some((ours, _theirs)) = unary_assignment("relu_assignment_f32_large", "cpu_ep_relu_f32")
+    else {
+        return;
+    };
+    assert!(
+        ours.iter().any(|o| o == "Relu"),
+        "Relu anchors MatMul+Bias+Relu fusion and must stay claimed, got ours={ours:?}"
+    );
+}
+
+/// 4096 is the single cell where `Softplus` measured a win (1.13x), with losses
+/// on both sides of it. This pins the decision to treat that as noise: if a
+/// later change turns the isolated cell into a dispatch range, this fails and
+/// forces a fresh sweep rather than letting one lucky point in.
+#[test]
+fn float32_softplus_is_not_assigned_at_its_one_winning_cell() {
+    let Some((ours, theirs)) =
+        unary_assignment("softplus_assignment_f32_mid", "cpu_ep_softplus_f32")
+    else {
+        return;
+    };
+    assert!(
+        !ours.iter().any(|op| op == "Softplus"),
+        "a single non-monotonic 4096 cell is not a dispatch range, got ours={ours:?}"
+    );
+    assert!(
+        theirs.iter().any(|op| op == "Softplus"),
+        "ORT must be running Softplus, got others={theirs:?}"
+    );
+}
