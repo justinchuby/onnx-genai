@@ -8472,7 +8472,16 @@ mod tests {
             return;
         }
         let block_size = 128usize;
-        assert!(selected_dot_kernel().supports_int4_direct(block_size, false));
+        // Dispatch selects the KAI SDOT route only where production enables it:
+        // `arm64_kai_sdot_direct_enabled` is off on macOS/iOS. Assert the
+        // documented policy rather than unconditional support. The kernel
+        // numerics below are exercised by *direct* calls, not by dispatch, so
+        // they still run everywhere `dotprod` is present.
+        assert_eq!(
+            selected_dot_kernel().supports_int4_direct(block_size, false),
+            DotKernel::arm64_kai_sdot_direct_enabled(),
+            "int4-direct dispatch support must follow the documented per-OS KAI policy"
+        );
         for &(k, n) in &[
             (1000usize, 257usize), // K and N tails.
             (1024, 1024),          // attention/output projection.
@@ -8528,31 +8537,29 @@ mod tests {
             let used_mlas = kernel.mlas_shards.get().is_some();
             #[cfg(not(feature = "mlas"))]
             let used_mlas = false;
+            // Whether a fast int4 route exists at all is per-OS policy:
+            // production disables KAI SDOT on macOS/iOS
+            // (`arm64_kai_sdot_direct_enabled`). Only demand one where the
+            // policy provides one; the kernel numerics above are direct calls
+            // and ran regardless.
+            let kai_dispatch_enabled = DotKernel::arm64_kai_sdot_direct_enabled();
             assert!(
-                used_kai || used_mlas,
+                used_kai || used_mlas || !kai_dispatch_enabled,
                 "aarch64 bits=4/block128 decode reached neither MLAS QNBit nor KAI SDOT for K={k} N={n}",
             );
             assert!(
-                used_kai || {
-                    #[cfg(feature = "mlas")]
-                    {
-                        used_mlas
-                    }
-                    #[cfg(not(feature = "mlas"))]
-                    {
-                        false
-                    }
-                },
-                "block-128 direct int4 path must cache packed KAI or MLAS QNBit weight",
-            );
-            assert!(
-                kernel.int8_weight.get().is_none(),
+                kernel.int8_weight.get().is_none() || !kai_dispatch_enabled,
                 "block-128 direct int4 path must bypass the int8 prepack fallback"
             );
             if used_kai {
                 assert_close(&y.to_f32(), &dot);
-            } else {
+            } else if used_mlas {
                 mlas_close(&y.to_f32(), &dot, 2e-1, "aarch64 MLAS qsi4 decode");
+            } else {
+                // No fast route by policy (macOS/iOS). Whatever generic
+                // accuracy_level = 4 path runs must still track the f32 oracle
+                // to CompInt8 tolerance.
+                assert_qai8dxp_close(&y.to_f32(), &expected);
             }
         }
     }
@@ -8741,7 +8748,21 @@ mod tests {
             return;
         }
         let (k, n, block_size) = (1024usize, 1024usize, 128usize);
-        assert!(selected_dot_kernel().supports_int4_direct(block_size, true));
+        // "Reachable" is a per-OS policy statement, not a universal one:
+        // production disables the KAI SDOT route on macOS/iOS
+        // (`arm64_kai_sdot_direct_enabled`), so on Apple silicon without MLAS
+        // there is no fast int4 route for this shape to reach. The KAI kernel's
+        // numerics stay covered there by
+        // `matmulnbits_arm64_kai_qsi4_block128_qwen_shapes_match_reference`,
+        // which calls it directly instead of through dispatch.
+        assert_eq!(
+            selected_dot_kernel().supports_int4_direct(block_size, true),
+            DotKernel::arm64_kai_sdot_direct_enabled(),
+            "int4-direct dispatch support must follow the documented per-OS KAI policy"
+        );
+        if !DotKernel::arm64_kai_sdot_direct_enabled() && !cfg!(feature = "mlas") {
+            return;
+        }
         let blocks = k.div_ceil(block_size);
         let activations: Vec<f32> = (0..k)
             .map(|i| ((i * 17 % 127) as f32 - 63.0) / 50.0)
@@ -9677,20 +9698,27 @@ mod tests {
         };
 
         // accuracy_level = 4 (CompInt8): the int8 route is licensed, so it must
-        // be reached and is held to the qai8dxp tolerance.
+        // be reached wherever production enables it. `arm64_kai_sdot_direct_enabled`
+        // is off on macOS/iOS, so reachability is asserted against that policy
+        // rather than unconditionally.
+        let kai_enabled = DotKernel::arm64_kai_sdot_direct_enabled();
         let (acc4, acc4_reached_kai) = run(4);
-        assert!(
-            acc4_reached_kai,
-            "real Qwen bits=8/block128/asymmetric shape did not reach KAI SDOT at accuracy_level=4"
+        assert_eq!(
+            acc4_reached_kai, kai_enabled,
+            "accuracy_level=4 KAI SDOT reachability must follow the documented per-OS policy \
+             (enabled={kai_enabled})"
         );
-        // Downcast to the concrete kernel type is not available through the EP
-        // trait object; the counter above is the dispatch proof.
-        assert_qai8dxp_close(&acc4, &expected);
+        if kai_enabled {
+            // Downcast to the concrete kernel type is not available through the
+            // EP trait object; the counter above is the dispatch proof.
+            assert_qai8dxp_close(&acc4, &expected);
+        }
 
         // accuracy_level = 0 (CompFp32): the int8 route must be declined, and
-        // the fp32 fallback must hold the tight oracle tolerance. Before the
-        // gate this shape ran CompInt8 here, because
-        // `arm64_kai_sdot_direct_enabled` defaults *on* for non-Apple aarch64.
+        // the fp32 fallback must hold the tight oracle tolerance. This half is
+        // the precision regression guard and runs on *every* aarch64 host,
+        // including Apple silicon. Before the gate this shape ran CompInt8 on
+        // non-Apple aarch64, where `arm64_kai_sdot_direct_enabled` defaults on.
         let (acc0, acc0_reached_kai) = run(0);
         assert!(
             !acc0_reached_kai,
@@ -9707,12 +9735,15 @@ mod tests {
             acc0_rel <= 1e-5,
             "accuracy_level=0 must reconstruct the fp32 oracle: relative RMSE {acc0_rel} exceeds 1e-5"
         );
-        // Self-calibrating: whatever this host's absolute error happens to be,
-        // the CompFp32 route must be strictly more accurate than CompInt8.
-        assert!(
-            acc0_rel < acc4_rel,
-            "accuracy_level=0 (relative RMSE {acc0_rel}) must be more accurate than accuracy_level=4 (relative RMSE {acc4_rel})"
-        );
+        if kai_enabled {
+            // Self-calibrating: whatever this host's absolute error happens to
+            // be, the CompFp32 route must be strictly more accurate than the
+            // CompInt8 one. Only meaningful where acc4 actually took CompInt8.
+            assert!(
+                acc0_rel < acc4_rel,
+                "accuracy_level=0 (relative RMSE {acc0_rel}) must be more accurate than accuracy_level=4 (relative RMSE {acc4_rel})"
+            );
+        }
     }
 
     /// Run the real end-to-end `MatMulNBits` kernel (`execute`) for an 8-bit,
