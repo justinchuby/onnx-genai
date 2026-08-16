@@ -43,6 +43,17 @@
 //!
 //! The margin rule is **>= 5% repeatable win at every measured thread count**;
 //! anything inside the noise band, and anything unmeasured, defers to ORT.
+//!
+//! # When deferral is unsound
+//!
+//! [`ClaimPreference::DeferToHost`] is a bet that the host has a kernel to run
+//! the node with. Under `session.disable_cpu_ep_fallback=1` it does not: a
+//! node no EP claims is unassignable and ORT fails session creation. The
+//! plugin therefore reads that session option at `CreateEp` and switches this
+//! gate off entirely for such sessions (`onnx-runtime-ep-plugin`'s
+//! `ExportedEp::host_fallback_available`), so the worst case is a slower
+//! kernel rather than a session that will not load. Anything added here may
+//! assume a host fallback exists.
 
 use onnx_runtime_ep_api::ClaimPreference;
 use onnx_runtime_ir::{DataType, Node, Shape};
@@ -53,7 +64,10 @@ use onnx_runtime_ir::{DataType, Node, Shape};
 /// An op absent from this list keeps the historical "support implies claim"
 /// behaviour — this module only ever *removes* claims it has evidence against,
 /// it never adds one.
-fn is_governed(op: &Node) -> bool {
+///
+/// Exposed so callers can skip materializing shape/dtype metadata for the
+/// nodes this module will wave through unconditionally.
+pub fn governs(op: &Node) -> bool {
     matches!(
         (op.domain.as_str(), op.op_type.as_str()),
         ("" | "ai.onnx", "Tanh" | "Sigmoid" | "Gelu" | "Sqrt" | "Erf")
@@ -79,10 +93,18 @@ fn is_governed(op: &Node) -> bool {
 /// after that, so that is the cap.
 const F16_GELU_TANH_MAX_ELEMENTS: usize = 262_144;
 
-/// Total element count of the first input, or `None` when any dimension is
-/// dynamic.
+/// Total element count of the first input, or `None` when the size is not
+/// knowable at capability time.
+///
+/// An empty [`Shape`] is *not* treated as a rank-0 scalar here: `Shape` is a
+/// `Vec<Dim>`, and a value whose rank is unknown (no `TensorShapeProto` at all)
+/// arrives as the same empty vector. The two cases are indistinguishable, and
+/// only one of them is safe to size-gate on, so both defer.
 fn static_elements(shapes: &[Shape]) -> Option<usize> {
     let shape = shapes.first()?;
+    if shape.is_empty() {
+        return None;
+    }
     let mut n = 1usize;
     for dim in shape.iter() {
         n = n.checked_mul(dim.as_static()?)?;
@@ -106,7 +128,7 @@ pub fn claim_preference(
     shapes: &[Shape],
     input_dtypes: &[DataType],
 ) -> ClaimPreference {
-    if !is_governed(op) {
+    if !governs(op) {
         return ClaimPreference::Claim;
     }
     let dtype = match input_dtypes.first() {
@@ -306,5 +328,51 @@ mod tests {
     fn a_missing_input_dtype_does_not_silently_decline() {
         let pref = claim_preference(&node("Tanh", &[]), 22, &[], &[]);
         assert!(pref.is_claim());
+    }
+
+    #[test]
+    fn an_empty_shape_is_treated_as_unknown_rank_not_as_a_scalar() {
+        // `Shape` is a `Vec<Dim>`: a rank-0 scalar and a value with no declared
+        // shape at all are the same empty vector. Sizing a claim on `n = 1`
+        // would let an unknown-rank tensor of any size through the f16 cap.
+        let g = node("Gelu", &[("approximate", "tanh")]);
+        let pref = claim_preference(&g, 22, &[Shape::new()], &[DataType::Float16]);
+        assert!(
+            !pref.is_claim(),
+            "an empty shape is not a size guarantee, got {pref:?}"
+        );
+        assert!(pref.reason().unwrap().contains("not static"));
+    }
+
+    #[test]
+    fn governs_matches_exactly_the_ops_the_policy_can_decline() {
+        for op in ["Tanh", "Sigmoid", "Gelu", "Sqrt", "Erf"] {
+            assert!(governs(&node(op, &[])), "{op} must be governed");
+        }
+        for op in ["MatMul", "Add", "Relu", "Softmax", "LayerNormalization"] {
+            assert!(!governs(&node(op, &[])), "{op} must not be governed");
+        }
+        let mut contrib = node("Gelu", &[]);
+        contrib.domain = "com.microsoft".to_string();
+        assert!(!governs(&contrib));
+
+        // The cheap pre-filter callers use to skip metadata materialization
+        // must never wave through a node `claim_preference` would decline.
+        for op in ["Tanh", "Sigmoid", "Gelu", "Sqrt", "Erf", "Add", "MatMul"] {
+            for dt in [
+                DataType::Float32,
+                DataType::Float16,
+                DataType::BFloat16,
+                DataType::Float64,
+            ] {
+                let n = node(op, &[]);
+                if !claim_preference(&n, 22, &[shape(&[1, 3072])], &[dt]).is_claim() {
+                    assert!(
+                        governs(&n),
+                        "{op}/{dt:?} is declined but `governs` says it can be skipped"
+                    );
+                }
+            }
+        }
     }
 }

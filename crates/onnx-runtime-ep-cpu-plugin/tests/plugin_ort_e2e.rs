@@ -3153,9 +3153,9 @@ fn assignment_policy_defers_float32_activations_to_ort() {
         let status = ((*api).GetTensorMutableData.unwrap())(output, &mut data_ptr);
         check_status(api, status, "GetTensorMutableData(assign_f32)");
         let got = std::slice::from_raw_parts(data_ptr as *const f32, 4);
-        for (i, (&g, &x)) in got.iter().zip(x_data.iter()).enumerate() {
+        for (i, ((&g, &x), &y)) in got.iter().zip(x_data.iter()).zip(y_data.iter()).enumerate() {
             let want = {
-                let s = x + x;
+                let s = x + y;
                 let t = s.tanh();
                 let q = t.sqrt();
                 1.0f32 / (1.0 + (-q).exp())
@@ -3177,8 +3177,14 @@ fn assignment_policy_defers_float32_activations_to_ort() {
 /// CPU EP has no bfloat16 `Tanh` kernel at all, so a deferral turns a working
 /// session into a `NOT_IMPLEMENTED` session-creation failure. The claim is a
 /// capability, not a performance bet, and must survive any future tightening of
-/// the performance thresholds. Session creation succeeding here *is* half the
-/// assertion.
+/// the performance thresholds.
+///
+/// This is a regression guard rather than a falsifier against `main`:
+/// `supports_op` is dtype-agnostic for these ops, so bf16 was already claimed
+/// before this policy existed and the test passes there too. What it pins is
+/// that no future threshold may take bf16 away. The assignment and numeric
+/// assertions carry the test — session creation alone would succeed even if ORT
+/// did have a bf16 kernel, since a claimed node never reaches ORT's.
 #[test]
 fn assignment_policy_always_claims_bfloat16_activations() {
     let _lock = lock_ort_ep();
@@ -3309,4 +3315,54 @@ fn assignment_policy_gates_float16_gelu_on_element_count() {
         }
     }
     eprintln!("\n✅ assignment_policy_gates_float16_gelu_on_element_count: PASSED");
+}
+
+/// Deferring assumes there is a host kernel to defer *to*. With
+/// `session.disable_cpu_ep_fallback=1` there is not — ORT refuses to place an
+/// unclaimed node on its own CPU EP, so a node this EP declines becomes
+/// unassignable and `CreateSession` fails. The plugin reads that session option
+/// at `CreateEp` and switches the routing-preference gate off for such
+/// sessions.
+///
+/// This is a falsifier for that safety valve: the same float32 graph whose
+/// activations are deferred in
+/// `assignment_policy_defers_float32_activations_to_ort` must, under this flag,
+/// both load *and* come back fully claimed. Without the valve `conformance_setup`
+/// panics inside `CreateSession`; with the gate wrongly disabled everywhere, the
+/// sibling test fails instead. Only the intended behaviour satisfies both.
+#[test]
+fn assignment_policy_yields_when_cpu_fallback_is_disabled() {
+    let _lock = lock_ort_ep();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let model_path = PathBuf::from(manifest_dir)
+        .join("tests/fixtures/activation_assignment_f32/model.onnx.textproto");
+
+    let Some((_lib, api, env, opts, session)) =
+        (unsafe { conformance_setup("cpu_ep_assign_nofb", &model_path, true) })
+    else {
+        eprintln!(
+            "*** SKIPPED: assignment_policy_yields_when_cpu_fallback_is_disabled — \
+             ORT or EP cdylib not found ***"
+        );
+        return;
+    };
+
+    unsafe {
+        let info = query_ep_assignment(api, session);
+        let ours = info.ops_on_our_ep();
+        eprintln!(
+            "  [assign_nofb] ours={ours:?}, others={:?}",
+            info.ops_not_on_our_ep()
+        );
+        for op in ["Add", "Tanh", "Sqrt", "Sigmoid"] {
+            assert!(
+                ours.contains(&op),
+                "with cpu-ep fallback disabled there is nothing to defer to, so '{op}' \
+                 must be claimed despite the performance policy; got: {:?}",
+                info.assignments
+            );
+        }
+        conformance_teardown(api, env, opts, session, "cpu_ep_assign_nofb");
+    }
+    eprintln!("\n✅ assignment_policy_yields_when_cpu_fallback_is_disabled: PASSED");
 }

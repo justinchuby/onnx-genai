@@ -158,6 +158,45 @@ impl ExecutionProvider for CpuExecutionProvider {
         crate::assignment_policy::claim_preference(op, opset, shapes, input_dtypes)
     }
 
+    /// Short-circuit the default adapter for the nodes the policy has no
+    /// opinion about.
+    ///
+    /// The default [`ExecutionProvider::claim_preference_node`] deep-clones
+    /// every input [`Shape`] before it can ask, and it runs for every node in
+    /// the graph. This policy governs five elementwise ops; a transformer graph
+    /// is overwhelmingly not those, so the cheap `(domain, op_type)` test comes
+    /// first and the allocation only happens when the answer can differ from
+    /// [`ClaimPreference::Claim`].
+    fn claim_preference_node(
+        &self,
+        view: &onnx_runtime_ir::GraphView<'_>,
+        node: onnx_runtime_ir::NodeIndex,
+        opset: u64,
+    ) -> ClaimPreference {
+        let ir_node = view.node(node);
+        if !crate::assignment_policy::governs(ir_node) {
+            return ClaimPreference::Claim;
+        }
+        let inputs = view.node_inputs(node);
+        let shapes = inputs
+            .iter()
+            .map(|input| {
+                input
+                    .map(|value| view.value(value).shape.clone())
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        let input_dtypes = inputs
+            .iter()
+            .map(|input| {
+                input
+                    .map(|value| view.value(value).dtype)
+                    .unwrap_or(DataType::Undefined)
+            })
+            .collect::<Vec<_>>();
+        crate::assignment_policy::claim_preference(ir_node, opset, &shapes, &input_dtypes)
+    }
+
     fn supports_op(
         &self,
         op: &Node,

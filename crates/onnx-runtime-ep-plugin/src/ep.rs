@@ -114,6 +114,14 @@ pub struct ExportedEp {
     /// that `GetCapability` can dtype-filter claims against the same source of
     /// truth. Empty when no registry entries were provided.
     pub registry_entries: Vec<KernelRegistryEntry>,
+    /// Whether ORT is allowed to run nodes this EP declines on its own CPU EP.
+    ///
+    /// `false` when the session sets `session.disable_cpu_ep_fallback=1`, in
+    /// which case the claim-time routing-preference gate is switched off: with
+    /// no host fallback, declining a node this EP *can* run turns a working
+    /// session into a session-creation failure, which is strictly worse than
+    /// running the node a little slower than ORT would have.
+    pub host_fallback_available: bool,
 }
 
 /// Owns an `OrtKernelRegistry*` allocated via ORT's EP API.
@@ -234,7 +242,18 @@ impl ExportedEp {
             name_cstr,
             kernel_registry: registry,
             registry_entries: entries,
+            host_fallback_available: true,
         }
+    }
+
+    /// Record whether the host runtime may run nodes this EP declines.
+    ///
+    /// Called from `CreateEp` with the session's
+    /// `session.disable_cpu_ep_fallback` setting. See
+    /// [`ExportedEp::host_fallback_available`].
+    pub fn with_host_fallback(mut self, available: bool) -> Self {
+        self.host_fallback_available = available;
+        self
     }
 }
 
@@ -332,10 +351,19 @@ fn ep_get_capability_inner(
     // `query_capabilities_filtered` predicate means the node is excluded before
     // convex partitioning, so ORT partitions around it instead of us handing
     // back a partition we would then run slower than ORT would.
+    //
+    // The gate is sound only while the host has a kernel to fall back to. Under
+    // `session.disable_cpu_ep_fallback=1` it does not, and a declined node is an
+    // unassignable node, so the gate is disabled for such sessions and the EP
+    // claims everything it can run.
+    let apply_claim_preference = exported.host_fallback_available;
     let claims = exported.ep.with(|ep| {
         ort_view.query_capabilities_filtered(ep, |node| {
             if is_gpu_ep && !node_inputs_all_routable(&view, node) {
                 return false;
+            }
+            if !apply_claim_preference {
+                return true;
             }
             let opset = view.graph().effective_opset(view.node(node)).unwrap_or(0);
             ep.claim_preference_node(&view, node, opset).is_claim()
