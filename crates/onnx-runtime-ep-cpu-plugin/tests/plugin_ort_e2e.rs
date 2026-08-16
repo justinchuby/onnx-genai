@@ -3424,22 +3424,33 @@ fn f32_to_f16_bits(x: f32) -> u16 {
     sign | out
 }
 
-/// Regression falsifier for a hard session-creation failure.
+/// float16 `com.microsoft::FastGelu` must reach this EP as **one** node.
 ///
-/// ORT has no float16 kernel for `com.microsoft::FastGelu`, so it inlines the
-/// contrib op into its function body (`Identity`/`Mul`/`Add`/`Tanh`/…). The
-/// routing preference then defers the float16 `Tanh` inside that body, which
-/// splits the remainder into a partition where `_inlfunc_FastGelu_X_bias` is
-/// both an output of our fused subgraph and an input to three later `Mul`s.
-/// `build_subgraph_routing` cannot route that shape, and failing at Compile is
-/// *not* a graceful decline — ORT surfaces it as
-/// `FAIL : Compile: multi-node subgraph has unroutable graph`, turning a model
-/// that used to load into one that does not.
+/// History, because the two failure modes are easy to confuse:
 ///
-/// The claim-time routing filter in `ep.rs` catches such partitions while
-/// declining is still free. This test fails without it.
+/// 1. ORT has no float16 kernel for `com.microsoft::FastGelu`, so if the node
+///    is not claimed ORT inlines the contrib function body
+///    (`Identity`/`Mul`/`Add`/`Tanh`/…). The routing preference then defers the
+///    float16 `Tanh` inside that body, splitting the remainder into a partition
+///    where `_inlfunc_FastGelu_X_bias` is both an output of our fused subgraph
+///    and an input to three later `Mul`s. `build_subgraph_routing` cannot route
+///    that shape, and failing at Compile is *not* a graceful decline — ORT
+///    surfaces it as `FAIL : Compile: multi-node subgraph has unroutable
+///    graph`, turning a model that used to load into one that does not. The
+///    claim-time routing filter in `ep.rs` catches such partitions while
+///    declining is still free (unit-tested there by
+///    `claim_with_internally_reused_subgraph_output_is_unroutable`).
+/// 2. Surviving that is not the same as being *fast*. Claiming the inlined
+///    fragments measured 0.10-0.24x of plain ORT. The node only reaches this EP
+///    whole once `ShapeInference::for_node` knows the contrib activations are
+///    shape-preserving — without that arm the fail-closed shape filter in
+///    `ep_get_capability_inner` silently drops the claim no matter what
+///    `supports_op` and `claim_preference` say.
+///
+/// So this test asserts the strong property that subsumes both: the session
+/// builds, `FastGelu` is on our EP, and none of the inlining artefacts exist.
 #[test]
-fn unroutable_partition_is_declined_not_fatal() {
+fn float16_fastgelu_is_claimed_as_a_single_node() {
     let _lock = lock_ort_ep();
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let model_path = PathBuf::from(manifest_dir)
@@ -3449,13 +3460,37 @@ fn unroutable_partition_is_declined_not_fatal() {
         (unsafe { conformance_setup("cpu_ep_fastgelu_f16", &model_path, false) })
     else {
         eprintln!(
-            "*** SKIPPED: unroutable_partition_is_declined_not_fatal — \
+            "*** SKIPPED: float16_fastgelu_is_claimed_as_a_single_node — \
              ORT or EP cdylib not found ***"
         );
         return;
     };
 
     unsafe {
+        let info = query_ep_assignment(api, session);
+        let ours = info.ops_on_our_ep();
+        eprintln!(
+            "  [fastgelu_f16] ours={ours:?}, others={:?}",
+            info.ops_not_on_our_ep()
+        );
+        assert!(
+            ours.contains(&"FastGelu"),
+            "float16 com.microsoft::FastGelu must be claimed whole — ORT has no float16 \
+             kernel for it, so anything else means the node was inlined and we claimed \
+             the pieces at ~0.12x; got: {:?}",
+            info.assignments
+        );
+        // The inlining signature. None of these op types exist in the fixture,
+        // so their absence is what proves the whole-node claim held.
+        for artefact in ["Identity", "Cast", "Mul", "Add", "Tanh"] {
+            assert!(
+                !ours.contains(&artefact) && !info.ops_not_on_our_ep().contains(&artefact),
+                "float16 FastGelu was inlined into its function body ('{artefact}' appeared) \
+                 — the whole-node claim did not hold; got: {:?}",
+                info.assignments
+            );
+        }
+
         let xs: [f32; 8] = [-4.0, -1.5, -0.5, 0.0, 0.5, 1.5, 3.0, 6.0];
         let mut x_data: [u16; 8] = std::array::from_fn(|i| f32_to_f16_bits(xs[i]));
         let shape: [i64; 2] = [1, 8];
@@ -3498,7 +3533,212 @@ fn unroutable_partition_is_declined_not_fatal() {
         ((*api).ReleaseValue.unwrap())(x_val);
         conformance_teardown(api, env, opts, session, "cpu_ep_fastgelu_f16");
     }
-    eprintln!("\n✅ unroutable_partition_is_declined_not_fatal: PASSED");
+    eprintln!("\n✅ float16_fastgelu_is_claimed_as_a_single_node: PASSED");
+}
+
+/// float32 `com.microsoft::FastGelu` must be **declined**, and ORT must keep it
+/// as one node on its own CPU EP.
+///
+/// This is the other half of the contrib-activation policy and the one that is
+/// easy to get wrong: unlike float16, ORT *does* have a float32 `FastGelu`
+/// kernel, and it is faster than ours across every measured length
+/// (0.63-0.75x at 3072/65536/1048576 elements, 1 thread, AVX2). Claiming it
+/// would be advertising a slower path as an EP assignment.
+///
+/// The falsifier has two parts, because either alone is satisfiable by a bug:
+/// `FastGelu` must not be on our EP (the policy defers), *and* `FastGelu` must
+/// still exist as an op in the graph (ORT took it whole rather than inlining
+/// it, so deferring genuinely handed work to a real kernel).
+#[test]
+fn float32_fastgelu_is_deferred_to_ort_as_a_single_node() {
+    let _lock = lock_ort_ep();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let model_path = PathBuf::from(manifest_dir)
+        .join("tests/fixtures/fastgelu_assignment_f32/model.onnx.textproto");
+
+    let Some((_lib, api, env, opts, session)) =
+        (unsafe { conformance_setup("cpu_ep_fastgelu_f32", &model_path, false) })
+    else {
+        eprintln!(
+            "*** SKIPPED: float32_fastgelu_is_deferred_to_ort_as_a_single_node — \
+             ORT or EP cdylib not found ***"
+        );
+        return;
+    };
+
+    unsafe {
+        let info = query_ep_assignment(api, session);
+        let ours = info.ops_on_our_ep();
+        let theirs = info.ops_not_on_our_ep();
+        eprintln!("  [fastgelu_f32] ours={ours:?}, others={theirs:?}");
+        assert!(
+            !ours.contains(&"FastGelu"),
+            "float32 com.microsoft::FastGelu must be deferred — ORT's own kernel is \
+             faster at every measured length; got: {:?}",
+            info.assignments
+        );
+        assert!(
+            theirs.contains(&"FastGelu"),
+            "float32 FastGelu was deferred but did not survive as a node — ORT inlined \
+             it instead, so the decline handed us fragments rather than handing ORT a \
+             kernel; got: {:?}",
+            info.assignments
+        );
+
+        let xs: [f32; 8] = [-4.0, -1.5, -0.5, 0.0, 0.5, 1.5, 3.0, 6.0];
+        let mut x_data = xs;
+        let shape: [i64; 2] = [1, 8];
+        let x_val = make_float_tensor(api, &mut x_data, &shape);
+
+        let input_names = [c"X".as_ptr()];
+        let output_names = [c"Z".as_ptr()];
+        let inputs: [*const ort::OrtValue; 1] = [x_val];
+        let mut output: *mut ort::OrtValue = ptr::null_mut();
+
+        let status = ((*api).Run.unwrap())(
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs.as_ptr(),
+            1,
+            output_names.as_ptr(),
+            1,
+            &mut output,
+        );
+        check_status(api, status, "Run(float32 FastGelu)");
+        assert!(!output.is_null());
+
+        let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
+        let status = ((*api).GetTensorMutableData.unwrap())(output, &mut data_ptr);
+        check_status(api, status, "GetTensorMutableData(float32 FastGelu)");
+        let result = std::slice::from_raw_parts(data_ptr as *const f32, 8);
+
+        for (i, &x) in xs.iter().enumerate() {
+            let inner = 0.797_884_6_f32 * (x + 0.044_715 * x * x * x);
+            let want = 0.5 * x * (1.0 + inner.tanh());
+            assert!(
+                (result[i] - want).abs() <= 1e-4 * want.abs().max(1.0),
+                "FastGelu(f32) output[{i}] for x={x}: got {}, want {want}",
+                result[i]
+            );
+        }
+
+        ((*api).ReleaseValue.unwrap())(output);
+        ((*api).ReleaseValue.unwrap())(x_val);
+        conformance_teardown(api, env, opts, session, "cpu_ep_fastgelu_f32");
+    }
+    eprintln!("\n✅ float32_fastgelu_is_deferred_to_ort_as_a_single_node: PASSED");
+}
+
+/// float16 `com.microsoft::BiasGelu` must be **declined** even though its
+/// siblings `FastGelu`/`QuickGelu` are claimed in the same dtype.
+///
+/// `BiasGelu` is the one contrib activation for which ORT registers a real
+/// float16 CPU kernel, so declining leaves a whole node rather than an inlined
+/// body — and that kernel beats ours (measured 1.03/0.96/0.98x deferred versus
+/// 0.79/0.70/0.68x claimed, at 3072/65536/1048576 elements). A blanket
+/// "float16 contrib activations are ours" rule would be dishonest here; this
+/// test is what stops that simplification.
+#[test]
+fn float16_biasgelu_is_deferred_to_ort() {
+    let _lock = lock_ort_ep();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let model_path = PathBuf::from(manifest_dir)
+        .join("tests/fixtures/biasgelu_assignment_f16/model.onnx.textproto");
+
+    let Some((_lib, api, env, opts, session)) =
+        (unsafe { conformance_setup("cpu_ep_biasgelu_f16", &model_path, false) })
+    else {
+        eprintln!(
+            "*** SKIPPED: float16_biasgelu_is_deferred_to_ort — \
+             ORT or EP cdylib not found ***"
+        );
+        return;
+    };
+
+    unsafe {
+        let info = query_ep_assignment(api, session);
+        let ours = info.ops_on_our_ep();
+        let theirs = info.ops_not_on_our_ep();
+        eprintln!("  [biasgelu_f16] ours={ours:?}, others={theirs:?}");
+        assert!(
+            !ours.contains(&"BiasGelu"),
+            "float16 com.microsoft::BiasGelu must be deferred — unlike FastGelu/QuickGelu, \
+             ORT has a real float16 kernel for it and that kernel is faster; got: {:?}",
+            info.assignments
+        );
+        assert!(
+            theirs.contains(&"BiasGelu"),
+            "float16 BiasGelu was deferred but did not survive as a node — ORT inlined it, \
+             which would make the decline a loss rather than a win; got: {:?}",
+            info.assignments
+        );
+
+        let xs: [f32; 8] = [-4.0, -1.5, -0.5, 0.0, 0.5, 1.5, 3.0, 6.0];
+        let bs: [f32; 8] = [0.5, -0.25, 0.0, 1.0, -1.0, 0.125, 0.75, -0.5];
+        let mut x_data: [u16; 8] = std::array::from_fn(|i| f32_to_f16_bits(xs[i]));
+        let mut b_data: [u16; 8] = std::array::from_fn(|i| f32_to_f16_bits(bs[i]));
+        let x_shape: [i64; 2] = [1, 8];
+        let b_shape: [i64; 1] = [8];
+        let x_val = make_float16_tensor(api, &mut x_data, &x_shape);
+        let b_val = make_float16_tensor(api, &mut b_data, &b_shape);
+
+        let input_names = [c"X".as_ptr(), c"B".as_ptr()];
+        let output_names = [c"Z".as_ptr()];
+        let inputs: [*const ort::OrtValue; 2] = [x_val, b_val];
+        let mut output: *mut ort::OrtValue = ptr::null_mut();
+
+        let status = ((*api).Run.unwrap())(
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs.as_ptr(),
+            2,
+            output_names.as_ptr(),
+            1,
+            &mut output,
+        );
+        check_status(api, status, "Run(float16 BiasGelu)");
+        assert!(!output.is_null());
+
+        let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
+        let status = ((*api).GetTensorMutableData.unwrap())(output, &mut data_ptr);
+        check_status(api, status, "GetTensorMutableData(float16 BiasGelu)");
+        let result = std::slice::from_raw_parts(data_ptr as *const u16, 8);
+
+        for i in 0..8 {
+            // BiasGelu is the *exact* erf formulation, not the tanh approximation.
+            let v = f16_bits_to_f32(x_data[i]) + f16_bits_to_f32(b_data[i]);
+            let want = 0.5 * v * (1.0 + erf_reference(v / std::f32::consts::SQRT_2));
+            let got = f16_bits_to_f32(result[i]);
+            assert!(
+                (got - want).abs() <= 2e-2 * want.abs().max(1.0),
+                "BiasGelu(f16) output[{i}] for x={}, b={}: got {got}, want {want}",
+                xs[i],
+                bs[i]
+            );
+        }
+
+        ((*api).ReleaseValue.unwrap())(output);
+        ((*api).ReleaseValue.unwrap())(b_val);
+        ((*api).ReleaseValue.unwrap())(x_val);
+        conformance_teardown(api, env, opts, session, "cpu_ep_biasgelu_f16");
+    }
+    eprintln!("\n✅ float16_biasgelu_is_deferred_to_ort: PASSED");
+}
+
+/// Abramowitz & Stegun 7.1.26 — accurate to ~1.5e-7, far tighter than the
+/// float16 tolerance the `BiasGelu` check uses it under.
+fn erf_reference(x: f32) -> f32 {
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let x = x.abs();
+    let t = 1.0 / (1.0 + 0.327_591_1 * x);
+    let y = 1.0
+        - (((((1.061_405_4 * t - 1.453_152_) * t) + 1.421_413_7) * t - 0.284_496_74) * t
+            + 0.254_829_6)
+            * t
+            * (-x * x).exp();
+    sign * y
 }
 
 /// Exact (`approximate="none"`) float16 `Gelu` is claimed for the same reason
