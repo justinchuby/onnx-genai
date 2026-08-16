@@ -24,9 +24,9 @@
 //! Every stage reuses a shared single-source-of-truth helper: the batched
 //! [`matmul_dense`](super::matmul::matmul_dense) GEMM for both `Q·Kᵀ` and
 //! `probs·V`, [`broadcast_apply`](super::add::broadcast_apply) for the additive
-//! mask, and [`softmax_slices`](super::softmax::softmax_slices) for the
-//! last-axis softmax — the same numerically-stable (max-subtract) reduction the
-//! standalone `Softmax` kernel uses.
+//! mask, and [`softmax_rows_in_place`](super::softmax::softmax_rows_in_place)
+//! for the last-axis softmax — the same numerically-stable (max-subtract)
+//! reduction the standalone `Softmax` kernel uses.
 
 use onnx_runtime_ep_api::{
     DeviceId, EpError, Kernel, KernelFactory, Result, TensorMut, TensorView,
@@ -36,7 +36,7 @@ use onnx_runtime_ir::{DataType, Node, broadcast_shapes, compute_contiguous_strid
 use super::add::broadcast_apply;
 use super::check_arity;
 use super::matmul::matmul_dense;
-use super::softmax::softmax_slices;
+use super::softmax::softmax_rows_in_place;
 use crate::dtype::{to_dense_f32_widen, write_dense_f32_narrow};
 use crate::strided::numel;
 
@@ -145,8 +145,12 @@ impl Kernel for FusedAttentionKernel {
         let seq_k = *scores_shape.last().unwrap();
         let n = numel(&scores_shape);
         let outer = n.checked_div(seq_k).unwrap_or(0);
-        let mut probs = vec![0.0f32; n];
-        softmax_slices(&scores, &mut probs, outer, seq_k, 1);
+        // `scores` is dead after this point, so the softmax runs in place - a
+        // score matrix is `batch·heads·seq_q·seq_k` floats, easily the largest
+        // buffer in the kernel, and allocating a second one only to copy into
+        // it was pure overhead.
+        let mut probs = scores;
+        softmax_rows_in_place(&mut probs, outer, seq_k);
 
         // Stage 4: out = probs · V. Wrap the dense `probs` buffer (contiguous
         // over `scores_shape`) as a view so the shared GEMM handles the batched
@@ -390,7 +394,7 @@ mod tests {
     fn sdpa_softmax_stage_matches_row_softmax() {
         // Cross-check that the fused softmax stage produces a proper row-softmax:
         // with an identity V and no mask, the output equals softmax(scores),
-        // proving the extracted `softmax_slices` helper is applied over the last
+        // proving the extracted softmax helper is applied over the last
         // axis. scores = Q·Kᵀ with Q = identity, so scores == Kᵀ.
         let q = [1.0f32, 0.0, 0.0, 1.0]; // [2,2] identity
         let kt = [1.0f32, 3.0, 2.0, 4.0]; // K^T [2,2]
