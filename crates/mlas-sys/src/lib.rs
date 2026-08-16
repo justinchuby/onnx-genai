@@ -58,6 +58,33 @@ unsafe extern "C" {
         multithread: c_int,
     );
 
+    fn mlas_qgemm_pack_b_size(n: usize, k: usize, a_is_signed: c_int, b_is_signed: c_int) -> usize;
+    fn mlas_qgemm_pack_b(
+        n: usize,
+        k: usize,
+        b: *const c_void,
+        ldb: usize,
+        a_is_signed: c_int,
+        b_is_signed: c_int,
+        packed_b: *mut c_void,
+    );
+    fn mlas_qgemm_i32_packed(
+        m: usize,
+        n: usize,
+        k: usize,
+        a_is_signed: c_int,
+        b_is_signed: c_int,
+        a: *const c_void,
+        lda: usize,
+        zero_point_a: u8,
+        packed_b: *const c_void,
+        zero_point_b: *const u8,
+        per_column_zero_points: c_int,
+        c: *mut i32,
+        ldc: usize,
+        multithread: c_int,
+    );
+
     fn mlas_sgemm_pack_b_size(trans_a: c_int, trans_b: c_int, n: usize, k: usize) -> usize;
     fn mlas_sgemm_pack_b(
         trans_a: c_int,
@@ -1177,6 +1204,148 @@ pub fn qgemm_i32(
             zero_point_a,
             b.as_ptr().cast::<c_void>(),
             n,
+            zero_point_b_ptr,
+            per_column,
+            c.as_mut_ptr(),
+            n,
+            c_int::from(mlas_threading_degree() > 1),
+        );
+    }
+}
+
+/// A constant quantized `B` pre-packed into MLAS's kernel layout.
+///
+/// [`qgemm_i32`] leaves `BIsPacked` unset, so MLAS re-packs the whole `k x n`
+/// weight on every call. ORT pre-packs a constant weight once at session
+/// initialisation instead; this is the same thing.
+///
+/// The packed layout is chosen by the kernel MLAS dispatches to, so a pack is
+/// only valid for the same `(n, k, a_signed, b_signed)` **on the same machine**.
+/// It must never be serialised, cached to disk, or shared across processes.
+pub struct QgemmPackedB {
+    ptr: *mut u8,
+    layout: std::alloc::Layout,
+    n: usize,
+    k: usize,
+    a_signed: bool,
+    b_signed: bool,
+}
+
+// SAFETY: the buffer is written once during `new` and only ever read afterwards
+// (MLAS takes it as `const void*`), so sharing it across threads is sound. This
+// mirrors `PackedB` above.
+unsafe impl Send for QgemmPackedB {}
+unsafe impl Sync for QgemmPackedB {}
+
+impl QgemmPackedB {
+    /// Pack a row-major `k x n` quantized B (`ldb == n`).
+    ///
+    /// Returns `None` when MLAS reports no packed layout for this shape and
+    /// signedness combination, which is its documented way of saying "call the
+    /// unpacked path"; callers must then keep using [`qgemm_i32`].
+    pub fn new(n: usize, k: usize, b: &[u8], a_signed: bool, b_signed: bool) -> Option<Self> {
+        assert_eq!(b.len(), k * n, "B must be k*n bytes");
+        if n == 0 || k == 0 {
+            return None;
+        }
+        // SAFETY: a pure size query with no pointer arguments.
+        let size =
+            unsafe { mlas_qgemm_pack_b_size(n, k, c_int::from(a_signed), c_int::from(b_signed)) };
+        if size == 0 {
+            return None;
+        }
+        let layout = std::alloc::Layout::from_size_align(size, 64).ok()?;
+        // SAFETY: `size` is non-zero, so the layout is non-zero-sized.
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!ptr.is_null(), "packed quantized-B allocation failed");
+        // SAFETY: `b` is `k * n` bytes as asserted, `ldb = n` matches the
+        // row-major layout, and `ptr` addresses `size` writable bytes -- the
+        // exact size MLAS just asked for.
+        unsafe {
+            mlas_qgemm_pack_b(
+                n,
+                k,
+                b.as_ptr().cast::<c_void>(),
+                n,
+                c_int::from(a_signed),
+                c_int::from(b_signed),
+                ptr.cast::<c_void>(),
+            );
+        }
+        Some(Self {
+            ptr,
+            layout,
+            n,
+            k,
+            a_signed,
+            b_signed,
+        })
+    }
+
+    /// The logical `(k, n)` dimensions and `(a_signed, b_signed)` this pack was
+    /// built for. A caller must not use it for any other combination.
+    pub fn identity(&self) -> (usize, usize, bool, bool) {
+        (self.k, self.n, self.a_signed, self.b_signed)
+    }
+}
+
+impl Drop for QgemmPackedB {
+    fn drop(&mut self) {
+        // SAFETY: `ptr`/`layout` are the pair returned by `alloc_zeroed` in
+        // `new` and this runs at most once.
+        unsafe { std::alloc::dealloc(self.ptr, self.layout) };
+    }
+}
+
+/// [`qgemm_i32`] against a B that was pre-packed by [`QgemmPackedB::new`].
+///
+/// Panics if `packed` was built for a different shape or signedness, which
+/// would otherwise make MLAS read the wrong layout.
+#[allow(clippy::too_many_arguments)]
+pub fn qgemm_i32_packed(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[u8],
+    a_signed: bool,
+    zero_point_a: u8,
+    packed: &QgemmPackedB,
+    zero_point_b: QgemmZeroPoints<'_>,
+    c: &mut [i32],
+) {
+    assert_eq!(a.len(), m * k, "A must be m*k bytes");
+    assert_eq!(c.len(), m * n, "C must be m*n i32");
+    assert_eq!(
+        packed.identity(),
+        (k, n, a_signed, packed.b_signed),
+        "the packed B was built for a different shape or signedness"
+    );
+    if m == 0 || n == 0 {
+        return;
+    }
+    let (zero_point_b_ptr, per_column) = match zero_point_b {
+        QgemmZeroPoints::PerTensor(ref value) => (std::ptr::from_ref(value), 0),
+        QgemmZeroPoints::PerColumn(values) => {
+            assert_eq!(values.len(), n, "per-column zero points must be n long");
+            (values.as_ptr(), 1)
+        }
+    };
+    ensure_threading();
+    // SAFETY: `a` and `c` are exactly the sizes asserted above, `packed` owns a
+    // buffer MLAS itself sized and filled for this `(n, k, signedness)`, the
+    // zero point pointer is either an `n`-long slice or a borrow of a local that
+    // outlives the call, and the shim writes only through `c`.
+    unsafe {
+        mlas_qgemm_i32_packed(
+            m,
+            n,
+            k,
+            c_int::from(a_signed),
+            c_int::from(packed.b_signed),
+            a.as_ptr().cast::<c_void>(),
+            k,
+            zero_point_a,
+            packed.ptr.cast::<c_void>(),
             zero_point_b_ptr,
             per_column,
             c.as_mut_ptr(),
@@ -3680,6 +3849,83 @@ mod tests {
              workload; probe said {}",
             qgemm_u8s8_is_exact()
         );
+    }
+
+    /// A pre-packed B must give bit-identical `i32` accumulators to the
+    /// unpacked path, for every signedness MLAS supports here and for both
+    /// zero-point layouts.
+    ///
+    /// Bit-identical is the right bar: the pack only changes B's memory layout,
+    /// not the arithmetic, so any difference is a packing bug rather than a
+    /// tolerable reordering.
+    #[test]
+    fn qgemm_packed_b_is_bit_identical_to_the_unpacked_path() {
+        let (m, n, k) = (5usize, 19usize, 37usize);
+        let a: Vec<u8> = (0..m * k).map(|i| (i * 37 % 251) as u8).collect();
+        let b: Vec<u8> = (0..k * n).map(|i| (i * 53 % 241) as u8).collect();
+        let mut checked = 0usize;
+        for (a_signed, b_signed) in [(false, false), (false, true), (true, true)] {
+            if !a_signed && b_signed && !qgemm_u8s8_is_exact() {
+                continue;
+            }
+            let Some(packed) = QgemmPackedB::new(n, k, &b, a_signed, b_signed) else {
+                continue;
+            };
+            assert_eq!(packed.identity(), (k, n, a_signed, b_signed));
+            let zero_point_a = 7u8;
+            let per_column: Vec<u8> = (0..n).map(|i| (i * 11 % 97) as u8).collect();
+            for zero_points in [
+                QgemmZeroPoints::PerTensor(13),
+                QgemmZeroPoints::PerColumn(&per_column),
+            ] {
+                let mut want = vec![0i32; m * n];
+                qgemm_i32(
+                    m,
+                    n,
+                    k,
+                    &a,
+                    a_signed,
+                    zero_point_a,
+                    &b,
+                    b_signed,
+                    zero_points,
+                    &mut want,
+                );
+                let mut got = vec![0i32; m * n];
+                qgemm_i32_packed(
+                    m,
+                    n,
+                    k,
+                    &a,
+                    a_signed,
+                    zero_point_a,
+                    &packed,
+                    zero_points,
+                    &mut got,
+                );
+                assert_eq!(
+                    got, want,
+                    "packed and unpacked qgemm disagreed for a_signed={a_signed} \
+                     b_signed={b_signed}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked > 0,
+            "no signedness/zero-point combination was exercised, so this test proved nothing"
+        );
+    }
+
+    #[test]
+    fn qgemm_packed_b_declines_empty_shapes() {
+        assert!(QgemmPackedB::new(0, 4, &[], false, false).is_none());
+        assert!(QgemmPackedB::new(4, 0, &[], false, false).is_none());
+    }
+
+    #[test]
+    fn qgemm_packed_b_is_send_sync() {
+        assert_send_sync::<QgemmPackedB>();
     }
 
     #[test]

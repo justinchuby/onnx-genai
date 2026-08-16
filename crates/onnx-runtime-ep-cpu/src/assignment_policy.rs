@@ -184,11 +184,32 @@ const MEASURED_MIN_WEIGHTS: usize = 1 << 20;
 /// | `MatMulNBits` int4 M=1     | 1.00 | 1.52 | 1.74 | 2.23 | 2.21 | 4.28 |
 ///
 /// So these are not slow kernels — they are kernels that realise roughly half
-/// of ORT's parallel speedup. Fixing that is a threadpool/partitioning problem
-/// (#1054 removed one cause, the 8-worker cap on the standalone MLAS pool), not
-/// a kernel-tuning one, and until it is fixed the honest answer at capability
-/// time is to let ORT run these nodes. The thread count is not visible here, so
-/// a claim would have to hold at *every* count; none of these do.
+/// of ORT's parallel speedup.
+///
+/// It is **not the threadpool**, which is what this note used to claim. #1054
+/// removed one real cause (the 8-worker cap on the standalone MLAS pool), but
+/// driving an MLAS GEMM directly through this crate's work-stealing pool at
+/// `K = N = 3584`, `M = 512` gives 99.9 ms at one thread, 14.3 ms at eight and
+/// 13.6 ms at sixteen — a 7.0-7.4x speedup, about what ORT achieves — with
+/// `serial_fallback_calls == 0` and `scheduled_iterations >= pool_threads *
+/// parallel_for_calls`. The pool can drive an MLAS GEMM to 7x on this host, so
+/// it is not the ceiling here.
+///
+/// Scope, because it matters: that measurement is taken on the **integer
+/// `QLinearMatMul`** path, the only kernel here with a committed phase-splitting
+/// instrument (`qlinear_phase_report`). It is a proxy. All three kernels share
+/// the pool, so "the pool is not the ceiling" transfers — but `QLinearMatMul`'s
+/// serial phases (requantize, `i32` accumulator staging) do not exist in
+/// `matmul.rs` or `matmul_nbits.rs`, so no millisecond figure transfers. Those
+/// kernels' own per-call serial work has **not** been decomposed; that is open.
+///
+/// On the proxy, non-GEMM work is ~2-4% of the call at one thread and 22-40% at
+/// eight, of which only a ~2 ms requantize-plus-alloc slice is repeatable and
+/// thread-stable; the rest is unattributed and varied 3x across identical runs
+/// on this contended host. The Amdahl *direction* is clear, the decomposition is
+/// not. Until it is, the honest answer at capability time is to let ORT run
+/// these nodes. The thread count is not visible here, so a claim would have to
+/// hold at *every* count; none of these do.
 const DECODE_PARALLEL_NOTE: &str = "measured slower than ORT's CPU kernel at every thread count \
      from 2 to 16 on x86-64 AVX2 (this EP realises about half of ORT's parallel speedup; at one \
      thread it is at parity)";
@@ -425,9 +446,9 @@ fn matmul_weight_elements(op: &Node, shapes: &[Shape]) -> Option<usize> {
             .ok()?
             .checked_mul(usize::try_from(n).ok()?);
     }
-    // `MatMul`/`Gemm` take B as input 1. `QLinearMatMul` never reaches here:
-    // it loses at every size measured, so it is decided before the size gate.
-    let b = shapes.get(1)?;
+    // `MatMul`/`Gemm` take B as input 1; `QLinearMatMul` takes it as input 3,
+    // after `a_scale` and `a_zero_point`.
+    let b = shapes.get(if op.op_type == "QLinearMatMul" { 3 } else { 1 })?;
     b.iter()
         .map(|dim| dim.as_static())
         .try_fold(1usize, |acc, dim| acc.checked_mul(dim?))
@@ -645,30 +666,61 @@ fn matmul_family_preference(
         return None;
     }
 
-    // `QLinearMatMul` is the one case that does not need a size gate: it loses
-    // by more than an order of magnitude at the smallest shape measured, and it
-    // loses for a *structural* reason rather than a tuning one. #1058 bound
-    // MLAS's integer QGEMM and took u8 x u8 from 27-119x down to 3-4x, but ORT
-    // pre-packs the constant B once at session init while this kernel packs
-    // inside every call -- at M=1 a 12.8 MB pack dominates a 1.7 ms call, which
-    // is the whole of the remaining 22x. Signed x signed is worse still (3.0x)
-    // because MLAS documents `AIsSigned` as unsupported off ARM, so on x86 only
-    // u8 x u8 reaches the fast path at all.
+    // `QLinearMatMul` splits by activation dtype, because the two dtypes now
+    // land on opposite sides of the line.
     //
-    // | shape (K=N=3584, 8 threads) | u8 x u8 | i8 x i8 |
-    // |-----------------------------|--------:|--------:|
-    // | M=1                         | 22.04   | 2.23    |
-    // | M=128                       | 4.19    | 3.02    |
-    // | M=512                       | 4.05    | 3.07    |
+    // #1058 bound MLAS's integer QGEMM (27-119x down to 3-4x). This round added
+    // a session-lifetime pre-pack for a constant B, dropped the per-call dense
+    // copy of the whole weight, parallelized requantization, and translated the
+    // signedness combinations MLAS has no kernel for into `u8 x u8` by moving
+    // the operand and its zero point together (`XOR 0x80` / `+128`), which is
+    // exact over the integers.
     //
-    // Closing it needs a prepack hook for constant initializers, with its own
-    // correctness surface (weight identity, address reuse, dynamic weights).
-    // Until that exists ORT should run these nodes.
+    // Ratios are ours/ORT p50, K = N = 3584, steady state, lower is better:
+    //
+    // | threads | u8 M=1 | u8 M=128 | u8 M=512 | i8 M=1 | i8 M=128 | i8 M=512 |
+    // |---------|-------:|---------:|---------:|-------:|---------:|---------:|
+    // | 1       | 1.13   | 1.20     | 1.20     | 0.03   | 0.25     | 0.26     |
+    // | 4       | 1.80   | 2.18     | 2.07     | 0.05   | 0.39     | 0.38     |
+    // | 8       | 2.33   | 2.43     | 2.12     | 0.09   | 0.47     | 0.42     |
+    // | 16      | 2.34   | 2.65     | 2.08     | 0.10   | 0.60     | 0.42     |
+    //
+    // Both rules are measured on x86-64 only and applied on every architecture,
+    // which is the same convention the rest of this module uses. aarch64 has
+    // native `i8 x i8` kernels (SDOT/SMMLA) that need no translation at all, so
+    // the claim there is if anything conservative; correctness on that lane is
+    // covered unconditionally by
+    // `qgemm_i32_matches_the_integer_oracle_for_every_signedness`, but the
+    // *speed* is unmeasured and is not claimed to be measured.
+    //
+    // `i8 x i8` is claimed: it wins at every measured point by 1.7x-33x, and it
+    // wins because ORT's own signed path is far slower than its unsigned one
+    // (ORT i8 M=128 T=8 is 21.7 ms against its own 4.0 ms for u8), not because
+    // this kernel does anything different for it -- after the translation both
+    // dtypes run the identical `u8 x u8` MLAS kernel at the same speed.
+    //
+    // `u8 x u8` still loses and is still deferred. The residue is thread
+    // scaling, not packing: at one thread it is 1.13-1.20x, and the gap widens
+    // with threads exactly as [`DECODE_PARALLEL_NOTE`] describes for every
+    // other dense path here. Cold cost is repaid immediately -- the first call
+    // at K=N=3584 M=1 costs 6.35 ms including the pack against 5.90 ms for the
+    // never-packed path, and every later call is 0.108 ms.
     if op.op_type == "QLinearMatMul" {
+        let signed = |index: usize| input_dtypes.get(index) == Some(&DataType::Int8);
+        if signed(0) && signed(3) {
+            return Some(ClaimPreference::Claim);
+        }
+        let weights = matmul_weight_elements(op, shapes);
+        if !weights.is_some_and(|elements| elements >= MEASURED_MIN_WEIGHTS) {
+            // Unmeasured and small: a partition boundary would cost more than
+            // the ratio above, so keep the historical claim.
+            return Some(ClaimPreference::Claim);
+        }
         return Some(ClaimPreference::defer(
-            "measured 2.2-22x slower than ORT's CPU QLinearMatMul on x86-64 AVX2: ORT pre-packs \
-             the constant B once at session init while this kernel packs inside every call, and \
-             MLAS's integer GEMM does not accept signed activations off ARM",
+            "measured 1.13-2.65x slower than ORT's CPU QLinearMatMul for unsigned activations on \
+             x86-64 AVX2 (K=N=3584, 1-16 threads); the constant weight is now pre-packed once and \
+             the residual gap is thread scaling, which widens from 1.13x at one thread to 2.65x \
+             at sixteen",
         ));
     }
 
@@ -874,29 +926,104 @@ mod tests {
         }
     }
 
-    /// `QLinearMatMul` loses at every shape measured, including the smallest,
-    /// and for a structural reason (ORT pre-packs B once; this kernel packs per
-    /// call). It defers regardless of size.
+    fn qlinear_shapes(b: Shape) -> Vec<Shape> {
+        vec![
+            shape(&[1, 8]),
+            shape(&[]),
+            shape(&[]),
+            b,
+            shape(&[]),
+            shape(&[]),
+            shape(&[]),
+            shape(&[]),
+        ]
+    }
+
+    fn qlinear_dtypes(a: DataType, b: DataType) -> Vec<DataType> {
+        vec![a, DataType::Float32, a, b, DataType::Float32, b]
+    }
+
+    /// Unsigned activations still lose in the measured region, so they defer;
+    /// below it the ratio is unmeasured and a partition boundary would cost
+    /// more than it saves.
+    ///
+    /// The weight for `QLinearMatMul` is input **3**, not input 1 -- reading
+    /// the wrong index here would size every node by an empty scale tensor and
+    /// silently claim the whole operator back.
     #[test]
-    fn qlinear_matmul_defers_at_every_size() {
+    fn qlinear_matmul_defers_unsigned_activations_in_the_measured_region() {
+        let big = claim_preference(
+            &dense_node("QLinearMatMul"),
+            22,
+            &qlinear_shapes(shape(&[3584, 3584])),
+            &qlinear_dtypes(DataType::Uint8, DataType::Uint8),
+        );
+        assert!(
+            !big.is_claim(),
+            "u8 activations are 1.13-2.65x slower than ORT at K=N=3584"
+        );
+
+        let small = claim_preference(
+            &dense_node("QLinearMatMul"),
+            22,
+            &qlinear_shapes(shape(&[8, 8])),
+            &qlinear_dtypes(DataType::Uint8, DataType::Uint8),
+        );
+        assert!(
+            small.is_claim(),
+            "a 64-weight QLinearMatMul is outside every measurement here"
+        );
+    }
+
+    /// Signed activations against signed weights are now faster than ORT at
+    /// every measured point (1.7x-33x), so they must be claimed.
+    ///
+    /// ORT's own signed path is the slow one -- after the `XOR 0x80`
+    /// translation both dtypes run the identical MLAS `u8 x u8` kernel here at
+    /// the same speed -- so this is a real assignment win, not a measurement
+    /// artefact of our own two paths differing.
+    #[test]
+    fn qlinear_matmul_claims_signed_activations() {
         for b in [shape(&[8, 8]), shape(&[3584, 3584])] {
-            let shapes = vec![
-                shape(&[1, 8]),
-                shape(&[]),
-                shape(&[]),
-                b,
-                shape(&[]),
-                shape(&[]),
-                shape(&[]),
-                shape(&[]),
-            ];
             let pref = claim_preference(
                 &dense_node("QLinearMatMul"),
                 22,
-                &shapes,
-                &[DataType::Uint8],
+                &qlinear_shapes(b),
+                &qlinear_dtypes(DataType::Int8, DataType::Int8),
             );
-            assert!(!pref.is_claim(), "QLinearMatMul is 2.2-22x slower than ORT");
+            assert!(
+                pref.is_claim(),
+                "i8 x i8 QLinearMatMul beats ORT at every measured shape"
+            );
+        }
+        // Mixed signedness was not measured, so it must not borrow the signed
+        // win: it follows the same size-gated rule as u8 x u8 -- deferred where
+        // that was measured to lose, claimed below it like every other
+        // unmeasured shape in this module.
+        for (a, b) in [
+            (DataType::Uint8, DataType::Int8),
+            (DataType::Int8, DataType::Uint8),
+        ] {
+            assert!(
+                !claim_preference(
+                    &dense_node("QLinearMatMul"),
+                    22,
+                    &qlinear_shapes(shape(&[3584, 3584])),
+                    &qlinear_dtypes(a, b),
+                )
+                .is_claim(),
+                "{a:?} x {b:?} is unmeasured; it must not inherit the signed claim"
+            );
+            assert!(
+                claim_preference(
+                    &dense_node("QLinearMatMul"),
+                    22,
+                    &qlinear_shapes(shape(&[8, 8])),
+                    &qlinear_dtypes(a, b),
+                )
+                .is_claim(),
+                "{a:?} x {b:?} below the measured region keeps the historical claim"
+            );
         }
     }
 
