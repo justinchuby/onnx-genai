@@ -56,12 +56,14 @@
 #    set.
 # 3. Windows-specific cfg issues (target_os = "windows") are not exercised.
 #    The portable test matrix covers Windows; this script covers "not macOS."
-# 4. onnx-runtime-cpuinfo joins the aarch64 pass only when an aarch64 cross gcc
-#    is installed, because its cmake build script compiles C *for the target*.
-#    ubuntu-latest does not ship one, so on CI it is skipped — and it DOES
-#    contain arch-gated Rust (src/lib.rs:129 and :144), so that skip is a real
-#    if narrow hole, not a formality.  The script says so out loud rather than
-#    reporting a clean run that silently checked less than it claims.
+# 4. The aarch64 pass needs a cross toolchain, not just a rustup target:
+#    ort-sys runs bindgen against onnxruntime_c_api.h for the target (so clang
+#    needs arm64 libc headers) and onnx-runtime-cpuinfo's cmake build script
+#    compiles C for the target.  ubuntu-latest ships neither, so the workflow
+#    installs gcc-aarch64-linux-gnu and libc6-dev-arm64-cross.  Without them
+#    the pass drops to the FFI-free subset — which excludes onnx-runtime-ep-cpu
+#    and therefore cannot see the bug class this was written for — so the drop
+#    is printed loudly, and on CI ($CI set) it is a hard failure instead.
 #
 # Exit codes
 # ----------
@@ -170,18 +172,24 @@ if [ "$HOST_OS" = "Linux" ]; then
     ARCH_SKIPPED=""
     ARCH_SKIP_HINT=""
     if command -v aarch64-linux-gnu-gcc >/dev/null 2>&1 \
-        || [ -n "${CC_aarch64_unknown_linux_gnu:-}" ]; then
+        && [ -d /usr/aarch64-linux-gnu/include ]; then
         ARCH_CRATES=("${CRATES_FULL[@]}")
-        ARCH_SCOPE_NOTE="full offline set (aarch64 cross gcc present)"
+        ARCH_SCOPE_NOTE="full offline set (aarch64 cross toolchain present)"
+    elif [ -n "${CI:-}" ]; then
+        # CI installs the toolchain explicitly, so its absence is a workflow
+        # bug, not a host limitation.  Fail loudly instead of quietly checking
+        # a subset that excludes the crate this gate exists for.
+        echo "✗ aarch64 cross toolchain missing on CI." >&2
+        echo "  The cross-arch pass needs gcc-aarch64-linux-gnu and" >&2
+        echo "  libc6-dev-arm64-cross: ort-sys runs bindgen for the target and" >&2
+        echo "  clang needs arm64 libc headers to parse onnxruntime_c_api.h." >&2
+        echo "  Add them to the workflow step that runs this script." >&2
+        exit 2
     else
-        ARCH_CRATES=()
-        for crate in "${CRATES_FULL[@]}"; do
-            [ "$crate" = "onnx-runtime-cpuinfo" ] && continue
-            ARCH_CRATES+=("$crate")
-        done
-        ARCH_SKIPPED="onnx-runtime-cpuinfo"
-        ARCH_SKIP_HINT="It has arch-gated Rust of its own, so this is a real gap: install an aarch64 cross gcc (apt install gcc-aarch64-linux-gnu) to close it."
-        ARCH_SCOPE_NOTE="full offline set minus onnx-runtime-cpuinfo"
+        ARCH_CRATES=("${CRATES_NO_FFI[@]}")
+        ARCH_SKIPPED="onnx-runtime-ep-cpu and the other ort-sys/cmake crates"
+        ARCH_SKIP_HINT="Install gcc-aarch64-linux-gnu and libc6-dev-arm64-cross to check them; CI does. Until then this pass cannot see arch-gating bugs in the CPU kernels, which is the main thing it is for."
+        ARCH_SCOPE_NOTE="FFI-free subset (no aarch64 cross toolchain)"
     fi
 else
     # On macOS (or other non-Linux hosts), ort-sys and cpuinfo need Linux
