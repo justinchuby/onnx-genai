@@ -1165,8 +1165,10 @@ impl Kernel for MatMulNBitsKernel {
             // aarch64, so `accuracy_level = 0` 8-bit decode silently ran
             // CompInt8 there. The final `else` does not quantize the
             // activations to int8: it keeps them at f32 or, when
-            // `eight_bit_int16_activation()` is on, at int16, which stays
-            // within the fp32 oracle's 1e-5 tolerance and so is not CompInt8.
+            // `eight_bit_int16_activation()` is on *and the model asked for
+            // reduced precision*, at int16. int16 activations are far more
+            // accurate than int8 but they are NOT fp32, so they are gated too
+            // (`reduced_precision_activation_allowed`).
             let int8_compute_allowed = self.accuracy_level == 4;
             if int8_compute_allowed && dot_kernel.uses_kai_sdot_direct(self.bits, self.block_size) {
                 let owned_weight;
@@ -1252,14 +1254,16 @@ impl Kernel for MatMulNBitsKernel {
                     owned_weight = numa_place_u8(built, self.n);
                     &owned_weight
                 };
+                let int16_activation = eight_bit_int16_activation()
+                    && reduced_precision_activation_allowed(self.accuracy_level);
                 with_decode_pool(|| {
-                    if eight_bit_int16_activation() {
+                    if int16_activation {
                         // int16-activation fast path: quantize the activation to
                         // int16 per K-block and reduce against the u8 weight with a
-                        // SIMD int16 dot product. int16 keeps enough precision to
-                        // match the fp32 result (unlike int8-activation, which is
-                        // ORT's fast-but-wrong path), while replacing the widening
-                        // u8->f32 FMA with a denser int16 madd.
+                        // SIMD int16 dot product, replacing the widening u8->f32
+                        // FMA with a denser int16 madd. This *is* a reduced-precision
+                        // compute type, so it is gated on `accuracy_level` -- see
+                        // `reduced_precision_activation_allowed`.
                         gemv_nk_u8_i16(
                             &activations,
                             &weight_u8.values,
@@ -3722,6 +3726,107 @@ enum DotKernel {
     /// dot-product intrinsic.
     #[cfg(target_arch = "aarch64")]
     NeonDot,
+}
+
+/// The best `DotKernel` this host can actually execute, resolved once.
+///
+/// [`selected_dot_kernel`] does the CPUID probing; this caches it so
+/// [`DotKernel::clamped_to_host`] costs one relaxed load per dot instead of a
+/// feature-detection call per dot.
+fn host_dot_kernel() -> DotKernel {
+    static HOST: OnceLock<DotKernel> = OnceLock::new();
+    *HOST.get_or_init(selected_dot_kernel)
+}
+
+/// Bitmask of the `DotKernel`s whose ISA this host implements, resolved once.
+fn host_dot_kernel_mask() -> u8 {
+    static MASK: OnceLock<u8> = OnceLock::new();
+    *MASK.get_or_init(|| {
+        let mut mask = DotKernel::Scalar.bit();
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::arch::is_x86_feature_detected!("avx2") {
+                mask |= DotKernel::Avx2.bit();
+                if std::arch::is_x86_feature_detected!("avxvnni") {
+                    mask |= DotKernel::AvxVnni.bit();
+                }
+                if std::arch::is_x86_feature_detected!("avx512f")
+                    && std::arch::is_x86_feature_detected!("avx512bw")
+                    && std::arch::is_x86_feature_detected!("avx512vnni")
+                    && std::arch::is_x86_feature_detected!("avx512vl")
+                {
+                    mask |= DotKernel::Avx512Vnni.bit();
+                }
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            // AdvSIMD is baseline on aarch64 and `dot_u8_i8_neon` uses only
+            // baseline intrinsics, so both NEON variants are always runnable;
+            // `dotprod` selects between them for throughput, not for safety.
+            mask |= DotKernel::Neon.bit() | DotKernel::NeonDot.bit();
+        }
+        mask
+    })
+}
+
+impl DotKernel {
+    /// One-hot tag used by [`host_dot_kernel_mask`].
+    fn bit(self) -> u8 {
+        match self {
+            DotKernel::Scalar => 1 << 0,
+            #[cfg(target_arch = "x86_64")]
+            DotKernel::Avx2 => 1 << 1,
+            #[cfg(target_arch = "x86_64")]
+            DotKernel::AvxVnni => 1 << 2,
+            #[cfg(target_arch = "x86_64")]
+            DotKernel::Avx512Vnni => 1 << 3,
+            #[cfg(target_arch = "aarch64")]
+            DotKernel::Neon => 1 << 1,
+            #[cfg(target_arch = "aarch64")]
+            DotKernel::NeonDot => 1 << 2,
+        }
+    }
+
+    /// Whether this host implements every instruction this kernel issues.
+    ///
+    /// Membership is tested per kernel rather than by ranking the ladder,
+    /// because the x86 ISA ladder is **not** a total order: Ice Lake and Cooper
+    /// Lake server parts ship AVX512-VNNI (EVEX `vpdpbusd`) with **no**
+    /// AVX-VNNI (the VEX encoding), so "supports the stronger kernel" does not
+    /// imply "supports the weaker one". A rank comparison would keep an
+    /// `AvxVnni` request on such a host and fault.
+    fn is_runnable_here(self) -> bool {
+        host_dot_kernel_mask() & self.bit() != 0
+    }
+
+    /// Degrade a requested kernel to one this host can actually run.
+    ///
+    /// The `unsafe fn`s behind [`dot_u8_i8`] carry `#[target_feature]` for
+    /// AVX2/AVX-VNNI/AVX-512-VNNI and are called on the strength of the
+    /// `DotKernel` value alone. Producing that value from anywhere other than
+    /// [`selected_dot_kernel`] -- a test, a future env override, a plumbed-through
+    /// field that outlives a process migration -- would execute an instruction
+    /// the CPU may not implement, i.e. `SIGILL`, from safe code. Rather than rely
+    /// on every present and future caller having probed CPUID first, the
+    /// dispatcher clamps: a request this host cannot run is answered by the
+    /// host's own best kernel.
+    ///
+    /// Every kernel in the ladder is bit-exact against [`dot_u8_i8_scalar`]
+    /// (asserted for all of them by `every_dot_kernel_is_bit_exact_on_this_host`),
+    /// so the substitution costs throughput and never accuracy.
+    ///
+    /// This is deliberately *not* an assertion. Clamping is total, allocation
+    /// free and bit-exact, so it is safe to leave enabled in release builds,
+    /// where a `debug_assert!` would be compiled out -- restoring the `SIGILL`
+    /// exactly where it is least debuggable.
+    fn clamped_to_host(self) -> DotKernel {
+        if self.is_runnable_here() {
+            self
+        } else {
+            host_dot_kernel()
+        }
+    }
 }
 
 impl DotKernel {
@@ -6607,19 +6712,22 @@ mod amx {
 
 fn dot_u8_i8(activation: &[u8], weight: &[i8], _kernel: DotKernel) -> i32 {
     debug_assert_eq!(activation.len(), weight.len());
+    // Never issue an instruction this CPU does not implement, whatever the
+    // caller asked for. See `DotKernel::clamped_to_host`.
+    let _kernel = _kernel.clamped_to_host();
     #[cfg(target_arch = "x86_64")]
     {
         match _kernel {
             DotKernel::Avx2 => {
-                // SAFETY: selected_dot_kernel checked AVX2 at runtime.
+                // SAFETY: `clamped_to_host` confirmed AVX2 via CPUID.
                 return unsafe { dot_u8_i8_avx2(activation, weight) };
             }
             DotKernel::AvxVnni => {
-                // SAFETY: selected_dot_kernel checked AVX-VNNI at runtime.
+                // SAFETY: `clamped_to_host` confirmed AVX2+AVX-VNNI via CPUID.
                 return unsafe { dot_u8_i8_avxvnni(activation, weight) };
             }
             DotKernel::Avx512Vnni => {
-                // SAFETY: selected_dot_kernel checked AVX512-VNNI and AVX512VL.
+                // SAFETY: `clamped_to_host` confirmed AVX512F/BW/VNNI/VL via CPUID.
                 return unsafe { dot_u8_i8_avx512vnni(activation, weight) };
             }
             DotKernel::Scalar => {}
@@ -6887,9 +6995,48 @@ fn gemv_nk_u8(
     }
 }
 
-/// Whether the 8-bit decode GEMV uses the int16-activation fast path.
+/// Whether the model has opted out of full-precision activations.
 ///
-/// Default **on**. Opt out (restore the fp32-activation [`gemv_nk_u8`]) with
+/// ONNX's `accuracy_level` on `MatMulNBits` names the *compute* type:
+/// `0` (unset) and `1` mean fp32, `2` fp16, `3` bf16, `4` int8. Anything that
+/// quantizes the activation before reducing is therefore only legal at `>= 2`;
+/// at `0`/`1` the kernel owes the caller an fp32 reduction.
+///
+/// The int8 SDOT routes above already gate on `accuracy_level == 4`. The
+/// int16-activation GEMV is more accurate than those but still short of fp32,
+/// so it lands at `>= 2` rather than being unconditional.
+///
+/// # Why this is not a free 12%
+///
+/// Measured on this repo's A/B harness, `MatMulNBits` bits=8, block_size=32,
+/// M=1, 8 threads, versus ONNX Runtime 1.27 on the same host (max absolute
+/// deviation from a float64 oracle over the whole output row):
+///
+/// | K=N  | int16 act | fp32 act | ORT   | int16 speed |
+/// |------|-----------|----------|-------|-------------|
+/// | 1024 | 1.9e-3    | 2.3e-5   | --    | +6.5%       |
+/// | 3584 | 6.0e-3    | 1.1e-4   | 1.2e-4| +12%        |
+/// | 4096 | 6.4e-3    | 9.2e-5   | --    | +18%        |
+///
+/// The fp32-activation path tracks ORT's own error almost exactly; the int16
+/// path is ~55x worse and fails the harness's default f32 parity gate
+/// (`1e-4 + 1e-3 * |y|`) on every one of those shapes. Buying 6-18% with 55x
+/// of the output's accuracy is not a trade this kernel may make on a model's
+/// behalf when the model asked for fp32 -- especially at M=1 decode, where the
+/// consumer is an argmax over near-ties (the same failure mode that makes
+/// ORT's int8 path flip qwen3's token 1479 -> 3988).
+///
+/// The fp32 path is still 4.3x faster than ORT at K=N=3584, so gating this
+/// costs no *honest* win.
+fn reduced_precision_activation_allowed(accuracy_level: i64) -> bool {
+    accuracy_level >= 2
+}
+
+/// Whether the 8-bit decode GEMV may use the int16-activation fast path at all.
+///
+/// Default **on**, but subject to [`reduced_precision_activation_allowed`]:
+/// this is the measurement/kill switch, not the precision policy. Opt out
+/// (restore the fp32-activation [`gemv_nk_u8`]) with
 /// `ONNX_GENAI_CPU_8BIT_ACT=fp32` (also accepts `f32`, `0`, `off`), used for
 /// A/B before/after measurement. This never enables int8-activation, which is
 /// ORT's fast-but-wrong path (it flips qwen3's near-tie token 1479 -> 3988).
@@ -9840,6 +9987,142 @@ mod tests {
         (y.to_f32(), oracle)
     }
 
+    /// Run the 8-bit `execute` path at an explicit `accuracy_level` and return
+    /// the largest absolute deviation from a float64 dequantize-and-reduce
+    /// oracle.
+    ///
+    /// float64, not the usual f32 `reference`, because the quantity under test
+    /// here *is* the reduction's precision: an f32 oracle carries its own
+    /// ~1e-4 of rounding at this K and would mask the effect entirely.
+    fn bits8_m1_max_abs_error_at(
+        accuracy_level: i64,
+        n: usize,
+        k: usize,
+        block_size: usize,
+    ) -> f32 {
+        // One large value per block and many small ones: a per-block int16
+        // activation scale is set by the large value, so every small value is
+        // quantized coarsely. This is the shape of real decode activations
+        // (a few outlier channels) and it is where a 16-bit activation loses
+        // most, which is what makes this test sensitive rather than lucky.
+        let activations: Vec<f32> = (0..k)
+            .map(|i| {
+                if i % block_size == 0 {
+                    18.0
+                } else {
+                    (i as f32 * 0.031 + 0.7).sin() * 0.05
+                }
+            })
+            .collect();
+        let weights_nk: Vec<f32> = (0..n * k)
+            .map(|i| (i as f32 * 0.0091).sin() * 1.2 + (i as f32 * 0.0003).cos() * 0.5)
+            .collect();
+        let blocks = k.div_ceil(block_size);
+        let (packed, scales, _, dequantized) = quantize_8bit(&weights_nk, n, k, block_size, false);
+        let (graph, node) = model_node(
+            &[1, k],
+            &[n, blocks, block_size],
+            &[n, blocks],
+            None,
+            &[1, n],
+            k,
+            n,
+            block_size,
+        );
+        let mut graph = graph;
+        graph
+            .node_mut(node)
+            .attributes
+            .insert("bits".into(), Attribute::Int(8));
+        graph
+            .node_mut(node)
+            .attributes
+            .insert("accuracy_level".into(), Attribute::Int(accuracy_level));
+        let model = Model::new(&graph);
+        let kernel = CpuExecutionProvider::new()
+            .get_kernel(model.graph.node(node), &[], 1)
+            .expect("bits=8 kernel must build");
+        let a = Owned::f32(&[1, k], &activations);
+        let b = Owned::u8(&[n, blocks, block_size], &packed);
+        let scales_tensor = Owned::f32(&[n, blocks], &scales);
+        let mut y = Owned::zeros_f32(&[1, n]);
+        kernel
+            .execute(
+                &[a.view(), b.view(), scales_tensor.view()],
+                &mut [y.view_mut()],
+            )
+            .expect("8-bit execute must succeed");
+        let out = y.to_f32();
+        (0..n)
+            .map(|column| {
+                let oracle: f64 = (0..k)
+                    .map(|i| activations[i] as f64 * dequantized[column * k + i] as f64)
+                    .sum();
+                (out[column] as f64 - oracle).abs() as f32
+            })
+            .fold(0.0f32, f32::max)
+    }
+
+    /// `accuracy_level` 0/1 mean fp32 compute, so the 8-bit M=1 decode GEMV may
+    /// not quantize the activation -- not to int8, and not to int16 either.
+    ///
+    /// This is a *precision* regression test, and it is built to fail if the
+    /// gate is removed: the same input at `accuracy_level = 2` (fp16 compute
+    /// permitted) is asserted to be at least 20x less accurate, which both
+    /// proves the int16 path is genuinely reachable for this shape -- so the
+    /// fp32 assertion is not passing vacuously on a shape that never had a fast
+    /// path -- and pins the size of what the gate is holding back.
+    ///
+    /// Measured against ONNX Runtime 1.27 on the A/B harness at K=N=3584, the
+    /// ungated int16 path deviated by 6.0e-3 where ORT itself deviates 1.2e-4
+    /// from a float64 oracle, i.e. ~50x worse, while buying 12%.
+    #[test]
+    fn eight_bit_decode_keeps_fp32_activations_unless_the_model_allows_less() {
+        let (n, k, block_size) = (32usize, 2048usize, 128usize);
+        let fp32_error = bits8_m1_max_abs_error_at(0, n, k, block_size);
+        let level1_error = bits8_m1_max_abs_error_at(1, n, k, block_size);
+        let reduced_error = bits8_m1_max_abs_error_at(2, n, k, block_size);
+
+        // The weights are 8-bit quantized, so even an exact reduction carries
+        // the weight quantization error; what must NOT appear on top of it is
+        // activation quantization. Scale the bound to the operand magnitudes
+        // rather than hard-coding a constant that a future shape change would
+        // silently loosen.
+        let bound = 2e-3 * (k as f32).sqrt();
+        assert!(
+            fp32_error <= bound,
+            "accuracy_level=0 must reduce in fp32: max abs error {fp32_error} > {bound}"
+        );
+        assert!(
+            level1_error <= bound,
+            "accuracy_level=1 must reduce in fp32: max abs error {level1_error} > {bound}"
+        );
+        assert!(
+            !reduced_precision_activation_allowed(0),
+            "accuracy_level 0 (unset) means fp32 compute"
+        );
+        assert!(
+            !reduced_precision_activation_allowed(1),
+            "accuracy_level 1 means fp32 compute"
+        );
+        for level in [2, 3, 4] {
+            assert!(
+                reduced_precision_activation_allowed(level),
+                "accuracy_level {level} permits a reduced-precision compute type"
+            );
+        }
+        // Falsifier: if this ever stops holding, the int16 path is no longer
+        // reachable here and the assertions above have gone vacuous.
+        if eight_bit_int16_activation() {
+            assert!(
+                reduced_error >= fp32_error * 20.0,
+                "int16 activation path is not being exercised at accuracy_level=2 \
+                 (fp32 error {fp32_error}, reduced-precision error {reduced_error}): \
+                 the fp32 assertions above are now vacuous"
+            );
+        }
+    }
+
     /// Qwen3-0.6B CPU int8/block-128 regression: the production `execute` path
     /// for 8-bit weights (symmetric default zero point and explicit asymmetric
     /// uint8 zero points; decode M=1 and prefill M=5) must reconstruct the same
@@ -10874,6 +11157,186 @@ mod tests {
             let simd = unsafe { dot_u8_i8_neon(&activation, &weight) };
             assert_eq!(simd, scalar, "len={len}: random neon dot mismatch");
         }
+    }
+
+    /// Every `DotKernel` variant, forced through the public dispatcher, on any
+    /// host, at every length that separates the kernels' vector bodies from
+    /// their remainder and scalar tails.
+    ///
+    /// Two independent properties, neither of which needs the exotic hardware:
+    ///
+    /// 1. **No `SIGILL`.** The `#[target_feature]` kernels are reached from safe
+    ///    code purely on the strength of a `DotKernel` value. Forcing an
+    ///    AVX-512-VNNI request on an AVX2-only host must be answered, not
+    ///    faulted. A test that merely called `selected_dot_kernel()` would prove
+    ///    nothing here -- it can only ever name a kernel the host already runs.
+    /// 2. **Bit-exactness.** On a host that *does* implement the ISA -- the
+    ///    AVX-512 CI lane, an ARM lane -- the same assertion stops being a clamp
+    ///    check and becomes the only correctness oracle the VNNI kernels have.
+    ///    So this test grows teeth exactly where it is otherwise untested.
+    ///
+    /// Lengths cover 0 (empty), sub-vector, each vector width and each width
+    /// plus/minus one, so the AVX-512 path's 64-wide body, its 32-byte VNNI
+    /// remainder and its scalar tail are all entered.
+    #[test]
+    fn every_dot_kernel_is_bit_exact_on_this_host() {
+        let kernels = [
+            DotKernel::Scalar,
+            #[cfg(target_arch = "x86_64")]
+            DotKernel::Avx2,
+            #[cfg(target_arch = "x86_64")]
+            DotKernel::AvxVnni,
+            #[cfg(target_arch = "x86_64")]
+            DotKernel::Avx512Vnni,
+            #[cfg(target_arch = "aarch64")]
+            DotKernel::Neon,
+            #[cfg(target_arch = "aarch64")]
+            DotKernel::NeonDot,
+        ];
+        for len in [
+            0usize, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 96, 127, 128, 129,
+        ] {
+            // Extremes, not a mild distribution: 255 x -128 is the product that
+            // saturates a 16-bit intermediate, which is how a kernel that used
+            // `vpmaddubsw`-style pairwise arithmetic would be caught.
+            let activation: Vec<u8> = (0..len)
+                .map(|i| {
+                    if i % 3 == 0 {
+                        255
+                    } else {
+                        (i * 37 % 256) as u8
+                    }
+                })
+                .collect();
+            let weight: Vec<i8> = (0..len)
+                .map(|i| {
+                    if i % 3 == 0 {
+                        -128
+                    } else {
+                        ((i * 53 % 256) as i32 - 128) as i8
+                    }
+                })
+                .collect();
+            let expected = dot_u8_i8_scalar(&activation, &weight);
+            for kernel in kernels {
+                assert_eq!(
+                    dot_u8_i8(&activation, &weight, kernel),
+                    expected,
+                    "{kernel:?} diverged from scalar at len {len}"
+                );
+            }
+        }
+    }
+
+    /// The clamp must be a real filter, not a constant.
+    ///
+    /// Falsifies both degenerate implementations: "always keep the request"
+    /// (which would fault on the unsupported kernels) and "always return the
+    /// host kernel" (which would silently discard a legitimately supported
+    /// request and make the ladder unreachable).
+    #[test]
+    fn dot_kernel_clamp_keeps_supported_requests_and_rewrites_only_the_rest() {
+        let host = host_dot_kernel();
+        assert!(
+            host.is_runnable_here(),
+            "the host's own selection must be runnable on the host"
+        );
+        assert_eq!(
+            host.clamped_to_host(),
+            host,
+            "clamping must not rewrite a kernel the host supports"
+        );
+        assert_eq!(
+            DotKernel::Scalar.clamped_to_host(),
+            DotKernel::Scalar,
+            "scalar has no ISA requirement and must survive clamping everywhere"
+        );
+        assert_eq!(
+            host.clamped_to_host().clamped_to_host(),
+            host.clamped_to_host(),
+            "clamping must be idempotent"
+        );
+        // Whatever this host is, an unsupported request lands on something it
+        // can run -- that is the entire postcondition.
+        for kernel in [
+            DotKernel::Scalar,
+            #[cfg(target_arch = "x86_64")]
+            DotKernel::Avx2,
+            #[cfg(target_arch = "x86_64")]
+            DotKernel::AvxVnni,
+            #[cfg(target_arch = "x86_64")]
+            DotKernel::Avx512Vnni,
+            #[cfg(target_arch = "aarch64")]
+            DotKernel::Neon,
+            #[cfg(target_arch = "aarch64")]
+            DotKernel::NeonDot,
+        ] {
+            assert!(
+                kernel.clamped_to_host().is_runnable_here(),
+                "{kernel:?} clamped to a kernel this host cannot run"
+            );
+        }
+    }
+
+    /// The one-hot tags must actually be one-hot and distinct, or the mask
+    /// aliases two kernels and `is_runnable_here` answers for the wrong one.
+    #[test]
+    fn dot_kernel_bits_are_distinct() {
+        let kernels = [
+            DotKernel::Scalar,
+            #[cfg(target_arch = "x86_64")]
+            DotKernel::Avx2,
+            #[cfg(target_arch = "x86_64")]
+            DotKernel::AvxVnni,
+            #[cfg(target_arch = "x86_64")]
+            DotKernel::Avx512Vnni,
+            #[cfg(target_arch = "aarch64")]
+            DotKernel::Neon,
+            #[cfg(target_arch = "aarch64")]
+            DotKernel::NeonDot,
+        ];
+        let mut seen = 0u8;
+        for kernel in kernels {
+            let bit = kernel.bit();
+            assert_eq!(bit.count_ones(), 1, "{kernel:?} tag is not one-hot");
+            assert_eq!(seen & bit, 0, "{kernel:?} tag collides with an earlier one");
+            seen |= bit;
+        }
+    }
+
+    /// The AVX-512-VNNI gate must demand every feature its `#[target_feature]`
+    /// list enables. `vpdpbusd` on `zmm` needs AVX512F+VNNI; the 256-bit
+    /// remainder in the same function needs AVX512VL; and MLAS's own SQNBit
+    /// dispatch additionally requires BW, so an AVX512F-only part (Xeon Phi
+    /// KNL/KNM) must not reach either. Hardware-independent: it reads the gate,
+    /// it does not need the CPU.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx512_vnni_selection_requires_the_full_feature_set() {
+        let has_all = std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vnni")
+            && std::arch::is_x86_feature_detected!("avx512vl");
+        assert_eq!(
+            selected_dot_kernel() == DotKernel::Avx512Vnni,
+            has_all,
+            "AVX-512-VNNI must be selected exactly when F+BW+VNNI+VL are all present"
+        );
+        assert_eq!(
+            host_dot_kernel_mask() & DotKernel::Avx512Vnni.bit() != 0,
+            has_all,
+            "the runnable-kernel mask must agree with the selection gate"
+        );
+        // AVX-VNNI is the VEX encoding and is *independent* of the AVX-512
+        // family: Ice Lake / Cooper Lake server parts have AVX512-VNNI without
+        // it. The mask must track it separately, never infer it.
+        assert_eq!(
+            host_dot_kernel_mask() & DotKernel::AvxVnni.bit() != 0,
+            std::arch::is_x86_feature_detected!("avx2")
+                && std::arch::is_x86_feature_detected!("avxvnni"),
+            "AVX-VNNI availability must be probed, not implied by AVX-512-VNNI"
+        );
     }
 
     /// aarch64 must never fall back to the scalar dot: `selected_dot_kernel`
