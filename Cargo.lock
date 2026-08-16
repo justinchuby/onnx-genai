@@ -2551,6 +2551,7 @@ dependencies = [
 name = "onnx-runtime-memory-governor"
 version = "0.1.0-dev.5"
 dependencies = [
+ "criterion",
  "thiserror 2.0.19",
 ]
 
