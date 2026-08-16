@@ -227,15 +227,28 @@ fn view_listed_twice_as_graph_output_yields_two_correct_tensors() {
     assert_eq!(out[1].to_vec_f32(), want);
 }
 
-/// A reversed slice gives the view a negative stride, so the largest contiguous
-/// run is a single element and the incremental odometer is the only thing
-/// producing the right answer. A block-copy fast path that ignores stride sign
-/// returns the rows in forward order and passes every length check.
+/// A reversed slice gives the outer axis a negative stride. The inner axis is
+/// still stride-1, so the gather copies whole 32-element rows -- but it must
+/// walk them *backwards*, and the collapse must refuse to fuse the two axes
+/// because `strides[0] == -32 != strides[1] * shape[1] == 32`. A fast path that
+/// ignores stride sign returns the rows in forward order and passes every
+/// length check.
 #[test]
 fn negative_stride_view_graph_output_is_reversed() {
+    reversed_rows_roundtrip(64, 32);
+}
+
+/// The same reversal at 2 MiB, i.e. above the parallel-gather threshold, so the
+/// negative-stride offset arithmetic is exercised by the fan-out and not only by
+/// the serial walk. The two tests together mean a sign bug cannot survive by
+/// living on only one of the two paths.
+#[test]
+fn negative_stride_view_graph_output_is_reversed_above_parallel_threshold() {
+    reversed_rows_roundtrip(2048, 256);
+}
+
+fn reversed_rows_roundtrip(rows: usize, cols: usize) {
     let mut g = Graph::new();
-    let rows = 64usize;
-    let cols = 32usize;
     let data = ramp(rows * cols);
     let src = f32_init(&mut g, "data", &[rows, cols], &data);
     let starts = i64_init(&mut g, "starts", &[1], &[(rows - 1) as i64]);
@@ -258,4 +271,59 @@ fn negative_stride_view_graph_output_is_reversed() {
         .flat_map(|r| data[r * cols..(r + 1) * cols].to_vec())
         .collect();
     assert_eq!(got, want);
+}
+
+/// The gather treats element size as a bare multiplier, so every dtype whose
+/// storage is not 4 bytes exercises block arithmetic the f32 tests never reach:
+/// a wrong `esize` still produces a correctly *shaped* tensor, just with the
+/// bytes sheared. `Int64` (8 B) and `Float16` (2 B) bracket f32 on both sides.
+#[test]
+fn non_f32_dtypes_permute_correctly_through_the_gather() {
+    for &(dtype, esize) in &[(DataType::Int64, 8usize), (DataType::Float16, 2usize)] {
+        let shape = [2usize, 130, 3, 17];
+        let n: usize = shape.iter().product();
+        // Distinct per element, and distinct in every byte lane, so a shear by
+        // any amount changes the value.
+        let bytes: Vec<u8> = (0..n)
+            .flat_map(|i| {
+                let v = (i as u64).wrapping_mul(0x0101_0101_0101_0101).to_le_bytes();
+                v[..esize].to_vec()
+            })
+            .collect();
+
+        let mut g = Graph::new();
+        let vid = g.create_named_value("data", dtype, static_shape(shape.iter().copied()));
+        g.set_initializer(
+            vid,
+            WeightRef::Inline(TensorData::from_raw(dtype, shape.to_vec(), bytes.clone())),
+        );
+        g.opset_imports.entry(String::new()).or_insert(17);
+        let out_dims = vec![2usize, 3, 130, 17];
+        let out = g.create_value(dtype, static_shape(out_dims.iter().copied()));
+        let mut node = Node::new(NodeId(0), "Transpose", vec![Some(vid)], vec![out]);
+        node.attributes
+            .insert("perm".to_string(), Attribute::Ints(vec![0, 2, 1, 3]));
+        g.insert_node(node);
+        g.add_output(out);
+
+        let mut session = InferenceSession::from_graph(g).expect("build");
+        let res = session.run(&[]).expect("run");
+        let got = res[0].as_bytes().to_vec();
+        assert_eq!(res[0].shape, out_dims, "{dtype:?}");
+        assert_eq!(got.len(), n * esize, "{dtype:?}");
+
+        // Reference: permute element indices, then splice the source bytes.
+        let mut want = Vec::with_capacity(n * esize);
+        for b in 0..shape[0] {
+            for h in 0..shape[2] {
+                for s in 0..shape[1] {
+                    for d in 0..shape[3] {
+                        let src = ((b * shape[1] + s) * shape[2] + h) * shape[3] + d;
+                        want.extend_from_slice(&bytes[src * esize..(src + 1) * esize]);
+                    }
+                }
+            }
+        }
+        assert!(got == want, "{dtype:?} gather sheared the bytes");
+    }
 }

@@ -983,10 +983,20 @@ impl Tensor {
     /// materializing the output.
     ///
     /// `fill` receives exactly `storage_bytes(numel)` bytes of **uninitialized**
-    /// memory as a `&mut [u8]` and must write all of them; `u8` has no invalid
-    /// bit patterns, so observing unwritten bytes is well-defined but arbitrary,
-    /// which is what makes a partial write a wrong answer rather than undefined
-    /// behaviour.
+    /// memory as a `&mut [u8]` and **must write every one of them**. Reading an
+    /// uninitialized `u8` is undefined behaviour -- Miri rejects it -- so this
+    /// is a hard obligation on the caller, not a "you get arbitrary bytes"
+    /// convenience. The only caller is the view-materialization path, whose
+    /// gather writes `numel * esize` bytes in disjoint blocks covering the whole
+    /// destination; `gather_view_into`'s falsifiers (`no_output_byte_is_left_
+    /// unwritten`, and the parallel-vs-serial bit-identity test) exist to keep
+    /// that true.
+    ///
+    /// If `fill` panics the buffer is dropped without reaching
+    /// [`ExecutionProvider::deallocate`], which per the ep-api contract leaks it
+    /// rather than double-freeing. That is the same behaviour as any other
+    /// panic between `allocate` and tensor construction, and is why `fill`
+    /// should stay a straight-line writer.
     pub(crate) fn from_host_fill(
         dtype: DataType,
         shape: Vec<usize>,
