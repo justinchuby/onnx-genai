@@ -386,8 +386,8 @@ fn group_fused_min_kv_bytes(fused_tasks: usize) -> usize {
 /// probe so it can be exercised with a synthetic cache size. On the calibration
 /// host the topology term is inert (4 MiB, below the floor), so testing it
 /// through [`group_fused_min_kv_bytes`] alone would prove nothing.
-fn min_kv_bytes_for(last_level_cache_bytes: usize, fused_tasks: usize) -> usize {
-    (last_level_cache_bytes / fused_tasks.max(1)).max(GROUP_FUSED_CALIBRATED_MIN_KV_BYTES)
+fn min_kv_bytes_for(llc_bytes: usize, fused_tasks: usize) -> usize {
+    (llc_bytes / fused_tasks.max(1)).max(GROUP_FUSED_CALIBRATED_MIN_KV_BYTES)
 }
 
 /// KV tokens a decode step actually streams per head.
@@ -3704,7 +3704,7 @@ mod tests {
         // if a host reports a cache size that is not a whole number of KiB per
         // fused task.
         let open_tokens = per_head.div_ceil(1024);
-        let closed_tokens = (per_head - 1) / 1024;
+        let closed_tokens = per_head.saturating_sub(1) / 1024;
         assert!(!group_fusion_pays_for_traffic(
             closed_tokens,
             128,
@@ -3850,11 +3850,18 @@ mod tests {
             llc == DEFAULT_LAST_LEVEL_CACHE_BYTES || (16 << 10..=1 << 40).contains(&llc),
             "implausible last-level cache {llc}"
         );
-        // The sentinel must collapse to exactly the calibrated constant.
-        assert_eq!(
-            min_kv_bytes_for(DEFAULT_LAST_LEVEL_CACHE_BYTES, 8),
-            GROUP_FUSED_CALIBRATED_MIN_KV_BYTES
-        );
+        // The sentinel must be zero, so that it collapses to exactly the
+        // calibrated constant at *every* task count. Anchoring only the
+        // collapse at one task count would admit a non-zero sentinel that
+        // silently changes the fallback for small task counts.
+        assert_eq!(DEFAULT_LAST_LEVEL_CACHE_BYTES, 0);
+        for tasks in [0usize, 1, 2, 8, usize::MAX] {
+            assert_eq!(
+                min_kv_bytes_for(DEFAULT_LAST_LEVEL_CACHE_BYTES, tasks),
+                GROUP_FUSED_CALIBRATED_MIN_KV_BYTES,
+                "sentinel must not depend on the task count"
+            );
+        }
     }
 
     /// A sliding-window model streams its window, not its cache, so the traffic
