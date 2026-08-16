@@ -43,7 +43,7 @@
 # Between the two passes, every crate is compiled with target_arch and
 # target_os each differing from the x86_64-Linux lanes at least once.  The
 # ARM64 lanes stay the execution signal; this is only the compile gate, and it
-# costs seconds on the quality lane instead of minutes on a scarce ARM runner.
+# runs on an existing Linux job instead of a scarce ARM runner.
 #
 # Known gaps
 # ----------
@@ -56,9 +56,12 @@
 #    set.
 # 3. Windows-specific cfg issues (target_os = "windows") are not exercised.
 #    The portable test matrix covers Windows; this script covers "not macOS."
-# 4. onnx-runtime-cpuinfo is excluded from the aarch64 pass: its cmake build
-#    script compiles C for the target and so needs a cross gcc that neither
-#    ubuntu-latest nor a macOS host has.  It contains no arch-gated Rust.
+# 4. onnx-runtime-cpuinfo joins the aarch64 pass only when an aarch64 cross gcc
+#    is installed, because its cmake build script compiles C *for the target*.
+#    ubuntu-latest does not ship one, so on CI it is skipped — and it DOES
+#    contain arch-gated Rust (src/lib.rs:129 and :144), so that skip is a real
+#    if narrow hole, not a formality.  The script says so out loud rather than
+#    reporting a clean run that silently checked less than it claims.
 #
 # Exit codes
 # ----------
@@ -159,15 +162,27 @@ if [ "$HOST_OS" = "Linux" ]; then
     # sysroot.  Use the full set.
     CRATES=("${CRATES_FULL[@]}")
     SCOPE_NOTE="full offline set (native target)"
-    # Same-OS cross, so no foreign sysroot is needed and every crate that is
-    # pure Rust (or whose build script only generates Rust) still checks.  Only
-    # cpuinfo, which compiles C for the target, needs a cross gcc.
-    ARCH_CRATES=()
-    for crate in "${CRATES_FULL[@]}"; do
-        [ "$crate" = "onnx-runtime-cpuinfo" ] && continue
-        ARCH_CRATES+=("$crate")
-    done
-    ARCH_SCOPE_NOTE="full offline set minus onnx-runtime-cpuinfo (needs a cross gcc)"
+    # Same-OS cross, so no foreign sysroot is needed and every pure-Rust crate
+    # still checks.  onnx-runtime-cpuinfo is the exception: its cmake build
+    # script compiles C *for the target*, so it needs an aarch64 cross gcc.
+    # It has arch-gated Rust of its own (src/lib.rs:129, :144), so include it
+    # whenever the toolchain is there and say so plainly when it is not.
+    ARCH_SKIPPED=""
+    ARCH_SKIP_HINT=""
+    if command -v aarch64-linux-gnu-gcc >/dev/null 2>&1 \
+        || [ -n "${CC_aarch64_unknown_linux_gnu:-}" ]; then
+        ARCH_CRATES=("${CRATES_FULL[@]}")
+        ARCH_SCOPE_NOTE="full offline set (aarch64 cross gcc present)"
+    else
+        ARCH_CRATES=()
+        for crate in "${CRATES_FULL[@]}"; do
+            [ "$crate" = "onnx-runtime-cpuinfo" ] && continue
+            ARCH_CRATES+=("$crate")
+        done
+        ARCH_SKIPPED="onnx-runtime-cpuinfo"
+        ARCH_SKIP_HINT="It has arch-gated Rust of its own, so this is a real gap: install an aarch64 cross gcc (apt install gcc-aarch64-linux-gnu) to close it."
+        ARCH_SCOPE_NOTE="full offline set minus onnx-runtime-cpuinfo"
+    fi
 else
     # On macOS (or other non-Linux hosts), ort-sys and cpuinfo need Linux
     # system headers that are unavailable without a cross-sysroot.  Fall back
@@ -177,6 +192,8 @@ else
     SCOPE_NOTE="FFI-free subset (ort-sys/cpuinfo excluded — CI covers the full set)"
     ARCH_CRATES=("${CRATES_NO_FFI[@]}")
     ARCH_SCOPE_NOTE="$SCOPE_NOTE"
+    ARCH_SKIPPED="onnx-runtime-ep-cpu and the other FFI crates"
+    ARCH_SKIP_HINT="Same limitation as the OS pass above; CI (Linux) checks them."
     echo "⚠  Running on $HOST_OS — scoping to crates without FFI build scripts."
     echo "   To check onnx-runtime-ep-cpu locally, install a Linux sysroot or"
     echo "   rely on CI (ubuntu-latest) where this script runs the full set."
@@ -227,6 +244,10 @@ echo "✓ OS-dimension check passed ($SCOPE_NOTE)"
 
 echo ""
 echo "▶ Cross-arch check (target: $ARCH_TARGET, scope: $ARCH_SCOPE_NOTE)"
+if [ -n "$ARCH_SKIPPED" ]; then
+    echo "  ⚠  NOT checked for $ARCH_TARGET: $ARCH_SKIPPED."
+    echo "     $ARCH_SKIP_HINT"
+fi
 echo "  Command: cargo clippy --target $ARCH_TARGET --all-targets ${ARCH_PKGS[*]} -- -D warnings"
 echo ""
 
