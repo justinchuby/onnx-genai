@@ -686,3 +686,59 @@ extern "C" void mlas_nchwc_pool(
         output,
         thread_pool);
 }
+
+// ---- Integer QGEMM (QLinearMatMul / MatMulInteger) ----
+//
+// MLAS's quantized GEMM is already compiled into this crate (qgemm.cpp plus the
+// AVX2/SSE41/AMX/NEON/UDOT/SDOT/SMMLA kernels); only the binding was missing, so
+// `QLinearMatMul` fell back to a scalar accumulation loop.
+//
+// Layout matches ORT's own `MatMulInteger`/`QLinearMatMul` call: `A` is M-by-K
+// row-major with `lda == K`, `B` is K-by-N row-major with `ldb == N`, and `C` is
+// the M-by-N int32 accumulator with `ldc == N`. Requantization is left to the
+// caller (no `OutputProcessor`), so this returns exactly the integer dot product
+// with the zero points folded in.
+extern "C" void mlas_qgemm_i32(
+    size_t M,
+    size_t N,
+    size_t K,
+    int a_is_signed,
+    int b_is_signed,
+    const void* A,
+    size_t lda,
+    uint8_t zero_point_a,
+    const void* B,
+    size_t ldb,
+    const uint8_t* zero_point_b,
+    int per_column_zero_points,
+    int32_t* C,
+    size_t ldc,
+    int multithread)
+{
+    MLAS_GEMM_QUANT_SHAPE_PARAMS shape;
+    shape.M = M;
+    shape.N = N;
+    shape.K = K;
+    shape.AIsSigned = a_is_signed != 0;
+    shape.BIsSigned = b_is_signed != 0;
+    shape.IsAccumulateMode = false;
+
+    MLAS_GEMM_QUANT_DATA_PARAMS data;
+    data.A = static_cast<const uint8_t*>(A);
+    data.lda = lda;
+    data.ZeroPointA = zero_point_a;
+    data.B = B;
+    data.ldb = ldb;
+    data.ZeroPointB = zero_point_b;
+    data.BIsPacked = false;
+    data.PerColumnZeroPoints = per_column_zero_points != 0;
+    data.C = C;
+    data.ldc = ldc;
+    data.OutputProcessor = nullptr;
+
+    MlasGemmBatch(
+        shape,
+        &data,
+        1,
+        multithread != 0 ? kMlasParallelSentinel : nullptr);
+}

@@ -233,8 +233,21 @@ impl Kernel for QLinearMatMulKernel {
         let b_quant = QuantParams::load("b", &inputs[4], &inputs[5], b.shape, QuantAxis::Column)?;
         let (y_scale, y_zero_point) = output_quant_params(&inputs[6], &inputs[7])?;
 
-        let a = read_quantized(&inputs[0])?;
-        let b = read_quantized(&inputs[3])?;
+        let a_signed = inputs[0].dtype == DataType::Int8;
+        let b_signed = inputs[3].dtype == DataType::Int8;
+        let qgemm = QgemmPlan::select(&a_quant, a_signed, b_signed, &geometry);
+        let a_bytes = to_dense_bytes(&inputs[0])?;
+        let b_bytes = to_dense_bytes(&inputs[3])?;
+        // The widened copies are four times the operand and are only the
+        // fallback's input, so skip them entirely when MLAS takes the work.
+        let (a, b) = if qgemm.is_some() {
+            (Vec::new(), Vec::new())
+        } else {
+            (
+                widen_quantized(&a_bytes, a_signed),
+                widen_quantized(&b_bytes, b_signed),
+            )
+        };
         let (m, k, n) = (geometry.m, geometry.k, geometry.n);
         let mut output = Vec::with_capacity(geometry.result_len);
         let mut batch_index = vec![0; geometry.batch_shape.len()];
@@ -258,6 +271,37 @@ impl Kernel for QLinearMatMulKernel {
             b_zero_points.clear();
             b_zero_points.extend((0..n).map(|column| b_quant.at(b_batch, column).1));
 
+            products.clear();
+            products.resize(m * n, 0);
+
+            if let Some(plan) = &qgemm {
+                plan.run(
+                    m,
+                    n,
+                    k,
+                    &a_bytes[a_offset..a_offset + m * k],
+                    &b_bytes[b_offset..b_offset + k * n],
+                    &b_zero_points,
+                    &mut products,
+                )?;
+                requantize_rows(
+                    &products,
+                    &a_quant,
+                    &b_quant,
+                    a_batch,
+                    b_batch,
+                    n,
+                    y_scale,
+                    y_zero_point,
+                    outputs[0].dtype,
+                    &mut output,
+                )?;
+                if batch + 1 < geometry.batch_count {
+                    next_index(&geometry.batch_shape, &mut batch_index);
+                }
+                continue;
+            }
+
             // Accumulate the integer product with `k` outermost so `B` is read
             // along its rows. The previous order walked `B` down a column with
             // stride `n`, which touches a fresh cache line per element.
@@ -274,8 +318,6 @@ impl Kernel for QLinearMatMulKernel {
             // Rows are independent, so integer accumulation stays deterministic
             // whether the rows are walked serially or under `par_chunks_mut`:
             // neither changes a summation order.
-            products.clear();
-            products.resize(m * n, 0);
             let b_zero_points = &b_zero_points[..];
             let accumulate_row = |row: usize, accumulators: &mut [i32]| {
                 let a_zero_point = a_quant.at(a_batch, row).1;
@@ -311,16 +353,18 @@ impl Kernel for QLinearMatMulKernel {
                     .for_each(|(row, accumulators)| accumulate_row(row, accumulators));
             }
 
-            for (row, accumulators) in products.chunks_exact(n).enumerate() {
-                let a_scale = a_quant.at(a_batch, row).0;
-                for (column, &accumulated) in accumulators.iter().enumerate() {
-                    let b_scale = b_quant.at(b_batch, column).0;
-                    let scale = a_scale * b_scale / y_scale;
-                    let value = (accumulated as f32 * scale).round_ties_even() as i64
-                        + i64::from(y_zero_point);
-                    push_quantized(&mut output, outputs[0].dtype, value)?;
-                }
-            }
+            requantize_rows(
+                &products,
+                &a_quant,
+                &b_quant,
+                a_batch,
+                b_batch,
+                n,
+                y_scale,
+                y_zero_point,
+                outputs[0].dtype,
+                &mut output,
+            )?;
             if batch + 1 < geometry.batch_count {
                 next_index(&geometry.batch_shape, &mut batch_index);
             }
@@ -469,6 +513,170 @@ fn read_quantized(view: &TensorView) -> Result<Vec<i32>> {
             "QLinearMatMul: expected Int8 or Uint8 tensor, got {other:?}"
         ))),
     }
+}
+
+fn widen_quantized(bytes: &[u8], signed: bool) -> Vec<i32> {
+    if signed {
+        bytes.iter().map(|&value| i32::from(value as i8)).collect()
+    } else {
+        bytes.iter().map(|&value| i32::from(value)).collect()
+    }
+}
+
+/// Narrow a zero point back to the operand's storage byte, or `None` if it does
+/// not fit -- an out-of-range zero point is a malformed model, and the exact
+/// fallback loop reports it the same way it always did.
+#[cfg(feature = "mlas")]
+fn zero_point_byte(value: i32, signed: bool) -> Option<u8> {
+    if signed {
+        i8::try_from(value).ok().map(|value| value as u8)
+    } else {
+        u8::try_from(value).ok()
+    }
+}
+
+/// Routes the integer accumulation to MLAS's quantized GEMM when that is both
+/// applicable and bit-exact.
+///
+/// MLAS ships tuned `u8`/`i8` GEMM kernels for AVX2, SSE4.1, AMX, NEON, dot
+/// product and SMMLA, and they are already compiled into `mlas-sys`; the
+/// binding was simply missing, so this kernel accumulated in a scalar loop and
+/// lost to ONNX Runtime by more than an order of magnitude.
+///
+/// Two restrictions keep the result bit-identical to the fallback:
+///
+/// * MLAS takes a single `ZeroPointA`, so a per-row `a_zero_point` stays on the
+///   fallback. Per-column `b_zero_point` is native (`PerColumnZeroPoints`).
+/// * On a kernel that pairs products into an `i16` (AVX2 without VNNI), `u8`
+///   activations against `i8` weights can saturate. `qgemm_u8s8_is_exact()`
+///   probes the running machine for exactly that, so the fast path is taken
+///   only where it is exact, and VNNI/AMX hosts get it automatically.
+#[cfg(feature = "mlas")]
+struct QgemmPlan {
+    a_signed: bool,
+    b_signed: bool,
+    zero_point_a: u8,
+    b_zero_point_bytes: std::cell::RefCell<Vec<u8>>,
+}
+
+#[cfg(feature = "mlas")]
+impl QgemmPlan {
+    fn select(
+        a_quant: &QuantParams,
+        a_signed: bool,
+        b_signed: bool,
+        geometry: &Geometry,
+    ) -> Option<Self> {
+        if geometry.m == 0 || geometry.n == 0 || geometry.k == 0 {
+            return None;
+        }
+        if a_quant.per_axis {
+            return None;
+        }
+        // MLAS documents (mlas.h, `MLAS_GEMM_QUANT_SHAPE_PARAMS`) that signed
+        // activations are unsupported off ARM, and on ARM only alongside signed
+        // weights. The generic kernel happens to answer correctly outside that
+        // envelope today, but relying on it would be relying on an accident, so
+        // stay inside the documented set and let the exact loop take the rest.
+        let signed_activations_supported = cfg!(target_arch = "aarch64") && b_signed;
+        if a_signed && !signed_activations_supported {
+            return None;
+        }
+        if !a_signed && b_signed && !mlas_sys::qgemm_u8s8_is_exact() {
+            return None;
+        }
+        let zero_point_a = zero_point_byte(a_quant.at(0, 0).1, a_signed)?;
+        Some(Self {
+            a_signed,
+            b_signed,
+            zero_point_a,
+            b_zero_point_bytes: std::cell::RefCell::new(Vec::new()),
+        })
+    }
+
+    fn run(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        a: &[u8],
+        b: &[u8],
+        b_zero_points: &[i32],
+        products: &mut [i32],
+    ) -> Result<()> {
+        let mut bytes = self.b_zero_point_bytes.borrow_mut();
+        bytes.clear();
+        bytes.reserve(n);
+        for &value in b_zero_points {
+            bytes.push(zero_point_byte(value, self.b_signed).ok_or_else(|| {
+                EpError::KernelFailed(format!(
+                    "QLinearMatMul: b_zero_point {value} does not fit the operand dtype"
+                ))
+            })?);
+        }
+        mlas_sys::qgemm_i32(
+            m,
+            n,
+            k,
+            a,
+            self.a_signed,
+            self.zero_point_a,
+            b,
+            self.b_signed,
+            mlas_sys::QgemmZeroPoints::PerColumn(&bytes),
+            products,
+        );
+        Ok(())
+    }
+}
+
+#[cfg(not(feature = "mlas"))]
+struct QgemmPlan;
+
+#[cfg(not(feature = "mlas"))]
+impl QgemmPlan {
+    fn select(_: &QuantParams, _: bool, _: bool, _: &Geometry) -> Option<Self> {
+        None
+    }
+
+    fn run(
+        &self,
+        _: usize,
+        _: usize,
+        _: usize,
+        _: &[u8],
+        _: &[u8],
+        _: &[i32],
+        _: &mut [i32],
+    ) -> Result<()> {
+        unreachable!("QgemmPlan::select never yields a plan without the mlas feature")
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn requantize_rows(
+    products: &[i32],
+    a_quant: &QuantParams,
+    b_quant: &QuantParams,
+    a_batch: usize,
+    b_batch: usize,
+    n: usize,
+    y_scale: f32,
+    y_zero_point: i32,
+    dtype: DataType,
+    output: &mut Vec<u8>,
+) -> Result<()> {
+    for (row, accumulators) in products.chunks_exact(n).enumerate() {
+        let a_scale = a_quant.at(a_batch, row).0;
+        for (column, &accumulated) in accumulators.iter().enumerate() {
+            let b_scale = b_quant.at(b_batch, column).0;
+            let scale = a_scale * b_scale / y_scale;
+            let value =
+                (accumulated as f32 * scale).round_ties_even() as i64 + i64::from(y_zero_point);
+            push_quantized(output, dtype, value)?;
+        }
+    }
+    Ok(())
 }
 
 fn push_quantized(bytes: &mut Vec<u8>, dtype: DataType, value: i64) -> Result<()> {
@@ -959,6 +1167,64 @@ mod tests {
     /// accumulator is covered separately by
     /// `qlinear_matmul_overflowing_accumulator_matches_the_previous_loop`,
     /// which needs a much larger `K` than is practical to sweep here.
+    #[cfg(feature = "mlas")]
+    fn quant_params(per_axis: bool, zero_point: i32, axis_len: usize) -> QuantParams {
+        QuantParams {
+            scales: vec![0.02; if per_axis { axis_len } else { 1 }],
+            zero_points: vec![zero_point; if per_axis { axis_len } else { 1 }],
+            axis_len,
+            per_axis,
+        }
+    }
+
+    /// The MLAS integer-GEMM route must be taken for the ordinary `u8 x u8`
+    /// case -- otherwise every parity test above silently exercises only the
+    /// fallback and proves nothing about the fast path.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn qgemm_plan_is_selected_for_the_ordinary_uint8_case() {
+        let geometry = Geometry::new(&[4, 32], &[32, 8]).unwrap();
+        assert!(
+            QgemmPlan::select(&quant_params(false, 128, 4), false, false, &geometry).is_some(),
+            "u8 activations against u8 weights with a per-tensor zero point is \
+             the case the binding exists for"
+        );
+    }
+
+    /// Every decline below is a correctness rule, not a tuning knob: MLAS takes
+    /// a single `ZeroPointA`, documents signed activations as unsupported off
+    /// ARM, and can saturate `u8 x i8` in an `i16` pair accumulator.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn qgemm_plan_declines_every_case_it_cannot_reproduce_exactly() {
+        let geometry = Geometry::new(&[4, 32], &[32, 8]).unwrap();
+        assert!(
+            QgemmPlan::select(&quant_params(true, 128, 4), false, false, &geometry).is_none(),
+            "per-row activation zero points have no MLAS equivalent"
+        );
+        assert_eq!(
+            QgemmPlan::select(&quant_params(false, 128, 4), false, true, &geometry).is_some(),
+            mlas_sys::qgemm_u8s8_is_exact(),
+            "u8 x i8 may only be routed to MLAS where that kernel is exact"
+        );
+        let signed_activations_ok = cfg!(target_arch = "aarch64");
+        assert_eq!(
+            QgemmPlan::select(&quant_params(false, -1, 4), true, true, &geometry).is_some(),
+            signed_activations_ok,
+            "signed activations are documented as ARM-only"
+        );
+        assert!(
+            QgemmPlan::select(&quant_params(false, -1, 4), true, false, &geometry).is_none(),
+            "signed activations against unsigned weights are outside the \
+             documented envelope on every architecture"
+        );
+        assert!(
+            QgemmPlan::select(&quant_params(false, 300, 4), false, false, &geometry).is_none(),
+            "a zero point that does not fit the operand dtype must fall back \
+             rather than be truncated"
+        );
+    }
+
     #[test]
     fn qlinear_matmul_reordered_accumulation_is_bit_identical() {
         for &(m, k, n) in &[
