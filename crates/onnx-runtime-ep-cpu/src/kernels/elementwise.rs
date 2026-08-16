@@ -530,14 +530,37 @@ impl Kernel for UnaryKernel {
         check_arity(self.op.name(), inputs, outputs, 1, 1, 1)?;
         let op = self.op;
         // Vectorised f32-domain fast path. `Float64` is excluded because it
-        // would round-trip through f32 and lose precision; `Sqrt` and `Erf`
-        // keep their exact scalar forms (see `kernels::simd_activations` for
-        // why `Erf` is deliberately not approximated).
-        if matches!(op, UnOp::Tanh) && inputs[0].dtype != DataType::Float64 {
+        // would round-trip through f32 and lose precision; `Erf` keeps its
+        // exact scalar form (see `kernels::simd_activations` for why `Erf` is
+        // deliberately not approximated).
+        //
+        // `Sqrt` joins `Tanh` here for a different reason than the usual
+        // speed-vs-accuracy trade: `vsqrtps` is the same correctly-rounded IEEE
+        // square root as the `sqrtss` it replaces, so this is pure throughput.
+        // The old `dispatch_float!`/`unary_typed` arm was the cost — it widened
+        // element by element through the `FloatElem` trait, `collect()`ed a
+        // whole `Vec<T>`, then copied that into the output, and the per-element
+        // `match` on the runtime `UnOp` blocked vectorisation of even the plain
+        // f32 case.
+        if matches!(op, UnOp::Tanh | UnOp::Sqrt) && inputs[0].dtype != DataType::Float64 {
             let x = to_dense_f32_widen(op.name(), &inputs[0])?;
-            return simd_activations::write_mapped(op.name(), &mut outputs[0], &x, |x, y| {
-                simd_activations::tanh_f32_slice(x, y)
-            });
+            return simd_activations::write_mapped(
+                op.name(),
+                &mut outputs[0],
+                &x,
+                |x, y| match op {
+                    UnOp::Tanh => simd_activations::tanh_f32_slice(x, y),
+                    UnOp::Sqrt => simd_activations::sqrt_f32_slice(x, y),
+                    // Unreachable today (the gate above only admits the two
+                    // arms), but a scalar fallback beats a panic if the gate
+                    // and this match ever drift apart.
+                    UnOp::Erf => {
+                        for (o, v) in y.iter_mut().zip(x) {
+                            *o = op.apply(*v);
+                        }
+                    }
+                },
+            );
         }
         dispatch_float!(inputs[0].dtype, op.name(), T => unary_typed::<T>(op, inputs, outputs))
     }
