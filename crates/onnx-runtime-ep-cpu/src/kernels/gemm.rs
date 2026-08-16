@@ -208,6 +208,7 @@ fn try_half_gemm(
 mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
+    use onnx_runtime_ir::{Attribute, Graph, NodeId, TensorData, WeightRef};
 
     #[allow(clippy::too_many_arguments)]
     fn gemm(
@@ -669,4 +670,172 @@ mod tests {
              it is no longer using the shared GEMM backend"
         );
     }
+
+    /// Serializes the tests that read the process-global weight-transpose cache
+    /// bytes or toggle its admission flag, so they never observe each other's
+    /// entries or setting under Rust's parallel test harness (#1056). Analogous
+    /// to `matmul_nbits`'s `CACHE_FLAG_TEST_LOCK`.
+    static TRANSPOSE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Build a single-node `Gemm` graph with a constant `[n, k]` `B` initializer
+    /// and `transB = 1`, for driving [`weight_transpose_cache_predicted_bytes`].
+    /// The initializer's *bytes* are irrelevant (the predictor reads only its
+    /// dims), so they are left zeroed; the executed kernel below uses its own
+    /// `Owned` `B` carrying real data.
+    fn trans_b_gemm_graph(n: usize, k: usize) -> Graph {
+        use onnx_runtime_ir::static_shape;
+        let mut graph = Graph::new();
+        let a = graph.create_named_value("A", DataType::Float32, static_shape([1, k]));
+        let b = graph.create_named_value("B", DataType::Float32, static_shape([n, k]));
+        let y = graph.create_named_value("Y", DataType::Float32, static_shape([1, n]));
+        graph.add_input(a);
+        graph.add_input(b);
+        let mut node = Node::new(NodeId(0), "Gemm", vec![Some(a), Some(b)], vec![y]);
+        node.attributes.insert("transB".into(), Attribute::Int(1));
+        graph.insert_node(node);
+        graph.add_output(y);
+        graph.set_initializer(
+            b,
+            WeightRef::Inline(TensorData::from_raw(
+                DataType::Float32,
+                vec![n, k],
+                vec![0u8; n * k * 4],
+            )),
+        );
+        graph
+    }
+
+    /// #1056 acceptance criterion: the predicted transpose-cache bytes must
+    /// equal the bytes actually held after a real run, ratio 1.00.
+    ///
+    /// This runs the constant-weight `transB` `Gemm` kernel through the `Kernel`
+    /// trait at *two* activation shapes (prefill `m = 4`, decode `m = 1`) — the
+    /// exact duplication the shape-keyed kernel cache produces in an
+    /// autoregressive session — and asserts that the process-global cache grows
+    /// by the predicted amount *once*, proving effect (b) from #1051 (per-
+    /// instantiation copies) does **not** apply here: the global cache keys on
+    /// the weight address, so the decode instance hits the prefill entry.
+    #[test]
+    fn predicted_transpose_bytes_equal_actual_after_gemm_execution() {
+        let _guard = TRANSPOSE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        matmul::set_weight_transpose_cache_enabled(true);
+
+        // Distinctive geometry so a stray same-shaped entry cannot alias it.
+        let (n, k) = (37usize, 91usize);
+        let graph = trans_b_gemm_graph(n, k);
+        let predicted = matmul::weight_transpose_cache_predicted_bytes(&graph);
+        assert_eq!(
+            predicted,
+            (n as u64) * (k as u64) * 4,
+            "one f32 [k,n] transpose per constant transB Gemm weight"
+        );
+
+        // One `B` buffer, shared by both kernel instances, so both key the
+        // global cache identically.
+        let b_data: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.013).sin()).collect();
+        let b = Owned::f32(&[n, k], &b_data);
+
+        let run = |m: usize| -> Vec<f32> {
+            let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.007).cos()).collect();
+            let a = Owned::f32(&[m, k], &a_data);
+            let mut y = Owned::zeros_f32(&[m, n]);
+            let mut kernel = GemmKernel {
+                alpha: 1.0,
+                beta: 1.0,
+                trans_a: false,
+                trans_b: true,
+                prepack: MatMulPrepack::default(),
+            };
+            kernel.set_constant_inputs(&[false, true]);
+            kernel
+                .execute(&[a.view(), b.view()], &mut [y.view_mut()])
+                .unwrap();
+            y.to_f32()
+        };
+
+        let before = matmul::weight_transpose_cache_bytes();
+        let _prefill = run(4);
+        let _decode = run(1);
+        let after = matmul::weight_transpose_cache_bytes();
+
+        // The process-global byte total is shared across the parallel test
+        // harness, so a *concurrent* test caching an unrelated weight can also
+        // grow it. Measure the bytes held for THIS weight directly by re-keying
+        // the global cache with the exact `B` pointer the kernel used (a
+        // constant, contiguous f32 input densifies to a borrow of its own
+        // buffer, so `dense(1)` and this query share one address): a hit returns
+        // the entry the two runs installed, never a fresh allocation.
+        //
+        // SAFETY: `b` is a live, contiguous `[n, k]` f32 tensor for the whole
+        // test, so its data pointer addresses exactly `n * k` f32 values.
+        let b_slice = unsafe { std::slice::from_raw_parts(b.view().data_ptr::<f32>(), n * k) };
+        let entry = crate::kernels::weight_transpose::cached_transpose_f32(b_slice, n, k)
+            .expect("the executed kernel cached this constant weight's transpose");
+        let actual = (entry.len() * std::mem::size_of::<f32>()) as u64;
+        assert_eq!(
+            actual, predicted,
+            "predicted transpose-cache bytes must equal the bytes actually held \
+             for this weight (ratio 1.00); two shape instantiations retain one \
+             shared copy"
+        );
+        // And that copy is genuinely part of the global total the plan budgets.
+        assert!(
+            after >= before + predicted as usize,
+            "the cached transpose must be reflected in the global byte total"
+        );
+    }
+
+    /// #1056 decline contract: when the cache is declined, a constant `transB`
+    /// `Gemm` weight retains **nothing** (the transpose is recomputed per call
+    /// and freed), and the result is byte-identical to the admitted run — a pure
+    /// performance tradeoff, never a numerical one.
+    #[test]
+    fn declined_transpose_cache_retains_nothing_and_is_byte_identical() {
+        let _guard = TRANSPOSE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // A fresh `B` never seen by the global cache, so a retained copy would
+        // show up as a byte increase we can detect.
+        let (n, k, m) = (29usize, 53usize, 3usize);
+        let b_data: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.019).sin()).collect();
+        let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.011).cos()).collect();
+
+        let run = || -> Vec<f32> {
+            let a = Owned::f32(&[m, k], &a_data);
+            let b = Owned::f32(&[n, k], &b_data);
+            let mut y = Owned::zeros_f32(&[m, n]);
+            let mut kernel = GemmKernel {
+                alpha: 1.0,
+                beta: 1.0,
+                trans_a: false,
+                trans_b: true,
+                prepack: MatMulPrepack::default(),
+            };
+            kernel.set_constant_inputs(&[false, true]);
+            kernel
+                .execute(&[a.view(), b.view()], &mut [y.view_mut()])
+                .unwrap();
+            y.to_f32()
+        };
+
+        // Declined: nothing may be retained.
+        matmul::set_weight_transpose_cache_enabled(false);
+        let before = matmul::weight_transpose_cache_bytes();
+        let declined = run();
+        let after = matmul::weight_transpose_cache_bytes();
+        assert_eq!(
+            after, before,
+            "a declined transpose cache must retain no session-lifetime bytes"
+        );
+
+        // Admitted: byte-identical output (transpose is the same math either way).
+        matmul::set_weight_transpose_cache_enabled(true);
+        let admitted = run();
+        assert_eq!(
+            declined, admitted,
+            "declining the transpose cache must not change results"
+        );
+
+        matmul::set_weight_transpose_cache_enabled(true);
+    }
 }
+

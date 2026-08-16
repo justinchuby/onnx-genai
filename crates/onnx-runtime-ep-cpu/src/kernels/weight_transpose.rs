@@ -36,9 +36,35 @@
 //! code could not be tested off macOS.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use rayon::prelude::*;
+
+/// Admission verdict for the process-global weight-transpose caches (#1056).
+///
+/// The transpose cache is a resident, session-lifetime, weight-scaled buffer:
+/// one full `K x N` copy per transposed constant weight. Like the resident
+/// dequant f32 cache (#987) and the MLAS SQNBit packed buffer (#1051), it must
+/// be *declinable* — when the memory-strategy plan cannot fit its predicted
+/// bytes, the kernels must compute the transpose per call and cache nothing,
+/// trading decode speed for footprint instead of overrunning the budget.
+///
+/// Defaults to enabled so the out-of-box path is unchanged; the engine flips it
+/// once, at load, from the plan's verdict (see `onnx-genai-engine`'s
+/// `set_weight_transpose_cache_enabled` beside the other two buffers' gates).
+static WEIGHT_TRANSPOSE_CACHE_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Admit (or decline) the process-global weight-transpose caches. See
+/// [`WEIGHT_TRANSPOSE_CACHE_ENABLED`].
+pub fn set_cache_enabled(enabled: bool) {
+    WEIGHT_TRANSPOSE_CACHE_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether the process-global weight-transpose caches are currently admitted.
+pub fn cache_enabled() -> bool {
+    WEIGHT_TRANSPOSE_CACHE_ENABLED.load(Ordering::Relaxed)
+}
 
 /// Total identity of one cached weight transpose.
 ///
@@ -226,15 +252,51 @@ static WEIGHT_TRANSPOSE_F16: LazyLock<TransposeCache<u16>> = LazyLock::new(Trans
 /// Process-global cache of transposed f32 weights (Accelerate GEMV / thin-M).
 static WEIGHT_TRANSPOSE_F32: LazyLock<TransposeCache<f32>> = LazyLock::new(TransposeCache::default);
 
+/// Compute the `[n, k]` transpose of `src[k, n]` **without** touching the
+/// process-global cache — the declined path (#1056).
+///
+/// Honours the same fail-closed length contract as
+/// [`TransposeCache::get_or_insert_transpose`] (returns `None` on a length
+/// mismatch, an empty vector for a zero-element matrix) so a caller cannot tell
+/// admitted from declined except by cost: the returned `Arc` is freshly
+/// allocated on every call and freed when the caller drops it, so nothing
+/// survives the kernel call and the cache's byte total stays put.
+fn transpose_uncached<T: Copy + Default + Send + Sync>(
+    src: &[T],
+    k: usize,
+    n: usize,
+) -> Option<Arc<Vec<T>>> {
+    let key = WeightTransposeKey::new(src.as_ptr(), k, n);
+    if key.numel() != Some(src.len()) {
+        return None;
+    }
+    if src.is_empty() {
+        return Some(Arc::new(Vec::new()));
+    }
+    Some(Arc::new(transpose_row_major(src, k, n)))
+}
+
 /// Cached `B_T[N,K]` for an f32 weight `B[K,N]`, or `None` when `src.len()` is
 /// not exactly `k * n`. See [`TransposeCache::get_or_insert_transpose`].
+///
+/// When the cache is declined ([`cache_enabled`] is `false`) the transpose is
+/// computed per call and not retained (#1056).
 pub fn cached_transpose_f32(src: &[f32], k: usize, n: usize) -> Option<Arc<Vec<f32>>> {
+    if !cache_enabled() {
+        return transpose_uncached(src, k, n);
+    }
     WEIGHT_TRANSPOSE_F32.get_or_insert_transpose(src, k, n)
 }
 
 /// Cached `B_T[N,K]` for an f16 weight `B[K,N]` held as raw `u16` bit patterns,
 /// or `None` when `src.len()` is not exactly `k * n`.
+///
+/// When the cache is declined ([`cache_enabled`] is `false`) the transpose is
+/// computed per call and not retained (#1056).
 pub fn cached_transpose_f16(src: &[u16], k: usize, n: usize) -> Option<Arc<Vec<u16>>> {
+    if !cache_enabled() {
+        return transpose_uncached(src, k, n);
+    }
     WEIGHT_TRANSPOSE_F16.get_or_insert_transpose(src, k, n)
 }
 
