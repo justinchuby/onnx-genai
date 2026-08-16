@@ -187,6 +187,16 @@ impl<T: Copy + Default + Send + Sync> TransposeCache<T> {
             .cloned()
     }
 
+    /// Drop a single entry by key. Test-only; used to clear a stale entry left
+    /// at a since-recycled address so a peek has a deterministic starting point.
+    #[cfg(test)]
+    pub fn remove(&self, key: &WeightTransposeKey) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
+    }
+
     /// Number of live entries.
     pub fn len(&self) -> usize {
         self.entries.lock().unwrap_or_else(|e| e.into_inner()).len()
@@ -352,6 +362,21 @@ pub(crate) fn f32_cache_contains(ptr: *const f32, k: usize, n: usize) -> bool {
     WEIGHT_TRANSPOSE_F32
         .get(&WeightTransposeKey::new(ptr, k, n))
         .is_some()
+}
+
+/// Test-only: drop any f32 entry keyed on `(ptr, k, n)`.
+///
+/// The cache keys on `(address, K, N)`. An address only names a weight while
+/// that weight is *live*; once freed, the allocator may recycle it for an
+/// unrelated buffer of the same dimensions, at which point a stale entry left
+/// by an earlier (now-freed) weight would answer [`f32_cache_contains`] `true`
+/// for a buffer that never went through the cache. A test that wants a
+/// deterministic "before" state calls this first: it is safe under the parallel
+/// harness because a *live* concurrent allocation can never share `ptr`, so the
+/// only entry this can remove is a stale one nobody is using.
+#[cfg(test)]
+pub(crate) fn f32_cache_evict(ptr: *const f32, k: usize, n: usize) {
+    WEIGHT_TRANSPOSE_F32.remove(&WeightTransposeKey::new(ptr, k, n));
 }
 
 /// Cached `B_T[N,K]` for an f16 weight `B[K,N]` held as raw `u16` bit patterns,

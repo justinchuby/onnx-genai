@@ -736,6 +736,14 @@ mod tests {
         // global cache identically.
         let b_data: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.013).sin()).collect();
         let b = Owned::f32(&[n, k], &b_data);
+        let b_ptr = b.view().data_ptr::<f32>();
+
+        // Evict any stale entry a since-freed weight of these dims may have left
+        // at this recycled address, so the first `run` below is a genuine miss
+        // and the byte total grows by `predicted` (rather than silently hitting a
+        // pre-existing entry and asserting against no growth). Safe: no live
+        // concurrent allocation can share `b_ptr`.
+        crate::kernels::weight_transpose::f32_cache_evict(b_ptr, n, k);
 
         let run = |m: usize| -> Vec<f32> {
             let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.007).cos()).collect();
@@ -801,9 +809,22 @@ mod tests {
         let b_data: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.019).sin()).collect();
         let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.011).cos()).collect();
         let b = Owned::f32(&[n, k], &b_data);
-        // SAFETY: `b` outlives every use of this pointer below and is a
-        // contiguous `[n, k]` f32 tensor, so the key names exactly this weight.
-        let b_ptr = unsafe { b.view().data_ptr::<f32>() };
+        // `b` outlives every use of this pointer below and is a contiguous
+        // `[n, k]` f32 tensor, so the key names exactly this weight.
+        let b_ptr = b.view().data_ptr::<f32>();
+
+        // Address reuse hygiene: the cache keys on `(addr, K, N)`, and an earlier
+        // (now-freed) weight of the same dims could have been recycled onto this
+        // exact address, leaving a stale entry that would make the probe below a
+        // false positive. Evict that key first so the "before" state is
+        // deterministically empty. Safe under the parallel harness: no *live*
+        // concurrent allocation can share `b_ptr`, so the only entry this can
+        // touch is a stale one nobody is using.
+        crate::kernels::weight_transpose::f32_cache_evict(b_ptr, n, k);
+        assert!(
+            !crate::kernels::weight_transpose::f32_cache_contains(b_ptr, n, k),
+            "precondition: this weight's key must start absent"
+        );
 
         let run = || -> Vec<f32> {
             let a = Owned::f32(&[m, k], &a_data);
