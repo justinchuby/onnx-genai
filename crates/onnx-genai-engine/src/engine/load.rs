@@ -477,11 +477,21 @@ impl Engine {
         // (which owns the kernel dispatch) how many extra bytes the cache costs,
         // rather than re-deriving the rule here where it would drift from the
         // kernel (#947). CUDA decode uses different kernels, so it never applies.
+        //
+        // #1056: the weight-transpose cache is the third such buffer. It holds
+        // one full `K x N` f32/f16 copy per transposed constant weight for the
+        // session (populated on all platforms by `Gemm` with `transB`, and on
+        // Apple also by `MatMul`). We ask the CPU EP to predict its bytes from
+        // the same graph and fold them into the resident total, so the single
+        // admission verdict below governs it alongside the other two.
         let resident_f32_cache_bytes = if native_cuda_load {
             0
         } else {
             match onnx_runtime_loader::load_model(&model_directory.model_path) {
-                Ok(graph) => onnx_runtime_ep_cpu::resident_dequant_f32_cache_bytes(&graph),
+                Ok(graph) => onnx_runtime_ep_cpu::resident_dequant_f32_cache_bytes(&graph)
+                    .saturating_add(onnx_runtime_ep_cpu::weight_transpose_cache_predicted_bytes(
+                        &graph,
+                    )),
                 Err(_) => 0,
             }
         };
@@ -544,6 +554,15 @@ impl Engine {
         // borrowed zero-copy int4 path (byte-identical, only slower on x86)
         // instead of doubling the weight footprint.
         onnx_runtime_ep_cpu::set_mlas_sqnbit_packing_enabled(
+            memory_strategy_plan.f32_weight_cache_admitted,
+        );
+        // #1056: the weight-transpose cache (one resident `K x N` f32/f16 copy
+        // per transposed constant weight) is the third buffer folded into
+        // `resident_f32_cache_bytes`, so the same verdict governs it. When
+        // declined, the `MatMul`/`Gemm` kernels transpose per call and retain
+        // nothing (byte-identical output, only slower decode) instead of holding
+        // the session-lifetime copies resident over budget.
+        onnx_runtime_ep_cpu::set_weight_transpose_cache_enabled(
             memory_strategy_plan.f32_weight_cache_admitted,
         );
         #[cfg(feature = "cuda")]

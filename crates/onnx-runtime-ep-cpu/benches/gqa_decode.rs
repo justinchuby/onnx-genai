@@ -28,10 +28,11 @@ mod common;
 
 use common::{FloatDType, Tensor};
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, TensorMut, TensorView};
 use onnx_runtime_ep_api::{ExecutionProvider, Kernel};
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ep_cpu::kernels::sdpa::{SoftmaxExp, sdpa_decode_group, sdpa_decode_row};
-use onnx_runtime_ir::{Attribute, Node, NodeId};
+use onnx_runtime_ir::{Attribute, DataType, DeviceId, Node, NodeId, compute_contiguous_strides};
 use rayon::ThreadPoolBuilder;
 
 /// `(label, num_heads, kv_num_heads, head_size)` for shipped decoder configs.
@@ -245,5 +246,163 @@ fn bench_gqa_kernel_decode(c: &mut Criterion) {
     group_bench.finish();
 }
 
-criterion_group!(benches, bench_sdpa_group_vs_row, bench_gqa_kernel_decode);
+/// Half-precision KV append A/B: aliased `present == past` versus the
+/// distinct-buffer copy path, at the same shipped geometries.
+///
+/// This is the measurement behind `detect_inplace_kv_half`. Both arms run the
+/// identical kernel on the identical geometry and produce identical numbers;
+/// the only difference is whether the caller bound `present` onto `past`.
+///
+/// * `copy` — distinct past and present buffers. `fill_present` widens the whole
+///   `f16`/`bf16` history into f32 scratch, then the output writer narrows the
+///   whole f32 scratch back out. Two full passes over the cache per token.
+/// * `append` — `present` aliases `past` at physical capacity. Only the new
+///   token's rows are narrowed in; the history is already resident. The
+///   full-history narrow disappears, leaving one widen for the attention core.
+///
+/// The gap is pure memory traffic and therefore grows with context length, which
+/// is why the sweep runs to 16 K tokens rather than stopping at a chat-sized
+/// window. Throughput is reported over the K+V bytes the attention core must
+/// read either way, so the ratio between arms reads directly as the fraction of
+/// cache traffic the append removes.
+fn bench_gqa_half_kv_append(c: &mut Criterion) {
+    let mut group_bench = c.benchmark_group("gqa_half_kv_append");
+    bind_decode_pool_width(8);
+    for (label, num_heads, kv_num_heads, head_size) in GEOMETRIES {
+        for kv_seq in KV_LENGTHS {
+            let past_len = kv_seq - 1;
+            let total = kv_seq;
+            let cpu = DeviceId::cpu();
+            let dt = DataType::Float16;
+
+            let q = Tensor::floats(
+                FloatDType::F32,
+                &[1, 1, num_heads * head_size],
+                &pseudo_random(num_heads * head_size, 11),
+            );
+            let cur_k = Tensor::floats(
+                FloatDType::F32,
+                &[1, 1, kv_num_heads * head_size],
+                &pseudo_random(kv_num_heads * head_size, 12),
+            );
+            let cur_v = Tensor::floats(
+                FloatDType::F32,
+                &[1, 1, kv_num_heads * head_size],
+                &pseudo_random(kv_num_heads * head_size, 13),
+            );
+            let seqlens = Tensor::i32(&[1], &[past_len as i32]);
+            let tsl = Tensor::i32(&[1], &[total as i32]);
+            let mut out = Tensor::zeros(FloatDType::F32, &[1, 1, num_heads * head_size]);
+
+            // --- copy arm: distinct past (past_len) and present (total). ---
+            let past_shape = vec![1, kv_num_heads, past_len, head_size];
+            let present_shape = vec![1, kv_num_heads, total, head_size];
+            let past_k = Tensor::floats(
+                FloatDType::F16,
+                &past_shape,
+                &pseudo_random(kv_num_heads * past_len * head_size, 14),
+            );
+            let past_v = Tensor::floats(
+                FloatDType::F16,
+                &past_shape,
+                &pseudo_random(kv_num_heads * past_len * head_size, 15),
+            );
+            let mut present_k = Tensor::zeros(FloatDType::F16, &present_shape);
+            let mut present_v = Tensor::zeros(FloatDType::F16, &present_shape);
+            let shapes: Vec<Vec<usize>> = vec![
+                vec![1, 1, num_heads * head_size],
+                vec![1, 1, kv_num_heads * head_size],
+                vec![1, 1, kv_num_heads * head_size],
+                past_shape.clone(),
+                past_shape.clone(),
+                vec![1],
+                vec![1],
+            ];
+            let kernel = gqa_kernel(num_heads, kv_num_heads, &shapes);
+            group_bench.throughput(Throughput::Bytes(
+                (2 * kv_num_heads * kv_seq * head_size * std::mem::size_of::<u16>()) as u64,
+            ));
+            group_bench.bench_function(
+                BenchmarkId::new(format!("{label}/f16/copy"), kv_seq),
+                |bencher| {
+                    bencher.iter(|| {
+                        let views = vec![
+                            q.view(),
+                            cur_k.view(),
+                            cur_v.view(),
+                            past_k.view(),
+                            past_v.view(),
+                            seqlens.view(),
+                            tsl.view(),
+                        ];
+                        let mut muts =
+                            vec![out.view_mut(), present_k.view_mut(), present_v.view_mut()];
+                        kernel
+                            .execute(black_box(&views), black_box(&mut muts))
+                            .expect("GQA half copy path must succeed");
+                    });
+                },
+            );
+
+            // --- append arm: one capacity buffer bound as both past and present.
+            // Raw pointers mirror the executor's device-binding wiring, which is
+            // the only way to express `present == past` through the kernel ABI.
+            let cap_elems = kv_num_heads * total * head_size;
+            let mut cap_k: Vec<u16> = pseudo_random(cap_elems, 14)
+                .iter()
+                .map(|&x| half::f16::from_f32(x).to_bits())
+                .collect();
+            let mut cap_v: Vec<u16> = pseudo_random(cap_elems, 15)
+                .iter()
+                .map(|&x| half::f16::from_f32(x).to_bits())
+                .collect();
+            let cap_shape = vec![1, kv_num_heads, total, head_size];
+            let cap_strides = compute_contiguous_strides(&cap_shape);
+            let kp = cap_k.as_mut_ptr().cast::<std::ffi::c_void>();
+            let vp = cap_v.as_mut_ptr().cast::<std::ffi::c_void>();
+            let cap_shapes: Vec<Vec<usize>> = vec![
+                vec![1, 1, num_heads * head_size],
+                vec![1, 1, kv_num_heads * head_size],
+                vec![1, 1, kv_num_heads * head_size],
+                cap_shape.clone(),
+                cap_shape.clone(),
+                vec![1],
+                vec![1],
+            ];
+            let cap_kernel = gqa_kernel(num_heads, kv_num_heads, &cap_shapes);
+            group_bench.bench_function(
+                BenchmarkId::new(format!("{label}/f16/append"), kv_seq),
+                |bencher| {
+                    bencher.iter(|| {
+                        let views = vec![
+                            q.view(),
+                            cur_k.view(),
+                            cur_v.view(),
+                            TensorView::new(DevicePtr(kp), dt, &cap_shape, &cap_strides, cpu),
+                            TensorView::new(DevicePtr(vp), dt, &cap_shape, &cap_strides, cpu),
+                            seqlens.view(),
+                            tsl.view(),
+                        ];
+                        let mut muts = vec![
+                            out.view_mut(),
+                            TensorMut::new(DevicePtrMut(kp), dt, &cap_shape, &cap_strides, cpu),
+                            TensorMut::new(DevicePtrMut(vp), dt, &cap_shape, &cap_strides, cpu),
+                        ];
+                        cap_kernel
+                            .execute(black_box(&views), black_box(&mut muts))
+                            .expect("GQA half append path must succeed");
+                    });
+                },
+            );
+        }
+    }
+    group_bench.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_sdpa_group_vs_row,
+    bench_gqa_kernel_decode,
+    bench_gqa_half_kv_append
+);
 criterion_main!(benches);

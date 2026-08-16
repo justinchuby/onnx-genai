@@ -1249,6 +1249,100 @@ fn conformance_chain_add_mul() {
     }
 }
 
+/// Same three-node chain, run repeatedly with changing inputs.
+///
+/// The routed path recycles a subgraph's intermediate storage — a buffer is
+/// retired once its last reader has run, and a thread-local pool carries the
+/// storage into the next `Run` without re-zeroing it. So from the second `Run`
+/// on, every intermediate is served dirty, holding the previous iteration's
+/// values.
+///
+/// That is only safe while each kernel writes the whole of its output. This
+/// test is the falsifier: the inputs change on every iteration, so any element
+/// a kernel failed to write would surface as the *previous* iteration's answer
+/// rather than the current one. A single `Run` cannot catch that, because the
+/// first pass through the pool is freshly zeroed.
+#[test]
+fn conformance_chain_add_mul_repeated_runs_do_not_leak_stale_intermediates() {
+    let _lock = lock_ort_ep();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let model_path =
+        PathBuf::from(manifest_dir).join("tests/fixtures/chain_add_mul/model.onnx.textproto");
+
+    let Some((_lib, api, env, opts, session)) =
+        (unsafe { conformance_setup("cpu_ep_chain_repeat", &model_path, true) })
+    else {
+        eprintln!(
+            "*** SKIPPED: conformance_chain_add_mul_repeated_runs_do_not_leak_stale \
+             intermediates — ORT or EP cdylib not found ***"
+        );
+        return;
+    };
+
+    unsafe { assert_ops_assigned_to_our_ep(api, session, &["Add", "Mul"], "chain_add_mul") };
+
+    unsafe {
+        for iter in 0..6u32 {
+            let base = (iter as f32) * 10.0 + 1.0;
+            let mut a_data: [f32; 4] = [base, base + 1.0, base + 2.0, base + 3.0];
+            let mut b_data: [f32; 4] = [base * 2.0; 4];
+            let mut c_data: [f32; 4] = [base + 0.5; 4];
+            let mut d_data: [f32; 4] = [-base; 4];
+            let shape: [i64; 2] = [1, 4];
+
+            let expected: Vec<f32> = (0..4)
+                .map(|i| (a_data[i] + b_data[i]) * c_data[i] + d_data[i])
+                .collect();
+
+            let a_val = make_float_tensor(api, &mut a_data, &shape);
+            let b_val = make_float_tensor(api, &mut b_data, &shape);
+            let c_val = make_float_tensor(api, &mut c_data, &shape);
+            let d_val = make_float_tensor(api, &mut d_data, &shape);
+
+            let input_names = [c"A".as_ptr(), c"B".as_ptr(), c"C".as_ptr(), c"D".as_ptr()];
+            let output_names = [c"T".as_ptr()];
+            let inputs: [*const ort::OrtValue; 4] = [a_val, b_val, c_val, d_val];
+            let mut output: *mut ort::OrtValue = ptr::null_mut();
+
+            let status = ((*api).Run.unwrap())(
+                session,
+                ptr::null(),
+                input_names.as_ptr(),
+                inputs.as_ptr(),
+                4,
+                output_names.as_ptr(),
+                1,
+                &mut output,
+            );
+            check_status(api, status, "Run");
+            assert!(!output.is_null());
+
+            let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
+            let status = ((*api).GetTensorMutableData.unwrap())(output, &mut data_ptr);
+            check_status(api, status, "GetTensorMutableData");
+            let result = std::slice::from_raw_parts(data_ptr as *const f32, 4);
+            for (i, (got, want)) in result.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    (got - want).abs() < 1e-4,
+                    "iteration {iter}: output[{i}] = {got}, want {want} \
+                     (a stale recycled intermediate would show the previous iteration)"
+                );
+            }
+
+            ((*api).ReleaseValue.unwrap())(output);
+            ((*api).ReleaseValue.unwrap())(a_val);
+            ((*api).ReleaseValue.unwrap())(b_val);
+            ((*api).ReleaseValue.unwrap())(c_val);
+            ((*api).ReleaseValue.unwrap())(d_val);
+        }
+
+        conformance_teardown(api, env, opts, session, "cpu_ep_chain_repeat");
+        eprintln!(
+            "\n✅ conformance_chain_add_mul_repeated_runs_do_not_leak_stale_intermediates: PASSED"
+        );
+    }
+}
+
 // ─── Conformance: MatMul ──────────────────────────────────────────────────────
 
 /// MatMul [2,3] × [3,2] → [2,2]

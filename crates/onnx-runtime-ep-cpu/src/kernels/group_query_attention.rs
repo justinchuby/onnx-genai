@@ -175,6 +175,18 @@ static PRESENT_DIRECT_CALLS: std::sync::atomic::AtomicUsize =
 static PRESENT_SCRATCH_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Count of forwards that appended into an aliased *half-precision*
+/// (`f16`/`bf16`) present==past cache instead of re-materialising the whole
+/// history. Reachability evidence for the append A/B, in the same spirit as
+/// [`present_direct_count`].
+static PRESENT_INPLACE_HALF_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Number of forwards that took the half-precision in-place append path.
+pub fn present_inplace_half_count() -> usize {
+    PRESENT_INPLACE_HALF_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Number of forwards that built the present cache directly in the graph
 /// outputs (no owned scratch, no trailing copy). Reachability evidence for A/B
 /// runs, in the same spirit as [`group_fused_count`].
@@ -821,6 +833,38 @@ enum PastSrc<'a> {
     Dense(Vec<f32>),
 }
 
+/// Element encoding of an aliased half-precision KV cache. Both variants are
+/// 16 bits wide but their bit layouts differ, so the append and widen passes
+/// must agree on one for the whole run.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HalfKv {
+    F16,
+    Bf16,
+}
+
+impl HalfKv {
+    fn dtype(self) -> onnx_runtime_ir::DataType {
+        match self {
+            HalfKv::F16 => onnx_runtime_ir::DataType::Float16,
+            HalfKv::Bf16 => onnx_runtime_ir::DataType::BFloat16,
+        }
+    }
+
+    fn widen_into(self, src: &[u16], dst: &mut [f32]) {
+        match self {
+            HalfKv::F16 => crate::dtype::widen_f16_slice_into(src, dst),
+            HalfKv::Bf16 => crate::dtype::widen_bf16_slice_into(src, dst),
+        }
+    }
+
+    fn narrow_into(self, src: &[f32], dst: &mut [u16]) {
+        match self {
+            HalfKv::F16 => crate::dtype::narrow_f16_slice_into(src, dst),
+            HalfKv::Bf16 => crate::dtype::narrow_bf16_slice_into(src, dst),
+        }
+    }
+}
+
 impl<'a> PastCache<'a> {
     fn from_cache(view: &'a TensorView<'a>, heads: usize, name: &str) -> Result<Self> {
         if view.shape.len() != 4 || view.shape[1] != heads {
@@ -1113,6 +1157,76 @@ impl GroupQueryAttentionKernel {
         pk_in != 0 && pv_in != 0 && pk_in == pk_out && pv_in == pv_out && pk_in != pv_in
     }
 
+    /// The half-precision counterpart of [`Self::detect_inplace_kv`].
+    ///
+    /// WHAT: reports the element width/encoding of an aliased `present == past`
+    /// KV cache held in `f16` or `bf16`, or `None` when the append path does not
+    /// apply.
+    ///
+    /// WHY: production decoders export their KV cache in half precision, and
+    /// until this gate existed every one of them missed the O(1) append. The
+    /// f32-only [`Self::detect_inplace_kv`] declined them, so each decode step
+    /// paid *two* full passes over the whole cache: `fill_present` widened the
+    /// entire `f16` history into f32 scratch, then the trailing output writer
+    /// narrowed the entire f32 scratch back into the graph's `present_*`
+    /// outputs. Only the second pass is avoidable — the attention core still
+    /// needs f32 K/V — but it is the expensive one, because it is a *write* over
+    /// `2 * B * H_kv * S * D` elements that dirties the whole cache footprint
+    /// every token. Appending in place removes it entirely and leaves an O(new
+    /// tokens) narrow behind.
+    ///
+    /// The gate is deliberately the same *structural* proof the f32 path uses —
+    /// identical origins, exact physical capacity, contiguous, no K/V aliasing —
+    /// so a caller that does not bind `present` onto `past` keeps today's
+    /// behaviour byte for byte. Mixed widths (an `f16` past with a `bf16`
+    /// present, say) are rejected: the two encodings share a width but not a
+    /// bit layout, so appending under the wrong one would silently corrupt.
+    fn detect_inplace_kv_half(
+        &self,
+        inputs: &[TensorView],
+        outputs: &[TensorMut],
+        present_sequence_length: usize,
+        present_len: usize,
+        past_key: Option<&PastCache>,
+    ) -> Option<HalfKv> {
+        use onnx_runtime_ir::DataType::{BFloat16, Float16};
+        let cache = past_key?;
+        if outputs.len() < 3 || present_sequence_length != cache.seq || inputs.len() < 5 {
+            return None;
+        }
+        let kind = match inputs[3].dtype {
+            Float16 => HalfKv::F16,
+            BFloat16 => HalfKv::Bf16,
+            _ => return None,
+        };
+        let want = kind.dtype();
+        for view in [&inputs[3], &inputs[4]] {
+            if view.is_absent()
+                || view.dtype != want
+                || !view.is_contiguous()
+                || view.numel() != present_len
+            {
+                return None;
+            }
+        }
+        for out in [&outputs[1], &outputs[2]] {
+            if out.dtype != want || !out.is_contiguous() || out.numel() != present_len {
+                return None;
+            }
+        }
+        // Structural aliasing, computed exactly as `detect_inplace_kv` does.
+        let in_ptr =
+            |view: &TensorView| (view.data.0 as *const u8).wrapping_add(view.byte_offset) as usize;
+        let out_ptr =
+            |out: &TensorMut| (out.data.0 as *const u8).wrapping_add(out.byte_offset) as usize;
+        let pk_in = in_ptr(&inputs[3]);
+        let pv_in = in_ptr(&inputs[4]);
+        let pk_out = out_ptr(&outputs[1]);
+        let pv_out = out_ptr(&outputs[2]);
+        (pk_in != 0 && pv_in != 0 && pk_in == pk_out && pv_in == pv_out && pk_in != pv_in)
+            .then_some(kind)
+    }
+
     /// Decide whether the present KV cache can be *assembled directly inside the
     /// graph's `present_key`/`present_value` outputs* instead of being built in
     /// owned scratch and then memcpy-ed out.
@@ -1288,6 +1402,104 @@ impl GroupQueryAttentionKernel {
                     past_value,
                     v,
                 );
+            }
+        }
+    }
+    /// Append the current step into an aliased half-precision `present == past`
+    /// cache and widen the resulting history into f32 attention scratch.
+    ///
+    /// Replaces `fill_present` + the trailing narrow for half-precision aliased
+    /// caches. Two passes become one and a half:
+    ///
+    /// * **append** — narrow only the `cur.seq` new rows per (batch, kv-head)
+    ///   into the cache at `[past_len, total)`. O(new tokens), not O(history).
+    ///   The prefix `[0, past_len)` is already resident from earlier steps and is
+    ///   never rewritten, which is the entire point of the aliased binding.
+    /// * **widen** — read `[0, total)` back out as f32 for the attention core and
+    ///   zero the unattended tail, exactly matching `fill_present`'s contract so
+    ///   every downstream reader sees an identically-shaped buffer.
+    ///
+    /// The eliminated pass is the full-history narrow the generic output writer
+    /// used to perform. Numerically the append is a no-op change: the new rows
+    /// go through the same round-to-nearest-even conversion the output writer
+    /// applied, and the history keeps whatever bits the previous step wrote —
+    /// which are precisely the bits the previous step's output writer produced.
+    ///
+    /// # Safety
+    ///
+    /// `half` must be the aliased cache proven by
+    /// [`Self::detect_inplace_kv_half`]: contiguous, `present_len` elements wide,
+    /// and no longer aliased by any live `PastCache` borrow. The caller must have
+    /// dropped `past_key`/`past_value` first — they view this same memory.
+    #[allow(clippy::too_many_arguments)]
+    fn append_and_widen_half(
+        &self,
+        kind: HalfKv,
+        half_k: &mut [u16],
+        half_v: &mut [u16],
+        scratch_k: &mut [f32],
+        scratch_v: &mut [f32],
+        k: &Bhsd,
+        v: &Bhsd,
+        past_lengths: &[usize],
+        totals: &[usize],
+        present_sequence_length: usize,
+        cache_dim: usize,
+    ) {
+        let rows = past_lengths.len() * self.kv_num_heads;
+        let row_len = present_sequence_length * cache_dim;
+
+        // Pass 1: append. Single-threaded on purpose — in decode this is one
+        // token per (batch, kv-head), far below any fan-out threshold, and the
+        // parallel machinery below would cost more than the copy.
+        for row_index in 0..rows {
+            let b = row_index / self.kv_num_heads;
+            let dst_cur = row_index * row_len + past_lengths[b] * cache_dim;
+            for (cur, half) in [(k, &mut *half_k), (v, &mut *half_v)] {
+                let cur_row_len = cur.seq * cache_dim;
+                let src_cur = row_index * cur_row_len;
+                kind.narrow_into(
+                    &cur.data[src_cur..src_cur + cur_row_len],
+                    &mut half[dst_cur..dst_cur + cur_row_len],
+                );
+            }
+        }
+
+        // Pass 2: widen the attended history back out for the attention core.
+        // Read-only over the cache, so the row fan-out needs no aliasing proof
+        // beyond the disjoint destination ranges it already guarantees.
+        let src_k: &[u16] = half_k;
+        let src_v: &[u16] = half_v;
+        let widen_row = |row_index: usize, dst: &mut [f32], src: &[u16]| {
+            let b = row_index / self.kv_num_heads;
+            let valid = totals[b] * cache_dim;
+            let base = row_index * row_len;
+            kind.widen_into(&src[base..base + valid], &mut dst[..valid]);
+            if valid < row_len {
+                dst[valid..row_len].fill(0.0);
+            }
+        };
+
+        let workers = crate::kernels::matmul_nbits::active_decode_worker_count().max(1);
+        let per_worker_bytes = row_len * size_of::<f32>() * rows.div_ceil(workers.min(rows.max(1)));
+        if rows > 1 && workers > 1 && per_worker_bytes >= min_parallel_present_bytes_per_worker() {
+            crate::kernels::matmul_nbits::decode_parallel_output_row_blocks(
+                scratch_k,
+                row_len,
+                rows,
+                |row_index, dst| widen_row(row_index, dst, src_k),
+            );
+            crate::kernels::matmul_nbits::decode_parallel_output_row_blocks(
+                scratch_v,
+                row_len,
+                rows,
+                |row_index, dst| widen_row(row_index, dst, src_v),
+            );
+        } else {
+            for row_index in 0..rows {
+                let base = row_index * row_len;
+                widen_row(row_index, &mut scratch_k[base..base + row_len], src_k);
+                widen_row(row_index, &mut scratch_v[base..base + row_len], src_v);
             }
         }
     }
@@ -1553,6 +1765,17 @@ impl Kernel for GroupQueryAttentionKernel {
         // and direct-write paths fill the aliased/graph output buffers and never
         // touch these.
         let direct_present = !in_place && self.detect_direct_present(inputs, outputs, present_len);
+        let inplace_half = if in_place || direct_present {
+            None
+        } else {
+            self.detect_inplace_kv_half(
+                inputs,
+                outputs,
+                present_sequence_length,
+                present_len,
+                past_key.as_ref(),
+            )
+        };
         let owned_present_k: Vec<f32>;
         let owned_present_v: Vec<f32>;
         let (present_k, present_v): (&[f32], &[f32]) = if in_place {
@@ -1586,6 +1809,51 @@ impl Kernel for GroupQueryAttentionKernel {
                 }
             }
             (&*present_k, &*present_v)
+        } else if let Some(kind) = inplace_half {
+            PRESENT_INPLACE_HALF_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let pk_ptr = outputs[1].data_ptr_mut::<u16>();
+            let pv_ptr = outputs[2].data_ptr_mut::<u16>();
+            // Release the immutable past borrows before mutating the aliased
+            // cache: past_key/past_value view the SAME memory as pk_ptr/pv_ptr,
+            // so no live borrow may coexist with the `&mut [u16]` below.
+            drop(past_key);
+            drop(past_value);
+            // SAFETY: `detect_inplace_kv_half` proved outputs[1]/[2] are
+            // contiguous 16-bit buffers of exactly `present_len` elements,
+            // structurally aliased with inputs[3]/[4] and disjoint from each
+            // other. They are the graph outputs, exclusively owned by this
+            // kernel invocation. `append_and_widen_half` writes only the current
+            // [past_len, total) rows and reads only [0, total), which prior steps
+            // (and the append itself) have initialised — never the unattended
+            // capacity beyond `total`.
+            let half_k = unsafe { std::slice::from_raw_parts_mut(pk_ptr, present_len) };
+            let half_v = unsafe { std::slice::from_raw_parts_mut(pv_ptr, present_len) };
+            let mut scratch_k = Vec::<f32>::with_capacity(present_len);
+            let mut scratch_v = Vec::<f32>::with_capacity(present_len);
+            // SAFETY: `append_and_widen_half` writes all `present_len` elements
+            // of both buffers — the widened [0, total) history plus the zeroed
+            // tail cover [0, present_sequence_length) for every (batch, kv-head)
+            // — before attention reads them.
+            unsafe {
+                scratch_k.set_len(present_len);
+                scratch_v.set_len(present_len);
+            }
+            self.append_and_widen_half(
+                kind,
+                half_k,
+                half_v,
+                &mut scratch_k,
+                &mut scratch_v,
+                &k,
+                &v,
+                &past_lengths,
+                &totals,
+                present_sequence_length,
+                cache_dim,
+            );
+            owned_present_k = scratch_k;
+            owned_present_v = scratch_v;
+            (&owned_present_k[..], &owned_present_v[..])
         } else if direct_present {
             PRESENT_DIRECT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // No present==past binding, but the graph's present outputs are
@@ -1942,10 +2210,11 @@ impl Kernel for GroupQueryAttentionKernel {
         } else {
             write_dense_f32_narrow("GroupQueryAttention", &mut outputs[0], &output)?;
         }
-        // In the in-place and direct-write paths the present outputs ARE the
-        // buffers we just filled, so re-emitting them would be a redundant
-        // self-copy — skip it. Only the owned-scratch path materializes here.
-        if !in_place && !direct_present {
+        // In the in-place, half-precision append and direct-write paths the
+        // present outputs ARE the buffers we just filled, so re-emitting them
+        // would be a redundant self-copy — skip it. Only the owned-scratch path
+        // materializes here.
+        if !in_place && !direct_present && inplace_half.is_none() {
             if outputs.len() >= 2 {
                 if decode_fast_write {
                     write_decode_output(&mut outputs[1], present_k)?;
@@ -4512,6 +4781,586 @@ mod tests {
         }
     }
 
+    /// Half-precision analogue of [`build_capacity_buffer`]: a
+    /// `[1, KV, capacity, DIM]` cache in `f16`/`bf16` bit patterns.
+    fn build_capacity_buffer_half(
+        kind: HalfKv,
+        capacity: usize,
+        past: usize,
+        past_data: &[f32],
+        tail: f32,
+    ) -> Vec<u16> {
+        let dense = build_capacity_buffer(capacity, past, past_data, tail);
+        let mut bits = vec![0u16; dense.len()];
+        kind.narrow_into(&dense, &mut bits);
+        bits
+    }
+
+    /// Widen the valid `[0, total)` prefix of every head out of a half-precision
+    /// capacity buffer, yielding a dense f32 `[1, KV, total, DIM]`.
+    fn head_prefix_half(kind: HalfKv, bits: &[u16], capacity: usize, total: usize) -> Vec<f32> {
+        let mut dense = vec![0.0f32; bits.len()];
+        kind.widen_into(bits, &mut dense);
+        head_prefix(&dense, capacity, total)
+    }
+
+    /// Half-precision analogue of [`run_inplace_step`]: `kbuf`/`vbuf` are the
+    /// aliased `[1, KV, capacity, DIM]` `f16`/`bf16` cache. Query and the current
+    /// K/V stay `f32` so the test isolates the cache encoding from the activation
+    /// encoding; the kernel accepts the mix because the append gate reads only
+    /// the past/present dtypes.
+    #[allow(clippy::too_many_arguments)]
+    fn run_inplace_half_step(
+        kernel: &dyn Kernel,
+        kind: HalfKv,
+        capacity: usize,
+        total: usize,
+        q_seq: usize,
+        query: &[f32],
+        cur_k: &[f32],
+        cur_v: &[f32],
+        kbuf: &mut [u16],
+        vbuf: &mut [u16],
+    ) -> Vec<f32> {
+        let kv_shape = [1usize, IP_KV_HEADS, capacity, IP_DIM];
+        let kv_strides = compute_contiguous_strides(&kv_shape);
+        let k_ptr = kbuf.as_mut_ptr() as *mut std::ffi::c_void;
+        let v_ptr = vbuf.as_mut_ptr() as *mut std::ffi::c_void;
+        let dt = kind.dtype();
+        let cpu = onnx_runtime_ir::DeviceId::cpu();
+        let query_owned = Owned::f32(&[1, q_seq, IP_NUM_HEADS * IP_DIM], query);
+        let ck = Owned::f32(&[1, q_seq, IP_KV_HEADS * IP_DIM], cur_k);
+        let cv = Owned::f32(&[1, q_seq, IP_KV_HEADS * IP_DIM], cur_v);
+        let seqlens = Owned::i32(&[1], &[(total - 1) as i32]);
+        let tsl = Owned::i32(&[], &[total as i32]);
+        let mut out = Owned::zeros_f32(&[1, q_seq, IP_NUM_HEADS * IP_DIM]);
+        // Past inputs and present outputs intentionally alias the same capacity
+        // buffers — the structural signal `detect_inplace_kv_half` gates on.
+        kernel
+            .execute(
+                &[
+                    query_owned.view(),
+                    ck.view(),
+                    cv.view(),
+                    TensorView::new(DevicePtr(k_ptr), dt, &kv_shape, &kv_strides, cpu),
+                    TensorView::new(DevicePtr(v_ptr), dt, &kv_shape, &kv_strides, cpu),
+                    seqlens.view(),
+                    tsl.view(),
+                ],
+                &mut [
+                    out.view_mut(),
+                    TensorMut::new(DevicePtrMut(k_ptr), dt, &kv_shape, &kv_strides, cpu),
+                    TensorMut::new(DevicePtrMut(v_ptr), dt, &kv_shape, &kv_strides, cpu),
+                ],
+            )
+            .unwrap();
+        out.to_f32()
+    }
+
+    /// Every value the half-cache tests feed the cache is an integer or a dyadic fraction
+    /// small enough to be exact in BOTH `f16` (11-bit mantissa) and `bf16`
+    /// (8-bit mantissa). That is deliberate: it makes the half-cache parity
+    /// assertion *exact* rather than tolerance-based, so a real rounding
+    /// regression in the append path cannot hide inside an epsilon.
+    fn half_decode_matches_copy_path(kind: HalfKv) {
+        let kernel = gqa_kernel(&[]);
+        let past = 3usize;
+        let total = 4usize;
+        let capacity = 9usize; // spare capacity beyond the attended window
+        let query = vec![0.5, -0.5, 1., 0., 0.25, 1., -1., 0.75];
+        let past_k = vec![1., 0., 0., 1., 2., -1., 10., 0., 0., 10., 5., 5.];
+        let past_v = vec![1., 2., 3., 4., 5., 6., 10., 20., 30., 40., 50., 60.];
+        let cur_k = vec![0.5, 0.5, 7., 7.];
+        let cur_v = vec![7., 8., 70., 80.];
+
+        let (copy_out, copy_pk, copy_pv) = run_copy_step(
+            kernel.as_ref(),
+            past,
+            total,
+            1,
+            &query,
+            &cur_k,
+            &cur_v,
+            &past_k,
+            &past_v,
+        );
+
+        let mut kbuf = build_capacity_buffer_half(kind, capacity, past, &past_k, f32::NAN);
+        let mut vbuf = build_capacity_buffer_half(kind, capacity, past, &past_v, f32::NAN);
+        let before = present_inplace_half_count();
+        let half_out = run_inplace_half_step(
+            kernel.as_ref(),
+            kind,
+            capacity,
+            total,
+            1,
+            &query,
+            &cur_k,
+            &cur_v,
+            &mut kbuf,
+            &mut vbuf,
+        );
+        assert!(
+            present_inplace_half_count() > before,
+            "{kind:?} aliased cache must take the append path, not the owned-scratch fall-back"
+        );
+
+        assert_eq!(
+            half_out, copy_out,
+            "{kind:?} append-path attention output must match the copy path exactly"
+        );
+        assert_eq!(
+            head_prefix_half(kind, &kbuf, capacity, total),
+            copy_pk,
+            "{kind:?} appended present_key prefix must match the copy path"
+        );
+        assert_eq!(
+            head_prefix_half(kind, &vbuf, capacity, total),
+            copy_pv,
+            "{kind:?} appended present_value prefix must match the copy path"
+        );
+    }
+
+    #[test]
+    fn inplace_half_f16_decode_matches_copy_path() {
+        half_decode_matches_copy_path(HalfKv::F16);
+    }
+
+    #[test]
+    fn inplace_half_bf16_decode_matches_copy_path() {
+        half_decode_matches_copy_path(HalfKv::Bf16);
+    }
+
+    /// The load-bearing claim of the append path: a decode step must rewrite
+    /// **only** the new token's rows. This walks four steps through one capacity
+    /// buffer and asserts, after every step, that the already-resident history
+    /// and the unattended tail are bit-identical to what they were before the
+    /// step. A kernel that re-materialised the whole cache — the behaviour every
+    /// half-precision model got before this path existed — fails here even
+    /// though its numerics would still be correct.
+    #[test]
+    fn inplace_half_rewrites_only_the_new_rows() {
+        for kind in [HalfKv::F16, HalfKv::Bf16] {
+            let kernel = gqa_kernel(&[]);
+            let capacity = 8usize;
+            let past0 = 2usize;
+            let past_k = vec![1., 0., 0., 1., 10., 0., 0., 10.];
+            let past_v = vec![1., 2., 3., 4., 10., 20., 30., 40.];
+            let mut kbuf = build_capacity_buffer_half(kind, capacity, past0, &past_k, 3.5);
+            let mut vbuf = build_capacity_buffer_half(kind, capacity, past0, &past_v, 3.5);
+
+            for step in 0..4usize {
+                let past = past0 + step;
+                let total = past + 1;
+                let before_k = kbuf.clone();
+                let before_v = vbuf.clone();
+                let q = vec![0.5, -0.5, 1., 0., 0.25, 1., -1., 0.75];
+                let cur_k = vec![0.5, 0.5, 7., 7.];
+                let cur_v = vec![7., 8., 70., 80.];
+                run_inplace_half_step(
+                    kernel.as_ref(),
+                    kind,
+                    capacity,
+                    total,
+                    1,
+                    &q,
+                    &cur_k,
+                    &cur_v,
+                    &mut kbuf,
+                    &mut vbuf,
+                );
+
+                for h in 0..IP_KV_HEADS {
+                    let row = h * capacity * IP_DIM;
+                    let appended = row + past * IP_DIM..row + total * IP_DIM;
+                    for (name, after, prior) in
+                        [("key", &kbuf, &before_k), ("value", &vbuf, &before_v)]
+                    {
+                        for idx in row..row + capacity * IP_DIM {
+                            if appended.contains(&idx) {
+                                continue;
+                            }
+                            assert_eq!(
+                                after[idx], prior[idx],
+                                "{kind:?} step {step} rewrote present_{name} element {idx} \
+                                 outside the appended range {appended:?}; the append path must \
+                                 leave resident history and unattended capacity untouched"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Prefill (`q_seq > 1`) appends a whole span rather than one row, and must
+    /// still match the copy path and leave the spare capacity alone.
+    #[test]
+    fn inplace_half_prefill_matches_copy_path() {
+        for kind in [HalfKv::F16, HalfKv::Bf16] {
+            let kernel = gqa_kernel(&[]);
+            let capacity = 6usize;
+            let q_seq = 3usize;
+            let total = 3usize;
+            let query = vec![
+                0.5, -0.5, 1., 0., 0.25, 1., -1., 0.75, 1., 1., 0., 0., 0.5, 0.5, 2., -2., 1., 0.,
+                0., 1., 0.25, 0.25, -1., 1.,
+            ];
+            let cur_k = vec![1., 0., 10., 0., 0., 1., 0., 10., 0.5, 0.5, 5., 5.];
+            let cur_v = vec![1., 2., 10., 20., 3., 4., 30., 40., 5., 6., 50., 60.];
+
+            let (copy_out, copy_pk, copy_pv) = run_copy_step(
+                kernel.as_ref(),
+                0,
+                total,
+                q_seq,
+                &query,
+                &cur_k,
+                &cur_v,
+                &[],
+                &[],
+            );
+
+            let mut kbuf = build_capacity_buffer_half(kind, capacity, 0, &[], 0.0);
+            let mut vbuf = build_capacity_buffer_half(kind, capacity, 0, &[], 0.0);
+            let half_out = run_inplace_half_step(
+                kernel.as_ref(),
+                kind,
+                capacity,
+                total,
+                q_seq,
+                &query,
+                &cur_k,
+                &cur_v,
+                &mut kbuf,
+                &mut vbuf,
+            );
+
+            assert_eq!(half_out, copy_out, "{kind:?} prefill output must match");
+            assert_eq!(
+                head_prefix_half(kind, &kbuf, capacity, total),
+                copy_pk,
+                "{kind:?} prefill present_key must match"
+            );
+            assert_eq!(
+                head_prefix_half(kind, &vbuf, capacity, total),
+                copy_pv,
+                "{kind:?} prefill present_value must match"
+            );
+        }
+    }
+
+    /// `f16` and `bf16` share a width but not a bit layout, so a past/present
+    /// pair that disagrees must NOT be appended under either encoding — doing so
+    /// would reinterpret every history element. The gate declines, and the
+    /// owned-scratch path (which converts through the generic writer) handles it.
+    #[test]
+    fn detect_inplace_kv_half_rejects_mixed_encodings() {
+        let kernel = raw_gqa_kernel(0, false);
+        let capacity = 4usize;
+        let present_len = IP_KV_HEADS * capacity * IP_DIM;
+        let kv_shape = [1usize, IP_KV_HEADS, capacity, IP_DIM];
+        let kv_strides = compute_contiguous_strides(&kv_shape);
+        let cpu = onnx_runtime_ir::DeviceId::cpu();
+        let mut kbuf = vec![0u16; present_len];
+        let mut vbuf = vec![0u16; present_len];
+        let k_ptr = kbuf.as_mut_ptr() as *mut std::ffi::c_void;
+        let v_ptr = vbuf.as_mut_ptr() as *mut std::ffi::c_void;
+        let view = |ptr: *mut std::ffi::c_void, dt: DataType| {
+            TensorView::new(DevicePtr(ptr), dt, &kv_shape, &kv_strides, cpu)
+        };
+        let out_mut = |ptr: *mut std::ffi::c_void, dt: DataType| {
+            TensorMut::new(DevicePtrMut(ptr), dt, &kv_shape, &kv_strides, cpu)
+        };
+        let past_view = view(k_ptr, DataType::Float16);
+        let past_key = PastCache::from_cache(&past_view, IP_KV_HEADS, "past_key").unwrap();
+        let out0 = Owned::zeros_f32(&[1, 1, IP_NUM_HEADS * IP_DIM]);
+
+        let inputs = [
+            out0.view(),
+            out0.view(),
+            out0.view(),
+            view(k_ptr, DataType::Float16),
+            view(v_ptr, DataType::Float16),
+            out0.view(),
+            out0.view(),
+        ];
+        // Same addresses, same width, different encoding on the present side.
+        let mismatched = [
+            out_mut(
+                out0.bytes.as_ptr() as *mut std::ffi::c_void,
+                DataType::Float32,
+            ),
+            out_mut(k_ptr, DataType::BFloat16),
+            out_mut(v_ptr, DataType::BFloat16),
+        ];
+        assert_eq!(
+            kernel.detect_inplace_kv_half(
+                &inputs,
+                &mismatched,
+                capacity,
+                present_len,
+                Some(&past_key)
+            ),
+            None,
+            "an f16 past with a bf16 present must not be appended in place"
+        );
+
+        // Matched encodings at the same addresses do fire, proving the rejection
+        // above is the encoding mismatch and not some unrelated gate condition.
+        let matched = [
+            out_mut(
+                out0.bytes.as_ptr() as *mut std::ffi::c_void,
+                DataType::Float32,
+            ),
+            out_mut(k_ptr, DataType::Float16),
+            out_mut(v_ptr, DataType::Float16),
+        ];
+        assert_eq!(
+            kernel.detect_inplace_kv_half(
+                &inputs,
+                &matched,
+                capacity,
+                present_len,
+                Some(&past_key)
+            ),
+            Some(HalfKv::F16),
+            "a matched f16 past/present pair must be appended in place"
+        );
+    }
+
+    /// Without structural aliasing there is no resident history to append to, so
+    /// the gate must decline and leave the pre-existing copy path in charge.
+    #[test]
+    fn detect_inplace_kv_half_rejects_unaliased_present() {
+        let kernel = raw_gqa_kernel(0, false);
+        let capacity = 4usize;
+        let present_len = IP_KV_HEADS * capacity * IP_DIM;
+        let kv_shape = [1usize, IP_KV_HEADS, capacity, IP_DIM];
+        let kv_strides = compute_contiguous_strides(&kv_shape);
+        let cpu = onnx_runtime_ir::DeviceId::cpu();
+        let mut kbuf = vec![0u16; present_len];
+        let mut vbuf = vec![0u16; present_len];
+        let mut other_k = vec![0u16; present_len];
+        let mut other_v = vec![0u16; present_len];
+        let k_ptr = kbuf.as_mut_ptr() as *mut std::ffi::c_void;
+        let v_ptr = vbuf.as_mut_ptr() as *mut std::ffi::c_void;
+        let dt = DataType::Float16;
+        let past_view = TensorView::new(DevicePtr(k_ptr), dt, &kv_shape, &kv_strides, cpu);
+        let past_key = PastCache::from_cache(&past_view, IP_KV_HEADS, "past_key").unwrap();
+        let out0 = Owned::zeros_f32(&[1, 1, IP_NUM_HEADS * IP_DIM]);
+        let inputs = [
+            out0.view(),
+            out0.view(),
+            out0.view(),
+            TensorView::new(DevicePtr(k_ptr), dt, &kv_shape, &kv_strides, cpu),
+            TensorView::new(DevicePtr(v_ptr), dt, &kv_shape, &kv_strides, cpu),
+            out0.view(),
+            out0.view(),
+        ];
+        let outputs = [
+            TensorMut::new(
+                DevicePtrMut(out0.bytes.as_ptr() as *mut std::ffi::c_void),
+                DataType::Float32,
+                &kv_shape,
+                &kv_strides,
+                cpu,
+            ),
+            TensorMut::new(
+                DevicePtrMut(other_k.as_mut_ptr() as *mut std::ffi::c_void),
+                dt,
+                &kv_shape,
+                &kv_strides,
+                cpu,
+            ),
+            TensorMut::new(
+                DevicePtrMut(other_v.as_mut_ptr() as *mut std::ffi::c_void),
+                dt,
+                &kv_shape,
+                &kv_strides,
+                cpu,
+            ),
+        ];
+        assert_eq!(
+            kernel.detect_inplace_kv_half(
+                &inputs,
+                &outputs,
+                capacity,
+                present_len,
+                Some(&past_key)
+            ),
+            None,
+            "distinct present buffers must keep the copy path"
+        );
+    }
+
+    /// Batch > 1 with **ragged** `seqlens_k`, and a chunked prefill where the
+    /// step appends a multi-token span on top of an existing history.
+    ///
+    /// These two shapes exercise the only arithmetic in `append_and_widen_half`
+    /// that `batch = 1, q_seq = 1` leaves untested: the per-row
+    /// `b = row_index / kv_num_heads` fan-out into a `past_lengths[b]` that
+    /// differs between rows, and a `cur.seq > 1` append offset. A row-indexing
+    /// slip would corrupt one batch row's cache with another's tokens while
+    /// leaving every existing test green, so it is pinned explicitly.
+    ///
+    /// Both are checked against the copy path, which computes the same answer
+    /// through completely separate code (`fill_present` + the generic output
+    /// narrow). Values are exact in `f16` and `bf16`, so the comparison is
+    /// `assert_eq!`, not a tolerance.
+    #[allow(clippy::too_many_arguments)]
+    fn half_ragged_case(
+        kind: HalfKv,
+        batch: usize,
+        capacity: usize,
+        q_seq: usize,
+        totals: &[i32],
+        past_extent: usize,
+    ) {
+        let kernel = gqa_kernel(&[]);
+        let cpu = onnx_runtime_ir::DeviceId::cpu();
+        let dt = kind.dtype();
+        // The ONNX contract is `total_sequence_length == max(seqlens_k) + 1`
+        // regardless of `q_seq`; the kernel derives `past_len` as
+        // `total - k.seq` internally.
+        let seqlens: Vec<i32> = totals.iter().map(|t| t - 1).collect();
+        let total_max = *totals.iter().max().unwrap() as usize;
+        let cache_dim = IP_DIM;
+        let rows = batch * IP_KV_HEADS;
+
+        // Deterministic, half-exact values: small integers scaled by a dyadic
+        // fraction stay exact in both an 11-bit and an 8-bit mantissa.
+        let vals = |n: usize, seed: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| (((i * 7 + seed * 13) % 17) as f32 - 8.0) * 0.5)
+                .collect()
+        };
+        let query = vals(batch * q_seq * IP_NUM_HEADS * cache_dim, 1);
+        let cur_k = vals(batch * q_seq * IP_KV_HEADS * cache_dim, 2);
+        let cur_v = vals(batch * q_seq * IP_KV_HEADS * cache_dim, 3);
+        let past_k = vals(rows * past_extent * cache_dim, 4);
+        let past_v = vals(rows * past_extent * cache_dim, 5);
+
+        // --- copy arm: distinct f32 past and present, the reference path. ---
+        let present_seq = past_extent.max(total_max);
+        let mut copy_out = Owned::zeros_f32(&[batch, q_seq, IP_NUM_HEADS * cache_dim]);
+        let mut copy_pk = Owned::zeros_f32(&[batch, IP_KV_HEADS, present_seq, cache_dim]);
+        let mut copy_pv = Owned::zeros_f32(&[batch, IP_KV_HEADS, present_seq, cache_dim]);
+        let q_owned = Owned::f32(&[batch, q_seq, IP_NUM_HEADS * cache_dim], &query);
+        let ck = Owned::f32(&[batch, q_seq, IP_KV_HEADS * cache_dim], &cur_k);
+        let cv = Owned::f32(&[batch, q_seq, IP_KV_HEADS * cache_dim], &cur_v);
+        let pk32 = Owned::f32(&[batch, IP_KV_HEADS, past_extent, cache_dim], &past_k);
+        let pv32 = Owned::f32(&[batch, IP_KV_HEADS, past_extent, cache_dim], &past_v);
+        let sl = Owned::i32(&[batch], &seqlens);
+        let tsl = Owned::i32(&[], &[total_max as i32]);
+        kernel
+            .execute(
+                &[
+                    q_owned.view(),
+                    ck.view(),
+                    cv.view(),
+                    pk32.view(),
+                    pv32.view(),
+                    sl.view(),
+                    tsl.view(),
+                ],
+                &mut [copy_out.view_mut(), copy_pk.view_mut(), copy_pv.view_mut()],
+            )
+            .unwrap();
+        let (copy_out, copy_pk, copy_pv) = (copy_out.to_f32(), copy_pk.to_f32(), copy_pv.to_f32());
+
+        // --- append arm: one half capacity buffer bound as past AND present. ---
+        let cap_elems = rows * capacity * cache_dim;
+        let mut dense = vec![0.0f32; cap_elems];
+        let mut dense_v = vec![0.0f32; cap_elems];
+        for row in 0..rows {
+            for s in 0..past_extent.min(capacity) {
+                for x in 0..cache_dim {
+                    dense[(row * capacity + s) * cache_dim + x] =
+                        past_k[(row * past_extent + s) * cache_dim + x];
+                    dense_v[(row * capacity + s) * cache_dim + x] =
+                        past_v[(row * past_extent + s) * cache_dim + x];
+                }
+            }
+        }
+        let mut kbuf = vec![0u16; cap_elems];
+        let mut vbuf = vec![0u16; cap_elems];
+        kind.narrow_into(&dense, &mut kbuf);
+        kind.narrow_into(&dense_v, &mut vbuf);
+
+        let cap_shape = [batch, IP_KV_HEADS, capacity, cache_dim];
+        let cap_strides = compute_contiguous_strides(&cap_shape);
+        let kp = kbuf.as_mut_ptr() as *mut std::ffi::c_void;
+        let vp = vbuf.as_mut_ptr() as *mut std::ffi::c_void;
+        let mut half_out = Owned::zeros_f32(&[batch, q_seq, IP_NUM_HEADS * cache_dim]);
+        let before = present_inplace_half_count();
+        kernel
+            .execute(
+                &[
+                    q_owned.view(),
+                    ck.view(),
+                    cv.view(),
+                    TensorView::new(DevicePtr(kp), dt, &cap_shape, &cap_strides, cpu),
+                    TensorView::new(DevicePtr(vp), dt, &cap_shape, &cap_strides, cpu),
+                    sl.view(),
+                    tsl.view(),
+                ],
+                &mut [
+                    half_out.view_mut(),
+                    TensorMut::new(DevicePtrMut(kp), dt, &cap_shape, &cap_strides, cpu),
+                    TensorMut::new(DevicePtrMut(vp), dt, &cap_shape, &cap_strides, cpu),
+                ],
+            )
+            .unwrap();
+        assert!(
+            present_inplace_half_count() > before,
+            "{kind:?} batch={batch} q_seq={q_seq}: the append path must fire"
+        );
+        assert_eq!(
+            half_out.to_f32(),
+            copy_out,
+            "{kind:?} batch={batch} q_seq={q_seq}: attention output must match the copy path"
+        );
+
+        // Compare each row's own valid prefix: the two arms use different row
+        // strides (capacity vs present_seq), so a flat compare would be wrong.
+        let mut widened = vec![0.0f32; cap_elems];
+        let mut widened_v = vec![0.0f32; cap_elems];
+        kind.widen_into(&kbuf, &mut widened);
+        kind.widen_into(&vbuf, &mut widened_v);
+        for row in 0..rows {
+            let b = row / IP_KV_HEADS;
+            let valid = totals[b] as usize * cache_dim;
+            for (name, got, want) in [("key", &widened, &copy_pk), ("value", &widened_v, &copy_pv)]
+            {
+                assert_eq!(
+                    &got[row * capacity * cache_dim..row * capacity * cache_dim + valid],
+                    &want[row * present_seq * cache_dim..row * present_seq * cache_dim + valid],
+                    "{kind:?} batch={batch} q_seq={q_seq}: appended present_{name} row {row} \
+                     (batch {b}, valid {} tokens) must match the copy path",
+                    totals[b]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inplace_half_batch_with_ragged_seqlens_matches_copy_path() {
+        for kind in [HalfKv::F16, HalfKv::Bf16] {
+            // batch 2, per-row histories of 3 and 1 tokens, one new token each.
+            half_ragged_case(kind, 2, 6, 1, &[4, 2], 3);
+        }
+    }
+
+    #[test]
+    fn inplace_half_chunked_prefill_matches_copy_path() {
+        for kind in [HalfKv::F16, HalfKv::Bf16] {
+            // A 3-token chunk appended on top of a 2-token history, spare
+            // capacity left over: exercises `cur.seq > 1` with `past_len > 0`.
+            half_ragged_case(kind, 1, 8, 3, &[5], 2);
+        }
+    }
+
     #[test]
     fn inplace_decode_matches_copy_path_at_exact_capacity() {
         // capacity == total ⇒ the in-place buffer layout is identical to the
@@ -4821,8 +5670,9 @@ mod tests {
         let kv_shape = [1usize, IP_KV_HEADS, capacity, IP_DIM];
         let kv_strides = compute_contiguous_strides(&kv_shape);
         let cpu = onnx_runtime_ir::DeviceId::cpu();
-        // f16 aliased buffer: the append path only supports contiguous f32, so
-        // the gate must reject it and preserve the widen/copy path.
+        // f16 aliased buffer: the *f32* append path is contiguous-f32 only, so
+        // this gate must reject it. Half-precision aliasing is handled by
+        // `detect_inplace_kv_half`, which routes to the half append path instead.
         let mut kbuf = Owned::f16(&kv_shape, &vec![0.0; present_len]);
         let mut vbuf = Owned::f16(&kv_shape, &vec![0.0; present_len]);
         let k_ptr = kbuf.bytes.as_mut_ptr() as *mut std::ffi::c_void;

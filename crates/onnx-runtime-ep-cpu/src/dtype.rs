@@ -757,6 +757,33 @@ pub fn widen_bf16_slice_into(src: &[u16], dst: &mut [f32]) {
     }
 }
 
+/// Narrow contiguous `f32` values into `f16` bit patterns.
+///
+/// Counterpart to [`widen_f16_slice_into`]: F16C `vcvtps2ph` on x86 with F16C +
+/// AVX2, NEON `fcvtn` on aarch64, scalar [`half`] otherwise. All three round to
+/// nearest-even and are bit-identical to `half::f16::from_f32`, so a cache
+/// written through this helper matches one written through the generic
+/// `write_dense_f32_narrow` output path element for element.
+///
+/// Exposed so the GroupQueryAttention append path can write *only the new
+/// token's rows* into an aliased half-precision `present` cache, instead of
+/// re-narrowing the whole history through the generic output writer.
+pub fn narrow_f16_slice_into(src: &[f32], dst: &mut [u16]) {
+    debug_assert_eq!(src.len(), dst.len());
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if f16c::available() {
+        // SAFETY: `f16c::available()` confirmed `f16c` + `avx2`; lengths match.
+        unsafe { f16c::narrow(src, dst) };
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    neon_f32_to_f16_bulk(src, dst);
+    #[cfg(not(target_arch = "aarch64"))]
+    for (d, &s) in dst.iter_mut().zip(src) {
+        *d = half::f16::from_f32(s).to_bits();
+    }
+}
+
 /// Narrow contiguous `f32` values into `bf16` bit patterns, rounding to
 /// nearest-even. Counterpart to [`widen_bf16_slice_into`], and bit-identical to
 /// `half::bf16::from_f32` on every input.
