@@ -85,11 +85,12 @@ buffer and then copied into the graph outputs, so every decode step copied the
 whole cache twice. Writing the appended KV straight into the `present_*`
 bindings removes one full copy.
 
-**Where we still lose:** wide-batch and many-head decode (phi3-mini b4, llama3
-b4) remains 2×–4.4× behind. Short contexts (past 511) are dominated by fixed
-per-run overhead, and one of them — phi3-mini p511 at t=16 — is an outright
-**regression** (3.70 → 5.61); it sits inside its own dispersion band
-(base [3.57–6.22], new [5.26–6.29]) but it is not a win and is listed as such.
+**Where we still lose:** wide-batch and many-head decode remains behind —
+phi3-mini b4 at 2.00–4.42 and llama3 b4 at 1.15–2.92. Short contexts (past 511)
+are dominated by fixed per-run overhead, and one of them — phi3-mini p511 at
+t=16 — is an outright **regression** (3.70 → 5.61); it sits inside its own
+dispersion band (base [3.57–6.22], new [5.26–6.29]) but it is not a win and is
+listed as such.
 
 All 48 measured cells are listed; **bold** marks the 45 that improved. Nothing
 is omitted.
@@ -187,8 +188,10 @@ not); and a full-tensor scratch buffer that was zeroed, filled and copied into
 the output. RoPE additionally branched on tensor layout inside its innermost
 loop.
 
-Removing the scratch buffer mattered more than the vectorization for RoPE alone
-(2.247 ms → 0.571 ms on one cell).
+Removing the scratch buffer mattered more than the vectorization for RoPE
+alone. The figure that showed this — 2.247 ms → 0.571 ms on one cell — comes
+from an ad-hoc bisecting run rather than from the base/new CSVs above, and is
+recorded here as a diagnostic, like the figures in §5.
 
 ### Controls (graphs with no Softmax/RoPE node — must not move)
 
@@ -292,8 +295,8 @@ the 30** cells — 11 of the 15 at ≥8 MiB, but only 5 of the 15 below it. It i
 directionally better at and above 8 MiB *at low thread counts* — but it loses at
 8 MiB t=32 (1.89 → 1.94), at 16 MiB t=16 (1.29 → 1.41) and at 32 MiB t=16 (1.23
 → 1.36), so "better above 8 MiB" is a tendency, not a rule. Below 8 MiB it is
-genuinely mixed, and the 1 MiB t=1 cell is its worst result anywhere (0.90 →
-1.35).
+genuinely mixed, and its single worst cell is 2 MiB t=4, where enabling fusion
+costs 2.0× (0.73 → 1.48).
 
 The gate is therefore expressed topology-relatively as
 `max(last_level_cache_bytes / fused_tasks, 8 MiB)`, with the 8 MiB floor — not
@@ -305,7 +308,10 @@ claimed, and the 1–4 MiB crossover is unresolved below the ±9% dispersion.
 
 * Parity (`parity=PASS`) recorded on **all 1194** measured cells across the six
   result files behind this document — before and after each change, with no
-  failures. `ab.py` now aborts loudly if any trial reports `parity=FAIL`.
+  failures. `ab.py` now tags any cell containing a `parity=FAIL` trial as
+  `PARITY_FAIL=n/m` in the medians summary and prints a closing warning, so a
+  numerically wrong arm can no longer produce a median that reads as a clean
+  win.
 * Bit-exactness or ≤1e-6 absolute agreement against independent scalar oracles
   for every rewritten kernel, across both layouts, both rotation modes, full and
   partial rotary, and sizes either side of each parallel threshold.
