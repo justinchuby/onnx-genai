@@ -200,6 +200,21 @@ went from 5.5x slower than ORT to **1.7x-33x faster**, and are now claimed.
 What is left for u8 x u8 is thread scaling, not packing: 1.13-1.20x at one thread, widening to
 2.08-2.65x at sixteen — the same root cause as [parallel efficiency](#1-parallel-efficiency-not-kernel-quality--f32-dense-and-int4-matmulnbits).
 
+Both `QLinearMatMul` rules were measured on **x86-64 AVX2 only** and are applied on every
+architecture, which is the same convention the rest of this table uses. aarch64 has native `i8 x i8`
+kernels (SDOT/SMMLA) that need no translation at all, so the claim there is if anything
+conservative — but its *speed* is unmeasured here and is not claimed to be measured. Correctness on
+that lane is covered unconditionally by `qgemm_i32_matches_the_integer_oracle_for_every_signedness`.
+
+Mixed signedness (`u8 x i8`, `i8 x u8`) was not measured either way. It follows the u8 rule rather
+than borrowing the signed win: deferred in the measured region, claimed below it like every other
+unmeasured shape here.
+
+The `i8 x i8` "before" ratios above (5.20/4.97/5.22 at 8 threads) were re-measured against ONNX
+Runtime 1.27.0 for this round on the same host. An earlier round recorded 2.23-3.07 for the same
+declined scalar path; the kernel side did not change between the two, so the difference is the
+baseline and the harness, not a regression.
+
 ## Precision
 
 `MatMulNBits` bits=8 M=1 was the only range this EP won outright, and part of that margin was bought

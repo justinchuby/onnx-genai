@@ -389,6 +389,14 @@ fn matmul_family_preference(
     // | 8       | 2.33   | 2.43     | 2.12     | 0.09   | 0.47     | 0.42     |
     // | 16      | 2.34   | 2.65     | 2.08     | 0.10   | 0.60     | 0.42     |
     //
+    // Both rules are measured on x86-64 only and applied on every architecture,
+    // which is the same convention the rest of this module uses. aarch64 has
+    // native `i8 x i8` kernels (SDOT/SMMLA) that need no translation at all, so
+    // the claim there is if anything conservative; correctness on that lane is
+    // covered unconditionally by
+    // `qgemm_i32_matches_the_integer_oracle_for_every_signedness`, but the
+    // *speed* is unmeasured and is not claimed to be measured.
+    //
     // `i8 x i8` is claimed: it wins at every measured point by 1.7x-33x, and it
     // wins because ORT's own signed path is far slower than its unsigned one
     // (ORT i8 M=128 T=8 is 21.7 ms against its own 4.0 ms for u8), not because
@@ -692,18 +700,35 @@ mod tests {
                 "i8 x i8 QLinearMatMul beats ORT at every measured shape"
             );
         }
-        // Mixed signedness was not measured, and its activation is unsigned, so
-        // it stays with the unsigned rule rather than borrowing the signed win.
-        assert!(
-            !claim_preference(
-                &dense_node("QLinearMatMul"),
-                22,
-                &qlinear_shapes(shape(&[3584, 3584])),
-                &qlinear_dtypes(DataType::Uint8, DataType::Int8),
-            )
-            .is_claim(),
-            "u8 x i8 is unmeasured; it must not inherit the signed claim"
-        );
+        // Mixed signedness was not measured, so it must not borrow the signed
+        // win: it follows the same size-gated rule as u8 x u8 -- deferred where
+        // that was measured to lose, claimed below it like every other
+        // unmeasured shape in this module.
+        for (a, b) in [
+            (DataType::Uint8, DataType::Int8),
+            (DataType::Int8, DataType::Uint8),
+        ] {
+            assert!(
+                !claim_preference(
+                    &dense_node("QLinearMatMul"),
+                    22,
+                    &qlinear_shapes(shape(&[3584, 3584])),
+                    &qlinear_dtypes(a, b),
+                )
+                .is_claim(),
+                "{a:?} x {b:?} is unmeasured; it must not inherit the signed claim"
+            );
+            assert!(
+                claim_preference(
+                    &dense_node("QLinearMatMul"),
+                    22,
+                    &qlinear_shapes(shape(&[8, 8])),
+                    &qlinear_dtypes(a, b),
+                )
+                .is_claim(),
+                "{a:?} x {b:?} below the measured region keeps the historical claim"
+            );
+        }
     }
 
     /// The deferrals are scoped to the region that was actually measured.
