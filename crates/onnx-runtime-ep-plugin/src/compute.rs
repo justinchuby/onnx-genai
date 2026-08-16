@@ -2562,6 +2562,10 @@ thread_local! {
 /// when it happens to be the last node. Re-zeroing on every reuse costs a full
 /// `memset` of the tensor — measured at 0.586x of ORT for an 8-node 1 MiB f32
 /// `Relu` chain against 0.801x without it.
+///
+/// Debug builds do fill reused storage, with a poison pattern rather than
+/// zeros, so a kernel that leaves part of its output unwritten fails loudly in
+/// tests instead of inheriting something plausible.
 fn take_host_intermediate(len: usize) -> Vec<u8> {
     HOST_INTERMEDIATE_POOL.with(|pool| {
         let mut pool = pool.borrow_mut();
@@ -2573,6 +2577,17 @@ fn take_host_intermediate(len: usize) -> Vec<u8> {
                 } else {
                     buf.truncate(len);
                 }
+                // Debug builds hand back a poison pattern rather than whatever
+                // the previous tenant left. A kernel that fails to write part
+                // of its output then produces an obviously wrong value in every
+                // test run instead of a plausible stale one, which is the
+                // failure this relaxation would otherwise make quieter. `0xFF`
+                // because it is the loudest pattern available: it reads as NaN
+                // in every float width and as -1 in every signed integer width,
+                // so it survives a tolerance comparison. Release builds skip
+                // it — that write is the whole cost being avoided.
+                #[cfg(debug_assertions)]
+                buf.fill(0xFF);
                 buf
             }
             None => vec![0u8; len],
