@@ -930,7 +930,9 @@ mod tests {
     /// the weight address, so the decode instance hits the prefill entry.
     #[test]
     fn predicted_transpose_bytes_equal_actual_after_gemm_execution() {
-        let _guard = TRANSPOSE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TRANSPOSE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Thread-local admit: never mutates the process-global the concurrent
         // `transposed_b` tests read (#1056 isolation).
         let _admit = crate::kernels::weight_transpose::CacheEnabledScope::new(true);
@@ -1014,7 +1016,9 @@ mod tests {
     /// performance tradeoff, never a numerical one.
     #[test]
     fn declined_transpose_cache_retains_nothing_and_is_byte_identical() {
-        let _guard = TRANSPOSE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = TRANSPOSE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         // A fresh `B` never seen by the global cache. Built once so its data
         // pointer is stable across both runs and can be probed by exact key.
@@ -1088,4 +1092,3 @@ mod tests {
         );
     }
 }
-
