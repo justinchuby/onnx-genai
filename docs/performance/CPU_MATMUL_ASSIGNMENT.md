@@ -98,10 +98,11 @@ batched `[4, 100, 3584]` is 400 rows and lands in the wide-prefill region even t
 dimension reaches 256. Any symbolic dimension anywhere in the batch makes the whole count unknown,
 which is the decode case and stays claimed.
 
-### Deferred ranges
+### Measured ranges below the 8-bit `MatMulNBits` win
 
 Same host, same harness, same convention: **p50/p90 are ours/ORT, lower is better**, so every number
-below 1.00 is a win and every number above it is a loss.
+below 1.00 is a win and every number above it is a loss. Most of these ranges are deferred; the
+`i8 x i8` `QLinearMatMul` rows at the bottom are claimed, and are marked as such.
 
 | op | dtype / bits | M | K, N | threads | p50 | p90 | assignment |
 |---|---|---|---|---|---|---|---|
@@ -123,7 +124,7 @@ below 1.00 is a win and every number above it is a loss.
 | `MatMul` | f32 | 128 | 3584 | 1 | 0.97 | 1.03 | defer |
 | `MatMul` | f32 | 128 | 3584 | 2 | 2.11 | 2.35 | defer |
 | `MatMul` | f32 | 128 | 3584 | 4 | 1.77 | 1.79 | defer |
-| `MatMul` | f32 | 128 | 3584 | 8 | 2.76 | 2.85 | defer |
+| `MatMul` | f32 | 128 | 3584 | 8 | 2.76 | 2.85 | defer (noisy) |
 | `MatMul` | f32 | 128 | 3584 | 16 | 1.65 | 1.73 | defer |
 | `MatMul` | f32 | 128 | 3584 | 32 | 0.67 | 0.88 | defer |
 | `MatMul` | f16 | 1 | 3584 | 1 | 0.86 | 0.96 | defer (see note) |
@@ -150,12 +151,24 @@ below 1.00 is a win and every number above it is a loss.
 | `Gemm` | f16 | 128 | 3584 | 8 | 1.86 | 2.24 | defer |
 | `Gemm` | f16 | 128 | 3584 | 16 | 1.44 | 1.46 | defer |
 | `Gemm` | f16 | 128 | 3584 | 32 | 1.19 | 1.35 | defer |
-| `QLinearMatMul` | u8 x u8 | 1 | 3584 | 8 | 22.04 | 27.30 | defer |
-| `QLinearMatMul` | u8 x u8 | 128 | 3584 | 8 | 4.19 | 4.23 | defer |
-| `QLinearMatMul` | u8 x u8 | 512 | 3584 | 8 | 4.05 | 4.16 | defer |
-| `QLinearMatMul` | i8 x i8 | 1 | 3584 | 8 | 2.23 | 2.37 | defer |
-| `QLinearMatMul` | i8 x i8 | 128 | 3584 | 8 | 3.02 | 3.05 | defer |
-| `QLinearMatMul` | i8 x i8 | 512 | 3584 | 8 | 3.07 | 3.21 | defer |
+| `QLinearMatMul` | u8 x u8 | 1 | 3584 | 1 | 1.13 | 1.18 | defer |
+| `QLinearMatMul` | u8 x u8 | 1 | 3584 | 8 | 2.33 | 2.77 | defer |
+| `QLinearMatMul` | u8 x u8 | 1 | 3584 | 16 | 2.34 | 2.58 | defer |
+| `QLinearMatMul` | u8 x u8 | 128 | 3584 | 1 | 1.20 | 1.21 | defer |
+| `QLinearMatMul` | u8 x u8 | 128 | 3584 | 8 | 2.43 | 2.80 | defer |
+| `QLinearMatMul` | u8 x u8 | 128 | 3584 | 16 | 2.65 | 3.42 | defer |
+| `QLinearMatMul` | u8 x u8 | 512 | 3584 | 1 | 1.20 | 1.21 | defer |
+| `QLinearMatMul` | u8 x u8 | 512 | 3584 | 8 | 2.12 | 2.22 | defer |
+| `QLinearMatMul` | u8 x u8 | 512 | 3584 | 16 | 2.08 | 2.18 | defer |
+| `QLinearMatMul` | i8 x i8 | 1 | 3584 | 1 | **0.03** | 0.03 | **claim** |
+| `QLinearMatMul` | i8 x i8 | 1 | 3584 | 8 | **0.09** | 0.09 | **claim** |
+| `QLinearMatMul` | i8 x i8 | 1 | 3584 | 16 | **0.10** | 0.10 | **claim** |
+| `QLinearMatMul` | i8 x i8 | 128 | 3584 | 1 | **0.25** | 0.25 | **claim** |
+| `QLinearMatMul` | i8 x i8 | 128 | 3584 | 8 | **0.47** | 0.53 | **claim** |
+| `QLinearMatMul` | i8 x i8 | 128 | 3584 | 16 | **0.60** | 0.69 | **claim** |
+| `QLinearMatMul` | i8 x i8 | 512 | 3584 | 1 | **0.26** | 0.26 | **claim** |
+| `QLinearMatMul` | i8 x i8 | 512 | 3584 | 8 | **0.42** | 0.43 | **claim** |
+| `QLinearMatMul` | i8 x i8 | 512 | 3584 | 16 | **0.42** | 0.47 | **claim** |
 
 Ranges **outside** the measured region keep the historical claim, and the code says so explicitly:
 `K * N < 2^20`, symbolic/dynamic weight shapes, and dense dtypes other than f32/f16 (where a
@@ -170,11 +183,57 @@ At **one thread this EP is at parity** (f32 1.00 / 0.97, int4 1.00 / 0.99). The 
 are added and closes again only at 32, where ORT's own scaling saturates. We realise roughly **half**
 of ORT's parallel speedup.
 
-That is a threadpool/partitioning problem, not a kernel problem. #1054 removed one cause — the
-standalone MLAS pool was clamped to `min(available, 8)` workers and never saw the EP's requested
-thread count, which cost 2.16x -> 1.61x at 32 vCPU — but the residual 1.4-2.4x at 2-16 threads is
-still open. Because the thread count is **not visible at capability time**, a claim would have to
-hold at every count, and none of these do.
+#1054 removed one cause — the standalone MLAS pool was clamped to `min(available, 8)` workers and
+never saw the EP's requested thread count, which cost 2.16x -> 1.61x at 32 vCPU. The residual
+1.4-2.4x (ours/ORT, lower is better) at 2-16 threads is still open.
+
+**It is not the pool.** Driving an MLAS GEMM directly through this crate's work-stealing pool,
+`K = N = 3584`, `M = 512`, warmed, on the same host:
+
+| pool threads | 1 | 2 | 4 | 8 | 16 | 32 |
+|---|---:|---:|---:|---:|---:|---:|
+| MLAS GEMM only | 99.9 ms | 60.3 ms | 26.9 ms | 14.3 ms | 13.6 ms | 11.0 ms |
+| speedup vs 1 thread | 1.0x | 1.7x | 3.7x | **7.0x** | **7.4x** | 9.1x |
+
+MLAS requests at least `pool_threads` partitions per call and they are dispatched. The instrument
+below prints them: on this host `sched_per_call` comes out at exactly the pool width (8 at
+`--threads 8`) with `serial_fallback=0`. The *committed assertion* in `mlas-sys` is only the
+inequality `scheduled_iterations >= pool_threads`, so the inequality is what is proven and the
+equality is what is observed. Either way the primitive and the pool together scale about as well as
+ORT does. The pool is therefore **not** where the 1.4-2.4x goes. What is left is the per-call work
+*around* the primitive, which does not shrink with threads.
+
+**Read the scope of that evidence carefully.** The numbers above are measured on the **integer
+`QLinearMatMul`** path (`qgemm_i32_packed`), which is the only kernel here with a committed
+phase-splitting instrument. That is a *proxy*, and it licenses exactly one transferable conclusion:
+this crate's work-stealing pool can drive an MLAS GEMM to 7x on this host, so the pool is not the
+ceiling for f32 or int4 either — all three go through the same pool. It does **not** license the
+specific phase names or milliseconds for f32/int4. `QLinearMatMul`'s serial phases (requantize, the
+`i32` accumulator staging) **do not exist** in `matmul.rs` or `matmul_nbits.rs`; those kernels have
+their own, different per-call work (dequant staging, activation densification, executor tensor
+handling) which has **not** been decomposed. Doing that decomposition is open work.
+
+What the instrument actually shows, on `QLinearMatMul`, `K = N = 3584`, `M = 512`:
+
+| phase | 1 thread | 8 threads |
+|---|---:|---:|
+| MLAS GEMM | ~100 ms | 14.5-15.7 ms |
+| requantize + accumulator alloc | 1.7-2.5 ms | ~1.5 ms |
+| unattributed (densify, executor, measurement) | 0-2 ms | 2.5-8.5 ms |
+| **non-GEMM share of the call** | **~2-4%** | **~22-40%** |
+
+Only the requantize + alloc slice is repeatable and genuinely thread-stable at ~2 ms. The
+unattributed remainder is **not** constant in the thread count — it is larger at 8 threads than at
+1, and it varied 2.5 / 4.3 / 8.5 ms across three consecutive runs of an identical configuration on
+this shared, heavily contended host. So the honest statement is a bound: **non-GEMM work is 22-40%
+of the call at 8 threads and ~2-4% at 1**, it is dominated by a term we have not attributed, and the
+Amdahl direction is clear even though the decomposition is not.
+
+`qlinear_phase_report` (`#[ignore]`d and `#[cfg(feature = "mlas")]`, in `kernels/qlinear_matmul.rs`)
+reproduces the split.
+
+Because the thread count is **not visible at capability time**, a claim would have to hold at every
+count, and none of these do.
 
 ### 2. A kernel gap — f16 dense (fixed by #1080; f16 now behaves like section 1)
 
@@ -183,44 +242,84 @@ kernels; this EP's f16 path did not reach the same primitive, and `Gemm` had no 
 #1080 routes constant-weight f16 `MatMul`/`Gemm` prefill through MLAS SGEMM with a once-only widened
 and packed `B`, and adds the missing GEMV.
 
-Measured on the same host, `K = N = 3584`, ours/ORT p50, lower is better:
+Same host, `K = N = 3584`, ours/ORT p50, lower is better:
 
-| | before #1080 | after #1080 |
-|---|---:|---:|
-| `MatMul` f16 M=128, T=1 | 2.47 | **1.00** |
-| `MatMul` f16 M=128, T=4 | 6.57 | **1.76** |
-| `MatMul` f16 M=128, T=16 | 7.10 | **1.30** |
-| `Gemm` f16 M=1, T=1 | 6.57 | **0.86** |
-| `Gemm` f16 M=1, T=8 | 46.67 | **1.83** |
+| | before #1080 | after #1080 | source of the "before" |
+|---|---:|---:|---|
+| `MatMul` f16 M=128, T=1 | 2.47 | **1.00** | this matrix, previous revision |
+| `MatMul` f16 M=128, T=4 | 6.57 | **1.76** | this matrix, previous revision |
+| `MatMul` f16 M=128, T=16 | 7.10 | **1.30** | this matrix, previous revision |
+| `Gemm` f16 M=1, T=1 | 6.57 | **0.86** | #1080's report |
+| `Gemm` f16 M=1, T=8 | 46.67 | **1.83** | #1080's report |
 
-The one-thread kernel gap is closed: f16 is now at parity at `M = 128` (1.00 / 1.03) and is a
-**genuine win at `M = 1`** (0.86 for both `MatMul` and `Gemm`, i.e. we are ~1.16x faster than ORT).
+The last two "before" figures are **not** re-measurements and could not be: `Gemm` had no f16 rows
+in this matrix because it had no f16 GEMV, and the pre-#1080 kernel no longer exists to re-run. They
+are quoted from #1080's report and are flagged so nobody mistakes them for a fresh measurement.
+
+The one-thread kernel gap is closed: f16 is at parity at `M = 128` (1.00 / 1.03) and is **parity to
+a modest win at `M = 1`** — 0.86 p50 for both `MatMul` and `Gemm` on the run recorded above, which
+is ~1.16x faster than ORT, but an independent re-run of `Gemm` M=1 T=1 on the same host gave 0.96,
+so the honest band is roughly **1.0x-1.16x**. It is no longer a loss, which is the point; the exact
+size of the win is inside this host's noise.
 
 **It is still deferred, and that is not a contradiction.** The thread count is not visible at
 capability time, so a claim has to hold at *every* count, and f16 now loses at 2-16 threads exactly
-the way f32 and int4 do (1.13-2.06 at `M = 1`, 1.30-1.90 at `M = 128`). In other words f16 has
+the way f32 and int4 do (0.98-2.06 at `M = 1`, 1.30-1.90 at `M = 128`; the single sub-1.00 entry is
+`Gemm` M=1 T=4 at 0.98, whose p90 is 1.85 and whose spread is 1.01, so it is noise and not a win). In other words f16 has
 stopped being a kernel-quality story and has joined the parallel-efficiency story in section 1. When
 section 1's per-call serial work is fixed, f16 should be re-evaluated for a claim at the same time as
 f32 and int4 — the `M = 1`, `T = 1` win says the primitive is now the right one.
 
 The improvement is not wasted in the meantime: deferral only applies where a host fallback exists
 (`ep.rs` gates `claim_preference_node` on `host_fallback_available`). In native-only mode this EP
-still runs its own f16 kernel, and that kernel is now 2.4x-14.3x faster than it was.
+still runs its own f16 kernel, and #1080 reports that kernel as 2.4x-14.3x faster than its
+predecessor. That range is ours-before over ours-after, from #1080's own report — it is a different
+quantity from this table's ours/ORT ratios and cannot be re-derived by dividing them.
 
-### 3. Per-call packing — `QLinearMatMul`
+### 3. Per-call packing — `QLinearMatMul` (**fixed**)
 
-#1058 bound MLAS's integer QGEMM and took u8 x u8 from **27-119x** down to 3-4x. What remains is
-structural: **ORT pre-packs the constant B once at session init; this kernel packs inside every
-call.** At M=1 a 12.8 MB pack dominates a 1.7 ms call, which is the whole of the residual 22x.
-`QLinearMatMulFactory::create` ignores its `Node`, so the kernel is stateless and prepacking would
-need a constant-initializer hook with its own correctness surface (weight identity, **address
-reuse**, dynamic weights).
+#1058 bound MLAS's integer QGEMM and took u8 x u8 from **27-119x** down to 3-4x. What remained was
+structural: **ORT pre-packed the constant B once at session init; this kernel packed inside every
+call**, and additionally copied the whole `K * N` weight into a dense buffer on every call. At M=1 a
+12.8 MB pack and copy dominated a 1.7 ms call, which was the whole of the residual 22x.
 
-Signed x signed is separately capped: MLAS documents `AIsSigned` as unsupported off ARM
-(`mlas.h:610-611`), so on x86 only u8 x u8 reaches the fast path at all. On AVX2 without VNNI, u8 x
-i8 is additionally **not bit-exact** — `vpmaddubsw` sums adjacent products into a saturating i16, and
-`255*(-128) + 255*(-128)` clamps — so it is excluded by a runtime exactness probe rather than an ISA
-table, which lets VNNI/AMX hosts pick the fast path up automatically.
+That is now fixed. The kernel takes `set_constant_inputs`, keys a session-lifetime pack on the
+weight's full identity (address, `K`, `N`, both signedness flags, and whether the bytes were sign
+translated), and skips the dense copy entirely once the pack exists. Cold cost is repaid on the
+**first** call:
+
+| K = N = 3584, M = 1 | time |
+|---|---|
+| first call, including dense copy + MLAS pack | 6.35 ms |
+| every later call | 0.108 ms |
+| never-packed path (what every call used to cost) | 5.90 ms |
+
+Signedness is no longer a cap either. MLAS documents `AIsSigned` as unsupported off ARM
+(`mlas.h:610-611`), and on AVX2 without VNNI u8 x i8 is **not bit-exact** — `vpmaddubsw` sums
+adjacent products into a saturating i16, and `255*(-128) + 255*(-128)` clamps. Rather than decline
+those combinations to a scalar loop, the offending operand is now *translated* into the unsigned
+domain: `XOR 0x80` on its bytes and `+128` on its zero point. Since the kernel computes
+`sum_k (a_k - za)(b_k - zb)`, shifting an operand and its zero point by the same constant leaves
+every `i32` accumulator bit-identical, and the call lands on the `u8 x u8` kernel. i8 activations
+went from 5.5x slower than ORT to **1.7x-33x faster**, and are now claimed.
+
+What is left for u8 x u8 is thread scaling, not packing: 1.13-1.20x at one thread, widening to
+2.08-2.65x at sixteen — the same root cause as [parallel efficiency](#1-parallel-efficiency-not-kernel-quality--f32-dense-and-int4-matmulnbits).
+
+Both `QLinearMatMul` rules were measured on **x86-64 AVX2 only** and are applied on every
+architecture, which is the same convention the rest of this table uses. aarch64 has native `i8 x i8`
+kernels (SDOT/SMMLA) that need no translation at all, so the claim there is if anything
+conservative — but its *speed* is unmeasured here and is not claimed to be measured. Correctness on
+that lane is covered unconditionally by `qgemm_i32_matches_the_integer_oracle_for_every_signedness`.
+
+Mixed signedness (`u8 x i8`, `i8 x u8`) was not measured either way. It follows the u8 rule rather
+than borrowing the signed win: deferred in the measured region, claimed below it like every other
+unmeasured shape here.
+
+The `i8 x i8` "before" ratios above (5.20/4.97/5.22 at 8 threads) were re-measured against ONNX
+Runtime 1.27.0 for this round on the same host. An earlier round recorded 2.23-3.07 for the same
+declined scalar path; the kernel side did not change between the two, so the difference is the
+baseline and the harness, not a regression.
 
 ## Precision
 

@@ -4067,3 +4067,158 @@ fn initializer_chain_still_fuses_into_one_claim() {
     }
     eprintln!("\n✅ initializer_chain_still_fuses_into_one_claim: PASSED");
 }
+
+// ─── Assignment falsifiers for the bit-exact elementwise unary ops ───────────
+
+/// Drive one fixture through a real ORT session and report which op types
+/// landed on this EP and which stayed on ORT's.
+///
+/// Returns `None` when ORT or the EP cdylib is unavailable, matching the skip
+/// behaviour of the other conformance tests in this file.
+fn unary_assignment(fixture: &str, reg: &str) -> Option<(Vec<String>, Vec<String>)> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let model_path =
+        PathBuf::from(manifest_dir).join(format!("tests/fixtures/{fixture}/model.onnx.textproto"));
+    let (_lib, api, env, opts, session) = unsafe { conformance_setup(reg, &model_path, false) }?;
+    unsafe {
+        let info = query_ep_assignment(api, session);
+        let ours: Vec<String> = info.ops_on_our_ep().iter().map(|s| s.to_string()).collect();
+        let theirs: Vec<String> = info
+            .ops_not_on_our_ep()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        eprintln!("  [{fixture}] ours={ours:?}, others={theirs:?}");
+        conformance_teardown(api, env, opts, session, reg);
+        Some((ours, theirs))
+    }
+}
+
+/// The whole point of the size thresholds: a range this EP is measured to lose
+/// must not be advertised to ORT as an assignment.
+///
+/// float32 `Sign` crosses over at 2048 elements (measured 0.95x at 1024, 1.15x
+/// at 2048), so 1024 must go to ORT and 4096 must come to us. Both halves are
+/// asserted in one test because either one alone is satisfiable by a policy
+/// that is simply wrong in the other direction.
+#[test]
+fn float32_sign_is_assigned_only_above_its_measured_crossover() {
+    let Some((below_ours, below_theirs)) =
+        unary_assignment("sign_assignment_f32_below", "cpu_ep_sign_below")
+    else {
+        eprintln!(
+            "*** SKIPPED: float32_sign_is_assigned_only_above_its_measured_crossover — \
+             ORT or EP cdylib not found ***"
+        );
+        return;
+    };
+    assert!(
+        !below_ours.iter().any(|op| op == "Sign"),
+        "1024-element float32 Sign is measured at 0.95x and must be left to ORT, \
+         but this EP claimed it (ours={below_ours:?})",
+    );
+    assert!(
+        below_theirs.iter().any(|op| op == "Sign"),
+        "the declined node must land on ORT's CPU EP as a single Sign node, \
+         not vanish or fragment (others={below_theirs:?})",
+    );
+
+    let Some((above_ours, _)) = unary_assignment("sign_assignment_f32_above", "cpu_ep_sign_above")
+    else {
+        return;
+    };
+    assert!(
+        above_ours.iter().any(|op| op == "Sign"),
+        "4096-element float32 Sign is measured at 1.53x and must be claimed, \
+         but this EP declined it (ours={above_ours:?})",
+    );
+}
+
+/// `Neg` is one `xorps` per element, so it is memory-bound on both sides and
+/// never reaches the 5% bar — not even at the largest tensor a transformer
+/// would hand a unary op. A policy that claims it anywhere is claiming a range
+/// it is measured to lose.
+#[test]
+fn float32_neg_is_never_assigned_even_at_a_megabyte() {
+    let Some((ours, theirs)) = unary_assignment("neg_assignment_f32_large", "cpu_ep_neg_large")
+    else {
+        eprintln!(
+            "*** SKIPPED: float32_neg_is_never_assigned_even_at_a_megabyte — \
+             ORT or EP cdylib not found ***"
+        );
+        return;
+    };
+    assert!(
+        !ours.iter().any(|op| op == "Neg"),
+        "float32 Neg peaks at 1.03x at 2 M elements and must never be claimed, \
+         but this EP claimed it at 1 M (ours={ours:?})",
+    );
+    assert!(
+        theirs.iter().any(|op| op == "Neg"),
+        "declining Neg must hand ORT a single Neg node (others={theirs:?})",
+    );
+}
+
+/// The one op whose float16 answer is the opposite of its float32 one. At
+/// 65536 elements float32 `Sign` is claimed and float16 `Sign` must not be:
+/// ORT has a native float16 kernel for it and this EP widens to float32 first,
+/// measured 0.35x. A dtype-blind threshold would get this backwards.
+#[test]
+fn float16_sign_is_not_assigned_where_float32_sign_would_be() {
+    let Some((ours, theirs)) = unary_assignment("sign_assignment_f16_large", "cpu_ep_sign_f16")
+    else {
+        eprintln!(
+            "*** SKIPPED: float16_sign_is_not_assigned_where_float32_sign_would_be — \
+             ORT or EP cdylib not found ***"
+        );
+        return;
+    };
+    assert!(
+        !ours.iter().any(|op| op == "Sign"),
+        "float16 Sign is measured at 0.35x against ORT's native float16 kernel and \
+         must be left to ORT (ours={ours:?})",
+    );
+    assert!(
+        theirs.iter().any(|op| op == "Sign"),
+        "ORT has a real float16 Sign kernel, so the declined node must stay a single \
+         Sign node rather than being cast-wrapped (others={theirs:?})",
+    );
+}
+
+/// The counterweight: thresholds that only ever decline would be trivially
+/// "honest" and useless. ORT's float16 `Round` takes 5.5 ms where this EP takes
+/// 0.45 ms, and that 12.4x win must actually be claimed.
+#[test]
+fn float16_round_is_assigned_because_it_wins() {
+    let Some((ours, _)) = unary_assignment("round_assignment_f16_above", "cpu_ep_round_f16") else {
+        eprintln!(
+            "*** SKIPPED: float16_round_is_assigned_because_it_wins — \
+             ORT or EP cdylib not found ***"
+        );
+        return;
+    };
+    assert!(
+        ours.iter().any(|op| op == "Round"),
+        "float16 Round is measured at 12.4x and must be claimed (ours={ours:?})",
+    );
+}
+
+/// An unknown element count could be either side of the crossover, and at
+/// decode it is reliably the losing side. The policy must fail conservative.
+#[test]
+fn dynamic_shapes_are_not_assigned() {
+    let Some((ours, theirs)) = unary_assignment("sign_assignment_f32_dynamic", "cpu_ep_sign_dyn")
+    else {
+        eprintln!("*** SKIPPED: dynamic_shapes_are_not_assigned — ORT or EP cdylib not found ***");
+        return;
+    };
+    assert!(
+        !ours.iter().any(|op| op == "Sign"),
+        "a dynamic element count is not provably above the crossover and must not be \
+         claimed (ours={ours:?})",
+    );
+    assert!(
+        theirs.iter().any(|op| op == "Sign"),
+        "the declined dynamic node must still be runnable by ORT (others={theirs:?})",
+    );
+}
