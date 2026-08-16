@@ -175,11 +175,13 @@ if [ "$HOST_OS" = "Linux" ]; then
         && [ -d /usr/aarch64-linux-gnu/include ]; then
         ARCH_CRATES=("${CRATES_FULL[@]}")
         ARCH_SCOPE_NOTE="full offline set (aarch64 cross toolchain present)"
-    elif [ -n "${CI:-}" ]; then
-        # CI installs the toolchain explicitly, so its absence is a workflow
-        # bug, not a host limitation.  Fail loudly instead of quietly checking
-        # a subset that excludes the crate this gate exists for.
-        echo "✗ aarch64 cross toolchain missing on CI." >&2
+    elif [ -n "${GITHUB_ACTIONS:-}" ]; then
+        # The workflow installs the toolchain explicitly, so its absence there
+        # is a workflow bug, not a host limitation: fail loudly instead of
+        # quietly checking a subset that excludes the crate this gate exists
+        # for.  Keyed on GITHUB_ACTIONS rather than CI so a developer who
+        # exports CI=1 for unrelated reasons does not get this failure.
+        echo "✗ aarch64 cross toolchain missing on GitHub Actions." >&2
         echo "  The cross-arch pass needs gcc-aarch64-linux-gnu and" >&2
         echo "  libc6-dev-arm64-cross: ort-sys runs bindgen for the target and" >&2
         echo "  clang needs arm64 libc headers to parse onnxruntime_c_api.h." >&2
@@ -283,4 +285,10 @@ fi
 echo ""
 echo "✓ Cross-arch check passed ($ARCH_SCOPE_NOTE)"
 echo ""
-echo "✓ Cross-compile check passed (target_os and target_arch dimensions)"
+if [ -n "$ARCH_SKIPPED" ]; then
+    echo "✓ Cross-compile check passed (target_os and target_arch dimensions)"
+    echo "  — REDUCED SCOPE: $ARCH_SKIPPED was not checked for $ARCH_TARGET."
+    echo "    See the warning above; this run proves less than a full one."
+else
+    echo "✓ Cross-compile check passed (target_os and target_arch dimensions)"
+fi
