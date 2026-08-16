@@ -29,7 +29,9 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{Attribute, DataType, Graph, Node, broadcast_shapes, compute_contiguous_strides};
+use onnx_runtime_ir::{
+    Attribute, DataType, Graph, Node, broadcast_shapes, compute_contiguous_strides,
+};
 use rayon::prelude::*;
 
 use super::check_arity;
@@ -223,11 +225,7 @@ fn node_weight_transpose_cache_bytes(node: &Node, graph: &Graph) -> u64 {
     // All platforms: `Gemm` with `transB != 0` transposes a constant `B[N,K]`
     // to `[K,N]` and caches it as f32 (`gemm.rs:119`).
     if node.op_type == "Gemm" {
-        let trans_b = node
-            .attr("transB")
-            .and_then(Attribute::as_int)
-            .unwrap_or(0)
-            != 0;
+        let trans_b = node.attr("transB").and_then(Attribute::as_int).unwrap_or(0) != 0;
         if !trans_b {
             return 0;
         }
