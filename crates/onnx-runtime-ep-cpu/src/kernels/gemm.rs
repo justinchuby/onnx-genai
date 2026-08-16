@@ -718,7 +718,9 @@ mod tests {
     #[test]
     fn predicted_transpose_bytes_equal_actual_after_gemm_execution() {
         let _guard = TRANSPOSE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        matmul::set_weight_transpose_cache_enabled(true);
+        // Thread-local admit: never mutates the process-global the concurrent
+        // `transposed_b` tests read (#1056 isolation).
+        let _admit = crate::kernels::weight_transpose::CacheEnabledScope::new(true);
 
         // Distinctive geometry so a stray same-shaped entry cannot alias it.
         let (n, k) = (37usize, 91usize);
@@ -793,15 +795,18 @@ mod tests {
     fn declined_transpose_cache_retains_nothing_and_is_byte_identical() {
         let _guard = TRANSPOSE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-        // A fresh `B` never seen by the global cache, so a retained copy would
-        // show up as a byte increase we can detect.
+        // A fresh `B` never seen by the global cache. Built once so its data
+        // pointer is stable across both runs and can be probed by exact key.
         let (n, k, m) = (29usize, 53usize, 3usize);
         let b_data: Vec<f32> = (0..n * k).map(|i| (i as f32 * 0.019).sin()).collect();
         let a_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.011).cos()).collect();
+        let b = Owned::f32(&[n, k], &b_data);
+        // SAFETY: `b` outlives every use of this pointer below and is a
+        // contiguous `[n, k]` f32 tensor, so the key names exactly this weight.
+        let b_ptr = unsafe { b.view().data_ptr::<f32>() };
 
         let run = || -> Vec<f32> {
             let a = Owned::f32(&[m, k], &a_data);
-            let b = Owned::f32(&[n, k], &b_data);
             let mut y = Owned::zeros_f32(&[m, n]);
             let mut kernel = GemmKernel {
                 alpha: 1.0,
@@ -817,25 +822,35 @@ mod tests {
             y.to_f32()
         };
 
-        // Declined: nothing may be retained.
-        matmul::set_weight_transpose_cache_enabled(false);
-        let before = matmul::weight_transpose_cache_bytes();
-        let declined = run();
-        let after = matmul::weight_transpose_cache_bytes();
-        assert_eq!(
-            after, before,
-            "a declined transpose cache must retain no session-lifetime bytes"
-        );
+        // Declined: this weight's transpose must not be resident afterward.
+        // Probe the exact `(addr, k, n)` key rather than a global byte total, so
+        // a concurrent test caching an unrelated weight cannot mask a leak.
+        let declined = {
+            let _decline = crate::kernels::weight_transpose::CacheEnabledScope::new(false);
+            let out = run();
+            assert!(
+                !crate::kernels::weight_transpose::f32_cache_contains(b_ptr, k, n),
+                "a declined transpose cache must retain nothing for this weight"
+            );
+            out
+        };
 
-        // Admitted: byte-identical output (transpose is the same math either way).
-        matmul::set_weight_transpose_cache_enabled(true);
-        let admitted = run();
+        // Admitted: byte-identical output (transpose is the same math either
+        // way) and now this weight *is* resident, confirming the two paths
+        // differ only in retention, not in numerics.
+        let admitted = {
+            let _admit = crate::kernels::weight_transpose::CacheEnabledScope::new(true);
+            let out = run();
+            assert!(
+                crate::kernels::weight_transpose::f32_cache_contains(b_ptr, k, n),
+                "an admitted transpose cache must retain this weight"
+            );
+            out
+        };
         assert_eq!(
             declined, admitted,
             "declining the transpose cache must not change results"
         );
-
-        matmul::set_weight_transpose_cache_enabled(true);
     }
 }
 

@@ -57,13 +57,68 @@ static WEIGHT_TRANSPOSE_CACHE_ENABLED: AtomicBool = AtomicBool::new(true);
 
 /// Admit (or decline) the process-global weight-transpose caches. See
 /// [`WEIGHT_TRANSPOSE_CACHE_ENABLED`].
+///
+/// This is the **production** entry point: the engine calls it exactly once, at
+/// load, from the plan's verdict. It writes a process-global that every worker
+/// thread reads, which is correct for production but toxic for a parallel test
+/// harness — a test that flipped it would race every other test in the process
+/// (this is the #983 / #1033 / #1056 "passes alone, fails in company" trap).
+/// Tests must therefore never call this; they use [`CacheEnabledScope`], a
+/// thread-local override that leaves this global untouched.
 pub fn set_cache_enabled(enabled: bool) {
     WEIGHT_TRANSPOSE_CACHE_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
+thread_local! {
+    /// Test-only, per-thread override of the admission verdict. `None` means
+    /// "defer to the process-global"; `Some(v)` forces `v` on **this thread
+    /// only**, so one test's decline cannot leak into another test running
+    /// concurrently on a different worker thread. Set exclusively through
+    /// [`CacheEnabledScope`], which restores the previous value on drop (even on
+    /// panic). Production never touches this.
+    static CACHE_ENABLED_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// Whether the process-global weight-transpose caches are currently admitted.
+///
+/// A thread-local override (set only by tests via [`CacheEnabledScope`]) wins
+/// over the process-global when present, so the decline path can be exercised
+/// on one thread without disturbing the rest of the parallel test harness.
 pub fn cache_enabled() -> bool {
+    if let Some(forced) = CACHE_ENABLED_OVERRIDE.with(|c| c.get()) {
+        return forced;
+    }
     WEIGHT_TRANSPOSE_CACHE_ENABLED.load(Ordering::Relaxed)
+}
+
+/// RAII, thread-local scoping of the admission verdict for tests (#1056).
+///
+/// Constructing one forces [`cache_enabled`] to `enabled` on the current thread;
+/// dropping it restores whatever was in effect before — including on panic, so a
+/// failing test can never leave the flag flipped for the tests that follow.
+/// Because the override is thread-local, a test scoping a decline here does not
+/// race the `transposed_b` tests running concurrently on other threads, which
+/// was the failure this type exists to prevent.
+#[cfg(test)]
+pub(crate) struct CacheEnabledScope {
+    prev: Option<bool>,
+}
+
+#[cfg(test)]
+impl CacheEnabledScope {
+    /// Force the admission verdict to `enabled` on this thread until dropped.
+    pub(crate) fn new(enabled: bool) -> Self {
+        let prev = CACHE_ENABLED_OVERRIDE.with(|c| c.replace(Some(enabled)));
+        Self { prev }
+    }
+}
+
+#[cfg(test)]
+impl Drop for CacheEnabledScope {
+    fn drop(&mut self) {
+        CACHE_ENABLED_OVERRIDE.with(|c| c.set(self.prev));
+    }
 }
 
 /// Total identity of one cached weight transpose.
@@ -286,6 +341,17 @@ pub fn cached_transpose_f32(src: &[f32], k: usize, n: usize) -> Option<Arc<Vec<f
         return transpose_uncached(src, k, n);
     }
     WEIGHT_TRANSPOSE_F32.get_or_insert_transpose(src, k, n)
+}
+
+/// Test-only: is the transpose of the `[k, n]` f32 weight based at `ptr`
+/// currently resident in the global cache? Unlike a global byte-total delta,
+/// this isolates one specific weight, so a concurrent test populating an
+/// unrelated entry cannot perturb the answer (#1056 isolation).
+#[cfg(test)]
+pub(crate) fn f32_cache_contains(ptr: *const f32, k: usize, n: usize) -> bool {
+    WEIGHT_TRANSPOSE_F32
+        .get(&WeightTransposeKey::new(ptr, k, n))
+        .is_some()
 }
 
 /// Cached `B_T[N,K]` for an f16 weight `B[K,N]` held as raw `u16` bit patterns,
