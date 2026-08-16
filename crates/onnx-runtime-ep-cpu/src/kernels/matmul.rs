@@ -29,7 +29,9 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{Node, broadcast_shapes, compute_contiguous_strides};
+use onnx_runtime_ir::{
+    Attribute, DataType, Graph, Node, broadcast_shapes, compute_contiguous_strides,
+};
 use rayon::prelude::*;
 
 use super::check_arity;
@@ -139,6 +141,113 @@ pub fn weight_transpose_cache_bytes() -> usize {
     weight_transpose::cache_bytes()
 }
 
+/// Admit (`true`) or decline (`false`) the process-global weight-transpose
+/// caches for the rest of the session (#1056).
+///
+/// When declined, the `MatMul`/`Gemm` kernels compute each constant-weight
+/// transpose per call and retain nothing, so the resident, session-lifetime,
+/// weight-scaled `K x N` copies never accrue. The engine calls this once at
+/// load from the memory-strategy plan's verdict, beside the identical gates for
+/// the resident dequant f32 cache (#987) and the MLAS SQNBit packed buffer
+/// (#1051), so one admission decision governs all three buffers. Declining is a
+/// pure performance tradeoff: the transpose is byte-identical whether cached or
+/// recomputed, so generated tokens are unchanged.
+pub fn set_weight_transpose_cache_enabled(enabled: bool) {
+    weight_transpose::set_cache_enabled(enabled);
+}
+
+/// Predicted bytes the process-global weight-transpose caches will hold for
+/// `graph` once it has run — the *prediction* the memory-strategy plan budgets
+/// for, whose accuracy [`weight_transpose_cache_bytes`] measures after the fact.
+///
+/// # What actually populates the cache
+///
+/// The cache holds one f32/f16 `N x K` transpose per **constant** (initializer)
+/// weight that a kernel feeds through [`weight_transpose::cached_transpose_f32`]
+/// / [`weight_transpose::cached_transpose_f16`]. The precise callers, and hence
+/// this predictor, are platform-split because the transpose is only consumed by
+/// the CPU EP's fast paths:
+///
+/// * **All platforms — `Gemm` with `transB != 0`** (`gemm.rs`
+///   `GemmKernel::execute`, the `transposed_b(&b, n, k)` call added in #1035):
+///   a constant `B` stored `[N, K]` is transposed once to the `[K, N]` the
+///   shared GEMM consumes and cached as **f32** (`gemm.rs` first widens `B` to
+///   dense f32 via `MatMulPrepack::dense`). Cost `N * K * 4` bytes. A
+///   non-constant `B`, or `transB == 0`, never caches. When both operands are
+///   f16/bf16 the node takes the half path (`try_half_gemm`) and does not
+///   transpose; this predictor still counts it (over-predicts, never under —
+///   the #1056-mandated safe direction), because whether `A` is half is not a
+///   graph-static property here.
+///
+/// * **Apple only — `MatMul` / `FusedMatMulBias` with a constant `B`**
+///   (`matmul.rs` `execute_with_backend` and `fused_matmul_bias.rs`, all guarded
+///   by `#[cfg(any(target_os = "macos", target_os = "ios"))]`): the Accelerate
+///   GEMV / thin-M paths cache the transpose as **f16** (`N * K * 2`, raw `u16`
+///   bit patterns) for a contiguous Float16 `B`, else **f32** (`N * K * 4`).
+///   These call sites are compiled out on x86/Windows, so this predictor's
+///   Apple arm is likewise `cfg`-gated: a binary predicts exactly what its own
+///   kernels will allocate.
+///
+/// The shape-keyed kernel cache instantiates a node once per activation shape
+/// (prefill `m > 1`, decode `m == 1`), but every instance keys the *global*
+/// cache on `(weight address, K, N)`, so the second instantiation hits the
+/// existing entry and allocates nothing extra. Unlike the MLAS packed buffer
+/// (#1051), the transpose is therefore held once per weight, not once per
+/// instantiation — no per-copy multiplier applies.
+pub fn weight_transpose_cache_predicted_bytes(graph: &Graph) -> u64 {
+    let mut total = 0_u64;
+    for node in graph.nodes.values() {
+        total = total.saturating_add(node_weight_transpose_cache_bytes(node, graph));
+    }
+    total
+}
+
+/// Element count of a node's constant 2-D `B` initializer (input index 1), or
+/// `None` when `B` is absent, non-constant, or not rank-2. Shared by both arms
+/// of [`weight_transpose_cache_predicted_bytes`].
+fn constant_b_numel(node: &Node, graph: &Graph) -> Option<(u64, DataType)> {
+    let b_value = (*node.inputs.get(1)?)?;
+    let weight = graph.initializers.get(&b_value)?;
+    let dims = weight.dims();
+    if dims.len() != 2 {
+        return None;
+    }
+    let numel = (dims[0] as u64).checked_mul(dims[1] as u64)?;
+    Some((numel, weight.dtype()))
+}
+
+/// Per-node contribution to [`weight_transpose_cache_predicted_bytes`]. Mirrors
+/// exactly the kernel call sites documented there.
+fn node_weight_transpose_cache_bytes(node: &Node, graph: &Graph) -> u64 {
+    if !node.is_default_domain() {
+        return 0;
+    }
+    // All platforms: `Gemm` with `transB != 0` transposes a constant `B[N,K]`
+    // to `[K,N]` and caches it as f32 (`gemm.rs:119`).
+    if node.op_type == "Gemm" {
+        let trans_b = node.attr("transB").and_then(Attribute::as_int).unwrap_or(0) != 0;
+        if !trans_b {
+            return 0;
+        }
+        let Some((numel, _dtype)) = constant_b_numel(node, graph) else {
+            return 0;
+        };
+        return numel.saturating_mul(4);
+    }
+    // Apple only: `MatMul` / `FusedMatMulBias` cache a constant `B`'s transpose
+    // in the Accelerate paths (see the function docs). Compiled out elsewhere so
+    // the predictor matches the kernels actually present in this binary.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    if node.op_type == "MatMul" || node.op_type == "FusedMatMulBias" {
+        let Some((numel, dtype)) = constant_b_numel(node, graph) else {
+            return 0;
+        };
+        let elem = if dtype == DataType::Float16 { 2 } else { 4 };
+        return numel.saturating_mul(elem);
+    }
+    0
+}
+
 /// Evict all entries from the global weight-transpose caches.
 ///
 /// **Must** be called when an Executor drops: the caches are keyed by
@@ -219,6 +328,13 @@ pub(crate) struct MatMulPrepack {
     dense: [OnceLock<Vec<f32>>; 2],
     #[cfg(feature = "mlas")]
     packed_b: OnceLock<mlas_sys::PackedB>,
+    /// MLAS-packed f32 panel built once from a constant **f16** B weight.
+    ///
+    /// The widened f32 copy is a temporary: it is consumed by `PackedB::new`
+    /// and dropped, so this costs one packed panel rather than the packed panel
+    /// plus a permanent 4*K*N dense copy the way `dense[1]` + `packed_b` would.
+    #[cfg(feature = "mlas")]
+    packed_b_from_half: OnceLock<Option<(WeightTransposeKey, mlas_sys::PackedB)>>,
     /// Lazily-computed transpose of the B weight matrix for the Accelerate
     /// column-parallel GEMV path, with the key it was computed for. Only
     /// populated for constant (model weight) inputs.
@@ -299,6 +415,15 @@ impl MatMulPrepack {
         if !self.constant_inputs[1] {
             return None;
         }
+        // #1056: when the plan declines the transpose cache, hand back `None` so
+        // the caller recomputes a transient transpose per call (freed at the end
+        // of the call) rather than memoizing an `Arc` in this kernel instance —
+        // that per-instance memo would survive the session and, multiplied by
+        // the shape-keyed kernel-cache instantiations, is exactly the resident
+        // footprint the decline is meant to shed.
+        if !weight_transpose::cache_enabled() {
+            return None;
+        }
         let key = WeightTransposeKey::new(b.as_ptr(), k, n);
         // Validate before touching the memo so a mismatched call can neither
         // install a wrong-length entry nor poison a correct one.
@@ -334,6 +459,10 @@ impl MatMulPrepack {
         use onnx_runtime_ir::DataType;
         if !self.constant_inputs[1] || b_view.dtype != DataType::Float16 || !b_view.is_contiguous()
         {
+            return None;
+        }
+        // #1056: declined cache -> recompute per call, retain nothing.
+        if !weight_transpose::cache_enabled() {
             return None;
         }
         // The caller derives `k` from A and `n` from B, so operands that
@@ -434,6 +563,60 @@ impl MatMulPrepack {
         (cached.len() == b_view.numel()).then(|| cached.as_slice())
     }
 
+    /// MLAS-packed B built by widening a constant f16 weight to f32 once.
+    ///
+    /// Returns `None` for a non-constant B: an activation would have to be
+    /// re-widened and re-packed on every call, which is the cost this exists to
+    /// remove, and caching it would be wrong the moment the activation changed.
+    #[cfg(feature = "mlas")]
+    fn packed_b_from_half(
+        &self,
+        view: &TensorView<'_>,
+        k: usize,
+        n: usize,
+    ) -> Result<Option<&mlas_sys::PackedB>> {
+        if !self.constant_inputs[1] {
+            return Ok(None);
+        }
+        // Defence in depth, mirroring `transposed_b`: a memo is only served
+        // back for the exact weight it was built from. Today the executor's
+        // kernel cache keys on node and input shapes and a constant input is a
+        // graph initializer whose address is stable, so the key can only ever
+        // match; the check exists so that broadening "constant" later fails
+        // loudly instead of silently returning another tensor's pack.
+        let key = WeightTransposeKey::new(view.data_ptr::<u16>(), k, n);
+        if let Some(cached) = self.packed_b_from_half.get() {
+            return Ok(cached
+                .as_ref()
+                .and_then(|(cached_key, packed)| (*cached_key == key).then_some(packed)));
+        }
+        let widened = to_dense_f32_widen("MatMul", view)?;
+        if key.numel() != Some(widened.len()) {
+            return Ok(None);
+        }
+        let packed = mlas_sys::PackedB::new(n, k, &widened);
+        drop(widened);
+        Ok(self
+            .packed_b_from_half
+            .get_or_init(|| Some((key, packed)))
+            .as_ref()
+            .and_then(|(cached_key, packed)| (*cached_key == key).then_some(packed)))
+    }
+
+    /// Whether the once-widened MLAS pack for a constant f16 B has been built.
+    ///
+    /// Lets sibling modules' tests assert which route served a call; the field
+    /// itself stays private to this module.
+    #[cfg(test)]
+    pub(crate) fn half_pack_is_built(&self) -> bool {
+        #[cfg(feature = "mlas")]
+        {
+            self.packed_b_from_half.get().is_some_and(Option::is_some)
+        }
+        #[cfg(not(feature = "mlas"))]
+        false
+    }
+
     #[cfg(feature = "mlas")]
     fn packed_b(&self, b: &[f32], k: usize, n: usize) -> Option<&mlas_sys::PackedB> {
         self.constant_inputs[1].then(|| {
@@ -497,6 +680,55 @@ fn gemm_packed(
     assert_eq!(packed.dimensions(), (k, n));
     mlas_sys::sgemm_nn_packed(m, a, packed, c);
     Ok(())
+}
+
+/// f16 prefill through MLAS SGEMM on a once-widened, once-packed B.
+///
+/// The portable blocked half GEMM re-packs B into cache-sized panels on *every*
+/// call and drives them from a 4x8 microkernel on the global rayon pool. For a
+/// constant weight all of that is avoidable: ORT widens f16 to f32 and runs the
+/// same tuned SGEMM it uses for float, and the difference is not small.
+/// `128x3584x3584` MatMul measured 2.44x slower than ORT at one thread and
+/// 8.24x at eight, because our scaling was 2.2x where ORT's was 7.5x.
+///
+/// Widening B is paid once and the f32 copy is dropped immediately, so the
+/// steady-state footprint is one MLAS panel rather than a panel plus a
+/// permanent dense copy. Only A is widened per call: `M*K` against B's `K*N`.
+///
+/// Returns `None` — leaving the caller's existing path untouched — for a
+/// non-MLAS backend, a non-f16 operand, a non-contiguous or wrongly-sized B, an
+/// activation B, or `M <= 1`. `M = 1` is excluded because packing needs row
+/// reuse to pay for itself and the decode GEMV is already at parity with ORT.
+#[cfg(feature = "mlas")]
+pub(crate) fn try_packed_half_prefill(
+    prepack: &MatMulPrepack,
+    backend: CpuBackend,
+    a: &TensorView,
+    b: &TensorView,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<Option<Vec<f32>>> {
+    if backend != CpuBackend::Mlas
+        || m <= 1
+        || a.dtype != onnx_runtime_ir::DataType::Float16
+        || b.dtype != onnx_runtime_ir::DataType::Float16
+        || !b.is_contiguous()
+        || b.numel() != k.saturating_mul(n)
+    {
+        return Ok(None);
+    }
+    b.validate()?;
+    let Some(packed) = prepack.packed_b_from_half(b, k, n)? else {
+        return Ok(None);
+    };
+    let a_dense = prepack.dense(0, a)?;
+    if a_dense.len() != m.saturating_mul(k) {
+        return Ok(None);
+    }
+    let mut result = vec![0.0f32; m * n];
+    gemm_packed(&a_dense, packed, &mut result, m, k, n)?;
+    Ok(Some(result))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -815,6 +1047,24 @@ impl MatMulKernel {
                 half_gemv::gemv_f16_kn(&a_dense, b_bits, &mut result, geom.k, geom.n);
                 return write_dense_f32_narrow("MatMul", &mut outputs[0], &result);
             }
+        }
+
+        // f16 prefill through MLAS SGEMM on a once-widened, once-packed B.
+        // Shared with `Gemm`; see `try_packed_half_prefill`.
+        #[cfg(feature = "mlas")]
+        if numel(&geom.batch_shape) <= 1
+            && geom.b_promoted_rank == 2
+            && let Some(result) = try_packed_half_prefill(
+                &self.prepack,
+                backend,
+                &inputs[0],
+                &inputs[1],
+                geom.m,
+                geom.k,
+                geom.n,
+            )?
+        {
+            return write_dense_f32_narrow("MatMul", &mut outputs[0], &result);
         }
 
         // Dedicated half-precision path: contiguous f16/bf16 operands stay in
@@ -2579,6 +2829,256 @@ mod tests {
             ptr_before,
             "dense[1] cache was reallocated on the second execute"
         );
+    }
+
+    /// The f16 prefill route through MLAS SGEMM must agree with the widened
+    /// reference on shapes whose edges the packed kernel has to handle: `K` and
+    /// `N` are both odd and `N` is below a SIMD step, so the tails dominate.
+    ///
+    /// Also proves the route is actually taken. Without the `packed_b_from_half`
+    /// assertion this test would keep passing if the optimisation silently
+    /// stopped applying and the slow blocked path served the call instead.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn f16_prefill_through_mlas_matches_the_widened_reference() {
+        let (m, k, n) = (6usize, 37usize, 5usize);
+        // Multiples of 1/16 are exact in f16, so any mismatch is the kernel's
+        // arithmetic rather than the operands' rounding.
+        let a_data: Vec<f32> = (0..m * k)
+            .map(|i| ((i * 7 % 23) as f32 - 11.0) / 16.0)
+            .collect();
+        let b_data: Vec<f32> = (0..k * n)
+            .map(|i| ((i * 13 % 31) as f32 - 15.0) / 16.0)
+            .collect();
+        let expected = naive_matmul(&a_data, &b_data, m, k, n);
+
+        let a = Owned::f16(&[m, k], &a_data);
+        let b = Owned::f16(&[k, n], &b_data);
+        let mut out = Owned::zeros_f32(&[m, n]);
+        let mut kernel = MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, true]);
+        kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+
+        // `execute` resolves its backend by auto-detection, and only MLAS has a
+        // pack to build; elsewhere the blocked path serves the call correctly.
+        assert_eq!(
+            kernel.prepack.packed_b_from_half.get().is_some(),
+            crate::backend::CpuBackend::auto_detect() == crate::backend::CpuBackend::Mlas,
+            "a constant f16 B at M>1 must be widened and packed once on MLAS, \
+             not repacked per call"
+        );
+        for (actual, want) in out.to_f32().iter().zip(expected.iter()) {
+            assert!(
+                (actual - want).abs() <= 1e-3,
+                "f16 prefill disagreed: got {actual}, want {want}"
+            );
+        }
+    }
+
+    /// The pack is built once and reused. A `OnceLock` that were re-initialised
+    /// per call would still be correct but would reintroduce the entire cost
+    /// this path exists to remove, and no numerical test would notice.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn f16_prefill_pack_is_built_once_across_calls() {
+        let (m, k, n) = (4usize, 16usize, 8usize);
+        let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 9) as f32 - 4.0) / 8.0).collect();
+        let b_data: Vec<f32> = (0..k * n).map(|i| ((i % 7) as f32 - 3.0) / 8.0).collect();
+        let a = Owned::f16(&[m, k], &a_data);
+        let b = Owned::f16(&[k, n], &b_data);
+        let mut prepack = MatMulPrepack::default();
+        prepack.set_constant_inputs(&[false, true]);
+        // Forced dispatch: whether the pack is reused is a property of the
+        // memo, not of which backend auto-detection happens to pick here.
+        let backend = crate::backend::CpuBackend::Mlas;
+
+        let first = try_packed_half_prefill(&prepack, backend, &a.view(), &b.view(), m, k, n)
+            .unwrap()
+            .expect("a constant f16 B at M>1 must take the packed route");
+        let packed_before = prepack
+            .packed_b_from_half
+            .get()
+            .expect("the first call must populate the pack")
+            .as_ref()
+            .expect("a constant B must pack") as *const _;
+
+        let second = try_packed_half_prefill(&prepack, backend, &a.view(), &b.view(), m, k, n)
+            .unwrap()
+            .expect("the second call must also take the packed route");
+        let packed_after = prepack.packed_b_from_half.get().unwrap().as_ref().unwrap() as *const _;
+
+        assert_eq!(
+            packed_before, packed_after,
+            "the MLAS pack was rebuilt on the second call"
+        );
+        assert_eq!(first, second, "repeated calls diverged");
+    }
+
+    /// An activation B must never be packed: the pack is only valid because a
+    /// constant weight never changes, and caching an activation would return a
+    /// stale product the moment the upstream op produced new values.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn f16_prefill_with_a_non_constant_b_is_correct_and_unpacked() {
+        let (m, k, n) = (3usize, 12usize, 6usize);
+        let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 9) as f32 - 4.0) / 8.0).collect();
+        let b1: Vec<f32> = (0..k * n).map(|i| ((i % 7) as f32 - 3.0) / 8.0).collect();
+        let b2: Vec<f32> = b1.iter().map(|v| v + 0.25).collect();
+
+        let a = Owned::f16(&[m, k], &a_data);
+        let mut kernel = MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, false]);
+
+        for b_data in [&b1, &b2] {
+            let b = Owned::f16(&[k, n], b_data);
+            let mut out = Owned::zeros_f32(&[m, n]);
+            kernel
+                .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+                .unwrap();
+            let expected = naive_matmul(&a_data, b_data, m, k, n);
+            for (actual, want) in out.to_f32().iter().zip(expected.iter()) {
+                assert!(
+                    (actual - want).abs() <= 1e-3,
+                    "non-constant f16 B disagreed: got {actual}, want {want}"
+                );
+            }
+            assert!(
+                kernel.prepack.packed_b_from_half.get().is_none(),
+                "an activation B must never be packed as a weight"
+            );
+        }
+    }
+
+    /// M=1 keeps the GEMV. Packing needs row reuse to pay for itself, and the
+    /// decode GEMV is memory-bound and already at parity with ORT, so building
+    /// a pack there would add cost and win nothing.
+    /// A second, different weight at the same `[k, n]` must never be served
+    /// the first weight's pack.
+    ///
+    /// The executor keys its kernel cache on node and input shapes and a
+    /// constant input is a graph initializer with a stable address, so this
+    /// cannot happen today. The guard is defence in depth: it makes any future
+    /// broadening of "constant" degrade to the slow-but-correct blocked path
+    /// rather than silently returning another tensor's product.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn a_different_weight_is_never_served_the_cached_pack() {
+        let (m, k, n) = (3usize, 12usize, 4usize);
+        let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 5) as f32 - 2.0) / 8.0).collect();
+        let first: Vec<f32> = (0..k * n).map(|i| ((i % 7) as f32 - 3.0) / 8.0).collect();
+        let second: Vec<f32> = first.iter().map(|value| value + 1.0).collect();
+        let a = Owned::f16(&[m, k], &a_data);
+        let b_first = Owned::f16(&[k, n], &first);
+        let b_second = Owned::f16(&[k, n], &second);
+        let mut prepack = MatMulPrepack::default();
+        prepack.set_constant_inputs(&[false, true]);
+
+        // Forced dispatch: the guard is hardware-independent, so assert it on
+        // every target rather than only where auto-detection picks MLAS.
+        let backend = crate::backend::CpuBackend::Mlas;
+        let served =
+            try_packed_half_prefill(&prepack, backend, &a.view(), &b_first.view(), m, k, n)
+                .unwrap()
+                .expect("the first weight builds and uses the pack");
+        let want_first = naive_matmul(&a_data, &first, m, k, n);
+        for (actual, want) in served.iter().zip(want_first.iter()) {
+            assert!((actual - want).abs() <= 1e-3, "first weight disagreed");
+        }
+
+        let reused =
+            try_packed_half_prefill(&prepack, backend, &a.view(), &b_second.view(), m, k, n)
+                .unwrap();
+        assert!(
+            reused.is_none(),
+            "a weight the pack was not built for must be declined, not served \
+             the cached pack; got a result that would be the first weight's"
+        );
+    }
+
+    /// Calls the shared helper directly at `M = 1`, bypassing the decode GEMV
+    /// that both kernels try first.
+    ///
+    /// `f16_decode_does_not_build_the_prefill_pack` and its `Gemm` twin only
+    /// fail under a compound injection, because at `M = 1` the GEMV returns
+    /// before the helper is ever reached. This one falsifies the `m <= 1` gate
+    /// on its own: remove it and the assertion below sees `Some`.
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn the_packed_prefill_helper_declines_a_single_row() {
+        let (k, n) = (24usize, 8usize);
+        let a = Owned::f16(
+            &[1, k],
+            &(0..k).map(|i| (i % 5) as f32 / 8.0).collect::<Vec<_>>(),
+        );
+        let b = Owned::f16(
+            &[k, n],
+            &(0..k * n).map(|i| (i % 7) as f32 / 8.0).collect::<Vec<_>>(),
+        );
+        let mut prepack = MatMulPrepack::default();
+        prepack.set_constant_inputs(&[false, true]);
+        let single_row = try_packed_half_prefill(
+            &prepack,
+            crate::backend::CpuBackend::Mlas,
+            &a.view(),
+            &b.view(),
+            1,
+            k,
+            n,
+        )
+        .unwrap();
+        assert!(
+            single_row.is_none(),
+            "packing needs row reuse to pay for itself, so M=1 must be declined"
+        );
+        assert!(
+            !prepack.half_pack_is_built(),
+            "a declined call must not leave a pack behind"
+        );
+
+        // The same weight at M=2 is accepted, so the decline above is the row
+        // count and not some unrelated rejection.
+        let a2 = Owned::f16(
+            &[2, k],
+            &(0..2 * k).map(|i| (i % 5) as f32 / 8.0).collect::<Vec<_>>(),
+        );
+        let two_rows = try_packed_half_prefill(
+            &prepack,
+            crate::backend::CpuBackend::Mlas,
+            &a2.view(),
+            &b.view(),
+            2,
+            k,
+            n,
+        )
+        .unwrap();
+        assert!(two_rows.is_some(), "M=2 must take the packed route");
+    }
+
+    #[cfg(feature = "mlas")]
+    #[test]
+    fn f16_decode_does_not_build_the_prefill_pack() {
+        let (k, n) = (24usize, 8usize);
+        let a_data: Vec<f32> = (0..k).map(|i| ((i % 9) as f32 - 4.0) / 8.0).collect();
+        let b_data: Vec<f32> = (0..k * n).map(|i| ((i % 7) as f32 - 3.0) / 8.0).collect();
+        let a = Owned::f16(&[1, k], &a_data);
+        let b = Owned::f16(&[k, n], &b_data);
+        let mut out = Owned::zeros_f32(&[1, n]);
+        let mut kernel = MatMulKernel::default();
+        kernel.set_constant_inputs(&[false, true]);
+        kernel
+            .execute(&[a.view(), b.view()], &mut [out.view_mut()])
+            .unwrap();
+
+        assert!(
+            kernel.prepack.packed_b_from_half.get().is_none(),
+            "M=1 must stay on the GEMV rather than building a prefill pack"
+        );
+        let expected = naive_matmul(&a_data, &b_data, 1, k, n);
+        for (actual, want) in out.to_f32().iter().zip(expected.iter()) {
+            assert!((actual - want).abs() <= 1e-3, "decode GEMV disagreed");
+        }
     }
 
     /// The x86 f16 decode GEMV must produce the same values as the blocked

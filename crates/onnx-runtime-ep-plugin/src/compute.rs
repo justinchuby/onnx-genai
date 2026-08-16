@@ -189,6 +189,16 @@ impl ShapeInference {
             | "Selu"
             | "Softplus"
             | "Softsign"
+            // `com.microsoft` shape-preserving activations. Absent from this
+            // table they resolve to `Declined`, and `GetCapability`'s
+            // fail-closed shape filter then drops the whole claim — so the EP
+            // never got these nodes at all, whatever `supports_op` said.
+            // `com.microsoft::Silu` is deliberately *not* listed: ORT 1.28 does
+            // not register it, so it is unreachable here and listing it would
+            // create an unmeasured claim the day that changes.
+            | "FastGelu"
+            | "QuickGelu"
+            | "BiasGelu"
             | "Cast"
             | "Identity"
             | "Dropout"
@@ -312,6 +322,16 @@ impl ShapeInference {
             | "Selu"
             | "Softplus"
             | "Softsign"
+            // `com.microsoft` shape-preserving activations. Absent from this
+            // table they resolve to `Declined`, and `GetCapability`'s
+            // fail-closed shape filter then drops the whole claim — so the EP
+            // never got these nodes at all, whatever `supports_op` said.
+            // `com.microsoft::Silu` is deliberately *not* listed: ORT 1.28 does
+            // not register it, so it is unreachable here and listing it would
+            // create an unmeasured claim the day that changes.
+            | "FastGelu"
+            | "QuickGelu"
+            | "BiasGelu"
             | "Cast"
             | "Identity"
             | "Dropout"
@@ -1984,6 +2004,27 @@ unsafe extern "C" fn compute_execute(
         let scratch_mem_info =
             unsafe { device_mem_info(api_ref, kernel_context, exported.device_staging.as_ref()) };
 
+        // Where a routed subgraph's *intermediates* are allocated.
+        //
+        // Device memory is not optional: a device kernel handed a host pointer
+        // dereferences it as device memory. Host memory is different — the
+        // intermediate only has to be readable by the next kernel on this
+        // thread, and `KernelContext_GetScratchBuffer` is a much worse way to
+        // get it than the Rust allocator. ORT's host scratch goes through an
+        // aligned allocation that glibc always services with a fresh `mmap`
+        // for buffers of this size, so every intermediate is a new mapping,
+        // first-touch page-faulted while the kernel writes it and unmapped at
+        // the end of the `Run`. Measured on an 8-node f32 `Relu` chain of
+        // 262144 elements (1 MiB per intermediate), one thread: 3246 us
+        // through ORT scratch vs 383 us through host buffers, an 8.5x
+        // difference on identical kernels, against ORT's own 220 us for the
+        // same graph. So: device memory when the resolved memory info is a
+        // device, host buffers otherwise.
+        let intermediate_scratch = match scratch_mem_info {
+            Some(mem_info) if unsafe { mem_info_is_device(api_ref, mem_info) } => Some(mem_info),
+            _ => None,
+        };
+
         let inputs = match unsafe { read_inputs(api_ref, kernel_context) } {
             Ok(v) => v,
             Err(e) => return fail_status(&format!("Compute: {e}")),
@@ -2002,6 +2043,13 @@ unsafe extern "C" fn compute_execute(
                 .num_intermediate_buffers)
                 .map(|_| None)
                 .collect();
+
+            // Last node that reads each intermediate buffer. A buffer whose
+            // last reader has run is dead and its storage can be handed
+            // straight back to the next allocation, so a chain of N nodes
+            // cycles a couple of buffers instead of touching N fresh ones.
+            let last_reader =
+                last_reader_per_buffer(&routing.input_sources, routing.num_intermediate_buffers);
 
             for (node_idx, entry) in exported.entries.iter().enumerate() {
                 let sources = &routing.input_sources[node_idx];
@@ -2172,16 +2220,16 @@ unsafe extern "C" fn compute_execute(
                     ort_outputs.iter_mut().map(|o| o.view_mut()).collect();
 
                 // For buffer-sink outputs, allocate the IntermediateBuf and get a
-                // mutable pointer into it. Prefer ORT scratch memory (device
-                // memory on a device EP) so intermediates live where the kernels
-                // execute; fall back to a host buffer only when no device memory
-                // info is available (e.g. the CPU EP or an input-less subgraph).
+                // mutable pointer into it. Device EPs take ORT scratch memory so
+                // intermediates live where the kernels execute; host EPs take a
+                // plain host buffer, which is both correct and measurably faster
+                // than ORT's host scratch allocator (see `intermediate_scratch`).
                 let mut new_bufs: Vec<(usize, IntermediateBuf)> = Vec::new();
                 for (buf_idx, shape, dtype) in &buf_writes {
                     let numel: usize = shape.iter().product();
                     let byte_len = dtype.byte_size() * numel;
                     let strides = contiguous_strides(shape);
-                    let (data, scratch_ptr) = match scratch_mem_info {
+                    let (data, scratch_ptr) = match intermediate_scratch {
                         Some(mem_info) => {
                             match unsafe {
                                 alloc_scratch(api_ref, kernel_context, mem_info, byte_len)
@@ -2194,7 +2242,7 @@ unsafe extern "C" fn compute_execute(
                                 }
                             }
                         }
-                        None => (vec![0u8; byte_len], std::ptr::null_mut()),
+                        None => (take_host_intermediate(byte_len), std::ptr::null_mut()),
                     };
                     new_bufs.push((
                         *buf_idx,
@@ -2297,8 +2345,27 @@ unsafe extern "C" fn compute_execute(
                             "Compute: buffer index {buf_idx} out of range"
                         ));
                     }
+                    if let Some(stale) = intermediates[buf_idx].take() {
+                        recycle_host_intermediate(stale.data);
+                    }
                     intermediates[buf_idx] = Some(buf);
                 }
+
+                // Retire every buffer this node was the last reader of. Doing
+                // it here — rather than at the end of the subgraph — is what
+                // lets the next node's allocation land on storage that is
+                // still hot in cache.
+                for (buf_idx, last) in last_reader.iter().enumerate() {
+                    if *last == Some(node_idx)
+                        && let Some(dead) = intermediates[buf_idx].take()
+                    {
+                        recycle_host_intermediate(dead.data);
+                    }
+                }
+            }
+
+            for slot in intermediates.drain(..).flatten() {
+                recycle_host_intermediate(slot.data);
             }
         } else if exported.entries.len() == 1 {
             // ── Fast path: single-kernel subgraph ─────────────────────────
@@ -2483,6 +2550,124 @@ unsafe extern "C" fn compute_execute(
 }
 
 /// Build a contiguous stride array from a shape (C-order, innermost stride = 1).
+/// How many retired host intermediates one thread keeps for reuse.
+///
+/// A routed subgraph's live set is bounded by its widest cut, which is small
+/// for the elementwise chains this path actually sees. Eight slots cover those
+/// without letting a pathological graph pin an unbounded amount of memory: past
+/// the cap, retired buffers are simply dropped.
+const HOST_INTERMEDIATE_POOL_SLOTS: usize = 8;
+
+thread_local! {
+    /// Retired host intermediate storage, per thread.
+    ///
+    /// Thread-local rather than shared: `Compute` runs on whichever thread ORT
+    /// calls it from, and a shared pool would need a lock on the hot path to
+    /// buy nothing — buffers are only ever reused by the call that retired
+    /// them or a later call on the same thread.
+    static HOST_INTERMEDIATE_POOL: std::cell::RefCell<Vec<Vec<u8>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Storage for one host intermediate of `len` bytes, reusing a retired buffer
+/// when one is large enough.
+///
+/// The returned bytes are initialized but **not** guaranteed to be zero when a
+/// retired buffer is reused. That is deliberate, and it is not a weakening of
+/// what kernels may assume: an output routed to an ORT sink already arrives as
+/// whatever `KernelContext_GetOutput` handed back, which ORT does not zero, and
+/// the single-kernel path has always worked that way. Producing the same
+/// contract for buffer sinks makes a kernel that fails to write its whole
+/// output fail the same way wherever it sits in a partition, instead of only
+/// when it happens to be the last node. Re-zeroing on every reuse costs a full
+/// `memset` of the tensor — measured at 0.586x of ORT for an 8-node 1 MiB f32
+/// `Relu` chain against 0.801x without it.
+///
+/// Debug builds do fill reused storage, with a poison pattern rather than
+/// zeros, so a kernel that leaves part of its output unwritten fails loudly in
+/// tests instead of inheriting something plausible.
+fn take_host_intermediate(len: usize) -> Vec<u8> {
+    HOST_INTERMEDIATE_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        match pool.iter().position(|buf| buf.capacity() >= len) {
+            Some(pos) => {
+                let mut buf = pool.swap_remove(pos);
+                if buf.len() < len {
+                    buf.resize(len, 0);
+                } else {
+                    buf.truncate(len);
+                }
+                // Debug builds hand back a poison pattern rather than whatever
+                // the previous tenant left. A kernel that fails to write part
+                // of its output then produces an obviously wrong value in every
+                // test run instead of a plausible stale one, which is the
+                // failure this relaxation would otherwise make quieter. `0xFF`
+                // because it is the loudest pattern available: it reads as NaN
+                // in every float width and as -1 in every signed integer width,
+                // so it survives a tolerance comparison. Release builds skip
+                // it — that write is the whole cost being avoided.
+                #[cfg(debug_assertions)]
+                buf.fill(0xFF);
+                buf
+            }
+            None => vec![0u8; len],
+        }
+    })
+}
+
+/// Hand a dead host intermediate back for reuse.
+///
+/// Buffers backed by ORT scratch have an empty `data` vector — they carry a
+/// borrowed `scratch_ptr` instead — so they are dropped here rather than
+/// pooled.
+fn recycle_host_intermediate(buf: Vec<u8>) {
+    if buf.capacity() == 0 {
+        return;
+    }
+    HOST_INTERMEDIATE_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < HOST_INTERMEDIATE_POOL_SLOTS {
+            pool.push(buf);
+        }
+    });
+}
+
+/// Empty this thread's pool.
+///
+/// Only for tests: the pool is per-thread, and libtest may run several tests on
+/// one thread, so a test that asserts *which* buffer comes back has to start
+/// from a known state rather than inherit whatever an earlier test retired.
+#[cfg(test)]
+fn drain_host_intermediate_pool() {
+    HOST_INTERMEDIATE_POOL.with(|pool| pool.borrow_mut().clear());
+}
+
+/// For each intermediate buffer, the highest node index that reads it, or
+/// `None` when no node does.
+///
+/// `None` covers two real cases: a buffer index no node consumes (the producer
+/// also routes that output to an ORT sink), and an out-of-range index in a
+/// malformed routing table. Both mean "nothing keeps this alive", which is the
+/// conservative answer for a liveness bound — a buffer is retired only after
+/// its recorded last reader has run, so a missing entry can never retire a
+/// buffer early.
+fn last_reader_per_buffer(
+    input_sources: &[Vec<NodeInputSource>],
+    num_buffers: usize,
+) -> Vec<Option<usize>> {
+    let mut last = vec![None; num_buffers];
+    for (node_idx, sources) in input_sources.iter().enumerate() {
+        for src in sources {
+            if let NodeInputSource::Buffer(b) = src
+                && let Some(slot) = last.get_mut(*b)
+            {
+                *slot = Some(node_idx);
+            }
+        }
+    }
+    last
+}
+
 fn contiguous_strides(shape: &[usize]) -> Vec<i64> {
     let mut strides = vec![1i64; shape.len()];
     for i in (0..shape.len().saturating_sub(1)).rev() {
@@ -4148,6 +4333,124 @@ mod tests {
             NodeInputSource::Buffer(0)
         ));
         assert!(matches!(routing.output_sinks[1][0], NodeOutputSink::Ort(0)));
+    }
+
+    // ── Intermediate buffer liveness and recycling ────────────────────────────
+
+    #[test]
+    fn last_reader_marks_the_final_consumer_of_each_buffer() {
+        // node0: ORT[0] → Buffer[0]; node1: Buffer[0] → Buffer[1];
+        // node2: Buffer[1] → ORT[0]. Buffer 0 dies after node1, buffer 1 after
+        // node2.
+        let sources = vec![
+            vec![NodeInputSource::Ort(0)],
+            vec![NodeInputSource::Buffer(0)],
+            vec![NodeInputSource::Buffer(1)],
+        ];
+        assert_eq!(
+            super::last_reader_per_buffer(&sources, 2),
+            vec![Some(1), Some(2)]
+        );
+    }
+
+    #[test]
+    fn last_reader_takes_the_highest_index_when_a_buffer_is_read_twice() {
+        // A buffer feeding both a later node and a much later node must stay
+        // alive until the *last* one has run, or the second read sees storage
+        // that has already been handed to another node.
+        let sources = vec![
+            vec![NodeInputSource::Ort(0)],
+            vec![NodeInputSource::Buffer(0)],
+            vec![NodeInputSource::Ort(1)],
+            vec![NodeInputSource::Buffer(0), NodeInputSource::Buffer(1)],
+        ];
+        assert_eq!(
+            super::last_reader_per_buffer(&sources, 2),
+            vec![Some(3), Some(3)]
+        );
+    }
+
+    #[test]
+    fn last_reader_is_none_for_unread_and_out_of_range_buffers() {
+        // Buffer 1 is never read (its producer also routes the output to ORT),
+        // and buffer 7 does not exist. Neither may be reported as live.
+        let sources = vec![
+            vec![NodeInputSource::Ort(0)],
+            vec![NodeInputSource::Buffer(0), NodeInputSource::Buffer(7)],
+            vec![NodeInputSource::Absent],
+        ];
+        assert_eq!(
+            super::last_reader_per_buffer(&sources, 2),
+            vec![Some(1), None]
+        );
+    }
+
+    #[test]
+    fn recycled_intermediate_storage_is_reused_without_reallocating() {
+        super::drain_host_intermediate_pool();
+        // The point of the pool is address reuse: a retired buffer must come
+        // back on the next request of the same size, so a chain of nodes keeps
+        // rewriting storage that is still in cache.
+        let first = super::take_host_intermediate(4096);
+        let addr = first.as_ptr() as usize;
+        super::recycle_host_intermediate(first);
+        let second = super::take_host_intermediate(4096);
+        assert_eq!(second.as_ptr() as usize, addr);
+        assert_eq!(second.len(), 4096);
+        super::recycle_host_intermediate(second);
+    }
+
+    #[test]
+    fn a_recycled_buffer_serves_a_smaller_request_at_the_requested_length() {
+        super::drain_host_intermediate_pool();
+        let big = super::take_host_intermediate(8192);
+        let addr = big.as_ptr() as usize;
+        super::recycle_host_intermediate(big);
+        let small = super::take_host_intermediate(64);
+        assert_eq!(small.as_ptr() as usize, addr);
+        // Length is what the caller asked for — `byte_len` bounds every
+        // `from_raw_parts` built from this buffer, so an over-long slice would
+        // be a real out-of-bounds view.
+        assert_eq!(small.len(), 64);
+        super::recycle_host_intermediate(small);
+    }
+
+    #[test]
+    fn a_request_larger_than_every_pooled_buffer_allocates_fresh_zeroed_storage() {
+        super::drain_host_intermediate_pool();
+        let seed = super::take_host_intermediate(32);
+        super::recycle_host_intermediate(seed);
+        let big = super::take_host_intermediate(1 << 20);
+        assert_eq!(big.len(), 1 << 20);
+        assert!(big.iter().all(|b| *b == 0));
+        super::recycle_host_intermediate(big);
+    }
+
+    #[test]
+    fn scratch_backed_buffers_are_not_pooled() {
+        super::drain_host_intermediate_pool();
+        // A scratch-backed IntermediateBuf carries an empty `data` vector and a
+        // borrowed pointer it does not own. Pooling that empty vector would
+        // fill a slot with nothing usable.
+        super::recycle_host_intermediate(Vec::new());
+        let taken = super::take_host_intermediate(16);
+        assert_eq!(taken.len(), 16);
+        assert!(taken.capacity() >= 16);
+        super::recycle_host_intermediate(taken);
+    }
+
+    #[test]
+    fn the_pool_is_bounded() {
+        super::drain_host_intermediate_pool();
+        let bufs: Vec<Vec<u8>> = (0..super::HOST_INTERMEDIATE_POOL_SLOTS * 4)
+            .map(|_| super::take_host_intermediate(128))
+            .collect();
+        for b in bufs {
+            super::recycle_host_intermediate(b);
+        }
+        super::HOST_INTERMEDIATE_POOL.with(|pool| {
+            assert!(pool.borrow().len() <= super::HOST_INTERMEDIATE_POOL_SLOTS);
+        });
     }
 
     // ── CreateState / ReleaseState lifecycle ──────────────────────────────────
