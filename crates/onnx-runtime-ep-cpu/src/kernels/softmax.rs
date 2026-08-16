@@ -189,13 +189,25 @@ fn scale_mask_softmax_serial(
                                 *v = *v * scale + m;
                             }
                         }
-                        // The common case — a contiguous mask row, which
-                        // auto-vectorizes as a fused multiply-add.
+                        // The common case — a contiguous mask row.
+                        //
+                        // `*v * scale + m` replaces a `*= scale` pass followed
+                        // by a `+= m` pass, and is bit-identical to it only
+                        // because rustc does not contract to an FMA without an
+                        // explicit `f32::mul_add`. That is what lets the
+                        // attention parity tests assert exact equality against
+                        // the two-pass reference; enabling contraction
+                        // globally would relax it to a tolerance.
                         1 => {
                             for (v, &m) in row.iter_mut().zip(&plan.values[base..base + d]) {
                                 *v = *v * scale + m;
                             }
                         }
+                        // Defensive: a dense row-major mask always yields a
+                        // last-axis stride of 0 or 1, so this is unreachable
+                        // today. It is kept correct rather than asserted away
+                        // so a future non-contiguous mask source cannot
+                        // silently produce wrong offsets.
                         step => {
                             for (j, v) in row.iter_mut().enumerate() {
                                 *v = *v * scale + plan.values[base + j * step];
