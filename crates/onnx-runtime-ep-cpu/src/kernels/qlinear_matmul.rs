@@ -236,16 +236,22 @@ impl Kernel for QLinearMatMulKernel {
         let a_signed = inputs[0].dtype == DataType::Int8;
         let b_signed = inputs[3].dtype == DataType::Int8;
         let qgemm = QgemmPlan::select(&a_quant, a_signed, b_signed, &geometry);
-        let a_bytes = to_dense_bytes(&inputs[0])?;
-        let b_bytes = to_dense_bytes(&inputs[3])?;
-        // The widened copies are four times the operand and are only the
-        // fallback's input, so skip them entirely when MLAS takes the work.
-        let (a, b) = if qgemm.is_some() {
-            (Vec::new(), Vec::new())
+        // The fallback's widened copies are four bytes per element; the MLAS
+        // route hands the raw bytes to the kernel. Materialize only what the
+        // chosen path reads, so neither pays for the other's buffers.
+        let (a_bytes, b_bytes, a, b) = if qgemm.is_some() {
+            (
+                to_dense_bytes(&inputs[0])?,
+                to_dense_bytes(&inputs[3])?,
+                Vec::new(),
+                Vec::new(),
+            )
         } else {
             (
-                widen_quantized(&a_bytes, a_signed),
-                widen_quantized(&b_bytes, b_signed),
+                Vec::new(),
+                Vec::new(),
+                read_quantized(&inputs[0])?,
+                read_quantized(&inputs[3])?,
             )
         };
         let (m, k, n) = (geometry.m, geometry.k, geometry.n);
@@ -515,17 +521,13 @@ fn read_quantized(view: &TensorView) -> Result<Vec<i32>> {
     }
 }
 
-fn widen_quantized(bytes: &[u8], signed: bool) -> Vec<i32> {
-    if signed {
-        bytes.iter().map(|&value| i32::from(value as i8)).collect()
-    } else {
-        bytes.iter().map(|&value| i32::from(value)).collect()
-    }
-}
-
 /// Narrow a zero point back to the operand's storage byte, or `None` if it does
-/// not fit -- an out-of-range zero point is a malformed model, and the exact
-/// fallback loop reports it the same way it always did.
+/// not fit.
+///
+/// Zero points are read from a `u8`/`i8` tensor, so they always fit and this is
+/// unreachable for any model that type-checks. It exists so a future caller
+/// that synthesizes quantization parameters cannot silently truncate one into
+/// a different kernel input; such a case declines to the exact loop instead.
 #[cfg(feature = "mlas")]
 fn zero_point_byte(value: i32, signed: bool) -> Option<u8> {
     if signed {
@@ -578,6 +580,12 @@ impl QgemmPlan {
         // weights. The generic kernel happens to answer correctly outside that
         // envelope today, but relying on it would be relying on an accident, so
         // stay inside the documented set and let the exact loop take the rest.
+        //
+        // The ARM `i8 x i8` kernels accumulate through non-saturating `vmull` /
+        // `vpadalq` / dot-product / SMMLA instructions, so unlike `u8 x i8` on
+        // AVX2 they need no exactness probe. That is asserted unconditionally
+        // by `qgemm_i32_matches_the_integer_oracle_for_every_signedness`, which
+        // runs on every architecture including the aarch64 CI lanes.
         let signed_activations_supported = cfg!(target_arch = "aarch64") && b_signed;
         if a_signed && !signed_activations_supported {
             return None;
@@ -1167,6 +1175,60 @@ mod tests {
     /// accumulator is covered separately by
     /// `qlinear_matmul_overflowing_accumulator_matches_the_previous_loop`,
     /// which needs a much larger `K` than is practical to sweep here.
+    /// The MLAS route `continue`s out of the batch loop before the fallback's
+    /// index bookkeeping, so a multi-batch model exercises an advancement path
+    /// no per-tensor test reached: every other batched case uses per-row `a`
+    /// quantization and therefore stays on the fallback.
+    #[test]
+    fn qlinear_matmul_batched_per_tensor_uint8_matches_reference() {
+        let (batches, m, k, n) = (3usize, 2usize, 4usize, 3usize);
+        let a_values: Vec<i32> = (0..batches * m * k)
+            .map(|index| ((index * 37 + 11) % 200 + 8) as i32)
+            .collect();
+        let b_values: Vec<i32> = (0..batches * k * n)
+            .map(|index| ((index * 53 + 5) % 200 + 12) as i32)
+            .collect();
+        let a = Owned::u8(
+            &[batches, m, k],
+            &a_values.iter().map(|&v| v as u8).collect::<Vec<_>>(),
+        );
+        let b = Owned::u8(
+            &[batches, k, n],
+            &b_values.iter().map(|&v| v as u8).collect::<Vec<_>>(),
+        );
+        let a_scale = Owned::f32(&[], &[0.03]);
+        let a_zero = Owned::u8(&[], &[100]);
+        let b_scale = Owned::f32(&[], &[0.02]);
+        let b_zero = Owned::u8(&[], &[110]);
+        let y_scale = Owned::f32(&[], &[0.25]);
+        let y_zero = Owned::u8(&[], &[128]);
+        let out = execute(
+            [
+                &a, &a_scale, &a_zero, &b, &b_scale, &b_zero, &y_scale, &y_zero,
+            ],
+            DataType::Uint8,
+            &[batches, m, n],
+        );
+
+        let mut expected = Vec::with_capacity(batches * m * n);
+        for batch in 0..batches {
+            for row in 0..m {
+                for column in 0..n {
+                    let mut product = 0.0f64;
+                    for inner in 0..k {
+                        let a = f64::from(a_values[batch * m * k + row * k + inner] - 100) * 0.03;
+                        let b =
+                            f64::from(b_values[batch * k * n + inner * n + column] - 110) * 0.02;
+                        product += a * b;
+                    }
+                    expected.push(((product / 0.25).round_ties_even() as i64 + 128).clamp(0, 255));
+                }
+            }
+        }
+        assert_eq!(output_values(&out), expected);
+        assert_eq!(expected.len(), batches * m * n);
+    }
+
     #[cfg(feature = "mlas")]
     fn quant_params(per_axis: bool, zero_point: i32, axis_len: usize) -> QuantParams {
         QuantParams {
