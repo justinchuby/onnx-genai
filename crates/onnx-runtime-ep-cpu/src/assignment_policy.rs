@@ -402,7 +402,9 @@ fn matmul_family_preference(
         // so rather than borrowing 4-bit's numbers.
         return Some(match bits {
             Some(2) => ClaimPreference::defer(
-                "MatMulNBits 2-bit: not measured directly, but it shares the dequant-then-GEMM                  structure and threadpool with 4-bit, which is measured slower than ORT at every                  thread count above 1",
+                "MatMulNBits 2-bit: not measured directly, but it shares the dequant-then-GEMM \
+                 structure and threadpool with 4-bit, which is measured slower than ORT at \
+                 every thread count above 1",
             ),
             other => ClaimPreference::defer(format!(
                 "MatMulNBits {}-bit: {DECODE_PARALLEL_NOTE}",
@@ -483,7 +485,8 @@ mod tests {
         let pref = claim_preference(&nbits_node(8, 3584, 3584), 22, &[], &[DataType::Float32]);
         assert!(
             pref.is_claim(),
-            "bits=8 MatMulNBits is 1.3-6.7x faster than ORT at every measured thread count"
+            "bits=8 MatMulNBits is 2.8-6.7x faster than ORT at decode at every measured thread \
+             count"
         );
     }
 
@@ -675,6 +678,60 @@ mod tests {
         assert!(
             claim_preference(&node, 22, &[], &[DataType::Float32]).is_claim(),
             "an absent block_size must not be assumed to be one ORT accepts"
+        );
+    }
+
+    /// Deferral reasons are surfaced to users, so a literal that lost its `\`
+    /// continuations (and therefore carries runs of indentation whitespace)
+    /// must not ship. Falsifies exactly the defect that shipped in `b36e55a72`.
+    #[test]
+    fn deferral_reasons_are_single_spaced_and_substantive() {
+        let mut seen = 0usize;
+        let mut check = |pref: ClaimPreference| {
+            if let ClaimPreference::DeferToHost { reason } = pref {
+                assert!(
+                    !reason.contains("  "),
+                    "deferral reason has a whitespace run, so it lost a line continuation: \
+                     {reason:?}"
+                );
+                assert!(
+                    reason.len() > 40 && !reason.contains('\n'),
+                    "deferral reason must be one substantive line: {reason:?}"
+                );
+                seen += 1;
+            }
+        };
+        for bits in [2, 4] {
+            check(claim_preference(
+                &nbits_node(bits, 3584, 3584),
+                22,
+                &[],
+                &[DataType::Float32],
+            ));
+        }
+        check(claim_preference(
+            &nbits_node(8, 3584, 3584),
+            22,
+            &[shape(&[512, 3584]), vec![]],
+            &[DataType::Float32],
+        ));
+        check(claim_preference(
+            &dense_node("QLinearMatMul"),
+            21,
+            &[shape(&[1, 3584]), shape(&[3584, 3584])],
+            &[DataType::Uint8],
+        ));
+        for dtype in [DataType::Float32, DataType::Float16] {
+            check(claim_preference(
+                &dense_node("MatMul"),
+                21,
+                &[shape(&[128, 3584]), shape(&[3584, 3584])],
+                &[dtype],
+            ));
+        }
+        assert!(
+            seen >= 5,
+            "expected to exercise several deferral reasons, saw {seen}"
         );
     }
 
