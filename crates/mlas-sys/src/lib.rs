@@ -1373,7 +1373,38 @@ pub struct SQNBitPackedB {
 unsafe impl Send for SQNBitPackedB {}
 unsafe impl Sync for SQNBitPackedB {}
 
+/// Live heap bytes currently retained by all [`SQNBitPackedB`] instances: the
+/// MLAS packed allocation plus the owned scale and zero-point copies. Maintained
+/// by construction/`Drop` so callers can compare the memory plan's *predicted*
+/// packed footprint against the bytes the kernels *actually* hold, in the same
+/// run (see the `MatMulNBits` accounting tests). This is heap only; it excludes
+/// the still-mapped on-disk weights and any GEMM workspace.
+static SQNBIT_PACKED_LIVE_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Snapshot of [`SQNBIT_PACKED_LIVE_BYTES`]: the heap bytes all live
+/// `SQNBitPackedB` instances currently retain (packed buffer + scale copy +
+/// optional zero-point copy).
+pub fn sqnbit_packed_live_bytes() -> usize {
+    SQNBIT_PACKED_LIVE_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl SQNBitPackedB {
+    /// Heap bytes this instance owns: the packed allocation plus the scale and
+    /// optional zero-point copies MLAS's `Fp32` path consumes at GEMM time.
+    pub fn owned_heap_bytes(&self) -> usize {
+        self.layout.size()
+            + self.scale.capacity() * std::mem::size_of::<f32>()
+            + self.zp.as_ref().map_or(0, Vec::capacity)
+    }
+
+    fn account_alloc(&self) {
+        SQNBIT_PACKED_LIVE_BYTES.fetch_add(
+            self.owned_heap_bytes(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
     /// Pack a blockwise-quantized B weight, returning `None` when MLAS reports
     /// no packing/kernel is available for this shape on the current host (the
     /// caller must then fall back to another path).
@@ -1408,7 +1439,7 @@ impl SQNBitPackedB {
                 zp_ptr,
             );
         }
-        Some(Self {
+        let packed = Self {
             ptr,
             layout,
             n,
@@ -1419,7 +1450,9 @@ impl SQNBitPackedB {
             has_zp,
             scale: scale.to_vec(),
             zp: zp.map(<[u8]>::to_vec),
-        })
+        };
+        packed.account_alloc();
+        Some(packed)
     }
 
     /// Reconstruct an MLAS packed weight from a previously packed buffer.
@@ -1449,7 +1482,7 @@ impl SQNBitPackedB {
         let ptr = unsafe { std::alloc::alloc(layout) };
         assert!(!ptr.is_null(), "SQNBit prepacked-B allocation failed");
         unsafe { std::ptr::copy_nonoverlapping(packed.as_ptr(), ptr, size) };
-        Some(Self {
+        let repacked = Self {
             ptr,
             layout,
             n,
@@ -1460,7 +1493,9 @@ impl SQNBitPackedB {
             has_zp,
             scale: scale.to_vec(),
             zp: zp.map(<[u8]>::to_vec),
-        })
+        };
+        repacked.account_alloc();
+        Some(repacked)
     }
 
     /// Serialized bytes of this host- and compute-type-specific MLAS layout.
@@ -1476,6 +1511,10 @@ impl SQNBitPackedB {
 
 impl Drop for SQNBitPackedB {
     fn drop(&mut self) {
+        SQNBIT_PACKED_LIVE_BYTES.fetch_sub(
+            self.owned_heap_bytes(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         unsafe { std::alloc::dealloc(self.ptr, self.layout) };
     }
 }
@@ -1731,6 +1770,71 @@ mod tests {
     use super::*;
 
     fn assert_send_sync<T: Send + Sync>() {}
+
+    /// The durable heap a `CompFp32` int4 `SQNBitPackedB` retains is exactly the
+    /// packed buffer **plus** its owned scale (and, when asymmetric, zero-point)
+    /// copies -- and it is linear in `N`, so per-shard packs sum to the whole.
+    ///
+    /// This is the mlas-sys-level anchor for the CPU EP's packed-buffer
+    /// accounting: `mlas_sqnbit_scale_zp_bytes` predicts the scale/zp overhead as
+    /// `N*ceil(K/blk)*4 (+ N*ceil(ceil(K/blk)/2))`, and this test proves that
+    /// prediction equals what a real packed buffer actually holds. If MLAS ever
+    /// changed what a packed weight retains, this fails rather than letting the
+    /// predictor silently drift below the real footprint (the under-reporting
+    /// direction an admission gate must never take).
+    #[test]
+    fn sqnbit_fp32_owned_heap_equals_packed_plus_scale_zp() {
+        let comp = SQNBitComputeType::Fp32;
+        let (n, k, blk) = (4864usize, 896usize, 32usize);
+        if !sqnbit_gemm_available(4, blk, comp) {
+            eprintln!("SQNBit fp32 int4 unavailable on host; skipping");
+            return;
+        }
+        let blocks = k.div_ceil(blk);
+        for asymmetric in [false, true] {
+            let weights: Vec<f32> = (0..n * k)
+                .map(|i| ((i as f32 * 0.019 + 0.13).sin()) * 1.7)
+                .collect();
+            let (packed_b, scales, zps, _d) = quantize_int4(&weights, n, k, blk, asymmetric);
+            let zp_slice = zps.as_deref();
+            let packed_size = sqnbit_packed_b_size(n, k, 4, blk, asymmetric, comp).unwrap();
+            let scale_bytes = n * blocks * std::mem::size_of::<f32>();
+            let zp_bytes = zp_slice.map_or(0, <[u8]>::len);
+            let expected_owned = packed_size + scale_bytes + zp_bytes;
+
+            let whole =
+                SQNBitPackedB::new(n, k, 4, blk, comp, &packed_b, &scales, zp_slice).unwrap();
+            assert_eq!(
+                whole.owned_heap_bytes(),
+                expected_owned,
+                "asymmetric={asymmetric}: owned heap must be packed + scales (+ zp)"
+            );
+
+            // The packed buffer is linear in N for Fp32, so N-row shards sum to
+            // the whole -- the exact partition `build_mlas_shards` performs.
+            let shard_align = 16usize;
+            let target = shard_align * ((n / 8).div_ceil(shard_align)).max(1);
+            let mut shard_owned = 0usize;
+            let mut start = 0usize;
+            while start < n {
+                let len = target.min(n - start).max(1);
+                let ps = &packed_b[start * blocks * (blk / 2)..(start + len) * blocks * (blk / 2)];
+                let ss = &scales[start * blocks..(start + len) * blocks];
+                let zs = zp_slice.map(|z| {
+                    let per_row = blocks.div_ceil(2);
+                    &z[start * per_row..(start + len) * per_row]
+                });
+                let shard = SQNBitPackedB::new(len, k, 4, blk, comp, ps, ss, zs).unwrap();
+                shard_owned += shard.owned_heap_bytes();
+                start += len;
+            }
+            assert_eq!(
+                shard_owned,
+                whole.owned_heap_bytes(),
+                "asymmetric={asymmetric}: per-shard owned heap must sum to the whole"
+            );
+        }
+    }
 
     #[test]
     fn packed_b_is_send_sync() {

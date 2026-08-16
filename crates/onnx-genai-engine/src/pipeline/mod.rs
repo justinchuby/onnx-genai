@@ -993,6 +993,13 @@ impl PipelineEngine {
         onnx_runtime_ep_cpu::set_resident_dequant_f32_cache_enabled(
             memory_strategy_plan.f32_weight_cache_admitted,
         );
+        // #1027: same admission verdict governs the int4 accuracy_level=0 MLAS
+        // SQNBit packed buffer (folded into `resident_f32_cache_bytes`); when
+        // declined the kernel keeps the borrowed zero-copy int4 path.
+        #[cfg(feature = "native-backend")]
+        onnx_runtime_ep_cpu::set_mlas_sqnbit_packing_enabled(
+            memory_strategy_plan.f32_weight_cache_admitted,
+        );
         #[cfg(all(feature = "cuda", feature = "native-backend"))]
         let authority_domain = if backend == PipelineBackend::Native {
             match native_decoder_device(config.native_device.as_ref()) {
