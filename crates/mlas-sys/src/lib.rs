@@ -72,6 +72,9 @@ unsafe extern "C" {
     /// Vectorized fused SiLU over `n` contiguous f32s. MLAS runtime-dispatches
     /// to its one-pass AVX-512F kernel when supported.
     fn mlas_compute_silu(input: *const f32, output: *mut f32, n: usize);
+    /// Row-wise softmax over `n` rows of `d` contiguous f32s, single-threaded,
+    /// using MLAS's SIMD max reduction and polynomial exp.
+    fn mlas_compute_softmax_in_place(data: *mut f32, n: usize, d: usize);
     fn mlas_eltwise_add(left: *const f32, right: *const f32, output: *mut f32, n: usize);
     fn mlas_compute_activation(
         kind: c_int,
@@ -528,6 +531,31 @@ pub fn compute_silu(input: &[f32], output: &mut [f32]) {
     // SAFETY: both slices are valid for `n` contiguous f32s; MLAS reads `input`
     // and writes `output`, and Rust's borrow rules prove they do not alias.
     unsafe { mlas_compute_silu(input.as_ptr(), output.as_mut_ptr(), input.len()) };
+}
+
+/// Row-wise in-place softmax, replacing a scalar `expf` loop: normalizes `n` rows of
+/// `d` contiguous f32s with MLAS's SIMD max reduction and polynomial exp — the
+/// same primitive ONNX Runtime's own Softmax and attention kernels use.
+///
+/// Single threaded; callers shard across threads themselves.
+///
+/// A row consisting entirely of `-inf` produces NaN, matching MLAS/ORT; callers
+/// that need the "fully masked row → zero" convention must screen for that case
+/// themselves.
+pub fn compute_softmax_in_place(data: &mut [f32], n: usize, d: usize) {
+    assert_eq!(
+        data.len(),
+        n.saturating_mul(d),
+        "compute_softmax_in_place expects exactly n*d elements"
+    );
+    if data.is_empty() {
+        return;
+    }
+    // SAFETY: `data` holds `n * d` contiguous f32s (asserted above) and is
+    // uniquely borrowed. MLAS's non-log softmax streams each row forward from
+    // input to output and then rescales the output, so a single buffer serving
+    // as both is well defined.
+    unsafe { mlas_compute_softmax_in_place(data.as_mut_ptr(), n, d) };
 }
 
 /// Compute contiguous Float32 elementwise addition with MLAS SIMD.
