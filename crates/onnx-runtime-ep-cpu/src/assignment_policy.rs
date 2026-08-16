@@ -44,6 +44,10 @@
 //! The margin rule is **>= 5% repeatable win at every measured thread count**;
 //! anything inside the noise band, and anything unmeasured, defers to ORT.
 //!
+//! The full matmul-family matrix -- every shape, thread count and ratio behind
+//! the decisions in [`matmul_family_preference`] -- is in
+//! `docs/performance/CPU_MATMUL_ASSIGNMENT.md`.
+//!
 //! # Deferring is only sound when the host has a kernel
 //!
 //! Two ways that assumption fails, both found by measurement rather than
