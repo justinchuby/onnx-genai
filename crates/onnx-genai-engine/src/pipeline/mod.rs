@@ -743,6 +743,23 @@ impl PipelineEngine {
         self.decode_backend
     }
 
+    /// Execution-provider placement reported by the loaded component sessions.
+    pub fn execution_provider_status(&self) -> String {
+        let mut summaries = self
+            .models
+            .sessions
+            .values()
+            .map(|session| session.execution_provider_status().summary())
+            .collect::<Vec<_>>();
+        summaries.sort();
+        summaries.dedup();
+        if summaries.is_empty() {
+            "native".to_string()
+        } else {
+            summaries.join("; ")
+        }
+    }
+
     /// Load a pipeline with explicit session options, chiefly to pin the
     /// execution provider.
     ///

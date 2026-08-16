@@ -28,10 +28,11 @@ A Rust inference runtime for generative AI models, built on ONNX Runtime.
 - **Pipelines and models:** metadata-declared multi-model pipelines, a tested
   tiny vision-language pipeline fixture, and real Qwen2.5-0.5B-Instruct and
   TinyStories generation built through Mobius.
-- **Execution providers:** select CPU, WebGPU, CUDA, CoreML, or any ORT plugin
-  EP with `ONNX_GENAI_EP` — a comma-separated priority list is supported so
-  several providers (including multiple plugins) can be composed; unavailable
-  providers warn and fall back to CPU.
+- **Execution providers:** select CPU, WebGPU, CUDA, CoreML, or configured ORT
+  plugin EPs with `ONNX_GENAI_EP` — a comma-separated priority list is
+  supported so several providers (including multiple plugins) can be composed;
+  unavailable requested providers fail clearly unless `ONNX_GENAI_EP_FALLBACK=1`
+  explicitly opts into a visible CPU retry.
 - **Extensibility:** public `Sampler`, `SpeculativeProposer`, logit processor
   registry, and KV/pipeline APIs, plus an internal `DecodeBackend` seam shared
   by dynamic and static-cache decoding.

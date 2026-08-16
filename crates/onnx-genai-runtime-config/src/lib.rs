@@ -139,6 +139,10 @@ pub struct RuntimeConfig {
     /// `ONNX_GENAI_REQUIRE_CUDA` (`bool`, default: false): rejects a session when
     /// CUDA cannot claim every executable node instead of falling back to CPU.
     pub require_cuda: bool,
+    /// `ONNX_GENAI_EP_FALLBACK` (`bool`, default: false): explicitly permits a
+    /// requested execution-provider failure to retry the session on CPU. When
+    /// unset, requested EP failures are surfaced as errors.
+    pub ep_fallback: bool,
     /// Whether `ONNX_GENAI_CUDA_GRAPH` was explicitly set in the environment.
     ///
     /// Lets callers distinguish "unset" (so they may auto-enable CUDA graph
@@ -332,6 +336,7 @@ impl RuntimeConfig {
             webgpu_graph_capture: env_bool(&lookup, "ONNX_GENAI_WEBGPU_GRAPH_CAPTURE", false),
             cuda_graph: env_bool(&lookup, "ONNX_GENAI_CUDA_GRAPH", false),
             require_cuda: env_bool(&lookup, "ONNX_GENAI_REQUIRE_CUDA", false),
+            ep_fallback: env_bool(&lookup, "ONNX_GENAI_EP_FALLBACK", false),
             cuda_graph_explicit: lookup("ONNX_GENAI_CUDA_GRAPH").is_some(),
             device_kv: env_bool(&lookup, "ONNX_GENAI_DEVICE_KV", false),
             shared_kv_present_binding: env_bool(
@@ -821,6 +826,7 @@ mod tests {
         assert!(!actual.webgpu_validation);
         assert!(!actual.webgpu_graph_capture);
         assert!(!actual.cuda_graph);
+        assert!(!actual.ep_fallback);
         assert!(!actual.cuda_graph_explicit);
         assert!(!actual.device_kv);
         assert!(!actual.shared_kv_present_binding);
@@ -892,6 +898,7 @@ mod tests {
                 ("ONNX_GENAI_WEBGPU_GRAPH_CAPTURE", truthy),
                 ("ONNX_GENAI_CUDA_GRAPH", truthy),
                 ("ONNX_GENAI_REQUIRE_CUDA", truthy),
+                ("ONNX_GENAI_EP_FALLBACK", truthy),
                 ("ONNX_GENAI_DEVICE_KV", truthy),
                 ("ONNX_GENAI_SHARED_KV_PRESENT_BINDING", truthy),
             ]);
@@ -899,6 +906,7 @@ mod tests {
             assert!(actual.webgpu_graph_capture);
             assert!(actual.cuda_graph);
             assert!(actual.require_cuda);
+            assert!(actual.ep_fallback);
             assert!(actual.device_kv);
             assert!(actual.shared_kv_present_binding);
         }
@@ -907,10 +915,12 @@ mod tests {
             ("ONNX_GENAI_WEBGPU_VALIDATION", "0"),
             ("ONNX_GENAI_DEVICE_KV", ""),
             ("ONNX_GENAI_CUDA_GRAPH", "no"),
+            ("ONNX_GENAI_EP_FALLBACK", "off"),
         ]);
         assert!(!actual.webgpu_validation);
         assert!(!actual.device_kv);
         assert!(!actual.cuda_graph);
+        assert!(!actual.ep_fallback);
         // Explicit "no" still counts as an explicit opt-out.
         assert!(actual.cuda_graph_explicit);
     }

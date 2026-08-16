@@ -1781,6 +1781,7 @@ mod tests {
 
         let summary = interactive::SessionSummary {
             settings: &settings,
+            execution_provider: "cpu".to_string(),
             resolved_decode_backend: EngineDecodeBackend::Ort,
             sampling,
             history: &history,
@@ -1833,6 +1834,7 @@ mod tests {
 
         let summary = interactive::SessionSummary {
             settings: &settings,
+            execution_provider: "cpu".to_string(),
             resolved_decode_backend: EngineDecodeBackend::Ort,
             sampling,
             history: &[],
@@ -1846,6 +1848,92 @@ mod tests {
             ),
             "{summary}"
         );
+    }
+
+    #[test]
+    fn session_summary_reports_loaded_provider_status() {
+        let settings =
+            interactive::SessionSettings::new(PathBuf::from("models/tiny"), &EngineArgs::default());
+        let usage = interactive::SessionUsage::default();
+        let summary = interactive::SessionSummary {
+            settings: &settings,
+            execution_provider: "cpu (CPU session fallback); skipped: webgpu, coreml".to_string(),
+            resolved_decode_backend: EngineDecodeBackend::Ort,
+            sampling: GenerateOptions::default(),
+            history: &[],
+            usage: &usage,
+        }
+        .to_string();
+
+        assert!(
+            summary.contains(
+                "execution provider: cpu (CPU session fallback); skipped: webgpu, coreml"
+            ),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn generate_profile_provider_comes_from_live_command_profile() -> anyhow::Result<()> {
+        let model = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm")
+            .canonicalize()?;
+        let dir = temp_dir("generate-live-profile");
+        let profile = dir.join("profile.json");
+
+        run(vec![
+            "onnx-genai".to_string(),
+            "--profile-json".to_string(),
+            profile.display().to_string(),
+            "generate".to_string(),
+            model.display().to_string(),
+            "--prompt".to_string(),
+            "hi".to_string(),
+            "--max-new-tokens".to_string(),
+            "1".to_string(),
+            "--no-stats".to_string(),
+            "--cpu-cores".to_string(),
+            "1".to_string(),
+        ])?;
+
+        assert_eq!(profile_execution_provider(&profile)?, "cpu");
+        fs::remove_dir_all(dir).unwrap();
+        Ok(())
+    }
+
+    #[test]
+    fn transcribe_profile_provider_comes_from_live_command_profile() -> anyhow::Result<()> {
+        let model = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-whisper")
+            .canonicalize()?;
+        let audio = model.join("tiny.wav");
+        let dir = temp_dir("transcribe-live-profile");
+        let profile = dir.join("profile.json");
+
+        run(vec![
+            "onnx-genai".to_string(),
+            "--profile-json".to_string(),
+            profile.display().to_string(),
+            "transcribe".to_string(),
+            model.display().to_string(),
+            audio.display().to_string(),
+            "--format".to_string(),
+            "json".to_string(),
+            "--cpu-cores".to_string(),
+            "1".to_string(),
+        ])?;
+
+        assert_eq!(profile_execution_provider(&profile)?, "cpu");
+        fs::remove_dir_all(dir).unwrap();
+        Ok(())
+    }
+
+    fn profile_execution_provider(path: &Path) -> anyhow::Result<String> {
+        let value: serde_json::Value = serde_json::from_str(&fs::read_to_string(path)?)?;
+        Ok(value["execution_provider"]
+            .as_str()
+            .expect("profile must include execution_provider")
+            .to_string())
     }
 
     #[test]

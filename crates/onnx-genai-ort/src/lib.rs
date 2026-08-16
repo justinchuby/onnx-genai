@@ -91,10 +91,10 @@ pub use onnx_genai_metadata::{
 pub use onnx_genai_runtime_config::EpSelection;
 pub use onnx_model_package::SelectionRequest as ModelPackageSelection;
 pub use session::{
-    CudaAttentionMode, EpCapabilities, GraphIo, GraphIoMetadata, HardwareKind, ResolvedEp,
-    RunPhaseError, Session, SessionOptions, TensorInfo, USE_ENV_ALLOCATORS,
-    available_execution_providers, capability, ep_selection, resolve_execution_provider,
-    selectable_execution_providers,
+    CudaAttentionMode, EpCapabilities, ExecutionProviderStatus, GraphIo, GraphIoMetadata,
+    HardwareKind, ResolvedEp, RunPhaseError, Session, SessionOptions, SkippedExecutionProvider,
+    TensorInfo, USE_ENV_ALLOCATORS, available_execution_providers, capability, ep_selection,
+    resolve_execution_provider, selectable_execution_providers,
 };
 pub use shared_kv_proposer::{
     SharedKvInput, SharedKvProposerSession, SharedKvProposerSignature, SharedKvProposerStepOutput,
