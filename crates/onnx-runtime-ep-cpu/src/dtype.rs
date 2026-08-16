@@ -501,7 +501,7 @@ macro_rules! dispatch_float {
 ///
 /// Non-contiguous or non-x86 callers fall back to the scalar `half` path.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-mod f16c {
+pub(crate) mod f16c {
     #[cfg(target_arch = "x86")]
     use std::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
@@ -579,7 +579,7 @@ mod f16c {
 /// so a rounding difference here would be a cross-EP divergence, not just a
 /// tolerance question.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-mod bf16x {
+pub(crate) mod bf16x {
     #[cfg(target_arch = "x86")]
     use std::arch::x86::*;
     #[cfg(target_arch = "x86_64")]

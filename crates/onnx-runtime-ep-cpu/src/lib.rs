@@ -28,6 +28,7 @@
 // dimensions often exceed Clippy's generic argument-count threshold.
 #![allow(clippy::too_many_arguments)]
 
+pub mod assignment_policy;
 pub mod backend;
 pub mod decode_affinity;
 pub mod decode_numa;
@@ -72,8 +73,9 @@ pub use kernels::matmul_nbits::bound_process_to_decode_budget;
 pub use kernels::matmul_nbits::set_decode_thread_budget;
 pub use kernels::matmul_nbits::with_decode_pool_scope;
 pub use kernels::matmul_nbits::{
-    matmul_nbits_decode_caches_dequant_f32, resident_dequant_f32_cache_bytes,
-    set_resident_dequant_f32_cache_enabled,
+    matmul_nbits_decode_caches_dequant_f32, matmul_nbits_resident_side_cache_bytes,
+    mlas_sqnbit_packed_live_bytes, resident_dequant_f32_cache_bytes,
+    set_mlas_sqnbit_packing_enabled, set_resident_dequant_f32_cache_enabled,
 };
 // #1056: a resident, session-lifetime, weight-scaled buffer must be reportable
 // in bytes. The entry-count accessor stays for the benchmarks that assert reuse.

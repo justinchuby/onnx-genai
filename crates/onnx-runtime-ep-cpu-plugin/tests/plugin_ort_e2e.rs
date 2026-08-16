@@ -3059,3 +3059,570 @@ fn conformance_matmul_initializer_weights() {
         eprintln!("\n✅ conformance_matmul_initializer_weights: PASSED");
     }
 }
+
+// ─── Assignment policy falsifiers ────────────────────────────────────────────
+//
+// `onnx_runtime_ep_cpu::assignment_policy` decides which nodes this EP asks ORT
+// to hand over, separately from `supports_op`, which decides what it *can* run.
+// A unit test can only check the predicate; these check the thing that actually
+// matters — what ORT does with the answer. Each one is a falsifier: it fails if
+// the EP takes a node the policy declines, if it gives up a node the policy
+// claims, or if the resulting partition produces wrong numbers.
+
+/// float32 `Tanh`/`Sqrt`/`Sigmoid` are measured slower than ORT's own MLAS
+/// kernels at every size on this ISA, so the plugin must not claim them — while
+/// `Add`, which the policy does not govern, must still be claimed. This is the
+/// falsifier for "declining is per-node and ORT partitions around it": if the
+/// deferral were expressed as `supports_op` returning `Unsupported`, or if it
+/// dropped the whole partition, `Add` would move too.
+#[test]
+fn assignment_policy_defers_float32_activations_to_ort() {
+    let _lock = lock_ort_ep();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let model_path = PathBuf::from(manifest_dir)
+        .join("tests/fixtures/activation_assignment_f32/model.onnx.textproto");
+
+    let Some((_lib, api, env, opts, session)) =
+        (unsafe { conformance_setup("cpu_ep_assign_f32", &model_path, false) })
+    else {
+        eprintln!(
+            "*** SKIPPED: assignment_policy_defers_float32_activations_to_ort — \
+             ORT or EP cdylib not found ***"
+        );
+        return;
+    };
+
+    unsafe {
+        let info = query_ep_assignment(api, session);
+        let ours = info.ops_on_our_ep();
+        let others = info.ops_not_on_our_ep();
+        eprintln!("  [assign_f32] ours={ours:?}, others={others:?}");
+        for op in ["Tanh", "Sqrt", "Sigmoid"] {
+            assert!(
+                !ours.contains(&op),
+                "float32 '{op}' is measured slower than ORT and must be left to ORT, \
+                 got assignment: {:?}",
+                info.assignments
+            );
+            assert!(
+                others.contains(&op),
+                "float32 '{op}' must actually be executed by ORT's own EP, \
+                 got assignment: {:?}",
+                info.assignments
+            );
+        }
+        // The policy governs only the ops it has evidence about. `Add` is not
+        // one of them, so declining the activations must not cost us the rest
+        // of the graph.
+        assert!(
+            ours.contains(&"Add"),
+            "declining activations must not drop the ungoverned 'Add' claim, \
+             got assignment: {:?}",
+            info.assignments
+        );
+    }
+
+    // The mixed partition must still compute the right answer: the boundary is
+    // crossed twice (into ORT for the activations, and the graph output comes
+    // back from ORT).
+    unsafe {
+        let mut x_data: [f32; 4] = [0.0, 0.25, 1.0, 4.0];
+        let mut y_data: [f32; 4] = [0.0, 0.25, 1.0, 4.0];
+        let shape: [i64; 2] = [1, 4];
+        let x_val = make_float_tensor(api, &mut x_data, &shape);
+        let y_val = make_float_tensor(api, &mut y_data, &shape);
+
+        let input_names = [c"X".as_ptr(), c"Y".as_ptr()];
+        let output_names = [c"Z".as_ptr()];
+        let inputs: [*const ort::OrtValue; 2] = [x_val, y_val];
+        let mut output: *mut ort::OrtValue = ptr::null_mut();
+        let status = ((*api).Run.unwrap())(
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs.as_ptr(),
+            2,
+            output_names.as_ptr(),
+            1,
+            &mut output,
+        );
+        check_status(api, status, "Run(assign_f32)");
+        assert!(!output.is_null());
+
+        let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
+        let status = ((*api).GetTensorMutableData.unwrap())(output, &mut data_ptr);
+        check_status(api, status, "GetTensorMutableData(assign_f32)");
+        let got = std::slice::from_raw_parts(data_ptr as *const f32, 4);
+        for (i, ((&g, &x), &y)) in got.iter().zip(x_data.iter()).zip(y_data.iter()).enumerate() {
+            let want = {
+                let s = x + y;
+                let t = s.tanh();
+                let q = t.sqrt();
+                1.0f32 / (1.0 + (-q).exp())
+            };
+            assert!(
+                (g - want).abs() < 1e-5,
+                "Z[{i}] = {g}, want {want} — mixed partition changed the numerics"
+            );
+        }
+        ((*api).ReleaseValue.unwrap())(output);
+        ((*api).ReleaseValue.unwrap())(x_val);
+        ((*api).ReleaseValue.unwrap())(y_val);
+        conformance_teardown(api, env, opts, session, "cpu_ep_assign_f32");
+        eprintln!("\n✅ assignment_policy_defers_float32_activations_to_ort: PASSED");
+    }
+}
+
+/// bfloat16 is the one case where declining would be actively harmful: ORT's
+/// CPU EP has no bfloat16 `Tanh` kernel at all, so a deferral turns a working
+/// session into a `NOT_IMPLEMENTED` session-creation failure. The claim is a
+/// capability, not a performance bet, and must survive any future tightening of
+/// the performance thresholds.
+///
+/// This is a regression guard rather than a falsifier against `main`:
+/// `supports_op` is dtype-agnostic for these ops, so bf16 was already claimed
+/// before this policy existed and the test passes there too. What it pins is
+/// that no future threshold may take bf16 away. The assignment and numeric
+/// assertions carry the test — session creation alone would succeed even if ORT
+/// did have a bf16 kernel, since a claimed node never reaches ORT's.
+#[test]
+fn assignment_policy_always_claims_bfloat16_activations() {
+    let _lock = lock_ort_ep();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let model_path = PathBuf::from(manifest_dir)
+        .join("tests/fixtures/activation_assignment_bf16/model.onnx.textproto");
+
+    let Some((_lib, api, env, opts, session)) =
+        (unsafe { conformance_setup("cpu_ep_assign_bf16", &model_path, false) })
+    else {
+        eprintln!(
+            "*** SKIPPED: assignment_policy_always_claims_bfloat16_activations — \
+             ORT or EP cdylib not found ***"
+        );
+        return;
+    };
+
+    unsafe {
+        let info = query_ep_assignment(api, session);
+        let ours = info.ops_on_our_ep();
+        eprintln!(
+            "  [assign_bf16] ours={ours:?}, others={:?}",
+            info.ops_not_on_our_ep()
+        );
+        assert!(
+            ours.contains(&"Tanh"),
+            "bfloat16 'Tanh' must stay claimed — ORT has no bfloat16 kernel and \
+             the session would fail to load without ours; got: {:?}",
+            info.assignments
+        );
+
+        // bf16 words: 0x3F80 = 1.0, 0x0000 = 0.0, 0xBF80 = -1.0, 0x4000 = 2.0
+        let mut x_data: [u16; 4] = [0x3F80, 0x0000, 0xBF80, 0x4000];
+        let mut y_data: [u16; 4] = [0x0000, 0x0000, 0x0000, 0x0000];
+        let shape: [i64; 2] = [1, 4];
+        let x_val = make_bfloat16_tensor(api, &mut x_data, &shape);
+        let y_val = make_bfloat16_tensor(api, &mut y_data, &shape);
+
+        let input_names = [c"X".as_ptr(), c"Y".as_ptr()];
+        let output_names = [c"Z".as_ptr()];
+        let inputs: [*const ort::OrtValue; 2] = [x_val, y_val];
+        let mut output: *mut ort::OrtValue = ptr::null_mut();
+        let status = ((*api).Run.unwrap())(
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs.as_ptr(),
+            2,
+            output_names.as_ptr(),
+            1,
+            &mut output,
+        );
+        check_status(api, status, "Run(assign_bf16)");
+        assert!(!output.is_null());
+
+        let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
+        let status = ((*api).GetTensorMutableData.unwrap())(output, &mut data_ptr);
+        check_status(api, status, "GetTensorMutableData(assign_bf16)");
+        let got = std::slice::from_raw_parts(data_ptr as *const u16, 4);
+        for (i, (&g, &x)) in got.iter().zip(x_data.iter()).enumerate() {
+            let want = f32::from_bits((x as u32) << 16).tanh();
+            let g = f32::from_bits((g as u32) << 16);
+            // bfloat16 carries 8 mantissa bits, so ~1e-2 relative is the format
+            // floor, not a kernel tolerance.
+            assert!(
+                (g - want).abs() < 1e-2,
+                "Z[{i}] = {g}, want ~{want} (bfloat16 Tanh)"
+            );
+        }
+        ((*api).ReleaseValue.unwrap())(output);
+        ((*api).ReleaseValue.unwrap())(x_val);
+        ((*api).ReleaseValue.unwrap())(y_val);
+        conformance_teardown(api, env, opts, session, "cpu_ep_assign_bf16");
+        eprintln!("\n✅ assignment_policy_always_claims_bfloat16_activations: PASSED");
+    }
+}
+
+/// float16 `Gelu` must be claimed at **every** size, and the falsifier is the
+/// absence of an inlined function body.
+///
+/// ORT's CPU EP has no float16 `Gelu` kernel, so declining does not hand the
+/// node over — ORT inlines the `Gelu` function into
+/// `Cast`/`Pow`/`Mul`/`Sum`/`Tanh`/`Sqrt` and this EP claims the ungoverned
+/// float16 constituents, measured at 0.014-0.049x of plain ORT. An element-count
+/// cap was written and deleted for exactly this reason; this test is what
+/// stops it coming back. Both fixtures (3072 and 300000 elements) must show a
+/// single claimed `Gelu` and no decomposition artefacts.
+#[test]
+fn assignment_policy_claims_float16_gelu_without_inlining_it() {
+    let _lock = lock_ort_ep();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+
+    for (tag, reg) in [
+        ("small", "cpu_ep_gelu_small"),
+        ("large", "cpu_ep_gelu_large"),
+    ] {
+        let model_path = PathBuf::from(manifest_dir).join(format!(
+            "tests/fixtures/gelu_assignment_f16_{tag}/model.onnx.textproto"
+        ));
+        let Some((_lib, api, env, opts, session)) =
+            (unsafe { conformance_setup(reg, &model_path, false) })
+        else {
+            eprintln!(
+                "*** SKIPPED: assignment_policy_claims_float16_gelu_without_inlining_it — \
+                 ORT or EP cdylib not found ***"
+            );
+            return;
+        };
+
+        unsafe {
+            let info = query_ep_assignment(api, session);
+            let ours = info.ops_on_our_ep();
+            eprintln!(
+                "  [gelu_f16_{tag}] ours={ours:?}, others={:?}",
+                info.ops_not_on_our_ep()
+            );
+            assert!(
+                ours.contains(&"Gelu"),
+                "float16 Gelu must be claimed at {tag} size — ORT has no float16 Gelu \
+                 kernel, so deferring inlines the function instead; got: {:?}",
+                info.assignments
+            );
+            // The decomposition signature: if ORT had inlined the function, the
+            // graph would contain `Pow`/`Sum`/`Mul` nodes that do not exist in
+            // the fixture. Their absence is what proves the claim held.
+            for artefact in ["Pow", "Sum", "Mul"] {
+                assert!(
+                    !ours.contains(&artefact) && !info.ops_not_on_our_ep().contains(&artefact),
+                    "float16 Gelu was inlined into its function body ('{artefact}' appeared) \
+                     — the claim did not hold; got: {:?}",
+                    info.assignments
+                );
+            }
+            conformance_teardown(api, env, opts, session, reg);
+        }
+    }
+    eprintln!("\n✅ assignment_policy_claims_float16_gelu_without_inlining_it: PASSED");
+}
+
+/// Deferring assumes there is a host kernel to defer *to*. With
+/// `session.disable_cpu_ep_fallback=1` there is not — ORT refuses to place an
+/// unclaimed node on its own CPU EP, so a node this EP declines becomes
+/// unassignable and `CreateSession` fails. The plugin reads that session option
+/// at `CreateEp` and switches the routing-preference gate off for such
+/// sessions.
+///
+/// This is a falsifier for that safety valve: the same float32 graph whose
+/// activations are deferred in
+/// `assignment_policy_defers_float32_activations_to_ort` must, under this flag,
+/// both load *and* come back fully claimed. Without the valve `conformance_setup`
+/// panics inside `CreateSession`; with the gate wrongly disabled everywhere, the
+/// sibling test fails instead. Only the intended behaviour satisfies both.
+#[test]
+fn assignment_policy_yields_when_cpu_fallback_is_disabled() {
+    let _lock = lock_ort_ep();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let model_path = PathBuf::from(manifest_dir)
+        .join("tests/fixtures/activation_assignment_f32/model.onnx.textproto");
+
+    let Some((_lib, api, env, opts, session)) =
+        (unsafe { conformance_setup("cpu_ep_assign_nofb", &model_path, true) })
+    else {
+        eprintln!(
+            "*** SKIPPED: assignment_policy_yields_when_cpu_fallback_is_disabled — \
+             ORT or EP cdylib not found ***"
+        );
+        return;
+    };
+
+    unsafe {
+        let info = query_ep_assignment(api, session);
+        let ours = info.ops_on_our_ep();
+        eprintln!(
+            "  [assign_nofb] ours={ours:?}, others={:?}",
+            info.ops_not_on_our_ep()
+        );
+        for op in ["Add", "Tanh", "Sqrt", "Sigmoid"] {
+            assert!(
+                ours.contains(&op),
+                "with cpu-ep fallback disabled there is nothing to defer to, so '{op}' \
+                 must be claimed despite the performance policy; got: {:?}",
+                info.assignments
+            );
+        }
+        conformance_teardown(api, env, opts, session, "cpu_ep_assign_nofb");
+    }
+    eprintln!("\n✅ assignment_policy_yields_when_cpu_fallback_is_disabled: PASSED");
+}
+
+// ─── Falsifier: an inlined contrib function must still build a session ────────
+
+/// Decode a float16 bit-pattern to `f32` (finite, normal/subnormal, no NaN
+/// payload preservation — sufficient for the tolerance checks below).
+fn f16_bits_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 1) as u32;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let man = (bits & 0x3ff) as u32;
+    let f = match exp {
+        0 if man == 0 => sign << 31,
+        0 => {
+            // Subnormal: normalise.
+            let mut e = -1i32;
+            let mut m = man;
+            while m & 0x400 == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            let m = m & 0x3ff;
+            (sign << 31) | (((127 - 15 + 2 + e) as u32) << 23) | (m << 13)
+        }
+        0x1f => (sign << 31) | (0xff << 23) | (man << 13),
+        _ => (sign << 31) | ((exp + 127 - 15) << 23) | (man << 13),
+    };
+    f32::from_bits(f)
+}
+
+/// Encode `f32` as a float16 bit-pattern (round-to-nearest-even, finite input).
+fn f32_to_f16_bits(x: f32) -> u16 {
+    let b = x.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let mut val = (b & 0x7fff_ffff) as i32;
+    if val >= 0x4780_0000 {
+        return sign | 0x7c00; // overflow → inf
+    }
+    if val < 0x3880_0000 {
+        // Subnormal or zero.
+        let scaled = f32::from_bits(val as u32) / 2f32.powi(-24);
+        return sign | (scaled.round() as u16);
+    }
+    val -= 0x3800_0000;
+    let mant = ((val >> 13) & 0x7fff) as u16;
+    let round = (val & 0x1fff) as u32;
+    let mut out = mant;
+    if round > 0x1000 || (round == 0x1000 && (out & 1) == 1) {
+        out += 1;
+    }
+    sign | out
+}
+
+/// Regression falsifier for a hard session-creation failure.
+///
+/// ORT has no float16 kernel for `com.microsoft::FastGelu`, so it inlines the
+/// contrib op into its function body (`Identity`/`Mul`/`Add`/`Tanh`/…). The
+/// routing preference then defers the float16 `Tanh` inside that body, which
+/// splits the remainder into a partition where `_inlfunc_FastGelu_X_bias` is
+/// both an output of our fused subgraph and an input to three later `Mul`s.
+/// `build_subgraph_routing` cannot route that shape, and failing at Compile is
+/// *not* a graceful decline — ORT surfaces it as
+/// `FAIL : Compile: multi-node subgraph has unroutable graph`, turning a model
+/// that used to load into one that does not.
+///
+/// The claim-time routing filter in `ep.rs` catches such partitions while
+/// declining is still free. This test fails without it.
+#[test]
+fn unroutable_partition_is_declined_not_fatal() {
+    let _lock = lock_ort_ep();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let model_path = PathBuf::from(manifest_dir)
+        .join("tests/fixtures/fastgelu_assignment_f16/model.onnx.textproto");
+
+    let Some((_lib, api, env, opts, session)) =
+        (unsafe { conformance_setup("cpu_ep_fastgelu_f16", &model_path, false) })
+    else {
+        eprintln!(
+            "*** SKIPPED: unroutable_partition_is_declined_not_fatal — \
+             ORT or EP cdylib not found ***"
+        );
+        return;
+    };
+
+    unsafe {
+        let xs: [f32; 8] = [-4.0, -1.5, -0.5, 0.0, 0.5, 1.5, 3.0, 6.0];
+        let mut x_data: [u16; 8] = std::array::from_fn(|i| f32_to_f16_bits(xs[i]));
+        let shape: [i64; 2] = [1, 8];
+        let x_val = make_float16_tensor(api, &mut x_data, &shape);
+
+        let input_names = [c"X".as_ptr()];
+        let output_names = [c"Z".as_ptr()];
+        let inputs: [*const ort::OrtValue; 1] = [x_val];
+        let mut output: *mut ort::OrtValue = ptr::null_mut();
+
+        let status = ((*api).Run.unwrap())(
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs.as_ptr(),
+            1,
+            output_names.as_ptr(),
+            1,
+            &mut output,
+        );
+        check_status(api, status, "Run(float16 FastGelu)");
+        assert!(!output.is_null());
+
+        let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
+        let status = ((*api).GetTensorMutableData.unwrap())(output, &mut data_ptr);
+        check_status(api, status, "GetTensorMutableData(float16 FastGelu)");
+        let result = std::slice::from_raw_parts(data_ptr as *const u16, 8);
+
+        for (i, &x) in xs.iter().enumerate() {
+            let inner = 0.797_884_6_f32 * (x + 0.044_715 * x * x * x);
+            let want = 0.5 * x * (1.0 + inner.tanh());
+            let got = f16_bits_to_f32(result[i]);
+            assert!(
+                (got - want).abs() <= 2e-2 * want.abs().max(1.0),
+                "FastGelu(f16) output[{i}] for x={x}: got {got}, want {want}"
+            );
+        }
+
+        ((*api).ReleaseValue.unwrap())(output);
+        ((*api).ReleaseValue.unwrap())(x_val);
+        conformance_teardown(api, env, opts, session, "cpu_ep_fastgelu_f16");
+    }
+    eprintln!("\n✅ unroutable_partition_is_declined_not_fatal: PASSED");
+}
+
+/// Exact (`approximate="none"`) float16 `Gelu` is claimed for the same reason
+/// the tanh variant is: ORT has no float16 `Gelu` kernel, so deferring makes it
+/// inline the function into `Cast`/`Pow`/`Sum`/`Mul`/`Erf`, and we then claim
+/// the ungoverned pieces at a far worse rate than ORT runs the whole node.
+#[test]
+fn assignment_policy_claims_exact_float16_gelu() {
+    let _lock = lock_ort_ep();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let model_path = PathBuf::from(manifest_dir)
+        .join("tests/fixtures/gelu_assignment_f16_exact/model.onnx.textproto");
+
+    let Some((_lib, api, env, opts, session)) =
+        (unsafe { conformance_setup("cpu_ep_gelu_exact_f16", &model_path, false) })
+    else {
+        eprintln!(
+            "*** SKIPPED: assignment_policy_claims_exact_float16_gelu — \
+             ORT or EP cdylib not found ***"
+        );
+        return;
+    };
+
+    unsafe {
+        let info = query_ep_assignment(api, session);
+        let ours = info.ops_on_our_ep();
+        eprintln!(
+            "  [gelu_f16_exact] ours={ours:?}, others={:?}",
+            info.ops_not_on_our_ep()
+        );
+        assert!(
+            ours.contains(&"Gelu"),
+            "exact float16 Gelu must be claimed — ORT has no float16 Gelu kernel, \
+             so deferring inlines the function; got: {:?}",
+            info.assignments
+        );
+        for artefact in ["Pow", "Sum", "Erf"] {
+            assert!(
+                !ours.contains(&artefact) && !info.ops_not_on_our_ep().contains(&artefact),
+                "exact float16 Gelu was inlined ('{artefact}' appeared); got: {:?}",
+                info.assignments
+            );
+        }
+        conformance_teardown(api, env, opts, session, "cpu_ep_gelu_exact_f16");
+    }
+    eprintln!("\n✅ assignment_policy_claims_exact_float16_gelu: PASSED");
+}
+
+/// The routing filter must not cost any fusion that actually worked.
+///
+/// `MatMul(W) + Add(B) + Relu`, both weights initializers, is the shape an
+/// over-broad filter would wrongly decline (an earlier draft that rejected every
+/// multi-node claim reading an initializer did exactly that, pushing all three
+/// nodes onto `CPUExecutionProvider`). ORT surfaces fused-subgraph initializers
+/// as subgraph inputs, so this routes fine and must stay one claimed subgraph.
+#[test]
+fn initializer_chain_still_fuses_into_one_claim() {
+    let _lock = lock_ort_ep();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let model_path = PathBuf::from(manifest_dir)
+        .join("tests/fixtures/initializer_chain_fusion/model.onnx.textproto");
+
+    let Some((_lib, api, env, opts, session)) =
+        (unsafe { conformance_setup("cpu_ep_init_chain", &model_path, false) })
+    else {
+        eprintln!(
+            "*** SKIPPED: initializer_chain_still_fuses_into_one_claim — \
+             ORT or EP cdylib not found ***"
+        );
+        return;
+    };
+
+    unsafe {
+        let info = query_ep_assignment(api, session);
+        eprintln!(
+            "  [init_chain] ours={:?}, others={:?}",
+            info.ops_on_our_ep(),
+            info.ops_not_on_our_ep()
+        );
+        assert!(
+            info.ops_not_on_our_ep().is_empty(),
+            "the whole MatMul+Add+Relu chain must stay fused on our EP; got: {:?}",
+            info.assignments
+        );
+
+        let mut x_data: [f32; 8] = [1.0, 2.0, 3.0, 4.0, -1.0, -2.0, -3.0, 0.5];
+        let x_shape: [i64; 2] = [2, 4];
+        let x_val = make_float_tensor(api, &mut x_data, &x_shape);
+
+        let input_names = [c"X".as_ptr()];
+        let output_names = [c"Y".as_ptr()];
+        let inputs: [*const ort::OrtValue; 1] = [x_val];
+        let mut output: *mut ort::OrtValue = ptr::null_mut();
+        let status = ((*api).Run.unwrap())(
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs.as_ptr(),
+            1,
+            output_names.as_ptr(),
+            1,
+            &mut output,
+        );
+        check_status(api, status, "Run(initializer chain)");
+
+        let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
+        let status = ((*api).GetTensorMutableData.unwrap())(output, &mut data_ptr);
+        check_status(api, status, "GetTensorMutableData(initializer chain)");
+        let result = std::slice::from_raw_parts(data_ptr as *const f32, 6);
+
+        // W = [[1,0,0],[0,1,0],[0,0,1],[1,1,1]], B = [-1, 0.5, 2]
+        // row0: [1,2,3] + [4,4,4] = [5,6,7]  + B = [4, 6.5, 9]
+        // row1: [-1,-2,-3] + [0.5,0.5,0.5] = [-0.5,-1.5,-2.5] + B = [-1.5, -1, -0.5] -> relu 0
+        let expected: [f32; 6] = [4.0, 6.5, 9.0, 0.0, 0.0, 0.0];
+        for (i, (got, want)) in result.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-5,
+                "output[{i}] = {got}, want {want}"
+            );
+        }
+
+        ((*api).ReleaseValue.unwrap())(output);
+        ((*api).ReleaseValue.unwrap())(x_val);
+        conformance_teardown(api, env, opts, session, "cpu_ep_init_chain");
+    }
+    eprintln!("\n✅ initializer_chain_still_fuses_into_one_claim: PASSED");
+}

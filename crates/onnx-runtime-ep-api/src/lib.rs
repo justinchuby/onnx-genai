@@ -45,7 +45,7 @@ pub use epcontext::{EpContext, EpContextRegistry, build_ep_context_registry};
 pub use error::{EpError, Result};
 pub use kernel::{
     ARG_BYTES, ARG_DEVICE, ARG_FLOPS, ARG_KERNEL_VARIANT, ARG_KERNEL_VARIANT_REASON,
-    CAT_KERNEL_WORKER, CaptureSupport, Cost, Kernel, KernelInput, KernelMatch,
+    CAT_KERNEL_WORKER, CaptureSupport, ClaimPreference, Cost, Kernel, KernelInput, KernelMatch,
     KernelVariantSelection, TensorMetadata, ViewOutput, WorkspaceLifetime, WorkspaceRequirement,
     WorkspaceView, kernel_variant_tracing_enabled, kernel_worker_span, record_kernel_metrics,
     record_kernel_variant_selection, record_kernel_variant_stage_selection, structural_input_bytes,
