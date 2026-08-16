@@ -1,0 +1,32 @@
+ir_version: 10
+graph {
+  node: [
+    { input: ["X"] output: ["Z"] op_type: "Gelu" attribute: [{ name: "approximate" type: STRING s: "tanh" }] }
+  ]
+  name: "gelu_assignment_f16_large"
+  input: [
+  {
+    name: "X"
+    type {
+      tensor_type {
+        elem_type: 10
+        shape { dim: [{ dim_value: 1 }, { dim_value: 300000 }] }
+      }
+    }
+  }
+  ]
+  output: [
+  {
+    name: "Z"
+    type {
+      tensor_type {
+        elem_type: 10
+        shape { dim: [{ dim_value: 1 }, { dim_value: 300000 }] }
+      }
+    }
+  }
+  ]
+}
+opset_import: [{
+  version: 22
+}]
