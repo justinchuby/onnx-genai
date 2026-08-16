@@ -322,9 +322,23 @@ fn ep_get_capability_inner(
     // initializer weights) must keep claiming such nodes — applying the gate to
     // it would wrongly decline them and break session creation with CPU fallback
     // disabled.
+    // Claim-time *routing preference* gate: a node this EP can run correctly is
+    // still left to the host runtime when the host's own kernel is measurably
+    // faster for that op/dtype/shape. This lives here, on the plugin path, and
+    // deliberately not in `supports_op`: the native session build turns a
+    // statically-shaped `KernelMatch::Unsupported` into a hard
+    // `unsupported_op` error, so a kernel we decline to *advertise* must stay
+    // reachable for native execution. Applying it inside the
+    // `query_capabilities_filtered` predicate means the node is excluded before
+    // convex partitioning, so ORT partitions around it instead of us handing
+    // back a partition we would then run slower than ORT would.
     let claims = exported.ep.with(|ep| {
         ort_view.query_capabilities_filtered(ep, |node| {
-            !is_gpu_ep || node_inputs_all_routable(&view, node)
+            if is_gpu_ep && !node_inputs_all_routable(&view, node) {
+                return false;
+            }
+            let opset = view.graph().effective_opset(view.node(node)).unwrap_or(0);
+            ep.claim_preference_node(&view, node, opset).is_claim()
         })
     });
 

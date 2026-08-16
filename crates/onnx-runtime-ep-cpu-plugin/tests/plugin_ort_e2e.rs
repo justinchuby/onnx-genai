@@ -3059,3 +3059,254 @@ fn conformance_matmul_initializer_weights() {
         eprintln!("\n✅ conformance_matmul_initializer_weights: PASSED");
     }
 }
+
+// ─── Assignment policy falsifiers ────────────────────────────────────────────
+//
+// `onnx_runtime_ep_cpu::assignment_policy` decides which nodes this EP asks ORT
+// to hand over, separately from `supports_op`, which decides what it *can* run.
+// A unit test can only check the predicate; these check the thing that actually
+// matters — what ORT does with the answer. Each one is a falsifier: it fails if
+// the EP takes a node the policy declines, if it gives up a node the policy
+// claims, or if the resulting partition produces wrong numbers.
+
+/// float32 `Tanh`/`Sqrt`/`Sigmoid` are measured slower than ORT's own MLAS
+/// kernels at every size on this ISA, so the plugin must not claim them — while
+/// `Add`, which the policy does not govern, must still be claimed. This is the
+/// falsifier for "declining is per-node and ORT partitions around it": if the
+/// deferral were expressed as `supports_op` returning `Unsupported`, or if it
+/// dropped the whole partition, `Add` would move too.
+#[test]
+fn assignment_policy_defers_float32_activations_to_ort() {
+    let _lock = lock_ort_ep();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let model_path = PathBuf::from(manifest_dir)
+        .join("tests/fixtures/activation_assignment_f32/model.onnx.textproto");
+
+    let Some((_lib, api, env, opts, session)) =
+        (unsafe { conformance_setup("cpu_ep_assign_f32", &model_path, false) })
+    else {
+        eprintln!(
+            "*** SKIPPED: assignment_policy_defers_float32_activations_to_ort — \
+             ORT or EP cdylib not found ***"
+        );
+        return;
+    };
+
+    unsafe {
+        let info = query_ep_assignment(api, session);
+        let ours = info.ops_on_our_ep();
+        let others = info.ops_not_on_our_ep();
+        eprintln!("  [assign_f32] ours={ours:?}, others={others:?}");
+        for op in ["Tanh", "Sqrt", "Sigmoid"] {
+            assert!(
+                !ours.contains(&op),
+                "float32 '{op}' is measured slower than ORT and must be left to ORT, \
+                 got assignment: {:?}",
+                info.assignments
+            );
+            assert!(
+                others.contains(&op),
+                "float32 '{op}' must actually be executed by ORT's own EP, \
+                 got assignment: {:?}",
+                info.assignments
+            );
+        }
+        // The policy governs only the ops it has evidence about. `Add` is not
+        // one of them, so declining the activations must not cost us the rest
+        // of the graph.
+        assert!(
+            ours.contains(&"Add"),
+            "declining activations must not drop the ungoverned 'Add' claim, \
+             got assignment: {:?}",
+            info.assignments
+        );
+    }
+
+    // The mixed partition must still compute the right answer: the boundary is
+    // crossed twice (into ORT for the activations, and the graph output comes
+    // back from ORT).
+    unsafe {
+        let mut x_data: [f32; 4] = [0.0, 0.25, 1.0, 4.0];
+        let mut y_data: [f32; 4] = [0.0, 0.25, 1.0, 4.0];
+        let shape: [i64; 2] = [1, 4];
+        let x_val = make_float_tensor(api, &mut x_data, &shape);
+        let y_val = make_float_tensor(api, &mut y_data, &shape);
+
+        let input_names = [c"X".as_ptr(), c"Y".as_ptr()];
+        let output_names = [c"Z".as_ptr()];
+        let inputs: [*const ort::OrtValue; 2] = [x_val, y_val];
+        let mut output: *mut ort::OrtValue = ptr::null_mut();
+        let status = ((*api).Run.unwrap())(
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs.as_ptr(),
+            2,
+            output_names.as_ptr(),
+            1,
+            &mut output,
+        );
+        check_status(api, status, "Run(assign_f32)");
+        assert!(!output.is_null());
+
+        let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
+        let status = ((*api).GetTensorMutableData.unwrap())(output, &mut data_ptr);
+        check_status(api, status, "GetTensorMutableData(assign_f32)");
+        let got = std::slice::from_raw_parts(data_ptr as *const f32, 4);
+        for (i, (&g, &x)) in got.iter().zip(x_data.iter()).enumerate() {
+            let want = {
+                let s = x + x;
+                let t = s.tanh();
+                let q = t.sqrt();
+                1.0f32 / (1.0 + (-q).exp())
+            };
+            assert!(
+                (g - want).abs() < 1e-5,
+                "Z[{i}] = {g}, want {want} — mixed partition changed the numerics"
+            );
+        }
+        ((*api).ReleaseValue.unwrap())(output);
+        ((*api).ReleaseValue.unwrap())(x_val);
+        ((*api).ReleaseValue.unwrap())(y_val);
+        conformance_teardown(api, env, opts, session, "cpu_ep_assign_f32");
+        eprintln!("\n✅ assignment_policy_defers_float32_activations_to_ort: PASSED");
+    }
+}
+
+/// bfloat16 is the one case where declining would be actively harmful: ORT's
+/// CPU EP has no bfloat16 `Tanh` kernel at all, so a deferral turns a working
+/// session into a `NOT_IMPLEMENTED` session-creation failure. The claim is a
+/// capability, not a performance bet, and must survive any future tightening of
+/// the performance thresholds. Session creation succeeding here *is* half the
+/// assertion.
+#[test]
+fn assignment_policy_always_claims_bfloat16_activations() {
+    let _lock = lock_ort_ep();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let model_path = PathBuf::from(manifest_dir)
+        .join("tests/fixtures/activation_assignment_bf16/model.onnx.textproto");
+
+    let Some((_lib, api, env, opts, session)) =
+        (unsafe { conformance_setup("cpu_ep_assign_bf16", &model_path, false) })
+    else {
+        eprintln!(
+            "*** SKIPPED: assignment_policy_always_claims_bfloat16_activations — \
+             ORT or EP cdylib not found ***"
+        );
+        return;
+    };
+
+    unsafe {
+        let info = query_ep_assignment(api, session);
+        let ours = info.ops_on_our_ep();
+        eprintln!(
+            "  [assign_bf16] ours={ours:?}, others={:?}",
+            info.ops_not_on_our_ep()
+        );
+        assert!(
+            ours.contains(&"Tanh"),
+            "bfloat16 'Tanh' must stay claimed — ORT has no bfloat16 kernel and \
+             the session would fail to load without ours; got: {:?}",
+            info.assignments
+        );
+
+        // bf16 words: 0x3F80 = 1.0, 0x0000 = 0.0, 0xBF80 = -1.0, 0x4000 = 2.0
+        let mut x_data: [u16; 4] = [0x3F80, 0x0000, 0xBF80, 0x4000];
+        let mut y_data: [u16; 4] = [0x0000, 0x0000, 0x0000, 0x0000];
+        let shape: [i64; 2] = [1, 4];
+        let x_val = make_bfloat16_tensor(api, &mut x_data, &shape);
+        let y_val = make_bfloat16_tensor(api, &mut y_data, &shape);
+
+        let input_names = [c"X".as_ptr(), c"Y".as_ptr()];
+        let output_names = [c"Z".as_ptr()];
+        let inputs: [*const ort::OrtValue; 2] = [x_val, y_val];
+        let mut output: *mut ort::OrtValue = ptr::null_mut();
+        let status = ((*api).Run.unwrap())(
+            session,
+            ptr::null(),
+            input_names.as_ptr(),
+            inputs.as_ptr(),
+            2,
+            output_names.as_ptr(),
+            1,
+            &mut output,
+        );
+        check_status(api, status, "Run(assign_bf16)");
+        assert!(!output.is_null());
+
+        let mut data_ptr: *mut std::ffi::c_void = ptr::null_mut();
+        let status = ((*api).GetTensorMutableData.unwrap())(output, &mut data_ptr);
+        check_status(api, status, "GetTensorMutableData(assign_bf16)");
+        let got = std::slice::from_raw_parts(data_ptr as *const u16, 4);
+        for (i, (&g, &x)) in got.iter().zip(x_data.iter()).enumerate() {
+            let want = f32::from_bits((x as u32) << 16).tanh();
+            let g = f32::from_bits((g as u32) << 16);
+            // bfloat16 carries 8 mantissa bits, so ~1e-2 relative is the format
+            // floor, not a kernel tolerance.
+            assert!(
+                (g - want).abs() < 1e-2,
+                "Z[{i}] = {g}, want ~{want} (bfloat16 Tanh)"
+            );
+        }
+        ((*api).ReleaseValue.unwrap())(output);
+        ((*api).ReleaseValue.unwrap())(x_val);
+        ((*api).ReleaseValue.unwrap())(y_val);
+        conformance_teardown(api, env, opts, session, "cpu_ep_assign_bf16");
+        eprintln!("\n✅ assignment_policy_always_claims_bfloat16_activations: PASSED");
+    }
+}
+
+/// The one claim that is a genuine performance bet: float16 `Gelu(tanh)` is
+/// measured 1.2-1.9x faster than ORT up to 262144 elements at 1, 8 and 16
+/// intra-op threads, and loses above that once ORT's thread pool takes over.
+/// Both sides of that boundary are asserted, because a threshold that is never
+/// exercised on its losing side is not a threshold.
+#[test]
+fn assignment_policy_gates_float16_gelu_on_element_count() {
+    let _lock = lock_ort_ep();
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+
+    for (tag, reg, want_ours) in [
+        ("small", "cpu_ep_gelu_small", true),
+        ("large", "cpu_ep_gelu_large", false),
+    ] {
+        let model_path = PathBuf::from(manifest_dir).join(format!(
+            "tests/fixtures/gelu_assignment_f16_{tag}/model.onnx.textproto"
+        ));
+        let Some((_lib, api, env, opts, session)) =
+            (unsafe { conformance_setup(reg, &model_path, false) })
+        else {
+            eprintln!(
+                "*** SKIPPED: assignment_policy_gates_float16_gelu_on_element_count — \
+                 ORT or EP cdylib not found ***"
+            );
+            return;
+        };
+
+        unsafe {
+            let info = query_ep_assignment(api, session);
+            let ours = info.ops_on_our_ep();
+            eprintln!(
+                "  [gelu_f16_{tag}] ours={ours:?}, others={:?}",
+                info.ops_not_on_our_ep()
+            );
+            if want_ours {
+                assert!(
+                    ours.contains(&"Gelu"),
+                    "float16 Gelu(tanh) below the measured cap is 1.5x ORT and must be \
+                     claimed; got: {:?}",
+                    info.assignments
+                );
+            } else {
+                assert!(
+                    !ours.contains(&"Gelu"),
+                    "float16 Gelu(tanh) above the measured cap loses to ORT's threaded \
+                     kernel and must not be claimed; got: {:?}",
+                    info.assignments
+                );
+            }
+            conformance_teardown(api, env, opts, session, reg);
+        }
+    }
+    eprintln!("\n✅ assignment_policy_gates_float16_gelu_on_element_count: PASSED");
+}

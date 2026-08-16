@@ -23,8 +23,8 @@
 //!    so `DeviceBuffer` is soundly `Send`/`Sync` (documented in ep-api).
 
 use onnx_runtime_ep_api::{
-    Cost, DeviceBuffer, EpConfig, EpError, ExecutionProvider, Fence, Kernel, KernelMatch,
-    OpRegistry, Result, deny, structural_input_bytes,
+    ClaimPreference, Cost, DeviceBuffer, EpConfig, EpError, ExecutionProvider, Fence, Kernel,
+    KernelMatch, OpRegistry, Result, deny, structural_input_bytes,
 };
 use onnx_runtime_ir::{DataType, DeviceId, DeviceType, Node, Shape, TensorLayout};
 
@@ -142,6 +142,20 @@ impl ExecutionProvider for CpuExecutionProvider {
     fn shutdown(&mut self) -> Result<()> {
         self.initialized = false;
         Ok(())
+    }
+
+    /// Routing preference, kept deliberately apart from [`Self::supports_op`].
+    ///
+    /// See [`crate::assignment_policy`] for the measured evidence behind each
+    /// deferral and for why a performance decline cannot live in `supports_op`.
+    fn claim_preference(
+        &self,
+        op: &Node,
+        opset: u64,
+        shapes: &[Shape],
+        input_dtypes: &[DataType],
+    ) -> ClaimPreference {
+        crate::assignment_policy::claim_preference(op, opset, shapes, input_dtypes)
     }
 
     fn supports_op(
