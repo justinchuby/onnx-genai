@@ -47,7 +47,37 @@ under test.
 | `MatMulNBits` | 8-bit, block 32 | 1 | 3584 | 8 | **0.25** | 0.30 | **claim** |
 | `MatMulNBits` | 8-bit, block 32 | 1 | 3584 | 16 | **0.23** | 0.23 | **claim** |
 | `MatMulNBits` | 8-bit, block 32 | 1 | 4096 | 8 | **0.23** | 0.24 | **claim** |
-| `MatMulNBits` | 8-bit, block 32 | 128 | 3584 | 8 | **0.75** | 0.77 | **claim** |
+| `MatMulNBits` | 8-bit, block 32 | 128 | 3584 | 2 | **0.90** | 0.91 | **claim** |
+| `MatMulNBits` | 8-bit, block 32 | 128 | 3584 | 4 | **0.87** | 0.87 | **claim** |
+| `MatMulNBits` | 8-bit, block 32 | 128 | 3584 | 8 | **0.94** | 1.06 | **claim** |
+| `MatMulNBits` | 8-bit, block 32 | 256 | 3584 | 2 | 1.17 | 1.18 | defer (static M) |
+| `MatMulNBits` | 8-bit, block 32 | 256 | 3584 | 4 | 1.15 | 1.16 | defer (static M) |
+| `MatMulNBits` | 8-bit, block 32 | 256 | 3584 | 8 | 0.99 | 1.05 | defer (static M) |
+| `MatMulNBits` | 8-bit, block 32 | 512 | 3584 | 2 | 1.41 | 1.42 | defer (static M) |
+| `MatMulNBits` | 8-bit, block 32 | 512 | 3584 | 4 | 1.39 | 1.39 | defer (static M) |
+| `MatMulNBits` | 8-bit, block 32 | 512 | 3584 | 8 | 1.25 | 1.32 | defer (static M) |
+
+### The 8-bit win is bounded by row count
+
+The 8-bit keep is **not** unconditional in `M`. The win erodes as rows are added and crosses over
+between 128 and 256 -- and the crossover rows are the *low*-dispersion measurements in this whole
+document (spread 0.01-0.04), so it is not a contended-host artefact.
+
+A node whose row count is **statically** >= 256 is pure prefill: there is no decode traffic on it to
+amortise the loss against, so it defers to the host.
+
+A **dynamic** row count is the LLM case, where a single node serves both phases and the choice
+cannot be split. Claiming is correct there by a wide margin: at 8 threads decode saves **6.06 ms per
+token** (1.78 ms ours vs 7.84 ms ORT) while a 512-row prefill costs **7.69 ms once** (38.58 vs
+30.89). The *second* generated token has already repaid the entire prefill loss.
+
+### Block sizes ORT cannot build stay claimed
+
+This EP accepts any power-of-two `block_size >= 16`; ORT's CPU `MatMulNBits` `ORT_ENFORCE`s
+`block_size` in {16, 32, 64, 128, 256}, and that check throws at *kernel construction*. Deferring a
+512-wide block would therefore turn a working session into a load failure, so those keep the claim
+regardless of the measured ratio -- the same safety rule the dense arm applies to dtypes ORT has no
+kernel for.
 | `MatMulNBits` | 4-bit, acc 0 | 1 | 3584 | 1 | 1.00 | 1.03 | defer |
 | `MatMulNBits` | 4-bit, acc 0 | 1 | 3584 | 2 | 1.52 | 1.56 | defer |
 | `MatMulNBits` | 4-bit, acc 0 | 1 | 3584 | 4 | 1.74 | 1.82 | defer |
@@ -158,8 +188,8 @@ Not measurable on this host, and therefore **not claimed anywhere**:
 
 ```sh
 export ORT_ROOT=<ort-prebuilt>            # the ort-sys download under target/
-cargo build --release -p onnx-genai-bench --bin bench_generic --features mlas
-LD_LIBRARY_PATH=$ORT_ROOT/lib ./target/release/bench_generic \
+cargo build --release -p onnx-genai-bench --bin bench_prec --features mlas
+LD_LIBRARY_PATH=$ORT_ROOT/lib ./target/release/bench_prec \
   --model <model>.onnx --runs 11 --warmups 4 \
   --native-threads 8 --ort-intra-threads 8
 ```

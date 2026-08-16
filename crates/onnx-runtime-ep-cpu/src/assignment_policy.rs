@@ -163,13 +163,13 @@ const DECODE_PARALLEL_NOTE: &str = "measured slower than ORT's CPU kernel at eve
 pub fn claim_preference(
     op: &Node,
     _opset: u64,
-    _shapes: &[Shape],
+    shapes: &[Shape],
     input_dtypes: &[DataType],
 ) -> ClaimPreference {
     if !governs(op) {
         return ClaimPreference::Claim;
     }
-    if let Some(preference) = matmul_family_preference(op, _shapes, input_dtypes) {
+    if let Some(preference) = matmul_family_preference(op, shapes, input_dtypes) {
         return preference;
     }
     let dtype = match input_dtypes.first() {
@@ -240,6 +240,21 @@ pub fn claim_preference(
 /// Dynamic shapes are deliberately *not* treated as "large". A symbolic `K` or
 /// `N` could be anything, and the deferrals below are scoped to a measured
 /// region; extending them to shapes we cannot size would defer on no evidence.
+/// The largest statically-known row count where this EP still beats ORT at
+/// 8-bit `MatMulNBits`. Measured crossover is between 128 and 256 rows.
+const MEASURED_MAX_CLAIMED_ROWS: usize = 256;
+
+/// The row count `M` of the activation, when it is statically known.
+///
+/// The activation is input 0 and is `[.., M, K]`, so `M` is the second-to-last
+/// dimension. Returns `None` for a dynamic or rank-deficient activation, which
+/// is the decode case and must not be mistaken for a small one.
+fn matmul_rows(shapes: &[Shape]) -> Option<usize> {
+    let activation = shapes.first()?;
+    let m = activation.get(activation.len().checked_sub(2)?)?;
+    m.as_static()
+}
+
 fn matmul_weight_elements(op: &Node, shapes: &[Shape]) -> Option<usize> {
     if op.op_type == "MatMulNBits" {
         // K and N are attributes, not shapes, so this is exact even when the
@@ -250,8 +265,9 @@ fn matmul_weight_elements(op: &Node, shapes: &[Shape]) -> Option<usize> {
             .ok()?
             .checked_mul(usize::try_from(n).ok()?);
     }
-    // `MatMul`/`Gemm` take B as input 1, `QLinearMatMul` as input 3.
-    let b = shapes.get(if op.op_type == "QLinearMatMul" { 3 } else { 1 })?;
+    // `MatMul`/`Gemm` take B as input 1. `QLinearMatMul` never reaches here:
+    // it loses at every size measured, so it is decided before the size gate.
+    let b = shapes.get(1)?;
     b.iter()
         .map(|dim| dim.as_static())
         .try_fold(1usize, |acc, dim| acc.checked_mul(dim?))
@@ -327,6 +343,44 @@ fn matmul_family_preference(
         // output parity. With fp32 activations restored the win above is
         // measured at parity=PASS.
         if bits == Some(8) {
+            // ...but only up to M=128. The win erodes with the row count and
+            // crosses over between 128 and 256 (ours/ORT, K=N=3584, p50, and
+            // these are the *low*-dispersion points, spread 0.01-0.04):
+            //
+            // | rows | T=2  | T=4  | T=8  |
+            // |------|------|------|------|
+            // | 128  | 0.90 | 0.87 | 0.94 |
+            // | 256  | 1.17 | 1.15 | 0.99 |
+            // | 512  | 1.41 | 1.39 | 1.25 |
+            //
+            // A node whose row count is *statically* >= 256 is pure prefill:
+            // there is no decode traffic on it to amortise the loss, so it
+            // goes to the host.
+            //
+            // A dynamic row count is the LLM case, where one node serves both
+            // decode and prefill and the choice cannot be split. Claiming is
+            // right there by a wide margin: at 8 threads decode saves 6.06 ms
+            // per token (1.78 vs 7.84 ms) while a 512-row prefill costs 7.69 ms
+            // once (38.58 vs 30.89), so the *second* generated token has
+            // already repaid the whole prefill loss.
+            if matmul_rows(shapes).is_some_and(|rows| rows >= MEASURED_MAX_CLAIMED_ROWS) {
+                return Some(ClaimPreference::defer(
+                    "8-bit MatMulNBits wins at decode but loses on wide prefill: 1.15-1.17 \
+                     (256 rows) and 1.25-1.41 (512 rows) ours/ORT at 2-8 threads, and a \
+                     statically wide node has no decode traffic to amortise that against",
+                ));
+            }
+            return Some(ClaimPreference::Claim);
+        }
+        // Deferring is only sound when the host actually has a kernel. This
+        // EP accepts any power-of-two `block_size` >= 16, but ORT's CPU
+        // MatMulNBits `ORT_ENFORCE`s `block_size` in {16, 32, 64, 128, 256}
+        // and that check throws at *kernel construction*, so handing it a
+        // 512-wide block turns a working session into a load failure. Keep
+        // the claim outside ORT's accepted set, exactly as the dense arm
+        // keeps dtypes ORT has no kernel for.
+        let block_size = op.attributes.get("block_size").and_then(|a| a.as_int());
+        if !matches!(block_size, Some(16 | 32 | 64 | 128 | 256)) {
             return Some(ClaimPreference::Claim);
         }
         // int4 is the decode workhorse and this EP still loses it above 1
@@ -385,11 +439,17 @@ mod tests {
     }
 
     fn nbits_node(bits: i64, k: i64, n: i64) -> Node {
+        nbits_node_blocked(bits, k, n, 32)
+    }
+
+    fn nbits_node_blocked(bits: i64, k: i64, n: i64, block_size: i64) -> Node {
         let mut node = Node::new(NodeId(0), "MatMulNBits", vec![], vec![]);
         node.domain = "com.microsoft".to_string();
         node.attributes.insert("bits".into(), Attribute::Int(bits));
         node.attributes.insert("K".into(), Attribute::Int(k));
         node.attributes.insert("N".into(), Attribute::Int(n));
+        node.attributes
+            .insert("block_size".into(), Attribute::Int(block_size));
         node
     }
 
@@ -514,6 +574,90 @@ mod tests {
             &[DataType::Float32],
         );
         assert!(thin.is_claim(), "K*N = 16 is far below the measured region");
+    }
+
+    /// The 8-bit keep is bounded by row count, not unconditional. A statically
+    /// wide node is pure prefill, where this EP is measured to lose; a dynamic
+    /// row count is decode, where it wins by 4-6x, and must stay claimed.
+    #[test]
+    fn eight_bit_is_kept_for_decode_and_declined_for_static_wide_prefill() {
+        let act = |rows: Dim| vec![vec![rows, Dim::Static(3584)], vec![]];
+        for rows in [1, 32, 128, 255] {
+            let pref = claim_preference(
+                &nbits_node(8, 3584, 3584),
+                22,
+                &act(Dim::Static(rows)),
+                &[DataType::Float32],
+            );
+            assert!(
+                pref.is_claim(),
+                "{rows} rows is inside the measured 8-bit win"
+            );
+        }
+        for rows in [256, 512, 4096] {
+            let pref = claim_preference(
+                &nbits_node(8, 3584, 3584),
+                22,
+                &act(Dim::Static(rows)),
+                &[DataType::Float32],
+            );
+            assert!(
+                !pref.is_claim(),
+                "{rows} rows is measured 1.15-1.41 ours/ORT with no decode traffic to amortise it"
+            );
+        }
+        // Decode: the row count is symbolic and one node serves both phases.
+        let pref = claim_preference(
+            &nbits_node(8, 3584, 3584),
+            22,
+            &act(Dim::Symbolic(SymbolId(0))),
+            &[DataType::Float32],
+        );
+        assert!(
+            pref.is_claim(),
+            "a dynamic row count is the decode case, worth 6.06 ms/token"
+        );
+    }
+
+    /// Deferring is only sound when ORT has a kernel. ORT's CPU `MatMulNBits`
+    /// `ORT_ENFORCE`s `block_size` in {16, 32, 64, 128, 256} at kernel
+    /// construction, while this EP accepts any power-of-two >= 16. Handing ORT
+    /// a 512-wide block would turn a working session into a load failure, so
+    /// those must stay claimed even though they are in the losing range.
+    #[test]
+    fn block_sizes_ort_cannot_build_stay_claimed() {
+        for block_size in [16, 32, 64, 128, 256] {
+            let pref = claim_preference(
+                &nbits_node_blocked(4, 3584, 3584, block_size),
+                22,
+                &[],
+                &[DataType::Float32],
+            );
+            assert!(
+                !pref.is_claim(),
+                "block_size={block_size} is inside ORT's accepted set and loses, so it must defer"
+            );
+        }
+        for block_size in [512, 1024] {
+            let pref = claim_preference(
+                &nbits_node_blocked(4, 3584, 3584, block_size),
+                22,
+                &[],
+                &[DataType::Float32],
+            );
+            assert!(
+                pref.is_claim(),
+                "block_size={block_size} would fail ORT_ENFORCE, so deferring it is a load failure"
+            );
+        }
+        // A missing `block_size` is a malformed node this EP would reject
+        // anyway; treat it as outside ORT's set rather than guessing.
+        let mut node = nbits_node(4, 3584, 3584);
+        node.attributes.remove("block_size");
+        assert!(
+            claim_preference(&node, 22, &[], &[DataType::Float32]).is_claim(),
+            "an absent block_size must not be assumed to be one ORT accepts"
+        );
     }
 
     /// `MatMulNBits` sizes itself from its `K`/`N` attributes, not its shapes,
