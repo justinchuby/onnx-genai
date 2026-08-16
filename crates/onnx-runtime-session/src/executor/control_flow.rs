@@ -381,6 +381,57 @@ impl Executor {
     /// view (strided gather over its source buffer) or truncating an owned
     /// buffer to its logical size. This is the single materialization seam used
     /// by the graph-output boundary and control-flow scope capture.
+    /// Materialize graph output `vid` straight into an owned tensor.
+    ///
+    /// The general path builds the bytes in a `Vec` and hands them to
+    /// `Tensor::from_raw`, which allocates the same bytes a second time and
+    /// memcpys between them. For a **view** output on a host-accessible device
+    /// -- a `Transpose`, `Reshape`, `Slice` or `Unsqueeze` whose result is a
+    /// graph output -- that second allocate-and-copy is pure overhead on top of
+    /// a gather that already writes every byte exactly once, so gather directly
+    /// into the tensor's allocation instead.
+    ///
+    /// Returns the tensor and the host bytes it materialized, so the caller's
+    /// attribution counter stays exact.
+    pub(super) fn contiguous_output_tensor(
+        &self,
+        vid: ValueId,
+        shape: &[usize],
+        dtype: DataType,
+    ) -> Result<(Tensor, usize)> {
+        let esize = dtype.byte_size();
+        if esize > 0
+            && !self.seq_elem_values.contains_key(&vid)
+            && let Some(view) = self.views.get(&vid)
+            && let Some(buf) = self.buffers.get(&view.source)
+            && buf.device().is_host_accessible()
+        {
+            let value_name = || format!("value#{}", vid.0);
+            let numel = checked_numel(shape, value_name)?;
+            let n = checked_storage_bytes(dtype, numel, value_name, shape)?;
+            // SAFETY: `buf` is a live device buffer owned by this executor's EP
+            // on a host-accessible device, so its `len()` bytes are readable
+            // from `as_ptr()` (ep-api safety invariant #1), and `u8` has no
+            // invalid bit patterns. The gather only reads, and the destination
+            // is a freshly allocated tensor that cannot alias it.
+            let src = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len()) };
+            let tensor = Tensor::from_host_fill(dtype, shape.to_vec(), |dst| {
+                gather_view_into(
+                    dst,
+                    src,
+                    &view.shape,
+                    &view.strides,
+                    view.byte_offset,
+                    esize,
+                );
+            })?;
+            return Ok((tensor, n));
+        }
+        let bytes = self.contiguous_bytes(vid, shape, dtype)?;
+        let n = bytes.len();
+        Ok((Tensor::from_raw(dtype, shape.to_vec(), &bytes)?, n))
+    }
+
     pub(super) fn contiguous_bytes(
         &self,
         vid: ValueId,
@@ -418,6 +469,26 @@ impl Executor {
                     "cannot materialize sub-byte view value#{}",
                     vid.0
                 )));
+            }
+            if buf.device().is_host_accessible() {
+                // The source is already host memory, so staging a full copy of
+                // it just to read it doubles the traffic of every view graph
+                // output -- and the staging buffer is `vec![0u8; ..]`, so the
+                // kernel zeroes pages that are overwritten immediately.
+                //
+                // SAFETY: `buf` is a live device buffer owned by this executor's
+                // EP on a host-accessible device, so its `len()` bytes are
+                // readable from `as_ptr()` (ep-api safety invariant #1), and
+                // `u8` has no invalid bit patterns. `gather_view` only reads.
+                let src =
+                    unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len()) };
+                return Ok(gather_view(
+                    src,
+                    &view.shape,
+                    &view.strides,
+                    view.byte_offset,
+                    esize,
+                ));
             }
             let mut host = vec![0u8; buf.len()];
             self.ep.copy_to_host(buf, &mut host)?;

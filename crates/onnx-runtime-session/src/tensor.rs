@@ -972,6 +972,52 @@ impl Tensor {
         Ok(Self::from_owned_buffer(allocator, dtype, shape, buffer))
     }
 
+    /// Allocate a host tensor and let `fill` write its bytes in place.
+    ///
+    /// The alternative is to build the bytes in a `Vec` and hand them to
+    /// [`from_raw`], which allocates the same bytes twice and memcpys between
+    /// them -- the objection [`zeros`] already records, and the reason `zeros`
+    /// exists. It matters most on the view-graph-output path, where the producer
+    /// is a strided gather whose result is the tensor and nothing else: there
+    /// the second allocation and copy are the entire remaining overhead of
+    /// materializing the output.
+    ///
+    /// `fill` receives exactly `storage_bytes(numel)` bytes of **uninitialized**
+    /// memory as a `&mut [u8]` and must write all of them; `u8` has no invalid
+    /// bit patterns, so observing unwritten bytes is well-defined but arbitrary,
+    /// which is what makes a partial write a wrong answer rather than undefined
+    /// behaviour.
+    pub(crate) fn from_host_fill(
+        dtype: DataType,
+        shape: Vec<usize>,
+        fill: impl FnOnce(&mut [u8]),
+    ) -> Result<Self> {
+        let expected =
+            checked_expected_bytes(dtype, &shape).ok_or_else(|| SessionError::ShapeOverflow {
+                value: "Tensor::from_host_fill".to_string(),
+                dims: shape.clone(),
+            })?;
+        let allocator = shared_cpu_ep();
+        let layout = TensorLayout::contiguous();
+        let mut buffer = allocator.allocate(expected.max(1), layout.alignment)?;
+        assert!(
+            buffer.device().is_host_accessible(),
+            "from_host_fill on non-host device {:?}",
+            buffer.device()
+        );
+        if expected > 0 {
+            // SAFETY: host-accessible device (asserted); `as_mut_ptr` comes from
+            // a unique `&mut buffer` with no alias, and the allocation is at
+            // least `expected` bytes because that is what was requested. `u8` has
+            // no invalid bit patterns, so a `&mut [u8]` over it is valid before
+            // it is written.
+            let dst =
+                unsafe { std::slice::from_raw_parts_mut(buffer.as_mut_ptr() as *mut u8, expected) };
+            fill(dst);
+        }
+        Ok(Self::from_owned_buffer(allocator, dtype, shape, buffer))
+    }
+
     /// Take ownership of an already-allocated, contiguous `buffer` (allocated by
     /// `allocator`) and wrap it as a row-major tensor **without copying**. The
     /// executor uses this to hand a produced output's host buffer straight to
