@@ -80,3 +80,10 @@ pub use kernels::matmul_nbits::{
 // #1056: a resident, session-lifetime, weight-scaled buffer must be reportable
 // in bytes. The entry-count accessor stays for the benchmarks that assert reuse.
 pub use kernels::matmul::weight_transpose_cache_bytes;
+// #1056: the transpose cache is now *governed*, not just reported: the plan
+// budgets `weight_transpose_cache_predicted_bytes` and, when it does not fit,
+// declines it via `set_weight_transpose_cache_enabled` (kernels then transpose
+// per call and retain nothing).
+pub use kernels::matmul::{
+    set_weight_transpose_cache_enabled, weight_transpose_cache_predicted_bytes,
+};

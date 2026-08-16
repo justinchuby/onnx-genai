@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{Node, broadcast_shapes, compute_contiguous_strides};
+use onnx_runtime_ir::{Attribute, DataType, Graph, Node, broadcast_shapes, compute_contiguous_strides};
 use rayon::prelude::*;
 
 use super::check_arity;
@@ -137,6 +137,117 @@ pub fn weight_transpose_cache_sizes() -> (usize, usize) {
 /// so this scales with model size and belongs in the memory plan (#1056).
 pub fn weight_transpose_cache_bytes() -> usize {
     weight_transpose::cache_bytes()
+}
+
+/// Admit (`true`) or decline (`false`) the process-global weight-transpose
+/// caches for the rest of the session (#1056).
+///
+/// When declined, the `MatMul`/`Gemm` kernels compute each constant-weight
+/// transpose per call and retain nothing, so the resident, session-lifetime,
+/// weight-scaled `K x N` copies never accrue. The engine calls this once at
+/// load from the memory-strategy plan's verdict, beside the identical gates for
+/// the resident dequant f32 cache (#987) and the MLAS SQNBit packed buffer
+/// (#1051), so one admission decision governs all three buffers. Declining is a
+/// pure performance tradeoff: the transpose is byte-identical whether cached or
+/// recomputed, so generated tokens are unchanged.
+pub fn set_weight_transpose_cache_enabled(enabled: bool) {
+    weight_transpose::set_cache_enabled(enabled);
+}
+
+/// Predicted bytes the process-global weight-transpose caches will hold for
+/// `graph` once it has run — the *prediction* the memory-strategy plan budgets
+/// for, whose accuracy [`weight_transpose_cache_bytes`] measures after the fact.
+///
+/// # What actually populates the cache
+///
+/// The cache holds one f32/f16 `N x K` transpose per **constant** (initializer)
+/// weight that a kernel feeds through [`weight_transpose::cached_transpose_f32`]
+/// / [`weight_transpose::cached_transpose_f16`]. The precise callers, and hence
+/// this predictor, are platform-split because the transpose is only consumed by
+/// the CPU EP's fast paths:
+///
+/// * **All platforms — `Gemm` with `transB != 0`** (`gemm.rs`
+///   `GemmKernel::execute`, the `transposed_b(&b, n, k)` call added in #1035):
+///   a constant `B` stored `[N, K]` is transposed once to the `[K, N]` the
+///   shared GEMM consumes and cached as **f32** (`gemm.rs` first widens `B` to
+///   dense f32 via `MatMulPrepack::dense`). Cost `N * K * 4` bytes. A
+///   non-constant `B`, or `transB == 0`, never caches. When both operands are
+///   f16/bf16 the node takes the half path (`try_half_gemm`) and does not
+///   transpose; this predictor still counts it (over-predicts, never under —
+///   the #1056-mandated safe direction), because whether `A` is half is not a
+///   graph-static property here.
+///
+/// * **Apple only — `MatMul` / `FusedMatMulBias` with a constant `B`**
+///   (`matmul.rs` `execute_with_backend` and `fused_matmul_bias.rs`, all guarded
+///   by `#[cfg(any(target_os = "macos", target_os = "ios"))]`): the Accelerate
+///   GEMV / thin-M paths cache the transpose as **f16** (`N * K * 2`, raw `u16`
+///   bit patterns) for a contiguous Float16 `B`, else **f32** (`N * K * 4`).
+///   These call sites are compiled out on x86/Windows, so this predictor's
+///   Apple arm is likewise `cfg`-gated: a binary predicts exactly what its own
+///   kernels will allocate.
+///
+/// The shape-keyed kernel cache instantiates a node once per activation shape
+/// (prefill `m > 1`, decode `m == 1`), but every instance keys the *global*
+/// cache on `(weight address, K, N)`, so the second instantiation hits the
+/// existing entry and allocates nothing extra. Unlike the MLAS packed buffer
+/// (#1051), the transpose is therefore held once per weight, not once per
+/// instantiation — no per-copy multiplier applies.
+pub fn weight_transpose_cache_predicted_bytes(graph: &Graph) -> u64 {
+    let mut total = 0_u64;
+    for node in graph.nodes.values() {
+        total = total.saturating_add(node_weight_transpose_cache_bytes(node, graph));
+    }
+    total
+}
+
+/// Element count of a node's constant 2-D `B` initializer (input index 1), or
+/// `None` when `B` is absent, non-constant, or not rank-2. Shared by both arms
+/// of [`weight_transpose_cache_predicted_bytes`].
+fn constant_b_numel(node: &Node, graph: &Graph) -> Option<(u64, DataType)> {
+    let b_value = (*node.inputs.get(1)?)?;
+    let weight = graph.initializers.get(&b_value)?;
+    let dims = weight.dims();
+    if dims.len() != 2 {
+        return None;
+    }
+    let numel = (dims[0] as u64).checked_mul(dims[1] as u64)?;
+    Some((numel, weight.dtype()))
+}
+
+/// Per-node contribution to [`weight_transpose_cache_predicted_bytes`]. Mirrors
+/// exactly the kernel call sites documented there.
+fn node_weight_transpose_cache_bytes(node: &Node, graph: &Graph) -> u64 {
+    if !node.is_default_domain() {
+        return 0;
+    }
+    // All platforms: `Gemm` with `transB != 0` transposes a constant `B[N,K]`
+    // to `[K,N]` and caches it as f32 (`gemm.rs:119`).
+    if node.op_type == "Gemm" {
+        let trans_b = node
+            .attr("transB")
+            .and_then(Attribute::as_int)
+            .unwrap_or(0)
+            != 0;
+        if !trans_b {
+            return 0;
+        }
+        let Some((numel, _dtype)) = constant_b_numel(node, graph) else {
+            return 0;
+        };
+        return numel.saturating_mul(4);
+    }
+    // Apple only: `MatMul` / `FusedMatMulBias` cache a constant `B`'s transpose
+    // in the Accelerate paths (see the function docs). Compiled out elsewhere so
+    // the predictor matches the kernels actually present in this binary.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    if node.op_type == "MatMul" || node.op_type == "FusedMatMulBias" {
+        let Some((numel, dtype)) = constant_b_numel(node, graph) else {
+            return 0;
+        };
+        let elem = if dtype == DataType::Float16 { 2 } else { 4 };
+        return numel.saturating_mul(elem);
+    }
+    0
 }
 
 /// Evict all entries from the global weight-transpose caches.
@@ -299,6 +410,15 @@ impl MatMulPrepack {
         if !self.constant_inputs[1] {
             return None;
         }
+        // #1056: when the plan declines the transpose cache, hand back `None` so
+        // the caller recomputes a transient transpose per call (freed at the end
+        // of the call) rather than memoizing an `Arc` in this kernel instance —
+        // that per-instance memo would survive the session and, multiplied by
+        // the shape-keyed kernel-cache instantiations, is exactly the resident
+        // footprint the decline is meant to shed.
+        if !weight_transpose::cache_enabled() {
+            return None;
+        }
         let key = WeightTransposeKey::new(b.as_ptr(), k, n);
         // Validate before touching the memo so a mismatched call can neither
         // install a wrong-length entry nor poison a correct one.
@@ -334,6 +454,10 @@ impl MatMulPrepack {
         use onnx_runtime_ir::DataType;
         if !self.constant_inputs[1] || b_view.dtype != DataType::Float16 || !b_view.is_contiguous()
         {
+            return None;
+        }
+        // #1056: declined cache -> recompute per call, retain nothing.
+        if !weight_transpose::cache_enabled() {
             return None;
         }
         // The caller derives `k` from A and `n` from B, so operands that
