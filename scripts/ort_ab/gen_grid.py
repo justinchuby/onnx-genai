@@ -6,6 +6,8 @@ are downloaded: the graphs are single-node and the tensor contents are the
 benchmark harness's deterministic synthetic pattern (SYNTHETIC DATA).
 """
 
+from __future__ import annotations
+
 from pathlib import Path
 
 from gen_gqa import build_gqa

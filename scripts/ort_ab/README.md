@@ -23,7 +23,12 @@ better; `1.0` is parity.
 
 * **Ratios, not absolutes.** Shared CI/dev hosts drift. Same-shape absolute
   timings on the reference host moved by more than 4× between sessions, while
-  the paired ratio stayed stable. Only publish ratios.
+  the paired ratio was far more stable. Only publish ratios — and only compare
+  ratios that came out of the *same* driver invocation. The ratio is not
+  perfectly session-invariant either: the same MHA graph measured as a control
+  in one session and as a subject in another differed by ~3× in ratio, because
+  `--runs`/`--warmups` change how much of ORT's one-off packing is amortised.
+  Never build a table by pasting cells from two different runs.
 * **Interleaved arms.** `ab.py` alternates the arms trial by trial, so drift
   hits both arms roughly equally instead of being attributed to whichever arm
   ran during a noisy minute.
@@ -33,8 +38,10 @@ better; `1.0` is parity.
   first-touch page faults and lazy packing otherwise land entirely on whichever
   arm goes first.
 * **Parity is checked on every cell.** The driver records the harness's
-  `parity=PASS/FAIL`. A performance number from a cell that does not produce
-  ORT's answer is not a performance number.
+  `parity=PASS/FAIL` per trial, marks any cell containing a failure as
+  `PARITY_FAIL=n/m` in the medians summary, and prints a warning at the end.
+  A performance number from a cell that does not produce ORT's answer is not a
+  performance number.
 * **Production shapes first.** Head counts, KV-head counts, head dims, hidden
   sizes and expert geometry come from public model configs. Benchmarks are not
   chosen to flatter the kernel.
@@ -103,10 +110,16 @@ python3 scripts/ort_ab/ab.py \
   *only* by the commits under test.
 * `--arm-env name=KEY=VALUE` — per-arm environment, for A/B-ing an opt-in
   threshold or feature flag using one binary in both arms.
-* `--threads` — passed through as `--native-threads`, which sets
-  `ONNX_GENAI_CPU_DECODE_THREADS` **and** confines the process to that many
-  CPUs, so the ORT session in the same process is equally constrained. That is
-  what makes the thread-count comparison fair.
+* `--threads` — passed through as **both** `--native-threads N` and
+  `--ort-intra-threads N`, so the two runtimes get matched pool widths.
+  `--native-threads` sets `ONNX_GENAI_CPU_DECODE_THREADS` (a decode-pool width
+  budget, read once into a `OnceLock` before any session is built);
+  `--ort-intra-threads` sets the ORT session's intra-op thread count. Neither
+  sets process CPU affinity — the comparison is between equally-sized thread
+  pools on an otherwise unconstrained machine, not between processes pinned to
+  N cores. On a contended host that means both arms see the same contention,
+  which is what makes the comparison fair; it does **not** mean either runtime
+  had N cores to itself.
 
 The driver prints a per-trial line for every cell and a medians table at the
 end, and writes the full per-trial CSV at exit.

@@ -119,22 +119,31 @@ def main() -> None:
     for model, threads in keys:
         line = [f"{model:28s} t={threads:<3d}"]
         for name in arms:
-            sel = [
-                r["ratio"]
+            cell = [
+                r
                 for r in rows
                 if r["model"] == model and r["threads"] == threads and r["arm"] == name
             ]
-            nat = [
-                r["native"]
-                for r in rows
-                if r["model"] == model and r["threads"] == threads and r["arm"] == name
-            ]
-            if sel:
+            if cell:
+                sel = [r["ratio"] for r in cell]
+                nat = [r["native"] for r in cell]
+                # A timing from a cell that does not reproduce ORT's answer is
+                # not a timing. Mark it in the summary rather than letting it
+                # blend into a median that reads as a clean win.
+                bad = sum(1 for r in cell if r["parity"] != "PASS")
+                flag = f" PARITY_FAIL={bad}/{len(cell)}" if bad else ""
                 line.append(
                     f"{name}: ratio_p50={median(sel):6.3f} "
-                    f"[{min(sel):.3f}-{max(sel):.3f}] native_p50={median(nat):8.3f}ms"
+                    f"[{min(sel):.3f}-{max(sel):.3f}] native_p50={median(nat):8.3f}ms{flag}"
                 )
         print("  ".join(line))
+
+    failed = sum(1 for r in rows if r["parity"] != "PASS")
+    if failed:
+        print(
+            f"\nWARNING: {failed}/{len(rows)} trials did not match ORT numerically. "
+            "Those cells' timings are not comparable and must not be published."
+        )
 
 
 if __name__ == "__main__":

@@ -10,6 +10,8 @@ No weights are downloaded (SYNTHETIC DATA); the graphs are single-node and the
 tensor contents come from the harness's deterministic pattern.
 """
 
+from __future__ import annotations
+
 from pathlib import Path
 
 from gen_gqa import build_gqa
