@@ -1814,14 +1814,25 @@ mod tests {
             }
             let alloc = start.elapsed() / reps;
 
+            // The partition counters are printed, not asserted, because the
+            // docs cite them as the reason the pool is exonerated. A reader
+            // reproducing this should see `serial_fallback=0` and
+            // `sched_per_call >= threads`.
+            let stats = mlas_sys::mlas_threading_stats();
+            let sched_per_call = stats
+                .scheduled_iterations
+                .checked_div(stats.parallel_for_calls)
+                .unwrap_or(0);
             println!(
                 "m={m} threads={}: whole={whole:?} gemm={gemm:?} requant={requant:?} \
-                 products-alloc={alloc:?} unattributed={:?}",
-                mlas_sys::mlas_threading_stats().pool_threads,
+                 products-alloc={alloc:?} unattributed={:?} \
+                 sched_per_call={sched_per_call} serial_fallback={}",
+                stats.pool_threads,
                 whole
                     .saturating_sub(gemm)
                     .saturating_sub(requant)
                     .saturating_sub(alloc),
+                stats.serial_fallback_calls,
             );
         }
     }

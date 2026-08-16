@@ -136,20 +136,28 @@ const MEASURED_MIN_WEIGHTS: usize = 1 << 20;
 ///
 /// It is **not the threadpool**, which is what this note used to claim. #1054
 /// removed one real cause (the 8-worker cap on the standalone MLAS pool), but
-/// driving MLAS's packed GEMM directly through this crate's work-stealing pool
-/// at `K = N = 3584`, `M = 512` gives 99.9 ms at one thread, 14.3 ms at eight
-/// and 13.6 ms at sixteen — a 7.0-7.4x speedup, about what ORT achieves — and
-/// `mlas_threading_stats()` shows MLAS requesting and receiving exactly
-/// `pool_threads` partitions per call at every count. The primitive scales.
+/// driving an MLAS GEMM directly through this crate's work-stealing pool at
+/// `K = N = 3584`, `M = 512` gives 99.9 ms at one thread, 14.3 ms at eight and
+/// 13.6 ms at sixteen — a 7.0-7.4x speedup, about what ORT achieves — with
+/// `serial_fallback_calls == 0` and `scheduled_iterations >= pool_threads *
+/// parallel_for_calls`. The pool can drive an MLAS GEMM to 7x on this host, so
+/// it is not the ceiling here.
 ///
-/// What does not scale is the serial per-call work *around* the primitive:
-/// densifying activations, allocating and zeroing accumulators, requantizing,
-/// and the executor's own tensor handling. That is roughly constant in the
-/// thread count, so its share grows as the GEMM shrinks — Amdahl, not
-/// scheduling. Shrinking it is the open work; until it is done the honest
-/// answer at capability time is to let ORT run these nodes. The thread count is
-/// not visible here, so a claim would have to hold at *every* count; none of
-/// these do.
+/// Scope, because it matters: that measurement is taken on the **integer
+/// `QLinearMatMul`** path, the only kernel here with a committed phase-splitting
+/// instrument (`qlinear_phase_report`). It is a proxy. All three kernels share
+/// the pool, so "the pool is not the ceiling" transfers — but `QLinearMatMul`'s
+/// serial phases (requantize, `i32` accumulator staging) do not exist in
+/// `matmul.rs` or `matmul_nbits.rs`, so no millisecond figure transfers. Those
+/// kernels' own per-call serial work has **not** been decomposed; that is open.
+///
+/// On the proxy, non-GEMM work is ~2-4% of the call at one thread and 22-40% at
+/// eight, of which only a ~2 ms requantize-plus-alloc slice is repeatable and
+/// thread-stable; the rest is unattributed and varied 3x across identical runs
+/// on this contended host. The Amdahl *direction* is clear, the decomposition is
+/// not. Until it is, the honest answer at capability time is to let ORT run
+/// these nodes. The thread count is not visible here, so a claim would have to
+/// hold at *every* count; none of these do.
 const DECODE_PARALLEL_NOTE: &str = "measured slower than ORT's CPU kernel at every thread count \
      from 2 to 16 on x86-64 AVX2 (this EP realises about half of ORT's parallel speedup; at one \
      thread it is at parity)";

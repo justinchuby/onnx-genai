@@ -159,29 +159,52 @@ of ORT's parallel speedup.
 
 #1054 removed one cause — the standalone MLAS pool was clamped to `min(available, 8)` workers and
 never saw the EP's requested thread count, which cost 2.16x -> 1.61x at 32 vCPU. The residual
-1.4-2.4x at 2-16 threads is still open.
+1.4-2.4x (ours/ORT, lower is better) at 2-16 threads is still open.
 
-**It is not the pool, and it is not MLAS's partitioning.** Driving MLAS's packed integer GEMM
-directly through this crate's work-stealing pool, `K = N = 3584`, `M = 512`, warmed, on the same
-host:
+**It is not the pool.** Driving an MLAS GEMM directly through this crate's work-stealing pool,
+`K = N = 3584`, `M = 512`, warmed, on the same host:
 
 | pool threads | 1 | 2 | 4 | 8 | 16 | 32 |
 |---|---:|---:|---:|---:|---:|---:|
 | MLAS GEMM only | 99.9 ms | 60.3 ms | 26.9 ms | 14.3 ms | 13.6 ms | 11.0 ms |
 | speedup vs 1 thread | 1.0x | 1.7x | 3.7x | **7.0x** | **7.4x** | 9.1x |
 
-MLAS requests exactly `pool_threads` partitions per call and every one of them is dispatched
-(`mlas_threading_stats().scheduled_iterations / parallel_for_calls` is exactly the pool width at
-every count above), so the primitive itself scales about as well as ORT does. What does not scale is
-the **per-call work around** the primitive — densifying the activation, allocating and zeroing the
-`i32` accumulator buffer, requantizing, and the executor's own tensor handling. At `M = 512` that is
-about 2 ms at one thread against a 100 ms GEMM (2%), and the same 2 ms against a 14 ms GEMM at eight
-(14%). Amdahl, not the threadpool.
+MLAS requests at least `pool_threads` partitions per call and they are dispatched. The instrument
+below prints them: on this host `sched_per_call` comes out at exactly the pool width (8 at
+`--threads 8`) with `serial_fallback=0`. The *committed assertion* in `mlas-sys` is only the
+inequality `scheduled_iterations >= pool_threads`, so the inequality is what is proven and the
+equality is what is observed. Either way the primitive and the pool together scale about as well as
+ORT does. The pool is therefore **not** where the 1.4-2.4x goes. What is left is the per-call work
+*around* the primitive, which does not shrink with threads.
 
-`qlinear_phase_report` (`#[ignore]`d, in `kernels/qlinear_matmul.rs`) reproduces the split. Note this
-host is shared and heavily contended: the GEMM and requantize columns are repeatable, the
-"unattributed" remainder varies by 3x run to run, so it is reported as a bound rather than a
-breakdown.
+**Read the scope of that evidence carefully.** The numbers above are measured on the **integer
+`QLinearMatMul`** path (`qgemm_i32_packed`), which is the only kernel here with a committed
+phase-splitting instrument. That is a *proxy*, and it licenses exactly one transferable conclusion:
+this crate's work-stealing pool can drive an MLAS GEMM to 7x on this host, so the pool is not the
+ceiling for f32 or int4 either — all three go through the same pool. It does **not** license the
+specific phase names or milliseconds for f32/int4. `QLinearMatMul`'s serial phases (requantize, the
+`i32` accumulator staging) **do not exist** in `matmul.rs` or `matmul_nbits.rs`; those kernels have
+their own, different per-call work (dequant staging, activation densification, executor tensor
+handling) which has **not** been decomposed. Doing that decomposition is open work.
+
+What the instrument actually shows, on `QLinearMatMul`, `K = N = 3584`, `M = 512`:
+
+| phase | 1 thread | 8 threads |
+|---|---:|---:|
+| MLAS GEMM | ~100 ms | 14.5-15.7 ms |
+| requantize + accumulator alloc | 1.7-2.5 ms | ~1.5 ms |
+| unattributed (densify, executor, measurement) | 0-2 ms | 2.5-8.5 ms |
+| **non-GEMM share of the call** | **~2-4%** | **~22-40%** |
+
+Only the requantize + alloc slice is repeatable and genuinely thread-stable at ~2 ms. The
+unattributed remainder is **not** constant in the thread count — it is larger at 8 threads than at
+1, and it varied 2.5 / 4.3 / 8.5 ms across three consecutive runs of an identical configuration on
+this shared, heavily contended host. So the honest statement is a bound: **non-GEMM work is 22-40%
+of the call at 8 threads and ~2-4% at 1**, it is dominated by a term we have not attributed, and the
+Amdahl direction is clear even though the decomposition is not.
+
+`qlinear_phase_report` (`#[ignore]`d and `#[cfg(feature = "mlas")]`, in `kernels/qlinear_matmul.rs`)
+reproduces the split.
 
 Because the thread count is **not visible at capability time**, a claim would have to hold at every
 count, and none of these do.
