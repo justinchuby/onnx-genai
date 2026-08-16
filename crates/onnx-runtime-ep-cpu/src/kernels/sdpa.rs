@@ -471,6 +471,152 @@ pub fn sdpa_decode_row_accessor<'a>(
     }
 }
 
+/// Run **every query head that shares one KV head** against that head's KV
+/// window `[lo, hi)` in a single streaming pass — the GQA/MQA decode analogue of
+/// [`sdpa_decode_row`].
+///
+/// # Why this exists
+///
+/// `sdpa_decode_row` scores one query row against the whole KV window. Calling
+/// it once per query head means the *same* K and V bytes are streamed
+/// `group = num_heads / kv_num_heads` times per decode step. At M=1 decode the
+/// window is a GEMV — arithmetic intensity is ~2 flops per loaded float — so
+/// that repeat traffic is the cost: a 7-way group (Qwen2.5-0.5B: 14 query heads
+/// over 2 KV heads) reads the KV cache seven times per layer per token.
+///
+/// This routine keeps `k_row(ks)` / `v_row(ks)` in registers/L1 for the whole
+/// group, so the KV cache is streamed **once** per group instead of once per
+/// query head. Arithmetic is unchanged; only the loop nesting is inverted.
+///
+/// # Bit-identity contract
+///
+/// For query head `g` the operations are, in order, exactly those
+/// [`sdpa_decode_row`] performs for that head:
+///
+/// * the score for key `ks` is `dot_f32(q_g, k_row(ks)) * scale` with the same
+///   optional softcap, evaluated with the same [`dot_f32`] accumulation order;
+/// * the max / `exp` / sum / normalize sequence runs over that head's own score
+///   slice, in ascending `ks` order;
+/// * the value reduction accumulates `axpy_f32(out_g, p, v_row(ks))` in
+///   ascending `ks` order, skipping `p == 0.0` exactly as the row path does.
+///
+/// Nothing is summed across heads, so inverting the loop nesting cannot change
+/// any rounding. The output is **bit-for-bit identical** to `group` successive
+/// [`sdpa_decode_row`] calls; `group_decode_matches_row_decode_bitwise` pins it.
+///
+/// # Layout
+///
+/// `q` holds the group's query rows back to back (`group * head_size` floats,
+/// query head `g` at `g * head_size`) and `out` the group's output rows
+/// (`group * v_head_size` floats). That is exactly the `BHSD` layout of a
+/// `q_seq == 1` decode step, so the caller passes sub-slices with no copy.
+///
+/// `scores` is caller-owned scratch, resized to `group * (hi - lo)`; passing the
+/// same buffer across calls keeps the per-call allocation out of the hot loop.
+///
+/// # Blocking
+///
+/// Both passes walk the KV window in tiles of [`group_kv_tile`] keys. Within a
+/// tile the group loop is *outside* the key loop, so each query head writes (and
+/// later reads) a contiguous run of scores rather than striding by `window`, and
+/// the tile's K/V rows stay L1-resident across the whole group. Tiling only
+/// reorders work between independent query heads, so the bit-identity contract
+/// above is unaffected.
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_decode_group(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    kv_seq: usize,
+    group: usize,
+    head_size: usize,
+    v_head_size: usize,
+    lo: usize,
+    hi: usize,
+    scale: f32,
+    softcap: Option<f32>,
+    exp: SoftmaxExp,
+    out: &mut [f32],
+    scores: &mut Vec<f32>,
+) {
+    debug_assert!(group >= 1);
+    debug_assert!(lo <= hi && hi <= kv_seq);
+    debug_assert_eq!(q.len(), group * head_size);
+    debug_assert_eq!(out.len(), group * v_head_size);
+    debug_assert_eq!(k.len(), kv_seq * head_size);
+    debug_assert_eq!(v.len(), kv_seq * v_head_size);
+
+    let window = hi - lo;
+    scores.clear();
+    scores.resize(group * window, 0.0);
+
+    // QK^T: stream each key tile once, score it against all `group` query rows
+    // while the tile is still in L1.
+    let k_tile = group_kv_tile(head_size);
+    for tile in (0..window).step_by(k_tile) {
+        let tile_end = (tile + k_tile).min(window);
+        for g in 0..group {
+            let q_row = &q[g * head_size..(g + 1) * head_size];
+            let dst = &mut scores[g * window + tile..g * window + tile_end];
+            for (slot, ks) in (lo + tile..lo + tile_end).enumerate() {
+                let k_base = ks * head_size;
+                let mut score = dot_f32(q_row, &k[k_base..k_base + head_size]);
+                score *= scale;
+                if let Some(softcap) = softcap {
+                    score = softcap * (score / softcap).tanh();
+                }
+                dst[slot] = score;
+            }
+        }
+    }
+
+    // Softmax per query head, over that head's own contiguous score slice.
+    for g in 0..group {
+        let row = &mut scores[g * window..(g + 1) * window];
+        let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0f32;
+        for score in row.iter_mut() {
+            *score = exp.exp(*score - max);
+            sum += *score;
+        }
+        if sum > 0.0 {
+            for score in row.iter_mut() {
+                *score /= sum;
+            }
+        }
+    }
+
+    // P·V: stream each value tile once, accumulating into all `group` outputs
+    // while the tile is still in L1.
+    out.fill(0.0);
+    let v_tile = group_kv_tile(v_head_size);
+    for tile in (0..window).step_by(v_tile) {
+        let tile_end = (tile + v_tile).min(window);
+        for g in 0..group {
+            let probabilities = &scores[g * window + tile..g * window + tile_end];
+            let output = &mut out[g * v_head_size..(g + 1) * v_head_size];
+            for (slot, ks) in (lo + tile..lo + tile_end).enumerate() {
+                let probability = probabilities[slot];
+                if probability == 0.0 {
+                    continue;
+                }
+                let v_base = ks * v_head_size;
+                axpy_f32(output, probability, &v[v_base..v_base + v_head_size]);
+            }
+        }
+    }
+}
+
+/// Keys per KV tile in [`sdpa_decode_group`], sized so one tile of K (or V) rows
+/// is about 16 KiB and therefore stays in L1D while the whole query group reads
+/// it. Head sizes are small and few in practice (64/80/96/128/256), so this is
+/// a cheap division rather than a tuned table.
+#[inline]
+fn group_kv_tile(head_size: usize) -> usize {
+    const TILE_BYTES: usize = 16 * 1024;
+    (TILE_BYTES / (head_size.max(1) * size_of::<f32>())).max(1)
+}
+
 /// One chunk's contribution to a flash-decoding (split-KV) softmax reduction.
 ///
 /// `max` is the running maximum score over the chunk's KV sub-window and `sum`
@@ -1332,6 +1478,145 @@ fn sdpa_f32_accelerate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `sdpa_decode_group` must be a pure loop-nesting inversion of
+    /// `sdpa_decode_row`: same operations, same order, per query head. Anything
+    /// less would silently change decode logits, so this asserts on raw bits
+    /// (not a tolerance) across a group of 7 heads with softcap, a non-trivial
+    /// window, and `head_size != v_head_size`.
+    #[test]
+    fn group_decode_matches_row_decode_bitwise() {
+        for &(group, kv_seq, dh, dv, lo, hi) in &[
+            (7usize, 37usize, 64usize, 64usize, 0usize, 30usize),
+            (2, 23, 133, 17, 5, 21),
+            (4, 64, 128, 128, 0, 64),
+            (8, 9, 48, 48, 3, 9),
+            // Degenerate: empty window and a single-element window.
+            (3, 11, 32, 32, 4, 4),
+            (3, 11, 32, 32, 4, 5),
+            // Windows longer than one KV tile (`group_kv_tile`), including a
+            // ragged final tile and asymmetric K/V head sizes (so the QK and
+            // P·V passes tile at different widths).
+            (5, 600, 64, 64, 0, 600),
+            (2, 700, 32, 128, 13, 691),
+        ] {
+            let scale = 1.0 / (dh as f32).sqrt();
+            for softcap in [None, Some(7.5f32)] {
+                let q: Vec<f32> = (0..group * dh)
+                    .map(|i| ((i * 17 % 101) as f32 - 50.0) / 37.0)
+                    .collect();
+                let k: Vec<f32> = (0..kv_seq * dh)
+                    .map(|i| ((i * 29 % 211) as f32 - 105.0) / 61.0)
+                    .collect();
+                let v: Vec<f32> = (0..kv_seq * dv)
+                    .map(|i| ((i * 43 % 157) as f32 - 78.0) / 53.0)
+                    .collect();
+
+                let mut expected = vec![f32::NAN; group * dv];
+                for g in 0..group {
+                    sdpa_decode_row(
+                        &q[g * dh..(g + 1) * dh],
+                        &k,
+                        &v,
+                        kv_seq,
+                        lo,
+                        hi,
+                        scale,
+                        softcap,
+                        SoftmaxExp::F64Intermediate,
+                        &mut expected[g * dv..(g + 1) * dv],
+                    );
+                }
+
+                let mut actual = vec![f32::NAN; group * dv];
+                let mut scores = Vec::new();
+                sdpa_decode_group(
+                    &q,
+                    &k,
+                    &v,
+                    kv_seq,
+                    group,
+                    dh,
+                    dv,
+                    lo,
+                    hi,
+                    scale,
+                    softcap,
+                    SoftmaxExp::F64Intermediate,
+                    &mut actual,
+                    &mut scores,
+                );
+
+                assert_eq!(
+                    actual.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    expected.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    "group={group} kv_seq={kv_seq} dh={dh} dv={dv} window={lo}..{hi} softcap={softcap:?}"
+                );
+            }
+        }
+    }
+
+    /// The caller-owned `scores` scratch is reused across calls with different
+    /// window lengths and group widths; a stale tail must never leak into a
+    /// later result.
+    #[test]
+    fn group_decode_reuses_scratch_without_leaking_state() {
+        let (kv_seq, dh, dv) = (48usize, 32usize, 32usize);
+        let scale = 1.0 / (dh as f32).sqrt();
+        let k: Vec<f32> = (0..kv_seq * dh)
+            .map(|i| ((i * 29 % 211) as f32 - 105.0) / 61.0)
+            .collect();
+        let v: Vec<f32> = (0..kv_seq * dv)
+            .map(|i| ((i * 43 % 157) as f32 - 78.0) / 53.0)
+            .collect();
+        let mut scores = Vec::new();
+        // A long, wide call first so the scratch is oversized for the next one.
+        for &(group, lo, hi) in &[(8usize, 0usize, 48usize), (2, 10, 20), (4, 0, 7)] {
+            let q: Vec<f32> = (0..group * dh)
+                .map(|i| ((i * 17 % 101) as f32 - 50.0) / 37.0)
+                .collect();
+            let mut fresh_scratch = Vec::new();
+            let mut reused = vec![f32::NAN; group * dv];
+            let mut fresh = vec![f32::NAN; group * dv];
+            sdpa_decode_group(
+                &q,
+                &k,
+                &v,
+                kv_seq,
+                group,
+                dh,
+                dv,
+                lo,
+                hi,
+                scale,
+                None,
+                SoftmaxExp::F64Intermediate,
+                &mut reused,
+                &mut scores,
+            );
+            sdpa_decode_group(
+                &q,
+                &k,
+                &v,
+                kv_seq,
+                group,
+                dh,
+                dv,
+                lo,
+                hi,
+                scale,
+                None,
+                SoftmaxExp::F64Intermediate,
+                &mut fresh,
+                &mut fresh_scratch,
+            );
+            assert_eq!(
+                reused.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                fresh.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                "group={group} window={lo}..{hi}"
+            );
+        }
+    }
 
     #[test]
     fn decode_row_f64_intermediate_is_bit_exact_with_gqa_reference() {
