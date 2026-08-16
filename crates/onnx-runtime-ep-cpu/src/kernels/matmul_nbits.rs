@@ -7830,7 +7830,9 @@ mod tests {
     use crate::CpuExecutionProvider;
     use crate::kernels::testutil::Owned;
     use onnx_runtime_ep_api::ExecutionProvider;
-    use onnx_runtime_ir::{Attribute, Graph, NodeId, TensorData, WeightRef, static_shape};
+    use onnx_runtime_ir::{Attribute, Graph, NodeId, static_shape};
+    #[cfg(feature = "mlas")]
+    use onnx_runtime_ir::{TensorData, WeightRef};
     use onnx_runtime_loader::{Model, encode_model_proto};
 
     fn model_node(
