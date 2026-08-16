@@ -36,10 +36,11 @@
 //!   does round to `1.0f32`, but `tanh(9) = 1 - 3.046e-8` rounds to
 //!   `0.99999994` (`0x3F7FFFFF`) because `3.046e-8` exceeds the `2.98e-8`
 //!   half-ulp threshold below `1.0`. `tanh` only rounds to `1.0f32` from
-//!   `|x| >= 9.010913`, so the substituted `±1` is one ulp high on
-//!   `9 < |x| < 9.010913`. MLAS and ORT return `1.0` there too, the scaled
-//!   error is `6.6e-9`, and the alternative in that range is the rational's
-//!   own out-of-range overshoot, so this is accepted rather than special-cased.
+//!   `|x| >= 9.010914` (the first f32 whose `tanh` does), so the substituted
+//!   `±1` is one ulp high on `9 < |x| < 9.010914`. MLAS and ORT return `1.0`
+//!   there too, the scaled error is `6.62e-9` against the module's asserted
+//!   `4e-7` bound, and the alternative in that range is the rational's own
+//!   out-of-range overshoot, so this is accepted rather than special-cased.
 //! * `NaN` propagates unchanged. Both the clamp (`maxps`/`minps` with the
 //!   value as the *second* operand, matching MLAS) and the saturation selects
 //!   (ordered compares, which are false for `NaN`) preserve it. Measured
