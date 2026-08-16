@@ -130,6 +130,105 @@ impl Bnsh {
     }
 }
 
+/// Elements below which the layout transforms stay on one thread: the copies
+/// are pure memory traffic, so the crossover is where a worker's share covers
+/// more than a few pages. Decode steps (`seq == 1`) never reach it.
+const MIN_PARALLEL_TRANSPOSE_ELEMENTS: usize = 64 * 1024;
+
+/// `(batch, seq, heads·dim)` → `(batch, heads, seq, dim)`, optionally adding a
+/// per-hidden `bias` broadcast over batch and sequence.
+///
+/// The innermost `dim` run is contiguous in **both** layouts, so each `(b, s,
+/// h)` triple is one `copy_from_slice` rather than `dim` strided element moves.
+/// Destination `(b, h)` planes are disjoint, so the outer loop fans out across
+/// the shared Rayon pool once the buffer is large enough to pay for it — ORT
+/// parallelizes the same transform inside `MaybeTransposeToBNSHAndAddBias`.
+fn transpose_bsnh_to_bnsh(
+    src: &[f32],
+    dst: &mut [f32],
+    batch: usize,
+    seq: usize,
+    heads: usize,
+    dim: usize,
+    bias: Option<&[f32]>,
+) {
+    debug_assert_eq!(src.len(), batch * seq * heads * dim);
+    debug_assert_eq!(dst.len(), batch * heads * seq * dim);
+    let plane = seq * dim;
+    if plane == 0 || batch == 0 || heads == 0 {
+        return;
+    }
+
+    let fill = |bh: usize, plane_out: &mut [f32]| {
+        let b = bh / heads;
+        let h = bh % heads;
+        for s in 0..seq {
+            let src_i = ((b * seq + s) * heads + h) * dim;
+            let out = &mut plane_out[s * dim..s * dim + dim];
+            out.copy_from_slice(&src[src_i..src_i + dim]);
+            if let Some(bias) = bias {
+                let bias = &bias[h * dim..h * dim + dim];
+                for (v, add) in out.iter_mut().zip(bias) {
+                    *v += *add;
+                }
+            }
+        }
+    };
+
+    if dst.len() >= MIN_PARALLEL_TRANSPOSE_ELEMENTS {
+        use rayon::prelude::*;
+        dst.par_chunks_mut(plane).enumerate().for_each(|(bh, out)| {
+            fill(bh, out);
+        });
+    } else {
+        for (bh, out) in dst.chunks_mut(plane).enumerate() {
+            fill(bh, out);
+        }
+    }
+}
+
+/// `(batch, heads, seq, dim)` → `(batch, seq, heads·dim)`, the inverse of
+/// [`transpose_bsnh_to_bnsh`], used to return the attention context in the
+/// operator's `BSH` output layout. Rows of the destination are disjoint per
+/// `(b, s)`, and the `dim` run is again contiguous on both sides.
+fn transpose_bnsh_to_bsnh(
+    src: &[f32],
+    dst: &mut [f32],
+    batch: usize,
+    seq: usize,
+    heads: usize,
+    dim: usize,
+) {
+    debug_assert_eq!(src.len(), batch * heads * seq * dim);
+    debug_assert_eq!(dst.len(), batch * seq * heads * dim);
+    let hidden = heads * dim;
+    if hidden == 0 || batch == 0 || seq == 0 {
+        return;
+    }
+
+    let fill = |bs: usize, row: &mut [f32]| {
+        let b = bs / seq;
+        let s = bs % seq;
+        for h in 0..heads {
+            let src_i = ((b * heads + h) * seq + s) * dim;
+            row[h * dim..h * dim + dim].copy_from_slice(&src[src_i..src_i + dim]);
+        }
+    };
+
+    if dst.len() >= MIN_PARALLEL_TRANSPOSE_ELEMENTS {
+        use rayon::prelude::*;
+        dst.par_chunks_mut(hidden)
+            .enumerate()
+            .for_each(|(bs, row)| {
+                fill(bs, row);
+            });
+    } else {
+        for (bs, row) in dst.chunks_mut(hidden).enumerate() {
+            fill(bs, row);
+        }
+    }
+}
+
 /// Materialize a Q/K/V input into a dense `[batch, heads, seq, dim]` f32 buffer.
 ///
 /// * A rank-4 input `(batch, heads, seq, dim)` is read as-is (already
@@ -193,21 +292,7 @@ fn load_bnsh(
             let dim = hidden / num_heads;
             let src = to_dense_f32_widen("MultiHeadAttention", view)?;
             let mut data = vec![0.0f32; batch * num_heads * seq * dim];
-            for b in 0..batch {
-                for s in 0..seq {
-                    for h in 0..num_heads {
-                        for d in 0..dim {
-                            let src_i = ((b * seq + s) * num_heads + h) * dim + d;
-                            let dst_i = ((b * num_heads + h) * seq + s) * dim + d;
-                            let mut v = src[src_i];
-                            if let Some(bias) = bias {
-                                v += bias[h * dim + d];
-                            }
-                            data[dst_i] = v;
-                        }
-                    }
-                }
-            }
+            transpose_bsnh_to_bnsh(&src, &mut data, batch, seq, num_heads, dim, bias);
             Ok(Bnsh {
                 data,
                 batch,
@@ -360,6 +445,11 @@ impl KeyMask for MhaKeyMask<'_> {
     fn at(&self, b: usize, i: usize, j: usize) -> f32 {
         self.mask
             .bias(b, i, j, self.q_seq, self.total_seq, self.filter)
+    }
+
+    #[inline]
+    fn is_identity(&self) -> bool {
+        matches!(self.mask, PadMask::None)
     }
 }
 
@@ -610,17 +700,7 @@ impl Kernel for MultiHeadAttentionKernel {
         });
         sdpa_f32(&tensors, &cfg, bias_hook, &mask_hook, &mut y, qk_cap);
         let mut y3 = vec![0.0f32; batch * q_seq * v_hidden];
-        for b in 0..batch {
-            for n in 0..num_heads {
-                for s in 0..q_seq {
-                    for c in 0..v_head_size {
-                        let src = ((b * num_heads + n) * q_seq + s) * v_head_size + c;
-                        let dst = (b * q_seq + s) * v_hidden + n * v_head_size + c;
-                        y3[dst] = y[src];
-                    }
-                }
-            }
-        }
+        transpose_bnsh_to_bsnh(&y, &mut y3, batch, q_seq, num_heads, v_head_size);
         write_dense_f32_narrow("MultiHeadAttention", &mut outputs[0], &y3)?;
 
         // present_key / present_value (outputs 1, 2), always 4D `(B, N, T, H)`.
@@ -721,5 +801,111 @@ mod tests {
         for (a, b) in got.iter().zip(expected.iter()) {
             assert!((a - b).abs() < 1e-6, "got {got:?}, expected {expected:?}");
         }
+    }
+    /// Deterministic pseudo-random values spanning several magnitudes, so a
+    /// transposition bug cannot hide behind a smooth ramp.
+    fn mixed_scale_value(index: usize, seed: u64) -> f32 {
+        let mut x = (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ seed;
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+        x ^= x >> 29;
+        let unit = ((x >> 11) as f64) / ((1u64 << 53) as f64);
+        let scale = 10f64.powi(((x & 0x7) as i32) - 3);
+        ((unit - 0.5) * 2.0 * scale) as f32
+    }
+
+    /// Reference `(batch, seq, heads*dim) -> (batch, heads, seq, dim)` written
+    /// the obvious element-at-a-time way, so the blocked/parallel production
+    /// routine is checked against the semantics it replaced.
+    fn reference_bsnh_to_bnsh(
+        src: &[f32],
+        batch: usize,
+        seq: usize,
+        heads: usize,
+        dim: usize,
+        bias: Option<&[f32]>,
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; batch * heads * seq * dim];
+        for b in 0..batch {
+            for s in 0..seq {
+                for h in 0..heads {
+                    for d in 0..dim {
+                        let src_i = ((b * seq + s) * heads + h) * dim + d;
+                        let dst_i = ((b * heads + h) * seq + s) * dim + d;
+                        let mut v = src[src_i];
+                        if let Some(bias) = bias {
+                            v += bias[h * dim + d];
+                        }
+                        out[dst_i] = v;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn qkv_transpose_is_bit_identical_on_both_sides_of_the_parallel_threshold() {
+        // Deliberately straddles MIN_PARALLEL_TRANSPOSE_ELEMENTS so the serial
+        // and Rayon arms are both exercised, including a decode-shaped case and
+        // a ragged head_size that is not a multiple of any vector width.
+        let cases = [
+            (1usize, 1usize, 4usize, 8usize),
+            (2, 3, 5, 7),
+            (1, 128, 12, 64),
+            (8, 128, 12, 64),
+        ];
+        for (ci, &(batch, seq, heads, dim)) in cases.iter().enumerate() {
+            let n = batch * seq * heads * dim;
+            let src: Vec<f32> = (0..n)
+                .map(|i| mixed_scale_value(i, 0x00C3_0000 + ci as u64))
+                .collect();
+            let bias: Vec<f32> = (0..heads * dim)
+                .map(|i| mixed_scale_value(i, 0x00C3_9000 + ci as u64))
+                .collect();
+            for use_bias in [false, true] {
+                let bias_ref = use_bias.then_some(bias.as_slice());
+                let expected = reference_bsnh_to_bnsh(&src, batch, seq, heads, dim, bias_ref);
+                let parallel = n >= MIN_PARALLEL_TRANSPOSE_ELEMENTS;
+                assert_eq!(
+                    parallel,
+                    ci >= 2,
+                    "case {ci} ({n} elements) landed on the wrong side of the parallel gate"
+                );
+                let mut got = vec![f32::NAN; batch * heads * seq * dim];
+                transpose_bsnh_to_bnsh(&src, &mut got, batch, seq, heads, dim, bias_ref);
+                assert_eq!(got, expected, "case {ci} use_bias={use_bias}");
+            }
+        }
+    }
+
+    #[test]
+    fn context_transpose_inverts_the_qkv_transpose() {
+        let cases = [
+            (1usize, 1usize, 4usize, 8usize),
+            (3, 9, 5, 7),
+            (8, 128, 12, 64),
+        ];
+        for (ci, &(batch, seq, heads, dim)) in cases.iter().enumerate() {
+            let n = batch * seq * heads * dim;
+            let bsnh: Vec<f32> = (0..n)
+                .map(|i| mixed_scale_value(i, 0x00D4_0000 + ci as u64))
+                .collect();
+            let mut bnsh = vec![f32::NAN; n];
+            transpose_bsnh_to_bnsh(&bsnh, &mut bnsh, batch, seq, heads, dim, None);
+            let mut back = vec![f32::NAN; n];
+            transpose_bnsh_to_bsnh(&bnsh, &mut back, batch, seq, heads, dim);
+            assert_eq!(back, bsnh, "case {ci} round trip");
+        }
+    }
+
+    #[test]
+    fn transposes_tolerate_empty_extents() {
+        let mut dst: Vec<f32> = Vec::new();
+        transpose_bsnh_to_bnsh(&[], &mut dst, 0, 4, 2, 8, None);
+        transpose_bsnh_to_bnsh(&[], &mut dst, 2, 0, 2, 8, None);
+        transpose_bnsh_to_bsnh(&[], &mut dst, 2, 4, 0, 8);
+        transpose_bnsh_to_bsnh(&[], &mut dst, 2, 0, 4, 8);
+        assert!(dst.is_empty());
     }
 }

@@ -164,6 +164,12 @@ pub struct SdpaConfig {
 /// every adapter hook here holds only shared `&[f32]`/scalars, so it is `Sync`.
 pub trait AttnBias: Sync {
     fn at(&self, b: usize, head: usize, i: usize, j: usize) -> f32;
+
+    /// `true` when [`AttnBias::at`] returns `0.0` for every index, letting the
+    /// fast paths drop the per-element virtual call entirely.
+    fn is_identity(&self) -> bool {
+        false
+    }
 }
 
 /// Per-`(batch, query, key)` additive key mask (head-independent, as in ORT's
@@ -171,6 +177,12 @@ pub trait AttnBias: Sync {
 /// mask it.
 pub trait KeyMask: Sync {
     fn at(&self, b: usize, i: usize, j: usize) -> f32;
+
+    /// `true` when [`KeyMask::at`] returns `0.0` for every index, letting the
+    /// fast paths drop the per-element virtual call entirely.
+    fn is_identity(&self) -> bool {
+        false
+    }
 }
 
 /// No-op attention bias (contributes `0.0` everywhere).
@@ -180,6 +192,11 @@ impl AttnBias for NoBias {
     fn at(&self, _b: usize, _head: usize, _i: usize, _j: usize) -> f32 {
         0.0
     }
+
+    #[inline]
+    fn is_identity(&self) -> bool {
+        true
+    }
 }
 
 /// No-op key mask (keeps every key).
@@ -188,6 +205,11 @@ impl KeyMask for NoMask {
     #[inline]
     fn at(&self, _b: usize, _i: usize, _j: usize) -> f32 {
         0.0
+    }
+
+    #[inline]
+    fn is_identity(&self) -> bool {
+        true
     }
 }
 
@@ -1254,11 +1276,20 @@ fn sdpa_f32_fast(
         ScaleMode::SplitSqrt(s) => s,
     };
 
+    // With no softcap and provably-identity hooks the per-element epilogue is
+    // pure overhead: two dynamic dispatches and a branch per logit, which at
+    // encoder shapes costs more than either GEMM.
+    let plain_epilogue = cfg.softcap.is_none() && bias.is_identity() && mask.is_identity();
+
     // One tile per `(b, head)`, contiguous in `y` as `[b, head, q_seq, Dv]`.
     let tile_v = q_seq * v_head_size;
+    let tile_logits = q_seq * kv_seq;
     y.par_chunks_mut(tile_v)
         .enumerate()
-        .for_each(|(bh, y_tile)| {
+        // The logits scratch is reused across every tile a worker handles: at
+        // BERT-base that is a 64 KiB allocation per `(batch, head)` pair, and
+        // glibc mmaps (and so re-faults) buffers of that size.
+        .for_each_init(Vec::<f32>::new, |logits, (bh, y_tile)| {
             let b = bh / num_heads;
             let n = bh % num_heads;
             let kv_n = n / heads_per_kv;
@@ -1271,43 +1302,57 @@ fn sdpa_f32_fast(
             let v_tile = &v[v_off..v_off + kv_seq * v_head_size];
 
             // logits[q_seq, kv_seq] = alpha · Q · Kᵀ.
-            let mut logits = vec![0.0f32; q_seq * kv_seq];
+            logits.clear();
+            logits.resize(tile_logits, 0.0);
+            let logits: &mut [f32] = logits.as_mut_slice();
             mlas_sys::sgemm(
-                false,
-                true,
-                q_seq,
-                kv_seq,
-                head_size,
-                alpha,
-                q_tile,
-                head_size,
-                k_tile,
-                head_size,
-                0.0,
-                &mut logits,
-                kv_seq,
+                false, true, q_seq, kv_seq, head_size, alpha, q_tile, head_size, k_tile, head_size,
+                0.0, logits, kv_seq,
             );
 
             // Per-row epilogue: softcap → bias → mask → causal → softmax, on
             // plain slices, in the scalar reference's exact add order.
-            for i in 0..q_seq {
-                let row = &mut logits[i * kv_seq..i * kv_seq + kv_seq];
-                for (j, s) in row.iter_mut().enumerate() {
-                    let mut val = *s;
-                    if let Some(softcap) = cfg.softcap {
-                        val = softcap * (val / softcap).tanh();
+            //
+            // When there is no softcap and both hooks are provably identities
+            // the whole element loop collapses to an optional causal tail fill,
+            // which matters: at BERT-base encoder shapes the two `&dyn` calls
+            // per logit cost more than either GEMM.
+            if plain_epilogue {
+                if cfg.causal {
+                    for i in 0..q_seq {
+                        let keep = (cfg.past_seq + i + 1).min(kv_seq);
+                        logits[i * kv_seq + keep..(i + 1) * kv_seq].fill(cfg.causal_fill);
                     }
-                    val += bias.at(b, n, i, j);
-                    val += mask.at(b, i, j);
-                    if cfg.causal && (j as i64) > cfg.past_seq as i64 + i as i64 {
-                        val = cfg.causal_fill;
-                    }
-                    *s = val;
                 }
+            } else {
+                for i in 0..q_seq {
+                    let row = &mut logits[i * kv_seq..i * kv_seq + kv_seq];
+                    for (j, s) in row.iter_mut().enumerate() {
+                        let mut val = *s;
+                        if let Some(softcap) = cfg.softcap {
+                            val = softcap * (val / softcap).tanh();
+                        }
+                        val += bias.at(b, n, i, j);
+                        val += mask.at(b, i, j);
+                        if cfg.causal && (j as i64) > cfg.past_seq as i64 + i as i64 {
+                            val = cfg.causal_fill;
+                        }
+                        *s = val;
+                    }
+                }
+            }
 
-                // Numerically-stable softmax with the fully-masked-row → zero
-                // guard (matching the scalar reference and ORT).
-                softmax_in_place(row, SoftmaxExp::F32);
+            // Numerically-stable softmax with the fully-masked-row → zero guard
+            // (matching the scalar reference and ORT). MLAS normalizes all
+            // `q_seq` rows with a vectorized exp — the same primitive ORT's own
+            // attention kernels use — but it has no `-inf` row convention, so a
+            // block that contains any `-inf` falls back to the scalar loop.
+            if logits.contains(&f32::NEG_INFINITY) {
+                for i in 0..q_seq {
+                    softmax_in_place(&mut logits[i * kv_seq..(i + 1) * kv_seq], SoftmaxExp::F32);
+                }
+            } else {
+                mlas_sys::compute_softmax_in_place(logits, q_seq, kv_seq);
             }
 
             // context[q_seq, Dv] = probs · V.
@@ -1318,7 +1363,7 @@ fn sdpa_f32_fast(
                 v_head_size,
                 kv_seq,
                 1.0,
-                &logits,
+                logits,
                 kv_seq,
                 v_tile,
                 v_head_size,
@@ -3029,5 +3074,131 @@ mod tests {
         run("prefill", 1, 32, 32, 512, 512, 128);
         run("decode", 1, 32, 32, 1, 513, 128);
         run("gqa-prefill", 1, 32, 8, 512, 512, 128);
+    }
+
+    /// A hook that contributes nothing but refuses to advertise itself as an
+    /// identity, forcing the fast path's general per-element epilogue. The
+    /// specialized branch must agree with it bit for bit.
+    struct OpaqueZeroBias;
+    impl AttnBias for OpaqueZeroBias {
+        fn at(&self, _b: usize, _head: usize, _i: usize, _j: usize) -> f32 {
+            0.0
+        }
+    }
+    struct OpaqueZeroMask;
+    impl KeyMask for OpaqueZeroMask {
+        fn at(&self, _b: usize, _i: usize, _j: usize) -> f32 {
+            0.0
+        }
+    }
+
+    #[test]
+    fn identity_hook_specialization_matches_the_general_epilogue() {
+        // (batch, heads, kv_heads, q_seq, kv_seq, head_size, v_head_size)
+        let shapes = [
+            (2usize, 8usize, 8usize, 5usize, 37usize, 64usize, 64usize),
+            (1, 12, 4, 128, 128, 64, 64),
+            (3, 6, 3, 7, 71, 33, 17),
+            (1, 4, 1, 1, 129, 80, 80),
+        ];
+        for (si, &(batch, heads, kv_heads, q_seq, kv_seq, dh, dv)) in shapes.iter().enumerate() {
+            let q = deterministic_values(batch * heads * q_seq * dh, 0x00A1_0000 + si as u64, 0.8);
+            let k =
+                deterministic_values(batch * kv_heads * kv_seq * dh, 0x00A1_1000 + si as u64, 0.8);
+            let v =
+                deterministic_values(batch * kv_heads * kv_seq * dv, 0x00A1_2000 + si as u64, 0.8);
+            let tensors = SdpaTensors {
+                q: &q,
+                k: &k,
+                v: &v,
+                batch,
+                num_heads: heads,
+                num_kv_heads: kv_heads,
+                q_seq,
+                kv_seq,
+                head_size: dh,
+                v_head_size: dv,
+            };
+            for causal in [false, true] {
+                let cfg = SdpaConfig {
+                    scale: ScaleMode::PostDot(1.0 / (dh as f32).sqrt()),
+                    softcap: None,
+                    causal,
+                    past_seq: kv_seq.saturating_sub(q_seq),
+                    causal_fill: f32::MIN,
+                };
+                let mut fast = vec![0.0f32; batch * heads * q_seq * dv];
+                let mut general = vec![0.0f32; batch * heads * q_seq * dv];
+                sdpa_f32(&tensors, &cfg, &NoBias, &NoMask, &mut fast, None);
+                sdpa_f32(
+                    &tensors,
+                    &cfg,
+                    &OpaqueZeroBias,
+                    &OpaqueZeroMask,
+                    &mut general,
+                    None,
+                );
+                assert_eq!(
+                    fast, general,
+                    "shape {si} causal={causal}: identity specialization diverged"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fully_masked_rows_stay_zero_when_the_fill_is_negative_infinity() {
+        // A row that is entirely `-inf` has no defined softmax; the kernel's
+        // convention (shared with the scalar oracle and ORT) is to emit zeros.
+        // MLAS has no such convention, so this exercises the guarded fallback.
+        struct MaskEverySecondRow;
+        impl KeyMask for MaskEverySecondRow {
+            fn at(&self, _b: usize, i: usize, _j: usize) -> f32 {
+                if i % 2 == 1 { f32::NEG_INFINITY } else { 0.0 }
+            }
+        }
+
+        let (batch, heads, q_seq, kv_seq, dh) = (2usize, 4usize, 6usize, 13usize, 32usize);
+        let q = deterministic_values(batch * heads * q_seq * dh, 0x00B2_0000, 0.7);
+        let k = deterministic_values(batch * heads * kv_seq * dh, 0x00B2_1000, 0.7);
+        let v = deterministic_values(batch * heads * kv_seq * dh, 0x00B2_2000, 0.7);
+        let tensors = SdpaTensors {
+            q: &q,
+            k: &k,
+            v: &v,
+            batch,
+            num_heads: heads,
+            num_kv_heads: heads,
+            q_seq,
+            kv_seq,
+            head_size: dh,
+            v_head_size: dh,
+        };
+        let cfg = SdpaConfig {
+            scale: ScaleMode::PostDot(1.0 / (dh as f32).sqrt()),
+            softcap: None,
+            causal: false,
+            past_seq: 0,
+            causal_fill: f32::NEG_INFINITY,
+        };
+        let mut y = vec![f32::NAN; batch * heads * q_seq * dh];
+        sdpa_f32(&tensors, &cfg, &NoBias, &MaskEverySecondRow, &mut y, None);
+        for b in 0..batch {
+            for h in 0..heads {
+                for i in 0..q_seq {
+                    let row = &y[(((b * heads + h) * q_seq) + i) * dh..][..dh];
+                    assert!(
+                        row.iter().all(|x| x.is_finite()),
+                        "b{b} h{h} row {i} not finite"
+                    );
+                    if i % 2 == 1 {
+                        assert!(
+                            row.iter().all(|x| *x == 0.0),
+                            "b{b} h{h} row {i} should be zeroed, got {row:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
