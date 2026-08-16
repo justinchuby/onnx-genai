@@ -249,6 +249,19 @@ pub(crate) fn tanh_f32_slice(input: &[f32], output: &mut [f32]) {
     dispatch!(input, output, tanh_scalar, tanh_avx2);
 }
 
+/// `y = √x`.
+///
+/// Unlike every other kernel in this module this is **not** an approximation.
+/// `vsqrtps` and `sqrtss` are the same correctly-rounded IEEE-754 square root,
+/// so the vector body, the scalar tail and the pre-existing `f32::sqrt` kernel
+/// this replaces all produce bit-identical results — `-0.0 -> -0.0`,
+/// `x < 0 -> NaN`, `+Inf -> +Inf`, subnormals exact. Nothing here trades
+/// accuracy for speed; the win is eight lanes per instruction plus the caller
+/// no longer materialising an intermediate `Vec` per call.
+pub(crate) fn sqrt_f32_slice(input: &[f32], output: &mut [f32]) {
+    dispatch!(input, output, f32::sqrt, sqrt_avx2);
+}
+
 /// `y = 1 / (1 + e^-x)`.
 pub(crate) fn sigmoid_f32_slice(input: &[f32], output: &mut [f32]) {
     dispatch!(input, output, sigmoid_scalar, sigmoid_avx2);
@@ -610,6 +623,12 @@ unsafe fn sigmoid_avx2(input: &[f32], output: &mut [f32]) {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
+unsafe fn sqrt_avx2(input: &[f32], output: &mut [f32]) {
+    unsafe { avx2::map_ps(input, output, |v| core::arch::x86_64::_mm256_sqrt_ps(v)) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
 unsafe fn tanh_gelu_bias_avx2(input: &[f32], bias: &[f32], width: usize, output: &mut [f32]) {
     unsafe { avx2::map_bias_ps(input, bias, width, output, |v| avx2::tanh_gelu_ps(v)) }
 }
@@ -802,6 +821,120 @@ mod tests {
                 1e30,
             ])
             .collect()
+    }
+
+    /// `sqrt` is not an approximation: the AVX2 body, the scalar tail and a
+    /// plain `f32::sqrt` must agree **bit for bit** on every input, including
+    /// the ones where a "fast" reciprocal-sqrt implementation would not. Every
+    /// length in `0..=64` is covered so the 8-wide body and the masked tail are
+    /// both exercised at every offset, and lengths below `SIMD_MIN_LEN` prove
+    /// the scalar dispatch arm agrees too.
+    #[test]
+    fn sqrt_is_bit_identical_to_scalar_at_every_length() {
+        let base: Vec<f32> = (0..64)
+            .map(|i| {
+                // A spread that includes exact squares, non-squares, subnormals
+                // and values whose sqrt is not representable.
+                match i % 8 {
+                    0 => i as f32,
+                    1 => 1.0 / (i as f32 + 1.0),
+                    2 => (i as f32) * 1e-30,
+                    3 => (i as f32) * 1e30,
+                    4 => f32::from_bits(i as u32 + 1), // subnormals
+                    5 => (i * i) as f32,
+                    6 => 2.0f32.powi(i - 32),
+                    _ => (i as f32) + 0.5,
+                }
+            })
+            .collect();
+        for len in 0..=64usize {
+            let x = &base[..len];
+            let mut got = vec![0.0f32; len];
+            sqrt_f32_slice(x, &mut got);
+            for (i, (&g, &v)) in got.iter().zip(x).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    v.sqrt().to_bits(),
+                    "sqrt mismatch at len={len} index={i} input={v:e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sqrt_special_values() {
+        let mut x = special_inputs();
+        // `special_inputs` is signed-symmetric, which is what matters for
+        // `sqrt`: every negative input must produce NaN.
+        x.push(1.0);
+        x.push(4.0);
+        let mut o = vec![0.0f32; x.len()];
+        sqrt_f32_slice(&x, &mut o);
+        assert!(o[PAD].is_nan(), "sqrt(-Inf) is NaN");
+        assert_eq!(
+            o[PAD + 1].to_bits(),
+            (-0.0f32).to_bits(),
+            "sqrt(-0) is -0, not NaN"
+        );
+        assert_eq!(o[PAD + 2].to_bits(), 0.0f32.to_bits(), "sqrt(+0) is +0");
+        assert_eq!(o[PAD + 3], f32::INFINITY, "sqrt(+Inf)");
+        assert!(o[PAD + 4].is_nan(), "sqrt(NaN)");
+        assert!(o[PAD + 5].is_nan(), "sqrt(-MAX) is NaN");
+        assert_eq!(o[PAD + 6], f32::MAX.sqrt());
+        assert!(o[PAD + 7].is_nan(), "sqrt(-1e30) is NaN");
+        assert_eq!(o[PAD + 8], 1e30f32.sqrt());
+        assert_eq!(o[x.len() - 2], 1.0);
+        assert_eq!(o[x.len() - 1], 2.0);
+    }
+
+    /// A NaN input must come back as a NaN with its payload and sign intact —
+    /// the same contract the transcendental kernels above hold.
+    #[test]
+    fn sqrt_preserves_nan_payload() {
+        let mut x = vec![1.0f32; PAD];
+        x.push(f32::from_bits(0x7FC0_1234));
+        x.push(f32::from_bits(0xFFC0_1234));
+        let mut o = vec![0.0f32; x.len()];
+        sqrt_f32_slice(&x, &mut o);
+        assert_eq!(o[PAD].to_bits(), 0x7FC0_1234);
+        assert_eq!(o[PAD + 1].to_bits(), 0xFFC0_1234);
+    }
+
+    /// `y = sqrt(y)` is a legal graph, and ORT hands us the same buffer for
+    /// both. `write_mapped`'s disjointness check has to reject the direct-write
+    /// arm there, exactly as it does for `Tanh` — this pins that it does for the
+    /// new `Sqrt` caller too, and that the narrowing (non-f32 output) arm agrees.
+    #[test]
+    fn sqrt_write_mapped_agrees_between_direct_and_aliased_outputs() {
+        let n = 257; // not a multiple of 8, so the masked tail runs too
+        let src: Vec<f32> = (0..n).map(|i| i as f32 * 0.37).collect();
+
+        let mut expected = vec![0.0f32; n];
+        sqrt_f32_slice(&src, &mut expected);
+
+        let mut disjoint = Owned::f32(&[n], &vec![0.0f32; n]);
+        write_mapped("Sqrt", &mut disjoint.view_mut(), &src, sqrt_f32_slice).unwrap();
+        assert_eq!(disjoint.to_f32(), expected);
+
+        let mut aliased = Owned::f32(&[n], &src);
+        {
+            let mut view = aliased.view_mut();
+            // SAFETY: `view` addresses `n` contiguous f32; the slice is only
+            // read while `write_mapped` decides which arm to take, which is
+            // exactly the aliasing `output_direct_write_eligible` must detect.
+            let borrowed: &[f32] =
+                unsafe { std::slice::from_raw_parts(view.data_ptr_mut::<f32>(), n) };
+            let borrowed: &[f32] = unsafe { std::mem::transmute(borrowed) };
+            write_mapped("Sqrt", &mut view, borrowed, sqrt_f32_slice).unwrap();
+        }
+        assert_eq!(aliased.to_f32(), expected);
+
+        let mut narrowed = Owned::f16(&[n], &vec![0.0f32; n]);
+        write_mapped("Sqrt", &mut narrowed.view_mut(), &src, sqrt_f32_slice).unwrap();
+        let got = narrowed.to_u16_bits();
+        for (g, e) in got.iter().zip(&expected) {
+            assert_eq!(*g, half::f16::from_f32(*e).to_bits());
+        }
     }
 
     #[test]
